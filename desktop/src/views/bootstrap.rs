@@ -1,0 +1,625 @@
+//! The bootstrap screens: progress while the app finds Shelbi, a full-window
+//! screen for each failure naming its fix, and the relaunch bar shown over the
+//! shell when the CLI is upgraded under a running app.
+//!
+//! Each failure's words are a pure [`Screen`] (tested without gpui); the
+//! render functions only lay it out.
+
+use std::path::Path;
+
+use gpui::{
+    div, prelude::*, px, svg, AnyElement, ClipboardItem, FontWeight, IntoElement, SharedString,
+};
+
+use crate::assets::icons;
+use crate::platform::discovery::{config_path_label, CliNotFound};
+use crate::platform::version::VersionCheck;
+use crate::platform::{BootstrapState, Failure, RelaunchNotice};
+use crate::theme::Theme;
+
+/// The CLI's install command.
+pub const INSTALL_COMMAND: &str = "brew install jlong/shelbi/shelbi";
+/// The CLI's upgrade command.
+pub const UPGRADE_COMMAND: &str = "brew upgrade shelbi";
+/// The app's own upgrade command (its cask).
+pub const APP_UPGRADE_COMMAND: &str = "brew upgrade --cask shelbi-desktop";
+/// Restarting the daemon onto the installed binary.
+pub const DAEMON_RESTART_COMMAND: &str = "shelbi daemon restart";
+
+/// The width of a bootstrap screen's column.
+const COLUMN_WIDTH: f32 = 560.0;
+const ICON_SIZE: f32 = 16.0;
+
+/// What a screen's primary button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenAction {
+    /// Run bootstrap again.
+    Retry,
+    /// Start a new instance of the app and quit this one.
+    Relaunch,
+}
+
+impl ScreenAction {
+    fn label(self) -> &'static str {
+        match self {
+            ScreenAction::Retry => "Try Again",
+            ScreenAction::Relaunch => "Relaunch Shelbi",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        icons::ARROW_PATH
+    }
+}
+
+/// One step of a fix: a sentence, optionally with a command to copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixStep {
+    pub text: String,
+    pub command: Option<String>,
+}
+
+impl FixStep {
+    fn say(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            command: None,
+        }
+    }
+
+    fn run(text: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            command: Some(command.into()),
+        }
+    }
+}
+
+/// A failure screen's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Screen {
+    pub title: String,
+    /// What happened, a paragraph per entry.
+    pub body: Vec<String>,
+    /// How to fix it, in order.
+    pub fix: Vec<FixStep>,
+    /// A labelled block of monospace detail (the paths searched, the
+    /// daemon's stderr).
+    pub details: Option<(String, Vec<String>)>,
+    pub action: ScreenAction,
+}
+
+/// The screen for a failure.
+pub fn failure_screen(failure: &Failure) -> Screen {
+    match failure {
+        Failure::CliNotFound(nf) => cli_not_found(nf),
+        Failure::DaemonFailedToStart { cli, failure } => {
+            let mut body = vec![failure.reason.clone()];
+            body.push(format!("The app ran `{} daemon`.", cli.display()));
+            let details = if failure.stderr_tail.is_empty() {
+                failure
+                    .stderr_log
+                    .as_ref()
+                    .map(|log| (format!("It wrote nothing to {}.", log.display()), Vec::new()))
+            } else {
+                let from = failure
+                    .stderr_log
+                    .as_ref()
+                    .map(|log| format!(" (full log: {})", log.display()))
+                    .unwrap_or_default();
+                Some((
+                    format!("The daemon's last output{from}:"),
+                    failure.stderr_tail.clone(),
+                ))
+            };
+            Screen {
+                title: "The Shelbi daemon didn't start".into(),
+                body,
+                fix: vec![
+                    FixStep::run(
+                        "Run it in a terminal to see the whole error, fix what it reports, then try again:",
+                        format!("{} daemon", shell_quote(cli)),
+                    ),
+                    FixStep::run("To see what a running daemon reports:", "shelbi daemon status"),
+                ],
+                details,
+                action: ScreenAction::Retry,
+            }
+        }
+        Failure::ControlUnreachable { socket, error } => Screen {
+            title: "Can't reach the Shelbi daemon".into(),
+            body: vec![
+                "The daemon started, but its control socket didn't answer.".into(),
+                format!("{}: {error}", socket.display()),
+            ],
+            fix: vec![FixStep::run(
+                "Restart the daemon (agent sessions are separate processes and keep running), then try again:",
+                DAEMON_RESTART_COMMAND,
+            )],
+            details: None,
+            action: ScreenAction::Retry,
+        },
+        Failure::VersionMismatch(check) => version_screen(check),
+    }
+}
+
+fn cli_not_found(nf: &CliNotFound) -> Screen {
+    let mut body = Vec::new();
+    match &nf.setting {
+        Some(path) => body.push(format!(
+            "desktop.cli_path in {} is {}, which isn't an executable file.",
+            config_path_label(),
+            path.display()
+        )),
+        None => body.push(
+            "The desktop app runs the shelbi command-line tool, and it isn't installed anywhere the app looked."
+                .into(),
+        ),
+    }
+    if let Some(error) = &nf.config_error {
+        body.push(format!(
+            "config.yaml couldn't be read, so any desktop.cli_path in it was not applied: {error}"
+        ));
+    }
+    let mut fix = Vec::new();
+    if nf.setting.is_some() {
+        fix.push(FixStep::say(format!(
+            "Correct desktop.cli_path in {}, or remove it to let the app search.",
+            config_path_label()
+        )));
+    } else {
+        fix.push(FixStep::run("Install it with Homebrew:", INSTALL_COMMAND));
+    }
+    fix.push(FixStep::run(
+        format!(
+            "Or tell the app where shelbi is, in {}:",
+            config_path_label()
+        ),
+        "desktop:\n  cli_path: /path/to/shelbi",
+    ));
+    Screen {
+        title: "Shelbi can't find the shelbi command".into(),
+        body,
+        fix,
+        details: Some((
+            "Searched:".into(),
+            nf.searched
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+        )),
+        action: ScreenAction::Retry,
+    }
+}
+
+fn version_screen(check: &VersionCheck) -> Screen {
+    match check {
+        VersionCheck::AppNewer { app, cli } => Screen {
+            title: "The shelbi CLI needs updating".into(),
+            body: vec![
+                format!("This app is Shelbi {app}, and the installed shelbi CLI is {cli}."),
+                "The app and the CLI ship together and must be the same version.".into(),
+            ],
+            fix: vec![FixStep::run(
+                "Upgrade the CLI, then try again:",
+                UPGRADE_COMMAND,
+            )],
+            details: Some((
+                "Versions:".into(),
+                vec![format!("app  {app}"), format!("cli  {cli}")],
+            )),
+            action: ScreenAction::Retry,
+        },
+        VersionCheck::DaemonStale { app, daemon } => Screen {
+            title: "The Shelbi daemon is out of date".into(),
+            body: vec![format!(
+                "The daemon is still running Shelbi {daemon} from before an upgrade. This app and the installed CLI are {app}."
+            )],
+            fix: vec![FixStep::run(
+                "Restart the daemon on the new version (agent sessions are separate processes and keep running), then try again:",
+                DAEMON_RESTART_COMMAND,
+            )],
+            details: Some((
+                "Versions:".into(),
+                vec![format!("app     {app}"), format!("daemon  {daemon}")],
+            )),
+            action: ScreenAction::Retry,
+        },
+        VersionCheck::AppOutdated { app, daemon } => Screen {
+            title: "Shelbi was updated".into(),
+            body: vec![format!(
+                "The shelbi CLI is now {daemon}, and this app is still Shelbi {app}. Relaunch to use the new version."
+            )],
+            fix: vec![FixStep::run(
+                "If it still says this after relaunching, update the app:",
+                APP_UPGRADE_COMMAND,
+            )],
+            details: Some((
+                "Versions:".into(),
+                vec![format!("app     {app}"), format!("daemon  {daemon}")],
+            )),
+            action: ScreenAction::Relaunch,
+        },
+        // Bootstrap never fails with a match; render it as the retry case.
+        VersionCheck::Match => Screen {
+            title: "Shelbi versions match".into(),
+            body: Vec::new(),
+            fix: Vec::new(),
+            details: None,
+            action: ScreenAction::Retry,
+        },
+    }
+}
+
+/// The relaunch bar's sentence.
+pub fn relaunch_message(notice: &RelaunchNotice) -> String {
+    let to = notice
+        .daemon_version
+        .as_deref()
+        .filter(|v| *v != notice.app_version)
+        .map(|v| format!(" to {v}"))
+        .unwrap_or_default();
+    format!(
+        "Shelbi was updated{to}. Relaunch to keep working: changes are paused until then; open sessions keep streaming."
+    )
+}
+
+/// `path` for a shell, single-quoted when it needs it.
+fn shell_quote(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+~".contains(c))
+    {
+        s
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+// ---- rendering --------------------------------------------------------------
+
+/// The in-flight screen: the wordmark and the current step.
+pub fn render_progress(state: &BootstrapState, theme: &Theme) -> AnyElement {
+    let label = state.progress_label().unwrap_or_default();
+    let detail = match state {
+        BootstrapState::StartingDaemon { cli } | BootstrapState::Connecting { cli } => Some(
+            format!("{} (from {})", cli.path.display(), cli.source.label()),
+        ),
+        _ => None,
+    };
+    centered(theme)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.accent)
+                        .child("Shelbi"),
+                )
+                .child(div().text_color(theme.text).child(format!("{label}…")))
+                .when_some(detail, |col, detail| {
+                    col.child(div().text_xs().text_color(theme.muted).child(detail))
+                }),
+        )
+        .into_any_element()
+}
+
+/// A failure screen. `on_action` runs the screen's button.
+pub fn render_failure(
+    screen: &Screen,
+    theme: &Theme,
+    on_action: impl Fn(ScreenAction, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let action = screen.action;
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .w(px(COLUMN_WIDTH))
+        .max_w_full()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    svg()
+                        .path(icons::EXCLAMATION_TRIANGLE)
+                        .size(px(20.0))
+                        .flex_none()
+                        .text_color(theme.status_yellow),
+                )
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.text_selected)
+                        .child(screen.title.clone()),
+                ),
+        );
+    for paragraph in &screen.body {
+        column = column.child(div().text_color(theme.text).child(paragraph.clone()));
+    }
+    for (ix, step) in screen.fix.iter().enumerate() {
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_color(theme.text).child(step.text.clone()));
+        if let Some(command) = &step.command {
+            block = block.child(command_box(ix, command, theme));
+        }
+        column = column.child(block);
+    }
+    if let Some((label, lines)) = &screen.details {
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_color(theme.muted).child(label.clone()));
+        if !lines.is_empty() {
+            block = block.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme.search_bg)
+                    .text_xs()
+                    .text_color(theme.fg_secondary)
+                    .children(lines.iter().map(|line| div().child(line.clone()))),
+            );
+        }
+        column = column.child(block);
+    }
+    column = column.child(
+        div().flex().flex_row().child(
+            div()
+                .id("bootstrap-action")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(theme.selection_bg)
+                .text_color(theme.text_selected)
+                .child(
+                    svg()
+                        .path(action.icon())
+                        .size(px(ICON_SIZE))
+                        .text_color(theme.text_selected),
+                )
+                .child(action.label())
+                .on_click(move |_, window, cx| on_action(action, window, cx)),
+        ),
+    );
+    centered(theme).child(column).into_any_element()
+}
+
+/// The relaunch bar shown over the shell.
+pub fn render_relaunch_bar(
+    notice: &RelaunchNotice,
+    theme: &Theme,
+    on_relaunch: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px_4()
+        .py_2()
+        .bg(theme.selection_bg)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_color(theme.status_yellow)
+                .child(
+                    svg()
+                        .path(icons::EXCLAMATION_TRIANGLE)
+                        .size(px(ICON_SIZE))
+                        .flex_none()
+                        .text_color(theme.status_yellow),
+                )
+                .child(relaunch_message(notice)),
+        )
+        .child(
+            div()
+                .id("relaunch")
+                .flex_none()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(theme.background)
+                .text_color(theme.text_selected)
+                .child(ScreenAction::Relaunch.label())
+                .on_click(move |_, window, cx| on_relaunch(window, cx)),
+        )
+        .into_any_element()
+}
+
+/// A full-window, centered, scrollable stage.
+fn centered(theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("bootstrap-stage")
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .size_full()
+        .p_8()
+        .overflow_y_scroll()
+        .bg(theme.main_background)
+        .text_sm()
+}
+
+/// A command in a monospace box with a copy button.
+fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoElement {
+    let copy: SharedString = command.to_string().into();
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .justify_between()
+        .gap_2()
+        .p_2()
+        .rounded_md()
+        .bg(theme.search_bg)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .text_color(theme.text_selected)
+                .children(command.lines().map(|line| div().child(line.to_string()))),
+        )
+        .child(
+            div()
+                .id(("copy-command", ix))
+                .flex_none()
+                .cursor_pointer()
+                .child(
+                    svg()
+                        .path(icons::CLIPBOARD_DOCUMENT)
+                        .size(px(ICON_SIZE))
+                        .text_color(theme.muted),
+                )
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))
+                }),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::daemon::DaemonFailure;
+    use std::path::PathBuf;
+
+    fn commands(screen: &Screen) -> Vec<&str> {
+        screen
+            .fix
+            .iter()
+            .filter_map(|s| s.command.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn cli_not_found_lists_the_paths_searched_and_the_setting() {
+        let screen = failure_screen(&Failure::CliNotFound(CliNotFound {
+            searched: vec![
+                PathBuf::from("/usr/bin/shelbi"),
+                PathBuf::from("/opt/homebrew/bin/shelbi"),
+            ],
+            setting: None,
+            config_error: None,
+        }));
+        let (label, lines) = screen.details.clone().unwrap();
+        assert_eq!(label, "Searched:");
+        assert_eq!(lines, ["/usr/bin/shelbi", "/opt/homebrew/bin/shelbi"]);
+        assert!(commands(&screen).contains(&INSTALL_COMMAND));
+        assert!(commands(&screen).iter().any(|c| c.contains("cli_path:")));
+        assert_eq!(screen.action, ScreenAction::Retry);
+    }
+
+    #[test]
+    fn a_bad_setting_is_named_instead_of_offering_an_install() {
+        let screen = failure_screen(&Failure::CliNotFound(CliNotFound {
+            searched: vec![PathBuf::from("/nope/shelbi")],
+            setting: Some(PathBuf::from("/nope/shelbi")),
+            config_error: None,
+        }));
+        assert!(screen.body[0].contains("/nope/shelbi"), "{:?}", screen.body);
+        assert!(!commands(&screen).contains(&INSTALL_COMMAND));
+    }
+
+    #[test]
+    fn daemon_failure_shows_the_stderr_tail_and_the_command_to_rerun() {
+        let screen = failure_screen(&Failure::DaemonFailedToStart {
+            cli: PathBuf::from("/Applications/My Tools/shelbi"),
+            failure: DaemonFailure {
+                reason: "`shelbi daemon` exited during startup (exit status: 2)".into(),
+                stderr_tail: vec!["error: bad key".into()],
+                stderr_log: Some(PathBuf::from("/h/logs/desktop-daemon-start.log")),
+            },
+        });
+        assert_eq!(screen.details.as_ref().unwrap().1, ["error: bad key"]);
+        assert!(screen
+            .details
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("desktop-daemon-start.log"));
+        assert_eq!(
+            commands(&screen)[0],
+            "'/Applications/My Tools/shelbi' daemon"
+        );
+    }
+
+    #[test]
+    fn the_unreachable_socket_screen_names_the_socket_and_the_restart() {
+        let screen = failure_screen(&Failure::ControlUnreachable {
+            socket: PathBuf::from("/h/control.sock"),
+            error: "connection refused".into(),
+        });
+        assert!(screen.body[1].contains("/h/control.sock"));
+        assert_eq!(commands(&screen), [DAEMON_RESTART_COMMAND]);
+    }
+
+    #[test]
+    fn app_newer_shows_both_versions_and_brew_upgrade() {
+        let screen = failure_screen(&Failure::VersionMismatch(VersionCheck::AppNewer {
+            app: "0.11.0".into(),
+            cli: "0.10.0".into(),
+        }));
+        assert!(screen.body[0].contains("0.11.0") && screen.body[0].contains("0.10.0"));
+        assert_eq!(commands(&screen), [UPGRADE_COMMAND]);
+        assert_eq!(screen.action, ScreenAction::Retry);
+    }
+
+    #[test]
+    fn an_outdated_app_offers_a_relaunch() {
+        let screen = failure_screen(&Failure::VersionMismatch(VersionCheck::AppOutdated {
+            app: "0.10.0".into(),
+            daemon: "0.11.0".into(),
+        }));
+        assert_eq!(screen.action, ScreenAction::Relaunch);
+    }
+
+    #[test]
+    fn a_stale_daemon_offers_a_restart() {
+        let screen = failure_screen(&Failure::VersionMismatch(VersionCheck::DaemonStale {
+            app: "0.11.0".into(),
+            daemon: "0.10.0".into(),
+        }));
+        assert_eq!(commands(&screen), [DAEMON_RESTART_COMMAND]);
+    }
+
+    #[test]
+    fn the_relaunch_message_names_the_new_version_when_known() {
+        let notice = RelaunchNotice {
+            app_version: "0.10.0".into(),
+            daemon_version: Some("0.11.0".into()),
+            reason: "x".into(),
+        };
+        assert!(relaunch_message(&notice).starts_with("Shelbi was updated to 0.11.0."));
+        let reload = RelaunchNotice {
+            daemon_version: Some("0.10.0".into()),
+            ..notice
+        };
+        assert!(relaunch_message(&reload).starts_with("Shelbi was updated."));
+    }
+}

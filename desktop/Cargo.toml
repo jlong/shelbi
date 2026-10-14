@@ -50,6 +50,9 @@ shelbi-state = { path = "../crates/shelbi-state" }
 shelbi-core = { path = "../crates/shelbi-core" }
 shelbi-palette = { path = "../crates/shelbi-palette" }
 
+# Bootstrap publishes its states from a std thread to the UI's async task.
+# Already in gpui's tree.
+async-channel = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

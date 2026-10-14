@@ -132,7 +132,8 @@ pub use hub_config::{
     HubConfig, ProjectMeta, ProjectSummary,
 };
 pub use daemon_lifecycle::{
-    daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
+    daemon_lock_held, ensure_daemon_running, ensure_daemon_running_with, hub_lock_path,
+    set_daemon_launcher, stop_daemon, DaemonLauncher, DaemonStartError,
 };
 pub use change_bus::{
     publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,
@@ -159,7 +160,8 @@ pub use ssh_control::{
 };
 pub use user_config::{
     editor_display_name, load_user_config, resolve_editor, save_user_config,
-    scaffold_user_config_if_missing, user_config_path, Keymap, UserConfig, ZenToggleChord,
+    scaffold_user_config_if_missing, user_config_path, DesktopConfig, Keymap, UserConfig,
+    ZenToggleChord,
     DEFAULT_EDITOR,
 };
 pub use workflows::{

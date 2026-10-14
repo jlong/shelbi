@@ -13,5 +13,10 @@
 //! - command palette and overlays (error log, review confirm, reject reason,
 //!   Zen intro): **`dt-palette-overlays`**
 //!
+//! - bootstrap progress, failure screens, and the relaunch bar:
+//!   **`dt-platform-bootstrap`** (`bootstrap`)
+//!
 //! Views read view models and invoke registry commands through
 //! `crate::commands`; they never hold domain logic of their own.
+
+pub mod bootstrap;

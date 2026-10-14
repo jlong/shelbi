@@ -36,6 +36,27 @@ pub struct UserConfig {
     /// program name (see [`editor_display_name`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+
+    /// Desktop app settings (`desktop:` block). Ignored by the CLI and TUI.
+    #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
+    pub desktop: DesktopConfig,
+}
+
+/// The desktop app's settings in `config.yaml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopConfig {
+    /// The `shelbi` CLI the desktop app runs, overriding its discovery (the
+    /// login-shell `PATH`, then the Homebrew prefixes and `~/.cargo/bin`).
+    /// A leading `~/` is expanded by the app. Unset means discover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<PathBuf>,
+}
+
+impl DesktopConfig {
+    /// Whether no desktop setting is present (so the block isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.cli_path.is_none()
+    }
 }
 
 /// Keymap overrides. Today just the Zen Mode toggle chord — extended as new
@@ -218,6 +239,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn desktop_cli_path_parses_and_round_trips() {
+        let cfg: UserConfig =
+            serde_yaml::from_str("desktop:\n  cli_path: /opt/shelbi/bin/shelbi\n").unwrap();
+        assert_eq!(
+            cfg.desktop.cli_path.as_deref(),
+            Some(std::path::Path::new("/opt/shelbi/bin/shelbi"))
+        );
+        let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        // Absent block: no key written, so the CLI's own saves don't add one.
+        let text = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        assert!(!text.contains("desktop"), "{text}");
     }
 
     #[test]
