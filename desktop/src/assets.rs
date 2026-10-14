@@ -23,9 +23,17 @@ pub mod icons {
     pub const BOLT: &str = "icons/heroicons/bolt.svg";
     pub const SERVER_STACK: &str = "icons/heroicons/server-stack.svg";
     pub const X_MARK: &str = "icons/heroicons/x-mark.svg";
-    pub const EXCLAMATION_TRIANGLE: &str = "icons/heroicons/exclamation-triangle.svg";
+    pub const ARROW_LEFT: &str = "icons/heroicons/arrow-left.svg";
     pub const ARROW_PATH: &str = "icons/heroicons/arrow-path.svg";
+    pub const ARROW_TOP_RIGHT_ON_SQUARE: &str = "icons/heroicons/arrow-top-right-on-square.svg";
     pub const CLIPBOARD_DOCUMENT: &str = "icons/heroicons/clipboard-document.svg";
+    pub const EXCLAMATION_TRIANGLE: &str = "icons/heroicons/exclamation-triangle.svg";
+    pub const FUNNEL: &str = "icons/heroicons/funnel.svg";
+    pub const LOCK_CLOSED: &str = "icons/heroicons/lock-closed.svg";
+    pub const PENCIL_SQUARE: &str = "icons/heroicons/pencil-square.svg";
+    pub const PLAY: &str = "icons/heroicons/play.svg";
+    pub const PLUS: &str = "icons/heroicons/plus.svg";
+    pub const USER: &str = "icons/heroicons/user.svg";
 }
 
 macro_rules! heroicon {
@@ -48,9 +56,17 @@ const HEROICONS: &[(&str, &[u8])] = &[
     heroicon!(icons::BOLT, "bolt.svg"),
     heroicon!(icons::SERVER_STACK, "server-stack.svg"),
     heroicon!(icons::X_MARK, "x-mark.svg"),
-    heroicon!(icons::EXCLAMATION_TRIANGLE, "exclamation-triangle.svg"),
+    heroicon!(icons::ARROW_LEFT, "arrow-left.svg"),
     heroicon!(icons::ARROW_PATH, "arrow-path.svg"),
+    heroicon!(icons::ARROW_TOP_RIGHT_ON_SQUARE, "arrow-top-right-on-square.svg"),
     heroicon!(icons::CLIPBOARD_DOCUMENT, "clipboard-document.svg"),
+    heroicon!(icons::EXCLAMATION_TRIANGLE, "exclamation-triangle.svg"),
+    heroicon!(icons::FUNNEL, "funnel.svg"),
+    heroicon!(icons::LOCK_CLOSED, "lock-closed.svg"),
+    heroicon!(icons::PENCIL_SQUARE, "pencil-square.svg"),
+    heroicon!(icons::PLAY, "play.svg"),
+    heroicon!(icons::PLUS, "plus.svg"),
+    heroicon!(icons::USER, "user.svg"),
 ];
 
 /// The app's asset source: the Heroicons first, then gpui-kit's assets.
@@ -81,16 +97,7 @@ mod tests {
 
     #[test]
     fn every_heroicon_loads_as_an_svg() {
-        for path in [
-            icons::CHAT_BUBBLE_LEFT_RIGHT,
-            icons::VIEW_COLUMNS,
-            icons::BOLT,
-            icons::SERVER_STACK,
-            icons::X_MARK,
-            icons::EXCLAMATION_TRIANGLE,
-            icons::ARROW_PATH,
-            icons::CLIPBOARD_DOCUMENT,
-        ] {
+        for path in HEROICONS.iter().map(|(p, _)| *p) {
             let bytes = Assets.load(path).unwrap().expect(path);
             assert!(bytes.starts_with(b"<svg"), "{path} is an SVG");
         }

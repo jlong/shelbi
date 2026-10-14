@@ -18,6 +18,7 @@ use shelbi_core::{Column, Machine, MachineKind, StatusCategory, WorkspaceSpec};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{ErrorLogEntry, IssueFile, ZenModeState};
 
+use crate::board::{self, BoardInput, BoardRules, WorkspaceFilter};
 use crate::nav::View;
 
 // ---------------------------------------------------------------------------
@@ -315,10 +316,35 @@ impl SidebarModel {
 // Issues board
 // ---------------------------------------------------------------------------
 
-/// The kanban board.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The kanban board, ready to draw: the visible columns (each with its cards
+/// in board order), plus the board-level chrome. Built by
+/// [`IssuesModel::build`] from a [`BoardInput`] and the active
+/// [`BoardFilters`]; every decision in it (which columns, which column a card
+/// sits in, card order, what a card shows) comes from [`crate::board`], so the
+/// TUI and the desktop board agree.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IssuesModel {
     pub columns: Vec<IssueColumn>,
+    /// The board label: the project's `display_name`, else its slug.
+    pub title: String,
+    /// True while no warm read has landed (a cold index): paint the columns
+    /// with a loading state instead of empty lanes that look real.
+    pub loading: bool,
+    /// The board freshness banner, when the index lags or is cached.
+    pub banner: Option<String>,
+    /// The last read's error, for the status line.
+    pub error: Option<String>,
+    /// True until the first terminal-history page lands: the done column is
+    /// still filling (the open board never waits on it).
+    pub done_loading: bool,
+    /// More terminal history is available behind "load more".
+    pub has_more_done: bool,
+    /// Whether cards carry their workflow-name badge (more than one workflow
+    /// loaded and no workflow filter).
+    pub show_workflow_badges: bool,
+    /// The active filters' chip labels.
+    pub workflow_filter_label: String,
+    pub workspace_filter_label: String,
 }
 
 /// A column definition: one status from `workflows/statuses.yaml`.
@@ -334,7 +360,11 @@ pub struct ColumnDef {
 pub struct IssueColumn {
     pub status_id: String,
     pub status_name: String,
+    /// The header label (`IN PROGRESS`), see [`crate::board::column_label`].
+    pub label: String,
     pub category: StatusCategory,
+    /// Renders as the narrow collapsed strip (empty, or the user collapsed it).
+    pub collapsed: bool,
     pub cards: Vec<IssueCard>,
 }
 
@@ -343,47 +373,252 @@ pub struct IssueColumn {
 pub struct IssueCard {
     pub id: String,
     pub title: String,
-    /// True when a dependency is not yet done (renders the 🔒 prefix).
+    /// True when a dependency is not yet done (renders the lock badge).
     pub blocked: bool,
+    /// The meta-line branch: the task's own branch, or a resolved
+    /// `base_branch` template ([`crate::board::card_branch`]).
     pub branch: Option<String>,
+    /// The task's own `workflow:` field, as written.
     pub workflow: Option<String>,
+    /// The workflow the card belongs to (its own, else the project default).
+    pub workflow_name: String,
+    /// The workspace the card is assigned to (`assigned_to`, no `@`).
+    pub assignee: Option<String>,
+    pub priority: u32,
+    /// Dependency badges, in `depends_on` order.
+    pub depends_on: Vec<DepBadge>,
+    /// The column the card buckets under (its status resolved against its
+    /// workflow).
+    pub status_id: String,
+    /// The status as stored (`Issue::column`) and `updated_at` as RFC3339:
+    /// the state this card was read at, which a mutation carries so the daemon
+    /// refuses it if another client changed the issue first.
+    pub stored_status: String,
+    pub updated_at: String,
+}
+
+/// One `depends_on` entry and where that dependency stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepBadge {
+    pub id: String,
+    /// The dependency's status id, or `None` when it isn't on the board.
+    pub status: Option<String>,
+    pub done: bool,
+}
+
+/// The view-only filters a client applies over the board. The workflow
+/// filter is per-session; the workspace filter is persisted in `state.json`
+/// (the client reads it back through [`BoardInput::workspace_filter`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoardFilters {
+    pub workflow: Option<String>,
+    pub workspace: Option<WorkspaceFilter>,
+}
+
+impl IssueCard {
+    /// The expected state a mutation of this card carries.
+    pub fn expected(&self) -> shelbi_proto::control::ExpectedState {
+        shelbi_proto::control::ExpectedState {
+            status: self.stored_status.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
 }
 
 impl IssuesModel {
-    /// Bucket a board slice into the given columns by status id. A card's
-    /// `blocked` flag is computed against the whole board, matching the
-    /// kanban's lock glyph.
-    pub fn from_board(columns: &[ColumnDef], board: &[IssueFile]) -> IssuesModel {
-        // id -> column, so dependency status can be checked for `is_blocked`.
-        let by_id: HashMap<String, Column> = board
+    /// Render a board: every visible column (from `statuses.yaml`, narrowed by
+    /// the workflow filter) with the cards that bucket under it, filtered by
+    /// workspace and workflow, in board order (priority, or newest-first in a
+    /// done column).
+    pub fn build(input: &BoardInput, filters: &BoardFilters) -> IssuesModel {
+        let rules = input.rules();
+        let tasks = input.tasks();
+        let by_id: HashMap<String, Column> = tasks
             .iter()
             .map(|f| (f.task.id.clone(), f.task.column.clone()))
             .collect();
-
-        let columns = columns
+        let workflow_filter = filters.workflow.as_deref();
+        let resolved: Vec<String> = tasks
             .iter()
+            .map(|tf| rules.resolved_status_id(&tf.task))
+            .collect();
+        let columns = input
+            .columns(workflow_filter)
+            .into_iter()
             .map(|def| {
-                let cards = board
+                let mut members: Vec<&IssueFile> = tasks
                     .iter()
-                    .filter(|f| f.task.column.as_str() == def.status_id)
-                    .map(|f| IssueCard {
-                        id: f.task.id.clone(),
-                        title: f.task.title.clone(),
-                        blocked: f.task.is_blocked(&by_id),
-                        branch: f.task.branch.clone(),
-                        workflow: f.task.workflow.clone(),
+                    .zip(&resolved)
+                    .filter(|(tf, status)| {
+                        status.as_str() == def.status_id
+                            && filters
+                                .workspace
+                                .as_ref()
+                                .is_none_or(|f| f.matches(tf.task.assigned_to.as_deref()))
+                            && workflow_filter.is_none_or(|w| rules.workflow_name(&tf.task) == w)
                     })
+                    .map(|(tf, _)| tf)
                     .collect();
+                board::sort_column_cards(def.category, &mut members);
+                let cards: Vec<IssueCard> = members
+                    .into_iter()
+                    .map(|tf| card_for(tf, &by_id, &rules, &def.status_id))
+                    .collect();
+                let collapsed = input
+                    .expansion(workflow_filter, &def.status_id)
+                    .is_collapsed(cards.len());
                 IssueColumn {
-                    status_id: def.status_id.clone(),
-                    status_name: def.status_name.clone(),
+                    label: board::column_label(&def.status_name),
+                    status_id: def.status_id,
+                    status_name: def.status_name,
                     category: def.category,
+                    collapsed,
                     cards,
                 }
             })
             .collect();
+        IssuesModel {
+            columns,
+            title: input.display_name.clone().unwrap_or_default(),
+            loading: input.loading,
+            banner: input.banner.clone(),
+            error: input.error.clone(),
+            done_loading: !input.closed_loaded,
+            has_more_done: input.closed_next_cursor.is_some(),
+            show_workflow_badges: board::show_card_workflow_label(
+                input.workflows.len(),
+                filters.workflow.is_some(),
+            ),
+            workflow_filter_label: filters
+                .workflow
+                .clone()
+                .unwrap_or_else(|| "All workflows".to_string()),
+            workspace_filter_label: filters
+                .workspace
+                .as_ref()
+                .map(WorkspaceFilter::label)
+                .unwrap_or_else(|| "All workspaces".to_string()),
+        }
+    }
 
-        IssuesModel { columns }
+    /// The card with `id`, wherever it sits.
+    pub fn card(&self, id: &str) -> Option<&IssueCard> {
+        self.columns
+            .iter()
+            .flat_map(|c| c.cards.iter())
+            .find(|c| c.id == id)
+    }
+
+    /// `(column, row)` of the card with `id`.
+    pub fn position(&self, id: &str) -> Option<(usize, usize)> {
+        self.columns.iter().enumerate().find_map(|(ci, col)| {
+            col.cards
+                .iter()
+                .position(|c| c.id == id)
+                .map(|ri| (ci, ri))
+        })
+    }
+}
+
+/// The task detail: the issue's frontmatter fields and its markdown body, as
+/// the board's detail view (the TUI's popover, the desktop's task detail)
+/// shows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDetailModel {
+    pub id: String,
+    pub title: String,
+    /// The stored status id and its display label (`IN PROGRESS`).
+    pub status_id: String,
+    pub status_label: String,
+    pub category: StatusCategory,
+    pub priority: u32,
+    pub assignee: Option<String>,
+    pub branch: Option<String>,
+    pub workflow_name: String,
+    pub depends_on: Vec<DepBadge>,
+    pub blocked: bool,
+    /// A recorded pull-request link ([`crate::board::pr_link`]).
+    pub pr_link: Option<String>,
+    /// `YYYY-MM-DD HH:MM UTC`.
+    pub created: String,
+    pub updated: String,
+    /// The markdown body.
+    pub body: String,
+}
+
+impl TaskDetailModel {
+    /// The detail of issue `id` on `input`'s board, or `None` when it is no
+    /// longer there.
+    pub fn build(input: &BoardInput, id: &str) -> Option<TaskDetailModel> {
+        let tasks = input.tasks();
+        let tf = tasks.iter().find(|tf| tf.task.id == id)?;
+        let by_id: HashMap<String, Column> = tasks
+            .iter()
+            .map(|f| (f.task.id.clone(), f.task.column.clone()))
+            .collect();
+        let rules = input.rules();
+        let status_id = rules.resolved_status_id(&tf.task);
+        let card = card_for(tf, &by_id, &rules, &status_id);
+        let status = input
+            .project_statuses
+            .statuses
+            .iter()
+            .find(|st| st.id == status_id);
+        let task = &tf.task;
+        Some(TaskDetailModel {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            status_label: board::column_label(
+                status.map(|st| st.name.as_str()).unwrap_or(task.column.default_status_name()),
+            ),
+            category: status.map(|st| st.category).unwrap_or(task.column.category()),
+            status_id,
+            priority: task.priority,
+            assignee: card.assignee,
+            branch: card.branch,
+            workflow_name: card.workflow_name,
+            depends_on: card.depends_on,
+            blocked: card.blocked,
+            pr_link: board::pr_link(task),
+            created: task.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            updated: task.updated_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            body: tf.body.clone(),
+        })
+    }
+}
+
+fn card_for(
+    tf: &IssueFile,
+    by_id: &HashMap<String, Column>,
+    rules: &BoardRules<'_>,
+    status_id: &str,
+) -> IssueCard {
+    let task = &tf.task;
+    let workflow_name = rules.workflow_name(task).to_string();
+    IssueCard {
+        id: task.id.clone(),
+        title: task.title.clone(),
+        blocked: task.is_blocked(by_id),
+        branch: board::card_branch(task, rules.workflows, &workflow_name),
+        workflow: task.workflow.clone(),
+        workflow_name,
+        assignee: task.assigned_to.clone(),
+        priority: task.priority,
+        depends_on: task
+            .depends_on
+            .iter()
+            .map(|dep| {
+                let status = by_id.get(dep);
+                DepBadge {
+                    id: dep.clone(),
+                    status: status.map(|c| c.as_str().to_string()),
+                    done: status.is_some_and(|c| c.category() == StatusCategory::Done),
+                }
+            })
+            .collect(),
+        status_id: status_id.to_string(),
+        stored_status: task.column.as_str().to_string(),
+        updated_at: task.updated_at.to_rfc3339(),
     }
 }
 
@@ -688,32 +923,101 @@ mod tests {
             issue_full("T-4", "todo", &["T-5"], None), // dep done -> not blocked
             issue("T-5", "done"),
         ];
-        let cols = vec![
-            ColumnDef {
-                status_id: "todo".into(),
-                status_name: "To do".into(),
-                category: StatusCategory::Ready,
-            },
-            ColumnDef {
-                status_id: "in-progress".into(),
-                status_name: "In progress".into(),
-                category: StatusCategory::Active,
-            },
-            ColumnDef {
-                status_id: "done".into(),
-                status_name: "Done".into(),
-                category: StatusCategory::Done,
-            },
-        ];
-        let model = IssuesModel::from_board(&cols, &board);
-        assert_eq!(model.columns.len(), 3);
-        let todo = &model.columns[0];
+        let input = board_input(board);
+        let model = IssuesModel::build(&input, &BoardFilters::default());
+        // The canonical statuses.yaml columns, in declared order.
+        let ids: Vec<&str> = model.columns.iter().map(|c| c.status_id.as_str()).collect();
+        assert_eq!(ids, ["backlog", "todo", "in-progress", "review", "done", "canceled"]);
+        let todo = &model.columns[1];
+        assert_eq!(todo.label, "TO DO");
         assert_eq!(todo.cards.len(), 3);
         let t2 = todo.cards.iter().find(|c| c.id == "T-2").unwrap();
         assert!(t2.blocked, "T-2 depends on an unfinished task");
+        assert_eq!(t2.depends_on[0].status.as_deref(), Some("in-progress"));
+        assert!(!t2.depends_on[0].done);
         let t4 = todo.cards.iter().find(|c| c.id == "T-4").unwrap();
         assert!(!t4.blocked, "T-4's dependency is done");
-        assert_eq!(model.columns[2].category, StatusCategory::Done);
+        assert!(t4.depends_on[0].done);
+        assert_eq!(model.columns[4].category, StatusCategory::Done);
+        // Empty columns auto-collapse; non-empty ones expand.
+        assert!(model.columns[0].collapsed, "empty backlog collapses");
+        assert!(!todo.collapsed);
+    }
+
+    fn board_input(open: Vec<IssueFile>) -> BoardInput {
+        BoardInput {
+            open,
+            loading: false,
+            closed_loaded: true,
+            ..BoardInput::default()
+        }
+    }
+
+    #[test]
+    fn issues_board_filters_by_workspace_and_carries_the_read_state() {
+        let mut board = vec![
+            issue_full("T-1", "todo", &[], Some("alpha")),
+            issue("T-2", "todo"),
+        ];
+        board[0].task.branch = Some("jlong/t-1".into());
+        let input = board_input(board);
+        let filters = BoardFilters {
+            workspace: Some(WorkspaceFilter::Workspace("alpha".into())),
+            ..BoardFilters::default()
+        };
+        let model = IssuesModel::build(&input, &filters);
+        let todo = &model.columns[1];
+        assert_eq!(todo.cards.len(), 1);
+        let card = &todo.cards[0];
+        assert_eq!(card.assignee.as_deref(), Some("alpha"));
+        assert_eq!(card.branch.as_deref(), Some("jlong/t-1"));
+        assert_eq!(card.workflow_name, "default");
+        assert_eq!(model.workspace_filter_label, "alpha");
+        // The expected state is the stored status + revision the card was read at.
+        let expected = card.expected();
+        assert_eq!(expected.status, "todo");
+        assert_eq!(expected.updated_at, input.open[0].task.updated_at.to_rfc3339());
+        assert_eq!(model.position("T-1"), Some((1, 0)));
+    }
+
+    #[test]
+    fn issues_board_done_column_fills_from_the_closed_page_newest_first() {
+        let mut input = board_input(vec![issue("T-1", "todo")]);
+        input.closed_loaded = false;
+        let model = IssuesModel::build(&input, &BoardFilters::default());
+        assert!(model.done_loading, "done is still filling until a closed page lands");
+        assert_eq!(model.columns[1].cards.len(), 1, "the open board never waits on history");
+
+        let mut older = issue("D-1", "done");
+        older.task.updated_at -= chrono::Duration::hours(2);
+        let newer = issue("D-2", "done");
+        input.apply_closed(Some(board::ClosedPage {
+            issues: vec![older, newer],
+            next_cursor: Some("next".into()),
+        }));
+        let model = IssuesModel::build(&input, &BoardFilters::default());
+        assert!(!model.done_loading);
+        assert!(model.has_more_done);
+        let done: Vec<&str> = model.columns[4].cards.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(done, ["D-2", "D-1"]);
+    }
+
+    #[test]
+    fn task_detail_carries_frontmatter_fields_and_body() {
+        let mut t = issue_full("T-1", "in-progress", &["T-2"], Some("alpha"));
+        t.task.branch = Some("jlong/t-1".into());
+        t.body = "## Goal\n\n- [ ] ship it\n".into();
+        let input = board_input(vec![t, issue("T-2", "todo")]);
+        let d = TaskDetailModel::build(&input, "T-1").unwrap();
+        assert_eq!(d.status_id, "in-progress");
+        assert_eq!(d.status_label, "IN PROGRESS");
+        assert_eq!(d.assignee.as_deref(), Some("alpha"));
+        assert_eq!(d.branch.as_deref(), Some("jlong/t-1"));
+        assert_eq!(d.workflow_name, "default");
+        assert!(d.blocked);
+        assert_eq!(d.depends_on[0].status.as_deref(), Some("todo"));
+        assert!(d.body.contains("- [ ] ship it"));
+        assert!(TaskDetailModel::build(&input, "gone").is_none());
     }
 
     #[test]

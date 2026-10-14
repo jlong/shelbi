@@ -5,16 +5,17 @@
 //! variant upstream in `shelbi-app` fails to compile here until the desktop
 //! handles it. Do not add a `_ =>` arm to either match.
 //!
-//! In the foundation every arm reaches [`not_implemented`], which logs a
+//! An arm whose subtask hasn't landed reaches [`not_implemented`], which logs a
 //! warning and asks the [`CommandHost`] (the window) to show the in-window
 //! "Not implemented yet: <command id>" banner. Each `dt-*` subtask replaces
-//! the arms it implements with the real behavior.
+//! the arms it implements with the real behavior. Implemented so far: the
+//! Issues view and the board's issue mutations (`dt-issues-board`).
 //!
 //! The id named in the banner is the command's registry id where the
 //! registry has one (`view:tasks`, `workspace:<name>`, `action:toggle-zen`,
 //! ...). The issue mutations are not surfaced in the palette, so the
-//! registry gives them no id; they get desktop-local `issue:<verb>:<id>`
-//! labels here, used only in the banner and the log.
+//! registry gives them no id; the tests name them with desktop-local
+//! `issue:<verb>:<id>` labels.
 
 use shelbi_app::{CommandKind, EditTarget, View};
 
@@ -25,6 +26,15 @@ pub trait CommandHost {
     /// Surface that `command_id` is not implemented yet (the window shows a
     /// banner).
     fn not_implemented(&mut self, command_id: &str);
+
+    /// Show the Issues board in the main area.
+    fn show_issues(&mut self);
+
+    /// Run an issue mutation (`MoveIssue`, `StartIssue`, `AssignIssue`,
+    /// `EditIssue`, `AddIssue`) through the board, which captures the state
+    /// the user was looking at and sends it with `execute_mutation` off the UI
+    /// thread.
+    fn issue_command(&mut self, kind: &CommandKind);
 }
 
 /// Run a command. Every [`CommandKind`] variant has its own arm.
@@ -70,16 +80,11 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
             EditTarget::ZenMode => not_implemented(host, "edit:zenmode"),
             EditTarget::Workflows => not_implemented(host, "edit:workflows"),
         },
-        // dt-issues-board / dt-board-dnd
-        CommandKind::MoveIssue { id, to_status } => {
-            not_implemented(host, &format!("issue:move:{id}:{to_status}"))
-        }
-        // dt-issues-board
-        CommandKind::StartIssue { id } => not_implemented(host, &format!("issue:start:{id}")),
-        // dt-issues-board
-        CommandKind::AssignIssue { id, workspace } => {
-            not_implemented(host, &format!("issue:assign:{id}:{workspace}"))
-        }
+        // The board's issue mutations (dt-issues-board; drag and drop reuses
+        // MoveIssue in dt-board-dnd).
+        CommandKind::MoveIssue { .. }
+        | CommandKind::StartIssue { .. }
+        | CommandKind::AssignIssue { .. } => host.issue_command(kind),
         // dt-review-view
         CommandKind::ApproveReview { id } => not_implemented(host, &format!("issue:approve:{id}")),
         // dt-review-view. The reason is user prose, so it stays out of the
@@ -87,10 +92,7 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::RejectReview { id, reason: _ } => {
             not_implemented(host, &format!("issue:reject:{id}"))
         }
-        // dt-issues-board
-        CommandKind::EditIssue { id } => not_implemented(host, &format!("issue:edit:{id}")),
-        // dt-issues-board
-        CommandKind::AddIssue { title: _ } => not_implemented(host, "issue:add"),
+        CommandKind::EditIssue { .. } | CommandKind::AddIssue { .. } => host.issue_command(kind),
     }
 }
 
@@ -130,8 +132,7 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
 /// Show a view in the main area. Every [`View`] variant has its own arm.
 pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
     match view {
-        // dt-issues-board
-        View::Issues => not_implemented(host, "view:tasks"),
+        View::Issues => host.show_issues(),
         // dt-activity-machines
         View::Activity => not_implemented(host, "view:activity"),
         // dt-activity-machines
@@ -160,19 +161,30 @@ pub fn not_implemented_message(command_id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Records what each dispatch reached: `stub:<id>` for the
+    /// not-implemented banner, `issues` for the board, `issue:<kind>` for an
+    /// issue mutation.
     #[derive(Default)]
     struct Recorder(Vec<String>);
 
     impl CommandHost for Recorder {
         fn not_implemented(&mut self, command_id: &str) {
-            self.0.push(command_id.to_string());
+            self.0.push(format!("stub:{command_id}"));
+        }
+
+        fn show_issues(&mut self) {
+            self.0.push("issues".to_string());
+        }
+
+        fn issue_command(&mut self, kind: &CommandKind) {
+            self.0.push(format!("issue:{kind:?}"));
         }
     }
 
     fn id_for(kind: CommandKind) -> String {
         let mut host = Recorder::default();
         dispatch_command(&kind, &mut host);
-        assert_eq!(host.0.len(), 1, "{kind:?} must reach the stub exactly once");
+        assert_eq!(host.0.len(), 1, "{kind:?} must reach one handler exactly once");
         host.0.remove(0)
     }
 
@@ -291,10 +303,28 @@ mod tests {
     }
 
     #[test]
-    fn every_command_reaches_the_not_implemented_stub() {
+    fn every_command_reaches_its_handler() {
         for (kind, expected) in every_command() {
-            assert_eq!(id_for(kind), expected);
+            let reached = id_for(kind.clone());
+            if is_board_command(&kind) {
+                assert_eq!(reached, format!("issue:{kind:?}"), "{expected} runs on the board");
+            } else if kind == CommandKind::ShowView(View::Issues) {
+                assert_eq!(reached, "issues");
+            } else {
+                assert_eq!(reached, format!("stub:{expected}"));
+            }
         }
+    }
+
+    fn is_board_command(kind: &CommandKind) -> bool {
+        matches!(
+            kind,
+            CommandKind::MoveIssue { .. }
+                | CommandKind::StartIssue { .. }
+                | CommandKind::AssignIssue { .. }
+                | CommandKind::EditIssue { .. }
+                | CommandKind::AddIssue { .. }
+        )
     }
 
     #[test]
@@ -309,12 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn every_view_reaches_the_stub() {
+    fn every_view_reaches_its_handler() {
         for (view, expected) in [
-            (View::Issues, "view:tasks"),
-            (View::Activity, "view:activity"),
-            (View::Machines, "view:machines"),
-            (View::Session("orch".into()), "view:orch"),
+            (View::Issues, "issues"),
+            (View::Activity, "stub:view:activity"),
+            (View::Machines, "stub:view:machines"),
+            (View::Session("orch".into()), "stub:view:orch"),
         ] {
             let mut host = Recorder::default();
             dispatch_view(&view, &mut host);

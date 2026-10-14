@@ -240,6 +240,68 @@ fn two_clients_moving_the_same_issue_one_wins_one_is_stale() {
     assert_eq!(home.column_of("t1"), "todo");
 }
 
+/// The board's refusal path end to end (`dt-issues-board`): a client renders a
+/// card, the CLI moves that issue before the client acts, and the client's
+/// move, sent with the state its card was read at (`IssueCard::expected`, what
+/// `execute_mutation_expecting` sends), is refused as stale and changes
+/// nothing; re-reading the board shows where the CLI put it.
+#[test]
+fn a_board_move_from_a_stale_card_is_refused_after_a_cli_move() {
+    let mut home = Home::new("board");
+    home.write_issue("t1", "backlog");
+    home.start_daemon();
+
+    // The client's read: the board model built from the issue as it is now.
+    let read_card = |home: &Home| {
+        let text =
+            std::fs::read_to_string(home.path.join("projects/p/tasks/t1.md")).unwrap();
+        let input = shelbi_app::board::BoardInput {
+            open: vec![shelbi_state::parse_task_file(&text).unwrap()],
+            loading: false,
+            closed_loaded: true,
+            ..Default::default()
+        };
+        let model =
+            shelbi_app::IssuesModel::build(&input, &shelbi_app::BoardFilters::default());
+        model.card("t1").cloned().unwrap()
+    };
+    let card = read_card(&home);
+    assert_eq!(card.status_id, "backlog");
+
+    // Between the read and the move, the CLI moves the issue.
+    let status = Command::new(BIN)
+        .args(["issue", "move", "t1", "--to", "todo", "-p", "p"])
+        .env("SHELBI_HOME", &home.path)
+        .env("SHELBI_HUB_SOCK", &home.hub)
+        .env("SHELBI_CONTROL_SOCK", &home.control)
+        .env_remove("SHELBI_ROOT")
+        .env("SHELBI_YES", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the CLI move ran");
+    assert_eq!(home.column_of("t1"), "todo");
+
+    // The client now moves its (stale) card, sending the state the card was
+    // read at, exactly what the desktop board puts on its mutation.
+    let mut client = connect(&home.control).unwrap();
+    let err = client
+        .mutate(&move_req(1, "t1", "in-progress", Some(card.expected())), &mut discard())
+        .unwrap_err();
+    match err {
+        shelbi_client::ClientError::Mutation(shelbi_proto::control::MutationError::Stale {
+            actual,
+            ..
+        }) => assert_eq!(actual.status, "todo", "the refusal names the real state"),
+        other => panic!("expected the daemon to refuse the stale card, got {other:?}"),
+    }
+    // Nothing changed; the board's re-read shows the CLI's move.
+    assert_eq!(home.column_of("t1"), "todo");
+    assert_eq!(read_card(&home).status_id, "todo");
+}
+
 #[test]
 fn a_mutation_finishes_after_the_client_disconnects() {
     let mut home = Home::new("leave");

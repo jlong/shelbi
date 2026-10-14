@@ -29,7 +29,34 @@ pub fn execute_mutation(
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
     let (project, id, kind) = map_to_kind(mutation)?;
-    route(&project, &id, kind, on_line)
+    // The `(status, revision)` the app last saw, so the daemon can reject a
+    // command whose issue moved on. `add` has no prior state. Read through the
+    // store (shelbi-state), not the orchestrator, to keep this crate light.
+    let expected = match &kind {
+        MutationKind::Add(_) => None,
+        _ => read_expected(&project, &id),
+    };
+    route(&project, &id, expected, kind, on_line)
+}
+
+/// [`execute_mutation`] with the expected state supplied by the caller: the
+/// `(status, revision)` the client was **looking at** when the user acted,
+/// rather than one re-read at send time. A board that renders a snapshot passes
+/// the card's read state, so if another client moved the issue after that
+/// snapshot the daemon refuses the mutation ([`ExecError::Conflict`]) instead
+/// of applying it to state the user never saw. `None` sends no expectation
+/// (the daemon applies unconditionally); `add` ignores it.
+pub fn execute_mutation_expecting(
+    mutation: &Mutation,
+    expected: Option<ExpectedState>,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
+    let (project, id, kind) = map_to_kind(mutation)?;
+    let expected = match &kind {
+        MutationKind::Add(_) => None,
+        _ => expected,
+    };
+    route(&project, &id, expected, kind, on_line)
 }
 
 /// Ask the daemon to start or stop a review slot's editor/diff/server sessions
@@ -178,17 +205,10 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
 fn route(
     project: &str,
     id: &str,
+    expected: Option<ExpectedState>,
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    // The `(status, revision)` the app last saw, so the daemon can reject a
-    // command whose issue moved on. `add` has no prior state. Read through the
-    // store (shelbi-state), not the orchestrator, to keep this crate light.
-    let expected = match &kind {
-        MutationKind::Add(_) => None,
-        _ => read_expected(project, id),
-    };
-
     shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
     let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
     let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)

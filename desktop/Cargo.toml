@@ -53,9 +53,17 @@ shelbi-palette = { path = "../crates/shelbi-palette" }
 # Bootstrap publishes its states from a std thread to the UI's async task.
 # Already in gpui's tree.
 async-channel = "2"
+# The Markdown parser gpui-kit's text view renders with (pinned to the version
+# gpui-base resolves), for the task detail's checklist count and its tests.
+markdown = "=1.0.0"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+
+[dev-dependencies]
+# Issue fixtures in the board tests carry timestamps.
+chrono = "0.4"
 
 [profile.release]
 lto = "thin"

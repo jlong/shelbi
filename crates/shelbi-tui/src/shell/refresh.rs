@@ -13,11 +13,6 @@
 //! one and assert the loop keeps running (the "no native view blocks the event
 //! loop while refreshing" criterion).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-
 use shelbi_app::view::SidebarModel;
 
 use crate::activity::ActivityData;
@@ -34,102 +29,22 @@ pub struct ShellSnapshot {
     pub machines: Option<MachinesData>,
 }
 
-/// A handle to a running refresh worker, generic over the payload `T` it
-/// publishes. Dropping it stops the worker and joins its thread.
+/// A refresh worker, generic over the payload `T` it publishes. Dropping it
+/// stops the worker and joins its thread. Shared with the desktop board; see
+/// [`shelbi_app::refresh::Refresher`].
 ///
-/// The shell runs two: the core refresher ([`ShellSnapshot`] — sidebar, board,
-/// machines, all read from the daemon index / disk) and a separate activity
-/// refresher ([`crate::activity::ActivityData`]). Splitting them is what keeps a
-/// slow activity-title hydration pass from delaying the sidebar: the core
-/// snapshot publishes on its own worker, untouched by the activity read.
-pub struct Refresher<T> {
-    request_tx: Option<Sender<()>>,
-    snapshot_rx: Receiver<T>,
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
+/// The shell runs several: the core refresher ([`ShellSnapshot`] — sidebar, board,
+/// machines, all read from the daemon index / disk), a separate activity
+/// refresher ([`crate::activity::ActivityData`]), and the closed-page refresher.
+/// Splitting them is what keeps a slow activity-title hydration pass from
+/// delaying the sidebar: the core snapshot publishes on its own worker.
+pub use shelbi_app::refresh::Refresher;
 
-/// Spawn a refresh worker driven by `reader`. The worker blocks until
-/// [`Refresher::request`] asks for a refresh, then calls `reader(gen)` off the UI
-/// thread and publishes the returned value. Requests that pile up while a read is
-/// in flight coalesce into a single refresh.
-pub fn spawn<T, F>(reader: F) -> Refresher<T>
-where
-    T: Send + 'static,
-    F: Fn(u64) -> T + Send + 'static,
-{
-    let (request_tx, request_rx) = mpsc::channel::<()>();
-    let (snapshot_tx, snapshot_rx) = mpsc::channel::<T>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-
-    let join = std::thread::Builder::new()
-        .name("shelbi-shell-refresh".to_string())
-        .spawn(move || {
-            let mut generation: u64 = 0;
-            while request_rx.recv().is_ok() {
-                if worker_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                // Coalesce any piled-up requests into one read.
-                while request_rx.try_recv().is_ok() {}
-                let snapshot = reader(generation);
-                generation = generation.wrapping_add(1);
-                if snapshot_tx.send(snapshot).is_err() {
-                    break;
-                }
-            }
-        })
-        .expect("spawn shell refresh worker thread");
-
-    Refresher {
-        request_tx: Some(request_tx),
-        snapshot_rx,
-        stop,
-        join: Some(join),
-    }
-}
-
-impl<T> Refresher<T> {
-    /// Ask for a refresh. Returns immediately — the read happens on the worker.
-    /// Returns `false` if the worker has stopped.
-    pub fn request(&self) -> bool {
-        match &self.request_tx {
-            Some(tx) => tx.send(()).is_ok(),
-            None => false,
-        }
-    }
-
-    /// The most recent snapshot available without blocking, draining older queued
-    /// ones so the caller always gets the freshest. `None` when nothing new has
-    /// arrived since the last call.
-    pub fn latest(&self) -> Option<T> {
-        let mut newest = None;
-        while let Ok(s) = self.snapshot_rx.try_recv() {
-            newest = Some(s);
-        }
-        newest
-    }
-
-    /// Stop the worker and join its thread. Idempotent; also runs on drop.
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let tx = self.request_tx.take();
-        if let Some(tx) = &tx {
-            let _ = tx.send(());
-        }
-        drop(tx);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
-impl<T> Drop for Refresher<T> {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
+/// Spawn a refresh worker driven by `reader` ([`shelbi_app::refresh::spawn_worker`]):
+/// the worker calls `reader(gen)` off the UI thread on each request and
+/// publishes the result; requests that pile up while a read is in flight
+/// coalesce into one.
+pub use shelbi_app::refresh::spawn_worker as spawn;
 
 #[cfg(test)]
 mod tests {
