@@ -204,35 +204,32 @@ pub fn layout_row(emu: &TermEmulator, row: u16, cols: u16, palette: &Palette) ->
             underline: a.underline,
             strikethrough: a.strikethrough,
         };
-        let mut text = String::new();
-        text.push(if blank { ' ' } else { cell.c });
-        if let Some(marks) = cell.zerowidth() {
-            text.extend(marks);
-        }
+        let ch = if blank { ' ' } else { cell.c };
+        let marks = cell.zerowidth();
 
-        if a.wide {
-            out.glyphs.push(GlyphRun {
-                col,
-                cells: 2,
-                text,
-                style,
-                wide: true,
-            });
-            continue;
-        }
-        match out.glyphs.last_mut() {
-            Some(run) if !run.wide && run.style == style && run.col + run.cells == col => {
-                run.text.push_str(&text);
+        // Characters go straight into their run's text: no per-cell string.
+        if !a.wide {
+            if let Some(run) = out
+                .glyphs
+                .last_mut()
+                .filter(|r| !r.wide && r.style == style && r.col + r.cells == col)
+            {
+                run.text.push(ch);
+                run.text.extend(marks.into_iter().flatten());
                 run.cells += 1;
+                continue;
             }
-            _ => out.glyphs.push(GlyphRun {
-                col,
-                cells: 1,
-                text,
-                style,
-                wide: false,
-            }),
         }
+        let mut text = String::with_capacity(16);
+        text.push(ch);
+        text.extend(marks.into_iter().flatten());
+        out.glyphs.push(GlyphRun {
+            col,
+            cells: width,
+            text,
+            style,
+            wide: a.wide,
+        });
     }
     out
 }

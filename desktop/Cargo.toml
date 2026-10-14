@@ -64,6 +64,12 @@ serde_json = "1"
 # `--visual-check` only (feature `visual-check`): save rendered frames.
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
+# `--bench-term` only (feature `bench`): the recorded Claude Code capture is
+# gzipped; CPU time and the feeder's terminal mode come from libc. Both are
+# already in the tree.
+flate2 = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+
 # Bootstrap publishes its states from a std thread to the UI's async task.
 # Already in gpui's tree.
 async-channel = "2"
@@ -89,6 +95,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # save the frames. A developer tool, off by default: it builds gpui with its
 # `test-support` feature.
 visual-check = ["gpui_platform/test-support", "dep:image"]
+# `cargo run --release --features bench -- --bench-term` (or
+# `scripts/bench-term.sh`): measure the terminal element under heavy output in
+# a real window over sandboxed sessions (`src/bench/`). A developer tool, off
+# by default.
+bench = ["dep:flate2", "dep:libc"]
 
 [dev-dependencies]
 # gpui's test context (`#[gpui::test]`, `VisualTestContext`) for view tests.

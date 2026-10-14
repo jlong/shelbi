@@ -152,7 +152,7 @@ impl Element for TerminalElement {
             let (family, size) = (pane.settings.font_family.clone(), pane.settings.font_size);
             let metrics = pane
                 .metrics
-                .get_or_insert_with(|| CellMetrics::measure(window, &family, size))
+                .get_or_insert_with(|| CellMetrics::cached(window, &family, size))
                 .clone();
             let viewer = metrics.grid_size(bounds.size);
             pane.begin_frame(bounds, viewer, cx);
