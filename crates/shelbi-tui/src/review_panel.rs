@@ -5,7 +5,7 @@
 //!
 //! - a **square back button** at the very top (a back-arrow glyph, no label)
 //!   that switches focus back to the dashboard window without tearing the
-//!   still-loaded review down — see [`PanelEffect::FocusDashboard`]. With the
+//!   still-loaded review down — see [`PanelEffect::Back`]. With the
 //!   **review status** (`Ready for review`) in the accent cyan on the button's
 //!   own row, two columns to its right,
 //! - **task info**: the task title (bold white) and the first few lines of the
@@ -43,71 +43,11 @@ use crate::panel::{
 };
 use crate::theme::palette;
 
-/// Which middle-pane view is currently shown. `Browser` isn't a persistent
-/// view — it opens the system browser — so only `Chat` / `Diff` / `Vim` are
-/// ever the *active* highlighted entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveView {
-    Chat,
-    Diff,
-    Vim,
-}
-
-/// The view-switcher entries. `Diff` sits directly below `Chat`; `Browser`
-/// renders only when a review URL is configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwitchItem {
-    Chat,
-    Diff,
-    Vim,
-    Browser,
-}
-
-/// One selectable panel row — the keyboard-navigable targets. The task-info
-/// block (title / description / `More`) is **not** a nav row: it is reached by
-/// click or the `m` key, so the nav cycle stays stable regardless of how the
-/// description wraps.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PanelRow {
-    /// The square back button at the top.
-    Back,
-    /// The `More` link in the task-info block — opens the full task-description
-    /// popover. Present only when the task has a body.
-    More,
-    /// The worktree folder name — click to reveal in the file manager.
-    Folder,
-    /// A middle-pane view switch.
-    Switch(SwitchItem),
-    Approve,
-    Reject,
-}
-
-/// What the host loop should do after a panel interaction. The panel never
-/// performs side effects itself so its logic stays unit-testable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PanelEffect {
-    /// Nothing to do (e.g. moved the selection).
-    None,
-    /// Switch the active window back to the dashboard, leaving the review
-    /// interface loaded.
-    FocusDashboard,
-    /// Swap the reviewer-chat pane into the content slot.
-    ShowChat,
-    /// Open the OS-configured diff tool over the review branch's changes.
-    ShowDiff,
-    /// Swap the editor pane into the content slot.
-    ShowVim,
-    /// Open the configured review URL in the system browser.
-    OpenBrowser,
-    /// Reveal the review worktree folder in the OS file manager.
-    RevealFolder,
-    /// Open the full task-description popover over the main area.
-    ShowDescription,
-    /// Accept: move the task out of review via the normal accept transition.
-    Approve,
-    /// Open the reject-reason overlay.
-    RejectPrompt,
-}
+// The panel's rows, effects and content views are the shared review model's
+// (`shelbi_app::review`), so the TUI and the desktop navigate the panel by one
+// table. `SwitchItem` keeps its local name for the view-switcher entries.
+pub use shelbi_app::review::{ActiveView, PanelEffect, PanelRow};
+pub use shelbi_app::view::ReviewSwitch as SwitchItem;
 
 /// The review panel's full state.
 pub struct ReviewPanel {
@@ -175,24 +115,13 @@ impl ReviewPanel {
     /// description's wrapped height (the task-info block is drawn outside this
     /// list).
     fn rows(&self) -> Vec<PanelRow> {
-        let mut rows = vec![PanelRow::Back];
+        let mut switches = vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Editor];
+        if self.has_review_url {
+            switches.push(SwitchItem::Browser);
+        }
         // `More` sits right under the back button, in reading order with the
         // task-info block it belongs to, and only when there's a body to open.
-        if !self.description.trim().is_empty() {
-            rows.push(PanelRow::More);
-        }
-        rows.extend([
-            PanelRow::Folder,
-            PanelRow::Switch(SwitchItem::Chat),
-            PanelRow::Switch(SwitchItem::Diff),
-            PanelRow::Switch(SwitchItem::Vim),
-        ]);
-        if self.has_review_url {
-            rows.push(PanelRow::Switch(SwitchItem::Browser));
-        }
-        rows.push(PanelRow::Approve);
-        rows.push(PanelRow::Reject);
-        rows
+        shelbi_app::review::panel_rows(!self.description.trim().is_empty(), true, &switches)
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].
@@ -219,20 +148,7 @@ impl ReviewPanel {
     }
 
     fn step(&mut self, delta: i32) {
-        let n = self.rows().len();
-        if n == 0 {
-            return;
-        }
-        let idx = self.selected.min(n - 1);
-        self.selected = if delta < 0 {
-            if idx == 0 {
-                n - 1
-            } else {
-                idx - 1
-            }
-        } else {
-            (idx + 1) % n
-        };
+        self.selected = shelbi_app::review::step_selection(self.selected, self.rows().len(), delta);
     }
 
     /// Activate the selected row (Enter / Space).
@@ -241,44 +157,25 @@ impl ReviewPanel {
         let Some(row) = rows.get(self.selected) else {
             return PanelEffect::None;
         };
-        self.activate_row(row.clone())
+        self.activate_row(*row)
     }
 
+    /// Activate `row` through the shared table, which also declines Approve /
+    /// Reject while the gated merge is already in flight — a replayed or
+    /// double press (Enter *or* click) is dropped.
     fn activate_row(&mut self, row: PanelRow) -> PanelEffect {
-        match row {
-            PanelRow::Back => PanelEffect::FocusDashboard,
-            PanelRow::More => self.request_description(),
-            PanelRow::Folder => PanelEffect::RevealFolder,
-            PanelRow::Switch(SwitchItem::Chat) => {
-                self.active_view = ActiveView::Chat;
-                PanelEffect::ShowChat
-            }
-            PanelRow::Switch(SwitchItem::Diff) => {
-                self.active_view = ActiveView::Diff;
-                PanelEffect::ShowDiff
-            }
-            PanelRow::Switch(SwitchItem::Vim) => {
-                self.active_view = ActiveView::Vim;
-                PanelEffect::ShowVim
-            }
-            PanelRow::Switch(SwitchItem::Browser) => PanelEffect::OpenBrowser,
-            // Decline Approve / Reject while the gated merge is already in
-            // flight — a replayed or double press (Enter *or* click) is dropped.
-            PanelRow::Approve if self.merging => PanelEffect::None,
-            PanelRow::Approve => PanelEffect::Approve,
-            PanelRow::Reject if self.merging => PanelEffect::None,
-            PanelRow::Reject => PanelEffect::RejectPrompt,
+        let has_body = !self.description.trim().is_empty();
+        let (effect, view) = shelbi_app::review::activate_row(row, has_body, self.merging);
+        if let Some(view) = view {
+            self.active_view = view;
         }
+        effect
     }
 
     /// Ask to open the task-description popover (the `More` link / `m` key).
     /// Returns [`PanelEffect::None`] when the task has no body.
     pub fn request_description(&self) -> PanelEffect {
-        if self.description.trim().is_empty() {
-            PanelEffect::None
-        } else {
-            PanelEffect::ShowDescription
-        }
+        shelbi_app::review::description_effect(!self.description.trim().is_empty())
     }
 
     /// Map a click at (`column`, `row`) to an effect.
@@ -298,7 +195,7 @@ impl ReviewPanel {
             if in_rect(rect, column, row) {
                 if let Some(r) = rows.get(idx) {
                     self.selected = idx;
-                    return self.activate_row(r.clone());
+                    return self.activate_row(*r);
                 }
             }
         }
@@ -481,27 +378,16 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
 
 /// Build the nav entry (glyph, label, active) for one review switch.
 fn switch_entry(app: &ReviewPanel, item: SwitchItem) -> NavEntry {
-    let (glyph, label, active) = match item {
-        SwitchItem::Chat => (
-            "🤓",
-            "Reviewer".to_string(),
-            app.active_view == ActiveView::Chat,
-        ),
-        SwitchItem::Diff => (
-            "🔀",
-            "View Diff".to_string(),
-            app.active_view == ActiveView::Diff,
-        ),
-        SwitchItem::Vim => (
-            "✍️",
-            format!("Edit in {}", app.editor_name),
-            app.active_view == ActiveView::Vim,
-        ),
-        SwitchItem::Browser => ("🌐", "Open Browser".to_string(), false),
+    // The labels are the shared model's, so both clients word them alike.
+    let (glyph, active) = match item {
+        SwitchItem::Chat => ("🤓", app.active_view == ActiveView::Chat),
+        SwitchItem::Diff => ("🔀", app.active_view == ActiveView::Diff),
+        SwitchItem::Editor => ("✍️", app.active_view == ActiveView::Editor),
+        SwitchItem::Browser => ("🌐", false),
     };
     NavEntry {
         glyph,
-        label,
+        label: item.label(&app.editor_name),
         active,
     }
 }
@@ -619,19 +505,7 @@ fn spinner_frame(tick: usize) -> char {
 /// Resolve the concrete review URL to open for `task_id` (with `$PORT` /
 /// `$SLOT` substituted), or `None` when none is configured.
 pub(crate) fn review_url(project_name: &str, task_id: &str) -> Option<String> {
-    let project = shelbi_state::load_project(project_name).ok()?;
-    let store = shelbi_state::issue_store_for_project(&project).ok()?;
-    let tf = store.get(task_id).ok().flatten()?;
-    let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task).ok()?;
-    let template = workflow.review_url_for_status(tf.task.column.as_str())?;
-    let port = tf
-        .task
-        .assigned_to
-        .as_deref()
-        .and_then(|ws| project.workspace(ws))
-        .and_then(|ws| ws.slot)
-        .and_then(|s| u16::try_from(s).ok());
-    Some(shelbi_core::substitute_review_url(template, port))
+    shelbi_orchestrator::review_session::review_url(project_name, task_id)
 }
 
 #[cfg(test)]
@@ -754,9 +628,9 @@ mod tests {
         let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Back)).unwrap();
         assert_eq!(idx, 0, "back button leads the panel");
         app.selected = idx;
-        assert_eq!(app.activate(), PanelEffect::FocusDashboard);
+        assert_eq!(app.activate(), PanelEffect::Back);
         let _ = render(&mut app, 30, 24);
-        assert_eq!(app.click(PAD, BACK_BUTTON_LINE), PanelEffect::FocusDashboard);
+        assert_eq!(app.click(PAD, BACK_BUTTON_LINE), PanelEffect::Back);
     }
 
     #[test]
@@ -924,9 +798,9 @@ mod tests {
     fn activating_chat_and_vim_returns_switch_effects_and_marks_active() {
         let mut app = panel(true);
         assert_eq!(app.active_view, ActiveView::Chat);
-        select_switch(&mut app, SwitchItem::Vim);
-        assert_eq!(app.activate(), PanelEffect::ShowVim);
-        assert_eq!(app.active_view, ActiveView::Vim);
+        select_switch(&mut app, SwitchItem::Editor);
+        assert_eq!(app.activate(), PanelEffect::ShowEditor);
+        assert_eq!(app.active_view, ActiveView::Editor);
         select_switch(&mut app, SwitchItem::Chat);
         assert_eq!(app.activate(), PanelEffect::ShowChat);
         assert_eq!(app.active_view, ActiveView::Chat);
@@ -955,7 +829,7 @@ mod tests {
             .collect();
         assert_eq!(
             switches,
-            vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Vim, SwitchItem::Browser]
+            vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Editor, SwitchItem::Browser]
         );
     }
 

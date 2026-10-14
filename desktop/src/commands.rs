@@ -15,7 +15,8 @@
 //! view and the board's issue mutations; `dt-activity-machines` the Activity
 //! and Machines views; `dt-palette-overlays` the Zen toggle, the error log,
 //! add project, loading a queued review onto a slot, and approving /
-//! rejecting a review.
+//! rejecting a review; `dt-review-view` the Review view a serving review
+//! opens.
 //!
 //! The id named in the banner is the command's registry id where the
 //! registry has one (`view:tasks`, `workspace:<name>`, `action:toggle-zen`,
@@ -79,8 +80,8 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::FocusWorkspace { workspace } => {
             host.show_view(&View::Session(workspace.clone()))
         }
-        // A queued task asks for its slot here; a serving one opens the
-        // review view (dt-review-view).
+        // A serving task opens the Review view (dt-review-view); a queued one
+        // asks which free slot to load it onto first.
         CommandKind::LoadReview { task_id } => host.load_review(task_id),
         // Legacy spawned agents: the TUI doesn't show them either ("legacy
         // spawned agents aren't shown here yet").

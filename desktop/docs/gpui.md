@@ -274,6 +274,14 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   method: a key the app leaves unhandled types nothing. The visual check
   drives IME and dead-key text through the `EntityInputHandler` methods
   directly, which is the path macOS calls.
+- **`cx.listener` borrows the context** (`dt-review-view`): a closure that
+  builds rows with `cx.listener(..)` holds `cx` immutably for as long as the
+  closure lives, so render any child that needs `&mut cx` (another
+  `render_*` helper) before defining the closure.
+- **A clamped paragraph needs an explicit ellipsis.** `line_clamp(n)` alone
+  cuts the last line mid-word with no marker; add `text_ellipsis()` beside it.
+  For a path, `text_ellipsis_start()` with `overflow_hidden().whitespace_nowrap()`
+  keeps the end visible (the TUI's left-truncated worktree).
 
 ### Menus and system notifications (`dt-menus-notifications`, gpui-pre 0.3.9)
 

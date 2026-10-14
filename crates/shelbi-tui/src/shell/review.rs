@@ -474,15 +474,18 @@ pub fn reveal_folder(project: &str, task: &str) -> Result<(), String> {
 fn map_effect(effect: PanelEffect) -> ReviewAction {
     match effect {
         PanelEffect::None => ReviewAction::None,
-        PanelEffect::FocusDashboard => ReviewAction::Back,
+        PanelEffect::Back => ReviewAction::Back,
         PanelEffect::ShowChat => ReviewAction::ShowContent(None),
         PanelEffect::ShowDiff => ReviewAction::ShowContent(Some(ReviewRole::Diff)),
-        PanelEffect::ShowVim => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
+        PanelEffect::ShowEditor => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
         PanelEffect::OpenBrowser => ReviewAction::OpenBrowser,
         PanelEffect::RevealFolder => ReviewAction::RevealFolder,
         PanelEffect::ShowDescription => ReviewAction::ShowDescription,
         PanelEffect::Approve => ReviewAction::Approve,
         PanelEffect::RejectPrompt => ReviewAction::Reject,
+        // The TUI handles `q` itself (`request_quit`); the shared table's Close
+        // means the same teardown.
+        PanelEffect::Close => ReviewAction::Close,
     }
 }
 

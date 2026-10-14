@@ -782,7 +782,7 @@ struct ProjectWorkers {
     /// stops and joins them when the bundle is replaced. `None` in tests, which
     /// skip the real hub-socket subscribers.
     _changes: Option<shelbi_app::changes::ChangeSubscription>,
-    _layout_sub: Option<crate::layout_sub::LayoutSubscription>,
+    _layout_sub: Option<shelbi_app::layout_sub::LayoutSubscription>,
 }
 
 /// Builds the per-project [`ProjectWorkers`] for a project. Injected onto
@@ -836,7 +836,7 @@ fn production_workers(project: &str, activity_cache: Arc<Mutex<ActivityMetaCache
     let closed_refresher =
         refresh::spawn(move |_generation| KanbanApp::read_closed_page(&proj_closed));
     let (changes, change_rx) = shelbi_app::changes::spawn(project);
-    let (layout_sub, layout_rx) = crate::layout_sub::spawn(project);
+    let (layout_sub, layout_rx) = shelbi_app::layout_sub::spawn(project);
     ProjectWorkers {
         refresher,
         activity_refresher,

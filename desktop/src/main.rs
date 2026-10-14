@@ -24,6 +24,8 @@ mod visual_check;
 #[cfg(feature = "visual-check")]
 mod visual_views;
 #[cfg(feature = "visual-check")]
+mod visual_review;
+#[cfg(feature = "visual-check")]
 mod visual_workspace;
 mod window_state;
 
@@ -56,6 +58,10 @@ enum Mode {
     /// fake sessions, one frame per state (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     VisualWorkspace(Option<String>),
+    /// `--visual-review [dir]`: render the Review view offscreen over fake
+    /// sessions, one frame per state (feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    VisualReview(Option<String>),
 }
 
 fn parse_args() -> Mode {
@@ -73,6 +79,8 @@ fn parse_args() -> Mode {
         Some("--visual-views") => Mode::VisualViews(args.next()),
         #[cfg(feature = "visual-check")]
         Some("--visual-workspace") => Mode::VisualWorkspace(args.next()),
+        #[cfg(feature = "visual-check")]
+        Some("--visual-review") => Mode::VisualReview(args.next()),
         Some(project) if !project.starts_with('-') => Mode::App,
         Some(other) => usage(&format!("unknown argument `{other}`")),
     }
@@ -102,6 +110,10 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::VisualWorkspace(dir) = mode {
         visual_workspace::run(visual_check::out_dir(dir));
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::VisualReview(dir) = mode {
+        visual_review::run(visual_check::out_dir(dir));
     }
     // The launch project: a local read before any window exists (the spike
     // has none).

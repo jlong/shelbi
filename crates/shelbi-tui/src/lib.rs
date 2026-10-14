@@ -14,7 +14,6 @@ mod handlers;
 mod kanban;
 mod keymap;
 mod machines;
-mod layout_sub;
 mod markdown;
 pub mod overlay;
 mod panel;

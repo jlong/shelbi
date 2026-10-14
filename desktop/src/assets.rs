@@ -49,6 +49,7 @@ pub mod icons {
     pub const ARROW_DOWN: &str = "icons/heroicons/arrow-down.svg";
     pub const CHEVRON_UP: &str = "icons/heroicons/chevron-up.svg";
     pub const CHEVRON_DOWN: &str = "icons/heroicons/chevron-down.svg";
+    pub const ARROWS_RIGHT_LEFT: &str = "icons/heroicons/arrows-right-left.svg";
 }
 
 macro_rules! heroicon {
@@ -97,6 +98,7 @@ const HEROICONS: &[(&str, &[u8])] = &[
     heroicon!(icons::ARROW_DOWN, "arrow-down.svg"),
     heroicon!(icons::CHEVRON_UP, "chevron-up.svg"),
     heroicon!(icons::CHEVRON_DOWN, "chevron-down.svg"),
+    heroicon!(icons::ARROWS_RIGHT_LEFT, "arrows-right-left.svg"),
 ];
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its

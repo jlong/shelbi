@@ -229,6 +229,9 @@ pub struct SessionView {
     remote_machine: Option<String>,
     /// The palette chord the idle placeholder names.
     palette_chord: String,
+    /// Whether an idle workspace shows the TUI's dev-slot idle placeholder
+    /// (else the plain "No live session" notice, as a review pane does).
+    idle_placeholder: bool,
     slot: Slot,
     restart: RestartController,
     reconnect: ReconnectController,
@@ -277,6 +280,7 @@ impl SessionView {
             on_death: OnDeath::Restart,
             remote_machine: None,
             palette_chord: String::new(),
+            idle_placeholder: true,
             slot: Slot::Empty,
             restart: RestartController::default(),
             shown: false,
@@ -315,6 +319,12 @@ impl SessionView {
     /// The palette chord the idle placeholder names.
     pub fn set_palette_chord(&mut self, chord: &str) {
         self.palette_chord = chord.to_string();
+    }
+
+    /// Whether an idle workspace shows the dev-slot idle placeholder (the
+    /// default) or the plain "No live session for <name>" notice.
+    pub fn set_idle_placeholder(&mut self, on: bool) {
+        self.idle_placeholder = on;
     }
 
     /// The session this view shows.
@@ -387,7 +397,9 @@ impl SessionView {
     /// The idle-workspace placeholder's lines (the TUI's), while idle.
     pub fn idle_lines(&self) -> Option<Vec<String>> {
         match &self.slot {
-            Slot::Idle(info) => Some(app_session::idle_placeholder_lines(info, &self.palette_chord)),
+            Slot::Idle(info) if self.idle_placeholder => {
+                Some(app_session::idle_placeholder_lines(info, &self.palette_chord))
+            }
             _ => None,
         }
     }

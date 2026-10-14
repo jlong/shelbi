@@ -29,12 +29,20 @@
 //! header (task, branch, machine, live state), with the user's shell beside it
 //! on demand. Like the chat, its terminals give the window the global chords.
 //!
+//! A review row (or the palette's `review:<id>`) opens the Review view
+//! ([`ReviewView`], `dt-review-view`) over the main area: the native review
+//! panel beside the review agent's chat, or its diff or editor. A queued
+//! review asks which free slot to load it onto first; the daemon loads it,
+//! and its `ReviewOpened` opens the view. Leaving the review returns to the
+//! view the main area showed before it.
+//!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown. A project switch opens (or focuses) the target's
 //! own window, so every project gets its own board.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{
@@ -47,6 +55,7 @@ use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::overlay::error_log::Viewer;
 use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
 use shelbi_app::overlay::review_confirm::Slot;
+use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
 use shelbi_app::view::{SidebarModel, SidebarTarget};
 use shelbi_app::{CommandKind, CommandRegistry, Mutation};
 use shelbi_core::ConfigMode;
@@ -76,6 +85,7 @@ use crate::theme::{self, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
+use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::{SettingsEvent, SettingsView};
@@ -215,6 +225,9 @@ enum Route {
     View,
     /// The settings view (transient: not remembered as a view).
     Settings(Entity<SettingsView>),
+    /// The Review view (transient too: the `ClientState`'s view stays the
+    /// one the review was opened over, so leaving it returns there).
+    Review,
 }
 
 /// A command dispatch asked the window for, collected first and then carried
@@ -369,6 +382,12 @@ pub struct ShelbiWindow {
     flash_generation: u64,
     /// The Workspace view, created the first time a workspace is shown.
     workspace: Option<Entity<WorkspaceView>>,
+    /// The Review view, created the first time a review is opened.
+    review: Option<Entity<ReviewView>>,
+    /// Opening a review: resolve, ask for a slot, load, open.
+    review_loader: ReviewLoader,
+    /// The blocking review work (resolve, load, the content sessions).
+    review_ops: Arc<dyn ReviewOps>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -439,6 +458,9 @@ impl ShelbiWindow {
             detecting: None,
             flash_generation: 0,
             workspace: None,
+            review: None,
+            review_loader: ReviewLoader::default(),
+            review_ops: Arc::new(crate::views::review::LiveOps),
             banner: None,
             status: None,
             focus_handle,
@@ -456,7 +478,7 @@ impl ShelbiWindow {
         this.sync_selection();
         // The feed and keymaps only read local state: start them now, so the
         // shell has data the moment bootstrap is done.
-        this.start_feed(cx);
+        this.start_feed(window, cx);
         this.load_keymaps(cx);
         match shared_ready {
             Some(ready) => this.on_ready(ready, cx),
@@ -636,22 +658,25 @@ impl ShelbiWindow {
     }
 
     /// Spawn the project's feed and pump its events into this view.
-    fn start_feed(&mut self, cx: &mut Context<Self>) {
+    fn start_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (feed, mut events) = ProjectFeed::spawn(&self.project);
         if let Some(control) = cx.try_global::<Shell>().and_then(|s| s.control.clone()) {
             control.watch(&self.project, &feed);
         }
         self._feed = Some(feed);
-        self._feed_task = Some(cx.spawn(async move |this, cx| {
+        self._feed_task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
-                if this.update(cx, |this, cx| this.apply_feed(event, cx)).is_err() {
+                if this
+                    .update_in(cx, |this, window, cx| this.apply_feed(event, window, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
         }));
     }
 
-    fn apply_feed(&mut self, event: FeedEvent, cx: &mut Context<Self>) {
+    fn apply_feed(&mut self, event: FeedEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             FeedEvent::Snapshot(snapshot) => {
                 if let Some(model) = snapshot.sidebar {
@@ -665,8 +690,10 @@ impl ShelbiWindow {
                         palette.set_entries(entries);
                     }
                     self.update_workspace_row(cx);
+                    self.update_review_row(window, cx);
                 }
             }
+            FeedEvent::Layout(event) => self.apply_layout(event, window, cx),
             FeedEvent::Link(link) => self.link = Some(link),
             FeedEvent::Session(notice) => match notice.kind {
                 SessionNoticeKind::Title(title) => {
@@ -986,12 +1013,12 @@ impl ShelbiWindow {
                     project: self.project.clone(),
                     id: id.clone(),
                 };
-                self.run_review_mutation(m, format!("Approving {id}…"), format!("Approved {id}."), cx);
+                self.run_review_mutation(id, m, Decision::APPROVE, window, cx);
             }
             HostCall::AskRejectReason(id) => {
                 self.open_overlay(ActiveOverlay::reject_reason(id), window, cx)
             }
-            HostCall::RejectReview(id, reason) => self.reject(id, reason, cx),
+            HostCall::RejectReview(id, reason) => self.reject(id, reason, window, cx),
         }
     }
 
@@ -1068,6 +1095,128 @@ impl ShelbiWindow {
         ws
     }
 
+    /// The Review view for the window's project, created on first use.
+    fn ensure_review(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ReviewView> {
+        if let Some(review) = &self.review {
+            return review.clone();
+        }
+        let project = self.project.clone();
+        let handle = window.window_handle();
+        let sink = self._feed.as_ref().map(|f| f.session_sink());
+        let deps = ReviewDeps {
+            ops: self.review_ops.clone(),
+            ..ReviewDeps::live(&project)
+        };
+        let review = cx.new(|cx| ReviewView::new(&project, handle, deps, sink, cx));
+        let sub = cx.subscribe_in(&review, window, |this, _, ev: &ReviewEvent, window, cx| match ev {
+            ReviewEvent::Focused => {
+                this.client.focus_main();
+                cx.notify();
+            }
+            // Approve, or Reject (which asks for the reason): the registry's
+            // commands, through the same gates as the palette's.
+            ReviewEvent::Command(kind) => this.run(kind.clone(), window, cx),
+            ReviewEvent::Back => this.leave_review(true, window, cx),
+            ReviewEvent::Closed => this.leave_review(false, window, cx),
+        });
+        self._subscriptions.push(sub);
+        self.review = Some(review.clone());
+        review
+    }
+
+    /// The sidebar's row for review task `task`.
+    fn review_row(&self, task: &str) -> Option<shelbi_app::view::ReviewRow> {
+        self.model.reviews.iter().find(|r| r.task_id == task).cloned()
+    }
+
+    /// The review the main area shows, when it shows one.
+    fn shown_review(&self, cx: &App) -> Option<String> {
+        if !matches!(self.route, Route::Review) {
+            return None;
+        }
+        let review = self.review.as_ref()?.read(cx);
+        review.is_shown().then(|| review.task_id().map(str::to_string)).flatten()
+    }
+
+    /// Open the review `info` describes in the main area.
+    fn open_review(&mut self, info: ReviewInfo, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = None;
+        self.banner = None;
+        let row = self.review_row(&info.task_id);
+        let review = self.ensure_review(window, cx);
+        self.route = Route::Review;
+        review.update(cx, |r, cx| r.show(info, row, cx));
+        self.client.focus_main();
+        self.sync_chat(window, cx);
+        self.focus_main_view(window, cx);
+        cx.notify();
+    }
+
+    /// Leave the review for the view it was opened over. Back (`back`) leaves
+    /// it loaded and hands keys to the sidebar, as the TUI's back button
+    /// does; a close or a decision goes back to the main area.
+    fn leave_review(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Review) {
+            return;
+        }
+        let view = self.client.view().clone();
+        self.perform(HostCall::ShowView(view), window, cx);
+        if back {
+            self.client.focus_sidebar();
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Hand the review its refreshed sidebar row (the live server state), and
+    /// drop a review whose task has left the review column: its close event
+    /// may have been missed while the daemon was unreachable (the TUI's
+    /// close-reconcile, `rt-tui-review`).
+    fn update_review_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.review.clone() else {
+            return;
+        };
+        let Some(task) = review.read(cx).task_id().map(str::to_string) else {
+            return;
+        };
+        let row = self.review_row(&task);
+        let gone = row.is_none() && !self.model.board_loading && self.model.config_error.is_none();
+        review.update(cx, |r, cx| r.update_row(row, cx));
+        if gone && self.shown_review(cx).as_deref() == Some(task.as_str()) && !review.read(cx).is_merging() {
+            self.review_ended(&task, window, cx);
+        }
+    }
+
+    /// The shown review's task left review elsewhere (merged on GitHub, moved
+    /// by another client): stop showing it.
+    fn review_ended(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(review) = self.review.clone() {
+            review.update(cx, |r, cx| r.hide(cx));
+        }
+        self.flash(format!("Review {task} closed."), cx);
+        self.leave_review(false, window, cx);
+    }
+
+    /// A layout event from the daemon: a slot this client loaded is serving
+    /// (open it), or the shown review's slot was freed (close it).
+    fn apply_layout(&mut self, event: shelbi_state::LayoutEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use shelbi_state::LayoutEvent;
+        match event {
+            LayoutEvent::ReviewOpened { task, .. } => {
+                let step = self.review_loader.review_opened(&task);
+                self.run_load_step(step, window, cx);
+            }
+            LayoutEvent::ReviewClosed { task, .. } => {
+                let merging = self.review.as_ref().is_some_and(|r| r.read(cx).is_merging());
+                if self.shown_review(cx).as_deref() == Some(task.as_str()) && !merging {
+                    self.review_ended(&task, window, cx);
+                }
+            }
+            // The content pane reconnects on its own; the chat likewise.
+            LayoutEvent::ReviewAgentRecovered { .. } | LayoutEvent::OrchestratorRestarted => {}
+        }
+    }
+
     /// The sidebar's row for workspace `name`.
     fn workspace_row(&self, name: &str) -> Option<shelbi_app::view::WorkspaceRow> {
         self.model.workspaces.iter().find(|w| w.name == name).cloned()
@@ -1124,6 +1273,15 @@ impl ShelbiWindow {
                 }
             }
         }
+        // The Review view is shown by `open_review`; likewise only hidden
+        // here. Hiding detaches its content; the daemon's sessions stay.
+        if !matches!(self.route, Route::Review) {
+            if let Some(review) = &self.review {
+                if review.read(cx).is_shown() {
+                    review.update(cx, |r, cx| r.hide(cx));
+                }
+            }
+        }
     }
 
     /// Whether a main-area terminal (the chat's, or the Workspace view's
@@ -1136,6 +1294,10 @@ impl ShelbiWindow {
                 .workspace
                 .as_ref()
                 .is_some_and(|ws| ws.read(cx).is_shown() && ws.read(cx).contains_focus(window, cx))
+            || self
+                .review
+                .as_ref()
+                .is_some_and(|r| r.read(cx).is_shown() && r.read(cx).contains_focus(window, cx))
     }
 
     /// The Activity feed for the window's project, created on first use.
@@ -1193,6 +1355,16 @@ impl ShelbiWindow {
     /// chat or the Workspace view takes it (their own keys), anything else
     /// leaves it on the window.
     fn focus_main_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Review) {
+            match &self.review {
+                Some(review) => {
+                    let target = review.read(cx).focus_target(cx);
+                    window.focus(&target, cx);
+                }
+                None => self.focus_handle.focus(window, cx),
+            }
+            return;
+        }
         if !matches!(self.route, Route::View) {
             self.focus_handle.focus(window, cx);
             return;
@@ -1300,6 +1472,9 @@ impl ShelbiWindow {
                 if let Some(ws) = &this.workspace {
                     ws.update(cx, |ws, cx| ws.note_deliberate_close(cx));
                 }
+                if let Some(review) = &this.review {
+                    review.update(cx, |r, cx| r.note_deliberate_close(cx));
+                }
             })
             .ok();
             let quit = cx
@@ -1321,6 +1496,9 @@ impl ShelbiWindow {
                     }
                     if let Some(ws) = &this.workspace {
                         ws.update(cx, |ws, cx| ws.clear_deliberate_close(cx));
+                    }
+                    if let Some(review) = &this.review {
+                        review.update(cx, |r, cx| r.clear_deliberate_close(cx));
                     }
                     this.banner = Some(format!("Couldn't quit the project: {e}").into());
                     cx.notify();
@@ -1518,11 +1696,12 @@ impl ShelbiWindow {
             }
             OverlayEvent::LoadReview { task_id, slot } => {
                 self.close_overlay(window, cx);
-                self.load_onto_slot(task_id, slot, cx);
+                let step = self.review_loader.slot_chosen(&task_id, &slot);
+                self.run_load_step(step, window, cx);
             }
             OverlayEvent::Rejected { task_id, reason } => {
                 self.close_overlay(window, cx);
-                self.reject(task_id, reason, cx);
+                self.reject(task_id, reason, window, cx);
             }
             OverlayEvent::ZenResult {
                 project,
@@ -1756,90 +1935,149 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// `LoadReview`: find out off the UI thread whether the task is already
-    /// on a review slot or still queued. A queued task asks which free slot
-    /// to load it onto; a serving one opens the review view (dt-review-view).
+    /// `LoadReview`: open a review task. Already shown, it just takes focus;
+    /// otherwise the load flow ([`ReviewLoader`]) resolves it off the UI
+    /// thread and opens it, or asks which free slot to load it onto.
     fn load_review(&mut self, task_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let task = task_id.clone();
-        let resolve = cx.background_executor().spawn(async move { resolve_review(&project, &task) });
-        cx.spawn_in(window, async move |this, cx| {
-            let resolved = resolve.await;
-            this.update_in(cx, |this, window, cx| match resolved {
-                Ok(None) => {
-                    this.banner =
-                        Some(commands::not_implemented_message(&format!("review:{task_id}")).into());
-                    cx.notify();
-                }
-                Ok(Some((title, free, total))) => this.open_overlay(
-                    ActiveOverlay::review_confirm(task_id, title, free, total),
-                    window,
-                    cx,
-                ),
-                Err(e) => {
-                    this.banner = Some(format!("Couldn't open the review: {e}").into());
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        if self.shown_review(cx).as_deref() == Some(task_id.as_str()) {
+            self.focus_main_view(window, cx);
+            return;
+        }
+        let step = self.review_loader.open(&task_id);
+        self.run_load_step(step, window, cx);
     }
 
-    /// Load a queued review task onto the slot the dialog chose, through the
-    /// daemon, off the UI thread.
-    fn load_onto_slot(&mut self, task_id: String, slot: String, cx: &mut Context<Self>) {
-        self.flash(format!("Loading {task_id} onto {slot}…"), cx);
-        let project = self.project.clone();
-        let (task, workspace) = (task_id.clone(), slot.clone());
-        let work = cx.background_executor().spawn(async move {
-            shelbi_app::review_session(
-                &project,
-                &task,
-                shelbi_app::ReviewSessionOp::Load { workspace },
-                &mut |_, _| {},
-            )
-            .map_err(|e| e.to_string())
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => this.flash(format!("Loaded {task_id} onto {slot}."), cx),
-                    Err(e) => this.banner = Some(format!("Couldn't load the review: {e}").into()),
-                }
-                this.request_refresh();
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+    /// Carry out one step of the review load flow; the blocking ones run on
+    /// the background executor and feed their result back into the flow.
+    fn run_load_step(&mut self, step: LoadStep, window: &mut Window, cx: &mut Context<Self>) {
+        match step {
+            LoadStep::None => {}
+            LoadStep::Resolve(task) => {
+                let (ops, project, t) = (self.review_ops.clone(), self.project.clone(), task.clone());
+                let resolve = cx.background_executor().spawn(async move { ops.resolve(&project, &t) });
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = resolve.await;
+                    this.update_in(cx, |this, window, cx| {
+                        let step = this.review_loader.resolved(&task, result);
+                        this.run_load_step(step, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            LoadStep::Open(info) => self.open_review(*info, window, cx),
+            LoadStep::AskSlot {
+                task,
+                title,
+                free_slots,
+            } => {
+                let total = free_slots.len();
+                let slots = free_slots
+                    .into_iter()
+                    .map(|name| Slot { name, occupant: None })
+                    .collect();
+                self.open_overlay(ActiveOverlay::review_confirm(task, title, slots, total), window, cx);
+            }
+            // The overlay's "No review workspace is configured." report.
+            LoadStep::NoSlots { task, title } => {
+                self.open_overlay(ActiveOverlay::review_confirm(task, title, Vec::new(), 0), window, cx)
+            }
+            // Every slot is busy: the overlay's busy report, and nothing is
+            // loaded. The task stays queued (pending-load) and the daemon's
+            // auto-loader puts it on the next slot that frees.
+            LoadStep::Busy { task, title } => {
+                self.open_overlay(ActiveOverlay::review_confirm(task, title, Vec::new(), 1), window, cx)
+            }
+            LoadStep::Load { task, slot } => {
+                self.status = Some(format!("Loading {task} onto {slot}…").into());
+                let (ops, project) = (self.review_ops.clone(), self.project.clone());
+                let (t, workspace) = (task.clone(), slot.clone());
+                let load = cx.background_executor().spawn(async move {
+                    ops.session_op(&project, &t, shelbi_app::ReviewSessionOp::Load { workspace })
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = load.await;
+                    this.update_in(cx, |this, window, cx| {
+                        let ok = result.is_ok();
+                        let step = this.review_loader.loaded(&task, result);
+                        // Loaded: the daemon's `ReviewOpened` opens the view,
+                        // unless it already has.
+                        this.status = (ok && this.review_loader.pending() == Some(task.as_str()))
+                            .then(|| format!("Loaded {task}; opening the review…").into());
+                        this.run_load_step(step, window, cx);
+                        this.request_refresh();
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            LoadStep::Failed(message) => {
+                self.status = None;
+                self.banner = Some(message.into());
+            }
+        }
+        cx.notify();
     }
 
-    fn reject(&mut self, id: String, reason: String, cx: &mut Context<Self>) {
+    fn reject(&mut self, id: String, reason: String, window: &mut Window, cx: &mut Context<Self>) {
         let m = Mutation::RejectReview {
             project: self.project.clone(),
             id: id.clone(),
             reason,
         };
-        self.run_review_mutation(m, format!("Rejecting {id}…"), format!("Rejected {id}."), cx);
+        self.run_review_mutation(id, m, Decision::REJECT, window, cx);
     }
 
-    /// Send a review decision to the daemon off the UI thread.
-    fn run_review_mutation(&mut self, m: Mutation, working: String, done: String, cx: &mut Context<Self>) {
-        self.flash(working, cx);
+    /// Send a review decision to the daemon off the UI thread. The daemon runs
+    /// it (the gated merge for an approve), so it completes even if this app
+    /// quits mid-merge. While it runs, an open Review view of the task is
+    /// inert; when it lands the view closes (success) or shows why not.
+    fn run_review_mutation(
+        &mut self,
+        id: String,
+        m: Mutation,
+        decision: Decision,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let review = self
+            .review
+            .clone()
+            .filter(|r| r.read(cx).task_id() == Some(id.as_str()));
+        match &review {
+            Some(r) => r.update(cx, |r, cx| r.set_merging(true, cx)),
+            None => self.flash(format!("{} {id}…", decision.working), cx),
+        }
         let work = cx.background_executor().spawn(async move {
             shelbi_app::execute_mutation(&m, &mut |_, _| {}).map_err(|e| e.to_string())
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
+                // The view may have moved on to another review meanwhile.
+                let review = review.filter(|r| r.read(cx).task_id() == Some(id.as_str()));
+                let shown = this.shown_review(cx).as_deref() == Some(id.as_str());
                 match result {
-                    Ok(()) => this.flash(done, cx),
-                    Err(e) => {
-                        this.status = None;
-                        this.banner = Some(e.into());
+                    Ok(()) => {
+                        if let Some(r) = &review {
+                            r.update(cx, |r, cx| r.finish(cx));
+                        }
+                        this.flash(format!("{} {id}.", decision.done), cx);
+                        if shown {
+                            this.leave_review(false, window, cx);
+                        }
                     }
+                    Err(e) => match &review {
+                        Some(r) => r.update(cx, |r, cx| {
+                            r.set_merging(false, cx);
+                            r.set_status(Some(format!("{} failed: {e}", decision.verb)), cx);
+                        }),
+                        None => {
+                            this.status = None;
+                            this.banner = Some(e.into());
+                        }
+                    },
                 }
                 this.request_refresh();
                 cx.notify();
@@ -2036,6 +2274,13 @@ impl ShelbiWindow {
     fn render_main(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.route {
             Route::Settings(view) => div().size_full().child(view.clone()).into_any_element(),
+            Route::Review => div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .children(self.review.clone())
+                .into_any_element(),
             Route::View => {
                 let view = self.client.view();
                 match (commands::view_stub_id(view), &self.issues) {
@@ -2216,26 +2461,26 @@ impl OverlayHost for ShelbiWindow {
     }
 }
 
-/// Whether review `task` is serving (`None`) or queued: then its title, the
-/// free review slots, and how many slots exist (blocking board reads).
-fn resolve_review(project: &str, task: &str) -> Result<Option<(String, Vec<Slot>, usize)>, String> {
-    use shelbi_orchestrator::review_session::{review_open_target, ReviewOpenTarget};
-    match review_open_target(project, task).map_err(|e| e.to_string())? {
-        ReviewOpenTarget::Serving(_) => Ok(None),
-        ReviewOpenTarget::Queued { title } => {
-            let all = shelbi_orchestrator::load::review_slots(project).map_err(|e| e.to_string())?;
-            let total = all.len();
-            let free = all
-                .into_iter()
-                .filter(|s| s.occupant.is_none())
-                .map(|s| Slot {
-                    name: s.name,
-                    occupant: None,
-                })
-                .collect();
-            Ok(Some((title, free, total)))
-        }
-    }
+/// A review decision's wording: the status while it runs, the note when it
+/// lands, and the panel's failure line (the TUI's `approve failed: …`).
+#[derive(Debug, Clone, Copy)]
+struct Decision {
+    working: &'static str,
+    done: &'static str,
+    verb: &'static str,
+}
+
+impl Decision {
+    const APPROVE: Decision = Decision {
+        working: "Approving",
+        done: "Approved",
+        verb: "approve",
+    };
+    const REJECT: Decision = Decision {
+        working: "Rejecting",
+        done: "Rejected",
+        verb: "reject",
+    };
 }
 
 impl SidebarHost for ShelbiWindow {
@@ -2511,6 +2756,47 @@ mod tests {
         for spec in ["h", "backspace", "shift-enter", "enter", "ctrl-c", "ctrl-a", "alt-b"] {
             assert!(!takes_from_terminal(&keymaps, chord(spec)), "{spec}");
         }
+    }
+
+    #[test]
+    fn the_review_panels_decisions_run_through_the_registry_and_the_daemon() {
+        // The Review view emits these for Approve and Reject.
+        assert_eq!(
+            calls(CommandKind::ApproveReview { id: "t1".into() }),
+            [HostCall::ApproveReview("t1".into())]
+        );
+        assert_eq!(
+            calls(CommandKind::RejectReview {
+                id: "t1".into(),
+                reason: String::new()
+            }),
+            [HostCall::AskRejectReason("t1".into())],
+            "Reject asks for the reason first"
+        );
+        assert_eq!(
+            calls(CommandKind::RejectReview {
+                id: "t1".into(),
+                reason: "flaky test".into()
+            }),
+            [HostCall::RejectReview("t1".into(), "flaky test".into())]
+        );
+        // All three reach the daemon, so they wait for bootstrap and are
+        // refused while a relaunch is pending.
+        for kind in [
+            CommandKind::ApproveReview { id: "t1".into() },
+            CommandKind::RejectReview {
+                id: "t1".into(),
+                reason: String::new(),
+            },
+            CommandKind::LoadReview { task_id: "t1".into() },
+        ] {
+            assert!(commands::sends_to_daemon(&kind), "{kind:?}");
+        }
+        // A review row opens the review flow.
+        assert_eq!(
+            calls(CommandKind::LoadReview { task_id: "t1".into() }),
+            [HostCall::LoadReview("t1".into())]
+        );
     }
 
     #[test]

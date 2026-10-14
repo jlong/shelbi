@@ -481,12 +481,10 @@ pub(crate) fn description_preview(body: &str, width: usize, max_lines: usize) ->
     if width == 0 || max_lines == 0 {
         return Vec::new();
     }
-    let mut words: Vec<String> = Vec::new();
-    for raw in body.lines() {
-        for w in strip_block_markers(raw).split_whitespace() {
-            words.push(w.to_string());
-        }
-    }
+    // The markdown stripping is the shared model's, so the desktop's preview
+    // reads the same prose.
+    let text = shelbi_app::review::description_text(body);
+    let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return Vec::new();
     }
@@ -529,46 +527,6 @@ pub(crate) fn description_preview(body: &str, width: usize, max_lines: usize) ->
         }
     }
     lines
-}
-
-/// Strip the leading block-level markdown markers from one source line and drop
-/// inline-code backticks. Blockquote `>` markers are removed; list bullets
-/// (`-`/`*`/`+`/`N.`/`N)`) are removed but their text is kept; an ATX heading
-/// line (`## Summary`) is dropped *whole* — its text is a section label, not
-/// prose, so the preview flows the body beneath it. Emphasis markers (`*`, `_`)
-/// are left alone so identifiers like `snake_case` survive.
-fn strip_block_markers(line: &str) -> String {
-    let mut t = line.trim();
-    while let Some(rest) = t.strip_prefix('>') {
-        t = rest.trim_start();
-    }
-    if t.starts_with('#') {
-        return String::new();
-    }
-    t = strip_list_marker(t);
-    t.replace('`', "")
-}
-
-/// Strip a single leading list marker (`- `, `* `, `+ `, or an ordered
-/// `N.`/`N)` followed by a space) from `s`.
-fn strip_list_marker(s: &str) -> &str {
-    let t = s.trim_start();
-    for m in ["- ", "* ", "+ "] {
-        if let Some(rest) = t.strip_prefix(m) {
-            return rest.trim_start();
-        }
-    }
-    let bytes = t.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 && i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b')') {
-        if let Some(rest) = t[i + 1..].strip_prefix(' ') {
-            return rest.trim_start();
-        }
-    }
-    t
 }
 
 /// Truncate `s` to at most `width` columns (no ellipsis) — used when a single
