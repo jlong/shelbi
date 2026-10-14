@@ -2,7 +2,8 @@
 //!
 //! The directory holds `sock` (the Unix socket), `lock` (held for the session's
 //! lifetime — an unheld lock means the session is dead), `meta.json`, and after
-//! exit `exit.json` and `final.txt`. The optional raw output log is `raw.log`.
+//! exit `exiting`, `exit.json` and `final.txt`. The optional raw output log is
+//! `raw.log`.
 //!
 //! The directory **name is a short hash**, not the readable session name,
 //! because the socket path has to fit in a `sockaddr_un.sun_path`, which is only
@@ -61,6 +62,15 @@ impl SessionPaths {
     /// `exit.json` — written when the child exits.
     pub fn exit(&self) -> PathBuf {
         self.dir.join("exit.json")
+    }
+
+    /// `exiting` — an empty marker written the moment the child is gone, just
+    /// before the session pushes its `exited` event and well before `exit.json`
+    /// (which waits on the writer flush grace and `final.txt`). Discovery reads
+    /// it so a client choosing a session never binds to one that is already
+    /// winding down (`client-connect-skips-exited-sessions`).
+    pub fn exiting(&self) -> PathBuf {
+        self.dir.join("exiting")
     }
 
     /// `final.txt` — the last screen plus recent history as text, on exit.

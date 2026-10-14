@@ -194,6 +194,19 @@ impl DiscoveredSession {
     pub fn usable(&self) -> bool {
         self.alive && !self.not_listening()
     }
+
+    /// Whether this session has already begun exiting: its child is gone and it
+    /// has written its `exiting` marker (just before pushing `exited` to its
+    /// clients) or its `exit.json`. Such a session still holds its lock and
+    /// still accepts connections through its exit flush grace, so it can read as
+    /// [`alive`](Self::alive) and even [`Reachable`](SocketReachability::Reachable),
+    /// yet a client attaching to it is dropped a moment later and sees a second
+    /// death. Read fresh from disk on every call (not cached by [`list`]), so a
+    /// session that started exiting after the scan is still caught at pick time
+    /// (`client-connect-skips-exited-sessions`).
+    pub fn exiting(&self) -> bool {
+        self.dir.join("exiting").exists() || self.dir.join("exit.json").exists()
+    }
 }
 
 /// Enumerate sessions under `root`, newest unspecified order. Directories with
@@ -337,6 +350,14 @@ pub fn reap_dead_keeping_recent(
 /// preferring the most recently launched. Returns `None` when no live session
 /// carries the name.
 ///
+/// A session that has already begun exiting ([`DiscoveredSession::exiting`]) is
+/// never chosen, even as the lone candidate: across a reload or crash relaunch
+/// the dying predecessor keeps its lock and keeps accepting for a moment after
+/// it has pushed `exited`, and binding to it drops the client straight back out,
+/// costing a second restart and its backoff. Skipping it leaves the replacement
+/// (or, if it has not appeared yet, `None`, which the attach paths retry) as the
+/// answer (`client-connect-skips-exited-sessions`).
+///
 /// Duplicates by name are normal — a relaunch races a not-yet-reaped predecessor,
 /// and an "alive but not listening" zombie ([`DiscoveredSession::not_listening`])
 /// lingers beside its replacement — so a lookup must choose *deliberately* rather
@@ -353,7 +374,7 @@ pub fn reap_dead_keeping_recent(
 pub fn choose_session(sessions: &[DiscoveredSession], name: &str) -> Option<DiscoveredSession> {
     let mut live: Vec<&DiscoveredSession> = sessions
         .iter()
-        .filter(|s| s.alive && s.meta.name == name)
+        .filter(|s| s.alive && s.meta.name == name && !s.exiting())
         .collect();
     match live.len() {
         0 => return None,
@@ -730,6 +751,63 @@ mod tests {
         let newer = named_at(b_dir.path(), b_sock, true, "demo/ws/x", "2026-02-01T00:00:00Z");
         let chosen = choose_session(&[older, newer], "demo/ws/x").expect("a usable session");
         assert_eq!(chosen.meta.launched_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn choose_session_skips_an_exiting_session_for_its_live_replacement() {
+        // The reload race (`client-connect-skips-exited-sessions`): the old
+        // session has pushed `exited` (its `exiting` marker is on disk) but still
+        // holds its lock and still answers the hello through its flush grace,
+        // while the replacement is live but has not bound its socket yet. Before
+        // the fix the probe saw the dying session Reachable and the replacement
+        // NotBound, so the client attached to the dying one, was dropped, and
+        // counted a second death. The replacement must win, in any list order
+        // and whichever one launched later.
+        let dying_dir = tempfile::tempdir().unwrap();
+        let dying_sock = dying_dir.path().join("sock");
+        let _dying_listener = hello_listener(&dying_sock);
+        std::fs::write(dying_dir.path().join("exiting"), b"").unwrap();
+
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh_sock = fresh_dir.path().join("sock"); // not bound yet
+
+        for (dying_at, fresh_at) in [("t1", "t2"), ("t2", "t1")] {
+            let dying = named_at(dying_dir.path(), dying_sock.clone(), true, "demo/orch", dying_at);
+            let fresh = named_at(fresh_dir.path(), fresh_sock.clone(), true, "demo/orch", fresh_at);
+            assert!(dying.exiting(), "the marker reads as exiting");
+            assert!(!fresh.exiting());
+            for order in [
+                vec![dying.clone(), fresh.clone()],
+                vec![fresh.clone(), dying.clone()],
+            ] {
+                let chosen = choose_session(&order, "demo/orch").expect("the live replacement");
+                assert_eq!(
+                    chosen.dir,
+                    fresh_dir.path(),
+                    "an exiting session must never be chosen over a live one",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn choose_session_never_returns_a_lone_exiting_session() {
+        // With only the dying session on disk (the replacement has not written
+        // its meta yet), there is nothing to attach to: `None`, which the attach
+        // paths retry until the replacement appears. Either exit signal counts:
+        // the early `exiting` marker or the later `exit.json`.
+        for marker in ["exiting", "exit.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("sock");
+            let _listener = hello_listener(&sock);
+            std::fs::write(dir.path().join(marker), b"").unwrap();
+            let only = named_at(dir.path(), sock, true, "demo/orch", "t1");
+            assert!(only.exiting(), "{marker} reads as exiting");
+            assert!(
+                choose_session(&[only], "demo/orch").is_none(),
+                "a lone session with {marker} must not be chosen",
+            );
+        }
     }
 
     #[test]
