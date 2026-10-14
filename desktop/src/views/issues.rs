@@ -185,6 +185,14 @@ impl IssuesView {
         self.needs_focus = true;
     }
 
+    /// Open task `id`'s detail (from an Activity row). A task the board hasn't
+    /// loaded yet fills in when its read lands.
+    pub fn open_task(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.open_detail(id);
+        self.needs_focus = true;
+        cx.notify();
+    }
+
     /// Drain the refreshers and background results; re-read on the cadence.
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
@@ -1228,7 +1236,7 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
         })
 }
 
-fn chip(theme: &Theme, icon: &'static str, label: String) -> gpui::Div {
+pub(super) fn chip(theme: &Theme, icon: &'static str, label: String) -> gpui::Div {
     div()
         .flex()
         .flex_row()

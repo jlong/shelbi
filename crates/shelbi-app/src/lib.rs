@@ -37,12 +37,14 @@
 //! (`shelbi-tui`, `shelbi-cli`). The `tests/no_ui_deps.rs` integration test
 //! asserts the invariant against the resolved dependency tree.
 
+pub mod activity;
 pub mod board;
 pub mod changes;
 pub mod command;
 pub mod exec;
 pub mod exec_daemon;
 pub mod nav;
+pub mod reachability;
 pub mod refresh;
 pub mod session;
 pub mod supervision;
@@ -58,6 +60,6 @@ pub use shelbi_proto::control::{ExpectedState, ReviewRole, ReviewSessionOp, Work
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};
 pub use refresh::{spawn_refresher, spawn_worker, RefreshHandle, Refresher, Snapshot};
 pub use view::{
-    ActivityModel, BoardFilters, ErrorLogModel, IssueCard, IssueColumn, IssuesModel,
+    BoardFilters, ErrorLogModel, IssueCard, IssueColumn, IssuesModel,
     MachinesModel, ReviewPanelModel, SidebarModel, TaskDetailModel,
 };

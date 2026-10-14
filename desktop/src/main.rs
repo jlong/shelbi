@@ -19,6 +19,8 @@ mod theme;
 mod views;
 #[cfg(feature = "visual-check")]
 mod visual_check;
+#[cfg(feature = "visual-check")]
+mod visual_views;
 mod window_state;
 
 use gpui::{actions, App, KeyBinding, Menu, MenuItem, SystemMenuType};
@@ -46,6 +48,10 @@ enum Mode {
     /// check its input handling (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     VisualCheck(Option<String>),
+    /// `--visual-views [dir]`: render the Activity and Machines views
+    /// offscreen against a sandboxed home (feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    VisualViews(Option<String>),
 }
 
 fn parse_args() -> Mode {
@@ -58,6 +64,8 @@ fn parse_args() -> Mode {
         },
         #[cfg(feature = "visual-check")]
         Some("--visual-check") => Mode::VisualCheck(args.next()),
+        #[cfg(feature = "visual-check")]
+        Some("--visual-views") => Mode::VisualViews(args.next()),
         Some(project) if !project.starts_with('-') => Mode::App,
         Some(other) => usage(&format!("unknown argument `{other}`")),
     }
@@ -76,6 +84,10 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::VisualCheck(dir) = mode {
         visual_check::run(visual_check::out_dir(dir));
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::VisualViews(dir) = mode {
+        visual_views::run(visual_check::out_dir(dir));
     }
     // The launch project: a local read before any window exists (the spike
     // has none).

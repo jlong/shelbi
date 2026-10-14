@@ -17,7 +17,7 @@ use shelbi_app::view::SidebarModel;
 
 use crate::activity::ActivityData;
 use crate::kanban::BoardData;
-use crate::machines::MachinesData;
+use shelbi_app::view::MachinesModel;
 
 /// One immutable published read of the world for the shell. The native-view
 /// fields carry the opaque data bundles the embedded apps fold in via their
@@ -26,7 +26,7 @@ pub struct ShellSnapshot {
     pub sidebar: Option<SidebarModel>,
     pub board: Option<BoardData>,
     pub activity: Option<ActivityData>,
-    pub machines: Option<MachinesData>,
+    pub machines: Option<MachinesModel>,
 }
 
 /// A refresh worker, generic over the payload `T` it publishes. Dropping it

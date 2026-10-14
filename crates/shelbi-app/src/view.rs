@@ -14,12 +14,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use shelbi_core::{Column, Machine, MachineKind, StatusCategory, WorkspaceSpec};
+use shelbi_core::{Column, Machine, MachineKind, Reachability, StatusCategory, WorkspaceSpec};
 use shelbi_palette::{Decoration, DecorationColor};
-use shelbi_state::{ErrorLogEntry, IssueFile, ZenModeState};
+use shelbi_state::machine_state::MachineRecord;
+use shelbi_state::{ErrorLogEntry, IssueFile, WorkspaceState, WorkspaceStatus, ZenModeState};
 
 use crate::board::{self, BoardInput, BoardRules, WorkspaceFilter};
 use crate::nav::View;
+use crate::theme::Tone;
 
 // ---------------------------------------------------------------------------
 // Sidebar
@@ -852,84 +854,21 @@ fn card_for(
 }
 
 // ---------------------------------------------------------------------------
-// Activity feed
-// ---------------------------------------------------------------------------
-
-/// The activity feed: a reverse-chronological list of events.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ActivityModel {
-    pub items: Vec<ActivityItem>,
-}
-
-/// One feed row. The host reads and parses `events.log`; this is the plain
-/// shape the feed renders.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivityItem {
-    /// RFC3339 timestamp string (as written in the log).
-    pub timestamp: String,
-    /// The acting agent/identity, if the line names one.
-    pub agent: Option<String>,
-    /// A short human summary of what happened.
-    pub summary: String,
-    pub kind: ActivityKind,
-}
-
-/// Coarse classification used by the feed's pill filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityKind {
-    /// An issue status transition.
-    Issue,
-    /// A workspace state change.
-    Workspace,
-    /// A Zen-mode dry-run / promotion event.
-    Zen,
-    /// Anything else (system lines, ssh, merges…).
-    Other,
-}
-
-/// The feed's pill filter (All / Zen / Workspaces). `All` shows everything
-/// except heartbeats (which never reach the model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ActivityFilter {
-    pub zen_only: bool,
-    pub workspaces_only: bool,
-}
-
-impl ActivityModel {
-    /// Wrap a pre-parsed, newest-first item list.
-    pub fn from_items(items: Vec<ActivityItem>) -> ActivityModel {
-        ActivityModel { items }
-    }
-
-    /// The items passing `filter`. `zen_only` keeps Zen events;
-    /// `workspaces_only` keeps workspace events; both unset keeps all.
-    pub fn filtered(&self, filter: ActivityFilter) -> Vec<&ActivityItem> {
-        self.items
-            .iter()
-            .filter(|it| match (filter.zen_only, filter.workspaces_only) {
-                (false, false) => true,
-                (true, false) => it.kind == ActivityKind::Zen,
-                (false, true) => it.kind == ActivityKind::Workspace,
-                // Both pills active: either category.
-                (true, true) => {
-                    matches!(it.kind, ActivityKind::Zen | ActivityKind::Workspace)
-                }
-            })
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Machines
 // ---------------------------------------------------------------------------
 
-/// The machines list (a new in-process view).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The machines view: every machine the project declares, each with every
+/// workspace that lives on it (review slots included). Shared by the TUI's
+/// machines view and the desktop's; `shelbi_orchestrator::machines_model`
+/// reads the inputs and [`MachinesModel::build`] maps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachinesModel {
+    /// The project's display name (or label), for the view's title.
+    pub display_name: Option<String>,
     pub machines: Vec<MachineRow>,
 }
 
-/// A machine row.
+/// A machine and the workspaces on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineRow {
     pub name: String,
@@ -937,40 +876,318 @@ pub struct MachineRow {
     /// SSH host, when this is a remote machine.
     pub host: Option<String>,
     pub is_local: bool,
+    /// Capability tags declared on the machine.
     pub tags: Vec<String>,
-    /// How many of the project's workspaces live on this machine.
-    pub workspace_count: usize,
-    /// How many of those are currently active (host-supplied; 0 when
-    /// unknown).
-    pub active_count: usize,
+    /// The resolved remote `shelbi` binary (path + version) once `shelbi
+    /// machine setup` has run for it. `None` for a local machine or a remote
+    /// not set up yet.
+    pub remote: Option<MachineRecord>,
+    /// Live reachability, folded in from a [`ReachabilityProber`]
+    /// (`fold_reachability`). A local machine is the hub itself: always
+    /// [`Reachability::Reachable`] and never probed. A remote reads
+    /// [`Reachability::Unknown`] ("checking…") until its first probe lands.
+    ///
+    /// [`ReachabilityProber`]: crate::reachability::ReachabilityProber
+    pub reachability: Reachability,
+    pub workspaces: Vec<MachineWorkspace>,
 }
 
+/// A workspace under its machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineWorkspace {
+    pub name: String,
+    /// Whether this is a `review`-tagged slot.
+    pub is_review_slot: bool,
+    /// The hub poller's last observed state (`status.yaml`), or `None` when
+    /// the workspace has none yet.
+    pub state: Option<WorkspaceState>,
+    /// The task the observed status names, if any.
+    pub current_task: Option<String>,
+    /// What the workspace is assigned, as `shelbi workspace list` reads it from
+    /// the board.
+    pub assignment: SlotAssignment,
+    /// The agent `shelbi workspace list` shows: the in-progress task's
+    /// `agent:` (default `developer`), `review` for a serving review slot.
+    /// `None` when idle.
+    pub agent: Option<String>,
+    /// The assigned task's title, when the board has it.
+    pub task_title: Option<String>,
+    /// The assigned task's branch.
+    pub branch: Option<String>,
+    /// For a review slot holding a review task: its server state and URL.
+    pub review: Option<ReviewSlot>,
+}
+
+/// A workspace's assignment, matching `shelbi workspace list`'s STATE cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotAssignment {
+    /// Nothing assigned.
+    Idle,
+    /// In-progress task(s) assigned to it (normally one; more means the board
+    /// diverged, and the cell shows them all).
+    InProgress(Vec<String>),
+    /// A review slot serving (or loading) a review-column task.
+    Review(String),
+}
+
+impl SlotAssignment {
+    /// The STATE cell text `shelbi workspace list` prints for this assignment:
+    /// `in_progress: <ids>`, `review: <id>`, or `idle`.
+    pub fn cell(&self) -> String {
+        match self {
+            SlotAssignment::Idle => "idle".to_string(),
+            SlotAssignment::InProgress(ids) => format!("in_progress: {}", ids.join(", ")),
+            SlotAssignment::Review(id) => format!("review: {id}"),
+        }
+    }
+
+    /// The task the slot holds (the first one, for a diverged board).
+    pub fn task(&self) -> Option<&str> {
+        match self {
+            SlotAssignment::Idle => None,
+            SlotAssignment::InProgress(ids) => ids.first().map(String::as_str),
+            SlotAssignment::Review(id) => Some(id),
+        }
+    }
+}
+
+/// A review slot's server: whether it is up and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSlot {
+    pub task_id: String,
+    /// [`ReviewState::Serving`] once the server is confirmed up, else
+    /// [`ReviewState::Loading`].
+    pub state: ReviewState,
+    /// The review URL (the workflow's `review:` template with `$PORT`/`$SLOT`
+    /// substituted), when the workflow declares one.
+    pub url: Option<String>,
+}
+
+impl ReviewSlot {
+    /// `serving` or `starting`.
+    pub fn label(&self) -> &'static str {
+        match self.state {
+            ReviewState::Serving => "serving",
+            _ => "starting",
+        }
+    }
+}
+
+/// Everything [`MachinesModel::build`] maps: plain data the host has already
+/// read (the project's declarations, the machine records, the workspace
+/// statuses, the board's in-progress tasks, and the resolved review slots).
+#[derive(Debug, Clone, Default)]
+pub struct MachinesInput {
+    pub display_name: Option<String>,
+    pub machines: Vec<Machine>,
+    /// The project's workspaces, each with whether it is a review slot.
+    pub workspaces: Vec<(WorkspaceSpec, bool)>,
+    pub records: HashMap<String, MachineRecord>,
+    pub statuses: HashMap<String, WorkspaceStatus>,
+    /// The board's in-progress tasks.
+    pub in_progress: Vec<IssueFile>,
+    /// Review slot name -> the review task it holds.
+    pub review_slots: HashMap<String, ReviewSlot>,
+    /// Task id -> the task's branch (as the orchestrator names it).
+    pub branches: HashMap<String, String>,
+    /// Task id -> title, for tasks in neither `in_progress` (review tasks).
+    pub titles: HashMap<String, String>,
+}
+
+/// The default agent `shelbi workspace list` shows for a task with no
+/// `agent:`.
+pub const DEFAULT_TASK_AGENT: &str = "developer";
+/// The agent `shelbi workspace list` shows for a review slot.
+pub const REVIEW_SLOT_AGENT: &str = "review";
+
 impl MachinesModel {
-    /// Build from the project's declared machines and workspaces.
-    /// `active_by_machine` maps a machine name to its count of currently
-    /// active workspaces (the host derives this from workspace statuses);
-    /// a machine absent from the map reports zero active.
-    pub fn from_project(
-        machines: &[Machine],
-        workspaces: &[WorkspaceSpec],
-        active_by_machine: &HashMap<String, usize>,
-    ) -> MachinesModel {
-        let machines = machines
+    /// Map the read inputs. Machines keep their declared order and each
+    /// lists its workspaces in declared order.
+    pub fn build(input: &MachinesInput) -> MachinesModel {
+        let machines = input
+            .machines
             .iter()
             .map(|m| {
-                let workspace_count = workspaces.iter().filter(|w| w.machine == m.name).count();
+                let is_local = m.kind == MachineKind::Local;
+                let workspaces = input
+                    .workspaces
+                    .iter()
+                    .filter(|(w, _)| w.machine == m.name)
+                    .map(|(w, review)| machine_workspace(input, w, *review))
+                    .collect();
                 MachineRow {
                     name: m.name.clone(),
                     kind: m.kind,
                     host: m.host.clone(),
-                    is_local: m.kind == MachineKind::Local,
+                    is_local,
                     tags: m.tags.clone(),
-                    workspace_count,
-                    active_count: active_by_machine.get(&m.name).copied().unwrap_or(0),
+                    remote: if is_local {
+                        None
+                    } else {
+                        input.records.get(&m.name).cloned()
+                    },
+                    reachability: if is_local {
+                        Reachability::Reachable
+                    } else {
+                        Reachability::Unknown
+                    },
+                    workspaces,
                 }
             })
             .collect();
-        MachinesModel { machines }
+        MachinesModel {
+            display_name: input.display_name.clone(),
+            machines,
+        }
+    }
+
+    /// The `(machine, ssh host)` pairs a reachability prober should probe:
+    /// the remotes only (a local machine is never probed). An SSH machine with
+    /// no explicit host is reached by its name, as `Machine::host()` does.
+    pub fn probe_targets(&self) -> Vec<(String, String)> {
+        self.machines
+            .iter()
+            .filter(|m| !m.is_local)
+            .map(|m| {
+                let host = m.host.clone().unwrap_or_else(|| m.name.clone());
+                (m.name.clone(), host)
+            })
+            .collect()
+    }
+
+    /// Overlay a prober's latest results onto the remotes. A remote with no
+    /// result yet keeps [`Reachability::Unknown`].
+    pub fn fold_reachability(&mut self, results: &HashMap<String, Reachability>) {
+        for m in &mut self.machines {
+            if m.is_local {
+                continue;
+            }
+            if let Some(r) = results.get(&m.name) {
+                m.reachability = r.clone();
+            }
+        }
+    }
+
+    /// Every workspace, in render order, as `(machine index, workspace index)`.
+    pub fn workspace_positions(&self) -> Vec<(usize, usize)> {
+        self.machines
+            .iter()
+            .enumerate()
+            .flat_map(|(mi, m)| (0..m.workspaces.len()).map(move |wi| (mi, wi)))
+            .collect()
+    }
+
+    /// Total workspaces across every machine.
+    pub fn workspace_count(&self) -> usize {
+        self.machines.iter().map(|m| m.workspaces.len()).sum()
+    }
+}
+
+fn machine_workspace(input: &MachinesInput, w: &WorkspaceSpec, is_review_slot: bool) -> MachineWorkspace {
+    let status = input.statuses.get(&w.name);
+    let mine: Vec<&IssueFile> = input
+        .in_progress
+        .iter()
+        .filter(|tf| tf.task.assigned_to.as_deref() == Some(w.name.as_str()))
+        .collect();
+    let review = input.review_slots.get(&w.name).cloned();
+    // `shelbi workspace list` precedence: an in-progress assignment, else a
+    // review slot's task, else idle.
+    let (assignment, agent) = if let Some(first) = mine.first() {
+        let agent = first
+            .task
+            .param_str("agent")
+            .unwrap_or(DEFAULT_TASK_AGENT)
+            .to_string();
+        (
+            SlotAssignment::InProgress(mine.iter().map(|tf| tf.task.id.clone()).collect()),
+            Some(agent),
+        )
+    } else if let Some(r) = &review {
+        (
+            SlotAssignment::Review(r.task_id.clone()),
+            Some(REVIEW_SLOT_AGENT.to_string()),
+        )
+    } else {
+        (SlotAssignment::Idle, None)
+    };
+    let task = assignment.task().map(str::to_string);
+    let task_title = task.as_deref().and_then(|id| {
+        mine.iter()
+            .find(|tf| tf.task.id == id)
+            .map(|tf| tf.task.title.clone())
+            .or_else(|| input.titles.get(id).cloned())
+    });
+    let branch = task.as_deref().and_then(|id| {
+        input.branches.get(id).cloned().or_else(|| {
+            mine.iter()
+                .find(|tf| tf.task.id == id)
+                .and_then(|tf| tf.task.branch.clone())
+        })
+    });
+    MachineWorkspace {
+        name: w.name.clone(),
+        is_review_slot,
+        state: status.map(|s| s.state),
+        current_task: status.and_then(|s| s.current_task.clone()),
+        assignment,
+        agent,
+        task_title,
+        branch,
+        review: review.filter(|_| mine.is_empty()),
+    }
+}
+
+/// The reachability badge text and tone the machines views show next to a
+/// remote's `ssh <host>` label. `error_max` bounds the unreachable reason.
+pub fn reachability_label(r: &Reachability, error_max: usize) -> (String, Tone) {
+    match r {
+        Reachability::Reachable => ("● reachable".to_string(), Tone::Green),
+        Reachability::Unknown => ("○ checking…".to_string(), Tone::DarkGray),
+        Reachability::Unreachable { error } => (
+            format!("● unreachable: {}", truncate_chars(error, error_max)),
+            Tone::Red,
+        ),
+    }
+}
+
+/// A remote's binary line: `<path> v<version>` (flagged when incompatible), or
+/// the prompt to set it up.
+pub fn remote_binary_label(remote: Option<&MachineRecord>) -> (String, Tone) {
+    match remote {
+        Some(rec) if rec.compatible => (format!("{} v{}", rec.path, rec.version), Tone::Green),
+        Some(rec) => (
+            format!("{} v{} (incompatible)", rec.path, rec.version),
+            Tone::Red,
+        ),
+        None => (
+            "not set up — run `shelbi machine setup`".to_string(),
+            Tone::Yellow,
+        ),
+    }
+}
+
+/// The short badge for an observed workspace state, and its tone.
+pub fn workspace_state_badge(state: Option<WorkspaceState>) -> (&'static str, Tone) {
+    match state {
+        Some(WorkspaceState::Working) => ("working", Tone::Green),
+        Some(WorkspaceState::AwaitingInput) => ("awaiting", Tone::Yellow),
+        Some(WorkspaceState::Blocked) => ("blocked", Tone::Red),
+        Some(WorkspaceState::Paused) => ("paused", Tone::Magenta),
+        Some(WorkspaceState::Serving) => ("serving", Tone::Cyan),
+        None => ("idle", Tone::DarkGray),
+    }
+}
+
+/// Truncate `s` to `max` chars, marking an elision with `…`.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(1);
+        let mut out: String = s.chars().take(keep).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -1389,99 +1606,229 @@ mod tests {
         assert!(TaskDetailModel::build(&input, "gone").is_none());
     }
 
-    #[test]
-    fn activity_filters_by_pill() {
-        let items = vec![
-            ActivityItem {
-                timestamp: "2026-10-03T10:00:00Z".into(),
-                agent: Some("developer".into()),
-                summary: "T-1 in-progress -> review".into(),
-                kind: ActivityKind::Issue,
+    fn machine(name: &str, kind: MachineKind, host: Option<&str>) -> Machine {
+        Machine {
+            name: name.into(),
+            kind,
+            work_dir: "/tmp".into(),
+            host: host.map(str::to_string),
+            tags: vec![],
+            forward: None,
+        }
+    }
+
+    fn ws_spec(name: &str, machine: &str) -> WorkspaceSpec {
+        WorkspaceSpec {
+            name: name.into(),
+            machine: machine.into(),
+            tags: vec![],
+            slot: None,
+        }
+    }
+
+    fn status(ws: &str, state: WorkspaceState, task: Option<&str>) -> WorkspaceStatus {
+        WorkspaceStatus {
+            workspace: ws.into(),
+            current_task: task.map(str::to_string),
+            state,
+            last_transition: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+        }
+    }
+
+    /// A local machine with a dev slot (working a task whose `agent:` is set)
+    /// and a review slot serving a review task; a remote with one idle slot.
+    fn machines_input() -> MachinesInput {
+        let mut working = issue_full("t1", "in-progress", &[], Some("alpha"));
+        working
+            .task
+            .params
+            .insert("agent".into(), "qa".into());
+        let mut records = HashMap::new();
+        records.insert(
+            "gpu".to_string(),
+            MachineRecord {
+                path: "/usr/local/bin/shelbi".into(),
+                version: "0.10.0".into(),
+                compatible: true,
+                source: "path".into(),
+                checked_at: chrono::Utc::now(),
             },
-            ActivityItem {
-                timestamp: "2026-10-03T10:01:00Z".into(),
-                agent: None,
-                summary: "alpha-1 working".into(),
-                kind: ActivityKind::Workspace,
-            },
-            ActivityItem {
-                timestamp: "2026-10-03T10:02:00Z".into(),
-                agent: None,
-                summary: "zen promoted T-9".into(),
-                kind: ActivityKind::Zen,
-            },
-        ];
-        let model = ActivityModel::from_items(items);
-        assert_eq!(model.filtered(ActivityFilter::default()).len(), 3);
-        assert_eq!(
-            model
-                .filtered(ActivityFilter {
-                    zen_only: true,
-                    workspaces_only: false
-                })
-                .len(),
-            1
         );
-        let both = model.filtered(ActivityFilter {
-            zen_only: true,
-            workspaces_only: true,
-        });
-        assert_eq!(both.len(), 2);
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "alpha".to_string(),
+            status("alpha", WorkspaceState::AwaitingInput, Some("t1")),
+        );
+        let mut review_slots = HashMap::new();
+        review_slots.insert(
+            "review".to_string(),
+            ReviewSlot {
+                task_id: "r9".into(),
+                state: ReviewState::Serving,
+                url: Some("http://localhost:3001".into()),
+            },
+        );
+        let mut branches = HashMap::new();
+        branches.insert("t1".to_string(), "jlong/t1".to_string());
+        branches.insert("r9".to_string(), "jlong/r9".to_string());
+        let mut titles = HashMap::new();
+        titles.insert("r9".to_string(), "Review me".to_string());
+        MachinesInput {
+            display_name: Some("Demo".into()),
+            machines: vec![
+                machine("local", MachineKind::Local, None),
+                machine("gpu", MachineKind::Ssh, Some("gpu.lan")),
+                machine("box", MachineKind::Ssh, None),
+            ],
+            workspaces: vec![
+                (ws_spec("alpha", "local"), false),
+                (ws_spec("review", "local"), true),
+                (ws_spec("gpu-1", "gpu"), false),
+            ],
+            records,
+            statuses,
+            in_progress: vec![working],
+            review_slots,
+            branches,
+            titles,
+        }
     }
 
     #[test]
-    fn machines_count_workspaces_and_active() {
-        let machines = vec![
-            Machine {
-                name: "local".into(),
-                kind: MachineKind::Local,
-                work_dir: "/tmp".into(),
-                host: None,
-                tags: vec!["review".into()],
-                forward: None,
-            },
-            Machine {
-                name: "gpu".into(),
-                kind: MachineKind::Ssh,
-                work_dir: "/home/me".into(),
-                host: Some("gpu.local".into()),
-                tags: vec![],
-                forward: None,
-            },
-        ];
-        let workspaces = vec![
-            WorkspaceSpec {
-                name: "local-1".into(),
-                machine: "local".into(),
-                tags: vec![],
-                slot: None,
-            },
-            WorkspaceSpec {
-                name: "local-2".into(),
-                machine: "local".into(),
-                tags: vec![],
-                slot: None,
-            },
-            WorkspaceSpec {
-                name: "gpu-1".into(),
-                machine: "gpu".into(),
-                tags: vec![],
-                slot: None,
-            },
-        ];
-        let mut active = HashMap::new();
-        active.insert("local".to_string(), 1usize);
-        let model = MachinesModel::from_project(&machines, &workspaces, &active);
-        let local = model.machines.iter().find(|m| m.name == "local").unwrap();
+    fn machines_group_every_workspace_under_its_machine() {
+        let model = MachinesModel::build(&machines_input());
+        let names: Vec<(&str, Vec<&str>)> = model
+            .machines
+            .iter()
+            .map(|m| {
+                (
+                    m.name.as_str(),
+                    m.workspaces.iter().map(|w| w.name.as_str()).collect(),
+                )
+            })
+            .collect();
+        // Declared order, review slots included, a machine with none kept.
+        assert_eq!(
+            names,
+            vec![
+                ("local", vec!["alpha", "review"]),
+                ("gpu", vec!["gpu-1"]),
+                ("box", vec![]),
+            ]
+        );
+        assert_eq!(model.display_name.as_deref(), Some("Demo"));
+        assert_eq!(model.workspace_count(), 3);
+        assert_eq!(model.workspace_positions(), vec![(0, 0), (0, 1), (1, 0)]);
+        let local = &model.machines[0];
         assert!(local.is_local);
-        assert_eq!(local.workspace_count, 2);
-        assert_eq!(local.active_count, 1);
-        assert_eq!(local.tags, vec!["review".to_string()]);
-        let gpu = model.machines.iter().find(|m| m.name == "gpu").unwrap();
-        assert!(!gpu.is_local);
-        assert_eq!(gpu.host.as_deref(), Some("gpu.local"));
-        assert_eq!(gpu.workspace_count, 1);
-        assert_eq!(gpu.active_count, 0);
+        assert_eq!(local.reachability, Reachability::Reachable, "the hub is never probed");
+        assert!(local.remote.is_none());
+        let gpu = &model.machines[1];
+        assert_eq!(gpu.reachability, Reachability::Unknown, "checking until probed");
+        assert_eq!(gpu.remote.as_ref().map(|r| r.version.as_str()), Some("0.10.0"));
+        assert!(model.machines[2].remote.is_none(), "not set up yet");
+    }
+
+    #[test]
+    fn machines_rows_carry_workspace_list_state_agent_task_branch_and_review() {
+        let model = MachinesModel::build(&machines_input());
+        let alpha = &model.machines[0].workspaces[0];
+        assert_eq!(alpha.assignment.cell(), "in_progress: t1");
+        assert_eq!(alpha.agent.as_deref(), Some("qa"), "the task's agent: wins");
+        assert_eq!(alpha.task_title.as_deref(), Some("Task t1"));
+        assert_eq!(alpha.branch.as_deref(), Some("jlong/t1"));
+        assert_eq!(alpha.state, Some(WorkspaceState::AwaitingInput));
+        assert!(alpha.review.is_none());
+
+        let review = &model.machines[0].workspaces[1];
+        assert!(review.is_review_slot);
+        assert_eq!(review.assignment.cell(), "review: r9");
+        assert_eq!(review.agent.as_deref(), Some(REVIEW_SLOT_AGENT));
+        assert_eq!(review.task_title.as_deref(), Some("Review me"));
+        assert_eq!(review.branch.as_deref(), Some("jlong/r9"));
+        let slot = review.review.as_ref().expect("a review slot");
+        assert_eq!(slot.label(), "serving");
+        assert_eq!(slot.url.as_deref(), Some("http://localhost:3001"));
+
+        let idle = &model.machines[1].workspaces[0];
+        assert_eq!(idle.assignment, SlotAssignment::Idle);
+        assert_eq!(idle.assignment.cell(), "idle");
+        assert!(idle.agent.is_none() && idle.branch.is_none() && idle.state.is_none());
+    }
+
+    #[test]
+    fn machines_default_agent_and_diverged_assignments_match_workspace_list() {
+        let mut input = machines_input();
+        input.in_progress[0].task.params.clear();
+        input
+            .in_progress
+            .push(issue_full("t2", "in-progress", &[], Some("alpha")));
+        let model = MachinesModel::build(&input);
+        let alpha = &model.machines[0].workspaces[0];
+        assert_eq!(alpha.agent.as_deref(), Some(DEFAULT_TASK_AGENT));
+        assert_eq!(alpha.assignment.cell(), "in_progress: t1, t2");
+    }
+
+    #[test]
+    fn machines_probe_remotes_only_and_fold_their_results() {
+        let mut model = MachinesModel::build(&machines_input());
+        assert_eq!(
+            model.probe_targets(),
+            vec![
+                ("gpu".to_string(), "gpu.lan".to_string()),
+                // An ssh machine with no host is reached by its name.
+                ("box".to_string(), "box".to_string()),
+            ]
+        );
+        let mut results = HashMap::new();
+        results.insert(
+            "gpu".to_string(),
+            Reachability::Unreachable {
+                error: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
+            },
+        );
+        // A stray result for the local machine is ignored.
+        results.insert(
+            "local".to_string(),
+            Reachability::Unreachable { error: "x".into() },
+        );
+        model.fold_reachability(&results);
+        assert_eq!(model.machines[0].reachability, Reachability::Reachable);
+        assert!(matches!(
+            model.machines[1].reachability,
+            Reachability::Unreachable { .. }
+        ));
+        assert_eq!(model.machines[2].reachability, Reachability::Unknown);
+    }
+
+    #[test]
+    fn machines_labels_read_like_the_tui() {
+        assert_eq!(
+            reachability_label(&Reachability::Unknown, 40),
+            ("○ checking…".to_string(), Tone::DarkGray)
+        );
+        assert_eq!(
+            reachability_label(&Reachability::Reachable, 40),
+            ("● reachable".to_string(), Tone::Green)
+        );
+        let (text, tone) = reachability_label(
+            &Reachability::Unreachable {
+                error: "a very long ssh failure reason".into(),
+            },
+            10,
+        );
+        assert_eq!(text, "● unreachable: a very lo…");
+        assert_eq!(tone, Tone::Red);
+        assert_eq!(
+            remote_binary_label(None).0,
+            "not set up — run `shelbi machine setup`"
+        );
+        assert_eq!(workspace_state_badge(None), ("idle", Tone::DarkGray));
+        assert_eq!(
+            workspace_state_badge(Some(WorkspaceState::Serving)),
+            ("serving", Tone::Cyan)
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub use model::{
     HeartbeatConfig, GithubConnection, Host, IssueTrackerBackend, IssueTrackerConfig, JiraConnection,
     LinearConnection, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic,
     Project, ProjectAgentConfig, ProjectRunnerConfig, ProjectShape,
-    PromptInjectionKind, PromptInjectionSpec, ReviewConfig, RunnerKind, Session, SessionConfig, SessionProject, Status, Issue,
+    PromptInjectionKind, PromptInjectionSpec, Reachability, ReviewConfig, RunnerKind, Session, SessionConfig, SessionProject, Status, Issue,
     IssueLaunchConfig, IssueZenConfig,
     WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_BUDGET_GRAPHQL_HIGH, DEFAULT_BUDGET_GRAPHQL_LOW, DEFAULT_BUDGET_GRAPHQL_MEDIUM,
