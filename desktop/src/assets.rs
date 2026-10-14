@@ -42,6 +42,10 @@ pub mod icons {
     pub const CHECK: &str = "icons/heroicons/check.svg";
     pub const SIGNAL_SLASH: &str = "icons/heroicons/signal-slash.svg";
     pub const ARROW_DOWN_CIRCLE: &str = "icons/heroicons/arrow-down-circle.svg";
+    pub const COMMAND_LINE: &str = "icons/heroicons/command-line.svg";
+    pub const FOLDER_OPEN: &str = "icons/heroicons/folder-open.svg";
+    pub const GLOBE_ALT: &str = "icons/heroicons/globe-alt.svg";
+    pub const DOCUMENT_TEXT: &str = "icons/heroicons/document-text.svg";
 }
 
 macro_rules! heroicon {
@@ -83,6 +87,10 @@ const HEROICONS: &[(&str, &[u8])] = &[
     heroicon!(icons::CHECK, "check.svg"),
     heroicon!(icons::SIGNAL_SLASH, "signal-slash.svg"),
     heroicon!(icons::ARROW_DOWN_CIRCLE, "arrow-down-circle.svg"),
+    heroicon!(icons::COMMAND_LINE, "command-line.svg"),
+    heroicon!(icons::FOLDER_OPEN, "folder-open.svg"),
+    heroicon!(icons::GLOBE_ALT, "globe-alt.svg"),
+    heroicon!(icons::DOCUMENT_TEXT, "document-text.svg"),
 ];
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its

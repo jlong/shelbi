@@ -48,7 +48,11 @@ use crate::error::ProtoError;
 /// v5 adds [`MutationKind::Prioritize`] (reorder an issue within its column
 /// through the daemon, so the desktop board's drag-to-reorder and the TUI's
 /// reorder keys go through the same per-issue queue as every other mutation).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
+///
+/// v6 adds [`WorkspaceSessionOp::EnsureShell`] / [`WorkspaceSessionOp::CloseShell`]:
+/// the desktop app's Workspace view asks the daemon for a plain user shell in
+/// the workspace's worktree, shown beside the agent (`dt-workspace-view`).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -261,6 +265,15 @@ pub enum WorkspaceSessionOp {
     /// End this workspace's editor and diff content sessions. The agent session
     /// is left running. Idempotent.
     Close,
+    /// Ensure the workspace's **user shell** is spawned and live: a plain login
+    /// shell in the worktree, named `<project>/ws/<workspace>/shell`, on the
+    /// workspace's own machine (over SSH for a remote one). Unlike the
+    /// `@shelbi-user-shell` slot shell `shelbi open` starts on an idle
+    /// workspace, it sits *beside* the agent session and never occupies the
+    /// slot, so dispatch is unaffected. Idempotent.
+    EnsureShell,
+    /// End the workspace's user shell. Idempotent.
+    CloseShell,
 }
 
 /// Client → daemon request to manage a dev workspace's editor/diff content

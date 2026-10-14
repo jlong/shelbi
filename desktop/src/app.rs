@@ -24,6 +24,11 @@
 //! global chords (the focus moves and the palette chords, Ctrl+Space and
 //! Cmd+K included) in the capture phase, so they never reach the session.
 //!
+//! A workspace row routes the main area to the Workspace view
+//! ([`WorkspaceView`], `dt-workspace-view`): its agent's terminal under a
+//! header (task, branch, machine, live state), with the user's shell beside it
+//! on demand. Like the chat, its terminals give the window the global chords.
+//!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown. A project switch opens (or focuses) the target's
@@ -69,6 +74,7 @@ use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
+use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::SettingsView;
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{Frame, WindowState};
@@ -353,6 +359,8 @@ pub struct ShelbiWindow {
     detecting: Option<String>,
     /// Bumped on each transient status, so a flash only clears its own.
     flash_generation: u64,
+    /// The Workspace view, created the first time a workspace is shown.
+    workspace: Option<Entity<WorkspaceView>>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -415,6 +423,7 @@ impl ShelbiWindow {
             palette_inputs: PaletteInputs::default(),
             detecting: None,
             flash_generation: 0,
+            workspace: None,
             banner: None,
             status: None,
             focus_handle,
@@ -476,6 +485,7 @@ impl ShelbiWindow {
                     if let Some(ActiveOverlay::Palette { palette, .. }) = &mut self.overlay {
                         palette.set_entries(entries);
                     }
+                    self.update_workspace_row(cx);
                 }
             }
             FeedEvent::Link(link) => self.link = Some(link),
@@ -502,6 +512,10 @@ impl ShelbiWindow {
             this.update(cx, |this, cx| {
                 this.palette_chord = palette_chord(&keymaps);
                 this.keymaps = keymaps;
+                if let Some(ws) = this.workspace.clone() {
+                    let chord = this.palette_chord.clone();
+                    ws.update(cx, |ws, cx| ws.set_palette_chord(&chord, cx));
+                }
                 cx.notify();
             })
             .ok();
@@ -746,6 +760,13 @@ impl ShelbiWindow {
                     let chat = self.ensure_chat(window, cx);
                     chat.update(cx, |chat, cx| chat.show(cx));
                 }
+                if let Some(name) = workspace_name(self.client.view()).map(str::to_string) {
+                    // Selecting it again re-selects its pane (re-opening a
+                    // dead one), as the chat does.
+                    let row = self.workspace_row(&name);
+                    let ws = self.ensure_workspace(window, cx);
+                    ws.update(cx, |ws, cx| ws.show(&name, row, cx));
+                }
                 self.sync_chat(window, cx);
                 self.focus_main_view(window, cx);
             }
@@ -813,7 +834,7 @@ impl ShelbiWindow {
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
         let chat =
-            cx.new(|cx| ChatView::new(&project, handle, ChatDeps::live(&project), sink, cx));
+            cx.new(|cx| ChatView::orchestrator(&project, handle, ChatDeps::live(&project), sink, cx));
         let sub = cx.subscribe(&chat, |this, _, ev: &ChatEvent, cx| match ev {
             // A click in the terminal moves the window's focus model to the
             // main area, so the sidebar stops taking keys.
@@ -821,10 +842,60 @@ impl ShelbiWindow {
                 this.client.focus_main();
                 cx.notify();
             }
+            // Only a close-on-exit pane (the user shell) ends; the chat
+            // restarts instead.
+            ChatEvent::Ended => {}
         });
         self._subscriptions.push(sub);
         self.chat = Some(chat.clone());
         chat
+    }
+
+    /// The Workspace view for the window's project, created on first use.
+    fn ensure_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<WorkspaceView> {
+        if let Some(ws) = &self.workspace {
+            return ws.clone();
+        }
+        let project = self.project.clone();
+        let handle = window.window_handle();
+        let sink = self._feed.as_ref().map(|f| f.session_sink());
+        let chord = self.palette_chord.clone();
+        let ws = cx.new(|cx| {
+            let mut ws = WorkspaceView::new(&project, handle, WorkspaceDeps::live(&project), sink, cx);
+            ws.set_palette_chord(&chord, cx);
+            ws
+        });
+        let sub = cx.subscribe(&ws, |this, _, ev: &WorkspaceEvent, cx| match ev {
+            WorkspaceEvent::Focused => {
+                this.client.focus_main();
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
+        self.workspace = Some(ws.clone());
+        ws
+    }
+
+    /// The sidebar's row for workspace `name`.
+    fn workspace_row(&self, name: &str) -> Option<shelbi_app::view::WorkspaceRow> {
+        self.model.workspaces.iter().find(|w| w.name == name).cloned()
+    }
+
+    /// Hand the shown workspace its refreshed sidebar row (its live state, and
+    /// the change that re-attaches an idle one).
+    fn update_workspace_row(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = self.workspace.clone() else {
+            return;
+        };
+        let Some(name) = ws.read(cx).workspace().map(str::to_string) else {
+            return;
+        };
+        let row = self.workspace_row(&name);
+        ws.update(cx, |ws, cx| ws.update_row(row, cx));
     }
 
     /// Whether the main area should show the chat right now.
@@ -853,13 +924,30 @@ impl ShelbiWindow {
                 chat.update(cx, |chat, cx| chat.hide(cx));
             }
         }
+        // The Workspace view is shown by `ShowView` (it needs the row); here
+        // it is only ever hidden, when the main area moves on.
+        let workspace_wanted = matches!(self.boot, Boot::Ready(_))
+            && matches!(self.route, Route::View)
+            && workspace_name(self.client.view()).is_some();
+        if !workspace_wanted {
+            if let Some(ws) = &self.workspace {
+                if ws.read(cx).is_shown() {
+                    ws.update(cx, |ws, cx| ws.hide(cx));
+                }
+            }
+        }
     }
 
-    /// Whether the chat's terminal holds keyboard focus.
+    /// Whether a main-area terminal (the chat's, or the Workspace view's
+    /// agent or shell) holds keyboard focus.
     fn chat_focused(&self, window: &Window, cx: &App) -> bool {
         self.chat
             .as_ref()
             .is_some_and(|chat| chat.read(cx).contains_focus(window, cx))
+            || self
+                .workspace
+                .as_ref()
+                .is_some_and(|ws| ws.read(cx).is_shown() && ws.read(cx).contains_focus(window, cx))
     }
 
     /// The Activity feed for the window's project, created on first use.
@@ -913,8 +1001,9 @@ impl ShelbiWindow {
         issues.update(cx, |v, cx| v.open_task(id, cx));
     }
 
-    /// Hand keyboard focus to what the main area shows: a native view or the
-    /// chat takes it (their own keys), anything else leaves it on the window.
+    /// Hand keyboard focus to what the main area shows: a native view, the
+    /// chat or the Workspace view takes it (their own keys), anything else
+    /// leaves it on the window.
     fn focus_main_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::View) {
             self.focus_handle.focus(window, cx);
@@ -939,6 +1028,12 @@ impl ShelbiWindow {
             view if is_chat(view) && self.chat.is_some() => {
                 if let Some(chat) = &self.chat {
                     let target = chat.read(cx).focus_target(cx);
+                    window.focus(&target, cx);
+                }
+            }
+            view if workspace_name(view).is_some() && self.workspace.is_some() => {
+                if let Some(ws) = &self.workspace {
+                    let target = ws.read(cx).focus_target(cx);
                     window.focus(&target, cx);
                 }
             }
@@ -1014,6 +1109,9 @@ impl ShelbiWindow {
                 if let Some(chat) = &this.chat {
                     chat.update(cx, |chat, _| chat.note_deliberate_close());
                 }
+                if let Some(ws) = &this.workspace {
+                    ws.update(cx, |ws, cx| ws.note_deliberate_close(cx));
+                }
             })
             .ok();
             let quit = cx
@@ -1032,6 +1130,9 @@ impl ShelbiWindow {
                 Err(e) => {
                     if let Some(chat) = &this.chat {
                         chat.update(cx, |chat, _| chat.clear_deliberate_close());
+                    }
+                    if let Some(ws) = &this.workspace {
+                        ws.update(cx, |ws, cx| ws.clear_deliberate_close(cx));
                     }
                     this.banner = Some(format!("Couldn't quit the project: {e}").into());
                     cx.notify();
@@ -1718,6 +1819,13 @@ impl ShelbiWindow {
                         .min_w_0()
                         .children(self.chat.clone())
                         .into_any_element(),
+                    (None, _) if workspace_name(view).is_some() && self.workspace.is_some() => div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .children(self.workspace.clone())
+                        .into_any_element(),
                     (None, Some(issues)) if *view == View::Issues => div()
                         .flex()
                         .flex_1()
@@ -1827,6 +1935,14 @@ impl ShelbiWindow {
 /// Whether `view` is the orchestrator chat.
 fn is_chat(view: &View) -> bool {
     matches!(view, View::Session(name) if name == "orch")
+}
+
+/// The workspace `view` shows, when it is a workspace's session.
+fn workspace_name(view: &View) -> Option<&str> {
+    match view {
+        View::Session(name) if name != "orch" => Some(name),
+        _ => None,
+    }
 }
 
 /// Whether the window takes `chord` away from a focused terminal: the focus
@@ -2087,6 +2203,22 @@ mod tests {
         assert!(is_chat(&View::Session("orch".into())));
         assert!(!is_chat(&View::Session("alpha".into())));
         assert!(!is_chat(&View::Issues));
+    }
+
+    #[test]
+    fn a_workspace_row_routes_to_the_workspace_view() {
+        // Selecting a workspace (its row, or the palette's `workspace:<name>`)
+        // shows its session view, which the window draws as the Workspace view.
+        assert_eq!(
+            calls(CommandKind::FocusWorkspace {
+                workspace: "alpha".into()
+            }),
+            [HostCall::ShowView(View::Session("alpha".into()))]
+        );
+        assert_eq!(workspace_name(&View::Session("alpha".into())), Some("alpha"));
+        assert_eq!(workspace_name(&View::Session("orch".into())), None);
+        assert_eq!(workspace_name(&View::Issues), None);
+        assert_eq!(commands::view_stub_id(&View::Session("alpha".into())), None);
     }
 
     #[test]

@@ -13,8 +13,12 @@ with the real sidebar (live workspace and review state), project switching,
 the refresh pipeline and a settings view (`docs/status/dt-shell-sidebar.md`),
 in the theme the `theme:` setting picks (`auto` follows the system
 appearance). The Issues nav row shows the native board and task detail
-(`dt-issues-board`, see `docs/status/dt-issues-board.md`); the other views
-show a "Not implemented yet" stub until their `dt-*` subtask lands.
+(`dt-issues-board`, see `docs/status/dt-issues-board.md`); the Orchestrator
+row the chat (`dt-chat-view`); a workspace row the Workspace view, its agent
+under a task/branch/machine/state header with a user shell beside it on demand,
+local or remote (`dt-workspace-view`, see `docs/status/dt-workspace-view.md`).
+The other views show a "Not implemented yet" stub until their `dt-*` subtask
+lands.
 `scripts/bundle.sh` packages it as a signed, notarized `Shelbi.app`, shipped
 as the `shelbi-desktop` Homebrew cask (`docs/status/dt-packaging.md`).
 
@@ -137,6 +141,7 @@ shelbi session new --name spike/sh -- zsh -l     # or `-- claude`
 cargo run -- --spike spike/sh                    # one window, one terminal element
 RUST_LOG=shelbi_desktop=debug cargo run -- --spike spike/sh   # + frame stats every 2s while painting
 cargo run --features visual-check -- --visual-check /tmp/vc   # offscreen: frames + input checks, no screen needed
+cargo run --features visual-check -- --visual-workspace /tmp/vw   # offscreen: the Workspace view's states, fake sessions
 ```
 
 Never point `--spike` at a real workspace's session: the window reports

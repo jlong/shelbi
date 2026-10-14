@@ -21,6 +21,8 @@ mod views;
 mod visual_check;
 #[cfg(feature = "visual-check")]
 mod visual_views;
+#[cfg(feature = "visual-check")]
+mod visual_workspace;
 mod window_state;
 
 use gpui::{actions, App, KeyBinding, Menu, MenuItem, SystemMenuType};
@@ -55,6 +57,10 @@ enum Mode {
     /// offscreen against a sandboxed home (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     VisualViews(Option<String>),
+    /// `--visual-workspace [dir]`: render the Workspace view offscreen over
+    /// fake sessions, one frame per state (feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    VisualWorkspace(Option<String>),
 }
 
 fn parse_args() -> Mode {
@@ -70,6 +76,8 @@ fn parse_args() -> Mode {
         Some("--visual-check") => Mode::VisualCheck(args.next()),
         #[cfg(feature = "visual-check")]
         Some("--visual-views") => Mode::VisualViews(args.next()),
+        #[cfg(feature = "visual-check")]
+        Some("--visual-workspace") => Mode::VisualWorkspace(args.next()),
         Some(project) if !project.starts_with('-') => Mode::App,
         Some(other) => usage(&format!("unknown argument `{other}`")),
     }
@@ -95,6 +103,10 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::VisualViews(dir) = mode {
         visual_views::run(visual_check::out_dir(dir));
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::VisualWorkspace(dir) = mode {
+        visual_workspace::run(visual_check::out_dir(dir));
     }
     // The launch project: a local read before any window exists (the spike
     // has none).

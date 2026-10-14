@@ -13,7 +13,9 @@
 //!   `activity.rs` over the toolkit-free `activity_state.rs`, `machines.rs`
 //!   over `machines_state.rs`, both from `shelbi-app`'s shared models)
 //! - workspace (agent terminal + header, user shell, remote workspaces):
-//!   **`dt-workspace-view`**
+//!   **`dt-workspace-view`** (landed: `workspace.rs`, its split math in
+//!   `workspace_layout.rs`; the attach/restart/reconnect machine both it and
+//!   the chat use is `session_view.rs`)
 //! - review panel with the editor and diff sessions: **`dt-review-view`**
 //! - command palette and overlays (error log, review load, reject reason,
 //!   Zen intro, add project): **`dt-palette-overlays`** (landed: `palette.rs`
@@ -31,6 +33,9 @@ pub mod activity_state;
 pub mod bootstrap;
 pub mod board_state;
 pub mod chat;
+pub mod session_view;
+pub mod workspace;
+pub mod workspace_layout;
 pub mod external_edit;
 pub mod issues;
 pub mod machines;

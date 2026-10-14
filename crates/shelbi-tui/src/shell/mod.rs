@@ -3916,31 +3916,11 @@ fn default_ws_status() -> crate::workspace_panel::WsStatus {
     }
 }
 
-/// The lines of the idle-workspace placeholder: the workspace identity, then a
-/// blank, then the "idle" state and how to start work on it. Pure (no IO, no
-/// rendering) so the content is unit-testable (`rt-tui-idle-workspace-open`).
+/// The lines of the idle-workspace placeholder
+/// ([`shelbi_app::session::idle_placeholder_lines`], shared with the desktop's
+/// Workspace view).
 fn idle_placeholder_lines(info: &session::IdleInfo, palette_chord: &str) -> Vec<String> {
-    // Identity: "<name>" then "<machine> · <branch>" (each part dropped when
-    // unknown, e.g. a remote workspace whose branch we don't resolve).
-    let mut identity: Vec<String> = Vec::new();
-    if !info.machine.is_empty() {
-        identity.push(info.machine.clone());
-    }
-    if let Some(branch) = &info.branch {
-        identity.push(branch.clone());
-    }
-    let mut lines = vec![info.name.clone()];
-    if !identity.is_empty() {
-        lines.push(identity.join(" · "));
-    }
-    lines.push(String::new());
-    lines.push("Idle — no running session.".to_string());
-    // Show the user's actual palette chord, not a hard-coded one.
-    lines.push(format!(
-        "Dispatch a ready task here from the Issues board, or the command palette ({palette_chord}), \
-         to start work."
-    ));
-    lines
+    shelbi_app::session::idle_placeholder_lines(info, palette_chord)
 }
 
 /// Render the idle-workspace placeholder (`rt-tui-idle-workspace-open`): the

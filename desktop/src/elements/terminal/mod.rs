@@ -43,7 +43,8 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    div, prelude::*, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable,
+    div, prelude::*, Bounds, ClipboardItem, Context, EntityInputHandler, ExternalPaths, FocusHandle,
+    Focusable,
     KeyDownEvent, MouseButton as GpuiMouseButton, Pixels, Point, ScrollDelta, SharedString,
     Subscription, Task, UTF16Selection, Window,
 };
@@ -604,6 +605,18 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Files dropped on the pane: paste their paths, as a terminal pastes a
+    /// dropped file (`rt-drag-and-drop-paste-into-a-review-or-workspace-panel`),
+    /// and take keyboard focus so the user can keep typing after the drop.
+    fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        let text = input::dropped_paths_text(paths.paths());
+        if text.is_empty() || self.io.is_none() {
+            return;
+        }
+        window.focus(&self.focus_handle, cx);
+        self.paste(text, cx);
+    }
+
     fn paste(&mut self, text: String, cx: &mut Context<Self>) {
         self.view.on_user_input();
         self.view.clear_selection();
@@ -906,6 +919,7 @@ impl Render for TerminalPane {
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_drop(cx.listener(Self::drop_paths))
             .relative()
             .size_full()
             .bg(theme.canvas)

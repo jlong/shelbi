@@ -28,6 +28,7 @@
 //!   [`restarting_notice`], [`gave_up_notice`], [`exit_line`]), so both
 //!   clients word them identically.
 
+pub mod reconnect;
 pub mod relaunch;
 pub mod restart;
 
@@ -41,6 +42,7 @@ pub use relaunch::{
     NoopRelauncher, PersistentRelauncher, Relauncher, ReviewRelauncher,
     WorkspaceContentRelauncher,
 };
+pub use reconnect::{ReconnectController, ReconnectPolicy};
 pub use restart::{DeathAction, RestartController};
 
 use crate::supervision::MAX_RESTARTS_IN_WINDOW;
@@ -82,7 +84,31 @@ pub enum SessionRef {
     WorkspaceContent { workspace: String, role: String },
 }
 
+/// The role token of a workspace's user shell
+/// ([`SessionRef::workspace_shell`]), `<project>/ws/<workspace>/shell`.
+pub const SHELL_ROLE: &str = "shell";
+
 impl SessionRef {
+    /// A dev workspace's user shell: the plain login shell the desktop's
+    /// Workspace view opens beside the agent. A [`SessionRef::WorkspaceContent`]
+    /// with the `shell` role, so it is named, ensured and relaunched like the
+    /// workspace's editor and diff.
+    pub fn workspace_shell(workspace: &str) -> Self {
+        SessionRef::WorkspaceContent {
+            workspace: workspace.to_string(),
+            role: SHELL_ROLE.to_string(),
+        }
+    }
+
+    /// The workspace a workspace-scoped target belongs to (its agent, editor,
+    /// diff or shell), `None` for the orchestrator and review sessions.
+    pub fn workspace(&self) -> Option<&str> {
+        match self {
+            SessionRef::Workspace(w) | SessionRef::WorkspaceContent { workspace: w, .. } => Some(w),
+            SessionRef::Orchestrator | SessionRef::Review { .. } => None,
+        }
+    }
+
     /// A human label for the status line / title.
     pub fn display(&self) -> String {
         match self {
@@ -180,6 +206,12 @@ pub enum ConnectFailure {
     /// for a session that *exited*, already carries its last output line (so a
     /// dead workspace or orchestrator surfaces why it's gone).
     Message(String),
+    /// The session lives on another machine that couldn't be reached (its
+    /// relay won't start, or the SSH connection under it dropped). The session
+    /// itself may well be running, so a client keeps reconnecting
+    /// ([`ReconnectController`]) rather than treating this as a death.
+    /// [`retry_connect`] returns it at once (it is not a socket-binding race).
+    Unreachable(String),
 }
 
 /// How [`retry_connect`] retries a session whose socket isn't up yet
@@ -404,6 +436,32 @@ pub fn last_final_line(dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The lines of the idle-workspace placeholder: the workspace identity
+/// (`<name>`, then `<machine> · <branch>` with each part dropped when unknown),
+/// a blank, then the "idle" state and how to start work on it, naming the
+/// user's actual palette chord. Shared by the TUI's main area and the desktop's
+/// Workspace view (`rt-tui-idle-workspace-open`).
+pub fn idle_placeholder_lines(info: &IdleInfo, palette_chord: &str) -> Vec<String> {
+    let mut identity: Vec<String> = Vec::new();
+    if !info.machine.is_empty() {
+        identity.push(info.machine.clone());
+    }
+    if let Some(branch) = &info.branch {
+        identity.push(branch.clone());
+    }
+    let mut lines = vec![info.name.clone()];
+    if !identity.is_empty() {
+        lines.push(identity.join(" · "));
+    }
+    lines.push(String::new());
+    lines.push("Idle — no running session.".to_string());
+    lines.push(format!(
+        "Dispatch a ready task here from the Issues board, or the command palette ({palette_chord}), \
+         to start work."
+    ));
+    lines
+}
+
 /// The main-area notice while a first connect is in flight.
 pub fn connecting_notice(target: &SessionRef) -> String {
     format!("Connecting to {}…", target.display())
@@ -412,6 +470,18 @@ pub fn connecting_notice(target: &SessionRef) -> String {
 /// The main-area notice for a connect that settled on a failure.
 pub fn failed_notice(target: &SessionRef, error: &str) -> String {
     format!("Couldn't attach to {}: {error}", target.display())
+}
+
+/// The notice shown while a remote session's connection is being re-established
+/// after its machine became unreachable (an SSH drop): "Reconnecting to
+/// <machine>… (attempt N)", then the reason on its own sentence.
+pub fn reconnecting_notice(machine: &str, attempt: u32, reason: &str) -> String {
+    let base = format!("Reconnecting to {machine}… (attempt {attempt})");
+    if reason.trim().is_empty() {
+        base
+    } else {
+        format!("{base} {}", reason.trim())
+    }
 }
 
 /// The notice shown while a pane that exited is being brought back:

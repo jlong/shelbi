@@ -138,7 +138,8 @@ impl Relauncher for ReviewRelauncher {
 
 /// Relauncher for the workspace interface's content manager. It shows the
 /// workspace agent (`Workspace`, persistent) and the editor/diff content
-/// sessions (`WorkspaceContent`, re-ensured by workspace name).
+/// sessions and the user shell (`WorkspaceContent`, re-ensured by workspace
+/// name).
 pub struct WorkspaceContentRelauncher {
     pub project: String,
 }
@@ -147,17 +148,17 @@ impl Relauncher for WorkspaceContentRelauncher {
     fn relaunch(&self, target: &SessionRef, reopen: bool) -> Result<(), String> {
         match target {
             SessionRef::WorkspaceContent { workspace, role } => {
-                let Some(role) = role_from_str(role) else {
-                    return Ok(());
+                let op = if role == super::SHELL_ROLE {
+                    WorkspaceSessionOp::EnsureShell
+                } else {
+                    let Some(role) = role_from_str(role) else {
+                        return Ok(());
+                    };
+                    WorkspaceSessionOp::Ensure { role }
                 };
-                crate::workspace_session(
-                    &self.project,
-                    workspace,
-                    WorkspaceSessionOp::Ensure { role },
-                    &mut |_, _| {},
-                )
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                crate::workspace_session(&self.project, workspace, op, &mut |_, _| {})
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
             }
             SessionRef::Workspace(_) | SessionRef::Orchestrator => {
                 if reopen {
