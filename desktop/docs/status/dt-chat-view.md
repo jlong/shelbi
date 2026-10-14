@@ -132,7 +132,8 @@ changed):
 - `cargo test -p shelbi-app`: ok (the moved supervision tests, plus the
   session and restart-controller tests)
 - `cargo test -p shelbi-tui --lib shell::`: 187 passed
-- `cargo test --workspace --no-fail-fast`: see "Full suite" below
+- `cargo test --workspace --no-fail-fast`: 3896 passed, 5 failed (load-bound
+  session e2e timeouts, see "Full suite" below)
 
 ### By hand (sandboxed hub)
 
@@ -170,8 +171,8 @@ cat'` orchestrator. The real hub was never touched.
 
 ## What's left
 
-- **Full root suite under load.** See below. The failures are the
-  session-process e2e tests with fixed timeouts.
+- **Full root suite under load.** Five session-process e2e tests timed out on
+  this machine (see below). CI is the authority for them.
 - **A reload costs two restarts.** When the old session exits, the first
   reattach can land on the still-exiting session (it holds its lock for a
   moment). That attach then drops and counts as a second death, with a 5s
@@ -185,3 +186,15 @@ cat'` orchestrator. The real hub was never touched.
   `dt-workspace-view` can reuse it.
 
 ### Full suite
+
+`cargo test --workspace --no-fail-fast` (load average 55 to 80 throughout):
+**3896 passed, 5 failed**. All five are `shelbi-cli` session-process e2e tests
+that wait a fixed 10s for a freshly spawned `shelbi __session` to bind its
+socket: `old_session_compat`, `remote_session_e2e`, `session_backend_e2e` (2)
+and `session_survival`. They fail the same way when rerun alone ("session
+socket never appeared"). By hand, a plain `shelbi session new` in a fresh
+`SHELBI_HOME` took more than 25s to bind on this machine at the time; the
+sandbox daemon's log also shows its login-shell env capture timing out at 10s.
+This branch changes nothing in `shelbi-session`, `shelbi-client` or
+`shelbi-cli` (`git diff --stat origin/jlong/desktop-app -- crates/shelbi-session
+crates/shelbi-client crates/shelbi-cli` is empty). Rely on CI for these.
