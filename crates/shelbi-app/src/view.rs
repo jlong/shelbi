@@ -129,6 +129,10 @@ pub enum WorkspaceBadge {
     Paused,
     /// · — no in-flight task assigned.
     Idle,
+    /// … — state not read yet: the row comes from the project's config (a
+    /// cold project switch paints its workspace rows before the first board /
+    /// status read lands), and the real badge replaces it within ~one refresh.
+    Loading,
 }
 
 impl WorkspaceBadge {
@@ -140,6 +144,7 @@ impl WorkspaceBadge {
             WorkspaceBadge::AwaitingPermission => "⚠",
             WorkspaceBadge::Paused => "⏸",
             WorkspaceBadge::Idle => "·",
+            WorkspaceBadge::Loading => "…",
         }
     }
 
@@ -150,7 +155,7 @@ impl WorkspaceBadge {
             WorkspaceBadge::AwaitingInput => DecorationColor::Yellow,
             WorkspaceBadge::AwaitingPermission => DecorationColor::Red,
             WorkspaceBadge::Paused => DecorationColor::Yellow,
-            WorkspaceBadge::Idle => DecorationColor::DarkGray,
+            WorkspaceBadge::Idle | WorkspaceBadge::Loading => DecorationColor::DarkGray,
         }
     }
 

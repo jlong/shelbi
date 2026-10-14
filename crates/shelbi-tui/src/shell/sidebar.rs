@@ -830,6 +830,9 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             ];
             let right_label = match agent {
                 Some(a) => title_case(a),
+                // A skeleton row (state not read yet) claims no state at all
+                // rather than a misleading "idle"; the `…` badge carries it.
+                None if *badge == WorkspaceBadge::Loading => String::new(),
                 None => "idle".to_string(),
             };
             let spans = right_align(left, right_label, Style::default().fg(MUTED), width);

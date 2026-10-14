@@ -296,6 +296,11 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     draw(&mut term, &mut state)?;
     let mut last_draw = Instant::now();
 
+    // Read every project's config-only sidebar skeleton in the background, so a
+    // later cold Switch Project paints the target's workspace rows on its very
+    // first frame without touching disk on the UI thread.
+    state.spawn_skeleton_prefetch();
+
     // Now probe the kitty keyboard protocol with a short timeout (the terminal
     // is in raw mode and nothing else is draining stdin yet). A headless PTY
     // that never answers falls back to `kitty: false` within the budget rather
@@ -782,9 +787,30 @@ struct ProjectWorkers {
 /// [`production_workers`].
 type WorkersFactory = Arc<dyn Fn(&str) -> ProjectWorkers + Send + Sync>;
 
-/// The production [`WorkersFactory`]: the snapshot and activity refreshers
-/// reading real view data for `project` plus the two live hub-socket subscribers.
-fn production_workers(project: &str) -> ProjectWorkers {
+/// The production [`WorkersFactory`]. Each project's activity-title cache lives
+/// in the factory, keyed by project, so it outlives the worker bundle a switch
+/// retires: switching back reuses the titles already resolved (no re-hydration),
+/// and a retired bundle's still-running hydration pass and the new bundle's
+/// first pass for the same project serialize on the one cache instead of both
+/// fetching the same ids.
+fn production_workers_factory() -> WorkersFactory {
+    let caches: Mutex<HashMap<String, Arc<Mutex<ActivityMetaCache>>>> = Mutex::new(HashMap::new());
+    Arc::new(move |project: &str| {
+        let cache = caches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(project.to_string())
+            .or_default()
+            .clone();
+        production_workers(project, cache)
+    })
+}
+
+/// The production worker bundle for `project`: the snapshot and activity
+/// refreshers reading real view data plus the two live hub-socket subscribers.
+/// `activity_cache` is this project's own title cache (see
+/// [`production_workers_factory`]).
+fn production_workers(project: &str, activity_cache: Arc<Mutex<ActivityMetaCache>>) -> ProjectWorkers {
     let proj = project.to_string();
     let refresher = refresh::spawn(move |generation| read_snapshot(&proj, generation));
     // The activity feed resolves task titles, which on a remote (github) board is
@@ -793,9 +819,8 @@ fn production_workers(project: &str) -> ProjectWorkers {
     // sidebar/board snapshot (#1631), and carries a persistent metadata cache so
     // resolution is incremental and terminates (closed-history titles resolve
     // once, then freeze) instead of re-sweeping done issues forever. The cache is
-    // built here, fresh per project, so switching projects never carries one
-    // project's resolved titles into another's feed.
-    let activity_cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
+    // per project, so switching projects never carries one project's resolved
+    // titles into another's feed.
     let proj_activity = project.to_string();
     let activity_refresher = refresh::spawn(move |_generation| {
         ActivityApp::read_activity_data(&proj_activity, &activity_cache)
@@ -838,6 +863,21 @@ fn build_embedded_apps(project: &str, keymaps: &Keymaps) -> (KanbanApp, Activity
     let mut machines = MachinesApp::new(project);
     machines.enable_reachability();
     (kanban, activity, machines)
+}
+
+/// Drop `old` on a background thread instead of the UI thread. A project switch
+/// replaces per-project state whose `Drop` *joins* threads — the refreshers wait
+/// out an in-flight read (the activity feed's cold title hydration measured
+/// ~20s on a large remote board), the hub subscribers wait out a 500ms read
+/// slice, the machines prober an SSH probe — and joining any of them inline
+/// froze the switch frame on the previous project. Retired state is already
+/// unreachable from the UI (its receivers go with it), so nothing it still
+/// produces can be rendered; it only winds down. If the thread can't be
+/// spawned, the value drops inline (the old, blocking behavior).
+fn retire<T: Send + 'static>(old: T) {
+    let _ = std::thread::Builder::new()
+        .name("shelbi-shell-retire".into())
+        .spawn(move || drop(old));
 }
 
 /// A cheap, zero-IO sidebar model for `project`: the fixed nav builtins plus the
@@ -946,6 +986,13 @@ struct ShellState {
     /// read for the key that matches the project it was stored under, so it can
     /// never show another project's data.
     sidebar_cache: HashMap<String, SidebarModel>,
+    /// Config-only sidebar skeletons (label + declared workspace rows with a
+    /// loading badge) for every registered project, built off the UI thread by
+    /// [`ShellState::spawn_skeleton_prefetch`]. A *cold* switch (no
+    /// `sidebar_cache` entry yet) paints the target's entry so its workspace rows
+    /// show on the next frame without any IO on the switch path; like
+    /// `sidebar_cache`, only ever read for its own key.
+    skeletons: Arc<Mutex<HashMap<String, SidebarModel>>>,
     /// The embedded native views. They share their rendering (`render_full`) and
     /// interaction with the standalone tmux-runtime processes; the shell drives
     /// them from off-thread snapshots rather than their own refresh loop.
@@ -1093,7 +1140,8 @@ impl ShellState {
             workspace_rx: None,
             workspace_opening: None,
             workers: None,
-            make_workers: Arc::new(production_workers),
+            make_workers: production_workers_factory(),
+            skeletons: Arc::new(Mutex::new(HashMap::new())),
             layout_bus: None,
             last_review_reconcile: Instant::now(),
             reconcile_rx: None,
@@ -1340,16 +1388,56 @@ impl ShellState {
     /// change, not a quit. Invoked from the command palette (`dispatch_effect`).
     /// Build (or rebuild) the background workers for the current project and ask
     /// the fresh refresher for a snapshot right away, so the new project's views
-    /// render without waiting for the periodic tick. Dropping the previous bundle
-    /// (if any) stops its threads and discards any in-flight snapshot from the old
-    /// project.
+    /// render without waiting for the periodic tick. The previous bundle (if any)
+    /// is [retired](retire): its threads wind down off the UI thread, and its
+    /// receivers go with it, so any in-flight read from the old project is
+    /// discarded rather than rendered.
     fn start_project_workers(&mut self) {
         let project = self.client.project().unwrap_or_default().to_string();
         let make = self.make_workers.clone();
-        // Replace first so the old bundle (and its snapshot receiver) is dropped
-        // before the new refresher is asked for data.
-        self.workers = Some(make(&project));
+        if let Some(old) = self.workers.replace(make(&project)) {
+            retire(old);
+        }
         self.request_refresh();
+    }
+
+    /// Build every registered project's config-only sidebar skeleton off the UI
+    /// thread (see [`ShellState::skeletons`]), replacing the set in one swap when
+    /// done. Run once after the first frame; a project added later just falls
+    /// back to the bare skeleton on its first switch.
+    fn spawn_skeleton_prefetch(&self) {
+        let skeletons = self.skeletons.clone();
+        let _ = std::thread::Builder::new()
+            .name("shelbi-shell-skeletons".into())
+            .spawn(move || {
+                let built: HashMap<String, SidebarModel> = shelbi_state::list_projects()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|p| {
+                        sidebar_model::read_config_skeleton(&p.name).map(|m| (p.name, m))
+                    })
+                    .collect();
+                *skeletons.lock().unwrap_or_else(|p| p.into_inner()) = built;
+            });
+    }
+
+    /// The sidebar model a switch into `project` paints on its first frame, from
+    /// memory only: the model it had when last left (warm — populated), else its
+    /// prefetched config skeleton (cold — label + workspace rows with a loading
+    /// badge), else the bare skeleton (nav rows + "Loading…"). Each source is
+    /// read only for `project`'s own key.
+    fn switch_frame_sidebar(&self, project: &str) -> SidebarModel {
+        if let Some(cached) = self.sidebar_cache.get(project) {
+            return cached.clone();
+        }
+        // `try_lock`: the prefetch holds the lock only for its final swap, but
+        // the switch frame must never wait on it.
+        let prefetched = self
+            .skeletons
+            .try_lock()
+            .ok()
+            .and_then(|m| m.get(project).cloned());
+        prefetched.unwrap_or_else(|| skeleton_sidebar_model(project))
     }
 
     /// Ask the current project's refreshers (the core snapshot and the activity
@@ -1425,12 +1513,20 @@ impl ShellState {
         // `ClientState::switch_project` records the current project's view and
         // restores the new project's remembered (or default) view.
         self.client.switch_project(project);
-        // Rebuild the session manager for the new project (dropping the old
-        // project's connection detaches, never kills).
-        self.sessions = SessionManager::new(project, self.connector.clone()).with_relauncher(
-            std::sync::Arc::new(relaunch::PersistentRelauncher {
-                project: project.to_string(),
-            }),
+        // Nothing below may block: the next frame must show the target project.
+        // Every piece of the old project's state whose `Drop` joins a thread (the
+        // worker bundle, the embedded apps' reachability prober, the sessions'
+        // connections) is swapped out and retired off the UI thread in one batch.
+        //
+        // Rebuild the session manager for the new project (the old project's
+        // connection detaches, never kills).
+        let old_sessions = std::mem::replace(
+            &mut self.sessions,
+            SessionManager::new(project, self.connector.clone()).with_relauncher(
+                std::sync::Arc::new(relaunch::PersistentRelauncher {
+                    project: project.to_string(),
+                }),
+            ),
         );
         // Rebuild the embedded native-view apps for the new project. This resets
         // their `project_name` — which card moves, `load more` and workspace-open
@@ -1443,23 +1539,32 @@ impl ShellState {
         // Show the board's own "Loading…" overlay (not bare empty columns) until
         // the first off-thread read for the new project lands.
         kanban.board_loading = true;
-        self.kanban = kanban;
-        self.activity = activity;
-        self.machines = machines;
-        // Paint the target project's sidebar chrome at once: its cached model when
-        // we've visited it this session (warm — immediate and populated), else a
-        // zero-IO skeleton (cold — nav rows + a "Loading…" placeholder). Either
-        // way the previous project's rows are gone this frame, and the fresh
-        // off-thread read below replaces it within ~one refresh.
-        self.sidebar_model = Some(
-            self.sidebar_cache
-                .get(project)
-                .cloned()
-                .unwrap_or_else(|| skeleton_sidebar_model(project)),
+        let old_apps = (
+            std::mem::replace(&mut self.kanban, kanban),
+            std::mem::replace(&mut self.activity, activity),
+            std::mem::replace(&mut self.machines, machines),
         );
+        // An open review / workspace interface belongs to the project we left: it
+        // renders over the sidebar column and main area regardless of
+        // `main_view`, so drop it (detaching its content view) along with any
+        // open/load still in flight for it, whose late result must not land in
+        // the new project.
+        let old_interfaces = (self.review.take(), self.workspace.take());
+        self.review_rx = None;
+        self.review_opening = None;
+        self.review_open_pending = None;
+        self.reconcile_rx = None;
+        self.workspace_rx = None;
+        self.workspace_opening = None;
+        retire((old_sessions, old_apps, old_interfaces));
+        // Paint the target project's sidebar chrome at once, from memory only
+        // (cached model, else prefetched config skeleton, else bare skeleton).
+        // Either way the previous project's rows are gone this frame, and the
+        // fresh off-thread read below replaces it within ~one refresh.
+        self.sidebar_model = Some(self.switch_frame_sidebar(project));
         // Rebuild the background workers (snapshot + activity + closed refreshers,
-        // change / layout subscribers) for the new project, dropping the old
-        // project's bundle. Without this the sidebar, board and review interface
+        // change / layout subscribers) for the new project, retiring the old
+        // project's bundle off the UI thread. Without this the sidebar, board and review interface
         // keep reading the launch project. `layout_bus` needs no rebind (it is
         // project-agnostic and filtered per tick); the daemon-push client
         // registration keeps its launch-project tag, which is informational only
@@ -6416,6 +6521,170 @@ mod tests {
             proj_workspaces,
             "the cached sidebar's workspaces are back at once"
         );
+    }
+
+    /// A config-only skeleton for `beta` as the prefetch would build it: its
+    /// display label and declared workspace rows, each awaiting its state.
+    fn beta_config_skeleton() -> SidebarModel {
+        let mut m = skeleton_sidebar_model("beta");
+        m.project_label = "Beta Board".into();
+        m.board_loading = false;
+        m.workspaces = ["gamma", "omega"]
+            .iter()
+            .map(|n| WorkspaceRow {
+                name: (*n).into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: None,
+                agent: None,
+                badge: shelbi_app::view::WorkspaceBadge::Loading,
+            })
+            .collect();
+        m
+    }
+
+    #[test]
+    fn a_cold_switch_paints_the_prefetched_config_skeleton_with_workspace_rows() {
+        // A cold switch (no cached model) paints the target's prefetched config
+        // skeleton: its label and workspace rows, each with the loading badge
+        // instead of a claimed state, never the previous project's rows.
+        let mut st = test_state();
+        st.skeletons
+            .lock()
+            .unwrap()
+            .insert("beta".into(), beta_config_skeleton());
+
+        st.switch_project("beta");
+        let model = st.sidebar_model.as_ref().expect("a skeleton model");
+        assert_eq!(model.project_label, "Beta Board");
+        let names: Vec<_> = model.workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["gamma", "omega"], "the target's declared workspaces");
+
+        let buf = render_sidebar_and_divider(&st, Rect::new(0, 0, 40, 30), false);
+        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Beta Board") && text.contains("gamma"), "{text}");
+        assert!(text.contains('…'), "rows show the loading badge: {text}");
+        assert!(!text.contains("idle"), "a loading row claims no state: {text}");
+        assert!(!text.contains("alpha"), "the previous project's rows are gone: {text}");
+    }
+
+    #[test]
+    fn a_cached_model_wins_over_the_prefetched_skeleton_on_a_warm_switch() {
+        // Warm switches stay as they were: the model the project had when it was
+        // left beats its (state-less) config skeleton.
+        let mut st = test_state();
+        let mut proj_skeleton = beta_config_skeleton();
+        proj_skeleton.project_label = "proj skeleton".into();
+        st.skeletons.lock().unwrap().insert("proj".into(), proj_skeleton);
+        st.switch_project("beta");
+        st.switch_project("proj");
+        let model = st.sidebar_model.as_ref().unwrap();
+        assert_eq!(model.project_label, "proj", "the cached model, not the skeleton");
+        assert_eq!(model.workspaces[0].badge, shelbi_app::view::WorkspaceBadge::Idle);
+    }
+
+    #[test]
+    fn a_cold_switch_never_waits_on_the_previous_projects_in_flight_reads() {
+        // The cold-switch stall: the switch retired the old project's worker
+        // bundle *inline*, and its `Drop` joins every refresher thread — so a read
+        // still in flight (the launch project's cold activity-title hydration,
+        // measured ~20s on a large remote board) froze the UI on the previous
+        // project until it finished. Wedge every read of the launch project and
+        // prove the switch returns at once with the target's skeleton painted.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let (g, started) = (gate.clone(), in_flight.clone());
+        let factory: WorkersFactory = Arc::new(move |project: &str| {
+            // A reader that blocks (up to 10s) until the gate opens, for the
+            // launch project only; the target project's reads return at once.
+            let wedge = {
+                let (g, started, wedged) = (g.clone(), started.clone(), project == "proj");
+                move || {
+                    if wedged {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let (lock, cvar) = &*g;
+                        let open = lock.lock().unwrap();
+                        let _ = cvar.wait_timeout_while(open, Duration::from_secs(10), |o| !*o);
+                    }
+                }
+            };
+            let (w1, w2, w3) = (wedge.clone(), wedge.clone(), wedge);
+            let (_ctx, change_rx) = std::sync::mpsc::channel();
+            let (_ltx, layout_rx) = std::sync::mpsc::channel();
+            ProjectWorkers {
+                refresher: refresh::spawn(move |_g| {
+                    w1();
+                    ShellSnapshot { sidebar: None, board: None, activity: None, machines: None }
+                }),
+                activity_refresher: refresh::spawn(move |_g| {
+                    w2();
+                    ActivityData::tagged_for_test("x")
+                }),
+                closed_refresher: refresh::spawn(move |_g| {
+                    w3();
+                    None
+                }),
+                change_rx,
+                layout_rx,
+                _changes: None,
+                _layout_sub: None,
+            }
+        });
+        let mut st = test_state();
+        st.make_workers = factory;
+        st.start_project_workers();
+        assert!(
+            wait_until(Duration::from_secs(5), || in_flight.load(Ordering::SeqCst) == 3),
+            "all three launch-project reads are in flight (and wedged)"
+        );
+        st.skeletons
+            .lock()
+            .unwrap()
+            .insert("beta".into(), beta_config_skeleton());
+
+        let t0 = Instant::now();
+        st.switch_project("beta");
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_secs(2),
+            "the switch must not wait on the old project's reads (took {took:?})"
+        );
+        let model = st.sidebar_model.as_ref().expect("the switch-frame model");
+        assert_eq!(model.project_label, "Beta Board", "the target's skeleton, at once");
+
+        // Release the retired readers so their threads wind down.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    #[test]
+    fn switching_projects_closes_the_previous_projects_review_interface() {
+        // An open review interface renders over the sidebar column and main area
+        // regardless of `main_view`, so a switch must drop it (and any in-flight
+        // open) or the previous project's review stays painted over the new one.
+        let mut st = test_state();
+        st.main_view = MainView::Review("t-1".into());
+        st.review = Some(ReviewInterface::new(
+            "proj",
+            st.connector.clone(),
+            "t-1",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+            None,
+        ));
+        st.review_opening = Some("t-2".into());
+        st.review_open_pending = Some("t-3".into());
+        st.workspace_opening = Some("alpha".into());
+
+        st.switch_project("beta");
+        assert!(st.review.is_none(), "the old project's review interface is gone");
+        assert!(st.workspace.is_none());
+        assert!(st.review_opening.is_none() && st.review_open_pending.is_none());
+        assert!(st.workspace_opening.is_none());
+        assert!(!matches!(st.main_view, MainView::Review(_)));
     }
 
     #[test]
