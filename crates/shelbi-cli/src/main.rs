@@ -686,7 +686,16 @@ fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
 /// instead of stderr. The process shares its TTY with ratatui's draw cycle, and
 /// any stray stderr write corrupts the cursor position — leaving raw `tracing`
 /// lines bleeding across the screen until the next full repaint (e.g. a
-/// resize). For all other commands the default stderr writer is fine.
+/// resize).
+///
+/// Every other command logs to **stderr**, never stdout. `tracing_subscriber`'s
+/// `fmt()` default writer is stdout, which silently corrupts the
+/// machine-readable stdout of commands a caller parses — `zen probe` (JSON),
+/// `zen scan` / `zen pr-create` / `zen ci-watch` (a line), `orchestrator events
+/// next`. A single `tracing` line emitted mid-run (e.g. the probe's
+/// "cleared shared cargo target over cap" cap-cleanup info) ahead of the JSON
+/// makes `jq` / the orchestrator's merge flow fail with a parse error. Pinning
+/// the writer to stderr keeps stdout clean for every command.
 fn init_tracing(cmd: Option<&Cmd>) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_env("SHELBI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
@@ -709,7 +718,11 @@ fn init_tracing(cmd: Option<&Cmd>) {
                 .try_init();
         }
     } else {
-        let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .try_init();
     }
 }
 
@@ -730,6 +743,80 @@ mod cli_tests {
     use clap::error::ErrorKind;
     use clap::Parser;
     use commands::workspace::WorkspaceCmd;
+
+    /// Regression: `tracing_subscriber::fmt()`'s default writer is stdout, so
+    /// the probe's cap-cleanup `tracing::info!` landed on stdout ahead of the
+    /// JSON report — any caller parsing stdout (`jq`, the orchestrator's merge
+    /// flow) then failed with `parse error: Invalid numeric literal`.
+    ///
+    /// `init_tracing` now pins non-TUI logs to stderr. This builds a subscriber
+    /// the same way (env filter + no target), routes it to a capture buffer
+    /// standing in for stderr, emits the exact cap-cleanup line mid-run, and
+    /// writes the probe's JSON report to a separate stdout buffer. stdout must
+    /// stay valid JSON while the log lands on the stderr sink.
+    #[test]
+    fn probe_stdout_stays_json_when_cap_cleanup_logs() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::EnvFilter;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let stderr_sink = BufWriter(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_target(false)
+            .with_writer(stderr_sink.clone())
+            .finish();
+
+        // Stands in for the process's stdout, where the probe prints its report.
+        let mut stdout = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            // The exact cap-cleanup info the probe emits before building; with
+            // the old stdout default writer this line corrupted the report.
+            tracing::info!(
+                target_dir = "/Users/jlong/Workspaces/shelbi/target",
+                cap_gib = 20u64,
+                "zen: cleared shared cargo target over cap before probe build",
+            );
+            let report = serde_json::json!({ "ok": true, "step": "probe" });
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        });
+
+        // stdout carries only the JSON report — it parses cleanly.
+        let stdout = String::from_utf8(stdout).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("probe stdout must be valid JSON");
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+
+        // The cap-cleanup line was emitted — to the (stderr) log sink, not stdout.
+        let logged = String::from_utf8(stderr_sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("cleared shared cargo target over cap"),
+            "cap-cleanup log should reach the stderr sink, got: {logged:?}"
+        );
+        assert!(
+            !stdout.contains("cleared shared cargo target over cap"),
+            "no tracing output may reach stdout, got: {stdout:?}"
+        );
+    }
 
     #[test]
     fn init_yes_parses_every_detected_plan_override() {
