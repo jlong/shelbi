@@ -110,8 +110,10 @@ pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
     Some(model)
 }
 
-/// The fixed nav builtins, matching the former sidebar's order.
-fn nav_items() -> Vec<NavItem> {
+/// The fixed nav builtins, matching the former sidebar's order. Also used by the
+/// shell's skeleton sidebar model, painted the instant a cold project switch
+/// lands (`ShellState::skeleton_sidebar_model`).
+pub(crate) fn nav_items() -> Vec<NavItem> {
     vec![
         NavItem {
             // The first nav item is the orchestrator chat. Labelled

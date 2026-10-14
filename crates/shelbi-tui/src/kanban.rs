@@ -50,6 +50,21 @@ pub struct KanbanApp {
     /// which then show the slug. Rendered via [`KanbanApp::display_label`].
     pub display_name: Option<String>,
     pub tasks: Vec<IssueFile>,
+    /// The **open** board as last read by the core snapshot refresher — the
+    /// in-progress/backlog/review columns, which the board index serves from a
+    /// local cache (fast). Retained separately from [`tasks`](Self::tasks) so a
+    /// closed-page fill (its own, network-capable refresher — see
+    /// [`Self::apply_closed_page`]) can merge the terminal `done`/`canceled`
+    /// lanes back in without the open board being re-read, and vice versa. The
+    /// two reads land independently so a slow (stale-cache) done-history fetch
+    /// never delays the open board's paint.
+    open_tasks: Vec<IssueFile>,
+    /// The first page of terminal `done`/`canceled` history as last read by the
+    /// closed-page refresher. Retained so a core open-board refresh (which no
+    /// longer reads the closed page) never discards the done column, and a
+    /// transient closed-read failure keeps the last-known lanes rather than
+    /// blanking them. User-paged extras live in [`closed_more`](Self::closed_more).
+    closed_first_page: Vec<IssueFile>,
     /// True on a cold process whose board hasn't loaded yet — no persisted
     /// snapshot to seed from ([`shelbi_state::BoardState::Cold`]). The board
     /// paints its column chrome plus a centered "Loading board…" overlay
@@ -528,18 +543,20 @@ enum BoardOutcome {
     /// A cold board: no index published yet. The chrome paints with a loading
     /// overlay until the daemon fills the index.
     Cold { banner: Option<String> },
-    /// A warm/stale board read. `base_tasks` is the open board; `closed` is the
-    /// on-demand terminal-history page (`None` when that read failed), merged with
-    /// any already-paged history on the UI thread.
+    /// A warm/stale board read. `base_tasks` is the **open** board only; the
+    /// terminal `done`/`canceled` history is read on its own refresher and folded
+    /// in by [`KanbanApp::apply_closed_page`], so a slow (stale-cache)
+    /// done-history fetch never delays this fast, locally-cached read.
     Warm {
         banner: Option<String>,
         base_tasks: Vec<IssueFile>,
-        closed: Option<ClosedPageRead>,
     },
 }
 
-/// The on-demand terminal `done`/`canceled` page a refresh read.
-struct ClosedPageRead {
+/// The on-demand terminal `done`/`canceled` page a refresh read. Produced by
+/// [`KanbanApp::read_closed_page`] on its own refresher and applied via
+/// [`KanbanApp::apply_closed_page`].
+pub(crate) struct ClosedPageRead {
     issues: Vec<IssueFile>,
     next_cursor: Option<String>,
 }
@@ -558,6 +575,8 @@ impl KanbanApp {
             project_name: project_name.into(),
             display_name: None,
             tasks: Vec::new(),
+            open_tasks: Vec::new(),
+            closed_first_page: Vec::new(),
             board_loading: false,
             board_banner: None,
             selected_column: 0,
@@ -954,12 +973,14 @@ impl KanbanApp {
         let project_statuses = shelbi_state::load_project_statuses(project_name)
             .map_err(|e| format!("statuses.yaml load failed: {e}"));
 
-        // The board read. `issue_store_for` is resolved for the on-demand terminal
-        // `done`/`canceled` lanes (their own lazy closed-cache path, see
-        // `gh-cache-p2-done-column-on-demand`), not for the open board.
+        // The **open** board only. `issue_store_for` is the config-validity gate;
+        // the open board is served from the published index / per-process snapshot
+        // cache (`read_board_report`), never a live backend read here. The terminal
+        // `done`/`canceled` history — the one network-capable read — is fetched on
+        // its own refresher (`read_closed_page`), so it never delays this paint.
         let board = match shelbi_state::issue_store_for(project_name) {
             Err(e) => BoardOutcome::Failed(format!("refresh failed: {e}")),
-            Ok(store) => {
+            Ok(_store) => {
                 // `read_board_report` serves this process's snapshot cache when no
                 // index exists and no daemon answers, so a bare `__tasks` pane on a
                 // hubless machine paints its last-known board rather than empty.
@@ -969,18 +990,10 @@ impl KanbanApp {
                         let banner = report.freshness.banner();
                         match report.state {
                             shelbi_state::BoardState::Cold => BoardOutcome::Cold { banner },
-                            state => {
-                                let base_tasks = state.into_issues();
-                                let closed = store.closed_page(None).ok().map(|page| ClosedPageRead {
-                                    issues: page.issues,
-                                    next_cursor: page.next_cursor,
-                                });
-                                BoardOutcome::Warm {
-                                    banner,
-                                    base_tasks,
-                                    closed,
-                                }
-                            }
+                            state => BoardOutcome::Warm {
+                                banner,
+                                base_tasks: state.into_issues(),
+                            },
                         }
                     }
                 }
@@ -993,6 +1006,33 @@ impl KanbanApp {
             workflows,
             project_statuses,
             board,
+        }
+    }
+
+    /// Read the first page of terminal `done`/`canceled` history for `project` —
+    /// the on-demand closed column (`gh-cache-p2-done-column-on-demand`). Split
+    /// off the core board read ([`read_board_data`](Self::read_board_data)) onto
+    /// its own refresher: it is the one read that can hit the backend (a live
+    /// GraphQL fetch when the ten-minute `done-history.json` cache has aged out),
+    /// so keeping it off the core snapshot means the open board, sidebar and
+    /// machines paint from their fast local caches without waiting on it. Served
+    /// from the done-history cache otherwise, so this adds no backend request
+    /// volume beyond what that cache already does. `None` when the store can't be
+    /// built or the read fails — the UI thread then keeps the last-known lanes.
+    pub(crate) fn read_closed_page(project: &str) -> Option<ClosedPageRead> {
+        let store = shelbi_state::issue_store_for(project).ok()?;
+        // Gate exactly as the old monolithic read did: the terminal history is
+        // read only for a non-cold board. A cold-open project (no index yet) adds
+        // no closed fetch — unchanged from before this split — and for a warm one
+        // the ten-minute done-history cache bounds it to one live fetch per TTL,
+        // so request volume per switch is unchanged.
+        match shelbi_state::read_board_report(project) {
+            Ok(report) if report.state.is_cold() => None,
+            Ok(_) => store.closed_page(None).ok().map(|page| ClosedPageRead {
+                issues: page.issues,
+                next_cursor: page.next_cursor,
+            }),
+            Err(_) => None,
         }
     }
 
@@ -1060,14 +1100,10 @@ impl KanbanApp {
                 self.board_loading = true;
                 self.last_refresh = Instant::now();
             }
-            BoardOutcome::Warm {
-                banner,
-                base_tasks,
-                closed,
-            } => {
+            BoardOutcome::Warm { banner, base_tasks } => {
                 self.board_banner = banner;
                 self.clear_refresh_error();
-                self.apply_warm_board(base_tasks, closed);
+                self.apply_warm_board(base_tasks);
             }
         }
 
@@ -1077,38 +1113,56 @@ impl KanbanApp {
         self.reconcile_pending_moves();
     }
 
-    /// Fold a warm/stale board read into `self.tasks`, merging the on-demand
-    /// terminal `done`/`canceled` lanes with any history the user already paged in.
-    fn apply_warm_board(&mut self, base_tasks: Vec<IssueFile>, closed: Option<ClosedPageRead>) {
+    /// Fold a warm/stale **open**-board read into the app. The terminal
+    /// `done`/`canceled` lanes are merged separately (their own refresher, via
+    /// [`apply_closed_page`](Self::apply_closed_page)) and retained across this
+    /// read in [`closed_first_page`](Self::closed_first_page) / `closed_more`, so
+    /// refreshing the open board never discards the done column.
+    fn apply_warm_board(&mut self, base_tasks: Vec<IssueFile>) {
         self.board_loading = false;
-        // The index is the **open** board — it deliberately omits the terminal
-        // history so a render never pays a `state=all` sweep. The Kanban renders
-        // every column, though, so merge the terminal `done`/`canceled` lanes
-        // (`gh-cache-p2-done-column-on-demand`). Dedupe by id so the local
-        // `file_system` backend — whose open board already returns the full board
-        // — is unaffected.
-        let mut tasks = base_tasks;
+        self.open_tasks = base_tasks;
+        self.rebuild_tasks();
+        self.last_refresh = Instant::now();
+        self.clamp_selection();
+    }
+
+    /// Fold a closed-page read (its own refresher, [`read_closed_page`](Self::read_closed_page))
+    /// into the terminal `done`/`canceled` lanes without touching the open board.
+    /// `None` — the store couldn't be built or the fetch failed — keeps the
+    /// last-known lanes rather than blanking the done column on a transient blip.
+    /// Fills in progressively after the open board, so a stale-cache GraphQL fetch
+    /// never delays the board's first paint.
+    pub(crate) fn apply_closed_page(&mut self, closed: Option<ClosedPageRead>) {
+        if let Some(page) = closed {
+            self.closed_first_page = page.issues;
+            self.closed_next_cursor = page.next_cursor;
+        }
+        self.rebuild_tasks();
+        self.clamp_selection();
+        // A late closed-page fill can land a card an in-flight move targets, so
+        // re-assert the optimistic overlay (same as the core board apply).
+        self.reconcile_pending_moves();
+    }
+
+    /// Recompute [`tasks`](Self::tasks) from the independently-read open board and
+    /// terminal history. The board index is the **open** board — it deliberately
+    /// omits the terminal history so a render never pays a `state=all` sweep — so
+    /// the first done-history page and any user-paged extras are merged on top.
+    /// Deduped by id (open wins) so the local `file_system` backend, whose open
+    /// board already returns the full board, is unaffected.
+    fn rebuild_tasks(&mut self) {
+        let mut tasks = self.open_tasks.clone();
         let mut seen: HashSet<String> = tasks.iter().map(|tf| tf.task.id.clone()).collect();
-        match closed {
-            Some(page) => {
-                self.closed_next_cursor = page.next_cursor;
-                // Any pages the user already paged in (`closed_more`) are merged
-                // back so a poll never drops them.
-                for tf in page.issues.into_iter().chain(self.closed_more.iter().cloned()) {
-                    if seen.insert(tf.task.id.clone()) {
-                        tasks.push(tf);
-                    }
-                }
-            }
-            None => {
-                // A failed closed read leaves the terminal lanes empty this paint;
-                // the open board still renders.
-                self.closed_next_cursor = None;
+        for tf in self
+            .closed_first_page
+            .iter()
+            .chain(self.closed_more.iter())
+        {
+            if seen.insert(tf.task.id.clone()) {
+                tasks.push(tf.clone());
             }
         }
         self.tasks = tasks;
-        self.last_refresh = Instant::now();
-        self.clamp_selection();
     }
 
     /// Whether a "load more" of the terminal history is available — the on-demand
@@ -1139,14 +1193,22 @@ impl KanbanApp {
         match store.closed_page(Some(&cursor)) {
             Ok(page) => {
                 self.closed_next_cursor = page.next_cursor;
-                let mut seen: HashSet<String> =
-                    self.tasks.iter().map(|tf| tf.task.id.clone()).collect();
+                // Accumulate the new page in `closed_more` (ids not already in the
+                // first page or an earlier "load more"), then rebuild so the merge
+                // order and dedup match every other board fill.
+                let mut seen: HashSet<String> = self
+                    .open_tasks
+                    .iter()
+                    .chain(self.closed_first_page.iter())
+                    .chain(self.closed_more.iter())
+                    .map(|tf| tf.task.id.clone())
+                    .collect();
                 for tf in page.issues {
                     if seen.insert(tf.task.id.clone()) {
-                        self.closed_more.push(tf.clone());
-                        self.tasks.push(tf);
+                        self.closed_more.push(tf);
                     }
                 }
+                self.rebuild_tasks();
                 self.clamp_selection();
             }
             Err(e) => {
@@ -3765,6 +3827,99 @@ mod tests {
         assert!(!app.has_more_done(), "no cursor ⇒ no load-more row");
         app.closed_next_cursor = Some("PAGE2".into());
         assert!(app.has_more_done(), "a cursor ⇒ a load-more row");
+    }
+
+    fn warm_board(base_tasks: Vec<IssueFile>) -> BoardData {
+        BoardData {
+            project: None,
+            state_snapshot: None,
+            workflows: Ok(vec![default_workflow()]),
+            project_statuses: Ok(default_project_statuses()),
+            board: BoardOutcome::Warm {
+                banner: None,
+                base_tasks,
+            },
+        }
+    }
+
+    fn closed(issues: Vec<IssueFile>, next: Option<&str>) -> ClosedPageRead {
+        ClosedPageRead {
+            issues,
+            next_cursor: next.map(str::to_string),
+        }
+    }
+
+    fn ids_in(app: &KanbanApp, col: usize) -> Vec<String> {
+        app.column_tasks(col)
+            .iter()
+            .map(|tf| tf.task.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn closed_page_fills_the_done_column_on_its_own() {
+        // The terminal history now lands on its own refresher: applying a closed
+        // page with no prior board read still populates the done column.
+        let mut app = KanbanApp::new("demo");
+        app.apply_closed_page(Some(closed(
+            vec![task_file("d1", Column::done(), 0, "2026-06-20T10:00:00Z")],
+            Some("CUR"),
+        )));
+        assert_eq!(ids_in(&app, DONE_IDX), vec!["d1"]);
+        assert!(app.has_more_done(), "the page's cursor is recorded");
+    }
+
+    #[test]
+    fn an_open_board_refresh_does_not_wipe_the_done_column() {
+        // The regression this split guards: the core snapshot no longer reads the
+        // closed page, so a periodic open-board refresh must keep the separately
+        // applied terminal history rather than blanking it.
+        let mut app = KanbanApp::new("demo");
+        app.apply_closed_page(Some(closed(
+            vec![task_file("d1", Column::done(), 0, "2026-06-20T10:00:00Z")],
+            None,
+        )));
+        // A later open-board read (no closed data in it).
+        app.apply_board_data(warm_board(vec![task_file(
+            "b1",
+            Column::backlog(),
+            0,
+            "2026-06-21T10:00:00Z",
+        )]));
+        assert_eq!(ids_in(&app, BACKLOG_IDX), vec!["b1"], "open board applied");
+        assert_eq!(ids_in(&app, DONE_IDX), vec!["d1"], "done column retained");
+    }
+
+    #[test]
+    fn a_closed_page_refresh_does_not_wipe_the_open_board() {
+        // The mirror of the above: a closed-page fill that lands after the open
+        // board must keep the open columns.
+        let mut app = KanbanApp::new("demo");
+        app.apply_board_data(warm_board(vec![task_file(
+            "b1",
+            Column::backlog(),
+            0,
+            "2026-06-21T10:00:00Z",
+        )]));
+        app.apply_closed_page(Some(closed(
+            vec![task_file("d1", Column::done(), 0, "2026-06-20T10:00:00Z")],
+            None,
+        )));
+        assert_eq!(ids_in(&app, BACKLOG_IDX), vec!["b1"], "open board retained");
+        assert_eq!(ids_in(&app, DONE_IDX), vec!["d1"], "done column applied");
+    }
+
+    #[test]
+    fn a_failed_closed_read_keeps_the_last_known_done_column() {
+        // `None` is a transient closed-read failure (store build / fetch). It must
+        // keep the last-known terminal lanes rather than blank the done column.
+        let mut app = KanbanApp::new("demo");
+        app.apply_closed_page(Some(closed(
+            vec![task_file("d1", Column::done(), 0, "2026-06-20T10:00:00Z")],
+            None,
+        )));
+        app.apply_closed_page(None);
+        assert_eq!(ids_in(&app, DONE_IDX), vec!["d1"], "done column retained");
     }
 
     #[test]
