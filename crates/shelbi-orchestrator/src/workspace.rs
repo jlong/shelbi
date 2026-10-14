@@ -3176,13 +3176,14 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         )));
     }
 
-    // 6. For Claude, wait until its input box is structurally ready before
-    //    typing the prompt. A fixed sleep is fragile: Claude's boot time
-    //    varies with load, and on a freshly-created worktree it may interpose
-    //    a "trust this folder" dialog first (which `wait_for_claude_ready`
-    //    auto-confirms). Other runners must not be inspected with this
-    //    Claude-specific parser; explicit `paste` runners use the conservative
-    //    startup settle above, then the shared delivery-only submit profile.
+    // 6. For Claude, wait until the session is live and its input box is
+    //    structurally ready before typing the prompt. A fixed sleep is
+    //    fragile: Claude's boot time varies with load, and on a
+    //    freshly-created worktree it may interpose a "trust this folder"
+    //    dialog first (which `wait_for_claude_ready` auto-confirms). Other
+    //    runners must not be inspected with this Claude-specific parser;
+    //    explicit `paste` runners use the conservative startup settle above,
+    //    then the shared delivery-only submit profile.
     //
     //    If the probe times out we do NOT fire-and-forget. Typing into a
     //    not-yet-ready UI silently drops the whole prompt: the keystrokes land
@@ -3190,63 +3191,188 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    anyway and the caller then marked the task `in_progress` — stranding a
     //    dead workspace "active" forever with no prompt (observed 2026-07-02 on
     //    alpha). Instead we abort the dispatch cleanly: record an actionable
-    //    event and return an error so the caller leaves the task in its
-    //    ready-category column for a clean retry.
-    if submit_profile.uses_claude_ui() {
-        if !crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)? {
-            if let Err(e) = shelbi_state::append_dispatch_event(
-                &a.project.name,
-                a.task_id,
-                &a.workspace.name,
-                "stalled",
-                "readiness_timeout",
-            ) {
-                eprintln!("shelbi: failed to record dispatch stalled in events.log: {e}");
+    //    `status=stalled` event and return an error so the caller leaves the
+    //    task in its ready-category column for a clean retry.
+    //
+    //    The spawn above returns once the session process is started, not once
+    //    it is bound, so a delivery can still find "no live session" while the
+    //    launch settles. That is retried (re-waiting for readiness) until the
+    //    shared deadline rather than failing the launch — the reopen resume
+    //    sent its `--continue` prompt ~100ms after the spawn, lost it to "no
+    //    live session", and left four workers idle at their prompts with the
+    //    board reading them `working` (`reopen-dev-resume-races-launch`).
+    let deadline = std::time::Instant::now() + crate::ready::READY_TIMEOUT;
+    let uses_claude_ui = submit_profile.uses_claude_ui();
+    if !uses_claude_ui {
+        std::thread::sleep(NON_CLAUDE_PASTE_STARTUP_SETTLE);
+    }
+    let outcome = deliver_when_live(
+        deadline,
+        crate::ready::READY_POLL_INTERVAL,
+        |left| {
+            if uses_claude_ui {
+                crate::ready::wait_for_claude_ready(a.host, a.addr, left)
+            } else {
+                Ok(true)
             }
-            return Err(Error::Other(format!(
+        },
+        || backend().probe(a.host, a.addr, None).is_alive(),
+        || {
+            // Baseline the pane's pre-delivery state BEFORE we deliver the
+            // prompt. On a claude `--continue` resume the pane replays the
+            // prior conversation into the scrollback — token-usage footers
+            // (`… ↑ 3.2k tokens)`) and all — so the busy probe would read that
+            // replay as "busy" and false-confirm a prompt whose Enter was
+            // actually dropped (the workspace then sits idle at Ctx 0 while the
+            // board shows `in_progress`; observed 2026-07-09 on bravo after a
+            // `task resume`). The baseline tells the verifier which signals
+            // predate this delivery so it can suppress them and rely on the
+            // reliable ones (title flipping to `shelbi:working` / input box
+            // clearing). Re-captured per attempt: a retry lands in a session
+            // that was not live for the previous one.
+            let baseline = crate::submit::PaneBaseline::capture(a.host, a.addr, submit_profile);
+            // 7. Deliver the prompt and verify it actually got submitted, not
+            //    just typed into the input box — `crate::submit::send_verified`
+            //    sends the text, settles, sends Enter as a separate key event,
+            //    and polls for a submit signal (retrying the Enter once if the
+            //    prompt is visibly parked in the box).
+            crate::submit::send_verified(a.host, a.addr, &startup_prompt, &baseline)
+        },
+    );
+    finish_live_delivery(&a.project.name, a.addr, a.task_id, &a.workspace.name, outcome)
+}
+
+/// Record how a launch's prompt delivery ended and turn it into the dispatch
+/// result: a submitted (or explicitly unverified) prompt is `Ok`; anything
+/// else records `status=stalled` — the event the orchestrator's heartbeat
+/// sweep keys on — and returns an error so the caller leaves the task put. A
+/// resume that comes up idle without its prompt is therefore a visible stall,
+/// never a silent `working` slot that isn't working.
+fn finish_live_delivery(
+    project: &str,
+    addr: &SessionTarget,
+    task_id: &str,
+    workspace: &str,
+    outcome: LiveDelivery,
+) -> Result<()> {
+    let (detail, why) = match outcome {
+        // If no submission signal ever lands, the prompt is lost — do not mark
+        // the task active. `record_dispatch_submit` records a `status=stalled`
+        // dispatch event; we then return an error so the caller leaves the task
+        // in its ready-category column, exactly like a readiness timeout,
+        // instead of moving it to `in_progress` on a workspace that never got
+        // the prompt.
+        LiveDelivery::Delivered(status) => {
+            if !record_dispatch_submit(project, addr, task_id, workspace, status) {
+                return Err(Error::Other(format!(
+                    "prompt was not accepted on {} — no submission signal after a retry \
+                     Enter. Dispatch aborted so the task stays put for retry; check the \
+                     workspace pane.",
+                    addr.label(),
+                )));
+            }
+            return Ok(());
+        }
+        LiveDelivery::NotReady => (
+            "readiness_timeout",
+            format!(
                 "claude readiness probe timed out after {}s on {} — dispatch aborted, \
                  prompt NOT sent so the task stays put for retry. Check the workspace \
                  pane, then re-run the dispatch.",
                 crate::ready::READY_TIMEOUT.as_secs(),
-                a.addr.label(),
-            )));
+                addr.label(),
+            ),
+        ),
+        LiveDelivery::Unreachable { last_error } => (
+            "session_unreachable",
+            format!(
+                "no live session on {} within {}s of launch — dispatch aborted, prompt \
+                 NOT sent so the task stays put for retry{}. Check the workspace pane, \
+                 then re-run the dispatch.",
+                addr.label(),
+                crate::ready::READY_TIMEOUT.as_secs(),
+                last_error.map(|e| format!(" (last delivery error: {e})")).unwrap_or_default(),
+            ),
+        ),
+        LiveDelivery::Failed(e) => (
+            "delivery_failed",
+            format!(
+                "delivering the prompt to {} failed: {e} — dispatch aborted so the task \
+                 stays put for retry; check the workspace pane.",
+                addr.label(),
+            ),
+        ),
+    };
+    append_dispatch_status(project, task_id, workspace, "stalled", detail);
+    Err(Error::Other(why))
+}
+
+/// How [`deliver_when_live`] ended.
+#[derive(Debug)]
+enum LiveDelivery {
+    /// The prompt was delivered into a live, ready session; carries the
+    /// submit verifier's verdict.
+    Delivered(crate::submit::SubmitStatus),
+    /// The session was live by the deadline but never showed a ready input
+    /// box (a hung boot, an unknown modal).
+    NotReady,
+    /// No live session by the deadline: the launch never came up (or never
+    /// bound its socket). Carries the last delivery error when an attempt
+    /// raced the launch.
+    Unreachable { last_error: Option<String> },
+    /// Delivery into a live session failed outright — not the launch race, so
+    /// not retried.
+    Failed(String),
+}
+
+/// Deliver a launch's startup prompt only once the session is live and ready,
+/// retrying while the launch is still settling, until `deadline`.
+///
+/// Each attempt first waits for readiness (`wait_ready`, handed the time left
+/// before `deadline`), then delivers. A readiness wait or a delivery that
+/// errors while the session is **not** live is the launch race — the spawn
+/// returned before the session bound its socket, or a stale same-named session
+/// was read — so it sleeps `poll` and tries again rather than failing the
+/// launch. An error against a live session is a real failure and returns at
+/// once. The pane reads, liveness probe, and delivery are injected so the
+/// retry rules are unit-testable without a live session.
+fn deliver_when_live(
+    deadline: std::time::Instant,
+    poll: std::time::Duration,
+    mut wait_ready: impl FnMut(std::time::Duration) -> Result<bool>,
+    mut is_live: impl FnMut() -> bool,
+    mut deliver: impl FnMut() -> Result<crate::submit::SubmitStatus>,
+) -> LiveDelivery {
+    let mut last_error: Option<String> = None;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return if is_live() {
+                LiveDelivery::NotReady
+            } else {
+                LiveDelivery::Unreachable { last_error }
+            };
         }
-    } else {
-        std::thread::sleep(NON_CLAUDE_PASTE_STARTUP_SETTLE);
+        let attempt = match wait_ready(left) {
+            Ok(true) => deliver().map(LiveDelivery::Delivered),
+            Ok(false) => {
+                return if is_live() {
+                    LiveDelivery::NotReady
+                } else {
+                    LiveDelivery::Unreachable { last_error }
+                };
+            }
+            Err(e) => Err(e),
+        };
+        match attempt {
+            Ok(done) => return done,
+            Err(e) if !is_live() => {
+                last_error = Some(e.to_string());
+                std::thread::sleep(poll.min(deadline.saturating_duration_since(std::time::Instant::now())));
+            }
+            Err(e) => return LiveDelivery::Failed(e.to_string()),
+        }
     }
-    // Baseline the pane's pre-delivery state BEFORE we deliver the prompt. On
-    // a claude `--continue` resume the pane replays the prior conversation
-    // into the scrollback — token-usage footers (`… ↑ 3.2k tokens)`) and all —
-    // so the busy probe would read that replay as "busy" and false-confirm a
-    // prompt whose Enter was actually dropped (the workspace then sits idle at
-    // Ctx 0 while the board shows `in_progress`; observed 2026-07-09 on bravo
-    // after a `task resume`). The baseline tells the verifier which signals
-    // predate this delivery so it can suppress them and rely on the reliable
-    // ones (title flipping to `shelbi:working` / input box clearing).
-    let baseline = crate::submit::PaneBaseline::capture(a.host, a.addr, submit_profile);
-
-    // 7. Deliver the prompt and verify it actually got submitted, not just
-    //    typed into the input box — `crate::submit::send_verified` sends the
-    //    text, settles, sends Enter as a separate key event, and polls for a
-    //    submit signal (retrying the Enter once if the prompt is visibly
-    //    parked in the box).
-    //
-    //    If no signal ever lands, the prompt is lost — do not mark the task
-    //    active. `record_dispatch_submit` records a `status=stalled` dispatch
-    //    event; we then return an error so the caller leaves the task in its
-    //    ready-category column, exactly like a readiness timeout, instead of
-    //    moving it to `in_progress` on a workspace that never got the prompt.
-    let status = crate::submit::send_verified(a.host, a.addr, &startup_prompt, &baseline)?;
-    if !record_dispatch_submit(&a.project.name, a.addr, a.task_id, &a.workspace.name, status) {
-        return Err(Error::Other(format!(
-            "prompt was not accepted on {} — no submission signal after a retry \
-             Enter. Dispatch aborted so the task stays put for retry; check the \
-             workspace pane.",
-            a.addr.label(),
-        )));
-    }
-
-    Ok(())
 }
 
 /// Map a verified-submit verdict onto the dispatch ledger: record the
@@ -13898,5 +14024,216 @@ mod handoff_readiness_git_tests {
             verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
             HandoffReadiness::Ready,
         );
+    }
+}
+
+#[cfg(test)]
+mod live_delivery_tests {
+    //! `deliver_when_live` / `finish_live_delivery`: a launch's startup prompt
+    //! goes out only once the session is live and ready, retries while the
+    //! launch is still binding, and a launch that never comes up is recorded as
+    //! `status=stalled` (`reopen-dev-resume-races-launch`).
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    const POLL: Duration = Duration::from_millis(1);
+
+    fn submitted() -> crate::submit::SubmitStatus {
+        crate::submit::SubmitStatus::Submitted {
+            detail: "busy_footer_observed",
+        }
+    }
+
+    fn no_live_session() -> Error {
+        Error::Other("no live session `shelbi/ws/alpha` to send to".into())
+    }
+
+    #[test]
+    fn a_delivery_that_races_the_launch_is_retried_until_the_session_binds() {
+        // The reopen bug: the readiness gate passed before the new session was
+        // bound, so the paste found no live session. Those attempts must be
+        // retried — not fail the resume — and the prompt lands once it binds.
+        let deliveries = Cell::new(0u32);
+        let outcome = deliver_when_live(
+            Instant::now() + Duration::from_secs(5),
+            POLL,
+            |_| Ok(true),
+            || deliveries.get() > 2,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                if deliveries.get() <= 2 {
+                    Err(no_live_session())
+                } else {
+                    Ok(submitted())
+                }
+            },
+        );
+        assert!(
+            matches!(outcome, LiveDelivery::Delivered(s) if s == submitted()),
+            "{outcome:?}"
+        );
+        assert_eq!(deliveries.get(), 3, "two raced attempts, then the delivery");
+    }
+
+    #[test]
+    fn a_session_that_never_comes_up_is_unreachable_not_delivered() {
+        let deliveries = Cell::new(0u32);
+        let outcome = deliver_when_live(
+            Instant::now() + Duration::from_secs(5),
+            POLL,
+            // The readiness wait burns its budget and gives up.
+            |_| Ok(false),
+            || false,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok(submitted())
+            },
+        );
+        assert!(
+            matches!(outcome, LiveDelivery::Unreachable { last_error: None }),
+            "{outcome:?}"
+        );
+        assert_eq!(deliveries.get(), 0, "nothing is typed into a session that never came up");
+    }
+
+    #[test]
+    fn retries_stop_at_the_deadline_with_the_last_error() {
+        let outcome = deliver_when_live(
+            Instant::now() + Duration::from_millis(30),
+            POLL,
+            |_| Ok(true),
+            || false,
+            || Err(no_live_session()),
+        );
+        match outcome {
+            LiveDelivery::Unreachable { last_error: Some(e) } => {
+                assert!(e.contains("no live session"), "{e}")
+            }
+            other => panic!("expected Unreachable with the last error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_live_session_that_never_gets_ready_is_not_ready() {
+        let outcome = deliver_when_live(
+            Instant::now() + Duration::from_secs(5),
+            POLL,
+            |_| Ok(false),
+            || true,
+            || Ok(submitted()),
+        );
+        assert!(matches!(outcome, LiveDelivery::NotReady), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_delivery_error_against_a_live_session_is_not_retried() {
+        let deliveries = Cell::new(0u32);
+        let outcome = deliver_when_live(
+            Instant::now() + Duration::from_secs(5),
+            POLL,
+            |_| Ok(true),
+            || true,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Err(Error::Other("pasting into session: broken pipe".into()))
+            },
+        );
+        assert!(matches!(outcome, LiveDelivery::Failed(_)), "{outcome:?}");
+        assert_eq!(deliveries.get(), 1);
+    }
+
+    #[test]
+    fn a_readiness_error_while_the_launch_settles_is_retried() {
+        // The trust-dialog Enter can hit the gap between a stale read and the
+        // new session binding; that is the same race, so it retries.
+        let waits = Cell::new(0u32);
+        let outcome = deliver_when_live(
+            Instant::now() + Duration::from_secs(5),
+            POLL,
+            |_| {
+                waits.set(waits.get() + 1);
+                if waits.get() == 1 {
+                    Err(Error::Other("no live session `x` to send Enter to".into()))
+                } else {
+                    Ok(true)
+                }
+            },
+            || waits.get() > 1,
+            || Ok(submitted()),
+        );
+        assert!(matches!(outcome, LiveDelivery::Delivered(_)), "{outcome:?}");
+        assert_eq!(waits.get(), 2);
+    }
+
+    fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-live-delivery-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let out = f();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        out
+    }
+
+    fn events() -> String {
+        std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default()
+    }
+
+    #[test]
+    fn an_unreachable_resume_records_stalled_for_the_workspace() {
+        with_home("unreachable", || {
+            let addr = SessionTarget::slot("shelbi-demo", "alpha");
+            let res = finish_live_delivery(
+                "demo",
+                &addr,
+                "t-1",
+                "alpha",
+                LiveDelivery::Unreachable {
+                    last_error: Some("no live session".into()),
+                },
+            );
+            assert!(res.is_err(), "an undelivered prompt fails the launch");
+            let log = events();
+            assert!(
+                log.contains("task=t-1 workspace=alpha status=stalled detail=session_unreachable"),
+                "log:\n{log}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_delivered_prompt_records_confirmed_not_stalled() {
+        with_home("delivered", || {
+            let addr = SessionTarget::slot("shelbi-demo", "alpha");
+            finish_live_delivery("demo", &addr, "t-1", "alpha", LiveDelivery::Delivered(submitted()))
+                .expect("a submitted prompt completes the launch");
+            let log = events();
+            assert!(log.contains("status=confirmed"), "log:\n{log}");
+            assert!(!log.contains("status=stalled"), "log:\n{log}");
+        });
+    }
+
+    #[test]
+    fn every_undelivered_outcome_records_stalled() {
+        for (outcome, detail) in [
+            (LiveDelivery::NotReady, "readiness_timeout"),
+            (LiveDelivery::Failed("boom".into()), "delivery_failed"),
+        ] {
+            with_home(detail, || {
+                let addr = SessionTarget::slot("shelbi-demo", "alpha");
+                assert!(finish_live_delivery("demo", &addr, "t-1", "alpha", outcome).is_err());
+                let log = events();
+                assert!(
+                    log.contains(&format!("status=stalled detail={detail}")),
+                    "log:\n{log}"
+                );
+            });
+        }
     }
 }
