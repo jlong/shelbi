@@ -51,6 +51,9 @@ pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
         session_lost: shelbi_state::read_session_lost().map(|_| {
             shelbi_state::SESSION_LOST_BANNER.to_string()
         }),
+        // Daemon-written when the orchestrator supervisor's relaunch failed or
+        // gave up; cleared once the orchestrator is alive again.
+        orchestrator_status: shelbi_state::read_orchestrator_supervision_status(project),
     };
 
     // A human-readable label when the project config carries one.
@@ -158,6 +161,7 @@ pub(crate) fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
         zen_mode: ZenModeState::Off,
         unread_errors: 0,
         session_lost: None,
+        orchestrator_status: None,
     })
 }
 

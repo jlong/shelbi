@@ -123,6 +123,16 @@ impl SupervisionState {
     pub fn decide(&mut self, i: &SupervisionInputs, now: Instant) -> SupervisionAction {
         if i.alive {
             self.ever_alive = true;
+            // Once we have given up we never relaunch the pane ourselves, so a
+            // live pane after a give-up was brought back from outside (a TUI
+            // open re-ran the bootstrap). That relaunch starts a fresh budget:
+            // a crash shortly after it is restarted again instead of being
+            // swallowed by the latched give-up.
+            if self.gave_up {
+                self.restarts.clear();
+                self.gave_up = false;
+                return SupervisionAction::None;
+            }
             // Consider the pane recovered once it has stayed up well past
             // the last restart, then forget the crash-loop history. A pane
             // that only flapped back briefly keeps its history so the cap
@@ -382,6 +392,29 @@ mod tests {
         assert_eq!(s.restart_count(), 0, "the budget is reset");
         // The very next dead tick relaunches immediately (no backoff, not
         // treated as an un-adopted never-seen pane), with a fresh budget.
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
+        assert_eq!(s.restart_count(), 1);
+    }
+
+    #[test]
+    fn an_outside_relaunch_after_give_up_starts_a_fresh_budget() {
+        // The supervisor gave up; then a TUI open brought the pane back itself
+        // (the bootstrap spawned it, no relaunch marker involved). A crash soon
+        // after must be restarted at once, not swallowed by the latched
+        // give-up or held off by the spent loop's backoff.
+        let mut s = SupervisionState::default();
+        let mut t = Instant::now();
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            s.decide(&alive(), t);
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(1);
+            assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
+        }
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::GiveUp);
+
+        // Seen alive again, well inside the recovery window of the last restart.
+        t += Duration::from_secs(1);
+        assert_eq!(s.decide(&alive(), t), SupervisionAction::None);
+        assert_eq!(s.restart_count(), 0, "the outside relaunch reset the budget");
         assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
         assert_eq!(s.restart_count(), 1);
     }

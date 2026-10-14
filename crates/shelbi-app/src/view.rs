@@ -72,6 +72,10 @@ pub struct SidebarModel {
     /// user-facing banner text; the shell paints it as a persistent top banner
     /// in every view. `None` on a healthy session.
     pub session_lost: Option<String>,
+    /// The daemon supervisor's status for a dead orchestrator it could not
+    /// bring back (e.g. `supervisor gave up: <reason>`), painted on the
+    /// sidebar's status row. `None` while the orchestrator is healthy.
+    pub orchestrator_status: Option<String>,
 }
 
 /// A fixed nav builtin (Chat / Issues / Activity).
@@ -307,6 +311,7 @@ impl SidebarModel {
             // IO of its own; the richer disk builder reads the hub-global marker
             // and sets this (`sidebar_model::read_sidebar_model`).
             session_lost: None,
+            orchestrator_status: None,
         }
     }
 }

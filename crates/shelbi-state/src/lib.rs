@@ -56,6 +56,7 @@ mod root;
 pub mod session_lost;
 mod ssh_control;
 pub mod supervision_relaunch;
+pub mod supervision_status;
 mod user_config;
 mod workflows;
 mod workspace_status;
@@ -101,6 +102,10 @@ pub use issue_store::{
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
+pub use supervision_status::{
+    clear_orchestrator_supervision_status, read_orchestrator_supervision_status,
+    write_orchestrator_supervision_status,
+};
 pub use session_lost::{
     clear_session_lost, read_session_lost, session_lost_active, session_lost_path,
     write_session_lost, RecoveryState, SessionLostRecord, SESSION_LOST_BANNER,
