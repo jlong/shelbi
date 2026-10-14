@@ -37,6 +37,7 @@ mod hub_version;
 mod issue_cache;
 pub mod machine_state;
 pub mod migration;
+pub mod questions;
 pub use migration::{
     all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
     workspace_migration_state, MigrationState,
