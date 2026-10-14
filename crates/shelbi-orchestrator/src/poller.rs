@@ -85,6 +85,7 @@ use shelbi_state::{
     append_heartbeat_event, append_issue_comment_event, append_limit_resume_event,
     append_push_event, append_rebase_event, append_task_event, append_workspace_dialog_event,
     append_workspace_event, append_workspace_pause_event, append_worktree_detach_event,
+    append_worktree_detach_skipped_event,
     events_log_path, load_workspace_status, parse_pane_title_marker, read_state,
     read_zenmode_summary, save_workspace_status, Cursor, IssueChange, IssueStore, WorkspaceState,
     WorkspaceStatus, ZenHeartbeatCue, ZenModeState, EXTERNAL_ISSUE_RECONCILE_CAUSE,
@@ -4279,6 +4280,18 @@ fn detach_workspace_worktree_after_handoff(
             // No worktree to release (never created or already torn down) — the
             // branch isn't held, so there's nothing to trace. Debug-only.
             tracing::debug!(workspace = %workspace.name, task = %task_id, "no worktree to detach on handoff");
+        }
+        crate::workspace::DetachOutcome::Skipped { reason } => {
+            // The ready-marker path calls the *unconditional*
+            // `detach_workspace_worktree`, which never skips — this arm exists
+            // only so the enum match stays exhaustive (and honest if this path
+            // is ever rerouted through the guarded variant).
+            if let Err(e) =
+                append_worktree_detach_skipped_event(task_id, &workspace.name, "?", &reason)
+            {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_worktree_detach_skipped_event failed");
+            }
+            tracing::debug!(workspace = %workspace.name, task = %task_id, reason = %reason, "worktree detach skipped on handoff");
         }
         crate::workspace::DetachOutcome::Failed { reason } => {
             if let Err(e) =

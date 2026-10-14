@@ -78,6 +78,19 @@ impl Fixture {
         }
     }
 
+    /// Like [`Self::store`] but with the task assigned to a workspace — the
+    /// state a worker's card is in when it crosses active→handoff.
+    fn store_assigned(&self, column: Column, workspace: &str) -> StubStore {
+        let mut task = bare_task("t");
+        task.column = column;
+        task.workflow = Some("mergewf".into());
+        task.assigned_to = Some(workspace.into());
+        StubStore {
+            issue: Mutex::new(task),
+            log: self.log.clone(),
+        }
+    }
+
     fn runner(&self) -> StubRunner {
         StubRunner {
             log: self.log.clone(),
@@ -275,6 +288,13 @@ impl TransitionRunner for StubRunner {
             ),
         )?;
         Ok(Vec::new())
+    }
+
+    fn detach_worktree_on_handoff(&self, _project_name: &str, task: &Issue) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("detach_worktree_on_handoff {}", task.id));
     }
 }
 
@@ -512,4 +532,65 @@ fn move_to_the_current_status_is_a_quiet_no_op() {
     assert!(!outcome.moved);
     assert_eq!(fx.calls(), vec!["move_status t -> done reason=user:cli"]);
     assert!(fx.events().is_empty());
+}
+
+#[test]
+fn active_to_handoff_move_of_an_assigned_card_detaches_the_worktree() {
+    // The headline for the non-marker handoff: an `in-progress -> review` hand
+    // move (the shape of `shelbi issue move <id> --to review`, incl. the
+    // orchestrator's heartbeat recovery) of an *assigned* card releases the
+    // worker's worktree from the task branch, after the status write — so a
+    // later `shelbi zen probe` isn't refused by the still-held branch.
+    for req in [cli_request("review"), board_request("review")] {
+        let fx = Fixture::new("handoff-detach");
+        let store = fx.store_assigned(Column::in_progress(), "alpha");
+
+        move_issue_with(&store, &fx.runner(), &req, &mut no_warnings).unwrap();
+
+        assert_eq!(
+            fx.calls(),
+            vec![
+                format!("move_status t -> review reason={}", req.reason),
+                "detach_worktree_on_handoff t".to_string(),
+            ],
+            "detach must run, and only after the status write",
+        );
+    }
+}
+
+#[test]
+fn active_to_handoff_move_of_an_unassigned_card_detaches_nothing() {
+    // No assigned workspace means no worktree holds the branch, so the
+    // non-marker handoff has nothing to release — the detach seam is never
+    // called (this is what keeps `edge_without_a_merge_*` a pure status move).
+    let fx = Fixture::new("handoff-unassigned");
+    let store = fx.store(Column::in_progress());
+
+    move_issue_with(&store, &fx.runner(), &cli_request("review"), &mut no_warnings).unwrap();
+
+    assert_eq!(
+        fx.calls(),
+        vec!["move_status t -> review reason=user:cli"],
+        "an unassigned card's handoff must not reach the detach seam",
+    );
+}
+
+#[test]
+fn non_handoff_move_of_an_assigned_card_detaches_nothing() {
+    // The detach is gated on the active→handoff *edge*, not merely on a moved,
+    // assigned card: a `review -> done` accept of an assigned card crosses
+    // handoff→done and must NOT re-detach (the ready-marker handoff already
+    // freed it; the accept edge only merges + deletes the branch).
+    let fx = Fixture::new("handoff-wrong-edge");
+    let store = fx.store_assigned(Column::review(), "alpha");
+
+    move_issue_with(&store, &fx.runner(), &board_request("done"), &mut no_warnings).unwrap();
+
+    assert!(
+        !fx.calls()
+            .iter()
+            .any(|c| c.starts_with("detach_worktree_on_handoff")),
+        "a handoff→done accept must not reach the detach seam: {:?}",
+        fx.calls(),
+    );
 }

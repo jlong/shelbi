@@ -4495,6 +4495,13 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             ));
             Ok(Vec::new())
         }
+
+        fn detach_worktree_on_handoff(&self, _project_name: &str, task: &shelbi_core::Issue) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("detach_worktree_on_handoff {}", task.id));
+        }
     }
 
     /// A board holding one `review` card whose workflow's `review -> done` edge

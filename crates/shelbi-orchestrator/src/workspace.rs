@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use shelbi_core::{
-    validate_task_id, Error, Host, Machine, Project, PromptInjectionKind, Result,
+    validate_task_id, Error, Host, Issue, Machine, Project, PromptInjectionKind, Result,
     WorkspaceSpec,
 };
 
@@ -6676,6 +6676,13 @@ pub enum DetachOutcome {
     /// The worktree isn't present on disk (never created, or already torn
     /// down) — there's no branch to free, so this is a benign no-op.
     NoWorktree,
+    /// The detach was deliberately NOT performed because the worktree still
+    /// holds work that isn't safe to free on a non-marker handoff — it has
+    /// uncommitted user changes, or its branch is ahead of `origin/<branch>`.
+    /// `reason` is a short token for the log (`uncommitted-changes(N)` /
+    /// `unpushed-commits`). Only [`detach_workspace_worktree_if_handoff_safe`]
+    /// returns this; the unconditional [`detach_workspace_worktree`] never does.
+    Skipped { reason: String },
     /// The detach couldn't be performed (probe or `git checkout --detach`
     /// errored). `reason` is a short snippet for the log; the caller keeps the
     /// handoff standing regardless.
@@ -6754,6 +6761,195 @@ pub fn detach_workspace_worktree(host: &Host, worktree: &Path) -> DetachOutcome 
         return DetachOutcome::Failed { reason };
     }
     DetachOutcome::Detached { from_branch }
+}
+
+/// Guarded [`detach_workspace_worktree`] for the **non-marker** active→handoff
+/// paths — an orchestrator heartbeat recovery, a hand `shelbi issue move`, or a
+/// board drag — that promote a card without the worker's ready marker.
+///
+/// The ready-marker handoff detaches unconditionally, and safely: it only runs
+/// after the worker signalled "done" and the poller rebased + pushed, so the
+/// worktree is always clean and `origin/<branch>` already carries the tip.
+/// A non-marker handoff has neither guarantee — it can fire while the worker
+/// was interrupted mid-task, its worktree holding uncommitted edits or commits
+/// it never pushed. Detaching *in place* still loses no work (see
+/// [`detach_workspace_worktree`]), but freeing the branch invites the next
+/// dispatch's [`sync_worktree`] reset and the review edge's `delete_branch` to
+/// run against a tip that only exists locally. So we detach ONLY when:
+///
+/// 1. the worktree is clean of *user-authored* changes (shelbi's own `.shelbi/`
+///    / `.claude/` footprint never counts — see [`user_dirty_porcelain_lines`]),
+///    and
+/// 2. its branch is not ahead of `origin/<branch>` — every commit is already
+///    published, which is the state the review checkout and the Zen probe read.
+///
+/// A worktree that fails either guard is left exactly as it is and reported as
+/// [`DetachOutcome::Skipped`] with a short reason, so the branch stays held and
+/// the board history records *why* no detach happened. An already-detached HEAD
+/// has no branch to publish-check and falls straight through to the idempotent
+/// detach. Best-effort like its sibling: every git failure surfaces as
+/// [`DetachOutcome::Failed`] rather than a panic.
+pub fn detach_workspace_worktree_if_handoff_safe(host: &Host, worktree: &Path) -> DetachOutcome {
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Nothing to free if the worktree was never materialized. Bounded like the
+    // rest of this path (see [`detach_workspace_worktree`]'s note).
+    match run_git_bounded(host, ["test", "-e", &format!("{wt_str}/.git")]) {
+        Ok(o) if o.status.success() => {}
+        Ok(_) => return DetachOutcome::NoWorktree,
+        Err(e) => {
+            return DetachOutcome::Failed {
+                reason: format!("worktree_probe_failed:{e}"),
+            }
+        }
+    }
+
+    // Guard 1 — never free a branch out from under uncommitted *user* work.
+    // `-z` is load-bearing so odd paths don't mis-parse and so shelbi's own
+    // scratch is carved out cleanly (the same read `rebase`/`sync` rely on).
+    match run_git_bounded(host, ["git", "-C", &wt_str, "status", "--porcelain", "-z"]) {
+        Ok(o) if o.status.success() => {
+            let porcelain = String::from_utf8_lossy(&o.stdout);
+            let dirty = user_dirty_porcelain_lines(&porcelain);
+            if !dirty.is_empty() {
+                return DetachOutcome::Skipped {
+                    reason: format!("uncommitted-changes({})", dirty.len()),
+                };
+            }
+        }
+        Ok(o) => {
+            return DetachOutcome::Failed {
+                reason: format!("status_failed:{}", String::from_utf8_lossy(&o.stderr).trim()),
+            }
+        }
+        Err(e) => {
+            return DetachOutcome::Failed {
+                reason: format!("status_spawn_failed:{e}"),
+            }
+        }
+    }
+
+    // Guard 2 — never free a branch whose tip isn't on origin yet. On a branch,
+    // require `origin/<branch>` to resolve AND `origin/<branch>..HEAD` to be
+    // empty (nothing ahead / never pushed both skip). An already-detached HEAD
+    // normalizes to `None` and skips the check — it has no branch to publish.
+    let branch = shelbi_ssh::run_capture_with_deadline(
+        host,
+        ["git", "-C", &wt_str, "rev-parse", "--abbrev-ref", "HEAD"],
+        POLLER_GIT_DEADLINE,
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|b| !b.is_empty() && b != "HEAD");
+
+    if let Some(branch) = &branch {
+        let ahead = run_git_bounded(
+            host,
+            [
+                "git",
+                "-C",
+                &wt_str,
+                "rev-list",
+                "--count",
+                &format!("origin/{branch}..HEAD"),
+            ],
+        );
+        // Published-and-current == the command succeeded (so `origin/<branch>`
+        // exists) and reported zero commits ahead. A missing remote branch
+        // (never pushed) errors here, which reads as "not published" — skip.
+        let published_and_current = matches!(
+            &ahead,
+            Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "0"
+        );
+        if !published_and_current {
+            return DetachOutcome::Skipped {
+                reason: "unpushed-commits".to_string(),
+            };
+        }
+    }
+
+    detach_workspace_worktree(host, worktree)
+}
+
+/// Release the assigned workspace's worktree from the task branch after a
+/// **non-marker** active→handoff move (an orchestrator heartbeat recovery, a
+/// hand `shelbi issue move`, or a board drag) — the same release the
+/// ready-marker handoff performs via `detach_workspace_worktree_after_handoff`,
+/// but routed through the guarded
+/// [`detach_workspace_worktree_if_handoff_safe`] so an interrupted worker's
+/// uncommitted or unpushed work is never freed out from under it.
+///
+/// Best-effort and self-logging by contract: the move already landed and is the
+/// source of truth, so every outcome is only recorded to `events.log`
+/// (`worktree-detach … status=ok|skipped|failed`) and nothing is propagated.
+/// A task with no assigned workspace, or one naming a workspace/machine the
+/// project no longer declares, is a quiet no-op — there's no worktree holding
+/// the branch.
+pub fn detach_assigned_worktree_on_handoff(project: &Project, task: &Issue) {
+    let Some(ws_name) = task.assigned_to.as_deref() else {
+        return; // No assigned workspace — nothing holds the branch.
+    };
+    let Some(spec) = project.workspace(ws_name) else {
+        tracing::debug!(task = %task.id, workspace = %ws_name, "handoff detach: workspace not declared in project config");
+        return;
+    };
+    let Some(machine) = project.machine(&spec.machine) else {
+        tracing::debug!(task = %task.id, workspace = %ws_name, machine = %spec.machine, "handoff detach: workspace names an unknown machine");
+        return;
+    };
+    let host = machine.host();
+    let worktree = workspace_worktree(machine, spec);
+
+    match detach_workspace_worktree_if_handoff_safe(&host, &worktree) {
+        DetachOutcome::Detached { from_branch } => {
+            let branch = from_branch.as_deref().unwrap_or("(already-detached)");
+            if let Err(e) =
+                shelbi_state::append_worktree_detach_event(&task.id, ws_name, branch, true, "")
+            {
+                tracing::warn!(task = %task.id, workspace = %ws_name, error = %e, "append_worktree_detach_event failed");
+            }
+            tracing::info!(
+                task = %task.id,
+                workspace = %ws_name,
+                branch = %branch,
+                "detached worker worktree on non-marker handoff; branch free for review checkout / probe",
+            );
+        }
+        DetachOutcome::Skipped { reason } => {
+            // Leave the worktree attached (in-flight work), but record why so a
+            // later `shelbi zen probe` refusal traces back to this skip rather
+            // than looking silent.
+            let branch =
+                worktree_current_branch(&host, &worktree).unwrap_or_else(|| "?".to_string());
+            if let Err(e) = shelbi_state::append_worktree_detach_skipped_event(
+                &task.id, ws_name, &branch, &reason,
+            ) {
+                tracing::warn!(task = %task.id, workspace = %ws_name, error = %e, "append_worktree_detach_skipped_event failed");
+            }
+            tracing::info!(
+                task = %task.id,
+                workspace = %ws_name,
+                reason = %reason,
+                "left worker worktree attached on non-marker handoff (uncommitted or unpushed work)",
+            );
+        }
+        DetachOutcome::NoWorktree => {
+            tracing::debug!(task = %task.id, workspace = %ws_name, "no worktree to detach on non-marker handoff");
+        }
+        DetachOutcome::Failed { reason } => {
+            if let Err(e) =
+                shelbi_state::append_worktree_detach_event(&task.id, ws_name, "?", false, &reason)
+            {
+                tracing::warn!(task = %task.id, workspace = %ws_name, error = %e, "append_worktree_detach_event failed");
+            }
+            tracing::warn!(
+                task = %task.id,
+                workspace = %ws_name,
+                reason = %reason,
+                "non-marker handoff worktree detach failed; task branch may still be held",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -12438,6 +12634,244 @@ mod sync_worktree_git_tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Give `repo` a bare `origin`, push `main` to it, and return the origin
+    /// path (for cleanup). Lets the guarded-detach tests exercise the
+    /// `origin/<branch>` publish check against a real remote-tracking ref.
+    fn wire_bare_origin(repo: &std::path::Path, label: &str) -> std::path::PathBuf {
+        let origin = std::env::temp_dir().join(format!(
+            "shelbi-origin-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&origin).unwrap();
+        assert!(run_git_in(&origin, &["init", "--bare", "-q", "-b", "main"])
+            .status
+            .success());
+        assert!(run_git_in(repo, &["remote", "add", "origin", origin.to_str().unwrap()])
+            .status
+            .success());
+        assert!(run_git_in(repo, &["push", "-q", "origin", "main"])
+            .status
+            .success());
+        origin
+    }
+
+    /// A minimal card assigned to `workspace` — enough for
+    /// [`detach_assigned_worktree_on_handoff`], which reads only `id` and
+    /// `assigned_to`.
+    fn assigned_task(id: &str, workspace: &str) -> Issue {
+        let now = chrono::Utc::now();
+        Issue {
+            id: id.into(),
+            title: id.into(),
+            column: shelbi_core::Column::review(),
+            priority: 0,
+            assigned_to: Some(workspace.into()),
+            workflow: None,
+            branch: Some(format!("shelbi/{id}")),
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            params: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn handoff_safe_detach_frees_a_clean_published_worktree() {
+        // The non-marker clean case: a worktree with no user changes whose
+        // branch tip is already on `origin/<branch>` detaches just like the
+        // ready-marker path, reporting the branch it freed.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("handoff-safe-clean");
+        let origin = wire_bare_origin(&repo, "handoff-safe-clean");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        // Publish the branch so its tip is on origin (nothing ahead).
+        assert!(run_git_in(&wt, &["push", "-q", "origin", "shelbi/x"])
+            .status
+            .success());
+
+        assert_eq!(
+            detach_workspace_worktree_if_handoff_safe(&Host::Local, &wt),
+            DetachOutcome::Detached {
+                from_branch: Some("shelbi/x".to_string())
+            },
+        );
+        assert_eq!(head_of(&wt), "HEAD", "clean published worktree must detach");
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn handoff_safe_detach_skips_a_dirty_worktree() {
+        // Never free a branch out from under uncommitted *user* work: a dirty
+        // worktree is left attached and reported Skipped with a count.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("handoff-safe-dirty");
+        let origin = wire_bare_origin(&repo, "handoff-safe-dirty");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        assert!(run_git_in(&wt, &["push", "-q", "origin", "shelbi/x"])
+            .status
+            .success());
+        // Uncommitted user work (not shelbi's `.shelbi/` / `.claude/` scratch).
+        std::fs::write(wt.join("wip.txt"), "in flight\n").unwrap();
+
+        assert_eq!(
+            detach_workspace_worktree_if_handoff_safe(&Host::Local, &wt),
+            DetachOutcome::Skipped {
+                reason: "uncommitted-changes(1)".to_string()
+            },
+        );
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/x",
+            "a dirty worktree must stay attached to its branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn handoff_safe_detach_skips_an_unpushed_branch() {
+        // Never free a branch whose tip isn't on origin yet: a clean worktree
+        // sitting on commits it never pushed is left attached (Skipped), so the
+        // review checkout / probe don't read a stale remote tip.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("handoff-safe-ahead");
+        let origin = wire_bare_origin(&repo, "handoff-safe-ahead");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        assert!(run_git_in(&wt, &["push", "-q", "origin", "shelbi/x"])
+            .status
+            .success());
+        // Commit (but DON'T push) new work — the branch is now ahead of origin.
+        std::fs::write(wt.join("more.txt"), "unpushed\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "more.txt"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "unpushed work"])
+            .status
+            .success());
+
+        assert_eq!(
+            detach_workspace_worktree_if_handoff_safe(&Host::Local, &wt),
+            DetachOutcome::Skipped {
+                reason: "unpushed-commits".to_string()
+            },
+        );
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/x",
+            "an unpushed branch must stay attached"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn detach_assigned_worktree_on_handoff_logs_ok_for_a_clean_card() {
+        // End-to-end of the non-marker path: an assigned card whose worktree is
+        // clean + published detaches and records a traceable `status=ok` line.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let _home = StateHomeGuard::install();
+        let repo = init_repo("assigned-detach-ok");
+        let origin = wire_bare_origin(&repo, "assigned-detach-ok");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        assert!(run_git_in(&wt, &["push", "-q", "origin", "shelbi/x"])
+            .status
+            .success());
+
+        let task = assigned_task("fix-1", "alice");
+        detach_assigned_worktree_on_handoff(&project, &task);
+
+        assert_eq!(head_of(&wt), "HEAD", "worktree must be detached");
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains(" worktree-detach ") && l.contains(" task=fix-1 "))
+            .unwrap_or_else(|| panic!("no detach line in log: {log:?}"));
+        assert!(
+            line.contains(" detached-from=shelbi/x ") && line.contains(" status=ok"),
+            "line: {line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn detach_assigned_worktree_on_handoff_logs_skipped_for_a_dirty_card() {
+        // A dirty worktree is left attached and the skip is logged with its
+        // reason, so a later probe refusal traces back to it.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let _home = StateHomeGuard::install();
+        let repo = init_repo("assigned-detach-skip");
+        let origin = wire_bare_origin(&repo, "assigned-detach-skip");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        assert!(run_git_in(&wt, &["push", "-q", "origin", "shelbi/x"])
+            .status
+            .success());
+        std::fs::write(wt.join("wip.txt"), "in flight\n").unwrap();
+
+        let task = assigned_task("fix-2", "alice");
+        detach_assigned_worktree_on_handoff(&project, &task);
+
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/x",
+            "a dirty worktree must stay attached"
+        );
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains(" worktree-detach ") && l.contains(" task=fix-2 "))
+            .unwrap_or_else(|| panic!("no detach line in log: {log:?}"));
+        assert!(
+            line.contains(" status=skipped") && line.contains(" detail=uncommitted-changes(1)"),
+            "line: {line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&origin);
     }
 
     #[test]

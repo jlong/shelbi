@@ -2707,6 +2707,38 @@ pub fn append_worktree_detach_event(
     append_event_line(&line)
 }
 
+/// Append a worktree-detach **skipped** line to `~/.shelbi/events.log`. Emitted
+/// by the non-marker active→handoff detach
+/// (`detach_workspace_worktree_if_handoff_safe`) when it deliberately leaves the
+/// worktree attached because it still holds work that isn't safe to free: the
+/// worktree has uncommitted user changes, or its branch is ahead of
+/// `origin/<branch>`.
+///
+/// `<rfc3339> worktree-detach task=<id> workspace=<name> branch=<branch> status=skipped detail=<detail>`
+///
+/// Distinct from the `status=failed` line [`append_worktree_detach_event`]
+/// emits: a skip is a safe, intentional no-op (the branch stays held on
+/// purpose), not an error — but it is still recorded so a later `shelbi zen
+/// probe` refusal over the still-held branch traces back here rather than
+/// looking silent. Shares the task-scoped, `project=`-less shape of its sibling;
+/// whitespace in every field folds to underscores so the record stays a single
+/// parseable line.
+pub fn append_worktree_detach_skipped_event(
+    task_id: &str,
+    workspace: &str,
+    branch: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let branch = sanitize_reason(branch);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} worktree-detach task={task_id} workspace={workspace} branch={branch} status=skipped detail={detail}"
+    ))
+}
+
 /// Append a ready-marker **deferral** line to `~/.shelbi/events.log`. Emitted by
 /// the poller's ready-marker handoff when the task load fails with a *transient*
 /// backend error (network blip, GitHub 403/rate-limit, timeout, malformed
