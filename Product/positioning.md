@@ -2,6 +2,16 @@
 
 Worked out July 2026 using a homepage-first positioning method (research notes live in the 32pixels ContextStore space, `Positioning/` folder). Decisions below were made deliberately, one at a time. Treat changes to any single element as a repositioning decision, not a copy edit.
 
+**October 2026 revision.** Two product facts changed since July: Shelbi runs its own sessions (tmux is no longer the runtime, and the `shelbi` binary now lives on each remote machine), and there is a second client, a native macOS app at feature parity with the TUI. The elements below that said "tmux" are updated in place. Each change is listed here so it can be re-decided rather than slip through as a copy edit:
+
+- Secondary anchors: "made with tmux" is gone. Proposed replacement: "terminal or desktop" (the two-clients fact). The other two anchors are unchanged.
+- Hero badge line: `open source · made with tmux · multi-machine` becomes `open source · TUI and macOS app · multi-machine`.
+- Features element: "kanban TUI" becomes "kanban board (TUI and macOS app)"; "worker pool (any machine, tmux)" becomes "worker pool (any machine over SSH)".
+- Feature grid: "Kanban TUI" becomes "Kanban TUI and macOS app"; "workers on any machine (just tmux + an agent CLI)" becomes "workers on any machine (SSH, git and an agent CLI)"; "made with tmux" becomes "your own sessions, nothing hosted".
+- Rare claims: a desktop app is itself table stakes in this space (see `Research/`), so the rare claim is one backend with two clients at parity, not the app. The orchestrator interface stays the wedge; the H1 and H2 are unchanged.
+- Fact-check status: a new paragraph at the end of that section records what shipped.
+
+
 **Positioning statement:**
 
 > For developers already running multiple coding agents in terminal tabs, Shelbi replaces the tab-juggling with a single agent you talk to: an orchestrator that writes work up as focused tasks, dispatches them to worker agents on any of your machines, and delivers the results back through workflows you define.
@@ -18,7 +28,7 @@ Worked out July 2026 using a homepage-first positioning method (research notes l
 
 - **Differentiation wedge:** *you talk to one agent that runs the rest.* With tabs, you are the router — multiplexing attention, replying in wrong tabs, forgetting paused sessions. With Shelbi you're no longer the router. Key mechanism backing the claim: **the orchestrator doesn't do the work, it assigns it** — so you can dump work on it as it occurs to you without derailing anything.
 
-- **Secondary anchors (hero-level):** open source · made with tmux · workers across your machines. Not in the hero: "Claude Code" by name (keeps scope open for other agent CLIs; use "coding agents" as the generic noun).
+- **Secondary anchors (hero-level):** open source · terminal or desktop · workers across your machines. Not in the hero: "Claude Code" by name (keeps scope open for other agent CLIs; use "coding agents" as the generic noun).
 
 - **Register:** developer-flat. Clear beats clever. No grandeur ("mission control" was considered and rejected), no multi-order benefits ("do more," "greater productivity"), no vision copy.
 
@@ -36,7 +46,7 @@ Worked out July 2026 using a homepage-first positioning method (research notes l
 | **Current tool**          | Terminal tabs, one agent per tab, you as the router and scheduler                                                                                       |
 | **Problem**               | Wrong-tab replies; forgotten paused agents; constant tab-cycling; the backlog living in your head                                                       |
 | **Capability**            | Talk to one agent — it writes work up as focused tasks, dispatches to workers, tracks everything, and returns finished work for review                  |
-| **Features**              | Orchestrator · kanban TUI · worker pool (any machine, tmux) · configurable workflow columns and review gates · specialized review agents · Zen Mode     |
+| **Features**              | Orchestrator · kanban board (TUI and macOS app) · worker pool (any machine over SSH) · configurable workflow columns and review gates · specialized review agents · Zen Mode |
 | **Benefit (first-order)** | Work is out of your head and nothing gets dropped; agents do better work on focused tasks; the quality bar is built into the system, not your vigilance |
 
 <br />
@@ -49,7 +59,7 @@ Worked out July 2026 using a homepage-first positioning method (research notes l
 >
 > **H2:** You talk to one agent, the orchestrator. It writes your work up as tasks, dispatches them to workers, and brings the finished work back for your review.
 >
-> Badge line: `open source · made with tmux · multi-machine` — CTAs: **Install now** / **Read the docs**
+> Badge line: `open source · TUI and macOS app · multi-machine` — CTAs: **Install now** / **Read the docs**
 
 (Meets the Minimum Viable Positioning bar: market element = the tab mess; product elements = orchestrator, dispatch, review.)
 
@@ -75,7 +85,7 @@ Worked out July 2026 using a homepage-first positioning method (research notes l
 
 ### Feature grid (supporting facts)
 
-Kanban TUI · workers on any machine (just tmux + an agent CLI) · made with tmux · review flow · plain-file state (markdown & YAML, no database, no cloud) · open source
+Kanban TUI and macOS app · workers on any machine (SSH, git and an agent CLI) · your own sessions, nothing hosted · review flow · plain-file state (markdown & YAML, no database, no cloud) · open source
 
 ### Closer
 
@@ -111,7 +121,9 @@ Install CTA (`curl … | sh` code block) + "Build from source" docs link.
 
 - If copy names workflow stages, use the real defaults: backlog, todo, in-progress, review, done, canceled.
 
-**Don't lead with table stakes:** parallel agents, worktree isolation, and auto-PRs are claimed by every competitor (see `Research/` for the teardowns). Shelbi's rare claims are the orchestrator interface, kanban intake, the multi-machine pool, plain-file state, and the tmux runtime.
+**Don't lead with table stakes:** parallel agents, worktree isolation, auto-PRs, and a desktop app are claimed by every competitor (see `Research/` for the teardowns). Shelbi's rare claims are the orchestrator interface, kanban intake, the multi-machine pool, plain-file state, and one backend with two clients at parity.
+
+**Fact-check addendum (October 2026):** Shelbi no longer runs on tmux. The daemon owns every agent session; the TUI, `shelbi attach`, and the macOS app attach to the same session and show the same screen. Remote machines run the `shelbi` binary (installed there once), reached over SSH; agents survive a dropped connection. The macOS app (gpui, Apple silicon, macOS 15 or later) ships as the `shelbi-desktop` Homebrew cask, depends on the CLI formula, and is at feature parity with the TUI: every command in the shared registry runs in both, enforced by tests. Copy may say "TUI and macOS app" and "your own sessions"; it may not say "made with tmux", "zero install on remote machines", or claim Linux desktop support (planned for a later release).
 
 **Deliberately excluded from the homepage:** "Claude Code" by name in the hero (scope stays open; say "coding agents"), "Inbox Zero" as the H1 (solution-intro level only), `shelbi zen dry-run` (docs material), and the review-burden reassurance beyond beat 5 plus the triad (don't over-defend).
 

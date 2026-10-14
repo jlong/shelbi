@@ -1,6 +1,6 @@
 # Vision
 
-Where Shelbi is going and why, one level above positioning. `positioning.md` says what we tell the champion today; this says what we are building toward. Written July 2026. Future claims here trace to `Plans/`; anything that doesn't is marked as direction, not commitment.
+Where Shelbi is going and why, one level above positioning. `positioning.md` says what we tell the champion today; this says what we are building toward. Written July 2026. Revised October 2026: Shelbi's own sessions replaced tmux, and a native macOS app joined the TUI as a second client. Future claims here trace to `Plans/`; anything that doesn't is marked as direction, not commitment.
 
 ## The world we're building for
 
@@ -18,34 +18,38 @@ Tasks are the unit of work. Every item becomes a scoped task before an agent tou
 
 Workflows are the quality bar. Every task moves through stages you define before it reaches you, and agents you author can govern columns: adversarial review, QA, security, whatever your project needs. The point is that the bar is built into the system rather than depending on your vigilance on a given afternoon. Boundaries are what make autonomy safe.
 
-Underneath, Shelbi runs on things a developer already owns: tmux panes, git worktrees, SSH, markdown and YAML on disk. That is architecture, not expedience. It means there is nothing to host, nothing to trust with your code, and nothing you can't inspect with the tools you already have.
+Underneath, Shelbi is one small backend on machines you already own: a daemon that owns each agent's terminal session, git worktrees for isolation, SSH to reach other machines, and markdown and YAML on disk for state. That is architecture, not expedience. It means there is nothing to host, nothing to trust with your code, and nothing you can't inspect with the tools you already have.
+
+You reach that backend through a client, and there are two: the TUI and a native macOS app. They are siblings, not tiers. Both render the same models, run the same command registry, and attach to the same sessions, so you can leave the TUI running on the hub, open the app on your laptop, and watch the same agent type. One backend, two clients, and no feature that lives in only one of them.
+
+## What has landed since July
+
+The July trajectory pointed at more of the loop running without you. Most of that is now shipped and stays described here because it is the shape of the product, not a roadmap.
+
+Workflows are pluggable: arbitrary statuses in five fixed categories, per-status agents, transition actions that push, open PRs and merge, and a loader that refuses ambiguous automation. Review runs in review workspaces that pair a dev server with the task under review, so human review means clicking through the running change. The orchestrator tails a live event feed and dispatches on its own; with Zen Mode on it reviews and merges work that clears your gates and reports what landed and what needs you. Workers ask the orchestrator questions over a message channel and get answers back without terminal plumbing. Workers run on any machine you can SSH into; the `shelbi` binary on the remote owns their sessions, so an agent survives a dropped connection. Homebrew and APT distribution, the public site and docs, and in-repo project config so a team's workflows, agents and templates arrive with a clone.
 
 ## What Shelbi will become
 
-The trajectory in `Plans/` points in one consistent direction: more of the loop runs without you, and the parts that don't get sharper.
+Two clients stay at parity. The desktop app ships for macOS first; a Linux build is planned for its own release (`Plans/desktop-app-gpui.md`, "Later: Linux desktop"). Parity is enforced by tests rather than by promise: every command has a scenario, each client has a smoke test, and a field a client doesn't show fails the build.
 
-Workflows generalize. The five hardcoded statuses become pluggable workflows with arbitrary stages, shared status definitions, and transition hooks that run tests, lints, and builds as gates. Agents become first-class, reusable roles you write once and wire to any column in any workflow. Review itself is being rebuilt from generic workflow primitives, so a review gate is configuration, not special-cased machinery.
+Rework resumes a conversation instead of starting cold. A task records the agent session that did its work, and a bounced task comes back to that same session with the reviewer's findings as its next message, on the same machine natively and across machines through a transcript or a hand-off summary (`Plans/resumable-task-sessions.md`; direction, not commitment).
 
-Review gets a real environment. Review workspaces pair a long-running dev server with the task under review, so human review means clicking through the running change, not reading a diff cold.
+Trust keeps escalating. As your gates prove they catch what you would, you spend more of your time with Zen on. It stays an explicit choice you make per session; Shelbi will not silently escalate its own autonomy.
 
-Trust escalates. The orchestrator gains a live event feed and auto-dispatches work so workers stay busy without you prompting each assignment. With Zen Mode on, it merges work that clears your gates and reports back on what landed and what needs you. The direction, though not a commitment, is that as your gates prove they catch what you would, you spend more of your time with Zen on. It stays an explicit choice you make per session; Shelbi will not silently escalate its own autonomy.
-
-The pool grows. Workers already run on any machine you can SSH into, with zero install on the remote side. Worker-orchestrator communication becomes a real protocol, so workers can ask questions and the orchestrator can answer without fragile terminal plumbing.
-
-Shelbi becomes easy to adopt and share. Homebrew and APT distribution, a public site and docs, and in-repo project config so a team's workflows, agents, and templates live in git and arrive with a clone. Tasks stay personal; process becomes shareable.
+The orchestrator gets sharper at the parts that still need you: better write-ups, better questions, less of your attention spent on routing and more on direction.
 
 ## What Shelbi will not be
 
-The competitor research in `Research/` maps the space well: cloud VMs, desktop apps, SaaS control planes, consumption metering. Shelbi deliberately is none of it.
+The competitor research in `Research/` maps the space well: cloud VMs, SaaS control planes, consumption metering, apps that own your sessions on someone else's machine. Shelbi deliberately is none of it.
 
 No cloud dependency and no SaaS control plane. Your agents run on your machines, reached over SSH trust you already have. There is no hosted state, no service that sees your code, and no company between you and your work.
 
 No database. State is markdown and YAML in plain files. You can grep it, diff it, edit it, and put it in git. This has held through every plan to date and we treat it as load-bearing.
 
-Terminal-native, permanently. tmux is the runtime, not a compatibility layer. Shelbi is not becoming a desktop app or an IDE.
+Not an IDE. Shelbi has a desktop client now, but the client is a window onto the same backend the TUI uses. It doesn't edit your code, hold state of its own, or move your sessions anywhere. Your editor stays your editor, and the terminal client stays a first-class way to run everything.
 
 Agent-agnostic. Shelbi drives agent CLIs; it does not ship a model or bet on a single provider.
 
 Developer-flat, not enterprise-suite. No per-seat pricing, no SSO and RBAC dashboards, no sprawling Jira-Slack-HubSpot integration matrix. Shelbi is a tool one developer installs and trusts, and a team adopts by committing config to a repo.
 
-And we don't compete on table stakes. Parallel agents, worktree isolation, and auto-PRs are claimed by everyone in the space. Shelbi's claim is the shape of the system around them: one orchestrator to talk to, tasks as the unit of work, workflows as the quality bar, on infrastructure you already own.
+And we don't compete on table stakes. Parallel agents, worktree isolation, auto-PRs, and a desktop app are claimed by everyone in the space. Shelbi's claim is the shape of the system around them: one orchestrator to talk to, tasks as the unit of work, workflows as the quality bar, two clients over one backend, on infrastructure you already own.
