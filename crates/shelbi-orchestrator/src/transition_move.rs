@@ -32,7 +32,8 @@
 use std::fmt;
 
 use shelbi_core::{
-    default_workflow, Column, Error, Issue, Project, Result, TransitionAction, Workflow,
+    default_workflow, Column, Error, Issue, Project, Result, StatusCategory, TransitionAction,
+    Workflow,
 };
 use shelbi_state::{IssueFile, IssueStore};
 
@@ -72,6 +73,17 @@ pub trait TransitionRunner {
         edge: &TransitionEdge<'_>,
         skip: &[TransitionAction],
     ) -> Result<Vec<ActionOutcome>>;
+
+    /// After an active→handoff move lands, release the assigned workspace's
+    /// worktree from the task branch — the non-marker equivalent of the
+    /// ready-marker handoff's detach, so a later `shelbi zen probe` / review
+    /// checkout isn't refused by the still-held branch. Guarded and
+    /// self-logging on the git side ([`crate::workspace::detach_assigned_worktree_on_handoff`]):
+    /// an interrupted worker's uncommitted or unpushed worktree is left
+    /// attached and logged `status=skipped`. Best-effort — the move already
+    /// landed and is the source of truth — so it returns nothing and never
+    /// fails the move.
+    fn detach_worktree_on_handoff(&self, project_name: &str, task: &Issue);
 }
 
 /// The live [`TransitionRunner`]: real branches, real merges.
@@ -115,6 +127,18 @@ impl TransitionRunner for GitTransitionRunner {
             edge.to,
             skip,
         )
+    }
+
+    fn detach_worktree_on_handoff(&self, project_name: &str, task: &Issue) {
+        match shelbi_state::load_project(project_name) {
+            Ok(project) => crate::workspace::detach_assigned_worktree_on_handoff(&project, task),
+            Err(error) => tracing::debug!(
+                task = %task.id,
+                project = %project_name,
+                %error,
+                "handoff detach: project config load failed; leaving worktree attached",
+            ),
+        }
     }
 }
 
@@ -397,6 +421,22 @@ pub fn move_issue_with(
         }
     }
 
+    // Non-marker active→handoff move (an orchestrator heartbeat recovery, a
+    // hand `shelbi issue move`, a board drag): release the worker's worktree
+    // from the task branch exactly as the poller's ready-marker handoff does,
+    // so the review checkout / Zen probe aren't refused by the still-held
+    // branch (`probe-checkout-preflight`). Only when the card actually moved
+    // (`moved.is_some()`) and carried an assigned workspace; the runner guards
+    // the git side so an interrupted worker's uncommitted/unpushed work is left
+    // attached and logged `status=skipped`. Best-effort — the move already
+    // landed above and is the source of truth.
+    if moved.is_some()
+        && tf.task.assigned_to.is_some()
+        && is_active_to_handoff(&workflow, &from_status, &to_status)
+    {
+        runner.detach_worktree_on_handoff(project, &tf.task);
+    }
+
     // Merge already landed and gated the move above; now fire the edge's
     // remaining actions (`delete_branch`, `run:`/`ready:`), skipping the ones
     // the gate already ran (the pre-merge prefix plus `merge`) so none is
@@ -470,6 +510,17 @@ fn resolve_issue_workflow(
             default_workflow()
         }
     }
+}
+
+/// True when the edge `from -> to` crosses from an [`StatusCategory::Active`]
+/// status into a [`StatusCategory::Handoff`] one, read from the workflow's own
+/// declared categories rather than [`Column::category`] (whose stock-id
+/// fallback buckets every custom status id as `Backlog`). This is the edge the
+/// poller's ready-marker handoff detaches the worktree on; a non-marker move
+/// across the same edge mirrors that release.
+fn is_active_to_handoff(workflow: &Workflow, from: &str, to: &str) -> bool {
+    workflow.status(from).map(|s| s.category) == Some(StatusCategory::Active)
+        && workflow.status(to).map(|s| s.category) == Some(StatusCategory::Handoff)
 }
 
 /// Resolve a move's target status against the issue's workflow, returning the
