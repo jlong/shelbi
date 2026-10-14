@@ -1,0 +1,65 @@
+# The Shelbi desktop app: a native macOS client built with gpui, a sibling of
+# the TUI at feature parity. It is its OWN Cargo workspace (the root workspace
+# lists `desktop` under `exclude`) so gpui's dependency tree never touches the
+# CLI's lockfile or its Rust 1.88 floor, and no root `--workspace` command sees
+# this crate. See README.md for the build and the architecture map.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "shelbi-desktop"
+# A version can't be inherited across workspaces, so this is a literal kept
+# equal to the root `[workspace.package] version`.
+# `scripts/release/check-version.sh` enforces that (and that it equals the tag).
+version = "0.10.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/jlong/shelbi"
+authors = ["John W. Long <john@johnwlong.com>"]
+description = "Native desktop client for Shelbi, built with gpui"
+# A git-pinned gpui (one of the two channels `dt-spike-terminal` weighs) could
+# not be published to crates.io anyway.
+publish = false
+
+[[bin]]
+name = "shelbi-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# ---- gpui channel -----------------------------------------------------------
+# Every gpui version choice lives HERE (and its rationale and breakage log in
+# docs/gpui.md), so switching channels is one commit. Today: the weekly
+# `gpui-pre` snapshot crates, renamed back to their upstream crate names so the
+# source reads `gpui::` / `gpui_platform::` exactly as it would against a
+# pinned Zed git dependency, plus the `gpui-kit` widget library. Pinned EXACT:
+# `gpui-kit` itself pins `gpui-pre` to an exact snapshot, and the two must move
+# together.
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9" }
+gpui-kit = { version = "=0.7.3" }
+
+# ---- shared Shelbi crates (by path) -----------------------------------------
+# gpui types stay in this crate; none of these may depend on gpui
+# (`crates/shelbi-app/tests/no_ui_deps.rs` guards shelbi-app and shelbi-state).
+shelbi-app = { path = "../crates/shelbi-app" }
+shelbi-term = { path = "../crates/shelbi-term" }
+shelbi-client = { path = "../crates/shelbi-client" }
+shelbi-proto = { path = "../crates/shelbi-proto" }
+shelbi-state = { path = "../crates/shelbi-state" }
+shelbi-core = { path = "../crates/shelbi-core" }
+shelbi-palette = { path = "../crates/shelbi-palette" }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Same rationale as the root workspace: dependency debug info is most of a
+# debug `target/`, and gpui's tree is large.
+[profile.dev.package."*"]
+debug = false

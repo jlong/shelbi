@@ -1,0 +1,138 @@
+# Shelbi desktop
+
+The native macOS client for Shelbi, built with [gpui](https://www.gpui.rs/).
+It is a sibling of the TUI (`crates/shelbi-tui`) at feature parity: both
+render over `shelbi-app` (navigation, the command registry, view models,
+background refresh) and talk to the same daemon and sessions. The plan is
+"Desktop App (gpui)" (`Plans/desktop-app-gpui.md` in the Shelbi ContextStore).
+
+Status: foundation. The window opens with the sidebar/main split in the dark
+tokens; every command and view shows a "Not implemented yet" banner until its
+`dt-*` subtask lands.
+
+## Build and run
+
+macOS on Apple silicon, macOS 15 or later.
+
+```sh
+cd desktop
+cargo run
+```
+
+`rust-toolchain.toml` pins the toolchain, so rustup installs it on first use.
+Set `RUST_LOG` (default `warn`) to see more of the log on stderr.
+
+## Its own workspace
+
+`desktop/` is a **separate Cargo workspace**: it has its own `Cargo.lock` and
+`rust-toolchain.toml`, and the root `Cargo.toml` lists it under `exclude`.
+No root `--workspace` command sees this crate, and gpui's dependency tree can
+never move the root lockfile or the CLI's Rust 1.88 floor. It depends on the
+shared crates by path (`../crates/...`).
+
+The package version is a literal (a version can't be inherited across
+workspaces). Keep it equal to the root `[workspace.package] version`;
+`scripts/release/check-version.sh` fails the release when they differ.
+
+## Rules
+
+- **gpui types stay in this crate.** `shelbi-app` and `shelbi-state` must
+  never depend on gpui; `crates/shelbi-app/tests/no_ui_deps.rs` enforces it.
+  If a shared crate needs something for the desktop, add a toolkit-free API
+  there and adapt it here.
+- **Every gpui version choice lives in `Cargo.toml` and `docs/gpui.md`**, so
+  switching gpui channels is one commit.
+- **Exhaustive command dispatch.** `src/commands.rs` matches every
+  `shelbi_app::CommandKind` and `View` variant with no wildcard arm, so a new
+  upstream variant fails to compile here until the desktop handles it. Never
+  add a `_ =>` arm.
+- **Icons are [Heroicons](https://heroicons.com/)** (MIT, 24px outline,
+  v2.2.0), vendored under `assets/icons/heroicons/` and served by
+  `src/assets.rs`. Add an icon by copying its SVG from the heroicons repo's
+  `optimized/24/outline/` at that tag, then adding a constant and a table row
+  in `src/assets.rs`. Don't use gpui-kit's bundled icon catalog in Shelbi's
+  own UI.
+- **Colors come from `src/theme.rs`**, whose token names match
+  `crates/shelbi-tui/src/theme.rs`. No color literals in views.
+
+## Architecture map
+
+```
+desktop/
+  Cargo.toml           the workspace + the shelbi-desktop package; gpui pins
+  Cargo.lock           this workspace's own lockfile (committed)
+  rust-toolchain.toml  the exact Rust version
+  build.rs             embeds macos/Info.plist so `cargo run` is "Shelbi" in the menu bar
+  macos/Info.plist     the unbundled binary's name (dt-packaging builds the real .app)
+  assets/icons/        vendored Heroicons + their LICENSE
+  docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
+  docs/status/         one <task-id>.md per subtask
+  src/main.rs          gpui App, the "Shelbi" window and menu
+  src/app.rs           root view: sidebar | main area split (placeholders)
+  src/commands.rs      exhaustive dispatch over CommandKind and View
+  src/theme.rs         the TUI's token names, dark values, as gpui colors
+  src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
+  src/platform/        login env, CLI discovery, daemon start, version check
+  src/views/           sidebar, chat, issues, activity, machines, workspace, review, palette
+  src/elements/        custom elements, chiefly the terminal
+```
+
+Which subtask fills what:
+
+| Module | Subtask |
+|---|---|
+| `elements/` terminal element, gpui channel decision | `dt-spike-terminal`, then `dt-terminal-complete`, `dt-terminal-perf-multiclient` |
+| `theme.rs` light theme, shared token names | `dt-theme-tokens` |
+| `platform/` | `dt-platform-bootstrap` |
+| `views/` sidebar, project switching, refresh pipeline, settings | `dt-shell-sidebar` |
+| `views/` chat | `dt-chat-view` |
+| `views/` issues board and task detail | `dt-issues-board`, `dt-board-dnd` |
+| `views/` activity and machines | `dt-activity-machines` |
+| `views/` palette and overlays | `dt-palette-overlays` |
+| `views/` workspace | `dt-workspace-view` |
+| `views/` review | `dt-review-view` |
+| native menus, notifications | `dt-menus-notifications` |
+| bundle, signing, cask | `dt-packaging` |
+| smoke tests, docs | `dt-parity-audit` |
+
+## Verifying a change
+
+Every subtask runs these before handing off:
+
+```sh
+# Always, from desktop/:
+cd desktop
+cargo build
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+When the change touches a shared crate under `crates/`, also run the root
+workspace checks from the repository root, and confirm the root `Cargo.lock`
+is unchanged:
+
+```sh
+cargo check --workspace --locked
+cargo build --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo +1.88 check --workspace --all-targets --locked   # the CLI's MSRV
+```
+
+CI: `.github/workflows/desktop-ci.yml` runs the three desktop commands on a
+`macos-14` (arm64) runner. It is manual only (`workflow_dispatch`, input
+`ref`); run it from the Actions tab against your branch.
+
+## Status docs
+
+Each subtask writes `docs/status/<task-id>.md` (for example
+`docs/status/dt-chat-view.md`) and keeps it current as it lands. Include:
+
+- **What landed:** the user-visible behavior, and which `commands.rs` arms
+  now do real work instead of the banner.
+- **What's left:** known gaps, deferred items, follow-ups.
+- **Decisions:** calls made along the way and why.
+- **Verification:** the commands run and their results, plus anything checked
+  by hand in the running app.
+
+The umbrella's own record is `docs/status/desktop-app.md`.
