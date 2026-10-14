@@ -86,6 +86,40 @@ pub fn chord_from_keystroke(keystroke: &Keystroke) -> Option<KeyChord> {
     Some(KeyChord::new(key, mods))
 }
 
+/// The chord an overlay's text field receives for a keystroke. Like
+/// [`chord_from_keystroke`], except that a key that types a character (with
+/// no Ctrl / Cmd held) arrives as that character: `A` for Shift+A, `é` for a
+/// dead-key sequence, so the shared state machines (which type
+/// `Key::Char(c)`) insert what the user typed. Keys that type nothing
+/// (arrows, Enter, Ctrl / Cmd chords) are the plain chord.
+pub fn overlay_chord(keystroke: &Keystroke) -> Option<KeyChord> {
+    let m = &keystroke.modifiers;
+    if !m.control && !m.platform {
+        if let Some(Some(typed)) = keystroke.key_char.as_deref().map(single_char) {
+            if !typed.is_control() {
+                return Some(KeyChord::new(Key::Char(typed), Mods::NONE));
+            }
+        }
+    }
+    chord_from_keystroke(keystroke)
+}
+
+/// Pasted `text` as the chords that type it into an overlay. A multi-line
+/// field takes a line break as Enter (the reject prompt's newline); a
+/// single-line one (the palette query, the add-project fields) drops it, so a
+/// paste can't submit. Other control characters are dropped.
+pub fn paste_chords(text: &str, multiline: bool) -> Vec<KeyChord> {
+    let text = text.replace("\r\n", "\n");
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' if multiline => Some(KeyChord::new(Key::Enter, Mods::NONE)),
+            '\t' => Some(KeyChord::new(Key::Char(' '), Mods::NONE)),
+            c if c.is_control() => None,
+            c => Some(KeyChord::new(Key::Char(c), Mods::NONE)),
+        })
+        .collect()
+}
+
 fn single_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
     match (chars.next(), chars.next()) {
@@ -164,6 +198,36 @@ mod tests {
             chord_from_keystroke(&ks("shift-tab", None)).map(|c| c.code),
             Some(Key::BackTab)
         );
+    }
+
+    #[test]
+    fn overlay_chords_type_what_the_key_types() {
+        let typed = |spec: &str, key_char: Option<&str>| {
+            overlay_chord(&ks(spec, key_char)).map(|c| (c.code, c.mods))
+        };
+        assert_eq!(typed("shift-a", Some("A")), Some((Key::Char('A'), Mods::NONE)));
+        assert_eq!(typed("a", Some("a")), Some((Key::Char('a'), Mods::NONE)));
+        assert_eq!(typed("shift-/", Some("?")), Some((Key::Char('?'), Mods::NONE)));
+        assert_eq!(typed("space", Some(" ")), Some((Key::Char(' '), Mods::NONE)));
+        // Chords stay chords: Ctrl+D submits the reject prompt, Cmd+K is the
+        // palette chord, Enter and the arrows type nothing.
+        assert_eq!(typed("ctrl-d", None), Some((Key::Char('d'), Mods::CONTROL)));
+        assert_eq!(typed("cmd-k", Some("k")), Some((Key::Char('k'), Mods::SUPER)));
+        assert_eq!(typed("enter", None), Some((Key::Enter, Mods::NONE)));
+        assert_eq!(typed("shift-tab", None).map(|c| c.0), Some(Key::BackTab));
+    }
+
+    #[test]
+    fn pastes_type_their_text_and_only_multiline_fields_take_newlines() {
+        let codes = |text: &str, multiline: bool| -> Vec<Key> {
+            paste_chords(text, multiline).into_iter().map(|c| c.code).collect()
+        };
+        assert_eq!(
+            codes("a\r\nb", true),
+            [Key::Char('a'), Key::Enter, Key::Char('b')]
+        );
+        assert_eq!(codes("a\nb", false), [Key::Char('a'), Key::Char('b')]);
+        assert_eq!(codes("x\ty", false), [Key::Char('x'), Key::Char(' '), Key::Char('y')]);
     }
 
     #[test]

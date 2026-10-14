@@ -13,7 +13,7 @@
 //! [`render_intro`] paints into any caller-supplied [`Rect`]. The caller owns
 //! the event loop and the one-shot flag.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -23,49 +23,12 @@ use ratatui::{
 };
 use crate::theme::palette;
 
-/// Which control has keyboard focus inside the intro popover.
-/// Tab cycles forward through these three in the order written; BackTab
-/// cycles backwards. Enter / Space activates the focused control —
-/// toggling the checkbox or firing the corresponding button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntroFocus {
-    Checkbox,
-    Cancel,
-    Enable,
-}
+// The state machine is shared with the desktop app (`shelbi_app::overlay`).
+pub use shelbi_app::overlay::zen_intro::{IntroFocus, IntroOutcome, IntroState};
+use shelbi_app::overlay::zen_intro as shared;
 
-/// Mutable state the popover renderer reads each frame. Constructed via
-/// [`IntroState::default`] — spec calls for the Enable Zen button to
-/// own initial focus (the user just clicked Enable, are you sure?) and
-/// the checkbox starts unchecked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntroState {
-    pub focus: IntroFocus,
-    pub dont_show_again: bool,
-}
-
-impl Default for IntroState {
-    fn default() -> Self {
-        Self {
-            focus: IntroFocus::Enable,
-            dont_show_again: false,
-        }
-    }
-}
-
-/// Result of feeding a key into the popover state machine. The caller
-/// drives the loop: `Continue` keeps redrawing, `Cancelled` /
-/// `Confirmed` exit and the caller looks at `state.dont_show_again` to
-/// decide whether to persist the global flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntroOutcome {
-    Continue,
-    Cancelled,
-    Confirmed,
-}
-
-/// Step the popover state machine. Pure function — no IO, no terminal,
-/// so every key path is covered by the unit tests below.
+/// Step the popover state machine ([`shared::step_intro`]) with a crossterm
+/// key. Pure, so every key path is unit-tested below.
 ///
 /// Bindings (spec):
 /// - `Tab` cycles Checkbox → Cancel → Enable → Checkbox; `BackTab`
@@ -75,33 +38,9 @@ pub enum IntroOutcome {
 ///   the Cancel button, or fires Enable.
 /// - `Esc` is equivalent to Cancel regardless of focus.
 pub fn step_intro(state: &mut IntroState, key: KeyEvent) -> IntroOutcome {
-    match key.code {
-        KeyCode::Esc => IntroOutcome::Cancelled,
-        KeyCode::Tab | KeyCode::Right => {
-            state.focus = match state.focus {
-                IntroFocus::Checkbox => IntroFocus::Cancel,
-                IntroFocus::Cancel => IntroFocus::Enable,
-                IntroFocus::Enable => IntroFocus::Checkbox,
-            };
-            IntroOutcome::Continue
-        }
-        KeyCode::BackTab | KeyCode::Left => {
-            state.focus = match state.focus {
-                IntroFocus::Checkbox => IntroFocus::Enable,
-                IntroFocus::Cancel => IntroFocus::Checkbox,
-                IntroFocus::Enable => IntroFocus::Cancel,
-            };
-            IntroOutcome::Continue
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => match state.focus {
-            IntroFocus::Checkbox => {
-                state.dont_show_again = !state.dont_show_again;
-                IntroOutcome::Continue
-            }
-            IntroFocus::Cancel => IntroOutcome::Cancelled,
-            IntroFocus::Enable => IntroOutcome::Confirmed,
-        },
-        _ => IntroOutcome::Continue,
+    match crate::keymap::chord_from_event(key) {
+        Some(chord) => shared::step_intro(state, chord),
+        None => IntroOutcome::Continue,
     }
 }
 
@@ -134,23 +73,14 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
         .split(area);
 
     let heading = Paragraph::new(Line::from(Span::styled(
-        "Enable Zen Mode?",
+        shared::HEADING,
         Style::default()
             .fg(palette().ansi_cyan)
             .add_modifier(Modifier::BOLD),
     )));
     f.render_widget(heading, layout[0]);
 
-    let body = Paragraph::new(
-        "Zen Mode lets the orchestrator act autonomously:\n\
-         \n  \
-         • Auto-promotes ready tasks to dispatch\n  \
-         • Auto-merges completed tasks that pass your project's checks \
-         (build/test + diff size + danger paths)\n\
-         \n\
-         You can pause it (palette → Pause Zen) or turn it off any time. \
-         Edit CLAUDE.md to tune what qualifies as in-scope or what gates merges.",
-    )
+    let body = Paragraph::new(shared::BODY)
     .style(Style::default().fg(palette().ansi_gray))
     .wrap(Wrap { trim: true });
     f.render_widget(body, layout[2]);
@@ -165,7 +95,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("{checkbox_glyph} Don't show this again"),
+            format!("{checkbox_glyph} {}", shared::CHECKBOX),
             checkbox_style,
         ))),
         layout[3],
@@ -188,9 +118,9 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
         Style::default().fg(palette().ansi_dark_gray)
     };
     let buttons = Paragraph::new(Line::from(vec![
-        Span::styled("  [ Cancel ]  ", cancel_style),
+        Span::styled(format!("  [ {} ]  ", shared::CANCEL), cancel_style),
         Span::raw("  "),
-        Span::styled("  [ Enable Zen ]  ", enable_style),
+        Span::styled(format!("  [ {} ]  ", shared::ENABLE), enable_style),
     ]));
     f.render_widget(buttons, layout[5]);
 }
@@ -198,7 +128,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

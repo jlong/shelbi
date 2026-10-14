@@ -1,7 +1,7 @@
 //! The shared Shelbi application model.
 //!
 //! This crate is the toolkit-independent core that both the single-process
-//! TUI and the later desktop app render. It owns five things:
+//! TUI and the later desktop app render. It owns:
 //!
 //! - [`nav`] — the model of what a client is looking at: the current
 //!   project, the sidebar selection, the current main view, focus, and
@@ -16,6 +16,10 @@
 //! - [`view`] — plain-data view models for the sidebar, issues board,
 //!   activity feed, machines list, review panel, and error log, built from
 //!   the existing `shelbi-state` readers.
+//! - [`overlay`] — the overlays' state machines (palette, error log,
+//!   review load, reject reason, Zen intro, add project), keyed on
+//!   toolkit-free chords so both clients drive the same decision tables;
+//!   [`command_model`] builds the palette's inputs from live state.
 //! - [`theme`] — the named color tokens (dark and light) both clients
 //!   paint with, and the `theme:` preference resolution.
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
@@ -41,15 +45,18 @@ pub mod activity;
 pub mod board;
 pub mod changes;
 pub mod command;
+pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
 pub mod nav;
+pub mod overlay;
 pub mod reachability;
 pub mod refresh;
 pub mod session;
 pub mod supervision;
 pub mod theme;
 pub mod view;
+pub mod zen;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};

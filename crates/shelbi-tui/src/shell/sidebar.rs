@@ -1031,15 +1031,8 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn nav_glyph(label: &str) -> &'static str {
-    match label {
-        // "Orchestrator" is the orchestrator-chat nav item (was "Chat"); the
-        // glyph is unchanged.
-        "Orchestrator" => "💬",
-        "Issues" => "📋",
-        "Activity" => "⚡",
-        "Machines" => "🖥",
-        _ => "•",
-    }
+    // Shared with the palette's nav decorations (and the desktop app).
+    shelbi_app::command_model::nav_glyph(label)
 }
 
 /// Map a shelbi-app nav `View` to a shell route. The orchestrator chat is the

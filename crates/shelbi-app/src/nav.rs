@@ -77,7 +77,8 @@ pub enum Focus {
 pub enum Overlay {
     /// The command palette.
     Palette,
-    /// Confirm approving (accepting) a review task.
+    /// Pick the review slot to load a queued review task onto ("Load for
+    /// review").
     ReviewConfirm { task_id: String },
     /// Collect a reason for rejecting a review task.
     RejectReason { task_id: String },
@@ -85,6 +86,8 @@ pub enum Overlay {
     ErrorLog,
     /// The first-run Zen Mode intro.
     ZenIntro,
+    /// The add-project form.
+    AddProject,
 }
 
 /// One client's view of Shelbi. Each attached UI (and each desktop window)

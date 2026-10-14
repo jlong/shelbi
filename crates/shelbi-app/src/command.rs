@@ -351,7 +351,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// legacy agents, the error-log action, switch-project targets,
+    /// the review decisions (approve / reject), legacy agents, the error-log action, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -422,6 +422,39 @@ impl CommandRegistry {
                 subtitle: r.subtitle.clone(),
                 shortcut: None,
                 hidden_until_query: false,
+            });
+        }
+
+        // Review decisions, one pair per review task. Hidden until the user
+        // types (the review rows above are the everyday entries): `appr` or
+        // the task's title surfaces them. Approve runs straight away (it has no
+        // confirmation in either client); reject needs a reason first, so the
+        // registry carries an empty one and the host opens the reason prompt.
+        for r in &model.reviews {
+            out.push(Command {
+                id: format!("action:approve-review:{}", r.task_id),
+                title: format!("Approve {}", r.title),
+                kind: CommandKind::ApproveReview {
+                    id: r.task_id.clone(),
+                },
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Accept the review and merge it".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+            out.push(Command {
+                id: format!("action:reject-review:{}", r.task_id),
+                title: format!("Reject {}", r.title),
+                kind: CommandKind::RejectReview {
+                    id: r.task_id.clone(),
+                    reason: String::new(),
+                },
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Send it back with a reason".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
             });
         }
 
@@ -628,6 +661,17 @@ impl CommandKind {
                 project: slug.to_string(),
             });
         }
+        if let Some(task) = id.strip_prefix("action:approve-review:") {
+            return Some(CommandKind::ApproveReview {
+                id: task.to_string(),
+            });
+        }
+        if let Some(task) = id.strip_prefix("action:reject-review:") {
+            return Some(CommandKind::RejectReview {
+                id: task.to_string(),
+                reason: String::new(),
+            });
+        }
         if let Some(agent) = id.strip_prefix("edit:agent:") {
             return Some(CommandKind::OpenEditor {
                 target: EditTarget::Agent(agent.to_string()),
@@ -746,6 +790,8 @@ mod tests {
             "action:toggle-zen",
             "workspace:alpha-1",
             "review:T-12",
+            "action:approve-review:T-12",
+            "action:reject-review:T-12",
             "agent:scratch",
             "action:error-log",
             "action:switch-project",
@@ -1018,6 +1064,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("from_id failed for {}", cmd.id()));
             assert_eq!(&parsed, cmd.kind(), "kind mismatch for id {}", cmd.id());
         }
+    }
+
+    #[test]
+    fn review_decisions_are_offered_per_review_and_hidden_until_typed() {
+        let reg = CommandRegistry::new();
+        let m = model();
+        let approve = reg.resolve("action:approve-review:T-12", &m).unwrap();
+        assert_eq!(approve.title(), "Approve Fix the thing");
+        assert!(approve.hidden_until_query());
+        assert!(approve.is_mutating());
+        assert_eq!(
+            approve.effect("alpha"),
+            Effect::Mutate(Mutation::ApproveReview {
+                project: "alpha".into(),
+                id: "T-12".into()
+            })
+        );
+        let reject = reg.resolve("action:reject-review:T-12", &m).unwrap();
+        assert_eq!(reject.title(), "Reject Fix the thing");
+        // The reason is collected by the host's prompt, not the registry.
+        assert_eq!(
+            reject.kind(),
+            &CommandKind::RejectReview {
+                id: "T-12".into(),
+                reason: String::new()
+            }
+        );
+        // Typing surfaces them; a blank query doesn't.
+        let entries = reg.entries(&m);
+        let blank = shelbi_palette::search(&entries, "");
+        assert!(blank.iter().all(|(e, _)| !e.id.starts_with("action:approve-review")));
+        let typed = shelbi_palette::search(&entries, "reject fix");
+        assert_eq!(typed[0].0.id, "action:reject-review:T-12");
     }
 
     #[test]
