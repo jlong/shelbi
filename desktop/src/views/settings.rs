@@ -11,8 +11,11 @@
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
 //!   reads.
 //!
+//! - `desktop.notifications`: which system notifications the app posts.
+//!
 //! A button opens `keys.yaml` (the key bindings both clients share) in the
-//! user's default text editor.
+//! user's default text editor; below it, any binding macOS already owns (⌘W,
+//! ⌘Space, ...) is reported, since it can't reach Shelbi.
 //!
 //! Saves go through [`shelbi_state::update_user_config`], which keeps every
 //! key this view doesn't own (the zen chord, the review editor, a newer
@@ -20,11 +23,15 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::*, px, Context, Entity, FontWeight, SharedString, Subscription, Window};
+use gpui::{
+    div, prelude::*, px, Context, Entity, EventEmitter, FontWeight, SharedString, Subscription,
+    Window,
+};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use shelbi_state::{DesktopConfig, OptionAsMeta, ThemePreference, UserConfig};
+use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 
 use crate::elements::terminal::TerminalSettings;
+use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::Theme;
 
 /// The values the view edits, parsed from the inputs.
@@ -35,6 +42,58 @@ pub struct SettingsValues {
     pub cli_path: String,
     pub theme: ThemePreference,
     pub option_as_meta: OptionAsMeta,
+    pub notifications: Switches,
+}
+
+/// The notification switches, as the form shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Switches {
+    pub workspace_blocked: bool,
+    pub review_ready: bool,
+    pub orchestrator_waiting: bool,
+}
+
+impl Default for Switches {
+    fn default() -> Self {
+        Switches::from(&DesktopNotifications::default())
+    }
+}
+
+impl From<&DesktopNotifications> for Switches {
+    fn from(n: &DesktopNotifications) -> Self {
+        Switches {
+            workspace_blocked: n.workspace_blocked(),
+            review_ready: n.review_ready(),
+            orchestrator_waiting: n.orchestrator_waiting(),
+        }
+    }
+}
+
+/// One notification switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    WorkspaceBlocked,
+    ReviewReady,
+    OrchestratorWaiting,
+}
+
+impl Switches {
+    fn get(&self, switch: Switch) -> bool {
+        match switch {
+            Switch::WorkspaceBlocked => self.workspace_blocked,
+            Switch::ReviewReady => self.review_ready,
+            Switch::OrchestratorWaiting => self.orchestrator_waiting,
+        }
+    }
+
+    fn toggle(&mut self, switch: Switch) {
+        let value = match switch {
+            Switch::WorkspaceBlocked => &mut self.workspace_blocked,
+            Switch::ReviewReady => &mut self.review_ready,
+            Switch::OrchestratorWaiting => &mut self.orchestrator_waiting,
+        };
+        *value = !*value;
+    }
 }
 
 impl SettingsValues {
@@ -55,6 +114,7 @@ impl SettingsValues {
                 .unwrap_or_default(),
             theme: cfg.theme,
             option_as_meta: cfg.desktop.option_as_meta.unwrap_or_default(),
+            notifications: Switches::from(&cfg.desktop.notifications),
         }
     }
 
@@ -72,12 +132,16 @@ impl SettingsValues {
                 _ => return Err(format!("Font size must be a number from 6 to 72, not `{s}`.")),
             },
         };
+        let mut notifications = DesktopNotifications::default();
+        let n = self.notifications;
+        notifications.set(n.workspace_blocked, n.review_ready, n.orchestrator_waiting);
         cfg.desktop = DesktopConfig {
             cli_path: blank(&self.cli_path).map(PathBuf::from),
             terminal_font_family: blank(&self.font_family),
             terminal_font_size: size,
             // Off is the default, so it isn't written.
             option_as_meta: (self.option_as_meta != OptionAsMeta::Off).then_some(self.option_as_meta),
+            notifications,
         };
         cfg.theme = self.theme;
         Ok(())
@@ -92,6 +156,13 @@ enum SaveState {
     Failed(String),
 }
 
+/// What the settings view tells its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsEvent {
+    /// `config.yaml` was written.
+    Saved,
+}
+
 /// The settings view.
 pub struct SettingsView {
     font_family: Entity<InputState>,
@@ -99,6 +170,9 @@ pub struct SettingsView {
     cli_path: Entity<InputState>,
     theme: ThemePreference,
     option_as_meta: OptionAsMeta,
+    notifications: Switches,
+    /// `keys.yaml` bindings macOS already owns, once the keymaps are read.
+    conflicts: Vec<ShortcutConflict>,
     /// False until the config has been read, so an early blur can't save
     /// blank values over it.
     loaded: bool,
@@ -107,7 +181,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
@@ -130,12 +204,40 @@ impl SettingsView {
             cli_path,
             theme: ThemePreference::Auto,
             option_as_meta: OptionAsMeta::Off,
+            notifications: Switches::default(),
+            conflicts: Vec::new(),
             loaded: false,
             state: SaveState::Idle,
             _subscriptions: subscriptions,
         };
         view.load(window, cx);
+        view.load_conflicts(project, cx);
         view
+    }
+
+    /// Read the project's merged keymaps off the UI thread and note the
+    /// bindings macOS owns.
+    fn load_conflicts(&mut self, project: &str, cx: &mut Context<Self>) {
+        let project = project.to_string();
+        let read = cx.background_executor().spawn(async move {
+            reserved_conflicts(&shelbi_state::keymap::load_keymaps(Some(&project)).0)
+        });
+        cx.spawn(async move |this, cx| {
+            let conflicts = read.await;
+            this.update(cx, |this, cx| {
+                this.conflicts = conflicts;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Flip a notification switch and save.
+    fn toggle_switch(&mut self, switch: Switch, cx: &mut Context<Self>) {
+        self.notifications.toggle(switch);
+        self.save(cx);
+        cx.notify();
     }
 
     /// Read the config off the UI thread and fill the form.
@@ -157,6 +259,7 @@ impl SettingsView {
                         set(&this.cli_path, values.cli_path, window, cx);
                         this.theme = values.theme;
                         this.option_as_meta = values.option_as_meta;
+                        this.notifications = values.notifications;
                         this.loaded = true;
                     }
                     Err(e) => {
@@ -177,6 +280,7 @@ impl SettingsView {
             cli_path: self.cli_path.read(cx).value().to_string(),
             theme: self.theme,
             option_as_meta: self.option_as_meta,
+            notifications: self.notifications,
         }
     }
 
@@ -217,6 +321,7 @@ impl SettingsView {
                     Ok(()) => {
                         // Open terminals pick up the font and Option key now.
                         TerminalSettings::set(applied, cx);
+                        cx.emit(SettingsEvent::Saved);
                         SaveState::Saved
                     }
                     Err(e) => SaveState::Failed(e),
@@ -294,6 +399,8 @@ fn open_keys_yaml() -> Result<(), String> {
     }
 }
 
+impl EventEmitter<SettingsEvent> for SettingsView {}
+
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -349,6 +456,34 @@ impl Render for SettingsView {
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
         };
+        let switches = self.notifications;
+        let toggle = |label: &'static str, switch: Switch, cx: &mut Context<Self>| {
+            let on = switches.get(switch);
+            div()
+                .id(label)
+                .debug_selector(move || format!("settings-notify-{label}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme.muted)
+                        .when(on, |d| d.bg(theme.white))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(on, |d| d.text_color(theme.canvas).text_xs().child("✓")),
+                )
+                .child(div().text_color(if on { theme.white } else { theme.gray }).child(label))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
+        };
+        let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
 
         div()
             .id("settings")
@@ -455,7 +590,36 @@ impl Render for SettingsView {
                             .text_xs()
                             .text_color(theme.muted)
                             .child("Shared by the TUI and the desktop app."),
-                    ),
+                    )
+                    .children(conflicts.into_iter().map(|line| {
+                        div()
+                            .debug_selector(|| "settings-shortcut-conflict".into())
+                            .text_xs()
+                            .text_color(theme.red)
+                            .child(line)
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(theme.white).child("Notifications"))
+                    .child(toggle(
+                        "A workspace is waiting for input or permission",
+                        Switch::WorkspaceBlocked,
+                        cx,
+                    ))
+                    .child(toggle("A task is ready for review", Switch::ReviewReady, cx))
+                    .child(toggle(
+                        "The orchestrator is waiting for an answer",
+                        Switch::OrchestratorWaiting,
+                        cx,
+                    ))
+                    .child(div().text_xs().text_color(theme.muted).child(
+                        "Not shown for what's already on screen in the front window. \
+                         macOS asks for permission the first time.",
+                    )),
             )
             .children(status.map(|(text, color)| div().text_color(color).child(text)))
     }
@@ -473,6 +637,11 @@ mod tests {
             cli_path: "~/bin/shelbi".into(),
             theme: ThemePreference::Light,
             option_as_meta: OptionAsMeta::Left,
+            notifications: Switches {
+                workspace_blocked: true,
+                review_ready: false,
+                orchestrator_waiting: true,
+            },
         };
         let mut cfg = UserConfig {
             editor: Some("hx".into()),
@@ -493,6 +662,10 @@ mod tests {
         assert_eq!(back.font_family, "Berkeley Mono");
         assert_eq!(back.cli_path, "~/bin/shelbi");
         assert_eq!(back.option_as_meta, OptionAsMeta::Left);
+        assert!(!back.notifications.review_ready);
+        assert!(back.notifications.workspace_blocked && back.notifications.orchestrator_waiting);
+        assert_eq!(cfg.desktop.notifications.review_ready, Some(false));
+        assert_eq!(cfg.desktop.notifications.workspace_blocked, None, "on is the default");
     }
 
     #[test]

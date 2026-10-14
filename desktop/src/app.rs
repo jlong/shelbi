@@ -52,6 +52,7 @@ use shelbi_app::{CommandKind, CommandRegistry, Mutation};
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::AddProjectError;
 use shelbi_proto::control::DetachSelector;
+use shelbi_state::DesktopNotifications;
 
 use crate::platform::version::APP_VERSION;
 use crate::platform::{
@@ -67,6 +68,8 @@ use shelbi_state::keymap::{
 use crate::assets::icons;
 use crate::commands::{self, CommandHost};
 use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
+use crate::menus;
+use crate::notify;
 use crate::projects::{self, Catalog};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
 use crate::theme::{self, Theme};
@@ -75,7 +78,7 @@ use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
-use crate::views::settings::SettingsView;
+use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{Frame, WindowState};
 
@@ -90,15 +93,6 @@ actions!(
         CloseWindow,
     ]
 );
-
-/// Bind the window-level shortcuts.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        gpui::KeyBinding::new("ctrl-cmd-s", ToggleSidebar, None),
-        gpui::KeyBinding::new("cmd-,", OpenSettings, None),
-        gpui::KeyBinding::new("cmd-w", CloseWindow, None),
-    ]);
-}
 
 const DEFAULT_WIDTH: f32 = 1200.0;
 const DEFAULT_HEIGHT: f32 = 800.0;
@@ -143,6 +137,20 @@ pub fn open_or_focus(project: &str, cx: &mut App) {
         }
     }
     open_window(project, cx);
+}
+
+/// A clicked notification: bring its project's window up and open the item.
+pub fn open_notice_tag(tag: &str, cx: &mut App) {
+    let Some((project, target)) = notify::parse_tag(tag) else {
+        return;
+    };
+    open_or_focus(&project, cx);
+    let handle = cx
+        .try_global::<Shell>()
+        .and_then(|s| s.windows.get(&project).copied());
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |this, window, cx| this.open_notice(target, window, cx));
+    }
 }
 
 fn open_window(project: &str, cx: &mut App) {
@@ -368,6 +376,13 @@ pub struct ShelbiWindow {
     focus_handle: FocusHandle,
     keymaps: Keymaps,
     palette_chord: String,
+    /// The window is the key window of the frontmost app: the menu bar shows
+    /// its commands, and its notices are suppressed for what it shows.
+    active: bool,
+    /// Turns this project's refreshes into system notifications.
+    notifier: notify::Tracker,
+    /// The user's notification switches (`desktop.notifications`).
+    notify_prefs: DesktopNotifications,
     /// The latest title each session reported.
     session_titles: HashMap<String, String>,
     window_state: WindowState,
@@ -428,6 +443,9 @@ impl ShelbiWindow {
             status: None,
             focus_handle,
             keymaps,
+            active: false,
+            notifier: notify::Tracker::new(project),
+            notify_prefs: DesktopNotifications::default(),
             session_titles: HashMap::new(),
             window_state,
             save_generation: 0,
@@ -454,8 +472,167 @@ impl ShelbiWindow {
             });
             this.schedule_save(cx);
         }));
+        this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            this.active = window.is_window_active();
+            if this.active {
+                this.on_activated(cx);
+            }
+        }));
+        this.load_notify_prefs(cx);
         window.set_window_title(&this.model.project_label);
         this
+    }
+
+    /// The window came to the front: the menu bar is now its, and the
+    /// settings it reads (`keys.yaml` included) may have changed while it was
+    /// behind.
+    fn on_activated(&mut self, cx: &mut Context<Self>) {
+        self.sync_menus(cx);
+        self.load_keymaps(cx);
+        self.load_notify_prefs(cx);
+        self.refresh_palette_inputs(cx);
+    }
+
+    /// Rebuild the menu bar from this window's state, when it is the active
+    /// window. Cheap when nothing changed (`menus::install` compares).
+    fn sync_menus(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
+        let tree = menus::tree::build(
+            &self.command_model(),
+            &self.keymaps,
+            menus::tree::WindowFacts {
+                sidebar_collapsed: self.collapsed,
+            },
+        );
+        menus::install(tree, cx);
+    }
+
+    /// The registry's input for this window: the live sidebar model plus the
+    /// last [`PaletteInputs`].
+    fn command_model(&self) -> shelbi_app::command::CommandModel {
+        let inputs = &self.palette_inputs;
+        shelbi_app::command_model::command_model_from(
+            &self.project,
+            &self.model,
+            inputs.others_attached,
+            inputs.other_projects.clone(),
+            inputs.edit_targets.clone(),
+        )
+    }
+
+    /// Read the notification switches off the UI thread.
+    fn load_notify_prefs(&mut self, cx: &mut Context<Self>) {
+        let read = cx
+            .background_executor()
+            .spawn(async { shelbi_state::load_user_config() });
+        cx.spawn(async move |this, cx| {
+            if let Ok(cfg) = read.await {
+                this.update(cx, |this, _| this.notify_prefs = cfg.desktop.notifications)
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Re-read the palette's (and the menus') inputs off the UI thread: other
+    /// projects, edit targets, whether another client is attached.
+    fn refresh_palette_inputs(&mut self, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        let control = self.ready().map(|r| r.control.clone());
+        let client_id = cx
+            .try_global::<Shell>()
+            .map(|s| s.client_id.clone())
+            .unwrap_or_default();
+        let read = cx
+            .background_executor()
+            .spawn(async move { PaletteInputs::read(&project, control, &client_id) });
+        cx.spawn(async move |this, cx| {
+            let inputs = read.await;
+            this.update(cx, |this, cx| {
+                this.palette_inputs = inputs;
+                let entries = this.palette_entries();
+                let projects = this.palette_inputs.projects.clone();
+                if let Some(ActiveOverlay::Palette { palette, .. }) = &mut this.overlay {
+                    palette.set_entries(entries);
+                    palette.set_projects(projects);
+                }
+                this.sync_menus(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Post (or clear) the notifications a refresh produced.
+    fn apply_notices(&mut self, changes: notify::Changes, cx: &mut Context<Self>) {
+        for tag in changes.cleared {
+            cx.dismiss_system_notification(&tag);
+        }
+        if changes.notices.is_empty() {
+            return;
+        }
+        let screen = notify::Screen {
+            frontmost: self.active,
+            showing: self.showing(),
+        };
+        let now = std::time::Instant::now();
+        for notice in changes.notices {
+            let tag = notice.tag();
+            let decision = notify::decide(
+                &notice,
+                &self.notify_prefs,
+                &screen,
+                self.notifier.last_posted(&tag),
+                now,
+            );
+            tracing::debug!(%tag, ?decision, "notification");
+            if decision == notify::Decision::Post {
+                cx.show_system_notification(gpui::SystemNotification {
+                    tag: tag.clone().into(),
+                    title: notice.title.into(),
+                    body: notice.body.into(),
+                    actions: Vec::new(),
+                });
+                self.notifier.record_posted(tag, now);
+            }
+        }
+    }
+
+    /// What the main area shows, as notices see it.
+    fn showing(&self) -> notify::Showing {
+        if !matches!(self.route, Route::View) {
+            return notify::Showing::Other;
+        }
+        match self.client.view() {
+            view if is_chat(view) => notify::Showing::Orchestrator,
+            View::Session(name) => notify::Showing::Workspace(name.clone()),
+            View::Issues => notify::Showing::Board,
+            View::Activity | View::Machines => notify::Showing::Other,
+        }
+    }
+
+    /// Open what a clicked notification is about.
+    pub fn open_notice(&mut self, target: notify::Target, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            notify::Target::Workspace(workspace) => {
+                // Select its sidebar row too, so the window says where it went.
+                if let Some(ordinal) = self.model.rows().iter().filter_map(|r| r.target()).position(
+                    |t| matches!(&t, SidebarTarget::Workspace(w) if *w == workspace),
+                ) {
+                    let count = self.selectable_count();
+                    self.client.select(ordinal, count);
+                }
+                self.client.focus_main();
+                self.run(CommandKind::FocusWorkspace { workspace }, window, cx);
+            }
+            notify::Target::Review(id) => self.open_task(&id, window, cx),
+            notify::Target::Orchestrator => {
+                self.run(CommandKind::ShowView(View::Session("orch".into())), window, cx)
+            }
+        }
     }
 
     /// Spawn the project's feed and pump its events into this view.
@@ -478,7 +655,9 @@ impl ShelbiWindow {
         match event {
             FeedEvent::Snapshot(snapshot) => {
                 if let Some(model) = snapshot.sidebar {
+                    let changes = self.notifier.observe_sidebar(&model);
                     self.model = model;
+                    self.apply_notices(changes, cx);
                     self.sync_selection();
                     // An open palette follows the live state, query kept.
                     let entries = self.palette_entries();
@@ -491,6 +670,12 @@ impl ShelbiWindow {
             FeedEvent::Link(link) => self.link = Some(link),
             FeedEvent::Session(notice) => match notice.kind {
                 SessionNoticeKind::Title(title) => {
+                    if notice.session == "orch" {
+                        let changes = self
+                            .notifier
+                            .observe_orchestrator(&title, &self.model.project_label);
+                        self.apply_notices(changes, cx);
+                    }
                     self.session_titles.insert(notice.session, title);
                 }
                 SessionNoticeKind::Exited => {
@@ -498,6 +683,7 @@ impl ShelbiWindow {
                 }
             },
         }
+        self.sync_menus(cx);
         cx.notify();
     }
 
@@ -516,6 +702,7 @@ impl ShelbiWindow {
                     let chord = this.palette_chord.clone();
                     ws.update(cx, |ws, cx| ws.set_palette_chord(&chord, cx));
                 }
+                this.sync_menus(cx);
                 cx.notify();
             })
             .ok();
@@ -581,6 +768,7 @@ impl ShelbiWindow {
     fn on_ready(&mut self, ready: Ready, cx: &mut Context<Self>) {
         self.boot = Boot::Ready(Box::new(ready));
         self.open_project(cx);
+        self.refresh_palette_inputs(cx);
     }
 
     fn ready(&self) -> Option<&Ready> {
@@ -1181,7 +1369,13 @@ impl ShelbiWindow {
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Settings(_)) {
-            let view = cx.new(|cx| SettingsView::new(window, cx));
+            let project = self.project.clone();
+            let view = cx.new(|cx| SettingsView::new(&project, window, cx));
+            // A saved switch applies to this window's next notice at once.
+            let sub = cx.subscribe(&view, |this, _, event: &SettingsEvent, cx| match event {
+                SettingsEvent::Saved => this.load_notify_prefs(cx),
+            });
+            self._subscriptions.push(sub);
             self.route = Route::Settings(view);
         }
         self.sync_chat(window, cx);
@@ -1198,6 +1392,7 @@ impl ShelbiWindow {
         }
         self.window_state.sidebar_collapsed = self.collapsed;
         self.schedule_save(cx);
+        self.sync_menus(cx);
         cx.notify();
     }
 
@@ -1255,15 +1450,7 @@ impl ShelbiWindow {
     /// The palette's entries for the current state: the registry over the
     /// live sidebar model and the last [`PaletteInputs`].
     fn palette_entries(&self) -> Vec<shelbi_palette::Entry> {
-        let inputs = &self.palette_inputs;
-        let model = shelbi_app::command_model::command_model_from(
-            &self.project,
-            &self.model,
-            inputs.others_attached,
-            inputs.other_projects.clone(),
-            inputs.edit_targets.clone(),
-        );
-        CommandRegistry::new().entries(&model)
+        CommandRegistry::new().entries(&self.command_model())
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1271,30 +1458,7 @@ impl ShelbiWindow {
         let projects = self.palette_inputs.projects.clone();
         self.open_overlay(ActiveOverlay::palette(entries, projects), window, cx);
         // Re-read the inputs off the UI thread; the open palette picks them up.
-        let project = self.project.clone();
-        let control = self.ready().map(|r| r.control.clone());
-        let client_id = cx
-            .try_global::<Shell>()
-            .map(|s| s.client_id.clone())
-            .unwrap_or_default();
-        let read = cx
-            .background_executor()
-            .spawn(async move { PaletteInputs::read(&project, control, &client_id) });
-        cx.spawn(async move |this, cx| {
-            let inputs = read.await;
-            this.update(cx, |this, cx| {
-                this.palette_inputs = inputs;
-                let entries = this.palette_entries();
-                let projects = this.palette_inputs.projects.clone();
-                if let Some(ActiveOverlay::Palette { palette, .. }) = &mut this.overlay {
-                    palette.set_entries(entries);
-                    palette.set_projects(projects);
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.refresh_palette_inputs(cx);
     }
 
     /// A key while an overlay is open: it takes every key except the app's
@@ -1304,32 +1468,12 @@ impl ShelbiWindow {
         let keystroke = &event.keystroke;
         let cmd = keystroke.modifiers.platform && !keystroke.modifiers.control;
         if cmd && keystroke.key == "v" {
-            let multiline = self.overlay.as_ref().is_some_and(ActiveOverlay::takes_newlines);
-            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                for chord in paste_chords(&text, multiline) {
-                    if let Some(o) = self.overlay.as_mut() {
-                        let event = o.handle_key(chord, &self.keymaps);
-                        if event != OverlayEvent::Stay {
-                            self.apply_overlay_event(event, window, cx);
-                            break;
-                        }
-                    }
-                }
-                self.detect_add_project(cx);
-            }
+            self.overlay_paste(window, cx);
             cx.stop_propagation();
-            cx.notify();
             return;
         }
         if cmd && keystroke.key == "c" {
-            if let Some(ActiveOverlay::ErrorLog {
-                viewer: Some(viewer),
-                ..
-            }) = &self.overlay
-            {
-                overlay::error_log::copy(viewer.text(), cx);
-                self.flash("Copied the error log.", cx);
-            }
+            self.overlay_copy(cx);
             cx.stop_propagation();
             return;
         }
@@ -1728,6 +1872,104 @@ impl ShelbiWindow {
         }
     }
 
+    /// Move keyboard focus to the sidebar (the `focus_sidebar` chord).
+    fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.collapsed {
+            self.client.focus_sidebar();
+            // Take keys back from a main view that holds focus.
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Move keyboard focus to the main area (the `focus_main` chord).
+    fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.client.focus_main();
+        self.focus_main_view(window, cx);
+        cx.notify();
+    }
+
+    // --- menus -------------------------------------------------------------
+
+    /// A menu item: a registry command runs exactly as the palette runs it.
+    fn menu_invoke(&mut self, invoke: &menus::MenuInvoke, window: &mut Window, cx: &mut Context<Self>) {
+        use menus::tree::{AppCommand, MenuAction};
+        match &invoke.target {
+            MenuAction::Command(id) => {
+                // The palette closes before running its entry; so does a menu
+                // pick made with an overlay up.
+                if self.overlay.is_some() {
+                    self.close_overlay(window, cx);
+                }
+                match CommandKind::from_id(id) {
+                    Some(kind) => self.run(kind, window, cx),
+                    None => self.banner = Some(format!("Unknown command: {id}").into()),
+                }
+            }
+            MenuAction::App(command) => match command {
+                AppCommand::About => self.show_about(window, cx),
+                AppCommand::Settings => self.open_settings(window, cx),
+                AppCommand::CloseWindow => window.remove_window(),
+                AppCommand::Minimize => window.minimize_window(),
+                AppCommand::Zoom => window.zoom_window(),
+                AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
+                AppCommand::CommandPalette => {
+                    if self.overlay.is_none() {
+                        self.open_palette(window, cx);
+                    }
+                }
+                AppCommand::FocusSidebar => self.focus_sidebar(window, cx),
+                AppCommand::FocusMain => self.focus_main(window, cx),
+                other => {
+                    menus::run_app_command(*other, cx);
+                }
+            },
+        }
+        cx.notify();
+    }
+
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let detail = match self.ready().and_then(|r| r.cli_version.clone()) {
+            Some(cli) => format!("Desktop {APP_VERSION}, CLI {cli}\n{}", menus::tree::DOCS_URL),
+            None => format!("Desktop {APP_VERSION}\n{}", menus::tree::DOCS_URL),
+        };
+        let answer = window.prompt(PromptLevel::Info, "Shelbi", Some(&detail), &["OK"], cx);
+        cx.spawn(async move |_, _| {
+            let _ = answer.await;
+        })
+        .detach();
+    }
+
+    /// Edit ▸ Paste with an overlay up: type the clipboard into its text.
+    fn overlay_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let multiline = self.overlay.as_ref().is_some_and(ActiveOverlay::takes_newlines);
+        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+            for chord in paste_chords(&text, multiline) {
+                if let Some(o) = self.overlay.as_mut() {
+                    let event = o.handle_key(chord, &self.keymaps);
+                    if event != OverlayEvent::Stay {
+                        self.apply_overlay_event(event, window, cx);
+                        break;
+                    }
+                }
+            }
+            self.detect_add_project(cx);
+        }
+        cx.notify();
+    }
+
+    /// Edit ▸ Copy with an overlay up: the error log's text, when it shows.
+    fn overlay_copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(ActiveOverlay::ErrorLog {
+            viewer: Some(viewer),
+            ..
+        }) = &self.overlay
+        {
+            overlay::error_log::copy(viewer.text(), cx);
+            self.flash("Copied the error log.", cx);
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let chord = chord_from_keystroke(&event.keystroke);
         tracing::trace!(keystroke = ?event.keystroke, ?chord, focus = ?self.client.focus(), "key down");
@@ -1751,23 +1993,22 @@ impl ShelbiWindow {
         }
         match self.keymaps.global.dispatch(chord) {
             Some(GlobalAction::FocusSidebar) => {
-                if !self.collapsed {
-                    self.client.focus_sidebar();
-                    // Take keys back from a main view that holds focus.
-                    self.focus_handle.focus(window, cx);
-                }
+                self.focus_sidebar(window, cx);
                 cx.stop_propagation();
-                cx.notify();
                 return;
             }
             Some(GlobalAction::FocusMain) => {
-                self.client.focus_main();
-                self.focus_main_view(window, cx);
+                self.focus_main(window, cx);
                 cx.stop_propagation();
-                cx.notify();
                 return;
             }
-            _ => {}
+            Some(GlobalAction::ZenToggle) => {
+                self.run(CommandKind::ToggleZen, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            // Ctrl+C quits the TUI; here it's the terminal's (⌘Q quits).
+            Some(GlobalAction::Quit | GlobalAction::OpenPalette) | None => {}
         }
         if self.client.focus() != Focus::Sidebar || self.collapsed {
             // The main area's views take their own keys once they land.
@@ -1946,13 +2187,13 @@ fn workspace_name(view: &View) -> Option<&str> {
 }
 
 /// Whether the window takes `chord` away from a focused terminal: the focus
-/// moves (Ctrl+H / Ctrl+L by default) and every palette chord (the
-/// configured one plus the reserved Ctrl+Space and Cmd+K). Everything else is
-/// the session's.
+/// moves (Ctrl+H / Ctrl+L by default), the Zen toggle (Option+Z), and every
+/// palette chord (the configured one plus the reserved Ctrl+Space and Cmd+K).
+/// Everything else is the session's.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
     matches!(
         keymaps.global.dispatch(chord),
-        Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain)
+        Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain | GlobalAction::ZenToggle)
     ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
 }
 
@@ -2156,11 +2397,43 @@ impl ShelbiWindow {
         let layer = self.overlay.as_ref().map(|o| {
             overlay::render_layer(o, window.viewport_size(), &self.keymaps, &theme, cx)
         });
+        // Edit ▸ Cut / Copy / Paste / Select All: a focused terminal handles
+        // them itself; an open overlay takes paste (and the error log's copy)
+        // here; a focused gpui-kit text input gets them forwarded as its own
+        // actions. Registered only when there is a target, so the menu items
+        // are gray when there isn't.
+        let overlay_open = self.overlay.is_some();
+        let input_focused =
+            !overlay_open && window.is_action_available(&gpui_kit::base::input::Paste, cx);
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
+            .on_action(cx.listener(Self::menu_invoke))
+            .on_action(cx.listener(|_, _: &menus::Minimize, window, _| window.minimize_window()))
+            .on_action(cx.listener(|_, _: &menus::Zoom, window, _| window.zoom_window()))
+            .when(overlay_open, |d| {
+                d.on_action(cx.listener(|this, _: &menus::Paste, window, cx| {
+                    this.overlay_paste(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &menus::Copy, _, cx| this.overlay_copy(cx)))
+            })
+            .when(input_focused, |d| {
+                use gpui_kit::base::input as kit;
+                d.on_action(cx.listener(|_, _: &menus::Cut, window, cx| {
+                    window.dispatch_action(Box::new(kit::Cut), cx)
+                }))
+                .on_action(cx.listener(|_, _: &menus::Copy, window, cx| {
+                    window.dispatch_action(Box::new(kit::Copy), cx)
+                }))
+                .on_action(cx.listener(|_, _: &menus::Paste, window, cx| {
+                    window.dispatch_action(Box::new(kit::Paste), cx)
+                }))
+                .on_action(cx.listener(|_, _: &menus::SelectAll, window, cx| {
+                    window.dispatch_action(Box::new(kit::SelectAll), cx)
+                }))
+            })
             .when_some(relaunch, |col, notice| {
                 col.child(boot_view::render_relaunch_bar(&notice, &theme, move |_, cx| {
                     let _ = weak.update(cx, |this, cx| {
@@ -2228,8 +2501,9 @@ mod tests {
             let ks = gpui::Keystroke::parse(spec).unwrap();
             chord_from_keystroke(&ks).unwrap()
         };
-        // Ctrl+H back to the sidebar, Ctrl+L to the main area, the palette.
-        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p", "cmd-k"] {
+        // Ctrl+H back to the sidebar, Ctrl+L to the main area, the palette,
+        // the Zen toggle.
+        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p", "cmd-k", "alt-z"] {
             assert!(takes_from_terminal(&keymaps, chord(spec)), "{spec}");
         }
         // Typing, Backspace (never mistaken for Ctrl+H), Shift+Enter, other

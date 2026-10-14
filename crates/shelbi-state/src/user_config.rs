@@ -96,6 +96,11 @@ pub struct DesktopConfig {
     /// Unset means `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_as_meta: Option<OptionAsMeta>,
+
+    /// Which system notifications the desktop app posts (`notifications:`).
+    /// Every kind is on unless switched off.
+    #[serde(default, skip_serializing_if = "DesktopNotifications::is_empty")]
+    pub notifications: DesktopNotifications,
 }
 
 /// Which Option keys act as Meta in the desktop app's terminals
@@ -159,6 +164,56 @@ impl DesktopConfig {
             && self.terminal_font_family.is_none()
             && self.terminal_font_size.is_none()
             && self.option_as_meta.is_none()
+            && self.notifications.is_empty()
+    }
+}
+
+/// The desktop app's notification switches (`desktop.notifications:`). A
+/// missing key means on, and only a switched-off kind is written, so the
+/// block stays absent until the user turns something off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopNotifications {
+    /// A workspace's agent stops for the user: it finished a turn and waits
+    /// for input, or a permission dialog is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_blocked: Option<bool>,
+
+    /// A task reaches the review column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_ready: Option<bool>,
+
+    /// The orchestrator finishes a turn and waits for an answer, or a
+    /// permission dialog is up in its session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_waiting: Option<bool>,
+}
+
+impl DesktopNotifications {
+    pub fn workspace_blocked(&self) -> bool {
+        self.workspace_blocked.unwrap_or(true)
+    }
+
+    pub fn review_ready(&self) -> bool {
+        self.review_ready.unwrap_or(true)
+    }
+
+    pub fn orchestrator_waiting(&self) -> bool {
+        self.orchestrator_waiting.unwrap_or(true)
+    }
+
+    /// Set each switch, writing only the ones that are off.
+    pub fn set(&mut self, workspace_blocked: bool, review_ready: bool, orchestrator_waiting: bool) {
+        let off = |on: bool| (!on).then_some(false);
+        self.workspace_blocked = off(workspace_blocked);
+        self.review_ready = off(review_ready);
+        self.orchestrator_waiting = off(orchestrator_waiting);
+    }
+
+    /// Whether every switch is at its default (so the block isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.workspace_blocked.is_none()
+            && self.review_ready.is_none()
+            && self.orchestrator_waiting.is_none()
     }
 }
 
@@ -400,6 +455,32 @@ mod tests {
         // Defaults write neither key, so the CLI's own saves don't add them.
         let text = serde_yaml::to_string(&UserConfig::default()).unwrap();
         assert!(!text.contains("desktop") && !text.contains("theme"), "{text}");
+    }
+
+    #[test]
+    fn desktop_notification_switches_default_on_and_write_only_when_off() {
+        let cfg: UserConfig =
+            serde_yaml::from_str("desktop:\n  notifications:\n    review_ready: false\n").unwrap();
+        let n = &cfg.desktop.notifications;
+        assert!(n.workspace_blocked() && n.orchestrator_waiting());
+        assert!(!n.review_ready());
+
+        let mut n = DesktopNotifications::default();
+        n.set(true, true, true);
+        assert!(n.is_empty(), "all on writes nothing");
+        n.set(false, true, true);
+        let cfg = UserConfig {
+            desktop: DesktopConfig {
+                notifications: n,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = serde_yaml::to_string(&cfg).unwrap();
+        assert!(text.contains("workspace_blocked: false"), "{text}");
+        assert!(!text.contains("review_ready"), "{text}");
+        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]

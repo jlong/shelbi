@@ -102,7 +102,10 @@ desktop/
   assets/fonts/        Geist (UI) and Geist Mono (terminal), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
   docs/status/         one <task-id>.md per subtask
-  src/main.rs          gpui App, the menu, the app-wide globals, the launch window
+  src/main.rs          gpui App, the app-wide globals, the launch window
+  src/menus/           the menu bar: tree.rs builds it as data from the CommandModel + keymaps
+                       (pure, tested); mod.rs converts it to gpui menus and owns their actions
+  src/notify.rs        system notifications: transitions to notices, when to post or suppress (pure)
   src/app.rs           a project window's root view: sidebar | main area, routing
                        through ClientState, one window per project (Shell)
   src/keys.rs          gpui keystrokes to shelbi_state::keymap KeyChords (so keys.yaml applies)

@@ -19,7 +19,10 @@
 //! mutation on a GitHub-backed board, and wakes the matching project's feed.
 //!
 //! Session events (title, exit) arrive from the terminal views'
-//! `shelbi-client` connections through a feed's [`SessionSink`].
+//! `shelbi-client` connections through a feed's [`SessionSink`]. The
+//! orchestrator's title is also probed after every refresh
+//! ([`orchestrator_title`]), since its chat is only attached while shown and
+//! its `shelbi:<state>` marker drives the "orchestrator is waiting" notice.
 //!
 //! Nothing here ever blocks the caller: spawning returns at once, a refresh
 //! request is a channel send, and dropping a feed only raises a stop flag (its
@@ -49,6 +52,35 @@ pub fn sidebar_reader() -> Reader {
         sidebar: shelbi_orchestrator::sidebar_model::read_sidebar_model(project),
         ..Default::default()
     })
+}
+
+/// Reads a project's orchestrator session title without attaching to it.
+pub type TitleProbe = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// The orchestrator chat's view name: what [`SessionNotice::session`] carries
+/// for its titles, from the chat view and the probe alike.
+pub const ORCHESTRATOR_SESSION: &str = "orch";
+
+/// The production probe: find the project's live orchestrator session and
+/// ask it for its title over a short-lived, never-attached connection (the
+/// session protocol's `info` request). `None` when there is no live session,
+/// it doesn't answer within half a second, or it has set no title.
+pub fn orchestrator_title(project: &str) -> Option<String> {
+    use shelbi_app::session::{discovery_name, SessionRef};
+    let root = shelbi_state::sessions_dir().ok()?;
+    let sessions = shelbi_client::list(&root).ok()?;
+    let session = shelbi_client::choose_session(
+        &sessions,
+        &discovery_name(project, &SessionRef::Orchestrator),
+    )?;
+    let (conn, _events) = shelbi_client::Connection::open_with_timeout(
+        &session.sock,
+        None,
+        &[shelbi_proto::capability::INFO],
+        Duration::from_millis(500),
+    )
+    .ok()?;
+    conn.info().ok()?.title
 }
 
 /// Whether the daemon is pushing changes or the feed is polling for them.
@@ -135,6 +167,7 @@ impl ProjectFeed {
                 connected,
                 changes: Some(changes),
                 keep_alive: Some(Box::new(subscription)),
+                orchestrator: Some(Arc::new(orchestrator_title)),
             },
             FeedTiming::default(),
         )
@@ -198,6 +231,9 @@ pub struct FeedSources {
     /// Kept alive by the feed thread and dropped there, so a subscription's
     /// joining `Drop` never runs on the UI thread.
     pub keep_alive: Option<Box<dyn Send>>,
+    /// Probes the orchestrator's title after each snapshot; a change goes
+    /// out as a [`SessionNoticeKind::Title`] for [`ORCHESTRATOR_SESSION`].
+    pub orchestrator: Option<TitleProbe>,
 }
 
 fn feed_loop(
@@ -213,7 +249,9 @@ fn feed_loop(
         connected,
         changes,
         keep_alive,
+        orchestrator,
     } = sources;
+    let mut orchestrator_title: Option<String> = None;
     let reader_project = project.to_string();
     let refresher = spawn_refresher(move |generation| reader(&reader_project, generation));
     refresher.request();
@@ -266,6 +304,18 @@ fn feed_loop(
                 .is_err()
             {
                 break;
+            }
+            if let Some(title) = orchestrator.as_ref().and_then(|probe| probe(project)) {
+                if orchestrator_title.as_ref() != Some(&title) {
+                    orchestrator_title = Some(title.clone());
+                    let notice = FeedEvent::Session(SessionNotice {
+                        session: ORCHESTRATOR_SESSION.to_string(),
+                        kind: SessionNoticeKind::Title(title),
+                    });
+                    if events.unbounded_send(notice).is_err() {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -397,6 +447,7 @@ mod tests {
             connected: connected.clone(),
             changes: None,
             keep_alive: None,
+            orchestrator: None,
         }
     }
 
@@ -501,6 +552,7 @@ mod tests {
                 connected,
                 changes: Some(change_rx),
                 keep_alive: None,
+                orchestrator: None,
             },
             fast(),
         );
@@ -508,6 +560,48 @@ mod tests {
         // Live with a 60s safety interval: only the wake can cause this one.
         change_tx.send(shelbi_app::changes::ChangeWake::Board).unwrap();
         next_matching(&mut rx, is_snapshot);
+    }
+
+    #[test]
+    fn the_orchestrator_title_is_probed_after_refreshes_and_sent_on_change() {
+        let connected = Arc::new(AtomicBool::new(false));
+        let titles = Arc::new(Mutex::new(vec![
+            "shelbi:working".to_string(),
+            "shelbi:working".to_string(),
+            "shelbi:idle".to_string(),
+        ]));
+        let probe_titles = titles.clone();
+        let probe: TitleProbe = Arc::new(move |project| {
+            assert_eq!(project, "demo");
+            let mut t = probe_titles.lock().unwrap();
+            (t.len() > 1).then(|| t.remove(0)).or_else(|| t.first().cloned())
+        });
+        let (_feed, mut rx) = ProjectFeed::spawn_with(
+            "demo",
+            canned("a"),
+            FeedSources {
+                orchestrator: Some(probe),
+                ..sources(&connected)
+            },
+            fast(),
+        );
+        let title = |ev: FeedEvent| match ev {
+            FeedEvent::Session(SessionNotice {
+                session,
+                kind: SessionNoticeKind::Title(t),
+            }) => (session, t),
+            other => panic!("{other:?}"),
+        };
+        let is_title = |e: &FeedEvent| matches!(e, FeedEvent::Session(_));
+        // The repeat of `working` is not re-sent.
+        assert_eq!(
+            title(next_matching(&mut rx, is_title)),
+            ("orch".to_string(), "shelbi:working".to_string())
+        );
+        assert_eq!(
+            title(next_matching(&mut rx, is_title)),
+            ("orch".to_string(), "shelbi:idle".to_string())
+        );
     }
 
     #[test]
