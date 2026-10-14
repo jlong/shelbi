@@ -243,3 +243,109 @@ caller.
 - [ ] `issue start --fresh` cold-starts and clears the block; a runner with
       `session_resume: false` always cold-starts
 - [ ] Quit and reopen brings in-progress workers back on their exact sessions
+
+## Addendum: machines, hubs and GitHub-backed boards (2026-10-14)
+
+John's question: a session transcript lives on one machine. When several
+people work a task from several Shelbi hubs (or one person from two hubs),
+a resume from a different machine is impossible. What then?
+
+### The session is tied to where it lives
+
+The `session:` block records *where* the conversation exists, not just its
+id. Two fields are added:
+
+```yaml
+session:
+  runner: claude
+  id: 7d2c6c1e-…
+  hub: 0f3a…            # stable hub id, minted once into ~/.shelbi/hub-id
+  hub_name: john-mb2    # hostname at the time, for humans
+  machine: hub          # the project's machine name on that hub
+  workspace: golf
+  cwd: /Users/jlong/Workspaces/shelbi/.shelbi/wt/golf
+  recorded_at: 2026-10-14T13:34:01Z
+```
+
+Resume policy, in order:
+
+1. **Same hub, same machine**: native resume (`--resume` / `codex resume`),
+   relinked to whichever workspace is free on that machine.
+2. **Same hub, different machine** (a remote workspace machine): the
+   transcript is a plain JSONL file under the user's home on the recording
+   machine. Shelbi copies it over the machine's existing SSH control path
+   into the target machine's runner directory and resumes with a fork,
+   recording the new location. Opt-in per project (`sessions.cross_machine:
+   true`); the default prefers the recording machine the way
+   `prefers_machine` does today, and only falls through when it is full.
+3. **Different hub**: no native resume. The task cold-starts on this hub,
+   with the handoff summary below as its context. The event line says why:
+   `session ... status=foreign-hub hub_name=john-mb2`. The foreign block is
+   left in place; the new hub adds its own `session:` when it records one,
+   so the task carries one block per hub that has touched it (`sessions:`
+   becomes a list keyed by hub).
+
+A foreign-hub session is never an error, never a prompt, and never retried.
+
+### Portable context: the handoff summary
+
+A transcript is the full context but it is not portable: it is large, it is
+runner-specific, and it contains tool output (environment, file contents,
+secrets) that must not be pushed to a repository or an issue tracker. The
+portable artifact is a summary the agent writes at handoff.
+
+- At handoff the worker writes `<worktree>/.shelbi/handoff-summary.md`:
+  what landed, the decisions and why, what it tried and rejected, open
+  threads, and the exact verification it ran. The developer agent's
+  handoff instructions already ask for most of this in the status doc;
+  this is the same content in a fixed, machine-findable place, capped in
+  size (16 KB).
+- The poller attaches it to the task as a hidden block in the body (the
+  same mechanism that carries frontmatter on GitHub-backed boards), so
+  every hub that reads the issue reads the summary. It is rewritten on
+  each handoff, not appended.
+- A cold start on any hub (foreign hub, lost transcript, `--fresh`) sends
+  the rework message plus the summary. A native resume does not send it;
+  the conversation already knows.
+
+This makes the cold path good enough that cross-hub work is a degraded
+mode, not a broken one, and it costs nothing when the resume is native.
+
+### Transcript export and import, opt in
+
+For one person with two hubs (laptop and desk), the transcript itself can
+move: `shelbi session export <task-id> > task.session` on the recording hub
+and `shelbi session import <task-id> task.session` on the other, which
+relinks it and marks the block as resumable there. The export is a file,
+never automatic, never written to the repo or the tracker. Secrets in tool
+output stay the user's responsibility, which is why this is a command and
+not a sync.
+
+### GitHub specifics
+
+- The hidden block already rides the issue body; adding `sessions:` is the
+  same one PATCH per record, inside the gh budget accounting.
+- Concurrent hubs writing the block are covered by the expected-state
+  write the board already uses; a lost race re-reads and re-applies.
+- The assignee check that `zen scan` applies (only issues assigned to the
+  authenticated account) is what partitions work between people today.
+  The `hub:` field makes the partition visible on the task instead of
+  implicit in who is logged in.
+
+### Decisions added
+
+| Question | Decision |
+|---|---|
+| What identifies "where the session lives" | `hub` (stable id) + `machine` + `cwd`. Hostname is informational. |
+| Cross-machine on one hub | Transcript copy over SSH, fork on arrival, opt-in per project. |
+| Cross-hub | Cold start with the handoff summary. Never an error. |
+| What travels with the task everywhere | The handoff summary, size-capped, in the hidden body block. Never the transcript. |
+| Moving a transcript between a person's own hubs | Explicit export/import command, file-based. |
+
+### Phasing change
+
+Phase 1 records `hub` and `machine` from the start (cheap, and the block's
+shape should not change later). The handoff summary is its own task in
+Phase 3 because every caller of the cold path benefits from it, including
+today's rework. Cross-machine copy and export/import are Phase 4.
+
