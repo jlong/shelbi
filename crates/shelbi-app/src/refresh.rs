@@ -148,6 +148,103 @@ impl Drop for RefreshHandle {
     }
 }
 
+/// A refresh worker generic over the payload `T` it publishes: the same
+/// request / coalesce / publish loop as [`spawn_refresher`], for a host whose
+/// reads don't fit [`Snapshot`] (the TUI shell's board / activity / closed-page
+/// refreshers, the desktop board's open and closed reads). Dropping it stops
+/// the worker and joins its thread.
+pub struct Refresher<T> {
+    request_tx: Option<Sender<()>>,
+    snapshot_rx: Receiver<T>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+/// Spawn a [`Refresher`] driven by `reader`. The worker blocks until
+/// [`Refresher::request`] asks for a refresh, then calls `reader(gen)` off the
+/// caller's thread and publishes the result. Requests that pile up while a
+/// read is in flight coalesce into one read.
+pub fn spawn_worker<T, F>(reader: F) -> Refresher<T>
+where
+    T: Send + 'static,
+    F: Fn(u64) -> T + Send + 'static,
+{
+    let (request_tx, request_rx) = mpsc::channel::<()>();
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<T>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+
+    let join = std::thread::Builder::new()
+        .name("shelbi-app-refresh".to_string())
+        .spawn(move || {
+            let mut generation: u64 = 0;
+            while request_rx.recv().is_ok() {
+                if worker_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                while request_rx.try_recv().is_ok() {}
+                let snapshot = reader(generation);
+                generation = generation.wrapping_add(1);
+                if snapshot_tx.send(snapshot).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn refresh worker thread");
+
+    Refresher {
+        request_tx: Some(request_tx),
+        snapshot_rx,
+        stop,
+        join: Some(join),
+    }
+}
+
+impl<T> Refresher<T> {
+    /// Ask for a refresh. Returns immediately; the read happens on the worker.
+    /// Returns `false` if the worker has stopped.
+    pub fn request(&self) -> bool {
+        match &self.request_tx {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// The most recent result available without blocking, draining older
+    /// queued ones. `None` when nothing new has arrived since the last call.
+    pub fn latest(&self) -> Option<T> {
+        let mut newest = None;
+        while let Ok(s) = self.snapshot_rx.try_recv() {
+            newest = Some(s);
+        }
+        newest
+    }
+
+    /// Block up to `timeout` for the next result.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<T> {
+        self.snapshot_rx.recv_timeout(timeout).ok()
+    }
+
+    /// Stop the worker and join its thread. Idempotent; also runs on drop.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let tx = self.request_tx.take();
+        if let Some(tx) = &tx {
+            let _ = tx.send(());
+        }
+        drop(tx);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl<T> Drop for Refresher<T> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +326,21 @@ mod tests {
         // Nothing left queued after a drain.
         assert!(handle.latest().is_none());
         assert!(latest.sidebar.is_some());
+    }
+
+    #[test]
+    fn a_generic_worker_publishes_coalesces_and_stops() {
+        let mut worker = spawn_worker(|gen| gen * 10);
+        assert!(worker.request());
+        assert_eq!(worker.recv_timeout(Duration::from_secs(2)), Some(0));
+        for _ in 0..5 {
+            worker.request();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(worker.latest().is_some());
+        assert!(worker.latest().is_none(), "drained");
+        worker.stop();
+        assert!(!worker.request());
     }
 
     #[test]

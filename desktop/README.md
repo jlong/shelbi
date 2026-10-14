@@ -10,8 +10,10 @@ Status: foundation. On launch the app finds the `shelbi` CLI, starts the
 daemon, and checks versions (`src/platform/`, see
 `docs/status/dt-platform-bootstrap.md`); then the window shows the
 sidebar/main split in the theme the `theme:` setting picks (`auto` follows
-the system appearance), where every command and view shows a
-"Not implemented yet" banner until its `dt-*` subtask lands.
+the system appearance), where the Issues nav row shows the native board and task detail
+(`dt-issues-board`, see `docs/status/dt-issues-board.md`) and every other
+command and view shows a "Not implemented yet" banner until its `dt-*`
+subtask lands.
 
 The app is a client of the `shelbi` CLI and needs it installed
 (`brew install jlong/shelbi/shelbi`). To point it at a particular build, set
@@ -85,6 +87,8 @@ desktop/
   src/app.rs           root view: sidebar | main area split (placeholders)
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
+  src/keys.rs          gpui keystroke -> Shelbi KeyChord (so keys.yaml applies)
+  src/project.rs       which project the window shows (until dt-shell-sidebar)
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
   src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette

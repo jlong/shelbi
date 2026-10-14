@@ -12,8 +12,8 @@
 //! per-view subtasks fill the main area.
 
 use gpui::{
-    div, prelude::*, px, svg, AnyElement, Context, FontWeight, SharedString, Subscription, Task,
-    Window,
+    div, prelude::*, px, svg, AnyElement, Context, Entity, FontWeight, SharedString,
+    Subscription, Task, Window,
 };
 use shelbi_app::{CommandKind, View};
 
@@ -26,6 +26,7 @@ use crate::platform::{
 };
 use crate::theme::{self, Theme};
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
+use crate::views::issues::{IssuesEvent, IssuesView};
 
 /// Sidebar width in the foundation. `dt-shell-sidebar` makes it resizable.
 const SIDEBAR_WIDTH: f32 = 240.0;
@@ -70,6 +71,14 @@ pub struct ShelbiWindow {
     banner: Option<SharedString>,
     /// Re-resolves the theme when the system appearance changes.
     _appearance: Subscription,
+    /// The Issues board, created the first time it is shown.
+    issues: Option<Entity<IssuesView>>,
+    /// Whether the main area shows the board.
+    showing_issues: bool,
+    /// Set by dispatch (which has no gpui context) and acted on right after.
+    want_issues: bool,
+    queued_issue_commands: Vec<CommandKind>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ShelbiWindow {
@@ -81,6 +90,11 @@ impl ShelbiWindow {
             _bootstrap: None,
             selected: None,
             banner: None,
+            issues: None,
+            showing_issues: false,
+            want_issues: false,
+            queued_issue_commands: Vec::new(),
+            _subscriptions: Vec::new(),
             _appearance: theme::follow_system(window, cx),
         };
         this.start_bootstrap(cx);
@@ -156,17 +170,62 @@ impl ShelbiWindow {
     }
 
     /// Run a command from the UI and repaint.
-    fn run(&mut self, kind: CommandKind, cx: &mut Context<Self>) {
+    fn run(&mut self, kind: CommandKind, window: &mut Window, cx: &mut Context<Self>) {
         if self.relaunch.is_some() && commands::sends_to_daemon(&kind) {
             self.banner = Some("Shelbi was updated: relaunch before making changes.".into());
             cx.notify();
             return;
         }
+        // Until bootstrap is ready no daemon launcher is installed, and
+        // `shelbi_state::ensure_daemon_running` would fall back to
+        // `current_exe()`: this app, not the CLI. Hold daemon-bound commands
+        // until then.
+        if !matches!(self.boot, Boot::Ready(_)) && commands::sends_to_daemon(&kind) {
+            self.banner = Some("Still connecting to Shelbi: try again in a moment.".into());
+            cx.notify();
+            return;
+        }
         if let CommandKind::ShowView(view) = &kind {
             self.selected = Some(view.clone());
+            self.showing_issues = false;
         }
         commands::dispatch_command(&kind, self);
+        if std::mem::take(&mut self.want_issues) {
+            if let Some(issues) = self.ensure_issues(window, cx) {
+                self.showing_issues = true;
+                issues.update(cx, |v, _| v.request_focus());
+            }
+        }
+        for kind in std::mem::take(&mut self.queued_issue_commands) {
+            if let Some(issues) = self.ensure_issues(window, cx) {
+                issues.update(cx, |v, cx| v.run_issue_command(&kind, window, cx));
+            }
+        }
         cx.notify();
+    }
+
+    /// The board for the window's project, created on first use. `None` (with
+    /// a banner) when no Shelbi project is registered.
+    fn ensure_issues(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<IssuesView>> {
+        if let Some(issues) = &self.issues {
+            return Some(issues.clone());
+        }
+        let Some(project) = crate::project::initial_project() else {
+            self.banner = Some("No Shelbi project found: run `shelbi init` in a repository.".into());
+            return None;
+        };
+        let issues = cx.new(|cx| IssuesView::new(project, cx));
+        let sub = cx.subscribe_in(&issues, window, |this, _, ev: &IssuesEvent, window, cx| {
+            let IssuesEvent::Command(kind) = ev;
+            this.run(kind.clone(), window, cx);
+        });
+        self._subscriptions.push(sub);
+        self.issues = Some(issues.clone());
+        Some(issues)
     }
 
     fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -204,8 +263,8 @@ impl ShelbiWindow {
                             .text_color(color),
                     )
                     .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.run(CommandKind::ShowView(view.clone()), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run(CommandKind::ShowView(view.clone()), window, cx)
                     }))
             });
 
@@ -236,6 +295,10 @@ impl ShelbiWindow {
             .flex()
             .flex_col()
             .flex_1()
+            // A flex item defaults to its content's width; the board's columns
+            // must scroll inside the main area, not widen it.
+            .min_w_0()
+            .overflow_hidden()
             .h_full()
             .bg(theme.canvas)
             .when_some(self.banner.clone(), |main, message| {
@@ -267,26 +330,40 @@ impl ShelbiWindow {
                         ),
                 )
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .flex_col()
-                    .gap_1()
-                    .text_color(theme.muted)
-                    .child("Shelbi desktop foundation: pick a view in the sidebar.")
-                    .when_some(self.connection_summary(), |col, summary| {
-                        col.child(div().text_xs().child(summary))
-                    }),
-            )
+            .map(|main| match (&self.issues, self.showing_issues) {
+                (Some(issues), true) => {
+                    main.child(div().flex_1().min_h_0().min_w_0().child(issues.clone()))
+                }
+                _ => main.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .flex_col()
+                        .gap_1()
+                        .text_color(theme.muted)
+                        .child("Shelbi desktop foundation: pick a view in the sidebar.")
+                        .when_some(self.connection_summary(), |col, summary| {
+                            col.child(div().text_xs().child(summary))
+                        }),
+                ),
+            })
     }
 }
 
 impl CommandHost for ShelbiWindow {
     fn not_implemented(&mut self, command_id: &str) {
         self.banner = Some(commands::not_implemented_message(command_id).into());
+    }
+
+    fn show_issues(&mut self) {
+        self.banner = None;
+        self.want_issues = true;
+    }
+
+    fn issue_command(&mut self, kind: &CommandKind) {
+        self.queued_issue_commands.push(kind.clone());
     }
 }
 

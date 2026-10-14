@@ -10,7 +10,9 @@ mod app;
 mod assets;
 mod commands;
 mod elements;
+mod keys;
 mod platform;
+mod project;
 mod theme;
 mod views;
 

@@ -6169,9 +6169,11 @@ name = "shelbi-desktop"
 version = "0.10.0"
 dependencies = [
  "async-channel",
+ "chrono",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
+ "markdown",
  "shelbi-app",
  "shelbi-client",
  "shelbi-core",

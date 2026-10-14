@@ -47,9 +47,16 @@ switch. A switch records the reason in this file.
   Shelbi's resolved theme (`gpui_kit::component::Theme::change`).
 - `src/assets.rs` falls back to gpui-kit's assets so its components' internal
   glyphs resolve. Shelbi's own icons are Heroicons, not gpui-kit's Lucide set.
-- No view uses a gpui-kit widget yet, and the window is not wrapped in
-  gpui-kit's `Root`. The first subtask that uses a dialog or notification
-  opens the window through `gpui_kit::open_window` (or wraps it in `Root`).
+- The Issues board (`dt-issues-board`) uses three gpui-kit widgets: the
+  Markdown `TextView` (task bodies; links open in the browser by default),
+  `Textarea` (the in-place body editor) and `Input` (the new-issue title).
+  All three work without gpui-kit's `Root`; the window is still not wrapped
+  in it. The first subtask that uses a dialog or notification opens the
+  window through `gpui_kit::open_window` (or wraps it in `Root`).
+- The `markdown` crate is a direct dependency pinned to the version
+  gpui-base resolves (`=1.0.0`), so the task detail's checklist count and
+  its tests read the same parse the `TextView` renders. Bump it with
+  gpui-kit.
 
 ## Upgrading
 
@@ -86,6 +93,11 @@ switch. A switch records the reason in this file.
   `cargo run`). `App::set_window_appearance(Some(..))` pins the window chrome
   for the `theme: dark` / `light` overrides; while pinned, the window stops
   tracking the system, so `auto` passes `None`.
+- **Flex items size to their content.** A `flex_1` child of a flex row
+  defaults to `min-width: auto`, so a wide child (the board's columns) widens
+  the whole main area instead of scrolling inside it, and absolutely
+  positioned overlays then center on the oversized box. Give the container
+  `min_w_0()` (and `overflow_hidden()`); the main area and the board both do.
 - `cargo` reports a future-incompatibility warning for `block 0.1.6`, pulled
   in by gpui's macOS platform crates. Upstream's to fix; harmless today.
 

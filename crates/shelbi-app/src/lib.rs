@@ -11,6 +11,8 @@
 //!   palette's string-prefix dispatch. Each command has an id, a title,
 //!   typed arguments, an availability check against the current model, and
 //!   an [`Effect`](exec::Effect) it produces.
+//! - [`board`] — the issues board's shared semantics (columns, status
+//!   resolution, legal moves, card order, filters) and its background reads.
 //! - [`view`] — plain-data view models for the sidebar, issues board,
 //!   activity feed, machines list, review panel, and error log, built from
 //!   the existing `shelbi-state` readers.
@@ -30,6 +32,7 @@
 //! (`shelbi-tui`, `shelbi-cli`). The `tests/no_ui_deps.rs` integration test
 //! asserts the invariant against the resolved dependency tree.
 
+pub mod board;
 pub mod command;
 pub mod exec;
 pub mod exec_daemon;
@@ -40,10 +43,13 @@ pub mod view;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};
-pub use exec_daemon::{execute_mutation, review_session, workspace_session};
-pub use shelbi_proto::control::{ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
+pub use exec_daemon::{
+    execute_mutation, execute_mutation_expecting, review_session, workspace_session,
+};
+pub use shelbi_proto::control::{ExpectedState, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};
-pub use refresh::{spawn_refresher, RefreshHandle, Snapshot};
+pub use refresh::{spawn_refresher, spawn_worker, RefreshHandle, Refresher, Snapshot};
 pub use view::{
-    ActivityModel, ErrorLogModel, IssuesModel, MachinesModel, ReviewPanelModel, SidebarModel,
+    ActivityModel, BoardFilters, ErrorLogModel, IssueCard, IssueColumn, IssuesModel,
+    MachinesModel, ReviewPanelModel, SidebarModel, TaskDetailModel,
 };
