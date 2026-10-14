@@ -16,8 +16,7 @@ use std::collections::HashMap;
 ///
 /// `Issues`, `Activity`, and `Machines` are native (in-process) views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
-/// orchestrator chat, a workspace agent, a legacy spawned agent, or a
-/// review editor/diff session.
+/// orchestrator chat, a workspace agent, or a review editor/diff session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
     Issues,

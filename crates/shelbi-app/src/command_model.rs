@@ -122,7 +122,6 @@ pub fn command_model_from(
         views,
         workspaces,
         reviews,
-        legacy_agents: Vec::new(),
         other_projects,
         edit_targets,
         other_clients_attached,
@@ -171,20 +170,7 @@ pub fn projects_column_from(
 /// The edit targets that exist on disk for `project`, titled like the
 /// palette's openers. Missing ones are skipped so no entry is dead.
 pub fn edit_targets(project: &str) -> Vec<EditItem> {
-    let mut out = Vec::new();
-    let mut push = |target: EditTarget, title: &str, path: Option<PathBuf>| {
-        if path.map(|p| p.exists()).unwrap_or(false) {
-            out.push(EditItem {
-                target,
-                title: title.to_string(),
-            });
-        }
-    };
-    push(
-        EditTarget::Project,
-        "Edit Project Settings",
-        project_settings_path(project),
-    );
+    let mut targets = vec![(EditTarget::Project, "Edit Project Settings".to_string())];
     // Per-agent openers, from `agents/`, sorted for stability.
     if let Ok(dir) = shelbi_state::agents_dir(project) {
         if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -195,26 +181,39 @@ pub fn edit_targets(project: &str) -> Vec<EditItem> {
                 .collect();
             agents.sort();
             for agent in agents {
-                let path = dir.join(&agent).join("instructions.md");
-                push(
-                    EditTarget::Agent(agent.clone()),
-                    &format!("Edit {agent} Settings"),
-                    Some(path),
-                );
+                let title = format!("Edit {agent} Settings");
+                targets.push((EditTarget::Agent(agent), title));
             }
         }
     }
-    push(
-        EditTarget::ZenMode,
-        "Edit Zen Mode",
-        shelbi_state::zenmode_path(project).ok(),
-    );
-    push(
-        EditTarget::Workflows,
-        "Edit Workflows",
-        shelbi_state::workflows_dir(project).ok(),
-    );
-    out
+    targets.push((EditTarget::ZenMode, "Edit Zen Mode".to_string()));
+    targets.push((EditTarget::Workflows, "Edit Workflows".to_string()));
+    targets
+        .into_iter()
+        .filter(|(target, _)| {
+            edit_target_path(project, target)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+        })
+        .map(|(target, title)| EditItem { target, title })
+        .collect()
+}
+
+/// The file (or, for [`EditTarget::Workflows`], the directory) an `edit:*`
+/// command opens for `project`: the one path both clients hand the user's
+/// editor. `None` when the project's directories can't be resolved.
+pub fn edit_target_path(project: &str, target: &EditTarget) -> Option<PathBuf> {
+    match target {
+        EditTarget::Project => project_settings_path(project),
+        EditTarget::Agent(agent) => Some(
+            shelbi_state::agents_dir(project)
+                .ok()?
+                .join(agent)
+                .join("instructions.md"),
+        ),
+        EditTarget::ZenMode => shelbi_state::zenmode_path(project).ok(),
+        EditTarget::Workflows => shelbi_state::workflows_dir(project).ok(),
+    }
 }
 
 /// The project settings file: an in-repo `project.yaml` over the global

@@ -77,6 +77,10 @@ pub struct ReviewPanel {
     hit_targets: Vec<(Rect, usize)>,
     /// Screen rect of the `More` link, when rendered (task has a body).
     more_hit: Option<Rect>,
+    /// The slot's server, live from the task's sidebar row: its sub-state and
+    /// `machine:port`. `None` until the shell has a row for the task. The
+    /// desktop's Review view shows the same (`render_server`).
+    pub server: Option<(shelbi_app::view::ReviewState, Option<String>)>,
 }
 
 impl ReviewPanel {
@@ -101,6 +105,7 @@ impl ReviewPanel {
             spinner: 0,
             hit_targets: Vec::new(),
             more_hit: None,
+            server: None,
         };
         // Focus the Chat switch initially — it's the default middle-pane view.
         panel.selected = panel
@@ -323,6 +328,23 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         y += 1;
     }
 
+    // 3b. The slot's server: its sub-state and location, live.
+    if let Some((state, location)) = &app.server {
+        if y < bottom {
+            y = advance_blank(y, bottom);
+        }
+        if y < bottom {
+            let line = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            render_server_line(f, *state, location.as_deref(), line);
+            y += 1;
+        }
+    }
+
     // blank
     y = advance_blank(y, bottom);
 
@@ -374,6 +396,37 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
             },
         );
     }
+}
+
+/// The server line: the sub-state's glyph and name (`serving`, `loading`,
+/// `pending-load`) in its color, then the location.
+fn render_server_line(
+    f: &mut Frame,
+    state: shelbi_app::view::ReviewState,
+    location: Option<&str>,
+    area: Rect,
+) {
+    let dec = state.decoration();
+    let mut spans = vec![Span::styled(
+        format!("{} {}", dec.glyph, shelbi_app::review::sub_state_label(state)),
+        Style::default().fg(crate::sidebar::decoration_to_color(dec.color)),
+    )];
+    if let Some(location) = location {
+        spans.push(Span::styled(
+            format!("  {location}"),
+            Style::default().fg(palette().ansi_dark_gray),
+        ));
+    }
+    let x = area.x + PAD;
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x,
+            y: area.y,
+            width: area.width.saturating_sub(PAD),
+            height: 1,
+        },
+    );
 }
 
 /// Build the nav entry (glyph, label, active) for one review switch.
@@ -553,6 +606,22 @@ mod tests {
         rows.iter()
             .position(|r| r.contains(needle))
             .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn the_server_line_follows_the_sidebar_row() {
+        use shelbi_app::view::ReviewState;
+        let mut app = panel(true);
+        let out = render(&mut app, 44, 30);
+        assert!(!out.contains("serving"), "no row yet, no server line: {out}");
+        app.server = Some((ReviewState::Serving, Some("hub:4101".into())));
+        let rows = render_lines(&mut app, 44, 30);
+        let y = row_y(&rows, "serving");
+        assert!(rows[y].contains("hub:4101"), "location beside the state: {}", rows[y]);
+        assert!(y > row_y(&rows, "wt/review"), "under the folder row");
+        assert!(y < row_y(&rows, "Reviewer"), "above the switcher");
+        app.server = Some((ReviewState::Loading, None));
+        assert!(render(&mut app, 44, 30).contains("loading"));
     }
 
     #[test]

@@ -26,8 +26,6 @@ pub enum Effect {
     FocusWorkspace { project: String, workspace: String },
     /// Load a task into a review slot and show it.
     LoadReview { project: String, task_id: String },
-    /// Focus an already-running session (e.g. a legacy spawned agent).
-    FocusSession { session: String },
     /// Open an editable config/instructions target in the user's editor.
     OpenEditor { target: EditTarget },
     /// Open the per-project error log.

@@ -37,6 +37,16 @@ brew trust jlong/shelbi
 brew install shelbi
 ```
 
+### macOS: the desktop app
+
+Shelbi also has a native macOS app (Apple silicon, macOS 15 or later), a
+second client over the same daemon and sessions as the TUI. It needs the CLI
+above; the cask depends on it.
+
+```bash
+brew install --cask shelbi-desktop
+```
+
 ### Ubuntu: APT
 
 ```bash
@@ -77,7 +87,8 @@ The docs at [shelbi.dev](https://shelbi.dev) are the source of truth.
 
 ## Contributing
 
-Shelbi is a Cargo workspace under `crates/` plus a Next.js site under `site/`.
+Shelbi is a Cargo workspace under `crates/`, a separate Cargo workspace for
+the macOS desktop app under `desktop/`, and a Next.js site under `site/`.
 
 ```bash
 cargo build --workspace
@@ -86,7 +97,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cd site && npm ci && npm run lint && npm run build
 ```
 
-See [AGENTS.md](AGENTS.md) for the crate layout and contributor conventions.
+The desktop app builds and tests from its own directory, on its own pinned
+toolchain (`desktop/rust-toolchain.toml`); the root `--workspace` commands
+don't see it:
+
+```bash
+cd desktop
+cargo build
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+See [AGENTS.md](AGENTS.md) for the crate layout and contributor conventions,
+and [desktop/README.md](desktop/README.md) for the desktop app.
 Bugs and feature requests: <https://github.com/jlong/shelbi/issues>.
 
 ## License

@@ -237,6 +237,18 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   `canvas(prepaint, paint)` child with `absolute().size_full()` reports its
   bounds in prepaint; store them in the view and `cx.notify()` only when they
   change. `on_mouse_up_out` catches a release outside the element.
+- **`Window::is_action_available` needs a drawn frame** (`dt-parity-audit`,
+  gpui-pre 0.3.9). It answers from the *last rendered* frame's dispatch tree,
+  and on a window's first frame that tree is empty: `root_node_id`'s
+  `debug_assert!(!self.nodes.is_empty())` panics (debug builds only; release
+  answers from an empty tree). A window that renders its shell on its very
+  first frame (one opened after bootstrap is already done, or a test window)
+  hits it; ask only once the view has drawn (`ShelbiWindow::drawn_once`).
+- **A headless window test with `TestAppContext`** (`src/app_smoke.rs`): build
+  the root view without its live side effects, `window.draw(cx).clear(cx)`
+  once so the dispatch tree exists, focus the view's handle, then
+  `simulate_keystrokes` reaches its `on_key_down` and `dispatch_action` its
+  `on_action` listeners (the menu bar's `MenuInvoke`), with no screen.
 - **`VisualTestAppContext` has no `debug_bounds`** (only the test contexts
   do: the rendered frame is crate-private), so the offscreen harnesses check
   view state rather than drawn selectors.

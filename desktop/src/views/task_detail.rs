@@ -87,10 +87,7 @@ pub fn render(
         let deps = d
             .depends_on
             .iter()
-            .map(|dep| {
-                let status = dep.status.as_deref().unwrap_or("missing");
-                format!("{} [{status}]", dep.id)
-            })
+            .map(dep_text)
             .collect::<Vec<_>>()
             .join(", ");
         let label = if d.blocked { "blocked by" } else { "depends on" };
@@ -348,4 +345,16 @@ fn icon_button(
         .cursor_pointer()
         .child(svg().path(icon).size(px(12.0)).text_color(theme.muted))
         .child(text.to_string())
+}
+
+/// One dependency as the detail lists it: `id [status]`, a `✓` once it's
+/// done (the TUI colors a done dependency green; the desktop is
+/// monochrome, so the mark carries it), `[missing]` for a dependency the
+/// board doesn't have.
+fn dep_text(dep: &shelbi_app::view::DepBadge) -> String {
+    match (&dep.status, dep.done) {
+        (Some(status), true) => format!("{} [{status}] ✓", dep.id),
+        (Some(status), false) => format!("{} [{status}]", dep.id),
+        (None, _) => format!("{} [missing]", dep.id),
+    }
 }

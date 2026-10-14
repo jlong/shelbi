@@ -40,8 +40,6 @@ pub enum CommandKind {
     FocusWorkspace { workspace: String },
     /// Load a task into a review slot and show it.
     LoadReview { task_id: String },
-    /// Focus an already-running (legacy spawned) agent session.
-    FocusSession { session: String },
     /// Toggle Zen Mode for the current project.
     ToggleZen,
     /// Open the per-project error log.
@@ -159,9 +157,6 @@ impl CommandKind {
                 project: p(),
                 task_id: task_id.clone(),
             },
-            CommandKind::FocusSession { session } => Effect::FocusSession {
-                session: session.clone(),
-            },
             CommandKind::ToggleZen => Effect::Mutate(Mutation::ToggleZen { project: p() }),
             CommandKind::OpenErrorLog => Effect::OpenErrorLog { project: p() },
             CommandKind::SwitchProject { project } => Effect::SwitchProject {
@@ -270,14 +265,6 @@ pub struct ReviewItem {
     pub decoration: Option<Decoration>,
 }
 
-/// A legacy spawned-agent row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentItem {
-    pub session: String,
-    pub title: String,
-    pub decoration: Option<Decoration>,
-}
-
 /// Another registered project (switch target).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectItem {
@@ -307,7 +294,6 @@ pub struct CommandModel {
     pub views: Vec<ViewItem>,
     pub workspaces: Vec<WorkspaceItem>,
     pub reviews: Vec<ReviewItem>,
-    pub legacy_agents: Vec<AgentItem>,
     /// Other registered projects (switch targets) — excludes the current
     /// project.
     pub other_projects: Vec<ProjectItem>,
@@ -351,7 +337,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// the review decisions (approve / reject), legacy agents, the error-log action, switch-project targets,
+    /// the review decisions (approve / reject), the error-log action, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -455,22 +441,6 @@ impl CommandRegistry {
                 subtitle: Some("Send it back with a reason".to_string()),
                 shortcut: None,
                 hidden_until_query: true,
-            });
-        }
-
-        // Legacy spawned agents.
-        for a in &model.legacy_agents {
-            out.push(Command {
-                id: format!("agent:{}", a.session),
-                title: a.title.clone(),
-                kind: CommandKind::FocusSession {
-                    session: a.session.clone(),
-                },
-                entry_kind: EntryKind::Agent,
-                decoration: a.decoration.clone(),
-                subtitle: None,
-                shortcut: None,
-                hidden_until_query: false,
             });
         }
 
@@ -651,11 +621,6 @@ impl CommandKind {
                 task_id: task_id.to_string(),
             });
         }
-        if let Some(session) = id.strip_prefix("agent:") {
-            return Some(CommandKind::FocusSession {
-                session: session.to_string(),
-            });
-        }
         if let Some(slug) = id.strip_prefix("action:switch-project:") {
             return Some(CommandKind::SwitchProject {
                 project: slug.to_string(),
@@ -753,11 +718,6 @@ mod tests {
                 subtitle: Some("local:9222".into()),
                 decoration: None,
             }],
-            legacy_agents: vec![AgentItem {
-                session: "scratch".into(),
-                title: "scratch".into(),
-                decoration: None,
-            }],
             other_projects: vec![ProjectItem {
                 slug: "beta".into(),
                 label: "Beta".into(),
@@ -792,7 +752,6 @@ mod tests {
             "review:T-12",
             "action:approve-review:T-12",
             "action:reject-review:T-12",
-            "agent:scratch",
             "action:error-log",
             "action:switch-project",
             "action:switch-project:beta",

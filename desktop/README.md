@@ -6,36 +6,57 @@ render over `shelbi-app` (navigation, the command registry, view models,
 background refresh) and talk to the same daemon and sessions. The plan is
 "Desktop App (gpui)" (`Plans/desktop-app-gpui.md` in the Shelbi ContextStore).
 
-Status: the app shell. On launch the app finds the `shelbi` CLI, starts the
-daemon, and checks versions (`src/platform/`, see
-`docs/status/dt-platform-bootstrap.md`); then each project gets its own window
-with the real sidebar (live workspace and review state), project switching,
-the refresh pipeline and a settings view (`docs/status/dt-shell-sidebar.md`),
-in the theme the `theme:` setting picks (`auto` follows the system
-appearance). The Issues nav row shows the native board and task detail
-(`dt-issues-board`, see `docs/status/dt-issues-board.md`); the Orchestrator
-row the chat (`dt-chat-view`); a workspace row the Workspace view, its agent
-under a task/branch/machine/state header with a user shell beside it on demand,
-local or remote (`dt-workspace-view`, see `docs/status/dt-workspace-view.md`).
-The other views show a "Not implemented yet" stub until their `dt-*` subtask
-lands.
-`scripts/bundle.sh` packages it as a signed, notarized `Shelbi.app`, shipped
-as the `shelbi-desktop` Homebrew cask (`docs/status/dt-packaging.md`).
+Status: feature parity with the TUI. Every command in the shared registry
+runs in both clients (`docs/parity.md` records the walk), every view renders
+natively, and no not-implemented path is left. On launch the app finds the
+`shelbi` CLI, starts the daemon, and checks versions; each project gets its
+own window with the sidebar, the Orchestrator chat, the Issues board and task
+detail, Activity, Machines, the Workspace view (an agent with a user shell
+beside it, local or remote), and the Review view; the command palette and the
+overlays (error log, add project, load for review, reject, Zen intro); native
+menus and system notifications. `scripts/bundle.sh` packages it as a signed,
+notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask. Each
+piece's story is in its status doc (`docs/README.md` lists them).
 
 The app is a client of the `shelbi` CLI and needs it installed
-(`brew install jlong/shelbi/shelbi`). To point it at a particular build, set
-`desktop.cli_path` in `~/.shelbi/config.yaml`:
+(`brew install jlong/shelbi/shelbi`); the cask depends on the formula.
+
+## Settings
+
+The app reads `~/.shelbi/config.yaml` (shared with the CLI and the TUI). The
+settings view (⌘,) edits the `desktop:` block, and terminal settings apply to
+open terminals at once.
 
 ```yaml
+theme: auto                          # auto (follows the system), dark, light; shared with the TUI
+editor: code --wait                  # edit:* commands, "Open in editor", Cmd+click; then $EDITOR, then vim
 desktop:
-  cli_path: ~/src/shelbi/target/debug/shelbi
+  cli_path: ~/src/shelbi/target/debug/shelbi   # skip discovery (login PATH, Homebrew, ~/.cargo/bin)
   terminal_font_family: Geist Mono   # the default; bundled with the app
   terminal_font_size: 13             # points, 6 to 72
   option_as_meta: false              # true, left, or right (Ghostty's shape)
+  notifications:                     # every kind is on unless switched off
+    workspace_blocked: true          # an agent waits for input or a permission
+    review_ready: true               # a task reaches the review column
+    orchestrator_waiting: true       # the orchestrator waits for an answer
 ```
 
-The settings view edits all of these; the terminal settings apply to open
-terminals at once.
+| Key | Default | What it does |
+|---|---|---|
+| `theme` | `auto` | Color theme. `auto` follows the system appearance live (the TUI reads `auto` as dark). |
+| `editor` | `$EDITOR`, then `vim` | The editor for `edit:*` commands, a task's "Open in editor", and Cmd+click on a path. A terminal editor opens in Terminal.app; a GUI editor directly. |
+| `desktop.cli_path` | discovered | The `shelbi` the app runs. A leading `~/` is expanded. |
+| `desktop.terminal_font_family` | Geist Mono | Terminal font. |
+| `desktop.terminal_font_size` | 13 | Terminal font size in points (6 to 72). |
+| `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
+| `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
+| `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. |
+
+Per-project window state (frame, sidebar width, sidebar collapsed) lives in
+`~/.shelbi/projects/<project>/desktop-window.json`. Environment:
+`SHELBI_PROJECT` picks the launch project, `RUST_LOG` the log level (default
+`warn`), `SHELBI_DESKTOP_UPDATE_CHECK=0` turns the update check off, and
+`SHELBI_DESKTOP_UPDATE_URL` points it at a fixture (see Update notice).
 
 ## Build and run
 
@@ -72,8 +93,9 @@ workspaces). Keep it equal to the root `[workspace.package] version`;
   switching gpui channels is one commit.
 - **Exhaustive command dispatch.** `src/commands.rs` matches every
   `shelbi_app::CommandKind` and `View` variant with no wildcard arm, so a new
-  upstream variant fails to compile here until the desktop handles it. Never
-  add a `_ =>` arm.
+  upstream variant fails to compile here until the desktop handles it (the
+  TUI's effect match is wildcard-free too). Never add a `_ =>` arm, and never
+  bring back a not-implemented path: a command lands in both clients at once.
 - **Icons are [Heroicons](https://heroicons.com/)** (MIT, 24px outline,
   v2.2.0), vendored under `assets/icons/heroicons/` and served by
   `src/assets.rs`. Add an icon by copying its SVG from the heroicons repo's
@@ -84,6 +106,26 @@ workspaces). Keep it equal to the root `[workspace.package] version`;
   `shelbi_app::theme` (one named set, dark and light, also used by the TUI)
   as gpui colors. Views read them with `cx.global::<Theme>()`. No color
   literals in views; a missing color is a new token in `shelbi_app::theme`.
+
+## Parity with the TUI
+
+Both clients run the same commands over the same models; the plan's
+"Keeping parity honest" is four checks, all part of `cargo test`:
+
+| Check | Where | Runs in |
+|---|---|---|
+| Exhaustive matches, no wildcard arm | `src/commands.rs` (`dispatch_command`, `sends_to_daemon`, `dispatch_view`), `src/menus/tree.rs` (`place`); the TUI's `dispatch_effect` in `crates/shelbi-tui/src/shell/mod.rs` | the compiler |
+| Headless scenario tests, one per command: the `Effect` and the model change | `crates/shelbi-app/tests/command_scenarios.rs` | root `cargo test` |
+| Smoke test per front end: every registry command through its real UI path | desktop: `src/app_smoke.rs` (palette Enter and the menu item, gpui test context); TUI: `every_registry_command_runs_from_the_palette` in `crates/shelbi-tui/src/shell/mod.rs` (`TestBackend`) | each workspace's `cargo test` |
+| View-model field checklist | `docs/parity.md`, guarded by `crates/shelbi-app/tests/parity_doc.rs` | root `cargo test` |
+
+Adding a command means: a `CommandKind` variant and its effect in
+`shelbi-app`, a scenario in `command_scenarios.rs` (the file won't compile
+without one), and an arm in both clients (neither will either). Adding a
+view-model field means a row in `docs/parity.md` naming where each client
+shows it. Platform differences are allowed where the platform differs (drag
+and drop, native menus, system notifications are desktop-only); the commands
+under them are shared. `docs/parity.md` lists the ones that exist.
 
 ## Architecture map
 
@@ -101,6 +143,8 @@ desktop/
   assets/icons/        vendored Heroicons + their LICENSE
   assets/fonts/        Geist (UI) and Geist Mono (terminal), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
+  docs/README.md       the status index: every subtask's status doc
+  docs/parity.md       the TUI parity record: view-model fields, the command walk
   docs/status/         one <task-id>.md per subtask
   src/main.rs          gpui App, the app-wide globals, the launch window
   src/menus/           the menu bar: tree.rs builds it as data from the CommandModel + keymaps
@@ -108,6 +152,7 @@ desktop/
   src/notify.rs        system notifications: transitions to notices, when to post or suppress (pure)
   src/app.rs           a project window's root view: sidebar | main area, routing
                        through ClientState, one window per project (Shell)
+  src/app_smoke.rs     the smoke test: every registry command via the palette and the menus
   src/keys.rs          gpui keystrokes to shelbi_state::keymap KeyChords (so keys.yaml applies)
   src/refresh.rs       the refresh pipeline: per-window feed (refresher, change
                        subscription, polling fallback) and the control-socket watcher
@@ -141,7 +186,7 @@ Which subtask fills what:
 | `views/` review | `dt-review-view` |
 | native menus, notifications | `dt-menus-notifications` |
 | bundle, signing, cask, update notice (`platform/update.rs`, `views/update.rs`) | `dt-packaging` |
-| smoke tests, docs | `dt-parity-audit` |
+| smoke tests (`app_smoke.rs`), `docs/parity.md`, docs | `dt-parity-audit` |
 
 ## The terminal element
 
@@ -162,6 +207,14 @@ TUI's rules where the TUI has the feature (the shared code is
 | Fonts | `terminal_font_family` / `terminal_font_size`, live. Geist Mono and Symbols Nerd Font Mono are bundled; a glyph the font lacks falls back to Geist Mono, then the Nerd symbols, then Menlo, then the system (CJK, emoji). |
 
 ### Accessibility
+
+Scope for this release: **every part of the app is keyboard-operable** (the
+sidebar, the palette, every overlay, the board's cards and dialogs, the
+Review and Workspace panels, the menus with their key equivalents), and **the
+terminal is readable by VoiceOver**. The native views other than the
+terminal (sidebar rows, board cards, panels) don't publish AccessKit nodes
+of their own yet, so VoiceOver reads the menu bar and the terminal but not
+those; that is the next accessibility step.
 
 The terminal publishes its screen through gpui's AccessKit integration while
 an assistive technology (VoiceOver) is running:
@@ -311,17 +364,22 @@ cargo test --workspace
 cargo +1.88 check --workspace --all-targets --locked   # the CLI's MSRV
 ```
 
+The desktop `cargo test` includes the smoke test (`app::smoke`); the root
+`cargo test --workspace` includes the scenario tests, the TUI smoke test, and
+the `docs/parity.md` guard. A failing parity check is a real gap: fix the
+client (or the table), never the check.
+
 CI: `.github/workflows/desktop-ci.yml` runs the three desktop commands on a
 `macos-14` (arm64) runner. It is manual only (`workflow_dispatch`, input
 `ref`); run it from the Actions tab against your branch.
 
 ## Status docs
 
-Each subtask writes `docs/status/<task-id>.md` (for example
-`docs/status/dt-chat-view.md`) and keeps it current as it lands. Include:
+`docs/README.md` indexes every subtask's status doc. Each subtask writes
+`docs/status/<task-id>.md` and keeps it current as it lands. Include:
 
 - **What landed:** the user-visible behavior, and which `commands.rs` arms
-  now do real work instead of the banner.
+  it made real.
 - **What's left:** known gaps, deferred items, follow-ups.
 - **Decisions:** calls made along the way and why.
 - **Verification:** the commands run and their results, plus anything checked
