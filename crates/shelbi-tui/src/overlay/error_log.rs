@@ -18,13 +18,14 @@ use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use shelbi_state::ErrorLogEntry;
+use crate::theme::palette;
 
 /// Column where an entry's message starts (and where its wrapped continuation
 /// lines align): `● ` marker (2) + `YYYY-MM-DD HH:MM` (16) + 2 spaces.
@@ -162,7 +163,7 @@ pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'st
     if rows.is_empty() {
         return vec![Line::from(Span::styled(
             "No errors logged.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))];
     }
     let msg_width = width.saturating_sub(MESSAGE_INDENT).max(1);
@@ -171,10 +172,10 @@ pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'st
         let marker = if *unread { "● " } else { "  " };
         let marker_style = if *unread {
             Style::default()
-                .fg(Color::Rgb(210, 120, 120))
+                .fg(palette().error_marker)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         };
         let ts = format_ts(entry);
         let msg_lines = wrap(&entry.message, msg_width);
@@ -182,13 +183,13 @@ pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'st
             if i == 0 {
                 out.push(Line::from(vec![
                     Span::styled(marker.to_string(), marker_style),
-                    Span::styled(format!("{ts}  "), Style::default().fg(Color::DarkGray)),
-                    Span::styled(chunk.clone(), Style::default().fg(Color::White)),
+                    Span::styled(format!("{ts}  "), Style::default().fg(palette().ansi_dark_gray)),
+                    Span::styled(chunk.clone(), Style::default().fg(palette().ansi_white)),
                 ]));
             } else {
                 out.push(Line::from(vec![
                     Span::raw(" ".repeat(MESSAGE_INDENT)),
-                    Span::styled(chunk.clone(), Style::default().fg(Color::White)),
+                    Span::styled(chunk.clone(), Style::default().fg(palette().ansi_white)),
                 ]));
             }
         }
@@ -202,7 +203,7 @@ pub fn render(f: &mut Frame, area: Rect, viewer: &mut Viewer) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(palette().ansi_yellow))
         .title(" Error log ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -222,7 +223,7 @@ pub fn render(f: &mut Frame, area: Rect, viewer: &mut Viewer) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "↑/↓ scroll · c clear · esc close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))),
         rows[1],
     );
@@ -255,6 +256,35 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The viewer (border, title, unread and read entries with their
+    /// timestamps and wrapped messages, the footer) and its empty state are
+    /// readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut viewer = Viewer::new(vec![
+                (
+                    entry(
+                        "2026-09-26T14:02:00.000000000Z",
+                        "merge failed: PR #9 is not mergeable: the merge commit cannot be cleanly created",
+                    ),
+                    true,
+                ),
+                (entry("2026-09-25T17:40:00.000000000Z", "dispatch failed: workspace busy"), false),
+            ]);
+            let mut term = Terminal::new(TestBackend::new(70, 16)).unwrap();
+            term.draw(|f| render(f, f.area(), &mut viewer)).unwrap();
+            crate::theme::assert_light_readable("error-log", term.backend().buffer());
+
+            let mut empty = Viewer::new(Vec::new());
+            let mut term = Terminal::new(TestBackend::new(70, 16)).unwrap();
+            term.draw(|f| render(f, f.area(), &mut empty)).unwrap();
+            crate::theme::assert_light_readable("error-log-empty", term.backend().buffer());
+        });
     }
 
     #[test]

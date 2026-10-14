@@ -36,6 +36,7 @@ use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::PaletteAction;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::palette;
 use crate::decoration_to_color;
 use crate::sidebar::{bleed_block_lines, nav_lines};
 use crate::theme;
@@ -102,8 +103,8 @@ pub fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
 pub fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static str, Color) {
     match indicator {
         ProjectIndicator::Active => ("●", theme::project_pulse_color(phase)),
-        ProjectIndicator::LoadedIdle => ("○", theme::PROJECT_STATUS_GREEN),
-        ProjectIndicator::Unloaded => ("○", theme::PROJECT_STATUS_NEUTRAL),
+        ProjectIndicator::LoadedIdle => ("○", palette().green),
+        ProjectIndicator::Unloaded => ("○", palette().ansi_dark_gray),
     }
 }
 
@@ -153,7 +154,7 @@ pub struct PaletteView<'a> {
 }
 
 /// Paint the palette into `area` (the content-sized overlay rect [`palette_rect`]
-/// computes). The rect is the panel: a solid [`theme::PALETTE_BG`] fill wrapped
+/// computes). The rect is the panel: a solid `palette().search` fill wrapped
 /// in a muted single-line border, content inset one column inside the border.
 pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     // A filled panel wrapped in the muted single-line border (the Figma
@@ -161,8 +162,8 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     // reads as one surface — and draws the border in the same pass.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::PALETTE_MUTED))
-        .style(Style::default().bg(theme::PALETTE_BG));
+        .border_style(Style::default().fg(palette().muted))
+        .style(Style::default().bg(palette().search));
     f.render_widget(block, area);
 
     let rows = panel_rows(area);
@@ -182,7 +183,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No matching commands",
-                Style::default().fg(theme::PALETTE_MUTED),
+                Style::default().fg(palette().muted),
             ))),
             commands_area,
         );
@@ -203,7 +204,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
             content,
             commands_focused.then_some(selected),
             commands_area.width as usize,
-            theme::SELECTION_BG,
+            palette().selection,
         );
         // Scroll the band to keep the selected pill visible when the list is
         // taller than the band (the half-block pitch doubles the row count).
@@ -220,7 +221,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             view.footer.to_string(),
-            Style::default().fg(theme::PALETTE_MUTED),
+            Style::default().fg(palette().muted),
         ))),
         rows[4],
     );
@@ -311,8 +312,8 @@ pub fn palette_rect(area: Rect, result_count: usize, project_count: Option<usize
 /// The search line: a `❯` prompt, then a green block cursor and the dim
 /// placeholder (empty query) or the typed query followed by the block cursor.
 fn search_line(query: &str) -> Line<'static> {
-    let prompt = Span::styled("❯ ", Style::default().fg(theme::PALETTE_FG));
-    let cursor = Style::default().bg(theme::PALETTE_GREEN).fg(Color::White);
+    let prompt = Span::styled("❯ ", Style::default().fg(palette().foreground));
+    let cursor = Style::default().bg(palette().green).fg(palette().on_color);
     if query.is_empty() {
         const PLACEHOLDER: &str = "Type a command or search";
         let mut chars = PLACEHOLDER.chars();
@@ -321,12 +322,12 @@ fn search_line(query: &str) -> Line<'static> {
         Line::from(vec![
             prompt,
             Span::styled(first, cursor),
-            Span::styled(rest, Style::default().fg(theme::PALETTE_MUTED)),
+            Span::styled(rest, Style::default().fg(palette().muted)),
         ])
     } else {
         Line::from(vec![
             prompt,
-            Span::styled(query.to_string(), Style::default().fg(theme::PALETTE_FG)),
+            Span::styled(query.to_string(), Style::default().fg(palette().foreground)),
             Span::styled(" ", cursor),
         ])
     }
@@ -364,9 +365,9 @@ fn icon_for(e: &Entry) -> (String, Color) {
         None => {
             let glyph = e.kind.icon();
             let color = if glyph == EntryKind::Action.icon() {
-                Color::Yellow
+                palette().ansi_yellow
             } else {
-                Color::DarkGray
+                palette().ansi_dark_gray
             };
             (glyph.to_string(), color)
         }
@@ -378,7 +379,7 @@ fn icon_for(e: &Entry) -> (String, Color) {
 /// aligned to a fixed x and truncated with `…` when it won't fit, and a
 /// right-aligned dim shortcut hint. Each row is padded to `row_width` so the
 /// selection fill spans the whole commands column; on the selected row the
-/// solid [`theme::SELECTION_BG`] fill is baked into every span (the shared
+/// solid `palette().selection` fill is baked into every span (the shared
 /// [`bleed_block_lines`] then bleeds that fill into the half-rows above and
 /// below). `selected` is the highlighted index when the commands column holds
 /// focus.
@@ -403,10 +404,10 @@ fn build_result_lines(
             let label_pad = LABEL_W.saturating_sub(UnicodeWidthStr::width(label.as_str()));
             let label_style = if is_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(palette().ansi_white)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::PALETTE_FG)
+                Style::default().fg(palette().foreground)
             };
 
             let mut spans = vec![
@@ -437,11 +438,11 @@ fn build_result_lines(
             }
             spans.push(Span::styled(
                 desc,
-                Style::default().fg(theme::PALETTE_MUTED),
+                Style::default().fg(palette().muted),
             ));
             if short_w > 0 {
                 spans.push(Span::raw(" ".repeat(filler + 1)));
-                spans.push(Span::styled(short, Style::default().fg(theme::PALETTE_MUTED)));
+                spans.push(Span::styled(short, Style::default().fg(palette().muted)));
             } else if filler > 0 {
                 spans.push(Span::raw(" ".repeat(filler)));
             }
@@ -451,7 +452,7 @@ fn build_result_lines(
             // label keeps its white/bold foreground; the description stays dim.
             if is_selected {
                 for s in &mut spans {
-                    s.style = s.style.bg(theme::SELECTION_BG);
+                    s.style = s.style.bg(palette().selection);
                 }
             }
 
@@ -473,7 +474,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "Projects",
-            Style::default().fg(theme::PALETTE_MUTED),
+            Style::default().fg(palette().muted),
         ))),
         rows[0],
     );
@@ -489,7 +490,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
         .collect();
     items.push(project_row_line(
         "+",
-        theme::PROJECT_STATUS_NEUTRAL,
+        palette().ansi_dark_gray,
         "Add project",
         width,
     ));
@@ -497,7 +498,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     // Selection patches background + weight only (never a foreground color) so a
     // loaded project's green ring keeps its status color under the bar.
     let highlight = Style::default()
-        .bg(theme::SELECTION_BG)
+        .bg(palette().selection)
         .add_modifier(Modifier::BOLD);
     let list = List::new(items).highlight_style(highlight);
     let mut s = ListState::default();
@@ -518,7 +519,7 @@ fn project_row_line(glyph: &str, glyph_color: Color, label: &str, width: usize) 
     let pad = width.saturating_sub(text_w);
     ListItem::new(Line::from(vec![
         Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
-        Span::styled(format!(" {label}"), Style::default().fg(theme::PALETTE_FG)),
+        Span::styled(format!(" {label}"), Style::default().fg(palette().foreground)),
         Span::raw(" ".repeat(pad)),
     ]))
 }
@@ -970,13 +971,13 @@ mod tests {
         assert_eq!(active_glyph, "●");
         let (idle_glyph, idle_color) = project_status_style(ProjectIndicator::LoadedIdle, 0.0);
         assert_eq!(idle_glyph, "○");
-        assert_eq!(idle_color, theme::PROJECT_STATUS_GREEN);
+        assert_eq!(idle_color, palette().green);
         // The unloaded project is a gray ring (design `#666`), distinguished
         // from the loaded ring by color, not glyph.
         let (unloaded_glyph, unloaded_color) =
             project_status_style(ProjectIndicator::Unloaded, 0.0);
         assert_eq!(unloaded_glyph, "○");
-        assert_eq!(unloaded_color, theme::PROJECT_STATUS_NEUTRAL);
+        assert_eq!(unloaded_color, palette().ansi_dark_gray);
     }
 
     #[test]
@@ -1005,6 +1006,75 @@ mod tests {
         let hits = p.results();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.id, "action:toggle-zen");
+    }
+
+    /// The palette (panel fill, border, prompt + placeholder or typed query
+    /// with the green cursor, command rows with every decoration color,
+    /// descriptions and shortcuts, the selected row, the Projects column in
+    /// each indicator state, the Add row, the footer) is readable on a light
+    /// terminal, with the commands and then the projects column focused.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let decorated = |id: &str, label: &str, glyph: &str, color: DecorationColor| Entry {
+            decoration: Some(Decoration {
+                glyph: glyph.into(),
+                color,
+            }),
+            ..entry_full(id, label, "Jump to it", Some("⌃G"))
+        };
+        let results: Vec<(Entry, u16)> = vec![
+            (entry_full("view:orch", "Chat", "Talk with the Orchestrator", Some("⌃O")), 0),
+            (entry_full("view:tasks", "Issues", "Queue up and manage work", None), 0),
+            (decorated("workspace:alpha", "alpha", "⏵", DecorationColor::Green), 0),
+            (decorated("workspace:bravo", "bravo", "?", DecorationColor::Yellow), 0),
+            (decorated("workspace:charlie", "charlie", "⚠", DecorationColor::Red), 0),
+            (decorated("review:a", "Palette fix", "✓", DecorationColor::Cyan), 0),
+            (decorated("review:b", "Nav fix", "▶", DecorationColor::Muted), 0),
+            (decorated("review:c", "Copy", "·", DecorationColor::DarkGray), 0),
+            (decorated("x:gray", "Gray", "•", DecorationColor::Gray), 0),
+            (decorated("x:blue", "Blue", "•", DecorationColor::Blue), 0),
+        ];
+        let projects = |selected: Option<usize>| ProjectsColumn {
+            rows: vec![
+                ProjectRow {
+                    label: "Website".into(),
+                    indicator: ProjectIndicator::Active,
+                },
+                ProjectRow {
+                    label: "Shelbi".into(),
+                    indicator: ProjectIndicator::LoadedIdle,
+                },
+                ProjectRow {
+                    label: "Archive".into(),
+                    indicator: ProjectIndicator::Unloaded,
+                },
+            ],
+            selected,
+            // Near the pulse's peak: its trough is meant to fade into the panel.
+            phase: 0.5,
+        };
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, query, selected, projects_selected) in [
+                ("palette-commands", "", 1, None),
+                ("palette-query", "ch", 2, None),
+                ("palette-projects", "", 0, Some(1)),
+                ("palette-add-project", "", 0, Some(3)),
+            ] {
+                let view = PaletteView {
+                    query,
+                    results: &results,
+                    selected,
+                    commands_focused: projects_selected.is_none(),
+                    projects: Some(projects(projects_selected)),
+                    footer: "↑↓ select · → projects · Ctrl+P close",
+                };
+                let mut term = Terminal::new(TestBackend::new(100, 18)).unwrap();
+                term.draw(|f| render(f, f.area(), &view)).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]
@@ -1050,7 +1120,7 @@ mod tests {
         assert!(text.contains('│') && text.contains('─'), "border edges: {text}");
         assert_eq!(
             buf[(0, 0)].fg,
-            theme::PALETTE_MUTED,
+            palette().muted,
             "the border renders in the muted color"
         );
         assert_eq!(buf[(0, 0)].symbol(), "┌", "top-left corner glyph");
@@ -1275,7 +1345,7 @@ mod tests {
                 if cell.symbol() == "○" {
                     assert_eq!(
                         cell.fg,
-                        theme::PROJECT_STATUS_GREEN,
+                        palette().green,
                         "the selected loaded-idle ring must stay green"
                     );
                     found = true;
@@ -1482,7 +1552,7 @@ mod tests {
 
         // Solid fill: the selected content row carries the selection background.
         assert!(
-            (0..buf.area.width).any(|x| buf[(x, chat_y)].bg == theme::SELECTION_BG),
+            (0..buf.area.width).any(|x| buf[(x, chat_y)].bg == palette().selection),
             "the selected row has the solid fill"
         );
         // Lower-half-block (`▄`) bleed row directly above the selection, drawn
@@ -1490,7 +1560,7 @@ mod tests {
         let above = chat_y - 1;
         assert!(
             (0..buf.area.width).any(|x| {
-                buf[(x, above)].symbol() == "▄" && buf[(x, above)].fg == theme::SELECTION_BG
+                buf[(x, above)].symbol() == "▄" && buf[(x, above)].fg == palette().selection
             }),
             "a ▄ bleed row sits above the selection: {}",
             dump(&buf)
@@ -1499,7 +1569,7 @@ mod tests {
         let below = chat_y + 1;
         assert!(
             (0..buf.area.width).any(|x| {
-                buf[(x, below)].symbol() == "▀" && buf[(x, below)].fg == theme::SELECTION_BG
+                buf[(x, below)].symbol() == "▀" && buf[(x, below)].fg == palette().selection
             }),
             "a ▀ bleed row sits below the selection: {}",
             dump(&buf)
@@ -1510,7 +1580,7 @@ mod tests {
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
                 let c = &buf[(x, y)];
-                if (c.symbol() == "▄" || c.symbol() == "▀") && c.fg == theme::SELECTION_BG {
+                if (c.symbol() == "▄" || c.symbol() == "▀") && c.fg == palette().selection {
                     assert!(
                         x < website_x,
                         "bleed stays in the commands column (x={x}, website_x={website_x})"
@@ -1522,7 +1592,7 @@ mod tests {
         for x in website_x..buf.area.width {
             assert_ne!(
                 buf[(x, web_y)].bg,
-                theme::SELECTION_BG,
+                palette().selection,
                 "a Projects row must carry no command selection fill"
             );
         }
@@ -1553,7 +1623,7 @@ mod tests {
         // clean-separator check is the row *above* Chat, which belongs to no
         // selection now.)
         assert!(
-            (0..buf.area.width).all(|x| buf[(x, chat_y)].bg != theme::SELECTION_BG),
+            (0..buf.area.width).all(|x| buf[(x, chat_y)].bg != palette().selection),
             "the deselected row has no leftover fill: {}",
             dump(&buf)
         );
@@ -1565,7 +1635,7 @@ mod tests {
         );
         // The newly selected Issues row carries the fill and its bleed rows.
         assert!(
-            (0..buf.area.width).any(|x| buf[(x, issues_y)].bg == theme::SELECTION_BG),
+            (0..buf.area.width).any(|x| buf[(x, issues_y)].bg == palette().selection),
             "the new selection is filled: {}",
             dump(&buf)
         );

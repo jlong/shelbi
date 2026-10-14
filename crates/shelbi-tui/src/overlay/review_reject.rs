@@ -18,11 +18,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use crate::theme::palette;
 
 /// What currently holds focus. The text area is the default focus so the
 /// reviewer can start typing immediately; `Tab` cycles through the two buttons
@@ -397,7 +398,7 @@ fn render(f: &mut Frame, area: Rect, prompt: &RejectPrompt) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(palette().ansi_red))
         .title(" Reject task ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -408,7 +409,7 @@ fn render(f: &mut Frame, area: Rect, prompt: &RejectPrompt) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "Reason for rejecting:",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(palette().ansi_gray),
         ))),
         rows[0],
     );
@@ -434,7 +435,7 @@ fn render(f: &mut Frame, area: Rect, prompt: &RejectPrompt) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "Ctrl-D reject · Enter newline · Esc cancel · Tab focus",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))),
         rows[4],
     );
@@ -445,7 +446,7 @@ fn render(f: &mut Frame, area: Rect, prompt: &RejectPrompt) {
 /// scrolls past the visible height the content scrolls to keep it in view.
 fn render_textarea(f: &mut Frame, prompt: &RejectPrompt, area: Rect) {
     let focused = prompt.focus == Focus::Text;
-    let border = if focused { Color::Cyan } else { Color::DarkGray };
+    let border = if focused { palette().ansi_cyan } else { palette().ansi_dark_gray };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border));
@@ -468,7 +469,7 @@ fn render_textarea(f: &mut Frame, prompt: &RejectPrompt, area: Rect) {
 fn textarea_lines(prompt: &RejectPrompt, focused: bool) -> Vec<Line<'static>> {
     let ta = &prompt.text;
     let cursor = Style::default().add_modifier(Modifier::REVERSED);
-    let plain = Style::default().fg(Color::White);
+    let plain = Style::default().fg(palette().ansi_white);
     ta.lines
         .iter()
         .enumerate()
@@ -496,10 +497,10 @@ fn textarea_lines(prompt: &RejectPrompt, focused: bool) -> Vec<Line<'static>> {
 fn button(label: &str, focused: bool) -> Span<'_> {
     let style = if focused {
         Style::default()
-            .fg(Color::Red)
+            .fg(palette().ansi_red)
             .add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Red)
+        Style::default().fg(palette().ansi_red)
     };
     Span::styled(label.to_string(), style)
 }
@@ -533,6 +534,31 @@ mod tests {
             }
         }
         prompt
+    }
+
+    /// The prompt (border, title, the textarea focused and unfocused with its
+    /// cursor, Reject and Cancel each focused) is readable on a light
+    /// terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, focus) in [
+                ("review-reject-text", Focus::Text),
+                ("review-reject-reject", Focus::Reject),
+                ("review-reject-cancel", Focus::Cancel),
+            ] {
+                let mut prompt = text_prompt("Tests fail on CI.\nPlease rebase.");
+                prompt.focus = focus;
+                let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+                term.draw(|f| render(f, f.area(), &prompt)).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+            let empty = RejectPrompt::default();
+            let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+            term.draw(|f| render(f, f.area(), &empty)).unwrap();
+            crate::theme::assert_light_readable("review-reject-empty", term.backend().buffer());
+        });
     }
 
     fn render_to_string(prompt: &RejectPrompt, w: u16, h: u16) -> String {

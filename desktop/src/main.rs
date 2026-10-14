@@ -20,7 +20,6 @@ use gpui::{
 };
 
 use crate::app::ShelbiWindow;
-use crate::theme::Theme;
 
 /// The app name: the window title and the menu bar's app menu.
 const APP_NAME: &str = "Shelbi";
@@ -36,10 +35,11 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
             // gpui-kit's component layer (theme, inputs, lists, dialogs) for the
-            // subtasks that adopt its widgets; our own tokens live in `Theme`.
+            // subtasks that adopt its widgets; our own tokens live in `Theme`,
+            // resolved from `config.yaml::theme` (gpui-kit's light/dark mode
+            // follows it).
             gpui_kit::init(cx);
-            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            cx.set_global(Theme::dark());
+            theme::init(cx);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -63,7 +63,7 @@ fn main() {
                     app_id: Some("co.32pixels.shelbi".into()),
                     ..Default::default()
                 },
-                |_, cx| cx.new(ShelbiWindow::new),
+                |window, cx| cx.new(|cx| ShelbiWindow::new(window, cx)),
             )
             .expect("failed to open the Shelbi window");
             cx.activate(true);

@@ -160,8 +160,8 @@ pub use ssh_control::{
 };
 pub use user_config::{
     editor_display_name, load_user_config, resolve_editor, save_user_config,
-    scaffold_user_config_if_missing, user_config_path, DesktopConfig, Keymap, UserConfig,
-    ZenToggleChord,
+    scaffold_user_config_if_missing, user_config_path, DesktopConfig, Keymap, ThemePreference,
+    UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };
 pub use workflows::{

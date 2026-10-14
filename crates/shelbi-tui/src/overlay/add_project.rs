@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
@@ -35,6 +35,7 @@ use ratatui::{
 
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{absolutize, validate_root, RootValidation};
+use crate::theme::palette;
 
 /// The three focusable controls, in Tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,14 +248,14 @@ impl Detected {
 
     fn line(&self) -> Span<'static> {
         if !self.exists {
-            return Span::styled("Detected: path not found", Style::default().fg(Color::Yellow));
+            return Span::styled("Detected: path not found", Style::default().fg(palette().ansi_yellow));
         }
         if self.is_git {
-            return Span::styled("Detected: git repo ✓", Style::default().fg(Color::Green));
+            return Span::styled("Detected: git repo ✓", Style::default().fg(palette().ansi_green));
         }
         Span::styled(
             "Detected: not a git repo (shelbi expects git, but will continue)",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette().ansi_yellow),
         )
     }
 }
@@ -272,10 +273,10 @@ fn render(f: &mut Frame, area: Rect, form: &Form) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(Span::styled(
             " Add a project ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -294,14 +295,14 @@ fn render(f: &mut Frame, area: Rect, form: &Form) {
     lines.push(match &form.error {
         Some(msg) => Line::from(Span::styled(
             format!("✗ {msg}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().ansi_red).add_modifier(Modifier::BOLD),
         )),
         None => Line::raw(""),
     });
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![Span::styled(
         "[ Enter ] Create    [ Esc ] Cancel    [ Tab ] Next field",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     )]));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -310,7 +311,7 @@ fn render(f: &mut Frame, area: Rect, form: &Form) {
 /// The live "where this lands" preview: the derived slug and the path its
 /// config will be written to.
 fn preview_line(name: &str, mode: ConfigMode) -> Line<'static> {
-    let label_style = Style::default().fg(Color::Gray);
+    let label_style = Style::default().fg(palette().ansi_gray);
     match derived_slug(name) {
         Some(slug) => {
             let path = match mode {
@@ -321,14 +322,14 @@ fn preview_line(name: &str, mode: ConfigMode) -> Line<'static> {
                 Span::styled("Folder / id: ", label_style),
                 Span::styled(
                     slug,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("   ({path})"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("   ({path})"), Style::default().fg(palette().ansi_dark_gray)),
             ])
         }
         None => Line::from(Span::styled(
             "Folder / id: (type a name to see the derived id)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         )),
     }
 }
@@ -338,17 +339,17 @@ fn preview_line(name: &str, mode: ConfigMode) -> Line<'static> {
 fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
     let label_style = if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().ansi_gray)
     };
     let mut spans = vec![
         Span::styled(format!("{label:<11}"), label_style),
         Span::raw(value.to_string()),
     ];
     if focused {
-        spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled("▏", Style::default().fg(palette().ansi_cyan)));
     }
     Line::from(spans)
 }
@@ -357,10 +358,10 @@ fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
 fn config_line(mode: ConfigMode, focused: bool) -> Line<'static> {
     let label_style = if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().ansi_gray)
     };
     let in_repo = if mode == ConfigMode::InRepo {
         "(•) In repo"
@@ -374,9 +375,9 @@ fn config_line(mode: ConfigMode, focused: bool) -> Line<'static> {
     };
     let opt_style = |selected: bool| {
         if selected {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette().ansi_white)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         }
     };
     Line::from(vec![
@@ -489,6 +490,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The form (title, labels, the focused field and cursor, the radio,
+    /// the detection line, an inline error, the key hints) is readable on a
+    /// light terminal with each control focused.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, focus) in [
+                ("add-project-name", Field::Name),
+                ("add-project-root", Field::Root),
+                ("add-project-config", Field::Config),
+            ] {
+                let mut f = form();
+                for c in "acme".chars() {
+                    f.handle_key(key(KeyCode::Char(c)));
+                }
+                f.set_error("a project already lives at `acme`".to_string());
+                f.focus = focus;
+                let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                term.draw(|frame| f.render(frame, frame.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]

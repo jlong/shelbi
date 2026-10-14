@@ -2,9 +2,10 @@
 //! `~/.shelbi/shelbi.yaml` (the hub config's project index) so a future
 //! `shelbi config reset` can wipe UI tweaks without nuking onboarding.
 //!
-//! Currently holds the Zen Mode toggle chord chosen by the first-run probe.
-//! Missing file → defaults (`zen_toggle = AltZ`); a missing `keymap:` block
-//! likewise falls back so older partial files keep loading.
+//! Holds the Zen Mode toggle chord chosen by the first-run probe, the review
+//! editor, and the color theme. Missing file → defaults (`zen_toggle = AltZ`,
+//! `theme = auto`); a missing `keymap:` block likewise falls back so older
+//! partial files keep loading.
 
 use std::fs;
 use std::path::PathBuf;
@@ -40,6 +41,32 @@ pub struct UserConfig {
     /// Desktop app settings (`desktop:` block). Ignored by the CLI and TUI.
     #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
     pub desktop: DesktopConfig,
+
+    /// Color theme for the TUI and the desktop app (`theme: auto | dark |
+    /// light`). A missing key is [`ThemePreference::Auto`], and `auto` is
+    /// omitted on save (lean on-disk form, like `editor`). The token values
+    /// live in `shelbi_app::theme`.
+    #[serde(default, skip_serializing_if = "ThemePreference::is_auto")]
+    pub theme: ThemePreference,
+}
+
+/// The `theme:` setting. `Auto` follows the system appearance where a client
+/// can read it (the desktop app) and is dark where it can't (the TUI:
+/// terminals don't report their appearance).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemePreference {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemePreference {
+    /// True for [`ThemePreference::Auto`], the default.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ThemePreference::Auto)
+    }
 }
 
 /// The desktop app's settings in `config.yaml`.
@@ -369,6 +396,51 @@ mod tests {
         // Flags are dropped; only the program name drives the label.
         assert_eq!(editor_display_name("code --wait"), "Code");
         assert_eq!(editor_display_name(""), "");
+    }
+
+    #[test]
+    fn theme_round_trips_and_defaults_to_auto() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A missing key (and a missing file) is `auto`.
+        assert_eq!(load_user_config().unwrap().theme, ThemePreference::Auto);
+        std::fs::write(home.join("config.yaml"), "editor: hx\n").unwrap();
+        assert_eq!(load_user_config().unwrap().theme, ThemePreference::Auto);
+
+        // Each value reads back from its lowercase spelling.
+        for (text, want) in [
+            ("auto", ThemePreference::Auto),
+            ("dark", ThemePreference::Dark),
+            ("light", ThemePreference::Light),
+        ] {
+            std::fs::write(home.join("config.yaml"), format!("theme: {text}\n")).unwrap();
+            assert_eq!(load_user_config().unwrap().theme, want, "theme: {text}");
+        }
+
+        // dark / light survive a save; auto is omitted (it is the default).
+        for pref in [ThemePreference::Dark, ThemePreference::Light] {
+            let cfg = UserConfig {
+                theme: pref,
+                ..UserConfig::default()
+            };
+            save_user_config(&cfg).unwrap();
+            assert_eq!(load_user_config().unwrap(), cfg);
+        }
+        let yaml = serde_yaml::to_string(&UserConfig {
+            theme: ThemePreference::Light,
+            ..UserConfig::default()
+        })
+        .unwrap();
+        assert!(yaml.contains("theme: light"), "got: {yaml}");
+        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        assert!(!yaml.contains("theme"), "auto omitted: {yaml}");
+
+        // An unknown value is a parse error, not a silent fallback, so
+        // `shelbi config lint` reports it.
+        assert!(serde_yaml::from_str::<UserConfig>("theme: purple\n").is_err());
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

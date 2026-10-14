@@ -1,7 +1,7 @@
 //! The shared Shelbi application model.
 //!
 //! This crate is the toolkit-independent core that both the single-process
-//! TUI and the later desktop app render. It owns four things:
+//! TUI and the later desktop app render. It owns five things:
 //!
 //! - [`nav`] — the model of what a client is looking at: the current
 //!   project, the sidebar selection, the current main view, focus, and
@@ -14,6 +14,8 @@
 //! - [`view`] — plain-data view models for the sidebar, issues board,
 //!   activity feed, machines list, review panel, and error log, built from
 //!   the existing `shelbi-state` readers.
+//! - [`theme`] — the named color tokens (dark and light) both clients
+//!   paint with, and the `theme:` preference resolution.
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
 //!   state off the caller's thread and publishes immutable snapshots over a
 //!   channel. Threads and channels only, so a gpui client can consume it
@@ -33,6 +35,7 @@ pub mod exec;
 pub mod exec_daemon;
 pub mod nav;
 pub mod refresh;
+pub mod theme;
 pub mod view;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};

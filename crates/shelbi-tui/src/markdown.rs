@@ -16,19 +16,16 @@
 //! `.wrap()`), so a code span never crosses the boundary and its background
 //! only ever covers characters inside `width`.
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-/// Background tint for inline `code` spans. `Indexed(236)` is a dark gray
-/// that sits just above the default terminal background — the same tint the
-/// activity feed uses for machine-driven rows.
-const CODE_BG: Color = Color::Indexed(236);
-/// Foreground for inline code — a light gray that stays legible on the
-/// tint without reading as a hard white box.
-const CODE_FG: Color = Color::Indexed(252);
+use crate::theme::palette;
 
+/// Inline `code` spans: the theme's `code_fg` on `code_bg`, a tint just off
+/// the default background (in dark, xterm 236 under 252: a light gray that
+/// stays legible on the tint without reading as a hard white box).
 fn code_style() -> Style {
-    Style::default().fg(CODE_FG).bg(CODE_BG)
+    Style::default().fg(palette().code_fg).bg(palette().code_bg)
 }
 
 /// Render a markdown note `body` into pre-wrapped lines for a pane of the
@@ -303,7 +300,7 @@ mod tests {
 
     /// True if any span in the line carries the inline-code background.
     fn has_code_bg(line: &Line<'_>) -> bool {
-        line.spans.iter().any(|s| s.style.bg == Some(CODE_BG))
+        line.spans.iter().any(|s| s.style.bg == Some(palette().code_bg))
     }
 
     #[test]
@@ -323,7 +320,7 @@ mod tests {
         let coded: String = lines[0]
             .spans
             .iter()
-            .filter(|s| s.style.bg == Some(CODE_BG))
+            .filter(|s| s.style.bg == Some(palette().code_bg))
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(coded, "cargo test");
@@ -409,5 +406,17 @@ mod tests {
         let lines = render_note("some `code` text", 0);
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "some code text");
+    }
+
+    #[test]
+    fn code_spans_render_readable_in_light() {
+        use ratatui::widgets::{Paragraph, Widget};
+        crate::theme::with_appearance(shelbi_app::theme::Appearance::Light, || {
+            let lines = render_note("run `cargo test` and **then** `cargo clippy`", 40);
+            let area = ratatui::layout::Rect::new(0, 0, 40, lines.len() as u16);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            Paragraph::new(lines).render(area, &mut buf);
+            crate::theme::assert_light_readable("markdown", &buf);
+        });
     }
 }

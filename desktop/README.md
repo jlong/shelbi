@@ -9,7 +9,8 @@ background refresh) and talk to the same daemon and sessions. The plan is
 Status: foundation. On launch the app finds the `shelbi` CLI, starts the
 daemon, and checks versions (`src/platform/`, see
 `docs/status/dt-platform-bootstrap.md`); then the window shows the
-sidebar/main split in the dark tokens, where every command and view shows a
+sidebar/main split in the theme the `theme:` setting picks (`auto` follows
+the system appearance), where every command and view shows a
 "Not implemented yet" banner until its `dt-*` subtask lands.
 
 The app is a client of the `shelbi` CLI and needs it installed
@@ -63,8 +64,10 @@ workspaces). Keep it equal to the root `[workspace.package] version`;
   `optimized/24/outline/` at that tag, then adding a constant and a table row
   in `src/assets.rs`. Don't use gpui-kit's bundled icon catalog in Shelbi's
   own UI.
-- **Colors come from `src/theme.rs`**, whose token names match
-  `crates/shelbi-tui/src/theme.rs`. No color literals in views.
+- **Colors come from `src/theme.rs`**, the shared tokens of
+  `shelbi_app::theme` (one named set, dark and light, also used by the TUI)
+  as gpui colors. Views read them with `cx.global::<Theme>()`. No color
+  literals in views; a missing color is a new token in `shelbi_app::theme`.
 
 ## Architecture map
 
@@ -81,7 +84,7 @@ desktop/
   src/main.rs          gpui App, the "Shelbi" window and menu
   src/app.rs           root view: sidebar | main area split (placeholders)
   src/commands.rs      exhaustive dispatch over CommandKind and View
-  src/theme.rs         the TUI's token names, dark values, as gpui colors
+  src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
   src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette

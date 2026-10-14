@@ -41,9 +41,10 @@ switch. A switch records the reason in this file.
 
 ### How the app uses gpui-kit today
 
-- `gpui_kit::init(cx)` installs the component layer (its theme, set to dark,
-  plus inputs, lists, dialogs, notifications), ready for the subtasks that
-  adopt its widgets.
+- `gpui_kit::init(cx)` installs the component layer (its theme plus inputs,
+  lists, dialogs, notifications), ready for the subtasks that adopt its
+  widgets. `src/theme.rs` keeps gpui-kit's light/dark mode in step with
+  Shelbi's resolved theme (`gpui_kit::component::Theme::change`).
 - `src/assets.rs` falls back to gpui-kit's assets so its components' internal
   glyphs resolve. Shelbi's own icons are Heroicons, not gpui-kit's Lucide set.
 - No view uses a gpui-kit widget yet, and the window is not wrapped in
@@ -79,6 +80,12 @@ switch. A switch records the reason in this file.
   only from the bundle.
 - **`NSProcessInfo.setProcessName` does not rename the menu bar app** for an
   unbundled binary; the embedded plist is the fix that works.
+- **Window appearance.** `Window::appearance()` and
+  `Context::observe_window_appearance` report and follow the system's
+  light/dark switch live (checked 2026-10-14 by flipping macOS dark mode under
+  `cargo run`). `App::set_window_appearance(Some(..))` pins the window chrome
+  for the `theme: dark` / `light` overrides; while pinned, the window stops
+  tracking the system, so `auto` passes `None`.
 - `cargo` reports a future-incompatibility warning for `block 0.1.6`, pulled
   in by gpui's macOS platform crates. Upstream's to fix; harmless today.
 

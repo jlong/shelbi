@@ -396,7 +396,7 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::*;
     use crate::shell::session::{ConnectFailure, Connected};
-    use crate::theme::STATUS_YELLOW;
+    use crate::theme::palette;
     use crossterm::event::KeyModifiers;
 
     /// A connector that never resolves — the content view stays Connecting, so
@@ -435,7 +435,7 @@ mod tests {
     fn status() -> WsStatus {
         WsStatus {
             text: "IN PROGRESS".into(),
-            color: STATUS_YELLOW,
+            color: palette().yellow,
         }
     }
 

@@ -11,7 +11,10 @@
 //! the sidebar with the real one (projects, nav, workspaces, Zen) and the
 //! per-view subtasks fill the main area.
 
-use gpui::{div, prelude::*, px, svg, AnyElement, Context, FontWeight, SharedString, Task, Window};
+use gpui::{
+    div, prelude::*, px, svg, AnyElement, Context, FontWeight, SharedString, Subscription, Task,
+    Window,
+};
 use shelbi_app::{CommandKind, View};
 
 use crate::assets::icons;
@@ -21,7 +24,7 @@ use crate::platform::{
     relaunch, Bootstrap, BootstrapEvent, BootstrapState, Failure, Ready, RelaunchNotice,
     SystemPlatform,
 };
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 
 /// Sidebar width in the foundation. `dt-shell-sidebar` makes it resizable.
@@ -65,17 +68,20 @@ pub struct ShelbiWindow {
     selected: Option<View>,
     /// The "Not implemented yet" banner, when a stub command ran.
     banner: Option<SharedString>,
+    /// Re-resolves the theme when the system appearance changes.
+    _appearance: Subscription,
 }
 
 impl ShelbiWindow {
     /// The window, with bootstrap started.
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             boot: Boot::InFlight(BootstrapState::ResolvingEnv),
             relaunch: None,
             _bootstrap: None,
             selected: None,
             banner: None,
+            _appearance: theme::follow_system(window, cx),
         };
         this.start_bootstrap(cx);
         this
@@ -170,9 +176,9 @@ impl ShelbiWindow {
             .map(|(ix, (label, icon, view))| {
                 let selected = self.selected.as_ref() == Some(&view);
                 let color = if selected {
-                    theme.text_selected
+                    theme.white
                 } else {
-                    theme.text
+                    theme.gray
                 };
                 div()
                     .id(("nav", ix))
@@ -185,11 +191,11 @@ impl ShelbiWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .when(selected, |row| {
-                        row.bg(theme.selection_bg)
-                            .text_color(theme.text_selected)
+                        row.bg(theme.selection)
+                            .text_color(theme.white)
                             .font_weight(FontWeight::BOLD)
                     })
-                    .when(!selected, |row| row.text_color(theme.text))
+                    .when(!selected, |row| row.text_color(theme.gray))
                     .child(
                         svg()
                             .path(icon)
@@ -218,7 +224,7 @@ impl ShelbiWindow {
                 div()
                     .px_3()
                     .pb_2()
-                    .text_color(theme.accent)
+                    .text_color(theme.cyan)
                     .font_weight(FontWeight::BOLD)
                     .child("Shelbi"),
             )
@@ -231,7 +237,7 @@ impl ShelbiWindow {
             .flex_col()
             .flex_1()
             .h_full()
-            .bg(theme.main_background)
+            .bg(theme.canvas)
             .when_some(self.banner.clone(), |main, message| {
                 main.child(
                     div()
@@ -241,8 +247,8 @@ impl ShelbiWindow {
                         .justify_between()
                         .px_4()
                         .py_2()
-                        .bg(theme.selection_bg)
-                        .text_color(theme.status_yellow)
+                        .bg(theme.selection)
+                        .text_color(theme.yellow)
                         .child(message)
                         .child(
                             div()
@@ -310,8 +316,8 @@ impl ShelbiWindow {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(theme, cx))
-                    // The sidebar's right-edge divider (`DIVIDER_DIM`).
-                    .child(div().w(px(1.0)).h_full().flex_none().bg(theme.divider_dim))
+                    // The sidebar's right-edge divider (`divider`).
+                    .child(div().w(px(1.0)).h_full().flex_none().bg(theme.divider))
                     .child(self.render_main(theme, cx)),
             )
             .into_any_element()
