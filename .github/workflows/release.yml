@@ -215,10 +215,150 @@ jobs:
         with:
           subject-checksums: dist/checksums.txt
 
+  desktop-release:
+    name: Desktop app (Shelbi.app)
+    # A tag push bundles after `release` has created the GitHub release, so
+    # the zip can be attached to it; a workflow_dispatch dry run (`release`
+    # skipped) bundles too and keeps the zip as a workflow artifact.
+    needs:
+      - validate
+      - smoke
+      - release
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      needs.smoke.result == 'success' &&
+      (needs.release.result == 'success' ||
+       (needs.validate.outputs.dry_run == 'true' && needs.release.result == 'skipped'))
+    # macos-15, not the darwin jobs' macos-14: the app's floor is macOS 15
+    # (desktop/.cargo/config.toml, LSMinimumSystemVersion), and bundle.sh runs
+    # the bundled binary (`--print-version`) as a smoke check.
+    runs-on: macos-15
+    # The signing and notary secrets live on the `release` environment (or at
+    # the repository level); see docs/release.md.
+    environment: release
+    permissions:
+      contents: write
+    outputs:
+      notarized: ${{ steps.bundle.outputs.notarized }}
+      signed: ${{ steps.bundle.outputs.signed }}
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      DRY_RUN: ${{ needs.validate.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # desktop/ is its own Cargo workspace with its own pinned toolchain;
+      # rustup reads desktop/rust-toolchain.toml from the working directory.
+      - name: Install the pinned desktop toolchain
+        working-directory: desktop
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Cache desktop/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      # Sign and notarize only with all five secrets; otherwise build an
+      # unsigned app, loudly, and stay green (the cask step below then skips).
+      - name: Check signing secrets
+        id: secrets
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          missing=()
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD NOTARY_KEY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=Desktop app NOT signed or notarized::Missing secrets: ${missing[*]}. Building an unsigned Shelbi.app; it will not be attached to the release or published to the Homebrew cask. See docs/release/homebrew-tap.md."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import the Developer ID certificate into a temporary keychain
+        if: steps.secrets.outputs.sign == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/shelbi-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          cert="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$cert"
+          security import "$cert" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$cert"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" > /dev/null
+          # Search the temporary keychain first, keeping the runner's own.
+          existing=()
+          while IFS= read -r line; do
+            existing+=("$(printf '%s' "$line" | xargs)")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, and zip Shelbi.app
+        id: bundle
+        env:
+          NOTARY_KEY_P8: ${{ steps.secrets.outputs.sign == 'true' && secrets.NOTARY_KEY_P8 || '' }}
+          NOTARY_KEY_ID: ${{ steps.secrets.outputs.sign == 'true' && secrets.NOTARY_KEY_ID || '' }}
+          NOTARY_ISSUER_ID: ${{ steps.secrets.outputs.sign == 'true' && secrets.NOTARY_ISSUER_ID || '' }}
+          # With the secrets present, anything short of notarized fails the job.
+          REQUIRE_NOTARIZATION: ${{ steps.secrets.outputs.sign == 'true' && '1' || '' }}
+        run: desktop/scripts/bundle.sh --out "$RUNNER_TEMP/desktop"
+
+      - name: Keep the zip as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shelbi-desktop-${{ needs.validate.outputs.version }}-arm64
+          path: |
+            ${{ runner.temp }}/desktop/Shelbi-*-arm64.zip
+            ${{ runner.temp }}/desktop/Shelbi-*-arm64.zip.sha256
+          if-no-files-found: error
+
+      # Only a notarized build goes on the release page: an unsigned zip
+      # downloaded from there is quarantined and Gatekeeper calls it damaged.
+      - name: Attach the zip to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTARIZED: ${{ steps.bundle.outputs.notarized }}
+          ZIP: ${{ steps.bundle.outputs.zip }}
+        run: |
+          if [ "$NOTARIZED" != "true" ]; then
+            echo "::warning::Not attaching $(basename "$ZIP") to $RELEASE_TAG: the build is not notarized."
+            exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: would attach $(basename "$ZIP") and $(basename "$ZIP").sha256 to $RELEASE_TAG"
+            exit 0
+          fi
+          gh release upload "$RELEASE_TAG" "$ZIP" "$ZIP.sha256" --clobber
+
+      - name: Remove the temporary keychain
+        if: always() && env.KEYCHAIN != ''
+        run: security delete-keychain "$KEYCHAIN" || true
+
   homebrew-pr:
     name: Open Homebrew tap PR
-    needs: release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_TAP_REPOSITORY != ''
+    # The desktop job only adds the cask to the same PR; its failure must not
+    # hold back the formula, hence always() + an explicit release check.
+    needs:
+      - release
+      - desktop-release
+    if: always() && needs.release.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_TAP_REPOSITORY != ''
     runs-on: ubuntu-latest
     environment: release-downstream
     permissions:
@@ -259,12 +399,35 @@ jobs:
             --checksums shelbi/dist/checksums.txt \
             --github-repo "$GITHUB_REPOSITORY"
 
+      # The desktop cask, only for a notarized build (desktop-release).
+      - name: Update desktop cask
+        id: cask
+        if: needs.desktop-release.outputs.notarized == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "Shelbi-${version}-arm64.zip.sha256" \
+            --dir shelbi/dist
+          owner="${TAP_REPOSITORY%%/*}"
+          ruby shelbi/scripts/release/update-homebrew-cask.rb \
+            --tap-dir homebrew-tap \
+            --version "$version" \
+            --sha256-file "shelbi/dist/Shelbi-${version}-arm64.zip.sha256" \
+            --github-repo "$GITHUB_REPOSITORY" \
+            --tap "${owner}/${TAP_REPOSITORY#*/homebrew-}"
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
       - name: Open tap update PR
         id: tap_pr
         working-directory: homebrew-tap
         env:
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          CASK_UPDATED: ${{ steps.cask.outputs.updated }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           branch="shelbi-${version}"
@@ -272,6 +435,9 @@ jobs:
           git config user.email "shelbi-release-bot@users.noreply.github.com"
           git checkout -B "$branch"
           git add Formula/shelbi.rb
+          if [ "$CASK_UPDATED" = "true" ]; then
+            git add Casks/shelbi-desktop.rb
+          fi
           git commit -m "shelbi ${version}"
           git push --force-with-lease origin "$branch"
           # Create the PR, or reuse the open one if this tag is being re-run.
@@ -280,7 +446,7 @@ jobs:
             --base main \
             --head "$branch" \
             --title "shelbi ${version}" \
-            --body "Updates the Shelbi formula to ${version} after GitHub Release artifacts were published.")"; then
+            --body "Updates the Shelbi formula$([ "$CASK_UPDATED" = "true" ] && echo " and the shelbi-desktop cask") to ${version} after GitHub Release artifacts were published.")"; then
             echo "Opened tap PR: $pr_url"
           else
             pr_url="$(gh pr list \
@@ -471,12 +637,61 @@ jobs:
           test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.codex-plugin/plugin.json
           test -f /usr/share/shelbi/plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
 
+  desktop-verify-install:
+    name: Verify desktop cask install
+    needs:
+      - validate
+      - desktop-release
+      - homebrew-pr
+    if: always() && needs.homebrew-pr.result == 'success' && needs.desktop-release.outputs.notarized == 'true'
+    # A clean runner new enough for the cask (depends_on macos: :sequoia, i.e. 15 or later).
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+    steps:
+      # Both named, as docs/release/homebrew-tap.md tells users: current
+      # Homebrew trusts a third-party tap's formulae and casks only when named
+      # on the command line (or after `brew trust`), and refuses to load the
+      # cask's `shelbi` dependency from the tap otherwise.
+      - name: Install the cask from the tap
+        run: |
+          tap="${TAP_REPOSITORY%%/*}/${TAP_REPOSITORY#*/homebrew-}"
+          brew tap "$tap"
+          brew install "$tap/shelbi" "$tap/shelbi-desktop"
+          shelbi --version
+          test -d /Applications/Shelbi.app
+
+      - name: Gatekeeper accepts the installed app
+        run: |
+          spctl --assess --type exec --verbose=2 /Applications/Shelbi.app
+          xcrun stapler validate /Applications/Shelbi.app
+
+      # Through LaunchServices, like a Finder launch: `--print-version` prints
+      # the app's version and its check of the `shelbi` formula, then exits.
+      # The quarantine Homebrew sets makes the first launch wait on the
+      # "downloaded from the Internet" confirmation, which nobody clicks on a
+      # runner; spctl has already passed the notarized app above.
+      - name: Launch the app to its version check
+        run: |
+          xattr -dr com.apple.quarantine /Applications/Shelbi.app
+          out="$RUNNER_TEMP/print-version.txt"
+          open -W --stdout "$out" --stderr "$RUNNER_TEMP/print-version.err" \
+            -a /Applications/Shelbi.app --args --print-version
+          cat "$out"
+          cat "$RUNNER_TEMP/print-version.err" >&2 || true
+          grep -qx "Shelbi $VERSION" "$out"
+          grep -q "^shelbi CLI: .* $VERSION (matches)$" "$out"
+
   downstream-publication:
     name: Prepare downstream publication
     needs:
       - release
       - homebrew-pr
       - apt-publish
+      - desktop-release
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-downstream
@@ -487,6 +702,8 @@ jobs:
         env:
           HOMEBREW_RESULT: ${{ needs.homebrew-pr.result }}
           APT_RESULT: ${{ needs.apt-publish.result }}
+          DESKTOP_RESULT: ${{ needs.desktop-release.result }}
+          DESKTOP_NOTARIZED: ${{ needs.desktop-release.outputs.notarized }}
         run: |
           cat <<EOF
           GitHub Release artifacts, checksums, .deb package, and attestations are published.
@@ -497,4 +714,8 @@ jobs:
           - APT publish (result: $APT_RESULT) is gated on vars.APT_REPO (the shelbi-apt
             hosting repository) plus APT_REPO_TOKEN, APT_GPG_PRIVATE_KEY, and
             APT_GPG_PASSPHRASE.
+          - Desktop app (result: $DESKTOP_RESULT, notarized: ${DESKTOP_NOTARIZED:-false}) is
+            attached and added to the tap's shelbi-desktop cask only when notarized, which
+            needs MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD, NOTARY_KEY_P8,
+            NOTARY_KEY_ID, and NOTARY_ISSUER_ID.
           EOF

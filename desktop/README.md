@@ -15,6 +15,8 @@ in the theme the `theme:` setting picks (`auto` follows the system
 appearance). The Issues nav row shows the native board and task detail
 (`dt-issues-board`, see `docs/status/dt-issues-board.md`); the other views
 show a "Not implemented yet" stub until their `dt-*` subtask lands.
+`scripts/bundle.sh` packages it as a signed, notarized `Shelbi.app`, shipped
+as the `shelbi-desktop` Homebrew cask (`docs/status/dt-packaging.md`).
 
 The app is a client of the `shelbi` CLI and needs it installed
 (`brew install jlong/shelbi/shelbi`). To point it at a particular build, set
@@ -81,7 +83,11 @@ desktop/
   Cargo.lock           this workspace's own lockfile (committed)
   rust-toolchain.toml  the exact Rust version
   build.rs             embeds macos/Info.plist so `cargo run` is "Shelbi" in the menu bar
-  macos/Info.plist     the unbundled binary's name (dt-packaging builds the real .app)
+  macos/Info.plist     the unbundled binary's name (no CFBundleIdentifier: see the file)
+  macos/Shelbi.app.plist  the .app bundle's Info.plist (bundle.sh fills in the version)
+  scripts/bundle.sh    build, bundle, sign, notarize, staple, zip, sha256 (see Packaging)
+  scripts/render-icon.sh  assets/icon/shelbi.svg -> shelbi-1024.png
+  assets/icon/         the app icon: SVG source + the 1024px PNG master bundle.sh cuts into .icns
   assets/icons/        vendored Heroicons + their LICENSE
   assets/fonts/geist/  Geist, the UI typeface (OFL) + its LICENSE
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
@@ -97,7 +103,8 @@ desktop/
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
-  src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch
+  src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch;
+                       --print-version (print_version.rs), the daily release check (update.rs)
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
   src/elements/        custom elements, chiefly the terminal (elements/terminal/)
   src/spike.rs         `--spike <session>`: one terminal element on one session
@@ -119,7 +126,7 @@ Which subtask fills what:
 | `views/` workspace | `dt-workspace-view` |
 | `views/` review | `dt-review-view` |
 | native menus, notifications | `dt-menus-notifications` |
-| bundle, signing, cask | `dt-packaging` |
+| bundle, signing, cask, update notice (`platform/update.rs`, `views/update.rs`) | `dt-packaging` |
 | smoke tests, docs | `dt-parity-audit` |
 
 ## The terminal element by hand
@@ -136,6 +143,79 @@ Never point `--spike` at a real workspace's session: the window reports
 its size on attach (which the session follows while no other client is
 active) and typing makes it the active client, so the agent's PTY would be
 resized to the spike window.
+
+## Packaging
+
+`scripts/bundle.sh` builds the distributable app: a release build for
+`aarch64-apple-darwin`, assembled into `target/bundle/Shelbi.app` (bundle id
+`dev.shelbi.desktop`, the version from `Cargo.toml`, the icon from
+`assets/icon/`), signed, notarized, stapled, then zipped as
+`target/bundle/Shelbi-<version>-arm64.zip` with a `.sha256` beside it. It
+bundles no CLI: the app is a client of the `shelbi` formula, and the Homebrew
+cask (`shelbi-desktop`) depends on it.
+
+```sh
+desktop/scripts/bundle.sh              # build + bundle (+ sign/notarize when it can)
+desktop/scripts/bundle.sh --no-build   # re-bundle the last release build
+open desktop/target/bundle/Shelbi.app
+desktop/target/bundle/Shelbi.app/Contents/MacOS/Shelbi --print-version
+```
+
+Each step runs only when its credentials are present, and the script ends by
+saying which build it produced (`SIGNED + NOTARIZED + STAPLED`, `SIGNED, NOT
+NOTARIZED`, or `UNSIGNED`):
+
+- **Signing** uses `SIGN_IDENTITY`, by default `Developer ID Application:
+  32pixels, LLC (6L5M94R7K7)`, when that identity is in your keychain. It signs
+  inside-out (any nested code, then the bundle; never `--deep`) with
+  `--options runtime --timestamp`. Without the identity the app is ad-hoc
+  signed: it runs on your Mac, nowhere else.
+- **Notarization** runs `notarytool submit --wait`, then `stapler staple` and
+  `spctl --assess`, when the app is Developer ID signed and you provide either
+  `NOTARY_PROFILE` (a `xcrun notarytool store-credentials` keychain profile) or
+  an App Store Connect API key: `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`, and the
+  `.p8` as a path in `NOTARY_KEY_PATH` (or base64 in `NOTARY_KEY_P8`, which is
+  what CI passes). For example:
+
+  ```sh
+  NOTARY_KEY_PATH=~/private_keys/AuthKey_<id>.p8 NOTARY_KEY_ID=<id> \
+    NOTARY_ISSUER_ID="$(cat ~/.appstoreconnect/issuer_id.txt)" \
+    desktop/scripts/bundle.sh
+  ```
+
+  Credentials that are set but wrong fail the script rather than quietly
+  producing an un-notarized build.
+
+`assets/icon/shelbi.svg` is the icon's source (the brand's pixel "S" on the
+macOS icon grid). After editing it, run `scripts/render-icon.sh` (needs
+ImageMagick) and commit the regenerated `shelbi-1024.png` too; `bundle.sh` only
+needs macOS's `sips` and `iconutil`.
+
+The release workflow (`.github/workflows/release.yml`, job `desktop-release`)
+runs the same script on every tag, with the certificate imported from
+secrets into a temporary keychain, and publishes the notarized zip to the
+GitHub release and the `shelbi-desktop` cask in `jlong/homebrew-shelbi`. The
+secret names and the flow are in `docs/release.md` and
+`docs/release/homebrew-tap.md` at the repository root.
+
+### Update notice
+
+Once a day, off the UI thread, the app asks the GitHub releases API for the
+latest Shelbi release (`src/platform/update.rs`). When it is newer than the
+app, every project window shows a bar with the command that upgrades it,
+`brew upgrade --cask shelbi-desktop`; otherwise it shows nothing. There is no
+in-app updater. The last answer is cached in `~/.shelbi/desktop-update-check.json`,
+so a relaunch inside the day shows the same notice without asking again.
+
+To see the notice without waiting for a release, point the check at a
+fixture (this bypasses the cache in both directions):
+
+```sh
+echo '{"tag_name":"v99.0.0","draft":false,"prerelease":false}' > /tmp/release.json
+SHELBI_DESKTOP_UPDATE_URL=file:///tmp/release.json cargo run
+```
+
+`SHELBI_DESKTOP_UPDATE_CHECK=0` turns the check off.
 
 ## Verifying a change
 

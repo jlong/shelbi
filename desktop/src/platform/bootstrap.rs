@@ -127,26 +127,9 @@ pub fn run(
     let env = platform.login_env();
 
     enter(BootstrapState::FindingCli);
-    let home = platform.home_dir();
-    let (setting, config_error) = match platform.cli_setting() {
-        Ok(setting) => (setting, None),
-        Err(e) => {
-            tracing::warn!("ignoring config.yaml for CLI discovery: {e}");
-            (None, Some(e))
-        }
-    };
-    let found = discovery::discover(
-        setting.as_deref(),
-        &env::path_dirs(&env),
-        home.as_deref(),
-        |p| platform.is_executable(p),
-    );
-    let cli = match found {
+    let cli = match find_cli(platform, &env) {
         Ok(cli) => cli,
-        Err(mut not_found) => {
-            not_found.config_error = config_error;
-            return enter(BootstrapState::Failed(Failure::CliNotFound(not_found)));
-        }
+        Err(not_found) => return enter(BootstrapState::Failed(Failure::CliNotFound(not_found))),
     };
     tracing::info!(cli = %cli.path.display(), source = cli.source.label(), "found the shelbi CLI");
     let cli_version = platform.cli_version(&cli.path, &env);
@@ -186,6 +169,29 @@ pub fn run(
         })),
         mismatch => enter(BootstrapState::Failed(Failure::VersionMismatch(mismatch))),
     }
+}
+
+/// Find the `shelbi` CLI the way bootstrap does: the `desktop.cli_path`
+/// setting, then `env`'s `PATH`, then the known install locations.
+pub fn find_cli(platform: &mut impl Platform, env: &Env) -> Result<CliLocation, CliNotFound> {
+    let home = platform.home_dir();
+    let (setting, config_error) = match platform.cli_setting() {
+        Ok(setting) => (setting, None),
+        Err(e) => {
+            tracing::warn!("ignoring config.yaml for CLI discovery: {e}");
+            (None, Some(e))
+        }
+    };
+    discovery::discover(
+        setting.as_deref(),
+        &env::path_dirs(env),
+        home.as_deref(),
+        |p| platform.is_executable(p),
+    )
+    .map_err(|mut not_found| {
+        not_found.config_error = config_error;
+        not_found
+    })
 }
 
 /// The real machine.

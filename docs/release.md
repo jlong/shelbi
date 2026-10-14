@@ -53,24 +53,48 @@ A tag push runs these jobs in `release.yml`:
    running `apt-get update`. A mismatch that clears within the window no longer
    fails the release; one that persists past the deadline still fails the job
    and logs the observed vs. expected sizes.
-6. **`downstream-publication`** — always runs after the above and records the
+6. **`desktop-release`**: after `release`, on `macos-15` in the **`release`**
+   environment: runs `desktop/scripts/bundle.sh` to build `Shelbi.app`, sign it
+   with the Developer ID certificate (imported into a temporary keychain),
+   notarize and staple it, then zip it as `Shelbi-<version>-arm64.zip` plus a
+   `.sha256`. The zip is always kept as a workflow artifact, and attached to the
+   GitHub release only when notarized. Without the five signing secrets (see
+   [Secrets](#secrets)) it builds an unsigned app with a warning annotation and
+   stays green; with them, anything short of notarized fails the job.
+   `macos-15` rather than `macos-14` because the app's floor is macOS 15 and the
+   script runs the bundled binary as a smoke check.
+7. **`homebrew-pr`** also writes `Casks/shelbi-desktop.rb`
+   (`scripts/release/update-homebrew-cask.rb`) into the same tap PR when
+   `desktop-release` notarized the app; a failed or unsigned desktop build never
+   holds back the formula.
+8. **`desktop-verify-install`**: on a clean `macos-15` runner after the tap PR
+   merges (notarized builds only): taps, installs the `shelbi` formula and the
+   `shelbi-desktop` cask (both named, for Homebrew's tap trust), checks
+   Gatekeeper accepts the app, and launches it through LaunchServices with
+   `open -W ... --args --print-version`, asserting the app's version and that
+   it found a matching `shelbi`.
+9. **`downstream-publication`** — always runs after the above and records the
    downstream result in the job log.
 
 The `workflow_dispatch` path (a manual run with a synthetic `ref_name` such as
 `v0.9.0`) is the **dry-run path**: it runs `validate` and `smoke`, then a
 `goreleaser-dry-run` job that builds snapshot artifacts on `macos-14` without
-publishing a GitHub Release.
+publishing a GitHub Release, and `desktop-release`, which bundles the app (signed
+and notarized when the secrets are present) and reports what it would attach
+without touching any release.
 
 ## Permissions and environments
 
 The workflow defaults to `contents: read`. Only the `release` job holds
 `contents: write`, `id-token: write`, `attestations: write`, and
-`artifact-metadata: write`.
+`artifact-metadata: write`. `desktop-release` holds `contents: write` too, to
+attach the notarized zip to the release.
 
 Two GitHub Actions environments scope the publishing jobs and hold their
 secrets and variables. Both exist in repository settings:
 
-- **`release`** — the GitHub Release publish job.
+- **`release`** — the GitHub Release publish job and `desktop-release` (which
+  reads the desktop signing secrets).
 - **`release-downstream`** — the Homebrew tap PR, APT publish, and
   downstream-publication jobs.
 
@@ -95,6 +119,21 @@ Downstream publication (already provisioned) needs:
   APT hosting repository.
 - `APT_GPG_PRIVATE_KEY` — ASCII-armored private key for signing APT metadata.
 - `APT_GPG_PASSPHRASE` — passphrase for the APT private key.
+
+The desktop app's signing and notarization (`desktop-release`) needs these five,
+on the `release` environment or the repository. The names are fixed; until all
+five exist the job builds an unsigned app and skips the cask:
+
+- `MACOS_CERTIFICATE_P12`: the `Developer ID Application: 32pixels, LLC
+  (6L5M94R7K7)` certificate and its private key, exported from Keychain Access
+  as a `.p12`, base64-encoded (`base64 -i cert.p12 | pbcopy`).
+- `MACOS_CERTIFICATE_PASSWORD`: the password set on that `.p12` export.
+- `NOTARY_KEY_P8`: an App Store Connect API key (`AuthKey_<id>.p8`),
+  base64-encoded. It must be a **Team** key with the **Developer** role
+  (Individual keys can't reach the notary API).
+- `NOTARY_KEY_ID`: that key's ID (the `<id>` in its file name).
+- `NOTARY_ISSUER_ID`: the team's Issuer ID (a UUID on the App Store Connect
+  keys page; not the Team ID).
 
 The APT signing fingerprint is **derived** in CI from the imported key by
 `scripts/release/export-apt-public-key.sh`; it is not a stored secret. Keep the

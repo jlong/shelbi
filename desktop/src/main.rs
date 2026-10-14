@@ -44,6 +44,9 @@ enum Mode {
     /// `--spike <session>`: one terminal element on one session, bypassing
     /// the project shell.
     Spike(String),
+    /// `--print-version`: print the app's version and the CLI check, then
+    /// exit (no window, no daemon). See `platform::print_version`.
+    PrintVersion,
     /// `--visual-check [dir]`: render the terminal element offscreen and
     /// check its input handling (feature `visual-check`).
     #[cfg(feature = "visual-check")]
@@ -62,6 +65,7 @@ fn parse_args() -> Mode {
             Some(session) => Mode::Spike(session),
             None => usage("--spike needs a session (see `shelbi session ls`)"),
         },
+        Some("--print-version") => Mode::PrintVersion,
         #[cfg(feature = "visual-check")]
         Some("--visual-check") => Mode::VisualCheck(args.next()),
         #[cfg(feature = "visual-check")]
@@ -73,7 +77,7 @@ fn parse_args() -> Mode {
 
 fn usage(problem: &str) -> ! {
     eprintln!(
-        "shelbi-desktop: {problem}\nusage: shelbi-desktop [<project>] | --spike <session>"
+        "shelbi-desktop: {problem}\nusage: shelbi-desktop [<project>] | --spike <session> | --print-version"
     );
     std::process::exit(2);
 }
@@ -81,6 +85,9 @@ fn usage(problem: &str) -> ! {
 fn main() {
     init_logging();
     let mode = parse_args();
+    if let Mode::PrintVersion = mode {
+        std::process::exit(platform::print_version::run());
+    }
     #[cfg(feature = "visual-check")]
     if let Mode::VisualCheck(dir) = mode {
         visual_check::run(visual_check::out_dir(dir));
@@ -143,6 +150,10 @@ fn main() {
                 shelbi_client::fresh_client_id(),
                 Some(ControlWatcher::spawn()),
             ));
+
+            // Once a day, off-thread: is there a newer release? Every
+            // project window shows the notice when there is.
+            views::update::spawn_check(cx);
 
             match launch {
                 Some(project) => app::open_or_focus(&project, cx),
