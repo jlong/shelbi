@@ -31,6 +31,7 @@ mod terminal_view;
 #[cfg(all(test, unix))]
 mod pty_input_tests;
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,7 +67,7 @@ use shelbi_state::keymap::{load_keymaps, DisplayStyle, GlobalAction, KeyChord, K
 use shelbi_term::Size;
 
 use crate::activity::{ActivityApp, ActivityData, ActivityMetaCache};
-use crate::kanban::{ExecutorMovePersister, KanbanApp};
+use crate::kanban::{ClosedPageRead, ExecutorMovePersister, KanbanApp};
 use crate::machines::MachinesApp;
 use caps::Caps;
 use overlays::{ActiveOverlay, OverlayEvent};
@@ -352,6 +353,13 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         }
         if let Some(activity) = state.latest_activity() {
             state.activity.apply_activity_data(activity);
+            state.dirty = true;
+        }
+        // The terminal done/canceled history fills in on its own refresher, after
+        // (and independent of) the open board, so a stale-cache GraphQL fetch
+        // never delays the board's first paint.
+        if let Some(closed) = state.latest_closed() {
+            state.kanban.apply_closed_page(closed);
             state.dirty = true;
         }
         // A change arrived for the workspace the main area is showing: if its
@@ -750,6 +758,12 @@ struct ProjectWorkers {
     /// project with a fresh cache: one project's resolved titles can't leak into
     /// another's feed.
     activity_refresher: refresh::Refresher<ActivityData>,
+    /// The terminal `done`/`canceled` history's own refresher. It is the one
+    /// board read that can hit the backend (a live GraphQL fetch when the
+    /// done-history cache has aged out), so — like the activity refresher — it is
+    /// split off the core snapshot: the open board, sidebar and machines paint
+    /// from their fast local caches and the done column fills in when this lands.
+    closed_refresher: refresh::Refresher<Option<ClosedPageRead>>,
     /// Wakes from the daemon change subscriber, drained each tick.
     change_rx: Receiver<changes::ChangeWake>,
     /// Pushed layout events from the daemon poller, drained by
@@ -786,15 +800,69 @@ fn production_workers(project: &str) -> ProjectWorkers {
     let activity_refresher = refresh::spawn(move |_generation| {
         ActivityApp::read_activity_data(&proj_activity, &activity_cache)
     });
+    // The terminal done/canceled history on its own refresher, so a stale-cache
+    // GraphQL fetch never delays the open board's paint. Served from the
+    // ten-minute done-history cache otherwise, so this adds no request volume.
+    let proj_closed = project.to_string();
+    let closed_refresher =
+        refresh::spawn(move |_generation| KanbanApp::read_closed_page(&proj_closed));
     let (changes, change_rx) = changes::spawn(project);
     let (layout_sub, layout_rx) = crate::layout_sub::spawn(project);
     ProjectWorkers {
         refresher,
         activity_refresher,
+        closed_refresher,
         change_rx,
         layout_rx,
         _changes: Some(changes),
         _layout_sub: Some(layout_sub),
+    }
+}
+
+/// Build a fresh set of the three embedded native-view apps for `project`, wired
+/// exactly as the shell needs them (keymaps, the executor move-persister, the
+/// machines reachability prober). Used at startup and rebuilt by
+/// [`ShellState::switch_project`] so each app's `project_name` — which its card
+/// moves, `load more`, and workspace-open actions target — follows the current
+/// project rather than staying pinned to the launch one, and so a switch clears
+/// the previous project's board/activity/machines data immediately.
+fn build_embedded_apps(project: &str, keymaps: &Keymaps) -> (KanbanApp, ActivityApp, MachinesApp) {
+    let mut kanban = KanbanApp::new(project);
+    kanban.keymaps = keymaps.clone();
+    // Board moves go through the shelbi-app executor (daemon-backed when
+    // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
+    kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
+    let activity = ActivityApp::new(project);
+    // The machines view probes remote reachability in the background (off the UI
+    // thread and the refresh worker); the prober winds down when the app drops.
+    let mut machines = MachinesApp::new(project);
+    machines.enable_reachability();
+    (kanban, activity, machines)
+}
+
+/// A cheap, zero-IO sidebar model for `project`: the fixed nav builtins plus the
+/// raw project name and a board-loading flag. Painted the instant a *cold*
+/// project switch lands (no cached model yet) so the sidebar shows the target
+/// project's chrome — its nav rows and a "Loading…" placeholder — on the next
+/// frame instead of the previous project's rows (or a blank column) while the
+/// first off-thread read runs. The real model (display-name label, workspaces,
+/// reviews, badges, version footer) replaces it within ~one refresh.
+fn skeleton_sidebar_model(project: &str) -> SidebarModel {
+    SidebarModel {
+        project_label: project.to_string(),
+        nav: sidebar_model::nav_items(),
+        workspaces: Vec::new(),
+        reviews: Vec::new(),
+        config_error: None,
+        board_loading: true,
+        collapsed_machines: Default::default(),
+        board_banner: None,
+        daemon_version_line: None,
+        daemon_version_mismatch: false,
+        status_line: String::new(),
+        zen_mode: shelbi_state::ZenModeState::Off,
+        unread_errors: 0,
+        session_lost: None,
     }
 }
 
@@ -870,6 +938,14 @@ struct ShellState {
     reconcile_rx: Option<Receiver<(String, bool)>>,
     caps: Caps,
     sidebar_model: Option<SidebarModel>,
+    /// The last sidebar model each visited project had, keyed by project name,
+    /// stashed when switching *away*. A switch *back* re-applies the cached model
+    /// at once so the sidebar is populated on the next frame (a warm switch is
+    /// visually immediate) instead of flashing the skeleton while the first
+    /// refresh runs; the fresh read replaces it within ~one refresh. Only ever
+    /// read for the key that matches the project it was stored under, so it can
+    /// never show another project's data.
+    sidebar_cache: HashMap<String, SidebarModel>,
     /// The embedded native views. They share their rendering (`render_full`) and
     /// interaction with the standalone tmux-runtime processes; the shell drives
     /// them from off-thread snapshots rather than their own refresh loop.
@@ -985,16 +1061,7 @@ impl ShellState {
         // Claim the one-time first-run hint, else surface any keymap-diagnostic
         // count. Mirrors the former sidebar's launch status line.
         let startup_status = sidebar::sidebar_startup_status_line(diags.len());
-        let mut kanban = KanbanApp::new(project);
-        kanban.keymaps = keymaps.clone();
-        // Board moves go through the shelbi-app executor (daemon-backed when
-        // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
-        kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
-        // The embedded machines view probes remote reachability in the
-        // background (off the UI thread and the refresh worker); the prober
-        // winds down when the shell state drops.
-        let mut machines = MachinesApp::new(project);
-        machines.enable_reachability();
+        let (kanban, activity, machines) = build_embedded_apps(project, &keymaps);
         // Seed the sidebar width from the user's saved choice (if any). The
         // stored value is the raw user choice; `draw` clamps it to the live
         // window at render time without overwriting the saved value. A read
@@ -1032,8 +1099,9 @@ impl ShellState {
             reconcile_rx: None,
             caps,
             sidebar_model: None,
+            sidebar_cache: HashMap::new(),
             kanban,
-            activity: ActivityApp::new(project),
+            activity,
             machines,
             keymaps,
             display_style,
@@ -1290,6 +1358,7 @@ impl ShellState {
         if let Some(w) = self.workers.as_ref() {
             w.refresher.request();
             w.activity_refresher.request();
+            w.closed_refresher.request();
         }
     }
 
@@ -1329,12 +1398,29 @@ impl ShellState {
             .and_then(|w| w.activity_refresher.latest())
     }
 
+    /// The freshest terminal `done`/`canceled` page from the current project's
+    /// closed refresher, or `None`. Like [`Self::latest_snapshot`], a read still
+    /// queued from a just-replaced (old-project) refresher went out with that
+    /// refresher's receiver, so this only ever yields the current project's data.
+    /// The outer `Option` is "a read landed"; the inner is the read's own result
+    /// (`None` when the store couldn't be built or the fetch failed).
+    fn latest_closed(&self) -> Option<Option<ClosedPageRead>> {
+        self.workers.as_ref().and_then(|w| w.closed_refresher.latest())
+    }
+
     fn switch_project(&mut self, project: &str) {
         // Switching to the already-current project (e.g. Enter on the current
         // row in the palette's Projects column) is a no-op; skip the session
         // rebuild so it doesn't needlessly detach and reconnect.
         if self.client.project() == Some(project) {
             return;
+        }
+        // Stash the project we're leaving so switching back is a warm, immediate
+        // paint rather than a skeleton flash (keyed by name, applied only for its
+        // own key below).
+        let leaving = self.client.project().map(str::to_string);
+        if let (Some(current), Some(model)) = (leaving, self.sidebar_model.clone()) {
+            self.sidebar_cache.insert(current, model);
         }
         // `ClientState::switch_project` records the current project's view and
         // restores the new project's remembered (or default) view.
@@ -1346,13 +1432,38 @@ impl ShellState {
                 project: project.to_string(),
             }),
         );
-        // Rebuild the background workers (snapshot refresher + change / layout
-        // subscribers) for the new project, dropping the old project's bundle.
-        // Without this the sidebar, board and review interface keep reading the
-        // launch project. `layout_bus` needs no rebind (it is project-agnostic and
-        // filtered per tick); the daemon-push client registration keeps its
-        // launch-project tag, which is informational only (re-exec and detach
-        // notices don't depend on the active project).
+        // Rebuild the embedded native-view apps for the new project. This resets
+        // their `project_name` — which card moves, `load more` and workspace-open
+        // actions target, otherwise still the launch project after a switch — and
+        // clears the previous project's board / activity / machines data so it is
+        // never shown (the fresh reads refill them). Interaction state (selection,
+        // scroll, in-flight optimistic moves) resetting is correct: it belonged to
+        // the project we left.
+        let (mut kanban, activity, machines) = build_embedded_apps(project, &self.keymaps);
+        // Show the board's own "Loading…" overlay (not bare empty columns) until
+        // the first off-thread read for the new project lands.
+        kanban.board_loading = true;
+        self.kanban = kanban;
+        self.activity = activity;
+        self.machines = machines;
+        // Paint the target project's sidebar chrome at once: its cached model when
+        // we've visited it this session (warm — immediate and populated), else a
+        // zero-IO skeleton (cold — nav rows + a "Loading…" placeholder). Either
+        // way the previous project's rows are gone this frame, and the fresh
+        // off-thread read below replaces it within ~one refresh.
+        self.sidebar_model = Some(
+            self.sidebar_cache
+                .get(project)
+                .cloned()
+                .unwrap_or_else(|| skeleton_sidebar_model(project)),
+        );
+        // Rebuild the background workers (snapshot + activity + closed refreshers,
+        // change / layout subscribers) for the new project, dropping the old
+        // project's bundle. Without this the sidebar, board and review interface
+        // keep reading the launch project. `layout_bus` needs no rebind (it is
+        // project-agnostic and filtered per tick); the daemon-push client
+        // registration keeps its launch-project tag, which is informational only
+        // (re-exec and detach notices don't depend on the active project).
         self.start_project_workers();
         self.reported_main = None;
         // Apply the restored view to the main area.
@@ -3989,11 +4100,14 @@ mod tests {
             let proj = project.to_string();
             let activity_refresher =
                 refresh::spawn(move |_g| ActivityData::tagged_for_test(&proj));
+            // The closed refresher touches no backend in tests — an empty page.
+            let closed_refresher = refresh::spawn(|_g| None);
             let (_ctx, change_rx) = std::sync::mpsc::channel();
             let (_ltx, layout_rx) = std::sync::mpsc::channel();
             ProjectWorkers {
                 refresher,
                 activity_refresher,
+                closed_refresher,
                 change_rx,
                 layout_rx,
                 _changes: None,
@@ -6141,11 +6255,13 @@ mod tests {
             let proj_activity = project.to_string();
             let activity_refresher =
                 refresh::spawn(move |_g| ActivityData::tagged_for_test(&proj_activity));
+            let closed_refresher = refresh::spawn(|_g| None);
             let (_ctx, change_rx) = std::sync::mpsc::channel();
             let (_ltx, layout_rx) = std::sync::mpsc::channel();
             ProjectWorkers {
                 refresher,
                 activity_refresher,
+                closed_refresher,
                 change_rx,
                 layout_rx,
                 _changes: None,
@@ -6227,6 +6343,79 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn switch_rebuilds_the_embedded_apps_for_the_new_project() {
+        // The embedded board / activity / machines apps carry the project their
+        // card moves, `load more`, and workspace-open actions target. Before this
+        // they stayed pinned to the launch project after a switch; the rebuild
+        // moves every one onto the switched-to project.
+        let mut st = test_state();
+        assert_eq!(st.kanban.project_name, "proj");
+        assert_eq!(st.activity.project_name, "proj");
+        assert_eq!(st.machines.project_name, "proj");
+
+        st.switch_project("beta");
+        assert_eq!(st.kanban.project_name, "beta");
+        assert_eq!(st.activity.project_name, "beta");
+        assert_eq!(st.machines.project_name, "beta");
+    }
+
+    #[test]
+    fn a_cold_switch_paints_a_skeleton_sidebar_for_the_target_project() {
+        // AC1/AC4: switching into a not-yet-visited project shows the target
+        // project's chrome at once — its nav rows plus a board-loading placeholder
+        // — never the previous project's rows, and before any off-thread read.
+        let mut st = test_state();
+        // The launch project's model is populated (test_state applies one).
+        assert!(st
+            .sidebar_model
+            .as_ref()
+            .is_some_and(|m| !m.workspaces.is_empty()));
+
+        st.switch_project("beta");
+        let model = st.sidebar_model.as_ref().expect("a skeleton model");
+        assert_eq!(model.project_label, "beta", "the target project's chrome");
+        assert!(model.board_loading, "a visible loading state while data loads");
+        assert!(
+            model.workspaces.is_empty(),
+            "no workspaces are shown from the previous (or any) project yet"
+        );
+        assert!(!model.nav.is_empty(), "the nav rows paint immediately");
+    }
+
+    #[test]
+    fn a_warm_switch_restores_the_cached_sidebar_immediately() {
+        // AC2: switching back to an already-visited project is visually immediate —
+        // the sidebar it had is re-applied on the switch, not a loading skeleton,
+        // so there is no flash while the first refresh runs.
+        let mut st = test_state();
+        // `proj` has a populated model (from test_state). Leaving it stashes that
+        // model; returning restores it.
+        let proj_workspaces = st
+            .sidebar_model
+            .as_ref()
+            .expect("launch model")
+            .workspaces
+            .len();
+        assert!(proj_workspaces > 0);
+
+        st.switch_project("beta"); // stashes proj's model; beta is a skeleton
+        assert!(st.sidebar_model.as_ref().unwrap().board_loading);
+
+        st.switch_project("proj"); // back to proj: restored from cache, not skeleton
+        let restored = st.sidebar_model.as_ref().expect("restored model");
+        assert_eq!(restored.project_label, "proj");
+        assert!(
+            !restored.board_loading,
+            "the cached model is applied, not a loading skeleton"
+        );
+        assert_eq!(
+            restored.workspaces.len(),
+            proj_workspaces,
+            "the cached sidebar's workspaces are back at once"
+        );
     }
 
     #[test]
