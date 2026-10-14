@@ -17,7 +17,6 @@
 //! shelbi-app's [`ClientState`]. This crate adds no model logic.
 
 mod caps;
-mod changes;
 mod overlays;
 mod refresh;
 mod relaunch;
@@ -25,7 +24,6 @@ mod review;
 mod session;
 mod sidebar;
 mod workspace;
-mod sidebar_model;
 mod terminal_view;
 
 #[cfg(all(test, unix))]
@@ -774,14 +772,14 @@ struct ProjectWorkers {
     /// from their fast local caches and the done column fills in when this lands.
     closed_refresher: refresh::Refresher<Option<ClosedPageRead>>,
     /// Wakes from the daemon change subscriber, drained each tick.
-    change_rx: Receiver<changes::ChangeWake>,
+    change_rx: Receiver<shelbi_app::changes::ChangeWake>,
     /// Pushed layout events from the daemon poller, drained by
     /// [`ShellState::poll_layout_events`].
     layout_rx: Receiver<shelbi_state::LayoutEvent>,
     /// RAII handles for the two subscriber threads; held only so their `Drop`
     /// stops and joins them when the bundle is replaced. `None` in tests, which
     /// skip the real hub-socket subscribers.
-    _changes: Option<changes::ChangeSubscription>,
+    _changes: Option<shelbi_app::changes::ChangeSubscription>,
     _layout_sub: Option<crate::layout_sub::LayoutSubscription>,
 }
 
@@ -835,7 +833,7 @@ fn production_workers(project: &str, activity_cache: Arc<Mutex<ActivityMetaCache
     let proj_closed = project.to_string();
     let closed_refresher =
         refresh::spawn(move |_generation| KanbanApp::read_closed_page(&proj_closed));
-    let (changes, change_rx) = changes::spawn(project);
+    let (changes, change_rx) = shelbi_app::changes::spawn(project);
     let (layout_sub, layout_rx) = crate::layout_sub::spawn(project);
     ProjectWorkers {
         refresher,
@@ -882,32 +880,6 @@ fn retire<T: Send + 'static>(old: T) {
     let _ = std::thread::Builder::new()
         .name("shelbi-shell-retire".into())
         .spawn(move || drop(old));
-}
-
-/// A cheap, zero-IO sidebar model for `project`: the fixed nav builtins plus the
-/// raw project name and a board-loading flag. Painted the instant a *cold*
-/// project switch lands (no cached model yet) so the sidebar shows the target
-/// project's chrome — its nav rows and a "Loading…" placeholder — on the next
-/// frame instead of the previous project's rows (or a blank column) while the
-/// first off-thread read runs. The real model (display-name label, workspaces,
-/// reviews, badges, version footer) replaces it within ~one refresh.
-fn skeleton_sidebar_model(project: &str) -> SidebarModel {
-    SidebarModel {
-        project_label: project.to_string(),
-        nav: sidebar_model::nav_items(),
-        workspaces: Vec::new(),
-        reviews: Vec::new(),
-        config_error: None,
-        board_loading: true,
-        collapsed_machines: Default::default(),
-        board_banner: None,
-        daemon_version_line: None,
-        daemon_version_mismatch: false,
-        status_line: String::new(),
-        zen_mode: shelbi_state::ZenModeState::Off,
-        unread_errors: 0,
-        session_lost: None,
-    }
 }
 
 struct ShellState {
@@ -1418,7 +1390,8 @@ impl ShellState {
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|p| {
-                        sidebar_model::read_config_skeleton(&p.name).map(|m| (p.name, m))
+                        shelbi_orchestrator::sidebar_model::read_config_skeleton(&p.name)
+                            .map(|m| (p.name, m))
                     })
                     .collect();
                 *skeletons.lock().unwrap_or_else(|p| p.into_inner()) = built;
@@ -1441,7 +1414,7 @@ impl ShellState {
             .try_lock()
             .ok()
             .and_then(|m| m.get(project).cloned());
-        prefetched.unwrap_or_else(|| skeleton_sidebar_model(project))
+        prefetched.unwrap_or_else(|| SidebarModel::skeleton(project))
     }
 
     /// Ask the current project's refreshers (the core snapshot and the activity
@@ -1464,7 +1437,7 @@ impl ShellState {
         if let Some(w) = self.workers.as_ref() {
             while let Ok(wake) = w.change_rx.try_recv() {
                 changed = true;
-                if let changes::ChangeWake::Workspace(ws) = wake {
+                if let shelbi_app::changes::ChangeWake::Workspace(ws) = wake {
                     woke.push(ws);
                 }
             }
@@ -3856,7 +3829,7 @@ fn agent_display_name(task: &shelbi_state::IssueFile) -> String {
         .task
         .param_str("agent")
         .unwrap_or(DEFAULT_TASK_AGENT);
-    sidebar::title_case(key)
+    shelbi_app::view::title_case(key)
 }
 
 /// The status label + colour the workspace panel shows beside the back button,
@@ -4053,7 +4026,7 @@ fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
 /// for the sidebar stalling behind a done-history hydration sweep.
 fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
     ShellSnapshot {
-        sidebar: sidebar_model::read_sidebar_model(project),
+        sidebar: shelbi_orchestrator::sidebar_model::read_sidebar_model(project),
         board: Some(KanbanApp::read_board_data(project)),
         activity: None,
         machines: Some(MachinesApp::read_data(project)),
@@ -6530,7 +6503,7 @@ mod tests {
     /// A config-only skeleton for `beta` as the prefetch would build it: its
     /// display label and declared workspace rows, each awaiting its state.
     fn beta_config_skeleton() -> SidebarModel {
-        let mut m = skeleton_sidebar_model("beta");
+        let mut m = SidebarModel::skeleton("beta");
         m.project_label = "Beta Board".into();
         m.board_loading = false;
         m.workspaces = ["gamma", "omega"]

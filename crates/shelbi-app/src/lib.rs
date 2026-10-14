@@ -21,7 +21,8 @@
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
 //!   state off the caller's thread and publishes immutable snapshots over a
 //!   channel. Threads and channels only, so a gpui client can consume it
-//!   without tokio.
+//!   without tokio. [`changes`] is its wake source: a hub-socket subscriber
+//!   for the daemon's board/workspace change notifications.
 //!
 //! # No UI toolkit
 //!
@@ -33,6 +34,7 @@
 //! asserts the invariant against the resolved dependency tree.
 
 pub mod board;
+pub mod changes;
 pub mod command;
 pub mod exec;
 pub mod exec_daemon;

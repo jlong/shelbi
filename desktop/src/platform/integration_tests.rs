@@ -358,6 +358,7 @@ fn boot_to_ready(
             BootstrapEvent::State(BootstrapState::Ready(_)) => "ready",
             BootstrapEvent::State(BootstrapState::Failed(_)) => "failed",
             BootstrapEvent::RelaunchRequired(_) => "relaunch",
+            BootstrapEvent::Detach(_) => "detach",
         })
         .collect();
     assert_eq!(

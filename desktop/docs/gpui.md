@@ -73,6 +73,12 @@ switch. A switch records the reason in this file.
 |---|---|---|---|---|
 | 2026-10-14 | | `gpui-pre 0.3.9`, `gpui-kit 0.7.3` | Initial pin. | |
 
+### Tests
+
+`[dev-dependencies]` repeats `gpui-pre` with its `test-support` feature, for
+`#[gpui::test]` and `VisualTestContext` (view tests open a headless test window
+and find elements by `debug_selector`). Same version, so the pin is unchanged.
+
 ### Known quirks
 
 - **Unbundled builds and the bundle identifier.** `cargo run` runs a bare

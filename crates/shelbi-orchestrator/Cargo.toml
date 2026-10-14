@@ -19,6 +19,10 @@ shelbi-proto = { workspace = true }
 # supplies the spawn spec, on-disk layout, and liveness lock.
 shelbi-client = { workspace = true }
 shelbi-session = { workspace = true }
+# `sidebar_model` builds the clients' shared `SidebarModel` (the TUI and the
+# desktop app both read their sidebar through it). shelbi-app is UI-toolkit
+# free and does not depend on this crate, so there is no cycle.
+shelbi-app = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }

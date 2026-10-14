@@ -1,19 +1,17 @@
-//! Hub-socket subscriber that wakes the shell's refresher on board/workspace
-//! changes.
+//! Hub-socket subscriber that wakes a client's refresher on board/workspace
+//! changes. Shared by the TUI shell and the desktop app.
 //!
 //! The native views are fed from snapshots **and daemon change notifications** —
 //! they do not run their own polling loop. When the daemon's poller observes a
 //! board or workspace change it publishes a [`shelbi_state::ChangeNotification`]
 //! on the hub's `subscribe` stream; this subscriber forwards a wake signal onto a
-//! channel the shell drains each tick and turns into a
-//! [`Refresher::request`](super::refresh::Refresher::request). A short
-//! periodic refresh in the event loop is the fallback for when no daemon is
-//! running (so a bare project still updates).
+//! channel the client drains and turns into a refresh request. A periodic
+//! refresh in the client is the fallback for when no daemon is running (so a
+//! bare project still updates).
 //!
 //! It owns a background thread that keeps the stream open and reconnects with a
 //! short backoff so a daemon that is still starting, idle-exits, or restarts is
-//! tolerated — the same connection shape as [`crate::layout_sub`], but it reacts
-//! to the board/workspace variants rather than the layout ones.
+//! tolerated. Threads and `std::sync::mpsc` only, like [`crate::refresh`].
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -25,8 +23,8 @@ use std::time::Duration;
 
 use shelbi_state::ChangeNotification;
 
-/// A refresh-worthy change, forwarded to the shell. A workspace change carries
-/// its name so the shell can retry just that workspace's idle/failed main-area
+/// A refresh-worthy change, forwarded to the client. A workspace change carries
+/// its name so a client can retry just that workspace's idle/failed main-area
 /// attach when its session starts (`rt-tui-idle-workspace-open`); a board change
 /// only requests a data refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,24 +54,41 @@ impl Drop for ChangeSubscription {
 }
 
 /// Spawn the subscriber thread for `project`, returning the RAII handle and the
-/// receiver the shell drains each tick. Every board/workspace change for this
-/// project yields one `()` wake; other projects and layout-only changes are
-/// filtered out thread-side.
+/// receiver the client drains. Every board/workspace change for this project
+/// yields one wake; other projects and layout-only changes are filtered out
+/// thread-side.
 pub fn spawn(project: &str) -> (ChangeSubscription, Receiver<ChangeWake>) {
+    spawn_observed(project, Arc::new(AtomicBool::new(false)))
+}
+
+/// [`spawn`], also keeping `connected` current: `true` while the subscription
+/// stream to the daemon is open, `false` while the daemon is unreachable and
+/// the thread is retrying. A client shows a "polling" indicator from it.
+pub fn spawn_observed(
+    project: &str,
+    connected: Arc<AtomicBool>,
+) -> (ChangeSubscription, Receiver<ChangeWake>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let project = project.to_string();
     let handle = thread::Builder::new()
-        .name("shelbi-shell-changes".to_string())
-        .spawn(move || subscriber_loop(&project, &tx, &stop_thread))
-        .expect("spawn shell change subscriber thread");
+        .name("shelbi-changes".to_string())
+        .spawn(move || subscriber_loop(&project, &tx, &stop_thread, &connected))
+        .expect("spawn change subscriber thread");
     (ChangeSubscription { stop, handle: Some(handle) }, rx)
 }
 
-fn subscriber_loop(project: &str, tx: &Sender<ChangeWake>, stop: &AtomicBool) {
+fn subscriber_loop(
+    project: &str,
+    tx: &Sender<ChangeWake>,
+    stop: &AtomicBool,
+    connected: &AtomicBool,
+) {
     while !stop.load(Ordering::SeqCst) {
-        match connect_and_stream(project, tx, stop) {
+        let end = connect_and_stream(project, tx, stop, connected);
+        connected.store(false, Ordering::SeqCst);
+        match end {
             StreamEnd::ReceiverGone => return,
             StreamEnd::Disconnected => sleep_slice(stop),
         }
@@ -85,7 +100,12 @@ enum StreamEnd {
     ReceiverGone,
 }
 
-fn connect_and_stream(project: &str, tx: &Sender<ChangeWake>, stop: &AtomicBool) -> StreamEnd {
+fn connect_and_stream(
+    project: &str,
+    tx: &Sender<ChangeWake>,
+    stop: &AtomicBool,
+    connected: &AtomicBool,
+) -> StreamEnd {
     let Ok(path) = shelbi_state::hub_socket_path() else {
         return StreamEnd::Disconnected;
     };
@@ -98,6 +118,7 @@ fn connect_and_stream(project: &str, tx: &Sender<ChangeWake>, stop: &AtomicBool)
     if stream.write_all(frame.as_bytes()).is_err() {
         return StreamEnd::Disconnected;
     }
+    connected.store(true, Ordering::SeqCst);
 
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];

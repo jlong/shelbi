@@ -34,6 +34,13 @@ pub mod icons {
     pub const PLAY: &str = "icons/heroicons/play.svg";
     pub const PLUS: &str = "icons/heroicons/plus.svg";
     pub const USER: &str = "icons/heroicons/user.svg";
+    pub const MAGNIFYING_GLASS: &str = "icons/heroicons/magnifying-glass.svg";
+    pub const COG_6_TOOTH: &str = "icons/heroicons/cog-6-tooth.svg";
+    pub const CHEVRON_UP_DOWN: &str = "icons/heroicons/chevron-up-down.svg";
+    pub const CHEVRON_DOUBLE_LEFT: &str = "icons/heroicons/chevron-double-left.svg";
+    pub const BARS_3: &str = "icons/heroicons/bars-3.svg";
+    pub const CHECK: &str = "icons/heroicons/check.svg";
+    pub const SIGNAL_SLASH: &str = "icons/heroicons/signal-slash.svg";
 }
 
 macro_rules! heroicon {
@@ -67,7 +74,31 @@ const HEROICONS: &[(&str, &[u8])] = &[
     heroicon!(icons::PLAY, "play.svg"),
     heroicon!(icons::PLUS, "plus.svg"),
     heroicon!(icons::USER, "user.svg"),
+    heroicon!(icons::MAGNIFYING_GLASS, "magnifying-glass.svg"),
+    heroicon!(icons::COG_6_TOOTH, "cog-6-tooth.svg"),
+    heroicon!(icons::CHEVRON_UP_DOWN, "chevron-up-down.svg"),
+    heroicon!(icons::CHEVRON_DOUBLE_LEFT, "chevron-double-left.svg"),
+    heroicon!(icons::BARS_3, "bars-3.svg"),
+    heroicon!(icons::CHECK, "check.svg"),
+    heroicon!(icons::SIGNAL_SLASH, "signal-slash.svg"),
 ];
+
+/// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its
+/// license under `assets/fonts/geist/`, from the `geist` npm package 1.7.2).
+const GEIST: &[&[u8]] = &[
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Regular.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Medium.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-SemiBold.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Bold.ttf")),
+];
+
+/// Register the vendored fonts, so views can set `font_family("Geist")`.
+pub fn load_fonts(cx: &mut gpui::App) {
+    let fonts = GEIST.iter().map(|bytes| Cow::Borrowed(*bytes)).collect();
+    if let Err(e) = cx.text_system().add_fonts(fonts) {
+        tracing::warn!(error = %e, "could not load the Geist fonts");
+    }
+}
 
 /// The app's asset source: the Heroicons first, then gpui-kit's assets.
 pub struct Assets;

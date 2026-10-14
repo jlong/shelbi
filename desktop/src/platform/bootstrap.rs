@@ -84,6 +84,9 @@ pub enum BootstrapEvent {
     /// relaunch prompt over the shell; the handle in `Ready` already refuses
     /// commands.
     RelaunchRequired(RelaunchNotice),
+    /// After `Ready`: the daemon told this client to detach (`shelbi detach`,
+    /// another client's "Detach Other Clients"). Carries the reason.
+    Detach(String),
 }
 
 /// A connected, hello-complete control socket.
@@ -250,9 +253,22 @@ pub struct Bootstrap;
 impl Bootstrap {
     /// Start bootstrap on its own thread. The receiver yields every state, then
     /// (after `Ready`) at most one [`BootstrapEvent::RelaunchRequired`].
+    // The app spawns with a client id (`spawn_as`); tests use this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(
+        platform: impl Platform + Send + 'static,
+        app_version: String,
+    ) -> async_channel::Receiver<BootstrapEvent> {
+        Self::spawn_as(platform, app_version, shelbi_client::fresh_client_id())
+    }
+
+    /// [`spawn`](Self::spawn), with the control watch registered as attached
+    /// client `client_id` and forwarding detach pushes as
+    /// [`BootstrapEvent::Detach`].
+    pub fn spawn_as(
         mut platform: impl Platform + Send + 'static,
         app_version: String,
+        client_id: String,
     ) -> async_channel::Receiver<BootstrapEvent> {
         let (tx, rx) = async_channel::unbounded();
         let spawned = std::thread::Builder::new()
@@ -262,9 +278,16 @@ impl Bootstrap {
                     let _ = tx.send_blocking(BootstrapEvent::State(state.clone()));
                 });
                 if let BootstrapState::Ready(ready) = end {
-                    ready.control.watch(move |notice| {
-                        let _ = tx.send_blocking(BootstrapEvent::RelaunchRequired(notice));
-                    });
+                    let detach_tx = tx.clone();
+                    ready.control.watch_as(
+                        client_id,
+                        move |notice| {
+                            let _ = tx.send_blocking(BootstrapEvent::RelaunchRequired(notice));
+                        },
+                        move |reason| {
+                            let _ = detach_tx.send_blocking(BootstrapEvent::Detach(reason));
+                        },
+                    );
                 }
             });
         if let Err(e) = spawned {

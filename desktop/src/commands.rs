@@ -5,11 +5,14 @@
 //! variant upstream in `shelbi-app` fails to compile here until the desktop
 //! handles it. Do not add a `_ =>` arm to either match.
 //!
-//! An arm whose subtask hasn't landed reaches [`not_implemented`], which logs a
-//! warning and asks the [`CommandHost`] (the window) to show the in-window
+//! An arm whose subtask hasn't landed reaches [`not_implemented`], which logs
+//! a warning and asks the [`CommandHost`] (the window) to show the in-window
 //! "Not implemented yet: <command id>" banner. Each `dt-*` subtask replaces
-//! the arms it implements with the real behavior. Implemented so far: the
-//! Issues view and the board's issue mutations (`dt-issues-board`).
+//! the arms it implements with the real behavior. `dt-shell-sidebar` owns view
+//! routing (every `View` routes through the window's `ClientState`; a view
+//! not yet ported draws the stub in the main area), project switching, and
+//! the detach / quit lifecycle commands; `dt-issues-board` owns the Issues
+//! view and the board's issue mutations.
 //!
 //! The id named in the banner is the command's registry id where the
 //! registry has one (`view:tasks`, `workspace:<name>`, `action:toggle-zen`,
@@ -26,15 +29,25 @@ pub trait CommandHost {
     /// Surface that `command_id` is not implemented yet (the window shows a
     /// banner).
     fn not_implemented(&mut self, command_id: &str);
-
-    /// Show the Issues board in the main area.
-    fn show_issues(&mut self);
-
+    /// Route the main area to `view` (`ClientState::set_view`) and focus it.
+    fn show_view(&mut self, view: &View);
     /// Run an issue mutation (`MoveIssue`, `StartIssue`, `AssignIssue`,
     /// `EditIssue`, `AddIssue`) through the board, which captures the state
     /// the user was looking at and sends it with `execute_mutation` off the UI
     /// thread.
     fn issue_command(&mut self, kind: &CommandKind);
+    /// Open (or focus) `project`'s window.
+    fn switch_project(&mut self, project: &str);
+    /// Show the project switcher.
+    fn open_project_switcher(&mut self);
+    /// Leave: close the app, leaving every session and agent running.
+    fn detach(&mut self);
+    /// Tell every other attached client to detach.
+    fn detach_other_clients(&mut self);
+    /// Confirm, then quit this window's project (its agents stop).
+    fn quit_project(&mut self);
+    /// Confirm, then quit Shelbi (every agent stops, the daemon exits).
+    fn quit_shelbi(&mut self);
 }
 
 /// Run a command. Every [`CommandKind`] variant has its own arm.
@@ -53,26 +66,23 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::ToggleZen => not_implemented(host, "action:toggle-zen"),
         // dt-palette-overlays
         CommandKind::OpenErrorLog => not_implemented(host, "action:error-log"),
-        // dt-shell-sidebar
+        // One window per project: open the target's, or focus it. A bare
+        // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
             if project.is_empty() {
-                not_implemented(host, "action:switch-project")
+                host.open_project_switcher()
             } else {
-                not_implemented(host, &format!("action:switch-project:{project}"))
+                host.switch_project(project)
             }
         }
-        // dt-shell-sidebar
+        // dt-palette-overlays: the add-project form is an overlay in the TUI.
         CommandKind::AddProject => not_implemented(host, "action:add-project"),
-        // dt-shell-sidebar
-        CommandKind::Detach => not_implemented(host, "action:detach"),
-        // dt-shell-sidebar
-        CommandKind::DetachOtherClients => not_implemented(host, "action:detach-others"),
-        // dt-shell-sidebar
-        CommandKind::QuitProject => not_implemented(host, "action:quit-project"),
-        // dt-shell-sidebar. Not the app's Cmd+Q: that only closes this
-        // client. This is the registry's "stop every agent and shut Shelbi
-        // down".
-        CommandKind::QuitShelbi => not_implemented(host, "action:quit-shelbi"),
+        CommandKind::Detach => host.detach(),
+        CommandKind::DetachOtherClients => host.detach_other_clients(),
+        CommandKind::QuitProject => host.quit_project(),
+        // Not the app's Cmd+Q: that only closes this client. This is the
+        // registry's "stop every agent and shut Shelbi down".
+        CommandKind::QuitShelbi => host.quit_shelbi(),
         // dt-palette-overlays
         CommandKind::OpenEditor { target } => match target {
             EditTarget::Project => not_implemented(host, "edit:project"),
@@ -129,16 +139,30 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
     }
 }
 
-/// Show a view in the main area. Every [`View`] variant has its own arm.
+/// Show a view in the main area. Every [`View`] variant has its own arm; each
+/// routes through the window's `ClientState`, and the main area draws the
+/// not-implemented stub ([`view_stub_id`]) for a view not yet ported.
 pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
     match view {
-        View::Issues => host.show_issues(),
+        View::Issues => host.show_view(view),
+        View::Activity => host.show_view(view),
+        View::Machines => host.show_view(view),
+        View::Session(_) => host.show_view(view),
+    }
+}
+
+/// The stub id the main area shows for `view` while its subtask hasn't
+/// landed, or `None` once it renders for real. Exhaustive like the dispatch.
+pub fn view_stub_id(view: &View) -> Option<String> {
+    match view {
+        // dt-issues-board: the native board.
+        View::Issues => None,
         // dt-activity-machines
-        View::Activity => not_implemented(host, "view:activity"),
+        View::Activity => Some("view:activity".into()),
         // dt-activity-machines
-        View::Machines => not_implemented(host, "view:machines"),
+        View::Machines => Some("view:machines".into()),
         // dt-chat-view (the orchestrator, `orch`) / dt-workspace-view
-        View::Session(name) => not_implemented(host, &format!("view:{name}")),
+        View::Session(name) => Some(format!("view:{name}")),
     }
 }
 
@@ -161,30 +185,46 @@ pub fn not_implemented_message(command_id: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Records what each dispatch reached: `stub:<id>` for the
-    /// not-implemented banner, `issues` for the board, `issue:<kind>` for an
-    /// issue mutation.
+    /// Records what dispatch asked of the host: a stub's command id, the
+    /// real call as `<call>:<arg>`, or `issue:<kind>` for an issue mutation.
     #[derive(Default)]
     struct Recorder(Vec<String>);
 
     impl CommandHost for Recorder {
         fn not_implemented(&mut self, command_id: &str) {
-            self.0.push(format!("stub:{command_id}"));
-        }
-
-        fn show_issues(&mut self) {
-            self.0.push("issues".to_string());
+            self.0.push(command_id.to_string());
         }
 
         fn issue_command(&mut self, kind: &CommandKind) {
             self.0.push(format!("issue:{kind:?}"));
+        }
+        fn show_view(&mut self, view: &View) {
+            self.0.push(format!("show:{}", view.as_view_id()));
+        }
+        fn switch_project(&mut self, project: &str) {
+            self.0.push(format!("switch:{project}"));
+        }
+        fn open_project_switcher(&mut self) {
+            self.0.push("switcher".into());
+        }
+        fn detach(&mut self) {
+            self.0.push("detach".into());
+        }
+        fn detach_other_clients(&mut self) {
+            self.0.push("detach-others".into());
+        }
+        fn quit_project(&mut self) {
+            self.0.push("quit-project".into());
+        }
+        fn quit_shelbi(&mut self) {
+            self.0.push("quit-shelbi".into());
         }
     }
 
     fn id_for(kind: CommandKind) -> String {
         let mut host = Recorder::default();
         dispatch_command(&kind, &mut host);
-        assert_eq!(host.0.len(), 1, "{kind:?} must reach one handler exactly once");
+        assert_eq!(host.0.len(), 1, "{kind:?} must reach the host exactly once");
         host.0.remove(0)
     }
 
@@ -193,10 +233,10 @@ mod tests {
     fn every_command() -> Vec<(CommandKind, &'static str)> {
         let s = |v: &str| v.to_string();
         vec![
-            (CommandKind::ShowView(View::Issues), "view:tasks"),
-            (CommandKind::ShowView(View::Activity), "view:activity"),
-            (CommandKind::ShowView(View::Machines), "view:machines"),
-            (CommandKind::ShowView(View::Session(s("orch"))), "view:orch"),
+            (CommandKind::ShowView(View::Issues), "show:tasks"),
+            (CommandKind::ShowView(View::Activity), "show:activity"),
+            (CommandKind::ShowView(View::Machines), "show:machines"),
+            (CommandKind::ShowView(View::Session(s("orch"))), "show:orch"),
             (
                 CommandKind::FocusWorkspace {
                     workspace: s("alpha"),
@@ -211,17 +251,14 @@ mod tests {
                 CommandKind::SwitchProject {
                     project: String::new(),
                 },
-                "action:switch-project",
+                "switcher",
             ),
-            (
-                CommandKind::SwitchProject { project: s("web") },
-                "action:switch-project:web",
-            ),
+            (CommandKind::SwitchProject { project: s("web") }, "switch:web"),
             (CommandKind::AddProject, "action:add-project"),
-            (CommandKind::Detach, "action:detach"),
-            (CommandKind::DetachOtherClients, "action:detach-others"),
-            (CommandKind::QuitProject, "action:quit-project"),
-            (CommandKind::QuitShelbi, "action:quit-shelbi"),
+            (CommandKind::Detach, "detach"),
+            (CommandKind::DetachOtherClients, "detach-others"),
+            (CommandKind::QuitProject, "quit-project"),
+            (CommandKind::QuitShelbi, "quit-shelbi"),
             (
                 CommandKind::OpenEditor {
                     target: EditTarget::Project,
@@ -287,13 +324,13 @@ mod tests {
         assert_eq!(
             allowed,
             [
-                "view:tasks",
-                "view:activity",
-                "view:machines",
-                "view:orch",
+                "show:tasks",
+                "show:activity",
+                "show:machines",
+                "show:orch",
                 "agent:s1",
                 "action:error-log",
-                "action:detach",
+                "detach",
                 "edit:project",
                 "edit:agent:dev",
                 "edit:zenmode",
@@ -303,15 +340,13 @@ mod tests {
     }
 
     #[test]
-    fn every_command_reaches_its_handler() {
+    fn every_command_reaches_the_host_once() {
         for (kind, expected) in every_command() {
             let reached = id_for(kind.clone());
             if is_board_command(&kind) {
                 assert_eq!(reached, format!("issue:{kind:?}"), "{expected} runs on the board");
-            } else if kind == CommandKind::ShowView(View::Issues) {
-                assert_eq!(reached, "issues");
             } else {
-                assert_eq!(reached, format!("stub:{expected}"));
+                assert_eq!(reached, expected);
             }
         }
     }
@@ -339,16 +374,17 @@ mod tests {
     }
 
     #[test]
-    fn every_view_reaches_its_handler() {
-        for (view, expected) in [
-            (View::Issues, "issues"),
-            (View::Activity, "stub:view:activity"),
-            (View::Machines, "stub:view:machines"),
-            (View::Session("orch".into()), "stub:view:orch"),
+    fn every_view_routes_and_unported_ones_name_their_stub() {
+        for (view, stub) in [
+            (View::Issues, None),
+            (View::Activity, Some("view:activity")),
+            (View::Machines, Some("view:machines")),
+            (View::Session("orch".into()), Some("view:orch")),
         ] {
             let mut host = Recorder::default();
             dispatch_view(&view, &mut host);
-            assert_eq!(host.0, vec![expected.to_string()]);
+            assert_eq!(host.0, vec![format!("show:{}", view.as_view_id())]);
+            assert_eq!(view_stub_id(&view).as_deref(), stub);
         }
     }
 
