@@ -12,16 +12,22 @@ use gpui::{
 };
 use shelbi_term::Size;
 
-/// The terminal font family, when installed. Geist Mono is Shelbi's
-/// monospace face; the app doesn't bundle it yet (see the status doc), so a
-/// machine without it falls back to [`FALLBACK_FAMILY`].
+/// The default terminal font family: Geist Mono, Shelbi's monospace face,
+/// bundled with the app (`assets::load_fonts`), so it is always available.
+/// A configured family that isn't installed falls back to it.
 pub const PRIMARY_FAMILY: &str = "Geist Mono";
 
-/// The system monospace face, used when Geist Mono isn't installed.
+/// The bundled symbol font for the private-use icons (Powerline, Devicons,
+/// and the rest of the Nerd Fonts set) that prompts and agents print.
+pub const SYMBOLS_FAMILY: &str = "Symbols Nerd Font Mono";
+
+/// The system monospace face: the last explicit fallback, for anything else
+/// Geist Mono lacks (box drawing, technical symbols). CJK and emoji fall
+/// through to the system's own cascade after it.
 pub const FALLBACK_FAMILY: &str = "Menlo";
 
-/// The terminal font size in logical pixels.
-pub const FONT_SIZE: f32 = 13.0;
+/// The default terminal font size in logical pixels.
+pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
 /// The least line height, as a multiple of the font size, so rows never
 /// crowd (some fonts report a tight ascent + descent).
@@ -49,22 +55,27 @@ impl CellMetrics {
         Self {
             width: px(width),
             height: px(height),
-            font_size: px(FONT_SIZE),
+            font_size: px(DEFAULT_FONT_SIZE),
             font: terminal_font(FALLBACK_FAMILY),
         }
     }
 
-    /// Measure the terminal font in `window`: Geist Mono if installed, else
-    /// the system monospace face.
-    pub fn measure(window: &Window) -> Self {
+    /// Measure the terminal font `family` at `size` in `window`. A family
+    /// that isn't installed falls back to Geist Mono (bundled), and if even
+    /// that is missing (a test without the app's fonts) to Menlo.
+    pub fn measure(window: &Window, family: &str, size: f32) -> Self {
         let text = window.text_system();
-        let family = if text.all_font_names().iter().any(|n| n == PRIMARY_FAMILY) {
-            PRIMARY_FAMILY
-        } else {
-            FALLBACK_FAMILY
-        };
+        let names = text.all_font_names();
+        let installed = |f: &str| names.iter().any(|n| n == f);
+        let family = [family, PRIMARY_FAMILY]
+            .into_iter()
+            .find(|f| installed(f))
+            .unwrap_or_else(|| {
+                tracing::warn!(family, "terminal font not installed; using {FALLBACK_FAMILY}");
+                FALLBACK_FAMILY
+            });
         let font = terminal_font(family);
-        let font_size = px(FONT_SIZE);
+        let font_size = px(size);
         let id = text.resolve_font(&font);
         let width = text
             .advance(id, font_size, 'm')
@@ -74,7 +85,7 @@ impl CellMetrics {
         // baseline), so take its magnitude.
         let natural =
             f32::from(text.ascent(id, font_size)) + f32::from(text.descent(id, font_size)).abs();
-        let height = px(natural.max(FONT_SIZE * MIN_LINE_HEIGHT).ceil());
+        let height = px(natural.max(size * MIN_LINE_HEIGHT).ceil());
         Self {
             width,
             height,
@@ -138,6 +149,10 @@ impl CellMetrics {
 /// The terminal font in `family`: regular weight, ligatures off. Ligatures
 /// would merge glyphs ("->" into one arrow) and break the one-glyph-per-cell
 /// grid the element paints.
+///
+/// A glyph the family lacks comes from [`fallbacks`] (Geist Mono, the Nerd
+/// symbols, Menlo), then from the system's cascade (CJK, emoji), so nothing
+/// renders as a missing-glyph box that any installed font can draw.
 pub fn terminal_font(family: &str) -> Font {
     Font {
         family: family.to_string().into(),
@@ -145,15 +160,31 @@ pub fn terminal_font(family: &str) -> Font {
             ("calt".into(), 0),
             ("liga".into(), 0),
         ])),
-        fallbacks: Some(FontFallbacks::from_fonts(vec![FALLBACK_FAMILY.into()])),
+        fallbacks: Some(FontFallbacks::from_fonts(fallbacks(family))),
         weight: FontWeight::NORMAL,
         style: FontStyle::Normal,
     }
 }
 
+/// The explicit fallback chain for `family`, in order: Geist Mono (unless
+/// it is the family), the Nerd symbols, then Menlo.
+pub fn fallbacks(family: &str) -> Vec<String> {
+    [PRIMARY_FAMILY, SYMBOLS_FAMILY, FALLBACK_FAMILY]
+        .into_iter()
+        .filter(|f| *f != family)
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallbacks_put_geist_mono_first_then_symbols_then_menlo() {
+        assert_eq!(fallbacks("Berkeley Mono"), vec!["Geist Mono", "Symbols Nerd Font Mono", "Menlo"]);
+        assert_eq!(fallbacks("Geist Mono"), vec!["Symbols Nerd Font Mono", "Menlo"]);
+    }
 
     #[test]
     fn grid_size_is_whole_cells_from_pixel_bounds() {

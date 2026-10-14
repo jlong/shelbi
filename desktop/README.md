@@ -29,7 +29,13 @@ The app is a client of the `shelbi` CLI and needs it installed
 ```yaml
 desktop:
   cli_path: ~/src/shelbi/target/debug/shelbi
+  terminal_font_family: Geist Mono   # the default; bundled with the app
+  terminal_font_size: 13             # points, 6 to 72
+  option_as_meta: false              # true, left, or right (Ghostty's shape)
 ```
+
+The settings view edits all of these; the terminal settings apply to open
+terminals at once.
 
 ## Build and run
 
@@ -93,7 +99,7 @@ desktop/
   scripts/render-icon.sh  assets/icon/shelbi.svg -> shelbi-1024.png
   assets/icon/         the app icon: SVG source + the 1024px PNG master bundle.sh cuts into .icns
   assets/icons/        vendored Heroicons + their LICENSE
-  assets/fonts/geist/  Geist, the UI typeface (OFL) + its LICENSE
+  assets/fonts/        Geist (UI) and Geist Mono (terminal), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
   docs/status/         one <task-id>.md per subtask
   src/main.rs          gpui App, the menu, the app-wide globals, the launch window
@@ -119,7 +125,7 @@ Which subtask fills what:
 
 | Module | Subtask |
 |---|---|
-| `elements/` terminal element, gpui channel decision | `dt-spike-terminal`, then `dt-terminal-complete`, `dt-terminal-perf-multiclient` |
+| `elements/` terminal element, gpui channel decision | `dt-spike-terminal`, `dt-terminal-complete`, then `dt-terminal-perf-multiclient` |
 | `theme.rs` light theme, shared token names | `dt-theme-tokens` |
 | `platform/` | `dt-platform-bootstrap` |
 | `views/` sidebar, project switching, refresh pipeline, settings | `dt-shell-sidebar` |
@@ -133,7 +139,44 @@ Which subtask fills what:
 | bundle, signing, cask, update notice (`platform/update.rs`, `views/update.rs`) | `dt-packaging` |
 | smoke tests, docs | `dt-parity-audit` |
 
-## The terminal element by hand
+## The terminal element
+
+`src/elements/terminal/` is every session the app shows (the chat, a
+workspace's agent, a review's editor and diff). What it does, with the
+TUI's rules where the TUI has the feature (the shared code is
+`shelbi-term`):
+
+| | |
+|---|---|
+| Scroll | The wheel, Shift+wheel (always Shelbi's), Shift+PageUp/PageDown/Home/End, and the scrollbar. New output doesn't move a scrolled-up view; "N lines below" jumps back. On the alternate screen (`less`, `man`) the wheel sends arrow keys. |
+| Select | Drag (cells), double-click (a word), triple-click (a line), Alt+drag (a block). Shift keeps a gesture Shelbi's while a program reports the mouse. Dragging past the top or bottom edge scrolls. A finished selection is copied; Cmd+C copies too. Works on both screens; it follows its text as output scrolls and goes away when that text changes. |
+| Paste | Cmd+V, bracketed when the program asked. |
+| Find | Cmd+F: search as you type (smart case), Enter / Shift+Enter (or Cmd+G / Cmd+Shift+G) for older / newer matches, Escape to close. |
+| Links | Hold Cmd to underline a URL or a `path[:line[:col]]` under the pointer; Cmd+click opens a URL in the browser and a file in your editor at that line (the `editor` setting, then `$EDITOR`, then `vim`; terminal editors open in Terminal.app). Relative paths resolve against the session's working directory. |
+| Keys | The TUI's encoder (kitty protocol, DECCKM). Option types characters and dead keys unless `option_as_meta` says otherwise; Option with Enter, arrows, Backspace, or Delete is always Meta. IME composition draws at the cursor. |
+| Mouse | Clicks, drags (`?1002`), and motion (`?1003`) reach a program that asks for them, SGR or X10 encoded. Alt hands a drag to a reporting program. |
+| Fonts | `terminal_font_family` / `terminal_font_size`, live. Geist Mono and Symbols Nerd Font Mono are bundled; a glyph the font lacks falls back to Geist Mono, then the Nerd symbols, then Menlo, then the system (CJK, emoji). |
+
+### Accessibility
+
+The terminal publishes its screen through gpui's AccessKit integration while
+an assistive technology (VoiceOver) is running:
+
+- **Supported:** the pane is a focusable `Terminal` node named after the
+  session; its children are the visible rows as text runs (wide characters
+  once, trailing blanks trimmed), and the cursor is the node's text
+  selection, so VoiceOver reads the screen, navigates it by line, word, and
+  character, and reports the cursor position. The tree follows scrolling
+  and output on the next frame.
+- **Not supported yet:** scrollback beyond the visible rows (scroll to bring
+  history on screen first), announcing new output as it arrives (no live
+  region, which would make a busy agent unusable to listen to), text
+  attributes (color, bold), and the selection or search matches as
+  accessible state. The find bar, the scrollbar, and the "lines below"
+  button are mouse/keyboard controls without accessible actions of their
+  own. AccessKit costs nothing while no assistive technology is connected.
+
+### By hand
 
 ```sh
 cd desktop

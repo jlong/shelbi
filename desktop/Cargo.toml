@@ -75,6 +75,10 @@ markdown = "=1.0.0"
 # shared crates already resolve.
 chrono = "0.4"
 
+# Display width of IME composition text (already in the tree via
+# alacritty_terminal).
+unicode-width = "0.2"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

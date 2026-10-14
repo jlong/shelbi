@@ -13,6 +13,7 @@
 //! encoded directly.
 
 use gpui::Keystroke;
+use shelbi_state::OptionAsMeta;
 use shelbi_term::input::{Key, Modifiers};
 
 /// What one key-down does in a terminal pane.
@@ -27,6 +28,8 @@ pub enum KeyAction {
     Copy,
     /// Cmd+V: paste the clipboard.
     Paste,
+    /// Cmd+F: open the find bar.
+    Find,
     /// Shift+PageUp / Shift+PageDown / Shift+Home / Shift+End: Shelbi's own
     /// scrollback (the program gets the key on the alternate screen, where
     /// there is no scrollback).
@@ -72,12 +75,13 @@ pub fn classify(ks: &Keystroke, option_as_alt: bool) -> KeyAction {
         sup: m.platform,
     };
 
-    // Cmd chords are the app's, except the clipboard pair.
+    // Cmd chords are the app's, except the clipboard pair and Find.
     if m.platform {
         let plain = !m.control && !m.alt && !m.shift;
         return match ks.key.as_str() {
             "c" if plain => KeyAction::Copy,
             "v" if plain => KeyAction::Paste,
+            "f" if plain => KeyAction::Find,
             _ => KeyAction::Ignore,
         };
     }
@@ -114,6 +118,44 @@ pub fn classify(ks: &Keystroke, option_as_alt: bool) -> KeyAction {
 
     // Plain, shifted, or Option-composed text: the input handler sends it.
     KeyAction::Text
+}
+
+/// Which Option keys are held right now: `(left, right)`.
+///
+/// gpui's modifiers don't say which side is down, so this asks the window
+/// server for the device-dependent modifier bits (`NX_DEVICELALTKEYMASK`,
+/// `NX_DEVICERALTKEYMASK`). Called at key-down, it reflects the key event
+/// being handled.
+#[cfg(target_os = "macos")]
+pub fn held_option_sides() -> (bool, bool) {
+    const COMBINED_SESSION_STATE: i32 = 0;
+    const LEFT_ALT: u64 = 0x0000_0020;
+    const RIGHT_ALT: u64 = 0x0000_0040;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceFlagsState(state: i32) -> u64;
+    }
+    // SAFETY: a pure query of the current modifier state.
+    let flags = unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) };
+    (flags & LEFT_ALT != 0, flags & RIGHT_ALT != 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn held_option_sides() -> (bool, bool) {
+    (true, true)
+}
+
+/// Whether a held Option is Meta under `setting`, given which Option keys
+/// are down (`(left, right)`). If neither side can be told (both bits
+/// clear), a one-sided setting treats it as that side.
+pub fn option_is_meta(setting: OptionAsMeta, (left, right): (bool, bool)) -> bool {
+    let unknown = !left && !right;
+    match setting {
+        OptionAsMeta::Off => false,
+        OptionAsMeta::Both => true,
+        OptionAsMeta::Left => left || unknown,
+        OptionAsMeta::Right => right || unknown,
+    }
 }
 
 /// gpui's names for keys that aren't text.
@@ -275,9 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn cmd_chords_are_the_apps_except_copy_and_paste() {
+    fn cmd_chords_are_the_apps_except_copy_paste_and_find() {
         assert_eq!(classify(&ks("cmd-c"), true), KeyAction::Copy);
         assert_eq!(classify(&ks("cmd-v"), true), KeyAction::Paste);
+        assert_eq!(classify(&ks("cmd-f"), true), KeyAction::Find);
+        assert_eq!(classify(&ks("cmd-shift-f"), true), KeyAction::Ignore);
         assert_eq!(classify(&ks("cmd-w"), true), KeyAction::Ignore);
         assert_eq!(classify(&ks("cmd-q"), true), KeyAction::Ignore);
         assert_eq!(classify(&ks("cmd-shift-c"), true), KeyAction::Ignore);
@@ -308,5 +352,31 @@ mod tests {
             KeyAction::Send(Key::PageUp, Modifiers::NONE)
         );
         assert_eq!(ScrollKey::Top.key(), Key::Home);
+    }
+
+    #[test]
+    fn with_option_typing_characters_option_letters_reach_the_input_handler() {
+        // The macOS default: Option+E is a dead key, Option+B types `∫`; the
+        // platform composes them, so they must reach the input handler.
+        assert_eq!(classify(&ks("alt-e"), false), KeyAction::Text);
+        assert_eq!(classify(&ks("alt-b"), false), KeyAction::Text);
+        // Named keys still carry Alt (Claude Code's Option+Enter newline).
+        assert_eq!(classify(&ks("alt-enter"), false), KeyAction::Send(Key::Enter, Modifiers::ALT));
+        // With Option as Meta, Option+B is Meta+B.
+        assert_eq!(classify(&ks("alt-b"), true), KeyAction::Send(Key::Char('b'), Modifiers::ALT));
+    }
+
+    #[test]
+    fn option_as_meta_by_side() {
+        use OptionAsMeta::*;
+        let (left, right, both) = ((true, false), (false, true), (true, true));
+        assert!(!option_is_meta(Off, left) && !option_is_meta(Off, both));
+        assert!(option_is_meta(Both, left) && option_is_meta(Both, right));
+        assert!(option_is_meta(Left, left) && !option_is_meta(Left, right));
+        assert!(option_is_meta(Right, right) && !option_is_meta(Right, left));
+        // Both held: either side counts.
+        assert!(option_is_meta(Left, both) && option_is_meta(Right, both));
+        // Side unknown: a one-sided setting still applies.
+        assert!(option_is_meta(Left, (false, false)));
     }
 }

@@ -1,11 +1,13 @@
 //! Text selection and copy.
 //!
-//! Selection is Shelbi's own, driven by Shift+drag (and plain drag when the
-//! program has not asked for the mouse — see [`crate::input`]). It exists only
-//! on the **normal** screen; [`crate::view::TerminalView`] enforces that. This
-//! module is the toolkit-neutral model: a start/end region in grid
-//! coordinates, text extraction from the emulator grid, and the OSC 52 copy
-//! encoder.
+//! Selection is Shelbi's own, driven by the mouse gesture rules in
+//! [`crate::gesture`] (a drag selects cells, a double-click a word, a
+//! triple-click a line, an Alt-drag a block). It exists only on the **normal**
+//! screen; [`crate::view::TerminalView`] enforces that, and keeps the live
+//! selection inside the emulator so it stays on its text as output scrolls and
+//! is dropped when that text changes. This module is the toolkit-neutral
+//! model: a [`Selection`]'s geometry in grid coordinates, text extraction from
+//! the emulator grid, the word boundaries, and the OSC 52 copy encoder.
 //!
 //! Copy uses OSC 52 ([`osc52_copy`]) so it works over SSH and through an outer
 //! tmux or Screen. The actual clipboard write — OSC 52 to the outer terminal,
@@ -53,19 +55,68 @@ impl Ord for Point {
     }
 }
 
-/// An in-progress or settled text selection: an anchor (where the drag began)
-/// and a focus (where it is now). A single click with no drag leaves both
-/// equal, which selects one cell.
+/// How a selection grows from where it started.
+///
+/// A viewer picks the mode from the gesture: a drag is [`SelectionMode::Cell`],
+/// a double-click [`SelectionMode::Word`], a triple-click
+/// [`SelectionMode::Line`], and an Alt-drag [`SelectionMode::Block`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Exactly the cells between the two ends, as a stream (the rest of the
+    /// first line, whole lines between, the start of the last).
+    #[default]
+    Cell,
+    /// Whole words: each end grows to the nearest [`WORD_SEPARATORS`]
+    /// boundary (across wrapped rows), so a double-click selects a word and a
+    /// drag extends word by word.
+    Word,
+    /// Whole lines (a wrapped line counts as one).
+    Line,
+    /// A rectangle: the same columns on every line between the two ends.
+    Block,
+}
+
+/// The characters that end a word for double-click selection.
+///
+/// Whitespace, quotes, brackets, and the separators that surround paths and
+/// identifiers in program output (`,` `|` `:` `;` and the box-drawing bar
+/// `│`). So a double-click on `src/main.rs:42` selects `src/main.rs`, and on
+/// `foo_bar-baz.txt` the whole name: `/`, `.`, `_`, `-`, `~`, `@`, `+`, `=`,
+/// `#`, and `%` are word characters. (alacritty's default set plus `;`.)
+pub const WORD_SEPARATORS: &str = ",│`|:;\"' ()[]{}<>\t";
+
+/// Whether `c` ends a word for double-click selection (see
+/// [`WORD_SEPARATORS`]). The emulator's own word search uses the same set.
+pub fn is_word_separator(c: char) -> bool {
+    WORD_SEPARATORS.contains(c)
+}
+
+/// A text selection: an anchor (where it began), a focus (where it is now),
+/// and a [`SelectionMode`].
+///
+/// As a plain value it is the selection *geometry*: which cells are selected
+/// and what text that yields. [`crate::view::TerminalView::selection`] returns
+/// one already resolved (a word or line selection's ends already grown to
+/// their boundaries, a block's ends as its top-left and bottom-right corners),
+/// so [`Selection::contains`] and [`Selection::row_span`] are exactly what to
+/// paint. A single click with no drag leaves anchor and focus equal, which
+/// [`Selection::is_empty`] reports for the cell and block modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     anchor: Point,
     focus: Point,
+    mode: SelectionMode,
 }
 
 impl Selection {
-    /// Begin a selection at `anchor`.
+    /// Begin a cell selection at `anchor`.
     pub fn start(anchor: Point) -> Self {
-        Self { anchor, focus: anchor }
+        Self::with_mode(anchor, SelectionMode::Cell)
+    }
+
+    /// Begin a selection in `mode` at `anchor`.
+    pub fn with_mode(anchor: Point, mode: SelectionMode) -> Self {
+        Self { anchor, focus: anchor, mode }
     }
 
     /// Extend the selection to `focus` (a drag).
@@ -73,8 +124,21 @@ impl Selection {
         self.focus = focus;
     }
 
-    /// The selection range normalized so start precedes end.
+    /// The selection's mode.
+    pub fn mode(&self) -> SelectionMode {
+        self.mode
+    }
+
+    /// The selection range normalized so start precedes end. For a block, the
+    /// top-left and bottom-right corners.
     pub fn range(&self) -> (Point, Point) {
+        if self.mode == SelectionMode::Block {
+            let (a, f) = (self.anchor, self.focus);
+            return (
+                Point::new(a.line.min(f.line), a.col.min(f.col)),
+                Point::new(a.line.max(f.line), a.col.max(f.col)),
+            );
+        }
         if self.anchor <= self.focus {
             (self.anchor, self.focus)
         } else {
@@ -82,34 +146,76 @@ impl Selection {
         }
     }
 
-    /// Whether the selection covers nothing wider than a single cell.
+    /// Whether the selection covers nothing wider than a single cell: a click
+    /// that never became a drag. A word or line selection is never empty (a
+    /// double-click on a one-letter word still selects it).
     pub fn is_empty(&self) -> bool {
-        self.anchor == self.focus
+        matches!(self.mode, SelectionMode::Cell | SelectionMode::Block) && self.anchor == self.focus
     }
 
-    /// Whether the cell at grid `line`/`col` falls inside the (stream)
-    /// selection. Mirrors [`extract_stream`]'s geometry so the on-screen
-    /// highlight matches exactly what a copy would yield: the start line is
-    /// selected from `start.col` on, the end line up to `end.col`, and every
-    /// line in between is selected whole.
-    pub fn contains(&self, line: i32, col: u16) -> bool {
+    /// The columns selected on grid `line`, as an inclusive `(first, last)`
+    /// pair clamped to a grid `cols` wide, or `None` when the line is outside
+    /// the selection. A stream selection takes the start line from
+    /// `start.col` on, the end line up to `end.col`, and every line between
+    /// whole; a block takes the same columns on every line. This is the
+    /// geometry both [`Selection::contains`] and a viewer's highlight use, and
+    /// it matches what [`Selection::extract_text`] copies.
+    pub fn row_span(&self, line: i32, cols: u16) -> Option<(u16, u16)> {
         let (start, end) = self.range();
-        if line < start.line || line > end.line {
-            return false;
+        if line < start.line || line > end.line || cols == 0 {
+            return None;
         }
-        let after_start = line > start.line || col >= start.col;
-        let before_end = line < end.line || col <= end.col;
-        after_start && before_end
+        let last_col = cols - 1;
+        let (first, last) = if self.mode == SelectionMode::Block {
+            (start.col, end.col)
+        } else {
+            let first = if line == start.line { start.col } else { 0 };
+            let last = if line == end.line { end.col } else { last_col };
+            (first, last)
+        };
+        let last = last.min(last_col);
+        (first <= last).then_some((first, last))
     }
 
-    /// Extract the selected text from `grid` as a stream selection (the whole
-    /// run from start to end, not a rectangle). Lines that the emulator marked
-    /// as wrapped are joined without a newline, matching `capture-pane -J`;
-    /// other line breaks become `\n`, with trailing whitespace trimmed.
+    /// Whether the cell at grid `line`/`col` falls inside the selection (see
+    /// [`Selection::row_span`]).
+    pub fn contains(&self, line: i32, col: u16) -> bool {
+        self.row_span(line, u16::MAX)
+            .is_some_and(|(first, last)| first <= col && col <= last)
+    }
+
+    /// Extract the selected text from `grid`. A stream selection (cell, word,
+    /// line) runs from start to end: lines that the emulator marked as wrapped
+    /// are joined without a newline, matching `capture-pane -J`, and other
+    /// line breaks become `\n` with trailing whitespace trimmed. A block takes
+    /// its columns from each line, one line of text per row.
     pub fn extract_text(&self, grid: &Grid<Cell>) -> String {
         let (start, end) = self.range();
-        extract_stream(grid, start, end)
+        if self.mode == SelectionMode::Block {
+            extract_block(grid, start, end)
+        } else {
+            extract_stream(grid, start, end)
+        }
     }
+}
+
+/// Extract a block (rectangle) selection: columns `start.col..=end.col` of
+/// every line from `start.line` to `end.line`, each row trimmed.
+pub(crate) fn extract_block(grid: &Grid<Cell>, start: Point, end: Point) -> String {
+    let cols = grid.columns() as u16;
+    let top = -(grid.history_size() as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    let (first_line, last_line) = (start.line.clamp(top, bottom), end.line.clamp(top, bottom));
+    if first_line > last_line || cols == 0 || start.col >= cols {
+        return String::new();
+    }
+    let rows: Vec<String> = (first_line..=last_line)
+        .map(|line| {
+            let (text, _) = row_text(grid, line, start.col, end.col, cols);
+            text.trim_end_matches(' ').to_string()
+        })
+        .collect();
+    rows.join("\n")
 }
 
 /// Extract a stream selection from `start` to `end` (inclusive) out of `grid`.
@@ -312,5 +418,48 @@ mod tests {
     fn osc52_wraps_base64_payload() {
         let seq = osc52_copy("foo");
         assert_eq!(seq, b"\x1b]52;c;Zm9v\x1b\\");
+    }
+
+    #[test]
+    fn row_span_is_the_stream_geometry() {
+        let mut s = Selection::start(Point::new(0, 2));
+        s.update(Point::new(2, 3));
+        assert_eq!(s.row_span(-1, 10), None);
+        assert_eq!(s.row_span(0, 10), Some((2, 9)));
+        assert_eq!(s.row_span(1, 10), Some((0, 9)));
+        assert_eq!(s.row_span(2, 10), Some((0, 3)));
+        assert_eq!(s.row_span(3, 10), None);
+        // Clamped to the grid width.
+        let mut wide = Selection::start(Point::new(0, 0));
+        wide.update(Point::new(0, 50));
+        assert_eq!(wide.row_span(0, 10), Some((0, 9)));
+    }
+
+    #[test]
+    fn block_geometry_is_a_rectangle_from_any_corner() {
+        let mut s = Selection::with_mode(Point::new(3, 1), SelectionMode::Block);
+        s.update(Point::new(1, 4));
+        assert_eq!(s.range(), (Point::new(1, 1), Point::new(3, 4)));
+        for line in 1..=3 {
+            assert_eq!(s.row_span(line, 10), Some((1, 4)));
+        }
+        assert!(s.contains(2, 1) && s.contains(2, 4));
+        assert!(!s.contains(2, 0) && !s.contains(2, 5) && !s.contains(0, 2));
+    }
+
+    #[test]
+    fn empty_only_for_a_click_in_cell_or_block_mode() {
+        assert!(Selection::with_mode(Point::new(0, 0), SelectionMode::Block).is_empty());
+        assert!(!Selection::with_mode(Point::new(0, 0), SelectionMode::Word).is_empty());
+        assert!(!Selection::with_mode(Point::new(0, 0), SelectionMode::Line).is_empty());
+    }
+
+    #[test]
+    fn extract_block_takes_the_columns_of_each_row() {
+        let term = mock_term("abcdef\r\ngh\r\nmnopqr");
+        let mut s = Selection::with_mode(Point::new(0, 1), SelectionMode::Block);
+        s.update(Point::new(2, 3));
+        // A short row contributes what it has, trimmed.
+        assert_eq!(s.extract_text(term.grid()), "bcd\nh\nnop");
     }
 }

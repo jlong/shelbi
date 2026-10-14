@@ -3,7 +3,9 @@
 //! Stored in `~/.shelbi/config.yaml` through `shelbi_state::user_config`:
 //!
 //! - `desktop.terminal_font_family` / `desktop.terminal_font_size`: the
-//!   terminals' font (read by the terminal element);
+//!   terminals' font, and `desktop.option_as_meta`: which Option keys are
+//!   Meta in terminals (the terminal element applies all three at once
+//!   through its `TerminalSettings` global);
 //! - `theme:` (`auto | dark | light`), shared with the TUI, which reads it on
 //!   its next start;
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
@@ -20,8 +22,9 @@ use std::path::PathBuf;
 
 use gpui::{div, prelude::*, px, Context, Entity, FontWeight, SharedString, Subscription, Window};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use shelbi_state::{DesktopConfig, ThemePreference, UserConfig};
+use shelbi_state::{DesktopConfig, OptionAsMeta, ThemePreference, UserConfig};
 
+use crate::elements::terminal::TerminalSettings;
 use crate::theme::Theme;
 
 /// The values the view edits, parsed from the inputs.
@@ -31,6 +34,7 @@ pub struct SettingsValues {
     pub font_size: String,
     pub cli_path: String,
     pub theme: ThemePreference,
+    pub option_as_meta: OptionAsMeta,
 }
 
 impl SettingsValues {
@@ -50,6 +54,7 @@ impl SettingsValues {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             theme: cfg.theme,
+            option_as_meta: cfg.desktop.option_as_meta.unwrap_or_default(),
         }
     }
 
@@ -71,6 +76,8 @@ impl SettingsValues {
             cli_path: blank(&self.cli_path).map(PathBuf::from),
             terminal_font_family: blank(&self.font_family),
             terminal_font_size: size,
+            // Off is the default, so it isn't written.
+            option_as_meta: (self.option_as_meta != OptionAsMeta::Off).then_some(self.option_as_meta),
         };
         cfg.theme = self.theme;
         Ok(())
@@ -91,6 +98,7 @@ pub struct SettingsView {
     font_size: Entity<InputState>,
     cli_path: Entity<InputState>,
     theme: ThemePreference,
+    option_as_meta: OptionAsMeta,
     /// False until the config has been read, so an early blur can't save
     /// blank values over it.
     loaded: bool,
@@ -121,6 +129,7 @@ impl SettingsView {
             font_size,
             cli_path,
             theme: ThemePreference::Auto,
+            option_as_meta: OptionAsMeta::Off,
             loaded: false,
             state: SaveState::Idle,
             _subscriptions: subscriptions,
@@ -147,6 +156,7 @@ impl SettingsView {
                         set(&this.font_size, values.font_size, window, cx);
                         set(&this.cli_path, values.cli_path, window, cx);
                         this.theme = values.theme;
+                        this.option_as_meta = values.option_as_meta;
                         this.loaded = true;
                     }
                     Err(e) => {
@@ -166,6 +176,7 @@ impl SettingsView {
             font_size: self.font_size.read(cx).value().to_string(),
             cli_path: self.cli_path.read(cx).value().to_string(),
             theme: self.theme,
+            option_as_meta: self.option_as_meta,
         }
     }
 
@@ -181,6 +192,11 @@ impl SettingsView {
             cx.notify();
             return;
         }
+        let applied = {
+            let mut cfg = UserConfig::default();
+            let _ = values.apply(&mut cfg);
+            TerminalSettings::from_config(&cfg.desktop)
+        };
         let write = cx.background_executor().spawn(async move {
             let mut invalid = None;
             let result = shelbi_state::update_user_config(|cfg| {
@@ -198,7 +214,11 @@ impl SettingsView {
             let result = write.await;
             this.update(cx, |this, cx| {
                 this.state = match result {
-                    Ok(()) => SaveState::Saved,
+                    Ok(()) => {
+                        // Open terminals pick up the font and Option key now.
+                        TerminalSettings::set(applied, cx);
+                        SaveState::Saved
+                    }
                     Err(e) => SaveState::Failed(e),
                 };
                 cx.notify();
@@ -213,6 +233,13 @@ impl SettingsView {
     fn set_theme(&mut self, theme: ThemePreference, window: &Window, cx: &mut Context<Self>) {
         self.theme = theme;
         crate::theme::apply_preference(theme, window, cx);
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Pick what Option does in terminals; saved and applied at once.
+    fn set_option_as_meta(&mut self, value: OptionAsMeta, cx: &mut Context<Self>) {
+        self.option_as_meta = value;
         self.save(cx);
         cx.notify();
     }
@@ -303,6 +330,25 @@ impl Render for SettingsView {
             SaveState::Failed(e) => Some((e.clone().into(), theme.red)),
         };
         let current = self.theme;
+        let option_as_meta = self.option_as_meta;
+        let option_chip = |label: &'static str, value: OptionAsMeta, cx: &mut Context<Self>| {
+            let selected = value == option_as_meta;
+            div()
+                .id(label)
+                .debug_selector(move || format!("settings-option-{label}"))
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |d| {
+                    d.bg(theme.selection)
+                        .text_color(theme.white)
+                        .font_weight(FontWeight::BOLD)
+                })
+                .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
+        };
 
         div()
             .id("settings")
@@ -354,6 +400,29 @@ impl Render for SettingsView {
                 "In points. Blank uses the default.",
                 &self.font_size,
             ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(theme.white).child("Option key in terminals"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(option_chip("Types characters", OptionAsMeta::Off, cx))
+                            .child(option_chip("Meta", OptionAsMeta::Both, cx))
+                            .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
+                            .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
+                    )
+                    .child(div().text_xs().text_color(theme.muted).child(
+                        "Characters: Option+E, E types é, as in other Mac apps. Meta: \
+                         Option+B sends Esc B, for shell word motion and Claude Code's \
+                         Option shortcuts. Option with Enter, the arrows, Backspace, or \
+                         Delete is Meta either way.",
+                    )),
+            )
             .child(field(
                 "Shelbi CLI",
                 "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
@@ -403,6 +472,7 @@ mod tests {
             font_size: " 14 ".into(),
             cli_path: "~/bin/shelbi".into(),
             theme: ThemePreference::Light,
+            option_as_meta: OptionAsMeta::Left,
         };
         let mut cfg = UserConfig {
             editor: Some("hx".into()),
@@ -416,11 +486,13 @@ mod tests {
             Some(std::path::Path::new("~/bin/shelbi"))
         );
         assert_eq!(cfg.theme, ThemePreference::Light);
+        assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
         assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
         assert_eq!(back.font_size, "14");
         assert_eq!(back.font_family, "Berkeley Mono");
         assert_eq!(back.cli_path, "~/bin/shelbi");
+        assert_eq!(back.option_as_meta, OptionAsMeta::Left);
     }
 
     #[test]

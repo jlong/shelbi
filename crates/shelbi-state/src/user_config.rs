@@ -87,6 +87,69 @@ pub struct DesktopConfig {
     /// app's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_font_size: Option<u16>,
+
+    /// Whether Option acts as Meta in the desktop app's terminals (Option+B
+    /// sends `ESC b`, for shell word motion and Claude Code's Option chords)
+    /// instead of typing the keyboard layout's Option characters and dead
+    /// keys (Option+E, E types `é`): `false` (the macOS default), `true`,
+    /// `left`, or `right` (only that Option key is Meta), as in Ghostty.
+    /// Unset means `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_as_meta: Option<OptionAsMeta>,
+}
+
+/// Which Option keys act as Meta in the desktop app's terminals
+/// (`desktop.option_as_meta`). Written as a YAML bool or `left` / `right`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptionAsMeta {
+    /// Neither: Option types characters and dead keys (`false`).
+    #[default]
+    Off,
+    /// Both Option keys are Meta (`true`).
+    Both,
+    /// Only the left Option key is Meta; the right one types characters.
+    Left,
+    /// Only the right Option key is Meta; the left one types characters.
+    Right,
+}
+
+impl Serialize for OptionAsMeta {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            OptionAsMeta::Off => s.serialize_bool(false),
+            OptionAsMeta::Both => s.serialize_bool(true),
+            OptionAsMeta::Left => s.serialize_str("left"),
+            OptionAsMeta::Right => s.serialize_str("right"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OptionAsMeta {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = OptionAsMeta;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("true, false, left, or right")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<OptionAsMeta, E> {
+                Ok(if v { OptionAsMeta::Both } else { OptionAsMeta::Off })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<OptionAsMeta, E> {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "both" => Ok(OptionAsMeta::Both),
+                    "false" => Ok(OptionAsMeta::Off),
+                    "left" => Ok(OptionAsMeta::Left),
+                    "right" => Ok(OptionAsMeta::Right),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
 }
 
 impl DesktopConfig {
@@ -95,6 +158,7 @@ impl DesktopConfig {
         self.cli_path.is_none()
             && self.terminal_font_family.is_none()
             && self.terminal_font_size.is_none()
+            && self.option_as_meta.is_none()
     }
 }
 
@@ -319,7 +383,8 @@ mod tests {
     fn desktop_settings_and_theme_round_trip() {
         let cfg: UserConfig = serde_yaml::from_str(
             "theme: light\ndesktop:\n  cli_path: /opt/shelbi/bin/shelbi\n  \
-             terminal_font_family: Geist Mono\n  terminal_font_size: 14\n",
+             terminal_font_family: Geist Mono\n  terminal_font_size: 14\n  \
+             option_as_meta: left\n",
         )
         .unwrap();
         assert_eq!(cfg.theme, ThemePreference::Light);
@@ -329,6 +394,7 @@ mod tests {
         );
         assert_eq!(cfg.desktop.terminal_font_family.as_deref(), Some("Geist Mono"));
         assert_eq!(cfg.desktop.terminal_font_size, Some(14));
+        assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
         let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
         // Defaults write neither key, so the CLI's own saves don't add them.
@@ -551,5 +617,23 @@ mod tests {
         let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
         assert!(!yaml.contains("editor"), "unset editor omitted: {yaml}");
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn option_as_meta_reads_bools_and_sides() {
+        let read = |v: &str| -> OptionAsMeta {
+            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  option_as_meta: {v}\n")).unwrap();
+            cfg.desktop.option_as_meta.unwrap()
+        };
+        assert_eq!(read("false"), OptionAsMeta::Off);
+        assert_eq!(read("true"), OptionAsMeta::Both);
+        assert_eq!(read("left"), OptionAsMeta::Left);
+        assert_eq!(read("Right"), OptionAsMeta::Right);
+        assert!(serde_yaml::from_str::<UserConfig>("desktop:\n  option_as_meta: sideways\n").is_err());
+        for v in [OptionAsMeta::Off, OptionAsMeta::Both, OptionAsMeta::Left, OptionAsMeta::Right] {
+            let text = serde_yaml::to_string(&v).unwrap();
+            assert_eq!(serde_yaml::from_str::<OptionAsMeta>(&text).unwrap(), v, "{text}");
+        }
+        assert_eq!(serde_yaml::to_string(&OptionAsMeta::Both).unwrap().trim(), "true");
     }
 }

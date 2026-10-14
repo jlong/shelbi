@@ -33,6 +33,8 @@
 //! - [`scrollback`]: scrollback navigation for sessions on the normal screen.
 //! - [`selection`]: text selection and the OSC 52 copy encoder.
 //! - [`search`]: search within scrollback and the visible screen.
+//! - [`links`]: URLs and file paths (with an optional `:line`) in the output,
+//!   for Cmd+click.
 //! - [`input`]: encode keys, mouse, paste, and focus into PTY bytes, with the
 //!   mouse-ownership policy as a pure function.
 //! - [`gesture`]: the mouse gesture state machine both clients share (a drag
@@ -50,6 +52,7 @@
 pub mod emulator;
 pub mod gesture;
 pub mod input;
+pub mod links;
 pub mod render;
 pub mod scrollback;
 pub mod search;

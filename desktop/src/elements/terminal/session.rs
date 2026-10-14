@@ -76,6 +76,9 @@ pub struct Connected {
     pub size: Size,
     /// The session's logical name (`project/workspace`).
     pub name: String,
+    /// The program's working directory (where a clicked relative path
+    /// resolves), when the attach knew it.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// How long [`connect`] keeps retrying a session that is still starting.
@@ -138,13 +141,17 @@ fn attempt(selector: &str) -> Result<Connected, Failure> {
         |what: &str, e: ClientError| Failure::Fatal(format!("{what} {}: {e}", session.meta.name));
     let info = conn.info().map_err(|e| fatal("querying", e))?;
     conn.attach(None).map_err(|e| fatal("attaching to", e))?;
-    wire(
+    let connected = wire(
         conn,
         events,
         Size::new(info.cols.max(1), info.rows.max(1)),
         session.meta.name.clone(),
     )
-    .map_err(Failure::Fatal)
+    .map_err(Failure::Fatal)?;
+    Ok(Connected {
+        cwd: Some(session.meta.cwd.clone()),
+        ..connected
+    })
 }
 
 /// Move an attached connection onto the pane's threads: a forwarder that moves
@@ -203,6 +210,7 @@ pub fn wire(
         events: event_rx,
         size,
         name,
+        cwd: None,
     })
 }
 
