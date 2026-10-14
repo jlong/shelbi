@@ -97,6 +97,13 @@
 
 ## Verification
 
+Rebase (2026-10-14): rebased onto `jlong/desktop-app` at `259540b6`
+(after `dt-chat-view`); the only conflict was `desktop/docs/gpui.md`, where
+both sets of quirk notes are kept. Re-run after the rebase: from `desktop/`,
+`cargo build` ok, `cargo clippy --all-targets -- -D warnings` ok, `cargo test`
+140 passed; from the root, `cargo check --workspace --locked` ok and
+`cargo clippy --workspace --all-targets -- -D warnings` ok.
+
 Run from `desktop/`:
 
 - `cargo build`: ok.
