@@ -676,6 +676,7 @@ pub fn should_show_zen_intro(project: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::palette;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::style::{Modifier, Style};
@@ -864,7 +865,7 @@ mod tests {
         let mut found_row = false;
         for y in rect.top()..rect.bottom() {
             let selected_cells: Vec<u16> = (rect.left()..rect.right())
-                .filter(|&x| buf[(x, y)].bg == crate::theme::SELECTION_BG)
+                .filter(|&x| buf[(x, y)].bg == palette().selection)
                 .collect();
             if selected_cells.is_empty() {
                 continue;
@@ -891,7 +892,7 @@ mod tests {
                 "the selection bar must reach the content's right edge, got {selected_cells:?}"
             );
             for x in first..=last {
-                if buf[(x, y)].bg != crate::theme::SELECTION_BG {
+                if buf[(x, y)].bg != palette().selection {
                     assert_eq!(
                         buf[(x, y)].symbol().trim(),
                         "",

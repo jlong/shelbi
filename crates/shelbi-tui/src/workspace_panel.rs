@@ -442,7 +442,7 @@ fn switch_entry(app: &WorkspacePanel, item: SwitchItem) -> NavEntry {
 mod tests {
     use super::*;
     use crate::panel::BACK_BUTTON_LINE;
-    use crate::theme::{ACCENT_CYAN, SELECTION_BG, STATUS_YELLOW};
+    use crate::theme::palette;
     use ratatui::{backend::TestBackend, Terminal};
 
     const BODY: &str = "## Summary\n\nWarm the application cache during startup so the first request can reuse the same data as subsequent requests.\n\n## Acceptance criteria\n\n- Initialize the cache once before accepting traffic.";
@@ -450,7 +450,7 @@ mod tests {
     fn in_progress() -> WsStatus {
         WsStatus {
             text: "IN PROGRESS".into(),
-            color: STATUS_YELLOW,
+            color: palette().yellow,
         }
     }
 
@@ -493,6 +493,53 @@ mod tests {
             .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
     }
 
+    /// The panel in each status color (in progress, ready for review, done,
+    /// a custom status) and with the back button, More, and a switch
+    /// selected, plus a status line, is readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            let statuses = [
+                ("in-progress", "IN PROGRESS", palette().yellow),
+                ("review", "READY FOR REVIEW", palette().cyan),
+                ("done", "DONE", palette().green),
+                ("custom", "BLOCKED", palette().muted),
+            ];
+            for (i, (name, text, color)) in statuses.into_iter().enumerate() {
+                let mut app = WorkspacePanel::new(
+                    "/Users/j/my-project/.shelbi/wt/alpha",
+                    "Vim".to_string(),
+                    "Developer".to_string(),
+                    "Cold-start cache",
+                    BODY,
+                    WsStatus {
+                        text: text.into(),
+                        color,
+                    },
+                );
+                app.status_line = "agent restarted".into();
+                let rows = app.rows();
+                app.selected = [
+                    PanelRow::Back,
+                    PanelRow::More,
+                    PanelRow::Folder,
+                    PanelRow::Switch(SwitchItem::Diff),
+                ]
+                .iter()
+                .filter_map(|want| rows.iter().position(|r| r == want))
+                .nth(i)
+                .unwrap_or(0);
+                let mut term = Terminal::new(TestBackend::new(44, 28)).unwrap();
+                term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+                crate::theme::assert_light_readable(
+                    &format!("workspace-panel-{name}"),
+                    term.backend().buffer(),
+                );
+            }
+        });
+    }
+
     #[test]
     fn renders_status_task_info_worktree_and_switches() {
         let mut app = panel();
@@ -519,7 +566,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let y = BACK_BUTTON_LINE;
         let x = (0..buf.area.width)
-            .find(|&x| buf[(x, y)].symbol() == "I" && buf[(x, y)].fg == STATUS_YELLOW)
+            .find(|&x| buf[(x, y)].symbol() == "I" && buf[(x, y)].fg == palette().yellow)
             .expect("the 'IN PROGRESS' I should be the status yellow");
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "status is bold");
         // The back-arrow glyph shares the row.
@@ -537,7 +584,7 @@ mod tests {
             "b",
             WsStatus {
                 text: "READY FOR REVIEW".into(),
-                color: ACCENT_CYAN,
+                color: palette().cyan,
             },
         );
         let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
@@ -545,7 +592,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let y = BACK_BUTTON_LINE;
         let found = (0..buf.area.width)
-            .any(|x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == ACCENT_CYAN);
+            .any(|x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == palette().cyan);
         assert!(found, "the status header carries its configured colour");
     }
 
@@ -562,9 +609,9 @@ mod tests {
         // main sidebar); the gutters stay transparent.
         assert_eq!(buf[(0, agent_y)].bg, Color::Reset, "left gutter is transparent");
         assert_eq!(buf[(width - 1, agent_y)].bg, Color::Reset, "right gutter is transparent");
-        assert_eq!(buf[(1, agent_y)].bg, SELECTION_BG, "the fill starts one column in");
+        assert_eq!(buf[(1, agent_y)].bg, palette().selection, "the fill starts one column in");
         for x in (width - 4)..(width - 1) {
-            assert_eq!(buf[(x, agent_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
+            assert_eq!(buf[(x, agent_y)].bg, palette().selection, "right-edge padding carries the fill, col {x}");
         }
     }
 
@@ -600,7 +647,7 @@ mod tests {
         let more_y = row_y(&rows, "More") as u16;
         let more_x = rows[more_y as usize].find("More").unwrap() as u16;
         let cell = &buf[(more_x, more_y)];
-        assert_eq!(cell.bg, SELECTION_BG, "focused More carries the selection fill");
+        assert_eq!(cell.bg, palette().selection, "focused More carries the selection fill");
         assert_eq!(cell.fg, Color::White, "focused More brightens to white");
         assert!(cell.modifier.contains(Modifier::BOLD), "focused More is bold");
     }

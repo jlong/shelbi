@@ -16,11 +16,12 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
+use crate::theme::palette;
 
 /// Which control has keyboard focus inside the intro popover.
 /// Tab cycles forward through these three in the order written; BackTab
@@ -135,7 +136,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
     let heading = Paragraph::new(Line::from(Span::styled(
         "Enable Zen Mode?",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette().ansi_cyan)
             .add_modifier(Modifier::BOLD),
     )));
     f.render_widget(heading, layout[0]);
@@ -150,17 +151,17 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
          You can pause it (palette → Pause Zen) or turn it off any time. \
          Edit CLAUDE.md to tune what qualifies as in-scope or what gates merges.",
     )
-    .style(Style::default().fg(Color::Gray))
+    .style(Style::default().fg(palette().ansi_gray))
     .wrap(Wrap { trim: true });
     f.render_widget(body, layout[2]);
 
     let checkbox_glyph = if state.dont_show_again { "[x]" } else { "[ ]" };
     let checkbox_style = if state.focus == IntroFocus::Checkbox {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().ansi_gray)
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -172,19 +173,19 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
 
     let cancel_style = if state.focus == IntroFocus::Cancel {
         Style::default()
-            .bg(crate::theme::SELECTION_BG)
-            .fg(Color::White)
+            .bg(palette().selection)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette().ansi_dark_gray)
     };
     let enable_style = if state.focus == IntroFocus::Enable {
         Style::default()
-            .bg(Color::Green)
-            .fg(Color::White)
+            .bg(palette().ansi_green)
+            .fg(palette().on_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette().ansi_dark_gray)
     };
     let buttons = Paragraph::new(Line::from(vec![
         Span::styled("  [ Cancel ]  ", cancel_style),
@@ -201,6 +202,29 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The intro (title, body, the checkbox, Cancel and Enable Zen each
+    /// focused) is readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, focus, checked) in [
+                ("zen-intro-enable", IntroFocus::Enable, false),
+                ("zen-intro-cancel", IntroFocus::Cancel, true),
+                ("zen-intro-checkbox", IntroFocus::Checkbox, true),
+            ] {
+                let state = IntroState {
+                    focus,
+                    dont_show_again: checked,
+                };
+                let mut term = Terminal::new(TestBackend::new(70, 20)).unwrap();
+                term.draw(|f| render_intro(f, f.area(), &state)).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]

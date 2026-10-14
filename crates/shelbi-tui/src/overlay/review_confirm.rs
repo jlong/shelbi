@@ -21,11 +21,12 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use crate::theme::palette;
 
 /// One review-tagged slot as the dialog sees it: the workspace name and, when
 /// occupied, the title of the task currently loaded on it (shown in quotes).
@@ -350,7 +351,7 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(" Load for review ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -358,7 +359,7 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     let title_line = Line::from(Span::styled(
         dialog.title.clone(),
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD),
     ));
 
@@ -366,7 +367,7 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     if !dialog.has_slots() {
         body.push(Line::from(Span::styled(
             dialog.empty_message.as_deref().unwrap_or(NO_WORKSPACE),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette().ansi_yellow),
         )));
         body.push(Line::raw(""));
         body.push(Line::from(button("[ Dismiss ]", true)).centered());
@@ -382,19 +383,19 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     } else {
         let slot = &dialog.slots[0];
         body.push(Line::from(vec![
-            Span::styled("Load onto review workspace ", Style::default().fg(Color::Gray)),
+            Span::styled("Load onto review workspace ", Style::default().fg(palette().ansi_gray)),
             Span::styled(
                 slot.name.clone(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette().ansi_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("?", Style::default().fg(Color::Gray)),
+            Span::styled("?", Style::default().fg(palette().ansi_gray)),
         ]));
         if let Some(occ) = &slot.occupant {
             body.push(Line::from(Span::styled(
                 format!("(returns \"{occ}\" to the queue)"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             )));
         } else {
             body.push(Line::raw(""));
@@ -417,10 +418,10 @@ fn slot_line(slot: &Slot, selected: bool) -> Line<'static> {
     let marker = if selected { "> " } else { "  " };
     let name_style = if selected {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette().ansi_cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(palette().ansi_white)
     };
     let state = match &slot.occupant {
         Some(title) => format!("  (serving \"{title}\")"),
@@ -429,7 +430,7 @@ fn slot_line(slot: &Slot, selected: bool) -> Line<'static> {
     Line::from(vec![
         Span::raw(marker),
         Span::styled(slot.name.clone(), name_style),
-        Span::styled(state, Style::default().fg(Color::DarkGray)),
+        Span::styled(state, Style::default().fg(palette().ansi_dark_gray)),
     ])
 }
 
@@ -438,10 +439,10 @@ fn slot_line(slot: &Slot, selected: bool) -> Line<'static> {
 fn button(label: &str, focused: bool) -> Span<'_> {
     let style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette().ansi_cyan)
             .add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette().ansi_cyan)
     };
     Span::styled(label.to_string(), style)
 }
@@ -461,6 +462,38 @@ mod tests {
 
     fn dialog(n: usize) -> Dialog {
         Dialog::new("t", slots(n))
+    }
+
+    /// The picker (slots, an occupied slot, the highlighted row, each
+    /// button focused), the one-slot confirm, and the informational variant
+    /// are readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let picker_with = |focus: Focus| {
+            let mut d = dialog(3);
+            d.slots[1].occupant = Some("Fix login".into());
+            d.selected = 2;
+            d.focus = focus;
+            d
+        };
+        let (picker, load, cancel) =
+            (picker_with(Focus::List), picker_with(Focus::Load), picker_with(Focus::Cancel));
+        let cases = [
+            ("review-confirm-picker", picker),
+            ("review-confirm-load", load),
+            ("review-confirm-cancel", cancel),
+            ("review-confirm-single", dialog(1)),
+            ("review-confirm-busy", Dialog::informational("Fix login", "Every review slot is busy.")),
+        ];
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, d) in &cases {
+                let mut term = Terminal::new(TestBackend::new(70, 16)).unwrap();
+                term.draw(|f| d.render(f, f.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]

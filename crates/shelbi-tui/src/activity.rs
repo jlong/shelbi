@@ -46,23 +46,24 @@ use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
 use shelbi_state::keymap::{load_keymaps, ActivityAction, DisplayStyle, Keymaps};
 use shelbi_state::{events_log_path, WorkspaceState, ZenModeState};
 
+use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
 
 /// Per-agent tint color. Identity in the feed is carried by color — a
 /// leading `●` dot plus the agent name, both painted in the workspace's
 /// tint — not by a picture. The mapping is hard-coded to the six declared
 /// phonetic-letter workspaces; every other name falls back to
-/// [`Color::Gray`], so a project that names workspaces `frontend` /
+/// `palette().ansi_gray`, so a project that names workspaces `frontend` /
 /// `backend` still renders, just without a unique tint.
 fn agent_color(name: &str) -> Color {
     match name {
-        "alpha" => Color::Cyan,
-        "bravo" => Color::Magenta,
-        "charlie" => Color::Green,
-        "delta" => Color::Yellow,
-        "echo" => Color::Blue,
-        "foxtrot" => Color::LightRed,
-        _ => Color::Gray,
+        "alpha" => palette().ansi_cyan,
+        "bravo" => palette().ansi_magenta,
+        "charlie" => palette().ansi_green,
+        "delta" => palette().ansi_yellow,
+        "echo" => palette().ansi_blue,
+        "foxtrot" => palette().ansi_light_red,
+        _ => palette().ansi_gray,
     }
 }
 
@@ -72,12 +73,12 @@ fn agent_color(name: &str) -> Color {
 /// there — one color language across both views.
 fn category_color(category: StatusCategory) -> Color {
     match category {
-        StatusCategory::Backlog => Color::Gray,
-        StatusCategory::Ready => Color::Blue,
-        StatusCategory::Active => Color::Yellow,
-        StatusCategory::Handoff => Color::Magenta,
-        StatusCategory::Done => Color::Green,
-        StatusCategory::Archived => Color::DarkGray,
+        StatusCategory::Backlog => palette().ansi_gray,
+        StatusCategory::Ready => palette().ansi_blue,
+        StatusCategory::Active => palette().ansi_yellow,
+        StatusCategory::Handoff => palette().ansi_magenta,
+        StatusCategory::Done => palette().ansi_green,
+        StatusCategory::Archived => palette().ansi_dark_gray,
     }
 }
 
@@ -1663,12 +1664,12 @@ fn render_title(f: &mut Frame, app: &ActivityApp, area: Rect) {
         Span::styled(
             "Activity",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("   {}", app.project_name),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ]);
     f.render_widget(Paragraph::new(title), area);
@@ -1686,18 +1687,18 @@ fn render_pills(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
     }
 
     let pills = [
-        (PillKind::All, "All", app.filter.is_all(), Color::Cyan),
-        (PillKind::Zen, "Zen", app.filter.zen, ZEN_FG),
+        (PillKind::All, "All", app.filter.is_all(), palette().ansi_cyan),
+        (PillKind::Zen, "Zen", app.filter.zen, zen_fg()),
         (
             PillKind::Workspaces,
             "Workspaces",
             app.filter.workspaces,
-            Color::Magenta,
+            palette().ansi_magenta,
         ),
     ];
 
-    let inactive = Style::default().fg(Color::DarkGray);
-    let sep_style = Style::default().fg(Color::DarkGray);
+    let inactive = Style::default().fg(palette().ansi_dark_gray);
+    let sep_style = Style::default().fg(palette().ansi_dark_gray);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut col: u16 = area.x;
@@ -1770,7 +1771,7 @@ fn render_footer(f: &mut Frame, app: &ActivityApp, area: Rect) {
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         text,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     )));
     f.render_widget(footer, area);
 }
@@ -1783,7 +1784,7 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
     if app.events.is_empty() {
         lines.push(Line::from(Span::styled(
             "no activity yet — waiting for the first event",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         )));
         return lines;
     }
@@ -1805,7 +1806,7 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
     if order.is_empty() {
         lines.push(Line::from(Span::styled(
             "no events match this filter",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         )));
         return lines;
     }
@@ -1890,7 +1891,7 @@ fn date_header(label: &str, width: usize) -> Line<'static> {
     let trail = "─".repeat(trail_w);
     Line::from(Span::styled(
         format!("{label_str}{trail}"),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ))
 }
 
@@ -1945,13 +1946,13 @@ fn agent_chip(name: &str, color: Color) -> Vec<Span<'static>> {
 /// Chip for a machine-driven or board-level row: a dimmed neutral label
 /// (`you`, `zen`, a host, a workspace ping, …).
 fn system_chip(label: &str) -> Vec<Span<'static>> {
-    identity_chip(label, Color::DarkGray, false)
+    identity_chip(label, palette().ansi_dark_gray, false)
 }
 
 /// The dim second line under a row. `Branch` gets the `⎇ ` icon and holds
 /// a git branch name; `Detail` is any other muted context fragment
 /// (`backlog → todo`, a zen bail reason, …). Both truncate with `…` and
-/// render in [`Color::DarkGray`].
+/// render in `palette().ansi_dark_gray`.
 enum SecondaryLine {
     Branch(String),
     Detail(String),
@@ -1959,7 +1960,9 @@ enum SecondaryLine {
 
 /// Foreground for the Zen filter pill. Kept from the old zen styling —
 /// the badge/background tint is gone, but green still reads "zen".
-const ZEN_FG: Color = Color::Green;
+fn zen_fg() -> Color {
+    palette().ansi_green
+}
 
 /// One parsed `reason=` string from a zen-driven task event. The
 /// orchestrator emits these as `key=value` pairs trailing a
@@ -2153,7 +2156,7 @@ struct Row {
     /// Dim verb word (finished / is building / merged / …). Empty means the
     /// message is a bare phrase with no verb column.
     verb: String,
-    /// Verb foreground. Issue rows keep the dim [`VERB_FG`]; system rows tint
+    /// Verb foreground. Issue rows keep the dim [`verb_fg`]; system rows tint
     /// it with the event's status color so `unreachable` reads red.
     verb_color: Color,
     /// The task title (or system phrase) — bright fg, wraps, never truncated.
@@ -2178,9 +2181,9 @@ impl Row {
         Row {
             chip: Vec::new(),
             verb: verb.into(),
-            verb_color: VERB_FG,
+            verb_color: verb_fg(),
             title: title.into(),
-            title_style: Style::default().fg(Color::White),
+            title_style: Style::default().fg(palette().ansi_white),
             trail: Vec::new(),
             pill: None,
             time,
@@ -2246,7 +2249,7 @@ fn render_event(
             };
             let mut row = Row::new("", body, when);
             row.chip = system_chip("event");
-            row.title_style = Style::default().fg(Color::DarkGray);
+            row.title_style = Style::default().fg(palette().ansi_dark_gray);
             paint_row(row, width)
         }
     }
@@ -2276,11 +2279,11 @@ fn render_system_event(
         SystemKind::Ssh => {
             let host = sys.target.as_deref().unwrap_or("host");
             let (verb, color) = if status == Some("failed") {
-                ("unreachable", Color::LightRed)
+                ("unreachable", palette().ansi_light_red)
             } else if status == Some("established") {
-                ("connected", Color::Green)
+                ("connected", palette().ansi_green)
             } else {
-                ("ssh", Color::Gray)
+                ("ssh", palette().ansi_gray)
             };
             let title = sys
                 .detail
@@ -2318,7 +2321,7 @@ fn render_system_event(
             (
                 agent_chip(&name, color),
                 "detached",
-                if ok { Color::Gray } else { Color::LightRed },
+                if ok { palette().ansi_gray } else { palette().ansi_light_red },
                 system_task_title(app, sys.target.as_deref()),
             )
         }
@@ -2327,7 +2330,7 @@ fn render_system_event(
             (
                 system_chip("merge"),
                 "merged",
-                if ok { Color::Green } else { Color::LightRed },
+                if ok { palette().ansi_green } else { palette().ansi_light_red },
                 system_task_title(app, sys.target.as_deref()),
             )
         }
@@ -2337,7 +2340,7 @@ fn render_system_event(
             (
                 agent_chip(&name, color),
                 "sent",
-                if stuck { Color::Yellow } else { Color::Blue },
+                if stuck { palette().ansi_yellow } else { palette().ansi_blue },
                 send_title(status),
             )
         }
@@ -2350,14 +2353,14 @@ fn render_system_event(
             (
                 system_chip("message"),
                 verb,
-                Color::Blue,
+                palette().ansi_blue,
                 system_task_title(app, sys.target.as_deref()),
             )
         }
         SystemKind::Closed => (
             system_chip(sys.target.as_deref().unwrap_or("project")),
             "closed",
-            Color::Gray,
+            palette().ansi_gray,
             sys.detail.clone().unwrap_or_else(|| "project closed".into()),
         ),
         SystemKind::Handoff => (
@@ -2371,7 +2374,7 @@ fn render_system_event(
         SystemKind::Mode => (
             system_chip("zen"),
             "",
-            Color::Green,
+            palette().ansi_green,
             format!("Zen mode turned {}", status.unwrap_or("changed")),
         ),
         SystemKind::Supervision => {
@@ -2379,7 +2382,7 @@ fn render_system_event(
             (
                 system_chip(sys.target.as_deref().unwrap_or("orchestrator")),
                 "supervisor",
-                if gave_up { Color::LightRed } else { Color::Yellow },
+                if gave_up { palette().ansi_light_red } else { palette().ansi_yellow },
                 humanize_token(status.unwrap_or("supervised")),
             )
         }
@@ -2388,7 +2391,7 @@ fn render_system_event(
             (
                 system_chip(sys.target.as_deref().unwrap_or("pane")),
                 "pane",
-                if alive { Color::Gray } else { Color::LightRed },
+                if alive { palette().ansi_gray } else { palette().ansi_light_red },
                 if alive {
                     "pane back".to_string()
                 } else {
@@ -2401,7 +2404,7 @@ fn render_system_event(
             (
                 system_chip("ci"),
                 "CI",
-                if ok { Color::Green } else { Color::LightRed },
+                if ok { palette().ansi_green } else { palette().ansi_light_red },
                 sys.detail
                     .clone()
                     .map(|d| {
@@ -2413,7 +2416,7 @@ fn render_system_event(
         SystemKind::Other => (
             system_chip(sys.target.as_deref().unwrap_or("")),
             "event",
-            Color::Gray,
+            palette().ansi_gray,
             sys.detail.clone().unwrap_or_else(|| "event".into()),
         ),
     };
@@ -2426,7 +2429,7 @@ fn render_system_event(
         } else {
             format!(" (×{count})")
         };
-        let trail = vec![Span::styled(label, Style::default().fg(Color::DarkGray))];
+        let trail = vec![Span::styled(label, Style::default().fg(palette().ansi_dark_gray))];
         (trail, format!("last {when}"))
     } else {
         (Vec::new(), when)
@@ -2533,9 +2536,9 @@ fn send_title(status: Option<&str>) -> String {
 
 fn rebase_status_color(status: Option<&str>) -> Color {
     match status {
-        Some("conflict") => Color::LightRed,
-        Some("succeeded") => Color::Green,
-        _ => Color::Gray,
+        Some("conflict") => palette().ansi_light_red,
+        Some("succeeded") => palette().ansi_green,
+        _ => palette().ansi_gray,
     }
 }
 
@@ -2545,18 +2548,18 @@ fn rebase_status_color(status: Option<&str>) -> Color {
 /// handed the tip off reads calm (green for a real push, gray for a no-op).
 fn push_status_color(status: Option<&str>) -> Color {
     match status {
-        Some("blocked") => Color::LightRed,
-        Some("failed") => Color::Yellow,
-        Some("pushed") | Some("force-pushed") => Color::Green,
-        _ => Color::Gray,
+        Some("blocked") => palette().ansi_light_red,
+        Some("failed") => palette().ansi_yellow,
+        Some("pushed") | Some("force-pushed") => palette().ansi_green,
+        _ => palette().ansi_gray,
     }
 }
 
 fn handoff_status_color(status: Option<&str>) -> Color {
     match status {
-        Some("written") | Some("native-thread") => Color::Green,
-        Some("timeout") | Some("send-failed") | Some("unconfirmed") => Color::Yellow,
-        _ => Color::Gray,
+        Some("written") | Some("native-thread") => palette().ansi_green,
+        Some("timeout") | Some("send-failed") | Some("unconfirmed") => palette().ansi_yellow,
+        _ => palette().ansi_gray,
     }
 }
 
@@ -2586,7 +2589,7 @@ fn render_zen_dryrun_event(
     );
     // A yellow `[DRYRUN]` chip so the row reads as "what Zen would have
     // done", visibly a preview rather than a real move.
-    row.chip = identity_chip("DRYRUN", Color::Yellow, true);
+    row.chip = identity_chip("DRYRUN", palette().ansi_yellow, true);
     let detail = detail.replace('_', " ");
     if !detail.is_empty() {
         row.secondary = Some(SecondaryLine::Detail(detail));
@@ -2745,7 +2748,7 @@ fn render_zen_event(
             .collect();
             (
                 "bailed on",
-                bail_tag(" — checks failed", Color::LightRed),
+                bail_tag(" — checks failed", palette().ansi_light_red),
                 (!parts.is_empty()).then(|| parts.join(" · ")),
                 None,
             )
@@ -2760,14 +2763,14 @@ fn render_zen_event(
             .collect();
             (
                 "bailed on",
-                bail_tag(" — diff too large", Color::Yellow),
+                bail_tag(" — diff too large", palette().ansi_yellow),
                 (!parts.is_empty()).then(|| parts.join(" · ")),
                 None,
             )
         }
         ZenReason::DangerPath { paths } => (
             "bailed on",
-            bail_tag(" — danger path", Color::Yellow),
+            bail_tag(" — danger path", palette().ansi_yellow),
             paths
                 .as_ref()
                 .map(|p| format!("touched: {}", humanize_list(p))),
@@ -2775,13 +2778,13 @@ fn render_zen_event(
         ),
         ZenReason::CiTimeout { duration } => (
             "bailed on",
-            bail_tag(" — ci timeout", Color::Yellow),
+            bail_tag(" — ci timeout", palette().ansi_yellow),
             duration.as_ref().map(|d| format!("ci timeout after {d}")),
             None,
         ),
         ZenReason::MergeConflict { files } => (
             "bailed on",
-            bail_tag(" — merge conflict", Color::Yellow),
+            bail_tag(" — merge conflict", palette().ansi_yellow),
             files
                 .as_ref()
                 .map(|f| format!("conflict in {}", humanize_list(f))),
@@ -2829,15 +2832,15 @@ fn render_workspace_event(
     // so `awaiting input` reads blue; the eye still skims past them in
     // aggregate but can pick out which workspace when scanning.
     let (verb, verb_color, detail) = match new {
-        WorkspaceState::Working => ("working", Color::DarkGray, None),
-        WorkspaceState::AwaitingInput => ("awaiting input", Color::Blue, None),
-        WorkspaceState::Blocked => ("blocked", Color::Yellow, Some("needs human approval")),
+        WorkspaceState::Working => ("working", palette().ansi_dark_gray, None),
+        WorkspaceState::AwaitingInput => ("awaiting input", palette().ansi_blue, None),
+        WorkspaceState::Blocked => ("blocked", palette().ansi_yellow, Some("needs human approval")),
         WorkspaceState::Paused => (
             "paused",
-            Color::DarkGray,
+            palette().ansi_dark_gray,
             Some("waiting for the limit to reset"),
         ),
-        WorkspaceState::Serving => ("serving", Color::Cyan, Some("branch is up for review")),
+        WorkspaceState::Serving => ("serving", palette().ansi_cyan, Some("branch is up for review")),
     };
 
     let mut row = Row::new(verb, String::new(), when);
@@ -2852,7 +2855,7 @@ fn render_workspace_event(
 fn agent_display(workspace: Option<&str>) -> (String, Color) {
     match workspace {
         Some(w) => (w.to_string(), agent_color(w)),
-        None => ("orchestrator".to_string(), Color::Gray),
+        None => ("orchestrator".to_string(), palette().ansi_gray),
     }
 }
 
@@ -2870,7 +2873,9 @@ const VERB_GAP: usize = 2;
 /// block on the first line.
 const RIGHT_GAP: usize = 2;
 /// Dim verb color — visible but subordinate to the bright title.
-const VERB_FG: Color = Color::Gray;
+fn verb_fg() -> Color {
+    palette().ansi_gray
+}
 
 /// Lay one [`Row`] out as a top-aligned three-column flex, wrapping the
 /// message to as many lines as the title needs:
@@ -2887,7 +2892,7 @@ const VERB_FG: Color = Color::Gray;
 /// align under the title. The title is never truncated with `…`; only a
 /// dim secondary line (branch / reason) elides. No background fill.
 fn paint_row(row: Row, width: usize) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(palette().ansi_dark_gray);
 
     // Chip column: at least CHIP_W wide so messages line up; a chip wider
     // than that pushes only its own row's message over by a single space.
@@ -3069,7 +3074,7 @@ fn paint_secondary(sec: SecondaryLine, width: usize, indent: usize) -> Line<'sta
         Span::raw(" ".repeat(indent)),
         Span::styled(
             format!("{icon}{text}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ])
 }
@@ -3587,6 +3592,43 @@ mod tests {
             }
             _ => panic!("expected two System events"),
         }
+    }
+
+    /// The feed (title, pills, task moves, workspace state changes, system
+    /// rows in success / failure / warning colors, the zen dry-run chip, the
+    /// footer) is readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let mut app = ActivityApp::new("demo");
+        for line in [
+            "2026-06-23T04:19:33+00:00 task=foo workflow=default todo -> in_progress reason=user:cli",
+            "2026-07-22T14:00:00+00:00 project=demo task=fix-login workflow=app in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff",
+            "2026-07-22T14:00:00+00:00 project=shelbi workspace=alpha working -> awaiting_input",
+            "2026-07-22T14:00:00+00:00 project=demo workspace=bravo working -> paused reason=usage-limit",
+            "2026-07-22T14:00:00+00:00 project=demo workspace=charlie pane_alive=false reason=worktree-missing",
+            "2026-07-22T14:00:00+00:00 dispatch task=t workspace=delta status=confirmed detail=busy_observed",
+            "2026-07-22T14:00:00+00:00 merge task=t workspace=echo base=main status=failed detail=not_mergeable",
+            "2026-07-22T14:00:00+00:00 push task=t workspace=foxtrot branch=b status=blocked detail=remote_has_unrebased_commits",
+            "2026-07-22T14:00:00+00:00 rebase task=t workspace=alpha branch=b status=up-to-date detail=default=abc",
+            "2026-07-22T14:00:00+00:00 project=shelbi task=t ci pr=42 check=build conclusion=failure head_sha=deadbeef",
+            "2026-07-22T14:00:00+00:00 project=shelbi task=t ci pr=42 check=all conclusion=success head_sha=deadbeef",
+            "2026-07-22T14:00:00+00:00 ssh reverse-forward host=devbox mode=tcp status=failed detail=master_open_failed",
+            "2026-07-22T14:00:00+00:00 send project=demo workspace=alpha status=submitted detail=busy_observed",
+            "2026-07-22T14:00:00+00:00 project=shelbi handoff outcome=written detail=/tmp/h.md",
+            "2026-06-24T10:00:00Z zen-dryrun task=fix-typo action=consider-auto-promote detail=mechanically-eligible",
+            "2026-06-23T12:00:00+00:00 project=demo heartbeat zen_eligible=5 idle_workspaces=4",
+            "2026-06-23T12:00:00+00:00 frobnicate=xyz weird",
+        ] {
+            app.events.push(parse_event_line(line));
+        }
+        app.status_line = "refreshed".into();
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut term = Terminal::new(TestBackend::new(140, 48)).unwrap();
+            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+            crate::theme::assert_light_readable("activity", term.backend().buffer());
+        });
     }
 
     #[test]

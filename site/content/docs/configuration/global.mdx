@@ -30,6 +30,7 @@ omits a block, resolves to defaults.
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. The canonical place to set it is `keys.yaml` (`defaults.global.zen_toggle`). |
+| `theme` | `auto` \| `dark` \| `light` | no | `auto` | Color theme for the TUI and the desktop app. See [Theme](#theme). |
 | `editor` | string | no | `$EDITOR`, else `vim` | Editor the [review interface](/docs/concepts/review-workspaces#the-review-editor)'s "Edit in `<editor>`" view launches in the review worktree. Hub-wide, so it follows you across projects. May be a bare command (`hx`) or one with flags (`code --wait`). Resolution order: this key, then `$EDITOR`, then `vim`. |
 
 ```yaml
@@ -37,11 +38,29 @@ omits a block, resolves to defaults.
 keymap:
   zen_toggle: ctrl-g
 editor: code --wait
+theme: light
 ```
 
 The `editor` display label in the switcher is the program's basename with its
 first letter upper-cased — `hx` shows as **Edit in Hx**, `code --wait` as
 **Edit in Code**.
+
+### Theme
+
+`theme` picks the color theme both clients use. The two themes share one
+set of named colors, so the TUI and the desktop app look like the same
+product.
+
+| Value | TUI | Desktop app |
+| --- | --- | --- |
+| `auto` (default) | dark (a terminal doesn't report whether it's light or dark) | follows the system appearance, and switches live when the system switches |
+| `dark` | dark | dark |
+| `light` | light, for a terminal with a light background | light |
+
+The TUI reads the setting once at startup, so restart it after a change. A
+missing key is `auto`. The dark theme follows your terminal's own palette for
+its status colors; the light theme pins every color, so it reads the same in
+any light terminal.
 
 ### `zen_toggle` chords
 

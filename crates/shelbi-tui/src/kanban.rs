@@ -39,6 +39,7 @@ use shelbi_orchestrator::transition::{
 };
 use shelbi_state::{KanbanColumnOverride, IssueFile};
 
+use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
 
 /// State for the Kanban TUI. Selection is `(column, row)` — `row` is the
@@ -2208,7 +2209,7 @@ fn render_loading_overlay(f: &mut Frame, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(
         "Loading board…",
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(palette().ansi_dark_gray)
             .add_modifier(Modifier::ITALIC),
     )))
     .alignment(Alignment::Center);
@@ -2257,16 +2258,16 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     };
 
     let mut left_spans = vec![
-        Span::styled("Issues · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Issues · ", Style::default().fg(palette().ansi_dark_gray)),
         Span::styled(
             app.display_label().to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("   {total} total"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ];
     // Board freshness banner (Phase 3 §6): a warm board reads plainly dim; a
@@ -2275,7 +2276,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // unchanging board.
     if let Some(banner) = &app.board_banner {
         let stale = banner.contains("stale") || banner.contains("no daemon");
-        let color = if stale { Color::Yellow } else { Color::DarkGray };
+        let color = if stale { palette().ansi_yellow } else { palette().ansi_dark_gray };
         left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
     }
     f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
@@ -2283,10 +2284,10 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     if let Some(area) = workflow_area {
         let style = if app.workflow_filter.is_some() {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(workflow_text, style))),
@@ -2300,10 +2301,10 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     if let Some(area) = workspace_area {
         let style = if app.workspace_filter.is_some() {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(workspace_text, style))),
@@ -2419,7 +2420,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
         let glyph = Span::styled(
             "◂",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         );
         let pos = Rect {
@@ -2434,7 +2435,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
         let glyph = Span::styled(
             "▸",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         );
         let pos = Rect {
@@ -2639,7 +2640,7 @@ fn render_collapsed_column(
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 count_text,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             ))),
             count_rect,
         );
@@ -2674,7 +2675,7 @@ fn render_column(
         Span::styled(header_text, header_style),
         Span::styled(
             format!(" ({})", tasks.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ]);
 
@@ -2717,7 +2718,7 @@ fn render_column(
             wrap_title_two_lines(&format!("{badge_prefix}{}", tf.task.title), max_text);
         let title_style = if blocked {
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette().ansi_dark_gray)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -2743,8 +2744,8 @@ fn render_column(
         if focused && row == app.selected_row {
             item = item.style(
                 Style::default()
-                    .bg(crate::theme::SELECTION_BG)
-                    .fg(Color::White)
+                    .bg(palette().selection)
+                    .fg(palette().ansi_white)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -2757,7 +2758,7 @@ fn render_column(
     if items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "(empty)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))));
     }
     // The done column is history loaded on demand (§4): when the closed page
@@ -2768,7 +2769,7 @@ fn render_column(
         items.push(ListItem::new(Line::from(Span::styled(
             "↓ load more (m)",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette().ansi_dark_gray)
                 .add_modifier(Modifier::ITALIC),
         ))));
     }
@@ -2852,13 +2853,13 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
             fc(km.kanban.first_chord_for(KanbanAction::OpenWorkspace)),
         ));
     }
-    let keys = Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
+    let keys = Line::from(Span::styled(text, Style::default().fg(palette().ansi_dark_gray)));
     let status = if app.status_line.is_empty() {
         Line::raw("")
     } else {
         Line::from(Span::styled(
             format!("  {}", app.status_line),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette().ansi_yellow),
         ))
     };
     f.render_widget(Paragraph::new(vec![keys, status]), area);
@@ -2925,11 +2926,11 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     f.render_widget(Clear, popover_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(vec![Span::styled(
             " Filter by workspace ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
@@ -2955,13 +2956,13 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let line = Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(prefix, Style::default().fg(palette().ansi_cyan)),
             Span::styled(label, label_style),
         ]);
         items.push(ListItem::new(line));
@@ -2986,15 +2987,15 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     state.select(Some(cursor.min(opts.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(crate::theme::SELECTION_BG)
-            .fg(Color::White)
+            .bg(palette().selection)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, list_area, &mut state);
 
     let hint = Line::from(Span::styled(
         " ↑↓ nav · ↵ select · c clear · esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), hint_area);
 
@@ -3059,11 +3060,11 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     f.render_widget(Clear, popover_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(vec![Span::styled(
             " Filter by workflow ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
@@ -3084,13 +3085,13 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let line = Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(prefix, Style::default().fg(palette().ansi_cyan)),
             Span::styled(label, label_style),
         ]);
         items.push(ListItem::new(line));
@@ -3112,15 +3113,15 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     state.select(Some(cursor.min(opts.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(crate::theme::SELECTION_BG)
-            .fg(Color::White)
+            .bg(palette().selection)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, list_area, &mut state);
 
     let hint = Line::from(Span::styled(
         " ↑↓ nav · ↵ select · c clear · esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), hint_area);
 
@@ -3163,15 +3164,15 @@ fn column_label(status_name: &str) -> String {
 /// Review column has — generic code keys off category, not name.
 fn category_color(category: StatusCategory) -> Color {
     match category {
-        StatusCategory::Backlog => Color::Gray,
-        StatusCategory::Ready => Color::Blue,
-        StatusCategory::Active => Color::Yellow,
-        StatusCategory::Handoff => Color::Magenta,
-        StatusCategory::Done => Color::Green,
+        StatusCategory::Backlog => palette().ansi_gray,
+        StatusCategory::Ready => palette().ansi_blue,
+        StatusCategory::Active => palette().ansi_yellow,
+        StatusCategory::Handoff => palette().ansi_magenta,
+        StatusCategory::Done => palette().ansi_green,
         // Closed-without-shipping (Cancelled / Won't Fix / Duplicate).
         // Darker than Backlog so the eye reads it as terminal-inactive,
         // not waiting-for-triage.
-        StatusCategory::Archived => Color::DarkGray,
+        StatusCategory::Archived => palette().ansi_dark_gray,
     }
 }
 
@@ -3277,8 +3278,8 @@ fn card_meta_line(
         spans.push(Span::styled(
             badge,
             Style::default()
-                .bg(crate::theme::WORKFLOW_BADGE_BG)
-                .fg(crate::theme::WORKFLOW_BADGE_FG),
+                .bg(palette().workflow_badge_bg)
+                .fg(palette().workflow_badge_fg),
         ));
     }
 
@@ -3293,7 +3294,7 @@ fn card_meta_line(
             }
             spans.push(Span::styled(
                 truncate(&format!("⎇ {branch}"), remaining),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             ));
         }
     }
@@ -3517,13 +3518,13 @@ pub(crate) fn render_task_popover_into(
     let title_text = truncate(&title, popover_area.width.saturating_sub(4) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(
                 title_text,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette().ansi_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -3550,7 +3551,7 @@ pub(crate) fn render_task_popover_into(
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(chunks[1].width as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))),
         chunks[1],
     );
@@ -3595,7 +3596,7 @@ pub(crate) fn render_task_popover_into(
     }
     let hint = Line::from(Span::styled(
         hint_text,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), chunks[3]);
 }
@@ -3616,7 +3617,7 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
         col_line.push(meta_label("workspace"));
         col_line.push(Span::styled(
             format!("@{w}"),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(palette().ansi_magenta),
         ));
     }
     lines.push(Line::from(col_line));
@@ -3640,7 +3641,7 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
             };
             let color = match dep_col {
                 Some(c) => column_color(c),
-                None => Color::Red,
+                None => palette().ansi_red,
             };
             spans.push(Span::styled(label_text, Style::default().fg(color)));
         }
@@ -3664,7 +3665,7 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
 }
 
 fn meta_label(label: &str) -> Span<'static> {
-    Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray))
+    Span::styled(format!("{label}: "), Style::default().fg(palette().ansi_dark_gray))
 }
 
 fn meta_row(label: &str, value: &str) -> Line<'static> {
@@ -6115,6 +6116,47 @@ transitions:
             rendered.contains("design-review") || rendered.contains("design-revi"),
             "design-review card label missing:\n{rendered}"
         );
+    }
+
+    /// The board (headers, cards, a selected card with its workflow badge,
+    /// the filter chips), the open workflow dropdown, and the task popover
+    /// are readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let mut app = KanbanApp::new("demo");
+        app.workspaces = vec!["alpha".into(), "bravo".into()];
+        app.workflows = vec![
+            default_workflow(),
+            workflow_using("design-review", &["backlog", "in-progress", "done"]),
+        ];
+        app.project_statuses = default_project_statuses();
+        app.all_columns = app.compute_all_columns();
+        app.tasks = vec![
+            task_in_workflow("d-backlog", Column::backlog(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-todo", Column::todo(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-wip", Column::in_progress(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-review", Column::review(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-done", Column::done(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("dr-wip", Column::in_progress(), Some("design-review"), "2026-06-20T10:00:00Z"),
+        ];
+        app.selected_column = 2;
+        app.selected_row = 0;
+        app.status_line = "moved d-wip to In Progress".into();
+        crate::theme::with_appearance(Appearance::Light, || {
+            let draw = |app: &mut KanbanApp, name: &str| {
+                let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
+                term.draw(|f| render_full(f, app, f.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            };
+            draw(&mut app, "kanban-board");
+            app.open_workflow_dropdown();
+            draw(&mut app, "kanban-workflow-dropdown");
+            app.workflow_dropdown = None;
+            app.open_popover();
+            draw(&mut app, "kanban-popover");
+        });
     }
 
     /// A full blank row separates consecutive cards in a column: the

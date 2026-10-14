@@ -41,7 +41,7 @@ use crate::panel::{
     render_status_line, render_task_info, reserve_status_area, NavEntry, BACK_BLOCK_H,
     BACK_BTN_WIDTH, PAD,
 };
-use crate::theme::{ACCENT_CYAN, ACTION_RED, PALETTE_GREEN};
+use crate::theme::palette;
 
 /// Which middle-pane view is currently shown. `Browser` isn't a persistent
 /// view — it opens the system browser — so only `Chat` / `Diff` / `Vim` are
@@ -352,7 +352,7 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         },
         app.selected == 0, // Back is always rows[0].
         "Ready for review",
-        Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD),
+        Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
     );
     let btn_w = (BACK_BTN_WIDTH as u16).min(area.width.saturating_sub(PAD)).max(1);
     push_hit(
@@ -523,7 +523,7 @@ fn render_actions(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("{} merging PR…", spinner_frame(app.spinner)),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(palette().ansi_yellow).add_modifier(Modifier::BOLD),
             ))),
             Rect {
                 x: x0,
@@ -550,8 +550,8 @@ fn render_actions(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
     let slack = width.saturating_sub(aw + rw);
     let gap = ACTIONS_GAP.min(slack).max(1);
 
-    let approve_style = action_style(PALETTE_GREEN, approve_sel);
-    let reject_style = action_style(ACTION_RED, reject_sel);
+    let approve_style = action_style(palette().green, approve_sel);
+    let reject_style = action_style(palette().red, reject_sel);
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -638,7 +638,7 @@ pub(crate) fn review_url(project_name: &str, task_id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::panel::BACK_BUTTON_LINE;
-    use crate::theme::SELECTION_BG;
+    use crate::theme::palette;
     use ratatui::{backend::TestBackend, Terminal};
 
     const BODY: &str = "## Summary\n\nWarm the application cache during startup so the first request can reuse the same data as subsequent requests.\n\n## Acceptance criteria\n\n- Initialize the cache once before accepting traffic.";
@@ -723,7 +723,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let y = BACK_BUTTON_LINE;
         let x = (0..buf.area.width)
-            .find(|&x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == ACCENT_CYAN)
+            .find(|&x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == palette().cyan)
             .expect("the 'Ready for review' R should be accent cyan");
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "status is bold");
     }
@@ -735,15 +735,15 @@ mod tests {
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let x = PAD; // button starts at the 2-col pad
-        assert_eq!(buf[(x, BACK_BUTTON_LINE)].bg, SELECTION_BG, "arrow row carries the button fill");
+        assert_eq!(buf[(x, BACK_BUTTON_LINE)].bg, palette().selection, "arrow row carries the button fill");
         assert_eq!(
             buf[(x, BACK_BUTTON_LINE - 1)].fg,
-            SELECTION_BG,
+            palette().selection,
             "bleed above carries the fill colour so it reads square"
         );
         assert_eq!(
             buf[(x, BACK_BUTTON_LINE + 1)].fg,
-            SELECTION_BG,
+            palette().selection,
             "bleed below carries the fill colour so it reads square"
         );
     }
@@ -786,6 +786,33 @@ mod tests {
             c.fg == Color::Red && !c.symbol().trim().is_empty()
         });
         assert!(red, "status row should be red:\n{out}");
+    }
+
+    /// The panel (status header, task info, More, the worktree line, the
+    /// switches, Approve / Reject plain and reverse-video, the red status
+    /// line) is readable on a light terminal in each selection.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, row) in [
+                ("review-panel-approve", PanelRow::Approve),
+                ("review-panel-reject", PanelRow::Reject),
+                ("review-panel-more", PanelRow::More),
+                ("review-panel-folder", PanelRow::Folder),
+            ] {
+                let mut app = panel(true);
+                app.status_line = "approve failed: PR #9 is not mergeable".to_string();
+                app.selected = app
+                    .rows()
+                    .iter()
+                    .position(|r| std::mem::discriminant(r) == std::mem::discriminant(&row))
+                    .unwrap();
+                let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
+                term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]
@@ -862,9 +889,9 @@ mod tests {
         // main sidebar: gutter columns transparent, the inner region filled.
         assert_eq!(buf[(0, chat_y)].bg, Color::Reset, "left gutter is transparent");
         assert_eq!(buf[(width - 1, chat_y)].bg, Color::Reset, "right gutter is transparent");
-        assert_eq!(buf[(1, chat_y)].bg, SELECTION_BG, "the fill starts one column in");
+        assert_eq!(buf[(1, chat_y)].bg, palette().selection, "the fill starts one column in");
         for x in (width - 4)..(width - 1) {
-            assert_eq!(buf[(x, chat_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
+            assert_eq!(buf[(x, chat_y)].bg, palette().selection, "right-edge padding carries the fill, col {x}");
         }
         assert_eq!(buf[(0, chat_y)].symbol(), " ", "column 0 is the indent gutter");
     }
@@ -987,7 +1014,7 @@ mod tests {
         let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
         let more_y = row_y(&rows, "More") as u16;
         let more_x = rows[more_y as usize].find("More").unwrap() as u16;
-        assert_eq!(buf[(more_x, more_y)].fg, ACCENT_CYAN, "More is accent cyan");
+        assert_eq!(buf[(more_x, more_y)].fg, palette().cyan, "More is accent cyan");
     }
 
     #[test]
@@ -1030,7 +1057,7 @@ mod tests {
         let more_y = row_y(&rows, "More") as u16;
         let more_x = rows[more_y as usize].find("More").unwrap() as u16;
         let cell = &buf[(more_x, more_y)];
-        assert_eq!(cell.bg, SELECTION_BG, "focused More carries the selection fill");
+        assert_eq!(cell.bg, palette().selection, "focused More carries the selection fill");
         assert_eq!(cell.fg, Color::White, "focused More brightens to white");
         assert!(cell.modifier.contains(Modifier::BOLD), "focused More is bold");
     }
@@ -1160,8 +1187,8 @@ mod tests {
     #[test]
     fn selected_action_renders_reverse_video_tint() {
         for (tint, needle, item) in [
-            (PALETTE_GREEN, "Approve", PanelRow::Approve),
-            (ACTION_RED, "Reject", PanelRow::Reject),
+            (palette().green, "Approve", PanelRow::Approve),
+            (palette().red, "Reject", PanelRow::Reject),
         ] {
             let width = 44u16;
             let mut app = panel(true);
@@ -1194,7 +1221,7 @@ mod tests {
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
-        for (tint, needle) in [(PALETTE_GREEN, "Approve"), (ACTION_RED, "Reject")] {
+        for (tint, needle) in [(palette().green, "Approve"), (palette().red, "Reject")] {
             let y = row_y(&rows, needle) as u16;
             let col = rows[y as usize].find(needle).unwrap() as u16;
             let cell = &buf[(col, y)];

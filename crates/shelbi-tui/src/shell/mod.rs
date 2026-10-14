@@ -66,6 +66,7 @@ use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
 use shelbi_state::keymap::{load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps};
 use shelbi_term::Size;
 
+use crate::theme::palette;
 use crate::activity::{ActivityApp, ActivityData, ActivityMetaCache};
 use crate::kanban::{ClosedPageRead, ExecutorMovePersister, KanbanApp};
 use crate::machines::MachinesApp;
@@ -224,6 +225,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // (truecolor, nesting) are instant and used to build the shell now; the
     // kitty round-trip is probed *after* the first draw, below.
     let caps = Caps::detect_fast();
+    // The color theme, chosen once from `config.yaml::theme` before the first
+    // frame (`auto` is dark: a terminal doesn't report its appearance).
+    crate::theme::install_from_config();
 
     let _guard = RawGuard::enter().context("entering raw mode")?;
     let mut term =
@@ -3745,12 +3749,12 @@ fn render_divider(buf: &mut ratatui::buffer::Buffer, sidebar_rect: Rect, active:
     // a semi-transparent terminal shows through behind it.
     let style = if active {
         Style::default()
-            .fg(crate::theme::DIVIDER_ACTIVE)
+            .fg(palette().divider_active)
             .bg(Color::Reset)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(crate::theme::DIVIDER_DIM)
+            .fg(palette().divider)
             .bg(Color::Reset)
     };
     for y in sidebar_rect.top()..sidebar_rect.bottom() {
@@ -3767,8 +3771,8 @@ fn render_status(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
     }
     let y = area.bottom() - 1;
     let style = Style::default()
-        .bg(Color::Rgb(40, 40, 50))
-        .fg(Color::Gray);
+        .bg(palette().status_bar)
+        .fg(palette().ansi_gray);
     let label = format!(" {text} ");
     for (x, ch) in (area.left()..area.right()).zip(label.chars().chain(std::iter::repeat(' '))) {
         if let Some(cell) = buf.cell_mut((x, y)) {
@@ -3786,8 +3790,8 @@ fn render_session_lost_banner(buf: &mut ratatui::buffer::Buffer, area: Rect, msg
         return;
     }
     let style = Style::default()
-        .bg(Color::Red)
-        .fg(Color::White)
+        .bg(palette().ansi_red)
+        .fg(palette().on_color)
         .add_modifier(Modifier::BOLD);
     let label = format!(" {msg} ");
     let y = area.top();
@@ -3860,26 +3864,26 @@ fn agent_display_name(task: &shelbi_state::IssueFile) -> String {
 /// in-progress workspace, so `IN PROGRESS` (bold yellow) is the usual case; the
 /// other arms keep it robust if the column changes under an open sidebar.
 fn status_for_column(column: &shelbi_core::Column) -> crate::workspace_panel::WsStatus {
-    use crate::theme::{ACCENT_CYAN, MUTED, PALETTE_GREEN, STATUS_YELLOW};
+    use crate::theme::palette;
     if *column == shelbi_core::Column::in_progress() {
         crate::workspace_panel::WsStatus {
             text: "IN PROGRESS".into(),
-            color: STATUS_YELLOW,
+            color: palette().yellow,
         }
     } else if *column == shelbi_core::Column::review() {
         crate::workspace_panel::WsStatus {
             text: "READY FOR REVIEW".into(),
-            color: ACCENT_CYAN,
+            color: palette().cyan,
         }
     } else if *column == shelbi_core::Column::done() {
         crate::workspace_panel::WsStatus {
             text: "DONE".into(),
-            color: PALETTE_GREEN,
+            color: palette().green,
         }
     } else {
         crate::workspace_panel::WsStatus {
             text: column.as_str().to_uppercase(),
-            color: MUTED,
+            color: palette().muted,
         }
     }
 }
@@ -3912,7 +3916,7 @@ fn ws_status_from_model(
 fn default_ws_status() -> crate::workspace_panel::WsStatus {
     crate::workspace_panel::WsStatus {
         text: "IDLE".into(),
-        color: crate::theme::MUTED,
+        color: palette().muted,
     }
 }
 
@@ -3964,10 +3968,10 @@ fn render_idle_workspace(
         .map(|(i, text)| {
             let style = if i == 0 {
                 // Name: bold white.
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD)
             } else {
                 // Identity + body: muted (`#7a7a7a`).
-                Style::default().fg(crate::theme::MUTED)
+                Style::default().fg(palette().muted)
             };
             Line::from(Span::styled(text, style))
         })
@@ -3990,7 +3994,7 @@ fn render_placeholder(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str)
     }
     let p = Paragraph::new(vec![Line::from(Span::styled(
         text,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ))])
     .wrap(Wrap { trim: true });
     p.render(centered(area), buf);
@@ -4023,8 +4027,8 @@ fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
     }
     let y = area.top();
     let style = Style::default()
-        .bg(Color::Rgb(90, 70, 30))
-        .fg(Color::White);
+        .bg(palette().notice)
+        .fg(palette().on_color);
     let label = format!(" {text} ");
     for (x, ch) in (area.left()..area.right()).zip(label.chars()) {
         if let Some(cell) = buf.cell_mut((x, y)) {
@@ -5020,7 +5024,7 @@ mod tests {
         let x = area.width - 1;
 
         let dim = render_sidebar_and_divider(&st, area, false);
-        assert_eq!(dim[(x, 3)].fg, crate::theme::DIVIDER_DIM, "dim at rest");
+        assert_eq!(dim[(x, 3)].fg, palette().divider, "dim at rest");
         assert!(
             !dim[(x, 3)].modifier.contains(ratatui::style::Modifier::BOLD),
             "the resting line is not bold"
@@ -5029,7 +5033,7 @@ mod tests {
         let hot = render_sidebar_and_divider(&st, area, true);
         assert_eq!(
             hot[(x, 3)].fg,
-            crate::theme::DIVIDER_ACTIVE,
+            palette().divider_active,
             "accent color while active"
         );
         assert!(
@@ -6753,5 +6757,20 @@ mod tests {
             vec!["quit_project:proj".to_string()],
             "the palette's quit-project must reach the daemon lifecycle command",
         );
+    }
+
+    #[test]
+    fn shell_chrome_renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            let area = Rect::new(0, 0, 60, 6);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            render_session_lost_banner(&mut buf, Rect::new(0, 0, 60, 1), "login session lost");
+            render_notice(&mut buf, Rect::new(0, 1, 60, 1), "keyboard protocol notice");
+            render_status(&mut buf, Rect::new(0, 2, 60, 2), "starting orchestrator…");
+            render_divider(&mut buf, Rect::new(0, 4, 20, 1), false);
+            render_divider(&mut buf, Rect::new(0, 5, 20, 1), true);
+            crate::theme::assert_light_readable("shell-chrome", &buf);
+        });
     }
 }

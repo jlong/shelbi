@@ -462,6 +462,10 @@ keymap:
 ## The sidebar label reflects the resolved editor name (Edit in Vim, Edit in Helix).
 # editor: vim
 
+## Color theme for the TUI and the desktop app: auto (default), dark, light.
+## auto follows the system appearance in the desktop app and is dark in the TUI.
+# theme: auto
+
 ## Keybinding overrides live in the sibling file ~/.shelbi/keys.yaml.
 ## See https://shelbi.dev/docs/configuration/global
 ";

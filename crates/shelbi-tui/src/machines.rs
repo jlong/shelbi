@@ -33,8 +33,8 @@ use shelbi_orchestrator::machine::{probe_reachability, Reachability, SshExec};
 use shelbi_state::machine_state::MachineRecord;
 use shelbi_state::WorkspaceState;
 
+use crate::theme::palette;
 use crate::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
-use crate::theme;
 
 /// Wall-clock bound on one reachability probe. Short so a wedged host fails fast
 /// into [`Reachability::Unreachable`] rather than holding the prober thread for
@@ -362,10 +362,10 @@ fn real_reachability_probe(_machine: &str, host: &str) -> Reachability {
 /// One span so both runtimes render it identically through [`machine_header_line`].
 fn reachability_span(r: &Reachability) -> Span<'static> {
     let (text, color) = match r {
-        Reachability::Reachable => ("● reachable".to_string(), Color::Green),
-        Reachability::Unknown => ("○ checking…".to_string(), Color::DarkGray),
+        Reachability::Reachable => ("● reachable".to_string(), palette().ansi_green),
+        Reachability::Unknown => ("○ checking…".to_string(), palette().ansi_dark_gray),
         Reachability::Unreachable { error } => {
-            (format!("● unreachable: {}", truncate(error, 40)), Color::Red)
+            (format!("● unreachable: {}", truncate(error, 40)), palette().ansi_red)
         }
     };
     Span::styled(format!("  {text}"), Style::default().fg(color))
@@ -374,12 +374,12 @@ fn reachability_span(r: &Reachability) -> Span<'static> {
 /// A short badge for an observed workspace state.
 fn state_badge(state: Option<WorkspaceState>) -> (&'static str, Color) {
     match state {
-        Some(WorkspaceState::Working) => ("working", Color::Green),
-        Some(WorkspaceState::AwaitingInput) => ("awaiting", Color::Yellow),
-        Some(WorkspaceState::Blocked) => ("blocked", Color::Red),
-        Some(WorkspaceState::Paused) => ("paused", Color::Magenta),
-        Some(WorkspaceState::Serving) => ("serving", Color::Cyan),
-        None => ("idle", Color::DarkGray),
+        Some(WorkspaceState::Working) => ("working", palette().ansi_green),
+        Some(WorkspaceState::AwaitingInput) => ("awaiting", palette().ansi_yellow),
+        Some(WorkspaceState::Blocked) => ("blocked", palette().ansi_red),
+        Some(WorkspaceState::Paused) => ("paused", palette().ansi_magenta),
+        Some(WorkspaceState::Serving) => ("serving", palette().ansi_cyan),
+        None => ("idle", palette().ansi_dark_gray),
     }
 }
 
@@ -405,11 +405,11 @@ fn render_title(f: &mut Frame, app: &MachinesApp, area: Rect) {
     let title = Line::from(vec![
         Span::styled(
             "Machines",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("   {}", app.display_label()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ]);
     f.render_widget(Paragraph::new(title), area);
@@ -424,7 +424,7 @@ fn render_body(f: &mut Frame, app: &MachinesApp, area: Rect) {
         };
         let p = Paragraph::new(Line::from(Span::styled(
             msg.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         )))
         .wrap(Wrap { trim: true });
         f.render_widget(p, area);
@@ -438,7 +438,7 @@ fn render_body(f: &mut Frame, app: &MachinesApp, area: Rect) {
         if m.workspaces.is_empty() {
             lines.push(Line::from(Span::styled(
                 "    (no workspaces)".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             )));
         }
         for (wi, w) in m.workspaces.iter().enumerate() {
@@ -454,7 +454,7 @@ fn render_body(f: &mut Frame, app: &MachinesApp, area: Rect) {
 fn machine_header_line(m: &MachineEntry) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
         m.name.clone(),
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD),
     )];
     // Location: local, or the ssh host.
     let loc = if m.is_local {
@@ -467,7 +467,7 @@ fn machine_header_line(m: &MachineEntry) -> Line<'static> {
     };
     spans.push(Span::styled(
         format!("  {loc}"),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     // Live reachability sits right next to the `ssh <host>` label — remotes only;
     // a local machine is the hub and is never probed.
@@ -477,14 +477,14 @@ fn machine_header_line(m: &MachineEntry) -> Line<'static> {
     if !m.tags.is_empty() {
         spans.push(Span::styled(
             format!("  [{}]", m.tags.join(", ")),
-            Style::default().fg(theme::WORKFLOW_BADGE_FG),
+            Style::default().fg(palette().workflow_badge_fg),
         ));
     }
     // Remote binary resolution (rt-machine-setup), or a prompt to set it up.
     if !m.is_local {
         match &m.remote {
             Some(rec) => {
-                let color = if rec.compatible { Color::Green } else { Color::Red };
+                let color = if rec.compatible { palette().ansi_green } else { palette().ansi_red };
                 let suffix = if rec.compatible { "" } else { " (incompatible)" };
                 spans.push(Span::styled(
                     format!("  {} v{}{}", rec.path, rec.version, suffix),
@@ -493,7 +493,7 @@ fn machine_header_line(m: &MachineEntry) -> Line<'static> {
             }
             None => spans.push(Span::styled(
                 "  not set up — run `shelbi machine setup`".to_string(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(palette().ansi_yellow),
             )),
         }
     }
@@ -504,7 +504,7 @@ fn workspace_line(w: &WorkspaceRow, selected: bool, width: u16) -> Line<'static>
     let (badge, badge_color) = state_badge(w.state);
     let pointer = if selected { "▸ " } else { "  " };
     let base = if selected {
-        Style::default().bg(theme::SELECTION_BG)
+        Style::default().bg(palette().selection)
     } else {
         Style::default()
     };
@@ -512,7 +512,7 @@ fn workspace_line(w: &WorkspaceRow, selected: bool, width: u16) -> Line<'static>
         Span::styled(format!("  {pointer}"), base),
         Span::styled(
             format!("{:<18}", truncate(&w.name, 18)),
-            base.fg(Color::White),
+            base.fg(palette().ansi_white),
         ),
         Span::styled(format!("{badge:<9}"), base.fg(badge_color)),
     ];
@@ -520,7 +520,7 @@ fn workspace_line(w: &WorkspaceRow, selected: bool, width: u16) -> Line<'static>
         Some(t) => t.clone(),
         None => "-".to_string(),
     };
-    spans.push(Span::styled(task, base.fg(Color::Gray)));
+    spans.push(Span::styled(task, base.fg(palette().ansi_gray)));
     // Pad the selection highlight to the full row width so it reads as a bar.
     if selected {
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -541,7 +541,7 @@ fn render_footer(f: &mut Frame, app: &MachinesApp, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))),
         area,
     );
@@ -595,6 +595,59 @@ mod tests {
             machines,
         });
         app
+    }
+
+    /// Machine headers (reachability, tags, the remote binary in each
+    /// state), workspace rows in every state, and the selected row are
+    /// readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let record = |compatible: bool| MachineRecord {
+            path: "/usr/local/bin/shelbi".into(),
+            version: "0.10.0".into(),
+            compatible,
+            source: "path".into(),
+            checked_at: chrono::Utc::now(),
+        };
+        let mut gpu = entry(
+            "gpu",
+            MachineKind::Ssh,
+            vec![
+                ws("gpu-1", Some(WorkspaceState::Serving), Some("T-3")),
+                ws("gpu-2", Some(WorkspaceState::Blocked), Some("T-4")),
+                ws("gpu-3", Some(WorkspaceState::Paused), None),
+            ],
+        );
+        gpu.tags = vec!["gpu".into(), "linux".into()];
+        gpu.remote = Some(record(true));
+        gpu.reachability = Reachability::Reachable;
+        let mut old = entry("old", MachineKind::Ssh, vec![ws("old-1", None, None)]);
+        old.remote = Some(record(false));
+        old.reachability = Reachability::Unreachable {
+            error: "connection refused".into(),
+        };
+        let fresh = entry("fresh", MachineKind::Ssh, vec![]);
+        let mut app = app_with(vec![
+            entry(
+                "local",
+                MachineKind::Local,
+                vec![
+                    ws("local-1", Some(WorkspaceState::Working), Some("T-1")),
+                    ws("local-2", Some(WorkspaceState::AwaitingInput), Some("T-2")),
+                ],
+            ),
+            gpu,
+            old,
+            fresh,
+        ]);
+        app.status_line = "refreshed".into();
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+            crate::theme::assert_light_readable("machines", term.backend().buffer());
+        });
     }
 
     #[test]

@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use shelbi_palette::DecorationColor;
+use crate::theme::palette;
 
 /// Rendered line count of the nav block: one item line per nav row plus a
 /// separator line above the first, below the last, and between each pair —
@@ -66,13 +67,13 @@ pub fn bleed_block_lines<'a>(
 pub fn decoration_to_color(c: DecorationColor) -> Color {
     match c {
         DecorationColor::Default => Color::Reset,
-        DecorationColor::Gray => Color::Gray,
-        DecorationColor::DarkGray => Color::DarkGray,
-        DecorationColor::Muted => crate::theme::PALETTE_MUTED,
-        DecorationColor::Green => Color::Green,
-        DecorationColor::Yellow => Color::Yellow,
-        DecorationColor::Red => Color::Red,
-        DecorationColor::Cyan => Color::Cyan,
-        DecorationColor::Blue => Color::Blue,
+        DecorationColor::Gray => palette().ansi_gray,
+        DecorationColor::DarkGray => palette().ansi_dark_gray,
+        DecorationColor::Muted => palette().muted,
+        DecorationColor::Green => palette().ansi_green,
+        DecorationColor::Yellow => palette().ansi_yellow,
+        DecorationColor::Red => palette().ansi_red,
+        DecorationColor::Cyan => palette().ansi_cyan,
+        DecorationColor::Blue => palette().ansi_blue,
     }
 }

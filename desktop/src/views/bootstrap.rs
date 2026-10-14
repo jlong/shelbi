@@ -298,10 +298,10 @@ pub fn render_progress(state: &BootstrapState, theme: &Theme) -> AnyElement {
                     div()
                         .text_xl()
                         .font_weight(FontWeight::BOLD)
-                        .text_color(theme.accent)
+                        .text_color(theme.cyan)
                         .child("Shelbi"),
                 )
-                .child(div().text_color(theme.text).child(format!("{label}…")))
+                .child(div().text_color(theme.gray).child(format!("{label}…")))
                 .when_some(detail, |col, detail| {
                     col.child(div().text_xs().text_color(theme.muted).child(detail))
                 }),
@@ -333,25 +333,25 @@ pub fn render_failure(
                         .path(icons::EXCLAMATION_TRIANGLE)
                         .size(px(20.0))
                         .flex_none()
-                        .text_color(theme.status_yellow),
+                        .text_color(theme.yellow),
                 )
                 .child(
                     div()
                         .text_lg()
                         .font_weight(FontWeight::BOLD)
-                        .text_color(theme.text_selected)
+                        .text_color(theme.white)
                         .child(screen.title.clone()),
                 ),
         );
     for paragraph in &screen.body {
-        column = column.child(div().text_color(theme.text).child(paragraph.clone()));
+        column = column.child(div().text_color(theme.gray).child(paragraph.clone()));
     }
     for (ix, step) in screen.fix.iter().enumerate() {
         let mut block = div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(theme.text).child(step.text.clone()));
+            .child(div().text_color(theme.gray).child(step.text.clone()));
         if let Some(command) = &step.command {
             block = block.child(command_box(ix, command, theme));
         }
@@ -370,9 +370,9 @@ pub fn render_failure(
                     .flex_col()
                     .p_2()
                     .rounded_md()
-                    .bg(theme.search_bg)
+                    .bg(theme.search)
                     .text_xs()
-                    .text_color(theme.fg_secondary)
+                    .text_color(theme.gray)
                     .children(lines.iter().map(|line| div().child(line.clone()))),
             );
         }
@@ -390,13 +390,13 @@ pub fn render_failure(
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .bg(theme.selection_bg)
-                .text_color(theme.text_selected)
+                .bg(theme.selection)
+                .text_color(theme.white)
                 .child(
                     svg()
                         .path(action.icon())
                         .size(px(ICON_SIZE))
-                        .text_color(theme.text_selected),
+                        .text_color(theme.white),
                 )
                 .child(action.label())
                 .on_click(move |_, window, cx| on_action(action, window, cx)),
@@ -419,20 +419,20 @@ pub fn render_relaunch_bar(
         .gap_4()
         .px_4()
         .py_2()
-        .bg(theme.selection_bg)
+        .bg(theme.selection)
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .text_color(theme.status_yellow)
+                .text_color(theme.yellow)
                 .child(
                     svg()
                         .path(icons::EXCLAMATION_TRIANGLE)
                         .size(px(ICON_SIZE))
                         .flex_none()
-                        .text_color(theme.status_yellow),
+                        .text_color(theme.yellow),
                 )
                 .child(relaunch_message(notice)),
         )
@@ -445,7 +445,7 @@ pub fn render_relaunch_bar(
                 .rounded_md()
                 .cursor_pointer()
                 .bg(theme.background)
-                .text_color(theme.text_selected)
+                .text_color(theme.white)
                 .child(ScreenAction::Relaunch.label())
                 .on_click(move |_, window, cx| on_relaunch(window, cx)),
         )
@@ -463,7 +463,7 @@ fn centered(theme: &Theme) -> gpui::Stateful<gpui::Div> {
         .size_full()
         .p_8()
         .overflow_y_scroll()
-        .bg(theme.main_background)
+        .bg(theme.canvas)
         .text_sm()
 }
 
@@ -478,12 +478,12 @@ fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoElement {
         .gap_2()
         .p_2()
         .rounded_md()
-        .bg(theme.search_bg)
+        .bg(theme.search)
         .child(
             div()
                 .flex()
                 .flex_col()
-                .text_color(theme.text_selected)
+                .text_color(theme.white)
                 .children(command.lines().map(|line| div().child(line.to_string()))),
         )
         .child(
