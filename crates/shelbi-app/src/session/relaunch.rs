@@ -1,9 +1,9 @@
-//! Concrete [`Relauncher`](super::session::Relauncher)s the shell installs on
-//! its session managers (`rt-auto-restart-killed-panes`).
+//! How a dead pane is brought back before a client view re-attaches
+//! (`rt-auto-restart-killed-panes`): the [`Relauncher`] seam and the concrete
+//! relaunchers the TUI and the desktop app install on their views.
 //!
-//! The restart loop in [`super::session`] is pane-kind agnostic; these supply
-//! the one kind-specific step — how to bring a given pane back before the
-//! manager re-attaches:
+//! A view's restart loop is pane-kind agnostic; these supply the one
+//! kind-specific step:
 //!
 //! - **Content sessions** (View-Diff / Edit) are re-`Ensure`d through the daemon
 //!   on *every* restart, because the daemon does not resurrect a dead content
@@ -14,10 +14,39 @@
 //!   *reopen* drops [`shelbi_state::supervision_relaunch`] markers to reset the
 //!   daemon's spent budget.
 
-use shelbi_app::{ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 use shelbi_state::supervision_relaunch as sr;
 
-use super::session::{Relauncher, SessionRef};
+use super::SessionRef;
+use crate::{ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
+
+/// How a dead pane is brought back before the view re-attaches, abstracted so
+/// a view's restart loop is one code path for every pane kind and so it is
+/// testable without a daemon.
+///
+/// The step runs off the UI thread (it may block on the daemon socket) and
+/// differs by pane kind: a *content* session (View-Diff / Edit) is
+/// re-`Ensure`d through the daemon, which won't resurrect it on its own; a
+/// *persistent* pane (orchestrator / agent / review slot) is the daemon
+/// supervisor's to relaunch, so an auto-restart is a no-op (the view just
+/// re-attaches once the daemon brings it back) and only a `reopen` drops a
+/// [`shelbi_state::supervision_relaunch`] marker to reset that daemon budget.
+pub trait Relauncher: Send + Sync {
+    /// (Re)launch the session for `target`. `reopen` is true when the user
+    /// re-selected a pane the budget had given up on (reset + relaunch), false
+    /// for an automatic in-view restart. `Ok` means the request was placed, not
+    /// that the session is live — the following connect proves that.
+    fn relaunch(&self, target: &SessionRef, reopen: bool) -> Result<(), String>;
+}
+
+/// A relauncher that does nothing: for a view whose pane kind the daemon fully
+/// owns and which never needs a reopen marker (and for tests).
+pub struct NoopRelauncher;
+
+impl Relauncher for NoopRelauncher {
+    fn relaunch(&self, _target: &SessionRef, _reopen: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 /// Map the content session's role token back to the wire role.
 fn role_from_str(s: &str) -> Option<ReviewRole> {
@@ -54,7 +83,8 @@ fn write_persistent_reopen_markers(project: &str, target: &SessionRef) -> Result
 }
 
 /// Relauncher for the main area, which shows only the orchestrator and agent
-/// panes — all daemon-supervised.
+/// panes — all daemon-supervised. The desktop's Chat view installs it for the
+/// orchestrator too.
 pub struct PersistentRelauncher {
     pub project: String,
 }
@@ -85,7 +115,7 @@ impl Relauncher for ReviewRelauncher {
                 let Some(role) = role_from_str(role) else {
                     return Ok(());
                 };
-                shelbi_app::review_session(
+                crate::review_session(
                     &self.project,
                     &self.task,
                     ReviewSessionOp::Ensure { role },
@@ -120,7 +150,7 @@ impl Relauncher for WorkspaceContentRelauncher {
                 let Some(role) = role_from_str(role) else {
                     return Ok(());
                 };
-                shelbi_app::workspace_session(
+                crate::workspace_session(
                     &self.project,
                     workspace,
                     WorkspaceSessionOp::Ensure { role },

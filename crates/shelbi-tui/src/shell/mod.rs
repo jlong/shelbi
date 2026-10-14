@@ -19,7 +19,9 @@
 mod caps;
 mod overlays;
 mod refresh;
-mod relaunch;
+// The relaunchers moved to `shelbi_app::session::relaunch` (shared with the
+// desktop app).
+use shelbi_app::session::relaunch;
 mod review;
 mod session;
 mod sidebar;
@@ -3585,7 +3587,7 @@ fn draw(
                 MainView::Session => match sessions.state() {
                     MainState::Empty => render_placeholder(buf, main_rect, "No session"),
                     MainState::Connecting(r) => {
-                        render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
+                        render_placeholder(buf, main_rect, &shelbi_app::session::connecting_notice(r))
                     }
                     MainState::Idle(info) => {
                         render_idle_workspace(buf, main_rect, info, sidebar_chrome.palette())
@@ -3593,12 +3595,12 @@ fn draw(
                     MainState::Failed(r, err) => render_placeholder(
                         buf,
                         main_rect,
-                        &format!("Couldn't attach to {}: {err}", r.display()),
+                        &shelbi_app::session::failed_notice(r, err),
                     ),
                     MainState::Restarting(attempt, max) => render_placeholder(
                         buf,
                         main_rect,
-                        &format!("Session exited — restarting ({attempt}/{max})…"),
+                        &shelbi_app::session::restarting_notice(attempt, max),
                     ),
                     MainState::GaveUp(last_line) => {
                         render_placeholder(buf, main_rect, &gave_up_notice(last_line))

@@ -17,6 +17,13 @@
 //! replaces it, and bringing up the project's orchestrator runs on the
 //! background executor through the CLI bootstrap found.
 //!
+//! The Orchestrator nav row (the view the window opens on) routes the main
+//! area to the Chat view ([`ChatView`], `dt-chat-view`): the orchestrator's
+//! session in a full-height terminal, attached while shown and detached while
+//! another view is. While its terminal holds focus, the window takes the
+//! global chords (the focus moves and the palette chord, plus Ctrl+Space) in
+//! the capture phase, so they never reach the session.
+//!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown. A project switch opens (or focuses) the target's
@@ -40,6 +47,7 @@ use crate::platform::{
     relaunch, Bootstrap, BootstrapEvent, BootstrapState, Failure, Ready, SystemPlatform,
 };
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
+use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use shelbi_state::keymap::{
     format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
@@ -248,6 +256,8 @@ pub struct ShelbiWindow {
     /// The Issues board for this window's project, created the first time it
     /// is shown.
     issues: Option<Entity<IssuesView>>,
+    /// The orchestrator chat, created the first time it is shown.
+    chat: Option<Entity<ChatView>>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -303,6 +313,7 @@ impl ShelbiWindow {
             switcher_open: false,
             route: Route::View,
             issues: None,
+            chat: None,
             banner: None,
             status: None,
             focus_handle,
@@ -500,6 +511,13 @@ impl ShelbiWindow {
                     Ok(()) => None,
                     Err(message) => Some(message.into()),
                 };
+                // The orchestrator is up now: re-attach a chat that isn't
+                // live, even mid-connect (that attach may have started before
+                // the session existed and give up on it), as the TUI does
+                // after its startup.
+                if let Some(chat) = &this.chat {
+                    chat.update(cx, |chat, cx| chat.reconnect(cx));
+                }
                 cx.notify();
             })
             .ok();
@@ -601,12 +619,20 @@ impl ShelbiWindow {
             HostCall::ShowView(view) => {
                 self.route = Route::View;
                 let issues = view == View::Issues;
+                let chat = is_chat(&view);
                 self.client.set_view(view);
                 self.client.focus_main();
                 self.banner = None;
                 if issues {
                     self.ensure_issues(window, cx);
                 }
+                if chat {
+                    // Selecting it again while it is failed or given up
+                    // re-opens it (a relaunch with a fresh budget).
+                    let chat = self.ensure_chat(window, cx);
+                    chat.update(cx, |chat, cx| chat.show(cx));
+                }
+                self.sync_chat(window, cx);
                 self.focus_main_view(window, cx);
             }
             HostCall::IssueCommand(kind) => {
@@ -649,12 +675,74 @@ impl ShelbiWindow {
         issues
     }
 
-    /// Hand keyboard focus to what the main area shows: the board takes it
-    /// (its own keys), anything else leaves it on the window.
+    /// The orchestrator chat for the window's project, created on first use.
+    fn ensure_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
+        if let Some(chat) = &self.chat {
+            return chat.clone();
+        }
+        let project = self.project.clone();
+        let handle = window.window_handle();
+        let sink = self._feed.as_ref().map(|f| f.session_sink());
+        let chat =
+            cx.new(|cx| ChatView::new(&project, handle, ChatDeps::live(&project), sink, cx));
+        let sub = cx.subscribe(&chat, |this, _, ev: &ChatEvent, cx| match ev {
+            // A click in the terminal moves the window's focus model to the
+            // main area, so the sidebar stops taking keys.
+            ChatEvent::Focused => {
+                this.client.focus_main();
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
+        self.chat = Some(chat.clone());
+        chat
+    }
+
+    /// Whether the main area should show the chat right now.
+    fn chat_wanted(&self) -> bool {
+        matches!(self.boot, Boot::Ready(_))
+            && matches!(self.route, Route::View)
+            && is_chat(self.client.view())
+    }
+
+    /// Attach the chat when the main area shows it and detach it when it
+    /// doesn't. Idempotent: it never re-shows a chat that is already shown,
+    /// so a failed or given-up chat waits for the user to re-select it.
+    fn sync_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = self.chat_wanted();
+        if wanted {
+            let chat = self.ensure_chat(window, cx);
+            if !chat.read(cx).is_shown() {
+                chat.update(cx, |chat, cx| chat.show(cx));
+                if self.client.focus() == Focus::Main {
+                    let target = chat.read(cx).focus_target(cx);
+                    window.focus(&target, cx);
+                }
+            }
+        } else if let Some(chat) = &self.chat {
+            if chat.read(cx).is_shown() {
+                chat.update(cx, |chat, cx| chat.hide(cx));
+            }
+        }
+    }
+
+    /// Whether the chat's terminal holds keyboard focus.
+    fn chat_focused(&self, window: &Window, cx: &App) -> bool {
+        self.chat
+            .as_ref()
+            .is_some_and(|chat| chat.read(cx).contains_focus(window, cx))
+    }
+
+    /// Hand keyboard focus to what the main area shows: the board and the
+    /// chat take it (their own keys), anything else leaves it on the window.
     fn focus_main_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match (&self.route, self.client.view(), &self.issues) {
-            (Route::View, View::Issues, Some(issues)) => {
+        match (&self.route, self.client.view(), &self.issues, &self.chat) {
+            (Route::View, View::Issues, Some(issues), _) => {
                 issues.update(cx, |v, _| v.request_focus());
+            }
+            (Route::View, view, _, Some(chat)) if is_chat(view) => {
+                let target = chat.read(cx).focus_target(cx);
+                window.focus(&target, cx);
             }
             _ => self.focus_handle.focus(window, cx),
         }
@@ -722,6 +810,14 @@ impl ShelbiWindow {
             if answer.await != Ok(0) {
                 return;
             }
+            // The orchestrator is about to be stopped on purpose: its exit is
+            // not a crash to restart.
+            this.update(cx, |this, cx| {
+                if let Some(chat) = &this.chat {
+                    chat.update(cx, |chat, _| chat.note_deliberate_close());
+                }
+            })
+            .ok();
             let quit = cx
                 .background_executor()
                 .spawn(async move {
@@ -736,6 +832,9 @@ impl ShelbiWindow {
             this.update_in(cx, |this, window, cx| match quit {
                 Ok(()) => window.remove_window(),
                 Err(e) => {
+                    if let Some(chat) = &this.chat {
+                        chat.update(cx, |chat, _| chat.clear_deliberate_close());
+                    }
                     this.banner = Some(format!("Couldn't quit the project: {e}").into());
                     cx.notify();
                 }
@@ -786,6 +885,7 @@ impl ShelbiWindow {
             let view = cx.new(|cx| SettingsView::new(window, cx));
             self.route = Route::Settings(view);
         }
+        self.sync_chat(window, cx);
         self.banner = None;
         self.client.focus_main();
         self.focus_main_view(window, cx);
@@ -831,6 +931,27 @@ impl ShelbiWindow {
 
     // --- keyboard ----------------------------------------------------------
 
+    /// The capture phase, ahead of the focused view: while the chat's terminal
+    /// holds focus, the global chords are the window's, never the session's
+    /// (the terminal would otherwise encode Ctrl+H as a backspace), as the TUI
+    /// intercepts them before forwarding a key to a session.
+    fn on_capture_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.chat_focused(window, cx) {
+            return;
+        }
+        let Some(chord) = chord_from_keystroke(&event.keystroke) else {
+            return;
+        };
+        if takes_from_terminal(&self.keymaps, chord) {
+            self.on_key_down(event, window, cx);
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let chord = chord_from_keystroke(&event.keystroke);
         tracing::trace!(keystroke = ?event.keystroke, ?chord, focus = ?self.client.focus(), "key down");
@@ -857,6 +978,15 @@ impl ShelbiWindow {
             Some(GlobalAction::FocusMain) => {
                 self.client.focus_main();
                 self.focus_main_view(window, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            // The palette also always opens on Ctrl+Space, the plan's reserved
+            // key, as in the TUI.
+            _ if is_reserved_palette_chord(chord) => {
+                // dt-palette-overlays
+                self.banner = Some(commands::not_implemented_message("action:palette").into());
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -912,6 +1042,13 @@ impl ShelbiWindow {
                         .when_some(self.session_title(view), |d, title| {
                             d.child(div().text_xs().child(title))
                         })
+                        .into_any_element(),
+                    (None, _) if is_chat(view) && self.chat.is_some() => div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .children(self.chat.clone())
                         .into_any_element(),
                     (None, Some(issues)) if *view == View::Issues => div()
                         .flex()
@@ -994,6 +1131,27 @@ impl ShelbiWindow {
     }
 }
 
+/// Whether `view` is the orchestrator chat.
+fn is_chat(view: &View) -> bool {
+    matches!(view, View::Session(name) if name == "orch")
+}
+
+/// Whether the window takes `chord` away from a focused terminal: the focus
+/// moves (Ctrl+H / Ctrl+L by default), the palette chord, and Ctrl+Space.
+/// Everything else is the session's.
+fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
+    matches!(
+        keymaps.global.dispatch(chord),
+        Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain | GlobalAction::OpenPalette)
+    ) || is_reserved_palette_chord(chord)
+}
+
+/// Ctrl+Space, the plan's permanently reserved palette key: it opens the
+/// palette from anywhere and is never forwarded to a session.
+fn is_reserved_palette_chord(chord: shelbi_state::keymap::KeyChord) -> bool {
+    chord == shelbi_state::keymap::KeyChord::new(Key::Char(' '), shelbi_state::keymap::Mods::CONTROL)
+}
+
 /// The palette-open chord as the search box shows it (`⌃P`).
 fn palette_chord(keymaps: &Keymaps) -> String {
     keymaps
@@ -1067,6 +1225,10 @@ impl ShelbiWindow {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = *theme;
+        // The chat attaches the first time the shell paints with it routed
+        // (bootstrap has no window to hand it); later changes go through
+        // `perform`. Idempotent.
+        self.sync_chat(window, cx);
         let window_width = window.viewport_size().width.as_f32();
         let catalog_projects = self
             .switcher_open
@@ -1120,6 +1282,7 @@ impl ShelbiWindow {
             .id("shelbi-window")
             .key_context("ShelbiWindow")
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(Self::on_capture_key_down))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
@@ -1191,6 +1354,35 @@ mod tests {
         );
         // The main area draws the board for it, not the not-implemented stub.
         assert_eq!(commands::view_stub_id(&View::Issues), None);
+    }
+
+    #[test]
+    fn the_orchestrator_row_routes_to_the_chat() {
+        assert_eq!(
+            calls(CommandKind::ShowView(View::Session("orch".into()))),
+            [HostCall::ShowView(View::Session("orch".into()))]
+        );
+        assert!(is_chat(&View::Session("orch".into())));
+        assert!(!is_chat(&View::Session("alpha".into())));
+        assert!(!is_chat(&View::Issues));
+    }
+
+    #[test]
+    fn a_focused_terminal_keeps_every_key_but_the_global_chords() {
+        let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
+        let chord = |spec: &str| {
+            let ks = gpui::Keystroke::parse(spec).unwrap();
+            chord_from_keystroke(&ks).unwrap()
+        };
+        // Ctrl+H back to the sidebar, Ctrl+L to the main area, the palette.
+        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p"] {
+            assert!(takes_from_terminal(&keymaps, chord(spec)), "{spec}");
+        }
+        // Typing, Backspace (never mistaken for Ctrl+H), Shift+Enter, other
+        // control keys reach the session.
+        for spec in ["h", "backspace", "shift-enter", "enter", "ctrl-c", "ctrl-a", "alt-b"] {
+            assert!(!takes_from_terminal(&keymaps, chord(spec)), "{spec}");
+        }
     }
 
     #[test]

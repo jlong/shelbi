@@ -113,7 +113,7 @@ impl ReviewInterface {
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
-            super::relaunch::ReviewRelauncher {
+            shelbi_app::session::ReviewRelauncher {
                 project: project.to_string(),
                 task: task_id.clone(),
             },
@@ -432,7 +432,7 @@ impl ReviewInterface {
             MainState::Restarting(attempt, max) => super::render_placeholder(
                 buf,
                 content_rect,
-                &format!("Session exited — restarting ({attempt}/{max})…"),
+                &shelbi_app::session::restarting_notice(attempt, max),
             ),
             MainState::GaveUp(last_line) => super::render_placeholder(
                 buf,

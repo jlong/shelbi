@@ -12,300 +12,32 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use shelbi_client::{ClientError, Connection, SessionEvents};
-use shelbi_orchestrator::supervision::{
-    SupervisionAction, SupervisionInputs, SupervisionState, MAX_RESTARTS_IN_WINDOW,
-};
-use shelbi_proto::capability;
+use shelbi_app::session::{exit_line, DeathAction, RestartController};
+use shelbi_client::{Connection, SessionEvents};
 use shelbi_term::Size;
 
 use super::terminal_view::TerminalPane;
 
-/// How a dead pane is brought back before the manager re-attaches, abstracted so
-/// the manager's restart loop is one code path for every pane kind and so it is
-/// testable without a daemon.
-///
-/// The step runs on the connect worker thread (it may block on the daemon
-/// socket) and differs by pane kind: a *content* session (View-Diff / Edit) is
-/// re-`Ensure`d through the daemon, which won't resurrect it on its own; a
-/// *persistent* pane (orchestrator / agent / review slot) is the daemon
-/// supervisor's to relaunch, so an auto-restart here is a no-op (the manager
-/// just re-attaches once the daemon brings it back) and only a `reopen` drops a
-/// [`shelbi_state::supervision_relaunch`] marker to reset that daemon budget.
-pub trait Relauncher: Send + Sync {
-    /// (Re)launch the session for `target`. `reopen` is true when the user
-    /// re-selected a pane the budget had given up on (reset + relaunch), false
-    /// for an automatic in-view restart. `Ok` means the request was placed, not
-    /// that the session is live — the following connect proves that.
-    fn relaunch(&self, target: &SessionRef, reopen: bool) -> Result<(), String>;
-}
-
-/// A relauncher that does nothing. The default for a manager whose pane kind the
-/// daemon fully owns and which never needs a reopen marker (and the seam tests
-/// inject their own), so [`SessionManager::new`] stays a two-argument
-/// constructor.
-pub struct NoopRelauncher;
-
-impl Relauncher for NoopRelauncher {
-    fn relaunch(&self, _target: &SessionRef, _reopen: bool) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-/// Which session a sidebar row refers to. The concrete session *name* used for
-/// discovery is derived from the project (sessions are named `<project>/orch`
-/// and `<project>/ws/<workspace>` by the session backend).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionRef {
-    /// The project's orchestrator chat session.
-    Orchestrator,
-    /// A dev workspace's session.
-    Workspace(String),
-    /// A review slot's content session: the editor or diff tool the review
-    /// interface shows in a terminal view (`rt-tui-review`). `slot` is the
-    /// review workspace, `role` is `editor` / `diff`. The daemon owns their
-    /// lifetime (see [`shelbi_orchestrator::review_session`]); the shell only
-    /// attaches. The review slot's agent (chat) session is a
-    /// [`SessionRef::Workspace`] of the slot name.
-    Review { slot: String, role: String },
-    /// A dev workspace's content session: the editor or diff tool the workspace
-    /// sidebar shows in a terminal view (the workspace-sidebar task). `workspace`
-    /// is the dev workspace, `role` is `editor` / `diff`. The dev-workspace twin
-    /// of [`SessionRef::Review`]: the daemon owns their lifetime (see
-    /// [`shelbi_orchestrator::workspace_session`]); the shell only attaches. The
-    /// workspace's agent session is a [`SessionRef::Workspace`].
-    WorkspaceContent { workspace: String, role: String },
-}
-
-impl SessionRef {
-    /// A human label for the status line / title.
-    pub fn display(&self) -> String {
-        match self {
-            SessionRef::Orchestrator => "orchestrator".to_string(),
-            SessionRef::Workspace(w) => w.clone(),
-            SessionRef::Review { slot, role } => format!("{slot} {role}"),
-            SessionRef::WorkspaceContent { workspace, role } => format!("{workspace} {role}"),
-        }
-    }
-}
-
-/// The session backend's discovery name for a ref within `project`.
-pub fn discovery_name(project: &str, r: &SessionRef) -> String {
-    match r {
-        SessionRef::Orchestrator => format!("{project}/orch"),
-        SessionRef::Workspace(w) => format!("{project}/ws/{w}"),
-        SessionRef::Review { slot, role } => format!("{project}/review/{slot}/{role}"),
-        SessionRef::WorkspaceContent { workspace, role } => {
-            format!("{project}/ws/{workspace}/{role}")
-        }
-    }
-}
-
-/// A freshly connected session handed back from the worker thread.
-pub struct Connected {
-    pub conn: Connection,
-    pub events: SessionEvents,
-    pub size: Size,
-}
-
-/// Identity for the idle-workspace placeholder: a declared workspace the client
-/// opened that has no live session (and no exited one to show a last line for).
-/// The main area shows this instead of a bare "couldn't attach" error so the
-/// sidebar selection and the main view agree (`rt-tui-idle-workspace-open`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdleInfo {
-    /// The workspace name.
-    pub name: String,
-    /// The machine the workspace is declared on.
-    pub machine: String,
-    /// The worktree's current branch, when known (local workspaces only).
-    pub branch: Option<String>,
-}
-
-/// Why a connect didn't yield a live session.
-pub enum ConnectFailure {
-    /// A declared workspace with no session at all — the main area shows the
-    /// idle-workspace placeholder rather than an error.
-    Idle(IdleInfo),
-    /// The session was just launched (its `meta.json` is on disk and discovery
-    /// reports it alive) but its socket isn't accepting connections yet —
-    /// `Connection::open` returned ENOENT / ECONNREFUSED. This is *transient*:
-    /// the connect worker retries it with a short backoff rather than surfacing
-    /// an error, because the session's `sock` is bound a beat after its dir
-    /// appears (`rt-tui-attach-retry-unbound-socket`). The string is the error
-    /// shown only if the retries run out.
-    Starting(String),
-    /// No live session exists yet, but one is *expected* to (re)appear, so this
-    /// is transient like [`Starting`]: the connect worker keeps retrying on the
-    /// `RetryPolicy` cadence and attaches as soon as a live session shows up.
-    /// Raised for the orchestrator when the project declares one (its config
-    /// loads) or an exited session with its name is already on disk — the shape
-    /// of a relaunch in progress: a daemon restart SIGTERMs the old
-    /// `<project>/orch` session and spawns a fresh one a beat later, and a TUI
-    /// that connects in that gap would otherwise settle on a permanent
-    /// "couldn't attach" error even though a healthy session arrives seconds
-    /// later (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
-    /// The string is the terminal error shown only if no live session appears
-    /// before the deadline (an exited session's last output line, when any).
-    Awaiting(String),
-    /// Any other no-session / attach failure. The message is shown as-is and,
-    /// for a session that *exited*, already carries its last output line (so a
-    /// dead workspace or orchestrator surfaces why it's gone — the behavior the
-    /// orchestrator view already had).
-    Message(String),
-}
-
-/// How the connect worker retries a session whose socket isn't up yet
-/// ([`ConnectFailure::Starting`]). A launched session binds its `sock` a beat
-/// after its dir appears, so the worker re-attempts the connect on this cadence
-/// until the socket is up or the deadline passes
-/// (`rt-tui-attach-retry-unbound-socket`).
-#[derive(Debug, Clone, Copy)]
-pub struct RetryPolicy {
-    /// Total time to keep retrying a still-starting session before giving up and
-    /// surfacing the error.
-    pub deadline: Duration,
-    /// Pause between attempts.
-    pub backoff: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            deadline: Duration::from_secs(15),
-            backoff: Duration::from_millis(250),
-        }
-    }
-}
-
-/// The blocking work of connecting to a session, injectable so the event loop
-/// can be tested against a connector that blocks without a real session.
-pub trait Connector: Send + Sync {
-    fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure>;
-}
+// The attach / restart vocabulary (session naming, the relaunch-tolerant
+// connect classification, the retry policy, the relaunch seam, the notices) is
+// shared with the desktop app in `shelbi_app::session`; re-exported so the
+// shell's modules keep their `session::` paths.
+pub use shelbi_app::session::{
+    gave_up_notice, ConnectFailure, Connected, Connector, IdleInfo, NoopRelauncher, Relauncher,
+    RetryPolicy, SessionRef,
+};
 
 /// The production connector: discover the session on disk, open it, and attach
-/// with a full replay.
+/// with a full replay ([`shelbi_app::session::connect`]), resolving an idle
+/// workspace's placeholder identity from the project config.
 pub struct LiveConnector;
 
 impl Connector for LiveConnector {
     fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
-        let root = shelbi_state::sessions_dir().map_err(|e| ConnectFailure::Message(e.to_string()))?;
-        let want = discovery_name(project, target);
-        let sessions =
-            shelbi_client::list(&root).map_err(|e| ConnectFailure::Message(e.to_string()))?;
-        // Several sessions can share a name (a relaunch racing a not-yet-reaped
-        // predecessor, or a zombie lingering beside its replacement), so choose
-        // the *usable* one deliberately — lock held and socket accepting, newest
-        // first — rather than take whatever `list` returned first. Taking the
-        // first `alive` one could land on the zombie, whose socket refuses the
-        // connect (`rt-re-entering-a-review-fails-to-attach`).
-        let sess = match shelbi_client::choose_session(&sessions, &want) {
-            Some(s) => s,
-            None => {
-                // No live session. If a *dead* one with this name left a
-                // `final.txt`, surface its last output line so the TUI explains
-                // *why* the session isn't there — e.g. an orchestrator that
-                // exited at launch with `command not found: claude` — instead of
-                // only "no live session" (`rt-login-env-capture-empty-path`).
-                let exited = sessions.iter().any(|s| s.meta.name == want && !s.alive);
-                let last_line = sessions
-                    .iter()
-                    .find(|s| s.meta.name == want && !s.alive)
-                    .and_then(|s| last_final_line(&s.dir));
-                // A declared workspace with no exited session is *idle*, not
-                // failed: show its identity + how to start, not a terse error
-                // (`rt-tui-idle-workspace-open`). A session that exited (or any
-                // non-workspace target) keeps the explanatory message.
-                if let (SessionRef::Workspace(name), None) = (target, &last_line) {
-                    return Err(ConnectFailure::Idle(idle_info(project, name)));
-                }
-                let msg = no_live_session_error(&want, last_line.as_deref());
-                // The orchestrator is relaunched out of band — a daemon restart
-                // SIGTERMs the old session and spawns a fresh one a beat later.
-                // If the TUI connected in that gap it finds only the exited
-                // session; rather than surfacing a terminal error the user must
-                // quit past, keep retrying until the new session binds
-                // (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
-                // `orchestrator_declared` is computed lazily, only when it could
-                // change the outcome (an exited session already proves one is
-                // expected), to avoid a config load on every workspace miss.
-                if should_await_session(target, exited, || orchestrator_declared(project)) {
-                    return Err(ConnectFailure::Awaiting(msg));
-                }
-                return Err(ConnectFailure::Message(msg));
-            }
-        };
-        let (conn, events) = match Connection::open(&sess.sock, None, capability::ALL) {
-            Ok(ce) => ce,
-            // The session dir (with `meta.json`) appears before its `sock` is
-            // bound, so a connect in that window fails with ENOENT (socket file
-            // absent) or ECONNREFUSED (file there, not yet listening). A session
-            // whose listener died *after* accepting — the zombie we may still land
-            // on when a replacement is coming up — instead tears the connection
-            // mid-hello: ENOTCONN, EPIPE, or ECONNRESET. Discovery told us a
-            // session with this name is alive, so every one of these is "still
-            // starting / racing a relaunch", not a terminal failure — signal a
-            // retry so a usable session (or the reaped zombie's replacement) is
-            // picked up on the next attempt
-            // (`rt-tui-attach-retry-unbound-socket`,
-            // `rt-re-entering-a-review-fails-to-attach`).
-            Err(ClientError::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NotConnected
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                return Err(ConnectFailure::Starting(starting_error(&want)));
-            }
-            Err(e) => return Err(ConnectFailure::Message(e.to_string())),
-        };
-        let size = match conn.info() {
-            Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
-            Err(_) => Size::new(80, 24),
-        };
-        conn.attach(None)
-            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
-        Ok(Connected {
-            conn,
-            events,
-            size,
-        })
+        shelbi_app::session::connect(project, target, idle_info)
     }
-}
-
-/// Whether a missing live session for `target` should be *awaited* — kept
-/// retrying by the connect worker — rather than reported as a terminal failure.
-/// True only for the orchestrator, and only when a session is expected: an
-/// exited one with its name is already on disk (`exited`), or the project
-/// declares an orchestrator (`declared`). A relaunch in that window brings a
-/// live session up within the retry deadline, so the TUI never settles on a
-/// stale "couldn't attach" error across an orchestrator relaunch
-/// (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
-///
-/// `declared` is a closure so the (blocking) config load runs only when the
-/// cheap `exited` signal didn't already settle it. Pure given its inputs, so
-/// the classification is unit-testable without a sessions directory.
-fn should_await_session(
-    target: &SessionRef,
-    exited: bool,
-    declared: impl FnOnce() -> bool,
-) -> bool {
-    matches!(target, SessionRef::Orchestrator) && (exited || declared())
-}
-
-/// Whether `project` declares an orchestrator — i.e. its config loads. A
-/// declared orchestrator is expected to have (or soon have) a live session.
-/// Best-effort: a project whose config can't be read reads as "not declared"
-/// and the connect falls back to the exited-session signal.
-fn orchestrator_declared(project: &str) -> bool {
-    shelbi_state::load_project(project).is_ok()
 }
 
 /// Assemble an idle workspace's [`IdleInfo`] from the project config and (for a
@@ -318,80 +50,8 @@ fn idle_info(project: &str, name: &str) -> IdleInfo {
             machine: id.machine,
             branch: id.branch,
         },
-        None => IdleInfo {
-            name: name.to_string(),
-            machine: String::new(),
-            branch: None,
-        },
+        None => IdleInfo::named(name),
     }
-}
-
-/// Compose the error shown when no live session named `want` exists, appending a
-/// dead session's last output line when one is available. Split out (pure) so the
-/// message is unit-testable without a real sessions directory.
-fn no_live_session_error(want: &str, last_line: Option<&str>) -> String {
-    match last_line {
-        Some(line) if !line.is_empty() => {
-            format!("no live session `{want}` — last output: {line}")
-        }
-        _ => format!("no live session `{want}`"),
-    }
-}
-
-/// The error shown when a just-launched session's socket never comes up within
-/// the retry deadline. Pure, so it's unit-testable without a real session.
-fn starting_error(want: &str) -> String {
-    format!("session `{want}` is starting (socket not up yet)")
-}
-
-/// The notice shown when the restart budget is spent: names the cap and how to
-/// bring the pane back ("select it again to relaunch"), and appends the last
-/// output line when there is one so a stuck pane shows *why* it stopped. Shared
-/// by every main-area / content render site so the wording stays identical.
-pub fn gave_up_notice(last_line: &str) -> String {
-    let base = format!(
-        "Stopped after {} restarts — select it again to relaunch.",
-        MAX_RESTARTS_IN_WINDOW
-    );
-    if last_line.trim().is_empty() {
-        base
-    } else {
-        format!("{base} Last output: {}", last_line.trim())
-    }
-}
-
-/// A one-line summary of why a live session's child exited, for the restart /
-/// give-up notice. Prefers the session's own reason, then the exit status or
-/// signal. Pure, so it's unit-testable without a session.
-fn exit_line(exited: Option<&shelbi_proto::Exited>) -> String {
-    match exited {
-        Some(e) => {
-            if let Some(r) = e.reason.as_deref() {
-                if !r.trim().is_empty() {
-                    return r.trim().to_string();
-                }
-            }
-            if let Some(code) = e.code {
-                return format!("exited with status {code}");
-            }
-            if let Some(sig) = e.signal {
-                return format!("killed by signal {sig}");
-            }
-            "session exited".to_string()
-        }
-        None => "session exited".to_string(),
-    }
-}
-
-/// The last non-empty line of a dead session's `<dir>/final.txt`, trimmed, or
-/// `None` when the file is absent or blank. This is the exited session's final
-/// screen line (e.g. `zsh:1: command not found: claude`).
-fn last_final_line(dir: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("final.txt")).ok()?;
-    text.lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .map(str::to_string)
 }
 
 /// A connected, live session binding. Boxed inside [`Slot`] because it is much
@@ -464,16 +124,14 @@ pub struct SessionManager {
     /// How to bring the current pane back before re-attaching (content re-ensure
     /// / persistent reopen marker). Shared, so the connect worker can run it.
     relauncher: Arc<dyn Relauncher>,
-    /// The crash-loop budget for the pane currently bound, reusing the daemon's
-    /// decision core so the client supervises content sessions (and reflects a
-    /// persistent pane's restarts) under the exact same cap / backoff / window.
-    /// Reset when a different target is shown or the user re-opens a given-up
-    /// pane (`request_relaunch`).
-    supervision: SupervisionState,
-    /// Set when the shell is deliberately tearing the pane down (`q` / Close /
-    /// quit), so the resulting exit is read as intentional and not restarted.
-    /// Cleared whenever a new target is shown.
-    deliberate_close: bool,
+    /// The restart decision core for the pane currently bound (shared with the
+    /// desktop app), reusing the daemon's crash-loop rules so the client
+    /// supervises content sessions (and reflects a persistent pane's restarts)
+    /// under the exact same cap / backoff / window. It also carries the
+    /// deliberate-teardown flag (`q` / Close / quit), so that exit is not
+    /// restarted. Reset when a different target is shown; re-armed when the
+    /// user re-opens a given-up pane.
+    restart: RestartController,
 }
 
 /// What the main area should draw right now.
@@ -502,8 +160,7 @@ impl SessionManager {
             retry: RetryPolicy::default(),
             last_size: None,
             relauncher: Arc::new(NoopRelauncher),
-            supervision: SupervisionState::default(),
-            deliberate_close: false,
+            restart: RestartController::default(),
         }
     }
 
@@ -541,12 +198,7 @@ impl SessionManager {
                 self.slot,
                 Slot::Failed { .. } | Slot::GaveUp { .. } | Slot::AwaitingRestart { .. }
             );
-        if reopen {
-            self.supervision.request_relaunch();
-        } else {
-            self.supervision = SupervisionState::default();
-        }
-        self.deliberate_close = false;
+        self.restart.begin(reopen);
         self.start_connect(target, if reopen { Some(true) } else { None }, None);
     }
 
@@ -590,7 +242,7 @@ impl SessionManager {
     /// quit), so the exit that follows is read as intentional and the supervisor
     /// stands down instead of restarting it. Cleared on the next [`show`].
     pub fn note_deliberate_close(&mut self) {
-        self.deliberate_close = true;
+        self.restart.note_deliberate_close();
     }
 
     /// Poll the in-flight connect without blocking and advance the restart
@@ -635,7 +287,7 @@ impl SessionManager {
                     target,
                     conn: c.conn,
                     events: c.events,
-                    pane: TerminalPane::new(c.size),
+                    pane: TerminalPane::new(Size::new(c.size.cols, c.size.rows)),
                 };
                 // The session attached at its spawn-time default size. If the
                 // shell asked for a viewport size while we were still
@@ -722,64 +374,48 @@ impl SessionManager {
                 // A pane that stays up past the recovery window forgets its
                 // crash history; a brief flap-back keeps it so the cap still
                 // trips. No slot change.
-                self.supervision.decide(
-                    &SupervisionInputs {
-                        alive: true,
-                        intentional_shutdown: false,
-                        has_work: false,
-                    },
-                    now,
-                );
+                self.restart.alive(now);
                 false
             }
             Observed::Dead { target, last_line } => self.act_on_death(target, last_line, now),
         }
     }
 
-    /// Decide what to do about a dead/failed pane and apply it. The pane the user
-    /// is viewing is always "work" (we want it up); a deliberate teardown is the
-    /// one case we don't restart.
+    /// Decide what to do about a dead/failed pane and apply it. The decision is
+    /// the shared [`RestartController`]'s: the pane the user is viewing is
+    /// always "work" (we want it up); a deliberate teardown is the one case we
+    /// don't restart.
     fn act_on_death(&mut self, target: SessionRef, last_line: String, now: Instant) -> bool {
-        let action = self.supervision.decide(
-            &SupervisionInputs {
-                alive: false,
-                intentional_shutdown: self.deliberate_close,
-                has_work: true,
-            },
-            now,
-        );
-        match action {
-            SupervisionAction::Restart => {
-                // `restart_count` is post-increment here, so it is the 1-based
-                // attempt number. Content re-ensures (the daemon won't on its
-                // own); a persistent pane relaunches via the daemon, so this is
-                // an auto (non-reopen) relaunch step.
-                let attempt = self.supervision.restart_count() as u32;
+        match self.restart.dead(now) {
+            DeathAction::Restart { attempt } => {
+                // Content re-ensures (the daemon won't on its own); a persistent
+                // pane relaunches via the daemon, so this is an auto (non-reopen)
+                // relaunch step.
                 self.emit_content_supervision(&target, "restart", "crash");
                 self.start_connect(target, Some(false), Some(attempt));
                 true
             }
-            SupervisionAction::GiveUp => {
+            DeathAction::GiveUp => {
                 self.emit_content_supervision(&target, "gave-up", "crash-loop");
                 self.slot = Slot::GaveUp { target, last_line };
                 true
             }
-            SupervisionAction::None => {
-                if self.deliberate_close || !self.supervision.ever_alive() {
-                    // Deliberate teardown, or a pane that never came up at all
-                    // (a first-open connect failure): stand down. Leave a
-                    // never-live failure showing as `Failed`; clear a
-                    // deliberately-closed pane so we stop supervising it.
-                    if self.deliberate_close && !matches!(self.slot, Slot::Empty) {
-                        self.slot = Slot::Empty;
-                        return true;
-                    }
+            // Deliberate teardown: clear the pane so we stop supervising it.
+            DeathAction::StandDown => {
+                if matches!(self.slot, Slot::Empty) {
                     return false;
                 }
-                // Inside the backoff between attempts: reflect it as "restarting"
-                // so the user sees the pane is coming back. Only rewrite the slot
-                // when the shown attempt changes, to avoid redraw churn.
-                let next_attempt = self.supervision.restart_count() as u32 + 1;
+                self.slot = Slot::Empty;
+                true
+            }
+            // A pane that never came up at all (a first-open connect failure):
+            // leave it showing as `Failed`.
+            DeathAction::Leave => false,
+            DeathAction::Backoff { next_attempt } => {
+                // Inside the backoff between attempts: reflect it as
+                // "restarting" so the user sees the pane is coming back. Only
+                // rewrite the slot when the shown attempt changes, to avoid
+                // redraw churn.
                 let already = matches!(
                     &self.slot,
                     Slot::AwaitingRestart { next_attempt: n, .. } if *n == next_attempt
@@ -857,7 +493,7 @@ impl SessionManager {
     }
 
     pub fn state(&self) -> MainState<'_> {
-        let max = MAX_RESTARTS_IN_WINDOW as u32;
+        let max = RestartController::max_restarts();
         match &self.slot {
             Slot::Empty => MainState::Empty,
             // A supervisor-kicked restart still connecting shows its progress;
@@ -953,41 +589,16 @@ impl ConnectJob {
                 return;
             }
         }
-        // Retry a session whose socket isn't up yet. A just-launched session has
-        // its dir (with `meta.json`) on disk a beat before its `sock` is bound,
-        // so a connect in that window returns `Starting` — we back off and try
-        // again rather than surfacing an error, until the socket is up or the
-        // deadline passes (`rt-tui-attach-retry-unbound-socket`). Every other
-        // outcome (a live attach, an idle workspace, an exited session) is
+        // Retry a session whose socket isn't up yet (or an orchestrator that is
+        // being relaunched) on the shared policy; every other outcome is
         // terminal and forwarded at once. Running the wait here, on the worker
         // thread, keeps the UI loop non-blocking — it only ever polls.
-        let started = Instant::now();
-        let mut result = self.connector.connect(&self.project, &self.target);
-        while matches!(
-            &result,
-            Err(ConnectFailure::Starting(_) | ConnectFailure::Awaiting(_))
-        ) {
-            if started.elapsed() >= self.retry.deadline {
-                // Give up: turn the transient signal into a terminal error so
-                // the user finally sees why the attach never completed.
-                result = match result {
-                    // A socket that never bound — name the give-up explicitly,
-                    // since the carried message only says "socket not up yet".
-                    Err(ConnectFailure::Starting(msg)) => Err(ConnectFailure::Message(format!(
-                        "{msg} — not reachable after {:?}",
-                        self.retry.deadline
-                    ))),
-                    // A session that never (re)appeared — surface its carried
-                    // message as-is: the exited session's last output line, when
-                    // any, which already explains why nothing is there.
-                    Err(ConnectFailure::Awaiting(msg)) => Err(ConnectFailure::Message(msg)),
-                    other => other,
-                };
-                break;
-            }
-            std::thread::sleep(self.retry.backoff);
-            result = self.connector.connect(&self.project, &self.target);
-        }
+        let result = shelbi_app::session::retry_connect(
+            self.connector.as_ref(),
+            &self.project,
+            &self.target,
+            self.retry,
+        );
         // The UI may have moved on; a failed send just means nobody is waiting.
         let _ = self.tx.send(result);
     }
@@ -996,70 +607,17 @@ impl ConnectJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_app::session::GridSize;
+    use shelbi_app::supervision::{
+        SupervisionAction, SupervisionInputs, SupervisionState, MAX_RESTARTS_IN_WINDOW,
+    };
+    use shelbi_proto::capability;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
+    use std::time::Duration;
 
     fn connecting(m: &SessionManager) -> bool {
         matches!(m.state(), MainState::Connecting(_))
-    }
-
-    #[test]
-    fn no_live_session_error_appends_the_exited_sessions_last_line() {
-        // An orchestrator that exited at launch has its final screen line
-        // surfaced, so the TUI shows the cause instead of only "no live session".
-        let msg = no_live_session_error(
-            "contextstore/orch",
-            Some("zsh:1: command not found: claude"),
-        );
-        assert_eq!(
-            msg,
-            "no live session `contextstore/orch` — last output: zsh:1: command not found: claude"
-        );
-    }
-
-    #[test]
-    fn no_live_session_error_without_a_last_line_is_the_bare_message() {
-        assert_eq!(
-            no_live_session_error("demo/orch", None),
-            "no live session `demo/orch`"
-        );
-        // An empty last line is treated as absent.
-        assert_eq!(
-            no_live_session_error("demo/orch", Some("")),
-            "no live session `demo/orch`"
-        );
-    }
-
-    #[test]
-    fn last_final_line_reads_the_last_nonblank_line_of_final_txt() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("final.txt"),
-            "booting orchestrator\nzsh:1: command not found: claude\n\n   \n",
-        )
-        .unwrap();
-        assert_eq!(
-            last_final_line(dir.path()).as_deref(),
-            Some("zsh:1: command not found: claude")
-        );
-    }
-
-    #[test]
-    fn last_final_line_is_none_without_final_txt() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(last_final_line(dir.path()), None);
-    }
-
-    #[test]
-    fn discovery_names_follow_the_backend_scheme() {
-        assert_eq!(
-            discovery_name("shelbi", &SessionRef::Orchestrator),
-            "shelbi/orch"
-        );
-        assert_eq!(
-            discovery_name("shelbi", &SessionRef::Workspace("alpha".into())),
-            "shelbi/ws/alpha"
-        );
     }
 
     /// A connector that blocks until the test releases it, so we can prove that
@@ -1226,8 +784,8 @@ mod tests {
             let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
                 .map_err(|e| ConnectFailure::Message(e.to_string()))?;
             let size = match conn.info() {
-                Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
-                Err(_) => Size::new(80, 24),
+                Ok(info) => GridSize::new(info.cols.max(1), info.rows.max(1)),
+                Err(_) => GridSize::new(80, 24),
             };
             conn.attach(None)
                 .map_err(|e| ConnectFailure::Message(e.to_string()))?;
@@ -1255,8 +813,8 @@ mod tests {
             let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
                 .map_err(|e| ConnectFailure::Message(e.to_string()))?;
             let size = match conn.info() {
-                Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
-                Err(_) => Size::new(80, 24),
+                Ok(info) => GridSize::new(info.cols.max(1), info.rows.max(1)),
+                Err(_) => GridSize::new(80, 24),
             };
             conn.attach(None)
                 .map_err(|e| ConnectFailure::Message(e.to_string()))?;
@@ -1466,14 +1024,6 @@ mod tests {
     }
 
     #[test]
-    fn starting_error_reads_as_a_terminal_message() {
-        assert_eq!(
-            starting_error("demo/orch"),
-            "session `demo/orch` is starting (socket not up yet)"
-        );
-    }
-
-    #[test]
     fn an_awaiting_orchestrator_retries_then_attaches_live() {
         // AC4: the connector sees only an exited session first (`Awaiting`) and
         // then a live one — the orchestrator relaunched as the TUI opened — and
@@ -1539,42 +1089,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn should_await_session_only_awaits_an_expected_orchestrator() {
-        // The orchestrator is awaited when an exited session is present or one is
-        // declared; with neither signal it is a terminal failure.
-        assert!(should_await_session(&SessionRef::Orchestrator, true, || false));
-        assert!(should_await_session(&SessionRef::Orchestrator, false, || true));
-        assert!(!should_await_session(&SessionRef::Orchestrator, false, || false));
-        // Workspaces and review content are never awaited — they keep their
-        // idle / terminal-message behavior.
-        assert!(!should_await_session(
-            &SessionRef::Workspace("alpha".into()),
-            true,
-            || true
-        ));
-        assert!(!should_await_session(
-            &SessionRef::Review {
-                slot: "r".into(),
-                role: "editor".into()
-            },
-            true,
-            || true
-        ));
-    }
-
-    #[test]
-    fn should_await_session_skips_the_declared_check_when_exited_settles_it() {
-        // The `declared` closure (a blocking config load) must not run when the
-        // cheap exited-session signal already proves a session is expected.
-        let called = std::cell::Cell::new(false);
-        assert!(should_await_session(&SessionRef::Orchestrator, true, || {
-            called.set(true);
-            true
-        }));
-        assert!(!called.get(), "the declared check is skipped when exited is true");
-    }
-
     /// A connector that opens a real session at its spawn size, but blocks
     /// inside `connect` until the test releases its gate — so the test can issue
     /// a resize while the slot is still connecting (the window in which the
@@ -1592,8 +1106,8 @@ mod tests {
             let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
                 .map_err(|e| ConnectFailure::Message(e.to_string()))?;
             let size = match conn.info() {
-                Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
-                Err(_) => Size::new(80, 24),
+                Ok(info) => GridSize::new(info.cols.max(1), info.rows.max(1)),
+                Err(_) => GridSize::new(80, 24),
             };
             conn.attach(None)
                 .map_err(|e| ConnectFailure::Message(e.to_string()))?;
@@ -1775,7 +1289,7 @@ mod tests {
     }
 
     /// Build a `SupervisionState` that has already given up, using only its
-    /// public API (the fields are private to the orchestrator crate): a live
+    /// public API (the fields are private to `shelbi_app::supervision`): a live
     /// sighting then MAX_RESTARTS_IN_WINDOW crashes, each past its backoff, then
     /// one more crash to trip give-up.
     fn gave_up_state() -> SupervisionState {
@@ -1793,7 +1307,7 @@ mod tests {
         };
         for n in 0..MAX_RESTARTS_IN_WINDOW {
             s.decide(&alive, t);
-            t += shelbi_orchestrator::supervision::BASE_BACKOFF * (1u32 << n)
+            t += shelbi_app::supervision::BASE_BACKOFF * (1u32 << n)
                 + Duration::from_secs(1);
             assert_eq!(s.decide(&dead, t), SupervisionAction::Restart);
         }
@@ -1815,8 +1329,8 @@ mod tests {
             .with_relauncher(relauncher.clone());
         let target = SessionRef::Orchestrator;
         // Put it in the given-up state the daemon/client would reach.
-        mgr.supervision = gave_up_state();
-        assert_eq!(mgr.supervision.restart_count(), MAX_RESTARTS_IN_WINDOW);
+        mgr.restart = RestartController::with_state(gave_up_state());
+        assert_eq!(mgr.restart.restart_count(), MAX_RESTARTS_IN_WINDOW);
         mgr.slot = Slot::GaveUp {
             target: target.clone(),
             last_line: "boom".into(),
@@ -1826,7 +1340,7 @@ mod tests {
         // Re-open the same target.
         mgr.show(target.clone());
         // Budget reset and a connect kicked.
-        assert_eq!(mgr.supervision.restart_count(), 0, "the budget is reset");
+        assert_eq!(mgr.restart.restart_count(), 0, "the budget is reset");
         assert!(matches!(mgr.slot, Slot::Connecting { .. }));
         // The worker ran a reopen relaunch; wait briefly for it.
         let mut saw_reopen = false;
@@ -1973,52 +1487,6 @@ mod tests {
             relauncher.calls.lock().unwrap().is_empty(),
             "no relaunch is requested for a deliberate close"
         );
-    }
-
-    #[test]
-    fn gave_up_notice_names_the_cap_and_last_line() {
-        let n = MAX_RESTARTS_IN_WINDOW;
-        assert_eq!(
-            gave_up_notice("command not found: vim"),
-            format!(
-                "Stopped after {n} restarts — select it again to relaunch. \
-                 Last output: command not found: vim"
-            )
-        );
-        assert_eq!(
-            gave_up_notice("   "),
-            format!("Stopped after {n} restarts — select it again to relaunch.")
-        );
-    }
-
-    #[test]
-    fn exit_line_prefers_reason_then_status_then_signal() {
-        use shelbi_proto::Exited;
-        assert_eq!(
-            exit_line(Some(&Exited {
-                code: Some(1),
-                signal: None,
-                reason: Some("usage limit reached".into()),
-            })),
-            "usage limit reached"
-        );
-        assert_eq!(
-            exit_line(Some(&Exited {
-                code: Some(2),
-                signal: None,
-                reason: None,
-            })),
-            "exited with status 2"
-        );
-        assert_eq!(
-            exit_line(Some(&Exited {
-                code: None,
-                signal: Some(9),
-                reason: None,
-            })),
-            "killed by signal 9"
-        );
-        assert_eq!(exit_line(None), "session exited");
     }
 
     #[test]
