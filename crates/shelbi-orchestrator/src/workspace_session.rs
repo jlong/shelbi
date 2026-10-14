@@ -20,7 +20,7 @@
 //! Local workspaces only: a remote workspace has no local session to spawn, so a
 //! remote workspace here is a clear `Err` the client surfaces on its status line.
 
-use shelbi_core::{Column, Error, Host, Project, Result};
+use shelbi_core::{Column, Error, Host, Result};
 
 use crate::review_session::ReviewContentRole;
 use crate::session_process_backend::SessionProcessBackend;
@@ -48,19 +48,32 @@ pub struct WorkspaceOpenInfo {
     pub task: Option<Box<shelbi_state::IssueFile>>,
 }
 
-/// Find the in-progress task assigned to `workspace`, resolving assignment the
-/// same way the sidebar does (the published board plus the local assignment
-/// overlay, so a remote tracker's fresh assignment is honored).
+/// Find the in-progress task assigned to `workspace`, read from the **same
+/// source the sidebar uses** — the daemon's published board index
+/// ([`shelbi_state::read_board_report_with_cfg`]) — not a fresh backend /
+/// process-cache read.
+///
+/// Reading the published index is what keeps the workspace panel's header
+/// (status / title / description) consistent with the sidebar badge and the
+/// issue board the moment the view opens. A `resolve_issue_store().list_in_status()`
+/// read can lag the published index by a tick on a remote board — its
+/// process-local snapshot cache is cold on the first read of a freshly launched
+/// TUI — which surfaced as an `IDLE` header on the first open while the sidebar
+/// already showed the task working, firming up only after a back-out + reopen.
+/// The index is a local file, so this adds no backend round trip. The assignment
+/// is taken straight from the index (the daemon already folded the overlay at
+/// publish), exactly as the sidebar does for its in-progress rows.
 fn in_progress_task_for(
     project_name: &str,
-    project: &Project,
+    cfg: &shelbi_core::IssueTrackerConfig,
     workspace: &str,
 ) -> Result<Option<shelbi_state::IssueFile>> {
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
-    let mut in_progress = store.list_in_status(&Column::in_progress())?;
-    shelbi_state::fold_assignment_overlay(project_name, &project.issue_tracker, &mut in_progress);
-    Ok(in_progress
+    let report = shelbi_state::read_board_report_with_cfg(project_name, cfg)?;
+    Ok(report
+        .state
+        .into_issues()
         .into_iter()
+        .filter(|tf| tf.task.column == Column::in_progress())
         .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace)))
 }
 
@@ -83,7 +96,7 @@ pub fn workspace_open_info(project_name: &str, workspace: &str) -> Result<Worksp
         .to_string_lossy()
         .to_string();
     let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
-    let task = in_progress_task_for(project_name, &project, workspace)?;
+    let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)?;
     Ok(WorkspaceOpenInfo {
         worktree,
         editor_name,
@@ -133,7 +146,7 @@ pub fn ensure_content_session(
     };
     // Tag the session with the current task id when there is one (best-effort —
     // the editor/diff work regardless).
-    let task = in_progress_task_for(project_name, &project, workspace)
+    let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)
         .ok()
         .flatten()
         .map(|tf| tf.task.id);
@@ -189,5 +202,116 @@ mod tests {
         let editor = content_session_name("myapp", "alpha", ReviewContentRole::Editor);
         assert_ne!(agent, editor);
         assert!(editor.starts_with(&format!("{agent}/")));
+    }
+
+    use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
+
+    fn fresh_shelbi_home(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-ws-session-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A GitHub-backend tracker config pointed at `owner/repo` — the remote case
+    /// where the published-index-vs-live-read divergence shows up (a
+    /// `file_system` board reads the same bytes either way).
+    fn github_cfg() -> IssueTrackerConfig {
+        IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn issue(id: &str, column: shelbi_core::Column, assigned_to: Option<&str>) -> shelbi_state::IssueFile {
+        let now = chrono::Utc::now();
+        shelbi_state::IssueFile {
+            task: shelbi_core::Issue {
+                id: id.into(),
+                title: id.into(),
+                column,
+                priority: 0,
+                assigned_to: assigned_to.map(str::to_string),
+                workflow: None,
+                branch: Some(format!("shelbi/{id}")),
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            body: format!("body of {id}"),
+            tracker_assignees: Vec::new(),
+        }
+    }
+
+    /// Publish a warm board index for `proj` carrying `board`, stamped with the
+    /// identity a `github` config expects so the reader trusts the file.
+    fn publish_index(board: Vec<shelbi_state::IssueFile>) {
+        let mut idx = shelbi_state::BoardIndex::fresh(board);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("proj", &idx).unwrap();
+    }
+
+    /// The first-open regression: the panel's task (header status / title /
+    /// description) is resolved from the daemon's **published board index** — the
+    /// same source the sidebar badge reads — so a working workspace resolves its
+    /// in-progress task on the first open. A GitHub backend's own
+    /// `resolve_issue_store().list_in_status()` read would miss here (no live
+    /// backend / a cold process cache), which is exactly the "IDLE on first open"
+    /// bug: reading the index can't regress to that.
+    #[test]
+    fn resolves_the_in_progress_task_from_the_published_index() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_shelbi_home("published-index");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        publish_index(vec![issue(
+            "cold-start",
+            shelbi_core::Column::in_progress(),
+            Some("alpha"),
+        )]);
+
+        let task = in_progress_task_for("proj", &github_cfg(), "alpha").unwrap();
+        std::env::remove_var("SHELBI_HOME");
+        let task = task.expect("the in-progress task is resolved from the published index");
+        assert_eq!(task.task.id, "cold-start");
+        assert_eq!(task.task.column, shelbi_core::Column::in_progress());
+        assert_eq!(task.body, "body of cold-start");
+    }
+
+    /// Only an in-progress task assigned to *this* workspace counts: a task in
+    /// another column, or one assigned to another workspace, is not the panel's
+    /// task (so a truly idle workspace resolves `None` → an `IDLE` header).
+    #[test]
+    fn ignores_other_columns_and_other_workspaces() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_shelbi_home("filters");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        publish_index(vec![
+            // In review, not in progress — not the dev workspace's running task.
+            issue("in-review", shelbi_core::Column::review(), Some("alpha")),
+            // In progress but assigned to a different workspace.
+            issue("other-ws", shelbi_core::Column::in_progress(), Some("bravo")),
+        ]);
+
+        let for_alpha = in_progress_task_for("proj", &github_cfg(), "alpha").unwrap();
+        let for_idle = in_progress_task_for("proj", &github_cfg(), "charlie").unwrap();
+        std::env::remove_var("SHELBI_HOME");
+        assert!(for_alpha.is_none(), "a review-column task is not the running task");
+        assert!(for_idle.is_none(), "an unassigned workspace has no running task");
     }
 }

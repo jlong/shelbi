@@ -1080,6 +1080,16 @@ impl ShellState {
             // Keep the selection in range as rows come and go.
             let view = SidebarView::build(&sidebar);
             self.client.clamp_selection(view.selectable_count());
+            // Firm up an open workspace panel's header from the fresh model (the
+            // same source the sidebar badge reads) so a late in-progress
+            // assignment — or a handoff that idles the workspace — reflects in
+            // the header within a poll tick, instead of freezing at the value it
+            // held when the view opened. Only the header status is re-derived;
+            // the panel's task title / description and content sessions stay put.
+            if let Some(ws) = self.workspace.as_mut() {
+                let status = ws_status_from_model(&sidebar, ws.workspace());
+                ws.set_header_status(status);
+            }
             self.sidebar_model = Some(sidebar);
             // Keep an open palette's command list warm as the board refreshes.
             // Compute the entries first so the `&mut self.overlay` borrow doesn't
@@ -3637,6 +3647,29 @@ fn status_for_column(column: &shelbi_core::Column) -> crate::workspace_panel::Ws
     }
 }
 
+/// The workspace panel's header status for `workspace`, derived from the live
+/// sidebar model — the same source the sidebar badge reads. A workspace with a
+/// current in-progress task reads `IN PROGRESS`; one with none reads `IDLE`.
+/// Used to firm up an open panel's header on each board refresh so it tracks the
+/// sidebar (and the issue board) rather than freezing at the value it held when
+/// the view opened. The workspace sidebar opens only for an in-progress
+/// workspace, so `IN PROGRESS` is the usual case; a handoff that clears the
+/// assignment idles the header the same tick the sidebar badge goes idle.
+fn ws_status_from_model(
+    model: &SidebarModel,
+    workspace: &str,
+) -> crate::workspace_panel::WsStatus {
+    let has_task = model
+        .workspaces
+        .iter()
+        .any(|w| w.name == workspace && w.current_task.is_some());
+    if has_task {
+        status_for_column(&shelbi_core::Column::in_progress())
+    } else {
+        default_ws_status()
+    }
+}
+
 /// The fallback status when the workspace has no resolvable task (the sidebar
 /// should not open in that case, but the panel degrades gracefully).
 fn default_ws_status() -> crate::workspace_panel::WsStatus {
@@ -5166,6 +5199,62 @@ mod tests {
             st.workspace_opening.as_deref(),
             Some("alpha"),
             "a workspace-with-task open goes through begin_workspace"
+        );
+    }
+
+    #[test]
+    fn an_open_workspace_header_firms_up_from_the_fresh_sidebar_model() {
+        // Regression (the "IDLE on first open" bug): an open workspace panel's
+        // header is re-derived from the live sidebar model on each board refresh
+        // — the same source the sidebar badge reads — so a header that opened
+        // stale firms up to the real status within a poll tick, and a handoff
+        // that idles the workspace is reflected without a reopen.
+        let mut st = test_state();
+        // Open the panel directly, seeded IDLE (as if the first-open resolve had
+        // come back before the task was visible to it).
+        st.workspace = Some(WorkspaceInterface::new(
+            "proj",
+            st.connector.clone(),
+            "alpha",
+            "/wt/alpha",
+            "Vim",
+            "Developer",
+            default_ws_status(),
+            None,
+        ));
+        assert_eq!(st.workspace.as_ref().unwrap().header_status_text(), "IDLE");
+
+        // A refresh lands with alpha working (current_task set) — the sidebar
+        // badge the open gate already trusted.
+        let mut sidebar = st.sidebar_model.clone().unwrap();
+        sidebar.workspaces[0].current_task = Some("t-1".into());
+        sidebar.workspaces[0].badge = shelbi_app::view::WorkspaceBadge::Working;
+        st.apply_snapshot(ShellSnapshot {
+            sidebar: Some(sidebar),
+            board: None,
+            activity: None,
+            machines: None,
+        });
+        assert_eq!(
+            st.workspace.as_ref().unwrap().header_status_text(),
+            "IN PROGRESS",
+            "the open header firms up from the fresh sidebar model"
+        );
+
+        // When the task hands off (current_task cleared) the workspace idles.
+        let mut sidebar = st.sidebar_model.clone().unwrap();
+        sidebar.workspaces[0].current_task = None;
+        sidebar.workspaces[0].badge = shelbi_app::view::WorkspaceBadge::Idle;
+        st.apply_snapshot(ShellSnapshot {
+            sidebar: Some(sidebar),
+            board: None,
+            activity: None,
+            machines: None,
+        });
+        assert_eq!(
+            st.workspace.as_ref().unwrap().header_status_text(),
+            "IDLE",
+            "a handoff that clears the assignment idles the header"
         );
     }
 
