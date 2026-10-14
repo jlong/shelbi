@@ -583,10 +583,11 @@ fn render_footer<H: SidebarHost>(
             )
             .child("Daemon unreachable · polling")
     });
-    let status = (!model.status_line.is_empty()).then(|| {
+    let status = footer_status(model, theme).map(|(line, color)| {
         div()
-            .text_color(theme.yellow)
-            .child(model.status_line.clone())
+            .debug_selector(|| "sidebar-status".into())
+            .text_color(color)
+            .child(line)
     });
 
     let icon_button = |id: &'static str, icon: &'static str| {
@@ -681,6 +682,23 @@ fn render_footer<H: SidebarHost>(
         .child(buttons)
 }
 
+/// The footer's status row, worded as the TUI's
+/// ([`SidebarModel::footer_status`]): the orchestrator supervisor's failure in
+/// red while there is one, else the status line in yellow. `None` hides the
+/// row.
+fn footer_status(model: &SidebarModel, theme: &Theme) -> Option<(String, Hsla)> {
+    let line = model.footer_status();
+    if line.is_empty() {
+        return None;
+    }
+    let color = if model.orchestrator_status.is_some() {
+        theme.ansi_red
+    } else {
+        theme.yellow
+    };
+    Some((line, color))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +723,21 @@ mod tests {
         assert_eq!(drag_width_cols(300.0, 1200.0), 33);
         assert_eq!(drag_width_cols(50.0, 1200.0), 24);
         assert_eq!(drag_width_cols(1000.0, 1200.0), 66);
+    }
+
+    #[test]
+    fn footer_status_shows_the_orchestrator_failure_in_red() {
+        let t = theme();
+        let mut model = SidebarModel::skeleton("demo");
+        assert_eq!(footer_status(&model, &t), None, "no status, no row");
+        model.status_line = "Indexing".into();
+        assert_eq!(footer_status(&model, &t), Some(("Indexing".into(), t.yellow)));
+        // The supervisor's failure takes the row, in the TUI's words.
+        model.orchestrator_status = Some("supervisor gave up: spawn refused".into());
+        assert_eq!(
+            footer_status(&model, &t),
+            Some(("Orchestrator: supervisor gave up: spawn refused".into(), t.ansi_red))
+        );
     }
 
     #[test]
@@ -1007,6 +1040,19 @@ mod render_tests {
         assert!(cx.debug_bounds("sidebar-section-Workspaces").is_none());
         assert!(cx.debug_bounds("sidebar-zen-band").is_none(), "zen is off");
         assert!(cx.debug_bounds("sidebar-errors").is_none(), "no unread errors");
+    }
+
+    #[gpui::test]
+    fn the_footer_shows_the_orchestrator_failure(app: &mut TestAppContext) {
+        let (_, mut healthy) = open(app, fixture_model(), 0, None);
+        assert!(healthy.debug_bounds("sidebar-status").is_none(), "healthy: no status row");
+
+        let mut model = fixture_model();
+        model.orchestrator_status = Some("supervisor gave up: spawn refused".into());
+        let (_, mut cx) = open(app, model, 0, None);
+        let status = cx.debug_bounds("sidebar-status").expect("the failure is drawn");
+        let version = cx.debug_bounds("sidebar-version").unwrap();
+        assert!(status.top() < version.top(), "above the version line, as in the TUI");
     }
 
     #[gpui::test]

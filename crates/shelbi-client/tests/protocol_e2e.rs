@@ -699,6 +699,20 @@ fn exited_event_is_pushed_when_the_child_dies() {
         _ => None,
     });
     assert!(exited.is_some(), "an exited event should be pushed when the child dies");
+    // By the time any client hears `exited`, the session has marked itself as
+    // exiting on disk, so discovery never hands a reattaching client this dying
+    // session while it still holds its lock through the flush grace
+    // (`client-connect-skips-exited-sessions`).
+    assert!(
+        sess.paths.exiting().exists(),
+        "the exiting marker must be written before `exited` is pushed",
+    );
+    let root = sess.paths.dir.parent().unwrap().to_path_buf();
+    let listed = shelbi_client::list(&root).unwrap();
+    assert!(
+        shelbi_client::choose_session(&listed, "demo/ws/exit").is_none(),
+        "a session that has pushed `exited` is never chosen",
+    );
     // run() returns on its own now the child is gone.
     if let Some(h) = sess.handle.take() {
         join_within(h, Duration::from_secs(10));

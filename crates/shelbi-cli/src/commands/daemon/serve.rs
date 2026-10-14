@@ -15,9 +15,10 @@
 //!
 //! - `event` (Phase 1) — body line is timestamped and appended to
 //!   `~/.shelbi/events.log`.
-//! - `request-clarification` (Phase 9) — emits a `question=… task=…
-//!   kind=clarification text=…` event so the orchestrator's tail surfaces
-//!   the question alongside every other transition. The reply travels back
+//! - `request-clarification` (Phase 9) — stores the full question under
+//!   `<project dir>/questions/`, then emits a `question=… task=…
+//!   kind=clarification file=… text=<preview>` event so the orchestrator's
+//!   tail surfaces the question alongside every other transition. The reply travels back
 //!   on the file-based `<worktree>/.shelbi/messages/<task-id>.log`
 //!   channel via `shelbi message --in-response-to`.
 //! - `message-pushed` (Phase 9, internal) — emitted by `shelbi message`
@@ -826,7 +827,8 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
                 // Empty, half-closed connection: explicit hello probe. This
                 // reply happens only after EOF, never ahead of a legacy event
                 // frame whose client expects `ok\n` as the first three bytes.
-                let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"));
+                let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"))
+                    .with_pid(std::process::id());
                 let _ = (&stream).write_all(hello.to_line().as_bytes());
             }
             break; // EOF
@@ -962,17 +964,19 @@ struct Message {
     /// `request-clarification`.
     #[serde(default)]
     question_id: Option<String>,
-    /// Free-form question text the worker wants the user to answer.
-    /// Truncated + folded before it lands in `events.log`. Required for
-    /// `request-clarification`.
+    /// Free-form question text the worker wants the user to answer. Stored
+    /// in full in the hub's question store; only a truncated, folded preview
+    /// lands in `events.log`. Required for `request-clarification`.
     #[serde(default)]
     question: Option<String>,
     /// Optional short excerpt the worker thinks is useful context for
-    /// the question — currently emitted only as a debug-trace breadcrumb
-    /// since the full question/context exchange lives in the message log,
-    /// not the events stream.
+    /// the question. Stored alongside the question text.
     #[serde(default)]
     context: Option<String>,
+    /// Optional workspace the asking worker runs in, recorded on the stored
+    /// question. When absent the daemon looks up the task's assignee.
+    #[serde(default)]
+    workspace: Option<String>,
     /// Opaque message id from `shelbi message`. Required for
     /// `message-ack` (worker referencing the message it processed) and
     /// `message-pushed` (the CLI announcing the push to the daemon).
@@ -1040,9 +1044,15 @@ fn handle_event(msg: &Message) -> Result<()> {
 }
 
 /// Worker-side clarification request. Required fields are `task_id`,
-/// `question_id`, and `question`; `context` is optional and currently
-/// emitted only as a debug breadcrumb since the full body lives in the
-/// per-task message log, not the events stream.
+/// `question_id`, and `question`; `project`, `workspace`, and `context` are
+/// optional.
+///
+/// The full question is written to the hub's question store
+/// (`<project dir>/questions/<task>/<id>.md`) *before* the events line is
+/// appended, so the line — which only has room for a preview — can name the
+/// file, and the orchestrator never has to answer a truncated question. A
+/// store failure still appends the line: a preview on the stream beats a
+/// question that vanishes.
 fn handle_request_clarification(msg: &Message) -> Result<()> {
     let task_id = required(msg.task_id.as_deref(), "request-clarification", "task_id")?;
     let question_id = required(
@@ -1051,18 +1061,59 @@ fn handle_request_clarification(msg: &Message) -> Result<()> {
         "question_id",
     )?;
     let question = required(msg.question.as_deref(), "request-clarification", "question")?;
-    shelbi_state::append_clarification_event(question_id, task_id, question)
+    // Scope to the worker's project only when it names a registered one: a
+    // `project=` on the line routes the event by exact match, so a mistyped
+    // name would hide the question from its orchestrator. An unresolvable
+    // project stores hub-level and keeps the legacy task-id routing.
+    let project = msg
+        .project
+        .as_deref()
+        .filter(|p| shelbi_state::has_project_registration(p).unwrap_or(false));
+    let workspace = msg
+        .workspace
+        .clone()
+        .or_else(|| project.and_then(|p| assigned_workspace(p, task_id)));
+    let stored = shelbi_state::questions::record_question(shelbi_state::questions::NewQuestion {
+        project,
+        task: task_id,
+        id: question_id,
+        workspace: workspace.as_deref(),
+        text: question,
+        context: msg.context.as_deref(),
+    });
+    let (event_id, file) = match &stored {
+        Ok(q) => (q.meta.id.as_str(), Some(q.path.as_path())),
+        Err(e) => {
+            tracing::warn!(
+                task = task_id,
+                question = question_id,
+                error = %e,
+                "shelbi daemon: could not store clarification text"
+            );
+            (question_id, None)
+        }
+    };
+    shelbi_state::append_clarification_event(project, event_id, task_id, question, file)
         .map_err(|e| anyhow!(e))?;
-    if msg.context.is_some() || msg.project.is_some() {
-        tracing::debug!(
-            project = msg.project.as_deref().unwrap_or("?"),
-            task = task_id,
-            question = question_id,
-            has_context = msg.context.is_some(),
-            "shelbi daemon: recorded clarification"
-        );
-    }
+    tracing::debug!(
+        project = msg.project.as_deref().unwrap_or("?"),
+        task = task_id,
+        question = event_id,
+        has_context = msg.context.is_some(),
+        "shelbi daemon: recorded clarification"
+    );
     Ok(())
+}
+
+/// The workspace the daemon-published board index has `task_id` assigned to.
+/// Best-effort: a missing index or unassigned task leaves the question's
+/// `workspace` unset.
+fn assigned_workspace(project: &str, task_id: &str) -> Option<String> {
+    shelbi_state::board_index::read_board_index(project)?
+        .board
+        .into_iter()
+        .find(|tf| tf.task.id == task_id)
+        .and_then(|tf| tf.task.assigned_to)
 }
 
 /// Internal verb: `shelbi message` calls into the daemon after a
@@ -1484,6 +1535,60 @@ mod tests {
             line.contains("dropdown") || line.contains("ARIA"),
             "line dropped the question text: {line}"
         );
+    }
+
+    /// A long question is stored in full on the hub before its events line
+    /// is appended, and the (truncated) line names the file it lives in.
+    #[test]
+    fn long_clarification_is_stored_in_full_and_the_line_names_its_file() {
+        let iso = IsolatedShelbiHome::new("clarify-full");
+        // `has_project_registration` only needs the registration file.
+        std::fs::create_dir_all(iso.home.join("projects")).unwrap();
+        std::fs::write(iso.home.join("projects/demo.yaml"), "name: demo\n").unwrap();
+        let d = test_daemon();
+        let question = format!("Defaults I am proceeding with unless you say otherwise: {}", "z".repeat(2048));
+        let payload = serde_json::json!({
+            "verb": "request-clarification",
+            "project": "demo",
+            "task_id": "dt-workspace-view",
+            "question_id": "q-001",
+            "question": question,
+            "workspace": "charlie",
+        })
+        .to_string();
+        dispatch(&payload, &d).expect("clarification dispatch");
+
+        let stored = shelbi_state::questions::load_question(Some("demo"), "dt-workspace-view", "q-001")
+            .unwrap()
+            .expect("question stored");
+        assert_eq!(stored.text, question);
+        assert_eq!(stored.meta.workspace.as_deref(), Some("charlie"));
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(line.contains(" project=demo "), "{line}");
+        assert!(
+            line.contains(&format!(" file={} ", stored.path.display())),
+            "line must name the question file: {line}"
+        );
+        assert!(line.ends_with('…'), "preview stays truncated: {line}");
+    }
+
+    /// An unregistered project name never scopes the line (an exact
+    /// `project=` mismatch would hide it from the orchestrator); the question
+    /// is still stored, hub-level.
+    #[test]
+    fn clarification_for_unregistered_project_is_stored_hub_level() {
+        let _iso = IsolatedShelbiHome::new("clarify-unscoped");
+        let d = test_daemon();
+        let payload = r#"{"verb":"request-clarification","project":"typo","task_id":"t-1","question_id":"q-1","question":"ok?"}"#;
+        dispatch(payload, &d).expect("clarification dispatch");
+        let stored = shelbi_state::questions::load_question(None, "t-1", "q-1")
+            .unwrap()
+            .expect("question stored hub-level");
+        assert_eq!(stored.meta.project, None);
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(!log.contains("project="), "{log}");
     }
 
     #[test]

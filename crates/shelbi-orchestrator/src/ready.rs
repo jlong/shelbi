@@ -76,35 +76,67 @@ pub const RESUME_COMPACTION_GRACE: std::time::Duration = std::time::Duration::fr
 /// then grant [`RESUME_COMPACTION_GRACE`] for the compaction it starts so a slow
 /// summarize doesn't itself read as a stall. This only fires on a resume; a cold
 /// dispatch never shows the dialog, so keying it in unconditionally is safe.
+///
+/// ## Ready means *live* and at the input box
+///
+/// A ready-looking screen is trusted only once the session also probes
+/// [`Alive`](crate::session_backend::Liveness::Alive). On a `quit`+reopen the
+/// slot's previous session lies dead under the same name, and its last frame —
+/// claude idle at its input box, footer and all — is exactly what
+/// [`is_input_ready`] matches. A screen read that ever served that frame (a
+/// pre-#1663 snapshot fell back to the dead session's `final.txt`) passed this
+/// gate ~100ms into a `--continue` resume, before the new session had bound its
+/// socket, so the prompt went to "no live session" and the worker came up idle
+/// (`reopen-dev-resume-races-launch`). The probe runs only on a ready-looking
+/// screen, so it costs nothing while the pane is still booting.
 pub fn wait_for_claude_ready(
     host: &Host,
     addr: &SessionTarget,
     timeout: std::time::Duration,
 ) -> Result<bool> {
     let target = addr.clone();
+    wait_for_ready_with(
+        timeout,
+        READY_POLL_INTERVAL,
+        // A capture failure here is transient (pane still spinning up); keep
+        // polling rather than aborting the whole task start.
+        || backend().snapshot(host, &target).unwrap_or_default(),
+        || backend().probe(host, &target, None).is_alive(),
+        || backend().send_enter(host, &target),
+    )
+}
+
+/// The polling core of [`wait_for_claude_ready`], with the pane reads and the
+/// Enter key injected so the readiness rules are unit-testable without a live
+/// session.
+pub(crate) fn wait_for_ready_with(
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    mut snapshot: impl FnMut() -> String,
+    mut is_live: impl FnMut() -> bool,
+    mut send_enter: impl FnMut() -> Result<()>,
+) -> Result<bool> {
     let mut deadline = std::time::Instant::now() + timeout;
     let mut trust_dismissed = false;
     let mut resume_summary_answered = false;
     while std::time::Instant::now() < deadline {
-        // A capture failure here is transient (pane still spinning up); keep
-        // polling rather than aborting the whole task start.
-        let screen = backend().snapshot(host, &target).unwrap_or_default();
-        if is_input_ready(&screen) {
+        let screen = snapshot();
+        if is_input_ready(&screen) && is_live() {
             return Ok(true);
         }
         if !trust_dismissed && is_trust_dialog(&screen) {
-            backend().send_enter(host, &target)?;
+            send_enter()?;
             trust_dismissed = true;
         }
         // Answer the resume-from-summary dialog once, then extend the deadline
         // to cover the compaction it kicks off. Latched so a capture taken
         // before Claude has consumed the Enter can't double-answer.
         if !resume_summary_answered && is_resume_summary_dialog(&screen) {
-            backend().send_enter(host, &target)?;
+            send_enter()?;
             resume_summary_answered = true;
             deadline = std::time::Instant::now() + RESUME_COMPACTION_GRACE;
         }
-        std::thread::sleep(READY_POLL_INTERVAL);
+        std::thread::sleep(poll);
     }
     Ok(false)
 }
@@ -773,6 +805,70 @@ fn resolve_local<Tz: chrono::TimeZone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    const IDLE_FRAME: &str = "\
+────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    #[test]
+    fn a_ready_frame_from_a_session_that_is_not_live_is_not_ready() {
+        // The reopen race: the previous (dead) session's last frame shows claude
+        // idle at its input box. Until the new session is live that frame must
+        // not pass the gate, or the prompt goes to "no live session".
+        let enters = Cell::new(0u32);
+        let ready = wait_for_ready_with(
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(1),
+            || IDLE_FRAME.to_string(),
+            || false,
+            || {
+                enters.set(enters.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!ready, "a not-live session is never ready");
+        assert_eq!(enters.get(), 0);
+    }
+
+    #[test]
+    fn a_ready_frame_passes_once_the_session_is_live() {
+        let probes = Cell::new(0u32);
+        let ready = wait_for_ready_with(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+            || IDLE_FRAME.to_string(),
+            || {
+                probes.set(probes.get() + 1);
+                probes.get() >= 3
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(ready);
+        assert_eq!(probes.get(), 3, "ready on the first live probe");
+    }
+
+    #[test]
+    fn a_booting_screen_skips_the_liveness_probe() {
+        let probes = Cell::new(0u32);
+        let ready = wait_for_ready_with(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(1),
+            String::new,
+            || {
+                probes.set(probes.get() + 1);
+                true
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!ready);
+        assert_eq!(probes.get(), 0, "the probe runs only on a ready-looking screen");
+    }
 
     // Real captures observed on a Linux (delta) workspace, used to pin the
     // readiness/trust detection against claude's actual rendered output.

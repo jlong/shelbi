@@ -105,6 +105,10 @@ Reply to a workspace's clarification question:
 shelbi message add-auth reply "yes, use the existing session table" --in-response-to q-004
 ```
 
+`--in-response-to` also marks the stored question answered, so it drops off
+[`shelbi question list`](/docs/cli/question). Read a question in full with
+`shelbi question show <id>` before you answer it.
+
 Fold in extra background without redirecting the work:
 
 ```bash
@@ -126,6 +130,8 @@ shelbi message status m-1785764991921-86377
 
 ## See also
 
+- [`shelbi question`](/docs/cli/question) lists and shows the clarification
+  questions a reply answers.
 - [`shelbi send`](/docs/cli/send) — the ephemeral counterpart: types a message
   straight into the workspace's pane instead of the durable message log.
 - [Workspaces](/docs/concepts/workspaces) — what a workspace is and how a task

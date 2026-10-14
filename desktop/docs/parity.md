@@ -149,6 +149,7 @@ equivalent datum.
 | `zen_mode` | green "ZEN MODE ON" band (`shell/sidebar.rs` `render_zen_row`); palette Zen toggle label | green "ZEN MODE ON" band (`views/sidebar.rs` `render_footer`); palette Zen toggle label; Zen menu item title (`menus/tree.rs`) |
 | `unread_errors` | red `!` button in the footer when > 0 (`shell/sidebar.rs` `render_footer`, `render_error_button`) | red `!` button in the footer when > 0 (`views/sidebar.rs` `render_footer`) |
 | `session_lost` | full-width red top banner in every view (`shell/mod.rs` `render_session_lost_banner`) | red notice at the top of the main column (`app.rs` render, `notice`) |
+| `orchestrator_status` | red `Orchestrator: <status>` footer status row, 3 rows reserved so it wraps, taking the row over `status_line` (`shell/sidebar.rs` `render_footer`, text from `SidebarModel::footer_status`); Orchestrator view placeholder "Orchestrator is down. <status>. Select Orchestrator again to relaunch it." while its session is not live (`shell/mod.rs` `orchestrator_down_notice`) | red `Orchestrator: <status>` footer status row above the version line (`views/sidebar.rs` `render_footer`, `footer_status`); the same placeholder in the Chat view while the orchestrator is not live (`views/session_view.rs` `notice`, fed by `app.rs` `update_chat_supervisor_status`) |
 
 ### `NavItem`
 | Field | TUI | Desktop |

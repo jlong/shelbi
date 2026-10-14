@@ -722,6 +722,7 @@ impl ShelbiWindow {
                     }
                     self.update_workspace_row(cx);
                     self.update_review_row(window, cx);
+                    self.update_chat_supervisor_status(cx);
                     true
                 }
                 _ => false,
@@ -1136,7 +1137,17 @@ impl ShelbiWindow {
         });
         self._subscriptions.push(sub);
         self.chat = Some(chat.clone());
+        self.update_chat_supervisor_status(cx);
         chat
+    }
+
+    /// Hand the chat the supervisor's orchestrator failure, which its
+    /// placeholder names while the orchestrator is down.
+    fn update_chat_supervisor_status(&mut self, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.clone() {
+            let status = self.model.orchestrator_status.clone();
+            chat.update(cx, |chat, cx| chat.set_supervisor_status(status, cx));
+        }
     }
 
     /// The Workspace view for the window's project, created on first use.

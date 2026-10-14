@@ -271,6 +271,7 @@ mod tests {
                 zen_mode: shelbi_state::ZenModeState::Off,
                 unread_errors: 0,
                 session_lost: None,
+                orchestrator_status: None,
             }),
             ..Default::default()
         }

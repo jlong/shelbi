@@ -114,6 +114,13 @@ enum Cmd {
         #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "120")]
         wait: Option<u64>,
     },
+    /// Read the clarification questions workers have asked: the full text
+    /// behind each `kind=clarification` events line, and which are still
+    /// open. Answer with `shelbi message <task> reply --in-response-to <id>`.
+    Question {
+        #[command(subcommand)]
+        cmd: commands::question::QuestionCmd,
+    },
     /// Ensure a workspace's session is up so the TUI can show it: a no-op for a
     /// workspace mid-task (dispatch owns its agent session), or a plain
     /// interactive login shell in the worktree for an idle workspace.
@@ -193,10 +200,9 @@ enum Cmd {
     /// Run the hub-side daemon that listens on `~/.shelbi/hub.sock`
     /// (overridable via `$SHELBI_HUB_SOCK`) for worker messages and
     /// appends `event`-verb payloads to `~/.shelbi/events.log`. Bare
-    /// `shelbi daemon` (no subcommand) is the foreground entry that
-    /// launchd/systemd call into. The `install`/`uninstall`/`status`/
-    /// `restart` subcommands manage that platform supervisor on the
-    /// user's behalf.
+    /// `shelbi daemon` (no subcommand) is the foreground entry; clients start
+    /// it on demand. `status`, `stop`, and `restart` act on the daemon of the
+    /// current root only (the pid in its `shelbi.pid`).
     Daemon {
         #[command(subcommand)]
         cmd: Option<commands::daemon::DaemonCmd>,
@@ -454,6 +460,7 @@ fn main() -> Result<()> {
             in_response_to,
             wait,
         }) => commands::message::run(cli.project, status, id, kind, body, in_response_to, wait),
+        Some(Cmd::Question { cmd }) => commands::question::run(cli.project, cmd),
         Some(Cmd::Open { name }) => commands::open::run(cli.project, name),
         Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
         Some(Cmd::Task { cmd }) => {

@@ -240,6 +240,26 @@ fn run_send(
     // Audit the push on the shared events stream.
     shelbi_state::append_message_event(&msg_id, &id).map_err(|e| anyhow!(e))?;
 
+    // The reply is durable in the task's message log now, so the question it
+    // answers is answered whether or not the worker has read it yet. Stamping
+    // the stored question is what drops it off `shelbi question list`; a
+    // failure here never fails the push that already landed.
+    if let Some(question_id) = in_response_to.as_deref() {
+        match shelbi_state::questions::mark_question_answered(
+            Some(&project_name),
+            &id,
+            question_id,
+            &msg_id,
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => eprintln!(
+                "note: no stored question `{question_id}` for task `{id}` — the reply was \
+                 sent, but there is no question file to mark answered"
+            ),
+            Err(e) => eprintln!("warning: could not mark question `{question_id}` answered: {e}"),
+        }
+    }
+
     // Best-effort: tell the hub daemon so it can arm the
     // unacked-message timer. The file append above is the durable record;
     // the daemon-side timer is only the safety net that turns into an
