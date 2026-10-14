@@ -132,6 +132,42 @@ pub const DEFAULT_SECURITY_INSTRUCTIONS: &str = include_str!("default_security.m
 /// charter.
 pub const DEFAULT_ADVERSARIAL_INSTRUCTIONS: &str = include_str!("default_adversarial.md.template");
 
+/// Bundled default `agents/_shared/preamble.md` — the hub-safety rules every
+/// agent on a live hub needs (no daemon/session stop from a worker pane, no
+/// name-pattern kills, sandbox-root discipline for daemon tests). Scaffolded on
+/// project creation; existing projects get it through the config-upgrade pass.
+pub const DEFAULT_SHARED_PREAMBLE: &str = include_str!("default_shared_preamble.md.template");
+
+/// Phrases that mark a shared preamble as already carrying the hub-safety
+/// rules (case-insensitive). A preamble with none of them predates the shipped
+/// default; the config-upgrade sniffer keys on this list, and a drift guard
+/// keeps it in sync with [`DEFAULT_SHARED_PREAMBLE`].
+pub const HUB_SAFETY_MARKERS: &[&str] = &["hub safety", "pkill"];
+
+/// Outcome of [`scaffold_shared_preamble`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedPreambleOutcome {
+    /// The file was missing and has just been written from the bundled default.
+    Created,
+    /// The file already existed and was left untouched.
+    Unchanged,
+}
+
+/// Write the default `agents/_shared/preamble.md` when absent, preserving any
+/// existing preamble byte-for-byte (the project owns it once it exists). Called
+/// wherever a project is created, next to the `pr-template.md` scaffold.
+pub fn scaffold_shared_preamble(project: &str) -> Result<SharedPreambleOutcome> {
+    let path = agent_shared_preamble_path(project)?;
+    if path.exists() {
+        return Ok(SharedPreambleOutcome::Unchanged);
+    }
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    crate::atomic_write(&path, DEFAULT_SHARED_PREAMBLE.as_bytes())?;
+    Ok(SharedPreambleOutcome::Created)
+}
+
 /// Bundled body of the review agent's `load-run-detection` skill: the
 /// auto-detect heuristics for booting an unknown project on `$PORT`.
 /// Kept in the agent (Decision A in the review-workspaces plan) rather

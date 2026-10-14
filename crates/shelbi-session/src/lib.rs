@@ -50,6 +50,7 @@ pub mod layout;
 pub mod lock;
 pub mod meta;
 pub mod output_split;
+pub mod procinfo;
 pub mod replay;
 pub mod responder;
 pub mod session;

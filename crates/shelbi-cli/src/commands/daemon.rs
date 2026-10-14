@@ -21,7 +21,7 @@
 //!   and the `refresh-board` hub verb.
 //! - [`poller`] — the per-project workspace-poller manager (one poller per open
 //!   project).
-//! - [`lifecycle`] — `restart` and `status` without a supervisor, plus the
+//! - [`lifecycle`] — `stop`, `restart`, and `status` without a supervisor, plus the
 //!   `retire_supervisor_units` upgrade step [`serve`] calls on startup.
 
 mod board;
@@ -43,6 +43,10 @@ pub enum DaemonCmd {
     /// Print a short human-readable status from the single-instance lock and
     /// the socket (no supervisor involved).
     Status,
+    /// Stop this root's daemon (the pid in its `shelbi.pid`) without starting a
+    /// new one. Running sessions are left alone; the next client starts a fresh
+    /// daemon that finds them.
+    Stop,
     /// Stop the running daemon and start a fresh one on the current binary,
     /// directly — no supervisor. Picks up a freshly installed binary and is the
     /// path the version-mismatch flow uses.
@@ -53,6 +57,7 @@ pub fn run(cmd: Option<DaemonCmd>) -> Result<()> {
     match cmd {
         None | Some(DaemonCmd::Run) => serve::run_foreground(),
         Some(DaemonCmd::Status) => lifecycle::status(),
+        Some(DaemonCmd::Stop) => lifecycle::stop(),
         Some(DaemonCmd::Restart) => lifecycle::restart(),
     }
 }

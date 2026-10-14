@@ -105,7 +105,13 @@ when that agent is active — most ship empty, but `review/` seeds a
 `load-run-detection` skill. The `_shared/preamble.md` file is special: its contents
 are prepended to *every* agent's instructions, so project-wide context (the
 repo layout, the house style, the test command) lives in one place instead of
-being copy-pasted into four prompts.
+being copy-pasted into four prompts. New projects ship it seeded with a short
+**Hub safety** section: agents share one live hub, so a worker must never stop
+the daemon or a session, or kill processes by name pattern, from its pane, and
+daemon tests run under a temp `SHELBI_ROOT` with the hub sockets unset. Edit
+or extend it freely. A project created before it shipped gets the file on its
+next start if it has none, or a config-upgrade finding asking the orchestrator
+to merge the section into the preamble it already has.
 
 When an issue is dispatched, the agent named for that status (or `developer`
 for an `active`-category status with no `agent:` named) has its rendered

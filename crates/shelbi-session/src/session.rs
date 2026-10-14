@@ -16,7 +16,9 @@
 //!    [`crate::transport`]), with a debounced PTY resize that follows the most
 //!    recently active client and a keepalive ping, and
 //! 5. on child exit (or SIGTERM/SIGHUP) kills the child's **process group**,
-//!    pushes the `exited` event, writes `exit.json` and `final.txt`, and exits.
+//!    pushes the `exited` event, writes `exit.json` (naming the signal and, when
+//!    the kernel reports it, the sending pid and its command) and `final.txt`,
+//!    and exits.
 //!
 //! ## Output ordering and sizing
 //!
@@ -30,7 +32,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -61,11 +63,50 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// `exited` event before the process tears down.
 const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(100);
 
-/// Set by the SIGTERM/SIGHUP handler to ask the main loop to shut down.
+/// Set by the SIGTERM/SIGHUP handler (or a dead listener) to ask the main loop
+/// to shut down.
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn on_terminate(_sig: libc::c_int) {
+/// The first terminating signal received (`0` = none: the shutdown was asked
+/// for internally, by a dead listener). Recorded so `exit.json` names the real
+/// signal instead of assuming SIGTERM.
+static TERM_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// The pid that sent [`TERM_SIGNAL`] (`0` = unknown). A session host only dies
+/// to a signal when something outside Shelbi's normal teardown aimed one at it
+/// (a `kill`, a `pkill` pattern, a supervisor reap), so naming the sender in
+/// `exit.json` is what turns "every session died at once" into a culprit.
+static TERM_SENDER: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_terminate(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    // Only the first signal is recorded: a second one (a supervisor escalating)
+    // must not overwrite the sender that started the shutdown.
+    if TERM_SIGNAL
+        .compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        TERM_SENDER.store(signal_sender_pid(info), Ordering::SeqCst);
+    }
     TERMINATE.store(true, Ordering::SeqCst);
+}
+
+/// The sending pid carried in a `SA_SIGINFO` signal's `siginfo_t`, or `0` when
+/// the kernel didn't supply one. Async-signal-safe: a plain field read.
+fn signal_sender_pid(info: *const libc::siginfo_t) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    // SAFETY: the kernel hands the handler a valid `siginfo_t` for an
+    // `SA_SIGINFO` handler; we only read the sender-pid field.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let pid = unsafe { (*info).si_pid() };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let pid = unsafe { (*info).si_pid };
+    pid
 }
 
 /// Arguments for [`run`] — what `shelbi __session` was launched with.
@@ -558,6 +599,70 @@ struct ChildExit {
     code: Option<i32>,
     signal: Option<i32>,
     reason: Option<String>,
+    sender_pid: Option<i32>,
+    sender: Option<String>,
+}
+
+/// Why the session host itself shut down (as opposed to its child exiting): the
+/// signal it received and who sent it, or an internal request from a dead
+/// listener (no signal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminateCause {
+    signal: Option<i32>,
+    sender_pid: Option<i32>,
+    sender: Option<String>,
+}
+
+impl TerminateCause {
+    /// Read what the signal handler recorded and resolve the sender's command.
+    fn observe() -> Self {
+        let signal = match TERM_SIGNAL.load(Ordering::SeqCst) {
+            0 => None,
+            s => Some(s),
+        };
+        let sender_pid = match TERM_SENDER.load(Ordering::SeqCst) {
+            p if p > 0 => Some(p),
+            _ => None,
+        };
+        let sender = sender_pid.and_then(crate::procinfo::process_command);
+        Self {
+            signal,
+            sender_pid,
+            sender,
+        }
+    }
+
+    fn reason(&self) -> String {
+        let Some(sig) = self.signal else {
+            return "session listener failed; shutting down".to_string();
+        };
+        let mut reason = format!("session received {}", signal_name(sig));
+        match (self.sender_pid, &self.sender) {
+            (Some(pid), Some(cmd)) => reason.push_str(&format!(" from pid {pid} ({cmd})")),
+            (Some(pid), None) => reason.push_str(&format!(" from pid {pid}")),
+            _ => {}
+        }
+        reason
+    }
+
+    fn into_exit(self) -> ChildExit {
+        ChildExit {
+            code: None,
+            signal: self.signal,
+            reason: Some(self.reason()),
+            sender_pid: self.sender_pid,
+            sender: self.sender,
+        }
+    }
+}
+
+/// A readable name for the signals a session host handles; the number otherwise.
+fn signal_name(sig: i32) -> String {
+    match sig {
+        libc::SIGTERM => "SIGTERM".to_string(),
+        libc::SIGHUP => "SIGHUP".to_string(),
+        other => format!("signal {other}"),
+    }
 }
 
 fn wait_for_child(
@@ -566,15 +671,14 @@ fn wait_for_child(
 ) -> ChildExit {
     loop {
         if TERMINATE.load(Ordering::SeqCst) {
+            // Resolve the sender before the 100ms grace below: a short-lived
+            // sender (`kill`, `pkill`) is gone soon after it signals.
+            let cause = TerminateCause::observe();
             shared.kill_child_group(Some(libc::SIGTERM));
             thread::sleep(Duration::from_millis(100));
             shared.kill_child_group(Some(libc::SIGKILL));
             let _ = child.wait();
-            return ChildExit {
-                code: None,
-                signal: Some(libc::SIGTERM),
-                reason: Some("session received a terminating signal".to_string()),
-            };
+            return cause.into_exit();
         }
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -582,6 +686,8 @@ fn wait_for_child(
                     code: Some(status.exit_code() as i32),
                     signal: None,
                     reason: None,
+                    sender_pid: None,
+                    sender: None,
                 };
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
@@ -590,6 +696,8 @@ fn wait_for_child(
                     code: None,
                     signal: None,
                     reason: Some(format!("error waiting for child: {e}")),
+                    sender_pid: None,
+                    sender: None,
                 };
             }
         }
@@ -787,10 +895,19 @@ fn is_resource_exhaustion(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
 }
 
+/// Route SIGTERM/SIGHUP to [`on_terminate`] as `SA_SIGINFO` handlers, so the
+/// sender's pid is available to record.
 fn install_signal_handlers() {
-    unsafe {
-        libc::signal(libc::SIGTERM, on_terminate as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_terminate as *const () as libc::sighandler_t);
+    for sig in [libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: a zeroed `sigaction` is a valid starting value; we set the
+        // handler, the flags, and an empty mask before installing it.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_terminate as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
     }
 }
 
@@ -816,6 +933,8 @@ fn write_exit(paths: &SessionPaths, exit: &ChildExit) -> Result<()> {
         signal: exit.signal,
         exited_at: chrono::Utc::now().to_rfc3339(),
         reason: exit.reason.clone(),
+        sender_pid: exit.sender_pid,
+        sender: exit.sender.clone(),
     };
     let json = rec.to_json().context("serializing exit.json")?;
     std::fs::write(paths.exit(), json)

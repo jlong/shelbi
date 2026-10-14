@@ -193,10 +193,9 @@ enum Cmd {
     /// Run the hub-side daemon that listens on `~/.shelbi/hub.sock`
     /// (overridable via `$SHELBI_HUB_SOCK`) for worker messages and
     /// appends `event`-verb payloads to `~/.shelbi/events.log`. Bare
-    /// `shelbi daemon` (no subcommand) is the foreground entry that
-    /// launchd/systemd call into. The `install`/`uninstall`/`status`/
-    /// `restart` subcommands manage that platform supervisor on the
-    /// user's behalf.
+    /// `shelbi daemon` (no subcommand) is the foreground entry; clients start
+    /// it on demand. `status`, `stop`, and `restart` act on the daemon of the
+    /// current root only (the pid in its `shelbi.pid`).
     Daemon {
         #[command(subcommand)]
         cmd: Option<commands::daemon::DaemonCmd>,

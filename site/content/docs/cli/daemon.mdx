@@ -23,12 +23,38 @@ session process restarts it. You rarely run any of these subcommands by hand.
 | --- | --- |
 | `run` | *(default)* Bind the hub socket and accept worker messages in the foreground until killed or until no project is open. |
 | `status` | Print a short human-readable status from the single-instance lock and the socket (no supervisor involved). |
+| `stop` | Stop the current root's daemon (the pid recorded in its `shelbi.pid`) without starting a new one. Running sessions keep running. |
 | `restart` | Stop the running daemon and start a fresh one on the current binary, directly. Picks up a freshly installed binary and is the path the version-mismatch flow uses. |
 
 Running `shelbi daemon` with no subcommand is equivalent to `shelbi daemon run`:
 it binds the hub socket and stays in the foreground, ingesting worker messages
 until killed or until no project is open. That's the form the on-demand start
 launches. You rarely run it by hand except to debug ingestion.
+
+## Stopping the daemon is safe for running agents
+
+Every agent session runs in its own detached process, not inside the daemon. A
+`shelbi daemon stop`, a `restart`, a crash, or a `kill` of the daemon leaves
+every session running; the next daemon (started on demand by any client, or by
+a session while its project is open) finds them on disk and they stay
+attachable.
+
+`stop` and `restart` only ever signal the daemon recorded in the **current
+root's** `shelbi.pid` (`--root`, `$SHELBI_ROOT`, or `$SHELBI_HOME`). They refuse,
+signalling nothing, when that record no longer names the same process (a stale
+or recycled pid) or when the hub socket answers as a different pid than the
+record (for example a temp `SHELBI_ROOT` with `$SHELBI_HUB_SOCK` still pointing
+at the live hub). To exercise daemon start/stop code without touching the live
+hub, use a fresh temp root and unset the hub sockets:
+
+```bash
+env -u SHELBI_HUB_SOCK -u SHELBI_CONTROL_SOCK SHELBI_ROOT="$(mktemp -d /tmp/shb.XXXX)" \
+  shelbi daemon stop
+```
+
+Never stop a daemon by name pattern (`pkill -f "shelbi daemon"`): every
+session and agent on a hub runs the same `shelbi` binary, so a pattern can't
+tell the daemon you meant from everything else.
 
 ## Flags
 
