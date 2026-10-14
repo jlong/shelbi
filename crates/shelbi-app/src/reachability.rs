@@ -1,24 +1,24 @@
 //! Background reachability probing for the machines view.
 //!
-//! The machines view ([`crate::machines`]) shows each remote machine's recorded
-//! `shelbi` binary path/version — but that is a durability-level fact from
-//! `rt-machine-setup`; it says nothing about whether the host is answering *right
-//! now*. The old tmux `while true; shelbi workspace list; sleep 5` loop probed
-//! remote panes over SSH every few seconds, so a box going down was visible
-//! there and isn't in the native view. This module restores that live signal
+//! The machines view (the TUI's `machines.rs`, the desktop's `views/machines.rs`)
+//! shows each remote machine's recorded `shelbi` binary path/version — but that
+//! is a durability-level fact from `rt-machine-setup`; it says nothing about
+//! whether the host is answering *right now*. The old tmux `while true; shelbi
+//! workspace list; sleep 5` loop probed remote panes over SSH every few seconds,
+//! so a box going down was visible there. This module restores that live signal
 //! without ever putting an SSH call on the render path.
 //!
 //! [`ReachabilityProber`] owns a background thread that probes each declared
 //! remote on a modest cadence (default 30s via [`REACHABILITY_CADENCE`]), backs
 //! off geometrically on failure up to a cap, and publishes the latest
-//! per-machine [`Reachability`] into a shared map. The view folds that map in on
-//! each refresh ([`crate::machines::MachinesApp::apply_data`]); the probe itself
-//! runs only on this thread, never on the UI thread or the shell's refresh
-//! worker, so neither a slow SSH connect nor a wedged host can stall rendering.
+//! per-machine [`Reachability`] into a shared map. A view folds that map in on
+//! each refresh ([`crate::view::MachinesModel::fold_reachability`]); the probe
+//! itself runs only on this thread, never on a UI thread or a refresh worker, so
+//! neither a slow SSH connect nor a wedged host can stall rendering.
 //!
-//! The probe is injected as a closure, so the standalone `__machines` process
-//! and the in-process shell both drive the real SSH probe while tests supply a
-//! deterministic stub.
+//! The probe is injected as a closure (this crate does no SSH): both clients
+//! pass `shelbi_orchestrator::machine::probe_reachability` over a short-deadline
+//! `SshExec`, and tests supply a deterministic stub.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use shelbi_orchestrator::machine::Reachability;
+pub use shelbi_core::Reachability;
 
 /// Default successful-probe cadence: re-check a healthy remote every 30s,
 /// matching the feel of the old `workspace list` shell loop without a per-frame
@@ -46,7 +46,12 @@ type ProbeFn = dyn Fn(&str, &str) -> Reachability + Send + Sync;
 /// latest probe result. A success resets to `cadence`; a failure doubles the
 /// current interval (saturating) up to `max`. Split out as a pure function so
 /// the backoff shape is unit-testable without threads or sleeping.
-fn next_interval(current: Option<Duration>, cadence: Duration, max: Duration, result: &Reachability) -> Duration {
+fn next_interval(
+    current: Option<Duration>,
+    cadence: Duration,
+    max: Duration,
+    result: &Reachability,
+) -> Duration {
     match result {
         Reachability::Reachable => cadence,
         // Unknown never reaches the store path, but treat it like a failure for
@@ -146,8 +151,14 @@ impl ReachabilityProber {
 }
 
 impl Drop for ReachabilityProber {
+    /// Raise the stop flag and let the worker wind down on its own. Unlike
+    /// [`stop`](ReachabilityProber::stop) this never joins: a probe can be
+    /// mid-SSH for its whole deadline, and a view dropping its prober (a window
+    /// closing, a project switch) must not wait that out on the UI thread.
     fn drop(&mut self) {
-        self.stop();
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.cvar.notify_all();
+        drop(self.join.take());
     }
 }
 
@@ -229,7 +240,8 @@ fn run(shared: &Shared) {
                 &result,
             );
             st.interval.insert(machine.clone(), interval);
-            st.next_due.insert(machine.clone(), Instant::now() + interval);
+            st.next_due
+                .insert(machine.clone(), Instant::now() + interval);
             st.results.insert(machine, result);
         }
     }
@@ -258,10 +270,15 @@ mod tests {
     fn next_interval_resets_on_success_and_backs_off_on_failure() {
         let cadence = Duration::from_secs(30);
         let max = Duration::from_secs(300);
-        let down = Reachability::Unreachable { error: String::new() };
+        let down = Reachability::Unreachable {
+            error: String::new(),
+        };
         // First failure doubles the cadence, each subsequent one doubles again
         // up to the cap.
-        assert_eq!(next_interval(None, cadence, max, &down), Duration::from_secs(60));
+        assert_eq!(
+            next_interval(None, cadence, max, &down),
+            Duration::from_secs(60)
+        );
         assert_eq!(
             next_interval(Some(Duration::from_secs(60)), cadence, max, &down),
             Duration::from_secs(120)
@@ -273,7 +290,12 @@ mod tests {
         );
         // A success snaps straight back to the healthy cadence.
         assert_eq!(
-            next_interval(Some(Duration::from_secs(300)), cadence, max, &Reachability::Reachable),
+            next_interval(
+                Some(Duration::from_secs(300)),
+                cadence,
+                max,
+                &Reachability::Reachable
+            ),
             cadence
         );
     }
@@ -299,12 +321,14 @@ mod tests {
         prober.set_targets(vec![("gpu".to_string(), "gpu.local".to_string())]);
 
         // First it reports the host down, with the error.
-        wait_for(Duration::from_secs(2), || match prober.snapshot().get("gpu") {
-            Some(Reachability::Unreachable { error }) => {
-                assert!(error.contains("refused"));
-                Some(())
+        wait_for(Duration::from_secs(2), || {
+            match prober.snapshot().get("gpu") {
+                Some(Reachability::Unreachable { error }) => {
+                    assert!(error.contains("refused"));
+                    Some(())
+                }
+                _ => None,
             }
-            _ => None,
         });
 
         // When the host comes back, the next probe recovers it to reachable.

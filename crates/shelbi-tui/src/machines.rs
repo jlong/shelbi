@@ -23,63 +23,20 @@
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use shelbi_core::{Host, Machine, MachineKind};
-use shelbi_orchestrator::machine::{probe_reachability, Reachability, SshExec};
-use shelbi_state::machine_state::MachineRecord;
-use shelbi_state::WorkspaceState;
+use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
+use shelbi_app::theme::Tone;
+use shelbi_app::view::{
+    reachability_label, remote_binary_label, truncate_chars, workspace_state_badge, MachineRow,
+    MachineWorkspace, MachinesModel,
+};
+use shelbi_orchestrator::machine::{probe_host_reachability, Reachability};
 
 use crate::theme::palette;
-use crate::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
-
-/// Wall-clock bound on one reachability probe. Short so a wedged host fails fast
-/// into [`Reachability::Unreachable`] rather than holding the prober thread for
-/// the install-sized default `SshExec` deadline.
-const REACHABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(10);
-
-/// One machine and the workspaces that live on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineEntry {
-    pub name: String,
-    pub kind: MachineKind,
-    /// SSH host, for a remote machine.
-    pub host: Option<String>,
-    pub is_local: bool,
-    /// Effective capability tags declared on the machine.
-    pub tags: Vec<String>,
-    /// The resolved remote binary (path + version), when `rt-machine-setup` has
-    /// run for this machine. `None` for a local machine or a remote that has not
-    /// been set up yet.
-    pub remote: Option<MachineRecord>,
-    /// Live reachability of a remote, published by the background prober and
-    /// folded in on refresh. A local machine is always reachable and never
-    /// probed, so this stays [`Reachability::Reachable`] for it and is not shown.
-    pub reachability: Reachability,
-    pub workspaces: Vec<WorkspaceRow>,
-}
-
-/// A workspace row under a machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceRow {
-    pub name: String,
-    /// The poller's last observed state, or `None` when the workspace has no
-    /// status file yet (idle / never dispatched).
-    pub state: Option<WorkspaceState>,
-    /// The task id the workspace is currently working, if any.
-    pub current_task: Option<String>,
-}
-
-/// The data one refresh reads. Produced by [`MachinesApp::read_data`] (off the UI
-/// thread in the shell) and folded in by [`MachinesApp::apply_data`].
-#[derive(Debug, Clone, Default)]
-pub struct MachinesData {
-    pub display_name: Option<String>,
-    pub machines: Vec<MachineEntry>,
-}
 
 /// The machines view's state: the machine/workspace rows plus the selection the
 /// user navigates. Selection addresses workspace rows only (machine headers are
@@ -87,8 +44,7 @@ pub struct MachinesData {
 /// host opens on Enter.
 pub struct MachinesApp {
     pub project_name: String,
-    display_name: Option<String>,
-    machines: Vec<MachineEntry>,
+    model: MachinesModel,
     /// Flattened `(machine_idx, workspace_idx)` for every selectable workspace
     /// row, in render order. Rebuilt on every [`apply_data`](Self::apply_data).
     selectable: Vec<(usize, usize)>,
@@ -109,8 +65,7 @@ impl MachinesApp {
     pub fn new(project_name: impl Into<String>) -> Self {
         MachinesApp {
             project_name: project_name.into(),
-            display_name: None,
-            machines: Vec::new(),
+            model: MachinesModel::default(),
             selectable: Vec::new(),
             selected: 0,
             status_line: String::new(),
@@ -130,7 +85,7 @@ impl MachinesApp {
         self.enable_reachability_with(
             REACHABILITY_CADENCE,
             REACHABILITY_BACKOFF_MAX,
-            real_reachability_probe,
+            |_machine: &str, host: &str| probe_host_reachability(host),
         );
     }
 
@@ -156,81 +111,30 @@ impl MachinesApp {
 
     /// The display label for the title bar (project display name or slug).
     pub fn display_label(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.project_name)
+        self.model
+            .display_name
+            .as_deref()
+            .unwrap_or(&self.project_name)
     }
 
-    pub fn machines(&self) -> &[MachineEntry] {
-        &self.machines
+    pub fn machines(&self) -> &[MachineRow] {
+        &self.model.machines
     }
 
-    /// Read the machines/workspaces/records off disk. Pure IO: safe to call on a
-    /// background worker. The hub poller's persisted workspace status supplies the
-    /// observed state (no live SSH probe here), so this is cheap and never blocks
-    /// on the network.
-    pub fn read_data(project_name: &str) -> MachinesData {
-        let Ok(project) = shelbi_state::load_project(project_name) else {
-            // A project whose YAML can't be read shows an empty machine list
-            // rather than failing the refresh — the status line carries the why.
-            return MachinesData::default();
-        };
-        let records = shelbi_state::machine_state::load_machine_records();
-
-        let machines = project
-            .machines
-            .iter()
-            .map(|m: &Machine| {
-                let is_local = m.kind == MachineKind::Local;
-                let remote = if is_local {
-                    None
-                } else {
-                    records.get(&m.name).cloned()
-                };
-                let workspaces = project
-                    .workspaces
-                    .iter()
-                    .filter(|w| w.machine == m.name)
-                    .map(|w| {
-                        let status = shelbi_state::load_workspace_status(&w.name)
-                            .ok()
-                            .flatten();
-                        WorkspaceRow {
-                            name: w.name.clone(),
-                            state: status.as_ref().map(|s| s.state),
-                            current_task: status.and_then(|s| s.current_task),
-                        }
-                    })
-                    .collect();
-                MachineEntry {
-                    name: m.name.clone(),
-                    kind: m.kind,
-                    host: m.host.clone(),
-                    is_local,
-                    tags: m.tags.clone(),
-                    remote,
-                    // A local machine is the hub itself — always reachable, never
-                    // probed. A remote starts Unknown ("checking") until the
-                    // background prober's first result folds in on a later refresh.
-                    reachability: if is_local {
-                        Reachability::Reachable
-                    } else {
-                        Reachability::Unknown
-                    },
-                    workspaces,
-                }
-            })
-            .collect();
-
-        MachinesData {
-            display_name: project.display_name.clone().or_else(|| project.label.clone()),
-            machines,
-        }
+    /// Read the machines view off disk through the shared reader
+    /// ([`shelbi_orchestrator::machines_model`], also the desktop's). Pure IO:
+    /// safe to call on a background worker. The hub poller's persisted
+    /// workspace status supplies the observed state (no live SSH probe here),
+    /// so this never blocks on a down host. A project whose YAML can't be read
+    /// shows an empty machine list rather than failing the refresh.
+    pub fn read_data(project_name: &str) -> MachinesModel {
+        shelbi_orchestrator::machines_model::read_machines_model(project_name).unwrap_or_default()
     }
 
-    /// Fold a freshly-read [`MachinesData`] in, rebuilding the selectable row list
-    /// and clamping the selection so it never points past the last workspace.
-    pub fn apply_data(&mut self, data: MachinesData) {
-        self.display_name = data.display_name;
-        self.machines = data.machines;
+    /// Fold a freshly-read [`MachinesModel`] in, rebuilding the selectable row
+    /// list and clamping the selection so it never points past the last workspace.
+    pub fn apply_data(&mut self, data: MachinesModel) {
+        self.model = data;
         self.rebuild_selectable();
         // Keep the prober's target set current (cheap, a no-op when unchanged),
         // then fold its latest results into the remote headers. Both touch only
@@ -241,40 +145,19 @@ impl MachinesApp {
     }
 
     /// Hand the prober the current set of remote `(machine, ssh_host)` targets.
-    /// Local machines are deliberately excluded, so they are never probed and
-    /// generate no SSH traffic.
+    /// Local machines are excluded, so they are never probed and generate no
+    /// SSH traffic.
     fn push_prober_targets(&self) {
-        let Some(prober) = &self.prober else {
-            return;
-        };
-        let targets = self
-            .machines
-            .iter()
-            .filter(|m| !m.is_local)
-            .map(|m| {
-                // Mirror `Machine::host()`: an ssh machine with no explicit host
-                // is reached by its name.
-                let host = m.host.clone().unwrap_or_else(|| m.name.clone());
-                (m.name.clone(), host)
-            })
-            .collect();
-        prober.set_targets(targets);
+        if let Some(prober) = &self.prober {
+            prober.set_targets(self.model.probe_targets());
+        }
     }
 
     /// Overlay the prober's latest reachability onto the remote machines. A
     /// remote with no result yet keeps its `Unknown` ("checking") state.
     fn fold_reachability(&mut self) {
-        let Some(prober) = &self.prober else {
-            return;
-        };
-        let snapshot = prober.snapshot();
-        for m in &mut self.machines {
-            if m.is_local {
-                continue;
-            }
-            if let Some(r) = snapshot.get(&m.name) {
-                m.reachability = r.clone();
-            }
+        if let Some(prober) = &self.prober {
+            self.model.fold_reachability(&prober.snapshot());
         }
     }
 
@@ -287,12 +170,7 @@ impl MachinesApp {
     }
 
     fn rebuild_selectable(&mut self) {
-        self.selectable.clear();
-        for (mi, m) in self.machines.iter().enumerate() {
-            for wi in 0..m.workspaces.len() {
-                self.selectable.push((mi, wi));
-            }
-        }
+        self.selectable = self.model.workspace_positions();
         let max = self.selectable.len().saturating_sub(1);
         if self.selected > max {
             self.selected = max;
@@ -327,7 +205,8 @@ impl MachinesApp {
     /// workspaces. This is what the host opens on Enter.
     pub fn selected_workspace(&self) -> Option<&str> {
         let (mi, wi) = self.selectable.get(self.selected)?;
-        self.machines
+        self.model
+            .machines
             .get(*mi)
             .and_then(|m| m.workspaces.get(*wi))
             .map(|w| w.name.as_str())
@@ -342,45 +221,27 @@ impl MachinesApp {
     }
 }
 
-/// The real reachability probe: an SSH `true` to the host with a short
-/// deadline, through the orchestrator's probe + the shared `shelbi_ssh`
-/// transport (same ControlMaster + reverse forward the poller uses). Runs on
-/// the prober thread.
-fn real_reachability_probe(_machine: &str, host: &str) -> Reachability {
-    let target = Host::Ssh {
-        host: host.to_string(),
-    };
-    let exec = SshExec::with_deadline(target, host.to_string(), REACHABILITY_PROBE_DEADLINE);
-    probe_reachability(&exec)
-}
-
 // ---------------------------------------------------------------------------
 // Rendering (shared by the standalone process and the in-process shell)
 // ---------------------------------------------------------------------------
 
+/// A shared tone as a terminal color.
+fn tone(t: Tone) -> ratatui::style::Color {
+    t.pick(palette())
+}
+
 /// The reachability badge shown next to a remote machine's `ssh <host>` label.
 /// One span so both runtimes render it identically through [`machine_header_line`].
 fn reachability_span(r: &Reachability) -> Span<'static> {
-    let (text, color) = match r {
-        Reachability::Reachable => ("● reachable".to_string(), palette().ansi_green),
-        Reachability::Unknown => ("○ checking…".to_string(), palette().ansi_dark_gray),
-        Reachability::Unreachable { error } => {
-            (format!("● unreachable: {}", truncate(error, 40)), palette().ansi_red)
-        }
-    };
-    Span::styled(format!("  {text}"), Style::default().fg(color))
+    let (text, t) = reachability_label(r, 40);
+    Span::styled(format!("  {text}"), Style::default().fg(tone(t)))
 }
 
 /// A short badge for an observed workspace state.
-fn state_badge(state: Option<WorkspaceState>) -> (&'static str, Color) {
-    match state {
-        Some(WorkspaceState::Working) => ("working", palette().ansi_green),
-        Some(WorkspaceState::AwaitingInput) => ("awaiting", palette().ansi_yellow),
-        Some(WorkspaceState::Blocked) => ("blocked", palette().ansi_red),
-        Some(WorkspaceState::Paused) => ("paused", palette().ansi_magenta),
-        Some(WorkspaceState::Serving) => ("serving", palette().ansi_cyan),
-        None => ("idle", palette().ansi_dark_gray),
-    }
+#[cfg(test)]
+fn state_badge(state: Option<shelbi_state::WorkspaceState>) -> (&'static str, ratatui::style::Color) {
+    let (label, t) = workspace_state_badge(state);
+    (label, tone(t))
 }
 
 /// Render the whole machines view into `area`. Shared by both runtimes.
@@ -416,7 +277,7 @@ fn render_title(f: &mut Frame, app: &MachinesApp, area: Rect) {
 }
 
 fn render_body(f: &mut Frame, app: &MachinesApp, area: Rect) {
-    if app.machines.is_empty() {
+    if app.model.machines.is_empty() {
         let msg = if app.status_line.is_empty() {
             "No machines declared for this project."
         } else {
@@ -433,7 +294,7 @@ fn render_body(f: &mut Frame, app: &MachinesApp, area: Rect) {
 
     let selected = app.selectable.get(app.selected).copied();
     let mut lines: Vec<Line> = Vec::new();
-    for (mi, m) in app.machines.iter().enumerate() {
+    for (mi, m) in app.model.machines.iter().enumerate() {
         lines.push(machine_header_line(m));
         if m.workspaces.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -451,7 +312,7 @@ fn render_body(f: &mut Frame, app: &MachinesApp, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn machine_header_line(m: &MachineEntry) -> Line<'static> {
+fn machine_header_line(m: &MachineRow) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
         m.name.clone(),
         Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD),
@@ -482,26 +343,15 @@ fn machine_header_line(m: &MachineEntry) -> Line<'static> {
     }
     // Remote binary resolution (rt-machine-setup), or a prompt to set it up.
     if !m.is_local {
-        match &m.remote {
-            Some(rec) => {
-                let color = if rec.compatible { palette().ansi_green } else { palette().ansi_red };
-                let suffix = if rec.compatible { "" } else { " (incompatible)" };
-                spans.push(Span::styled(
-                    format!("  {} v{}{}", rec.path, rec.version, suffix),
-                    Style::default().fg(color),
-                ));
-            }
-            None => spans.push(Span::styled(
-                "  not set up — run `shelbi machine setup`".to_string(),
-                Style::default().fg(palette().ansi_yellow),
-            )),
-        }
+        let (text, t) = remote_binary_label(m.remote.as_ref());
+        spans.push(Span::styled(format!("  {text}"), Style::default().fg(tone(t))));
     }
     Line::from(spans)
 }
 
-fn workspace_line(w: &WorkspaceRow, selected: bool, width: u16) -> Line<'static> {
-    let (badge, badge_color) = state_badge(w.state);
+fn workspace_line(w: &MachineWorkspace, selected: bool, width: u16) -> Line<'static> {
+    let (badge, badge_tone) = workspace_state_badge(w.state);
+    let badge_color = tone(badge_tone);
     let pointer = if selected { "▸ " } else { "  " };
     let base = if selected {
         Style::default().bg(palette().selection)
@@ -511,7 +361,7 @@ fn workspace_line(w: &WorkspaceRow, selected: bool, width: u16) -> Line<'static>
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!("  {pointer}"), base),
         Span::styled(
-            format!("{:<18}", truncate(&w.name, 18)),
+            format!("{:<18}", truncate_chars(&w.name, 18)),
             base.fg(palette().ansi_white),
         ),
         Span::styled(format!("{badge:<9}"), base.fg(badge_color)),
@@ -547,21 +397,17 @@ fn render_footer(f: &mut Frame, app: &MachinesApp, area: Rect) {
     );
 }
 
-/// Truncate `s` to `max` display chars, adding an ellipsis when it overflows.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let keep = max.saturating_sub(1);
-        let mut out: String = s.chars().take(keep).collect();
-        out.push('…');
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_app::view::SlotAssignment;
+    use shelbi_core::MachineKind;
+    use shelbi_state::machine_state::MachineRecord;
+    use shelbi_state::WorkspaceState;
+
+    type MachineEntry = MachineRow;
+    type WorkspaceRow = MachineWorkspace;
+    type MachinesData = MachinesModel;
 
     fn entry(name: &str, kind: MachineKind, workspaces: Vec<WorkspaceRow>) -> MachineEntry {
         MachineEntry {
@@ -583,8 +429,17 @@ mod tests {
     fn ws(name: &str, state: Option<WorkspaceState>, task: Option<&str>) -> WorkspaceRow {
         WorkspaceRow {
             name: name.into(),
+            is_review_slot: false,
             state,
             current_task: task.map(str::to_string),
+            assignment: match task {
+                Some(t) => SlotAssignment::InProgress(vec![t.to_string()]),
+                None => SlotAssignment::Idle,
+            },
+            agent: None,
+            task_title: None,
+            branch: None,
+            review: None,
         }
     }
 

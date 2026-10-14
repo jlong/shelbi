@@ -1730,6 +1730,7 @@ dependencies = [
  "shelbi-proto",
  "shelbi-state",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

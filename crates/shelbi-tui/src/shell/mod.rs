@@ -5604,14 +5604,14 @@ mod tests {
 
     #[test]
     fn machines_enter_opens_the_selected_workspace_session() {
-        use crate::machines::{MachineEntry, MachinesData, WorkspaceRow as MachineWsRow};
+        use shelbi_app::view::{MachineRow, MachineWorkspace, MachinesModel, SlotAssignment};
         use shelbi_core::MachineKind;
 
         let mut st = test_state();
         // Feed the machines view one machine with one workspace.
-        st.machines.apply_data(MachinesData {
+        st.machines.apply_data(MachinesModel {
             display_name: Some("proj".into()),
-            machines: vec![MachineEntry {
+            machines: vec![MachineRow {
                 name: "local".into(),
                 kind: MachineKind::Local,
                 host: None,
@@ -5619,7 +5619,17 @@ mod tests {
                 tags: vec![],
                 remote: None,
                 reachability: shelbi_orchestrator::machine::Reachability::Reachable,
-                workspaces: vec![MachineWsRow { name: "alpha".into(), state: None, current_task: None }],
+                workspaces: vec![MachineWorkspace {
+                    name: "alpha".into(),
+                    is_review_slot: false,
+                    state: None,
+                    current_task: None,
+                    assignment: SlotAssignment::Idle,
+                    agent: None,
+                    task_title: None,
+                    branch: None,
+                    review: None,
+                }],
             }],
         });
         st.main_view = MainView::Native(View::Machines);

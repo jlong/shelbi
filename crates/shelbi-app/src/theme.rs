@@ -539,6 +539,45 @@ const TOKEN_NAMES: &[&str] = &[
     "ansi_cyan",
 ];
 
+/// A text color a shared view model asks for by token name, so a row built
+/// once in `shelbi-app` (an activity row, a machines badge) paints the same
+/// token in the TUI and the desktop. Each names a [`Theme`] field; a client
+/// resolves it with [`Tone::pick`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tone {
+    White,
+    Gray,
+    DarkGray,
+    Red,
+    LightRed,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    /// The workflow badge's foreground (machine tags).
+    WorkflowBadge,
+}
+
+impl Tone {
+    /// The token this tone names in `theme`.
+    pub fn pick<C: Copy>(self, theme: &Theme<C>) -> C {
+        match self {
+            Tone::White => theme.ansi_white,
+            Tone::Gray => theme.ansi_gray,
+            Tone::DarkGray => theme.ansi_dark_gray,
+            Tone::Red => theme.ansi_red,
+            Tone::LightRed => theme.ansi_light_red,
+            Tone::Green => theme.ansi_green,
+            Tone::Yellow => theme.ansi_yellow,
+            Tone::Blue => theme.ansi_blue,
+            Tone::Magenta => theme.ansi_magenta,
+            Tone::Cyan => theme.ansi_cyan,
+            Tone::WorkflowBadge => theme.workflow_badge_fg,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

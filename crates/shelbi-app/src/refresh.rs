@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
-use crate::view::{ActivityModel, ErrorLogModel, IssuesModel, MachinesModel, SidebarModel};
+use crate::activity::Feed;
+use crate::view::{ErrorLogModel, IssuesModel, MachinesModel, SidebarModel};
 
 /// One immutable published view of the world. A refresh produces exactly
 /// one of these. Fields are `Option` so a reader that can't currently
@@ -33,7 +34,7 @@ pub struct Snapshot {
     pub taken_at: Option<SystemTime>,
     pub sidebar: Option<SidebarModel>,
     pub issues: Option<IssuesModel>,
-    pub activity: Option<ActivityModel>,
+    pub activity: Option<Feed>,
     pub machines: Option<MachinesModel>,
     pub errors: Option<ErrorLogModel>,
 }

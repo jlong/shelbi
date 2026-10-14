@@ -71,6 +71,10 @@ async-channel = "2"
 # gpui-base resolves), for the task detail's checklist count and its tests.
 markdown = "=1.0.0"
 
+# The activity feed's clock (relative times, day headers): the version the
+# shared crates already resolve.
+chrono = "0.4"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

@@ -15,7 +15,9 @@ use std::ops::Deref;
 
 use gpui::{rgb, App, Context, Global, Hsla, Subscription, Window, WindowAppearance};
 use shelbi_palette::DecorationColor;
-use shelbi_app::theme::{resolve_appearance, Appearance, Rgb, Theme as Tokens, ThemePreference};
+use shelbi_app::theme::{
+    resolve_appearance, Appearance, Rgb, Theme as Tokens, ThemePreference, Tone,
+};
 use shelbi_term::render::Rgb as TermRgb;
 
 /// The resolved theme, installed as a gpui [`Global`]. Views read the tokens
@@ -57,6 +59,12 @@ impl Theme {
 
     pub fn is_dark(&self) -> bool {
         self.appearance == Appearance::Dark
+    }
+
+    /// The token a shared view model names by [`Tone`] (an activity row's
+    /// chip, a machines badge).
+    pub fn tone(&self, tone: Tone) -> Hsla {
+        tone.pick(&self.colors)
     }
 
     /// The color a shared badge decoration paints in, mapped exactly as the

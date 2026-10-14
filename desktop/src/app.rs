@@ -58,7 +58,9 @@ use crate::keys::chord_from_keystroke;
 use crate::projects::{self, Catalog};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
 use crate::theme::{self, Theme};
+use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::issues::{IssuesEvent, IssuesView};
+use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::settings::SettingsView;
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{Frame, WindowState};
@@ -258,6 +260,9 @@ pub struct ShelbiWindow {
     issues: Option<Entity<IssuesView>>,
     /// The orchestrator chat, created the first time it is shown.
     chat: Option<Entity<ChatView>>,
+    /// The Activity feed and the Machines view, likewise created on first show.
+    activity: Option<Entity<ActivityView>>,
+    machines: Option<Entity<MachinesView>>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -314,6 +319,8 @@ impl ShelbiWindow {
             route: Route::View,
             issues: None,
             chat: None,
+            activity: None,
+            machines: None,
             banner: None,
             status: None,
             focus_handle,
@@ -618,14 +625,22 @@ impl ShelbiWindow {
             }
             HostCall::ShowView(view) => {
                 self.route = Route::View;
-                let issues = view == View::Issues;
                 let chat = is_chat(&view);
+                match view {
+                    View::Issues => {
+                        self.ensure_issues(window, cx);
+                    }
+                    View::Activity => {
+                        self.ensure_activity(window, cx);
+                    }
+                    View::Machines => {
+                        self.ensure_machines(window, cx);
+                    }
+                    View::Session(_) => {}
+                }
                 self.client.set_view(view);
                 self.client.focus_main();
                 self.banner = None;
-                if issues {
-                    self.ensure_issues(window, cx);
-                }
                 if chat {
                     // Selecting it again while it is failed or given up
                     // re-opens it (a relaunch with a fresh budget).
@@ -733,16 +748,85 @@ impl ShelbiWindow {
             .is_some_and(|chat| chat.read(cx).contains_focus(window, cx))
     }
 
-    /// Hand keyboard focus to what the main area shows: the board and the
-    /// chat take it (their own keys), anything else leaves it on the window.
-    fn focus_main_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match (&self.route, self.client.view(), &self.issues, &self.chat) {
-            (Route::View, View::Issues, Some(issues), _) => {
-                issues.update(cx, |v, _| v.request_focus());
+    /// The Activity feed for the window's project, created on first use.
+    /// A task row opens the task's detail on the board; a workspace row's
+    /// `FocusWorkspace` goes through [`Self::run`] like the sidebar's.
+    fn ensure_activity(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ActivityView> {
+        if let Some(activity) = &self.activity {
+            return activity.clone();
+        }
+        let project = self.project.clone();
+        let activity = cx.new(|cx| ActivityView::new(project, cx));
+        let sub = cx.subscribe_in(&activity, window, |this, _, ev: &ActivityEvent, window, cx| {
+            match ev {
+                ActivityEvent::OpenTask(id) => this.open_task(id, window, cx),
+                ActivityEvent::Command(kind) => this.run(kind.clone(), window, cx),
             }
-            (Route::View, view, _, Some(chat)) if is_chat(view) => {
-                let target = chat.read(cx).focus_target(cx);
-                window.focus(&target, cx);
+        });
+        self._subscriptions.push(sub);
+        self.activity = Some(activity.clone());
+        activity
+    }
+
+    /// The Machines view for the window's project, created on first use.
+    fn ensure_machines(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<MachinesView> {
+        if let Some(machines) = &self.machines {
+            return machines.clone();
+        }
+        let project = self.project.clone();
+        let machines = cx.new(|cx| MachinesView::new(project, cx));
+        let sub = cx.subscribe_in(&machines, window, |this, _, ev: &MachinesEvent, window, cx| {
+            let MachinesEvent::Command(kind) = ev;
+            this.run(kind.clone(), window, cx);
+        });
+        self._subscriptions.push(sub);
+        self.machines = Some(machines.clone());
+        machines
+    }
+
+    /// Show task `id`'s detail: route to the board and open it there.
+    fn open_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(CommandKind::ShowView(View::Issues), window, cx);
+        let issues = self.ensure_issues(window, cx);
+        issues.update(cx, |v, cx| v.open_task(id, cx));
+    }
+
+    /// Hand keyboard focus to what the main area shows: a native view or the
+    /// chat takes it (their own keys), anything else leaves it on the window.
+    fn focus_main_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::View) {
+            self.focus_handle.focus(window, cx);
+            return;
+        }
+        match self.client.view() {
+            View::Issues if self.issues.is_some() => {
+                if let Some(issues) = &self.issues {
+                    issues.update(cx, |v, _| v.request_focus());
+                }
+            }
+            View::Activity if self.activity.is_some() => {
+                if let Some(activity) = &self.activity {
+                    activity.update(cx, |v, _| v.request_focus());
+                }
+            }
+            View::Machines if self.machines.is_some() => {
+                if let Some(machines) = &self.machines {
+                    machines.update(cx, |v, _| v.request_focus());
+                }
+            }
+            view if is_chat(view) && self.chat.is_some() => {
+                if let Some(chat) = &self.chat {
+                    let target = chat.read(cx).focus_target(cx);
+                    window.focus(&target, cx);
+                }
             }
             _ => self.focus_handle.focus(window, cx),
         }
@@ -1057,7 +1141,20 @@ impl ShelbiWindow {
                         .min_w_0()
                         .child(issues.clone())
                         .into_any_element(),
-                    (None, _) => div().into_any_element(),
+                    (None, _) => {
+                        let native = match view {
+                            View::Activity => self.activity.clone().map(|v| v.into_any_element()),
+                            View::Machines => self.machines.clone().map(|v| v.into_any_element()),
+                            _ => None,
+                        };
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .children(native)
+                            .into_any_element()
+                    }
                 }
             }
         };

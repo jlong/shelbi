@@ -12,7 +12,8 @@
 //! routing (every `View` routes through the window's `ClientState`; a view
 //! not yet ported draws the stub in the main area), project switching, and
 //! the detach / quit lifecycle commands; `dt-issues-board` owns the Issues
-//! view and the board's issue mutations.
+//! view and the board's issue mutations; `dt-activity-machines` the Activity
+//! and Machines views.
 //!
 //! The id named in the banner is the command's registry id where the
 //! registry has one (`view:tasks`, `workspace:<name>`, `action:toggle-zen`,
@@ -159,10 +160,9 @@ pub fn view_stub_id(view: &View) -> Option<String> {
     match view {
         // dt-issues-board: the native board.
         View::Issues => None,
-        // dt-activity-machines
-        View::Activity => Some("view:activity".into()),
-        // dt-activity-machines
-        View::Machines => Some("view:machines".into()),
+        // dt-activity-machines: the native feed and machines views.
+        View::Activity => None,
+        View::Machines => None,
         // dt-chat-view: the orchestrator chat.
         View::Session(name) if name == "orch" => None,
         // dt-workspace-view
@@ -389,8 +389,8 @@ mod tests {
     fn every_view_routes_and_unported_ones_name_their_stub() {
         for (view, stub) in [
             (View::Issues, None),
-            (View::Activity, Some("view:activity")),
-            (View::Machines, Some("view:machines")),
+            (View::Activity, None),
+            (View::Machines, None),
             (View::Session("orch".into()), None),
             (View::Session("alpha".into()), Some("view:alpha")),
         ] {

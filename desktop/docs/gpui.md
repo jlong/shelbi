@@ -214,6 +214,16 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   The drag constructor gets `&mut App`, not the view: reach the view through a
   `WeakEntity` (`cx.weak_entity()`). A drag released off every target never
   reaches a drop handler; poll `cx.has_active_drag()` to clear drag state.
+- **Background-executor timers don't fire on an offscreen
+  `VisualTestAppContext`** (no run loop): a view whose data arrives through a
+  `cx.spawn` loop on `background_executor().timer(..)` never polls. The
+  `--visual-views` check calls the views' `poll` (feature `visual-check`)
+  between frames instead.
+- **`gpui::list` re-anchors to the top on a full splice.** `ListState::splice`
+  over a range containing the scroll anchor moves the anchor to the range
+  start, and `reset` drops it. A feed that grows at the top every refresh
+  (Activity) therefore uses a plain `overflow_y_scroll` container, whose
+  pixel offset survives re-renders.
 
 ## Build time and binary size
 
