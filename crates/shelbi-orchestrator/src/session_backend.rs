@@ -252,6 +252,8 @@ pub trait SessionBackend {
     // --- snapshot / history / final screen ------------------------------
 
     /// The target's current visible content as plain text (wrapped lines joined).
+    /// Live sessions only: a dead session has no current screen (its frozen last
+    /// frame is [`final_screen`](Self::final_screen)), so this errors for one.
     fn snapshot(&self, host: &Host, target: &SessionTarget) -> Result<String>;
 
     /// Snapshot including `lines` of scrollback before the visible area.

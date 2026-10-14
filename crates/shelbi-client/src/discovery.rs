@@ -221,13 +221,23 @@ pub fn list(root: &Path) -> Result<Vec<DiscoveredSession>, crate::ClientError> {
         let short_id = entry.file_name().to_string_lossy().into_owned();
         out.push(DiscoveredSession {
             sock: dir.join("sock"),
-            alive: is_held(&dir.join("lock")),
+            alive: is_live(&dir),
             short_id,
             dir,
             meta,
         });
     }
     Ok(out)
+}
+
+/// Whether the session in `dir` is alive: its lifetime lock is held **and** it
+/// has not written its exit record. `exit.json` is written only after the child
+/// is gone (and after `final.txt`), so its presence is proof of death even in
+/// the instant before the session process exits and drops its lock — a dead
+/// session never reads as alive off a lock read alone
+/// (`phantom-working-dead-session`).
+fn is_live(dir: &Path) -> bool {
+    !dir.join("exit.json").exists() && is_held(&dir.join("lock"))
 }
 
 /// Remove **every** session directory under `root` whose lock is not held (the
@@ -903,5 +913,25 @@ mod tests {
         let sock = dir.path().join("sock");
         std::fs::write(&sock, b"not a socket").unwrap();
         assert_eq!(probe_socket(&sock), SocketReachability::Unknown);
+    }
+
+    #[test]
+    fn a_session_that_wrote_its_exit_record_is_dead_even_with_its_lock_held() {
+        // The exit record lands before the session process drops its lock, and
+        // a lock read can be fooled; `exit.json` is proof of death either way,
+        // so discovery never offers an exited session as live (and so never as
+        // "usable" — a dead dir has no `sock`, which reads as still-binding).
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        write_dead_dir(root, "gone", "demo/ws/golf", "2026-01-01T00:00:00Z");
+        let dir = root.join("gone");
+        let _held = shelbi_session::lock::SessionLock::acquire(&dir.join("lock")).unwrap();
+        assert!(list(root).unwrap()[0].alive, "lock held, no exit record: live");
+
+        std::fs::write(dir.join("exit.json"), br#"{"code":143}"#).unwrap();
+        let found = list(root).unwrap();
+        assert!(!found[0].alive, "an exit record means dead");
+        assert!(!found[0].usable());
+        assert!(choose_session(&found, "demo/ws/golf").is_none());
     }
 }
