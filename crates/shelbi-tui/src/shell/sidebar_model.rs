@@ -113,6 +113,54 @@ pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
 /// The fixed nav builtins, matching the former sidebar's order. Also used by the
 /// shell's skeleton sidebar model, painted the instant a cold project switch
 /// lands (`ShellState::skeleton_sidebar_model`).
+/// A sidebar skeleton for `project` built from its **config alone** — the
+/// display label and the declared (non-review) workspaces, each with a
+/// [`WorkspaceBadge::Loading`] badge — plus the persisted machine-collapse set.
+/// No board, status, review-slot, or daemon reads, so it is cheap, but it still
+/// touches disk: the shell builds these off the UI thread ahead of time
+/// (`ShellState::spawn_skeleton_prefetch`) so a *cold* project switch can paint
+/// the target's workspace rows on the very next frame. `None` when the
+/// project's config doesn't load (the caller falls back to the bare skeleton).
+pub(crate) fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
+    let p = load_project(project).ok()?;
+    let workspaces = p
+        .workspaces
+        .iter()
+        .filter(|w| !p.effective_tags(w).contains("review"))
+        .filter_map(|w| {
+            let machine = p.machine(&w.machine)?;
+            Some(WorkspaceRow {
+                name: w.name.clone(),
+                machine: w.machine.clone(),
+                is_remote: !machine.host().is_local(),
+                current_task: None,
+                agent: None,
+                badge: WorkspaceBadge::Loading,
+            })
+        })
+        .collect();
+    Some(SidebarModel {
+        project_label: p
+            .display_name
+            .clone()
+            .or_else(|| p.label.clone())
+            .unwrap_or_else(|| project.to_string()),
+        nav: nav_items(),
+        workspaces,
+        reviews: Vec::new(),
+        config_error: None,
+        board_loading: false,
+        collapsed_machines: sidebar_collapsed_machines().unwrap_or_default(),
+        board_banner: None,
+        daemon_version_line: None,
+        daemon_version_mismatch: false,
+        status_line: String::new(),
+        zen_mode: ZenModeState::Off,
+        unread_errors: 0,
+        session_lost: None,
+    })
+}
+
 pub(crate) fn nav_items() -> Vec<NavItem> {
     vec![
         NavItem {
@@ -327,5 +375,59 @@ fn probe_daemon_version() -> (String, bool) {
             format!("daemon {daemon} ≠ cli {cli} — shelbi daemon restart"),
             true,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_config_skeleton_lists_declared_workspaces_awaiting_state() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-skeleton-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join("projects/demo.yaml"),
+            "name: demo\ndisplay_name: Demo Board\nrepo: ''\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\n\
+             - name: devbox\n  kind: ssh\n  host: devbox.local\n  work_dir: /work/demo\n\
+             workspaces:\n- name: review\n  machine: hub\n  tags: [review]\n\
+             - name: alpha\n  machine: hub\n- name: delta\n  machine: devbox\n",
+        )
+        .unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let model = read_config_skeleton("demo").expect("a skeleton from config");
+        let missing = read_config_skeleton("nope");
+        std::env::remove_var("SHELBI_HOME");
+
+        assert_eq!(model.project_label, "Demo Board");
+        let rows: Vec<_> = model
+            .workspaces
+            .iter()
+            .map(|w| (w.name.as_str(), w.machine.as_str(), w.is_remote))
+            .collect();
+        assert_eq!(
+            rows,
+            [("alpha", "hub", false), ("delta", "devbox", true)],
+            "declared dev workspaces, review slot excluded"
+        );
+        assert!(model
+            .workspaces
+            .iter()
+            .all(|w| w.badge == WorkspaceBadge::Loading && w.agent.is_none()));
+        assert!(!model.board_loading, "the rows themselves carry the loading state");
+        assert!(missing.is_none(), "an unknown project falls back to the bare skeleton");
     }
 }
