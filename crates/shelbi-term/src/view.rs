@@ -74,6 +74,14 @@ impl TerminalView {
         self.search = None;
     }
 
+    /// The viewport rows that changed since the last call (see
+    /// [`TermEmulator::take_damage`]). Output, a resize, and a scrollback move
+    /// all damage the screen; selection and search do not (a viewer repaints
+    /// those itself when it changes them).
+    pub fn take_damage(&mut self) -> crate::render::Damage {
+        self.emu.take_damage()
+    }
+
     /// Note that the user sent input: the view follows the live bottom again.
     pub fn on_user_input(&mut self) {
         self.scroll_to_bottom();
@@ -242,6 +250,15 @@ impl TerminalView {
         self.search.as_ref().and_then(|s| s.current())
     }
 
+    /// Every match of the active search, in buffer order (empty with no
+    /// search, or on the alternate screen), for painting the highlights.
+    pub fn search_matches(&self) -> &[Match] {
+        match &self.search {
+            Some(s) if self.scrollback_enabled() => s.matches(),
+            _ => &[],
+        }
+    }
+
     /// Clear any active search.
     pub fn clear_search(&mut self) {
         self.search = None;
@@ -327,6 +344,18 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(v.search_current().unwrap().line, 0);
         assert_eq!(v.search_next().unwrap().line, 1);
+    }
+
+    #[test]
+    fn search_matches_lists_every_hit() {
+        let mut v = view();
+        assert!(v.search_matches().is_empty());
+        v.feed(b"needle here\r\nand needle again");
+        v.start_search("needle", false);
+        let lines: Vec<i32> = v.search_matches().iter().map(|m| m.line).collect();
+        assert_eq!(lines, vec![0, 1]);
+        v.clear_search();
+        assert!(v.search_matches().is_empty());
     }
 
     #[test]

@@ -25,46 +25,18 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color as RatColor, Modifier, Style};
 
 use shelbi_client::SessionEvent;
+use shelbi_term::gesture::MouseGesture;
 use shelbi_term::input::{self, Key, Modifiers};
+use shelbi_term::render::{CellAttrs, Underline};
 use shelbi_term::selection;
 use shelbi_term::view::TerminalView;
-use shelbi_term::viewport::{self, Placement};
+use shelbi_term::viewport;
 use shelbi_term::Size;
 
-/// What a mouse event over the pane resolved to.
-#[derive(Debug)]
-pub enum MouseOutcome {
-    /// Bytes to forward to the agent (program mouse reporting).
-    Forward(Vec<u8>),
-    /// Shelbi handled it locally (scrollback / selection); redraw.
-    Handled,
-    /// A completed selection whose text should be copied.
-    Copy(String),
-    /// Nothing to do.
-    Ignored,
-}
-
-/// Where a left-button gesture is in its lifecycle. A gesture's ownership is
-/// decided once, at press time: a plain press is *buffered* (we don't yet know
-/// whether it will become a click or a drag), the first motion turns it into a
-/// Shelbi selection, and a release with no motion is a click.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DragState {
-    /// No left button is down.
-    Idle,
-    /// Left is down at this viewer cell but has not moved yet — we don't know
-    /// whether it will become a click or a drag. The first motion makes it a
-    /// Shelbi selection anchored here; a release with no motion is a click.
-    /// `forward_click` records what that click does: forward a press+release to
-    /// the program (the program is reporting and nothing reclaimed the gesture)
-    /// or, when clear, just drop the stale highlight (a bare Shelbi click).
-    Pressed { col: u16, row: u16, forward_click: bool },
-    /// A Shelbi selection drag is underway.
-    Selecting,
-    /// The gesture belongs to the program (the Alt escape hatch): every event
-    /// is forwarded, press through release.
-    Program,
-}
+/// What a mouse event over the pane resolved to. The gesture rules (a drag
+/// selects, a click reaches the program, Shift and Alt override) are
+/// `shelbi-term`'s, shared with the desktop app.
+pub use shelbi_term::gesture::MouseOutcome;
 
 /// One session rendered into the main area.
 pub struct TerminalPane {
@@ -76,8 +48,8 @@ pub struct TerminalPane {
     pub bell: bool,
     /// Set once the session's child has exited.
     pub exited: Option<shelbi_proto::Exited>,
-    /// Lifecycle of the current left-button gesture (selection vs. click).
-    drag: DragState,
+    /// Lifecycle of the current mouse gesture (selection vs. click).
+    gesture: MouseGesture,
 }
 
 impl TerminalPane {
@@ -87,7 +59,7 @@ impl TerminalPane {
             session_size,
             bell: false,
             exited: None,
-            drag: DragState::Idle,
+            gesture: MouseGesture::default(),
         }
     }
 
@@ -134,12 +106,7 @@ impl TerminalPane {
 
     /// Derive the key-encoding modes from the emulator's current terminal mode.
     pub fn key_encoding(&self) -> input::KeyEncoding {
-        let mode = self.view.emulator().mode();
-        input::KeyEncoding {
-            kitty: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
-            application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
-            newline_mode: mode.contains(TermMode::LINE_FEED_NEW_LINE),
-        }
+        self.view.emulator().key_encoding()
     }
 
     /// Encode a key press into PTY bytes, snapping the view back to the live
@@ -204,11 +171,11 @@ impl TerminalPane {
 
     /// Handle a mouse event whose coordinates are already pane-relative
     /// (0-based, column/row inside the draw area). `viewer` is the size of that
-    /// draw area; `reporting`/`sgr`/`shift` decide ownership. The session's grid
-    /// (sized to the most-recently-active client, which may not be us) is
-    /// letterboxed or clipped into `viewer`, and that same placement translates
-    /// the click back to a session cell — so a click in the letterbox margin or
-    /// outside a clipped window maps to nothing.
+    /// draw area. The session's grid (sized to the most-recently-active client,
+    /// which may not be us) is letterboxed or clipped into `viewer`, and that
+    /// same placement translates the click back to a session cell, so a click
+    /// in the letterbox margin or outside a clipped window maps to nothing. The
+    /// gesture rules live in [`shelbi_term::gesture`].
     pub fn on_mouse(
         &mut self,
         m: &CtMouseEvent,
@@ -216,184 +183,11 @@ impl TerminalPane {
         pane_row: u16,
         viewer: Size,
     ) -> MouseOutcome {
-        let mode = self.view.emulator().mode();
-        let reporting = mode.intersects(TermMode::MOUSE_MODE);
-        let shift = m.modifiers.contains(KeyModifiers::SHIFT);
-        let placement = viewport::fit(self.session_size, viewer);
-        match m.kind {
-            // The left button is the selection/click gesture — a small state
-            // machine (see `DragState`) decides per gesture between a Shelbi
-            // selection and a forwarded click.
-            MouseEventKind::Down(CtMouseButton::Left)
-            | MouseEventKind::Drag(CtMouseButton::Left)
-            | MouseEventKind::Up(CtMouseButton::Left) => {
-                self.left_mouse(m, pane_col, pane_row, &placement)
-            }
-            // Wheel and the other buttons keep the simple ownership policy: the
-            // program gets them when it is reporting (unless Shift reclaims
-            // them); otherwise the wheel scrolls Shelbi's scrollback.
-            _ => match input::mouse_owner(reporting, shift) {
-                input::MouseOwner::Shelbi => match m.kind {
-                    MouseEventKind::ScrollUp => {
-                        self.view.scroll_up(3);
-                        MouseOutcome::Handled
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.view.scroll_down(3);
-                        MouseOutcome::Handled
-                    }
-                    _ => MouseOutcome::Ignored,
-                },
-                input::MouseOwner::Program => self.forward_mouse(m, pane_col, pane_row, &placement),
-            },
-        }
-    }
-
-    /// Encode a mouse event for the program, if a session cell lies under it.
-    fn forward_mouse(
-        &self,
-        m: &CtMouseEvent,
-        col: u16,
-        row: u16,
-        placement: &Placement,
-    ) -> MouseOutcome {
-        let Some(ev) = map_mouse(m, col, row) else {
+        let Some(ev) = map_mouse(m, pane_col, pane_row) else {
             return MouseOutcome::Ignored;
         };
-        match input::encode_mouse(&ev, self.mouse_modes(), placement) {
-            Some(bytes) => MouseOutcome::Forward(bytes),
-            None => MouseOutcome::Ignored,
-        }
-    }
-
-    fn mouse_modes(&self) -> input::MouseModes {
-        let mode = self.view.emulator().mode();
-        input::MouseModes {
-            reporting: mode.intersects(TermMode::MOUSE_MODE),
-            sgr: mode.contains(TermMode::SGR_MOUSE),
-        }
-    }
-
-    /// Left-button handling: a plain drag selects (even when the program has
-    /// mouse reporting on), a plain click reaches the program, Shift forces a
-    /// selection, and Alt forwards the whole gesture to the program (the escape
-    /// hatch for programs that need drags). A finished selection copies.
-    fn left_mouse(
-        &mut self,
-        m: &CtMouseEvent,
-        col: u16,
-        row: u16,
-        placement: &Placement,
-    ) -> MouseOutcome {
-        let reporting = self.view.emulator().mode().intersects(TermMode::MOUSE_MODE);
-        let shift = m.modifiers.contains(KeyModifiers::SHIFT);
-        let alt = m.modifiers.contains(KeyModifiers::ALT);
-        match m.kind {
-            MouseEventKind::Down(CtMouseButton::Left) => {
-                // A new press ends any lingering highlight (the "next click"
-                // rule) and we defer the selection-vs-click decision to the
-                // first motion. Alt+reporting is the one exception: it hands the
-                // whole gesture to the program up front.
-                self.view.clear_selection();
-                if reporting && !shift && alt {
-                    self.drag = DragState::Program;
-                    return self.forward_mouse(m, col, row, placement);
-                }
-                // A click (no drag) forwards to the program only when the
-                // program is reporting and did not reclaim the gesture via
-                // Shift; otherwise a bare click is Shelbi's and does nothing.
-                let forward_click = reporting && !shift;
-                self.drag = DragState::Pressed { col, row, forward_click };
-                MouseOutcome::Handled
-            }
-            MouseEventKind::Drag(CtMouseButton::Left) => match self.drag {
-                DragState::Program => self.forward_mouse(m, col, row, placement),
-                DragState::Pressed { col: c0, row: r0, .. } => {
-                    // First motion: this gesture is a drag, so it is a Shelbi
-                    // selection anchored at the press point.
-                    if let Some(p) = self.view.viewer_point_to_grid(placement, c0, r0) {
-                        self.view.begin_selection(p);
-                    }
-                    if let Some(p) = self.view.viewer_point_to_grid(placement, col, row) {
-                        self.view.update_selection(p);
-                    }
-                    self.drag = DragState::Selecting;
-                    MouseOutcome::Handled
-                }
-                DragState::Selecting => {
-                    if let Some(p) = self.view.viewer_point_to_grid(placement, col, row) {
-                        self.view.update_selection(p);
-                    }
-                    MouseOutcome::Handled
-                }
-                DragState::Idle => MouseOutcome::Handled,
-            },
-            MouseEventKind::Up(CtMouseButton::Left) => {
-                match std::mem::replace(&mut self.drag, DragState::Idle) {
-                    DragState::Program => self.forward_mouse(m, col, row, placement),
-                    DragState::Selecting => self.finish_selection(),
-                    DragState::Pressed { col: c0, row: r0, forward_click } => {
-                        if forward_click {
-                            // A plain click while the program is reporting: now
-                            // that we know it never became a drag, forward the
-                            // buffered press and this release as a clean click.
-                            self.forward_click(c0, r0, col, row, placement)
-                        } else {
-                            // A bare Shelbi click: the old highlight was already
-                            // dropped on the press; nothing more to do.
-                            MouseOutcome::Handled
-                        }
-                    }
-                    DragState::Idle => MouseOutcome::Ignored,
-                }
-            }
-            _ => MouseOutcome::Ignored,
-        }
-    }
-
-    /// Resolve a finished selection drag: copy it when it actually spans text,
-    /// otherwise drop the stray highlight of a drag that never left its anchor.
-    fn finish_selection(&mut self) -> MouseOutcome {
-        let dragged = self.view.selection().is_some_and(|s| !s.is_empty());
-        match self.view.selection_text() {
-            Some(text) if dragged && !text.is_empty() => MouseOutcome::Copy(text),
-            _ => {
-                self.view.clear_selection();
-                MouseOutcome::Handled
-            }
-        }
-    }
-
-    /// Forward a buffered click (press at `c0,r0`, release at `cr,rr`) to the
-    /// program as a press immediately followed by a release.
-    fn forward_click(
-        &self,
-        c0: u16,
-        r0: u16,
-        cr: u16,
-        rr: u16,
-        placement: &Placement,
-    ) -> MouseOutcome {
-        let modes = self.mouse_modes();
-        let ev = |action, col, row| input::MouseEvent {
-            action,
-            button: input::MouseButton::Left,
-            col,
-            row,
-            mods: Modifiers::default(),
-        };
-        let mut bytes = Vec::new();
-        if let Some(down) = input::encode_mouse(&ev(input::MouseAction::Press, c0, r0), modes, placement) {
-            bytes.extend_from_slice(&down);
-        }
-        if let Some(up) = input::encode_mouse(&ev(input::MouseAction::Release, cr, rr), modes, placement) {
-            bytes.extend_from_slice(&up);
-        }
-        if bytes.is_empty() {
-            MouseOutcome::Ignored
-        } else {
-            MouseOutcome::Forward(bytes)
-        }
+        let placement = viewport::fit(self.session_size, viewer);
+        self.gesture.handle(&mut self.view, &ev, &placement)
     }
 
     /// Paint the pane into `area`, clipping or letterboxing the session grid.
@@ -489,33 +283,27 @@ fn render_grid(
 /// terminal (or through an outer multiplexer) that cannot carry 24-bit color.
 fn cell_style(cell: &Cell, truecolor: bool) -> Style {
     let (mut fg, mut bg) = (conv_color(cell.fg, truecolor), conv_color(cell.bg, truecolor));
-    let f = cell.flags;
-    if f.contains(Flags::INVERSE) {
+    let a = CellAttrs::from_flags(cell.flags);
+    if a.inverse {
         std::mem::swap(&mut fg, &mut bg);
     }
     let mut style = Style::default().fg(fg).bg(bg);
-    if f.contains(Flags::BOLD) {
+    if a.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if f.contains(Flags::DIM) {
+    if a.dim {
         style = style.add_modifier(Modifier::DIM);
     }
-    if f.contains(Flags::ITALIC) {
+    if a.italic {
         style = style.add_modifier(Modifier::ITALIC);
     }
-    if f.intersects(
-        Flags::UNDERLINE
-            | Flags::DOUBLE_UNDERLINE
-            | Flags::UNDERCURL
-            | Flags::DOTTED_UNDERLINE
-            | Flags::DASHED_UNDERLINE,
-    ) {
+    if a.underline != Underline::None {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
-    if f.contains(Flags::HIDDEN) {
+    if a.hidden {
         style = style.add_modifier(Modifier::HIDDEN);
     }
-    if f.contains(Flags::STRIKEOUT) {
+    if a.strikethrough {
         style = style.add_modifier(Modifier::CROSSED_OUT);
     }
     style

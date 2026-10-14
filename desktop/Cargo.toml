@@ -51,11 +51,18 @@ shelbi-core = { path = "../crates/shelbi-core" }
 shelbi-palette = { path = "../crates/shelbi-palette" }
 shelbi-orchestrator = { path = "../crates/shelbi-orchestrator" }
 
-# Feed events cross to gpui's foreground over a futures channel (already in
-# gpui's tree); window state is JSON.
+# The emulator `shelbi-term` drives (its grid and cell types are part of
+# shelbi-term's API): the same vendored fork the root workspace uses.
+alacritty_terminal = { path = "../vendor/alacritty_terminal" }
+
+# Feed events and the terminal element's output cross to gpui's foreground
+# over a futures channel (already in gpui's tree); window state is JSON.
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# `--visual-check` only (feature `visual-check`): save rendered frames.
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 # Bootstrap publishes its states from a std thread to the UI's async task.
 # Already in gpui's tree.
@@ -66,6 +73,14 @@ markdown = "=1.0.0"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[features]
+# `cargo run --features visual-check -- --visual-check <dir>`: render the
+# terminal element offscreen (gpui's Metal render-to-image, no screen or
+# permission needed), drive simulated keys and mouse into a fake session, and
+# save the frames. A developer tool, off by default: it builds gpui with its
+# `test-support` feature.
+visual-check = ["gpui_platform/test-support", "dep:image"]
 
 [dev-dependencies]
 # gpui's test context (`#[gpui::test]`, `VisualTestContext`) for view tests.

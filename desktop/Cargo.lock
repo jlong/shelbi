@@ -2641,6 +2641,7 @@ dependencies = [
  "gpui-pre-linux",
  "gpui-pre-macos",
  "gpui-pre-web",
+ "gpui-pre-wgpu",
  "gpui-pre-windows",
 ]
 
@@ -2797,6 +2798,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-collections",
  "gpui-pre-util",
+ "image",
  "itertools 0.14.0",
  "log",
  "parking_lot",
@@ -6410,12 +6412,14 @@ dependencies = [
 name = "shelbi-desktop"
 version = "0.10.0"
 dependencies = [
+ "alacritty_terminal",
  "async-channel",
  "chrono",
  "futures",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
+ "image",
  "markdown",
  "serde",
  "serde_json",

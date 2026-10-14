@@ -14,8 +14,11 @@ mod keys;
 mod platform;
 mod projects;
 mod refresh;
+mod spike;
 mod theme;
 mod views;
+#[cfg(feature = "visual-check")]
+mod visual_check;
 mod window_state;
 
 use gpui::{actions, App, KeyBinding, Menu, MenuItem, SystemMenuType};
@@ -31,10 +34,55 @@ const APP_NAME: &str = "Shelbi";
 // `QuitShelbi`, which stops every agent, is a separate command).
 actions!(shelbi_desktop, [Quit]);
 
+/// What the command line asked for.
+enum Mode {
+    /// The app, on the launch project (`projects::launch_project` reads the
+    /// optional project argument itself).
+    App,
+    /// `--spike <session>`: one terminal element on one session, bypassing
+    /// the project shell.
+    Spike(String),
+    /// `--visual-check [dir]`: render the terminal element offscreen and
+    /// check its input handling (feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    VisualCheck(Option<String>),
+}
+
+fn parse_args() -> Mode {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => Mode::App,
+        Some("--spike") => match args.next() {
+            Some(session) => Mode::Spike(session),
+            None => usage("--spike needs a session (see `shelbi session ls`)"),
+        },
+        #[cfg(feature = "visual-check")]
+        Some("--visual-check") => Mode::VisualCheck(args.next()),
+        Some(project) if !project.starts_with('-') => Mode::App,
+        Some(other) => usage(&format!("unknown argument `{other}`")),
+    }
+}
+
+fn usage(problem: &str) -> ! {
+    eprintln!(
+        "shelbi-desktop: {problem}\nusage: shelbi-desktop [<project>] | --spike <session>"
+    );
+    std::process::exit(2);
+}
+
 fn main() {
     init_logging();
-    // The launch project: a local read before any window exists.
-    let launch = projects::launch_project();
+    let mode = parse_args();
+    #[cfg(feature = "visual-check")]
+    if let Mode::VisualCheck(dir) = mode {
+        visual_check::run(visual_check::out_dir(dir));
+    }
+    // The launch project: a local read before any window exists (the spike
+    // has none).
+    let launch = match mode {
+        Mode::App => projects::launch_project(),
+        _ => None,
+    };
 
     gpui_platform::application()
         .with_assets(assets::Assets)
@@ -56,6 +104,19 @@ fn main() {
                 MenuItem::action(format!("Quit {APP_NAME}"), Quit),
             ])]);
 
+            // Closing the last window quits the app (its agents keep running).
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+
+            if let Mode::Spike(session) = mode {
+                spike::open(session, cx);
+                return;
+            }
+
             // The project list and each project's config skeleton, read in
             // the background so a switch paints the target's chrome at once.
             let catalog = Catalog::default();
@@ -70,14 +131,6 @@ fn main() {
                 shelbi_client::fresh_client_id(),
                 Some(ControlWatcher::spawn()),
             ));
-
-            // Closing the last window quits the app (its agents keep running).
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
 
             match launch {
                 Some(project) => app::open_or_focus(&project, cx),
