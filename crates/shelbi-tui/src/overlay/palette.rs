@@ -573,6 +573,16 @@ impl Palette {
         self.inner.selected()
     }
 
+    /// Focus the Projects column (the bare "Switch Project").
+    pub fn focus_projects(&mut self) {
+        self.inner.focus_projects();
+    }
+
+    /// Whether the Projects column holds focus.
+    pub fn projects_focused(&self) -> bool {
+        self.inner.focus() == shared::PaletteFocus::Projects
+    }
+
     /// The fuzzy-filtered results for the current query.
     pub fn results(&self) -> Vec<(Entry, u16)> {
         self.inner.results()

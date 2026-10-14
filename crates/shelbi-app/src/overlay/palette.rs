@@ -147,6 +147,16 @@ impl Palette {
         self.focus
     }
 
+    /// Move focus to the Projects column's first row (the bare "Switch
+    /// Project" lands here). A palette with no Projects column keeps the
+    /// commands focused.
+    pub fn focus_projects(&mut self) {
+        if !self.projects.is_empty() {
+            self.focus = PaletteFocus::Projects;
+            self.project_selected = 0;
+        }
+    }
+
     pub fn projects(&self) -> &[ProjectEntry] {
         &self.projects
     }

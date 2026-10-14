@@ -343,6 +343,14 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             }
         }
 
+        // An `edit:*` command asked for the user's editor: hand it the terminal
+        // and wait (the editor owns the screen meanwhile), then repaint.
+        if let Some(path) = state.pending_editor.take() {
+            state.status = Some(run_editor(&mut term, &path));
+            state.reported_main = None;
+            state.dirty = true;
+        }
+
         // Background sources (all non-blocking). A daemon change notification
         // triggers an immediate refresh; the periodic request is the fallback.
         // These read the current project's worker bundle, which a project switch
@@ -749,6 +757,42 @@ impl Bootstrap for DaemonBootstrap {
     }
 }
 
+/// What the palette reads from disk besides the sidebar model: the other
+/// registered projects (switch targets and the Projects column) and the edit
+/// targets that exist. Behind a trait so a test can open the palette over a
+/// fixed project list without touching the real Shelbi root.
+trait PaletteInputs: Send + Sync {
+    /// The registered projects other than `project`, as switch targets.
+    fn other_projects(&self, project: &str) -> Vec<shelbi_app::command::ProjectItem>;
+    /// The `edit:*` targets that exist on disk for `project`.
+    fn edit_targets(&self, project: &str) -> Vec<shelbi_app::command::EditItem>;
+    /// The palette's Projects column, `current` leading.
+    fn projects_column(&self, current: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry>;
+}
+
+/// The production [`PaletteInputs`]: small local reads of the Shelbi root.
+struct DiskPaletteInputs;
+
+impl PaletteInputs for DiskPaletteInputs {
+    fn other_projects(&self, project: &str) -> Vec<shelbi_app::command::ProjectItem> {
+        shelbi_state::list_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.name != project)
+            .map(|p| shelbi_app::command::ProjectItem {
+                label: p.display_label().to_string(),
+                slug: p.name,
+            })
+            .collect()
+    }
+    fn edit_targets(&self, project: &str) -> Vec<shelbi_app::command::EditItem> {
+        shelbi_app::command_model::edit_targets(project)
+    }
+    fn projects_column(&self, current: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+        overlays::build_projects_column(current)
+    }
+}
+
 /// The background workers bound to one project: the core snapshot refresher that
 /// feeds the sidebar / board / machines views, the activity refresher that feeds
 /// the activity feed, plus the two hub-socket subscribers (daemon change
@@ -1036,6 +1080,17 @@ struct ShellState {
     /// finishes. Blocking commands (e.g. the Zen toggle) run here so they never
     /// freeze the one event loop.
     job: Option<Receiver<String>>,
+    /// A file (or directory) to open in the user's editor. The run loop takes it
+    /// after handling input: it hands the terminal to the editor and waits, then
+    /// restores the shell (the TUI's half of the palette's `edit:*` commands).
+    pending_editor: Option<PathBuf>,
+    /// Where the palette's on-disk inputs come from (disk in production).
+    palette_inputs: Arc<dyn PaletteInputs>,
+    /// Test seam: when set, [`ShellState::dispatch_effect`] records each effect
+    /// here instead of performing it, so a smoke test can assert what a UI path
+    /// reached without running the effect.
+    #[cfg(test)]
+    effect_tap: Option<Vec<Effect>>,
     /// A pending off-UI-thread add-project scaffold. Separate from [`Self::job`]
     /// because on success the shell must switch to the new project on the UI
     /// thread, so the result is typed ([`CreateOutcome`]) rather than a bare
@@ -1148,6 +1203,10 @@ impl ShellState {
             palette_chord,
             status: None,
             job: None,
+            pending_editor: None,
+            palette_inputs: Arc::new(DiskPaletteInputs),
+            #[cfg(test)]
+            effect_tap: None,
             create_job: None,
             should_quit: false,
             dirty: true,
@@ -1187,6 +1246,12 @@ impl ShellState {
                 let status = ws_status_from_model(&sidebar, ws.workspace());
                 ws.set_header_status(status);
             }
+            // An open review's server line follows its sidebar row, as the
+            // desktop's Review view does.
+            if let Some(review) = self.review.as_mut() {
+                let row = sidebar.reviews.iter().find(|r| r.task_id == review.task_id());
+                review.set_server(row);
+            }
             self.sidebar_model = Some(sidebar);
             // Keep an open palette's command list warm as the board refreshes.
             // Compute the entries first so the `&mut self.overlay` borrow doesn't
@@ -1224,7 +1289,13 @@ impl ShellState {
             return Vec::new();
         };
         let other_clients_attached = self.other_clients.load(Ordering::SeqCst) > 0;
-        let model = overlays::build_command_model(project, sidebar, other_clients_attached);
+        let model = shelbi_app::command_model::command_model_from(
+            project,
+            sidebar,
+            other_clients_attached,
+            self.palette_inputs.other_projects(project),
+            self.palette_inputs.edit_targets(project),
+        );
         CommandRegistry::new().entries(&model)
     }
 
@@ -1840,9 +1911,18 @@ impl ShellState {
         let projects = self
             .client
             .project()
-            .map(overlays::build_projects_column)
+            .map(|p| self.palette_inputs.projects_column(p))
             .unwrap_or_default();
         self.overlay = Some(ActiveOverlay::palette(entries, projects));
+    }
+
+    /// The bare "Switch Project": the palette with its Projects column focused,
+    /// the TUI's project switcher.
+    fn open_project_switcher(&mut self) {
+        self.open_palette();
+        if let Some(ActiveOverlay::Palette(p)) = &mut self.overlay {
+            p.focus_projects();
+        }
     }
 
     /// Act on what the active overlay yielded.
@@ -2061,30 +2141,30 @@ impl ShellState {
     }
 
     /// Carry out a command [`Effect`]. Navigation effects change the main view
-    /// directly; the error log and Zen intro open as overlays; the Zen toggle
-    /// runs off the UI thread. Effects whose home is a later Phase 4 subtask
-    /// (switch/add/quit project, opening an external editor, loading a review)
-    /// surface a status note rather than silently doing nothing.
+    /// directly; the error log, the add-project form, the reject prompt and the
+    /// Zen intro open as overlays; an `edit:*` target opens in the user's
+    /// editor; mutations run off the UI thread. Every effect and every
+    /// mutation has its own arm (no catch-all), so a new one fails to compile
+    /// until the TUI handles it.
     fn dispatch_effect(&mut self, effect: Effect) {
+        #[cfg(test)]
+        if let Some(tap) = self.effect_tap.as_mut() {
+            tap.push(effect);
+            return;
+        }
         match effect {
             Effect::ShowView(v) => self.show_view_effect(v),
             Effect::FocusWorkspace { workspace, .. } => {
                 self.show(RowTarget::Session(SessionRef::Workspace(workspace)))
             }
             Effect::LoadReview { task_id, .. } => self.begin_review(task_id),
-            Effect::FocusSession { session } => {
-                self.status = Some(format!(
-                    "focus session {session} — legacy spawned agents aren't shown here yet"
-                ))
-            }
             Effect::OpenErrorLog { project } => {
                 self.overlay = Some(ActiveOverlay::error_log(project));
             }
-            Effect::OpenEditor { target } => {
-                self.status = Some(format!(
-                    "edit {target:?} — opening an external editor lands in a later Phase 4 subtask"
-                ))
-            }
+            Effect::OpenEditor { target } => self.open_editor(&target),
+            // A bare switch (the palette's "Switch Project") picks the target in
+            // the Projects column; a named one switches.
+            Effect::SwitchProject { project } if project.is_empty() => self.open_project_switcher(),
             Effect::SwitchProject { project } => self.switch_project(&project),
             Effect::AddProject => {
                 // Open the in-process add-project form over the main area. On
@@ -2101,8 +2181,8 @@ impl ShellState {
             Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),
             // The palette's review decisions. Approving the review that is open
             // here goes through its panel (so the panel holds while it merges);
-            // any other runs off the UI thread with a status line. Reject always
-            // asks for the reason first.
+            // any other runs off the UI thread with a status line. Reject asks
+            // for the reason first unless one came with it.
             Effect::Mutate(Mutation::ApproveReview { project, id }) => {
                 if self.review.as_ref().map(|r| r.task_id()) == Some(id.as_str()) {
                     self.apply_review_action(ReviewAction::Approve);
@@ -2117,12 +2197,52 @@ impl ShellState {
                     });
                 }
             }
-            Effect::Mutate(Mutation::RejectReview { id, .. }) => {
+            Effect::Mutate(Mutation::RejectReview { id, reason, .. }) if reason.trim().is_empty() => {
                 self.overlay = Some(ActiveOverlay::reject_reason(id));
             }
-            Effect::Mutate(other) => {
-                self.status = Some(format!("mutation {other:?} is not reachable from the palette"))
+            Effect::Mutate(m @ Mutation::RejectReview { .. }) => {
+                self.spawn_mutation(m, "rejected", "reject failed")
             }
+            // The form's submit, wherever it came from: validate, scaffold, switch.
+            Effect::Mutate(Mutation::AddProject { name, root, mode }) => {
+                self.submit_add_project(name, root, mode)
+            }
+            // The board's card mutations. The embedded board sends its own
+            // through its move persister; one arriving here (no palette entry
+            // produces them) goes straight to the daemon.
+            Effect::Mutate(m @ Mutation::MoveIssue { .. }) => self.spawn_mutation(m, "moved", "move failed"),
+            Effect::Mutate(m @ Mutation::StartIssue { .. }) => {
+                self.spawn_mutation(m, "started", "start failed")
+            }
+            Effect::Mutate(m @ Mutation::AssignIssue { .. }) => {
+                self.spawn_mutation(m, "assigned", "assign failed")
+            }
+            Effect::Mutate(m @ Mutation::EditIssue { .. }) => self.spawn_mutation(m, "edited", "edit failed"),
+            Effect::Mutate(m @ Mutation::AddIssue { .. }) => self.spawn_mutation(m, "added", "add failed"),
+            Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
+                self.spawn_mutation(m, "reordered", "reorder failed")
+            }
+        }
+    }
+
+    /// Send `m` to the daemon off the UI thread; the status line reports `done`
+    /// or `failed: <why>`.
+    fn spawn_mutation(&mut self, m: Mutation, done: &'static str, failed: &'static str) {
+        self.spawn_job(move || match run_review_mutation(&m) {
+            Ok(()) => done.to_string(),
+            Err(e) => format!("{failed}: {e}"),
+        });
+    }
+
+    /// Open an `edit:*` target in the user's editor: the run loop hands the
+    /// terminal over on its next turn ([`run_editor`]).
+    fn open_editor(&mut self, target: &shelbi_app::EditTarget) {
+        let Some(project) = self.client.project() else {
+            return;
+        };
+        match shelbi_app::command_model::edit_target_path(project, target) {
+            Some(path) => self.pending_editor = Some(path),
+            None => self.status = Some("couldn't find that file to edit".to_string()),
         }
     }
 
@@ -3470,6 +3590,22 @@ fn draw(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut ShellState,
 ) -> Result<()> {
+    // Bracket the frame in a synchronized update so the terminal never shows
+    // it half-painted.
+    let begin = execute!(io::stdout(), BeginSynchronizedUpdate);
+    let res = draw_frame(term, state);
+    if begin.is_ok() {
+        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+    }
+    res
+}
+
+/// Paint one frame of the shell on `term`: the production terminal, or a
+/// `TestBackend` in the smoke tests.
+fn draw_frame<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    state: &mut ShellState,
+) -> Result<()> {
     // Compute layout up front so we can report the main-area size to the live
     // session before painting.
     let full = Rect {
@@ -3567,7 +3703,6 @@ fn draw(
     let sessions = &state.sessions;
 
     let mut cursor: Option<(u16, u16)> = None;
-    let begin = execute!(io::stdout(), BeginSynchronizedUpdate);
     let res = term.draw(|frame| {
         // Native views render through the `Frame` (their own `render_full`), so
         // they must run before the shared buffer is taken below.
@@ -3710,9 +3845,6 @@ fn draw(
     state.overlay = overlay;
     state.review = review;
     state.workspace = workspace;
-    if begin.is_ok() {
-        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
-    }
     res.context("drawing the shell")?;
     Ok(())
 }
@@ -4090,21 +4222,52 @@ fn restore_terminal() {
 /// the terminal supports it. Restores everything on drop and on panic.
 struct RawGuard;
 
+/// Raw mode, the alternate screen, mouse/focus/paste capture and the kitty
+/// keyboard push: what [`RawGuard::enter`] sets up and [`restore_terminal`]
+/// undoes. Also re-entered after an external editor had the terminal.
+fn enter_terminal_modes() -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut out = io::stdout();
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange,
+        EnableBracketedPaste,
+    )?;
+    let _ = execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    Ok(())
+}
+
+/// Run the user's editor (`shelbi_state::resolve_editor`: the config's
+/// `editor`, then `$EDITOR`, then vim) on `path` in the foreground: leave the
+/// shell's terminal modes, wait for the editor, restore them, and force a full
+/// repaint. Returns the status line to show. The loop's input reader is on
+/// this thread, so nothing competes with the editor for keys.
+fn run_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, path: &std::path::Path) -> String {
+    let editor = shelbi_state::resolve_editor();
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vim").to_string();
+    restore_terminal();
+    let outcome = std::process::Command::new(&program)
+        .args(parts)
+        .arg(path)
+        .status();
+    let _ = enter_terminal_modes();
+    let _ = term.clear();
+    match outcome {
+        Ok(status) if status.success() => format!("edited {}", path.display()),
+        Ok(status) => format!("{program} exited with {status}"),
+        Err(e) => format!("couldn't start the editor `{editor}`: {e}"),
+    }
+}
+
 impl RawGuard {
     fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        let mut out = io::stdout();
-        execute!(
-            out,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableFocusChange,
-            EnableBracketedPaste,
-        )?;
-        let _ = execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        enter_terminal_modes()?;
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore_terminal();
@@ -6763,6 +6926,208 @@ mod tests {
             vec!["quit_project:proj".to_string()],
             "the palette's quit-project must reach the daemon lifecycle command",
         );
+    }
+
+    /// Fixed palette inputs for the smoke test: one other project and every
+    /// edit target, read from nowhere.
+    struct FixturePaletteInputs;
+
+    impl PaletteInputs for FixturePaletteInputs {
+        fn other_projects(&self, _project: &str) -> Vec<shelbi_app::command::ProjectItem> {
+            vec![shelbi_app::command::ProjectItem {
+                slug: "beta".into(),
+                label: "Beta".into(),
+            }]
+        }
+        fn edit_targets(&self, _project: &str) -> Vec<shelbi_app::command::EditItem> {
+            use shelbi_app::command::EditItem;
+            use shelbi_app::EditTarget;
+            vec![
+                EditItem {
+                    target: EditTarget::Project,
+                    title: "Edit Project Settings".into(),
+                },
+                EditItem {
+                    target: EditTarget::Agent("developer".into()),
+                    title: "Edit developer Settings".into(),
+                },
+                EditItem {
+                    target: EditTarget::ZenMode,
+                    title: "Edit Zen Mode".into(),
+                },
+                EditItem {
+                    target: EditTarget::Workflows,
+                    title: "Edit Workflows".into(),
+                },
+            ]
+        }
+        fn projects_column(&self, current: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+            shelbi_app::command_model::projects_column_from(
+                current,
+                vec![("proj".into(), "proj".into()), ("beta".into(), "Beta".into())],
+                &Default::default(),
+            )
+        }
+    }
+
+    /// A shell whose palette lists every kind of registry command: the nav
+    /// views, a workspace, a review (with its approve / reject), another
+    /// project, every edit target, and a second attached client. Effects are
+    /// tapped, not performed.
+    fn smoke_state() -> ShellState {
+        let mut st = test_state();
+        st.palette_inputs = Arc::new(FixturePaletteInputs);
+        st.other_clients.store(1, Ordering::SeqCst);
+        if let Some(model) = st.sidebar_model.as_mut() {
+            model.reviews = vec![shelbi_app::view::ReviewRow {
+                task_id: "T-9".into(),
+                title: "Warm the cache".into(),
+                branch: "jlong/T-9".into(),
+                location: None,
+                workspace: None,
+                state: shelbi_app::view::ReviewState::Pending,
+            }];
+        }
+        st.effect_tap = Some(Vec::new());
+        st
+    }
+
+    fn type_key(st: &mut ShellState, c: char) {
+        let mods = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(c), mods)));
+    }
+
+    fn screen_text(term: &Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The TUI's palette smoke test: every command the registry offers is
+    /// run through the real UI path (Ctrl+Space opens the palette, the title is
+    /// typed, the arrows land on the entry, Enter runs it), the frame is drawn
+    /// on ratatui's `TestBackend` with the entry on screen, and the command's
+    /// effect is what reaches the executor.
+    #[test]
+    fn every_registry_command_runs_from_the_palette() {
+        let mut st = smoke_state();
+        let model = shelbi_app::command_model::command_model_from(
+            "proj",
+            st.sidebar_model.as_ref().unwrap(),
+            true,
+            FixturePaletteInputs.other_projects("proj"),
+            FixturePaletteInputs.edit_targets("proj"),
+        );
+        let commands = CommandRegistry::new().commands(&model);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
+        let mut ran = Vec::new();
+        for command in &commands {
+            st.overlay = None;
+            st.client.focus_main();
+            st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+            assert!(
+                matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
+                "Ctrl+Space opens the palette for {}",
+                command.id()
+            );
+            for c in command.title().chars() {
+                type_key(&mut st, c);
+            }
+            // Walk the selection down to the entry (a fuzzy query can rank a
+            // sibling first, as it would for a user).
+            for _ in 0..commands.len() {
+                let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+                    panic!("the palette stays open while typing");
+                };
+                let results = p.results();
+                let at = results
+                    .iter()
+                    .position(|(e, _)| e.id == command.id())
+                    .unwrap_or_else(|| panic!("typing {:?} finds {}", command.title(), command.id()));
+                if p.selected() == at {
+                    break;
+                }
+                assert!(p.selected() < at, "{} is below the selection", command.id());
+                st.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+            }
+            draw_frame(&mut term, &mut st).unwrap();
+            let screen = screen_text(&term);
+            let shown: String = command.title().chars().take(16).collect();
+            assert!(screen.contains(&shown), "{} is on screen:\n{screen}", command.id());
+
+            st.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(st.overlay.is_none(), "Enter closes the palette for {}", command.id());
+            let tap = st.effect_tap.as_ref().unwrap();
+            assert_eq!(
+                tap.last(),
+                Some(&command.effect("proj")),
+                "{} reached the executor",
+                command.id()
+            );
+            ran.push(command.id().to_string());
+        }
+        // Every registry command, the ones hidden until typed included.
+        assert_eq!(ran.len(), commands.len());
+        for id in [
+            "view:orch",
+            "view:tasks",
+            "view:activity",
+            "view:machines",
+            "action:toggle-zen",
+            "workspace:alpha",
+            "review:T-9",
+            "action:approve-review:T-9",
+            "action:reject-review:T-9",
+            "action:error-log",
+            "action:switch-project",
+            "action:switch-project:beta",
+            "action:add-project",
+            "edit:project",
+            "edit:agent:developer",
+            "edit:zenmode",
+            "edit:workflows",
+            "action:detach",
+            "action:detach-others",
+            "action:quit-project",
+            "action:quit-shelbi",
+        ] {
+            assert!(ran.iter().any(|r| r == id), "{id} was walked");
+        }
+    }
+
+    #[test]
+    fn a_bare_switch_project_opens_the_projects_column() {
+        let mut st = smoke_state();
+        st.effect_tap = None;
+        st.dispatch_effect(Effect::SwitchProject {
+            project: String::new(),
+        });
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette opens as the switcher");
+        };
+        assert!(p.projects_focused(), "on the Projects column");
+        assert_eq!(st.client.project(), Some("proj"), "nothing switched yet");
+    }
+
+    #[test]
+    fn an_edit_target_queues_the_editor_for_the_run_loop() {
+        let mut st = smoke_state();
+        st.effect_tap = None;
+        st.dispatch_effect(Effect::OpenEditor {
+            target: shelbi_app::EditTarget::ZenMode,
+        });
+        let path = st.pending_editor.clone().expect("the editor is queued");
+        assert!(path.ends_with("zenmode.md"), "{}", path.display());
     }
 
     #[test]

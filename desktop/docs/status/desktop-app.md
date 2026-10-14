@@ -25,7 +25,11 @@
 
 ## What's left
 
-Everything the `dt-*` subtasks own; see the table in `../../README.md`.
+At the foundation, everything the `dt-*` subtasks owned. All of them have
+landed; `dt-parity-audit` removed the not-implemented stub described above
+and recorded parity with the TUI in `../parity.md`. The status of every
+subtask is indexed in `../README.md`; what remains open is the "Known gaps"
+list in `../parity.md`.
 
 ## Decisions
 

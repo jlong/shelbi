@@ -20,8 +20,6 @@ use ratatui::Frame;
 
 use std::path::Path;
 
-use shelbi_app::command::CommandModel;
-use shelbi_app::view::SidebarModel;
 use std::collections::HashMap;
 
 use shelbi_core::{Column, ConfigMode};
@@ -465,18 +463,6 @@ fn confirm_event(task_id: &str, outcome: overlay::review_confirm::Outcome) -> Ov
     }
 }
 
-/// Build the palette's [`CommandModel`] from the shell's live sidebar model plus
-/// a few light on-disk reads (the other projects and the edit targets). Shared
-/// with the desktop app ([`shelbi_app::command_model`]), so both clients list
-/// the same entries in the same order.
-pub fn build_command_model(
-    project: &str,
-    sidebar: &SidebarModel,
-    other_clients_attached: bool,
-) -> CommandModel {
-    shelbi_app::command_model::build_command_model(project, sidebar, other_clients_attached)
-}
-
 /// Build the palette's Projects column from the registered projects on disk
 /// ([`shelbi_app::command_model::build_projects_column`]): the current project
 /// leads (filled `●`), other open projects get the green ring (`○`), and
@@ -500,7 +486,9 @@ mod tests {
     use ratatui::style::{Modifier, Style};
     use ratatui::Terminal;
     use shelbi_app::nav::View;
-    use shelbi_app::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, WorkspaceRow};
+    use shelbi_app::view::{
+        NavItem, ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -911,14 +899,14 @@ mod tests {
             unread_errors: 0,
             session_lost: None,
         };
-        let m = build_command_model("alpha", &sidebar, false);
+        let m = shelbi_app::command_model::command_model_from("alpha", &sidebar, false, Vec::new(), Vec::new());
         assert_eq!(m.project.as_deref(), Some("alpha"));
         assert!(m.zen_on);
         let view_ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
         assert!(view_ids.contains(&"view:orch"));
         assert!(view_ids.contains(&"view:tasks"));
         // Machines is palette-only now: it isn't in the sidebar nav, but
-        // `build_command_model` adds its command so Ctrl+P → Machines works.
+        // `command_model_from` adds its command so Ctrl+P → Machines works.
         assert!(
             view_ids.contains(&"view:machines"),
             "Machines reachable from the palette, got: {view_ids:?}"
@@ -963,7 +951,7 @@ mod tests {
             unread_errors: 0,
             session_lost: None,
         };
-        let m = build_command_model("alpha", &sidebar, false);
+        let m = shelbi_app::command_model::command_model_from("alpha", &sidebar, false, Vec::new(), Vec::new());
         let machines = m.views.iter().filter(|v| v.id == "view:machines").count();
         assert_eq!(machines, 1, "exactly one Machines command");
     }
@@ -995,7 +983,7 @@ mod tests {
         };
 
         let ids = |others: bool| -> Vec<String> {
-            let m = build_command_model("alpha", &sidebar, others);
+            let m = shelbi_app::command_model::command_model_from("alpha", &sidebar, others, Vec::new(), Vec::new());
             CommandRegistry::new()
                 .entries(&m)
                 .into_iter()

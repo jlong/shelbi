@@ -318,8 +318,6 @@ pub enum Placement {
     GoWorkspace,
     /// Go ▸ Reviews ▸ <task>: open, approve, reject.
     GoReview,
-    /// Go ▸ Agents (legacy spawned sessions).
-    GoAgent,
     /// View: the Zen toggle and the error log.
     View,
     /// File: add / switch project, open project, edit configuration.
@@ -338,7 +336,6 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::LoadReview { .. } => Placement::GoReview,
         CommandKind::ApproveReview { .. } => Placement::GoReview,
         CommandKind::RejectReview { .. } => Placement::GoReview,
-        CommandKind::FocusSession { .. } => Placement::GoAgent,
         CommandKind::ToggleZen => Placement::View,
         CommandKind::OpenErrorLog => Placement::View,
         CommandKind::SwitchProject { .. } => Placement::File,
@@ -568,16 +565,6 @@ fn go_menu<'a, I: Iterator<Item = &'a Command>>(
         })
         .collect();
     items.push(submenu("Reviews", reviews, "No Reviews"));
-
-    let agents: Vec<MenuEntry> = by_place(Placement::GoAgent)
-        .map(|c| command(c, c.title()))
-        .collect();
-    if !agents.is_empty() {
-        items.push(MenuEntry::Submenu {
-            title: "Agents".into(),
-            items: agents,
-        });
-    }
     MenuSpec {
         title: "Go".into(),
         items,
@@ -683,7 +670,7 @@ impl MenuTree {
 mod tests {
     use super::*;
     use shelbi_app::command::{
-        AgentItem, EditItem, ProjectItem, ReviewItem, ViewItem, WorkspaceItem,
+        EditItem, ProjectItem, ReviewItem, ViewItem, WorkspaceItem,
     };
     use shelbi_app::{EditTarget, View};
 
@@ -695,7 +682,7 @@ mod tests {
         shelbi_state::keymap::validate_keymaps_yaml(yaml, None).0
     }
 
-    /// A project with two nav views, a workspace, a review, a legacy agent,
+    /// A project with two nav views, a workspace, a review,
     /// another project, an edit target and a second client.
     fn fixture() -> CommandModel {
         let view = |id: &str, title: &str, view: View| ViewItem {
@@ -722,11 +709,6 @@ mod tests {
                 task_id: "T-1".into(),
                 title: "Fix the thing".into(),
                 subtitle: None,
-                decoration: None,
-            }],
-            legacy_agents: vec![AgentItem {
-                session: "scratch".into(),
-                title: "scratch".into(),
                 decoration: None,
             }],
             other_projects: vec![ProjectItem {
@@ -845,12 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn go_lists_views_workspaces_reviews_and_agents() {
+    fn go_lists_views_workspaces_and_reviews() {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
         let go = tree.menu("Go").unwrap();
         assert_eq!(
             titles(&go.items),
-            ["Orchestrator", "Issues", "Machines", "-", "Workspaces ▸", "Reviews ▸", "Agents ▸"]
+            ["Orchestrator", "Issues", "Machines", "-", "Workspaces ▸", "Reviews ▸"]
         );
         let MenuEntry::Submenu { items: reviews, .. } = &go.items[5] else {
             panic!("reviews submenu");
@@ -876,7 +858,6 @@ mod tests {
         let model = CommandModel {
             workspaces: vec![],
             reviews: vec![],
-            legacy_agents: vec![],
             other_projects: vec![],
             edit_targets: vec![],
             ..fixture()
@@ -885,8 +866,6 @@ mod tests {
         for placeholder in ["No Workspaces", "No Reviews", "No Other Projects", "Nothing to Edit"] {
             assert!(!find(&tree, placeholder).enabled, "{placeholder}");
         }
-        // No legacy agents: no Agents submenu at all.
-        assert!(!titles(&tree.menu("Go").unwrap().items).contains(&"Agents ▸".to_string()));
     }
 
     #[test]

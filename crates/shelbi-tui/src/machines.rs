@@ -32,7 +32,7 @@ use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REA
 use shelbi_app::theme::Tone;
 use shelbi_app::view::{
     reachability_label, remote_binary_label, truncate_chars, workspace_state_badge, MachineRow,
-    MachineWorkspace, MachinesModel,
+    MachineWorkspace, MachinesModel, SlotAssignment,
 };
 use shelbi_orchestrator::machine::{probe_host_reachability, Reachability};
 
@@ -349,6 +349,10 @@ fn machine_header_line(m: &MachineRow) -> Line<'static> {
     Line::from(spans)
 }
 
+/// One workspace row: name, observed state, agent, the assignment (as
+/// `shelbi workspace list` prints it) with the task's title, its branch, and a
+/// review slot's server state and URL. The desktop's Machines rows show the
+/// same cells (`desktop/src/views/machines.rs` `workspace_row`).
 fn workspace_line(w: &MachineWorkspace, selected: bool, width: u16) -> Line<'static> {
     let (badge, badge_tone) = workspace_state_badge(w.state);
     let badge_color = tone(badge_tone);
@@ -358,6 +362,7 @@ fn workspace_line(w: &MachineWorkspace, selected: bool, width: u16) -> Line<'sta
     } else {
         Style::default()
     };
+    let agent = w.agent.as_deref().unwrap_or("-");
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!("  {pointer}"), base),
         Span::styled(
@@ -365,12 +370,43 @@ fn workspace_line(w: &MachineWorkspace, selected: bool, width: u16) -> Line<'sta
             base.fg(palette().ansi_white),
         ),
         Span::styled(format!("{badge:<9}"), base.fg(badge_color)),
+        Span::styled(
+            format!("{:<12}", truncate_chars(agent, 11)),
+            base.fg(palette().ansi_gray),
+        ),
     ];
-    let task = match &w.current_task {
-        Some(t) => t.clone(),
-        None => "-".to_string(),
-    };
-    spans.push(Span::styled(task, base.fg(palette().ansi_gray)));
+    match &w.assignment {
+        SlotAssignment::Idle => {
+            spans.push(Span::styled("idle", base.fg(palette().ansi_dark_gray)));
+        }
+        assignment => {
+            spans.push(Span::styled(assignment.cell(), base.fg(palette().ansi_gray)));
+            if let Some(title) = &w.task_title {
+                spans.push(Span::styled(
+                    format!("  {}", truncate_chars(title, 48)),
+                    base.fg(palette().ansi_white),
+                ));
+            }
+        }
+    }
+    if let Some(branch) = &w.branch {
+        spans.push(Span::styled(
+            format!("  {}{}", shelbi_app::activity::BRANCH_ICON, truncate_chars(branch, 40)),
+            base.fg(palette().ansi_dark_gray),
+        ));
+    }
+    if let Some(review) = &w.review {
+        let label = review.label();
+        let color = if label == "serving" {
+            tone(Tone::Cyan)
+        } else {
+            tone(Tone::DarkGray)
+        };
+        spans.push(Span::styled(format!("  {label}"), base.fg(color)));
+        if let Some(url) = &review.url {
+            spans.push(Span::styled(format!(" {url}"), base.fg(tone(Tone::Cyan))));
+        }
+    }
     // Pad the selection highlight to the full row width so it reads as a bar.
     if selected {
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -450,6 +486,44 @@ mod tests {
             machines,
         });
         app
+    }
+
+    /// A workspace row carries the cells the desktop's Machines row shows:
+    /// the agent, the assignment with the task's title, the branch, and a
+    /// review slot's server state and URL.
+    #[test]
+    fn a_workspace_row_shows_agent_assignment_title_branch_and_review() {
+        let text = |w: &WorkspaceRow| -> String {
+            workspace_line(w, false, 200)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        let mut dev = ws("dev-1", Some(WorkspaceState::Working), Some("T-3"));
+        dev.agent = Some("developer".into());
+        dev.task_title = Some("Warm the cache".into());
+        dev.branch = Some("jlong/T-3".into());
+        let line = text(&dev);
+        for want in ["dev-1", "developer", "in_progress: T-3", "Warm the cache", "jlong/T-3"] {
+            assert!(line.contains(want), "{want} in {line:?}");
+        }
+
+        let mut review = ws("review-1", Some(WorkspaceState::Serving), None);
+        review.assignment = SlotAssignment::Review("T-9".into());
+        review.agent = Some("review".into());
+        review.review = Some(shelbi_app::view::ReviewSlot {
+            task_id: "T-9".into(),
+            state: shelbi_app::view::ReviewState::Serving,
+            url: Some("http://localhost:4101".into()),
+        });
+        let line = text(&review);
+        for want in ["review: T-9", "serving", "http://localhost:4101"] {
+            assert!(line.contains(want), "{want} in {line:?}");
+        }
+
+        let idle = text(&ws("dev-2", None, None));
+        assert!(idle.contains("idle") && idle.contains(" - "), "{idle:?}");
     }
 
     /// Machine headers (reachability, tags, the remote binary in each

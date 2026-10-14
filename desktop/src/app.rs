@@ -57,7 +57,7 @@ use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
 use shelbi_app::overlay::review_confirm::Slot;
 use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
 use shelbi_app::view::{SidebarModel, SidebarTarget};
-use shelbi_app::{CommandKind, CommandRegistry, Mutation};
+use shelbi_app::{CommandKind, CommandRegistry, EditTarget, Mutation};
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::AddProjectError;
 use shelbi_proto::control::DetachSelector;
@@ -234,7 +234,6 @@ enum Route {
 /// out with the window and its context in hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCall {
-    NotImplemented(String),
     ShowView(View),
     IssueCommand(CommandKind),
     SwitchProject(String),
@@ -250,12 +249,10 @@ pub enum HostCall {
     ApproveReview(String),
     AskRejectReason(String),
     RejectReview(String, String),
+    OpenEditor(EditTarget),
 }
 
 impl CommandHost for Vec<HostCall> {
-    fn not_implemented(&mut self, command_id: &str) {
-        self.push(HostCall::NotImplemented(command_id.to_string()));
-    }
     fn show_view(&mut self, view: &View) {
         self.push(HostCall::ShowView(view.clone()));
     }
@@ -300,6 +297,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn reject_review(&mut self, id: &str, reason: &str) {
         self.push(HostCall::RejectReview(id.to_string(), reason.to_string()));
+    }
+    fn open_editor(&mut self, target: &EditTarget) {
+        self.push(HostCall::OpenEditor(target.clone()));
     }
 }
 
@@ -402,8 +402,6 @@ pub struct ShelbiWindow {
     notifier: notify::Tracker,
     /// The user's notification switches (`desktop.notifications`).
     notify_prefs: DesktopNotifications,
-    /// The latest title each session reported.
-    session_titles: HashMap<String, String>,
     window_state: WindowState,
     /// Bumped on every state change worth saving; a debounced save only
     /// writes if no newer change followed it.
@@ -411,10 +409,58 @@ pub struct ShelbiWindow {
     _feed: Option<ProjectFeed>,
     _feed_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+    /// The shell has been drawn at least once (gpui has a frame to answer
+    /// action-availability questions from).
+    drawn_once: bool,
+    /// Test seam: when set, [`Self::run`] records the host calls a command
+    /// dispatches here instead of performing them, and the palette's inputs
+    /// stay the ones the test set (no disk read).
+    #[cfg(test)]
+    tap: Option<std::rc::Rc<std::cell::RefCell<Vec<HostCall>>>>,
 }
 
 impl ShelbiWindow {
     pub fn new(
+        project: &str,
+        window_state: WindowState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let shared_ready = cx.try_global::<Shell>().and_then(|s| s.ready.clone());
+        let mut this = Self::build(project, window_state, window, cx);
+        // The feed and keymaps only read local state: start them now, so the
+        // shell has data the moment bootstrap is done.
+        this.start_feed(window, cx);
+        this.load_keymaps(cx);
+        match shared_ready {
+            Some(ready) => this.on_ready(ready, cx),
+            None => this.start_bootstrap(cx),
+        }
+        this._subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
+            let b = window.window_bounds().get_bounds();
+            this.window_state.frame = Some(Frame {
+                x: b.origin.x.as_f32(),
+                y: b.origin.y.as_f32(),
+                width: b.size.width.as_f32(),
+                height: b.size.height.as_f32(),
+            });
+            this.schedule_save(cx);
+        }));
+        this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            this.active = window.is_window_active();
+            if this.active {
+                this.on_activated(cx);
+            }
+        }));
+        this.load_notify_prefs(cx);
+        window.set_window_title(&this.model.project_label);
+        this
+    }
+
+    /// The window's state with nothing started: no feed, no bootstrap, the
+    /// built-in keymaps. [`Self::new`] starts the live pieces on top; the
+    /// smoke test drives a window built here.
+    fn build(
         project: &str,
         window_state: WindowState,
         window: &mut Window,
@@ -435,7 +481,6 @@ impl ShelbiWindow {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let shared_ready = cx.try_global::<Shell>().and_then(|s| s.ready.clone());
         let mut this = ShelbiWindow {
             project: project.to_string(),
             boot: Boot::InFlight(BootstrapState::ResolvingEnv),
@@ -468,40 +513,16 @@ impl ShelbiWindow {
             active: false,
             notifier: notify::Tracker::new(project),
             notify_prefs: DesktopNotifications::default(),
-            session_titles: HashMap::new(),
             window_state,
             save_generation: 0,
             _feed: None,
             _feed_task: None,
             _subscriptions: Vec::new(),
+            drawn_once: false,
+            #[cfg(test)]
+            tap: None,
         };
         this.sync_selection();
-        // The feed and keymaps only read local state: start them now, so the
-        // shell has data the moment bootstrap is done.
-        this.start_feed(window, cx);
-        this.load_keymaps(cx);
-        match shared_ready {
-            Some(ready) => this.on_ready(ready, cx),
-            None => this.start_bootstrap(cx),
-        }
-        this._subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
-            let b = window.window_bounds().get_bounds();
-            this.window_state.frame = Some(Frame {
-                x: b.origin.x.as_f32(),
-                y: b.origin.y.as_f32(),
-                width: b.size.width.as_f32(),
-                height: b.size.height.as_f32(),
-            });
-            this.schedule_save(cx);
-        }));
-        this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
-            this.active = window.is_window_active();
-            if this.active {
-                this.on_activated(cx);
-            }
-        }));
-        this.load_notify_prefs(cx);
-        window.set_window_title(&this.model.project_label);
         this
     }
 
@@ -561,6 +582,10 @@ impl ShelbiWindow {
     /// Re-read the palette's (and the menus') inputs off the UI thread: other
     /// projects, edit targets, whether another client is attached.
     fn refresh_palette_inputs(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if self.tap.is_some() {
+            return;
+        }
         let project = self.project.clone();
         let control = self.ready().map(|r| r.control.clone());
         let client_id = cx
@@ -707,6 +732,8 @@ impl ShelbiWindow {
             }
             FeedEvent::Link(link) => self.link.replace(link) != Some(link),
             FeedEvent::Session(notice) => match notice.kind {
+                // The chat and workspace views draw their own sessions' titles;
+                // the window only turns the orchestrator's into notifications.
                 SessionNoticeKind::Title(title) => {
                     if notice.session == "orch" {
                         let changes = self
@@ -714,9 +741,9 @@ impl ShelbiWindow {
                             .observe_orchestrator(&title, &self.model.project_label);
                         self.apply_notices(changes, cx);
                     }
-                    self.session_titles.insert(notice.session, title.clone()) != Some(title)
+                    false
                 }
-                SessionNoticeKind::Exited => self.session_titles.remove(&notice.session).is_some(),
+                SessionNoticeKind::Exited => false,
             },
         };
         if changed {
@@ -935,6 +962,11 @@ impl ShelbiWindow {
     /// Run a registry command. While a relaunch is required (the CLI was
     /// upgraded under the app), commands that reach the daemon are refused.
     fn run(&mut self, kind: CommandKind, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Some(tap) = &self.tap {
+            commands::dispatch_command(&kind, &mut *tap.borrow_mut());
+            return;
+        }
         if self.relaunch_required() && commands::sends_to_daemon(&kind) {
             self.banner = Some("Shelbi was updated: relaunch before making changes.".into());
             cx.notify();
@@ -959,9 +991,6 @@ impl ShelbiWindow {
 
     fn perform(&mut self, call: HostCall, window: &mut Window, cx: &mut Context<Self>) {
         match call {
-            HostCall::NotImplemented(id) => {
-                self.banner = Some(commands::not_implemented_message(&id).into());
-            }
             HostCall::ShowView(view) => {
                 self.route = Route::View;
                 let chat = is_chat(&view);
@@ -1030,7 +1059,40 @@ impl ShelbiWindow {
                 self.open_overlay(ActiveOverlay::reject_reason(id), window, cx)
             }
             HostCall::RejectReview(id, reason) => self.reject(id, reason, window, cx),
+            HostCall::OpenEditor(target) => self.open_editor(target, cx),
         }
+    }
+
+    /// `edit:*`: open the target's file (the workflows directory for
+    /// `edit:workflows`) in the user's editor, the path the TUI opens
+    /// (`edit_target_path`). The lookup and the launch run off the UI thread;
+    /// a terminal editor opens in Terminal.app, a GUI editor directly.
+    fn open_editor(&mut self, target: EditTarget, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        let launch = cx.background_executor().spawn(async move {
+            let path = shelbi_app::command_model::edit_target_path(&project, &target)
+                .filter(|p| p.exists())
+                .ok_or_else(|| "Couldn't find that file to edit.".to_string())?;
+            let editor = shelbi_state::resolve_editor();
+            crate::views::external_edit::spawn(&crate::views::external_edit::launch_for(&editor, &path))?;
+            Ok::<_, String>(format!(
+                "Opened {} in {}.",
+                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                shelbi_state::editor_display_name(&editor)
+            ))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = launch.await;
+            this.update(cx, |this, cx| match result {
+                Ok(message) => this.flash(message, cx),
+                Err(e) => {
+                    this.banner = Some(e.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The board for the window's project, created on first use. Its
@@ -2292,59 +2354,24 @@ impl ShelbiWindow {
                 .min_w_0()
                 .children(self.review.clone())
                 .into_any_element(),
+            // Every view draws natively; a view whose entity isn't built yet
+            // (the first frame after routing) draws an empty main area.
             Route::View => {
                 let view = self.client.view();
-                match (commands::view_stub_id(view), &self.issues) {
-                    (Some(id), _) => div()
-                        .debug_selector(|| "main-stub".into())
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .text_color(theme.muted)
-                        .child(commands::not_implemented_message(&id))
-                        .when_some(self.session_title(view), |d, title| {
-                            d.child(div().text_xs().child(title))
-                        })
-                        .into_any_element(),
-                    (None, _) if is_chat(view) && self.chat.is_some() => div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .children(self.chat.clone())
-                        .into_any_element(),
-                    (None, _) if workspace_name(view).is_some() && self.workspace.is_some() => div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .children(self.workspace.clone())
-                        .into_any_element(),
-                    (None, Some(issues)) if *view == View::Issues => div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .child(issues.clone())
-                        .into_any_element(),
-                    (None, _) => {
-                        let native = match view {
-                            View::Activity => self.activity.clone().map(|v| v.into_any_element()),
-                            View::Machines => self.machines.clone().map(|v| v.into_any_element()),
-                            _ => None,
-                        };
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .children(native)
-                            .into_any_element()
-                    }
-                }
+                let content = match view {
+                    View::Issues => self.issues.clone().map(|v| v.into_any_element()),
+                    View::Activity => self.activity.clone().map(|v| v.into_any_element()),
+                    View::Machines => self.machines.clone().map(|v| v.into_any_element()),
+                    View::Session(_) if is_chat(view) => self.chat.clone().map(|v| v.into_any_element()),
+                    View::Session(_) => self.workspace.clone().map(|v| v.into_any_element()),
+                };
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .children(content)
+                    .into_any_element()
             }
         };
         let notice = |text: SharedString, color| {
@@ -2419,13 +2446,6 @@ impl ShelbiWindow {
                 )
             })
             .child(body)
-    }
-
-    fn session_title(&self, view: &View) -> Option<String> {
-        match view {
-            View::Session(name) => self.session_titles.get(name).cloned(),
-            _ => None,
-        }
     }
 }
 
@@ -2659,8 +2679,13 @@ impl ShelbiWindow {
         // actions. Registered only when there is a target, so the menu items
         // are gray when there isn't.
         let overlay_open = self.overlay.is_some();
-        let input_focused =
-            !overlay_open && window.is_action_available(&gpui_kit::base::input::Paste, cx);
+        // gpui answers this from the last drawn frame, and asserts (debug
+        // builds) that there is one: a window that opens already bootstrapped
+        // (a second project's, or the smoke test's) has none on its first.
+        let input_focused = !overlay_open
+            && self.drawn_once
+            && window.is_action_available(&gpui_kit::base::input::Paste, cx);
+        self.drawn_once = true;
         div()
             .relative()
             .flex()
@@ -2704,6 +2729,10 @@ impl ShelbiWindow {
 }
 
 #[cfg(test)]
+#[path = "app_smoke.rs"]
+mod smoke;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2719,8 +2748,6 @@ mod tests {
             calls(CommandKind::ShowView(View::Issues)),
             [HostCall::ShowView(View::Issues)]
         );
-        // The main area draws the board for it, not the not-implemented stub.
-        assert_eq!(commands::view_stub_id(&View::Issues), None);
     }
 
     #[test]
@@ -2747,7 +2774,6 @@ mod tests {
         assert_eq!(workspace_name(&View::Session("alpha".into())), Some("alpha"));
         assert_eq!(workspace_name(&View::Session("orch".into())), None);
         assert_eq!(workspace_name(&View::Issues), None);
-        assert_eq!(commands::view_stub_id(&View::Session("alpha".into())), None);
     }
 
     #[test]

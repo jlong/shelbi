@@ -192,6 +192,17 @@ impl ReviewInterface {
         }
     }
 
+    /// Follow the task's sidebar row: the panel's server line shows its
+    /// sub-state and location. Returns whether anything changed.
+    pub fn set_server(&mut self, row: Option<&shelbi_app::view::ReviewRow>) -> bool {
+        let server = row.map(|r| (r.state, r.location.clone()));
+        if self.panel.server == server {
+            return false;
+        }
+        self.panel.server = server;
+        true
+    }
+
     /// Put a message on the panel's status line (effect failures, notes).
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.panel.status_line = msg.into();

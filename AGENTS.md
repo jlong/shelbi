@@ -23,10 +23,15 @@ a Rust workspace plus a Next.js marketing/docs site.
   scrollback, selection, search, input encoding)
 - `crates/shelbi-app`: shared, toolkit-independent application model (nav,
   command registry, view models, background refresh)
-- `crates/shelbi-tui`: ratatui dashboard
+- `crates/shelbi-tui`: ratatui dashboard (the TUI client)
 - `crates/shelbi-palette`: fuzzy command palette (Ctrl+P by default) for the TUI
 - `crates/shelbi-agent`: pluggable agent CLI runners
 - `crates/shelbi-ssh`: local/SSH command execution wrapper
+- `desktop/`: the native macOS client (gpui), a sibling of the TUI over
+  `shelbi-app`. Its **own Cargo workspace** (excluded from the root one, own
+  `Cargo.lock` and `rust-toolchain.toml`); gpui types never leave it. Read
+  `desktop/README.md` first; status docs are indexed in
+  `desktop/docs/README.md`
 - `site/`: Next.js marketing and docs site (has its own AGENTS.md)
 - `scripts/`: install script; release scripts in `scripts/release/`
 - `docs/`: release runbooks
@@ -40,6 +45,33 @@ a Rust workspace plus a Next.js marketing/docs site.
   binary is required)
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - Site: `cd site && npm run lint && npm run build`
+- Desktop (from `desktop/`, never part of the root `--workspace` commands):
+  `cargo build`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+  Desktop CI is manual (`desktop-ci.yml`), so run these yourself before
+  handing off any change under `desktop/`. A change to a shared crate the
+  desktop uses (`shelbi-app`, `shelbi-term`, `shelbi-client`, `shelbi-state`,
+  ...) runs both sets, and must not move the root `Cargo.lock` (root MSRV is
+  Rust 1.88: `cargo check --workspace --locked`).
+
+## Two clients, one model (TUI and desktop parity)
+
+The TUI and the desktop app render the same `shelbi-app` models and run the
+same command registry. Keep them at parity:
+
+- A new `CommandKind` needs its effect in `shelbi-app`, a scenario in
+  `crates/shelbi-app/tests/command_scenarios.rs`, and an arm in both
+  clients' exhaustive matches (`desktop/src/commands.rs`, the TUI's
+  `dispatch_effect` in `crates/shelbi-tui/src/shell/mod.rs`). None of these
+  matches has a wildcard arm; don't add one, and don't add a
+  "not implemented" path in either client.
+- A new public field on a `shelbi_app::view` model needs a row in
+  `desktop/docs/parity.md` saying where each client shows it
+  (`crates/shelbi-app/tests/parity_doc.rs` fails until it has one).
+- Each client has a smoke test that runs every registry command through its
+  real UI path (TUI: `every_registry_command_runs_from_the_palette`;
+  desktop: `desktop/src/app_smoke.rs`). Keep them passing.
+- Toolkit-free logic found in one client moves into `shelbi-app` rather than
+  being duplicated in the other.
 
 ## Changing shipped defaults (existing installs don't get them for free)
 

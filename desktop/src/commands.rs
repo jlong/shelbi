@@ -5,24 +5,12 @@
 //! variant upstream in `shelbi-app` fails to compile here until the desktop
 //! handles it. Do not add a `_ =>` arm to either match.
 //!
-//! An arm whose subtask hasn't landed reaches [`not_implemented`], which logs
-//! a warning and asks the [`CommandHost`] (the window) to show the in-window
-//! "Not implemented yet: <command id>" banner. Each `dt-*` subtask replaces
-//! the arms it implements with the real behavior. `dt-shell-sidebar` owns view
-//! routing (every `View` routes through the window's `ClientState`; a view
-//! not yet ported draws the stub in the main area), project switching, and
-//! the detach / quit lifecycle commands; `dt-issues-board` owns the Issues
-//! view and the board's issue mutations; `dt-activity-machines` the Activity
-//! and Machines views; `dt-palette-overlays` the Zen toggle, the error log,
-//! add project, loading a queued review onto a slot, and approving /
-//! rejecting a review; `dt-review-view` the Review view a serving review
-//! opens.
-//!
-//! The id named in the banner is the command's registry id where the
-//! registry has one (`view:tasks`, `workspace:<name>`, `action:toggle-zen`,
-//! ...). The issue mutations are not surfaced in the palette, so the
-//! registry gives them no id; the tests name them with desktop-local
-//! `issue:<verb>:<id>` labels.
+//! Every arm is real: there is no not-implemented path. A command either
+//! routes to a view, runs through the board, or asks the [`CommandHost`] (the
+//! window) for one specific action, which the window performs with its
+//! context in hand. `dt-parity-audit` removed the foundation's stub once the
+//! last arms (`OpenEditor`, and `FocusSession`, retired upstream with the
+//! tmux-era legacy agents it focused) were done.
 
 use std::path::Path;
 
@@ -32,9 +20,6 @@ use shelbi_app::{CommandKind, EditTarget, Mutation, View};
 /// implement it with a recorder, so dispatch is exercised without a gpui
 /// context.
 pub trait CommandHost {
-    /// Surface that `command_id` is not implemented yet (the window shows a
-    /// banner).
-    fn not_implemented(&mut self, command_id: &str);
     /// Route the main area to `view` (`ClientState::set_view`) and focus it.
     fn show_view(&mut self, view: &View);
     /// Run an issue mutation (`MoveIssue`, `StartIssue`, `AssignIssue`,
@@ -68,6 +53,9 @@ pub trait CommandHost {
     fn ask_reject_reason(&mut self, id: &str);
     /// Reject a review task with `reason`.
     fn reject_review(&mut self, id: &str, reason: &str);
+    /// Open an `edit:*` target (project settings, an agent's instructions,
+    /// `zenmode.md`, the workflows directory) in the user's editor.
+    fn open_editor(&mut self, target: &EditTarget);
 }
 
 /// Run a command. Every [`CommandKind`] variant has its own arm.
@@ -83,9 +71,6 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // A serving task opens the Review view (dt-review-view); a queued one
         // asks which free slot to load it onto first.
         CommandKind::LoadReview { task_id } => host.load_review(task_id),
-        // Legacy spawned agents: the TUI doesn't show them either ("legacy
-        // spawned agents aren't shown here yet").
-        CommandKind::FocusSession { session } => not_implemented(host, &format!("agent:{session}")),
         CommandKind::ToggleZen => host.toggle_zen(),
         CommandKind::OpenErrorLog => host.open_error_log(),
         // One window per project: open the target's, or focus it. A bare
@@ -104,14 +89,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // Not the app's Cmd+Q: that only closes this client. This is the
         // registry's "stop every agent and shut Shelbi down".
         CommandKind::QuitShelbi => host.quit_shelbi(),
-        // The TUI doesn't open editors from the palette yet either (its status
-        // line says so); both clients pick this up together.
-        CommandKind::OpenEditor { target } => match target {
-            EditTarget::Project => not_implemented(host, "edit:project"),
-            EditTarget::Agent(agent) => not_implemented(host, &format!("edit:agent:{agent}")),
-            EditTarget::ZenMode => not_implemented(host, "edit:zenmode"),
-            EditTarget::Workflows => not_implemented(host, "edit:workflows"),
-        },
+        // The same path the TUI opens (`edit_target_path`), in the user's
+        // editor: a terminal editor in Terminal.app, a GUI one directly.
+        CommandKind::OpenEditor { target } => host.open_editor(target),
         // The board's issue mutations (dt-issues-board; drag and drop reuses
         // MoveIssue and adds PrioritizeIssue in dt-board-dnd).
         CommandKind::MoveIssue { .. }
@@ -139,7 +119,6 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
 pub fn sends_to_daemon(kind: &CommandKind) -> bool {
     match kind {
         CommandKind::ShowView(_) => false,
-        CommandKind::FocusSession { .. } => false,
         CommandKind::OpenErrorLog => false,
         // Edits a local file in the user's editor.
         CommandKind::OpenEditor { .. } => false,
@@ -181,8 +160,8 @@ pub fn run_add_project(
 }
 
 /// Show a view in the main area. Every [`View`] variant has its own arm; each
-/// routes through the window's `ClientState`, and the main area draws the
-/// not-implemented stub ([`view_stub_id`]) for a view not yet ported.
+/// routes through the window's `ClientState`, and the main area draws it
+/// natively (the board, the feed, the machines, the chat, a workspace).
 pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
     match view {
         View::Issues => host.show_view(view),
@@ -192,51 +171,16 @@ pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
     }
 }
 
-/// The stub id the main area shows for `view` while its subtask hasn't
-/// landed, or `None` once it renders for real. Exhaustive like the dispatch.
-pub fn view_stub_id(view: &View) -> Option<String> {
-    match view {
-        // dt-issues-board: the native board.
-        View::Issues => None,
-        // dt-activity-machines: the native feed and machines views.
-        View::Activity => None,
-        View::Machines => None,
-        // dt-chat-view: the orchestrator chat.
-        View::Session(name) if name == "orch" => None,
-        // dt-workspace-view: the Workspace view.
-        View::Session(_) => None,
-    }
-}
-
-/// The shared stub every unimplemented arm calls: log at warn, then let the
-/// host show the banner.
-fn not_implemented(host: &mut impl CommandHost, command_id: &str) {
-    tracing::warn!(
-        command = command_id,
-        "command not implemented yet in the desktop app"
-    );
-    host.not_implemented(command_id);
-}
-
-/// The banner text for an unimplemented command.
-pub fn not_implemented_message(command_id: &str) -> String {
-    format!("Not implemented yet: {command_id}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Records what dispatch asked of the host: a stub's command id, the
-    /// real call as `<call>:<arg>`, or `issue:<kind>` for an issue mutation.
+    /// Records what dispatch asked of the host: the call as `<call>:<arg>`,
+    /// or `issue:<kind>` for an issue mutation.
     #[derive(Default)]
     struct Recorder(Vec<String>);
 
     impl CommandHost for Recorder {
-        fn not_implemented(&mut self, command_id: &str) {
-            self.0.push(command_id.to_string());
-        }
-
         fn issue_command(&mut self, kind: &CommandKind) {
             self.0.push(format!("issue:{kind:?}"));
         }
@@ -282,6 +226,15 @@ mod tests {
         fn reject_review(&mut self, id: &str, reason: &str) {
             self.0.push(format!("reject:{id}:{reason}"));
         }
+        fn open_editor(&mut self, target: &EditTarget) {
+            let id = match target {
+                EditTarget::Project => "edit:project".to_string(),
+                EditTarget::Agent(agent) => format!("edit:agent:{agent}"),
+                EditTarget::ZenMode => "edit:zenmode".to_string(),
+                EditTarget::Workflows => "edit:workflows".to_string(),
+            };
+            self.0.push(format!("editor:{id}"));
+        }
     }
 
     fn id_for(kind: CommandKind) -> String {
@@ -307,7 +260,6 @@ mod tests {
                 "show:alpha",
             ),
             (CommandKind::LoadReview { task_id: s("t1") }, "load-review:t1"),
-            (CommandKind::FocusSession { session: s("s1") }, "agent:s1"),
             (CommandKind::ToggleZen, "toggle-zen"),
             (CommandKind::OpenErrorLog, "error-log"),
             (
@@ -326,25 +278,25 @@ mod tests {
                 CommandKind::OpenEditor {
                     target: EditTarget::Project,
                 },
-                "edit:project",
+                "editor:edit:project",
             ),
             (
                 CommandKind::OpenEditor {
                     target: EditTarget::Agent(s("dev")),
                 },
-                "edit:agent:dev",
+                "editor:edit:agent:dev",
             ),
             (
                 CommandKind::OpenEditor {
                     target: EditTarget::ZenMode,
                 },
-                "edit:zenmode",
+                "editor:edit:zenmode",
             ),
             (
                 CommandKind::OpenEditor {
                     target: EditTarget::Workflows,
                 },
-                "edit:workflows",
+                "editor:edit:workflows",
             ),
             (
                 CommandKind::MoveIssue {
@@ -402,13 +354,12 @@ mod tests {
                 "show:activity",
                 "show:machines",
                 "show:orch",
-                "agent:s1",
                 "error-log",
                 "detach",
-                "edit:project",
-                "edit:agent:dev",
-                "edit:zenmode",
-                "edit:workflows",
+                "editor:edit:project",
+                "editor:edit:agent:dev",
+                "editor:edit:zenmode",
+                "editor:edit:workflows",
             ]
         );
     }
@@ -439,9 +390,10 @@ mod tests {
 
     #[test]
     fn registry_ids_match_the_shared_id_scheme() {
-        // Where the registry has an id for a command, the banner names that
-        // same id, so a user can match the banner to the palette entry.
+        // Where the registry has an id for a command, the recorded call names
+        // that same id.
         for (kind, expected) in every_command() {
+            let expected = expected.strip_prefix("editor:").unwrap_or(expected);
             if let Some(parsed) = CommandKind::from_id(expected) {
                 assert_eq!(parsed, kind, "{expected} round-trips through the registry");
             }
@@ -449,26 +401,17 @@ mod tests {
     }
 
     #[test]
-    fn every_view_routes_and_unported_ones_name_their_stub() {
-        for (view, stub) in [
-            (View::Issues, None),
-            (View::Activity, None),
-            (View::Machines, None),
-            (View::Session("orch".into()), None),
-            (View::Session("alpha".into()), None),
+    fn every_view_routes_to_the_main_area() {
+        for view in [
+            View::Issues,
+            View::Activity,
+            View::Machines,
+            View::Session("orch".into()),
+            View::Session("alpha".into()),
         ] {
             let mut host = Recorder::default();
             dispatch_view(&view, &mut host);
             assert_eq!(host.0, vec![format!("show:{}", view.as_view_id())]);
-            assert_eq!(view_stub_id(&view).as_deref(), stub);
         }
-    }
-
-    #[test]
-    fn banner_names_the_command() {
-        assert_eq!(
-            not_implemented_message("view:tasks"),
-            "Not implemented yet: view:tasks"
-        );
     }
 }
