@@ -13,7 +13,9 @@
 //! not yet ported draws the stub in the main area), project switching, and
 //! the detach / quit lifecycle commands; `dt-issues-board` owns the Issues
 //! view and the board's issue mutations; `dt-activity-machines` the Activity
-//! and Machines views.
+//! and Machines views; `dt-palette-overlays` the Zen toggle, the error log,
+//! add project, loading a queued review onto a slot, and approving /
+//! rejecting a review.
 //!
 //! The id named in the banner is the command's registry id where the
 //! registry has one (`view:tasks`, `workspace:<name>`, `action:toggle-zen`,
@@ -21,7 +23,9 @@
 //! registry gives them no id; the tests name them with desktop-local
 //! `issue:<verb>:<id>` labels.
 
-use shelbi_app::{CommandKind, EditTarget, View};
+use std::path::Path;
+
+use shelbi_app::{CommandKind, EditTarget, Mutation, View};
 
 /// What dispatch needs from its caller. The window implements it; tests
 /// implement it with a recorder, so dispatch is exercised without a gpui
@@ -49,6 +53,20 @@ pub trait CommandHost {
     fn quit_project(&mut self);
     /// Confirm, then quit Shelbi (every agent stops, the daemon exits).
     fn quit_shelbi(&mut self);
+    /// Toggle Zen Mode (through the first-run intro on a first off-to-on).
+    fn toggle_zen(&mut self);
+    /// Open the project's error log.
+    fn open_error_log(&mut self);
+    /// Open the add-project form.
+    fn open_add_project(&mut self);
+    /// Open a review task: a queued one asks which slot to load it onto.
+    fn load_review(&mut self, task_id: &str);
+    /// Approve (accept and merge) a review task.
+    fn approve_review(&mut self, id: &str);
+    /// Ask for the reason to reject a review task with.
+    fn ask_reject_reason(&mut self, id: &str);
+    /// Reject a review task with `reason`.
+    fn reject_review(&mut self, id: &str, reason: &str);
 }
 
 /// Run a command. Every [`CommandKind`] variant has its own arm.
@@ -59,14 +77,13 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::FocusWorkspace { workspace } => {
             not_implemented(host, &format!("workspace:{workspace}"))
         }
-        // dt-review-view
-        CommandKind::LoadReview { task_id } => not_implemented(host, &format!("review:{task_id}")),
+        // A queued task asks for its slot here; a serving one opens the
+        // review view (dt-review-view).
+        CommandKind::LoadReview { task_id } => host.load_review(task_id),
         // dt-workspace-view
         CommandKind::FocusSession { session } => not_implemented(host, &format!("agent:{session}")),
-        // dt-palette-overlays
-        CommandKind::ToggleZen => not_implemented(host, "action:toggle-zen"),
-        // dt-palette-overlays
-        CommandKind::OpenErrorLog => not_implemented(host, "action:error-log"),
+        CommandKind::ToggleZen => host.toggle_zen(),
+        CommandKind::OpenErrorLog => host.open_error_log(),
         // One window per project: open the target's, or focus it. A bare
         // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
@@ -76,15 +93,15 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
                 host.switch_project(project)
             }
         }
-        // dt-palette-overlays: the add-project form is an overlay in the TUI.
-        CommandKind::AddProject => not_implemented(host, "action:add-project"),
+        CommandKind::AddProject => host.open_add_project(),
         CommandKind::Detach => host.detach(),
         CommandKind::DetachOtherClients => host.detach_other_clients(),
         CommandKind::QuitProject => host.quit_project(),
         // Not the app's Cmd+Q: that only closes this client. This is the
         // registry's "stop every agent and shut Shelbi down".
         CommandKind::QuitShelbi => host.quit_shelbi(),
-        // dt-palette-overlays
+        // The TUI doesn't open editors from the palette yet either (its status
+        // line says so); both clients pick this up together.
         CommandKind::OpenEditor { target } => match target {
             EditTarget::Project => not_implemented(host, "edit:project"),
             EditTarget::Agent(agent) => not_implemented(host, &format!("edit:agent:{agent}")),
@@ -97,12 +114,15 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         | CommandKind::StartIssue { .. }
         | CommandKind::AssignIssue { .. }
         | CommandKind::PrioritizeIssue { .. } => host.issue_command(kind),
-        // dt-review-view
-        CommandKind::ApproveReview { id } => not_implemented(host, &format!("issue:approve:{id}")),
-        // dt-review-view. The reason is user prose, so it stays out of the
-        // banner and the log.
-        CommandKind::RejectReview { id, reason: _ } => {
-            not_implemented(host, &format!("issue:reject:{id}"))
+        // Approve has no confirmation, in either client.
+        CommandKind::ApproveReview { id } => host.approve_review(id),
+        // The palette's reject carries no reason: ask for one first.
+        CommandKind::RejectReview { id, reason } => {
+            if reason.trim().is_empty() {
+                host.ask_reject_reason(id)
+            } else {
+                host.reject_review(id, reason)
+            }
         }
         CommandKind::EditIssue { .. } | CommandKind::AddIssue { .. } => host.issue_command(kind),
     }
@@ -139,6 +159,20 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::EditIssue { .. } => true,
         CommandKind::AddIssue { .. } => true,
         CommandKind::PrioritizeIssue { .. } => true,
+    }
+}
+
+/// Run a `Mutation::AddProject` the add-project form produced: validate it
+/// (its repo path resolved against `cwd`) and scaffold the project, the way
+/// the TUI's form does. Returns the new project's slug. Blocking.
+pub fn run_add_project(
+    mutation: &Mutation,
+    cwd: &Path,
+) -> Result<String, shelbi_orchestrator::project_create::AddProjectError> {
+    use shelbi_orchestrator::project_create::{add_project, AddProjectError};
+    match mutation {
+        Mutation::AddProject { name, root, mode } => add_project(name, root, *mode, cwd),
+        other => Err(AddProjectError::Failed(format!("not an add-project mutation: {other:?}"))),
     }
 }
 
@@ -223,6 +257,27 @@ mod tests {
         fn quit_shelbi(&mut self) {
             self.0.push("quit-shelbi".into());
         }
+        fn toggle_zen(&mut self) {
+            self.0.push("toggle-zen".into());
+        }
+        fn open_error_log(&mut self) {
+            self.0.push("error-log".into());
+        }
+        fn open_add_project(&mut self) {
+            self.0.push("add-project".into());
+        }
+        fn load_review(&mut self, task_id: &str) {
+            self.0.push(format!("load-review:{task_id}"));
+        }
+        fn approve_review(&mut self, id: &str) {
+            self.0.push(format!("approve:{id}"));
+        }
+        fn ask_reject_reason(&mut self, id: &str) {
+            self.0.push(format!("reject-reason:{id}"));
+        }
+        fn reject_review(&mut self, id: &str, reason: &str) {
+            self.0.push(format!("reject:{id}:{reason}"));
+        }
     }
 
     fn id_for(kind: CommandKind) -> String {
@@ -247,10 +302,10 @@ mod tests {
                 },
                 "workspace:alpha",
             ),
-            (CommandKind::LoadReview { task_id: s("t1") }, "review:t1"),
+            (CommandKind::LoadReview { task_id: s("t1") }, "load-review:t1"),
             (CommandKind::FocusSession { session: s("s1") }, "agent:s1"),
-            (CommandKind::ToggleZen, "action:toggle-zen"),
-            (CommandKind::OpenErrorLog, "action:error-log"),
+            (CommandKind::ToggleZen, "toggle-zen"),
+            (CommandKind::OpenErrorLog, "error-log"),
             (
                 CommandKind::SwitchProject {
                     project: String::new(),
@@ -258,7 +313,7 @@ mod tests {
                 "switcher",
             ),
             (CommandKind::SwitchProject { project: s("web") }, "switch:web"),
-            (CommandKind::AddProject, "action:add-project"),
+            (CommandKind::AddProject, "add-project"),
             (CommandKind::Detach, "detach"),
             (CommandKind::DetachOtherClients, "detach-others"),
             (CommandKind::QuitProject, "quit-project"),
@@ -302,16 +357,20 @@ mod tests {
                 },
                 "issue:assign:t1:alpha",
             ),
+            (CommandKind::ApproveReview { id: s("t1") }, "approve:t1"),
             (
-                CommandKind::ApproveReview { id: s("t1") },
-                "issue:approve:t1",
+                CommandKind::RejectReview {
+                    id: s("t1"),
+                    reason: String::new(),
+                },
+                "reject-reason:t1",
             ),
             (
                 CommandKind::RejectReview {
                     id: s("t1"),
                     reason: s("nope"),
                 },
-                "issue:reject:t1",
+                "reject:t1:nope",
             ),
             (CommandKind::EditIssue { id: s("t1") }, "issue:edit:t1"),
             (CommandKind::AddIssue { title: s("New") }, "issue:add"),
@@ -340,7 +399,7 @@ mod tests {
                 "show:machines",
                 "show:orch",
                 "agent:s1",
-                "action:error-log",
+                "error-log",
                 "detach",
                 "edit:project",
                 "edit:agent:dev",

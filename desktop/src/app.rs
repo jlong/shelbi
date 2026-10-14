@@ -21,8 +21,8 @@
 //! area to the Chat view ([`ChatView`], `dt-chat-view`): the orchestrator's
 //! session in a full-height terminal, attached while shown and detached while
 //! another view is. While its terminal holds focus, the window takes the
-//! global chords (the focus moves and the palette chord, plus Ctrl+Space) in
-//! the capture phase, so they never reach the session.
+//! global chords (the focus moves and the palette chords, Ctrl+Space and
+//! Cmd+K included) in the capture phase, so they never reach the session.
 //!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
@@ -37,9 +37,15 @@ use gpui::{
     Global, KeyDownEvent, MouseButton, MouseMoveEvent, PromptLevel, SharedString, Subscription, Task,
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
+use shelbi_app::command::{EditItem, ProjectItem};
 use shelbi_app::nav::{ClientState, Focus, View};
+use shelbi_app::overlay::error_log::Viewer;
+use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
+use shelbi_app::overlay::review_confirm::Slot;
 use shelbi_app::view::{SidebarModel, SidebarTarget};
-use shelbi_app::CommandKind;
+use shelbi_app::{CommandKind, CommandRegistry, Mutation};
+use shelbi_core::ConfigMode;
+use shelbi_orchestrator::project_create::AddProjectError;
 use shelbi_proto::control::DetachSelector;
 
 use crate::platform::version::APP_VERSION;
@@ -55,13 +61,14 @@ use shelbi_state::keymap::{
 
 use crate::assets::icons;
 use crate::commands::{self, CommandHost};
-use crate::keys::chord_from_keystroke;
+use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
 use crate::projects::{self, Catalog};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
 use crate::theme::{self, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
+use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::settings::SettingsView;
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{Frame, WindowState};
@@ -209,6 +216,13 @@ pub enum HostCall {
     DetachOthers,
     QuitProject,
     QuitShelbi,
+    ToggleZen,
+    OpenErrorLog,
+    OpenAddProject,
+    LoadReview(String),
+    ApproveReview(String),
+    AskRejectReason(String),
+    RejectReview(String, String),
 }
 
 impl CommandHost for Vec<HostCall> {
@@ -239,6 +253,74 @@ impl CommandHost for Vec<HostCall> {
     fn quit_shelbi(&mut self) {
         self.push(HostCall::QuitShelbi);
     }
+    fn toggle_zen(&mut self) {
+        self.push(HostCall::ToggleZen);
+    }
+    fn open_error_log(&mut self) {
+        self.push(HostCall::OpenErrorLog);
+    }
+    fn open_add_project(&mut self) {
+        self.push(HostCall::OpenAddProject);
+    }
+    fn load_review(&mut self, task_id: &str) {
+        self.push(HostCall::LoadReview(task_id.to_string()));
+    }
+    fn approve_review(&mut self, id: &str) {
+        self.push(HostCall::ApproveReview(id.to_string()));
+    }
+    fn ask_reject_reason(&mut self, id: &str) {
+        self.push(HostCall::AskRejectReason(id.to_string()));
+    }
+    fn reject_review(&mut self, id: &str, reason: &str) {
+        self.push(HostCall::RejectReview(id.to_string(), reason.to_string()));
+    }
+}
+
+/// What the palette's entries are built from besides the sidebar model: reads
+/// of other projects, the edit targets on disk, and whether another client is
+/// attached. Kept from the last read so the palette opens at once; re-read
+/// (off the UI thread) each time it opens.
+#[derive(Debug, Clone, Default)]
+pub struct PaletteInputs {
+    pub other_projects: Vec<ProjectItem>,
+    pub edit_targets: Vec<EditItem>,
+    pub projects: Vec<PaletteProject>,
+    pub others_attached: bool,
+}
+
+impl PaletteInputs {
+    /// Read them (blocking: small local files and one control-socket call).
+    fn read(project: &str, control: Option<crate::platform::control::ControlHandle>, client_id: &str) -> Self {
+        let summaries = shelbi_state::list_projects().unwrap_or_default();
+        let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let others_attached = control
+            .and_then(|c| c.connect().ok())
+            .and_then(|mut c| c.list_clients().ok())
+            .is_some_and(|clients| clients.iter().any(|c| c.client_id != client_id));
+        PaletteInputs {
+            other_projects: summaries
+                .iter()
+                .filter(|p| p.name != project)
+                .map(|p| ProjectItem {
+                    slug: p.name.clone(),
+                    label: p.display_label().to_string(),
+                })
+                .collect(),
+            edit_targets: shelbi_app::command_model::edit_targets(project),
+            projects: shelbi_app::command_model::projects_column_from(
+                project,
+                summaries
+                    .iter()
+                    .map(|p| (p.name.clone(), p.display_label().to_string()))
+                    .collect(),
+                &open,
+            ),
+            others_attached,
+        }
+    }
 }
 
 /// A project window's root view.
@@ -264,6 +346,13 @@ pub struct ShelbiWindow {
     /// The Activity feed and the Machines view, likewise created on first show.
     activity: Option<Entity<ActivityView>>,
     machines: Option<Entity<MachinesView>>,
+    /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
+    overlay: Option<ActiveOverlay>,
+    palette_inputs: PaletteInputs,
+    /// The repo path an add-project detection is running for.
+    detecting: Option<String>,
+    /// Bumped on each transient status, so a flash only clears its own.
+    flash_generation: u64,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -322,6 +411,10 @@ impl ShelbiWindow {
             chat: None,
             activity: None,
             machines: None,
+            overlay: None,
+            palette_inputs: PaletteInputs::default(),
+            detecting: None,
+            flash_generation: 0,
             banner: None,
             status: None,
             focus_handle,
@@ -378,6 +471,11 @@ impl ShelbiWindow {
                 if let Some(model) = snapshot.sidebar {
                     self.model = model;
                     self.sync_selection();
+                    // An open palette follows the live state, query kept.
+                    let entries = self.palette_entries();
+                    if let Some(ActiveOverlay::Palette { palette, .. }) = &mut self.overlay {
+                        palette.set_entries(entries);
+                    }
                 }
             }
             FeedEvent::Link(link) => self.link = Some(link),
@@ -670,6 +768,21 @@ impl ShelbiWindow {
             HostCall::DetachOthers => self.detach_others(cx),
             HostCall::QuitProject => self.confirm_quit_project(window, cx),
             HostCall::QuitShelbi => self.confirm_quit_shelbi(window, cx),
+            HostCall::ToggleZen => self.toggle_zen(window, cx),
+            HostCall::OpenErrorLog => self.open_error_log(window, cx),
+            HostCall::OpenAddProject => self.open_add_project(window, cx),
+            HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
+            HostCall::ApproveReview(id) => {
+                let m = Mutation::ApproveReview {
+                    project: self.project.clone(),
+                    id: id.clone(),
+                };
+                self.run_review_mutation(m, format!("Approving {id}…"), format!("Approved {id}."), cx);
+            }
+            HostCall::AskRejectReason(id) => {
+                self.open_overlay(ActiveOverlay::reject_reason(id), window, cx)
+            }
+            HostCall::RejectReview(id, reason) => self.reject(id, reason, cx),
         }
     }
 
@@ -1014,6 +1127,483 @@ impl ShelbiWindow {
         .detach();
     }
 
+    // --- overlays ----------------------------------------------------------
+
+    /// Show `overlay`. Keys go to it until it closes; the routed view and the
+    /// focus to return to are left as they were.
+    fn open_overlay(&mut self, overlay: ActiveOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        self.client.open_overlay(overlay.nav());
+        self.overlay = Some(overlay);
+        self.switcher_open = false;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Close the overlay and hand keys back to where focus was.
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = None;
+        self.detecting = None;
+        self.client.close_overlay();
+        match self.client.focus() {
+            Focus::Main => self.focus_main_view(window, cx),
+            Focus::Sidebar => self.focus_handle.focus(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// The palette's entries for the current state: the registry over the
+    /// live sidebar model and the last [`PaletteInputs`].
+    fn palette_entries(&self) -> Vec<shelbi_palette::Entry> {
+        let inputs = &self.palette_inputs;
+        let model = shelbi_app::command_model::command_model_from(
+            &self.project,
+            &self.model,
+            inputs.others_attached,
+            inputs.other_projects.clone(),
+            inputs.edit_targets.clone(),
+        );
+        CommandRegistry::new().entries(&model)
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.palette_entries();
+        let projects = self.palette_inputs.projects.clone();
+        self.open_overlay(ActiveOverlay::palette(entries, projects), window, cx);
+        // Re-read the inputs off the UI thread; the open palette picks them up.
+        let project = self.project.clone();
+        let control = self.ready().map(|r| r.control.clone());
+        let client_id = cx
+            .try_global::<Shell>()
+            .map(|s| s.client_id.clone())
+            .unwrap_or_default();
+        let read = cx
+            .background_executor()
+            .spawn(async move { PaletteInputs::read(&project, control, &client_id) });
+        cx.spawn(async move |this, cx| {
+            let inputs = read.await;
+            this.update(cx, |this, cx| {
+                this.palette_inputs = inputs;
+                let entries = this.palette_entries();
+                let projects = this.palette_inputs.projects.clone();
+                if let Some(ActiveOverlay::Palette { palette, .. }) = &mut this.overlay {
+                    palette.set_entries(entries);
+                    palette.set_projects(projects);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A key while an overlay is open: it takes every key except the app's
+    /// own Cmd shortcuts (close the window, quit), plus Cmd+V to paste into
+    /// its text and Cmd+C to copy the error log.
+    fn overlay_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let cmd = keystroke.modifiers.platform && !keystroke.modifiers.control;
+        if cmd && keystroke.key == "v" {
+            let multiline = self.overlay.as_ref().is_some_and(ActiveOverlay::takes_newlines);
+            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                for chord in paste_chords(&text, multiline) {
+                    if let Some(o) = self.overlay.as_mut() {
+                        let event = o.handle_key(chord, &self.keymaps);
+                        if event != OverlayEvent::Stay {
+                            self.apply_overlay_event(event, window, cx);
+                            break;
+                        }
+                    }
+                }
+                self.detect_add_project(cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if cmd && keystroke.key == "c" {
+            if let Some(ActiveOverlay::ErrorLog {
+                viewer: Some(viewer),
+                ..
+            }) = &self.overlay
+            {
+                overlay::error_log::copy(viewer.text(), cx);
+                self.flash("Copied the error log.", cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // The app's other Cmd shortcuts (⌘W, ⌘Q, ⌘,) stay live; ⌘K is the
+        // palette chord, which toggles it closed.
+        if cmd && keystroke.key != "k" {
+            return;
+        }
+        cx.stop_propagation();
+        let Some(chord) = overlay_chord(keystroke) else {
+            // A key with no chord still dismisses the "no slots" report.
+            if let Some(ActiveOverlay::ReviewConfirm { task_id, dialog }) = &self.overlay {
+                let event = overlay::confirm_event(task_id, dialog.dismiss_if_empty());
+                self.apply_overlay_event(event, window, cx);
+            }
+            return;
+        };
+        let Some(o) = self.overlay.as_mut() else {
+            return;
+        };
+        let event = o.handle_key(chord, &self.keymaps);
+        self.apply_overlay_event(event, window, cx);
+        cx.notify();
+    }
+
+    /// Act on what the open overlay resolved to.
+    fn apply_overlay_event(&mut self, event: OverlayEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            OverlayEvent::Stay => self.detect_add_project(cx),
+            OverlayEvent::Close => self.close_overlay(window, cx),
+            OverlayEvent::FocusSidebar => {
+                self.client.focus_sidebar();
+                self.close_overlay(window, cx);
+            }
+            OverlayEvent::RunEntry(entry) => {
+                // Close first: the command may open another overlay.
+                self.close_overlay(window, cx);
+                match CommandKind::from_id(&entry.id) {
+                    Some(kind) => self.run(kind, window, cx),
+                    None => self.banner = Some(format!("Unknown command: {}", entry.id).into()),
+                }
+            }
+            OverlayEvent::LoadReview { task_id, slot } => {
+                self.close_overlay(window, cx);
+                self.load_onto_slot(task_id, slot, cx);
+            }
+            OverlayEvent::Rejected { task_id, reason } => {
+                self.close_overlay(window, cx);
+                self.reject(task_id, reason, cx);
+            }
+            OverlayEvent::ZenResult {
+                project,
+                confirmed,
+                dont_show_again,
+            } => {
+                self.close_overlay(window, cx);
+                self.run_zen(project, Some((confirmed, dont_show_again)), cx);
+            }
+            OverlayEvent::AddProjectSubmit { name, root, mode } => {
+                self.submit_add_project(name, root, mode, window, cx)
+            }
+            OverlayEvent::ClearErrors { project } => {
+                if let Some(ActiveOverlay::ErrorLog {
+                    viewer: Some(viewer),
+                    ..
+                }) = &mut self.overlay
+                {
+                    viewer.clear();
+                }
+                let clear = cx
+                    .background_executor()
+                    .spawn(async move { shelbi_state::clear_errors(&project).map_err(|e| e.to_string()) });
+                cx.spawn(async move |this, cx| {
+                    let result = clear.await;
+                    this.update(cx, |this, cx| {
+                        if let Err(e) = result {
+                            this.banner = Some(format!("Couldn't clear the error log: {e}").into());
+                        }
+                        this.request_refresh();
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            OverlayEvent::Copy(text) => {
+                overlay::error_log::copy(text, cx);
+                self.flash("Copied the error log.", cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ask the feed for a fresh sidebar (the Zen band, the unread count).
+    fn request_refresh(&self) {
+        if let Some(feed) = &self._feed {
+            feed.request();
+        }
+    }
+
+    /// Show `message` as the status note for a few seconds.
+    fn flash(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.flash_generation += 1;
+        let generation = self.flash_generation;
+        self.status = Some(message.into());
+        let timer = cx.background_executor().timer(std::time::Duration::from_secs(4));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.flash_generation == generation {
+                    this.status = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// `ToggleZen`: through the first-run intro on a first off-to-on toggle
+    /// (both checks read small local files, off the UI thread).
+    fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        let check = cx
+            .background_executor()
+            .spawn(async move { shelbi_app::zen::should_show_intro(&project) });
+        cx.spawn_in(window, async move |this, cx| {
+            let intro = check.await;
+            this.update_in(cx, |this, window, cx| {
+                let project = this.project.clone();
+                if intro {
+                    this.open_overlay(ActiveOverlay::zen_intro(project), window, cx);
+                } else {
+                    this.run_zen(project, None, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Toggle Zen (or apply the intro's answer) off the UI thread, then
+    /// refresh the sidebar so its Zen band follows.
+    fn run_zen(&mut self, project: String, intro: Option<(bool, bool)>, cx: &mut Context<Self>) {
+        let work = cx.background_executor().spawn(async move {
+            match intro {
+                Some((confirmed, dont_show_again)) => {
+                    shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again)
+                }
+                None => shelbi_app::zen::toggle(&project)
+                    .unwrap_or_else(|e| format!("Zen toggle failed: {e}")),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let message = work.await;
+            this.update(cx, |this, cx| {
+                this.flash(message, cx);
+                this.request_refresh();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `OpenErrorLog`: open it at once, read and mark the log read off the
+    /// UI thread (the sidebar's unread button clears on the next refresh).
+    fn open_error_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        self.open_overlay(ActiveOverlay::error_log(project.clone()), window, cx);
+        let read = cx.background_executor().spawn({
+            let project = project.clone();
+            async move {
+                let rows = shelbi_state::read_errors_with_unread(&project).unwrap_or_default();
+                let _ = shelbi_state::mark_errors_read(&project);
+                rows
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let rows = read.await;
+            this.update(cx, |this, cx| {
+                if let Some(ActiveOverlay::ErrorLog { project: p, viewer, .. }) = &mut this.overlay {
+                    if *p == project {
+                        *viewer = Some(Viewer::new(rows));
+                    }
+                }
+                this.request_refresh();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `AddProject`: the form, its repo path prefilled with the working
+    /// directory (the home directory when the app was opened from Finder).
+    fn open_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = std::env::current_dir()
+            .ok()
+            .filter(|d| d.parent().is_some())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.open_overlay(ActiveOverlay::add_project(&cwd), window, cx);
+        self.detect_add_project(cx);
+    }
+
+    /// Run the form's "Detected:" check off the UI thread when its repo path
+    /// changed (one at a time; a newer path is checked when the older lands).
+    fn detect_add_project(&mut self, cx: &mut Context<Self>) {
+        let Some(ActiveOverlay::AddProject { form, .. }) = &self.overlay else {
+            return;
+        };
+        let Some(root) = form.detection_due() else {
+            return;
+        };
+        if self.detecting.is_some() {
+            return;
+        }
+        self.detecting = Some(root.clone());
+        let cwd = form.cwd().to_path_buf();
+        let detect = cx.background_executor().spawn({
+            let root = root.clone();
+            async move { shelbi_orchestrator::project_create::detect_root(&cwd, &root) }
+        });
+        cx.spawn(async move |this, cx| {
+            let detected = detect.await;
+            this.update(cx, |this, cx| {
+                this.detecting = None;
+                if let Some(ActiveOverlay::AddProject { form, .. }) = &mut this.overlay {
+                    form.set_detected(&root, detected);
+                }
+                this.detect_add_project(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Run the form's `Mutation::AddProject` off the UI thread. A validation
+    /// error goes back on the form; success opens the new project's window.
+    fn submit_add_project(
+        &mut self,
+        name: String,
+        root: String,
+        mode: ConfigMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ActiveOverlay::AddProject { form, busy }) = &mut self.overlay else {
+            return;
+        };
+        *busy = true;
+        let cwd = form.cwd().to_path_buf();
+        let mutation = Mutation::AddProject { name, root, mode };
+        let work = cx
+            .background_executor()
+            .spawn(async move { commands::run_add_project(&mutation, &cwd) });
+        cx.spawn_in(_window, async move |this, cx| {
+            let result = work.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(slug) => {
+                    this.close_overlay(window, cx);
+                    this.flash(format!("Created project {slug}."), cx);
+                    if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
+                        catalog.refresh(|| {});
+                    }
+                    cx.defer(move |cx| open_or_focus(&slug, cx));
+                }
+                Err(AddProjectError::Invalid(msg)) | Err(AddProjectError::Failed(msg)) => {
+                    if let Some(ActiveOverlay::AddProject { form, busy }) = &mut this.overlay {
+                        *busy = false;
+                        form.set_error(msg);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `LoadReview`: find out off the UI thread whether the task is already
+    /// on a review slot or still queued. A queued task asks which free slot
+    /// to load it onto; a serving one opens the review view (dt-review-view).
+    fn load_review(&mut self, task_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        let task = task_id.clone();
+        let resolve = cx.background_executor().spawn(async move { resolve_review(&project, &task) });
+        cx.spawn_in(window, async move |this, cx| {
+            let resolved = resolve.await;
+            this.update_in(cx, |this, window, cx| match resolved {
+                Ok(None) => {
+                    this.banner =
+                        Some(commands::not_implemented_message(&format!("review:{task_id}")).into());
+                    cx.notify();
+                }
+                Ok(Some((title, free, total))) => this.open_overlay(
+                    ActiveOverlay::review_confirm(task_id, title, free, total),
+                    window,
+                    cx,
+                ),
+                Err(e) => {
+                    this.banner = Some(format!("Couldn't open the review: {e}").into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Load a queued review task onto the slot the dialog chose, through the
+    /// daemon, off the UI thread.
+    fn load_onto_slot(&mut self, task_id: String, slot: String, cx: &mut Context<Self>) {
+        self.flash(format!("Loading {task_id} onto {slot}…"), cx);
+        let project = self.project.clone();
+        let (task, workspace) = (task_id.clone(), slot.clone());
+        let work = cx.background_executor().spawn(async move {
+            shelbi_app::review_session(
+                &project,
+                &task,
+                shelbi_app::ReviewSessionOp::Load { workspace },
+                &mut |_, _| {},
+            )
+            .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.flash(format!("Loaded {task_id} onto {slot}."), cx),
+                    Err(e) => this.banner = Some(format!("Couldn't load the review: {e}").into()),
+                }
+                this.request_refresh();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reject(&mut self, id: String, reason: String, cx: &mut Context<Self>) {
+        let m = Mutation::RejectReview {
+            project: self.project.clone(),
+            id: id.clone(),
+            reason,
+        };
+        self.run_review_mutation(m, format!("Rejecting {id}…"), format!("Rejected {id}."), cx);
+    }
+
+    /// Send a review decision to the daemon off the UI thread.
+    fn run_review_mutation(&mut self, m: Mutation, working: String, done: String, cx: &mut Context<Self>) {
+        self.flash(working, cx);
+        let work = cx.background_executor().spawn(async move {
+            shelbi_app::execute_mutation(&m, &mut |_, _| {}).map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.flash(done, cx),
+                    Err(e) => {
+                        this.status = None;
+                        this.banner = Some(e.into());
+                    }
+                }
+                this.request_refresh();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     // --- keyboard ----------------------------------------------------------
 
     /// The capture phase, ahead of the focused view: while the chat's terminal
@@ -1040,9 +1630,18 @@ impl ShelbiWindow {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let chord = chord_from_keystroke(&event.keystroke);
         tracing::trace!(keystroke = ?event.keystroke, ?chord, focus = ?self.client.focus(), "key down");
+        if self.overlay.is_some() {
+            self.overlay_key(event, window, cx);
+            return;
+        }
         let Some(chord) = chord else {
             return;
         };
+        if shelbi_app::overlay::opens_palette(&self.keymaps, &chord) {
+            self.open_palette(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if chord.code == Key::Esc && self.switcher_open {
             self.switcher_open = false;
             cx.stop_propagation();
@@ -1063,22 +1662,6 @@ impl ShelbiWindow {
             Some(GlobalAction::FocusMain) => {
                 self.client.focus_main();
                 self.focus_main_view(window, cx);
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            // The palette also always opens on Ctrl+Space, the plan's reserved
-            // key, as in the TUI.
-            _ if is_reserved_palette_chord(chord) => {
-                // dt-palette-overlays
-                self.banner = Some(commands::not_implemented_message("action:palette").into());
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            Some(GlobalAction::OpenPalette) => {
-                // dt-palette-overlays
-                self.banner = Some(commands::not_implemented_message("action:palette").into());
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -1247,19 +1830,14 @@ fn is_chat(view: &View) -> bool {
 }
 
 /// Whether the window takes `chord` away from a focused terminal: the focus
-/// moves (Ctrl+H / Ctrl+L by default), the palette chord, and Ctrl+Space.
-/// Everything else is the session's.
+/// moves (Ctrl+H / Ctrl+L by default) and every palette chord (the
+/// configured one plus the reserved Ctrl+Space and Cmd+K). Everything else is
+/// the session's.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
     matches!(
         keymaps.global.dispatch(chord),
-        Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain | GlobalAction::OpenPalette)
-    ) || is_reserved_palette_chord(chord)
-}
-
-/// Ctrl+Space, the plan's permanently reserved palette key: it opens the
-/// palette from anywhere and is never forwarded to a session.
-fn is_reserved_palette_chord(chord: shelbi_state::keymap::KeyChord) -> bool {
-    chord == shelbi_state::keymap::KeyChord::new(Key::Char(' '), shelbi_state::keymap::Mods::CONTROL)
+        Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain)
+    ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
 }
 
 /// The palette-open chord as the search box shows it (`⌃P`).
@@ -1271,6 +1849,38 @@ fn palette_chord(keymaps: &Keymaps) -> String {
         .unwrap_or_default()
 }
 
+impl OverlayHost for ShelbiWindow {
+    fn overlay_mut(&mut self) -> Option<&mut ActiveOverlay> {
+        self.overlay.as_mut()
+    }
+
+    fn overlay_event(&mut self, event: OverlayEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_overlay_event(event, window, cx);
+    }
+}
+
+/// Whether review `task` is serving (`None`) or queued: then its title, the
+/// free review slots, and how many slots exist (blocking board reads).
+fn resolve_review(project: &str, task: &str) -> Result<Option<(String, Vec<Slot>, usize)>, String> {
+    use shelbi_orchestrator::review_session::{review_open_target, ReviewOpenTarget};
+    match review_open_target(project, task).map_err(|e| e.to_string())? {
+        ReviewOpenTarget::Serving(_) => Ok(None),
+        ReviewOpenTarget::Queued { title } => {
+            let all = shelbi_orchestrator::load::review_slots(project).map_err(|e| e.to_string())?;
+            let total = all.len();
+            let free = all
+                .into_iter()
+                .filter(|s| s.occupant.is_none())
+                .map(|s| Slot {
+                    name: s.name,
+                    occupant: None,
+                })
+                .collect();
+            Ok(Some((title, free, total)))
+        }
+    }
+}
+
 impl SidebarHost for ShelbiWindow {
     fn sidebar_event(&mut self, event: SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
@@ -1279,10 +1889,7 @@ impl SidebarHost for ShelbiWindow {
                 self.client.select(ordinal, count);
                 self.activate_selection(window, cx);
             }
-            // dt-palette-overlays
-            SidebarEvent::OpenSearch => {
-                self.banner = Some(commands::not_implemented_message("action:palette").into());
-            }
+            SidebarEvent::OpenSearch => self.open_palette(window, cx),
             SidebarEvent::ToggleSwitcher => {
                 if self.switcher_open {
                     self.switcher_open = false;
@@ -1430,7 +2037,11 @@ impl ShelbiWindow {
 
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
+        let layer = self.overlay.as_ref().map(|o| {
+            overlay::render_layer(o, window.viewport_size(), &self.keymaps, &theme, cx)
+        });
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -1442,6 +2053,7 @@ impl ShelbiWindow {
                 }))
             })
             .child(shell.flex_1().min_h_0())
+            .children(layer)
             .into_any_element()
     }
 }
@@ -1485,7 +2097,7 @@ mod tests {
             chord_from_keystroke(&ks).unwrap()
         };
         // Ctrl+H back to the sidebar, Ctrl+L to the main area, the palette.
-        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p"] {
+        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p", "cmd-k"] {
             assert!(takes_from_terminal(&keymaps, chord(spec)), "{spec}");
         }
         // Typing, Backspace (never mistaken for Ctrl+H), Shift+Enter, other

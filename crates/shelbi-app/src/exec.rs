@@ -129,10 +129,12 @@ pub enum Mutation {
     /// Toggle Zen Mode for a project.
     ToggleZen { project: String },
     /// Scaffold and open a new project (payload collected by the host's
-    /// add-project form).
+    /// add-project form): the raw name, the repo path as typed (resolved
+    /// against the host's working directory), and where its config lives.
     AddProject {
         name: String,
         root: String,
+        mode: shelbi_core::ConfigMode,
     },
 }
 

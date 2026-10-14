@@ -15,8 +15,9 @@
 //! - workspace (agent terminal + header, user shell, remote workspaces):
 //!   **`dt-workspace-view`**
 //! - review panel with the editor and diff sessions: **`dt-review-view`**
-//! - command palette and overlays (error log, review confirm, reject reason,
-//!   Zen intro): **`dt-palette-overlays`**
+//! - command palette and overlays (error log, review load, reject reason,
+//!   Zen intro, add project): **`dt-palette-overlays`** (landed: `palette.rs`
+//!   and `overlay/`, over the shared `shelbi_app::overlay` state machines)
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
@@ -35,6 +36,8 @@ pub mod issues;
 pub mod machines;
 pub mod machines_state;
 pub mod markdown;
+pub mod overlay;
+pub mod palette;
 pub mod task_detail;
 pub mod settings;
 pub mod sidebar;

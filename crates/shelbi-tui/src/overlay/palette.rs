@@ -24,7 +24,7 @@
 
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -34,6 +34,13 @@ use ratatui::{
 };
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::PaletteAction;
+
+// The palette's state machine and project indicators are shared with the
+// desktop app (`shelbi_app::overlay::palette`).
+pub use shelbi_app::overlay::palette::{
+    project_indicator, PaletteFocus as Focus, PaletteStep, ProjectEntry, ProjectIndicator,
+};
+use shelbi_app::overlay::palette as shared;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::palette;
@@ -72,40 +79,16 @@ const CHROME_ROWS: u16 = 6;
 // Project indicators (Projects column status glyphs)
 // ---------------------------------------------------------------------------
 
-/// A project row's liveness indicator in the Projects column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectIndicator {
-    /// The current/open project (active) — filled green disc, pulsing.
-    Active,
-    /// Loaded but not the current project — green ring, no fill.
-    LoadedIdle,
-    /// Not loaded — neutral/gray ring.
-    Unloaded,
-}
-
-/// Resolve a project's indicator from its two live inputs. Not-loaded
-/// dominates: a project with no live session shows the neutral ring even if a
-/// stale active-category task lingers on disk, because nothing is progressing
-/// it.
-pub fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
-    if !loaded {
-        ProjectIndicator::Unloaded
-    } else if active {
-        ProjectIndicator::Active
-    } else {
-        ProjectIndicator::LoadedIdle
-    }
-}
-
 /// Leading status glyph + color for a project row, given its indicator and the
 /// current pulse `phase`. The Figma uses a filled `●` for the active project, a
 /// `○` ring for every other (green when loaded, gray when not).
 pub fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static str, Color) {
-    match indicator {
-        ProjectIndicator::Active => ("●", theme::project_pulse_color(phase)),
-        ProjectIndicator::LoadedIdle => ("○", palette().green),
-        ProjectIndicator::Unloaded => ("○", palette().ansi_dark_gray),
-    }
+    let color = match indicator {
+        ProjectIndicator::Active => theme::project_pulse_color(phase),
+        ProjectIndicator::LoadedIdle => palette().green,
+        ProjectIndicator::Unloaded => palette().ansi_dark_gray,
+    };
+    (indicator.glyph(), color)
 }
 
 /// Current pulse phase in `[0.0, 1.0)`, derived from how long the picker has
@@ -556,48 +539,13 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 // The in-process overlay state
 // ---------------------------------------------------------------------------
 
-/// A switch-target project for the Projects column: its slug (for the
-/// switch-project entry id), display label, and resolved status indicator.
-#[derive(Debug, Clone)]
-pub struct ProjectEntry {
-    pub slug: String,
-    pub label: String,
-    pub indicator: ProjectIndicator,
-}
-
-/// Which column holds focus inside the open palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Commands,
-    Projects,
-}
-
-/// What feeding one key into the in-process palette resolved to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaletteStep {
-    /// Keep the overlay open (filtered, moved selection, edited the query).
-    Continue,
-    /// Close the overlay and return focus to the agent (Escape / the palette
-    /// chord again).
-    Close,
-    /// Close the overlay and move focus to the sidebar (Tab).
-    FocusSidebar,
-    /// Run this entry's command, then close the overlay.
-    Activate(Entry),
-}
-
-/// The in-process command palette overlay. Holds the current query, the command
-/// selection, the switch-target projects, and which column holds focus; the
-/// host (the shell) supplies the entries from
+/// The in-process command palette overlay: the shared state machine
+/// ([`shared::Palette`]) plus when it opened (the active project's pulse phase).
+/// The host (the shell) supplies the entries from
 /// [`shelbi_app::CommandRegistry::entries`] and the projects, and turns an
 /// activated [`Entry`] into a command effect.
 pub struct Palette {
-    query: String,
-    selected: usize,
-    entries: Vec<Entry>,
-    projects: Vec<ProjectEntry>,
-    focus: Focus,
-    project_selected: usize,
+    inner: shared::Palette,
     opened_at: Instant,
 }
 
@@ -606,12 +554,7 @@ impl Palette {
     /// column (empty hides the column).
     pub fn new(entries: Vec<Entry>, projects: Vec<ProjectEntry>) -> Self {
         Self {
-            query: String::new(),
-            selected: 0,
-            entries,
-            projects,
-            focus: Focus::Commands,
-            project_selected: 0,
+            inner: shared::Palette::new(entries, projects),
             opened_at: Instant::now(),
         }
     }
@@ -619,20 +562,20 @@ impl Palette {
     /// Replace the entry list (a background refresh landed) without disturbing
     /// the query; the renderer re-clamps the selection.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
-        self.entries = entries;
+        self.inner.set_entries(entries);
     }
 
     pub fn query(&self) -> &str {
-        &self.query
+        self.inner.query()
     }
 
     pub fn selected(&self) -> usize {
-        self.selected
+        self.inner.selected()
     }
 
     /// The fuzzy-filtered results for the current query.
     pub fn results(&self) -> Vec<(Entry, u16)> {
-        shelbi_palette::search(&self.entries, &self.query)
+        self.inner.results()
     }
 
     /// The overlay rect for the current content within `area`, via
@@ -640,113 +583,20 @@ impl Palette {
     /// query filters the list.
     pub fn overlay_rect(&self, area: Rect) -> Rect {
         let result_count = self.results().len();
-        let project_count = (!self.projects.is_empty()).then_some(self.projects.len());
+        let projects = self.inner.projects().len();
+        let project_count = (projects > 0).then_some(projects);
         palette_rect(area, result_count, project_count)
-    }
-
-    /// The highest selectable index in the Projects column: one past the last
-    /// project (the trailing "Add project" row).
-    fn projects_max(&self) -> usize {
-        self.projects.len()
-    }
-
-    /// Synthesize the [`Entry`] activated by Enter on the focused project row.
-    /// A project row maps to its `action:switch-project:<slug>` entry; the
-    /// trailing row maps to `action:add-project`. The shell resolves either id
-    /// through the registry, so no new effect plumbing is needed.
-    fn project_entry(&self) -> Entry {
-        let (id, label) = match self.projects.get(self.project_selected) {
-            Some(p) => (format!("action:switch-project:{}", p.slug), p.label.clone()),
-            None => ("action:add-project".to_string(), "Add project".to_string()),
-        };
-        Entry {
-            id,
-            label,
-            kind: EntryKind::Action,
-            subtitle: None,
-            shortcut: None,
-            decoration: None,
-            hidden_until_query: false,
-        }
     }
 
     /// Feed one key press. `action` is the palette-mode binding the host
     /// resolved from its keymap (so Close/Activate/Nav/Backspace honor the
     /// user's `keys.yaml`); Tab, Space, the arrow keys, and unbound printable
-    /// chars are handled by raw key code so they behave regardless of bindings.
+    /// chars are handled by raw key so they behave regardless of bindings
+    /// ([`shared::Palette::handle_key`]).
     pub fn handle_key(&mut self, ev: KeyEvent, action: Option<PaletteAction>) -> PaletteStep {
-        // Tab leaves the palette for the sidebar (plan focus model). Handled
-        // ahead of the keymap so a user binding can't shadow it.
-        if ev.code == KeyCode::Tab && ev.modifiers.is_empty() {
-            return PaletteStep::FocusSidebar;
-        }
-        // Right/Left move focus into and out of the Projects column.
-        if ev.code == KeyCode::Right && ev.modifiers.is_empty() {
-            if self.focus == Focus::Commands && !self.projects.is_empty() {
-                self.focus = Focus::Projects;
-                self.project_selected = 0;
-            }
-            return PaletteStep::Continue;
-        }
-        if ev.code == KeyCode::Left && ev.modifiers.is_empty() {
-            self.focus = Focus::Commands;
-            return PaletteStep::Continue;
-        }
-        // Space always types into the query (even if a keymap binds it); this
-        // also pulls focus back to the commands column.
-        if ev.code == KeyCode::Char(' ')
-            && (ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT)
-        {
-            self.type_char(' ');
-            return PaletteStep::Continue;
-        }
-
-        match action {
-            Some(PaletteAction::Close) => PaletteStep::Close,
-            Some(PaletteAction::Activate) => {
-                if self.focus == Focus::Projects {
-                    return PaletteStep::Activate(self.project_entry());
-                }
-                match self.results().get(self.selected) {
-                    Some((entry, _)) => PaletteStep::Activate(entry.clone()),
-                    None => PaletteStep::Continue,
-                }
-            }
-            Some(PaletteAction::NavUp) => {
-                if self.focus == Focus::Projects {
-                    self.project_selected = self.project_selected.saturating_sub(1);
-                } else {
-                    self.selected = self.selected.saturating_sub(1);
-                }
-                PaletteStep::Continue
-            }
-            Some(PaletteAction::NavDown) => {
-                if self.focus == Focus::Projects {
-                    if self.project_selected < self.projects_max() {
-                        self.project_selected += 1;
-                    }
-                } else {
-                    let count = self.results().len();
-                    if self.selected + 1 < count {
-                        self.selected += 1;
-                    }
-                }
-                PaletteStep::Continue
-            }
-            Some(PaletteAction::Backspace) => {
-                self.query.pop();
-                self.selected = 0;
-                self.focus = Focus::Commands;
-                PaletteStep::Continue
-            }
-            None => {
-                if let KeyCode::Char(c) = ev.code {
-                    if ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT {
-                        self.type_char(c);
-                    }
-                }
-                PaletteStep::Continue
-            }
+        match crate::keymap::chord_from_event(ev) {
+            Some(chord) => self.inner.handle_key(chord, action),
+            None => PaletteStep::Continue,
         }
     }
 
@@ -756,9 +606,10 @@ impl Palette {
     /// selects that item and activates it. A click outside the commands column
     /// (the Projects column, the search line, the footer, or the blank area
     /// below a short list) leaves the palette open unchanged.
+    ///
+    /// [`overlay_rect`]: Palette::overlay_rect
     pub fn handle_click(&mut self, rect: Rect, col: u16, row: u16) -> PaletteStep {
-        let results = self.results();
-        let n = results.len();
+        let n = self.results().len();
         if n == 0 {
             return PaletteStep::Continue;
         }
@@ -766,7 +617,7 @@ impl Palette {
         if rows.len() < 3 {
             return PaletteStep::Continue;
         }
-        let (commands_area, _) = split_results(rows[2], !self.projects.is_empty());
+        let (commands_area, _) = split_results(rows[2], !self.inner.projects().is_empty());
         // Horizontal + vertical bounds of the commands band.
         if col < commands_area.x
             || col >= commands_area.x.saturating_add(commands_area.width)
@@ -779,42 +630,31 @@ impl Palette {
         // full `2n + 1`-row bleed block. Each item owns a 2-row band (its
         // bleed-above and its label row), so `line / 2` resolves the item; the
         // final trailing bleed row clamps to the last item.
-        let selected = self.selected.min(n - 1);
+        let selected = self.inner.selected_in(n);
         let band_h = commands_area.height as usize;
         let off = command_scroll_offset(n, selected, band_h);
         let line = (row - commands_area.y) as usize + off;
         if line >= nav_lines(n) {
             return PaletteStep::Continue;
         }
-        let item = (line / 2).min(n - 1);
-        self.selected = item;
-        self.focus = Focus::Commands;
-        PaletteStep::Activate(results[item].0.clone())
-    }
-
-    /// Type a character into the query, resetting the command selection and
-    /// pulling focus back to the commands column (typing filters commands).
-    fn type_char(&mut self, c: char) {
-        self.query.push(c);
-        self.selected = 0;
-        self.focus = Focus::Commands;
+        self.inner.click_item((line / 2).min(n - 1))
     }
 
     /// The Projects column view, or `None` when there are no projects.
     fn projects_view(&self) -> Option<ProjectsColumn> {
-        if self.projects.is_empty() {
+        let projects = self.inner.projects();
+        if projects.is_empty() {
             return None;
         }
         Some(ProjectsColumn {
-            rows: self
-                .projects
+            rows: projects
                 .iter()
                 .map(|p| ProjectRow {
                     label: p.label.clone(),
                     indicator: p.indicator,
                 })
                 .collect(),
-            selected: (self.focus == Focus::Projects).then_some(self.project_selected),
+            selected: self.inner.project_selection(),
             phase: pulse_phase(self.opened_at),
         })
     }
@@ -822,18 +662,14 @@ impl Palette {
     /// Paint the overlay into `area`.
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let results = self.results();
-        let footer = if self.projects.is_empty() {
-            "↑↓ navigate · Enter activate · Esc / Ctrl+P close"
-        } else {
-            "↑↓ navigate · → projects · Enter activate · Esc / Ctrl+P close"
-        };
+        let footer = self.inner.footer("Ctrl+P");
         let view = PaletteView {
-            query: &self.query,
+            query: self.inner.query(),
             results: &results,
-            selected: self.selected,
-            commands_focused: self.focus == Focus::Commands,
+            selected: self.inner.selected(),
+            commands_focused: self.inner.focus() == Focus::Commands,
             projects: self.projects_view(),
-            footer,
+            footer: &footer,
         };
         render(f, area, &view);
     }
@@ -842,6 +678,7 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use shelbi_palette::{Decoration, DecorationColor};
 
     fn entry(id: &str, label: &str) -> Entry {
@@ -997,7 +834,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(p.results().len(), 2);
-        p.selected = 1;
+        p.inner.set_selected(1);
         for c in "zen".chars() {
             assert_eq!(p.handle_key(key(KeyCode::Char(c)), None), PaletteStep::Continue);
         }
@@ -1180,18 +1017,18 @@ mod tests {
             vec![entry("view:tasks", "Issues")],
             vec![project("website", "Website", ProjectIndicator::Active)],
         );
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
         assert_eq!(p.handle_key(key(KeyCode::Right), None), PaletteStep::Continue);
-        assert_eq!(p.focus, Focus::Projects);
+        assert_eq!(p.inner.focus(), Focus::Projects);
         assert_eq!(p.handle_key(key(KeyCode::Left), None), PaletteStep::Continue);
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
     }
 
     #[test]
     fn right_is_a_noop_without_projects() {
         let mut p = Palette::new(vec![entry("view:tasks", "Issues")], Vec::new());
         p.handle_key(key(KeyCode::Right), None);
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
     }
 
     #[test]
@@ -1233,9 +1070,9 @@ mod tests {
             vec![project("website", "Website", ProjectIndicator::Active)],
         );
         p.handle_key(key(KeyCode::Right), None);
-        assert_eq!(p.focus, Focus::Projects);
+        assert_eq!(p.inner.focus(), Focus::Projects);
         p.handle_key(key(KeyCode::Char('i')), None);
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
         assert_eq!(p.query(), "i");
     }
 
@@ -1250,7 +1087,7 @@ mod tests {
         for _ in 0..5 {
             p.handle_key(key(KeyCode::Down), Some(PaletteAction::NavDown));
         }
-        assert_eq!(p.project_selected, 1);
+        assert_eq!(p.inner.project_selection(), Some(1));
     }
 
     #[test]

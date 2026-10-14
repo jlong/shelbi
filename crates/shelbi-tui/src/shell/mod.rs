@@ -2099,6 +2099,27 @@ impl ShellState {
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
             Effect::QuitShelbi => self.quit(QuitAction::QuitShelbi),
             Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),
+            // The palette's review decisions. Approving the review that is open
+            // here goes through its panel (so the panel holds while it merges);
+            // any other runs off the UI thread with a status line. Reject always
+            // asks for the reason first.
+            Effect::Mutate(Mutation::ApproveReview { project, id }) => {
+                if self.review.as_ref().map(|r| r.task_id()) == Some(id.as_str()) {
+                    self.apply_review_action(ReviewAction::Approve);
+                } else {
+                    let m = Mutation::ApproveReview {
+                        project,
+                        id: id.clone(),
+                    };
+                    self.spawn_job(move || match run_review_mutation(&m) {
+                        Ok(()) => format!("approved {id}"),
+                        Err(e) => format!("approve failed: {e}"),
+                    });
+                }
+            }
+            Effect::Mutate(Mutation::RejectReview { id, .. }) => {
+                self.overlay = Some(ActiveOverlay::reject_reason(id));
+            }
             Effect::Mutate(other) => {
                 self.status = Some(format!("mutation {other:?} is not reachable from the palette"))
             }
@@ -4621,6 +4642,26 @@ mod tests {
             "running the palette's Machines command shows the Machines view"
         );
         assert_eq!(st.client.view(), &View::Machines);
+    }
+
+    #[test]
+    fn the_palettes_reject_entry_asks_for_a_reason() {
+        // The registry's `action:reject-review:<id>` carries no reason, so the
+        // shell opens the reject prompt for that task instead of sending it.
+        let mut st = test_state();
+        st.run_entry(&shelbi_palette::Entry {
+            id: "action:reject-review:T-7".into(),
+            label: "Reject Fix it".into(),
+            kind: shelbi_palette::EntryKind::Action,
+            subtitle: None,
+            shortcut: None,
+            decoration: None,
+            hidden_until_query: true,
+        });
+        assert!(
+            matches!(&st.overlay, Some(ActiveOverlay::RejectReason { task_id, .. }) if task_id == "T-7"),
+            "the reject prompt opens for the task"
+        );
     }
 
     #[test]
