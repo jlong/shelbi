@@ -90,6 +90,7 @@ use shelbi_term::gesture::{MouseGesture, MouseOutcome};
 use shelbi_term::input::{self, Modifiers, MouseAction, MouseButton, MouseEvent};
 use shelbi_term::links::Link;
 use shelbi_term::render::Damage;
+use shelbi_term::selection::Point as SelPoint;
 use shelbi_term::view::TerminalView;
 use shelbi_term::viewport::{self, Placement};
 use shelbi_term::Size;
@@ -833,23 +834,14 @@ impl TerminalPane {
             // Typed text reaches `replace_text_in_range` through the input
             // handler (IME and dead keys compose there).
             KeyAction::Text => {}
+            // ⌘C / ⌘V normally arrive as the Edit menu's actions (bound in
+            // this element's `Terminal` key context); this is the fallback.
             KeyAction::Copy => {
-                if let Some(text) = self.selection_text() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
+                self.copy(cx);
                 cx.stop_propagation();
             }
             KeyAction::Paste => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    match self.search.as_mut() {
-                        Some(bar) => {
-                            if bar.insert(&text) {
-                                self.run_search(cx);
-                            }
-                        }
-                        None => self.paste(text, cx),
-                    }
-                }
+                self.paste_clipboard(cx);
                 cx.stop_propagation();
             }
             KeyAction::Find => {
@@ -873,6 +865,41 @@ impl TerminalPane {
             }
             KeyAction::Ignore => {}
         }
+    }
+
+    /// Edit ▸ Copy: the selection to the clipboard.
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Edit ▸ Paste: the clipboard's text to the find bar while it is open,
+    /// otherwise to the program.
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            match self.search.as_mut() {
+                Some(bar) => {
+                    if bar.insert(&text) {
+                        self.run_search(cx);
+                    }
+                }
+                None => self.paste(text, cx),
+            }
+        }
+    }
+
+    /// Edit ▸ Select All: everything retained, scrollback included (the
+    /// alternate screen has none, so just its grid).
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let size = self.view.emulator().size();
+        let history = self.view.emulator().history_len() as i32;
+        self.view.begin_selection(SelPoint { line: -history, col: 0 });
+        self.view.update_selection(SelPoint {
+            line: i32::from(size.rows) - 1,
+            col: size.cols.saturating_sub(1),
+        });
+        cx.notify();
     }
 
     /// The current non-empty selection's text.
@@ -1612,6 +1639,7 @@ impl Render for TerminalPane {
         let a11y = window.is_a11y_active().then(|| self.a11y_children(window));
         let search_bar = self.render_search_bar(&theme, cx);
         let jump = self.render_jump_to_bottom(&theme, cx);
+        let has_selection = self.view.selection().is_some_and(|s| !s.is_empty());
         div()
             .id("terminal-pane")
             .key_context("Terminal")
@@ -1624,6 +1652,13 @@ impl Render for TerminalPane {
             .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, _, cx| {
                 this.modifiers_changed(e.modifiers, cx)
             }))
+            // The Edit menu: Copy only with a selection (gray otherwise);
+            // there is nothing to cut in a terminal.
+            .when(has_selection, |d| {
+                d.on_action(cx.listener(|this, _: &crate::menus::Copy, _, cx| this.copy(cx)))
+            })
+            .on_action(cx.listener(|this, _: &crate::menus::Paste, _, cx| this.paste_clipboard(cx)))
+            .on_action(cx.listener(|this, _: &crate::menus::SelectAll, _, cx| this.select_all(cx)))
             .relative()
             .size_full()
             .bg(theme.canvas)

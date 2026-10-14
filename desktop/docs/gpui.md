@@ -275,6 +275,59 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   drives IME and dead-key text through the `EntityInputHandler` methods
   directly, which is the path macOS calls.
 
+### Menus and system notifications (`dt-menus-notifications`, gpui-pre 0.3.9)
+
+- **System notifications are in the pinned snapshot**: `App::show_system_notification`,
+  `dismiss_system_notification` and `on_system_notification_response` (a
+  `SystemNotification { tag, title, body, actions }`), over
+  `UNUserNotificationCenter` in `gpui_macos::system_notifications`. No
+  `objc2` bridge of our own was needed. The center is created lazily, and
+  only when the main bundle has an identifier: under `cargo run` (no
+  `CFBundleIdentifier`, see "Unbundled builds" above) posting is a logged
+  no-op, so notifications only appear from `scripts/bundle.sh`'s `Shelbi.app`.
+  Authorization is requested on the first post, not at launch. gpui's
+  delegate presents banners even while the app is frontmost
+  (`willPresentNotification` returns Banner | List), so suppressing a notice
+  for what is on screen is the app's job (`src/notify.rs`). A notification's
+  tag is its request identifier: posting the same tag replaces it.
+- **Menu items are enabled by action availability, not by `disabled`.**
+  AppKit autoenables menu items through `validateMenuItem:`, which gpui
+  answers with `App::is_action_available` (a handler for the item's action
+  on the active window's focused path, or a global one). `MenuItem::disabled`
+  sets `setEnabled:`, which autoenabling overrides. So a disabled item gets an
+  action nothing handles (`menus::MenuUnavailable`), and an item that should
+  gray out with its target (Edit ▸ Copy without a terminal selection) has its
+  handler registered conditionally (`.when(..., |d| d.on_action(...))`).
+  Availability reads the last rendered frame.
+- **Key equivalents come from the keymap.** `set_menus` takes each item's key
+  equivalent from `Keymap::bindings_for_action`: the *earliest* binding whose
+  context predicate matches a fixed Workspace/Pane/Editor context, else the
+  earliest binding at all. A binding in a context no element declares is
+  therefore a pure menu label: it never fires from the keyboard but still
+  shows on the item. The desktop binds its `keys.yaml` shortcuts that way
+  (context `ShelbiMenuLabel`) and keeps handling the keys itself. gpui has no
+  way to remove one binding (`clear_key_bindings` drops gpui-kit's too), and
+  data actions compare by value, so each new shortcut set is bound under a
+  fresh `MenuInvoke::generation`; stale bindings match no item. Only one-
+  keystroke bindings become key equivalents.
+- **Key bindings dispatch before key listeners.** A keystroke matching a
+  binding on the focused path runs its action first; `on_key_down` /
+  `capture_key_down` only see it if no binding handled it. The Edit keys
+  (⌘C ⌘V ⌘A) are bound in the terminal's `Terminal` key context, so they run
+  the terminal's Edit actions there and fall through to the overlays' and
+  gpui-kit inputs' own handling elsewhere.
+- **A key the window handles never reaches the menu.** For a key-down with
+  modifiers, AppKit offers the event to the key window's
+  `performKeyEquivalent:` first and to the main menu only if gpui reports it
+  unhandled, so a chord both the window and a menu item carry fires once.
+- **The menu named "Window" is AppKit's Windows menu** (gpui calls
+  `setWindowsMenu:` for it): AppKit appends the open windows by title, the key
+  one checked, so the project windows are listed without our own items.
+- `window.dispatch_action(..)` defers to the next effect cycle, so an action
+  handler can forward a different action to the focused element (the window
+  forwards Edit ▸ Copy to a focused gpui-kit input as
+  `gpui_kit::base::input::Copy`).
+
 ## Build time and binary size
 
 The foundation window (sidebar/main split, no views). Clean builds of the

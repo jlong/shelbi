@@ -11,6 +11,8 @@ mod assets;
 mod commands;
 mod elements;
 mod keys;
+mod menus;
+mod notify;
 mod platform;
 mod projects;
 mod refresh;
@@ -25,18 +27,11 @@ mod visual_views;
 mod visual_workspace;
 mod window_state;
 
-use gpui::{actions, App, KeyBinding, Menu, MenuItem, SystemMenuType};
+use gpui::App;
 
 use crate::app::Shell;
 use crate::projects::Catalog;
 use crate::refresh::ControlWatcher;
-
-/// The app name: the menu bar's app menu.
-const APP_NAME: &str = "Shelbi";
-
-// App-level actions. `Quit` closes this client only (the registry's
-// `QuitShelbi`, which stops every agent, is a separate command).
-actions!(shelbi_desktop, [Quit]);
 
 /// What the command line asked for.
 enum Mode {
@@ -127,14 +122,25 @@ fn main() {
             assets::load_fonts(cx);
             elements::terminal::TerminalSettings::init(cx);
 
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-            app::bind_keys(cx);
-            cx.set_menus([Menu::new(APP_NAME).items([
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action(format!("Quit {APP_NAME}"), Quit),
-            ])]);
+            // The menu bar: the macOS-standard shortcuts now (⌘Q closes this
+            // client only; the registry's Quit Shelbi, which stops every
+            // agent, is its own confirmed item), then the active window's
+            // commands once it has state (`ShelbiWindow::sync_menus`).
+            menus::init(cx);
+            menus::install(
+                menus::tree::build(
+                    &Default::default(),
+                    &shelbi_state::keymap::validate_keymaps_yaml("", None).0,
+                    Default::default(),
+                ),
+                cx,
+            );
+            // A clicked notification focuses its project's window and opens
+            // the item. (Notifications only post from the bundled app: an
+            // unbundled `cargo run` has no notification center.)
+            cx.on_system_notification_response(|response, cx| {
+                app::open_notice_tag(&response.tag, cx);
+            });
 
             // Closing the last window quits the app (its agents keep running).
             cx.on_window_closed(|cx, _| {
