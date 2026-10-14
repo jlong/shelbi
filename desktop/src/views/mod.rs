@@ -4,6 +4,7 @@
 //! - sidebar, project switching, the refresh pipeline into gpui, settings:
 //!   **`dt-shell-sidebar`**
 //! - chat (the orchestrator's terminal, full height): **`dt-chat-view`**
+//!   (landed: `chat.rs`)
 //! - issues board and task detail: **`dt-issues-board`** (landed:
 //!   `issues.rs` draws the board over the toolkit-free `board_state.rs`,
 //!   `task_detail.rs` the detail, `markdown.rs` / `external_edit.rs` its
@@ -23,6 +24,7 @@
 
 pub mod bootstrap;
 pub mod board_state;
+pub mod chat;
 pub mod external_edit;
 pub mod issues;
 pub mod markdown;

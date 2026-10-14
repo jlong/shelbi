@@ -23,6 +23,10 @@
 //!   channel. Threads and channels only, so a gpui client can consume it
 //!   without tokio. [`changes`] is its wake source: a hub-socket subscriber
 //!   for the daemon's board/workspace change notifications.
+//! - [`session`] — showing a session in a main area: naming
+//!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
+//!   classification, and the per-pane restart controller over
+//!   [`supervision`], the crash-loop core the daemon poller shares.
 //!
 //! # No UI toolkit
 //!
@@ -40,6 +44,8 @@ pub mod exec;
 pub mod exec_daemon;
 pub mod nav;
 pub mod refresh;
+pub mod session;
+pub mod supervision;
 pub mod theme;
 pub mod view;
 

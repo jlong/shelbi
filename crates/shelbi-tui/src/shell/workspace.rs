@@ -92,7 +92,7 @@ impl WorkspaceInterface {
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
-            super::relaunch::WorkspaceContentRelauncher {
+            shelbi_app::session::WorkspaceContentRelauncher {
                 project: project.to_string(),
             },
         ));
@@ -345,7 +345,7 @@ impl WorkspaceInterface {
             MainState::Restarting(attempt, max) => super::render_placeholder(
                 buf,
                 content_rect,
-                &format!("Session exited — restarting ({attempt}/{max})…"),
+                &shelbi_app::session::restarting_notice(attempt, max),
             ),
             MainState::GaveUp(last_line) => super::render_placeholder(
                 buf,

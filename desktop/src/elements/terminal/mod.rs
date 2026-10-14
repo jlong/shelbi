@@ -97,6 +97,22 @@ pub enum PaneStatus {
     Failed(String),
 }
 
+/// What a pane tells the view that holds it about its session, so a view can
+/// supervise it (the Chat view restarts a pane whose session died) and the
+/// shell can show the program's title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEvent {
+    /// The program set its title (empty = reset).
+    Title(String),
+    /// The session's program exited.
+    Exited(shelbi_proto::Exited),
+    /// The connection ended without an exit: the session process went away
+    /// (killed, or replaced by a relaunch).
+    Closed,
+}
+
+impl gpui::EventEmitter<PaneEvent> for TerminalPane {}
+
 /// Where the grid was painted last frame, for mapping pointer positions.
 #[derive(Debug, Clone)]
 pub(crate) struct Geometry {
@@ -206,7 +222,7 @@ impl TerminalPane {
                 Ok(c) => {
                     let events = c.events;
                     let attached = this.update(cx, |pane, cx| {
-                        pane.attached(c.name, c.size, Box::new(c.link), cx);
+                        pane.attached(c.name, c.size, c.link, cx);
                     });
                     if attached.is_err() {
                         return;
@@ -224,6 +240,47 @@ impl TerminalPane {
             Self::pump(this, events, cx).await;
         }));
         pane
+    }
+
+    /// A pane over a session the caller already attached to (and wired with
+    /// [`session::wire`]): it is live at once and starts pumping the attach
+    /// replay. The Chat view attaches through `shelbi_app::session` (its
+    /// relaunch-tolerant connect) and hands the result here.
+    pub fn attached_to(
+        connected: session::Connected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let session::Connected {
+            link,
+            events,
+            size,
+            name,
+        } = connected;
+        let mut pane = Self::new(name.clone(), window, cx);
+        pane.attached(name, size, link, cx);
+        pane._pump = Some(cx.spawn_in(window, async move |this, cx| {
+            Self::pump(this, events, cx).await;
+        }));
+        pane
+    }
+
+    /// The visible screen as text, one line per row (tests).
+    #[cfg(test)]
+    pub fn terminal_text(&self) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        let grid = self.view.emulator().grid();
+        (0..grid.screen_lines())
+            .map(|row| {
+                (0..grid.columns())
+                    .map(|col| grid[Line(row as i32)][Column(col)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// A pane already attached to `io` at `size`, with no session behind it:
@@ -391,6 +448,7 @@ impl TerminalPane {
         let _ = this.update(cx, |pane, cx| {
             if pane.status == PaneStatus::Live {
                 pane.status = PaneStatus::Failed("the session closed the connection".into());
+                cx.emit(PaneEvent::Closed);
             }
             pane.io = None;
             cx.notify();
@@ -416,6 +474,7 @@ impl TerminalPane {
                     self.view.resize(self.session_size);
                 }
                 SessionEvent::Title(t) => {
+                    cx.emit(PaneEvent::Title(t.clone()));
                     self.title = if t.is_empty() { None } else { Some(t) };
                     cx.notify();
                 }
@@ -426,6 +485,7 @@ impl TerminalPane {
                         (_, Some(s)) => format!("killed by signal {s}"),
                         _ => "exited".into(),
                     });
+                    cx.emit(PaneEvent::Exited(e));
                     cx.notify();
                 }
             }

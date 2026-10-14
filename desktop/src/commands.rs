@@ -161,7 +161,9 @@ pub fn view_stub_id(view: &View) -> Option<String> {
         View::Activity => Some("view:activity".into()),
         // dt-activity-machines
         View::Machines => Some("view:machines".into()),
-        // dt-chat-view (the orchestrator, `orch`) / dt-workspace-view
+        // dt-chat-view: the orchestrator chat.
+        View::Session(name) if name == "orch" => None,
+        // dt-workspace-view
         View::Session(name) => Some(format!("view:{name}")),
     }
 }
@@ -379,7 +381,8 @@ mod tests {
             (View::Issues, None),
             (View::Activity, Some("view:activity")),
             (View::Machines, Some("view:machines")),
-            (View::Session("orch".into()), Some("view:orch")),
+            (View::Session("orch".into()), None),
+            (View::Session("alpha".into()), Some("view:alpha")),
         ] {
             let mut host = Recorder::default();
             dispatch_view(&view, &mut host);

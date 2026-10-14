@@ -189,6 +189,19 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   instead.
 - `VisualTestAppContext::capture_screenshot` renders the *last* drawn scene;
   call `window.draw(cx).clear(cx)` first to render a fresh frame.
+- **Key dispatch runs capture (root to focused) then bubble (focused to
+  root).** A focused terminal encodes and `stop_propagation`s every control
+  key in its bubble handler, so a window-level chord the terminal must never
+  see (Ctrl+H, Ctrl+Space) has to be taken in the window's
+  `capture_key_down`. `dt-chat-view` does that only while the chat's terminal
+  holds focus, so the board's text inputs keep their own Ctrl chords.
+- **Focus listeners (`on_focus_in` / `on_focus_out`) fire when the window next
+  draws**, not when `window.focus(..)` is called; a `TestAppContext` that only
+  runs `run_until_parked` never sees them. And `Window::focused` keeps
+  reporting a dropped entity's focus handle until that draw. To know whether a
+  view held focus at some event, read `handle.is_focused(window)` at the event
+  (`cx.subscribe_in` hands the subscriber the window), and compare
+  `window.focused(cx)` against the old handle rather than `None`.
 
 ## Build time and binary size
 

@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
-use shelbi_client::{ClientError, Connection, DiscoveredSession, SessionEvent};
+use shelbi_client::{ClientError, Connection, DiscoveredSession, SessionEvent, SessionEvents};
 use shelbi_proto::capability;
 use shelbi_term::Size;
 
@@ -68,8 +68,8 @@ impl SessionIo for SessionLink {
 
 /// A connected session, attached and streaming.
 pub struct Connected {
-    /// The input side.
-    pub link: SessionLink,
+    /// The input side ([`SessionLink`] for a real session).
+    pub link: Box<dyn SessionIo + Send>,
     /// Output and pushed events, starting with the attach replay.
     pub events: UnboundedReceiver<SessionEvent>,
     /// The session's size at attach time.
@@ -138,7 +138,26 @@ fn attempt(selector: &str) -> Result<Connected, Failure> {
         |what: &str, e: ClientError| Failure::Fatal(format!("{what} {}: {e}", session.meta.name));
     let info = conn.info().map_err(|e| fatal("querying", e))?;
     conn.attach(None).map_err(|e| fatal("attaching to", e))?;
+    wire(
+        conn,
+        events,
+        Size::new(info.cols.max(1), info.rows.max(1)),
+        session.meta.name.clone(),
+    )
+    .map_err(Failure::Fatal)
+}
 
+/// Move an attached connection onto the pane's threads: a forwarder that moves
+/// the reader's events onto an async channel the UI awaits, and a writer that
+/// owns the connection. Used by [`connect`] and by views that attach through
+/// `shelbi_app::session` (the Chat view), so every pane talks to its session
+/// the same way.
+pub fn wire(
+    conn: Connection,
+    events: SessionEvents,
+    size: Size,
+    name: String,
+) -> Result<Connected, String> {
     // Forward the reader's std channel onto an async one the UI awaits.
     let (event_tx, event_rx) = unbounded();
     let std_rx = events.into_inner();
@@ -151,7 +170,7 @@ fn attempt(selector: &str) -> Result<Connected, Failure> {
                 }
             }
         })
-        .map_err(|e| Failure::Fatal(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
 
     // The writer thread owns the connection.
     let supports_paste = conn.supports(capability::PASTE);
@@ -177,13 +196,13 @@ fn attempt(selector: &str) -> Result<Connected, Failure> {
                 }
             }
         })
-        .map_err(|e| Failure::Fatal(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
 
     Ok(Connected {
-        link: SessionLink { tx },
+        link: Box::new(SessionLink { tx }),
         events: event_rx,
-        size: Size::new(info.cols.max(1), info.rows.max(1)),
-        name: session.meta.name.clone(),
+        size,
+        name,
     })
 }
 
