@@ -208,7 +208,250 @@ impl ReviewState {
     }
 }
 
+impl WorkspaceRow {
+    /// The right-aligned label on the workspace's row: the agent's name in
+    /// title case, `idle` with no task, or nothing for a skeleton row whose
+    /// state hasn't been read yet (its `…` badge carries that).
+    pub fn right_label(&self) -> String {
+        match &self.agent {
+            Some(a) => title_case(a),
+            None if self.badge == WorkspaceBadge::Loading => String::new(),
+            None => "idle".to_string(),
+        }
+    }
+}
+
+/// The fixed nav builtins, in sidebar order: the orchestrator chat, the issues
+/// board, the activity feed. Machines is reachable from the command palette,
+/// not the sidebar nav.
+pub fn default_nav_items() -> Vec<NavItem> {
+    vec![
+        NavItem {
+            label: "Orchestrator".into(),
+            view: View::Session("orch".into()),
+        },
+        NavItem {
+            label: "Issues".into(),
+            view: View::Issues,
+        },
+        NavItem {
+            label: "Activity".into(),
+            view: View::Activity,
+        },
+    ]
+}
+
+/// Uppercase the first character of a lowercase identifier (`developer` →
+/// `Developer`). Empty input is preserved.
+pub fn title_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// One laid-out sidebar row: the flat, ordered list every renderer draws, so
+/// the TUI and the desktop app show the same items in the same order with the
+/// same labels. Built by [`SidebarModel::rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarRow {
+    /// A fixed nav builtin.
+    Nav { label: String, view: View },
+    /// A section header (`Workspaces`, `Ready for Review`, `Queued for Review`).
+    Section(String),
+    /// A present-but-broken project config, shown under the Workspaces header.
+    ConfigError(String),
+    /// Vertical breathing room between sections.
+    Blank,
+    /// The dim "Loading…" placeholder of a cold board.
+    Loading,
+    /// A machine group header (only when the project spans several machines).
+    MachineGroup {
+        name: String,
+        collapsed: bool,
+        total: usize,
+        active: usize,
+    },
+    /// A dev workspace.
+    Workspace {
+        name: String,
+        badge: WorkspaceBadge,
+        /// The right-aligned label ([`WorkspaceRow::right_label`]).
+        right_label: String,
+        /// Indented under a machine group header.
+        indent: bool,
+    },
+    /// A review-column task (a two-line entry: title, then `⎇ branch`).
+    Review {
+        task_id: String,
+        title: String,
+        branch: String,
+        location: Option<String>,
+        state: ReviewState,
+    },
+}
+
+/// What a selectable [`SidebarRow`] opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarTarget {
+    /// A nav builtin's view.
+    View(View),
+    /// A dev workspace, by name.
+    Workspace(String),
+    /// A review-column task, by id.
+    Review(String),
+    /// A machine group header: toggles its collapse state.
+    Machine(String),
+}
+
+impl SidebarRow {
+    /// Whether keyboard selection stops on this row. Headers, blanks, the
+    /// loading placeholder and the config error are skipped.
+    pub fn is_selectable(&self) -> bool {
+        self.target().is_some()
+    }
+
+    /// What opening this row does, or `None` for a non-selectable row.
+    pub fn target(&self) -> Option<SidebarTarget> {
+        match self {
+            SidebarRow::Nav { view, .. } => Some(SidebarTarget::View(view.clone())),
+            SidebarRow::MachineGroup { name, .. } => Some(SidebarTarget::Machine(name.clone())),
+            SidebarRow::Workspace { name, .. } => Some(SidebarTarget::Workspace(name.clone())),
+            SidebarRow::Review { task_id, .. } => Some(SidebarTarget::Review(task_id.clone())),
+            SidebarRow::Section(_)
+            | SidebarRow::ConfigError(_)
+            | SidebarRow::Blank
+            | SidebarRow::Loading => None,
+        }
+    }
+}
+
 impl SidebarModel {
+    /// A zero-IO sidebar for `project`: the fixed nav, the raw project name,
+    /// and the board-loading flag. Painted the instant a cold project switch
+    /// lands, before any read for the target project has finished, so the
+    /// chrome shows the target project immediately and data cascades in.
+    pub fn skeleton(project: &str) -> SidebarModel {
+        SidebarModel {
+            project_label: project.to_string(),
+            nav: default_nav_items(),
+            workspaces: Vec::new(),
+            reviews: Vec::new(),
+            config_error: None,
+            board_loading: true,
+            collapsed_machines: BTreeSet::new(),
+            board_banner: None,
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
+            status_line: String::new(),
+            zen_mode: ZenModeState::Off,
+            unread_errors: 0,
+            session_lost: None,
+        }
+    }
+
+    /// Lay the model out as the ordered row list: the fixed nav, then the
+    /// machine-grouped workspace pool (or the config-error / loading
+    /// placeholder), then the Ready / Queued review sections. Each section
+    /// header and its rows drop together when empty.
+    pub fn rows(&self) -> Vec<SidebarRow> {
+        let mut rows: Vec<SidebarRow> = self
+            .nav
+            .iter()
+            .map(|nav| SidebarRow::Nav {
+                label: nav.label.clone(),
+                view: nav.view.clone(),
+            })
+            .collect();
+
+        // Cold board, nothing loaded yet: a dim "Loading…" placeholder.
+        if self.board_loading {
+            rows.push(SidebarRow::Blank);
+            rows.push(SidebarRow::Loading);
+            return rows;
+        }
+
+        if let Some(message) = &self.config_error {
+            rows.push(SidebarRow::Blank);
+            rows.push(SidebarRow::Section("Workspaces".into()));
+            rows.push(SidebarRow::ConfigError(message.clone()));
+        } else if !self.workspaces.is_empty() {
+            rows.push(SidebarRow::Blank);
+            rows.push(SidebarRow::Section("Workspaces".into()));
+            // Group by machine when the project declares more than one; a
+            // single-machine project collapses to a flat list.
+            let mut machines: Vec<&str> = Vec::new();
+            for w in &self.workspaces {
+                if !machines.contains(&w.machine.as_str()) {
+                    machines.push(&w.machine);
+                }
+            }
+            let workspace_row = |w: &WorkspaceRow, indent: bool| SidebarRow::Workspace {
+                name: w.name.clone(),
+                badge: w.badge,
+                right_label: w.right_label(),
+                indent,
+            };
+            if machines.len() > 1 {
+                for machine in machines {
+                    let on_machine: Vec<&WorkspaceRow> = self
+                        .workspaces
+                        .iter()
+                        .filter(|w| w.machine == machine)
+                        .collect();
+                    let collapsed = self.collapsed_machines.contains(machine);
+                    rows.push(SidebarRow::MachineGroup {
+                        name: machine.to_string(),
+                        collapsed,
+                        total: on_machine.len(),
+                        active: on_machine
+                            .iter()
+                            .filter(|w| w.current_task.is_some())
+                            .count(),
+                    });
+                    if !collapsed {
+                        rows.extend(on_machine.into_iter().map(|w| workspace_row(w, true)));
+                    }
+                }
+            } else {
+                rows.extend(self.workspaces.iter().map(|w| workspace_row(w, false)));
+            }
+        }
+
+        let review_row = |r: &ReviewRow| SidebarRow::Review {
+            task_id: r.task_id.clone(),
+            title: r.title.clone(),
+            branch: r.branch.clone(),
+            location: r.location.clone(),
+            state: r.state,
+        };
+        // Ready for Review: Serving / Loading rows (already on a slot).
+        let ready: Vec<&ReviewRow> = self
+            .reviews
+            .iter()
+            .filter(|r| r.state != ReviewState::Pending)
+            .collect();
+        if !ready.is_empty() {
+            rows.push(SidebarRow::Blank);
+            rows.push(SidebarRow::Section("Ready for Review".into()));
+            rows.extend(ready.into_iter().map(review_row));
+        }
+        // Queued for Review: Pending rows (waiting for a free slot).
+        let queued: Vec<&ReviewRow> = self
+            .reviews
+            .iter()
+            .filter(|r| r.state == ReviewState::Pending)
+            .collect();
+        if !queued.is_empty() {
+            rows.push(SidebarRow::Blank);
+            rows.push(SidebarRow::Section("Queued for Review".into()));
+            rows.extend(queued.into_iter().map(review_row));
+        }
+
+        rows
+    }
+
     /// Build the sidebar from one already-read board slice, mirroring the
     /// TUI's approach of filtering the single board rather than making a
     /// second round trip.
@@ -274,21 +517,7 @@ impl SidebarModel {
 
         SidebarModel {
             project_label: project_label.into(),
-            nav: vec![
-                NavItem {
-                    // The orchestrator chat nav item; see the sidebar builder.
-                    label: "Orchestrator".into(),
-                    view: View::Session("orch".into()),
-                },
-                NavItem {
-                    label: "Issues".into(),
-                    view: View::Issues,
-                },
-                NavItem {
-                    label: "Activity".into(),
-                    view: View::Activity,
-                },
-            ],
+            nav: default_nav_items(),
             workspaces,
             reviews,
             config_error: None,
@@ -912,6 +1141,146 @@ mod tests {
         assert_eq!(a1.current_task.as_deref(), Some("T-1"));
         let a2 = model.workspaces.iter().find(|w| w.name == "alpha-2").unwrap();
         assert_eq!(a2.current_task, None);
+    }
+
+    fn ws_row(name: &str, machine: &str, task: Option<&str>, badge: WorkspaceBadge) -> WorkspaceRow {
+        WorkspaceRow {
+            name: name.into(),
+            machine: machine.into(),
+            is_remote: false,
+            current_task: task.map(str::to_string),
+            agent: task.map(|_| "developer".to_string()),
+            badge,
+        }
+    }
+
+    fn review_row(id: &str, state: ReviewState) -> ReviewRow {
+        ReviewRow {
+            task_id: id.into(),
+            title: format!("Task {id}"),
+            branch: format!("jlong/{id}"),
+            location: None,
+            workspace: None,
+            state,
+        }
+    }
+
+    #[test]
+    fn rows_lay_out_nav_workspaces_then_ready_and_queued_reviews() {
+        let mut model = SidebarModel::skeleton("demo");
+        model.board_loading = false;
+        model.workspaces = vec![
+            ws_row("alpha", "hub", Some("T-1"), WorkspaceBadge::Working),
+            ws_row("bravo", "hub", None, WorkspaceBadge::Idle),
+        ];
+        model.reviews = vec![
+            review_row("T-2", ReviewState::Pending),
+            review_row("T-3", ReviewState::Serving),
+        ];
+        let rows = model.rows();
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                SidebarRow::Nav { label, .. } => format!("nav:{label}"),
+                SidebarRow::Section(s) => format!("section:{s}"),
+                SidebarRow::Blank => "blank".into(),
+                SidebarRow::Workspace {
+                    name, right_label, indent, ..
+                } => format!("ws:{name}:{right_label}:{indent}"),
+                SidebarRow::Review { task_id, .. } => format!("review:{task_id}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "nav:Orchestrator",
+                "nav:Issues",
+                "nav:Activity",
+                "blank",
+                "section:Workspaces",
+                // Single machine: a flat, unindented list.
+                "ws:alpha:Developer:false",
+                "ws:bravo:idle:false",
+                "blank",
+                "section:Ready for Review",
+                "review:T-3",
+                "blank",
+                "section:Queued for Review",
+                "review:T-2",
+            ]
+        );
+        let targets: Vec<SidebarTarget> = rows.iter().filter_map(SidebarRow::target).collect();
+        assert_eq!(targets[0], SidebarTarget::View(View::Session("orch".into())));
+        assert_eq!(targets[3], SidebarTarget::Workspace("alpha".into()));
+        assert_eq!(targets[5], SidebarTarget::Review("T-3".into()));
+        assert_eq!(targets.len(), 7, "headers and blanks are not selectable");
+    }
+
+    #[test]
+    fn rows_group_by_machine_and_hide_collapsed_groups() {
+        let mut model = SidebarModel::skeleton("demo");
+        model.board_loading = false;
+        model.workspaces = vec![
+            ws_row("alpha", "hub", Some("T-1"), WorkspaceBadge::Working),
+            ws_row("delta", "devbox", None, WorkspaceBadge::Idle),
+            ws_row("echo", "devbox", Some("T-4"), WorkspaceBadge::AwaitingInput),
+        ];
+        model.collapsed_machines.insert("devbox".into());
+        let rows = model.rows();
+        assert!(rows.contains(&SidebarRow::MachineGroup {
+            name: "hub".into(),
+            collapsed: false,
+            total: 1,
+            active: 1,
+        }));
+        assert!(rows.contains(&SidebarRow::MachineGroup {
+            name: "devbox".into(),
+            collapsed: true,
+            total: 2,
+            active: 1,
+        }));
+        let workspaces: Vec<(&str, bool)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                SidebarRow::Workspace { name, indent, .. } => Some((name.as_str(), *indent)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(workspaces, [("alpha", true)], "a collapsed group hides its rows");
+    }
+
+    #[test]
+    fn skeleton_and_config_error_rows() {
+        let skeleton = SidebarModel::skeleton("demo");
+        assert_eq!(skeleton.project_label, "demo");
+        let rows = skeleton.rows();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[4], SidebarRow::Loading);
+
+        let mut broken = SidebarModel::skeleton("demo");
+        broken.board_loading = false;
+        broken.config_error = Some("demo.yaml: bad".into());
+        assert_eq!(
+            broken.rows()[3..],
+            [
+                SidebarRow::Blank,
+                SidebarRow::Section("Workspaces".into()),
+                SidebarRow::ConfigError("demo.yaml: bad".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_right_label_reads_agent_idle_or_nothing() {
+        let mut row = ws_row("alpha", "hub", Some("T-1"), WorkspaceBadge::Working);
+        assert_eq!(row.right_label(), "Developer");
+        row.agent = None;
+        row.badge = WorkspaceBadge::Idle;
+        assert_eq!(row.right_label(), "idle");
+        row.badge = WorkspaceBadge::Loading;
+        assert_eq!(row.right_label(), "");
+        assert_eq!(title_case(""), "");
     }
 
     #[test]

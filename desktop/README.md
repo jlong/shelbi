@@ -6,14 +6,15 @@ render over `shelbi-app` (navigation, the command registry, view models,
 background refresh) and talk to the same daemon and sessions. The plan is
 "Desktop App (gpui)" (`Plans/desktop-app-gpui.md` in the Shelbi ContextStore).
 
-Status: foundation. On launch the app finds the `shelbi` CLI, starts the
+Status: the app shell. On launch the app finds the `shelbi` CLI, starts the
 daemon, and checks versions (`src/platform/`, see
-`docs/status/dt-platform-bootstrap.md`); then the window shows the
-sidebar/main split in the theme the `theme:` setting picks (`auto` follows
-the system appearance), where the Issues nav row shows the native board and task detail
-(`dt-issues-board`, see `docs/status/dt-issues-board.md`) and every other
-command and view shows a "Not implemented yet" banner until its `dt-*`
-subtask lands.
+`docs/status/dt-platform-bootstrap.md`); then each project gets its own window
+with the real sidebar (live workspace and review state), project switching,
+the refresh pipeline and a settings view (`docs/status/dt-shell-sidebar.md`),
+in the theme the `theme:` setting picks (`auto` follows the system
+appearance). The Issues nav row shows the native board and task detail
+(`dt-issues-board`, see `docs/status/dt-issues-board.md`); the other views
+show a "Not implemented yet" stub until their `dt-*` subtask lands.
 
 The app is a client of the `shelbi` CLI and needs it installed
 (`brew install jlong/shelbi/shelbi`). To point it at a particular build, set
@@ -30,7 +31,8 @@ macOS on Apple silicon, macOS 15 or later.
 
 ```sh
 cd desktop
-cargo run
+cargo run              # the most recently launched project
+cargo run -- <project> # or a named one ($SHELBI_PROJECT works too)
 ```
 
 `rust-toolchain.toml` pins the toolchain, so rustup installs it on first use.
@@ -81,14 +83,19 @@ desktop/
   build.rs             embeds macos/Info.plist so `cargo run` is "Shelbi" in the menu bar
   macos/Info.plist     the unbundled binary's name (dt-packaging builds the real .app)
   assets/icons/        vendored Heroicons + their LICENSE
+  assets/fonts/geist/  Geist, the UI typeface (OFL) + its LICENSE
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
   docs/status/         one <task-id>.md per subtask
-  src/main.rs          gpui App, the "Shelbi" window and menu
-  src/app.rs           root view: sidebar | main area split (placeholders)
+  src/main.rs          gpui App, the menu, the app-wide globals, the launch window
+  src/app.rs           a project window's root view: sidebar | main area, routing
+                       through ClientState, one window per project (Shell)
+  src/keys.rs          gpui keystrokes to shelbi_state::keymap KeyChords (so keys.yaml applies)
+  src/refresh.rs       the refresh pipeline: per-window feed (refresher, change
+                       subscription, polling fallback) and the control-socket watcher
+  src/projects.rs      the project catalog (+ skeleton prefetch) and opening a project
+  src/window_state.rs  per-project window frame and sidebar width/collapse
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
-  src/keys.rs          gpui keystroke -> Shelbi KeyChord (so keys.yaml applies)
-  src/project.rs       which project the window shows (until dt-shell-sidebar)
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
   src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette

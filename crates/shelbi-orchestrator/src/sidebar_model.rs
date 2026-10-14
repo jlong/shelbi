@@ -1,5 +1,6 @@
-//! Build the shell's [`SidebarModel`] from disk — the rich, IO-backed builder
-//! that the off-thread refresher calls each tick.
+//! Build the clients' [`SidebarModel`] from disk: the rich, IO-backed builder
+//! a client's off-thread refresher calls each tick. Shared by the TUI shell and
+//! the desktop app, so both read the same sidebar from the same state.
 //!
 //! `shelbi_app::view::SidebarModel::from_board` is the toolkit- and
 //! orchestrator-free *structural* builder (it can't read a workspace's
@@ -8,12 +9,13 @@
 //! disk-derived data the former tmux-runtime sidebar showed on top: machine
 //! grouping, per-workspace state badges, the review sections split by lifecycle
 //! state (with branch + serving location), the config-load error, the collapse
-//! set, and the footer's daemon-version probe and board-freshness banner. It is
-//! a near-verbatim port of the old `crate::app::App::refresh` sidebar path.
+//! set, and the footer's daemon-version probe and board-freshness banner.
+//!
+//! Every function here can block (disk, the daemon socket, and for a remote
+//! review slot an SSH liveness probe), so call them off the UI thread.
 
-use shelbi_app::nav::View;
 use shelbi_app::view::{
-    NavItem, ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow,
+    default_nav_items, ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow,
 };
 use shelbi_core::Column;
 use shelbi_state::{
@@ -27,10 +29,10 @@ use shelbi_state::{
 /// Mirrors the old sidebar's `refresh`: one board read feeds both the workspace
 /// pool and the review sections; the store-build result gates config-error
 /// classification exactly as before.
-pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
+pub fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
     let mut model = SidebarModel {
         project_label: project.to_string(),
-        nav: nav_items(),
+        nav: default_nav_items(),
         workspaces: Vec::new(),
         reviews: Vec::new(),
         config_error: None,
@@ -110,18 +112,16 @@ pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
     Some(model)
 }
 
-/// The fixed nav builtins, matching the former sidebar's order. Also used by the
-/// shell's skeleton sidebar model, painted the instant a cold project switch
-/// lands (`ShellState::skeleton_sidebar_model`).
 /// A sidebar skeleton for `project` built from its **config alone** — the
 /// display label and the declared (non-review) workspaces, each with a
 /// [`WorkspaceBadge::Loading`] badge — plus the persisted machine-collapse set.
 /// No board, status, review-slot, or daemon reads, so it is cheap, but it still
 /// touches disk: the shell builds these off the UI thread ahead of time
-/// (`ShellState::spawn_skeleton_prefetch`) so a *cold* project switch can paint
+/// (the TUI's `ShellState::spawn_skeleton_prefetch`, the desktop's project
+/// prefetch) so a *cold* project switch can paint
 /// the target's workspace rows on the very next frame. `None` when the
 /// project's config doesn't load (the caller falls back to the bare skeleton).
-pub(crate) fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
+pub fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
     let p = load_project(project).ok()?;
     let workspaces = p
         .workspaces
@@ -145,7 +145,7 @@ pub(crate) fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
             .clone()
             .or_else(|| p.label.clone())
             .unwrap_or_else(|| project.to_string()),
-        nav: nav_items(),
+        nav: default_nav_items(),
         workspaces,
         reviews: Vec::new(),
         config_error: None,
@@ -159,29 +159,6 @@ pub(crate) fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
         unread_errors: 0,
         session_lost: None,
     })
-}
-
-pub(crate) fn nav_items() -> Vec<NavItem> {
-    vec![
-        NavItem {
-            // The first nav item is the orchestrator chat. Labelled
-            // "Orchestrator" per the Figma (the glyph stays 💬); the palette
-            // entry derives from this label, so it aligns too.
-            label: "Orchestrator".into(),
-            view: View::Session("orch".into()),
-        },
-        NavItem {
-            label: "Issues".into(),
-            view: View::Issues,
-        },
-        NavItem {
-            label: "Activity".into(),
-            view: View::Activity,
-        },
-        // Machines is reachable from the command palette (Ctrl+P → Machines),
-        // not the sidebar nav — this keeps the shell's nav at parity with main
-        // (Chat / Issues / Activity). See `overlays::build_command_model`.
-    ]
 }
 
 /// Default agent surfaced when a task has no explicit `agent:` — matches
@@ -302,7 +279,7 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
                  state: ReviewState| {
         let workflow = load_task_workflow(project_name, &project, task).ok();
         let branch =
-            shelbi_orchestrator::branch::branch_name_for_task(&project, workflow.as_ref(), task)
+            crate::branch::branch_name_for_task(&project, workflow.as_ref(), task)
                 .unwrap_or_else(|_| {
                     task.branch
                         .clone()
@@ -328,7 +305,7 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
             .filter(|w| project.effective_tags(w).contains("review"));
         match loaded_on {
             Some(ws)
-                if shelbi_orchestrator::workspace::review_slot_is_serving(
+                if crate::workspace::review_slot_is_serving(
                     &project,
                     ws,
                     &tf.task.id,
@@ -365,9 +342,10 @@ fn project_config_present(project: &str) -> bool {
 }
 
 /// Probe the hub daemon and precompute the footer version segment + mismatch
-/// flag — a verbatim port of the old sidebar's `probe_daemon_version`.
+/// flag. `cli` is this build's version (the workspace version every client
+/// shares).
 fn probe_daemon_version() -> (String, bool) {
-    let cli = env!("CARGO_PKG_VERSION");
+    let cli = shelbi_state::CLIENT_VERSION;
     match daemon_version_status() {
         DaemonVersionStatus::NotRunning => (format!("daemon not running · cli {cli}"), false),
         DaemonVersionStatus::Match { version } => (format!("daemon {version} · cli {cli}"), false),
@@ -384,9 +362,7 @@ mod tests {
 
     #[test]
     fn read_config_skeleton_lists_declared_workspaces_awaiting_state() {
-        let _g = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-skeleton-{}-{}",
             std::process::id(),

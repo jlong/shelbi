@@ -14,6 +14,7 @@
 use std::ops::Deref;
 
 use gpui::{rgb, App, Context, Global, Hsla, Subscription, Window, WindowAppearance};
+use shelbi_palette::DecorationColor;
 use shelbi_app::theme::{resolve_appearance, Appearance, Rgb, Theme as Tokens, ThemePreference};
 
 /// The resolved theme, installed as a gpui [`Global`]. Views read the tokens
@@ -53,6 +54,21 @@ impl Theme {
     pub fn is_dark(&self) -> bool {
         self.appearance == Appearance::Dark
     }
+
+    /// The color a shared badge decoration paints in, mapped exactly as the
+    /// TUI sidebar's `badge_color` maps it (busy green, muted bullet, ready
+    /// cyan, normal gray; the rest through the terminal hues).
+    pub fn decoration(&self, color: DecorationColor) -> Hsla {
+        match color {
+            DecorationColor::Green => self.green,
+            DecorationColor::DarkGray | DecorationColor::Muted => self.muted,
+            DecorationColor::Cyan => self.cyan,
+            DecorationColor::Gray | DecorationColor::Default => self.gray,
+            DecorationColor::Yellow => self.ansi_yellow,
+            DecorationColor::Red => self.ansi_red,
+            DecorationColor::Blue => self.ansi_blue,
+        }
+    }
 }
 
 fn is_dark(appearance: WindowAppearance) -> bool {
@@ -85,6 +101,14 @@ pub fn init(cx: &mut App) {
         .unwrap_or_default();
     cx.set_window_appearance(chrome_appearance(preference));
     install(Theme::resolve(preference, cx.window_appearance()), cx);
+}
+
+/// Switch to `preference` now (the settings view's theme choice): re-resolve
+/// against `window`'s appearance, pin or release the window chrome, and
+/// repaint.
+pub fn apply_preference(preference: ThemePreference, window: &Window, cx: &mut App) {
+    cx.set_window_appearance(chrome_appearance(preference));
+    install(Theme::resolve(preference, window.appearance()), cx);
 }
 
 /// Make `theme` current: our global, and gpui-kit's light/dark mode so its

@@ -27,7 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap};
 
 use shelbi_app::nav::View;
-use shelbi_app::view::{ReviewState, SidebarModel, WorkspaceBadge};
+use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::keymap::{DisplayStyle, GlobalAction, Keymaps};
 use shelbi_state::ZenModeState;
 
@@ -112,7 +112,7 @@ enum Row {
     Workspace {
         name: String,
         badge: WorkspaceBadge,
-        agent: Option<String>,
+        right_label: String,
         indent: bool,
         target: RowTarget,
     },
@@ -615,134 +615,62 @@ const LIST_INDENT: Margin = Margin {
     vertical: 0,
 };
 
-/// Build the ordered row list from the model, mirroring the old renderer's
-/// `rows()`: a fixed nav, then the machine-grouped workspace pool (or the
-/// config-error / loading placeholder), then the Ready / Queued review
-/// sections. Each section header and its rows drop together when empty.
+/// Build the ordered row list from the model. The layout itself (which rows,
+/// in which order, with which labels) is [`SidebarModel::rows`], shared with the
+/// desktop app; this only attaches the TUI's glyphs and routes.
 fn build_rows(model: &SidebarModel) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
-    for nav in &model.nav {
-        rows.push(Row::Nav {
-            glyph: nav_glyph(&nav.label),
-            label: nav.label.clone(),
-            target: target_from_view(&nav.view),
-        });
-    }
-
-    // Cold board, nothing loaded yet: a dim "Loading…" placeholder.
-    if model.board_loading {
-        rows.push(Row::Blank);
-        rows.push(Row::Loading);
-        return rows;
-    }
-
-    if let Some(message) = &model.config_error {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Workspaces".into()));
-        rows.push(Row::ConfigError(message.clone()));
-    } else if !model.workspaces.is_empty() {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Workspaces".into()));
-        // Group by machine when the project declares more than one; a
-        // single-machine project collapses to a flat list.
-        let machines: Vec<&str> = {
-            let mut seen: Vec<&str> = Vec::new();
-            for w in &model.workspaces {
-                if !seen.iter().any(|m| *m == w.machine) {
-                    seen.push(&w.machine);
-                }
-            }
-            seen
-        };
-        let grouped = machines.len() > 1;
-        if grouped {
-            for machine in &machines {
-                let machine_str = *machine;
-                let on_machine: Vec<_> = model
-                    .workspaces
-                    .iter()
-                    .filter(|w| w.machine == machine_str)
-                    .collect();
-                let total = on_machine.len();
-                let active = on_machine
-                    .iter()
-                    .filter(|w| w.current_task.is_some())
-                    .count();
-                let collapsed = model.collapsed_machines.contains(machine_str);
-                rows.push(Row::MachineGroup {
-                    name: machine_str.to_string(),
-                    collapsed,
-                    total,
-                    active,
-                    target: RowTarget::Machine(machine_str.to_string()),
-                });
-                if collapsed {
-                    continue;
-                }
-                for w in on_machine {
-                    rows.push(Row::Workspace {
-                        name: w.name.clone(),
-                        badge: w.badge,
-                        agent: w.agent.clone(),
-                        indent: true,
-                        target: RowTarget::Session(SessionRef::Workspace(w.name.clone())),
-                    });
-                }
-            }
-        } else {
-            for w in &model.workspaces {
-                rows.push(Row::Workspace {
-                    name: w.name.clone(),
-                    badge: w.badge,
-                    agent: w.agent.clone(),
-                    indent: false,
-                    target: RowTarget::Session(SessionRef::Workspace(w.name.clone())),
-                });
-            }
-        }
-    }
-
-    // Ready for Review — Serving / Loading rows (already on a slot).
-    let ready: Vec<_> = model
-        .reviews
-        .iter()
-        .filter(|r| !matches!(r.state, ReviewState::Pending))
-        .collect();
-    if !ready.is_empty() {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Ready for Review".into()));
-        for r in ready {
-            rows.push(Row::Review {
-                title: r.title.clone(),
-                branch: r.branch.clone(),
-                location: r.location.clone(),
-                state: r.state,
-                target: RowTarget::Review(r.task_id.clone()),
-            });
-        }
-    }
-
-    // Queued for Review — Pending rows (waiting for a free slot).
-    let queued: Vec<_> = model
-        .reviews
-        .iter()
-        .filter(|r| matches!(r.state, ReviewState::Pending))
-        .collect();
-    if !queued.is_empty() {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Queued for Review".into()));
-        for r in queued {
-            rows.push(Row::Review {
-                title: r.title.clone(),
-                branch: r.branch.clone(),
-                location: r.location.clone(),
-                state: r.state,
-                target: RowTarget::Review(r.task_id.clone()),
-            });
-        }
-    }
-
-    rows
+    model
+        .rows()
+        .into_iter()
+        .map(|row| match row {
+            SidebarRow::Nav { label, view } => Row::Nav {
+                glyph: nav_glyph(&label),
+                label,
+                target: target_from_view(&view),
+            },
+            SidebarRow::Section(label) => Row::Section(label),
+            SidebarRow::ConfigError(message) => Row::ConfigError(message),
+            SidebarRow::Blank => Row::Blank,
+            SidebarRow::Loading => Row::Loading,
+            SidebarRow::MachineGroup {
+                name,
+                collapsed,
+                total,
+                active,
+            } => Row::MachineGroup {
+                target: RowTarget::Machine(name.clone()),
+                name,
+                collapsed,
+                total,
+                active,
+            },
+            SidebarRow::Workspace {
+                name,
+                badge,
+                right_label,
+                indent,
+            } => Row::Workspace {
+                target: RowTarget::Session(SessionRef::Workspace(name.clone())),
+                name,
+                badge,
+                right_label,
+                indent,
+            },
+            SidebarRow::Review {
+                task_id,
+                title,
+                branch,
+                location,
+                state,
+            } => Row::Review {
+                title,
+                branch,
+                location,
+                state,
+                target: RowTarget::Review(task_id),
+            },
+        })
+        .collect()
 }
 
 /// One nav item row. Selected rows fill edge to edge with the selection
@@ -810,7 +738,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
         Row::Workspace {
             name,
             badge,
-            agent,
+            right_label,
             indent,
             ..
         } => {
@@ -823,14 +751,10 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 ),
                 Span::styled(name.clone(), name_style(selected, focused)),
             ];
-            let right_label = match agent {
-                Some(a) => title_case(a),
-                // A skeleton row (state not read yet) claims no state at all
-                // rather than a misleading "idle"; the `…` badge carries it.
-                None if *badge == WorkspaceBadge::Loading => String::new(),
-                None => "idle".to_string(),
-            };
-            let spans = right_align(left, right_label, Style::default().fg(palette().muted), width);
+            // A skeleton row (state not read yet) carries an empty label rather
+            // than a misleading "idle"; the `…` badge carries it.
+            let spans =
+                right_align(left, right_label.clone(), Style::default().fg(palette().muted), width);
             ListItem::new(Line::from(spans))
         }
         Row::Review {
@@ -923,16 +847,6 @@ fn right_align(
     out.push(Span::raw(" ".repeat(pad)));
     out.push(Span::styled(right, right_style));
     out
-}
-
-/// Uppercase the first character of a lowercase identifier (`developer` →
-/// `Developer`). Empty input is preserved.
-pub(crate) fn title_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 /// Truncate `s` to at most `max` columns (by char count), appending `…` when it

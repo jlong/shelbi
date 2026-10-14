@@ -257,6 +257,13 @@ impl ClientState {
         self.sidebar_selection = (self.sidebar_selection + 1).min(max);
     }
 
+    /// Select the `index`-th selectable row directly (a click), clamped like
+    /// [`select_down`](Self::select_down) so it never points past the last of
+    /// `row_count` rows.
+    pub fn select(&mut self, index: usize, row_count: usize) {
+        self.sidebar_selection = index.min(row_count.saturating_sub(1));
+    }
+
     /// Clamp the selection into range after the sidebar's row list changes
     /// (e.g. a workspace appeared or a review task cleared).
     pub fn clamp_selection(&mut self, row_count: usize) {
@@ -406,6 +413,12 @@ mod tests {
         // Row list shrinks (a workspace vanished): selection clamps in.
         c.clamp_selection(2);
         assert_eq!(c.sidebar_selection(), 1);
+
+        // A click selects a row directly, clamped to the list.
+        c.select(1, 5);
+        assert_eq!(c.sidebar_selection(), 1);
+        c.select(9, 5);
+        assert_eq!(c.sidebar_selection(), 4);
 
         // An empty row list parks the selection at 0.
         c.clamp_selection(0);

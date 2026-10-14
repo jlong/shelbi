@@ -49,6 +49,13 @@ shelbi-proto = { path = "../crates/shelbi-proto" }
 shelbi-state = { path = "../crates/shelbi-state" }
 shelbi-core = { path = "../crates/shelbi-core" }
 shelbi-palette = { path = "../crates/shelbi-palette" }
+shelbi-orchestrator = { path = "../crates/shelbi-orchestrator" }
+
+# Feed events cross to gpui's foreground over a futures channel (already in
+# gpui's tree); window state is JSON.
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Bootstrap publishes its states from a std thread to the UI's async task.
 # Already in gpui's tree.
@@ -60,8 +67,9 @@ markdown = "=1.0.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-
 [dev-dependencies]
+# gpui's test context (`#[gpui::test]`, `VisualTestContext`) for view tests.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 # Issue fixtures in the board tests carry timestamps.
 chrono = "0.4"
 

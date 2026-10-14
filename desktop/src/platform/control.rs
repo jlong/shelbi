@@ -141,18 +141,37 @@ impl ControlHandle {
     /// with another version as "relaunch required", and call `on_relaunch`
     /// once when that happens. The thread ends then.
     pub fn watch(&self, on_relaunch: impl Fn(RelaunchNotice) + Send + 'static) {
+        self.watch_as(shelbi_client::fresh_client_id(), on_relaunch, |reason| {
+            tracing::info!(%reason, "daemon asked this client to detach");
+        });
+    }
+
+    /// [`watch`](Self::watch), registered as attached client `client_id` (so
+    /// "Detach Other Clients" can name this app), and calling `on_detach`
+    /// with the reason when the daemon tells this client to detach.
+    pub fn watch_as(
+        &self,
+        client_id: String,
+        on_relaunch: impl Fn(RelaunchNotice) + Send + 'static,
+        on_detach: impl Fn(String) + Send + 'static,
+    ) {
         let handle = self.clone();
         let spawned = std::thread::Builder::new()
             .name("shelbi-desktop-control-watch".into())
-            .spawn(move || handle.watch_loop(on_relaunch));
+            .spawn(move || handle.watch_loop(client_id, on_relaunch, on_detach));
         if let Err(e) = spawned {
             tracing::error!("could not start the control watch: {e}");
         }
     }
 
-    fn watch_loop(&self, on_relaunch: impl Fn(RelaunchNotice)) {
+    fn watch_loop(
+        &self,
+        client_id: String,
+        on_relaunch: impl Fn(RelaunchNotice),
+        on_detach: impl Fn(String),
+    ) {
         let info = ClientInfo {
-            client_id: shelbi_client::fresh_client_id(),
+            client_id,
             kind: ClientKind::Desktop,
             host: shelbi_client::hostname(),
             pid: Some(std::process::id()),
@@ -190,10 +209,7 @@ impl ControlHandle {
                         announce(self.notice(Some(daemon_version), Some(reason)));
                         return;
                     }
-                    // Detach is the shell's to handle (dt-shell-sidebar).
-                    Ok(Some(Notice::Detach { reason })) => {
-                        tracing::info!(%reason, "daemon asked this client to detach");
-                    }
+                    Ok(Some(Notice::Detach { reason })) => on_detach(reason),
                     Ok(Some(Notice::Changed(_))) => {}
                     Ok(None) | Err(_) => break,
                 }

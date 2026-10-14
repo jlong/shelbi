@@ -41,6 +41,7 @@ pub mod review_ui;
 pub mod session_backend;
 pub mod session_guard;
 pub mod session_process_backend;
+pub mod sidebar_model;
 pub mod submit;
 pub mod supervision;
 pub mod system_plugin;

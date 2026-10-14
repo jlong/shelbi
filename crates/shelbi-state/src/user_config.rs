@@ -3,9 +3,9 @@
 //! `shelbi config reset` can wipe UI tweaks without nuking onboarding.
 //!
 //! Holds the Zen Mode toggle chord chosen by the first-run probe, the review
-//! editor, and the color theme. Missing file → defaults (`zen_toggle = AltZ`,
-//! `theme = auto`); a missing `keymap:` block likewise falls back so older
-//! partial files keep loading.
+//! editor, the color theme, and the desktop app's own settings (`desktop:`).
+//! Missing file → defaults (`zen_toggle = AltZ`, `theme = auto`); a missing
+//! `keymap:` block likewise falls back so older partial files keep loading.
 
 use std::fs;
 use std::path::PathBuf;
@@ -38,16 +38,16 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
 
-    /// Desktop app settings (`desktop:` block). Ignored by the CLI and TUI.
-    #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
-    pub desktop: DesktopConfig,
-
     /// Color theme for the TUI and the desktop app (`theme: auto | dark |
     /// light`). A missing key is [`ThemePreference::Auto`], and `auto` is
     /// omitted on save (lean on-disk form, like `editor`). The token values
     /// live in `shelbi_app::theme`.
     #[serde(default, skip_serializing_if = "ThemePreference::is_auto")]
     pub theme: ThemePreference,
+
+    /// Desktop app settings (`desktop:` block). Ignored by the CLI and TUI.
+    #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
+    pub desktop: DesktopConfig,
 }
 
 /// The `theme:` setting. `Auto` follows the system appearance where a client
@@ -77,12 +77,24 @@ pub struct DesktopConfig {
     /// A leading `~/` is expanded by the app. Unset means discover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_path: Option<PathBuf>,
+
+    /// Font family for the desktop app's terminals. Unset means the app's
+    /// default (Geist Mono).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_family: Option<String>,
+
+    /// Font size, in points, for the desktop app's terminals. Unset means the
+    /// app's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_size: Option<u16>,
 }
 
 impl DesktopConfig {
     /// Whether no desktop setting is present (so the block isn't written).
     pub fn is_empty(&self) -> bool {
         self.cli_path.is_none()
+            && self.terminal_font_family.is_none()
+            && self.terminal_font_size.is_none()
     }
 }
 
@@ -235,6 +247,41 @@ pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
     atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
 }
 
+/// Load the user config, apply `edit`, and write it back, keeping every
+/// top-level key this build doesn't model (a newer client's settings) instead
+/// of dropping it the way a plain [`save_user_config`] round-trip would. Keys
+/// the edited config omits on save (a cleared `editor`, an `auto` theme, an
+/// empty `desktop:` block) are removed. YAML comments are not preserved.
+/// Returns the config as written.
+pub fn update_user_config(edit: impl FnOnce(&mut UserConfig)) -> Result<UserConfig> {
+    use serde_yaml::{Mapping, Value};
+
+    let path = user_config_path()?;
+    let mut raw: Mapping = if path.exists() {
+        match serde_yaml::from_str::<Value>(&fs::read_to_string(&path)?)? {
+            Value::Mapping(m) => m,
+            _ => Mapping::new(),
+        }
+    } else {
+        Mapping::new()
+    };
+    let mut cfg: UserConfig = serde_yaml::from_value(Value::Mapping(raw.clone()))?;
+    edit(&mut cfg);
+
+    let Value::Mapping(known) = serde_yaml::to_value(&cfg)? else {
+        unreachable!("UserConfig serializes to a mapping");
+    };
+    for key in ["keymap", "editor", "theme", "desktop"] {
+        raw.remove(key);
+    }
+    for (key, value) in known {
+        raw.insert(key, value);
+    }
+    ensure_dir(&shelbi_home()?)?;
+    atomic_write(&path, serde_yaml::to_string(&Value::Mapping(raw))?.as_bytes())?;
+    Ok(cfg)
+}
+
 /// Write a self-documenting `~/.shelbi/config.yaml` when one doesn't already
 /// exist — the scaffold `shelbi init` drops so the hub-wide UI preferences are
 /// discoverable inline (see [`shelbi_core::scaffold::CONFIG_YAML`]). Idempotent:
@@ -269,18 +316,62 @@ mod tests {
     }
 
     #[test]
-    fn desktop_cli_path_parses_and_round_trips() {
-        let cfg: UserConfig =
-            serde_yaml::from_str("desktop:\n  cli_path: /opt/shelbi/bin/shelbi\n").unwrap();
+    fn desktop_settings_and_theme_round_trip() {
+        let cfg: UserConfig = serde_yaml::from_str(
+            "theme: light\ndesktop:\n  cli_path: /opt/shelbi/bin/shelbi\n  \
+             terminal_font_family: Geist Mono\n  terminal_font_size: 14\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.theme, ThemePreference::Light);
         assert_eq!(
             cfg.desktop.cli_path.as_deref(),
             Some(std::path::Path::new("/opt/shelbi/bin/shelbi"))
         );
+        assert_eq!(cfg.desktop.terminal_font_family.as_deref(), Some("Geist Mono"));
+        assert_eq!(cfg.desktop.terminal_font_size, Some(14));
         let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
-        // Absent block: no key written, so the CLI's own saves don't add one.
+        // Defaults write neither key, so the CLI's own saves don't add them.
         let text = serde_yaml::to_string(&UserConfig::default()).unwrap();
-        assert!(!text.contains("desktop"), "{text}");
+        assert!(!text.contains("desktop") && !text.contains("theme"), "{text}");
+    }
+
+    #[test]
+    fn update_user_config_keeps_unknown_and_shared_keys() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(
+            home.join("config.yaml"),
+            "keymap:\n  zen_toggle: ctrl-g\neditor: hx\nfuture_key:\n  nested: 1\n",
+        )
+        .unwrap();
+
+        let written = update_user_config(|c| {
+            c.theme = ThemePreference::Dark;
+            c.desktop.terminal_font_size = Some(13);
+        })
+        .unwrap();
+        assert_eq!(written.theme, ThemePreference::Dark);
+
+        // What another client (the TUI) reads on its next start.
+        let back = load_user_config().unwrap();
+        assert_eq!(back.keymap.zen_toggle, ZenToggleChord::CtrlG);
+        assert_eq!(back.editor.as_deref(), Some("hx"));
+        assert_eq!(back.theme, ThemePreference::Dark);
+        assert_eq!(back.desktop.terminal_font_size, Some(13));
+        let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(text.contains("future_key"), "an unknown key survives: {text}");
+
+        // Clearing a setting removes its key instead of leaving a stale one.
+        update_user_config(|c| {
+            c.theme = ThemePreference::Auto;
+            c.desktop = DesktopConfig::default();
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!text.contains("theme") && !text.contains("desktop"), "{text}");
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

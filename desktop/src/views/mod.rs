@@ -27,3 +27,5 @@ pub mod external_edit;
 pub mod issues;
 pub mod markdown;
 pub mod task_detail;
+pub mod settings;
+pub mod sidebar;
