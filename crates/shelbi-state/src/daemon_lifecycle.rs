@@ -3,7 +3,7 @@
 //! The hub daemon is started on demand and exits when no project is open (the
 //! launchd/systemd units are retired). This module is the client half: the
 //! shared `ensure_daemon_running` that any client calls before it needs the
-//! daemon, a `stop_daemon` used by `shelbi daemon restart`, and the
+//! daemon, a root-scoped `stop_daemon` used by `shelbi daemon stop`/`restart`, and the
 //! single-instance lock helpers shared with the daemon's own bind lock.
 //!
 //! See `docs/removing-tmux/phase3-daemon.md` (Lifecycle).
@@ -15,9 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use crate::{
-    hub_socket_path, is_process_alive, probe_daemon_hello, read_daemon_pid, DaemonProbe,
-};
+use crate::{hub_socket_path, probe_daemon_hello, DaemonProbe};
 use shelbi_core::{Error, Result};
 
 /// How long [`ensure_daemon_running`] waits for a freshly spawned daemon to
@@ -273,47 +271,141 @@ fn wait_for_socket(
     result
 }
 
-/// Stop a running hub daemon and wait for it to exit, returning whether one was
-/// signalled. Used by `shelbi daemon restart`, which then starts a fresh daemon
-/// on the current binary.
+/// What [`stop_daemon`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// No daemon is running under this root (its lock is free and its socket
+    /// is silent). Nothing was signalled.
+    NotRunning,
+    /// This root's recorded daemon `pid` was signalled and has exited.
+    Stopped { pid: libc::pid_t },
+    /// A daemon appears to be up, but this root's `shelbi.pid` doesn't identify
+    /// a process that is safe to signal. Nothing was signalled; `reason` says
+    /// why and what to fix.
+    Refused { reason: String },
+}
+
+/// The pure decision [`stop_daemon`] makes before it sends any signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopDecision {
+    Nothing,
+    Signal(libc::pid_t),
+    Refuse(String),
+}
+
+/// Decide which pid (if any) a stop may signal.
 ///
-/// Sends SIGTERM to the PID in the daemon PID record (the daemon drains and
-/// exits on it), then waits up to [`STOP_DEADLINE`] for the single-instance
-/// lock to release — the authoritative "it's gone" signal, since the lock dies
-/// with the holder. A SIGKILL fallback fires if the drain wedges past the
-/// deadline. Returns `Ok(false)` when no daemon was running.
-pub fn stop_daemon() -> Result<bool> {
-    if !daemon_lock_held() && !socket_answers() {
-        return Ok(false);
+/// * `up` — this root's daemon lock is held or its hub socket answers.
+/// * `record` — this root's `shelbi.pid`: the recorded pid and whether it is
+///   provably that same process still ([`crate::recorded_daemon_is_same_process`]).
+/// * `answering` — the pid the hub socket's hello reported, when it did.
+///
+/// The only pid that is ever signalled is the one recorded under **this** root,
+/// and only when nothing contradicts it: a recycled/stale record or a socket
+/// answered by a different pid (the socket env and the root disagree, e.g. a
+/// sandbox `SHELBI_ROOT` with the pane's real `SHELBI_HUB_SOCK` still set) is
+/// refused rather than guessed at.
+fn decide_stop(
+    up: bool,
+    record: Option<(libc::pid_t, bool)>,
+    answering: Option<u32>,
+    pid_file: &std::path::Path,
+) -> StopDecision {
+    if !up {
+        return StopDecision::Nothing;
     }
-    let Some(pid) = read_daemon_pid()? else {
-        // Lock held but no PID on file: an older or mid-startup daemon we can't
-        // signal by PID. Report nothing stopped; the caller's start path still
-        // converges on one daemon via the bind lock.
-        return Ok(false);
+    let Some((pid, same_process)) = record else {
+        return StopDecision::Refuse(format!(
+            "a hub daemon is up, but {} records no pid to signal; \
+             if it is still starting, retry in a moment",
+            pid_file.display()
+        ));
     };
-    if !is_process_alive(pid) {
-        return Ok(false);
+    if !same_process {
+        return StopDecision::Refuse(format!(
+            "{} records pid {pid}, which is no longer that daemon (stale or recycled pid); \
+             refusing to signal it",
+            pid_file.display()
+        ));
     }
-    // SAFETY: kill with a real signal to a pid we read; only affects that process.
+    if let Some(answering) = answering {
+        if answering as libc::pid_t != pid {
+            return StopDecision::Refuse(format!(
+                "the hub socket is answered by pid {answering}, but {} records pid {pid}; \
+                 the socket env (SHELBI_HUB_SOCK) and the root disagree, refusing to signal either",
+                pid_file.display()
+            ));
+        }
+    }
+    StopDecision::Signal(pid)
+}
+
+/// Stop this root's hub daemon and wait for it to exit. Used by `shelbi daemon
+/// stop` and `shelbi daemon restart`.
+///
+/// Root-scoped by construction: the only pid it ever signals is the one in
+/// **this root's** `shelbi.pid` (`$SHELBI_ROOT`/`$SHELBI_HOME`/`--root`), and
+/// only after [`decide_stop`] finds nothing contradicting it — the record must
+/// still name the same process (start-time identity), and when the hub socket
+/// answers, it must answer as that same pid. So a stop under a sandbox root can
+/// never reach the live hub's daemon, even with the pane's real hub-socket env
+/// leaking in. (Stopping a daemon is not fatal for in-flight work in any case:
+/// session hosts run in their own sessions, outlive the daemon, and a restarted
+/// daemon finds them on disk.)
+///
+/// Sends SIGTERM (the daemon drains and exits on it), then waits up to
+/// [`STOP_DEADLINE`] for the process to go away or its single-instance lock to
+/// release. A SIGKILL fallback fires only if that same process is still there.
+pub fn stop_daemon() -> Result<StopOutcome> {
+    let up = daemon_lock_held() || socket_answers();
+    if !up {
+        // Nothing under this root: the fast path a sandbox stop takes, which
+        // never even reads a pid.
+        return Ok(StopOutcome::NotRunning);
+    }
+    let record = crate::read_daemon_pid_record()?;
+    let answering = match probe_daemon_hello() {
+        DaemonProbe::Hello(hello) => hello.pid,
+        _ => None,
+    };
+    let pid_file = crate::daemon_pid_file_path()?;
+    let pid = match decide_stop(
+        up,
+        record
+            .as_ref()
+            .map(|r| (r.pid, crate::recorded_daemon_is_same_process(r))),
+        answering,
+        &pid_file,
+    ) {
+        StopDecision::Nothing => return Ok(StopOutcome::NotRunning),
+        StopDecision::Refuse(reason) => return Ok(StopOutcome::Refused { reason }),
+        StopDecision::Signal(pid) => pid,
+    };
+    let record = record.expect("decide_stop signals only a recorded pid");
+    let still_there = || crate::recorded_daemon_is_same_process(&record);
+
+    // SAFETY: kill with a real signal to the pid this root recorded, verified
+    // above to still be that process; only affects that process.
     unsafe { libc::kill(pid, libc::SIGTERM) };
 
     let start = Instant::now();
-    while daemon_lock_held() {
+    while still_there() && daemon_lock_held() {
         if start.elapsed() >= STOP_DEADLINE {
             // The drain wedged. Escalate once so a restart isn't blocked
-            // forever by a stuck daemon.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // forever by a stuck daemon — re-checking identity first.
+            if still_there() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
             break;
         }
         std::thread::sleep(POLL_SLICE);
     }
     // Give a SIGKILLed daemon a final moment to let the lock die with it.
     let kill_deadline = Instant::now() + Duration::from_secs(2);
-    while daemon_lock_held() && Instant::now() < kill_deadline {
+    while still_there() && daemon_lock_held() && Instant::now() < kill_deadline {
         std::thread::sleep(POLL_SLICE);
     }
-    Ok(true)
+    Ok(StopOutcome::Stopped { pid })
 }
 
 #[cfg(test)]
@@ -393,7 +485,60 @@ mod tests {
     fn stop_daemon_is_a_noop_when_nothing_is_running() {
         let _l = LOCK.lock().unwrap();
         let _g = SockGuard::new("stopnoop");
-        assert!(!stop_daemon().unwrap(), "no daemon → nothing stopped");
+        assert_eq!(
+            stop_daemon().unwrap(),
+            StopOutcome::NotRunning,
+            "no daemon → nothing stopped"
+        );
+    }
+
+    fn pid_file() -> PathBuf {
+        PathBuf::from("/tmp/sandbox/shelbi.pid")
+    }
+
+    #[test]
+    fn decide_stop_signals_nothing_when_this_root_has_no_daemon() {
+        // A sandbox root with a free lock and a silent socket never even looks
+        // at a pid — whatever another root's daemon is doing.
+        assert_eq!(decide_stop(false, None, None, &pid_file()), StopDecision::Nothing);
+        assert_eq!(
+            decide_stop(false, Some((4242, true)), Some(4242), &pid_file()),
+            StopDecision::Nothing
+        );
+    }
+
+    #[test]
+    fn decide_stop_signals_only_this_roots_verified_pid() {
+        assert_eq!(
+            decide_stop(true, Some((4242, true)), Some(4242), &pid_file()),
+            StopDecision::Signal(4242)
+        );
+        // An older daemon whose hello carries no pid: the verified record alone.
+        assert_eq!(
+            decide_stop(true, Some((4242, true)), None, &pid_file()),
+            StopDecision::Signal(4242)
+        );
+    }
+
+    #[test]
+    fn decide_stop_refuses_when_the_socket_and_the_root_disagree() {
+        // Sandbox root (its record names its own daemon) but the pane's real
+        // SHELBI_HUB_SOCK still points at the live hub, which answers as a
+        // different pid: signal neither.
+        let d = decide_stop(true, Some((4242, true)), Some(1111), &pid_file());
+        let StopDecision::Refuse(reason) = d else {
+            panic!("expected a refusal, got {d:?}");
+        };
+        assert!(reason.contains("1111") && reason.contains("4242"), "{reason}");
+        assert!(reason.contains("SHELBI_HUB_SOCK"), "{reason}");
+    }
+
+    #[test]
+    fn decide_stop_refuses_a_stale_or_recycled_record() {
+        let d = decide_stop(true, Some((4242, false)), None, &pid_file());
+        assert!(matches!(d, StopDecision::Refuse(ref r) if r.contains("recycled")), "{d:?}");
+        let d = decide_stop(true, None, Some(4242), &pid_file());
+        assert!(matches!(d, StopDecision::Refuse(ref r) if r.contains("no pid")), "{d:?}");
     }
 
     /// A launcher running `sh -c <script> daemon` stand-in: `exe` is a script

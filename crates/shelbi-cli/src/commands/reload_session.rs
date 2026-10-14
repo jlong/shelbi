@@ -104,7 +104,11 @@ impl ReloadOps for LiveReload {
         // Stop the running daemon and start a fresh one on the current binary.
         // (The idle monitor / watchdog would restart it anyway while a project
         // is open, but an explicit restart makes reload prompt and deterministic.)
-        let _ = shelbi_state::stop_daemon();
+        // A refusal (this root's pid record doesn't verify) must not fall
+        // through to "restarted": the old daemon would silently keep running.
+        if let Ok(shelbi_state::StopOutcome::Refused { reason }) = shelbi_state::stop_daemon() {
+            anyhow::bail!("restarting the hub daemon: {reason}");
+        }
         shelbi_state::ensure_daemon_running()
             .map_err(|e| anyhow::anyhow!("restarting the hub daemon: {e}"))
     }

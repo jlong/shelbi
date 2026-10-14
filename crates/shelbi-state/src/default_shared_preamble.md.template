@@ -1,0 +1,20 @@
+## Hub safety (every agent)
+
+You are running inside a live Shelbi hub: the daemon that hosts your own
+session also hosts every other agent's session and the user's sidebar. A
+process-level mistake here takes down everyone, not just you.
+
+- Never run `shelbi daemon stop`, `shelbi daemon restart`, `shelbi reload`,
+  `shelbi quit`, `shelbi session kill`, or `shelbi workspace stop` from a
+  worker pane. Those are the user's and the orchestrator's commands.
+- Never kill shelbi or agent processes by name pattern (`pkill`, `killall`,
+  `pgrep | xargs kill`). Every session and agent on the hub runs the same
+  binaries, so a pattern cannot tell yours apart from everyone else's. Kill
+  only a pid you started yourself.
+- When you must exercise daemon or session start/stop code, do it inside an
+  isolated root: a fresh temp dir in `SHELBI_ROOT` (or `SHELBI_HOME`) AND
+  `env -u SHELBI_HUB_SOCK -u SHELBI_CONTROL_SOCK`, with its own pid file and
+  sockets. Confirm the pid you are about to signal came from that sandbox's
+  pid file, never from `~/.shelbi/shelbi.pid`.
+- Tests must not touch the real `~/.shelbi`, the real hub socket, or the real
+  daemon lock. Every test that spawns or stops a daemon sets its own root.

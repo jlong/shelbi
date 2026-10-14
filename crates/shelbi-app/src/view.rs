@@ -75,6 +75,10 @@ pub struct SidebarModel {
     /// user-facing banner text; the shell paints it as a persistent top banner
     /// in every view. `None` on a healthy session.
     pub session_lost: Option<String>,
+    /// The daemon supervisor's status for a dead orchestrator it could not
+    /// bring back (e.g. `supervisor gave up: <reason>`), painted on the
+    /// sidebar's status row. `None` while the orchestrator is healthy.
+    pub orchestrator_status: Option<String>,
 }
 
 /// A fixed nav builtin (Chat / Issues / Activity).
@@ -476,6 +480,17 @@ impl SidebarModel {
             zen_mode: ZenModeState::Off,
             unread_errors: 0,
             session_lost: None,
+            orchestrator_status: None,
+        }
+    }
+
+    /// The footer's status row text: the orchestrator supervisor's failure
+    /// (`Orchestrator: <status>`, painted red) takes the row while there is one,
+    /// else [`SidebarModel::status_line`]. Empty means no status row.
+    pub fn footer_status(&self) -> String {
+        match &self.orchestrator_status {
+            Some(status) => format!("Orchestrator: {status}"),
+            None => self.status_line.clone(),
         }
     }
 
@@ -665,6 +680,7 @@ impl SidebarModel {
             // IO of its own; the richer disk builder reads the hub-global marker
             // and sets this (`sidebar_model::read_sidebar_model`).
             session_lost: None,
+            orchestrator_status: None,
         }
     }
 }
@@ -1542,6 +1558,16 @@ mod tests {
             })
             .collect();
         assert_eq!(workspaces, [("alpha", true)], "a collapsed group hides its rows");
+    }
+
+    #[test]
+    fn footer_status_names_the_orchestrator_failure_over_the_status_line() {
+        let mut model = SidebarModel::skeleton("demo");
+        assert_eq!(model.footer_status(), "", "no status, no row");
+        model.status_line = "hint".into();
+        assert_eq!(model.footer_status(), "hint");
+        model.orchestrator_status = Some("supervisor gave up: spawn refused".into());
+        assert_eq!(model.footer_status(), "Orchestrator: supervisor gave up: spawn refused");
     }
 
     #[test]

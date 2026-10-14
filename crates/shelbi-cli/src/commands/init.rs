@@ -777,6 +777,13 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         let path = shelbi_state::pr_template_path(&local_alias).map_err(|e| anyhow!(e))?;
         println!("✓ wrote PR template: {}", path.display());
     }
+    if let shelbi_state::SharedPreambleOutcome::Created =
+        shelbi_state::scaffold_shared_preamble(&local_alias).map_err(|e| anyhow!(e))?
+    {
+        let path =
+            shelbi_state::agent_shared_preamble_path(&local_alias).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote shared agent preamble (hub safety): {}", path.display());
+    }
 
     println!();
     if suffixed_from.is_some() {

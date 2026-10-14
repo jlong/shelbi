@@ -37,6 +37,7 @@ mod hub_version;
 mod issue_cache;
 pub mod machine_state;
 pub mod migration;
+pub mod questions;
 pub use migration::{
     all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
     workspace_migration_state, MigrationState,
@@ -56,6 +57,7 @@ mod root;
 pub mod session_lost;
 mod ssh_control;
 pub mod supervision_relaunch;
+pub mod supervision_status;
 mod user_config;
 mod workflows;
 mod workspace_status;
@@ -101,6 +103,10 @@ pub use issue_store::{
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
+pub use supervision_status::{
+    clear_orchestrator_supervision_status, read_orchestrator_supervision_status,
+    write_orchestrator_supervision_status,
+};
 pub use session_lost::{
     clear_session_lost, read_session_lost, session_lost_active, session_lost_path,
     write_session_lost, RecoveryState, SessionLostRecord, SESSION_LOST_BANNER,
@@ -112,7 +118,8 @@ pub use root::{
 
 pub use agent_workspaces::{
     agent_divergence, agent_instructions_path, agent_manifest_path, agent_settings_path,
-    agent_shared_preamble_path,
+    agent_shared_preamble_path, scaffold_shared_preamble, SharedPreambleOutcome,
+    DEFAULT_SHARED_PREAMBLE, HUB_SAFETY_MARKERS,
     agent_skills_dir, agent_workspace_dir, classify_agent_divergence, compose_agent_prompt,
     content_hash, count_agent_skills, default_agent_body, default_agent_settings, is_default_agent,
     legacy_claude_md_path, list_agents, load_agent_manifest, load_agent_settings,
@@ -133,7 +140,7 @@ pub use hub_config::{
 };
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, ensure_daemon_running_with, hub_lock_path,
-    set_daemon_launcher, stop_daemon, DaemonLauncher, DaemonStartError,
+    set_daemon_launcher, stop_daemon, DaemonLauncher, DaemonStartError, StopOutcome,
 };
 pub use change_bus::{
     publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,
@@ -151,7 +158,8 @@ pub use resolve::{
 pub use ssh_control::{
     cleanup_stale_control_masters, daemon_pid_file_path, ensure_ssh_control_dir,
     forward_state_path, is_process_alive, load_forward_state, load_host_forward, read_daemon_pid,
-    read_daemon_pid_record, reconcile_forward_state, remote_hub_endpoint, remote_hub_socket_path,
+    read_daemon_pid_record, recorded_daemon_is_same_process, reconcile_forward_state,
+    remote_hub_endpoint, remote_hub_socket_path,
     remove_daemon_pid_file, reverse_forward_spec, reverse_forward_spec_tcp, save_host_forward,
     ssh_control_dir, ssh_control_path_template, tcp_forward_port_base, tcp_forward_port_span,
     write_daemon_pid,

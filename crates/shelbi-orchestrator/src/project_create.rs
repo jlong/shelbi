@@ -791,6 +791,13 @@ pub fn scaffold_project(
         let path = shelbi_state::pr_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
         out.note(&format!("✓ wrote PR template: {}", path.display()));
     }
+    if let shelbi_state::SharedPreambleOutcome::Created =
+        shelbi_state::scaffold_shared_preamble(&resolved.name).map_err(|e| anyhow!(e))?
+    {
+        let path =
+            shelbi_state::agent_shared_preamble_path(&resolved.name).map_err(|e| anyhow!(e))?;
+        out.note(&format!("✓ wrote shared agent preamble (hub safety): {}", path.display()));
+    }
 
     // Disclose and install the context-scoped default-branch commit guard now,
     // with the user's knowledge — this is the consented install. Project open
@@ -1015,6 +1022,16 @@ mod tests {
         assert!(tail.contains(&&format!("✓ wrote project statuses: {}", statuses.display())));
         assert!(tail.contains(&&format!("✓ wrote Zen policy: {}", zen.display())));
         assert!(tail.contains(&&format!("✓ wrote PR template: {}", pr.display())));
+        let preamble = shelbi_state::agent_shared_preamble_path("acme").unwrap();
+        assert!(tail.contains(&&format!(
+            "✓ wrote shared agent preamble (hub safety): {}",
+            preamble.display()
+        )));
+        assert_eq!(
+            std::fs::read_to_string(&preamble).unwrap(),
+            shelbi_state::DEFAULT_SHARED_PREAMBLE,
+            "a new project ships the hub-safety preamble"
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

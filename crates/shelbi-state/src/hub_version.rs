@@ -76,6 +76,12 @@ pub struct DaemonHello {
     pub version: String,
     /// The daemon's [`HUB_PROTOCOL_VERSION`].
     pub protocol: u32,
+    /// The daemon's own pid. Lets a client tell *which* process answers on the
+    /// socket it reached, so `stop_daemon` can refuse to signal a pid that the
+    /// socket and the root's `shelbi.pid` disagree about. Absent from daemons
+    /// that predate it (and ignored by clients that predate it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 impl DaemonHello {
@@ -84,12 +90,19 @@ impl DaemonHello {
             hello: HELLO_DISCRIMINATOR.to_string(),
             version: version.to_string(),
             protocol: HUB_PROTOCOL_VERSION,
+            pid: None,
         }
+    }
+
+    /// This hello, stamped with the answering daemon's pid.
+    pub fn with_pid(mut self, pid: u32) -> Self {
+        self.pid = Some(pid);
+        self
     }
 
     /// Serialize to the newline-terminated wire line the daemon writes.
     pub fn to_line(&self) -> String {
-        // A struct of two strings and a u32 can't fail to serialize;
+        // A struct of two strings and two integers can't fail to serialize;
         // fall back to an empty line rather than panicking in the
         // daemon's accept path if that ever changes.
         let mut line = serde_json::to_string(self).unwrap_or_default();

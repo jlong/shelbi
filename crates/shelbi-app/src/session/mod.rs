@@ -25,7 +25,8 @@
 //! - [`Relauncher`] ([`relaunch`]): how a dead pane is brought back before
 //!   the client re-attaches.
 //! - The notices the views show ([`connecting_notice`], [`failed_notice`],
-//!   [`restarting_notice`], [`gave_up_notice`], [`exit_line`]), so both
+//!   [`restarting_notice`], [`gave_up_notice`], [`orchestrator_down_notice`],
+//!   [`exit_line`]), so both
 //!   clients word them identically.
 
 pub mod reconnect;
@@ -491,6 +492,16 @@ pub fn restarting_notice(attempt: u32, max: u32) -> String {
     format!("Session exited — restarting ({attempt}/{max})…")
 }
 
+/// The Orchestrator view's placeholder while the orchestrator session is down
+/// and the daemon supervisor has reported why it is not coming back
+/// (`supervisor_status`, the sidebar model's `orchestrator_status`). It stands
+/// in for the client's own connecting / given-up notice, since the supervisor's
+/// reason is the one that explains the outage. Shared by both clients so the
+/// wording stays identical.
+pub fn orchestrator_down_notice(supervisor_status: &str) -> String {
+    format!("Orchestrator is down. {supervisor_status}. Select Orchestrator again to relaunch it.")
+}
+
 /// The notice shown when the restart budget is spent: names the cap and how to
 /// bring the pane back ("select it again to relaunch"), and appends the last
 /// output line when there is one so a stuck pane shows *why* it stopped. Shared
@@ -671,6 +682,11 @@ mod tests {
         assert_eq!(
             gave_up_notice("   "),
             format!("Stopped after {n} restarts — select it again to relaunch.")
+        );
+        assert_eq!(
+            orchestrator_down_notice("supervisor gave up: spawn refused"),
+            "Orchestrator is down. supervisor gave up: spawn refused. \
+             Select Orchestrator again to relaunch it."
         );
     }
 

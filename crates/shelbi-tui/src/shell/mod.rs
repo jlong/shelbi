@@ -3586,6 +3586,24 @@ fn review_view_is_stale(
 
 // --- rendering -------------------------------------------------------------
 
+/// The Orchestrator view's placeholder while its session is down and the daemon
+/// supervisor has reported why (`orch-relaunch-noop-after-session-death`): the
+/// supervisor's reason replaces a bare "Connecting…" / attach error, so a view
+/// that won't load says what failed. `None` for any other target, a live (or
+/// idle) session, or no supervisor report.
+fn orchestrator_down_notice(
+    target: Option<&SessionRef>,
+    state: &MainState<'_>,
+    supervisor_status: Option<&str>,
+) -> Option<String> {
+    if target != Some(&SessionRef::Orchestrator)
+        || matches!(state, MainState::Live(_) | MainState::Idle(_))
+    {
+        return None;
+    }
+    supervisor_status.map(shelbi_app::session::orchestrator_down_notice)
+}
+
 fn draw(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut ShellState,
@@ -3691,6 +3709,12 @@ fn draw_frame<B: ratatui::backend::Backend>(
     // mutably — a native view's `render_full` takes `&mut app` and `&mut Frame`.
     let sidebar_view = state.sidebar_view();
     let sidebar_chrome = state.sidebar_chrome();
+    // The daemon supervisor's reason a dead orchestrator isn't coming back, for
+    // the Orchestrator view's placeholder.
+    let orchestrator_status = state
+        .sidebar_model
+        .as_ref()
+        .and_then(|m| m.orchestrator_status.clone());
     let main_view = state.main_view.clone();
     let is_review = matches!(main_view, MainView::Review(_));
     let is_workspace = matches!(main_view, MainView::Workspace(_));
@@ -3739,7 +3763,15 @@ fn draw_frame<B: ratatui::backend::Backend>(
             }
 
             // Main area (session / review-fallback; native views drawn above).
+            let orch_down = orchestrator_down_notice(
+                sessions.current_target(),
+                &sessions.state(),
+                orchestrator_status.as_deref(),
+            );
             match &main_view {
+                MainView::Session if orch_down.is_some() => {
+                    render_placeholder(buf, main_rect, orch_down.as_deref().unwrap_or_default())
+                }
                 MainView::Session => match sessions.state() {
                     MainState::Empty => render_placeholder(buf, main_rect, "No session"),
                     MainState::Connecting(r) => {
@@ -4288,6 +4320,24 @@ mod tests {
     use super::*;
     use shelbi_app::view::{NavItem, WorkspaceRow};
 
+    #[test]
+    fn orchestrator_view_names_the_supervisor_failure_while_down() {
+        let orch = SessionRef::Orchestrator;
+        let status = Some("supervisor gave up: spawn refused");
+        let notice = orchestrator_down_notice(Some(&orch), &MainState::Connecting(&orch), status)
+            .expect("a down orchestrator with a supervisor report names it");
+        assert!(notice.contains("supervisor gave up: spawn refused"), "{notice}");
+        assert!(
+            orchestrator_down_notice(Some(&orch), &MainState::GaveUp("boom"), status).is_some(),
+            "the client's own give-up defers to the supervisor's reason",
+        );
+        // No report, or not the orchestrator: the normal placeholder stands.
+        assert_eq!(orchestrator_down_notice(Some(&orch), &MainState::Connecting(&orch), None), None);
+        let ws = SessionRef::Workspace("alpha".into());
+        assert_eq!(orchestrator_down_notice(Some(&ws), &MainState::Connecting(&ws), status), None);
+        assert_eq!(orchestrator_down_notice(None, &MainState::Empty, status), None);
+    }
+
     struct NoopConnector;
     impl session::Connector for NoopConnector {
         fn connect(
@@ -4383,6 +4433,7 @@ mod tests {
                 zen_mode: shelbi_state::ZenModeState::Off,
                 unread_errors: 0,
                 session_lost: None,
+                orchestrator_status: None,
             }),
             board: None,
             activity: None,
@@ -4437,6 +4488,7 @@ mod tests {
                 zen_mode: shelbi_state::ZenModeState::Off,
                 unread_errors: 0,
                 session_lost: None,
+                orchestrator_status: None,
             }),
             board: None,
             activity: None,

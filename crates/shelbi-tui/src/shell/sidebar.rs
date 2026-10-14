@@ -49,6 +49,8 @@ pub(crate) const FIRST_RUN_HINT: &str = "Ctrl+P palette · type E to edit settin
 /// chrome and warm enough to signal something's wrong.
 const ERROR_BUTTON_W: u16 = 5;
 const ERROR_BUTTON_H: u16 = 3;
+/// Rows the footer status reserves for the orchestrator supervisor's failure.
+const ORCH_STATUS_ROWS: u16 = 3;
 
 /// What a selectable sidebar row routes to when opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +153,9 @@ pub struct SidebarView {
     daemon_version_line: Option<String>,
     daemon_version_mismatch: bool,
     status_line: String,
+    /// The status row carries the orchestrator supervisor's failure (painted
+    /// red) rather than the launch-time status line.
+    status_is_orchestrator_failure: bool,
     zen_mode: ZenModeState,
     unread_errors: usize,
 }
@@ -170,7 +175,10 @@ impl SidebarView {
             board_banner: model.board_banner.clone(),
             daemon_version_line: model.daemon_version_line.clone(),
             daemon_version_mismatch: model.daemon_version_mismatch,
-            status_line: model.status_line.clone(),
+            // A dead orchestrator the supervisor couldn't bring back outranks
+            // the launch-time hint: it is why the Orchestrator view won't load.
+            status_line: model.footer_status(),
+            status_is_orchestrator_failure: model.orchestrator_status.is_some(),
             zen_mode: model.zen_mode,
             unread_errors: model.unread_errors,
         }
@@ -200,7 +208,8 @@ impl SidebarView {
     }
 
     /// Footer height: the three fixed rows (version / blank / zen band) plus the
-    /// status row's height (0 when empty, 2 for the first-run hint, else 1). The
+    /// status row's height (0 when empty, 2 for the first-run hint,
+    /// [`ORCH_STATUS_ROWS`] for an orchestrator supervisor failure, else 1). The
     /// zen band paints only while Zen is on, but the row is always reserved so
     /// the version line never shifts when Zen toggles.
     fn footer_height(&self) -> u16 {
@@ -210,6 +219,10 @@ impl SidebarView {
     fn status_row_height(&self) -> u16 {
         if self.status_line.is_empty() {
             0
+        } else if self.status_is_orchestrator_failure {
+            // The supervisor's reason is a sentence (it names the failed
+            // session and why), so give it room to wrap.
+            ORCH_STATUS_ROWS
         } else if self.status_line == FIRST_RUN_HINT {
             2
         } else {
@@ -492,7 +505,9 @@ impl SidebarView {
 
         let mut idx = 0;
         if has_status {
-            let style = if self.status_line == FIRST_RUN_HINT {
+            let style = if self.status_is_orchestrator_failure {
+                Style::default().fg(palette().ansi_red)
+            } else if self.status_line == FIRST_RUN_HINT {
                 Style::default().fg(palette().ansi_dark_gray)
             } else {
                 Style::default().fg(palette().ansi_yellow)
@@ -1111,6 +1126,7 @@ mod tests {
             zen_mode: ZenModeState::Off,
             unread_errors: 0,
             session_lost: None,
+            orchestrator_status: None,
         }
     }
 
@@ -1790,6 +1806,36 @@ mod tests {
         let joined = rows.join("\n");
         assert!(joined.contains("Ctrl+P palette · type E to edit"), "first line of the hint is missing:\n{joined}");
         assert!(joined.contains("settings"), "the final word must not be clipped:\n{joined}");
+    }
+
+    /// A supervisor give-up on the orchestrator takes the footer status row,
+    /// in red, over the launch-time hint, wrapping instead of clipping.
+    #[test]
+    fn orchestrator_supervisor_failure_paints_red_on_the_status_row() {
+        let mut model = empty_model();
+        model.status_line = FIRST_RUN_HINT.to_string();
+        model.orchestrator_status = Some("supervisor gave up: spawn refused".into());
+        let view = SidebarView::build(&model);
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+        })
+        .unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+        assert!(joined.contains("Orchestrator: supervisor gave up:"), "got:\n{joined}");
+        assert!(joined.contains("spawn refused"), "the reason wraps, not clips:\n{joined}");
+        assert!(!joined.contains("Ctrl+P palette"), "the failure outranks the hint:\n{joined}");
+        let y = row_y(&rows, "Orchestrator: supervisor") as u16;
+        let x = rows[y as usize].find("Orchestrator: supervisor").unwrap() as u16;
+        let buf = term.backend().buffer().clone();
+        assert_eq!(buf[(x, y)].fg, palette().ansi_red);
+
+        // Healthy orchestrator: no status, the hint comes back.
+        model.orchestrator_status = None;
+        let joined = render_rows_with(&model, 0, true, &default_chrome(), 40, 16).join("\n");
+        assert!(!joined.contains("supervisor gave up"), "got:\n{joined}");
     }
 
     /// The version row paints the daemon/CLI segment, red on mismatch.

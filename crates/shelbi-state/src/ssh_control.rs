@@ -320,6 +320,26 @@ fn is_recorded_daemon_alive(rec: &DaemonPidRecord) -> bool {
     }
 }
 
+/// Is the daemon recorded in the PID file **provably** the same running
+/// process — strict enough to *signal* it?
+///
+/// Stricter than [`is_recorded_daemon_alive`], which errs toward "alive" so a
+/// cleanup never deletes a real daemon's state. A kill must err the other way:
+/// when the record carries a start-time, the live process's start-time must be
+/// readable and equal, otherwise the pid may have been recycled to an unrelated
+/// process (a session host, an agent) and signalling it would kill the wrong
+/// thing. Only a legacy record with no start-time falls back to bare liveness.
+pub fn recorded_daemon_is_same_process(rec: &DaemonPidRecord) -> bool {
+    if !is_process_alive(rec.pid) {
+        return false;
+    }
+    match (rec.start_time, process_start_time(rec.pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 /// Outcome of [`cleanup_stale_control_masters`] — surfaced so the
 /// daemon can log a one-liner instead of guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]

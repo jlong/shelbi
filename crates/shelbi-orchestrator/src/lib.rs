@@ -265,59 +265,126 @@ pub fn orchestrator_pane_alive(project_name: &str) -> Result<bool> {
 
 
 
-/// Restart a crashed orchestrator — the **session half** of the supervision
-/// relaunch, split out of [`ensure_dashboard`] for the daemon
-/// (`rt-daemon-layout-split`; `docs/removing-tmux/phase3-daemon.md`, "Layout
-/// leaves the poller").
+/// Timing for the supervisor's orchestrator relaunch
+/// ([`supervise_restart_orchestrator`]). Injected so tests run on a short clock.
+#[derive(Debug, Clone, Copy)]
+pub struct OrchRelaunchTiming {
+    /// How long to wait for the new session to come up (its `meta.json`
+    /// written and its socket answering). A healthy session binds in well under
+    /// a second.
+    pub ready_timeout: std::time::Duration,
+    /// How long the new session must stay up after it first answers. A launch
+    /// command that cannot run (a missing runner binary) exits within
+    /// milliseconds, briefly answering the probe first; that is a failed
+    /// relaunch, not a restart.
+    pub settle: std::time::Duration,
+}
+
+impl Default for OrchRelaunchTiming {
+    fn default() -> Self {
+        Self {
+            ready_timeout: std::time::Duration::from_secs(10),
+            settle: std::time::Duration::from_millis(750),
+        }
+    }
+}
+
+/// Poll interval while waiting for a relaunched orchestrator session.
+const ORCH_RELAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Relaunch a crashed orchestrator — the daemon supervisor's restart
+/// (`rt-daemon-layout-split`, `orch-relaunch-noop-after-session-death`).
 ///
-/// The daemon's poller owns detecting the crash ([`orchestrator_pane_alive`])
-/// and driving the session back up, but it must make no tmux *layout* call and
-/// no `review_ui` pane call. So the restart goes through the
-/// [`SessionBackend`](session_backend::SessionBackend) seam: it rebuilds the
-/// orchestrator's launch command (the same wrapper [`ensure_dashboard`] splits
-/// in, minus the first-launch greeting) and asks the backend to **respawn the
-/// pinned orchestrator session in place**. The poller then publishes a
-/// [`LayoutEvent::OrchestratorRestarted`](shelbi_state::LayoutEvent) so a client
-/// — on tmux the always-present dashboard sidebar pane — arranges the view
-/// (re-running [`ensure_dashboard`] if the pane had vanished entirely, which is
-/// the tmux layout the daemon no longer does itself).
+/// Under the project's dashboard lock (so a concurrent TUI `ensure_dashboard`
+/// can't spawn a second orchestrator), `spawn` brings a fresh orchestrator
+/// session up — production passes [`relaunch_orchestrator_session`], the
+/// session half of [`ensure_dashboard`]. The restart then counts as a success
+/// **only once the new session is live**: the same backend probe the
+/// supervisor's crash detection uses ([`orchestrator_pane_alive`]) must answer
+/// `Alive` within the timing's `ready_timeout`, and still answer after its
+/// `settle`. A spawn error, a session that never comes up, or one that exits
+/// right after launch is an `Err` carrying the reason (for the last, the final
+/// line its screen printed), so the caller logs `restart-failed` rather than a
+/// `restart` that left nothing running.
 ///
-/// Generic over the backend so supervision is testable with a stub that records
-/// the respawn without a tmux server (the "restart with no client attached"
-/// test): `backend()` returns the tmux backend in production, where respawn maps
-/// to `respawn-pane -k` and `get_env` to `show-environment`.
+/// There is no respawn-in-place: a session process keeps the binary and PTY it
+/// started with, so a dead orchestrator is always replaced by a new session.
+/// Generic over the backend (only `probe` and `final_screen` are used) so the
+/// success criterion is testable with a stub, with no session process.
 ///
-/// Returns the backend's [`RespawnOutcome`](session_backend::RespawnOutcome).
-/// The one runtime (the session-process backend) has no respawn-in-place
-/// analogue — a session keeps the binary it started with — so it comes back
-/// [`Failed`](session_backend::RespawnOutcome::Failed), and the caller leans on
-/// the published `OrchestratorRestarted` event to let a client rebuild the
-/// orchestrator session from scratch on reopen.
+/// A session found already alive under the lock (another caller relaunched it
+/// first) is a success without spawning.
 pub fn supervise_restart_orchestrator<B: session_backend::SessionBackend>(
     backend: &B,
     project_name: &str,
-) -> Result<session_backend::RespawnOutcome> {
-    use session_backend::SessionTarget;
-
+    spawn: impl FnOnce() -> Result<BootstrapStatus>,
+    timing: OrchRelaunchTiming,
+) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    // Validate the project has a local hub (the orchestrator always runs there).
-    project
+    let hub = project
         .machines
         .iter()
         .find(|m| matches!(m.kind, MachineKind::Local))
         .ok_or_else(|| {
             Error::Other(format!("project `{project_name}` has no local hub machine"))
         })?;
+    let host = hub.host();
+    let target = dashboard_addr(project_name);
+    let deadline = crate::workspace::probe_deadline();
 
-    let target = SessionTarget::session(format!("shelbi-{project_name}"));
+    let _bootstrap_lock = shelbi_state::lock_dashboard(project_name)?;
+    if backend.probe(&host, &target, Some(deadline)).is_alive() {
+        return Ok(());
+    }
+    spawn()?;
 
-    // Ask the backend to respawn the orchestrator session in place. The session
-    // backend has no in-place respawn (a session keeps its binary), so it returns
-    // `Failed` — which the poller treats as "let a fresh rebuild happen" (it
-    // publishes `OrchestratorRestarted`, and a reopen runs
-    // `ensure_orchestrator_session`). The command is unused by the session
-    // backend; the seam stays generic so a stub can assert the attempt.
-    Ok(backend.respawn(&target, ""))
+    // Hold the lock until the session is live, so a TUI bootstrap racing this
+    // relaunch sees the new session instead of spawning a duplicate beside it.
+    let name = session_process_backend::session_name(&target);
+    let started = std::time::Instant::now();
+    let mut last = backend.probe(&host, &target, Some(deadline));
+    while !last.is_alive() {
+        if started.elapsed() >= timing.ready_timeout {
+            let detail = match last {
+                session_backend::Liveness::Unreachable { reason } => format!(" ({reason})"),
+                _ => last_screen_line(backend, &host, &target)
+                    .map(|line| format!(": {line}"))
+                    .unwrap_or_default(),
+            };
+            return Err(Error::Other(format!(
+                "orchestrator session `{name}` did not come up within {}s of the spawn{detail}",
+                timing.ready_timeout.as_secs_f32(),
+            )));
+        }
+        std::thread::sleep(ORCH_RELAUNCH_POLL.min(timing.ready_timeout));
+        last = backend.probe(&host, &target, Some(deadline));
+    }
+
+    std::thread::sleep(timing.settle);
+    if !backend.probe(&host, &target, Some(deadline)).is_alive() {
+        let detail = last_screen_line(backend, &host, &target)
+            .map(|line| format!(": {line}"))
+            .unwrap_or_default();
+        return Err(Error::Other(format!(
+            "orchestrator session `{name}` exited right after launch{detail}"
+        )));
+    }
+    Ok(())
+}
+
+/// The last non-blank line a (dead) session printed, for a relaunch failure's
+/// reason — typically the shell's "command not found" for a missing runner.
+fn last_screen_line<B: session_backend::SessionBackend>(
+    backend: &B,
+    host: &Host,
+    target: &SessionTarget,
+) -> Option<String> {
+    let screen = backend.final_screen(host, target).ok()?;
+    screen
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_string)
 }
 
 
@@ -474,6 +541,59 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         }
     }
 
+    let status = spawn_orchestrator_locked(project_name, &host, hub.work_dir.as_path(), &runner_spec)?;
+    // A successful bring-up answers any supervisor failure the sidebar is still
+    // showing (e.g. a TUI open after the supervisor gave up). Best-effort.
+    let _ = shelbi_state::clear_orchestrator_supervision_status(project_name);
+    Ok(status)
+}
+
+/// Bring the orchestrator session up for a crashed/dead orchestrator — the
+/// session half of [`ensure_dashboard`] without its project-open side effects
+/// (marking the project open, refreshing the commit guard), for the daemon
+/// supervisor's relaunch ([`supervise_restart_orchestrator`]). The caller holds
+/// the project's dashboard lock ([`shelbi_state::lock_dashboard`]), so this and
+/// a concurrent TUI `ensure_dashboard` never both spawn. Idempotent: a live
+/// session is left alone.
+pub fn relaunch_orchestrator_session(project_name: &str) -> Result<BootstrapStatus> {
+    let project = shelbi_state::load_project(project_name)?;
+    let hub = project
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, MachineKind::Local))
+        .ok_or_else(|| {
+            Error::Other(format!("project `{project_name}` has no local hub machine"))
+        })?;
+    let host = hub.host();
+    let runner_spec = project
+        .runner(&project.orchestrator.runner)
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "orchestrator runner `{}` not declared in project `{project_name}`",
+                project.orchestrator.runner
+            ))
+        })?
+        .clone();
+    // A relaunch is a replacement launch (the old session is dead), so it is
+    // subject to the same runner-transition guard as a cold `ensure_dashboard`.
+    handoff::validate_orchestrator_runner_transition(
+        project_name,
+        &project.orchestrator.runner,
+        &runner_spec.command,
+    )?;
+    spawn_orchestrator_locked(project_name, &host, hub.work_dir.as_path(), &runner_spec)
+}
+
+/// Deploy the orchestrator's agent context into its workdir and bring its
+/// session up. Shared by [`ensure_dashboard`] and
+/// [`relaunch_orchestrator_session`]; the caller holds the dashboard lock.
+fn spawn_orchestrator_locked(
+    project_name: &str,
+    host: &Host,
+    hub_work_dir: &std::path::Path,
+    runner_spec: &shelbi_core::AgentRunnerSpec,
+) -> Result<BootstrapStatus> {
+    let session = format!("shelbi-{project_name}");
     // Materialize the orchestrator's workdir upfront — needed whether we
     // create the session from scratch or just the right pane. The
     // orchestrator's agent context (composed preamble +
@@ -487,7 +607,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let workdir = shelbi_state::project_dir(project_name)?;
     shelbi_state::ensure_dir(&workdir)?;
     let _ = workspace::deploy_agent_context(
-        &host,
+        host,
         &workdir,
         project_name,
         shelbi_state::ORCHESTRATOR_AGENT,
@@ -498,14 +618,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // pane stdin. Everything above (project-open, the commit guard refresh,
     // agent-context deploy) is backend-agnostic and has already run; the session
     // itself is brought up here.
-    ensure_orchestrator_session(
-        &host,
-        project_name,
-        &session,
-        &runner_spec,
-        &workdir,
-        hub.work_dir.as_path(),
-    )
+    ensure_orchestrator_session(host, project_name, &session, runner_spec, &workdir, hub_work_dir)
 }
 
 
@@ -991,12 +1104,12 @@ fn ensure_orchestrator_session(
 
 #[cfg(test)]
 mod supervise_restart_orchestrator_tests {
-    //! The session half of the supervision relaunch
-    //! ([`supervise_restart_orchestrator`]) must restart a crashed orchestrator
-    //! through the [`SessionBackend`](session_backend::SessionBackend) seam, with
-    //! no tmux server and no attached client — the daemon's
-    //! "restart with no client attached" path (`rt-daemon-layout-split`). A stub
-    //! backend records the calls so the behavior is asserted without tmux.
+    //! The supervisor's orchestrator relaunch ([`supervise_restart_orchestrator`])
+    //! counts as a restart only once the new session is live
+    //! (`orch-relaunch-noop-after-session-death`): a spawn that errors, or one
+    //! whose session never answers the probe or dies right after launch, is a
+    //! failure. A stub backend
+    //! scripts the probe answers so this is asserted with no session process.
     use super::*;
     use session_backend::{
         InjectionGuard, Liveness, RespawnOutcome, SessionBackend, SessionTarget, SlotInfo,
@@ -1005,65 +1118,58 @@ mod supervise_restart_orchestrator_tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    /// A `SessionBackend` that answers `get_env` from a canned value and records
-    /// every `respawn`. Every other method is unreachable here — the restart path
-    /// touches only `get_env` and `respawn` — so they panic if a future change
-    /// starts calling them, flagging that the test needs widening.
+    /// A `SessionBackend` whose `probe` answers from a script (the last answer
+    /// repeats once the script runs out) and counts the probes, and whose
+    /// `final_screen` returns a canned screen. Every other method is unreachable
+    /// here — the restart path only probes and reads the final screen — so they
+    /// panic if a future change starts calling them, flagging that the test
+    /// needs widening.
     struct StubBackend {
-        /// When set, `respawn` returns [`RespawnOutcome::Failed`] — the shape the
-        /// real session backend returns (a session keeps the binary it started
-        /// with), so the restart seam's outcome propagation is testable.
-        fail_respawn: bool,
-        /// `(target label, command)` of each `respawn`, in call order.
-        respawns: Mutex<Vec<(String, String)>>,
+        probes: Mutex<std::collections::VecDeque<Liveness>>,
+        probe_count: Mutex<usize>,
+        /// What `final_screen` returns (the dead session's last screen).
+        final_screen: String,
     }
 
     impl StubBackend {
-        fn new() -> Self {
+        fn scripted(answers: &[Liveness]) -> Self {
             Self {
-                fail_respawn: false,
-                respawns: Mutex::new(Vec::new()),
+                probes: Mutex::new(answers.iter().cloned().collect()),
+                probe_count: Mutex::new(0),
+                final_screen: String::new(),
             }
         }
 
-        fn failing() -> Self {
-            Self {
-                fail_respawn: true,
-                respawns: Mutex::new(Vec::new()),
-            }
+        fn with_final_screen(mut self, screen: &str) -> Self {
+            self.final_screen = screen.to_string();
+            self
         }
     }
 
     impl SessionBackend for StubBackend {
         fn get_env(&self, _host: &Host, _t: &SessionTarget, _var: &str) -> Result<Option<String>> {
-            unreachable!("the restart path no longer reads session env (no pane pin)")
+            unreachable!("the restart path never reads session env")
         }
 
-        fn respawn(&self, target: &SessionTarget, cmd: &str) -> RespawnOutcome {
-            self.respawns
-                .lock()
-                .unwrap()
-                .push((target.label(), cmd.to_string()));
-            if self.fail_respawn {
-                RespawnOutcome::Failed {
-                    target: target.label(),
-                    reason: "session keeps the binary it started with".into(),
-                }
-            } else {
-                RespawnOutcome::Respawned {
-                    target: target.label(),
-                }
-            }
+        fn respawn(&self, _target: &SessionTarget, _cmd: &str) -> RespawnOutcome {
+            unreachable!("a session has no respawn-in-place; the restart spawns a new one")
         }
 
         fn spawn(&self, _h: &Host, _t: &SessionTarget, _c: Option<&str>) -> Result<()> {
-            unreachable!("spawn not used by the restart path")
+            unreachable!("the restart spawns through its injected spawn step")
         }
         fn kill(&self, _h: &Host, _t: &SessionTarget) -> Result<()> {
             unreachable!("kill not used by the restart path")
         }
-        fn probe(&self, _h: &Host, _t: &SessionTarget, _d: Option<Duration>) -> Liveness {
-            unreachable!("probe not used by the restart path")
+        fn probe(&self, _h: &Host, t: &SessionTarget, _d: Option<Duration>) -> Liveness {
+            assert_eq!(t.label(), format!("shelbi-{}", PROJECT.with(|p| p.borrow().clone())));
+            *self.probe_count.lock().unwrap() += 1;
+            let mut q = self.probes.lock().unwrap();
+            if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().expect("scripted probe answers")
+            }
         }
         fn send_text(&self, _h: &Host, _t: &SessionTarget, _x: &str) -> Result<()> {
             unreachable!()
@@ -1081,7 +1187,7 @@ mod supervise_restart_orchestrator_tests {
             unreachable!()
         }
         fn final_screen(&self, _h: &Host, _t: &SessionTarget) -> Result<String> {
-            unreachable!()
+            Ok(self.final_screen.clone())
         }
         fn title(&self, _h: &Host, _t: &SessionTarget) -> Result<String> {
             unreachable!()
@@ -1159,42 +1265,124 @@ mod supervise_restart_orchestrator_tests {
         }
     }
 
+    thread_local! {
+        /// The project the current test seeded, so the stub can assert the
+        /// probe targets that project's orchestrator session.
+        static PROJECT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+
+    fn seed(name: &str) -> super::tests_support_restart::Fixture {
+        PROJECT.with(|p| *p.borrow_mut() = name.to_string());
+        seed_project(name)
+    }
+
+    const SHORT: OrchRelaunchTiming = OrchRelaunchTiming {
+        ready_timeout: Duration::from_millis(300),
+        settle: Duration::from_millis(10),
+    };
+
     #[test]
-    fn restarts_the_orchestrator_session_in_place_via_the_backend() {
-        let _fx = seed_project("alpha");
-        let backend = StubBackend::new();
+    fn a_relaunch_succeeds_only_once_the_new_session_is_live() {
+        let _fx = seed("alpha");
+        // Dead before the spawn; the new session takes two polls to bind.
+        let backend =
+            StubBackend::scripted(&[Liveness::Dead, Liveness::Dead, Liveness::Dead, Liveness::Alive]);
+        let mut spawns = 0;
 
-        let outcome = supervise_restart_orchestrator(&backend, "alpha").unwrap();
+        supervise_restart_orchestrator(
+            &backend,
+            "alpha",
+            || {
+                spawns += 1;
+                Ok(BootstrapStatus::Started)
+            },
+            OrchRelaunchTiming {
+                ready_timeout: Duration::from_secs(5),
+                settle: Duration::from_millis(10),
+            },
+        )
+        .expect("the relaunch came up");
 
-        // The restart respawns the orchestrator session by name (no pane pin):
-        // the session keeps its slot, so the target is `shelbi-<project>`.
-        assert_eq!(
-            outcome,
-            RespawnOutcome::Respawned {
-                target: "shelbi-alpha".into()
-            }
-        );
-        let respawns = backend.respawns.lock().unwrap();
-        assert_eq!(respawns.len(), 1, "exactly one respawn");
-        assert_eq!(respawns[0].0, "shelbi-alpha", "respawned the orchestrator session");
+        assert_eq!(spawns, 1, "exactly one spawn");
+        // Dead before the spawn, two dead polls, live, then live after the settle.
+        assert_eq!(*backend.probe_count.lock().unwrap(), 5, "polled until live, then settled");
     }
 
     #[test]
-    fn propagates_a_failed_respawn_from_the_backend() {
-        let _fx = seed_project("beta");
-        // The real session backend returns `Failed` because a live session keeps
-        // the binary it started with; the restart seam must surface that so the
-        // poller falls back to republishing `OrchestratorRestarted` and letting a
-        // client rebuild the dashboard on reopen.
-        let backend = StubBackend::failing();
+    fn a_session_that_exits_right_after_launch_is_a_failure() {
+        // A missing runner binary: the session answers once, then its child
+        // fails to exec and the session is dead by the settle re-probe.
+        let _fx = seed("epsilon");
+        let backend = StubBackend::scripted(&[Liveness::Dead, Liveness::Alive, Liveness::Dead])
+            .with_final_screen(
+                "/bin/sh: exec: /nonexistent/orch: cannot execute: No such file or directory\n\n",
+            );
 
-        let outcome = supervise_restart_orchestrator(&backend, "beta").unwrap();
+        let err = supervise_restart_orchestrator(
+            &backend,
+            "epsilon",
+            || Ok(BootstrapStatus::Started),
+            SHORT,
+        )
+        .expect_err("a session that died on launch is not a restart");
 
-        assert!(matches!(outcome, RespawnOutcome::Failed { .. }));
-        // The attempt was still made against the session, exactly once.
-        let respawns = backend.respawns.lock().unwrap();
-        assert_eq!(respawns.len(), 1, "one respawn attempted");
-        assert_eq!(respawns[0].0, "shelbi-beta");
+        let msg = err.to_string();
+        assert!(msg.contains("epsilon/orch") && msg.contains("exited right after launch"), "{msg}");
+        assert!(msg.ends_with("cannot execute: No such file or directory"), "names the cause: {msg}");
+    }
+
+    #[test]
+    fn a_spawn_that_never_comes_up_is_a_failure_not_a_restart() {
+        // The 2026-10-14 incident: the relaunch "returned" but no session ever
+        // existed. That must surface as an error, not a success.
+        let _fx = seed("beta");
+        let backend = StubBackend::scripted(&[Liveness::Dead]);
+
+        let err = supervise_restart_orchestrator(
+            &backend,
+            "beta",
+            || Ok(BootstrapStatus::Started),
+            SHORT,
+        )
+        .expect_err("a session that never came up is a failed relaunch");
+
+        let msg = err.to_string();
+        assert!(msg.contains("beta/orch"), "names the session: {msg}");
+        assert!(msg.contains("did not come up"), "says why: {msg}");
+    }
+
+    #[test]
+    fn a_spawn_error_propagates_with_its_reason() {
+        let _fx = seed("gamma");
+        let backend = StubBackend::scripted(&[Liveness::Dead]);
+
+        let err = supervise_restart_orchestrator(
+            &backend,
+            "gamma",
+            || Err(Error::Other("spawning session `gamma/orch`: exec failed".into())),
+            SHORT,
+        )
+        .expect_err("a refused spawn is a failed relaunch");
+
+        assert!(err.to_string().contains("exec failed"), "{err}");
+        // Probed once (dead) before the spawn, never polled after the error.
+        assert_eq!(*backend.probe_count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn an_already_live_session_is_not_spawned_again() {
+        // Another caller (a TUI bootstrap) brought the orchestrator up while the
+        // supervisor waited on the dashboard lock: no second spawn.
+        let _fx = seed("delta");
+        let backend = StubBackend::scripted(&[Liveness::Alive]);
+
+        supervise_restart_orchestrator(
+            &backend,
+            "delta",
+            || panic!("must not spawn over a live session"),
+            SHORT,
+        )
+        .unwrap();
     }
 }
 

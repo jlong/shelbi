@@ -65,6 +65,13 @@ pub struct ExitRecord {
     /// A short human-readable reason, when the session has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// When the session host itself was signalled: the pid that sent the
+    /// signal, as the kernel reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_pid: Option<i32>,
+    /// The sender's command (best-effort: absent when it had already exited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 impl ExitRecord {
@@ -134,10 +141,13 @@ mod tests {
             signal: None,
             exited_at: "2026-10-03T12:34:56Z".into(),
             reason: None,
+            sender_pid: None,
+            sender: None,
         };
         let json = rec.to_json().unwrap();
         assert!(json.contains("\"code\""));
         assert!(!json.contains("signal"));
         assert!(!json.contains("reason"));
+        assert!(!json.contains("sender"));
     }
 }

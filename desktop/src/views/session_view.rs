@@ -232,6 +232,10 @@ pub struct SessionView {
     /// Whether an idle workspace shows the TUI's dev-slot idle placeholder
     /// (else the plain "No live session" notice, as a review pane does).
     idle_placeholder: bool,
+    /// The daemon supervisor's reason a dead orchestrator is not coming back
+    /// (the sidebar model's `orchestrator_status`); the orchestrator view's
+    /// placeholder names it while the session is down.
+    supervisor_status: Option<String>,
     slot: Slot,
     restart: RestartController,
     reconnect: ReconnectController,
@@ -281,6 +285,7 @@ impl SessionView {
             remote_machine: None,
             palette_chord: String::new(),
             idle_placeholder: true,
+            supervisor_status: None,
             slot: Slot::Empty,
             restart: RestartController::default(),
             shown: false,
@@ -327,6 +332,15 @@ impl SessionView {
         self.idle_placeholder = on;
     }
 
+    /// The daemon supervisor's orchestrator failure, from the sidebar model.
+    /// Repaints only when it changed.
+    pub fn set_supervisor_status(&mut self, status: Option<String>, cx: &mut Context<Self>) {
+        if self.supervisor_status != status {
+            self.supervisor_status = status;
+            cx.notify();
+        }
+    }
+
     /// The session this view shows.
     #[cfg(test)]
     pub fn target(&self) -> &SessionRef {
@@ -371,6 +385,15 @@ impl SessionView {
     /// TUI words it. An idle workspace shows [`Self::idle_lines`] instead.
     pub fn notice(&self) -> Option<String> {
         let max = RestartController::max_restarts();
+        // A down orchestrator the supervisor gave up on: its reason stands in
+        // for the view's own connecting / given-up notice, as in the TUI.
+        if let Some(status) = self.supervisor_status.as_deref() {
+            if self.target == SessionRef::Orchestrator
+                && !matches!(self.slot, Slot::Live(_) | Slot::Idle(_))
+            {
+                return Some(app_session::orchestrator_down_notice(status));
+            }
+        }
         Some(match &self.slot {
             Slot::Live(_) => return None,
             Slot::Empty => "No session".to_string(),
@@ -1325,6 +1348,39 @@ mod tests {
         // The window brought the orchestrator up: retry without a re-select.
         assert!(h.update(|c, cx| c.reconnect(cx)));
         assert_eq!(h.phase(), SessionPhase::Live);
+    }
+
+    #[gpui::test]
+    fn a_down_orchestrator_names_the_supervisor_failure(cx: &mut TestAppContext) {
+        let mut h = open(
+            cx,
+            vec![
+                Outcome::Fail("no live session `demo/orch`"),
+                Outcome::Live(Size::new(80, 24)),
+            ],
+        );
+        h.update(|c, cx| c.show(cx));
+        let notice = |h: &mut Harness| h.chat.read_with(&h.cx, |c, _| c.notice());
+        assert_eq!(
+            notice(&mut h).as_deref(),
+            Some("Couldn't attach to orchestrator: no live session `demo/orch`")
+        );
+        // The supervisor gave up: its reason replaces the attach error, in the
+        // TUI's words.
+        h.update(|c, cx| {
+            c.set_supervisor_status(Some("supervisor gave up: spawn refused".into()), cx)
+        });
+        assert_eq!(
+            notice(&mut h).as_deref(),
+            Some(
+                "Orchestrator is down. supervisor gave up: spawn refused. \
+                 Select Orchestrator again to relaunch it."
+            )
+        );
+        // Live again: the terminal, not a notice, even before the status clears.
+        assert!(h.update(|c, cx| c.reconnect(cx)));
+        assert_eq!(h.phase(), SessionPhase::Live);
+        assert_eq!(notice(&mut h), None);
     }
 
     #[gpui::test]

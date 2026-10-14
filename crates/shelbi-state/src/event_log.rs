@@ -1447,30 +1447,44 @@ pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
     })
 }
 
-/// Append `<rfc3339> question=<question-id> task=<task-id> kind=clarification text=<truncated>`
+/// Append
+/// `<rfc3339> question=<question-id> task=<task-id> [project=<p>] kind=clarification [file=<path>] text=<preview>`
 /// to `~/.shelbi/events.log`. Emitted by the hub daemon when a worker sends
 /// `{"verb":"request-clarification", ...}` over the hub socket — surfaces
 /// the question to the orchestrator via the same events stream every other
-/// transition rides on. The original question text is folded (whitespace →
-/// underscores) and truncated so the line stays single-record and bounded,
-/// then the trailing `…` marker tells operators reading the log that the
-/// full body lives in the worker's `.shelbi/messages/<task-id>.log` thread
-/// (the daemon never persists clarification text — it's hands-off
-/// orchestration metadata).
-pub fn append_clarification_event(question_id: &str, task_id: &str, text: &str) -> Result<()> {
+/// transition rides on. The question text is folded (whitespace →
+/// underscores) and truncated so the line stays single-record and bounded;
+/// the full text is stored first by [`crate::questions::record_question`] and
+/// `file=` names that file (omitted when the path holds whitespace, which
+/// would tear the token; `shelbi question show <id>` finds it either way).
+pub fn append_clarification_event(
+    project: Option<&str>,
+    question_id: &str,
+    task_id: &str,
+    text: &str,
+    file: Option<&Path>,
+) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let question_id = sanitize_field(question_id);
     let task_id = sanitize_field(task_id);
+    let project = project
+        .map(|p| format!(" project={}", sanitize_field(p)))
+        .unwrap_or_default();
+    let file = file
+        .map(|f| f.to_string_lossy().into_owned())
+        .filter(|f| !f.chars().any(char::is_whitespace))
+        .map(|f| format!(" file={f}"))
+        .unwrap_or_default();
     let truncated = sanitize_reason(&truncate_with_ellipsis(text, CLARIFICATION_TEXT_BUDGET));
     append_event_line(&format!(
-        "{ts} question={question_id} task={task_id} kind=clarification text={truncated}"
+        "{ts} question={question_id} task={task_id}{project} kind=clarification{file} text={truncated}"
     ))
 }
 
 /// Maximum chars of the clarification question we copy into the event line.
 /// Bounded so a verbose question doesn't blow the line past readable
-/// terminals; the full text lives in the orchestrator's message log thread
-/// anyway. Picked at 120 — long enough to be informative in `events tail`,
+/// terminals; the full text lives in the question file the line's `file=`
+/// names. Picked at 120 — long enough to be informative in `events tail`,
 /// short enough to stay on one screen-line in a typical 200-col terminal
 /// after the timestamp + key/value prefixes.
 const CLARIFICATION_TEXT_BUDGET: usize = 120;
@@ -3324,7 +3338,7 @@ fn event_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
 /// otherwise write a second, attacker-shaped line the orchestrator's reaction
 /// rules act on, and stray whitespace would shift the space-delimited token
 /// positions every prefix/position-keyed parser depends on.
-fn sanitize_field(s: &str) -> String {
+pub(crate) fn sanitize_field(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
@@ -5215,7 +5229,7 @@ mod tests {
         // multi-screen blob. Whitespace folds to `_` so the line stays
         // parseable as a single space-separated record.
         let q = "lorem ipsum dolor sit amet ".repeat(10);
-        append_clarification_event("q-001", "feat-X", &q).unwrap();
+        append_clarification_event(None, "q-001", "feat-X", &q, None).unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let line = log.lines().next().unwrap();
         // Shape: `<ts> question=q-001 task=feat-X kind=clarification text=…`
@@ -5242,12 +5256,42 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_clarification_event("q-002", "fix-bug", "use http or https?").unwrap();
+        append_clarification_event(None, "q-002", "fix-bug", "use http or https?", None).unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let line = log.lines().next().unwrap();
         // Short question fits entirely; sanitize folds the two spaces in
         // the question to underscores so the record stays single-line.
         assert!(line.ends_with(" text=use_http_or_https?"), "{line}");
+    }
+
+    #[test]
+    fn append_clarification_event_names_project_and_question_file() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let file = Path::new("/h/projects/demo/questions/t/q-1.md");
+        append_clarification_event(Some("demo"), "q-1", "t", "why?", Some(file)).unwrap();
+        // A path holding whitespace would tear the record, so it is left out.
+        append_clarification_event(Some("demo"), "q-2", "t", "how?", Some(Path::new("/a b/q.md")))
+            .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines[0].ends_with(
+                " question=q-1 task=t project=demo kind=clarification \
+                 file=/h/projects/demo/questions/t/q-1.md text=why?"
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(" question=q-2 task=t project=demo kind=clarification text=how?"),
+            "{}",
+            lines[1]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
