@@ -136,6 +136,20 @@ impl WorkspaceInterface {
         self.panel.status_line = msg.into();
     }
 
+    /// Replace the panel's header status (the badge beside the back button).
+    /// Called on each board refresh so the header tracks the live workspace
+    /// state the sidebar shows, rather than freezing at the value it held when
+    /// the view opened.
+    pub fn set_header_status(&mut self, status: WsStatus) {
+        self.panel.status = status;
+    }
+
+    /// The current header status text (test accessor).
+    #[cfg(test)]
+    pub(crate) fn header_status_text(&self) -> &str {
+        &self.panel.status.text
+    }
+
     /// Mark the content session's teardown as deliberate, so the exit that
     /// follows a `Close` is not auto-restarted by the content supervisor.
     pub fn note_deliberate_close(&mut self) {
