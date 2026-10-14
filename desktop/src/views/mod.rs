@@ -20,6 +20,7 @@
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
+//! - the new-release notice: **`dt-packaging`** (`update`)
 //!
 //! Views read view models and invoke registry commands through
 //! `crate::commands`; they never hold domain logic of their own.
@@ -37,3 +38,4 @@ pub mod markdown;
 pub mod task_detail;
 pub mod settings;
 pub mod sidebar;
+pub mod update;

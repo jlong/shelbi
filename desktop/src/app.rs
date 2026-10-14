@@ -48,6 +48,7 @@ use crate::platform::{
 };
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
+use crate::views::update::{self as update_view, UpdateState};
 use shelbi_state::keymap::{
     format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
@@ -1200,6 +1201,18 @@ impl ShelbiWindow {
             .when_some(self.model.session_lost.clone(), |main, lost| {
                 main.child(notice(lost.into(), theme.red))
             })
+            // A newer release (platform::update), in the main column so it
+            // clears the titlebar's traffic lights.
+            .when_some(
+                cx.try_global::<UpdateState>()
+                    .and_then(|u| u.visible().cloned()),
+                |main, update| {
+                    main.child(update_view::render_update_bar(&update, theme, |_, cx| {
+                        cx.global_mut::<UpdateState>().dismissed = true;
+                        cx.refresh_windows();
+                    }))
+                },
+            )
             .when_some(self.status.clone(), |main, status| {
                 main.child(notice(status, theme.muted))
             })

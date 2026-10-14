@@ -468,7 +468,7 @@ fn centered(theme: &Theme) -> gpui::Stateful<gpui::Div> {
 }
 
 /// A command in a monospace box with a copy button.
-fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoElement {
+pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoElement {
     let copy: SharedString = command.to_string().into();
     div()
         .flex()

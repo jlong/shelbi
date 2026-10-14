@@ -163,8 +163,12 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   `gpui_kit::init`) believes it is in a real bundle, calls
   `UNUserNotificationCenter`, and the app aborts with
   `bundleProxyForCurrentProcess is nil`. `dt-packaging`'s real `.app` has
-  both; `dt-menus-notifications` should expect system notifications to work
-  only from the bundle.
+  both (its own plist, `macos/Shelbi.app.plist`, with
+  `CFBundleIdentifier = dev.shelbi.desktop`): launched from the bundle with
+  `open`, `gpui_kit::init` runs without the abort (checked 2026-10-14, macOS
+  26, Developer ID signed with the hardened runtime and no entitlements).
+  `dt-menus-notifications` should expect system notifications to work only
+  from the bundle (`scripts/bundle.sh`).
 - **`NSProcessInfo.setProcessName` does not rename the menu bar app** for an
   unbundled binary; the embedded plist is the fix that works.
 - **Window appearance.** `Window::appearance()` and

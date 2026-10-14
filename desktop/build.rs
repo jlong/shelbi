@@ -3,8 +3,9 @@
 //! macOS names an unbundled executable's app menu (the bold name in the menu
 //! bar) from the main bundle's `CFBundleName`, and for a bare binary the
 //! main bundle's Info.plist is this embedded section. Without it `cargo run`
-//! shows "shelbi-desktop" in the menu bar. `dt-packaging` builds the real
-//! `.app` with its own Info.plist; this one only covers running unbundled.
+//! shows "shelbi-desktop" in the menu bar. `scripts/bundle.sh` builds the
+//! real `.app` with its own Info.plist (`macos/Shelbi.app.plist`), which
+//! wins inside the bundle; this one only covers running unbundled.
 
 fn main() {
     println!("cargo:rerun-if-changed=macos/Info.plist");

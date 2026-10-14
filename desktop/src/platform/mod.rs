@@ -9,16 +9,19 @@
 //! ([`control`], [`version`]), and fails at the step that broke with what its
 //! screen needs to name the fix. `views::bootstrap` renders each state.
 //!
-//! Native menus and system notifications (`dt-menus-notifications`) and the
-//! app bundle (`dt-packaging`) are platform concerns too, but live where
-//! those subtasks put them.
+//! `--print-version` ([`print_version`]) is bootstrap's headless check, and
+//! [`update`] the once-a-day new-release check. Native menus and system
+//! notifications (`dt-menus-notifications`) are platform concerns too, but
+//! live where that subtask puts them; the app bundle is `scripts/bundle.sh`.
 
 pub mod bootstrap;
 pub mod control;
 pub mod daemon;
 pub mod discovery;
 pub mod env;
+pub mod print_version;
 pub mod relaunch;
+pub mod update;
 pub mod version;
 
 #[cfg(test)]
