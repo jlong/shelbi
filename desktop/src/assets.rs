@@ -23,6 +23,9 @@ pub mod icons {
     pub const BOLT: &str = "icons/heroicons/bolt.svg";
     pub const SERVER_STACK: &str = "icons/heroicons/server-stack.svg";
     pub const X_MARK: &str = "icons/heroicons/x-mark.svg";
+    pub const EXCLAMATION_TRIANGLE: &str = "icons/heroicons/exclamation-triangle.svg";
+    pub const ARROW_PATH: &str = "icons/heroicons/arrow-path.svg";
+    pub const CLIPBOARD_DOCUMENT: &str = "icons/heroicons/clipboard-document.svg";
 }
 
 macro_rules! heroicon {
@@ -45,6 +48,9 @@ const HEROICONS: &[(&str, &[u8])] = &[
     heroicon!(icons::BOLT, "bolt.svg"),
     heroicon!(icons::SERVER_STACK, "server-stack.svg"),
     heroicon!(icons::X_MARK, "x-mark.svg"),
+    heroicon!(icons::EXCLAMATION_TRIANGLE, "exclamation-triangle.svg"),
+    heroicon!(icons::ARROW_PATH, "arrow-path.svg"),
+    heroicon!(icons::CLIPBOARD_DOCUMENT, "clipboard-document.svg"),
 ];
 
 /// The app's asset source: the Heroicons first, then gpui-kit's assets.
@@ -81,6 +87,9 @@ mod tests {
             icons::BOLT,
             icons::SERVER_STACK,
             icons::X_MARK,
+            icons::EXCLAMATION_TRIANGLE,
+            icons::ARROW_PATH,
+            icons::CLIPBOARD_DOCUMENT,
         ] {
             let bytes = Assets.load(path).unwrap().expect(path);
             assert!(bytes.starts_with(b"<svg"), "{path} is an SVG");

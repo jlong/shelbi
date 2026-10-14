@@ -6,9 +6,20 @@ render over `shelbi-app` (navigation, the command registry, view models,
 background refresh) and talk to the same daemon and sessions. The plan is
 "Desktop App (gpui)" (`Plans/desktop-app-gpui.md` in the Shelbi ContextStore).
 
-Status: foundation. The window opens with the sidebar/main split in the dark
-tokens; every command and view shows a "Not implemented yet" banner until its
-`dt-*` subtask lands.
+Status: foundation. On launch the app finds the `shelbi` CLI, starts the
+daemon, and checks versions (`src/platform/`, see
+`docs/status/dt-platform-bootstrap.md`); then the window shows the
+sidebar/main split in the dark tokens, where every command and view shows a
+"Not implemented yet" banner until its `dt-*` subtask lands.
+
+The app is a client of the `shelbi` CLI and needs it installed
+(`brew install jlong/shelbi/shelbi`). To point it at a particular build, set
+`desktop.cli_path` in `~/.shelbi/config.yaml`:
+
+```yaml
+desktop:
+  cli_path: ~/src/shelbi/target/debug/shelbi
+```
 
 ## Build and run
 
@@ -72,8 +83,8 @@ desktop/
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         the TUI's token names, dark values, as gpui colors
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
-  src/platform/        login env, CLI discovery, daemon start, version check
-  src/views/           sidebar, chat, issues, activity, machines, workspace, review, palette
+  src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch
+  src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
   src/elements/        custom elements, chiefly the terminal
 ```
 

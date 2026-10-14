@@ -94,6 +94,39 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
     }
 }
 
+/// Whether `kind` asks the daemon to do something (start, change, or stop
+/// work), as opposed to only showing what is already there. While a relaunch
+/// is required (the CLI was upgraded under the app) these are refused; views,
+/// including attached session views, keep working. No wildcard arm.
+pub fn sends_to_daemon(kind: &CommandKind) -> bool {
+    match kind {
+        CommandKind::ShowView(_) => false,
+        CommandKind::FocusSession { .. } => false,
+        CommandKind::OpenErrorLog => false,
+        // Edits a local file in the user's editor.
+        CommandKind::OpenEditor { .. } => false,
+        // Only this client lets go.
+        CommandKind::Detach => false,
+        // May launch the workspace's agent.
+        CommandKind::FocusWorkspace { .. } => true,
+        CommandKind::LoadReview { .. } => true,
+        CommandKind::ToggleZen => true,
+        // Starts the target project's orchestrator.
+        CommandKind::SwitchProject { .. } => true,
+        CommandKind::AddProject => true,
+        CommandKind::DetachOtherClients => true,
+        CommandKind::QuitProject => true,
+        CommandKind::QuitShelbi => true,
+        CommandKind::MoveIssue { .. } => true,
+        CommandKind::StartIssue { .. } => true,
+        CommandKind::AssignIssue { .. } => true,
+        CommandKind::ApproveReview { .. } => true,
+        CommandKind::RejectReview { .. } => true,
+        CommandKind::EditIssue { .. } => true,
+        CommandKind::AddIssue { .. } => true,
+    }
+}
+
 /// Show a view in the main area. Every [`View`] variant has its own arm.
 pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
     match view {
@@ -230,6 +263,31 @@ mod tests {
             (CommandKind::EditIssue { id: s("t1") }, "issue:edit:t1"),
             (CommandKind::AddIssue { title: s("New") }, "issue:add"),
         ]
+    }
+
+    #[test]
+    fn only_views_and_local_actions_run_while_a_relaunch_is_pending() {
+        let allowed: Vec<&str> = every_command()
+            .into_iter()
+            .filter(|(kind, _)| !sends_to_daemon(kind))
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(
+            allowed,
+            [
+                "view:tasks",
+                "view:activity",
+                "view:machines",
+                "view:orch",
+                "agent:s1",
+                "action:error-log",
+                "action:detach",
+                "edit:project",
+                "edit:agent:dev",
+                "edit:zenmode",
+                "edit:workflows",
+            ]
+        );
     }
 
     #[test]

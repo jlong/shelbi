@@ -63,7 +63,7 @@ fn main() {
                     app_id: Some("co.32pixels.shelbi".into()),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| ShelbiWindow::new()),
+                |_, cx| cx.new(ShelbiWindow::new),
             )
             .expect("failed to open the Shelbi window");
             cx.activate(true);
