@@ -1041,6 +1041,12 @@ struct NormalizedEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     metadata: BTreeMap<String, String>,
+    /// For a `clarification` event, the stored question in full (its `text`,
+    /// `asked_at`, `answered_at`, file `path`, …). The events line carries
+    /// only a truncated preview, so this is what the orchestrator answers
+    /// from. Absent for a line written before questions were stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question: Option<shelbi_state::questions::Question>,
 }
 
 fn normalize_line(
@@ -1055,6 +1061,9 @@ fn normalize_line(
     }
 
     let kind = event_kind(&parsed);
+    let question = (kind == "clarification")
+        .then(|| stored_question(&scope.project, &parsed))
+        .flatten();
     Some(NormalizedEvent {
         cursor: cursor.to_string(),
         offset,
@@ -1068,7 +1077,22 @@ fn normalize_line(
         to: parsed.to,
         reason: parsed.fields.get("reason").cloned(),
         metadata: parsed.fields,
+        question,
     })
+}
+
+/// Load the full question a `clarification` line points at from the hub's
+/// question store. A missing or unreadable file degrades to no record: the
+/// event still delivers with its preview.
+fn stored_question(
+    project: &str,
+    parsed: &ParsedLine,
+) -> Option<shelbi_state::questions::Question> {
+    let id = parsed.fields.get("question")?;
+    let task = parsed.fields.get("task")?;
+    shelbi_state::questions::load_question(Some(project), task, id)
+        .ok()
+        .flatten()
 }
 
 fn line_belongs_to_project(scope: &ProjectScope, parsed: &ParsedLine) -> bool {
@@ -1424,6 +1448,48 @@ workspaces: []\n";
         assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
         assert_eq!(response.events[1].task.as_deref(), Some("owned"));
         assert_eq!(response.events[1].kind, "task_transition");
+    }
+
+    /// A clarification's events line is only a preview; the drained event
+    /// carries the stored question in full under `question.text`.
+    #[test]
+    fn drain_carries_the_full_text_of_a_clarification() {
+        let (_guard, _tmp) = setup_home();
+        let text = format!("Which default should I keep?\n{}", "detail ".repeat(300));
+        let stored =
+            shelbi_state::questions::record_question(shelbi_state::questions::NewQuestion {
+                project: Some("demo"),
+                task: "feat-q",
+                id: "q-001",
+                workspace: Some("charlie"),
+                text: &text,
+                context: None,
+            })
+            .unwrap();
+        shelbi_state::append_clarification_event(
+            Some("demo"),
+            "q-001",
+            "feat-q",
+            &text,
+            Some(&stored.path),
+        )
+        .unwrap();
+        // A legacy line (no stored file) still delivers, just without a record.
+        shelbi_state::append_clarification_event(Some("demo"), "q-old", "feat-q", "old?", None)
+            .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        assert_eq!(response.events.len(), 2, "{:?}", response.events);
+        let ev = &response.events[0];
+        assert_eq!(ev.kind, "clarification");
+        let q = ev.question.as_ref().expect("full question attached");
+        assert_eq!(q.text, text);
+        assert_eq!(q.meta.workspace.as_deref(), Some("charlie"));
+        assert!(response.events[1].question.is_none());
+
+        let json = serde_json::to_value(ev).unwrap();
+        assert_eq!(json["question"]["text"], serde_json::Value::String(text));
+        assert_eq!(json["question"]["id"], "q-001");
     }
 
     /// An `IssueFile` with just enough shape for `ProjectScope::task_ids` to

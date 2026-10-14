@@ -1,0 +1,85 @@
+---
+title: shelbi question
+order: 33.5
+summary: Read the clarification questions workers have asked, in full, and see which ones are still open.
+---
+
+```text
+shelbi question list [--task <TASK>] [--all] [--json]
+shelbi question show <ID> [--task <TASK>] [--json]
+```
+
+When a workspace hits an ambiguity it sends a `request-clarification` to the
+hub. The hub stores the full question before it writes anything to the events
+stream, at:
+
+```text
+~/.shelbi/projects/<project>/questions/<task-id>/<question-id>.md
+```
+
+Each file is markdown with frontmatter (`id`, `task`, `workspace`, `kind`,
+`asked_at`, and `answered_at` once answered) followed by the question text,
+untouched.
+
+The `events.log` line for the question only has room for a short preview. It
+carries `question=<id>`, `task=<id>`, and `file=<path>` so a reader can find the
+full text, and `shelbi orchestrator events next` (and `drain`) attach the whole
+stored question to the event as `question`, with the full text under
+`question.text`.
+
+Question ids are chosen by the worker and are only unique per task. If a worker
+reuses an id for a different question on the same task, the hub stores the new
+one as `<id>-2` (then `-3`, and so on) and reports that id on the events line,
+so an earlier question is never overwritten. Sending the identical question
+again is treated as a retry.
+
+## list
+
+Lists the project's questions, oldest first. Only open (unanswered) questions
+are shown unless you pass `--all`, so a freshly reopened orchestrator can find
+what it still owes an answer.
+
+| Option | Meaning |
+| --- | --- |
+| `--task <TASK>` | Only questions asked by this task. |
+| `--all` | Include answered questions. |
+| `--json` | Print the questions, full text included, as a JSON array. |
+
+## show
+
+Prints one question in full, with who asked it, when, whether it has been
+answered, and the command to answer it. `<ID>` is the id from the events line.
+When two tasks used the same id, name the task with `--task <TASK>` or write the
+id as `<task>/<id>`.
+
+## Answering
+
+Answer with [`shelbi message`](/docs/cli/message):
+
+```bash
+shelbi message add-auth reply "yes, use the existing session table" --in-response-to q-004
+```
+
+The reply is appended to the task's message log as usual, and the stored
+question gets `answered_at` (plus the reply's `msg_id`), which drops it from
+`shelbi question list`.
+
+## Examples
+
+See what is waiting on an answer:
+
+```bash
+shelbi question list
+```
+
+Read a question the events line cut short:
+
+```bash
+shelbi question show q-001
+```
+
+Everything one task has asked, answered or not:
+
+```bash
+shelbi question list --task add-auth --all
+```
