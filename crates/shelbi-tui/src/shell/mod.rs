@@ -811,10 +811,13 @@ struct ShellState {
     /// seam so a slow bootstrap can be stubbed in tests
     /// (`rt-tui-headless-startup-block`).
     bootstrap: Arc<dyn Bootstrap>,
-    /// The in-flight startup job, drained by [`ShellState::poll_startup`]. `Some`
-    /// from [`ShellState::spawn_startup`] until the daemon + dashboard bootstrap
-    /// finishes; the first frame draws while it is still pending.
-    startup_rx: Option<Receiver<Result<(), String>>>,
+    /// The in-flight startup job and the project it bootstraps, drained by
+    /// [`ShellState::poll_startup`]. `Some` from [`ShellState::spawn_startup`]
+    /// until the daemon + dashboard bootstrap finishes; the first frame draws
+    /// while it is still pending. A project switch replaces it (dropping the old
+    /// project's receiver), so a late result for a project the user already left
+    /// never lands in the new project's view or status.
+    startup_rx: Option<(String, Receiver<Result<(), String>>)>,
     /// The open review interface (panel + content terminal view), when
     /// `main_view` is [`MainView::Review`]. `rt-tui-review`.
     review: Option<ReviewInterface>,
@@ -1345,6 +1348,16 @@ impl ShellState {
         // Apply the restored view to the main area.
         let restored = self.client.view().clone();
         self.apply_restored_view(restored);
+        // Bring up the new project's orchestrator off the UI thread, exactly as a
+        // fresh launch in it would: without this only the launch project's
+        // orchestrator was ever started, so a project whose orchestrator crashed
+        // (or was never opened this run) showed an empty orchestrator view.
+        // `ensure_dashboard` is idempotent (a live session is left alone, and the
+        // per-project dashboard lock serializes racing callers), so switching
+        // into a running project or back and forth never double-launches. This
+        // replaces any still-pending startup job, dropping its receiver.
+        self.status = Some(STARTUP_STATUS.to_string());
+        self.spawn_startup();
         self.dirty = true;
     }
 
@@ -1777,14 +1790,15 @@ impl ShellState {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let bootstrap = self.bootstrap.clone();
+        let job_project = project.clone();
         if std::thread::Builder::new()
             .name("shelbi-shell-startup".into())
             .spawn(move || {
-                let _ = tx.send(bootstrap.bootstrap(&project));
+                let _ = tx.send(bootstrap.bootstrap(&job_project));
             })
             .is_ok()
         {
-            self.startup_rx = Some(rx);
+            self.startup_rx = Some((project, rx));
         }
     }
 
@@ -1794,7 +1808,14 @@ impl ShellState {
     /// Returns `true` when the job finished (so the caller redraws).
     fn poll_startup(&mut self) -> bool {
         let result = match &self.startup_rx {
-            Some(rx) => match rx.try_recv() {
+            // A job for a project the user has since left is stale: drop it
+            // without touching the current project's view or status. (A switch
+            // already replaces the job; this guards any other path.)
+            Some((project, _)) if self.client.project() != Some(project.as_str()) => {
+                self.startup_rx = None;
+                return false;
+            }
+            Some((_, rx)) => match rx.try_recv() {
                 Ok(r) => r,
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
@@ -5715,7 +5736,7 @@ mod tests {
             Arc::new(NoopConnector),
             caps,
             lifecycle,
-            Arc::new(DaemonBootstrap),
+            Arc::new(ScriptedBootstrap::default()),
         );
         // Hub-free workers so `switch_project` doesn't touch the socket in tests.
         st.make_workers = recording_workers_factory(Arc::new(Mutex::new(Vec::new())));
@@ -5784,6 +5805,145 @@ mod tests {
         open_gate.send(()).unwrap();
         let done = wait_until(Duration::from_secs(2), || st.poll_startup());
         assert!(done, "poll_startup reports completion once the bootstrap returns");
+    }
+
+    /// A bootstrap that records every project it was asked to bring up. A project
+    /// with a gate registered (see [`ScriptedBootstrap::gate`]) blocks until the
+    /// test sends its result; any other returns `Ok(())` at once. Stands in for
+    /// the daemon/dashboard bootstrap so a project switch touches no real
+    /// orchestrator in tests.
+    #[derive(Default)]
+    struct ScriptedBootstrap {
+        calls: Mutex<Vec<String>>,
+        gates: Mutex<std::collections::HashMap<String, Receiver<Result<(), String>>>>,
+        /// Projects whose bootstrap has returned (set just before returning).
+        finished: Mutex<Vec<String>>,
+    }
+    impl ScriptedBootstrap {
+        /// Gate `project`'s bootstrap; the returned sender releases it with a result.
+        fn gate(&self, project: &str) -> std::sync::mpsc::Sender<Result<(), String>> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.gates.lock().unwrap().insert(project.to_string(), rx);
+            tx
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn finished(&self, project: &str) -> bool {
+            self.finished.lock().unwrap().iter().any(|p| p == project)
+        }
+    }
+    impl Bootstrap for ScriptedBootstrap {
+        fn bootstrap(&self, project: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(project.to_string());
+            let gate = self.gates.lock().unwrap().remove(project);
+            let result = match gate {
+                Some(rx) => rx.recv().unwrap_or(Ok(())),
+                None => Ok(()),
+            };
+            self.finished.lock().unwrap().push(project.to_string());
+            result
+        }
+    }
+
+    fn scripted_state(boot: Arc<ScriptedBootstrap>) -> ShellState {
+        let caps = Caps {
+            kitty: true,
+            truecolor: true,
+            nested: None,
+        };
+        let mut st = ShellState::new_with(
+            "proj",
+            Arc::new(NoopConnector),
+            caps,
+            Arc::new(RecordingLifecycle::default()),
+            boot,
+        );
+        st.make_workers = recording_workers_factory(Arc::new(Mutex::new(Vec::new())));
+        st
+    }
+
+    #[test]
+    fn switching_projects_bootstraps_the_target_projects_orchestrator() {
+        // The bug: only the launch project's orchestrator was ever started, so
+        // switching into a project whose orchestrator wasn't running left its
+        // orchestrator view empty. A switch must run the same off-thread
+        // bootstrap a fresh launch in that project runs.
+        let boot = Arc::new(ScriptedBootstrap::default());
+        let release_beta = boot.gate("beta");
+        let mut st = scripted_state(boot.clone());
+
+        st.switch_project("beta");
+        // The switch returned while beta's bootstrap is still wedged on its gate:
+        // it runs off the UI thread, and the starting status shows meanwhile.
+        let ran = wait_until(Duration::from_secs(2), || boot.calls() == ["beta"]);
+        assert!(ran, "a switch bootstraps the target project: {:?}", boot.calls());
+        assert_eq!(st.status.as_deref(), Some(STARTUP_STATUS));
+        assert!(!st.poll_startup(), "the pending bootstrap never blocks the UI");
+
+        release_beta.send(Ok(())).unwrap();
+        let done = wait_until(Duration::from_secs(2), || st.poll_startup());
+        assert!(done, "beta's bootstrap result is folded in");
+        assert_eq!(st.status, None, "the starting status clears once it is up");
+
+        // Switching to the already-current project is a no-op: no second
+        // bootstrap. Switching back bootstraps `proj` (ensure_dashboard is
+        // idempotent for a live orchestrator, so this never double-launches).
+        st.switch_project("beta");
+        st.switch_project("proj");
+        let ran = wait_until(Duration::from_secs(2), || boot.calls() == ["beta", "proj"]);
+        assert!(ran, "one bootstrap per real switch: {:?}", boot.calls());
+    }
+
+    #[test]
+    fn a_late_bootstrap_result_for_a_left_project_is_ignored() {
+        // A bootstrap for project A that finishes after the user switched to B
+        // must not re-attach or put a status into B's view.
+        let boot = Arc::new(ScriptedBootstrap::default());
+        let release_proj = boot.gate("proj");
+        let release_beta = boot.gate("beta");
+        let mut st = scripted_state(boot.clone());
+
+        // The launch project's bootstrap is in flight...
+        st.status = Some(STARTUP_STATUS.to_string());
+        st.spawn_startup();
+        assert!(wait_until(Duration::from_secs(2), || boot.calls() == ["proj"]));
+        // ...when the user switches to beta (whose bootstrap is also pending).
+        st.switch_project("beta");
+        assert!(wait_until(Duration::from_secs(2), || boot.calls() == ["proj", "beta"]));
+
+        // proj's bootstrap now fails late. Its result must never surface.
+        release_proj.send(Err("proj failed".into())).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || boot.finished("proj")));
+        for _ in 0..20 {
+            assert!(!st.poll_startup(), "a stale result is not folded into beta");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            st.status.as_deref(),
+            Some(STARTUP_STATUS),
+            "beta's status is untouched by proj's late failure"
+        );
+
+        // beta's own result still lands.
+        release_beta.send(Err("beta failed".into())).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || st.poll_startup()));
+        assert_eq!(st.status.as_deref(), Some("beta failed"));
+    }
+
+    #[test]
+    fn poll_startup_drops_a_job_keyed_to_another_project() {
+        // Belt-and-braces for the project key: a finished job whose project isn't
+        // the current one is dropped without touching status or the view.
+        let boot = Arc::new(ScriptedBootstrap::default());
+        let mut st = scripted_state(boot);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err("other failed".into())).unwrap();
+        st.startup_rx = Some(("other".into(), rx));
+        st.status = None;
+        assert!(!st.poll_startup());
+        assert!(st.startup_rx.is_none(), "the stale job is dropped");
+        assert_eq!(st.status, None);
     }
 
     /// Spin until `f` is true or `timeout` elapses (bounded; never a hard hang).
