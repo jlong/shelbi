@@ -13,6 +13,15 @@
 //! Commands leave the view as [`IssuesEvent::Command`] so the window runs them
 //! through the one exhaustive dispatch (`crate::commands`), which hands the
 //! issue mutations back to [`IssuesView::run_issue_command`].
+//!
+//! Drag and drop: a card body is a drag source ([`CardDrag`], drawn by a
+//! [`CardGhost`] under the pointer); every column is a drop target, and the
+//! cards of the dragged card's own column are reorder targets. Legality comes
+//! from the state ([`BoardState::drop_target`]): a refused column is dimmed
+//! with its reason and never highlights under the pointer; a drop on it sends
+//! nothing and puts the reason in the status line. A legal drop becomes the
+//! same registry command the keys send, so it goes through the window's
+//! dispatch and the daemon like any other move.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -22,6 +31,7 @@ use gpui::{
     FocusHandle, FontWeight, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
     Window,
 };
+use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
 use shelbi_app::board::{self, BoardRead, ClosedPage};
 use shelbi_app::{CommandKind, ExecError, IssueCard, IssueColumn, TaskDetailModel};
@@ -49,6 +59,46 @@ const ICON: f32 = 14.0;
 pub enum IssuesEvent {
     /// Run this registry command through `commands::dispatch_command`.
     Command(CommandKind),
+}
+
+/// The value a card drag carries.
+#[derive(Debug, Clone)]
+pub struct CardDrag {
+    pub id: String,
+}
+
+/// The card that follows the pointer during a drag.
+pub struct CardGhost {
+    title: SharedString,
+    id: SharedString,
+}
+
+impl Render for CardGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        div()
+            .w(px(COLUMN_WIDTH))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.gray)
+            .bg(theme.selection)
+            .opacity(0.9)
+            .shadow_lg()
+            .text_sm()
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.white)
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .child(self.title.clone()),
+            )
+            .child(div().text_xs().text_color(theme.muted).child(self.id.clone()))
+    }
 }
 
 /// A background result.
@@ -176,12 +226,25 @@ impl IssuesView {
                 }
             }
         }
+        // A drag released off the board (or cancelled) never reaches a drop
+        // handler; let go of its column styling.
+        if self.state.dragging().is_some() && !cx.has_active_drag() {
+            self.state.end_drag();
+            changed = true;
+        }
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresh();
         }
         if changed {
             cx.notify();
         }
+    }
+
+    /// A card was dropped: run what the state makes of it.
+    fn handle_drop(&mut self, intents: Vec<Intent>, window: &mut Window, cx: &mut Context<Self>) {
+        self.needs_focus = true;
+        self.apply_intents(intents, window, cx);
+        cx.notify();
     }
 
     fn refresh(&mut self) {
@@ -535,6 +598,8 @@ impl IssuesView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let focused = ci == self.state.selected_column;
+        let drop = self.state.dragging().map(|id| self.state.drop_target(id, ci));
+        let refused = matches!(drop, Some(DropTarget::Refused(_)));
         let letters: Vec<_> = col
             .label
             .chars()
@@ -564,6 +629,21 @@ impl IssuesView {
                 this.apply_intents(intents, window, cx);
                 cx.notify();
             }))
+            .when(refused, |d| d.opacity(0.35))
+            .when(drop.is_some() && !refused, |d| {
+                let theme = *theme;
+                d.drag_over::<CardDrag>(move |s, _, _, _| {
+                    s.bg(theme.selection).border_color(theme.white)
+                })
+            })
+            // A refused target still takes the drop, so the state can say why
+            // (it sends nothing).
+            .when(drop.is_some(), |d| {
+                d.on_drop(cx.listener(move |this, drag: &CardDrag, window, cx| {
+                    let intents = this.state.drop_on_column(&drag.id, ci);
+                    this.handle_drop(intents, window, cx);
+                }))
+            })
     }
 
     fn render_column(
@@ -577,16 +657,39 @@ impl IssuesView {
         let model = self.state.model();
         let focused = ci == self.state.selected_column;
         let is_done = col.category == shelbi_core::StatusCategory::Done;
+        let drop = self.state.dragging().map(|id| self.state.drop_target(id, ci));
+        // In the dragged card's own column each card is a reorder target; the
+        // row it was dragged from says which edge marks the landing spot.
+        let reorder_from = match drop {
+            Some(DropTarget::Reorder) => self
+                .state
+                .dragging()
+                .and_then(|id| col.cards.iter().position(|c| c.id == id)),
+            _ => None,
+        };
         let cards: Vec<_> = col
             .cards
             .iter()
             .enumerate()
             .map(|(ri, card)| {
                 let selected = focused && ri == self.state.selected_row;
-                self.render_card(card, ci, ri, selected, show_wf, theme, cx)
-                    .into_any_element()
+                let card_el = self.render_card(card, ci, ri, selected, show_wf, theme, cx);
+                match reorder_from {
+                    Some(from) => reorder_target(card_el, card, ci, ri, from, theme, cx)
+                        .into_any_element(),
+                    None => card_el.into_any_element(),
+                }
             })
             .collect();
+        let refused = match &drop {
+            Some(DropTarget::Refused(msg)) => Some(msg.clone()),
+            _ => None,
+        };
+        let drop_hint = match &drop {
+            Some(DropTarget::Move { merge: true }) => Some("Drop to run the gated merge"),
+            Some(DropTarget::Move { merge: false }) => Some("Drop to move here"),
+            _ => None,
+        };
         let empty = col.cards.is_empty();
         let header = div()
             .id(("header", ci))
@@ -610,6 +713,23 @@ impl IssuesView {
                     .text_xs()
                     .text_color(theme.muted)
                     .child(format!("{}", col.cards.len())),
+            )
+            // While a card is dragged, what a drop here does (in the header
+            // row, so the cards don't shift when the drag starts).
+            .children(
+                refused
+                    .clone()
+                    .map(|msg| format!("Can't drop: {msg}"))
+                    .or(drop_hint.map(str::to_string))
+                    .map(|text| {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(text)
+                    }),
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let intents = this.state.toggle_column(ci);
@@ -653,14 +773,31 @@ impl IssuesView {
                         })),
                 )
             });
+        let theme = *theme;
         div()
+            .id(("column-drop", ci))
             .flex()
             .flex_col()
             .flex_none()
             .w(px(COLUMN_WIDTH))
             .h_full()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::transparent_black())
             .child(header)
             .child(body)
+            .when(refused.is_some(), |d| d.opacity(0.35))
+            .when(drop.is_some() && refused.is_none(), |d| {
+                d.drag_over::<CardDrag>(move |s, _, _, _| s.border_color(theme.gray))
+            })
+            // A refused target still takes the drop, so the state can say why
+            // (it sends nothing).
+            .when(drop.is_some(), |d| {
+                d.on_drop(cx.listener(move |this, drag: &CardDrag, window, cx| {
+                    let intents = this.state.drop_on_column(&drag.id, ci);
+                    this.handle_drop(intents, window, cx);
+                }))
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -673,10 +810,16 @@ impl IssuesView {
         show_wf: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let pending = self.state.pending(&card.id).cloned();
         let notice = self.state.notice(&card.id).map(str::to_string);
+        let dragged = self.state.dragging() == Some(card.id.as_str());
         let id = card.id.clone();
+        let weak = cx.weak_entity();
+        let drag = CardDrag {
+            id: card.id.clone(),
+        };
+        let ghost_title = SharedString::from(card.title.clone());
         let title_color = if card.blocked {
             theme.muted
         } else if selected {
@@ -697,12 +840,32 @@ impl IssuesView {
             .border_color(if selected { theme.gray } else { theme.divider })
             .bg(if selected { theme.selection } else { theme.search })
             .when(pending.is_some(), |d| d.opacity(0.65))
+            // The card being dragged stays as a placeholder under its ghost.
+            .when(dragged, |d| d.opacity(0.3))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.state.select(ci, ri);
                 this.state.open_detail(&id);
                 cx.notify();
             }))
+            // A card with a change in flight can't be dragged (one mutation
+            // per issue at a time).
+            .when(pending.is_none(), |d| {
+                d.on_drag(drag, move |drag: &CardDrag, _offset, _window, cx: &mut App| {
+                    let id = drag.id.clone();
+                    let _ = weak.update(cx, |view, cx| {
+                        if !view.state.begin_drag(&id) {
+                            view.state.status = Some(format!("{id}: a change is already in progress"));
+                        }
+                        cx.notify();
+                    });
+                    let title = ghost_title.clone();
+                    cx.new(|_| CardGhost {
+                        title,
+                        id: SharedString::from(drag.id.clone()),
+                    })
+                })
+            })
             .child(
                 div()
                     .flex()
@@ -763,7 +926,9 @@ impl IssuesView {
                                 .mt(px(1.0))
                                 .text_color(theme.red),
                         )
-                        .child(div().flex_1().child(message))
+                        // Wraps (a gated merge's refusal can be long); the
+                        // status line carries it too.
+                        .child(div().flex_1().min_w_0().line_clamp(4).child(message))
                         .child(
                             div()
                                 .id(SharedString::from(format!("dismiss-{}", card.id)))
@@ -784,7 +949,7 @@ impl IssuesView {
         let km = self.keymaps();
         let h = |a| self.hint(km.kanban.first_chord_for(a));
         let hints = format!(
-            "{}/{} column   {}/{} card   {} open   {}/{} move   s start   a assign   e edit   E editor   n new   {} workflow   f workspace   {} refresh",
+            "{}/{} column   {}/{} card   {} open   {}/{} move   {}/{} reorder   drag to move or reorder   s start   a assign   e edit   E editor   n new   {} workflow   f workspace   {} refresh",
             h(KanbanAction::NavLeft),
             h(KanbanAction::NavRight),
             h(KanbanAction::NavUp),
@@ -792,6 +957,8 @@ impl IssuesView {
             h(KanbanAction::OpenPopover),
             h(KanbanAction::MoveCardLeft),
             h(KanbanAction::MoveCardRight),
+            h(KanbanAction::ReorderUp),
+            h(KanbanAction::ReorderDown),
             h(KanbanAction::CycleWorkflowFilter),
             h(KanbanAction::Refresh),
         );
@@ -929,6 +1096,9 @@ impl Render for IssuesView {
             self.needs_focus = false;
             window.focus(&self.focus, cx);
         }
+        if self.state.dragging().is_some() && !cx.has_active_drag() {
+            self.state.end_drag();
+        }
         let theme = *cx.global::<Theme>();
         let detail = self
             .state
@@ -972,6 +1142,37 @@ impl Render for IssuesView {
 }
 
 // ---- small pieces ------------------------------------------------------------
+
+/// Make `card` (row `ri` of column `ci`, the dragged card's own column) a
+/// reorder target: hovering it marks the edge the dragged card lands on (above
+/// when dragging up from row `from`, below when dragging down) and a drop
+/// takes its place.
+fn reorder_target(
+    card: gpui::Stateful<gpui::Div>,
+    target: &IssueCard,
+    ci: usize,
+    ri: usize,
+    from: usize,
+    theme: &Theme,
+    cx: &mut Context<IssuesView>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = *theme;
+    let target_id = target.id.clone();
+    card.drag_over::<CardDrag>(move |s, _, _, _| {
+        let s = s.border_color(theme.white);
+        if ri < from {
+            s.border_t_4()
+        } else if ri > from {
+            s.border_b_4()
+        } else {
+            s
+        }
+    })
+    .on_drop(cx.listener(move |this, drag: &CardDrag, window, cx| {
+        let intents = this.state.drop_on_card(&drag.id, ci, &target_id);
+        this.handle_drop(intents, window, cx);
+    }))
+}
 
 /// A card's meta lines: workflow badge + branch, then assignee and deps.
 fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement {

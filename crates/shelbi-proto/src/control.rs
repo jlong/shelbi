@@ -44,7 +44,11 @@ use crate::error::ProtoError;
 /// and detach them; and [`ServerMsg::ClientList`] / [`ServerMsg::Detached`] /
 /// [`ServerMsg::Detach`] carry the replies and the push that tells a client to
 /// leave (agents keep running).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
+///
+/// v5 adds [`MutationKind::Prioritize`] (reorder an issue within its column
+/// through the daemon, so the desktop board's drag-to-reorder and the TUI's
+/// reorder keys go through the same per-issue queue as every other mutation).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -148,6 +152,12 @@ pub enum MutationKind {
     Reject {
         reason: String,
     },
+    /// Reorder the issue within its status column: land it at absolute slot
+    /// `position` (0 is the top) in the column's canonical order (priority,
+    /// then id), clamped into range by the store. Other cards shift.
+    Prioritize {
+        position: u32,
+    },
 }
 
 impl MutationKind {
@@ -162,6 +172,7 @@ impl MutationKind {
             MutationKind::Edit(_) => "edit",
             MutationKind::Approve => "approve",
             MutationKind::Reject { .. } => "reject",
+            MutationKind::Prioritize { .. } => "prioritize",
         }
     }
 }
@@ -544,6 +555,21 @@ mod tests {
         let (back, n): (ClientMsg, usize) = decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn round_trips_a_prioritize_request() {
+        let msg = ClientMsg::Mutate(MutationRequest {
+            request_id: 8,
+            project: "p".into(),
+            id: "t-2".into(),
+            expected: None,
+            kind: MutationKind::Prioritize { position: 3 },
+        });
+        let bytes = encode(&msg).unwrap();
+        let (back, _): (ClientMsg, usize) = decode(&bytes).unwrap();
+        assert_eq!(back, msg);
+        assert_eq!(MutationKind::Prioritize { position: 0 }.verb(), "prioritize");
     }
 
     #[test]

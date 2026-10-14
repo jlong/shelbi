@@ -75,7 +75,7 @@ pub enum EditTarget {
 /// steps. `rt-mutations-daemon` owns the daemon-side routing; here they are
 /// just typed requests.
 ///
-/// The issue mutations (`MoveIssue` … `AddIssue`) are the generic set the
+/// The issue mutations (`MoveIssue` … `PrioritizeIssue`) are the generic set the
 /// plan names. They are not surfaced in the tmux palette today — the
 /// registry carries them so the single-process TUI and the desktop app can
 /// bind them without a second definition — while [`Mutation::ToggleZen`]
@@ -118,6 +118,13 @@ pub enum Mutation {
         project: String,
         title: String,
         workflow: Option<String>,
+    },
+    /// Reorder an issue within its status column: land it at absolute slot
+    /// `position` (0 is the top) of the column's priority order.
+    PrioritizeIssue {
+        project: String,
+        id: String,
+        position: u32,
     },
     /// Toggle Zen Mode for a project.
     ToggleZen { project: String },

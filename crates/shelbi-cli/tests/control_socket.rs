@@ -5,7 +5,8 @@
 //! project and one issue, spawns a real `shelbi daemon` against it (short socket
 //! paths — macOS caps Unix-socket paths at ~104 bytes), and drives mutations
 //! over the typed control protocol via [`shelbi_client::ControlClient`]. Only
-//! `move` mutations are used: they are deterministic (no git, no agent spawn),
+//! `move` and `prioritize` mutations are used: they are deterministic (no git,
+//! no agent spawn),
 //! and the daemon's concurrency guarantees — one mutation per issue at a time,
 //! the expected-state gate, finish-if-the-client-leaves, and change
 //! notifications — are identical for every mutation kind. The merge/dispatch
@@ -67,14 +68,29 @@ impl Home {
 
     /// Write issue `id` in `column` with the fixed `updated_at` [`T0`].
     fn write_issue(&self, id: &str, column: &str) {
+        self.write_issue_at(id, column, 0);
+    }
+
+    /// [`Self::write_issue`] at `priority`.
+    fn write_issue_at(&self, id: &str, column: &str, priority: u32) {
         std::fs::write(
             self.path.join(format!("projects/p/tasks/{id}.md")),
             format!(
-                "---\nid: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
+                "---\nid: {id}\ntitle: {id}\ncolumn: {column}\npriority: {priority}\n\
                  created_at: {T0}\nupdated_at: {T0}\n---\nbody\n"
             ),
         )
         .unwrap();
+    }
+
+    /// The current `priority:` value of issue `id` on disk.
+    fn priority_of(&self, id: &str) -> u32 {
+        let text =
+            std::fs::read_to_string(self.path.join(format!("projects/p/tasks/{id}.md"))).unwrap();
+        text.lines()
+            .find_map(|l| l.strip_prefix("priority:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
     }
 
     /// The current `column:` value of issue `id` on disk.
@@ -300,6 +316,48 @@ fn a_board_move_from_a_stale_card_is_refused_after_a_cli_move() {
     // Nothing changed; the board's re-read shows the CLI's move.
     assert_eq!(home.column_of("t1"), "todo");
     assert_eq!(read_card(&home).status_id, "todo");
+}
+
+#[test]
+fn a_prioritize_reorders_the_column_and_a_stale_sibling_reorder_is_refused() {
+    let mut home = Home::new("prio");
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        home.write_issue_at(id, "todo", i as u32);
+    }
+    home.start_daemon();
+    let at_t0 = ExpectedState {
+        status: "todo".into(),
+        updated_at: T0.into(),
+    };
+    let prio_req = |request_id, id: &str, position| MutationRequest {
+        request_id,
+        project: "p".into(),
+        id: id.into(),
+        expected: Some(at_t0.clone()),
+        kind: MutationKind::Prioritize { position },
+    };
+
+    // `c` to the top: the board's drag sends the registry's PrioritizeIssue as
+    // this request, carrying the card's read state.
+    let mut client = connect(&home.control).unwrap();
+    client.mutate(&prio_req(1, "c", 0), &mut discard()).unwrap();
+    assert_eq!(
+        ["c", "a", "b"].map(|id| home.priority_of(id)),
+        [0, 1, 2],
+        "c landed on top and the rest shifted down"
+    );
+
+    // The renumber rewrote `b`'s revision, so a reorder sent from the old
+    // snapshot is refused rather than applied to a column the user didn't see.
+    let err = client.mutate(&prio_req(2, "b", 0), &mut discard()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            shelbi_client::ClientError::Mutation(shelbi_proto::control::MutationError::Stale { .. })
+        ),
+        "expected a stale refusal, got {err:?}"
+    );
+    assert_eq!(home.priority_of("b"), 2, "nothing changed");
 }
 
 #[test]
