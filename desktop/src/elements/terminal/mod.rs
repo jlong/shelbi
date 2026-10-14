@@ -171,8 +171,9 @@ pub(crate) struct Geometry {
 }
 
 /// Per-frame timing, logged at `debug` every couple of seconds while frames
-/// are painting (`RUST_LOG=shelbi_desktop=debug`). An idle pane paints no
-/// frames, so it logs nothing.
+/// are painting (`RUST_LOG=shelbi_desktop=debug`), and each frame at `trace`
+/// (`shelbi_desktop::terminal::frame`). An idle pane paints no frames, so it
+/// logs nothing.
 #[derive(Debug, Default)]
 pub(crate) struct FrameStats {
     pub frames: u32,
@@ -184,13 +185,36 @@ pub(crate) struct FrameStats {
     pub window_start: Option<Instant>,
     /// Rows laid out by the most recent frame (not reset with the window).
     pub last_rebuilt: usize,
+    /// Since the pane was made (not reset with the window): output bytes
+    /// fed, and resyncs (the session's attach replay, or its
+    /// recovery of a client that fell behind).
+    pub total_fed: u64,
+    pub resyncs: u32,
+    pub total_feed_time: Duration,
+    /// When output was last fed.
+    pub last_fed_at: Option<Instant>,
+    /// When output was first fed, and when the first frame after that
+    /// painted (how long a newly shown session takes to appear).
+    pub first_fed_at: Option<Instant>,
+    pub first_content_at: Option<Instant>,
 }
 
 impl FrameStats {
     pub fn record_frame(&mut self, took: Duration, rows_rebuilt: usize) {
+        // One event per painted frame (`RUST_LOG=shelbi_desktop::terminal::frame=trace`):
+        // what an idle check counts.
+        tracing::trace!(
+            target: "shelbi_desktop::terminal::frame",
+            us = took.as_micros() as u64,
+            rows = rows_rebuilt,
+            "frame"
+        );
         let now = Instant::now();
         let start = *self.window_start.get_or_insert(now);
         self.last_rebuilt = rows_rebuilt;
+        if self.first_fed_at.is_some() && self.first_content_at.is_none() {
+            self.first_content_at = Some(now);
+        }
         self.frames += 1;
         self.busy += took;
         self.max = self.max.max(took);
@@ -209,6 +233,12 @@ impl FrameStats {
             );
             *self = FrameStats {
                 last_rebuilt: rows_rebuilt,
+                total_fed: self.total_fed,
+                resyncs: self.resyncs,
+                total_feed_time: self.total_feed_time,
+                last_fed_at: self.last_fed_at,
+                first_fed_at: self.first_fed_at,
+                first_content_at: self.first_content_at,
                 ..FrameStats::default()
             };
         }
@@ -559,6 +589,7 @@ impl TerminalPane {
         io: Box<dyn SessionIo>,
         cx: &mut Context<Self>,
     ) {
+        tracing::debug!(target: "shelbi_desktop::terminal", session = %name, ?size, "attached");
         self.title = Some(name);
         self.session_size = size;
         self.view = TerminalView::new(size);
@@ -633,6 +664,7 @@ impl TerminalPane {
         for ev in batch {
             match ev {
                 SessionEvent::Resync { replay, .. } => {
+                    self.stats.resyncs += 1;
                     fed += replay.len();
                     self.view.feed(&replay);
                 }
@@ -664,6 +696,10 @@ impl TerminalPane {
         }
         if fed > 0 {
             self.stats.bytes_fed += fed;
+            self.stats.total_fed += fed as u64;
+            self.stats.total_feed_time += start.elapsed();
+            self.stats.last_fed_at = Some(Instant::now());
+            self.stats.first_fed_at.get_or_insert(start);
             self.stats.feed_time += start.elapsed();
             self.activity(cx);
             self.schedule_search_refresh(cx);
@@ -724,6 +760,37 @@ impl TerminalPane {
 
     pub(crate) fn view(&self) -> &TerminalView {
         &self.view
+    }
+
+    /// Output bytes fed since the pane was made (the bench).
+    #[cfg_attr(not(feature = "bench"), allow(dead_code))]
+    pub(crate) fn total_fed(&self) -> u64 {
+        self.stats.total_fed
+    }
+
+    /// When output was last fed (the bench).
+    #[cfg_attr(not(feature = "bench"), allow(dead_code))]
+    pub(crate) fn last_fed_at(&self) -> Option<Instant> {
+        self.stats.last_fed_at
+    }
+
+    /// When output was first fed and when the first frame after that painted
+    /// (the bench).
+    #[cfg_attr(not(feature = "bench"), allow(dead_code))]
+    pub(crate) fn first_content(&self) -> (Option<Instant>, Option<Instant>) {
+        (self.stats.first_fed_at, self.stats.first_content_at)
+    }
+
+    /// Time spent feeding the emulator since the pane was made (the bench).
+    #[cfg_attr(not(feature = "bench"), allow(dead_code))]
+    pub(crate) fn feed_time_total(&self) -> Duration {
+        self.stats.total_feed_time
+    }
+
+    /// Resyncs received since the pane was made (the bench).
+    #[cfg_attr(not(feature = "bench"), allow(dead_code))]
+    pub(crate) fn resyncs(&self) -> u32 {
+        self.stats.resyncs
     }
 
     pub(crate) fn is_focused(&self) -> bool {

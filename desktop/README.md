@@ -122,6 +122,7 @@ desktop/
   src/elements/        custom elements, chiefly the terminal (elements/terminal/)
   src/spike.rs         `--spike <session>`: one terminal element on one session
   src/visual_check.rs  `--visual-check <dir>` (feature `visual-check`): offscreen render + input checks
+  src/bench/           `--bench-term` (feature `bench`): the terminal performance bench and its helpers
 ```
 
 Which subtask fills what:
@@ -189,6 +190,24 @@ RUST_LOG=shelbi_desktop=debug cargo run -- --spike spike/sh   # + frame stats ev
 cargo run --features visual-check -- --visual-check /tmp/vc   # offscreen: frames + input checks, no screen needed
 cargo run --features visual-check -- --visual-workspace /tmp/vw   # offscreen: the Workspace view's states, fake sessions
 ```
+
+### Performance and concurrent clients
+
+`dt-terminal-perf-multiclient` (numbers in `docs/status/dt-terminal-perf-multiclient.md`):
+
+```sh
+scripts/bench-term.sh                  # the bench: a real window, sandboxed sessions, ~2 min
+scripts/bench-term.sh --input yes --source direct --skip-many   # one case
+scripts/multiclient-check.sh           # app + TUI + shelbi attach on one session, typing in turn
+scripts/idle-cpu.sh                    # the full app's idle CPU with one attached session
+```
+
+All three run in a sandboxed Shelbi root under `/tmp` with the hub's socket
+variables unset. `multiclient-check.sh` and `idle-cpu.sh` drive the
+`shelbi` CLI in `$SHELBI_BIN` (default `PATH`), which must speak this
+branch's control protocol for the full app (`target/debug/shelbi` from the
+repository root does). The bench and the concurrent-client check open
+windows without taking focus; `idle-cpu.sh` runs the real app, which does.
 
 Never point `--spike` at a real workspace's session: the window reports
 its size on attach (which the session follows while no other client is

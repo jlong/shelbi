@@ -2,7 +2,11 @@
 //! between pixels and cells.
 //!
 //! Everything except [`CellMetrics::measure`] is plain arithmetic over gpui's
-//! geometry types, unit-tested without a window. The pixel-to-grid rule itself
+//! geometry types, unit-tested without a window. Measuring is cached per
+//! family and size for the life of the process ([`CellMetrics::cached`]):
+//! checking that a family is installed enumerates every font on the system,
+//! about 125 ms on the dev machine, which every newly shown session paid on
+//! its first frame before (`dt-terminal-perf-multiclient`). The pixel-to-grid rule itself
 //! (whole cells, at least 1x1) is `shelbi_term::Size::from_pixels`, shared and
 //! tested in `shelbi-term`.
 
@@ -48,7 +52,26 @@ pub struct CellMetrics {
     pub font: Font,
 }
 
+thread_local! {
+    /// Measured cells by (requested family, font size bits). The UI thread's
+    /// only; fonts are loaded at startup, before any pane measures.
+    static MEASURED: std::cell::RefCell<std::collections::HashMap<(String, u32), CellMetrics>> =
+        Default::default();
+}
+
 impl CellMetrics {
+    /// [`CellMetrics::measure`], once per family and size: every pane after
+    /// the first (a session switched to, a split) reuses the measurement.
+    pub fn cached(window: &Window, family: &str, size: f32) -> Self {
+        let key = (family.to_string(), size.to_bits());
+        if let Some(m) = MEASURED.with(|m| m.borrow().get(&key).cloned()) {
+            return m;
+        }
+        let measured = Self::measure(window, family, size);
+        MEASURED.with(|m| m.borrow_mut().insert(key, measured.clone()));
+        measured
+    }
+
     /// A cell of a given size (tests).
     #[cfg(test)]
     pub fn new(width: f32, height: f32) -> Self {

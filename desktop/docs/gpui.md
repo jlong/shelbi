@@ -336,6 +336,36 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   forwards Edit ▸ Copy to a focused gpui-kit input as
   `gpui_kit::base::input::Copy`).
 
+- **`TextSystem::all_font_names()` is slow** (`dt-terminal-perf-multiclient`):
+  it enumerates every installed font through CoreText, about 125 ms on the
+  dev machine. The terminal checked its configured family against it on every
+  new pane's first frame, so every session shown (a workspace switched to)
+  stalled the UI thread that long. `CellMetrics::cached` measures once per
+  family and size.
+- **`cx.notify()` only repaints windows that rendered the entity last
+  frame** (`App::notify` filters through `tracked_entities`). A terminal pane
+  that is alive but not in the tree (hidden) can keep notifying for free; it
+  costs no frames. The flip side: anything that *is* in the tree and notifies
+  repaints the whole window (views aren't cached unless `.cached()`), so a
+  feed that notifies on every unchanged read repaints the window on its timer.
+- **Inactive windows are throttled to 30 fps** (`WindowOptions::
+  inactive_frame_interval`, default 33 ms), but only frames forced by
+  `on_next_frame` / animation requests; plain `notify` frames in an inactive
+  window still run at the display rate. The terminal never uses
+  `on_next_frame`, so a background window streams output at full rate.
+- **`Window::dispatch_keystroke` inside `WindowHandle::update`** panics with
+  "cannot update <root> while it is already being updated" when dispatch
+  reaches the root view's listeners. Dispatch through
+  `AsyncApp::update_window` (the window, not the root entity) instead (the
+  bench's `--bench-client`).
+- **Profiling a release build**: the release profile strips symbols, so
+  `sample` shows addresses only. Build a symbolized copy in its own target
+  directory: `CARGO_PROFILE_RELEASE_STRIP=none
+  CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_LTO=false
+  cargo build --release --features bench --target-dir target/prof`, then
+  `sample <pid> <seconds>` while it runs (the main thread is
+  `Thread_<n>: main`).
+
 ## Build time and binary size
 
 The foundation window (sidebar/main split, no views). Clean builds of the

@@ -676,10 +676,16 @@ impl ShelbiWindow {
         }));
     }
 
+    /// Fold a feed event into the window, repainting (and re-deriving the
+    /// menus) only when it changed something: the feed re-reads the project
+    /// on a timer (every 5 s while the daemon pushes, 750 ms while polling)
+    /// and most reads find nothing new, so an idle window must not repaint
+    /// for them (`dt-terminal-perf-multiclient`). The notifier diffs against
+    /// its last model, so an identical snapshot has nothing to tell it.
     fn apply_feed(&mut self, event: FeedEvent, window: &mut Window, cx: &mut Context<Self>) {
-        match event {
-            FeedEvent::Snapshot(snapshot) => {
-                if let Some(model) = snapshot.sidebar {
+        let changed = match event {
+            FeedEvent::Snapshot(snapshot) => match snapshot.sidebar {
+                Some(model) if model != self.model => {
                     let changes = self.notifier.observe_sidebar(&model);
                     self.model = model;
                     self.apply_notices(changes, cx);
@@ -691,10 +697,15 @@ impl ShelbiWindow {
                     }
                     self.update_workspace_row(cx);
                     self.update_review_row(window, cx);
+                    true
                 }
+                _ => false,
+            },
+            FeedEvent::Layout(event) => {
+                self.apply_layout(event, window, cx);
+                true
             }
-            FeedEvent::Layout(event) => self.apply_layout(event, window, cx),
-            FeedEvent::Link(link) => self.link = Some(link),
+            FeedEvent::Link(link) => self.link.replace(link) != Some(link),
             FeedEvent::Session(notice) => match notice.kind {
                 SessionNoticeKind::Title(title) => {
                     if notice.session == "orch" {
@@ -703,15 +714,15 @@ impl ShelbiWindow {
                             .observe_orchestrator(&title, &self.model.project_label);
                         self.apply_notices(changes, cx);
                     }
-                    self.session_titles.insert(notice.session, title);
+                    self.session_titles.insert(notice.session, title.clone()) != Some(title)
                 }
-                SessionNoticeKind::Exited => {
-                    self.session_titles.remove(&notice.session);
-                }
+                SessionNoticeKind::Exited => self.session_titles.remove(&notice.session).is_some(),
             },
+        };
+        if changed {
+            self.sync_menus(cx);
+            cx.notify();
         }
-        self.sync_menus(cx);
-        cx.notify();
     }
 
     /// Read the user's merged keymaps (`keys.yaml`) off the UI thread.

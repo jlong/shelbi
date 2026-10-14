@@ -8,6 +8,8 @@
 
 mod app;
 mod assets;
+#[cfg(feature = "bench")]
+mod bench;
 mod commands;
 mod elements;
 mod keys;
@@ -62,6 +64,10 @@ enum Mode {
     /// sessions, one frame per state (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     VisualReview(Option<String>),
+    /// `--bench-term [options]`, `--bench-feed ...`, `--bench-record ...`:
+    /// the terminal performance bench and its helpers (feature `bench`).
+    #[cfg(feature = "bench")]
+    Bench(String, Vec<String>),
 }
 
 fn parse_args() -> Mode {
@@ -81,6 +87,10 @@ fn parse_args() -> Mode {
         Some("--visual-workspace") => Mode::VisualWorkspace(args.next()),
         #[cfg(feature = "visual-check")]
         Some("--visual-review") => Mode::VisualReview(args.next()),
+        #[cfg(feature = "bench")]
+        Some(flag @ ("--bench-term" | "--bench-feed" | "--bench-record" | "--bench-client")) => {
+            Mode::Bench(flag.to_string(), args.collect())
+        }
         Some(project) if !project.starts_with('-') => Mode::App,
         Some(other) => usage(&format!("unknown argument `{other}`")),
     }
@@ -114,6 +124,15 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::VisualReview(dir) = mode {
         visual_review::run(visual_check::out_dir(dir));
+    }
+    #[cfg(feature = "bench")]
+    if let Mode::Bench(flag, args) = &mode {
+        match flag.as_str() {
+            "--bench-feed" => bench::feed::run(args),
+            "--bench-record" => bench::record::run(args),
+            "--bench-client" => bench::client::run(args),
+            _ => bench::run(args),
+        }
     }
     // The launch project: a local read before any window exists (the spike
     // has none).
