@@ -35,9 +35,82 @@ The plan weighs two live options:
 | Zed git dependency at a pinned revision | Authoritative; upgrade on our own schedule | No widget library; heavy checkout; can't publish |
 
 The foundation starts on `gpui-pre` + `gpui-kit`, the plan's default if both
-work. **`dt-spike-terminal` makes the real decision**: it evaluates the git
-dependency and `gpui-kit`'s inputs, lists, menus, and markdown, and may
-switch. A switch records the reason in this file.
+work. `dt-spike-terminal` evaluated both (below) and **the terminal element is
+built on `gpui-pre` + `gpui-kit` today**. The orchestrator makes the final
+call; a switch records its reason in this file.
+
+### The channel evaluation (`dt-spike-terminal`, 2026-10-14)
+
+Both channels were built from the same sources (`desktop/` with the terminal
+element) against **the same gpui code**: the git channel pins
+`zed-industries/zed@93d745668805029476e6d7fbb19652116fed51de`, the commit
+`gpui-pre 0.3.9` was cut from. So the difference is the channel, not gpui.
+
+```toml
+# The git channel, as built:
+gpui = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de", features = ["font-kit"] }
+```
+
+**Does it build?** Both do, with Rust 1.99.0 and no change to the terminal
+element. What the switch needed:
+
+- **`gpui_platform`'s `font-kit` feature, explicitly.** `gpui-pre` turns it on
+  by default; Zed's crate doesn't (Zed's own workspace enables it). Without it
+  the app builds and runs but logs `gpui_macos was compiled without the
+  font-kit feature, so no text will be rendered` and draws no text at all.
+- **Dropping `gpui-kit`**, which pins `gpui-pre` and can't sit beside a git
+  gpui. Six lines change: `gpui_kit::init` and its theme call in `main.rs`, and
+  the gpui-kit asset fallback in `assets.rs`.
+- The visual check's `gpui_platform/test-support` feature exists in both.
+
+**Numbers.** Apple M4, 10 cores, Rust 1.99.0. Each is a clean build into a
+fresh target dir, run back to back on a shared hub whose load average was
+50–90 from other workers' builds, so treat wall times as rough and compare
+within a row. The one-time Zed git fetch took 5m32s and keeps a 397 MB git db
+plus a 492 MB checkout in `~/.cargo/git`.
+
+| | `gpui-pre` + `gpui-kit` | Zed git (no widget library) |
+|---|---|---|
+| Debug, clean | 618 s (load ≈57) | 455 s (load ≈62–78) |
+| Debug, warm (touch `element.rs`) | 18 s | 8 s |
+| Debug binary | 92 MB | 46 MB |
+| Release, clean (`lto = "thin"`, `codegen-units = 1`) | 1307 s (load ≈53–61) | 977 s (load ≈54–71) |
+| Release binary (stripped) | 13.7 MB | 7.8 MB |
+| `target/` after both | 4.0 GB | 2.5 GB |
+
+The size and time gap is almost all `gpui-kit` (gpui-component, gpui-base,
+their tree-sitter grammars, markdown, charts), not the channel: the gpui code
+is identical. A git-channel app that grows its own widgets would close much
+of that gap.
+
+**What `gpui-kit` gives us** (longbridge's gpui-component, Apache-2.0):
+
+- *Lists*: `List`/`ListState` over a `ListDelegate`, virtualized
+  (`v_virtual_list`), with sections, loading state, and a `searchable_list`.
+  That covers the palette, the issues list, activity, and machines.
+- *Inputs*: single-line `Input` (search, number, OTP, clear button), `textarea`,
+  and a code `editor` with tree-sitter highlighting. That covers the palette
+  query, task edit forms, and settings.
+- *Menus*: context, dropdown, and popup menus, an app menu bar, and native
+  menus.
+- *Markdown and rich text*: `gpui-base`'s text layer (the `markdown` crate),
+  with frontmatter and code highlighting. That covers task bodies and the
+  review panel.
+- Also: dock and resizable panels, dialogs, sheets, notifications, tabs,
+  tables, tooltips, a sidebar, and a status bar.
+
+**What `gpui-pre` couldn't do for the element: nothing.** Every gpui API the
+element uses (custom `Element`, `shape_line` with `force_width`, `paint_quad`,
+`window.on_mouse_event`, `Window::handle_input` + `EntityInputHandler`,
+`FocusHandle`, `VisualTestAppContext` + `render_to_image`) is the same in
+both, because it is the same code.
+
+**Recommendation: stay on `gpui-pre` + `gpui-kit`.** The element gives no
+reason to switch, and the widget library is worth the extra build time for
+the views the remaining subtasks build. The git channel stays a one-commit
+fallback (`Cargo.toml` + the six `gpui-kit` lines) if the snapshot publisher
+goes quiet. Watch out for `font-kit` if it's ever taken.
 
 ### How the app uses gpui-kit today
 
@@ -72,6 +145,7 @@ switch. A switch records the reason in this file.
 | Date | From | To | What broke | Fix |
 |---|---|---|---|---|
 | 2026-10-14 | | `gpui-pre 0.3.9`, `gpui-kit 0.7.3` | Initial pin. | |
+| 2026-10-14 | `gpui-pre 0.3.9` | (no upgrade) Zed git @`93d7456`, evaluated in a scratch copy | No text rendered: `gpui_macos` without `font-kit`. `gpui-kit` can't coexist with a git gpui. | `features = ["font-kit"]` on `gpui_platform`; drop `gpui-kit` (6 lines). Not switched. |
 
 ### Tests
 
@@ -106,6 +180,15 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   `min_w_0()` (and `overflow_hidden()`); the main area and the board both do.
 - `cargo` reports a future-incompatibility warning for `block 0.1.6`, pulled
   in by gpui's macOS platform crates. Upstream's to fix; harmless today.
+- **Font metrics report the descent signed** (negative, below the baseline):
+  `text_system().descent(..)` is negative for Geist Mono, so a line height is
+  `ascent + descent.abs()`. Shaped `LineLayout`s report it positive.
+- **`Window::resize` on an offscreen `VisualTestAppContext` window does nothing
+  synchronously**: it dispatches `setContentSize` to the real main queue, which
+  never drains without a run loop. The visual check resizes a wrapper view
+  instead.
+- `VisualTestAppContext::capture_screenshot` renders the *last* drawn scene;
+  call `window.draw(cx).clear(cx)` first to render a fresh frame.
 
 ## Build time and binary size
 
@@ -127,3 +210,9 @@ An incremental debug rebuild after touching `src/main.rs` takes about 4s.
 
 Re-measure after a gpui upgrade or a channel switch, and add a row here
 rather than replacing these.
+
+**2026-10-14, with the terminal element (`dt-spike-terminal`).** Measured on
+a shared hub at load average 50–90, so not comparable to the quiet-machine
+row above. Clean `gpui-pre` + `gpui-kit`: debug 618 s / 92 MB, release
+1307 s / 13.7 MB, warm debug rebuild after touching `element.rs` 18 s. The
+Zed-git comparison is in "The channel evaluation" above.

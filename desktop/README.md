@@ -99,7 +99,9 @@ desktop/
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
   src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
-  src/elements/        custom elements, chiefly the terminal
+  src/elements/        custom elements, chiefly the terminal (elements/terminal/)
+  src/spike.rs         `--spike <session>`: one terminal element on one session
+  src/visual_check.rs  `--visual-check <dir>` (feature `visual-check`): offscreen render + input checks
 ```
 
 Which subtask fills what:
@@ -119,6 +121,21 @@ Which subtask fills what:
 | native menus, notifications | `dt-menus-notifications` |
 | bundle, signing, cask | `dt-packaging` |
 | smoke tests, docs | `dt-parity-audit` |
+
+## The terminal element by hand
+
+```sh
+cd desktop
+shelbi session new --name spike/sh -- zsh -l     # or `-- claude`
+cargo run -- --spike spike/sh                    # one window, one terminal element
+RUST_LOG=shelbi_desktop=debug cargo run -- --spike spike/sh   # + frame stats every 2s while painting
+cargo run --features visual-check -- --visual-check /tmp/vc   # offscreen: frames + input checks, no screen needed
+```
+
+Never point `--spike` at a real workspace's session: the window reports
+its size on attach (which the session follows while no other client is
+active) and typing makes it the active client, so the agent's PTY would be
+resized to the spike window.
 
 ## Verifying a change
 

@@ -12,3 +12,5 @@
 //! Licensing: Zed's `terminal` / `terminal_view` crates are GPL-3.0 and
 //! Shelbi is MIT, so their code can't be copied or depended on.
 //! `gpui-terminal` (MIT/Apache-2.0) is the permissive reference.
+
+pub mod terminal;

@@ -16,6 +16,7 @@ use std::ops::Deref;
 use gpui::{rgb, App, Context, Global, Hsla, Subscription, Window, WindowAppearance};
 use shelbi_palette::DecorationColor;
 use shelbi_app::theme::{resolve_appearance, Appearance, Rgb, Theme as Tokens, ThemePreference};
+use shelbi_term::render::Rgb as TermRgb;
 
 /// The resolved theme, installed as a gpui [`Global`]. Views read the tokens
 /// through it (`cx.global::<Theme>().gray`).
@@ -25,6 +26,8 @@ pub struct Theme {
     /// can re-resolve `auto`.
     pub preference: ThemePreference,
     colors: Tokens<Hsla>,
+    /// The terminal element's colors for this appearance.
+    pub terminal: TerminalPalette,
 }
 
 impl Deref for Theme {
@@ -47,6 +50,7 @@ impl Theme {
         };
         Self {
             preference,
+            terminal: TerminalPalette::for_tokens(&tokens),
             colors: tokens.map(|swatch| hsla(swatch.rgb)),
         }
     }
@@ -80,6 +84,83 @@ fn is_dark(appearance: WindowAppearance) -> bool {
 
 fn hsla(color: Rgb) -> Hsla {
     rgb(u32::from_be_bytes([0, color.r, color.g, color.b])).into()
+}
+
+/// The terminal element's colors: what a session's default foreground,
+/// background, cursor, and sixteen ANSI colors resolve to.
+///
+/// In the TUI these are the user's own terminal's palette, which a window
+/// doesn't have. The defaults come from the shared tokens (the background is
+/// `canvas`, the main area the terminal sits in; the selection is `selection`;
+/// the current search match is `cyan`), so they follow the theme. The ANSI
+/// sixteen are a terminal palette rather than UI tokens: Ghostty's defaults
+/// (Tomorrow Night) in the dark theme, the palette the TUI's tokens were tuned
+/// against, so a session reads the same in both clients, and a GitHub-light
+/// style set in the light theme, with "white" darkened so it shows on white.
+/// Indexed colors 16..=255 are the fixed xterm cube and ramp
+/// ([`shelbi_term::render::xterm_256`]) and true color passes through. A
+/// program's own OSC 4/10/11/12 redefinitions win over these at render time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalPalette {
+    /// The default foreground (`Foreground`): the `foreground` token.
+    pub foreground: TermRgb,
+    /// The default background (`Background`): the `canvas` token.
+    pub background: TermRgb,
+    /// The cursor fill (and the beam / underline / outline color): `white`.
+    pub cursor: TermRgb,
+    /// The glyph color under a block cursor: `canvas`.
+    pub cursor_text: TermRgb,
+    /// The selection highlight behind selected cells: `selection`.
+    pub selection: TermRgb,
+    /// A search match's highlight.
+    pub search_match: TermRgb,
+    /// The current search match's highlight: `cyan`.
+    pub search_current: TermRgb,
+    /// ANSI colors 0..=15: black, red, green, yellow, blue, magenta, cyan,
+    /// white, then the bright eight.
+    pub ansi: [TermRgb; 16],
+}
+
+impl TerminalPalette {
+    /// The terminal palette for a resolved token set.
+    pub fn for_tokens(tokens: &Tokens) -> Self {
+        let c = |swatch: shelbi_app::theme::Swatch| {
+            TermRgb::new(swatch.rgb.r, swatch.rgb.g, swatch.rgb.b)
+        };
+        let dark = tokens.appearance == Appearance::Dark;
+        let (search_match, ansi) = if dark {
+            (
+                0x5c5c5c,
+                [
+                    0x1d1f21, 0xcc6666, 0xb5bd68, 0xf0c674, 0x81a2be, 0xb294bb, 0x8abeb7, 0xc5c8c6,
+                    0x666666, 0xd54e53, 0xb9ca4a, 0xe7c547, 0x7aa6da, 0xc397d8, 0x70c0b1, 0xeaeaea,
+                ],
+            )
+        } else {
+            (
+                0xc8c8c8,
+                [
+                    0x24292f, 0xcf222e, 0x116329, 0x7d4e00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
+                    0x57606a, 0xa40e26, 0x1a7f37, 0x9a6700, 0x218bff, 0xa475f9, 0x3192aa, 0x8c959f,
+                ],
+            )
+        };
+        Self {
+            foreground: c(tokens.foreground),
+            background: c(tokens.canvas),
+            cursor: c(tokens.white),
+            cursor_text: c(tokens.canvas),
+            selection: c(tokens.selection),
+            search_match: TermRgb::hex(search_match),
+            search_current: c(tokens.cyan),
+            ansi: ansi.map(TermRgb::hex),
+        }
+    }
+}
+
+/// A terminal [`TermRgb`] as a gpui color.
+pub fn rgb_hsla(c: TermRgb) -> Hsla {
+    rgb(u32::from_be_bytes([0, c.r, c.g, c.b])).into()
 }
 
 /// The window chrome (title bar, borders) for a setting: pinned for `dark` /
@@ -188,6 +269,25 @@ mod tests {
                 assert_eq!(rgb8(got), (want.rgb.r, want.rgb.g, want.rgb.b), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn terminal_palette_follows_the_theme() {
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            let t = Theme::resolve(ThemePreference::Auto, system);
+            assert_eq!(rgb_hsla(t.terminal.background), t.canvas);
+            assert_eq!(rgb_hsla(t.terminal.foreground), t.foreground);
+            assert_eq!(rgb_hsla(t.terminal.selection), t.selection);
+            assert_eq!(rgb_hsla(t.terminal.search_current), t.cyan);
+            assert_eq!(rgb_hsla(t.terminal.cursor_text), t.canvas);
+        }
+        let dark = Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark).terminal;
+        assert_eq!(dark.ansi[1], TermRgb::hex(0xcc6666), "Ghostty's red");
+        let light = Theme::resolve(ThemePreference::Light, WindowAppearance::Light).terminal;
+        assert_ne!(
+            light.ansi[7], light.background,
+            "ANSI white must show on the light canvas"
+        );
     }
 
     #[test]
