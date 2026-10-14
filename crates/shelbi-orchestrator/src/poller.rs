@@ -227,6 +227,8 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // pane per project, not per workspace), so it lives on the supervisor tick
     // alongside the heartbeat rather than inside any per-workspace thread.
     let mut orch_supervision = SupervisionState::default();
+    // The orchestrator's most recent relaunch error, named in its give-up.
+    let mut orch_last_failure: Option<String> = None;
 
     // Per-review-slot crash-loop bookkeeping for the resume-a-stranded-slot
     // pass. Project-wide (needs the whole review column + every review slot),
@@ -345,7 +347,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
 
                 // Relaunch the orchestrator pane if it crashed (Zen stays off after
                 // the restart via its own `__zen-orch-start` crash-recovery step).
-                maybe_supervise_orchestrator(&project, &mut orch_supervision);
+                maybe_supervise_orchestrator(&project, &mut orch_supervision, &mut orch_last_failure);
 
                 // Auto-load any queued review task onto an idle review slot.
                 // Project-wide (needs the whole review column + every review
@@ -4703,8 +4705,26 @@ fn redispatch_workspace(
 
 
 
-fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState) {
+/// Auto-restart supervision for the project's orchestrator, run every
+/// supervisor tick. A relaunch is logged `supervision=restart` only once the
+/// new orchestrator session is live; a spawn that errors or never comes up is
+/// `supervision=restart-failed reason=<error>` with a matching error-log entry
+/// (`orch-relaunch-noop-after-session-death`). Every failure and the crash-loop
+/// give-up are also written as the orchestrator's supervision status, which
+/// the TUI paints on the sidebar until the orchestrator is seen alive again.
+/// `last_failure` carries the most recent relaunch error so the give-up can
+/// name it.
+fn maybe_supervise_orchestrator(
+    project: &Project,
+    state: &mut SupervisionState,
+    last_failure: &mut Option<String>,
+) {
     let alive = crate::orchestrator_pane_alive(&project.name).unwrap_or(true);
+    if alive {
+        // A live orchestrator answers whatever the sidebar was still showing.
+        *last_failure = None;
+        let _ = shelbi_state::clear_orchestrator_supervision_status(&project.name);
+    }
     // A TUI reopen of a gave-up orchestrator drops a relaunch marker; consume it
     // (only while dead, so a healthy pane's backoff is never reset) and re-arm
     // the budget so this tick relaunches it with a fresh count.
@@ -4725,22 +4745,24 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
     match state.decide(&inputs, Instant::now()) {
         SupervisionAction::None => {}
         SupervisionAction::Restart => {
-            // The session half: restart the orchestrator through the
-            // `SessionBackend` seam, with no tmux layout call
-            // (`rt-daemon-layout-split`). The layout half — placing/rebuilding the
-            // dashboard — is the published `OrchestratorRestarted` event a client
-            // reacts to (on tmux the always-present sidebar re-runs
-            // `ensure_dashboard`, which re-splits the orchestrator pane if the
-            // crash collapsed it). The event fires whether or not the in-place
-            // respawn landed, so a client always heals the view; the respawn
-            // succeeding is the no-client-attached restart the daemon owns.
-            let outcome = crate::supervise_restart_orchestrator(&backend(), &project.name);
-            shelbi_state::publish_layout(
+            // Bring a fresh orchestrator session up (the session half of
+            // `ensure_dashboard`, under the dashboard lock) and wait for it to
+            // answer. Only a live session is a restart; the layout event then
+            // tells an attached client to re-attach to it.
+            let outcome = crate::supervise_restart_orchestrator(
+                &backend(),
                 &project.name,
-                shelbi_state::LayoutEvent::OrchestratorRestarted,
+                || crate::relaunch_orchestrator_session(&project.name),
+                crate::OrchRelaunchTiming::default(),
             );
             match outcome {
-                Ok(_) => {
+                Ok(()) => {
+                    *last_failure = None;
+                    let _ = shelbi_state::clear_orchestrator_supervision_status(&project.name);
+                    shelbi_state::publish_layout(
+                        &project.name,
+                        shelbi_state::LayoutEvent::OrchestratorRestarted,
+                    );
                     if let Err(e) = shelbi_state::append_supervision_event(
                         &project.name,
                         None,
@@ -4749,18 +4771,31 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
                     ) {
                         tracing::warn!(project = %project.name, error = %e, "append_supervision_event failed");
                     }
-                    tracing::info!(project = %project.name, "supervisor relaunched crashed orchestrator pane");
+                    tracing::info!(project = %project.name, "supervisor relaunched crashed orchestrator session");
                 }
                 Err(e) => {
+                    let reason = e.to_string();
                     if let Err(le) = shelbi_state::append_supervision_event(
                         &project.name,
                         None,
                         "restart-failed",
-                        &e.to_string(),
+                        &reason,
                     ) {
                         tracing::warn!(project = %project.name, error = %le, "append_supervision_event failed");
                     }
-                    tracing::warn!(project = %project.name, error = %e, "supervisor orchestrator relaunch failed");
+                    if let Err(le) = shelbi_state::append_error(
+                        &project.name,
+                        &format!("orchestrator relaunch failed: {reason}"),
+                        Some("supervisor"),
+                    ) {
+                        tracing::warn!(project = %project.name, error = %le, "append_error failed");
+                    }
+                    let _ = shelbi_state::write_orchestrator_supervision_status(
+                        &project.name,
+                        &format!("orchestrator relaunch failed: {reason}"),
+                    );
+                    tracing::warn!(project = %project.name, error = %reason, "supervisor orchestrator relaunch failed");
+                    *last_failure = Some(reason);
                 }
             }
         }
@@ -4770,8 +4805,27 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
             {
                 tracing::warn!(project = %project.name, error = %e, "append_supervision_event failed");
             }
+            let status = orchestrator_gave_up_status(last_failure.as_deref());
+            if let Err(e) = shelbi_state::append_error(&project.name, &status, Some("supervisor")) {
+                tracing::warn!(project = %project.name, error = %e, "append_error failed");
+            }
+            let _ = shelbi_state::write_orchestrator_supervision_status(&project.name, &status);
             tracing::warn!(project = %project.name, "supervisor gave up relaunching orchestrator pane after the crash-loop cap");
         }
+    }
+}
+
+/// The user-facing give-up line for the orchestrator: the last relaunch error
+/// when the relaunches themselves failed, else the crash loop (each relaunch
+/// came up and then died again).
+fn orchestrator_gave_up_status(last_failure: Option<&str>) -> String {
+    match last_failure {
+        Some(reason) => format!("supervisor gave up: {reason}"),
+        None => format!(
+            "supervisor gave up: the orchestrator crashed {} times in {} minutes",
+            crate::supervision::MAX_RESTARTS_IN_WINDOW + 1,
+            crate::supervision::CRASH_LOOP_WINDOW.as_secs() / 60,
+        ),
     }
 }
 

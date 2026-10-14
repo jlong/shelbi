@@ -1091,6 +1091,7 @@ mod tests {
             zen_mode: shelbi_state::ZenModeState::On,
             unread_errors: 0,
             session_lost: None,
+            orchestrator_status: None,
         };
         let m = build_command_model("alpha", &sidebar, false);
         assert_eq!(m.project.as_deref(), Some("alpha"));
@@ -1143,6 +1144,7 @@ mod tests {
             zen_mode: shelbi_state::ZenModeState::Off,
             unread_errors: 0,
             session_lost: None,
+            orchestrator_status: None,
         };
         let m = build_command_model("alpha", &sidebar, false);
         let machines = m.views.iter().filter(|v| v.id == "view:machines").count();
@@ -1173,6 +1175,7 @@ mod tests {
             zen_mode: shelbi_state::ZenModeState::Off,
             unread_errors: 0,
             session_lost: None,
+            orchestrator_status: None,
         };
 
         let ids = |others: bool| -> Vec<String> {
