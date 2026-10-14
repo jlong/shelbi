@@ -287,19 +287,29 @@ impl SessionBackend for SessionProcessBackend {
         if host.is_ssh() {
             return remote_session::snapshot(host, &name, lines);
         }
+        // The *current* screen exists only for a live session. A dead session's
+        // `final.txt` is its last frame, frozen mid-spinner or at a prompt; fed
+        // to the poller's state classifier it reads as live activity and logs a
+        // phantom `-> working` for a workspace with no running agent
+        // (`phantom-working-dead-session`). Dead reads go through
+        // [`final_screen`](SessionBackend::final_screen) explicitly.
         let session = self
-            .find_any(&name)
-            .ok_or_else(|| Error::Other(format!("no session `{name}` to snapshot")))?;
+            .find_live(&name)
+            .ok_or_else(|| Error::Other(format!("no live session `{name}` to snapshot")))?;
         let history = if lines == 0 {
             None
         } else {
             Some(lines as u32)
         };
-        // One call that reads a live session over its socket or a dead one from
-        // `final.txt`, both in `capture-pane -p -J` shape (so the ready.rs /
+        // Read over the socket, in `capture-pane -p -J` shape (so the ready.rs /
         // submit.rs detectors read it identically to a tmux capture).
         let snap = shelbi_client::snapshot(&session, history)
             .map_err(|e| Error::Other(format!("snapshotting session `{name}`: {e}")))?;
+        // It died between discovery and connect, and the client fell back to its
+        // final screen: that is not a current screen either.
+        if snap.source != SnapshotSource::Live {
+            return Err(Error::Other(format!("session `{name}` exited before it could be snapshotted")));
+        }
         Ok(snap.text)
     }
 
@@ -746,6 +756,111 @@ mod tests {
             });
             (lock, Some(listener))
         }
+    }
+
+    /// The last frame a Claude worker left on screen when it was SIGTERMed
+    /// mid-turn: a live-looking spinner row above the input box, then the
+    /// resume chrome (from the `phantom-working-dead-session` incident).
+    const DEAD_SPINNER_FRAME: &str = "\
+⏺ Bash(git show a883c510 -- crates/shelbi-tui/src/shell/mod.rs | head -500)
+  ⎿  Allowed by auto mode classifier
+
+✶ Zigzagging… (42s · ↓ 1.7k tokens · thinking with high effort)
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #1635 · ← for agents
+
+Resume this session with:
+claude --resume a7b448d4-e35d-4246-9870-953e5ab7a895
+";
+
+    /// Write an *exited* session directory: `meta.json`, an unheld `lock`, no
+    /// `sock` (the session removes it on exit), and the `final.txt` +
+    /// `exit.json` it writes on the way out.
+    fn write_exited_session_dir(sessions: &std::path::Path, id: &str, name: &str, frame: &str) {
+        let dir = sessions.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id: id.into(),
+            name: name.into(),
+            argv: vec!["claude".into()],
+            cwd: dir.clone(),
+            task: Some("merged-task".into()),
+            launched_at: "2026-10-13T14:27:00Z".into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        std::fs::write(dir.join("lock"), b"").unwrap();
+        std::fs::write(dir.join("final.txt"), frame).unwrap();
+        std::fs::write(dir.join("exit.json"), br#"{"code":143}"#).unwrap();
+    }
+
+    #[test]
+    fn a_dead_session_with_a_spinner_frame_is_never_live_or_snapshotted() {
+        // `phantom-working-dead-session`: a workspace whose sessions had all
+        // exited logged `awaiting_input -> working`. Its sessions' final frames
+        // show a Claude spinner; while another prober (a TUI refresh, `shelbi
+        // session ls`) held the dead session's lock mid-probe, discovery read it
+        // as alive, and with no `sock` file the session read as still-binding, so
+        // the poller saw the slot up, snapshotted the dead `final.txt`, and
+        // classified the spinner as live work. Neither half may happen.
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-dead-spin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // The fixture really is a frame the state classifier reads as working.
+        assert!(crate::ready::is_claude_working(DEAD_SPINNER_FRAME));
+
+        write_exited_session_dir(&sessions, "53041a7ef1f428b0", "demo/ws/golf", DEAD_SPINNER_FRAME);
+        write_exited_session_dir(&sessions, "d70e097b571567c7", "demo/ws/golf", DEAD_SPINNER_FRAME);
+        // Concurrent probers holding each dead session's lock right now.
+        let probers: Vec<std::fs::File> = ["53041a7ef1f428b0", "d70e097b571567c7"]
+            .iter()
+            .map(|id| {
+                use std::os::unix::io::AsRawFd;
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(sessions.join(id).join("lock"))
+                    .unwrap();
+                assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
+                f
+            })
+            .collect();
+
+        let b = SessionProcessBackend;
+        let target = SessionTarget::slot("shelbi-demo", "golf");
+        assert!(matches!(b.probe(&Host::Local, &target, None), Liveness::Dead));
+        let slots = b
+            .enumerate_slots(&Host::Local, &SessionTarget::session("shelbi-demo"), None)
+            .unwrap()
+            .unwrap();
+        assert!(slots.iter().all(|s| s.name != "golf"), "a dead slot is not enumerated: {slots:?}");
+        assert!(
+            !crate::workspace::workspace_pane_alive(&Host::Local, &target).unwrap(),
+            "the poller's liveness gate sees no pane",
+        );
+        // The current-screen reads refuse a dead session outright, so no
+        // classifier is ever handed the frozen spinner.
+        assert!(b.snapshot(&Host::Local, &target).is_err());
+        assert!(b.history(&Host::Local, &target, 50).is_err());
+        // The explicit post-exit read still serves it (crash records, `final.txt`).
+        assert!(b.final_screen(&Host::Local, &target).unwrap().contains("Zigzagging"));
+
+        drop(probers);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

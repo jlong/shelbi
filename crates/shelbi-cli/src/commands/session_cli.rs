@@ -338,8 +338,9 @@ fn attach(project: Option<&str>, selector: &str, detach_key: &str) -> Result<()>
 /// prefix, unique name substring. When a stage finds several candidates, ties
 /// are broken first toward names under `"<project>/"` (when a `project` is set
 /// and owns any hit), then toward the single *live* session among what remains
-/// (dead predecessor dirs outlive a relaunch); a tie that still has several
-/// candidates is an error that lists them.
+/// (dead predecessor dirs outlive a relaunch), and — when none is live and all
+/// share one name — toward the newest of those exited predecessors; a tie that
+/// still has several candidates is an error that lists them.
 pub(crate) fn resolve_index(
     sessions: &[DiscoveredSession],
     project: Option<&str>,
@@ -387,6 +388,24 @@ pub(crate) fn resolve_index(
                     candidates.iter().copied().filter(|&i| sessions[i].alive).collect();
                 if live.len() == 1 {
                     return Ok(live[0]);
+                }
+                // No live candidate, and every hit is the same logical session:
+                // the exited predecessors of one workspace (no relaunch since).
+                // They are not distinct things to choose between, so land on
+                // the most recently launched one (its `final.txt` is the latest
+                // screen) rather than erroring (`phantom-working-dead-session`).
+                // Different names stay ambiguous, as do several live sessions.
+                let first_name = &sessions[candidates[0]].meta.name;
+                if live.is_empty()
+                    && candidates.iter().all(|&i| &sessions[i].meta.name == first_name)
+                {
+                    if let Some(&newest) =
+                        candidates.iter().max_by(|&&a, &&b| {
+                            sessions[a].meta.launched_at.cmp(&sessions[b].meta.launched_at)
+                        })
+                    {
+                        return Ok(newest);
+                    }
                 }
                 let names: Vec<String> = candidates
                     .iter()
@@ -497,6 +516,32 @@ mod tests {
         // The project tie-break and the live tie-break compose: `--project demo`
         // narrows nothing here (all are demo) and the live pick still lands.
         assert_eq!(resolve_index(&sessions, Some("demo"), "review").unwrap(), 1);
+    }
+
+    #[test]
+    fn dead_sessions_never_make_a_workspace_selector_ambiguous() {
+        // `phantom-working-dead-session`: `shelbi session snapshot golf` with
+        // only golf's two exited sessions errored "matches several". Both are
+        // the same workspace session, so the newest one's final screen is the
+        // answer.
+        let mut older = session("53041a7e", "shelbi/ws/golf", false);
+        older.meta.launched_at = "2026-10-13T14:27:00Z".into();
+        let mut newer = session("d70e097b", "shelbi/ws/golf", false);
+        newer.meta.launched_at = "2026-10-13T14:28:00Z".into();
+        let sessions = vec![newer, older, session("aaaa1111", "shelbi/ws/golfer", false)];
+        assert_eq!(resolve_index(&sessions, None, "golf").unwrap(), 0);
+        assert_eq!(resolve_index(&sessions, Some("shelbi"), "golf").unwrap(), 0);
+        // A live golf session still wins over both dead ones.
+        let mut with_live = sessions.clone();
+        with_live.push(session("live9999", "shelbi/ws/golf", true));
+        assert_eq!(resolve_index(&with_live, None, "golf").unwrap(), 3);
+        // Dead sessions under *different* names stay ambiguous.
+        let mixed = vec![
+            session("aaaa1111", "demo/ws/golf", false),
+            session("bbbb2222", "other/ws/golf", false),
+        ];
+        let err = resolve_index(&mixed, None, "golf").unwrap_err().to_string();
+        assert!(err.contains("matches several"), "{err}");
     }
 
     #[test]
