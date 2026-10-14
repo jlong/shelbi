@@ -177,6 +177,84 @@ pub fn adjacent_column(
     Some(eligible[next])
 }
 
+/// What dropping a card on a column does (a drag on the board). The board
+/// renders refused targets as not droppable before the drop, and only sends a
+/// mutation for [`DropTarget::Move`] and [`DropTarget::Reorder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropTarget {
+    /// The card's own column: a reorder within it (priority).
+    Reorder,
+    /// A legal status move. `merge` when the edge runs the workflow's gated
+    /// merge (the daemon runs the transition's actions, exactly as
+    /// `shelbi issue move` does).
+    Move { merge: bool },
+    /// Not a legal drop, with the reason to show.
+    Refused(String),
+}
+
+/// Whether `task` may be dropped on the column `target_status_id` (whose
+/// category is `target_category`). Moves follow the card's workflow:
+/// transitions are any-to-any between the statuses it declares
+/// ([`Workflow::transition_allowed`]), so a column whose status the workflow
+/// doesn't declare is refused. A drop on the card's own column is a reorder,
+/// refused in a done column, which shows newest first rather than by priority.
+pub fn drop_target(
+    rules: BoardRules<'_>,
+    task: &Issue,
+    target_status_id: &str,
+    target_category: StatusCategory,
+) -> DropTarget {
+    let current = rules.resolved_status_id(task);
+    if current == target_status_id {
+        if target_category == StatusCategory::Done {
+            return DropTarget::Refused("done is ordered by completion".to_string());
+        }
+        return DropTarget::Reorder;
+    }
+    let Some(wf) = rules.workflow_for(task) else {
+        return DropTarget::Refused(format!(
+            "its workflow `{}` isn't loaded",
+            rules.workflow_name(task)
+        ));
+    };
+    if !wf.transition_allowed(&current, target_status_id) {
+        return DropTarget::Refused(format!("not in the `{}` workflow", wf.name));
+    }
+    DropTarget::Move {
+        merge: wf.is_merge_transition(&current, target_status_id),
+    }
+}
+
+/// The absolute slot to send as a priority move (`PrioMove::Set`) so `id`
+/// lands where `target_id` sits now, or at the bottom when `target_id` is
+/// `None`. Slots index the card's whole stored column in the stores' canonical
+/// order (priority, then id), which the store re-derives under its lock: the
+/// board shows a filtered column, so a visible row index is not a slot.
+/// `None` when either card is missing or they sit in different stored columns.
+pub fn reorder_slot(tasks: &[IssueFile], id: &str, target_id: Option<&str>) -> Option<u32> {
+    let card = tasks.iter().find(|tf| tf.task.id == id)?;
+    let mut column: Vec<&IssueFile> = tasks
+        .iter()
+        .filter(|tf| tf.task.column == card.task.column)
+        .collect();
+    column.sort_by(|a, b| {
+        a.task
+            .priority
+            .cmp(&b.task.priority)
+            .then_with(|| a.task.id.cmp(&b.task.id))
+    });
+    let slot = match target_id {
+        Some(target) => column.iter().position(|tf| tf.task.id == target)?,
+        None => column.len().checked_sub(1)?,
+    };
+    u32::try_from(slot).ok()
+}
+
+/// The slot `id` sits at now in its stored column ([`reorder_slot`]'s order).
+pub fn current_slot(tasks: &[IssueFile], id: &str) -> Option<u32> {
+    reorder_slot(tasks, id, Some(id))
+}
+
 /// Sort one column's cards in place. Done columns show the most recently
 /// completed first (`updated_at` is rewritten on the move into done, so it is a
 /// stable proxy for completion time); every other column keeps the board's
@@ -961,5 +1039,128 @@ mod tests {
         });
         assert_eq!(input.tasks().len(), 3, "load more dedups against the board");
         assert!(input.closed_next_cursor.is_none());
+    }
+
+    // ---- drag and drop ------------------------------------------------------
+
+    /// A card on `workflow` (`None` = the project default) in `status`.
+    fn card_on(id: &str, status: &str, workflow: Option<&str>) -> IssueFile {
+        let mut tf = issue(id, status);
+        tf.task.workflow = workflow.map(str::to_string);
+        tf
+    }
+
+    #[test]
+    fn drop_targets_follow_the_shipped_task_workflow() {
+        use StatusCategory::*;
+        let workflows = vec![shelbi_core::task_workflow(), shelbi_core::subtask_workflow()];
+        let rules = BoardRules {
+            workflows: &workflows,
+            default_workflow_name: shelbi_core::TASK_WORKFLOW_NAME,
+        };
+        let card = card_on("t", "in-progress", None);
+        // Any declared status is a legal move (transitions are any-to-any).
+        assert_eq!(
+            drop_target(rules, &card.task, "todo", Ready),
+            DropTarget::Move { merge: false }
+        );
+        assert_eq!(
+            drop_target(rules, &card.task, "review", Handoff),
+            DropTarget::Move { merge: false }
+        );
+        // `in-progress -> done` declares no merge in `task` (review gates it).
+        assert_eq!(
+            drop_target(rules, &card.task, "done", Done),
+            DropTarget::Move { merge: false }
+        );
+        // `review -> done` runs the gated merge.
+        let in_review = card_on("r", "review", None);
+        assert_eq!(
+            drop_target(rules, &in_review.task, "done", Done),
+            DropTarget::Move { merge: true }
+        );
+        // A column no workflow declares is refused.
+        assert!(matches!(
+            drop_target(rules, &card.task, "qa", Handoff),
+            DropTarget::Refused(msg) if msg.contains("`task` workflow")
+        ));
+        // Its own column is a reorder.
+        assert_eq!(
+            drop_target(rules, &card.task, "in-progress", Active),
+            DropTarget::Reorder
+        );
+    }
+
+    #[test]
+    fn drop_targets_follow_the_shipped_subtask_workflow() {
+        use StatusCategory::*;
+        let workflows = vec![shelbi_core::task_workflow(), shelbi_core::subtask_workflow()];
+        let rules = BoardRules {
+            workflows: &workflows,
+            default_workflow_name: shelbi_core::TASK_WORKFLOW_NAME,
+        };
+        let sub = card_on("s", "in-progress", Some(shelbi_core::SUBTASK_WORKFLOW_NAME));
+        // `subtask` has no review status: the REVIEW column refuses it.
+        assert!(matches!(
+            drop_target(rules, &sub.task, "review", Handoff),
+            DropTarget::Refused(msg) if msg.contains("`subtask` workflow")
+        ));
+        // ...and merges straight from in-progress to done.
+        assert_eq!(
+            drop_target(rules, &sub.task, "done", Done),
+            DropTarget::Move { merge: true }
+        );
+        assert_eq!(
+            drop_target(rules, &sub.task, "backlog", Backlog),
+            DropTarget::Move { merge: false }
+        );
+    }
+
+    #[test]
+    fn drop_target_refuses_an_unloaded_workflow_and_a_done_reorder() {
+        use StatusCategory::*;
+        let workflows = vec![shelbi_core::task_workflow()];
+        let rules = BoardRules {
+            workflows: &workflows,
+            default_workflow_name: shelbi_core::TASK_WORKFLOW_NAME,
+        };
+        let ghost = card_on("g", "todo", Some("ghost"));
+        assert!(matches!(
+            drop_target(rules, &ghost.task, "done", Done),
+            DropTarget::Refused(msg) if msg.contains("`ghost`")
+        ));
+        let done = card_on("d", "done", None);
+        assert!(matches!(
+            drop_target(rules, &done.task, "done", Done),
+            DropTarget::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn reorder_slot_indexes_the_whole_stored_column_in_priority_order() {
+        let mut tasks: Vec<IssueFile> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut tf = issue(id, "todo");
+                tf.task.priority = i as u32;
+                tf
+            })
+            .collect();
+        tasks.push(issue("x", "backlog"));
+        // Listed out of order: the slot comes from priority, not list order.
+        tasks.reverse();
+        assert_eq!(reorder_slot(&tasks, "d", Some("b")), Some(1));
+        assert_eq!(reorder_slot(&tasks, "a", Some("c")), Some(2));
+        assert_eq!(reorder_slot(&tasks, "a", None), Some(3), "None is the bottom");
+        assert_eq!(current_slot(&tasks, "c"), Some(2));
+        // A target in another stored column has no slot.
+        assert_eq!(reorder_slot(&tasks, "a", Some("x")), None);
+        assert_eq!(reorder_slot(&tasks, "nope", None), None);
+        // Equal priorities break ties by id, like the stores.
+        for tf in tasks.iter_mut() {
+            tf.task.priority = 0;
+        }
+        assert_eq!(current_slot(&tasks, "b"), Some(1));
     }
 }

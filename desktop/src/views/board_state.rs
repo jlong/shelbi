@@ -15,11 +15,21 @@
 //! TUI has no start, assign, add or edit keys; the desktop adds `s`, `a`, `n`,
 //! `e` (edit in place) and `E` (open in the editor) outside the keymap, the way
 //! the TUI routes `f` / `w` / `m`, so the shipped `keys.yaml` is untouched.
+//!
+//! Drag and drop (`dt-board-dnd`) is additive: the view reports a drag's start
+//! and its drop ([`BoardState::begin_drag`], [`BoardState::drop_on_column`],
+//! [`BoardState::drop_on_card`]) and gets back the same registry commands the
+//! keys produce. Whether a column takes a card is `shelbi_app::board`'s
+//! [`board::drop_target`], so a refused target renders as not droppable before
+//! the drop. While a move or reorder is in flight the board shows the card
+//! where it is headed, dimmed with a pending row; a refusal drops that overlay,
+//! so the card snaps back to where it really is, with the daemon's message.
 
 use std::collections::BTreeMap;
 
 use shelbi_app::board::{
-    self, BoardInput, BoardRead, ClosedPage, WorkflowOption, WorkspaceFilter, WorkspaceOption,
+    self, BoardInput, BoardRead, ClosedPage, DropTarget, WorkflowOption, WorkspaceFilter,
+    WorkspaceOption,
 };
 use shelbi_app::{
     BoardFilters, CommandKind, Effect, ExecError, ExpectedState, IssueCard, IssuesModel, Mutation,
@@ -90,6 +100,14 @@ pub struct Pending {
     /// For a move, the target status: the board shows the move settled once a
     /// read has the card there.
     pub to_status: Option<String>,
+    /// For a reorder, the slot the card is headed for in its stored column:
+    /// settled once a read has it there.
+    pub to_slot: Option<u32>,
+    /// The stored column this mutation renumbers (a move's or start's source,
+    /// a reorder's column). Every card whose priority shifts gets a new
+    /// revision, so the column's other cards wait for this one to land rather
+    /// than send a state the daemon would refuse as changed elsewhere.
+    pub renumbers: Option<String>,
     /// The daemon acknowledged it; the card stays pending until a read shows
     /// the change (so a read already in flight can't flash the old state).
     pub acked: bool,
@@ -123,7 +141,8 @@ impl MutationJob {
             Effect::Mutate(m @ (Mutation::MoveIssue { .. }
             | Mutation::StartIssue { .. }
             | Mutation::AssignIssue { .. }
-            | Mutation::AddIssue { .. })) => Some(m),
+            | Mutation::AddIssue { .. }
+            | Mutation::PrioritizeIssue { .. })) => Some(m),
             _ => None,
         }
     }
@@ -178,6 +197,8 @@ pub struct BoardState {
     /// The base state of an in-place edit, captured when the editor opened, so
     /// a save refuses if someone else edited the issue meanwhile.
     edit_base: BTreeMap<String, ExpectedState>,
+    /// The card being dragged, while a drag is on.
+    dragging: Option<String>,
     /// One line of feedback under the board.
     pub status: Option<String>,
 }
@@ -200,6 +221,7 @@ impl BoardState {
             notices: BTreeMap::new(),
             staged_edits: BTreeMap::new(),
             edit_base: BTreeMap::new(),
+            dragging: None,
             status: None,
         }
     }
@@ -244,14 +266,14 @@ impl BoardState {
     pub fn apply_open(&mut self, read: BoardRead) {
         self.input.apply_open(read);
         self.filters.workspace = self.input.workspace_filter.clone();
-        self.rebuild();
         self.settle_pending();
+        self.rebuild();
     }
 
     pub fn apply_closed(&mut self, page: Option<ClosedPage>) {
         self.input.apply_closed(page);
-        self.rebuild();
         self.settle_pending();
+        self.rebuild();
     }
 
     pub fn apply_more(&mut self, page: Result<ClosedPage, String>) {
@@ -269,6 +291,7 @@ impl BoardState {
         // exists (a read that reorders cards shouldn't move the selection).
         let selected = self.selected_card().map(|c| c.id.clone());
         self.model = IssuesModel::build(&self.input, &self.filters);
+        self.overlay_pending();
         if let Some(id) = selected {
             if let Some((c, r)) = self.model.position(&id) {
                 self.selected_column = c;
@@ -278,9 +301,57 @@ impl BoardState {
         self.clamp_selection();
     }
 
+    /// Show in-flight moves and reorders where they are headed: a moving card
+    /// sits in its target column, a reordering card at its target slot. The
+    /// overlay is rebuilt from `pending` on every rebuild, so dropping a
+    /// pending entry (a refusal) puts the card back where the read has it.
+    fn overlay_pending(&mut self) {
+        let tasks = self.input.tasks();
+        for (id, p) in &self.pending {
+            if let Some(to) = &p.to_status {
+                let Some((from, row)) = self.model.position(id) else {
+                    continue;
+                };
+                let Some(to_col) = self.model.columns.iter().position(|c| &c.status_id == to)
+                else {
+                    continue;
+                };
+                if from == to_col {
+                    continue;
+                }
+                let mut card = self.model.columns[from].cards.remove(row);
+                card.status_id = to.clone();
+                let target = &mut self.model.columns[to_col];
+                // Where the daemon puts it: the bottom of a priority column,
+                // the top of a done column (newest first).
+                if target.category == shelbi_core::StatusCategory::Done {
+                    target.cards.insert(0, card);
+                } else {
+                    target.cards.push(card);
+                }
+            } else if let Some(slot) = p.to_slot {
+                let Some((col, _)) = self.model.position(id) else {
+                    continue;
+                };
+                let order = reordered_column(&tasks, id, slot);
+                self.model.columns[col]
+                    .cards
+                    .sort_by_key(|c| order.iter().position(|o| *o == c.id).unwrap_or(usize::MAX));
+            }
+        }
+        let wf_filter = self.filters.workflow.clone();
+        for col in &mut self.model.columns {
+            col.collapsed = self
+                .input
+                .expansion(wf_filter.as_deref(), &col.status_id)
+                .is_collapsed(col.cards.len());
+        }
+    }
+
     /// Drop acked mutations a read now confirms: a move once the card sits in
-    /// its target status, anything else once the card's revision moved on (or
-    /// the card is gone, e.g. filtered out).
+    /// its target status, a reorder once it sits at its slot (or its revision
+    /// moved on), anything else once the card's revision moved on (or the card
+    /// is gone, e.g. filtered out).
     fn settle_pending(&mut self) {
         let tasks = self.input.tasks();
         self.pending.retain(|id, p| {
@@ -293,9 +364,11 @@ impl BoardState {
             let Some(tf) = tasks.iter().find(|tf| &tf.task.id == id) else {
                 return false;
             };
-            match &p.to_status {
-                Some(to) => tf.task.column.as_str() != to,
-                None => tf.task.updated_at.to_rfc3339() == p.sent_from.updated_at,
+            let revised = tf.task.updated_at.to_rfc3339() != p.sent_from.updated_at;
+            match (&p.to_status, p.to_slot) {
+                (Some(to), _) => tf.task.column.as_str() != to,
+                (None, Some(slot)) => !revised && board::current_slot(&tasks, id) != Some(slot),
+                (None, None) => !revised,
             }
         });
     }
@@ -569,11 +642,10 @@ impl BoardState {
                     None => Vec::new(),
                 },
                 KanbanAction::ReorderUp | KanbanAction::ReorderDown => {
-                    // The registry has no priority mutation yet (the TUI writes
-                    // the store directly), and every desktop mutation goes
-                    // through the registry and the daemon.
-                    self.status = Some("reordering isn't available in the desktop yet".into());
-                    Vec::new()
+                    match selected {
+                        Some((id, _)) => self.reorder_key(&id, action == KanbanAction::ReorderDown),
+                        None => Vec::new(),
+                    }
                 }
                 KanbanAction::OpenPopover => {
                     if let Some((id, _)) = selected {
@@ -861,25 +933,33 @@ impl BoardState {
     /// An `EditIssue` with no staged body (e.g. from the palette) opens the
     /// in-place editor instead.
     pub fn begin_mutation(&mut self, kind: &CommandKind) -> Result<MutationJob, Vec<Intent>> {
-        let (id, label, to_status) = match kind {
+        let (id, label, to_status, to_slot) = match kind {
             CommandKind::MoveIssue { id, to_status } => {
-                let label = self
-                    .model
-                    .columns
-                    .iter()
-                    .find(|c| &c.status_id == to_status)
-                    .map_or(to_status.clone(), |c| c.label.clone());
-                (id.clone(), format!("Moving to {label}…"), Some(to_status.clone()))
+                let column = self.model.columns.iter().find(|c| &c.status_id == to_status);
+                let label = column.map_or(to_status.clone(), |c| c.label.clone());
+                let merge = column.is_some_and(|c| {
+                    self.drop_target_status(id, &c.status_id, c.category)
+                        == DropTarget::Move { merge: true }
+                });
+                let label = if merge {
+                    format!("Moving to {label} (gated merge)…")
+                } else {
+                    format!("Moving to {label}…")
+                };
+                (id.clone(), label, Some(to_status.clone()), None)
             }
-            CommandKind::StartIssue { id } => (id.clone(), "Starting…".to_string(), None),
+            CommandKind::StartIssue { id } => (id.clone(), "Starting…".to_string(), None, None),
             CommandKind::AssignIssue { id, workspace } => {
-                (id.clone(), format!("Assigning to @{workspace}…"), None)
+                (id.clone(), format!("Assigning to @{workspace}…"), None, None)
             }
             CommandKind::EditIssue { id } => {
                 if !self.staged_edits.contains_key(id) {
                     return Err(self.begin_edit(id));
                 }
-                (id.clone(), "Saving…".to_string(), None)
+                (id.clone(), "Saving…".to_string(), None, None)
+            }
+            CommandKind::PrioritizeIssue { id, position } => {
+                (id.clone(), "Reordering…".to_string(), None, Some(*position))
             }
             CommandKind::AddIssue { title } => {
                 if self.pending.contains_key(ADD_KEY) {
@@ -895,6 +975,8 @@ impl BoardState {
                             updated_at: String::new(),
                         },
                         to_status: None,
+                        to_slot: None,
+                        renumbers: None,
                         acked: false,
                     },
                 );
@@ -924,6 +1006,20 @@ impl BoardState {
             self.status = Some(format!("{id} is no longer on the board"));
             return Err(vec![Intent::Refresh]);
         };
+        // The card's priority may have shifted under a sibling's in-flight
+        // change; wait for it to land so the state sent is the real one.
+        if let Some(column) = self.renumbering(&id, &sent_from.status) {
+            self.status = Some(format!(
+                "{id}: waiting for the last change in {column} to land; try again in a moment"
+            ));
+            return Err(Vec::new());
+        }
+        let renumbers = match kind {
+            CommandKind::MoveIssue { .. }
+            | CommandKind::StartIssue { .. }
+            | CommandKind::PrioritizeIssue { .. } => Some(sent_from.status.clone()),
+            _ => None,
+        };
         self.notices.remove(&id);
         self.pending.insert(
             id.clone(),
@@ -931,9 +1027,12 @@ impl BoardState {
                 label,
                 sent_from,
                 to_status,
+                to_slot,
+                renumbers,
                 acked: false,
             },
         );
+        self.rebuild();
         Ok(MutationJob {
             id,
             kind: kind.clone(),
@@ -971,10 +1070,177 @@ impl BoardState {
                     self.status = Some(format!("{id}: {message}"));
                     self.notices.insert(id.to_string(), message);
                 }
+                // Drop the overlay: the card snaps back to where it is.
+                self.rebuild();
             }
         }
         vec![Intent::Refresh]
     }
+
+    /// The label of the stored column `status` when another card's in-flight
+    /// change is renumbering it.
+    fn renumbering(&self, id: &str, status: &str) -> Option<String> {
+        self.pending
+            .iter()
+            .any(|(other, p)| other != id && p.renumbers.as_deref() == Some(status))
+            .then(|| {
+                self.model
+                    .columns
+                    .iter()
+                    .find(|c| c.status_id == status)
+                    .map_or_else(|| status.to_string(), |c| c.label.clone())
+            })
+    }
+
+    // ---- reorder ----------------------------------------------------------
+
+    /// `Shift+k` / `Shift+j`: trade places with the visible neighbour, through
+    /// the registry's `PrioritizeIssue` (the TUI's reorder keys, same slot).
+    fn reorder_key(&mut self, id: &str, down: bool) -> Vec<Intent> {
+        let Some((col, row)) = self.model.position(id) else {
+            return Vec::new();
+        };
+        let cards = &self.model.columns[col].cards;
+        let neighbour = if down {
+            cards.get(row + 1)
+        } else {
+            row.checked_sub(1).and_then(|r| cards.get(r))
+        };
+        let Some(target) = neighbour.map(|c| c.id.clone()) else {
+            return Vec::new();
+        };
+        match self.drop_target(id, col) {
+            DropTarget::Refused(msg) => {
+                self.status = Some(format!("{id}: can't reorder here: {msg}"));
+                Vec::new()
+            }
+            _ => self.reorder_to(id, Some(&target)),
+        }
+    }
+
+    /// A `PrioritizeIssue` landing `id` where `target` sits (the bottom for
+    /// `None`), or nothing when that is where it already is.
+    fn reorder_to(&mut self, id: &str, target: Option<&str>) -> Vec<Intent> {
+        let tasks = self.input.tasks();
+        let Some(position) = board::reorder_slot(&tasks, id, target) else {
+            self.status = Some(format!("{id}: can't reorder against that card"));
+            return Vec::new();
+        };
+        if board::current_slot(&tasks, id) == Some(position) {
+            return Vec::new();
+        }
+        vec![Intent::Command(CommandKind::PrioritizeIssue {
+            id: id.to_string(),
+            position,
+        })]
+    }
+
+    // ---- drag and drop ----------------------------------------------------
+
+    /// A drag of `id` started. Returns false (and the view starts no drag) for
+    /// a card with a change in flight.
+    pub fn begin_drag(&mut self, id: &str) -> bool {
+        if self.pending.contains_key(id) {
+            return false;
+        }
+        if let Some((c, r)) = self.model.position(id) {
+            self.select(c, r);
+        }
+        self.dragging = Some(id.to_string());
+        true
+    }
+
+    pub fn dragging(&self) -> Option<&str> {
+        self.dragging.as_deref()
+    }
+
+    /// The drag ended without a drop on the board.
+    pub fn end_drag(&mut self) {
+        self.dragging = None;
+    }
+
+    /// What dropping `id` on column `col` does ([`board::drop_target`]).
+    pub fn drop_target(&self, id: &str, col: usize) -> DropTarget {
+        match self.model.columns.get(col) {
+            Some(c) => self.drop_target_status(id, &c.status_id, c.category),
+            None => DropTarget::Refused("no such column".to_string()),
+        }
+    }
+
+    fn drop_target_status(
+        &self,
+        id: &str,
+        status_id: &str,
+        category: shelbi_core::StatusCategory,
+    ) -> DropTarget {
+        if self.pending.contains_key(id) {
+            return DropTarget::Refused("a change is already in progress".to_string());
+        }
+        let tasks = self.input.tasks();
+        match tasks.iter().find(|tf| tf.task.id == id) {
+            Some(tf) => board::drop_target(self.input.rules(), &tf.task, status_id, category),
+            None => DropTarget::Refused("it is no longer on the board".to_string()),
+        }
+    }
+
+    /// `id` was dropped on column `col`'s body (not on a card): a move, or in
+    /// its own column a reorder to the bottom.
+    pub fn drop_on_column(&mut self, id: &str, col: usize) -> Vec<Intent> {
+        self.dragging = None;
+        self.status = None;
+        match self.drop_target(id, col) {
+            DropTarget::Move { .. } => vec![Intent::Command(CommandKind::MoveIssue {
+                id: id.to_string(),
+                to_status: self.model.columns[col].status_id.clone(),
+            })],
+            DropTarget::Reorder => self.reorder_to(id, None),
+            DropTarget::Refused(msg) => {
+                let label = self
+                    .model
+                    .columns
+                    .get(col)
+                    .map_or_else(String::new, |c| c.label.clone());
+                self.status = Some(format!("{id} can't move to {label}: {msg}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// `id` was dropped on the card `target` in column `col`: in its own
+    /// column it takes `target`'s place; elsewhere it is a column drop.
+    pub fn drop_on_card(&mut self, id: &str, col: usize, target: &str) -> Vec<Intent> {
+        if self.drop_target(id, col) != DropTarget::Reorder {
+            return self.drop_on_column(id, col);
+        }
+        self.dragging = None;
+        self.status = None;
+        self.reorder_to(id, Some(target))
+    }
+}
+
+/// `id`'s stored column, in priority order, with `id` moved to `slot`: the
+/// order a reorder lands (the store's `set_task_priority`).
+fn reordered_column(tasks: &[shelbi_state::IssueFile], id: &str, slot: u32) -> Vec<String> {
+    let Some(card) = tasks.iter().find(|tf| tf.task.id == id) else {
+        return Vec::new();
+    };
+    let mut column: Vec<&shelbi_state::IssueFile> = tasks
+        .iter()
+        .filter(|tf| tf.task.column == card.task.column)
+        .collect();
+    column.sort_by(|a, b| {
+        a.task
+            .priority
+            .cmp(&b.task.priority)
+            .then_with(|| a.task.id.cmp(&b.task.id))
+    });
+    let mut ids: Vec<String> = column.into_iter().map(|tf| tf.task.id.clone()).collect();
+    if let Some(from) = ids.iter().position(|o| o == id) {
+        let moved = ids.remove(from);
+        let at = (slot as usize).min(ids.len());
+        ids.insert(at, moved);
+    }
+    ids
 }
 
 #[cfg(test)]
@@ -1325,5 +1591,265 @@ mod tests {
         }));
         assert!(!b.model().done_loading);
         assert_eq!(press(&mut b, "m"), vec![Intent::LoadMore]);
+    }
+
+    // ---- drag and drop (dt-board-dnd) -------------------------------------
+
+    /// A read under the shipped `task` + `subtask` workflows, `task` the
+    /// project default.
+    fn shipped_read(tasks: Vec<IssueFile>) -> BoardRead {
+        let mut r = read(tasks);
+        r.project.as_mut().unwrap().default_workflow_name = shelbi_core::TASK_WORKFLOW_NAME.into();
+        r.workflows = Ok(vec![shelbi_core::task_workflow(), shelbi_core::subtask_workflow()]);
+        r
+    }
+
+    fn shipped_board(tasks: Vec<IssueFile>) -> BoardState {
+        let mut b = BoardState::new("demo", default_keymaps());
+        b.apply_open(shipped_read(tasks));
+        b.apply_closed(None);
+        b
+    }
+
+    fn col_of(b: &BoardState, status: &str) -> usize {
+        b.model()
+            .columns
+            .iter()
+            .position(|c| c.status_id == status)
+            .unwrap()
+    }
+
+    fn ids_in(b: &BoardState, status: &str) -> Vec<String> {
+        b.model().columns[col_of(b, status)]
+            .cards
+            .iter()
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    fn prio(id: &str, status: &str, priority: u32) -> IssueFile {
+        let mut tf = issue(id, status);
+        tf.task.priority = priority;
+        tf
+    }
+
+    #[test]
+    fn drop_legality_follows_the_cards_workflow() {
+        let mut sub = issue("S", "in-progress");
+        sub.task.workflow = Some(shelbi_core::SUBTASK_WORKFLOW_NAME.into());
+        let mut b = shipped_board(vec![issue("T", "in-progress"), sub, issue("R", "review")]);
+        let review = col_of(&b, "review");
+        let done = col_of(&b, "done");
+        let in_progress = col_of(&b, "in-progress");
+        assert_eq!(b.drop_target("T", review), DropTarget::Move { merge: false });
+        assert_eq!(b.drop_target("T", in_progress), DropTarget::Reorder);
+        assert_eq!(b.drop_target("R", done), DropTarget::Move { merge: true });
+        // A subtask has no review status: the REVIEW column refuses it before
+        // the drop, and merges straight into done.
+        assert!(matches!(b.drop_target("S", review), DropTarget::Refused(_)));
+        assert_eq!(b.drop_target("S", done), DropTarget::Move { merge: true });
+
+        // A drop on the refused column sends nothing and says why.
+        assert!(b.begin_drag("S"));
+        assert_eq!(b.dragging(), Some("S"));
+        assert!(b.drop_on_column("S", review).is_empty());
+        assert_eq!(b.dragging(), None);
+        let status = b.status.clone().unwrap();
+        assert!(status.contains("can't move to REVIEW") && status.contains("`subtask`"), "{status}");
+        assert_eq!(ids_in(&b, "in-progress"), ["T", "S"], "nothing moved");
+    }
+
+    #[test]
+    fn a_dropped_card_shows_pending_in_its_target_then_settles_when_accepted() {
+        let mut b = shipped_board(vec![issue("R", "review")]);
+        let done = col_of(&b, "done");
+        assert!(b.begin_drag("R"));
+        let intents = b.drop_on_column("R", done);
+        assert_eq!(
+            intents,
+            vec![Intent::Command(CommandKind::MoveIssue {
+                id: "R".into(),
+                to_status: "done".into()
+            })],
+            "a drop is the registry's MoveIssue: the daemon runs the transition's merge"
+        );
+        let Intent::Command(kind) = &intents[0] else { unreachable!() };
+        let job = b.begin_mutation(kind).unwrap();
+        assert_eq!(job.expected.as_ref().unwrap().status, "review");
+        // Pending: the card sits in its target, labelled with the gated merge.
+        assert_eq!(ids_in(&b, "done"), ["R"]);
+        assert!(ids_in(&b, "review").is_empty());
+        assert!(b.pending("R").unwrap().label.contains("gated merge"));
+        assert!(!b.begin_drag("R"), "a pending card can't be dragged again");
+
+        // Accepted: stays pending (and in place) until a read shows it.
+        b.finish_mutation("R", Ok(()));
+        b.apply_open(shipped_read(vec![issue("R", "review")]));
+        assert_eq!(ids_in(&b, "done"), ["R"]);
+        assert!(b.pending("R").is_some());
+        b.apply_open(shipped_read(vec![issue("R", "done")]));
+        assert!(b.pending("R").is_none());
+        assert_eq!(ids_in(&b, "done"), ["R"]);
+    }
+
+    #[test]
+    fn a_refused_drop_snaps_back_with_the_daemons_message() {
+        let mut b = shipped_board(vec![issue("R", "review")]);
+        let done = col_of(&b, "done");
+        b.begin_drag("R");
+        let Intent::Command(kind) = b.drop_on_column("R", done).remove(0) else {
+            panic!("a command");
+        };
+        b.begin_mutation(&kind).unwrap();
+        assert_eq!(ids_in(&b, "done"), ["R"]);
+        // The gated merge failed on the daemon.
+        b.finish_mutation(
+            "R",
+            Err(ExecError::Backend("merge failed: conflicts in src/lib.rs".into())),
+        );
+        assert_eq!(ids_in(&b, "review"), ["R"], "snapped back");
+        assert!(ids_in(&b, "done").is_empty());
+        assert!(b.pending("R").is_none());
+        assert_eq!(b.notice("R"), Some("merge failed: conflicts in src/lib.rs"));
+    }
+
+    #[test]
+    fn dropping_on_a_card_in_its_own_column_reorders_through_the_registry() {
+        let mut b = shipped_board(vec![
+            prio("A", "todo", 0),
+            prio("B", "todo", 1),
+            prio("C", "todo", 2),
+        ]);
+        let todo = col_of(&b, "todo");
+        b.begin_drag("C");
+        let intents = b.drop_on_card("C", todo, "A");
+        assert_eq!(
+            intents,
+            vec![Intent::Command(CommandKind::PrioritizeIssue {
+                id: "C".into(),
+                position: 0
+            })]
+        );
+        let job = b.begin_mutation(&CommandKind::PrioritizeIssue {
+            id: "C".into(),
+            position: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            job.mutation("demo"),
+            Some(Mutation::PrioritizeIssue {
+                project: "demo".into(),
+                id: "C".into(),
+                position: 0
+            })
+        );
+        assert_eq!(ids_in(&b, "todo"), ["C", "A", "B"], "shown at its slot while pending");
+        assert_eq!(b.pending("C").unwrap().label, "Reordering…");
+        // The column's other cards wait: their revisions are about to change.
+        assert!(b.begin_mutation(&CommandKind::StartIssue { id: "A".into() }).is_err());
+        let status = b.status.clone().unwrap();
+        assert!(status.contains("waiting for the last change in TO DO"), "{status}");
+
+        b.finish_mutation("C", Ok(()));
+        let mut after = vec![prio("C", "todo", 0), prio("A", "todo", 1), prio("B", "todo", 2)];
+        for tf in &mut after {
+            tf.task.updated_at += chrono::Duration::seconds(1);
+        }
+        b.apply_open(shipped_read(after));
+        assert!(b.pending("C").is_none(), "settled");
+        assert_eq!(ids_in(&b, "todo"), ["C", "A", "B"]);
+        assert!(b.begin_mutation(&CommandKind::StartIssue { id: "A".into() }).is_ok());
+    }
+
+    #[test]
+    fn reorder_drops_that_change_nothing_send_nothing() {
+        let mut b = shipped_board(vec![prio("A", "todo", 0), prio("B", "todo", 1)]);
+        let todo = col_of(&b, "todo");
+        b.begin_drag("A");
+        assert!(b.drop_on_card("A", todo, "A").is_empty(), "dropped on itself");
+        b.begin_drag("B");
+        assert!(b.drop_on_column("B", todo).is_empty(), "already at the bottom");
+        b.begin_drag("A");
+        assert_eq!(
+            b.drop_on_column("A", todo),
+            vec![Intent::Command(CommandKind::PrioritizeIssue {
+                id: "A".into(),
+                position: 1
+            })],
+            "the column body is the bottom"
+        );
+        // A drop on a card in another column is a move to that column.
+        let mut b = shipped_board(vec![prio("A", "todo", 0), prio("X", "in-progress", 0)]);
+        let in_progress = col_of(&b, "in-progress");
+        b.begin_drag("A");
+        assert_eq!(
+            b.drop_on_card("A", in_progress, "X"),
+            vec![Intent::Command(CommandKind::MoveIssue {
+                id: "A".into(),
+                to_status: "in-progress".into()
+            })]
+        );
+    }
+
+    #[test]
+    fn a_refused_reorder_snaps_back() {
+        let mut b = shipped_board(vec![prio("A", "todo", 0), prio("B", "todo", 1)]);
+        let kind = CommandKind::PrioritizeIssue {
+            id: "B".into(),
+            position: 0,
+        };
+        b.begin_mutation(&kind).unwrap();
+        assert_eq!(ids_in(&b, "todo"), ["B", "A"]);
+        b.finish_mutation(
+            "B",
+            Err(ExecError::Conflict("you saw `todo` rev 1, it is now `review` rev 2".into())),
+        );
+        assert_eq!(ids_in(&b, "todo"), ["A", "B"]);
+        assert!(b.notice("B").unwrap().starts_with("Not applied: it changed elsewhere"));
+    }
+
+    #[test]
+    fn shift_j_and_k_reorder_with_the_whole_column_slot() {
+        let mut assigned = prio("A", "todo", 0);
+        assigned.task.assigned_to = Some("alpha".into());
+        let mut hidden = prio("B", "todo", 1);
+        hidden.task.assigned_to = Some("bravo".into());
+        let mut last = prio("C", "todo", 2);
+        last.task.assigned_to = Some("alpha".into());
+        let mut b = shipped_board(vec![assigned, hidden, last]);
+        b.set_workspace_filter(Some(WorkspaceFilter::Workspace("alpha".into())));
+        let todo = col_of(&b, "todo");
+        b.select(todo, 0);
+        assert_eq!(
+            press(&mut b, "J"),
+            vec![Intent::Command(CommandKind::PrioritizeIssue {
+                id: "A".into(),
+                position: 2
+            })],
+            "past the visible neighbour C, at slot 2 (B is filtered out)"
+        );
+        b.select(todo, 1);
+        assert_eq!(
+            press(&mut b, "K"),
+            vec![Intent::Command(CommandKind::PrioritizeIssue {
+                id: "C".into(),
+                position: 0
+            })]
+        );
+        assert!(press(&mut b, "J").is_empty(), "no card below C");
+    }
+
+    #[test]
+    fn a_move_into_an_empty_collapsed_column_expands_it_while_pending() {
+        let mut b = shipped_board(vec![issue("A", "todo")]);
+        let review = col_of(&b, "review");
+        assert!(b.model().columns[review].collapsed, "empty columns collapse");
+        b.begin_mutation(&CommandKind::MoveIssue {
+            id: "A".into(),
+            to_status: "review".into(),
+        })
+        .unwrap();
+        assert!(!b.model().columns[review].collapsed);
+        assert!(b.model().columns[col_of(&b, "todo")].collapsed);
     }
 }

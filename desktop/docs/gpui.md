@@ -202,6 +202,18 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   view held focus at some event, read `handle.is_focused(window)` at the event
   (`cx.subscribe_in` hands the subscriber the window), and compare
   `window.focused(cx)` against the old handle rather than `None`.
+- Drag and drop (`dt-board-dnd`, gpui-pre 0.3.9): `on_drag(value, ctor)`
+  starts after a 2px move and draws the constructor's view at the pointer
+  minus the grab offset, so a ghost the card's width lines up with the card.
+  `drag_over::<T>` styles apply only while `can_drop` passes, but a drop on an
+  element whose `can_drop` is false is *consumed* (the active drag is taken and
+  no listener runs), so a refusal can't explain itself there; the board keeps
+  `can_drop` unset and refuses in its own `on_drop`. Drop listeners fire child
+  first, and a child's `can_drop: false` would also swallow the drop before its
+  parent sees it, so only attach `on_drop` to children that should take it.
+  The drag constructor gets `&mut App`, not the view: reach the view through a
+  `WeakEntity` (`cx.weak_entity()`). A drag released off every target never
+  reaches a drop handler; poll `cx.has_active_drag()` to clear drag state.
 
 ## Build time and binary size
 

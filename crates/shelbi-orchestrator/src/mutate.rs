@@ -1,5 +1,6 @@
 //! The one library behind every issue **mutation** — `move`, `start`,
-//! `assign`/`unassign`, `edit`, `add`, and review `approve`/`reject`.
+//! `assign`/`unassign`, `edit`, `add`, `prioritize` (reorder within a column),
+//! and review `approve`/`reject`.
 //!
 //! Historically each of these lived in `shelbi-cli` (`commands/issue.rs` and the
 //! review commands), reading the issue, running git/merge side effects, and
@@ -310,6 +311,11 @@ pub fn apply(
             let store = issue_store(project)?;
             Ok(change_note(store.as_ref(), project, id, kind.verb()))
         }
+        MutationKind::Prioritize { position } => {
+            apply_prioritize(project, id, *position, sink, recheck)?;
+            let store = issue_store(project)?;
+            Ok(change_note(store.as_ref(), project, id, kind.verb()))
+        }
     }
 }
 
@@ -352,6 +358,30 @@ fn apply_move(
         }
     })?;
     sink.out(&format!("✓ {id} → {}", outcome.column));
+    Ok(())
+}
+
+// --- prioritize -----------------------------------------------------------
+
+/// Land `id` at absolute slot `position` in its column (the store re-derives
+/// the column under its lock and clamps), the daemon-routed form of
+/// `shelbi issue prio --set`. Prints the same line the CLI does.
+fn apply_prioritize(
+    project: &str,
+    id: &str,
+    position: u32,
+    sink: &mut dyn OutputSink,
+    recheck: Recheck<'_>,
+) -> Result<(), MutateError> {
+    let store = issue_store(project)?;
+    let tf = load_issue(store.as_ref(), id)?;
+    // A plain state write, but a reorder queued behind a move that took the
+    // card to another column must not land it at a slot in the new column.
+    recheck()?;
+    store
+        .set_priority(id, shelbi_state::PrioMove::Set(position))
+        .map_err(MutateError::backend)?;
+    sink.out(&format!("✓ {id} now at slot {position} in {}", tf.task.column));
     Ok(())
 }
 

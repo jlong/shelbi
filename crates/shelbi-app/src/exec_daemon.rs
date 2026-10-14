@@ -8,7 +8,7 @@
 //! app composes this with its own client-local navigation handling to form a
 //! full [`Executor`](crate::exec::Executor).
 //!
-//! Only the issue mutations (`MoveIssue` … `AddIssue`) are daemon-routed here;
+//! Only the issue mutations (`MoveIssue` … `PrioritizeIssue`) are daemon-routed here;
 //! the lifecycle mutations ([`Mutation::ToggleZen`], [`Mutation::AddProject`])
 //! are not part of the issue control protocol and are left to the host.
 
@@ -191,6 +191,17 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
                 workflow: workflow.clone(),
                 branch: None,
             })),
+        ),
+        Mutation::PrioritizeIssue {
+            project,
+            id,
+            position,
+        } => (
+            project.clone(),
+            id.clone(),
+            MutationKind::Prioritize {
+                position: *position,
+            },
         ),
         Mutation::ToggleZen { .. } | Mutation::AddProject { .. } => {
             return Err(ExecError::Backend(

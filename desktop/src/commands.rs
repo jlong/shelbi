@@ -91,10 +91,11 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
             EditTarget::Workflows => not_implemented(host, "edit:workflows"),
         },
         // The board's issue mutations (dt-issues-board; drag and drop reuses
-        // MoveIssue in dt-board-dnd).
+        // MoveIssue and adds PrioritizeIssue in dt-board-dnd).
         CommandKind::MoveIssue { .. }
         | CommandKind::StartIssue { .. }
-        | CommandKind::AssignIssue { .. } => host.issue_command(kind),
+        | CommandKind::AssignIssue { .. }
+        | CommandKind::PrioritizeIssue { .. } => host.issue_command(kind),
         // dt-review-view
         CommandKind::ApproveReview { id } => not_implemented(host, &format!("issue:approve:{id}")),
         // dt-review-view. The reason is user prose, so it stays out of the
@@ -136,6 +137,7 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::RejectReview { .. } => true,
         CommandKind::EditIssue { .. } => true,
         CommandKind::AddIssue { .. } => true,
+        CommandKind::PrioritizeIssue { .. } => true,
     }
 }
 
@@ -313,6 +315,13 @@ mod tests {
             ),
             (CommandKind::EditIssue { id: s("t1") }, "issue:edit:t1"),
             (CommandKind::AddIssue { title: s("New") }, "issue:add"),
+            (
+                CommandKind::PrioritizeIssue {
+                    id: s("t1"),
+                    position: 0,
+                },
+                "issue:prioritize:t1",
+            ),
         ]
     }
 
@@ -361,6 +370,7 @@ mod tests {
                 | CommandKind::AssignIssue { .. }
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
+                | CommandKind::PrioritizeIssue { .. }
         )
     }
 

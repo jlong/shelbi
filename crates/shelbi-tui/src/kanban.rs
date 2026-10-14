@@ -239,6 +239,15 @@ pub(crate) trait MovePersister: Send + Sync {
     /// Persist a move of `id` to `target`, returning the settled move or a
     /// ready-to-display error. Called on the background persistence thread.
     fn persist(&self, project: &str, id: &str, target: &Column) -> PersistResult;
+
+    /// Reorder `id` to absolute `slot` in its column (`Shift+k`/`Shift+j`). The
+    /// default writes the store directly (the standalone board); the shell's
+    /// persister sends the registry's `PrioritizeIssue` through the daemon.
+    fn persist_priority(&self, project: &str, id: &str, slot: u32) -> Result<(), String> {
+        shelbi_state::issue_store_for(project)
+            .and_then(|s| s.set_priority(id, shelbi_state::PrioMove::Set(slot)))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// The default persister: the shared in-process library move
@@ -276,6 +285,18 @@ impl MovePersister for ExecutorMovePersister {
         shelbi_app::execute_mutation(&mutation, &mut sink)
             .map(|()| PersistedMove::default())
             .map_err(|e| format!("move failed: {e}"))
+    }
+
+    fn persist_priority(&self, project: &str, id: &str, slot: u32) -> Result<(), String> {
+        let kind = shelbi_app::CommandKind::PrioritizeIssue {
+            id: id.to_string(),
+            position: slot,
+        };
+        let shelbi_app::Effect::Mutate(mutation) = kind.effect_with_project(project) else {
+            return Err("reorder is not a daemon mutation".to_string());
+        };
+        shelbi_app::execute_mutation(&mutation, &mut |_stream, _line: &str| {})
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1822,8 +1843,18 @@ impl KanbanApp {
             self.fail_status(format!("reorder blocked: {e}"));
             return;
         }
-        if let Err(e) = shelbi_state::issue_store_for(&self.project_name)
-            .and_then(|s| s.set_priority(&id, shelbi_state::PrioMove::Set(new_pos as u32)))
+        // Trade places with the visible neighbour. The slot indexes the whole
+        // stored column (shared with the desktop's drag), since a filter can
+        // hide cards between the two.
+        let target = self
+            .column_tasks(self.selected_column)
+            .get(new_pos)
+            .map(|tf| tf.task.id.clone());
+        let slot = board_rules::reorder_slot(&self.tasks, &id, target.as_deref())
+            .unwrap_or(new_pos as u32);
+        if let Err(e) = self
+            .move_persister()
+            .persist_priority(&self.project_name, &id, slot)
         {
             self.fail_status(format!("reorder failed: {e}"));
             return;
@@ -3892,6 +3923,45 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             "error: {}",
             errors[0].message
         );
+    }
+
+    /// Records reorders instead of persisting them; moves are not expected.
+    #[derive(Default)]
+    struct RecordingPrioPersister(std::sync::Mutex<Vec<(String, u32)>>);
+
+    impl MovePersister for RecordingPrioPersister {
+        fn persist(&self, _project: &str, _id: &str, _target: &Column) -> PersistResult {
+            Err("unexpected move".into())
+        }
+
+        fn persist_priority(&self, _project: &str, id: &str, slot: u32) -> Result<(), String> {
+            self.0.lock().unwrap().push((id.to_string(), slot));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reorder_goes_through_the_persister_with_the_whole_column_slot() {
+        // With a workspace filter hiding `b`, `a`'s visible neighbour `d` sits at
+        // slot 2 of the stored column, not row 1: Shift+j must land `a` past
+        // `d`, which the visible row index alone would not.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("prio-slot");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+        for (id, prio, ws) in [("a", 0, "alpha"), ("b", 1, "bravo"), ("d", 2, "alpha")] {
+            let tf = task_file_for(id, Column::todo(), prio, "2026-06-20T10:00:00Z", Some(ws));
+            shelbi_state::save_task("demo", &tf.task, &tf.body).unwrap();
+        }
+        let recorder = Arc::new(RecordingPrioPersister::default());
+        let mut app = KanbanApp::new("demo");
+        app.move_persister = Some(recorder.clone());
+        app.refresh();
+        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
+        app.selected_column = 1;
+        app.selected_row = 0;
+
+        app.reorder_down();
+        assert_eq!(*recorder.0.lock().unwrap(), [("a".to_string(), 2)]);
     }
 
     #[test]

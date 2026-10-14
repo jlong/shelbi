@@ -70,6 +70,11 @@ pub enum CommandKind {
     RejectReview { id: String, reason: String },
     EditIssue { id: String },
     AddIssue { title: String },
+    /// Reorder an issue within its column: land it at absolute slot
+    /// `position` (0 is the top) of the column's priority order. The board
+    /// computes the slot from the unfiltered column
+    /// ([`crate::board::reorder_slot`]).
+    PrioritizeIssue { id: String, position: u32 },
 }
 
 /// A registry command: metadata + typed arguments. Built by the registry
@@ -119,6 +124,7 @@ impl Command {
                 | CommandKind::RejectReview { .. }
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
+                | CommandKind::PrioritizeIssue { .. }
         )
     }
 
@@ -203,6 +209,13 @@ impl CommandKind {
                 title: title.clone(),
                 workflow: None,
             }),
+            CommandKind::PrioritizeIssue { id, position } => {
+                Effect::Mutate(Mutation::PrioritizeIssue {
+                    project: p(),
+                    id: id.clone(),
+                    position: *position,
+                })
+            }
         }
     }
 }
@@ -852,6 +865,33 @@ mod tests {
                 task_id: "T-12".into()
             }
         );
+    }
+
+    #[test]
+    fn prioritize_issue_is_a_daemon_mutation_with_the_slot() {
+        let kind = CommandKind::PrioritizeIssue {
+            id: "t1".into(),
+            position: 2,
+        };
+        assert_eq!(
+            kind.effect_with_project("alpha"),
+            Effect::Mutate(Mutation::PrioritizeIssue {
+                project: "alpha".into(),
+                id: "t1".into(),
+                position: 2,
+            })
+        );
+        let cmd = Command {
+            id: String::new(),
+            title: String::new(),
+            kind,
+            entry_kind: EntryKind::Action,
+            decoration: None,
+            subtitle: None,
+            shortcut: None,
+            hidden_until_query: false,
+        };
+        assert!(cmd.is_mutating());
     }
 
     #[test]
