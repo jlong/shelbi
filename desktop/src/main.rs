@@ -125,6 +125,7 @@ fn main() {
             gpui_kit::init(cx);
             theme::init(cx);
             assets::load_fonts(cx);
+            elements::terminal::TerminalSettings::init(cx);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

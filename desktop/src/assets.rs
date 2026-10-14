@@ -46,6 +46,9 @@ pub mod icons {
     pub const FOLDER_OPEN: &str = "icons/heroicons/folder-open.svg";
     pub const GLOBE_ALT: &str = "icons/heroicons/globe-alt.svg";
     pub const DOCUMENT_TEXT: &str = "icons/heroicons/document-text.svg";
+    pub const ARROW_DOWN: &str = "icons/heroicons/arrow-down.svg";
+    pub const CHEVRON_UP: &str = "icons/heroicons/chevron-up.svg";
+    pub const CHEVRON_DOWN: &str = "icons/heroicons/chevron-down.svg";
 }
 
 macro_rules! heroicon {
@@ -91,6 +94,9 @@ const HEROICONS: &[(&str, &[u8])] = &[
     heroicon!(icons::FOLDER_OPEN, "folder-open.svg"),
     heroicon!(icons::GLOBE_ALT, "globe-alt.svg"),
     heroicon!(icons::DOCUMENT_TEXT, "document-text.svg"),
+    heroicon!(icons::ARROW_DOWN, "arrow-down.svg"),
+    heroicon!(icons::CHEVRON_UP, "chevron-up.svg"),
+    heroicon!(icons::CHEVRON_DOWN, "chevron-down.svg"),
 ];
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its
@@ -102,11 +108,118 @@ const GEIST: &[&[u8]] = &[
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Bold.ttf")),
 ];
 
-/// Register the vendored fonts, so views can set `font_family("Geist")`.
+/// Geist Mono, the terminal typeface (SIL Open Font License 1.1, vendored
+/// with its license under `assets/fonts/geist-mono/`, from the `geist` npm
+/// package 1.7.2): regular, bold, and their italics, so the terminal's SGR
+/// bold and italic use real faces, not synthesized ones.
+const GEIST_MONO: &[&[u8]] = &[
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist-mono/GeistMono-Regular.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist-mono/GeistMono-Bold.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist-mono/GeistMono-Italic.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist-mono/GeistMono-BoldItalic.ttf")),
+];
+
+/// Symbols Nerd Font Mono (Nerd Fonts v3.4.0, MIT for the build, the glyph
+/// sets under their own licenses; see `assets/fonts/nerd-symbols/`): the
+/// terminal's fallback for the private-use icons prompts and agents print,
+/// which no system font covers. CJK and emoji fall back through the system
+/// (CoreText's cascade).
+const NERD_SYMBOLS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf"
+));
+
+/// Register the vendored fonts, so views can set `font_family("Geist")` and
+/// the terminal can use Geist Mono and its symbol fallback on any machine.
+///
+/// gpui keeps added fonts in its own (font-kit) memory source, which resolves
+/// a primary family but not a **fallback**: CoreText resolves a font's
+/// cascade list by name among the fonts *it* knows. So the terminal's
+/// fallbacks (Geist Mono, the Nerd symbols) are also registered with CoreText
+/// for this process.
 pub fn load_fonts(cx: &mut gpui::App) {
-    let fonts = GEIST.iter().map(|bytes| Cow::Borrowed(*bytes)).collect();
+    let fonts = GEIST
+        .iter()
+        .chain(GEIST_MONO)
+        .chain(std::iter::once(&NERD_SYMBOLS))
+        .map(|bytes| Cow::Borrowed(*bytes))
+        .collect();
     if let Err(e) = cx.text_system().add_fonts(fonts) {
-        tracing::warn!(error = %e, "could not load the Geist fonts");
+        tracing::warn!(error = %e, "could not load the bundled fonts");
+    }
+    for bytes in GEIST_MONO.iter().chain(std::iter::once(&NERD_SYMBOLS)) {
+        if let Err(e) = coretext::register_font(bytes) {
+            tracing::warn!(error = %e, "could not register a bundled font for fallback");
+        }
+    }
+}
+
+/// Process-scoped CoreText registration of embedded font data.
+#[cfg(target_os = "macos")]
+mod coretext {
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDataProviderCreateWithData(
+            info: *mut c_void,
+            data: *const c_void,
+            size: usize,
+            release: Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>,
+        ) -> CFTypeRef;
+        fn CGFontCreateWithDataProvider(provider: CFTypeRef) -> CFTypeRef;
+    }
+
+    #[link(name = "CoreText", kind = "framework")]
+    unsafe extern "C" {
+        fn CTFontManagerRegisterGraphicsFont(font: CFTypeRef, error: *mut CFTypeRef) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    /// Register `bytes` (a whole font file, alive for the process) with
+    /// CoreText for this process, so a cascade list can name its family.
+    pub fn register_font(bytes: &'static [u8]) -> Result<(), String> {
+        // SAFETY: `bytes` is 'static, so the provider (which doesn't copy and
+        // has no release callback) never outlives it; each created CF object
+        // is released once; a failed registration's error is released too.
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                None,
+            );
+            if provider.is_null() {
+                return Err("CGDataProviderCreateWithData failed".into());
+            }
+            let font = CGFontCreateWithDataProvider(provider);
+            CFRelease(provider);
+            if font.is_null() {
+                return Err("not a font CoreGraphics can read".into());
+            }
+            let mut error: CFTypeRef = std::ptr::null();
+            let ok = CTFontManagerRegisterGraphicsFont(font, &mut error);
+            CFRelease(font);
+            if !error.is_null() {
+                CFRelease(error);
+            }
+            // A font already registered (a second window's init) is fine.
+            let _ = ok;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod coretext {
+    pub fn register_font(_bytes: &'static [u8]) -> Result<(), String> {
+        Ok(())
     }
 }
 

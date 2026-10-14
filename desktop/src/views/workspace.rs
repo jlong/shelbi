@@ -1102,6 +1102,7 @@ mod tests {
                 events: rx,
                 size: Size::new(80, 24),
                 name,
+                cwd: None,
             })
         }
     }

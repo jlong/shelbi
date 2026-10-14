@@ -8,10 +8,14 @@
 //!   every base glyph lands on its cell whatever the font's own advances; a
 //!   wide character is shaped alone at its cell.
 //! - **Paint**, back to front: the default background, cell backgrounds,
-//!   search and selection highlights, glyphs, the cursor (block, beam,
-//!   underline, or hollow when unfocused) with the glyph under a block cursor
-//!   repainted in the cursor's text color, and any IME composition. It also
-//!   registers the pointer listeners and the input handler.
+//!   search and selection highlights ([`super::highlights`]), glyphs, a
+//!   Cmd-hovered link's underline, the cursor (block, beam, underline, or
+//!   hollow when unfocused) with the glyph under a block cursor repainted in
+//!   the cursor's text color, any IME composition (over the cells at the
+//!   cursor, underlined, its selected clause underlined thicker), and the
+//!   scrollbar. It also registers the pointer listeners and the input
+//!   handler. (Modifier changes reach the pane's own div: gpui sends them
+//!   along the focus path, which ends at the focused pane, not this child.)
 //!
 //! The session grid is letterboxed (centered) or clipped (anchored top-left)
 //! into the viewer by `shelbi_term::viewport`, the same placement the TUI uses
@@ -32,9 +36,10 @@ use gpui::{
 use shelbi_term::render::{CursorShape, Underline};
 use shelbi_term::Size;
 
+use super::highlights;
 use super::layout::{GlyphRun, Palette};
 use super::metrics::CellMetrics;
-use super::{Geometry, TerminalPane};
+use super::{scrollbar, Geometry, TerminalPane};
 use crate::theme::{rgb_hsla, Theme};
 
 /// The element. Cheap to build each render; all state lives in the pane.
@@ -67,6 +72,16 @@ pub struct CursorPaint {
     glyph: Option<(Point<Pixels>, ShapedLine)>,
 }
 
+/// An IME composition as this frame paints it.
+pub struct CompositionPaint {
+    /// Covers the cells the composition is drawn over.
+    background: Bounds<Pixels>,
+    origin: Point<Pixels>,
+    line: ShapedLine,
+    /// The thick underline under the input method's selected clause.
+    clause: Option<Bounds<Pixels>>,
+}
+
 /// Everything prepaint computed for paint.
 pub struct Frame {
     hitbox: Hitbox,
@@ -75,9 +90,15 @@ pub struct Frame {
     background: Hsla,
     quads: Vec<(Bounds<Pixels>, Hsla)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    /// Quads painted over the glyphs (a hovered link's underline).
+    over: Vec<(Bounds<Pixels>, Hsla)>,
     cursor: Option<CursorPaint>,
-    marked: Option<(Point<Pixels>, ShapedLine)>,
+    composition: Option<CompositionPaint>,
+    /// The scrollbar thumb.
+    scrollbar: Option<(Bounds<Pixels>, Hsla)>,
+    background_fill: Hsla,
     line_height: Pixels,
+    pointer: PointerStyle,
 }
 
 impl IntoElement for TerminalElement {
@@ -128,9 +149,10 @@ impl Element for TerminalElement {
 
         // Geometry and damage: the only mutation of the pane in a frame.
         let (metrics, rows, rows_rebuilt, palette) = self.pane.update(cx, |pane, cx| {
+            let (family, size) = (pane.settings.font_family.clone(), pane.settings.font_size);
             let metrics = pane
                 .metrics
-                .get_or_insert_with(|| CellMetrics::measure(window))
+                .get_or_insert_with(|| CellMetrics::measure(window, &family, size))
                 .clone();
             let viewer = metrics.grid_size(bounds.size);
             pane.begin_frame(bounds, viewer, cx);
@@ -150,7 +172,7 @@ impl Element for TerminalElement {
         let shown = Size::new(geometry.placement.cols.len, geometry.placement.rows.len);
         let view = pane.view();
         let emu = view.emulator();
-        let offset = emu.display_offset() as i32;
+        let offset = emu.display_offset();
         let text = window.text_system().clone();
 
         // Cell backgrounds, then highlights over them.
@@ -165,46 +187,37 @@ impl Element for TerminalElement {
         }
         let search_color = rgb_hsla(theme.search_match);
         let current_color = rgb_hsla(theme.search_current);
-        let current = view.search_current();
-        for m in view.search_matches() {
-            let row = m.line + offset;
-            if row < 0 || row >= shown.rows as i32 || m.start_col >= shown.cols {
-                continue;
-            }
-            let len = m.end_col.min(shown.cols) - m.start_col;
-            let color = if Some(*m) == current {
-                current_color
-            } else {
-                search_color
-            };
-            quads.push((
-                metrics.cell_bounds(origin, m.start_col, row as u16, len),
-                color,
-            ));
+        for (span, current) in
+            highlights::match_spans(view.search_matches(), view.search_current(), offset, shown)
+        {
+            let color = if current { current_color } else { search_color };
+            quads.push((metrics.cell_bounds(origin, span.col, span.row, span.len), color));
         }
         if let Some(sel) = view.selection().filter(|s| !s.is_empty()) {
-            let (start, end) = sel.range();
             let selection_color = rgb_hsla(theme.selection);
-            for row in 0..shown.rows {
-                let line = row as i32 - offset;
-                if line < start.line || line > end.line {
-                    continue;
-                }
-                let first = if line == start.line { start.col } else { 0 };
-                let last = if line == end.line {
-                    end.col
-                } else {
-                    shown.cols.saturating_sub(1)
-                };
-                let last = last.min(shown.cols.saturating_sub(1));
-                if first <= last {
-                    quads.push((
-                        metrics.cell_bounds(origin, first, row, last - first + 1),
-                        selection_color,
-                    ));
-                }
+            for span in highlights::selection_spans(&sel, offset, shown) {
+                quads.push((
+                    metrics.cell_bounds(origin, span.col, span.row, span.len),
+                    selection_color,
+                ));
             }
         }
+
+        // A Cmd-hovered link's underline, along the bottom of its cells.
+        let mut over = Vec::new();
+        if let Some(link) = pane.hovered_link.as_ref() {
+            for span in highlights::link_spans(link, offset, shown) {
+                let cells = metrics.cell_bounds(origin, span.col, span.row, span.len);
+                over.push((
+                    Bounds {
+                        origin: point(cells.left(), cells.bottom() - px(2.0)),
+                        size: size(cells.size.width, px(1.0)),
+                    },
+                    palette.foreground(),
+                ));
+            }
+        }
+        let offset = offset as i32;
 
         // Glyphs.
         let mut lines = Vec::new();
@@ -217,12 +230,15 @@ impl Element for TerminalElement {
         }
 
         // The cursor: hidden until a session is attached, while scrolled away,
-        // or on the blink's off phase; an outline while the pane isn't focused.
+        // on the blink's off phase, or under a composition; an outline while
+        // the pane isn't focused.
         let focused = pane.is_focused();
+        let composing_here = pane.composition.is_some() && !pane.search_open();
         let cursor = emu
             .cursor()
             .filter(|c| c.row < shown.rows && c.col < shown.cols)
             .filter(|_| pane.is_live() && (pane.blink_on || !focused))
+            .filter(|_| !composing_here)
             .map(|c| {
                 let cell_origin = |col, row| metrics.cell_bounds(origin, col, row, 1).origin;
                 let cell = metrics.cell_bounds(origin, c.col, c.row, 1);
@@ -286,28 +302,79 @@ impl Element for TerminalElement {
                 }
             });
 
-        // An IME composition, drawn at the cursor cell and underlined.
-        let marked = pane.marked_text.as_ref().and_then(|t| {
-            let c = emu.cursor()?;
-            let at = metrics.cell_bounds(origin, c.col, c.row, 1).origin;
-            let color = palette.foreground();
-            let run = TextRun {
-                len: t.len(),
-                font: metrics.font.clone(),
-                color,
-                background_color: Some(palette.background()),
-                underline: Some(UnderlineStyle {
-                    thickness: px(1.0),
-                    color: Some(color),
-                    wavy: false,
-                }),
-                strikethrough: None,
+        // An IME composition, drawn over the cells at the cursor and
+        // underlined, its selected clause underlined thicker. (In the find
+        // bar while that is open; the bar draws it.)
+        let composition = pane
+            .composition
+            .as_ref()
+            .filter(|_| !pane.search_open())
+            .and_then(|comp| {
+                let c = emu.cursor()?;
+                let at = metrics.cell_bounds(origin, c.col, c.row, 1).origin;
+                let color = palette.foreground();
+                let run = TextRun {
+                    len: comp.text.len(),
+                    font: metrics.font.clone(),
+                    color,
+                    background_color: None,
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(color),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                };
+                let line = text.shape_line(comp.text.clone().into(), metrics.font_size, &[run], None);
+                let x_of = |utf16: usize| {
+                    let byte = super::utf16_to_byte_range(&comp.text, 0..utf16).end;
+                    line.x_for_index(byte)
+                };
+                let clause = (comp.selected.start < comp.selected.end).then(|| {
+                    let (x0, x1) = (x_of(comp.selected.start), x_of(comp.selected.end));
+                    Bounds {
+                        origin: point(at.x + x0, at.y + metrics.height - px(2.0)),
+                        size: size(x1 - x0, px(2.0)),
+                    }
+                });
+                let width = line.width.max(metrics.width);
+                Some(CompositionPaint {
+                    background: Bounds {
+                        origin: at,
+                        size: size(width, metrics.height),
+                    },
+                    origin: at,
+                    line,
+                    clause,
+                })
+            });
+
+        // The scrollbar thumb, over the right edge.
+        let scrollbar = pane.scrollbar_thumb().map(|thumb| {
+            let color = if pane.scrollbar_active() || pane.scrollbar_hovered {
+                cx.global::<Theme>().gray
+            } else {
+                cx.global::<Theme>().muted.opacity(0.6)
             };
-            Some((
-                at,
-                text.shape_line(t.clone().into(), metrics.font_size, &[run], None),
-            ))
+            (
+                Bounds {
+                    origin: point(
+                        bounds.right() - px(scrollbar::WIDTH + scrollbar::INSET),
+                        bounds.top() + px(thumb.top),
+                    ),
+                    size: size(px(scrollbar::WIDTH), px(thumb.height)),
+                },
+                color,
+            )
         });
+
+        let pointer = if pane.hovered_link.is_some() {
+            PointerStyle::PointingHand
+        } else if pane.scrollbar_hovered || pane.scrollbar_active() {
+            PointerStyle::Arrow
+        } else {
+            PointerStyle::IBeam
+        };
 
         Frame {
             hitbox,
@@ -316,9 +383,13 @@ impl Element for TerminalElement {
             background: palette.background(),
             quads,
             lines,
+            over,
             cursor,
-            marked,
+            composition,
+            scrollbar,
+            background_fill: palette.background(),
             line_height: metrics.height,
+            pointer,
         }
     }
 
@@ -340,6 +411,9 @@ impl Element for TerminalElement {
             for (at, line) in &frame.lines {
                 let _ = line.paint(*at, frame.line_height, TextAlign::Left, None, window, cx);
             }
+            for (b, color) in &frame.over {
+                window.paint_quad(fill(*b, *color));
+            }
             if let Some(cursor) = &frame.cursor {
                 match cursor.shape {
                     CursorShape::HollowBlock => {
@@ -351,13 +425,22 @@ impl Element for TerminalElement {
                     let _ = glyph.paint(*at, frame.line_height, TextAlign::Left, None, window, cx);
                 }
             }
-            if let Some((at, line)) = &frame.marked {
-                let _ = line.paint(*at, frame.line_height, TextAlign::Left, None, window, cx);
+            if let Some(comp) = &frame.composition {
+                window.paint_quad(fill(comp.background, frame.background_fill));
+                let _ = comp
+                    .line
+                    .paint(comp.origin, frame.line_height, TextAlign::Left, None, window, cx);
+                if let Some(clause) = comp.clause {
+                    window.paint_quad(fill(clause, frame.cursor_color()));
+                }
+            }
+            if let Some((b, color)) = &frame.scrollbar {
+                window.paint_quad(fill(*b, *color).corner_radii(px(scrollbar::WIDTH / 2.0)));
             }
         });
 
         self.register_listeners(&frame.hitbox, window, cx);
-        window.set_cursor_style(PointerStyle::IBeam, &frame.hitbox);
+        window.set_cursor_style(frame.pointer, &frame.hitbox);
         let focus = self.pane.read(cx).focus_handle_ref().clone();
         window.handle_input(
             &focus,
@@ -372,6 +455,13 @@ impl Element for TerminalElement {
     }
 }
 
+impl Frame {
+    /// The color the composition's clause underline takes: the cursor's.
+    fn cursor_color(&self) -> Hsla {
+        self.cursor.as_ref().map_or(self.background_fill.opacity(0.0), |c| c.color)
+    }
+}
+
 impl TerminalElement {
     fn register_listeners(&self, hitbox: &Hitbox, window: &mut Window, _cx: &mut App) {
         let pane = self.pane.clone();
@@ -379,15 +469,19 @@ impl TerminalElement {
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
                 pane.update(cx, |p, cx| {
-                    p.mouse_down(e.button, e.position, e.modifiers, window, cx)
+                    p.mouse_down(e.button, e.position, e.modifiers, e.click_count, window, cx)
                 });
                 cx.stop_propagation();
             }
         });
         let pane = self.pane.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Bubble && e.pressed_button == Some(gpui::MouseButton::Left) {
-                pane.update(cx, |p, cx| p.mouse_drag(e.position, e.modifiers, cx));
+        let hb = hitbox.clone();
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble {
+                let hovered = hb.is_hovered(window);
+                pane.update(cx, |p, cx| {
+                    p.mouse_move(e.position, e.pressed_button, e.modifiers, hovered, cx)
+                });
             }
         });
         let pane = self.pane.clone();

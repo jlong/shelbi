@@ -444,10 +444,9 @@ fn handle_mouse(
         },
         input::MouseOwner::Program => {
             if let Some(ev) = map_mouse(&m) {
-                let modes = input::MouseModes {
-                    reporting,
-                    sgr: mode.contains(TermMode::SGR_MOUSE),
-                };
+                // The emulator's modes: drags and motion only where the
+                // program asked for them.
+                let modes = view.emulator().mouse_modes();
                 let placement = viewport::fit(session_size, viewer);
                 if let Some(bytes) = input::encode_mouse(&ev, modes, &placement) {
                     let _ = conn.input(&bytes);

@@ -74,7 +74,7 @@ impl From<Size> for Dims {
 /// are simply ignored here; the view layer learns about those from the
 /// session's pushed events, not from this local emulator.
 #[derive(Clone, Default)]
-struct DiscardProxy {
+pub(crate) struct DiscardProxy {
     discarded_replies: Arc<AtomicUsize>,
 }
 
@@ -109,7 +109,13 @@ impl TermEmulator {
     pub fn new(size: Size) -> Self {
         let discarded_replies = Arc::new(AtomicUsize::new(0));
         let proxy = DiscardProxy { discarded_replies: Arc::clone(&discarded_replies) };
-        let config = Config { scrolling_history: SCROLLBACK_LINES, kitty_keyboard: true, ..Config::default() };
+        let config = Config {
+            scrolling_history: SCROLLBACK_LINES,
+            kitty_keyboard: true,
+            // Double-click word boundaries (the emulator's semantic search).
+            semantic_escape_chars: crate::selection::WORD_SEPARATORS.to_owned(),
+            ..Config::default()
+        };
         let term = Term::new(config, &Dims::from(size), proxy);
         Self { term, parser: Processor::new(), discarded_replies, size }
     }
@@ -144,6 +150,17 @@ impl TermEmulator {
         self.term.grid()
     }
 
+    /// The emulator itself, for the view's selection (which lives in the
+    /// `Term` so it rotates with scrolling).
+    pub(crate) fn term(&self) -> &Term<DiscardProxy> {
+        &self.term
+    }
+
+    /// The emulator itself, mutably (see [`TermEmulator::term`]).
+    pub(crate) fn term_mut(&mut self) -> &mut Term<DiscardProxy> {
+        &mut self.term
+    }
+
     /// The current terminal mode flags.
     pub fn mode(&self) -> TermMode {
         *self.term.mode()
@@ -154,6 +171,13 @@ impl TermEmulator {
     /// are disabled here (plan, "Shared client crates").
     pub fn on_alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether a wheel should reach the program as arrow keys: it is on the
+    /// alternate screen (a pager or editor with no scrollback of ours) and
+    /// alternate-scroll mode (`ESC[?1007h`, on by default) is set.
+    pub fn alternate_scroll(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
     }
 
     /// Whether the program enabled bracketed paste.
@@ -252,7 +276,12 @@ impl TermEmulator {
     /// [`crate::input::encode_mouse`] and the ownership policy.
     pub fn mouse_modes(&self) -> MouseModes {
         let mode = self.term.mode();
-        MouseModes { reporting: mode.intersects(TermMode::MOUSE_MODE), sgr: mode.contains(TermMode::SGR_MOUSE) }
+        MouseModes {
+            reporting: mode.intersects(TermMode::MOUSE_MODE),
+            drag: mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+        }
     }
 
     /// The number of query replies this emulator generated and discarded (see
@@ -413,7 +442,11 @@ mod tests {
         e.feed(b"\x1b[?1000h\x1b[?1006h"); // click reporting, SGR
         let k = e.key_encoding();
         assert!(k.kitty && k.application_cursor_keys && !k.newline_mode);
-        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, sgr: true });
+        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, drag: false, motion: false, sgr: true });
+        e.feed(b"\x1b[?1002h"); // button-event tracking: drags too
+        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, drag: true, motion: false, sgr: true });
+        e.feed(b"\x1b[?1003h"); // any-event tracking: all motion
+        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, drag: true, motion: true, sgr: true });
     }
 
     #[test]

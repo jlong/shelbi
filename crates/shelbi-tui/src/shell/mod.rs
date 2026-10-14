@@ -3085,8 +3085,8 @@ impl ShellState {
             KeyCode::Char('/') => {
                 self.search_input = Some(String::new());
             }
-            KeyCode::Char('n') => p.search_next(),
-            KeyCode::Char('N') => p.search_prev(),
+            KeyCode::Char('n') => p.search_older(),
+            KeyCode::Char('N') => p.search_newer(),
             KeyCode::Esc => {
                 p.clear_search();
                 p.scroll_to_bottom();

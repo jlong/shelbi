@@ -87,6 +87,7 @@ impl SessionConnector for Sessions {
             events: rx,
             size: Size::new(120, 40),
             name,
+            cwd: None,
         })
     }
 }

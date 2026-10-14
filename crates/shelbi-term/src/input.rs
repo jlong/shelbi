@@ -281,6 +281,9 @@ pub enum MouseAction {
     Release,
     /// Pointer moved with the button held.
     Drag,
+    /// Pointer moved with no button held (reported only in any-event motion
+    /// mode, `ESC[?1003h`; the event's button is ignored).
+    Move,
 }
 
 /// A mouse event in **viewer** cell coordinates. The encoder translates the
@@ -304,6 +307,13 @@ pub struct MouseEvent {
 pub struct MouseModes {
     /// Any mouse reporting is on (click, drag, or motion).
     pub reporting: bool,
+    /// Motion with a button held is reported: button-event tracking
+    /// (`ESC[?1002h`) or any-event tracking (`ESC[?1003h`). Plain click
+    /// reporting (`ESC[?1000h`) reports presses and releases only.
+    pub drag: bool,
+    /// Motion with no button held is reported too: any-event tracking
+    /// (`ESC[?1003h`).
+    pub motion: bool,
     /// SGR extended encoding (`ESC[?1006h`). When off, legacy X10 is used.
     pub sgr: bool,
 }
@@ -311,18 +321,28 @@ pub struct MouseModes {
 /// Encode a mouse event for the program, translating viewer coordinates to the
 /// session pane via `placement`.
 ///
-/// Returns `None` when the program is not reporting the mouse, or when the
-/// event lands in letterbox margin / outside a clipped window (there is no
-/// session cell under it). The ownership decision ([`mouse_owner`]) is the
+/// Returns `None` when the program is not reporting the mouse, when it
+/// isn't reporting this kind of event (a drag under click-only reporting,
+/// motion without any-event tracking), or when the event lands in letterbox
+/// margin / outside a clipped window (there is no session cell under it). The ownership decision ([`mouse_owner`]) is the
 /// caller's; this only encodes events already destined for the program.
 pub fn encode_mouse(ev: &MouseEvent, modes: MouseModes, placement: &Placement) -> Option<Vec<u8>> {
-    if !modes.reporting {
+    let wanted = match ev.action {
+        MouseAction::Press | MouseAction::Release => modes.reporting,
+        MouseAction::Drag => modes.drag,
+        MouseAction::Move => modes.motion,
+    };
+    if !wanted {
         return None;
     }
     let (scol, srow) = placement.viewer_to_session(ev.col, ev.row)?;
 
-    let mut cb = button_code(ev.button);
-    if matches!(ev.action, MouseAction::Drag) {
+    let mut cb = match ev.action {
+        // No button held: button code 3, as a release would be.
+        MouseAction::Move => 3,
+        _ => button_code(ev.button),
+    };
+    if matches!(ev.action, MouseAction::Drag | MouseAction::Move) {
         cb += 32; // motion bit
     }
     // Modifier bits (Shelbi owns Shift, so it is not forwarded here).
@@ -503,7 +523,7 @@ mod tests {
             row: 5,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: false, sgr: true };
+        let modes = MouseModes { reporting: false, sgr: true, ..MouseModes::default() };
         assert_eq!(encode_mouse(&ev, modes, &identity_placement()), None);
     }
 
@@ -516,7 +536,7 @@ mod tests {
             row: 0,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: true, sgr: true };
+        let modes = MouseModes { reporting: true, sgr: true, ..MouseModes::default() };
         assert_eq!(
             encode_mouse(&ev, modes, &identity_placement()).unwrap(),
             b"\x1b[<0;1;1M".to_vec()
@@ -532,7 +552,7 @@ mod tests {
             row: 2,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: true, sgr: true };
+        let modes = MouseModes { reporting: true, sgr: true, ..MouseModes::default() };
         assert_eq!(
             encode_mouse(&ev, modes, &identity_placement()).unwrap(),
             b"\x1b[<0;4;3m".to_vec()
@@ -548,7 +568,7 @@ mod tests {
             row: 10,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: true, sgr: true };
+        let modes = MouseModes { reporting: true, sgr: true, ..MouseModes::default() };
         assert_eq!(
             encode_mouse(&ev, modes, &identity_placement()).unwrap(),
             b"\x1b[<64;11;11M".to_vec()
@@ -567,7 +587,7 @@ mod tests {
             row: 5,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: true, sgr: true };
+        let modes = MouseModes { reporting: true, sgr: true, ..MouseModes::default() };
         // session (5,2) -> 1-based (6,3)
         assert_eq!(
             encode_mouse(&ev, modes, &placement).unwrap(),
@@ -585,7 +605,7 @@ mod tests {
             row: 5,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: true, sgr: true };
+        let modes = MouseModes { reporting: true, sgr: true, ..MouseModes::default() };
         assert_eq!(encode_mouse(&ev, modes, &placement), None);
     }
 
@@ -598,7 +618,7 @@ mod tests {
             row: 0,
             mods: Modifiers::NONE,
         };
-        let modes = MouseModes { reporting: true, sgr: false };
+        let modes = MouseModes { reporting: true, sgr: false, ..MouseModes::default() };
         // ESC [ M, button 0+32=32 (space), col 0+33=33 ('!'), row 0+33=33 ('!')
         assert_eq!(
             encode_mouse(&ev, modes, &identity_placement()).unwrap(),
@@ -614,5 +634,37 @@ mod tests {
             "/Users/me/Screen\\ Shot\\ \\(1\\).png /tmp/a\\'b\\&c"
         );
         assert_eq!(dropped_paths_text::<&str>(&[]), "");
+    }
+
+    fn mouse(action: MouseAction, button: MouseButton) -> MouseEvent {
+        MouseEvent { action, button, col: 4, row: 2, mods: Modifiers::NONE }
+    }
+
+    #[test]
+    fn drags_are_reported_only_under_button_or_any_event_tracking() {
+        let drag = mouse(MouseAction::Drag, MouseButton::Left);
+        let click_only = MouseModes { reporting: true, sgr: true, ..MouseModes::default() };
+        assert_eq!(encode_mouse(&drag, click_only, &identity_placement()), None);
+        let button_event = MouseModes { drag: true, ..click_only };
+        // Left (0) + motion bit (32), 1-based coordinates.
+        assert_eq!(encode_mouse(&drag, button_event, &identity_placement()).unwrap(), b"\x1b[<32;5;3M");
+        // A middle-button drag carries its own button code.
+        let middle = mouse(MouseAction::Drag, MouseButton::Middle);
+        assert_eq!(encode_mouse(&middle, button_event, &identity_placement()).unwrap(), b"\x1b[<33;5;3M");
+    }
+
+    #[test]
+    fn motion_without_a_button_needs_any_event_tracking() {
+        let moved = mouse(MouseAction::Move, MouseButton::Left);
+        let button_event = MouseModes { reporting: true, drag: true, sgr: true, ..MouseModes::default() };
+        assert_eq!(encode_mouse(&moved, button_event, &identity_placement()), None);
+        let any_event = MouseModes { motion: true, ..button_event };
+        // "No button" (3) + motion bit (32) = 35.
+        assert_eq!(encode_mouse(&moved, any_event, &identity_placement()).unwrap(), b"\x1b[<35;5;3M");
+        let legacy = MouseModes { sgr: false, ..any_event };
+        assert_eq!(
+            encode_mouse(&moved, legacy, &identity_placement()).unwrap(),
+            vec![0x1b, b'[', b'M', 35 + 32, 4 + 33, 2 + 33]
+        );
     }
 }

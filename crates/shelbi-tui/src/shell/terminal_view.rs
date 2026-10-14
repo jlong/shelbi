@@ -154,16 +154,19 @@ impl TerminalPane {
         self.view.scroll_to_bottom();
     }
 
-    /// Start (or refine) a literal search across scrollback. Returns the match
-    /// count.
+    /// Start (or refine) a literal search across scrollback, from the newest
+    /// match on screen. Returns the match count.
     pub fn search(&mut self, query: &str) -> usize {
         self.view.start_search(query, true)
     }
-    pub fn search_next(&mut self) {
-        self.view.search_next();
-    }
-    pub fn search_prev(&mut self) {
+    /// The next match back into history (`n`), wrapping to the newest. The
+    /// shared stepping the desktop binds to Enter.
+    pub fn search_older(&mut self) {
         self.view.search_prev();
+    }
+    /// The next match toward the live bottom (`N`), wrapping to the oldest.
+    pub fn search_newer(&mut self) {
+        self.view.search_next();
     }
     pub fn clear_search(&mut self) {
         self.view.clear_search();
@@ -454,6 +457,8 @@ fn map_mouse(m: &CtMouseEvent, col: u16, row: u16) -> Option<input::MouseEvent> 
         MouseEventKind::Drag(b) => (input::MouseAction::Drag, btn(b)),
         MouseEventKind::ScrollUp => (input::MouseAction::Press, input::MouseButton::WheelUp),
         MouseEventKind::ScrollDown => (input::MouseAction::Press, input::MouseButton::WheelDown),
+        // Motion with no button: forwarded to a program in any-event tracking.
+        MouseEventKind::Moved => (input::MouseAction::Move, input::MouseButton::Left),
         _ => return None,
     };
     Some(input::MouseEvent {
@@ -692,6 +697,9 @@ mod tests {
         // program (press, motion, release all forwarded) and selects nothing.
         let mut pane = TerminalPane::new(Size::new(20, 3));
         enable_sgr_mouse(&mut pane);
+        // Button-event tracking, as vim asks for: the drag's motion is
+        // reported too (under click-only reporting it isn't).
+        pane.view.feed(b"\x1b[?1002h");
         pane.view.feed(b"hello world");
         let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 0, KM::ALT);
         // Press: SGR button 0 + Alt bit (8) at 1-based (1,1).
@@ -838,6 +846,11 @@ mod tests {
         }
         let count = pane.search("needle");
         assert!(count >= 1, "found at least one match for a scrolled-off term");
-        assert!(pane.view.search_current().is_some());
+        let newest = pane.view.search_current().expect("a current match");
+        // `n` steps back into history, `N` returns.
+        pane.search_older();
+        assert!(pane.view.search_current().unwrap().line < newest.line);
+        pane.search_newer();
+        assert_eq!(pane.view.search_current(), Some(newest));
     }
 }

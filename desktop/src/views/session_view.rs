@@ -976,6 +976,7 @@ mod tests {
                         events: rx,
                         size,
                         name: app_session::discovery_name(project, target),
+                        cwd: None,
                     })
                 }
                 Outcome::Fail(m) => Err(ConnectFailure::Message(m.into())),

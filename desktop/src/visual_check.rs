@@ -16,6 +16,12 @@
 //! - drives mouse events and checks the ownership rules (wheel and drag are
 //!   Shelbi's until the program reports the mouse; Shift reclaims them);
 //! - resizes the window and checks the debounced size report;
+//! - checks the fonts (Geist Mono bundled, every showcase glyph found in some
+//!   font, a live font change re-measuring the grid), the find bar, word /
+//!   line / block selection, the scrollbar and "Jump to bottom", output not
+//!   yanking a scrolled-up view, Cmd-hover and Cmd+click links, the
+//!   alternate screen (wheel as arrows, selection), the mouse modes, the
+//!   Option key setting, and IME composition, cancel, and dead keys;
 //! - times frames: an idle redraw, and a `yes`-style flood fed in chunks.
 //!
 //! It prints one line per check and exits non-zero if any failed.
@@ -34,9 +40,11 @@ use gpui::{
 use shelbi_term::Size;
 
 use crate::elements::terminal::session::SessionIo;
-use crate::elements::terminal::TerminalPane;
+use crate::elements::terminal::{TerminalPane, TerminalSettings};
 use crate::theme::Theme;
+use gpui::{MouseDownEvent, MouseUpEvent};
 use shelbi_app::theme::ThemePreference;
+use shelbi_term::links::LinkTarget;
 
 /// What the pane sent to its (fake) session.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +123,10 @@ pub fn run(out: PathBuf) -> ! {
         ThemePreference::Dark,
         gpui::WindowAppearance::Dark,
     ));
+    cx.update(|cx| {
+        crate::assets::load_fonts(cx);
+        cx.set_global(TerminalSettings::default());
+    });
     let io = Recorder::default();
     let pane_io = io.clone();
     let handle = cx
@@ -169,9 +181,19 @@ impl Check {
         let first = self.draw();
         self.size_reports(first);
         self.showcase();
+        self.fonts();
         self.keys();
+        self.option_key();
         self.ime();
         self.mouse();
+        self.mouse_modes();
+        self.selection_modes();
+        self.selection_autoscroll();
+        self.selection_survives_output();
+        self.scrolling();
+        self.find_bar();
+        self.links();
+        self.alt_screen();
         self.resize();
         self.timing();
     }
@@ -354,12 +376,14 @@ impl Check {
                 "Shift+Enter without the kitty protocol is a bare CR",
             ),
             ("alt-enter", b"\x1b\r", "Option+Enter is Meta+Enter"),
+            ("alt-backspace", b"\x1b\x7f", "Option+Backspace is Meta (delete a word), whatever the Option setting"),
+            ("alt-left alt-right", b"\x1b[1;3D\x1b[1;3C", "Option+arrows are Meta (word motion)"),
+            ("alt-delete", b"\x1b[3;3~", "Option+Delete is Meta"),
             ("tab", b"\t", "Tab"),
             ("shift-tab", b"\x1b[Z", "Shift+Tab is backtab"),
             ("backspace", b"\x7f", "Backspace is DEL"),
             ("ctrl-h", b"\x08", "Ctrl+H is BS"),
             ("ctrl-c", b"\x03", "Ctrl+C"),
-            ("alt-b", b"\x1bb", "Option+B is Meta+B"),
             ("escape", b"\x1b", "Escape"),
             ("up down left right", b"\x1b[A\x1b[B\x1b[D\x1b[C", "arrows"),
             ("ctrl-left", b"\x1b[1;5D", "Ctrl+Left"),
@@ -448,8 +472,9 @@ impl Check {
         self.reset_screen();
         self.feed(b"$ ");
         self.io.take();
+        // A Japanese composition, its first clause selected by the IME.
         self.with_pane(|pane, window, cx| {
-            pane.replace_and_mark_text_in_range(None, "にほ", None, window, cx);
+            pane.replace_and_mark_text_in_range(None, "にほんご", Some(0..2), window, cx);
         })
         .unwrap();
         self.save("ime-composing.png");
@@ -459,13 +484,65 @@ impl Check {
             during.is_empty(),
             format!("{during:?}"),
         );
-        self.with_pane(|pane, window, cx| pane.replace_text_in_range(None, "日本", window, cx))
+        let (marked, read_back, candidates, cursor_x) = self
+            .with_pane(|pane, window, cx| {
+                let marked = pane.marked_text_range(window, cx);
+                let mut adjusted = None;
+                let read_back = pane.text_for_range(0..2, &mut adjusted, window, cx);
+                let candidates = pane.candidate_bounds(2..4, window, cx);
+                let m = pane.metrics.clone().unwrap();
+                (marked, read_back, candidates, m.width * 2.0)
+            })
+            .unwrap();
+        // "にほ" is four cells wide, so the second clause starts 4 cells past
+        // the cursor (at column 2).
+        let (w, _) = self.cell();
+        self.expect(
+            "the input method reads the composition back and places candidates under its clause",
+            marked == Some(0..4)
+                && read_back.as_deref() == Some("にほ")
+                && candidates.is_some_and(|b| (f32::from(b.origin.x - cursor_x) - 4.0 * w).abs() < 0.5),
+            format!("marked {marked:?}, read {read_back:?}, candidates {candidates:?}"),
+        );
+        self.with_pane(|pane, window, cx| pane.replace_text_in_range(None, "日本語", window, cx))
             .unwrap();
         let got = self.io.input();
         self.expect(
             "committing a composition sends its text",
-            got == "日本".as_bytes(),
+            got == "日本語".as_bytes(),
             format!("{got:?}"),
+        );
+
+        // Cancel: the input method unmarks; nothing is sent.
+        self.with_pane(|pane, window, cx| {
+            pane.replace_and_mark_text_in_range(None, "か", None, window, cx);
+            pane.unmark_text(window, cx);
+        })
+        .unwrap();
+        let sent = self.io.take();
+        let composing = self
+            .with_pane(|pane, window, cx| pane.marked_text_range(window, cx))
+            .unwrap();
+        self.expect(
+            "a cancelled composition sends nothing and clears",
+            sent.is_empty() && composing.is_none(),
+            format!("{sent:?} {composing:?}"),
+        );
+
+        // A dead key: Option+E marks an accent, the next E commits é.
+        self.with_pane(|pane, window, cx| {
+            pane.replace_and_mark_text_in_range(None, "´", Some(1..1), window, cx);
+        })
+        .unwrap();
+        self.save("dead-key.png");
+        let during = self.io.take();
+        self.with_pane(|pane, window, cx| pane.replace_text_in_range(None, "é", window, cx))
+            .unwrap();
+        let got = self.io.input();
+        self.expect(
+            "a dead key sequence sends the composed character",
+            during.is_empty() && got == "é".as_bytes(),
+            format!("during {during:?}, sent {got:?}"),
         );
     }
 
@@ -595,6 +672,599 @@ impl Check {
             format!("sent {got:?}, clipboard {clip:?}"),
         );
         self.feed(b"\x1b[?1000l\x1b[?1006l");
+    }
+
+    fn fonts(&mut self) {
+        // The bundled Geist Mono is the default, with no system install.
+        let family = self
+            .with_pane(|pane, _, _| pane.metrics.as_ref().map(|m| m.font.family.to_string()))
+            .unwrap();
+        self.expect(
+            "the terminal font is the bundled Geist Mono",
+            family.as_deref() == Some("Geist Mono"),
+            format!("{family:?}"),
+        );
+
+        // Every glyph of the fallback showcase comes from some font: no
+        // `.notdef` (glyph 0, the missing-glyph box).
+        self.reset_screen();
+        let sample = "Geist Mono → 漢字かな한국어 👍🎉 ✓ │ ⏺ ✻ ⎿ \u{e0a0} \u{e0b0} \u{f121} \u{f07b} \u{e7a8}";
+        self.feed(format!("{sample}\r\n").as_bytes());
+        self.save("fallback.png");
+        let missing = self
+            .handle
+            .update(&mut self.cx, |_, window, _| {
+                use crate::elements::terminal::metrics::{terminal_font, SYMBOLS_FAMILY};
+                let text_system = window.text_system().clone();
+                let glyphs = |ch: char, font: gpui::Font| -> Vec<u32> {
+                    let text: gpui::SharedString = ch.to_string().into();
+                    let run = gpui::TextRun {
+                        len: text.len(),
+                        font,
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = text_system.shape_line(text, px(13.0), &[run], None);
+                    line.runs.iter().flat_map(|r| r.glyphs.iter()).map(|g| g.id.0).collect()
+                };
+                let mut missing = Vec::new();
+                let mut private_use = Vec::new();
+                for ch in sample.chars().filter(|c| *c != ' ') {
+                    let got = glyphs(ch, terminal_font("Geist Mono"));
+                    // A glyph no font has comes back as `.notdef` (glyph 0).
+                    if got.is_empty() || got.contains(&0) {
+                        missing.push(format!("{ch}: no glyph"));
+                    }
+                    if ('\u{e000}'..='\u{f8ff}').contains(&ch) {
+                        private_use.push((ch, got));
+                    }
+                }
+                // LastResort draws every character of a block with the same
+                // box glyph; the bundled symbols font has one per icon. So
+                // distinct icons sharing a glyph are boxes.
+                println!("      private-use glyphs: {private_use:?}");
+                let mut ids: Vec<&Vec<u32>> = private_use.iter().map(|(_, g)| g).collect();
+                ids.sort();
+                ids.dedup();
+                if ids.len() < private_use.len() {
+                    missing.push(format!("Nerd Font icons drawn as LastResort boxes ({SYMBOLS_FAMILY} not in the cascade)"));
+                }
+                missing
+            })
+            .unwrap();
+        self.expect(
+            "CJK, emoji, symbols, and Nerd Font icons all find a font (no boxes)",
+            missing.is_empty(),
+            format!("missing glyphs for {missing:?}"),
+        );
+
+        // A font change applies live: the cell is re-measured and the new
+        // grid size reported.
+        let (w0, h0) = self.cell();
+        self.io.take();
+        self.cx.update(|cx| {
+            TerminalSettings::set(
+                TerminalSettings {
+                    font_size: 18.0,
+                    ..TerminalSettings::default()
+                },
+                cx,
+            )
+        });
+        self.draw();
+        self.cx.advance_clock(Duration::from_millis(100));
+        self.draw();
+        let (w1, h1) = self.cell();
+        let sent = self.io.take();
+        let want = Size::from_pixels(1000.0, 600.0, w1, h1);
+        self.expect(
+            "a font size change re-measures the cell and reports the new grid",
+            w1 > w0 && h1 > h0 && sent.contains(&Sent::Resize(want)),
+            format!("cell {w0}x{h0} -> {w1}x{h1}, sent {sent:?}"),
+        );
+        self.save("font-18.png");
+        self.cx.update(|cx| TerminalSettings::set(TerminalSettings::default(), cx));
+        self.draw();
+        self.cx.advance_clock(Duration::from_millis(100));
+        self.draw();
+        let (w, h) = self.cell();
+        let back = Size::from_pixels(1000.0, 600.0, w, h);
+        self.with_pane(|pane, _, cx| pane.session_resized(back, cx))
+            .unwrap();
+        self.io.take();
+    }
+
+    fn option_key(&mut self) {
+        self.reset_screen();
+        // The default: Option types characters, so Option+E reaches the input
+        // handler (a dead key on a real keyboard), nothing is encoded.
+        let got = self.keys_sent("alt-b");
+        self.expect(
+            "with Option typing characters, Option+B sends no Meta sequence",
+            !got.starts_with(b"\x1b"),
+            format!("{got:?}"),
+        );
+        self.cx.update(|cx| {
+            TerminalSettings::set(
+                TerminalSettings {
+                    option_as_meta: shelbi_state::OptionAsMeta::Both,
+                    ..TerminalSettings::default()
+                },
+                cx,
+            )
+        });
+        self.draw();
+        let got = self.keys_sent("alt-b");
+        self.expect(
+            "with Option as Meta (a live setting change), Option+B is ESC b",
+            got == b"\x1bb",
+            format!("{got:?}"),
+        );
+        self.cx.update(|cx| TerminalSettings::set(TerminalSettings::default(), cx));
+        self.draw();
+    }
+
+    fn press(&mut self, at: Point<Pixels>, clicks: usize, modifiers: Modifiers) {
+        self.cx.simulate_mouse_move(self.window, at, None, modifiers);
+        self.cx.simulate_event(
+            self.window,
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count: clicks,
+                first_mouse: false,
+            },
+        );
+        self.cx.simulate_event(
+            self.window,
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count: clicks,
+            },
+        );
+        self.draw();
+    }
+
+    fn modifiers(&mut self, modifiers: Modifiers) {
+        self.cx.simulate_event(
+            self.window,
+            gpui::ModifiersChangedEvent {
+                modifiers,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn clipboard(&mut self) -> Option<String> {
+        self.cx.read_from_clipboard().and_then(|c| c.text())
+    }
+
+    fn mouse_modes(&mut self) {
+        self.reset_screen();
+        self.feed(b"0123456789\r\n0123456789");
+        let from = self.at(1, 0);
+        let to = self.at(4, 0);
+        // Click reporting only (1000): a press and release, no motion.
+        self.feed(b"\x1b[?1000h\x1b[?1006h");
+        self.io.take();
+        self.drag(from, to, Modifiers {
+            alt: true,
+            ..Default::default()
+        });
+        let got = String::from_utf8_lossy(&self.io.input()).to_string();
+        self.expect(
+            "under click-only reporting an Alt-drag forwards press and release, no motion",
+            got == "\x1b[<8;2;1M\x1b[<8;5;1m",
+            format!("{got:?}"),
+        );
+        // Button-event tracking (1002): the drag's motion too, once per cell.
+        self.feed(b"\x1b[?1002h");
+        self.drag(from, to, Modifiers {
+            alt: true,
+            ..Default::default()
+        });
+        let got = String::from_utf8_lossy(&self.io.input()).to_string();
+        self.expect(
+            "under button-event tracking the drag's motion is forwarded, once per cell",
+            got.starts_with("\x1b[<8;2;1M") && got.contains("\x1b[<40;5;1M") && got.ends_with("\x1b[<8;5;1m"),
+            format!("{got:?}"),
+        );
+        // Any-event tracking (1003): plain motion with no button.
+        self.feed(b"\x1b[?1003h");
+        self.io.take();
+        let at = self.at(6, 1);
+        self.cx
+            .simulate_mouse_move(self.window, at, None, Modifiers::default());
+        let got = String::from_utf8_lossy(&self.io.input()).to_string();
+        self.expect(
+            "under any-event tracking plain motion is forwarded (button 35)",
+            got == "\x1b[<35;7;2M",
+            format!("{got:?}"),
+        );
+        // Legacy X10 encoding when the program didn't ask for SGR. (Each of
+        // 1000/1002/1003 replaces the others, as in xterm.)
+        self.feed(b"\x1b[?1006l\x1b[?1003l\x1b[?1000h");
+        self.io.take();
+        let cell = self.at(2, 1);
+        self.cx.simulate_click(self.window, cell, Modifiers::default());
+        let got = self.io.input();
+        self.expect(
+            "without SGR a click is X10-encoded",
+            got == [0x1b, b'[', b'M', 32, 35, 34, 0x1b, b'[', b'M', 35, 35, 34],
+            format!("{got:?}"),
+        );
+        self.feed(b"\x1b[?1000l");
+    }
+
+    fn selection_modes(&mut self) {
+        self.reset_screen();
+        self.feed(b"cargo test src/main.rs:42 ok\r\nsecond line here\r\nabcdefgh\r\nijklmnop\r\nqrstuvwx");
+        // Double-click: a word (`:` ends it).
+        let at = self.at(14, 0);
+        self.press(at, 1, Modifiers::default());
+        let at = self.at(14, 0);
+        self.press(at, 2, Modifiers::default());
+        let clip = self.clipboard();
+        self.expect(
+            "a double-click selects and copies the word",
+            clip.as_deref() == Some("src/main.rs"),
+            format!("{clip:?}"),
+        );
+        self.save("select-word.png");
+        // Triple-click: the line.
+        let at = self.at(3, 1);
+        self.press(at, 3, Modifiers::default());
+        let clip = self.clipboard();
+        self.expect(
+            "a triple-click selects and copies the line",
+            clip.as_deref() == Some("second line here"),
+            format!("{clip:?}"),
+        );
+        // Alt-drag: a block.
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let (from, to) = (self.at(2, 2), self.at(4, 4));
+        self.drag(from, to, alt);
+        self.save("select-block.png");
+        let clip = self.clipboard();
+        self.expect(
+            "an Alt-drag selects and copies a block",
+            clip.as_deref() == Some("cde\nklm\nstu"),
+            format!("{clip:?}"),
+        );
+        // Cmd+C copies the selection again.
+        self.cx
+            .write_to_clipboard(ClipboardItem::new_string("other".into()));
+        self.cx.simulate_keystrokes(self.window, "cmd-c");
+        let clip = self.clipboard();
+        self.expect(
+            "Cmd+C copies the selection",
+            clip.as_deref() == Some("cde\nklm\nstu"),
+            format!("{clip:?}"),
+        );
+    }
+
+    fn selection_autoscroll(&mut self) {
+        self.reset_screen();
+        let mut history = String::new();
+        for i in 0..100 {
+            history.push_str(&format!("auto line {i}\r\n"));
+        }
+        self.feed(history.as_bytes());
+        let from = self.at(2, 3);
+        let above = point(from.x, px(-20.0));
+        self.cx
+            .simulate_mouse_down(self.window, from, MouseButton::Left, Modifiers::default());
+        let inside = self.at(2, 1);
+        self.cx
+            .simulate_mouse_move(self.window, inside, MouseButton::Left, Modifiers::default());
+        self.cx
+            .simulate_mouse_move(self.window, above, MouseButton::Left, Modifiers::default());
+        self.cx.advance_clock(Duration::from_millis(520));
+        self.draw();
+        let offset = self.scroll_offset();
+        self.cx
+            .simulate_mouse_up(self.window, above, MouseButton::Left, Modifiers::default());
+        self.draw();
+        let (offset_after, selected) = self
+            .with_pane(|pane, _, _| {
+                let v = pane.terminal_view();
+                (v.scroll_offset(), v.selection_text().unwrap_or_default())
+            })
+            .unwrap();
+        let lines = selected.lines().count();
+        self.expect(
+            "holding a selection drag above the grid scrolls back and extends the selection",
+            offset >= 5 && offset_after == offset && lines > 5,
+            format!("offset {offset} -> {offset_after}, {lines} lines selected"),
+        );
+    }
+
+    fn selection_survives_output(&mut self) {
+        self.reset_screen();
+        self.feed(b"keep this text\r\n");
+        let (from, to) = (self.at(0, 0), self.at(3, 0));
+        self.drag(from, to, Modifiers::default());
+        let mut more = String::new();
+        for i in 0..80 {
+            more.push_str(&format!("more output {i}\r\n"));
+        }
+        self.feed(more.as_bytes());
+        let text = self
+            .with_pane(|pane, _, _| pane.terminal_view().selection_text())
+            .unwrap();
+        self.expect(
+            "a selection survives output that scrolls it into history",
+            text.as_deref() == Some("keep"),
+            format!("{text:?}"),
+        );
+        self.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        let gone = self
+            .with_pane(|pane, _, _| pane.terminal_view().selection().is_none())
+            .unwrap();
+        self.expect(
+            "the selection goes when the text under it is erased",
+            gone,
+            "still selected",
+        );
+    }
+
+    fn scrolling(&mut self) {
+        self.reset_screen();
+        let mut history = String::new();
+        for i in 0..300 {
+            history.push_str(&format!("scroll line {i}\r\n"));
+        }
+        self.feed(history.as_bytes());
+        let middle = self.at(10, 10);
+        self.wheel(middle, 20.0, Modifiers::default());
+        let offset = self.scroll_offset();
+        let top_before = self.row_text_on_screen(0);
+        self.feed(b"new output 1\r\nnew output 2\r\nnew output 3\r\n");
+        let top_after = self.row_text_on_screen(0);
+        let offset_after = self.scroll_offset();
+        self.expect(
+            "new output while scrolled up doesn't move the view",
+            top_before == top_after && offset_after == offset + 3,
+            format!("top {top_before:?} -> {top_after:?}, offset {offset} -> {offset_after}"),
+        );
+        self.save("scrolled-jump.png");
+
+        // The scrollbar shows the position; dragging its thumb to the top
+        // reaches the oldest line.
+        let thumb = self
+            .with_pane(|pane, _, _| pane.scrollbar_thumb_bounds())
+            .unwrap();
+        self.expect("the scrollbar shows with history", thumb.is_some(), "no thumb");
+        if let Some(thumb) = thumb {
+            let grab = thumb.center();
+            let top = point(grab.x, px(-50.0));
+            self.cx
+                .simulate_mouse_down(self.window, grab, MouseButton::Left, Modifiers::default());
+            self.cx
+                .simulate_mouse_move(self.window, top, MouseButton::Left, Modifiers::default());
+            self.cx
+                .simulate_mouse_up(self.window, top, MouseButton::Left, Modifiers::default());
+            self.draw();
+            let (offset, history) = self
+                .with_pane(|pane, _, _| {
+                    let v = pane.terminal_view();
+                    (v.scroll_offset(), v.emulator().history_len())
+                })
+                .unwrap();
+            self.expect(
+                "dragging the scrollbar thumb to the top scrolls to the oldest line",
+                offset == history,
+                format!("offset {offset} of {history}"),
+            );
+            // A click low on the track jumps most of the way back down.
+            let bounds = self
+                .with_pane(|pane, _, _| pane.element_bounds())
+                .unwrap()
+                .unwrap();
+            let low = point(thumb.center().x, bounds.bottom() - px(5.0));
+            self.cx
+                .simulate_click(self.window, low, Modifiers::default());
+            let offset = self.scroll_offset();
+            self.expect(
+                "a click on the track jumps toward it",
+                offset < 20,
+                format!("offset {offset}"),
+            );
+        }
+
+        // "Jump to bottom".
+        self.wheel(middle, 15.0, Modifiers::default());
+        self.save("jump-to-bottom.png");
+        let bounds = self
+            .with_pane(|pane, _, _| pane.element_bounds())
+            .unwrap()
+            .unwrap();
+        let button = point(bounds.right() - px(40.0), bounds.bottom() - px(24.0));
+        self.cx
+            .simulate_click(self.window, button, Modifiers::default());
+        let offset = self.scroll_offset();
+        self.expect(
+            "the Jump to bottom button returns to the live bottom",
+            offset == 0,
+            format!("offset {offset}"),
+        );
+        // Typing also returns to the bottom.
+        self.wheel(middle, 5.0, Modifiers::default());
+        self.keys_sent("x");
+        let offset = self.scroll_offset();
+        self.expect("typing returns to the live bottom", offset == 0, format!("offset {offset}"));
+    }
+
+    fn row_text_on_screen(&mut self, row: u16) -> String {
+        self.with_pane(|pane, _, _| {
+            let v = pane.terminal_view();
+            v.screen_text().rows.get(row as usize).cloned().unwrap_or_default()
+        })
+        .unwrap()
+    }
+
+    fn find_bar(&mut self) {
+        self.reset_screen();
+        let mut text = String::new();
+        for i in 0..120 {
+            if i % 30 == 5 {
+                text.push_str(&format!("line {i} has a Needle in it\r\n"));
+            } else {
+                text.push_str(&format!("line {i}\r\n"));
+            }
+        }
+        text.push_str("the last needle");
+        self.feed(text.as_bytes());
+        self.io.take();
+        self.cx.simulate_keystrokes(self.window, "cmd-f");
+        self.cx.simulate_input(self.window, "needle");
+        self.draw();
+        let state = self.with_pane(|pane, _, _| pane.search_state()).unwrap();
+        let sent = self.io.take();
+        self.expect(
+            "Cmd+F opens the find bar; typing searches (smart case) and reaches only the bar",
+            state == Some(("needle".into(), "5 of 5".into())) && sent.is_empty(),
+            format!("{state:?}, sent {sent:?}"),
+        );
+        self.save("find-bar.png");
+        self.cx.simulate_keystrokes(self.window, "enter enter");
+        let state = self.with_pane(|pane, _, _| pane.search_state()).unwrap();
+        let offset = self.scroll_offset();
+        self.expect(
+            "Enter steps to older matches and scrolls them into view",
+            state.as_ref().map(|s| s.1.as_str()) == Some("3 of 5") && offset > 0,
+            format!("{state:?}, offset {offset}"),
+        );
+        self.cx.simulate_keystrokes(self.window, "shift-enter");
+        let state = self.with_pane(|pane, _, _| pane.search_state()).unwrap();
+        self.expect(
+            "Shift+Enter steps to the newer match",
+            state.as_ref().map(|s| s.1.as_str()) == Some("4 of 5"),
+            format!("{state:?}"),
+        );
+        self.cx.simulate_keystrokes(self.window, "cmd-g");
+        let state = self.with_pane(|pane, _, _| pane.search_state()).unwrap();
+        self.expect(
+            "Cmd+G steps older too",
+            state.as_ref().map(|s| s.1.as_str()) == Some("3 of 5"),
+            format!("{state:?}"),
+        );
+        self.cx.simulate_input(self.window, "X");
+        let state = self.with_pane(|pane, _, _| pane.search_state()).unwrap();
+        self.expect(
+            "an uppercase letter makes the search case-sensitive",
+            state.as_ref().map(|s| s.1.as_str()) == Some("No matches"),
+            format!("{state:?}"),
+        );
+        self.cx.simulate_keystrokes(self.window, "backspace");
+        self.save("find-bar-stepped.png");
+        self.cx.simulate_keystrokes(self.window, "escape");
+        let (state, matches) = self
+            .with_pane(|pane, _, _| (pane.search_state(), pane.terminal_view().search_matches().len()))
+            .unwrap();
+        let sent = self.io.take();
+        self.expect(
+            "Escape closes the bar and clears the highlights, sending nothing",
+            state.is_none() && matches == 0 && sent.is_empty(),
+            format!("{state:?}, {matches} matches, sent {sent:?}"),
+        );
+        let got = self.keys_sent("a");
+        self.expect("after closing, keys reach the session again", got == b"a", format!("{got:?}"));
+    }
+
+    fn links(&mut self) {
+        self.reset_screen();
+        self.feed(b"see https://example.com/docs and src/main.rs:12:3 here");
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        let pane_sink = sink.clone();
+        self.with_pane(|pane, _, _| {
+            pane.set_link_sink(pane_sink);
+            pane.set_cwd(PathBuf::from("/tmp"));
+        })
+        .unwrap();
+        let cmd = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let url_at = self.at(8, 0);
+        self.cx
+            .simulate_mouse_move(self.window, url_at, None, Modifiers::default());
+        let hovered = self
+            .with_pane(|pane, _, _| pane.hovered_link().cloned())
+            .unwrap();
+        self.expect("without Cmd nothing is underlined", hovered.is_none(), format!("{hovered:?}"));
+        self.modifiers(cmd);
+        self.draw();
+        let hovered = self
+            .with_pane(|pane, _, _| pane.hovered_link().map(|l| l.target.clone()))
+            .unwrap();
+        self.expect(
+            "holding Cmd over a URL underlines it",
+            hovered == Some(LinkTarget::Url("https://example.com/docs".into())),
+            format!("{hovered:?}"),
+        );
+        self.save("link-hover.png");
+        self.cx.simulate_click(self.window, url_at, cmd);
+        let path_at = self.at(36, 0);
+        self.cx.simulate_click(self.window, path_at, cmd);
+        let opened = sink.borrow().clone();
+        self.expect(
+            "Cmd+click opens the URL, and the path at its line and column",
+            opened
+                == vec![
+                    LinkTarget::Url("https://example.com/docs".into()),
+                    LinkTarget::Path {
+                        path: "src/main.rs".into(),
+                        line: Some(12),
+                        column: Some(3),
+                    },
+                ],
+            format!("{opened:?}"),
+        );
+        let sent = self.io.take();
+        self.expect(
+            "a Cmd+click doesn't reach the session or start a selection",
+            sent.is_empty(),
+            format!("{sent:?}"),
+        );
+        self.modifiers(Modifiers::default());
+        self.draw();
+        let hovered = self
+            .with_pane(|pane, _, _| pane.hovered_link().cloned())
+            .unwrap();
+        self.expect("releasing Cmd removes the underline", hovered.is_none(), format!("{hovered:?}"));
+    }
+
+    fn alt_screen(&mut self) {
+        self.reset_screen();
+        // `less`: the alternate screen, application cursor keys.
+        self.feed(b"\x1b[?1049h\x1b[?1h\x1b[Hpager line one\r\npager line two");
+        self.io.take();
+        let middle = self.at(5, 5);
+        self.wheel(middle, 2.0, Modifiers::default());
+        let got = self.io.input();
+        self.expect(
+            "on the alternate screen the wheel sends arrow keys (alternate scroll)",
+            got == b"\x1bOA\x1bOA",
+            format!("{got:?}"),
+        );
+        let (from, to) = (self.at(0, 1), self.at(9, 1));
+        self.drag(from, to, Modifiers::default());
+        let clip = self.clipboard();
+        self.expect(
+            "selection works on the alternate screen (copying out of a pager)",
+            clip.as_deref() == Some("pager line"),
+            format!("{clip:?}"),
+        );
+        self.feed(b"\x1b[?1l\x1b[?1049l");
     }
 
     fn resize(&mut self) {

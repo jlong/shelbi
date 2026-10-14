@@ -6434,6 +6434,7 @@ dependencies = [
  "shelbi-term",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

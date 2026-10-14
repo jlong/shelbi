@@ -240,6 +240,40 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
 - **`VisualTestAppContext` has no `debug_bounds`** (only the test contexts
   do: the rendered frame is crate-private), so the offscreen harnesses check
   view state rather than drawn selectors.
+- **`text_system().add_fonts` fonts can't be fallbacks.** gpui keeps added
+  fonts in a font-kit memory source, which resolves a *primary* family, but a
+  `Font`'s `fallbacks` become a CoreText cascade list that CoreText resolves by
+  name among the fonts *it* knows. An embedded font named there is skipped and
+  the glyph falls to LastResort (a box). `assets::load_fonts` also registers
+  the terminal's fallbacks with `CTFontManagerRegisterGraphicsFont`
+  (process scope). The visual check catches a regression: LastResort draws
+  every private-use icon with one shared glyph id. (`get_font_for_id` can't
+  name a font CoreText picked during fallback; it returns `None`.)
+- **Modifier changes travel the focus path only.** A `ModifiersChangedEvent`
+  goes from the focused node up to the root, so a listener registered in a
+  custom element's paint (a child of the focused view's div) never hears it.
+  The terminal registers `on_modifiers_changed` on the pane's own div.
+- **Modifiers don't say which side.** `Modifiers::alt` is either Option key;
+  `desktop.option_as_meta: left|right` reads the device-dependent bits
+  (`NX_DEVICELALTKEYMASK` 0x20, `NX_DEVICERALTKEYMASK` 0x40) from
+  `CGEventSourceFlagsState` at key-down instead.
+- **The Option key and dead keys.** A key-down the element leaves unhandled
+  goes to the platform input handler, which is where macOS composes dead keys
+  (`setMarkedText("´")`, then `insertText("é")`) and IME text. So the terminal
+  encodes a character key itself only when it has a control meaning (Ctrl, or
+  Option while Option is Meta); everything else must stay unhandled. Option
+  with a named key (Enter, arrows, Backspace, Delete) has no dead-key meaning
+  and is always encoded as Meta, whatever `desktop.option_as_meta` says.
+- **AccessKit is live only while an assistive technology is connected.**
+  `Window::is_a11y_active()` gates the work; a node needs both an id and a
+  role; `div().a11y_synthetic_children(..)` adds text runs under a node that
+  has real keyboard focus (its `track_focus` registers it as focusable). The
+  test platform never activates AccessKit, so the visual check can't see the
+  tree.
+- `simulate_keystrokes("alt-b")` in a `VisualTestAppContext` runs no input
+  method: a key the app leaves unhandled types nothing. The visual check
+  drives IME and dead-key text through the `EntityInputHandler` methods
+  directly, which is the path macOS calls.
 
 ## Build time and binary size
 
