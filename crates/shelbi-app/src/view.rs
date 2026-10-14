@@ -223,6 +223,132 @@ impl WorkspaceRow {
     }
 }
 
+impl WorkspaceBadge {
+    /// The state in words, for a header or tooltip beside the glyph.
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkspaceBadge::Working => "Working",
+            WorkspaceBadge::AwaitingInput => "Awaiting input",
+            WorkspaceBadge::AwaitingPermission => "Needs permission",
+            WorkspaceBadge::Paused => "Paused",
+            WorkspaceBadge::Idle => "Idle",
+            WorkspaceBadge::Loading => "Loading",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace view
+// ---------------------------------------------------------------------------
+
+/// What a workspace view resolved about its workspace's task, read off the UI
+/// thread (`shelbi_orchestrator::workspace_session::workspace_details`). The
+/// sidebar row carries the live state and the task id; this carries what the
+/// row doesn't: the title, the branch, the body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceDetailsInfo {
+    /// The in-progress task's id and title, when the workspace has one.
+    pub task: Option<(String, String)>,
+    /// The task's markdown body (the description the header's More opens).
+    pub body: String,
+    /// The branch: the task's, else the local worktree's.
+    pub branch: Option<String>,
+    /// The worktree path on the workspace's machine.
+    pub worktree: String,
+    /// The resolved editor's display name (`Vim`, ...).
+    pub editor_name: String,
+}
+
+/// The header above a workspace's agent: which task it is working (id and
+/// title), on which branch and machine, and its live state. Built from the
+/// sidebar's [`WorkspaceRow`] (live: the state and the task id move with every
+/// refresh) and the resolved [`WorkspaceDetailsInfo`] (the title and branch,
+/// read once per task).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHeader {
+    pub name: String,
+    /// The task id, when the workspace is working one.
+    pub task_id: Option<String>,
+    /// The task's title, once resolved for *that* task (a title read for the
+    /// previous task is never shown under a new id).
+    pub title: Option<String>,
+    pub branch: Option<String>,
+    pub machine: String,
+    pub is_remote: bool,
+    /// The agent's display name (`Developer`), when the row knows it.
+    pub agent: Option<String>,
+    /// The live state: the sidebar's badge, so the two never disagree.
+    pub state: WorkspaceBadge,
+}
+
+impl WorkspaceHeader {
+    /// The header for `row`, filling the title (and the task's branch) from
+    /// `details` only when they describe the task the row says is running.
+    pub fn build(row: &WorkspaceRow, details: Option<&WorkspaceDetailsInfo>) -> Self {
+        let task_details = details.and_then(|d| d.task.as_ref());
+        let same_task = matches!(
+            (row.current_task.as_deref(), task_details),
+            (Some(id), Some((resolved, _))) if id == resolved
+        );
+        let title = if same_task {
+            task_details.map(|(_, title)| title.clone())
+        } else {
+            None
+        };
+        // A branch resolved for a different task (or for the worktree while
+        // idle) is stale once the row moves on.
+        let details_current = same_task || (row.current_task.is_none() && task_details.is_none());
+        let branch = details
+            .filter(|_| details_current)
+            .and_then(|d| d.branch.clone());
+        WorkspaceHeader {
+            name: row.name.clone(),
+            task_id: row.current_task.clone(),
+            title,
+            branch,
+            machine: row.machine.clone(),
+            is_remote: row.is_remote,
+            agent: row.agent.as_deref().map(title_case),
+            state: row.badge,
+        }
+    }
+
+    /// Whether `details` is out of date for this header: the row names a task
+    /// the details don't describe (or the reverse), so the view re-reads them.
+    pub fn needs_details(row: &WorkspaceRow, details: Option<&WorkspaceDetailsInfo>) -> bool {
+        let resolved = details.and_then(|d| d.task.as_ref()).map(|(id, _)| id.as_str());
+        details.is_none() || row.current_task.as_deref() != resolved
+    }
+
+    /// The task line: `id  title`, the id alone until the title resolves, or
+    /// `None` while idle.
+    pub fn task_line(&self) -> Option<String> {
+        let id = self.task_id.as_ref()?;
+        Some(match &self.title {
+            Some(title) if !title.is_empty() => format!("{id}  {title}"),
+            _ => id.clone(),
+        })
+    }
+
+    /// The location line: `machine · branch`, with the branch dropped when
+    /// unknown and `(remote)` marking a machine reached over SSH.
+    pub fn location_line(&self) -> String {
+        let mut machine = self.machine.clone();
+        if self.is_remote {
+            machine.push_str(" (remote)");
+        }
+        match &self.branch {
+            Some(branch) if !branch.is_empty() => format!("{machine} · {branch}"),
+            _ => machine,
+        }
+    }
+
+    /// The state badge as the sidebar draws it, plus its words.
+    pub fn state_decoration(&self) -> Decoration {
+        self.state.decoration()
+    }
+}
+
 /// The fixed nav builtins, in sidebar order: the orchestrator chat, the issues
 /// board, the activity feed. Machines is reachable from the command palette,
 /// not the sidebar nav.
@@ -1895,5 +2021,88 @@ mod tests {
         let dec = ReviewState::Pending.decoration();
         assert_eq!(dec.glyph, "·");
         assert_eq!(dec.color, DecorationColor::DarkGray);
+    }
+
+    fn header_row(task: Option<&str>, badge: WorkspaceBadge, remote: bool) -> WorkspaceRow {
+        WorkspaceRow {
+            name: "alpha".into(),
+            machine: if remote { "gpu-box" } else { "hub" }.into(),
+            is_remote: remote,
+            current_task: task.map(str::to_string),
+            agent: task.map(|_| "developer".to_string()),
+            badge,
+        }
+    }
+
+    fn details(task: Option<(&str, &str)>, branch: Option<&str>) -> WorkspaceDetailsInfo {
+        WorkspaceDetailsInfo {
+            task: task.map(|(id, title)| (id.to_string(), title.to_string())),
+            branch: branch.map(str::to_string),
+            ..WorkspaceDetailsInfo::default()
+        }
+    }
+
+    #[test]
+    fn a_working_workspace_header_shows_task_branch_machine_and_state() {
+        let row = header_row(Some("cold-start"), WorkspaceBadge::Working, false);
+        let d = details(Some(("cold-start", "Cold-start cache")), Some("jlong/cold-start"));
+        let h = WorkspaceHeader::build(&row, Some(&d));
+        assert_eq!(h.task_line().as_deref(), Some("cold-start  Cold-start cache"));
+        assert_eq!(h.location_line(), "hub · jlong/cold-start");
+        assert_eq!(h.agent.as_deref(), Some("Developer"));
+        assert_eq!(h.state, WorkspaceBadge::Working);
+        assert_eq!(h.state.label(), "Working");
+        assert_eq!(h.state_decoration().glyph, "⏵");
+        assert!(!WorkspaceHeader::needs_details(&row, Some(&d)));
+    }
+
+    #[test]
+    fn the_header_shows_the_id_alone_until_the_title_resolves() {
+        let row = header_row(Some("cold-start"), WorkspaceBadge::AwaitingInput, false);
+        let h = WorkspaceHeader::build(&row, None);
+        assert_eq!(h.task_line().as_deref(), Some("cold-start"));
+        assert_eq!(h.location_line(), "hub");
+        assert_eq!(h.state.label(), "Awaiting input");
+        assert!(WorkspaceHeader::needs_details(&row, None));
+    }
+
+    #[test]
+    fn details_for_a_previous_task_never_label_a_new_one() {
+        // The row moved on to a new task; the details still describe the old.
+        let row = header_row(Some("next-task"), WorkspaceBadge::Working, false);
+        let stale = details(Some(("cold-start", "Cold-start cache")), Some("jlong/cold-start"));
+        let h = WorkspaceHeader::build(&row, Some(&stale));
+        assert_eq!(h.task_line().as_deref(), Some("next-task"));
+        assert_eq!(h.branch, None, "the old task's branch is not shown");
+        assert!(WorkspaceHeader::needs_details(&row, Some(&stale)));
+
+        // A handoff idled the row: the old task's title and branch go too.
+        let idle = header_row(None, WorkspaceBadge::Idle, false);
+        let h = WorkspaceHeader::build(&idle, Some(&stale));
+        assert_eq!(h.task_line(), None);
+        assert_eq!(h.branch, None);
+        assert_eq!(h.state.label(), "Idle");
+        assert!(WorkspaceHeader::needs_details(&idle, Some(&stale)));
+    }
+
+    #[test]
+    fn an_idle_workspace_header_shows_its_worktree_branch() {
+        let row = header_row(None, WorkspaceBadge::Idle, false);
+        let d = details(None, Some("main"));
+        let h = WorkspaceHeader::build(&row, Some(&d));
+        assert_eq!(h.task_line(), None);
+        assert_eq!(h.agent, None);
+        assert_eq!(h.location_line(), "hub · main");
+        assert!(!WorkspaceHeader::needs_details(&row, Some(&d)));
+    }
+
+    #[test]
+    fn a_remote_workspace_header_names_its_machine() {
+        let row = header_row(Some("t-9"), WorkspaceBadge::AwaitingPermission, true);
+        let d = details(Some(("t-9", "Ship it")), Some("jlong/t-9"));
+        let h = WorkspaceHeader::build(&row, Some(&d));
+        assert_eq!(h.location_line(), "gpu-box (remote) · jlong/t-9");
+        assert_eq!(h.state.label(), "Needs permission");
+        assert_eq!(h.state_decoration().color, DecorationColor::Red);
     }
 }

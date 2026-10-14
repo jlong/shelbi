@@ -104,7 +104,13 @@ impl Home {
     }
 
     fn start_daemon(&mut self) {
+        self.start_daemon_with(&[]);
+    }
+
+    /// Start the daemon with extra environment (`(name, value)` pairs).
+    fn start_daemon_with(&mut self, env: &[(&str, &str)]) {
         let child = Command::new(BIN)
+            .envs(env.iter().copied())
             .arg("daemon")
             .env("SHELBI_HOME", &self.path)
             .env("SHELBI_HUB_SOCK", &self.hub)
@@ -435,3 +441,121 @@ fn other_connected_clients_are_notified_of_a_change() {
     assert_eq!(note.verb, "move");
     assert_eq!(note.status, "todo");
 }
+
+/// Kill every live session under `home`'s sessions directory (the daemon spawns
+/// them detached, so they outlive it).
+fn kill_sessions(home: &Path) {
+    let Ok(sessions) = shelbi_client::list(&home.join("sessions")) else {
+        return;
+    };
+    for s in sessions.iter().filter(|s| s.alive) {
+        if let Ok((conn, _)) = shelbi_client::Connection::open(&s.sock, None, &[]) {
+            let _ = conn.kill(None);
+        }
+    }
+}
+
+/// `dt-workspace-view`: the daemon starts a workspace's user shell on request
+/// (`<project>/ws/<workspace>/shell`, a login shell in the worktree), reuses it
+/// when asked again, and ends it on `CloseShell`, leaving the agent's slot
+/// alone.
+#[test]
+fn the_daemon_starts_and_ends_a_workspaces_user_shell() {
+    use shelbi_proto::control::{WorkspaceSessionOp, WorkspaceSessionRequest};
+
+    let mut home = Home::new("shell");
+    let work_dir = home.path.join("w");
+    let worktree = work_dir.join(".shelbi/wt/dev");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        home.path.join("projects/p.yaml"),
+        format!(
+            "name: p\nrepo: /tmp/p\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: local\n    kind: local\n    work_dir: {}\n\
+             workspaces:\n  - {{ name: dev, machine: local, runner: claude }}\n",
+            work_dir.display()
+        ),
+    )
+    .unwrap();
+    // A plain `sh` as the login shell, so the test doesn't run the developer's.
+    home.start_daemon_with(&[("SHELL", "/bin/sh")]);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            kill_sessions(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(home.path.clone());
+
+    let req = |request_id, op| WorkspaceSessionRequest {
+        request_id,
+        project: "p".into(),
+        workspace: "dev".into(),
+        op,
+    };
+    let live_shells = |home: &Path| {
+        shelbi_client::list(&home.join("sessions"))
+            .map(|l| {
+                l.into_iter()
+                    .filter(|s| s.alive && s.meta.name == "p/ws/dev/shell")
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut client = connect(&home.control).unwrap();
+    client
+        .workspace_session(&req(1, WorkspaceSessionOp::EnsureShell), &mut discard())
+        .expect("ensure the shell");
+    assert!(
+        wait_until(Duration::from_secs(10), || live_shells(&home.path).len() == 1),
+        "the shell session never came up"
+    );
+    // Asking again reuses it.
+    client
+        .workspace_session(&req(2, WorkspaceSessionOp::EnsureShell), &mut discard())
+        .unwrap();
+    assert_eq!(live_shells(&home.path).len(), 1, "an ensure is idempotent");
+
+    // It is a shell in the worktree.
+    let shell = live_shells(&home.path).remove(0);
+    // Its socket binds a beat after the session is listed.
+    let mut opened = None;
+    assert!(wait_until(Duration::from_secs(10), || {
+        opened = shelbi_client::Connection::open(&shell.sock, None, shelbi_proto::capability::ALL).ok();
+        opened.is_some()
+    }));
+    let (conn, events) = opened.unwrap();
+    conn.attach(None).unwrap();
+    conn.input(b"pwd\r").unwrap();
+    let want = worktree.canonicalize().unwrap().display().to_string();
+    let rx = events.into_inner();
+    let mut seen = Vec::new();
+    let found = wait_until(Duration::from_secs(10), || {
+        while let Ok(ev) = rx.try_recv() {
+            if let shelbi_client::SessionEvent::Output { data, .. }
+            | shelbi_client::SessionEvent::Resync { replay: data, .. } = ev
+            {
+                seen.extend_from_slice(&data);
+            }
+        }
+        String::from_utf8_lossy(&seen).contains(&want)
+    });
+    assert!(found, "pwd in the shell names the worktree: {:?}", String::from_utf8_lossy(&seen));
+    drop(conn);
+
+    client
+        .workspace_session(&req(3, WorkspaceSessionOp::CloseShell), &mut discard())
+        .expect("close the shell");
+    assert!(
+        wait_until(Duration::from_secs(10), || live_shells(&home.path).is_empty()),
+        "the shell session ended"
+    );
+    // Closing an already-closed shell is fine.
+    client
+        .workspace_session(&req(4, WorkspaceSessionOp::CloseShell), &mut discard())
+        .unwrap();
+}
+

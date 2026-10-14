@@ -645,7 +645,8 @@ fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
 }
 
 /// Carry out one workspace-session request (the workspace-sidebar task):
-/// start/stop a dev workspace's editor/diff content sessions through
+/// start/stop a dev workspace's editor/diff content sessions, or its user
+/// shell (`dt-workspace-view`), through
 /// [`shelbi_orchestrator::workspace_session`], then report the result keyed by
 /// `request_id`. The dev-workspace twin of [`run_review_session_job`]; like it,
 /// these are not issue mutations, so they skip the per-issue lock and recheck —
@@ -664,6 +665,12 @@ fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>
         }
         WorkspaceSessionOp::Close => {
             workspace_session::close_content(&req.project, &req.workspace)
+        }
+        WorkspaceSessionOp::EnsureShell => {
+            workspace_session::ensure_user_shell(&req.project, &req.workspace)
+        }
+        WorkspaceSessionOp::CloseShell => {
+            workspace_session::close_user_shell(&req.project, &req.workspace)
         }
     };
     match result {

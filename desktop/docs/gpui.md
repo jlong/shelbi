@@ -228,6 +228,18 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   start, and `reset` drops it. A feed that grows at the top every refresh
   (Activity) therefore uses a plain `overflow_y_scroll` container, whose
   pixel offset survives re-renders.
+- **File drops** (`dt-workspace-view`). `on_drop::<ExternalPaths>` on an
+  element receives Finder drops; a test drives one with
+  `simulate_event(FileDropEvent::Entered { .. })` then `Submit`. gpui-pre
+  0.3.9's macOS platform delivers only file drags (`ExternalPaths`), so
+  dragging plain text from another app onto a terminal does nothing.
+- **Measuring an element for a drag** (the Workspace view's split divider): a
+  `canvas(prepaint, paint)` child with `absolute().size_full()` reports its
+  bounds in prepaint; store them in the view and `cx.notify()` only when they
+  change. `on_mouse_up_out` catches a release outside the element.
+- **`VisualTestAppContext` has no `debug_bounds`** (only the test contexts
+  do: the rendered frame is crate-private), so the offscreen harnesses check
+  view state rather than drawn selectors.
 
 ## Build time and binary size
 

@@ -308,10 +308,13 @@ impl SessionManager {
             // converts them to a `Message`. One arriving here would mean the
             // worker didn't retry, so treat it as a plain failure rather than
             // silently dropping it.
+            // The TUI's connector is local-only, so `Unreachable` (a remote
+            // machine's relay) never arrives; were it to, it is a failure.
             Err(
                 ConnectFailure::Starting(error)
                 | ConnectFailure::Awaiting(error)
-                | ConnectFailure::Message(error),
+                | ConnectFailure::Message(error)
+                | ConnectFailure::Unreachable(error),
             ) => Slot::Failed { target, error },
         };
         true

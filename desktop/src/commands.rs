@@ -73,14 +73,17 @@ pub trait CommandHost {
 pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
     match kind {
         CommandKind::ShowView(view) => dispatch_view(view, host),
-        // dt-workspace-view
+        // dt-workspace-view: the Workspace view. Selecting it attaches the
+        // agent; an idle workspace shows the TUI's idle placeholder (nothing
+        // is launched from here: the daemon dispatches agents).
         CommandKind::FocusWorkspace { workspace } => {
-            not_implemented(host, &format!("workspace:{workspace}"))
+            host.show_view(&View::Session(workspace.clone()))
         }
         // A queued task asks for its slot here; a serving one opens the
         // review view (dt-review-view).
         CommandKind::LoadReview { task_id } => host.load_review(task_id),
-        // dt-workspace-view
+        // Legacy spawned agents: the TUI doesn't show them either ("legacy
+        // spawned agents aren't shown here yet").
         CommandKind::FocusSession { session } => not_implemented(host, &format!("agent:{session}")),
         CommandKind::ToggleZen => host.toggle_zen(),
         CommandKind::OpenErrorLog => host.open_error_log(),
@@ -199,8 +202,8 @@ pub fn view_stub_id(view: &View) -> Option<String> {
         View::Machines => None,
         // dt-chat-view: the orchestrator chat.
         View::Session(name) if name == "orch" => None,
-        // dt-workspace-view
-        View::Session(name) => Some(format!("view:{name}")),
+        // dt-workspace-view: the Workspace view.
+        View::Session(_) => None,
     }
 }
 
@@ -300,7 +303,7 @@ mod tests {
                 CommandKind::FocusWorkspace {
                     workspace: s("alpha"),
                 },
-                "workspace:alpha",
+                "show:alpha",
             ),
             (CommandKind::LoadReview { task_id: s("t1") }, "load-review:t1"),
             (CommandKind::FocusSession { session: s("s1") }, "agent:s1"),
@@ -451,7 +454,7 @@ mod tests {
             (View::Activity, None),
             (View::Machines, None),
             (View::Session("orch".into()), None),
-            (View::Session("alpha".into()), Some("view:alpha")),
+            (View::Session("alpha".into()), None),
         ] {
             let mut host = Recorder::default();
             dispatch_view(&view, &mut host);
