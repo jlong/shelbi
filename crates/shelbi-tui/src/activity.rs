@@ -326,6 +326,26 @@ pub(crate) struct ActivityData {
     status: Option<String>,
 }
 
+#[cfg(test)]
+impl ActivityData {
+    /// An empty activity read whose status line carries `tag`, for tests that
+    /// need a stand-in without touching disk or the tracker and want to read back
+    /// which refresher produced it (e.g. asserting the activity source follows
+    /// the current project after a switch).
+    pub(crate) fn tagged_for_test(tag: &str) -> Self {
+        Self {
+            events: Vec::new(),
+            task_cache: HashMap::new(),
+            status: Some(tag.to_string()),
+        }
+    }
+
+    /// The status line, for tests to read back a [`Self::tagged_for_test`] tag.
+    pub(crate) fn tag_for_test(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+}
+
 /// How many previously-unresolved ids one off-thread activity read resolves.
 ///
 /// The shell reads the feed on a background worker and re-requests it on the

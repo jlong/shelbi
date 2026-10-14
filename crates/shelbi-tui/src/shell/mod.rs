@@ -243,37 +243,18 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // React to the daemon poller's layout events (review opened/closed/agent
     // recovered), with this process's own change bus as the setting-off
     // fallback — the same two sources the tmux sidebar drains
-    // (`rt-daemon-layout-split`), now driving the native review interface.
+    // (`rt-daemon-layout-split`), now driving the native review interface. The
+    // bus is project-agnostic (filtered per tick); the hub-socket layout
+    // subscriber is part of the per-project worker bundle below.
     state.layout_bus = Some(shelbi_state::subscribe_changes());
-    // Held for the loop's lifetime; dropping it stops the subscriber thread.
-    let (_layout_sub, layout_rx) = crate::layout_sub::spawn(project);
-    state.layout_rx = Some(layout_rx);
 
-    let proj = project.to_string();
-    let refresher = refresh::spawn(move |generation| read_snapshot(&proj, generation));
-    refresher.request();
+    // Spawn the per-project background workers (snapshot + activity refreshers +
+    // the change and layout hub-socket subscribers) for the launch project, and
+    // request an initial refresh. A project switch rebuilds this bundle for the new project
+    // (`ShellState::switch_project`), so every native view follows the current
+    // project rather than staying pinned to the launch one.
+    state.start_project_workers();
     let mut last_refresh = Instant::now();
-
-    // The activity feed resolves task titles, which on a remote (github) board is
-    // live `gh` traffic that can take seconds on a large closed history. It runs
-    // on its **own** refresher so a slow title-hydration pass never delays the
-    // sidebar/board snapshot above, and carries a persistent metadata cache so
-    // resolution is incremental and terminates (closed-history titles resolve
-    // once, then freeze) instead of re-sweeping done issues forever — the
-    // sidebar-never-loads / endless-refetch incident.
-    let activity_cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
-    let proj_activity = project.to_string();
-    let activity_refresher: refresh::Refresher<ActivityData> = {
-        let cache = Arc::clone(&activity_cache);
-        refresh::spawn(move |_generation| {
-            ActivityApp::read_activity_data(&proj_activity, &cache)
-        })
-    };
-    activity_refresher.request();
-
-    // Daemon change notifications drive refreshes (the native views don't poll);
-    // the periodic request below is the fallback for a hubless project.
-    let (_changes, change_rx) = changes::spawn(project);
 
     // Daemon-push listener: a background subscription — registered as this
     // attached client — that flips `reexec` on a re-exec push (this client is out
@@ -354,26 +335,22 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
 
         // Background sources (all non-blocking). A daemon change notification
         // triggers an immediate refresh; the periodic request is the fallback.
-        let mut changed = false;
-        let mut woke_workspaces: Vec<String> = Vec::new();
-        while let Ok(wake) = change_rx.try_recv() {
-            changed = true;
-            if let changes::ChangeWake::Workspace(ws) = wake {
-                woke_workspaces.push(ws);
-            }
-        }
+        // These read the current project's worker bundle, which a project switch
+        // replaces, so after a switch they follow the new project.
+        let (changed, woke_workspaces) = state.drain_change_wakes();
         if changed || last_refresh.elapsed() >= REFRESH_INTERVAL {
-            refresher.request();
-            // Drive the activity worker on the same cadence so its incremental
-            // title hydration keeps making progress (and keeps picking up new
-            // events) without ever gating the core snapshot below.
-            activity_refresher.request();
+            // Drives both the core snapshot refresher and the activity refresher
+            // (on the same cadence, so the activity feed's incremental title
+            // hydration keeps making progress without ever gating the core
+            // snapshot). Both live in the current project's worker bundle, so
+            // after a switch they follow the new project.
+            state.request_refresh();
             last_refresh = Instant::now();
         }
-        if let Some(snap) = refresher.latest() {
+        if let Some(snap) = state.latest_snapshot() {
             state.apply_snapshot(snap);
         }
-        if let Some(activity) = activity_refresher.latest() {
+        if let Some(activity) = state.latest_activity() {
             state.activity.apply_activity_data(activity);
             state.dirty = true;
         }
@@ -755,6 +732,72 @@ impl Bootstrap for DaemonBootstrap {
     }
 }
 
+/// The background workers bound to one project: the core snapshot refresher that
+/// feeds the sidebar / board / machines views, the activity refresher that feeds
+/// the activity feed, plus the two hub-socket subscribers (daemon change
+/// notifications and layout events). All are created for one project at spawn and
+/// never re-target themselves, so
+/// [`ShellState::switch_project`] rebuilds the whole bundle for the new project.
+/// Dropping the old bundle stops and joins every thread (each handle's `Drop`
+/// does so) and, crucially, drops the old refresher's snapshot receiver — any
+/// snapshot still in flight from the previous project is discarded rather than
+/// rendered over the new project's data.
+struct ProjectWorkers {
+    refresher: refresh::Refresher<ShellSnapshot>,
+    /// The activity feed's own refresher (sidebar/board never wait on its live
+    /// `gh` title hydration — #1631). It is part of the bundle, and carries a
+    /// **per-project** metadata cache, so a switch rebuilds it for the new
+    /// project with a fresh cache: one project's resolved titles can't leak into
+    /// another's feed.
+    activity_refresher: refresh::Refresher<ActivityData>,
+    /// Wakes from the daemon change subscriber, drained each tick.
+    change_rx: Receiver<changes::ChangeWake>,
+    /// Pushed layout events from the daemon poller, drained by
+    /// [`ShellState::poll_layout_events`].
+    layout_rx: Receiver<shelbi_state::LayoutEvent>,
+    /// RAII handles for the two subscriber threads; held only so their `Drop`
+    /// stops and joins them when the bundle is replaced. `None` in tests, which
+    /// skip the real hub-socket subscribers.
+    _changes: Option<changes::ChangeSubscription>,
+    _layout_sub: Option<crate::layout_sub::LayoutSubscription>,
+}
+
+/// Builds the per-project [`ProjectWorkers`] for a project. Injected onto
+/// [`ShellState`] so a test can record which project each (re)build was asked for
+/// and substitute a reader that touches no disk / socket; production uses
+/// [`production_workers`].
+type WorkersFactory = Arc<dyn Fn(&str) -> ProjectWorkers + Send + Sync>;
+
+/// The production [`WorkersFactory`]: the snapshot and activity refreshers
+/// reading real view data for `project` plus the two live hub-socket subscribers.
+fn production_workers(project: &str) -> ProjectWorkers {
+    let proj = project.to_string();
+    let refresher = refresh::spawn(move |generation| read_snapshot(&proj, generation));
+    // The activity feed resolves task titles, which on a remote (github) board is
+    // live `gh` traffic that can take seconds on a large closed history. It runs
+    // on its **own** refresher so a slow title-hydration pass never delays the
+    // sidebar/board snapshot (#1631), and carries a persistent metadata cache so
+    // resolution is incremental and terminates (closed-history titles resolve
+    // once, then freeze) instead of re-sweeping done issues forever. The cache is
+    // built here, fresh per project, so switching projects never carries one
+    // project's resolved titles into another's feed.
+    let activity_cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
+    let proj_activity = project.to_string();
+    let activity_refresher = refresh::spawn(move |_generation| {
+        ActivityApp::read_activity_data(&proj_activity, &activity_cache)
+    });
+    let (changes, change_rx) = changes::spawn(project);
+    let (layout_sub, layout_rx) = crate::layout_sub::spawn(project);
+    ProjectWorkers {
+        refresher,
+        activity_refresher,
+        change_rx,
+        layout_rx,
+        _changes: Some(changes),
+        _layout_sub: Some(layout_sub),
+    }
+}
+
 struct ShellState {
     client: ClientState,
     sessions: SessionManager,
@@ -800,10 +843,20 @@ struct ShellState {
     /// any other task never steals this client's view
     /// (`rt-tui-review-load-queued`).
     review_open_pending: Option<String>,
-    /// Pushed layout events from the daemon poller over the hub socket
-    /// (`rt-daemon-layout-split`), plus this process's own change bus as the
-    /// setting-off fallback. Drained by [`ShellState::poll_layout_events`].
-    layout_rx: Option<Receiver<shelbi_state::LayoutEvent>>,
+    /// The background workers for the current project (snapshot refresher + the
+    /// change and layout hub-socket subscribers). `None` until
+    /// [`ShellState::start_project_workers`] runs at startup; rebuilt for the new
+    /// project by [`ShellState::switch_project`] so every native view follows the
+    /// current project.
+    workers: Option<ProjectWorkers>,
+    /// Factory that builds [`ProjectWorkers`] for a project, injected so a test
+    /// can record the project each build is asked for.
+    make_workers: WorkersFactory,
+    /// This process's own change bus, the setting-off fallback that feeds layout
+    /// events when the producing poller lives in-process rather than the daemon
+    /// (`rt-daemon-layout-split`). Unlike the hub-socket subscriber it is
+    /// project-agnostic — [`ShellState::poll_layout_events`] filters it by the
+    /// current project each tick — so a project switch needs no rebind.
     layout_bus: Option<shelbi_state::ChangeSubscription>,
     /// Throttle for the open-review close-reconcile (the board read runs off the
     /// UI thread, at most ~1 Hz, and only while a review is open).
@@ -969,7 +1022,8 @@ impl ShellState {
             workspace: None,
             workspace_rx: None,
             workspace_opening: None,
-            layout_rx: None,
+            workers: None,
+            make_workers: Arc::new(production_workers),
             layout_bus: None,
             last_review_reconcile: Instant::now(),
             reconcile_rx: None,
@@ -1203,6 +1257,65 @@ impl ShellState {
     /// rebuilt for the new project and the restored view is applied to the main
     /// area. Agents in the old project keep running — switching is a view
     /// change, not a quit. Invoked from the command palette (`dispatch_effect`).
+    /// Build (or rebuild) the background workers for the current project and ask
+    /// the fresh refresher for a snapshot right away, so the new project's views
+    /// render without waiting for the periodic tick. Dropping the previous bundle
+    /// (if any) stops its threads and discards any in-flight snapshot from the old
+    /// project.
+    fn start_project_workers(&mut self) {
+        let project = self.client.project().unwrap_or_default().to_string();
+        let make = self.make_workers.clone();
+        // Replace first so the old bundle (and its snapshot receiver) is dropped
+        // before the new refresher is asked for data.
+        self.workers = Some(make(&project));
+        self.request_refresh();
+    }
+
+    /// Ask the current project's refreshers (the core snapshot and the activity
+    /// feed) for fresh data. No-op before the workers are started.
+    fn request_refresh(&self) {
+        if let Some(w) = self.workers.as_ref() {
+            w.refresher.request();
+            w.activity_refresher.request();
+        }
+    }
+
+    /// Drain the current project's change subscriber, returning whether any change
+    /// arrived and the names of the workspaces whose change carried one (so the
+    /// shown-workspace idle attach can be retried). No-op before the workers are
+    /// started.
+    fn drain_change_wakes(&self) -> (bool, Vec<String>) {
+        let mut changed = false;
+        let mut woke = Vec::new();
+        if let Some(w) = self.workers.as_ref() {
+            while let Ok(wake) = w.change_rx.try_recv() {
+                changed = true;
+                if let changes::ChangeWake::Workspace(ws) = wake {
+                    woke.push(ws);
+                }
+            }
+        }
+        (changed, woke)
+    }
+
+    /// The freshest snapshot from the current project's refresher, or `None`. A
+    /// snapshot still queued from a just-replaced (old-project) refresher went out
+    /// with that refresher's receiver, so this only ever yields the current
+    /// project's data.
+    fn latest_snapshot(&self) -> Option<ShellSnapshot> {
+        self.workers.as_ref().and_then(|w| w.refresher.latest())
+    }
+
+    /// The freshest activity read from the current project's activity refresher,
+    /// or `None`. Like [`Self::latest_snapshot`], a read still queued from a
+    /// just-replaced (old-project) refresher went out with that refresher's
+    /// receiver, so this only ever yields the current project's activity data.
+    fn latest_activity(&self) -> Option<ActivityData> {
+        self.workers
+            .as_ref()
+            .and_then(|w| w.activity_refresher.latest())
+    }
+
     fn switch_project(&mut self, project: &str) {
         // Switching to the already-current project (e.g. Enter on the current
         // row in the palette's Projects column) is a no-op; skip the session
@@ -1220,6 +1333,14 @@ impl ShellState {
                 project: project.to_string(),
             }),
         );
+        // Rebuild the background workers (snapshot refresher + change / layout
+        // subscribers) for the new project, dropping the old project's bundle.
+        // Without this the sidebar, board and review interface keep reading the
+        // launch project. `layout_bus` needs no rebind (it is project-agnostic and
+        // filtered per tick); the daemon-push client registration keeps its
+        // launch-project tag, which is informational only (re-exec and detach
+        // notices don't depend on the active project).
+        self.start_project_workers();
         self.reported_main = None;
         // Apply the restored view to the main area.
         let restored = self.client.view().clone();
@@ -2228,21 +2349,13 @@ impl ShellState {
     /// close-reconcile the tmux path never needed (`rt-tui-review`).
     fn poll_layout_events(&mut self) -> bool {
         let mut events = Vec::new();
-        let mut disconnected = false;
-        if let Some(rx) = self.layout_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(ev) => events.push(ev),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
+        if let Some(rx) = self.workers.as_ref().map(|w| &w.layout_rx) {
+            // Drain until Empty or Disconnected (the subscriber thread only
+            // disconnects on bundle drop; a switch replaces the whole bundle, so
+            // there is no stale receiver to null out here).
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
             }
-        }
-        if disconnected {
-            self.layout_rx = None;
         }
         let project = self.client.project().map(str::to_string);
         if let (Some(bus), Some(project)) = (self.layout_bus.as_ref(), project.as_ref()) {
@@ -3802,6 +3915,65 @@ mod tests {
         test_state_with_connector(Arc::new(NoopConnector))
     }
 
+    /// A [`WorkersFactory`] that resolves no SHELBI_HOME and opens no hub socket:
+    /// a refresher whose reader returns an empty snapshot and dummy, immediately-
+    /// closed receivers with no subscriber threads. Installed on every test state
+    /// so a `switch_project` under `cfg(test)` rebuilds a safe bundle instead of
+    /// the production one. Each build appends the requested project to `log`, so a
+    /// test can assert the refresh source follows the current project.
+    fn recording_workers_factory(log: Arc<Mutex<Vec<String>>>) -> WorkersFactory {
+        Arc::new(move |project: &str| {
+            log.lock().unwrap().push(project.to_string());
+            let refresher = refresh::spawn(|_g| ShellSnapshot {
+                sidebar: None,
+                board: None,
+                activity: None,
+                machines: None,
+            });
+            // The activity refresher tags its read with the project, so a test can
+            // read back (via `latest_activity`) which project it followed.
+            let proj = project.to_string();
+            let activity_refresher =
+                refresh::spawn(move |_g| ActivityData::tagged_for_test(&proj));
+            let (_ctx, change_rx) = std::sync::mpsc::channel();
+            let (_ltx, layout_rx) = std::sync::mpsc::channel();
+            ProjectWorkers {
+                refresher,
+                activity_refresher,
+                change_rx,
+                layout_rx,
+                _changes: None,
+                _layout_sub: None,
+            }
+        })
+    }
+
+    /// A snapshot whose sidebar names `project`, so a test can tell which
+    /// project's refresher produced it.
+    fn tagged_snapshot(project: &str) -> ShellSnapshot {
+        ShellSnapshot {
+            sidebar: Some(SidebarModel {
+                project_label: project.to_string(),
+                nav: vec![],
+                workspaces: vec![],
+                reviews: vec![],
+                config_error: None,
+                board_loading: false,
+                collapsed_machines: Default::default(),
+                board_banner: None,
+                daemon_version_line: None,
+                daemon_version_mismatch: false,
+                status_line: String::new(),
+                zen_mode: shelbi_state::ZenModeState::Off,
+                unread_errors: 0,
+                session_lost: None,
+            }),
+            board: None,
+            activity: None,
+            machines: None,
+        }
+    }
+
     fn test_state_with_connector(connector: Arc<dyn session::Connector>) -> ShellState {
         let caps = Caps {
             kitty: true,
@@ -3809,6 +3981,10 @@ mod tests {
             nested: None,
         };
         let mut st = ShellState::new("proj", connector, caps);
+        // Keep `switch_project` (and any startup) from touching the hub socket or
+        // resolving SHELBI_HOME in tests. Tests that care about which project the
+        // refresher follows install their own recording factory + log.
+        st.make_workers = recording_workers_factory(Arc::new(Mutex::new(Vec::new())));
         st.apply_snapshot(ShellSnapshot {
             sidebar: Some(SidebarModel {
                 project_label: "proj".into(),
@@ -5534,13 +5710,16 @@ mod tests {
             truecolor: true,
             nested: None,
         };
-        ShellState::new_with(
+        let mut st = ShellState::new_with(
             "proj",
             Arc::new(NoopConnector),
             caps,
             lifecycle,
             Arc::new(DaemonBootstrap),
-        )
+        );
+        // Hub-free workers so `switch_project` doesn't touch the socket in tests.
+        st.make_workers = recording_workers_factory(Arc::new(Mutex::new(Vec::new())));
+        st
     }
 
     /// A bootstrap that blocks until the test releases its gate, standing in for
@@ -5664,6 +5843,141 @@ mod tests {
         // Back to beta: Machines is restored.
         st.switch_project("beta");
         assert!(matches!(st.main_view, MainView::Native(View::Machines)));
+    }
+
+    #[test]
+    fn the_refresh_source_follows_the_current_project_after_a_switch() {
+        // AC5: the snapshot refresher (which feeds the sidebar, board, activity
+        // and machines views) must be rebuilt for the new project on every switch,
+        // not stay pinned to the launch project. A recording factory logs the
+        // project each (re)build is asked for, so the log must trace the switches.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut st = test_state();
+        st.make_workers = recording_workers_factory(log.clone());
+
+        // Start the workers for the launch project (as `run_with` does once).
+        st.start_project_workers();
+        assert_eq!(*log.lock().unwrap(), vec!["proj".to_string()]);
+
+        // Switching rebuilds the refresher for the new project…
+        st.switch_project("beta");
+        // …and switching back rebuilds it again for the original.
+        st.switch_project("proj");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["proj".to_string(), "beta".to_string(), "proj".to_string()],
+            "the refresh source must follow the current project across switches"
+        );
+
+        // A no-op switch to the already-current project rebuilds nothing.
+        st.switch_project("proj");
+        assert_eq!(
+            log.lock().unwrap().len(),
+            3,
+            "switching to the current project must not rebuild the workers"
+        );
+    }
+
+    #[test]
+    fn a_switch_discards_a_snapshot_left_in_flight_from_the_old_project() {
+        // AC3: a snapshot produced by the old project's refresher but not yet
+        // folded in must never be rendered after the switch. The switch drops the
+        // old worker bundle (and its snapshot receiver), so `latest_snapshot` only
+        // ever sees the new project's refresher.
+        let mut st = test_state();
+        // Each project's refresher tags its snapshot with the project name.
+        st.make_workers = Arc::new(|project: &str| {
+            let proj = project.to_string();
+            let refresher = refresh::spawn(move |_g| tagged_snapshot(&proj));
+            let proj_activity = project.to_string();
+            let activity_refresher =
+                refresh::spawn(move |_g| ActivityData::tagged_for_test(&proj_activity));
+            let (_ctx, change_rx) = std::sync::mpsc::channel();
+            let (_ltx, layout_rx) = std::sync::mpsc::channel();
+            ProjectWorkers {
+                refresher,
+                activity_refresher,
+                change_rx,
+                layout_rx,
+                _changes: None,
+                _layout_sub: None,
+            }
+        });
+
+        // Start proj's workers (requests a refresh) but do NOT drain it: proj's
+        // snapshot is now in flight. Switching drops proj's bundle — and with it
+        // that snapshot — and builds beta's.
+        st.start_project_workers();
+        st.switch_project("beta");
+
+        // Bounded wait (no fixed sleep) for a snapshot to become available; it can
+        // only come from beta's refresher, never proj's dropped one.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let snap = loop {
+            if let Some(s) = st.latest_snapshot() {
+                break s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the new project's snapshot never arrived"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(
+            snap.sidebar.expect("tagged sidebar").project_label,
+            "beta",
+            "after the switch latest_snapshot yields only the new project's data; \
+             the in-flight proj snapshot was discarded"
+        );
+    }
+
+    #[test]
+    fn the_activity_source_follows_the_current_project_after_a_switch() {
+        // Rework (#1631 landed a second, activity-only refresher): the activity
+        // feed now also lives in the per-project worker bundle, so after a switch
+        // its data must come from the new project — not stay pinned to the launch
+        // one. The recording factory's activity refresher tags each read with the
+        // project it was built for, so `latest_activity` traces the switches.
+        let mut st = test_state();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        st.make_workers = recording_workers_factory(log);
+
+        st.start_project_workers();
+        assert_eq!(
+            wait_for_activity_tag(&st).as_deref(),
+            Some("proj"),
+            "the launch project's activity data"
+        );
+
+        st.switch_project("beta");
+        assert_eq!(
+            wait_for_activity_tag(&st).as_deref(),
+            Some("beta"),
+            "after the switch the activity data comes from the new project"
+        );
+
+        st.switch_project("proj");
+        assert_eq!(
+            wait_for_activity_tag(&st).as_deref(),
+            Some("proj"),
+            "switching back follows the original project again"
+        );
+    }
+
+    /// Bounded wait (no fixed sleep) for the current project's activity refresher
+    /// to publish its first read, returning its [`ActivityData::tag_for_test`] tag.
+    fn wait_for_activity_tag(st: &ShellState) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(a) = st.latest_activity() {
+                return a.tag_for_test().map(str::to_string);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the activity refresher never published"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
