@@ -166,11 +166,11 @@ heroicons! {
     COMMAND_LINE = "command-line";
     FOLDER_OPEN = "folder-open";
     GLOBE_ALT = "globe-alt";
-    DOCUMENT_TEXT = "document-text";
     ARROW_DOWN = "arrow-down";
     CHEVRON_UP = "chevron-up";
     CHEVRON_DOWN = "chevron-down";
     ARROWS_RIGHT_LEFT = "arrows-right-left";
+    SHARE = "share";
 }
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its

@@ -1,33 +1,46 @@
 //! The Workspace view (`dt-workspace-view`): a dev workspace's agent session
-//! (`<project>/ws/<name>`) in the terminal element, under a header showing the
-//! task it is working (id and title), its branch, its machine and its live
-//! state, with the user's own shell beside it on demand.
+//! (`<project>/ws/<name>`) in the terminal element, with the user's own shell
+//! beside it on demand, and the workspace panel in the sidebar's column
+//! (`dt-workspace-sidebar`).
 //!
 //! It follows the TUI's workspace interface (`crates/shelbi-tui/src/shell/workspace.rs`,
 //! `workspace_panel.rs`) and its idle-workspace open (`rt-tui-idle-workspace-open`):
 //!
+//! - **The panel** takes the navigation sidebar's column while the workspace
+//!   is open, as the review panel does: the view renders as the panel, at
+//!   whatever width the window's column gives it, and the window puts
+//!   [`WorkspaceView::render_main`] (the terminals and the description
+//!   popover) in the main area beside it. It shows the back button and the
+//!   live state, the workspace's name and agent role; the task's full title,
+//!   id and a description preview with More (the full description in a
+//!   popover); the branch, the worktree folder (click to reveal it in Finder)
+//!   and the machine; then the view switch and the Shell toggle as rows. Its
+//!   rows, selection and keys are the shared [`WorkspacePanelState`] (the
+//!   TUI's panel navigates by the same functions). An idle workspace gets a
+//!   reduced panel: name, state and where it lives, no task, switch or shell.
 //! - **The agent.** Selecting a workspace attaches its agent session. An idle
 //!   workspace (no session) shows the TUI's idle placeholder and re-attaches
 //!   as soon as the sidebar row changes (a dispatch started a session), as the
 //!   TUI retries the shown workspace on a change. Nothing is launched by
 //!   selecting it: the daemon dispatches agents.
-//! - **The panel's affordances**, in the header while the workspace has a
-//!   task (the TUI shows its workspace panel only then): the task's full
-//!   description (More), the worktree folder (Reveal), and the view switch:
-//!   the agent, View Diff, Edit in <editor>. Diff and editor are the daemon's
-//!   `<project>/ws/<name>/{diff,editor}` content sessions, ensured through
-//!   `WorkspaceSessionOp::Ensure` and only attached here; Close (the TUI's `q`)
-//!   ends them. Like the TUI's, they are local workspaces only.
-//! - **The user shell.** A toggle opens a second terminal beside the agent,
-//!   split with a draggable divider ([`super::workspace_layout`]), attached to
-//!   the workspace's user shell (`<project>/ws/<name>/shell`, a login shell in
-//!   the worktree on the workspace's machine) that the daemon starts
-//!   (`WorkspaceSessionOp::EnsureShell`). Toggling it off, leaving the view,
-//!   or exiting the shell closes it.
+//! - **The view switch**: the agent, View Diff, Edit in <editor>. Diff and
+//!   editor are the daemon's `<project>/ws/<name>/{diff,editor}` content
+//!   sessions, ensured through `WorkspaceSessionOp::Ensure` and only attached
+//!   here; Close (the × on the active one) ends them, and `q` (the TUI's
+//!   Close) ends them and goes back. Like the TUI's, they are local
+//!   workspaces only.
+//! - **The user shell.** The Shell row opens a second terminal beside the
+//!   agent, split with a draggable divider ([`super::workspace_layout`]),
+//!   attached to the workspace's user shell (`<project>/ws/<name>/shell`, a
+//!   login shell in the worktree on the workspace's machine) that the daemon
+//!   starts (`WorkspaceSessionOp::EnsureShell`). Toggling it off, leaving the
+//!   view, or exiting the shell closes it.
 //! - **Remote workspaces.** A workspace on another machine attaches through
-//!   that machine's relay (`shelbi_orchestrator::session_connect`), the header
+//!   that machine's relay (`shelbi_orchestrator::session_connect`), the panel
 //!   names the machine, and a dropped SSH connection reconnects
 //!   ([`super::session_view`]).
+//! - **Back** (the back button, Esc) asks the window to return to the view
+//!   the workspace was opened over, leaving its sessions as they are.
 //! - **Restart states** are the shared session view's (the Chat view's).
 //! - **Drop to paste.** Files dropped on either terminal paste their paths.
 
@@ -35,38 +48,33 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, prelude::*, px, relative, AnyWindowHandle, Bounds, Context, CursorStyle,
-    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton,
-    MouseMoveEvent, Pixels, SharedString, Subscription, Window,
+    canvas, div, prelude::*, px, relative, AnyElement, AnyWindowHandle, Bounds, Context,
+    CursorStyle, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    MouseButton, MouseMoveEvent, Pixels, SharedString, Subscription, Window,
 };
 use gpui_kit::component::text::TextView;
 use shelbi_app::session::{SessionRef, WorkspaceContentRelauncher};
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceHeader, WorkspaceRow};
-use shelbi_app::{ReviewRole, WorkspaceSessionOp};
+use shelbi_app::workspace_panel::{WorkspacePanelState, WsEffect, WsPanelShape, WsRow};
+use shelbi_app::WorkspaceSessionOp;
 
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent};
+use super::sidebar::TRAFFIC_LIGHT_INSET;
 use super::workspace_layout::{Split, DIVIDER_W};
 use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::Theme;
 
-/// Which content the left pane shows. The TUI's `WsView`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentView {
-    /// The workspace's agent session (the default).
-    Agent,
-    Diff,
-    Editor,
-}
+/// Which content the left pane shows: the panel's view switch (the TUI's
+/// `WsView`).
+pub use shelbi_app::workspace_panel::WsSwitch as ContentView;
 
-impl ContentView {
-    fn role(self) -> Option<ReviewRole> {
-        match self {
-            ContentView::Agent => None,
-            ContentView::Diff => Some(ReviewRole::Diff),
-            ContentView::Editor => Some(ReviewRole::Editor),
-        }
-    }
+/// Where keyboard focus sits inside the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsFocus {
+    Panel,
+    Content,
 }
 
 /// The blocking work the view hands the background executor: reading a
@@ -149,6 +157,9 @@ pub enum WorkspaceEvent {
     /// One of its terminals took keyboard focus: the window's focus model
     /// moves to the main area.
     Focused,
+    /// Back (the back button, Esc, or `q` after closing the content): return
+    /// to the view the workspace was opened over.
+    Back,
 }
 
 /// The Workspace view for one project window. It shows one workspace at a
@@ -163,9 +174,11 @@ pub struct WorkspaceView {
     row: Option<WorkspaceRow>,
     details: Option<WorkspaceDetailsInfo>,
     details_pending: bool,
+    /// The panel's rows, selection and active view switch entry.
+    panel: WorkspacePanelState,
+    focus: WsFocus,
     /// The left pane: the agent, or its diff or editor.
     content: Entity<SessionView>,
-    content_view: ContentView,
     /// The user shell beside it.
     shell: Entity<SessionView>,
     shell_open: bool,
@@ -175,7 +188,8 @@ pub struct WorkspaceView {
     /// Where the panes were laid out last frame, for the divider drag.
     split_bounds: Option<Bounds<Pixels>>,
     dragging: bool,
-    /// A failure or note under the header (the TUI panel's status line).
+    /// A failure or note at the foot of the panel (the TUI panel's status
+    /// line).
     status_line: Option<String>,
     description_open: bool,
     /// Bumped whenever the shown workspace changes; a background result for
@@ -213,13 +227,17 @@ impl WorkspaceView {
             v
         });
         let subscriptions = vec![
-            cx.subscribe(&content, |_, _, ev: &SessionViewEvent, cx| {
+            cx.subscribe(&content, |this, _, ev: &SessionViewEvent, cx| {
                 if *ev == SessionViewEvent::Focused {
+                    this.focus = WsFocus::Content;
                     cx.emit(WorkspaceEvent::Focused);
                 }
             }),
             cx.subscribe(&shell, |this, _, ev: &SessionViewEvent, cx| match ev {
-                SessionViewEvent::Focused => cx.emit(WorkspaceEvent::Focused),
+                SessionViewEvent::Focused => {
+                    this.focus = WsFocus::Content;
+                    cx.emit(WorkspaceEvent::Focused);
+                }
                 // The user exited the shell: close the split.
                 SessionViewEvent::Ended => {
                     this.shell_open = false;
@@ -236,8 +254,9 @@ impl WorkspaceView {
             row: None,
             details: None,
             details_pending: false,
+            panel: WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true, true)),
+            focus: WsFocus::Panel,
             content,
-            content_view: ContentView::Agent,
             shell,
             shell_open: false,
             shell_starting: false,
@@ -272,9 +291,11 @@ impl WorkspaceView {
             self.details_pending = false;
             self.status_line = None;
             self.description_open = false;
-            self.content_view = ContentView::Agent;
             self.row = None;
+            self.panel = WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true, true));
+            self.focus = WsFocus::Panel;
         }
+        self.panel.set_active(ContentView::Agent);
         self.shown = true;
         self.set_row(row, cx);
         let target = self.agent_target();
@@ -325,19 +346,36 @@ impl WorkspaceView {
         self.content.update(cx, |c, _| c.clear_deliberate_close());
     }
 
-    /// Where keyboard focus goes when the main area takes it: the agent pane.
+    /// Where keyboard focus goes when the view takes it: the agent pane once
+    /// the user moved there, else the panel (as the review's).
     pub fn focus_target(&self, cx: &gpui::App) -> FocusHandle {
-        if self.content.read(cx).is_shown() {
+        if self.focus == WsFocus::Content && self.content.read(cx).pane().is_some() {
             self.content.read(cx).focus_target(cx)
         } else {
             self.focus_handle.clone()
         }
     }
 
-    /// Whether keyboard focus is in one of the view's terminals.
+    /// Give the panel keyboard focus (the sidebar chord while the panel holds
+    /// the sidebar's column).
+    pub fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus = WsFocus::Panel;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Whether keyboard focus is in the view: its panel or one of its
+    /// terminals.
     pub fn contains_focus(&self, window: &Window, cx: &gpui::App) -> bool {
-        self.content.read(cx).contains_focus(window, cx)
+        self.focus_handle.is_focused(window)
+            || self.content.read(cx).contains_focus(window, cx)
             || self.shell.read(cx).contains_focus(window, cx)
+    }
+
+    /// The panel's navigation state.
+    #[cfg(feature = "visual-check")]
+    pub fn panel(&self) -> &WorkspacePanelState {
+        &self.panel
     }
 
     /// The header as shown now.
@@ -355,8 +393,8 @@ impl WorkspaceView {
         Some(WorkspaceHeader::build(&row, self.details.as_ref()))
     }
 
-    /// Whether the workspace is working a task (the TUI opens its workspace
-    /// panel, with the view switch, only then).
+    /// Whether the workspace is working a task (the panel shows the task,
+    /// the view switch and the shell only then).
     fn has_task(&self) -> bool {
         self.row.as_ref().is_some_and(|r| r.current_task.is_some())
     }
@@ -378,9 +416,30 @@ impl WorkspaceView {
             None => self.details.is_none(),
         };
         self.row = row;
+        self.sync_panel();
         if stale {
             self.request_details(cx);
         }
+    }
+
+    /// The details, when they describe what the row shows now (its task, or
+    /// the idle worktree).
+    fn current_details(&self) -> Option<&WorkspaceDetailsInfo> {
+        let details = self.details.as_ref()?;
+        let row = self.row.as_ref()?;
+        let resolved = details.task.as_ref().map(|(id, _)| id.as_str());
+        (row.current_task.as_deref() == resolved).then_some(details)
+    }
+
+    /// The panel's rows for what the workspace is doing now.
+    fn panel_shape(&self) -> WsPanelShape {
+        let has_body = self.current_details().is_some_and(|d| !d.body.trim().is_empty());
+        WsPanelShape::for_workspace(self.has_task(), has_body, !self.is_remote(), true)
+    }
+
+    fn sync_panel(&mut self) {
+        let shape = self.panel_shape();
+        self.panel.sync(&shape);
     }
 
     /// Read the workspace's details off the UI thread (one read at a time; a
@@ -410,6 +469,7 @@ impl WorkspaceView {
                     Ok(details) => this.details = Some(details),
                     Err(e) => tracing::warn!(error = %e, "couldn't read the workspace's details"),
                 }
+                this.sync_panel();
                 cx.notify();
             })
             .ok();
@@ -447,6 +507,70 @@ impl WorkspaceView {
         .detach();
     }
 
+    // --- the panel ---------------------------------------------------------
+
+    /// Carry out a panel effect.
+    fn apply(&mut self, effect: WsEffect, window: &mut Window, cx: &mut Context<Self>) {
+        match effect {
+            WsEffect::None => {}
+            WsEffect::Back => cx.emit(WorkspaceEvent::Back),
+            WsEffect::Close => {
+                self.close_content(cx);
+                cx.emit(WorkspaceEvent::Back);
+            }
+            WsEffect::RevealFolder => self.reveal_folder(cx),
+            WsEffect::ShowAgent => self.select_view(ContentView::Agent, cx),
+            WsEffect::ShowDiff => self.select_view(ContentView::Diff, cx),
+            WsEffect::ShowEditor => self.select_view(ContentView::Editor, cx),
+            WsEffect::ShowDescription => {
+                self.description_open = true;
+                cx.notify();
+            }
+            WsEffect::ToggleShell => self.toggle_shell(window, cx),
+        }
+    }
+
+    /// A click on a panel row.
+    fn click(&mut self, row: WsRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus = WsFocus::Panel;
+        window.focus(&self.focus_handle, cx);
+        let effect = self.panel.click(row);
+        self.apply(effect, window, cx);
+        cx.notify();
+    }
+
+    /// A key while the panel has focus.
+    fn panel_key(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.description_open && event.keystroke.key == "escape" {
+            self.description_open = false;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let Some(chord) = chord_from_keystroke(&event.keystroke) else {
+            return;
+        };
+        // Tab moves to the agent's terminal once it is live (the TUI's).
+        if chord.code == shelbi_state::keymap::Key::Tab && chord.mods.is_empty() {
+            if self.content.read(cx).pane().is_some() {
+                self.focus = WsFocus::Content;
+                let target = self.content.read(cx).focus_target(cx);
+                window.focus(&target, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let before = self.panel.selected();
+        let effect = self.panel.handle_key(chord);
+        if effect == WsEffect::None && before == self.panel.selected() {
+            // Not the panel's key: let the window have it.
+            return;
+        }
+        cx.stop_propagation();
+        self.apply(effect, window, cx);
+        cx.notify();
+    }
+
     // --- the view switch (the TUI panel's Agent / View Diff / Edit) --------
 
     /// Show the agent, its diff, or its editor in the left pane. Diff and
@@ -458,12 +582,12 @@ impl WorkspaceView {
             self.show_agent(cx);
             return;
         };
-        self.content_view = view;
+        self.panel.set_active(view);
         cx.notify();
         self.session_op(WorkspaceSessionOp::Ensure { role }, cx, move |this, result, cx| {
             let workspace = this.workspace.clone().unwrap_or_default();
             match result {
-                Ok(()) if this.content_view == view && this.shown => {
+                Ok(()) if this.panel.active() == view && this.shown => {
                     let target = SessionRef::WorkspaceContent {
                         workspace,
                         role: role.as_str().to_string(),
@@ -481,14 +605,14 @@ impl WorkspaceView {
 
     /// Show the agent in the left pane (leaving the status line alone).
     fn show_agent(&mut self, cx: &mut Context<Self>) {
-        self.content_view = ContentView::Agent;
+        self.panel.set_active(ContentView::Agent);
         let target = self.agent_target();
         self.content.update(cx, |c, cx| c.show_target(target, cx));
         cx.notify();
     }
 
-    /// End the diff and editor sessions and show the agent (the TUI panel's
-    /// `q` Close).
+    /// End the diff and editor sessions and show the agent (the × on the
+    /// active entry; `q` also goes back, as the TUI panel's Close).
     pub fn close_content(&mut self, cx: &mut Context<Self>) {
         self.select_view(ContentView::Agent, cx);
         self.session_op(WorkspaceSessionOp::Close, cx, |this, result, _| {
@@ -611,161 +735,277 @@ impl WorkspaceView {
 
     // --- rendering ---------------------------------------------------------
 
-    fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = self.header();
-        let has_task = self.has_task();
-        let local = !self.is_remote();
-        let editor_name = self
-            .details
-            .as_ref()
+    fn render_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = div()
+            .id("workspace-panel")
+            .debug_selector(|| "workspace-panel".into())
+            .track_focus(&self.focus_handle)
+            .key_context("WorkspacePanel")
+            .on_key_down(cx.listener(Self::panel_key))
+            .flex()
+            .flex_col()
+            .size_full()
+            .gap_4()
+            .p_3()
+            // The window's leading column: clear of the traffic lights, as
+            // the sidebar's header is.
+            .pt(px(TRAFFIC_LIGHT_INSET))
+            .overflow_y_scroll()
+            .bg(theme.background)
+            .text_sm()
+            .text_color(theme.gray);
+        let Some(header) = self.header() else {
+            return root;
+        };
+        let details = self.current_details();
+        let editor_name = details
             .map(|d| d.editor_name.clone())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "Editor".into());
-        let has_body = self.details.as_ref().is_some_and(|d| !d.body.trim().is_empty());
-        let content_view = self.content_view;
-
-        let title_row = header.as_ref().map(|h| {
-            let dec = h.state_decoration();
+        let agent_name = header.agent.clone().unwrap_or_else(|| "Agent".into());
+        let panel = &self.panel;
+        let focused = self.focus == WsFocus::Panel;
+        let selected = |row: WsRow| focused && panel.selected_row() == Some(row);
+        let row_base = |id: &'static str, row: WsRow| {
             div()
+                .id(id)
+                .debug_selector(move || id.into())
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .min_w_0()
-                .child(
-                    div()
-                        .debug_selector(|| "workspace-state".into())
-                        .flex_none()
-                        .text_color(theme.decoration(dec.color))
-                        .child(format!("{} {}", dec.glyph, h.state.label())),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "workspace-name".into())
-                        .flex_none()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.white)
-                        .child(h.name.clone()),
-                )
-                .when_some(h.task_line(), |row, line| {
-                    row.child(
-                        div()
-                            .debug_selector(|| "workspace-task".into())
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.gray)
-                            .child(line),
-                    )
-                })
-        });
-
-        let location = header.as_ref().map(|h| {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .min_w_0()
-                .text_xs()
-                .text_color(theme.muted)
-                .when(h.is_remote, |d| {
-                    d.child(heroicon(icons::GLOBE_ALT, IconSize::Micro).text_color(theme.muted))
-                })
-                .child(
-                    div()
-                        .debug_selector(|| "workspace-location".into())
-                        .truncate()
-                        .child(h.location_line()),
-                )
-                .when_some(h.agent.clone(), |d, agent| d.child(format!("· {agent}")))
-        });
-
-        let switch = |id: &'static str, label: String, view: ContentView| {
-            let active = content_view == view;
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
                 .px_2()
-                .py_0p5()
                 .rounded_md()
-                .text_xs()
                 .cursor_pointer()
-                .when(active, |d| d.bg(theme.selection).text_color(theme.white))
-                .when(!active, |d| d.text_color(theme.muted).hover(|s| s.bg(theme.search)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.select_view(view, cx)))
+                .when(selected(row), |d| d.bg(theme.selection))
+                .when(!selected(row), |d| d.hover(|s| s.bg(theme.search)))
+                .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
         };
-        let agent_label = header
-            .as_ref()
-            .and_then(|h| h.agent.clone())
-            .unwrap_or_else(|| "Agent".into());
-        let switcher = (has_task && local).then(|| {
+        // A non-interactive line of the "where" block.
+        let fact = |selector: &'static str, icon: Icon, text: String| {
             div()
+                .debug_selector(move || selector.into())
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_0p5()
-                .child(switch("ws-switch-agent", agent_label, ContentView::Agent))
-                .child(switch("ws-switch-diff", "View Diff".into(), ContentView::Diff))
-                .child(switch("ws-switch-editor", format!("Edit in {editor_name}"), ContentView::Editor))
-                .when(content_view != ContentView::Agent, |d| {
-                    d.child(
-                        icon_button(theme, "ws-close-content", icons::X_MARK, "Close")
-                            .on_click(cx.listener(|this, _, _, cx| this.close_content(cx))),
-                    )
-                })
-        });
+                .gap_2()
+                .px_2()
+                .h(px(26.0))
+                .min_w_0()
+                .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
+                .child(div().min_w_0().truncate().child(text))
+        };
 
-        let actions = div()
+        // Status: back, the live state, the name and the agent's role.
+        let dec = header.state_decoration();
+        let status = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .child(
+                row_base("ws-back", WsRow::Back)
+                    .size(IconSize::Standard.px() + px(8.0))
+                    .justify_center()
+                    .px_0()
+                    .child(heroicon(icons::ARROW_LEFT, IconSize::Standard).text_color(theme.gray)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "workspace-state".into())
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.decoration(dec.color))
+                    .child(format!("{} {}", dec.glyph, header.state.label())),
+            );
+        let identity = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
-            .when(has_task && has_body, |d| {
-                d.child(
-                    icon_button(theme, "ws-more", icons::DOCUMENT_TEXT, "More")
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx))),
-                )
-            })
-            .when(has_task && local, |d| {
-                d.child(
-                    icon_button(theme, "ws-reveal", icons::FOLDER_OPEN, "Reveal")
-                        .on_click(cx.listener(|this, _, _, cx| this.reveal_folder(cx))),
-                )
-            })
-            .child(
-                icon_button(theme, "ws-shell-toggle", icons::COMMAND_LINE, "Shell")
-                    .debug_selector(|| "ws-shell-toggle".into())
-                    .when(self.shell_open, |d| d.bg(theme.selection).text_color(theme.white))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_shell(window, cx))),
-            );
-
-        div()
-            .debug_selector(|| "workspace-header".into())
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap_1()
-            .px_4()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.divider)
+            .px_2()
+            .min_w_0()
             .child(
                 div()
+                    .debug_selector(|| "workspace-name".into())
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.white)
+                    .child(header.name.clone()),
+            )
+            .when_some(header.agent.clone(), |d, role| {
+                d.child(
+                    div()
+                        .debug_selector(|| "workspace-role".into())
+                        .flex_none()
+                        .text_color(theme.muted)
+                        .child(format!("· {role}")),
+                )
+            });
+
+        // Task: the full title (wrapped), its id, the description preview.
+        let task = header.task_id.clone().map(|id| {
+            let preview = details
+                .map(|d| shelbi_app::review::description_text(&d.body))
+                .unwrap_or_default();
+            let more = panel.rows().contains(&WsRow::More).then(|| {
+                row_base("ws-more", WsRow::More).child(div().text_color(theme.cyan).child("More"))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .px_2()
+                        .child(
+                            div()
+                                .debug_selector(|| "workspace-title".into())
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.white)
+                                .child(header.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| id.clone())),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "workspace-task-id".into())
+                                .text_xs()
+                                .text_color(theme.muted)
+                                .child(id),
+                        )
+                        .when(!preview.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(|| "workspace-description".into())
+                                    .text_color(theme.gray)
+                                    .text_ellipsis()
+                                    .line_clamp(3)
+                                    .child(preview),
+                            )
+                        }),
+                )
+                .children(more)
+        });
+
+        // Where: the branch, the worktree (click to reveal it when local),
+        // the machine.
+        let worktree = self.details.as_ref().map(|d| d.worktree.clone()).filter(|w| !w.is_empty());
+        let folder = worktree.map(|path| {
+            let text = div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_start()
+                .child(path);
+            if panel.rows().contains(&WsRow::Folder) {
+                row_base("ws-folder", WsRow::Folder)
+                    .h(px(26.0))
+                    .child(heroicon(icons::FOLDER_OPEN, IconSize::Mini).text_color(theme.muted))
+                    .child(text)
+                    .into_any_element()
+            } else {
+                div()
+                    .debug_selector(|| "workspace-worktree".into())
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .children(title_row)
-                    .child(div().flex().flex_row().items_center().gap_3().flex_none().children(switcher).child(actions)),
+                    .gap_2()
+                    .px_2()
+                    .h(px(26.0))
+                    .child(heroicon(icons::FOLDER_OPEN, IconSize::Mini).text_color(theme.muted))
+                    .child(text)
+                    .into_any_element()
+            }
+        });
+        let machine = if header.is_remote {
+            fact("workspace-machine", icons::GLOBE_ALT, format!("{} (remote)", header.machine))
+        } else {
+            fact("workspace-machine", icons::SERVER_STACK, header.machine.clone())
+        };
+        let place = div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .children(
+                header
+                    .branch
+                    .clone()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| fact("workspace-branch", icons::SHARE, b)),
             )
-            .children(location)
+            .children(folder)
+            .child(machine);
+
+        // The view switch, then the shell toggle.
+        let active = panel.active();
+        let switches = panel.rows().iter().filter_map(|row| match row {
+            WsRow::Switch(item) => Some(*item),
+            _ => None,
+        });
+        let switches = switches.map(|item| {
+            let (id, icon) = match item {
+                ContentView::Agent => ("ws-switch-agent", icons::CHAT_BUBBLE_LEFT_RIGHT),
+                ContentView::Diff => ("ws-switch-diff", icons::ARROWS_RIGHT_LEFT),
+                ContentView::Editor => ("ws-switch-editor", icons::PENCIL_SQUARE),
+            };
+            let on = active == item;
+            let color = if on { theme.white } else { theme.gray };
+            row_base(id, WsRow::Switch(item))
+                .h(px(30.0))
+                .text_color(color)
+                .when(on, |d| d.font_weight(FontWeight::BOLD).bg(theme.selection))
+                .child(heroicon(icon, IconSize::Standard).text_color(color))
+                .child(div().flex_1().min_w_0().truncate().child(item.label(&agent_name, &editor_name)))
+                .when(on && item != ContentView::Agent, |d| {
+                    d.child(
+                        div()
+                            .id("ws-close-content")
+                            .debug_selector(|| "ws-close-content".into())
+                            .flex_none()
+                            .rounded_md()
+                            .hover(|s| s.bg(theme.search))
+                            .child(heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.muted))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_content(cx);
+                            })),
+                    )
+                })
+        });
+        let shell = panel.rows().contains(&WsRow::Shell).then(|| {
+            let (state, color) = match (self.shell_open, self.shell_starting) {
+                (true, true) => ("starting", theme.muted),
+                (true, false) => ("on", theme.green),
+                (false, _) => ("off", theme.muted),
+            };
+            row_base("ws-shell-toggle", WsRow::Shell)
+                .h(px(30.0))
+                .child(heroicon(icons::COMMAND_LINE, IconSize::Standard).text_color(theme.gray))
+                .child(div().flex_1().child("Shell"))
+                .child(
+                    div()
+                        .debug_selector(|| "ws-shell-state".into())
+                        .flex_none()
+                        .text_xs()
+                        .text_color(color)
+                        .child(state),
+                )
+        });
+
+        root.child(div().flex().flex_col().gap_1().child(status).child(identity))
+            .children(task)
+            .child(place)
+            .child(div().flex().flex_col().gap_0p5().children(switches))
+            .children(shell)
             .when_some(self.status_line.clone(), |d, line| {
                 d.child(
                     div()
                         .debug_selector(|| "workspace-status".into())
-                        .text_xs()
+                        .px_2()
                         .text_color(theme.yellow)
                         .child(line),
                 )
@@ -833,6 +1073,7 @@ impl WorkspaceView {
         });
         div()
             .id("ws-panes")
+            .debug_selector(|| "ws-panes".into())
             .relative()
             .flex()
             .flex_row()
@@ -968,42 +1209,20 @@ impl WorkspaceView {
     }
 }
 
-fn icon_button(
-    theme: &Theme,
-    id: &'static str,
-    icon: Icon,
-    text: &str,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .text_xs()
-        .text_color(theme.muted)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.search))
-        .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
-        .child(text.to_string())
-}
-
 impl Focusable for WorkspaceView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl WorkspaceView {
+    /// The main area beside the panel: the agent (or its diff or editor),
+    /// the user shell when open, and the description popover over them.
+    pub fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
         div()
             .id("workspace-view")
             .debug_selector(|| "workspace-view".into())
-            .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
                 if this.description_open && ev.keystroke.key == "escape" {
                     this.toggle_description(cx);
@@ -1018,14 +1237,22 @@ impl Render for WorkspaceView {
             .min_w_0()
             .size_full()
             .bg(theme.canvas)
-            .child(self.render_header(&theme, cx))
             .child(self.render_panes(&theme, cx))
             .children(self.render_description(&theme, cx))
+            .into_any_element()
+    }
+}
+
+/// The view itself renders as the panel; the window sizes and places it.
+impl Render for WorkspaceView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        self.render_panel(&theme, cx)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Mutex;
@@ -1037,6 +1264,7 @@ mod tests {
         self as app_session, ConnectFailure, IdleInfo, ReconnectPolicy, Relauncher, RetryPolicy,
     };
     use shelbi_app::theme::ThemePreference;
+    use shelbi_app::ReviewRole;
     use shelbi_client::SessionEvent;
     use shelbi_term::Size;
 
@@ -1053,7 +1281,7 @@ mod tests {
     /// Sessions by name: a name in `idle` (until removed) or `unreachable`
     /// answers that way, anything else attaches.
     #[derive(Default)]
-    struct FakeSessions {
+    pub(crate) struct FakeSessions {
         idle: Mutex<Vec<String>>,
         unreachable: Mutex<Vec<String>>,
         /// Every attach: the session name and its event sender.
@@ -1114,10 +1342,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeOps {
+    pub(crate) struct FakeOps {
         details: Mutex<Option<WorkspaceDetailsInfo>>,
         ops: Mutex<Vec<WorkspaceSessionOp>>,
         fail_ops: Mutex<bool>,
+        revealed: Mutex<Vec<String>>,
     }
 
     impl WorkspaceOps for FakeOps {
@@ -1132,13 +1361,33 @@ mod tests {
                 Ok(())
             }
         }
-        fn reveal(&self, _path: &str) -> Result<(), String> {
+        fn reveal(&self, path: &str) -> Result<(), String> {
+            self.revealed.lock().unwrap().push(path.to_string());
             Ok(())
+        }
+    }
+
+    /// The window's layout in small: the panel in a sidebar-width column and
+    /// the main area beside it.
+    struct Host {
+        view: Entity<WorkspaceView>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let main = self.view.update(cx, |v, cx| v.render_main(cx));
+            div()
+                .flex()
+                .flex_row()
+                .size_full()
+                .child(div().flex_none().w(px(280.0)).h_full().child(self.view.clone()))
+                .child(div().flex().flex_1().min_w_0().h_full().child(main))
         }
     }
 
     struct Harness {
         view: Entity<WorkspaceView>,
+        events: Rc<std::cell::RefCell<Vec<WorkspaceEvent>>>,
         cx: VisualTestContext,
         sessions: Arc<FakeSessions>,
         ops: Arc<FakeOps>,
@@ -1175,6 +1424,36 @@ mod tests {
             self.cx.run_until_parked();
         }
 
+        fn click(&mut self, selector: &'static str) {
+            self.draw();
+            let at = self
+                .cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is drawn"))
+                .center();
+            self.cx.simulate_click(at, gpui::Modifiers::none());
+            self.cx.run_until_parked();
+        }
+
+        fn key(&mut self, keystroke: &str) {
+            self.cx.simulate_keystrokes(keystroke);
+            self.cx.run_until_parked();
+        }
+
+        fn focus_panel(&mut self) {
+            self.draw();
+            self.cx.update(|window, cx| self.view.update(cx, |v, cx| v.focus_panel(window, cx)));
+            self.cx.run_until_parked();
+        }
+
+        fn events(&self) -> Vec<WorkspaceEvent> {
+            self.events.borrow().clone()
+        }
+
+        fn active(&self) -> ContentView {
+            self.view.read_with(&self.cx, |v, _| v.panel.active())
+        }
+
         fn advance(&mut self, by: Duration) {
             self.now.set(self.now.get() + by);
             self.cx.executor().advance_clock(by);
@@ -1182,7 +1461,27 @@ mod tests {
         }
     }
 
-    fn row(name: &str, task: Option<&str>, badge: WorkspaceBadge, remote: bool) -> WorkspaceRow {
+    /// Deps over fake sessions (every attach succeeds) and fake daemon ops
+    /// that answer with [`details_for_t1`], for the window's tests.
+    pub(crate) fn fake_deps() -> (WorkspaceDeps, Arc<FakeSessions>, Arc<FakeOps>) {
+        let sessions = Arc::new(FakeSessions::default());
+        let ops = Arc::new(FakeOps::default());
+        *ops.details.lock().unwrap() = Some(details_for_t1());
+        let s = sessions.clone();
+        let deps = WorkspaceDeps {
+            ops: ops.clone(),
+            sessions: Rc::new(move || SessionDeps {
+                connector: s.clone(),
+                relauncher: s.clone(),
+                retry: RetryPolicy::default(),
+                reconnect: ReconnectPolicy::default(),
+                clock: Rc::new(Instant::now),
+            }),
+        };
+        (deps, sessions, ops)
+    }
+
+    pub(crate) fn row(name: &str, task: Option<&str>, badge: WorkspaceBadge, remote: bool) -> WorkspaceRow {
         WorkspaceRow {
             name: name.into(),
             machine: if remote { "gpu" } else { "hub" }.into(),
@@ -1237,18 +1536,25 @@ mod tests {
             }
         };
         let deps = Cell::new(Some(deps));
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = events.clone();
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 let handle = window.window_handle();
-                cx.new(|cx| WorkspaceView::new("demo", handle, deps.take().unwrap(), None, cx))
+                let view = cx.new(|cx| WorkspaceView::new("demo", handle, deps.take().unwrap(), None, cx));
+                cx.subscribe(&view, move |_, ev: &WorkspaceEvent, _| sink.borrow_mut().push(ev.clone()))
+                    .detach();
+                cx.new(|_| Host { view })
             })
             .unwrap()
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
-        let view = window.root(&mut vcx).unwrap();
+        let host = window.root(&mut vcx).unwrap();
+        let view = host.read_with(&vcx, |h, _| h.view.clone());
         vcx.run_until_parked();
         Harness {
             view,
+            events,
             cx: vcx,
             sessions,
             ops,
@@ -1257,7 +1563,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_working_workspace_shows_its_agent_live_under_the_header(cx: &mut TestAppContext) {
+    fn a_working_workspace_shows_its_agent_live_beside_its_panel(cx: &mut TestAppContext) {
         let mut h = open(cx);
         h.update(|v, cx| v.show("alpha", Some(working()), cx));
         assert_eq!(h.content_phase(), SessionPhase::Live);
@@ -1271,11 +1577,18 @@ mod tests {
 
         h.draw();
         for selector in [
-            "workspace-header",
+            "workspace-panel",
+            "ws-back",
             "workspace-state",
             "workspace-name",
-            "workspace-task",
-            "workspace-location",
+            "workspace-role",
+            "workspace-title",
+            "workspace-task-id",
+            "workspace-description",
+            "ws-more",
+            "workspace-branch",
+            "ws-folder",
+            "workspace-machine",
             "ws-switch-agent",
             "ws-switch-diff",
             "ws-switch-editor",
@@ -1283,6 +1596,57 @@ mod tests {
         ] {
             assert!(h.cx.debug_bounds(selector).is_some(), "{selector} is drawn");
         }
+        assert!(h.cx.debug_bounds("ws-close-content").is_none(), "the agent has no ×");
+        assert!(h.cx.debug_bounds("workspace-header").is_none(), "no header row");
+
+        // The terminal starts at the top of the main area.
+        let main = h.cx.debug_bounds("workspace-view").unwrap();
+        let panes = h.cx.debug_bounds("ws-panes").unwrap();
+        assert_eq!(panes.origin.y, main.origin.y, "nothing above the terminal");
+        assert_eq!(panes.size.height, main.size.height);
+
+        // The panel sits in its column, the panes beside it.
+        let panel = h.cx.debug_bounds("workspace-panel").unwrap();
+        assert!(panel.right() <= panes.origin.x);
+
+        // The full title wraps rather than truncating, under the status.
+        let state = h.cx.debug_bounds("workspace-state").unwrap();
+        let title = h.cx.debug_bounds("workspace-title").unwrap();
+        assert!(title.origin.y > state.origin.y);
+        let row = h.view.read_with(&h.cx, |v, _| v.panel.rows().to_vec());
+        assert_eq!(
+            row,
+            [
+                WsRow::Back,
+                WsRow::More,
+                WsRow::Folder,
+                WsRow::Switch(ContentView::Agent),
+                WsRow::Switch(ContentView::Diff),
+                WsRow::Switch(ContentView::Editor),
+                WsRow::Shell,
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_long_title_wraps_in_the_panel(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        *h.ops.details.lock().unwrap() = Some(WorkspaceDetailsInfo {
+            task: Some((
+                "t-1".into(),
+                "Desktop: a terminal pane sometimes can't scroll to the live bottom after a resize".into(),
+            )),
+            ..details_for_t1()
+        });
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.draw();
+        let name = h.cx.debug_bounds("workspace-name").unwrap();
+        let title = h.cx.debug_bounds("workspace-title").unwrap();
+        assert!(
+            title.size.height > name.size.height * 1.5,
+            "the title takes more than one line: {title:?} vs {name:?}"
+        );
+        assert!(title.size.width <= px(280.0));
     }
 
     #[gpui::test]
@@ -1304,6 +1668,7 @@ mod tests {
         h.sessions.idle.lock().unwrap().push("demo/ws/alpha".into());
         *h.ops.details.lock().unwrap() = Some(WorkspaceDetailsInfo {
             branch: Some("main".into()),
+            worktree: "/w/alpha".into(),
             ..WorkspaceDetailsInfo::default()
         });
         h.update(|v, cx| v.show("alpha", Some(row("alpha", None, WorkspaceBadge::Idle, false)), cx));
@@ -1313,8 +1678,25 @@ mod tests {
         assert_eq!(header.task_line(), None);
         assert_eq!(header.location_line(), "hub · main");
         h.draw();
-        assert!(h.cx.debug_bounds("ws-switch-diff").is_none(), "no view switch without a task");
-        assert!(h.cx.debug_bounds("ws-shell-toggle").is_some(), "the shell is always offered");
+        // The reduced panel: name, state and where it lives.
+        for selector in ["ws-back", "workspace-state", "workspace-name", "ws-folder", "workspace-branch"] {
+            assert!(h.cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+        }
+        for selector in [
+            "workspace-title",
+            "workspace-task-id",
+            "ws-more",
+            "workspace-role",
+            "ws-switch-agent",
+            "ws-switch-diff",
+            "ws-shell-toggle",
+        ] {
+            assert!(h.cx.debug_bounds(selector).is_none(), "{selector} is not drawn while idle");
+        }
+        let rows = h.view.read_with(&h.cx, |v, _| v.panel.rows().to_vec());
+        assert_eq!(rows, [WsRow::Back, WsRow::Folder]);
+        // The main area shows the idle placeholder.
+        assert!(h.cx.debug_bounds("ws-panes").is_some());
 
         // An unrelated refresh (same row) doesn't retry.
         h.update(|v, cx| v.update_row(Some(row("alpha", None, WorkspaceBadge::Idle, false)), cx));
@@ -1325,6 +1707,10 @@ mod tests {
         h.update(|v, cx| v.update_row(Some(working()), cx));
         assert_eq!(h.content_phase(), SessionPhase::Live);
         assert_eq!(h.sessions.attached(), vec!["demo/ws/alpha"]);
+        // And the panel grows the task, the switch and the shell.
+        h.draw();
+        assert!(h.cx.debug_bounds("ws-switch-agent").is_some());
+        assert!(h.cx.debug_bounds("ws-shell-toggle").is_some());
     }
 
     #[gpui::test]
@@ -1417,8 +1803,11 @@ mod tests {
         assert_eq!(h.sessions.attached(), vec!["demo/ws/alpha", "demo/ws/alpha/diff"]);
         assert_eq!(h.content_phase(), SessionPhase::Live);
 
-        h.update(|v, cx| v.close_content(cx));
-        assert_eq!(h.view.read_with(&h.cx, |v, _| v.content_view), ContentView::Agent);
+        h.draw();
+        assert!(h.cx.debug_bounds("ws-close-content").is_some(), "the active diff has a ×");
+        h.click("ws-close-content");
+        assert_eq!(h.active(), ContentView::Agent);
+        assert!(h.events().is_empty(), "the × stays in the workspace");
         assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::Close));
         assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/alpha"));
     }
@@ -1429,7 +1818,7 @@ mod tests {
         h.update(|v, cx| v.show("alpha", Some(working()), cx));
         *h.ops.fail_ops.lock().unwrap() = true;
         h.update(|v, cx| v.select_view(ContentView::Editor, cx));
-        assert_eq!(h.view.read_with(&h.cx, |v, _| v.content_view), ContentView::Agent);
+        assert_eq!(h.active(), ContentView::Agent);
         assert_eq!(
             h.view.read_with(&h.cx, |v, _| v.status_line.clone()).as_deref(),
             Some("couldn't open view: the daemon said no")
@@ -1462,6 +1851,12 @@ mod tests {
         assert_eq!(header.location_line(), "gpu (remote) · jlong/t-1");
         h.draw();
         assert!(h.cx.debug_bounds("ws-switch-diff").is_none(), "no diff/editor off the hub");
+        assert!(h.cx.debug_bounds("ws-switch-editor").is_none());
+        assert!(h.cx.debug_bounds("ws-folder").is_none(), "nothing to reveal off the hub");
+        assert!(h.cx.debug_bounds("workspace-worktree").is_some(), "the path is still shown");
+        assert!(h.cx.debug_bounds("ws-switch-agent").is_some());
+        assert!(h.cx.debug_bounds("ws-shell-toggle").is_some());
+        assert!(h.cx.debug_bounds("workspace-machine").is_some());
 
         // The SSH connection under the relay dies: the stream ends, the
         // machine is unreachable for a while, then answers again.
@@ -1473,5 +1868,119 @@ mod tests {
         h.advance(Duration::from_secs(1));
         assert_eq!(h.content_phase(), SessionPhase::Live, "recovered on its own");
         assert_eq!(h.sessions.attached(), vec!["demo/ws/alpha"]);
+    }
+
+    #[gpui::test]
+    fn panel_keys_navigate_switch_and_go_back(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.focus_panel();
+        assert_eq!(
+            h.view.read_with(&h.cx, |v, _| v.panel.selected_row()),
+            Some(WsRow::Switch(ContentView::Agent)),
+            "the agent is selected first"
+        );
+        h.key("down");
+        h.key("enter");
+        assert_eq!(h.active(), ContentView::Diff);
+        assert_eq!(h.ops(), vec![WorkspaceSessionOp::Ensure { role: ReviewRole::Diff }]);
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/alpha/diff"));
+
+        // Down twice more to the shell, and toggle it.
+        h.key("j");
+        h.key("j");
+        h.key("space");
+        assert!(h.view.read_with(&h.cx, |v, _| v.shell_open()));
+        assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::EnsureShell));
+
+        // `m` opens the description; Esc closes it before it leaves.
+        h.key("m");
+        assert!(h.view.read_with(&h.cx, |v, _| v.description_open));
+        h.key("escape");
+        assert!(!h.view.read_with(&h.cx, |v, _| v.description_open));
+        assert!(h.events().is_empty());
+
+        // Esc goes back.
+        h.key("escape");
+        assert_eq!(h.events(), vec![WorkspaceEvent::Back]);
+    }
+
+    #[gpui::test]
+    fn tab_moves_to_the_agent_and_the_sidebar_chord_comes_back(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.focus_panel();
+        h.key("tab");
+        let in_terminal = h.cx.update(|window, cx| {
+            let v = h.view.read(cx);
+            v.content.read(cx).contains_focus(window, cx)
+        });
+        assert!(in_terminal, "Tab hands the keys to the agent");
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.focus), WsFocus::Content);
+        h.focus_panel();
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.focus), WsFocus::Panel);
+    }
+
+    #[gpui::test]
+    fn q_closes_the_content_and_goes_back(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.update(|v, cx| v.select_view(ContentView::Editor, cx));
+        h.focus_panel();
+        h.key("q");
+        assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::Close));
+        assert_eq!(h.active(), ContentView::Agent);
+        assert_eq!(h.events(), vec![WorkspaceEvent::Back]);
+    }
+
+    #[gpui::test]
+    fn panel_rows_click_like_the_header_buttons_did(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+
+        // The worktree reveals in Finder.
+        h.click("ws-folder");
+        assert_eq!(*h.ops.revealed.lock().unwrap(), vec!["/w/alpha".to_string()]);
+
+        // More opens the description.
+        h.click("ws-more");
+        assert!(h.view.read_with(&h.cx, |v, _| v.description_open));
+        h.draw();
+        assert!(h.cx.debug_bounds("ws-description").is_some());
+        h.update(|v, cx| v.toggle_description(cx));
+
+        // The editor switch, then the agent.
+        h.click("ws-switch-editor");
+        assert_eq!(h.active(), ContentView::Editor);
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/alpha/editor"));
+        h.click("ws-switch-agent");
+        assert_eq!(h.active(), ContentView::Agent);
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/alpha"));
+
+        // The shell toggles on and off.
+        h.click("ws-shell-toggle");
+        assert!(h.view.read_with(&h.cx, |v, _| v.shell_open()));
+        h.draw();
+        assert!(h.cx.debug_bounds("ws-shell-pane").is_some());
+        h.click("ws-shell-toggle");
+        assert!(!h.view.read_with(&h.cx, |v, _| v.shell_open()));
+        assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::CloseShell));
+
+        // Back.
+        h.click("ws-back");
+        assert_eq!(h.events(), vec![WorkspaceEvent::Back]);
+    }
+
+    #[gpui::test]
+    fn the_editor_row_names_the_resolved_editor(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        let (agent, editor) = h.view.read_with(&h.cx, |v, _| {
+            let header = v.header().unwrap();
+            let editor = v.current_details().map(|d| d.editor_name.clone()).unwrap();
+            (header.agent.unwrap(), editor)
+        });
+        assert_eq!(ContentView::Agent.label(&agent, &editor), "Developer");
+        assert_eq!(ContentView::Editor.label(&agent, &editor), "Edit in Vim");
     }
 }

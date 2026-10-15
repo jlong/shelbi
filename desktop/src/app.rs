@@ -25,9 +25,14 @@
 //! Cmd+K included) in the capture phase, so they never reach the session.
 //!
 //! A workspace row routes the main area to the Workspace view
-//! ([`WorkspaceView`], `dt-workspace-view`): its agent's terminal under a
-//! header (task, branch, machine, live state), with the user's shell beside it
-//! on demand. Like the chat, its terminals give the window the global chords.
+//! ([`WorkspaceView`], `dt-workspace-view`): its agent's terminal, full
+//! height, with the user's shell beside it on demand. Its panel (status,
+//! task, branch, worktree, machine, the view switch and the Shell toggle)
+//! takes the sidebar's column with the same push as a review's
+//! (`dt-workspace-sidebar`); its Back returns to the view the workspace was
+//! opened over. Going from a workspace to a review, or back, passes through
+//! the sidebar. Like the chat, its terminals give the window the global
+//! chords.
 //!
 //! A review row (or the palette's `review:<id>`) opens the Review view
 //! ([`ReviewView`], `dt-review-view`): the native review panel takes the
@@ -390,15 +395,19 @@ pub struct ShelbiWindow {
     flash_generation: u64,
     /// The Workspace view, created the first time a workspace is shown.
     workspace: Option<Entity<WorkspaceView>>,
+    /// The view the shown workspace was opened over: its panel's Back
+    /// returns there (the default view when it was the first one shown).
+    workspace_return: Option<View>,
     /// The Review view, created the first time a review is opened.
     review: Option<Entity<ReviewView>>,
-    /// The leading column's occupant (the sidebar, or the review panel in
-    /// its place) and the push between them.
+    /// The leading column's occupant (the sidebar, or the review or
+    /// workspace panel in its place) and the push between them.
     column: ColumnSwap,
-    /// The column's width while a review holds it with the sidebar
-    /// collapsed, once the user drags it (else the default width).
-    collapsed_review_cols: Option<u16>,
-    /// The sidebar's scroll, kept while the review panel stands in for it.
+    /// The column's width while a panel (a review's or a workspace's) holds
+    /// it with the sidebar collapsed, once the user drags it (else the
+    /// default width).
+    collapsed_panel_cols: Option<u16>,
+    /// The sidebar's scroll, kept while a panel stands in for it.
     sidebar_scroll: ScrollHandle,
     /// The column transition's clock and the system's Reduce Motion setting
     /// (injectable for tests).
@@ -440,6 +449,9 @@ pub struct ShelbiWindow {
     /// Test seam: the Review view's deps (fake sessions and daemon ops).
     #[cfg(any(test, feature = "visual-check"))]
     review_deps: Option<ReviewDeps>,
+    /// Test seam: the Workspace view's deps, likewise.
+    #[cfg(any(test, feature = "visual-check"))]
+    workspace_deps: Option<WorkspaceDeps>,
 }
 
 impl ShelbiWindow {
@@ -526,9 +538,10 @@ impl ShelbiWindow {
             detecting: None,
             flash_generation: 0,
             workspace: None,
+            workspace_return: None,
             review: None,
             column: ColumnSwap::new(),
-            collapsed_review_cols: None,
+            collapsed_panel_cols: None,
             sidebar_scroll: ScrollHandle::new(),
             clock: Rc::new(Instant::now),
             reduce_motion: Rc::new(crate::platform::motion::reduce_motion),
@@ -551,6 +564,8 @@ impl ShelbiWindow {
             tap: None,
             #[cfg(any(test, feature = "visual-check"))]
             review_deps: None,
+            #[cfg(any(test, feature = "visual-check"))]
+            workspace_deps: None,
         };
         this.sync_selection();
         this
@@ -1023,6 +1038,14 @@ impl ShelbiWindow {
     fn perform(&mut self, call: HostCall, window: &mut Window, cx: &mut Context<Self>) {
         match call {
             HostCall::ShowView(view) => {
+                // Opening a workspace from another view remembers that view
+                // for the panel's Back; moving between workspaces (or back to
+                // the one a review was opened over) keeps it.
+                if workspace_name(&view).is_none() {
+                    self.workspace_return = None;
+                } else if workspace_name(self.client.view()).is_none() {
+                    self.workspace_return = Some(self.client.view().clone());
+                }
                 self.route = Route::View;
                 let chat = is_chat(&view);
                 match view {
@@ -1193,16 +1216,20 @@ impl ShelbiWindow {
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
         let chord = self.palette_chord.clone();
+        let deps = WorkspaceDeps::live(&project);
+        #[cfg(any(test, feature = "visual-check"))]
+        let deps = self.workspace_deps.take().unwrap_or(deps);
         let ws = cx.new(|cx| {
-            let mut ws = WorkspaceView::new(&project, handle, WorkspaceDeps::live(&project), sink, cx);
+            let mut ws = WorkspaceView::new(&project, handle, deps, sink, cx);
             ws.set_palette_chord(&chord, cx);
             ws
         });
-        let sub = cx.subscribe(&ws, |this, _, ev: &WorkspaceEvent, cx| match ev {
+        let sub = cx.subscribe_in(&ws, window, |this, _, ev: &WorkspaceEvent, window, cx| match ev {
             WorkspaceEvent::Focused => {
                 this.client.focus_main();
                 cx.notify();
             }
+            WorkspaceEvent::Back => this.leave_workspace(window, cx),
         });
         self._subscriptions.push(sub);
         self.workspace = Some(ws.clone());
@@ -1287,6 +1314,26 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Leave the workspace for the view it was opened over: the sidebar comes
+    /// back into its column (the push's reverse) and takes the keys again, on
+    /// its selected row, as leaving a review does. Showing the other view
+    /// detaches the workspace's panes, as moving off a workspace always has;
+    /// the daemon's sessions stay.
+    fn leave_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::View) || workspace_name(self.client.view()).is_none() {
+            return;
+        }
+        let view = self.workspace_return.take().unwrap_or_else(View::default_for_project);
+        if !self.tapped_return(&view, window, cx) {
+            self.perform(HostCall::ShowView(view), window, cx);
+        }
+        if !self.collapsed {
+            self.client.focus_sidebar();
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
     /// Under the test tap, leaving a review records the view it returns to
     /// instead of building it (building one reads the project's state) and
     /// only leaves the route. Returns whether it did.
@@ -1295,6 +1342,11 @@ impl ShelbiWindow {
         if let Some(tap) = &self.tap {
             tap.borrow_mut().push(HostCall::ShowView(view.clone()));
             self.route = Route::View;
+            if workspace_name(self.client.view()).is_some() {
+                // Leaving a workspace: the main area (and so the column)
+                // moves off it, though the view itself is only recorded.
+                self.client.set_view(view.clone());
+            }
             self.sync_chat(window, cx);
             return true;
         }
@@ -1303,11 +1355,17 @@ impl ShelbiWindow {
     }
 
     /// Point the leading column at what the route wants (the review panel
-    /// while a review is open, else the sidebar), starting the push when that
-    /// changes: a slide, or a crossfade under Reduce Motion.
+    /// while a review is open, the workspace panel while a workspace is
+    /// shown, else the sidebar), starting the push when that changes: a
+    /// slide, or a crossfade under Reduce Motion.
     fn sync_column(&mut self, now: Instant) {
+        let workspace_shown = matches!(self.route, Route::View)
+            && workspace_name(self.client.view()).is_some()
+            && self.workspace.is_some();
         let want = if matches!(self.route, Route::Review) && self.review.is_some() {
             Occupant::Review
+        } else if workspace_shown {
+            Occupant::Workspace
         } else {
             Occupant::Sidebar
         };
@@ -1317,10 +1375,10 @@ impl ShelbiWindow {
         }
     }
 
-    /// Whether the review panel stands in the sidebar's column (or is on its
-    /// way in).
-    fn review_in_column(&self) -> bool {
-        self.column.target() == Occupant::Review
+    /// Whether a panel (the review's or the workspace's) stands in the
+    /// sidebar's column (or is on its way in).
+    fn panel_in_column(&self) -> bool {
+        self.column.target() != Occupant::Sidebar
     }
 
     /// Hand the review its refreshed sidebar row (the live server state), and
@@ -1719,11 +1777,11 @@ impl ShelbiWindow {
     }
 
     /// A divider drag asked for `width` columns: the user's sidebar width,
-    /// and the column's while a review holds it with the sidebar collapsed.
+    /// and the column's while a panel holds it with the sidebar collapsed.
     fn drag_column(&mut self, width: u16, cx: &mut Context<Self>) {
         let mut changed = false;
-        if self.collapsed && self.review_in_column() && self.collapsed_review_cols != Some(width) {
-            self.collapsed_review_cols = Some(width);
+        if self.collapsed && self.panel_in_column() && self.collapsed_panel_cols != Some(width) {
+            self.collapsed_panel_cols = Some(width);
             changed = true;
         }
         if width != self.client.sidebar_width() {
@@ -2291,6 +2349,12 @@ impl ShelbiWindow {
                 self.client.focus_main();
                 review.update(cx, |r, cx| r.focus_panel(window, cx));
             }
+        } else if self.column.target() == Occupant::Workspace {
+            // Likewise the workspace panel.
+            if let Some(ws) = self.workspace.clone() {
+                self.client.focus_main();
+                ws.update(cx, |w, cx| w.focus_panel(window, cx));
+            }
         } else if !self.collapsed {
             self.client.focus_sidebar();
             // Take keys back from a main view that holds focus.
@@ -2427,9 +2491,9 @@ impl ShelbiWindow {
             // Ctrl+C quits the TUI; here it's the terminal's (⌘Q quits).
             Some(GlobalAction::Quit | GlobalAction::OpenPalette) | None => {}
         }
-        if self.client.focus() != Focus::Sidebar || self.collapsed || self.review_in_column() {
+        if self.client.focus() != Focus::Sidebar || self.collapsed || self.panel_in_column() {
             // The main area's views take their own keys once they land; the
-            // sidebar takes none while the review panel stands in for it.
+            // sidebar takes none while a panel stands in for it.
             return;
         }
         let count = self.selectable_count();
@@ -2473,7 +2537,7 @@ impl ShelbiWindow {
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
                     View::Session(_) if is_chat(view) => self.chat.clone().map(|v| v.into_any_element()),
-                    View::Session(_) => self.workspace.clone().map(|v| v.into_any_element()),
+                    View::Session(_) => self.workspace.clone().map(|w| w.update(cx, |w, cx| w.render_main(cx))),
                 };
                 div()
                     .flex()
@@ -2693,21 +2757,22 @@ impl ShelbiWindow {
         let catalog_projects = self
             .switcher_open
             .then(|| cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default());
-        // The leading column: the sidebar, or the review panel in its place,
-        // both while the push between them runs (clipped to the column).
+        // The leading column: the sidebar, or a review's or workspace's panel
+        // in its place, both while the push between them runs (clipped to
+        // the column).
         let now = (self.clock)();
         self.sync_column(now);
         let frame = self.column.frame(now);
         if frame.animating {
             window.request_animation_frame();
         } else if self.column.target() == Occupant::Sidebar {
-            self.collapsed_review_cols = None;
+            self.collapsed_panel_cols = None;
         }
         let column = column_swap::column(
             &frame,
             self.collapsed,
             self.client.sidebar_width(),
-            self.collapsed_review_cols,
+            self.collapsed_panel_cols,
         );
         let column_shown = column.is_some();
         let column = column.map(|c| {
@@ -2744,6 +2809,10 @@ impl ShelbiWindow {
                 .review
                 .zip(self.review.clone())
                 .map(|(l, review)| layer("column-review", l).child(review));
+            let workspace = c
+                .workspace
+                .zip(self.workspace.clone())
+                .map(|(l, ws)| layer("column-workspace", l).child(ws));
             div()
                 .id("leading-column")
                 .debug_selector(|| "leading-column".into())
@@ -2755,6 +2824,7 @@ impl ShelbiWindow {
                 .bg(theme.background)
                 .children(sidebar)
                 .children(review)
+                .children(workspace)
         });
         let divider_color = if self.dragging {
             theme.divider_active

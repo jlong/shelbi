@@ -100,6 +100,33 @@ paths on every `cargo test`.
   the default width, and Back returns to the collapsed state. Leaving gives
   the sidebar back with its selection, scroll and keyboard focus where they
   were.
+- **The workspace panel takes the sidebar's place** in both clients, as the
+  review panel does, and both navigate it by the same rows and keys
+  (`shelbi_app::workspace_panel`: Back, More, the folder, the view switch;
+  ↑/↓ or j/k, Enter, `m`, Esc for Back, `q` to close the diff and editor and
+  go back, Tab to the agent). The desktop's (`views/workspace.rs`
+  `render_panel`) pushes in with the review's motion and differs in what it
+  shows:
+  - **An idle workspace gets a reduced panel** (name, live state, branch,
+    worktree, machine) beside the idle placeholder. The TUI keeps its
+    sidebar for an idle workspace and opens the panel only for one with a
+    task.
+  - **The status is the live state** (Working, Awaiting input, …, the
+    sidebar badge), with the workspace name and agent role under it. The TUI
+    shows the task's column (IN PROGRESS) and no name.
+  - **The task's id and branch, and the machine** show in the panel; the
+    TUI shows them only in the More popover (the machine not at all).
+  - **A Shell row** opens the user shell beside the agent (the TUI has no
+    user shell), and the active Diff or Editor row has a × that ends those
+    sessions without leaving.
+  - **A remote workspace** keeps the agent and Shell rows and shows its
+    worktree path without a reveal; the TUI opens remote workspaces with
+    the same panel as local ones.
+  - **Back returns to the view the workspace was opened over**, as the TUI's
+    does; going from a workspace to a review (or back) pops one panel to the
+    sidebar and pushes the other.
+  There is no header above the agent's terminal any more: it starts at the
+  top of the main area.
 - **Dropping files and images on a terminal pane** pastes the escaped paths
   followed by a space, in both clients, so Claude Code attaches a dropped
   image. The TUI gets that paste from its own terminal (Ghostty and
@@ -127,10 +154,10 @@ Found by this audit and not closed by it; each is a follow-up.
   changed elsewhere" (the card's revision had moved under the first, which
   this client made); Start succeeded once the board refreshed. The board
   should take the revision its own mutation produced.
-- **The TUI's workspace panel has no header** like the desktop's (workspace
-  name, live state, machine, branch, remote marker). Its status is the task's
-  column, so a workspace waiting for input still reads IN PROGRESS.
-  `WorkspaceHeader` is unused by the TUI.
+- **The TUI's workspace panel shows less than the desktop's** (workspace
+  name, live state, machine, branch, task id, remote marker). Its status is
+  the task's column, so a workspace waiting for input still reads IN
+  PROGRESS. `WorkspaceHeader` is unused by the TUI.
 - **The TUI review panel** shows the live server state and location (added
   here) but not the health check or the sub-state detail, and always shows
   Diff and Editor (it has no remote flag for a review slot).
@@ -184,12 +211,12 @@ equivalent datum.
 ### `WorkspaceRow`
 | Field | TUI | Desktop |
 |---|---|---|
-| `name` | row label (`shell/sidebar.rs` `render_row`); palette entry title | row label (`views/sidebar.rs` `row_text`); palette; Go menu; workspace header name in bold (`views/workspace.rs` `render_header`); notification titles (`notify.rs`) |
-| `machine` | machine group header text when the project spans several machines (via `rows()`, `shell/sidebar.rs` `render_row`) | machine group header (via `rows()`, `views/sidebar.rs` `row_text`); header location line `machine · branch` (`views/workspace.rs` `render_header`); remote attach target (`views/workspace.rs` `set_row`) |
-| `is_remote` | not used (remote attach comes from session discovery, `shell/session.rs`) | header globe icon and `(remote)` suffix (`views/workspace.rs` `render_header`); routes the session through the remote relay and hides Diff/Editor/Reveal (`views/workspace.rs` `set_row`, `render_header`) |
-| `current_task` | not shown as text in the sidebar; counts toward `M active` on a collapsed group (via `rows()`); palette workspace subtitle; gates opening the workspace panel (`shell/mod.rs` `workspace_has_task`) and the panel's IN PROGRESS/IDLE status (`shell/mod.rs` `ws_status_from_model`) | `M active` count (via `rows()`); palette subtitle; header task line id (`views/workspace.rs` `render_header` via `WorkspaceHeader`); gates the view switcher, More and Reveal (`views/workspace.rs` `has_task`); notification body (`notify.rs`) |
-| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label (`views/sidebar.rs` `row_text`); header `· Agent` and the Agent switch label (`views/workspace.rs` `render_header`) |
-| `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | colored state glyph in the row (`views/sidebar.rs` `render_row`); header glyph plus words, e.g. `⏵ Working` (`views/workspace.rs` `render_header`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) |
+| `name` | row label (`shell/sidebar.rs` `render_row`); palette entry title | row label (`views/sidebar.rs` `row_text`); palette; Go menu; workspace panel name in bold (`views/workspace.rs` `render_panel`); notification titles (`notify.rs`) |
+| `machine` | machine group header text when the project spans several machines (via `rows()`, `shell/sidebar.rs` `render_row`) | machine group header (via `rows()`, `views/sidebar.rs` `row_text`); panel machine row (`views/workspace.rs` `render_panel`); remote attach target (`views/workspace.rs` `set_row`) |
+| `is_remote` | not used (remote attach comes from session discovery, `shell/session.rs`) | panel machine row with a globe icon and `(remote)` (`views/workspace.rs` `render_panel`); routes the session through the remote relay and drops the Diff, Editor and folder rows (`views/workspace.rs` `set_row`, `panel_shape`) |
+| `current_task` | not shown as text in the sidebar; counts toward `M active` on a collapsed group (via `rows()`); palette workspace subtitle; gates opening the workspace panel (`shell/mod.rs` `workspace_has_task`) and the panel's IN PROGRESS/IDLE status (`shell/mod.rs` `ws_status_from_model`) | `M active` count (via `rows()`); palette subtitle; panel task id and the full panel vs the reduced idle one (`views/workspace.rs` `render_panel`, `panel_shape` via `has_task`); notification body (`notify.rs`) |
+| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
+| `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | colored state glyph in the row (`views/sidebar.rs` `render_row`); panel status glyph plus words beside the back button, e.g. `⏵ Working` (`views/workspace.rs` `render_panel`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) |
 
 ### `ReviewRow`
 | Field | TUI | Desktop |
@@ -206,25 +233,25 @@ The TUI never constructs this struct; its workspace panel reads the same facts f
 
 | Field | TUI | Desktop |
 |---|---|---|
-| `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | header task line `id  title` (`views/workspace.rs` `render_header` via `WorkspaceHeader::task_line`); description popover heading (`views/workspace.rs` `render_description`) |
-| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | More button shown only when non-empty, markdown description popover (`views/workspace.rs` `render_header`, `render_description`); no inline preview |
-| `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | header location line `machine · branch` (`views/workspace.rs` `render_header` via `location_line`) |
-| `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | not shown: only the path the Reveal button opens (`views/workspace.rs` `reveal_folder`) |
-| `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch label (`views/workspace.rs` `render_header`) |
+| `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, bold and wrapped, with the id under it (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); description popover heading (`views/workspace.rs` `render_description`) |
+| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | three-line preview and More in the panel, only when non-empty (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`); markdown description popover (`views/workspace.rs` `render_description`) |
+| `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | panel branch row (`views/workspace.rs` `render_panel` via `WorkspaceHeader`) |
+| `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel folder row, left-truncated, click reveals in Finder when local (`views/workspace.rs` `render_panel`, `reveal_folder`) |
+| `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
 
 ### `WorkspaceHeader`
 The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the back button plus a column status (`IN PROGRESS` / `IDLE`), the title, a preview, the folder row and the switcher.
 
 | Field | TUI | Desktop |
 |---|---|---|
-| `name` | not used; the workspace panel never shows the workspace name | bold name in the header title row (`views/workspace.rs` `render_header`) |
-| `task_id` | not used; id only in the More popover | header task line (`views/workspace.rs` `render_header` via `task_line`) |
-| `title` | not used; the panel shows the task title from its own `IssueFile` (`workspace_panel.rs` `render_task_info`) | header task line after the id (`views/workspace.rs` `render_header` via `task_line`) |
-| `branch` | not used; branch only in the More popover | header location line (`views/workspace.rs` `render_header` via `location_line`) |
-| `machine` | not used | header location line (`views/workspace.rs` `render_header` via `location_line`) |
-| `is_remote` | not used | globe icon and `(remote)` in the location line (`views/workspace.rs` `render_header`) |
-| `agent` | not used; Agent switch label comes from the task's `agent:` frontmatter (`shell/mod.rs` `agent_display_name`) | `· Agent` after the location and the Agent switch label (`views/workspace.rs` `render_header`) |
-| `state` | not used; panel status is the task column (`IN PROGRESS`/`IDLE`, `shell/mod.rs` `status_for_column`, `ws_status_from_model`), not the live badge | glyph plus state words, colored, in the title row (`views/workspace.rs` `render_header` via `state_decoration`) |
+| `name` | not used; the workspace panel never shows the workspace name | bold name under the panel's status (`views/workspace.rs` `render_panel`) |
+| `task_id` | not used; id only in the More popover | panel id line under the title (`views/workspace.rs` `render_panel`) |
+| `title` | not used; the panel shows the task title from its own `IssueFile` (`workspace_panel.rs` `render_task_info`) | panel title, wrapped (`views/workspace.rs` `render_panel`) |
+| `branch` | not used; branch only in the More popover | panel branch row (`views/workspace.rs` `render_panel`) |
+| `machine` | not used | panel machine row (`views/workspace.rs` `render_panel`) |
+| `is_remote` | not used | globe icon and `(remote)` on the panel machine row (`views/workspace.rs` `render_panel`) |
+| `agent` | not used; Agent switch label comes from the task's `agent:` frontmatter (`shell/mod.rs` `agent_display_name`) | `· Agent` role after the panel name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
+| `state` | not used; panel status is the task column (`IN PROGRESS`/`IDLE`, `shell/mod.rs` `status_for_column`, `ws_status_from_model`), not the live badge | glyph plus state words, colored, beside the panel's back button (`views/workspace.rs` `render_panel` via `state_decoration`) |
 
 #
 

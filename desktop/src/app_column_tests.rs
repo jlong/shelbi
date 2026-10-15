@@ -1,11 +1,13 @@
-//! The leading column with a review open (`dt-review-replaces-sidebar`): the
-//! review panel takes the sidebar's column at the sidebar's width, the push
-//! between them runs both ways (and turns around mid-way), and leaving gives
-//! the sidebar back as it was: selection, scroll, collapsed state and keys.
+//! The leading column with a review or a workspace open
+//! (`dt-review-replaces-sidebar`, `dt-workspace-sidebar`): the panel takes the
+//! sidebar's column at the sidebar's width, the push between them runs both
+//! ways (and turns around mid-way), going from one panel to the other passes
+//! through the sidebar, and leaving gives the sidebar back as it was:
+//! selection, scroll, collapsed state and keys.
 //!
 //! The window is the smoke test's headless one ([`Harness`]) with fake review
-//! sessions and daemon ops, an injected clock for the transition and an
-//! injected Reduce Motion setting.
+//! and workspace sessions and daemon ops, an injected clock for the
+//! transition and an injected Reduce Motion setting.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -20,6 +22,7 @@ use super::smoke::Harness;
 use super::*;
 use crate::views::column_swap::SLIDE;
 use crate::views::review::tests::{fake_deps, info, row};
+use crate::views::workspace::tests::fake_deps as fake_workspace_deps;
 
 struct Column {
     h: Harness,
@@ -37,13 +40,17 @@ impl Column {
         let now = Rc::new(Cell::new(Instant::now()));
         let reduce_motion = Rc::new(Cell::new(false));
         let (deps, _sessions, ops) = fake_deps();
+        let (ws_deps, _ws_sessions, _ws_ops) = fake_workspace_deps();
         let (n, r) = (now.clone(), reduce_motion.clone());
         h.window.update(&mut h.cx, |w, _| {
             w.clock = Rc::new(move || n.get());
             w.reduce_motion = Rc::new(move || r.get());
             w.review_ops = ops;
             w.review_deps = Some(deps);
+            w.workspace_deps = Some(ws_deps);
             w.model.reviews.push(row(ReviewState::Serving));
+            // The fixture's workspace works the task the fake details describe.
+            w.model.workspaces[0].current_task = Some("t-1".into());
             setup(w);
         });
         let mut c = Column {
@@ -76,6 +83,29 @@ impl Column {
             w.open_review(info(), window, cx);
         });
         self.h.draw();
+    }
+
+    /// Select the workspace's sidebar row, then show it (what Enter on it
+    /// does: `FocusWorkspace` shows its session view; the tap only records
+    /// commands, so the view is shown directly).
+    fn open_workspace(&mut self) {
+        let ordinal = self.ordinal_of(&SidebarTarget::Workspace("alpha-1".into()));
+        self.update(|w, window, cx| {
+            let count = w.selectable_count();
+            w.client.select(ordinal, count);
+            w.client.focus_main();
+            w.perform(HostCall::ShowView(View::Session("alpha-1".into())), window, cx);
+        });
+        self.h.draw();
+    }
+
+    fn workspace(&self) -> Entity<WorkspaceView> {
+        self.read(|w, _| w.workspace.clone().expect("a workspace was shown"))
+    }
+
+    fn workspace_panel_focused(&mut self) -> bool {
+        let ws = self.workspace();
+        self.h.cx.update(|window, cx| ws.read(cx).focus_handle(cx).is_focused(window))
     }
 
     fn ordinal_of(&self, target: &SidebarTarget) -> usize {
@@ -377,4 +407,187 @@ fn the_sidebars_scroll_survives_the_review(cx: &mut TestAppContext) {
     c.advance(SLIDE);
     assert!(c.drawn("sidebar"));
     assert_eq!(c.read(|w, _| w.sidebar_scroll.offset()), scrolled, "scrolled where it was");
+}
+
+#[gpui::test]
+fn a_workspace_takes_the_sidebars_column_with_a_push(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    let column_w = c.width("leading-column");
+    let column_x = c.left("leading-column");
+    c.open_workspace();
+
+    // The first frame: both, the panel just right of the column.
+    assert!(c.drawn("column-sidebar") && c.drawn("column-workspace"));
+    assert!(!c.drawn("column-review"));
+    assert_eq!(c.left("column-workspace"), column_x + column_w);
+    let session_x = c.left("workspace-view");
+    assert!(session_x >= column_x + column_w, "the terminal sits right of the column");
+
+    // Mid-way.
+    c.advance(SLIDE / 2);
+    assert!(c.left("column-sidebar") < column_x);
+    let panel_x = c.left("column-workspace");
+    assert!(panel_x > column_x && panel_x < column_x + column_w);
+    assert_eq!(c.left("workspace-view"), session_x, "the terminal never moves");
+
+    // Done: the panel in the column, the terminal beside it from the top.
+    c.advance(SLIDE);
+    assert!(!c.drawn("column-sidebar") && !c.drawn("sidebar"));
+    assert!(c.drawn("workspace-panel"));
+    assert_eq!(c.width("workspace-panel"), column_w, "the panel fills the sidebar's width");
+    assert!(c.drawn("ws-switch-agent") && c.drawn("ws-shell-toggle"));
+    let main = c.bounds("workspace-view").unwrap();
+    let panes = c.bounds("ws-panes").unwrap();
+    assert_eq!(panes.origin.y, main.origin.y, "the agent terminal starts at the top");
+    assert_eq!(main.origin.y, gpui::px(0.0));
+    assert!(!c.drawn("workspace-header"));
+}
+
+#[gpui::test]
+fn esc_on_the_workspace_panel_pushes_back_to_the_sidebar_as_it_was(cx: &mut TestAppContext) {
+    let mut c = Column::open_with(cx, |w| {
+        let mut rows: Vec<WorkspaceRow> = (0..80)
+            .map(|i| WorkspaceRow {
+                name: format!("ws-{i}"),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: None,
+                agent: None,
+                badge: WorkspaceBadge::Idle,
+            })
+            .collect();
+        rows.insert(0, w.model.workspaces[0].clone());
+        w.model.workspaces = rows;
+    });
+    let scrolled = point(gpui::px(0.0), gpui::px(-120.0));
+    c.read(|w, _| w.sidebar_scroll.set_offset(scrolled));
+    c.h.draw();
+    let selected = c.ordinal_of(&SidebarTarget::Workspace("alpha-1".into()));
+    c.open_workspace();
+    c.advance(SLIDE);
+    assert!(c.workspace_panel_focused(), "the panel has the keys");
+
+    // Arrow keys move the panel's selection, not the hidden sidebar's.
+    c.h.key("down");
+    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), selected);
+
+    // Esc is Back: the reverse push, then the sidebar as it was.
+    c.h.key("escape");
+    c.h.draw();
+    assert!(c.drawn("column-sidebar") && c.drawn("column-workspace"), "both while it leaves");
+    c.advance(SLIDE / 2);
+    assert!(c.left("column-workspace") > c.left("leading-column"), "the panel leaves right");
+    assert!(c.left("column-sidebar") < c.left("leading-column"), "the sidebar returns from the left");
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar") && !c.drawn("column-workspace"));
+    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), selected, "the selection is still on it");
+    assert_eq!(c.read(|w, _| w.client.focus()), Focus::Sidebar);
+    let window_focused = c.h.cx.update(|window, cx| c.h.window.read(cx).focus_handle.is_focused(window));
+    assert!(window_focused, "the sidebar's keys");
+    assert_eq!(c.read(|w, _| w.sidebar_scroll.offset()), scrolled, "scrolled where it was");
+    assert_eq!(
+        c.h.take_calls(),
+        vec![HostCall::ShowView(View::Machines)],
+        "back to the view it was opened over"
+    );
+}
+
+#[gpui::test]
+fn the_back_button_and_a_toggle_mid_push(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    let column_x = c.left("leading-column");
+    c.open_workspace();
+    c.advance(Duration::from_millis(60));
+    let panel_x = c.left("column-workspace");
+    assert!(panel_x > column_x);
+
+    // The back button before the panel arrived: it heads out from where it is.
+    let ws = c.workspace();
+    c.h.cx.update(|_, cx| ws.update(cx, |_, cx| cx.emit(crate::views::workspace::WorkspaceEvent::Back)));
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    let turned = c.left("column-workspace");
+    assert!((turned - panel_x).abs() < 0.5, "no jump: {panel_x} then {turned}");
+    c.advance(Duration::from_millis(30));
+    assert!(c.left("column-workspace") > turned, "now leaving right");
+
+    // Selecting it again mid-leave turns around once more.
+    let leaving = c.left("column-workspace");
+    c.open_workspace();
+    c.advance(Duration::from_millis(10));
+    assert!(c.left("column-workspace") < leaving, "coming back in");
+    c.advance(SLIDE);
+    assert!(!c.drawn("sidebar") && c.drawn("workspace-panel"));
+
+    // The back button itself.
+    c.h.click_selector("ws-back");
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar") && !c.drawn("column-workspace"));
+}
+
+#[gpui::test]
+fn the_sidebar_chord_focuses_the_workspace_panel(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_workspace();
+    c.advance(SLIDE);
+    let before = c.read(|w, _| w.client.sidebar_selection());
+    c.update(|w, window, cx| w.focus_sidebar(window, cx));
+    assert!(c.workspace_panel_focused());
+    c.h.key("up");
+    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), before, "the hidden sidebar didn't move");
+}
+
+#[gpui::test]
+fn a_review_from_a_workspace_passes_through_the_sidebar_and_back(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_workspace();
+    c.advance(SLIDE);
+
+    // A review opened over the workspace: the workspace panel pops first.
+    c.update(|w, window, cx| w.open_review(info(), window, cx));
+    c.h.draw();
+    c.advance(SLIDE / 2);
+    assert!(c.drawn("column-workspace") && c.drawn("column-sidebar"));
+    assert!(!c.drawn("column-review"), "the review waits for the sidebar");
+    c.advance(SLIDE / 2);
+    c.advance(SLIDE / 2);
+    assert!(c.drawn("column-review") && c.drawn("column-sidebar"));
+    assert!(!c.drawn("column-workspace"));
+    c.advance(SLIDE);
+    assert!(c.drawn("review-panel") && !c.drawn("column-sidebar"));
+
+    // Back from the review returns to the workspace, through the sidebar.
+    c.back();
+    c.advance(SLIDE / 2);
+    assert!(c.drawn("column-review") && !c.drawn("column-workspace"));
+    c.advance(SLIDE * 2);
+    assert!(c.drawn("workspace-panel") && !c.drawn("column-review"));
+    assert_eq!(c.read(|w, _| w.workspace_return.clone()), Some(View::Machines), "its Back target kept");
+}
+
+#[gpui::test]
+fn a_collapsed_sidebar_lends_its_column_to_the_workspace_panel(cx: &mut TestAppContext) {
+    let mut c = Column::open_with(cx, |w| w.collapsed = true);
+    assert!(!c.drawn("leading-column"));
+    c.open_workspace();
+    assert!(c.drawn("column-workspace") && !c.drawn("column-sidebar"));
+    c.advance(SLIDE);
+    assert_eq!(c.width("workspace-panel"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
+    c.h.key("escape");
+    c.advance(SLIDE);
+    assert!(!c.drawn("leading-column") && c.drawn("expand-sidebar"));
+    assert!(c.read(|w, _| w.collapsed));
+}
+
+#[gpui::test]
+fn reduce_motion_crossfades_the_workspace_panel(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.reduce_motion.set(true);
+    let column_x = c.left("leading-column");
+    c.open_workspace();
+    c.advance(Duration::from_millis(40));
+    assert!(c.drawn("column-sidebar") && c.drawn("column-workspace"));
+    assert_eq!(c.left("column-workspace"), column_x, "no slide");
+    c.advance(crate::views::column_swap::FADE);
+    assert!(!c.drawn("column-sidebar") && c.drawn("workspace-panel"));
 }

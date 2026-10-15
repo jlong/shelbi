@@ -1,17 +1,21 @@
-//! The window's leading column and the push between its two occupants
-//! (`dt-review-replaces-sidebar`).
+//! The window's leading column and the push between its occupants
+//! (`dt-review-replaces-sidebar`, `dt-workspace-sidebar`).
 //!
-//! The column shows the navigation sidebar, or, while a review is open, the
-//! review panel in its place, as the TUI's review panel replaces its sidebar.
-//! Going in and coming back out are a push between two levels of a
-//! navigation stack: the sidebar slides out to the left and fades while the
-//! panel slides in from the right and fades in, and the reverse on the way
-//! back. With Reduce Motion on, the two crossfade in place instead.
+//! The column shows the navigation sidebar, or, while a review or a workspace
+//! is open, that one's panel in its place, as the TUI's review and workspace
+//! panels replace its sidebar. Going in and coming back out are a push
+//! between two levels of a navigation stack: the sidebar slides out to the
+//! left and fades while the panel slides in from the right and fades in, and
+//! the reverse on the way back. With Reduce Motion on, the two crossfade in
+//! place instead. The two panels are siblings on the upper level, so going
+//! from one to the other goes back through the sidebar: the first panel pops,
+//! then the second is pushed.
 //!
 //! Toolkit-free and clock-injected, so the state machine (entering, leaving,
-//! a second toggle mid-transition reversing from where it stands) is tested
-//! without a frame loop. The window asks [`ColumnSwap::frame`] what to draw
-//! each frame and keeps requesting frames while it says it is animating.
+//! a second toggle mid-transition reversing from where it stands, a panel
+//! swapped for the other) is tested without a frame loop. The window asks
+//! [`ColumnSwap::frame`] what to draw each frame and keeps requesting frames
+//! while it says it is animating.
 
 use std::time::{Duration, Instant};
 
@@ -20,15 +24,16 @@ use std::time::{Duration, Instant};
 pub enum Occupant {
     Sidebar,
     Review,
+    Workspace,
 }
 
 impl Occupant {
-    /// The occupant's place on the transition's axis: 0 the sidebar, 1 the
-    /// review panel.
+    /// The occupant's level on the transition's axis: 0 the sidebar, 1 a
+    /// panel pushed over it.
     fn position(self) -> f32 {
         match self {
             Occupant::Sidebar => 0.0,
-            Occupant::Review => 1.0,
+            Occupant::Review | Occupant::Workspace => 1.0,
         }
     }
 }
@@ -79,13 +84,26 @@ impl Layer {
     };
 }
 
-/// What one frame of the column draws. Both layers only while a swap runs.
+/// What one frame of the column draws: the sidebar and at most one panel,
+/// both only while a swap runs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frame {
     pub sidebar: Option<Layer>,
     pub review: Option<Layer>,
+    pub workspace: Option<Layer>,
     /// A swap is still running: request another frame.
     pub animating: bool,
+}
+
+impl Frame {
+    fn with_panel(sidebar: Option<Layer>, panel: Occupant, layer: Option<Layer>, animating: bool) -> Self {
+        Frame {
+            sidebar,
+            review: layer.filter(|_| panel == Occupant::Review),
+            workspace: layer.filter(|_| panel == Occupant::Workspace),
+            animating,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,10 +115,16 @@ struct Transition {
     motion: Motion,
 }
 
-/// The column's occupant and the swap under way, if any.
+/// The column's occupant, the swap under way, if any, and the panel to push
+/// once the column is back at the sidebar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSwap {
+    /// Where the current swap is heading: the sidebar, or [`Self::panel`].
     target: Occupant,
+    /// The panel on the upper level (drawn while it is in or moving).
+    panel: Occupant,
+    /// The other panel, pushed once the column is back at the sidebar.
+    queued: Option<(Occupant, Motion)>,
     transition: Option<Transition>,
 }
 
@@ -115,13 +139,16 @@ impl ColumnSwap {
     pub fn new() -> Self {
         Self {
             target: Occupant::Sidebar,
+            panel: Occupant::Review,
+            queued: None,
             transition: None,
         }
     }
 
-    /// The occupant the column shows, or is on its way to.
+    /// The occupant the column shows, or is on its way to (past the sidebar
+    /// when one panel is making way for the other).
     pub fn target(&self) -> Occupant {
-        self.target
+        self.queued.map_or(self.target, |(panel, _)| panel)
     }
 
     /// A swap is under way (as of its last [`Self::settle`]).
@@ -133,12 +160,31 @@ impl ColumnSwap {
     /// Swap to `to`, starting at `now`. A no-op when that is already the
     /// target. Mid-swap, it reverses from where the column stands, taking the
     /// share of the full duration that is left to cover, so the motion never
-    /// jumps. Returns whether anything changed.
+    /// jumps. A panel asked for while the other one is in (or on its way)
+    /// first sends the column back to the sidebar, then pushes. Returns
+    /// whether anything changed.
     pub fn show(&mut self, to: Occupant, motion: Motion, now: Instant) -> bool {
-        if to == self.target {
+        if to == self.target() {
             return false;
         }
+        self.queued = None;
         let from = self.position(now);
+        if to != Occupant::Sidebar && to != self.panel && from > 0.0 {
+            // The other panel is (partly) in: pop it first.
+            self.queued = Some((to, motion));
+            if self.target != Occupant::Sidebar {
+                self.start(Occupant::Sidebar, from, motion, now);
+            }
+            return true;
+        }
+        if to != Occupant::Sidebar {
+            self.panel = to;
+        }
+        self.start(to, from, motion, now);
+        true
+    }
+
+    fn start(&mut self, to: Occupant, from: f32, motion: Motion, now: Instant) {
         self.target = to;
         let distance = (to.position() - from).abs();
         self.transition = Some(Transition {
@@ -147,23 +193,37 @@ impl ColumnSwap {
             duration: motion.duration().mul_f32(distance),
             motion,
         });
-        true
     }
 
-    /// Jump to the end of any swap under way.
+    /// Jump to the end of any swap under way (and of a queued push).
     #[cfg(test)]
     pub fn finish(&mut self) {
         self.transition = None;
-    }
-
-    /// Drop a swap that has run its course by `now`.
-    pub fn settle(&mut self, now: Instant) {
-        if self.transition.is_some_and(|t| progress(&t, now) >= 1.0) {
-            self.transition = None;
+        if let Some((panel, _)) = self.queued.take() {
+            self.panel = panel;
+            self.target = panel;
         }
     }
 
-    /// Where the column stands at `now` on the 0 (sidebar) to 1 (review)
+    /// Drop a swap that has run its course by `now`; one that brought the
+    /// column back to the sidebar for the other panel starts that push, from
+    /// the moment the pop ended.
+    pub fn settle(&mut self, now: Instant) {
+        let Some(t) = self.transition else {
+            return;
+        };
+        if progress(&t, now) < 1.0 {
+            return;
+        }
+        self.transition = None;
+        if let Some((panel, motion)) = self.queued.take() {
+            self.panel = panel;
+            self.start(panel, 0.0, motion, t.started + t.duration);
+            self.settle(now);
+        }
+    }
+
+    /// Where the column stands at `now` on the 0 (sidebar) to 1 (panel)
     /// axis, eased.
     pub fn position(&self, now: Instant) -> f32 {
         let to = self.target.position();
@@ -178,16 +238,8 @@ impl ColumnSwap {
         self.settle(now);
         let Some(t) = self.transition else {
             return match self.target {
-                Occupant::Sidebar => Frame {
-                    sidebar: Some(Layer::REST),
-                    review: None,
-                    animating: false,
-                },
-                Occupant::Review => Frame {
-                    sidebar: None,
-                    review: Some(Layer::REST),
-                    animating: false,
-                },
+                Occupant::Sidebar => Frame::with_panel(Some(Layer::REST), self.panel, None, false),
+                panel => Frame::with_panel(None, panel, Some(Layer::REST), false),
             };
         };
         let p = self.position(now);
@@ -195,19 +247,20 @@ impl ColumnSwap {
             Motion::Slide => 1.0,
             Motion::Fade => 0.0,
         };
-        Frame {
+        Frame::with_panel(
             // The sidebar is the lower level: it leaves to the left.
-            sidebar: Some(Layer {
+            Some(Layer {
                 offset: -p * slide,
                 opacity: 1.0 - p,
             }),
-            // The review panel is pushed on: it comes in from the right.
-            review: Some(Layer {
+            self.panel,
+            // A panel is pushed on: it comes in from the right.
+            Some(Layer {
                 offset: (1.0 - p) * slide,
                 opacity: p,
             }),
-            animating: true,
-        }
+            true,
+        )
     }
 }
 
@@ -219,16 +272,17 @@ pub struct Column {
     pub width_cols: u16,
     pub sidebar: Option<Layer>,
     pub review: Option<Layer>,
+    pub workspace: Option<Layer>,
 }
 
 /// The leading column for `frame`, or `None` when there is none (the sidebar
-/// collapsed, no review in its place). The column is the user's sidebar
-/// width (`user_cols`). A collapsed sidebar is never drawn, but a review
-/// still takes the column, at the default sidebar width until the user drags
-/// it (`dragged_cols`), and the column goes again once the review has left.
+/// collapsed, no panel in its place). The column is the user's sidebar width
+/// (`user_cols`). A collapsed sidebar is never drawn, but a panel still takes
+/// the column, at the default sidebar width until the user drags it
+/// (`dragged_cols`), and the column goes again once the panel has left.
 pub fn column(frame: &Frame, collapsed: bool, user_cols: u16, dragged_cols: Option<u16>) -> Option<Column> {
     let sidebar = frame.sidebar.filter(|_| !collapsed);
-    if sidebar.is_none() && frame.review.is_none() {
+    if sidebar.is_none() && frame.review.is_none() && frame.workspace.is_none() {
         return None;
     }
     let width_cols = if collapsed {
@@ -240,6 +294,7 @@ pub fn column(frame: &Frame, collapsed: bool, user_cols: u16, dragged_cols: Opti
         width_cols,
         sidebar,
         review: frame.review,
+        workspace: frame.workspace,
     })
 }
 
@@ -424,6 +479,143 @@ mod tests {
         swap.show(Occupant::Sidebar, Motion::Slide, t1);
         assert!(column(&swap.frame(t1 + SLIDE / 2), true, 40, None).is_some());
         assert_eq!(column(&swap.frame(t1 + SLIDE), true, 40, None), None);
+    }
+
+    #[test]
+    fn the_workspace_panel_pushes_in_and_pops_out_like_the_review() {
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        assert!(swap.show(Occupant::Workspace, Motion::Slide, t0));
+        assert_eq!(swap.target(), Occupant::Workspace);
+        let f = swap.frame(t0);
+        assert_eq!(f.sidebar, Some(Layer { offset: 0.0, opacity: 1.0 }));
+        assert_eq!(f.workspace, Some(Layer { offset: 1.0, opacity: 0.0 }));
+        assert_eq!(f.review, None, "only the panel going in draws");
+
+        let f = swap.frame(t0 + SLIDE / 2);
+        let (s, w) = (f.sidebar.unwrap(), f.workspace.unwrap());
+        assert!(s.offset < 0.0 && w.offset > 0.0);
+        assert!(close(w.offset - s.offset, 1.0));
+
+        let f = swap.frame(t0 + SLIDE);
+        assert_eq!((f.sidebar, f.review, f.workspace), (None, None, Some(Layer::REST)));
+        assert!(!f.animating);
+
+        // Back: the reverse.
+        let t1 = t0 + SLIDE;
+        assert!(swap.show(Occupant::Sidebar, Motion::Slide, t1));
+        let f = swap.frame(t1 + ms(100));
+        assert!(f.workspace.unwrap().offset > 0.0, "the panel slides out to the right");
+        assert!(f.sidebar.unwrap().offset < 0.0, "the sidebar comes back from the left");
+        let f = swap.frame(t1 + SLIDE);
+        assert_eq!((f.sidebar, f.review, f.workspace), (Some(Layer::REST), None, None));
+    }
+
+    #[test]
+    fn backing_out_of_a_workspace_mid_push_reverses_from_where_it_stands() {
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Workspace, Motion::Slide, t0);
+        let mid = t0 + ms(80);
+        let at = swap.position(mid);
+        assert!(swap.show(Occupant::Sidebar, Motion::Slide, mid));
+        assert!(close(swap.position(mid), at), "continues from {at}");
+        let f = swap.frame(mid + ms(1));
+        assert!(f.workspace.is_some() && f.review.is_none(), "the workspace panel leaves");
+        let back = SLIDE.mul_f32(at);
+        let f = swap.frame(mid + back);
+        assert!(!f.animating);
+        assert_eq!((f.sidebar, f.workspace), (Some(Layer::REST), None));
+
+        // And in again mid-way back: it turns around again.
+        swap.show(Occupant::Workspace, Motion::Slide, mid + back);
+        let turn = mid + back + ms(50);
+        let at = swap.position(turn);
+        swap.show(Occupant::Sidebar, Motion::Slide, turn);
+        assert!(swap.show(Occupant::Workspace, Motion::Slide, turn));
+        assert!(close(swap.position(turn), at));
+    }
+
+    #[test]
+    fn going_from_a_workspace_to_a_review_passes_through_the_sidebar() {
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Workspace, Motion::Slide, t0);
+        swap.finish();
+
+        // The review is asked for: the workspace panel pops first.
+        assert!(swap.show(Occupant::Review, Motion::Slide, t0));
+        assert_eq!(swap.target(), Occupant::Review, "where it is headed");
+        assert!(!swap.show(Occupant::Review, Motion::Slide, t0), "already headed there");
+        let f = swap.frame(t0 + SLIDE / 2);
+        assert!(f.workspace.is_some() && f.review.is_none(), "the workspace leaves first");
+        assert!(f.sidebar.is_some());
+
+        // Back at the sidebar, the review is pushed from the moment the pop
+        // ended, with no gap.
+        let f = swap.frame(t0 + SLIDE);
+        assert!(f.animating);
+        assert_eq!(f.workspace, None);
+        assert_eq!(f.review, Some(Layer { offset: 1.0, opacity: 0.0 }));
+        let f = swap.frame(t0 + SLIDE + SLIDE / 2);
+        assert!(f.review.unwrap().offset < 1.0 && f.review.unwrap().offset > 0.0);
+        let f = swap.frame(t0 + SLIDE * 2);
+        assert_eq!((f.sidebar, f.review, f.workspace), (None, Some(Layer::REST), None));
+
+        // And back the other way, through the sidebar too.
+        let t1 = t0 + SLIDE * 2;
+        swap.show(Occupant::Workspace, Motion::Slide, t1);
+        let f = swap.frame(t1 + SLIDE / 2);
+        assert!(f.review.is_some() && f.workspace.is_none());
+        let f = swap.frame(t1 + SLIDE * 2);
+        assert_eq!((f.sidebar, f.review, f.workspace), (None, None, Some(Layer::REST)));
+    }
+
+    #[test]
+    fn a_frame_that_skips_the_whole_hop_lands_on_the_second_panel() {
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Review, Motion::Fade, t0);
+        swap.finish();
+        swap.show(Occupant::Workspace, Motion::Fade, t0);
+        let f = swap.frame(t0 + FADE * 3);
+        assert_eq!((f.sidebar, f.review, f.workspace), (None, None, Some(Layer::REST)));
+        assert!(!f.animating);
+    }
+
+    #[test]
+    fn changing_course_while_a_hop_is_queued() {
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Workspace, Motion::Slide, t0);
+        swap.finish();
+        swap.show(Occupant::Review, Motion::Slide, t0);
+        let mid = t0 + ms(60);
+        let at = swap.position(mid);
+
+        // Back to the workspace before the pop finished: it turns around and
+        // the review is never pushed.
+        assert!(swap.show(Occupant::Workspace, Motion::Slide, mid));
+        assert!(close(swap.position(mid), at));
+        let f = swap.frame(mid + SLIDE);
+        assert_eq!((f.sidebar, f.review, f.workspace), (None, None, Some(Layer::REST)));
+
+        // Asking for the review, then the sidebar: the pop runs, nothing follows.
+        swap.show(Occupant::Review, Motion::Slide, mid + SLIDE);
+        assert!(swap.show(Occupant::Sidebar, Motion::Slide, mid + SLIDE + ms(30)));
+        assert_eq!(swap.target(), Occupant::Sidebar);
+        let f = swap.frame(mid + SLIDE * 3);
+        assert_eq!((f.sidebar, f.review, f.workspace), (Some(Layer::REST), None, None));
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_lends_its_column_to_a_workspace_panel() {
+        let t0 = Instant::now();
+        let mut swap = ColumnSwap::new();
+        swap.show(Occupant::Workspace, Motion::Slide, t0);
+        let c = column(&swap.frame(t0 + SLIDE), true, 40, None).unwrap();
+        assert_eq!(c.width_cols, shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!((c.sidebar, c.review, c.workspace), (None, None, Some(Layer::REST)));
     }
 
     #[test]

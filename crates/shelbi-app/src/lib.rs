@@ -61,6 +61,7 @@ pub mod session;
 pub mod supervision;
 pub mod theme;
 pub mod view;
+pub mod workspace_panel;
 pub mod zen;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
