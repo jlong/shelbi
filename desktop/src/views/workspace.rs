@@ -35,7 +35,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, prelude::*, px, relative, svg, AnyWindowHandle, Bounds, Context, CursorStyle,
+    canvas, div, prelude::*, px, relative, AnyWindowHandle, Bounds, Context, CursorStyle,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton,
     MouseMoveEvent, Pixels, SharedString, Subscription, Window,
 };
@@ -46,7 +46,7 @@ use shelbi_app::{ReviewRole, WorkspaceSessionOp};
 
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent};
 use super::workspace_layout::{Split, DIVIDER_W};
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, Icon, IconSize};
 use crate::refresh::SessionSink;
 use crate::theme::Theme;
 
@@ -669,7 +669,7 @@ impl WorkspaceView {
                 .text_xs()
                 .text_color(theme.muted)
                 .when(h.is_remote, |d| {
-                    d.child(svg().path(icons::GLOBE_ALT).size(px(12.0)).text_color(theme.muted))
+                    d.child(heroicon(icons::GLOBE_ALT, IconSize::Micro).text_color(theme.muted))
                 })
                 .child(
                     div()
@@ -942,7 +942,7 @@ impl WorkspaceView {
                                     div()
                                         .id("ws-description-close")
                                         .cursor_pointer()
-                                        .child(svg().path(icons::X_MARK).size(px(16.0)).text_color(theme.muted))
+                                        .child(heroicon(icons::X_MARK, IconSize::Standard).text_color(theme.muted))
                                         .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx))),
                                 ),
                         )
@@ -971,7 +971,7 @@ impl WorkspaceView {
 fn icon_button(
     theme: &Theme,
     id: &'static str,
-    icon: &'static str,
+    icon: Icon,
     text: &str,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -987,7 +987,7 @@ fn icon_button(
         .text_color(theme.muted)
         .cursor_pointer()
         .hover(|s| s.bg(theme.search))
-        .child(svg().path(icon).size(px(12.0)).text_color(theme.muted))
+        .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
         .child(text.to_string())
 }
 

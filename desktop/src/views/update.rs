@@ -3,14 +3,12 @@
 //! upgrades the app. Dismissing it hides it in every window until the next
 //! launch (the check itself runs at most once a day).
 
-use gpui::{div, prelude::*, px, svg, AnyElement, Global, IntoElement};
+use gpui::{div, prelude::*, AnyElement, Global, IntoElement};
 
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, IconSize};
 use crate::platform::update::UpdateNotice;
 use crate::theme::Theme;
 use crate::views::bootstrap::{command_box, APP_UPGRADE_COMMAND};
-
-const ICON_SIZE: f32 = 16.0;
 
 /// The app-wide result of the launch's update check.
 #[derive(Debug, Default)]
@@ -70,11 +68,7 @@ pub fn render_update_bar(
                 .items_center()
                 .gap_2()
                 .child(
-                    svg()
-                        .path(icons::ARROW_DOWN_CIRCLE)
-                        .size(px(ICON_SIZE))
-                        .flex_none()
-                        .text_color(theme.white),
+                    heroicon(icons::ARROW_DOWN_CIRCLE, IconSize::Standard).text_color(theme.white),
                 )
                 .child(notice.message())
                 .child(div().text_color(theme.muted).child("Upgrade with"))
@@ -86,10 +80,7 @@ pub fn render_update_bar(
                 .flex_none()
                 .cursor_pointer()
                 .child(
-                    svg()
-                        .path(icons::X_MARK)
-                        .size(px(ICON_SIZE))
-                        .text_color(theme.muted),
+                    heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.muted),
                 )
                 .on_click(move |_, window, cx| on_dismiss(window, cx)),
         )

@@ -19,13 +19,13 @@
 //! clamped by `shelbi_app::nav::clamp_sidebar_width`.
 
 use gpui::{
-    div, prelude::*, px, svg, AnyElement, Context, FontWeight, Hsla, SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString, Window,
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::ZenModeState;
 
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, Icon, IconSize};
 use crate::projects::ProjectEntry;
 use crate::refresh::DaemonLink;
 use crate::theme::Theme;
@@ -37,7 +37,6 @@ pub const COLUMN_PX: f32 = 9.0;
 /// Room left above the title for the macOS traffic lights.
 pub const TRAFFIC_LIGHT_INSET: f32 = 38.0;
 
-const ICON: f32 = 16.0;
 const ROW_H: f32 = 26.0;
 const NAV_ROW_H: f32 = 30.0;
 
@@ -161,7 +160,7 @@ pub fn row_text(row: &SidebarRow, theme: &Theme) -> RowText {
 }
 
 /// The Heroicon for a nav view.
-pub fn nav_icon(view: &View) -> &'static str {
+pub fn nav_icon(view: &View) -> Icon {
     match view {
         View::Session(_) => icons::CHAT_BUBBLE_LEFT_RIGHT,
         View::Issues => icons::VIEW_COLUMNS,
@@ -275,11 +274,7 @@ fn render_header<H: SidebarHost>(
                 .child(props.model.project_label.clone()),
         )
         .child(
-            svg()
-                .path(icons::CHEVRON_UP_DOWN)
-                .size(px(ICON))
-                .flex_none()
-                .text_color(theme.muted),
+            heroicon(icons::CHEVRON_UP_DOWN, IconSize::Mini).text_color(theme.muted),
         )
         .on_click(cx.listener(|this, _, window, cx| {
             this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
@@ -299,11 +294,7 @@ fn render_header<H: SidebarHost>(
         .bg(theme.search)
         .cursor_pointer()
         .child(
-            svg()
-                .path(icons::MAGNIFYING_GLASS)
-                .size(px(ICON))
-                .flex_none()
-                .text_color(theme.gray),
+            heroicon(icons::MAGNIFYING_GLASS, IconSize::Mini).text_color(theme.gray),
         )
         .child(div().flex_1().child("Search"))
         .child(div().flex_none().child(props.palette_chord.clone()))
@@ -348,13 +339,8 @@ fn render_switcher<H: SidebarHost>(
             .cursor_pointer()
             .hover(|s| s.bg(theme.selection))
             .child(
-                div().w(px(ICON)).flex_none().when(is_current, |d| {
-                    d.child(
-                        svg()
-                            .path(icons::CHECK)
-                            .size(px(ICON))
-                            .text_color(theme.green),
-                    )
+                div().w(IconSize::Mini.px()).flex_none().when(is_current, |d| {
+                    d.child(heroicon(icons::CHECK, IconSize::Mini).text_color(theme.green))
                 }),
             )
             .child(div().flex_1().min_w_0().truncate().child(p.label.clone()))
@@ -409,11 +395,7 @@ fn render_nav_row<H: SidebarHost>(
         .when(bright, |d| d.font_weight(FontWeight::BOLD))
         .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
         .child(
-            svg()
-                .path(nav_icon(view))
-                .size(px(ICON))
-                .flex_none()
-                .text_color(color),
+            heroicon(nav_icon(view), IconSize::Standard).text_color(color),
         )
         .child(label.clone())
         .on_click(cx.listener(move |this, _, window, cx| {
@@ -575,11 +557,7 @@ fn render_footer<H: SidebarHost>(
             .gap_1()
             .text_color(theme.yellow)
             .child(
-                svg()
-                    .path(icons::SIGNAL_SLASH)
-                    .size(px(14.0))
-                    .flex_none()
-                    .text_color(theme.yellow),
+                heroicon(icons::SIGNAL_SLASH, IconSize::Micro).text_color(theme.yellow),
             )
             .child("Daemon unreachable · polling")
     });
@@ -590,15 +568,15 @@ fn render_footer<H: SidebarHost>(
             .child(line)
     });
 
-    let icon_button = |id: &'static str, icon: &'static str| {
+    let icon_button = |id: &'static str, icon: Icon| {
         div()
             .id(id)
             .debug_selector(move || id.into())
-            .p_1()
+            .p_0p5()
             .rounded_md()
             .cursor_pointer()
             .hover(|s| s.bg(theme.search))
-            .child(svg().path(icon).size(px(ICON)).text_color(theme.muted))
+            .child(heroicon(icon, IconSize::Standard).text_color(theme.muted))
     };
     let buttons = div()
         .flex()
@@ -615,7 +593,8 @@ fn render_footer<H: SidebarHost>(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(26.0))
+                    // An icon button's size: a standard icon and its padding.
+                    .size(IconSize::Standard.px() + px(4.0))
                     .rounded_md()
                     .bg(theme.error_button)
                     .text_color(theme.on_color)

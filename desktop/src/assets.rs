@@ -1,105 +1,177 @@
 //! Embedded assets: the icons the app draws.
 //!
 //! **Every icon in Shelbi's own UI is a Heroicon** (MIT, Tailwind Labs,
-//! vendored under `assets/icons/heroicons/` with its LICENSE, 24px outline
-//! set from heroicons v2.2.0). To add one, copy its SVG from
-//! `optimized/24/outline/` at that tag into the folder, then add a constant
-//! below and a row to [`HEROICONS`]. Don't reach for gpui-kit's bundled icon
-//! catalog in Shelbi's own views; it is only the fallback that keeps
-//! gpui-kit components' internal glyphs (a checkbox tick, a dropdown caret)
-//! resolving.
+//! vendored under `assets/icons/heroicons/` with its LICENSE, from heroicons
+//! v2.2.0). Don't reach for gpui-kit's bundled icon catalog in Shelbi's own
+//! views; it is only the fallback that keeps gpui-kit components' internal
+//! glyphs (a checkbox tick, a dropdown caret) resolving.
 //!
-//! Render one with `gpui::svg().path(icons::X_MARK)`; the SVG's
-//! `currentColor` takes the element's `text_color`.
+//! **An icon renders at exactly one of three sizes**, each drawn from the
+//! Heroicons set made for that grid, so an icon is never a scaled copy of a
+//! larger drawing:
+//!
+//! | [`IconSize`] | Pixels | Heroicons set     | Use it for |
+//! |--------------|--------|-------------------|------------|
+//! | `Standard`   | 24×24  | `24/outline/`     | toolbar and header buttons, the sidebar's view icons, the bootstrap/update screens' status icons |
+//! | `Mini`       | 20×20  | `20/solid/`       | inline icons in rows, chips, buttons with a text label, the terminal search bar |
+//! | `Micro`      | 16×16  | `16/solid/`       | icons set inside dense text: card badges, activity/machine row markers, link arrows |
+//!
+//! Render one with [`heroicon`]`(icons::X_MARK, IconSize::Mini)`; the SVG's
+//! `currentColor` takes the element's `text_color`. No view calls
+//! `svg()` or sets an icon's pixel size itself (a test guards it); pick the
+//! size by the icon's context, and grow the row around it rather than
+//! shrinking an icon below 16.
+//!
+//! To add an icon, copy its SVG from all three sets at the v2.2.0 tag
+//! (`optimized/24/outline/`, `optimized/20/solid/`, `optimized/16/solid/`)
+//! into `assets/icons/heroicons/{24,20,16}/`, then add a row to the
+//! `heroicons!` list below.
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui::{px, svg, AssetSource, Pixels, Result, SharedString, Styled, Svg};
 
-/// Asset paths of the vendored Heroicons.
-pub mod icons {
-    pub const CHAT_BUBBLE_LEFT_RIGHT: &str = "icons/heroicons/chat-bubble-left-right.svg";
-    pub const VIEW_COLUMNS: &str = "icons/heroicons/view-columns.svg";
-    pub const BOLT: &str = "icons/heroicons/bolt.svg";
-    pub const SERVER_STACK: &str = "icons/heroicons/server-stack.svg";
-    pub const X_MARK: &str = "icons/heroicons/x-mark.svg";
-    pub const ARROW_LEFT: &str = "icons/heroicons/arrow-left.svg";
-    pub const ARROW_PATH: &str = "icons/heroicons/arrow-path.svg";
-    pub const ARROW_TOP_RIGHT_ON_SQUARE: &str = "icons/heroicons/arrow-top-right-on-square.svg";
-    pub const CLIPBOARD_DOCUMENT: &str = "icons/heroicons/clipboard-document.svg";
-    pub const EXCLAMATION_TRIANGLE: &str = "icons/heroicons/exclamation-triangle.svg";
-    pub const FUNNEL: &str = "icons/heroicons/funnel.svg";
-    pub const LOCK_CLOSED: &str = "icons/heroicons/lock-closed.svg";
-    pub const PENCIL_SQUARE: &str = "icons/heroicons/pencil-square.svg";
-    pub const PLAY: &str = "icons/heroicons/play.svg";
-    pub const PLUS: &str = "icons/heroicons/plus.svg";
-    pub const USER: &str = "icons/heroicons/user.svg";
-    pub const MAGNIFYING_GLASS: &str = "icons/heroicons/magnifying-glass.svg";
-    pub const COG_6_TOOTH: &str = "icons/heroicons/cog-6-tooth.svg";
-    pub const CHEVRON_UP_DOWN: &str = "icons/heroicons/chevron-up-down.svg";
-    pub const CHEVRON_DOUBLE_LEFT: &str = "icons/heroicons/chevron-double-left.svg";
-    pub const BARS_3: &str = "icons/heroicons/bars-3.svg";
-    pub const CHECK: &str = "icons/heroicons/check.svg";
-    pub const SIGNAL_SLASH: &str = "icons/heroicons/signal-slash.svg";
-    pub const ARROW_DOWN_CIRCLE: &str = "icons/heroicons/arrow-down-circle.svg";
-    pub const COMMAND_LINE: &str = "icons/heroicons/command-line.svg";
-    pub const FOLDER_OPEN: &str = "icons/heroicons/folder-open.svg";
-    pub const GLOBE_ALT: &str = "icons/heroicons/globe-alt.svg";
-    pub const DOCUMENT_TEXT: &str = "icons/heroicons/document-text.svg";
-    pub const ARROW_DOWN: &str = "icons/heroicons/arrow-down.svg";
-    pub const CHEVRON_UP: &str = "icons/heroicons/chevron-up.svg";
-    pub const CHEVRON_DOWN: &str = "icons/heroicons/chevron-down.svg";
-    pub const ARROWS_RIGHT_LEFT: &str = "icons/heroicons/arrows-right-left.svg";
+/// The three sizes an icon renders at. See the module docs for which to use
+/// where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconSize {
+    /// 24×24, from Heroicons' 24px outline set.
+    Standard,
+    /// 20×20, from Heroicons' 20px solid ("mini") set.
+    Mini,
+    /// 16×16, from Heroicons' 16px solid ("micro") set.
+    Micro,
 }
 
-macro_rules! heroicon {
-    ($path:expr, $file:literal) => {
+impl IconSize {
+    #[cfg(test)]
+    pub const ALL: [IconSize; 3] = [IconSize::Standard, IconSize::Mini, IconSize::Micro];
+
+    /// The icon's width and height.
+    pub fn px(self) -> Pixels {
+        px(self.grid())
+    }
+
+    /// The Heroicons grid the size draws from, in pixels.
+    const fn grid(self) -> f32 {
+        match self {
+            IconSize::Standard => 24.0,
+            IconSize::Mini => 20.0,
+            IconSize::Micro => 16.0,
+        }
+    }
+}
+
+/// One vendored Heroicon: the same symbol drawn once per [`IconSize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Icon {
+    name: &'static str,
+    standard: &'static str,
+    mini: &'static str,
+    micro: &'static str,
+}
+
+impl Icon {
+    /// The Heroicons name, e.g. `x-mark`.
+    #[cfg(test)]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    /// The asset path of the drawing for `size`.
+    pub const fn path(self, size: IconSize) -> &'static str {
+        match size {
+            IconSize::Standard => self.standard,
+            IconSize::Mini => self.mini,
+            IconSize::Micro => self.micro,
+        }
+    }
+}
+
+/// `icon` at `size`: the only way Shelbi's views draw an icon.
+pub fn heroicon(icon: Icon, size: IconSize) -> Svg {
+    svg().path(icon.path(size)).size(size.px()).flex_none()
+}
+
+macro_rules! heroicon_file {
+    ($set:literal, $file:literal) => {
         (
-            $path,
+            concat!("icons/heroicons/", $set, "/", $file, ".svg"),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/assets/icons/heroicons/",
-                $file
+                $set,
+                "/",
+                $file,
+                ".svg"
             )) as &[u8],
         )
     };
 }
 
-/// Every vendored Heroicon, by asset path.
-const HEROICONS: &[(&str, &[u8])] = &[
-    heroicon!(icons::CHAT_BUBBLE_LEFT_RIGHT, "chat-bubble-left-right.svg"),
-    heroicon!(icons::VIEW_COLUMNS, "view-columns.svg"),
-    heroicon!(icons::BOLT, "bolt.svg"),
-    heroicon!(icons::SERVER_STACK, "server-stack.svg"),
-    heroicon!(icons::X_MARK, "x-mark.svg"),
-    heroicon!(icons::ARROW_LEFT, "arrow-left.svg"),
-    heroicon!(icons::ARROW_PATH, "arrow-path.svg"),
-    heroicon!(icons::ARROW_TOP_RIGHT_ON_SQUARE, "arrow-top-right-on-square.svg"),
-    heroicon!(icons::CLIPBOARD_DOCUMENT, "clipboard-document.svg"),
-    heroicon!(icons::EXCLAMATION_TRIANGLE, "exclamation-triangle.svg"),
-    heroicon!(icons::FUNNEL, "funnel.svg"),
-    heroicon!(icons::LOCK_CLOSED, "lock-closed.svg"),
-    heroicon!(icons::PENCIL_SQUARE, "pencil-square.svg"),
-    heroicon!(icons::PLAY, "play.svg"),
-    heroicon!(icons::PLUS, "plus.svg"),
-    heroicon!(icons::USER, "user.svg"),
-    heroicon!(icons::MAGNIFYING_GLASS, "magnifying-glass.svg"),
-    heroicon!(icons::COG_6_TOOTH, "cog-6-tooth.svg"),
-    heroicon!(icons::CHEVRON_UP_DOWN, "chevron-up-down.svg"),
-    heroicon!(icons::CHEVRON_DOUBLE_LEFT, "chevron-double-left.svg"),
-    heroicon!(icons::BARS_3, "bars-3.svg"),
-    heroicon!(icons::CHECK, "check.svg"),
-    heroicon!(icons::SIGNAL_SLASH, "signal-slash.svg"),
-    heroicon!(icons::ARROW_DOWN_CIRCLE, "arrow-down-circle.svg"),
-    heroicon!(icons::COMMAND_LINE, "command-line.svg"),
-    heroicon!(icons::FOLDER_OPEN, "folder-open.svg"),
-    heroicon!(icons::GLOBE_ALT, "globe-alt.svg"),
-    heroicon!(icons::DOCUMENT_TEXT, "document-text.svg"),
-    heroicon!(icons::ARROW_DOWN, "arrow-down.svg"),
-    heroicon!(icons::CHEVRON_UP, "chevron-up.svg"),
-    heroicon!(icons::CHEVRON_DOWN, "chevron-down.svg"),
-    heroicon!(icons::ARROWS_RIGHT_LEFT, "arrows-right-left.svg"),
-];
+macro_rules! heroicons {
+    ($($const:ident = $file:literal;)*) => {
+        /// The vendored Heroicons.
+        pub mod icons {
+            use super::Icon;
+
+            $(
+                pub const $const: Icon = Icon {
+                    name: $file,
+                    standard: concat!("icons/heroicons/24/", $file, ".svg"),
+                    mini: concat!("icons/heroicons/20/", $file, ".svg"),
+                    micro: concat!("icons/heroicons/16/", $file, ".svg"),
+                };
+            )*
+
+            /// Every vendored icon.
+            #[cfg(test)]
+            pub const ALL: &[Icon] = &[$($const),*];
+        }
+
+        /// Every vendored drawing, by asset path: three per icon.
+        const HEROICONS: &[(&str, &[u8])] = &[$(
+            heroicon_file!("24", $file),
+            heroicon_file!("20", $file),
+            heroicon_file!("16", $file),
+        )*];
+    };
+}
+
+heroicons! {
+    CHAT_BUBBLE_LEFT_RIGHT = "chat-bubble-left-right";
+    VIEW_COLUMNS = "view-columns";
+    BOLT = "bolt";
+    SERVER_STACK = "server-stack";
+    X_MARK = "x-mark";
+    ARROW_LEFT = "arrow-left";
+    ARROW_PATH = "arrow-path";
+    ARROW_TOP_RIGHT_ON_SQUARE = "arrow-top-right-on-square";
+    CLIPBOARD_DOCUMENT = "clipboard-document";
+    EXCLAMATION_TRIANGLE = "exclamation-triangle";
+    FUNNEL = "funnel";
+    LOCK_CLOSED = "lock-closed";
+    PENCIL_SQUARE = "pencil-square";
+    PLAY = "play";
+    PLUS = "plus";
+    USER = "user";
+    MAGNIFYING_GLASS = "magnifying-glass";
+    COG_6_TOOTH = "cog-6-tooth";
+    CHEVRON_UP_DOWN = "chevron-up-down";
+    CHEVRON_DOUBLE_LEFT = "chevron-double-left";
+    BARS_3 = "bars-3";
+    CHECK = "check";
+    SIGNAL_SLASH = "signal-slash";
+    ARROW_DOWN_CIRCLE = "arrow-down-circle";
+    COMMAND_LINE = "command-line";
+    FOLDER_OPEN = "folder-open";
+    GLOBE_ALT = "globe-alt";
+    DOCUMENT_TEXT = "document-text";
+    ARROW_DOWN = "arrow-down";
+    CHEVRON_UP = "chevron-up";
+    CHEVRON_DOWN = "chevron-down";
+    ARROWS_RIGHT_LEFT = "arrows-right-left";
+}
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its
 /// license under `assets/fonts/geist/`, from the `geist` npm package 1.7.2).
@@ -252,10 +324,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_heroicon_loads_as_an_svg() {
-        for path in HEROICONS.iter().map(|(p, _)| *p) {
-            let bytes = Assets.load(path).unwrap().expect(path);
-            assert!(bytes.starts_with(b"<svg"), "{path} is an SVG");
+    fn every_heroicon_loads_as_an_svg_in_all_three_sizes() {
+        for icon in icons::ALL {
+            for size in IconSize::ALL {
+                let path = icon.path(size);
+                assert_eq!(
+                    path,
+                    format!("icons/heroicons/{}/{}.svg", size.grid() as u32, icon.name())
+                );
+                let bytes = Assets.load(path).unwrap().expect(path);
+                let svg = std::str::from_utf8(&bytes).expect(path);
+                assert!(svg.starts_with("<svg"), "{path} is an SVG");
+                // Drawn on its own grid, from the set made for that size:
+                // outline at 24, solid at 20 and 16.
+                let grid = size.grid() as u32;
+                assert!(
+                    svg.contains(&format!(r#"viewBox="0 0 {grid} {grid}""#)),
+                    "{path} is drawn on a {grid}px grid"
+                );
+                let outline = svg.contains(r#"fill="none""#) && svg.contains("stroke=");
+                assert_eq!(outline, size == IconSize::Standard, "{path}: outline only at 24px");
+            }
         }
     }
 
@@ -263,5 +352,44 @@ mod tests {
     fn heroicons_are_listed() {
         let listed = Assets.list("icons/heroicons/").unwrap();
         assert_eq!(listed.len(), HEROICONS.len());
+        assert_eq!(HEROICONS.len(), icons::ALL.len() * IconSize::ALL.len());
+    }
+
+    #[test]
+    fn icon_sizes_are_24_20_and_16_pixels() {
+        assert_eq!(IconSize::Standard.px(), px(24.0));
+        assert_eq!(IconSize::Mini.px(), px(20.0));
+        assert_eq!(IconSize::Micro.px(), px(16.0));
+    }
+
+    /// No view draws an SVG or sizes an icon itself: every icon goes through
+    /// [`heroicon`], so it renders at one of the three sizes, from the set
+    /// drawn for it.
+    #[test]
+    fn only_the_icon_helper_draws_icons() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this = src.join("assets.rs");
+        let mut files = vec![src];
+        let mut offenders = Vec::new();
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path == this {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains("svg()") || line.contains("icons/heroicons/") {
+                    offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "draw icons with assets::heroicon(icon, IconSize::…), not svg():\n{}",
+            offenders.join("\n")
+        );
     }
 }

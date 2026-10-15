@@ -34,7 +34,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, relative, svg, AnyWindowHandle, Context, ElementId, Entity, EventEmitter,
+    div, prelude::*, px, relative, AnyWindowHandle, Context, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, Hsla, SharedString, Subscription, Window,
 };
 use gpui_kit::component::text::TextView;
@@ -47,7 +47,7 @@ use shelbi_app::view::ReviewRow;
 use shelbi_app::{CommandKind, ReviewSessionOp};
 
 use super::session_view::{SessionDeps, SessionView, SessionViewEvent};
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, IconSize};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::Theme;
@@ -669,10 +669,10 @@ impl ReviewView {
             .gap_3()
             .child(
                 row_base("review-back", PanelRow::Back)
-                    .size(px(28.0))
+                    .size(IconSize::Standard.px() + px(8.0))
                     .justify_center()
                     .px_0()
-                    .child(svg().path(icons::ARROW_LEFT).size(px(16.0)).text_color(theme.gray)),
+                    .child(heroicon(icons::ARROW_LEFT, IconSize::Standard).text_color(theme.gray)),
             )
             .child(
                 div()
@@ -716,7 +716,7 @@ impl ReviewView {
         let folder = (!model.is_remote()).then(|| {
             row_base("review-folder", PanelRow::Folder)
                 .h(px(26.0))
-                .child(svg().path(icons::FOLDER_OPEN).size(px(16.0)).flex_none().text_color(theme.muted))
+                .child(heroicon(icons::FOLDER_OPEN, IconSize::Mini).text_color(theme.muted))
                 .child(
                     div()
                         .min_w_0()
@@ -746,7 +746,7 @@ impl ReviewView {
                 .h(px(30.0))
                 .text_color(color)
                 .when(active, |d| d.font_weight(FontWeight::BOLD).bg(theme.selection))
-                .child(svg().path(icon).size(px(16.0)).flex_none().text_color(color))
+                .child(heroicon(icon, IconSize::Standard).text_color(color))
                 .child(item.label(&model.editor_name))
         });
 
@@ -768,7 +768,7 @@ impl ReviewView {
                         .h(px(28.0))
                         .text_color(theme.green)
                         .font_weight(FontWeight::BOLD)
-                        .child(svg().path(icons::CHECK).size(px(16.0)).text_color(theme.green))
+                        .child(heroicon(icons::CHECK, IconSize::Mini).text_color(theme.green))
                         .child("Approve"),
                 )
                 .child(
@@ -776,7 +776,7 @@ impl ReviewView {
                         .h(px(28.0))
                         .text_color(theme.red)
                         .font_weight(FontWeight::BOLD)
-                        .child(svg().path(icons::X_MARK).size(px(16.0)).text_color(theme.red))
+                        .child(heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.red))
                         .child("Reject"),
                 )
                 .into_any_element()
@@ -878,10 +878,7 @@ impl ReviewView {
                         .hover(|s| s.underline())
                         .child(div().min_w_0().truncate().child(url))
                         .child(
-                            svg()
-                                .path(icons::ARROW_TOP_RIGHT_ON_SQUARE)
-                                .size(px(12.0))
-                                .flex_none()
+                            heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE, IconSize::Micro)
                                 .text_color(theme.cyan),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -953,7 +950,7 @@ impl ReviewView {
                                     div()
                                         .id("review-description-close")
                                         .cursor_pointer()
-                                        .child(svg().path(icons::X_MARK).size(px(16.0)).text_color(theme.muted))
+                                        .child(heroicon(icons::X_MARK, IconSize::Standard).text_color(theme.muted))
                                         .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
                                 ),
                         )

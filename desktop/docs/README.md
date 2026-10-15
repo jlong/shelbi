@@ -81,6 +81,7 @@ is left, and how it was verified.
 |---|---|---|
 | `dt-parity-audit` | No stubs left; scenario tests for every command; a smoke test per front end; the field checklist; the hand walk; these docs | [`status/dt-parity-audit.md`](status/dt-parity-audit.md) |
 | `dt-merge-main` | `origin/main` merged into the umbrella: the four conflicts resolved, main's `orchestrator_status` shown in both clients | [`status/dt-merge-main.md`](status/dt-merge-main.md) |
+| `dt-icon-sizes` | Every icon at 24, 20 or 16px, each from the Heroicons set drawn for that size, through one helper | [`status/dt-icon-sizes.md`](status/dt-icon-sizes.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

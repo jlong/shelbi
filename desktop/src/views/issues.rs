@@ -27,7 +27,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, relative, svg, App, ClickEvent, Context, Entity, EventEmitter,
+    div, prelude::*, px, relative, App, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, FontWeight, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
     Window,
 };
@@ -40,7 +40,7 @@ use shelbi_state::keymap::{format_chord, DisplayStyle, KanbanAction, Keymaps};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, Icon, IconSize};
 use crate::keys::chord_from_keystroke;
 use crate::theme::Theme;
 
@@ -52,7 +52,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const COLUMN_WIDTH: f32 = 272.0;
 /// A collapsed column's width.
 const COLLAPSED_WIDTH: f32 = 36.0;
-const ICON: f32 = 14.0;
 
 /// What the view asks of the window.
 #[derive(Debug, Clone)]
@@ -550,10 +549,7 @@ impl IssuesView {
             .child(div().flex_1())
             .when(self.state.has_pending(), |row| {
                 row.child(
-                    svg()
-                        .path(icons::ARROW_PATH)
-                        .size(px(ICON))
-                        .text_color(theme.muted),
+                    heroicon(icons::ARROW_PATH, IconSize::Mini).text_color(theme.muted),
                 )
             })
             .child(
@@ -882,11 +878,8 @@ impl IssuesView {
                     .items_start()
                     .when(card.blocked, |d| {
                         d.child(
-                            svg()
-                                .path(icons::LOCK_CLOSED)
-                                .size(px(ICON))
-                                .flex_none()
-                                .mt(px(2.0))
+                            heroicon(icons::LOCK_CLOSED, IconSize::Micro)
+                                .mt(px(3.0))
                                 .text_color(theme.muted),
                         )
                     })
@@ -912,7 +905,7 @@ impl IssuesView {
                         .gap_1()
                         .text_xs()
                         .text_color(theme.muted)
-                        .child(svg().path(icons::ARROW_PATH).size(px(12.0)).text_color(theme.muted))
+                        .child(heroicon(icons::ARROW_PATH, IconSize::Micro).text_color(theme.muted))
                         .child(p.label),
                 )
             })
@@ -927,11 +920,8 @@ impl IssuesView {
                         .text_xs()
                         .text_color(theme.red)
                         .child(
-                            svg()
-                                .path(icons::EXCLAMATION_TRIANGLE)
-                                .size(px(12.0))
-                                .flex_none()
-                                .mt(px(1.0))
+                            heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Micro)
+                                .mt(px(2.0))
                                 .text_color(theme.red),
                         )
                         // Wraps (a gated merge's refusal can be long); the
@@ -942,7 +932,7 @@ impl IssuesView {
                                 .id(SharedString::from(format!("dismiss-{}", card.id)))
                                 .flex_none()
                                 .cursor_pointer()
-                                .child(svg().path(icons::X_MARK).size(px(12.0)).text_color(theme.muted))
+                                .child(heroicon(icons::X_MARK, IconSize::Micro).mt(px(2.0)).text_color(theme.muted))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     cx.stop_propagation();
                                     this.state.dismiss_notice(&id);
@@ -1236,7 +1226,7 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
         })
 }
 
-pub(super) fn chip(theme: &Theme, icon: &'static str, label: String) -> gpui::Div {
+pub(super) fn chip(theme: &Theme, icon: Icon, label: String) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -1249,7 +1239,7 @@ pub(super) fn chip(theme: &Theme, icon: &'static str, label: String) -> gpui::Di
         .text_xs()
         .text_color(theme.gray)
         .cursor_pointer()
-        .child(svg().path(icon).size(px(12.0)).text_color(theme.muted))
+        .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
         .child(label)
 }
 

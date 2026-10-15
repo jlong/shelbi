@@ -8,10 +8,10 @@
 use std::path::Path;
 
 use gpui::{
-    div, prelude::*, px, svg, AnyElement, ClipboardItem, FontWeight, IntoElement, SharedString,
+    div, prelude::*, px, AnyElement, ClipboardItem, FontWeight, IntoElement, SharedString,
 };
 
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, Icon, IconSize};
 use crate::platform::discovery::{config_path_label, CliNotFound};
 use crate::platform::version::VersionCheck;
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
@@ -28,7 +28,6 @@ pub const DAEMON_RESTART_COMMAND: &str = "shelbi daemon restart";
 
 /// The width of a bootstrap screen's column.
 const COLUMN_WIDTH: f32 = 560.0;
-const ICON_SIZE: f32 = 16.0;
 
 /// What a screen's primary button does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +46,7 @@ impl ScreenAction {
         }
     }
 
-    fn icon(self) -> &'static str {
+    fn icon(self) -> Icon {
         icons::ARROW_PATH
     }
 }
@@ -329,10 +328,7 @@ pub fn render_failure(
                 .items_center()
                 .gap_2()
                 .child(
-                    svg()
-                        .path(icons::EXCLAMATION_TRIANGLE)
-                        .size(px(20.0))
-                        .flex_none()
+                    heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Standard)
                         .text_color(theme.yellow),
                 )
                 .child(
@@ -393,10 +389,7 @@ pub fn render_failure(
                 .bg(theme.selection)
                 .text_color(theme.white)
                 .child(
-                    svg()
-                        .path(action.icon())
-                        .size(px(ICON_SIZE))
-                        .text_color(theme.white),
+                    heroicon(action.icon(), IconSize::Mini).text_color(theme.white),
                 )
                 .child(action.label())
                 .on_click(move |_, window, cx| on_action(action, window, cx)),
@@ -428,10 +421,7 @@ pub fn render_relaunch_bar(
                 .gap_2()
                 .text_color(theme.yellow)
                 .child(
-                    svg()
-                        .path(icons::EXCLAMATION_TRIANGLE)
-                        .size(px(ICON_SIZE))
-                        .flex_none()
+                    heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Standard)
                         .text_color(theme.yellow),
                 )
                 .child(relaunch_message(notice)),
@@ -492,10 +482,7 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
                 .flex_none()
                 .cursor_pointer()
                 .child(
-                    svg()
-                        .path(icons::CLIPBOARD_DOCUMENT)
-                        .size(px(ICON_SIZE))
-                        .text_color(theme.muted),
+                    heroicon(icons::CLIPBOARD_DOCUMENT, IconSize::Mini).text_color(theme.muted),
                 )
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))

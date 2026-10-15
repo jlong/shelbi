@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
-    div, prelude::*, px, svg, App, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
+    div, prelude::*, px, App, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
     Hsla, KeyDownEvent, ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::activity::{
@@ -32,7 +32,7 @@ use shelbi_app::CommandKind;
 use shelbi_state::keymap::{format_chord, ActivityAction, DisplayStyle};
 
 use super::activity_state::{ActivityState, Intent, Picker};
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, IconSize};
 use crate::keys::chord_from_keystroke;
 use crate::theme::Theme;
 
@@ -43,7 +43,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The identity-chip column's width, so messages line up across rows (the
 /// TUI's 9-cell chip column). A wider chip pushes only its own row over.
 const CHIP_WIDTH: f32 = 84.0;
-const ICON: f32 = 12.0;
 
 /// What the feed asks of the window.
 #[derive(Debug, Clone)]
@@ -610,8 +609,8 @@ fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
         .cursor_pointer()
         .hover(|s| s.bg(theme.selection))
         .child(
-            div().w(px(ICON)).when(selected, |d| {
-                d.child(svg().path(icons::CHECK).size(px(ICON)).text_color(theme.white))
+            div().w(IconSize::Micro.px()).flex_none().when(selected, |d| {
+                d.child(heroicon(icons::CHECK, IconSize::Micro).text_color(theme.white))
             }),
         )
         .child(label)

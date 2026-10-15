@@ -96,12 +96,15 @@ workspaces). Keep it equal to the root `[workspace.package] version`;
   upstream variant fails to compile here until the desktop handles it (the
   TUI's effect match is wildcard-free too). Never add a `_ =>` arm, and never
   bring back a not-implemented path: a command lands in both clients at once.
-- **Icons are [Heroicons](https://heroicons.com/)** (MIT, 24px outline,
-  v2.2.0), vendored under `assets/icons/heroicons/` and served by
-  `src/assets.rs`. Add an icon by copying its SVG from the heroicons repo's
-  `optimized/24/outline/` at that tag, then adding a constant and a table row
-  in `src/assets.rs`. Don't use gpui-kit's bundled icon catalog in Shelbi's
-  own UI.
+- **Icons are [Heroicons](https://heroicons.com/)** (MIT, v2.2.0), vendored
+  under `assets/icons/heroicons/{24,20,16}/` and served by `src/assets.rs`.
+  An icon renders at exactly one of three sizes, each from the set drawn for
+  that grid: 24px standard (`24/outline`), 20px mini (`20/solid`), 16px micro
+  (`16/solid`). Draw one with `assets::heroicon(icons::X, IconSize::Mini)`;
+  no view calls `svg()` or sizes an icon itself (a test guards it). Add an
+  icon by copying its SVG from all three sets at that tag, then adding a row
+  to the `heroicons!` list in `src/assets.rs`. Don't use gpui-kit's bundled
+  icon catalog in Shelbi's own UI.
 - **Colors come from `src/theme.rs`**, the shared tokens of
   `shelbi_app::theme` (one named set, dark and light, also used by the TUI)
   as gpui colors. Views read them with `cx.global::<Theme>()`. No color
