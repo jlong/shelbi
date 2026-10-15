@@ -22,6 +22,8 @@
 //! - command palette and overlays (error log, review load, reject reason,
 //!   Zen intro, add project): **`dt-palette-overlays`** (landed: `palette.rs`
 //!   and `overlay/`, over the shared `shelbi_app::overlay` state machines)
+//! - the review panel taking the sidebar's column, with the push between
+//!   them: **`dt-review-replaces-sidebar`** (`column_swap`)
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
@@ -35,6 +37,7 @@ pub mod activity_state;
 pub mod bootstrap;
 pub mod board_state;
 pub mod chat;
+pub mod column_swap;
 pub mod session_view;
 pub mod workspace;
 pub mod workspace_layout;

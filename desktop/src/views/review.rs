@@ -1,6 +1,11 @@
 //! The Review view (`dt-review-view`): a ready-for-review task's review
-//! interface in the main area, the native review panel beside a content
-//! terminal.
+//! interface, the native review panel beside a content terminal.
+//!
+//! The panel takes the navigation sidebar's column while a review is open
+//! (`dt-review-replaces-sidebar`, as the TUI's panel replaces its sidebar):
+//! the view renders as the panel, at whatever width the window's column
+//! gives it, and the window puts [`ReviewView::render_main`] (the content and
+//! the description popover) in the main area beside it.
 //!
 //! It follows the TUI's review interface (`crates/shelbi-tui/src/shell/review.rs`,
 //! `review_panel.rs`):
@@ -34,7 +39,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyWindowHandle, Context, ElementId, Entity, EventEmitter,
+    div, prelude::*, px, relative, AnyElement, AnyWindowHandle, Context, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, Hsla, SharedString, Subscription, Window,
 };
 use gpui_kit::component::text::TextView;
@@ -47,13 +52,11 @@ use shelbi_app::view::ReviewRow;
 use shelbi_app::{CommandKind, ReviewSessionOp};
 
 use super::session_view::{SessionDeps, SessionView, SessionViewEvent};
+use super::sidebar::TRAFFIC_LIGHT_INSET;
 use crate::assets::{heroicon, icons, IconSize};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::Theme;
-
-/// The panel's width.
-pub const PANEL_W: f32 = 300.0;
 
 /// The blocking work behind a review, run on the background executor:
 /// resolving and loading a review task, the daemon's content sessions, and the
@@ -404,6 +407,14 @@ impl ReviewView {
             }
             _ => self.focus_handle.clone(),
         }
+    }
+
+    /// Give the panel keyboard focus (the sidebar chord while the panel holds
+    /// the sidebar's column).
+    pub fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus = ReviewFocus::Panel;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
     }
 
     /// Whether keyboard focus is in the view (its panel or its terminal).
@@ -790,11 +801,12 @@ impl ReviewView {
             .on_key_down(cx.listener(Self::panel_key))
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(PANEL_W))
-            .h_full()
+            .size_full()
             .gap_4()
             .p_3()
+            // The window's leading column: clear of the traffic lights, as
+            // the sidebar's header is.
+            .pt(px(TRAFFIC_LIGHT_INSET))
             .overflow_y_scroll()
             .bg(theme.background)
             .text_sm()
@@ -982,43 +994,57 @@ impl Focusable for ReviewView {
     }
 }
 
-impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ReviewView {
+    /// The main area beside the panel: the content terminal, and the
+    /// description popover over it when open. Empty when nothing was shown.
+    pub fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
         let root = div()
             .id("review-view")
             .debug_selector(|| "review-view".into())
             .relative()
             .flex()
-            .flex_row()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .size_full()
             .bg(theme.canvas);
         let Some(shown) = &self.review else {
-            return root;
+            return root.into_any_element();
         };
-        let panel = self.render_panel(shown, &theme, cx);
         let description = self.render_description(shown, &theme, cx);
-        root.child(panel)
-            .child(div().w(px(1.0)).h_full().flex_none().bg(theme.divider))
-            .child(
-                div()
-                    .debug_selector(|| "review-content".into())
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .h_full()
-                    .child(shown.content.clone()),
-            )
-            .children(description)
+        root.child(
+            div()
+                .debug_selector(|| "review-content".into())
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .h_full()
+                .child(shown.content.clone()),
+        )
+        .children(description)
+        .into_any_element()
+    }
+}
+
+/// The view itself renders as the panel; the window sizes and places it.
+impl Render for ReviewView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        match &self.review {
+            Some(shown) => self.render_panel(shown, &theme, cx).into_any_element(),
+            None => div()
+                .debug_selector(|| "review-panel-empty".into())
+                .size_full()
+                .bg(theme.background)
+                .into_any_element(),
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Mutex;
@@ -1049,7 +1075,7 @@ mod tests {
     /// Sessions by name: a name in `refusing` fails to attach (a zombie, a
     /// session not up yet), anything else attaches.
     #[derive(Default)]
-    struct FakeSessions {
+    pub(crate) struct FakeSessions {
         refusing: Mutex<Vec<String>>,
         attaches: Mutex<Vec<(String, UnboundedSender<SessionEvent>)>>,
     }
@@ -1090,7 +1116,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeOps {
+    pub(crate) struct FakeOps {
         ops: Mutex<Vec<(String, ReviewSessionOp)>>,
         fail_ops: Mutex<bool>,
         opened: Mutex<Vec<String>>,
@@ -1115,6 +1141,24 @@ mod tests {
         fn reveal(&self, path: &str) -> Result<(), String> {
             self.opened.lock().unwrap().push(path.to_string());
             Ok(())
+        }
+    }
+
+    /// The window's composition in miniature: the panel in a leading column,
+    /// the main area beside it.
+    struct Host {
+        view: Entity<ReviewView>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let main = self.view.update(cx, |v, cx| v.render_main(cx));
+            div()
+                .flex()
+                .flex_row()
+                .size_full()
+                .child(div().w(px(252.0)).h_full().flex_none().child(self.view.clone()))
+                .child(main)
         }
     }
 
@@ -1183,7 +1227,7 @@ mod tests {
         }
     }
 
-    fn info() -> ReviewInfo {
+    pub(crate) fn info() -> ReviewInfo {
         ReviewInfo {
             task_id: "t-1".into(),
             slot: "review-1".into(),
@@ -1197,7 +1241,7 @@ mod tests {
         }
     }
 
-    fn row(state: ReviewState) -> ReviewRow {
+    pub(crate) fn row(state: ReviewState) -> ReviewRow {
         ReviewRow {
             task_id: "t-1".into(),
             title: "Cold-start cache".into(),
@@ -1208,11 +1252,9 @@ mod tests {
         }
     }
 
-    fn open(cx: &mut TestAppContext) -> Harness {
-        cx.update(|cx| {
-            cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
-            gpui_kit::init(cx);
-        });
+    /// Review deps over fake sessions and daemon ops: nothing reaches a
+    /// daemon or a session (the window's tests use them too).
+    pub(crate) fn fake_deps() -> (ReviewDeps, Arc<FakeSessions>, Arc<FakeOps>) {
         let sessions = Arc::new(FakeSessions::default());
         let ops = Arc::new(FakeOps::default());
         let now = Rc::new(Cell::new(Instant::now()));
@@ -1235,17 +1277,27 @@ mod tests {
                 }),
             }
         };
+        (deps, sessions, ops)
+    }
+
+    fn open(cx: &mut TestAppContext) -> Harness {
+        cx.update(|cx| {
+            cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
+            gpui_kit::init(cx);
+        });
+        let (deps, sessions, ops) = fake_deps();
         let events = Rc::new(std::cell::RefCell::new(Vec::new()));
         let deps = Cell::new(Some(deps));
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 let handle = window.window_handle();
-                cx.new(|cx| ReviewView::new("demo", handle, deps.take().unwrap(), None, cx))
+                let view = cx.new(|cx| ReviewView::new("demo", handle, deps.take().unwrap(), None, cx));
+                cx.new(|_| Host { view })
             })
             .unwrap()
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
-        let view = window.root(&mut vcx).unwrap();
+        let view = window.root(&mut vcx).unwrap().read_with(&vcx, |h, _| h.view.clone());
         let sink = events.clone();
         vcx.update(|_, cx| {
             cx.subscribe(&view, move |_, ev: &ReviewEvent, _| sink.borrow_mut().push(ev.clone()))

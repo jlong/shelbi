@@ -19,6 +19,7 @@ pub mod control;
 pub mod daemon;
 pub mod discovery;
 pub mod env;
+pub mod motion;
 pub mod print_version;
 pub mod relaunch;
 pub mod update;

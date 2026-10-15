@@ -19,7 +19,7 @@
 //! clamped by `shelbi_app::nav::clamp_sidebar_width`.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, ScrollHandle, SharedString, Window,
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
@@ -90,6 +90,9 @@ pub struct SidebarProps<'a> {
     /// The project switcher, when open: every project and the current one.
     pub switcher: Option<(&'a [ProjectEntry], &'a str)>,
     pub width: f32,
+    /// The rows' scroll, owned by the window so it outlives frames the
+    /// sidebar isn't drawn in (a review panel standing in for it).
+    pub scroll: ScrollHandle,
 }
 
 /// One row's text, as the TUI draws it: the badge glyph and its color, the
@@ -241,6 +244,7 @@ pub fn render<H: SidebarHost>(
                 .px_2()
                 .pt_2()
                 .overflow_y_scroll()
+                .track_scroll(&props.scroll)
                 .children(rest),
         )
         .child(render_footer(&props, theme, cx))
@@ -881,6 +885,7 @@ mod render_tests {
                     palette_chord: "⌃P".into(),
                     switcher: None,
                     width: 252.0,
+                    scroll: gpui::ScrollHandle::new(),
                 },
                 &theme,
                 cx,

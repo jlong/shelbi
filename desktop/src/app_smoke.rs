@@ -13,7 +13,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use gpui::{TestAppContext, VisualTestContext, WindowAppearance};
 use shelbi_app::command::{Command, EditItem, ProjectItem};
@@ -22,11 +21,8 @@ use shelbi_app::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, Workspac
 
 use super::*;
 use crate::menus::tree::{MenuAction, WindowFacts};
-use crate::platform::bootstrap::Ready;
-use crate::platform::control::ControlHandle;
-use crate::platform::discovery::{Candidate, CliSource};
 
-fn fixture_model() -> SidebarModel {
+pub(super) fn fixture_model() -> SidebarModel {
     let mut m = SidebarModel::skeleton("alpha");
     m.nav = vec![
         NavItem {
@@ -83,32 +79,14 @@ fn fixture_inputs() -> PaletteInputs {
     }
 }
 
-/// A bootstrap result that points nowhere: the shell renders, and nothing
-/// can reach a real CLI or daemon (the tap stops commands before they would).
-fn fake_ready() -> Ready {
-    Ready {
-        cli: Candidate {
-            path: "/nonexistent/shelbi".into(),
-            source: CliSource::Setting,
-        },
-        cli_version: None,
-        env: Arc::new(Default::default()),
-        control: ControlHandle::new(
-            "/nonexistent/control.sock".into(),
-            APP_VERSION.into(),
-            APP_VERSION.into(),
-        ),
-    }
-}
-
-struct Harness {
-    window: Entity<ShelbiWindow>,
-    cx: VisualTestContext,
-    tap: Rc<RefCell<Vec<HostCall>>>,
+pub(super) struct Harness {
+    pub(super) window: Entity<ShelbiWindow>,
+    pub(super) cx: VisualTestContext,
+    pub(super) tap: Rc<RefCell<Vec<HostCall>>>,
 }
 
 impl Harness {
-    fn open(cx: &mut TestAppContext) -> Harness {
+    pub(super) fn open(cx: &mut TestAppContext) -> Harness {
         cx.update(|cx| {
             cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
             gpui_kit::init(cx);
@@ -119,7 +97,7 @@ impl Harness {
             cx.open_window(Default::default(), |window, cx| {
                 cx.new(|cx| {
                     let mut w = ShelbiWindow::build("alpha", WindowState::default(), window, cx);
-                    w.boot = Boot::Ready(Box::new(fake_ready()));
+                    w.boot = Boot::Ready(Box::new(inert_ready()));
                     w.model = fixture_model();
                     w.palette_inputs = fixture_inputs();
                     w.tap = Some(window_tap);
@@ -142,18 +120,18 @@ impl Harness {
         h
     }
 
-    fn draw(&mut self) {
+    pub(super) fn draw(&mut self) {
         self.cx.update(|window, cx| window.draw(cx).clear(cx));
         self.cx.run_until_parked();
     }
 
-    fn key(&mut self, keystroke: &str) {
+    pub(super) fn key(&mut self, keystroke: &str) {
         self.cx.simulate_keystrokes(keystroke);
         self.cx.run_until_parked();
     }
 
     /// Focus the window's own handle (where its key handlers live).
-    fn focus_window(&mut self) {
+    pub(super) fn focus_window(&mut self) {
         self.cx.update(|window, cx| {
             let handle = self.window.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
@@ -161,7 +139,7 @@ impl Harness {
         self.draw();
     }
 
-    fn take_calls(&self) -> Vec<HostCall> {
+    pub(super) fn take_calls(&self) -> Vec<HostCall> {
         std::mem::take(&mut *self.tap.borrow_mut())
     }
 
