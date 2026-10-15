@@ -5,8 +5,9 @@
 //! matches) or under the glyphs (a link's underline). The geometry itself is
 //! `shelbi_term`'s ([`Selection::row_span`], [`Link::row_span`]), the same the
 //! TUI highlights with and the copy extracts; this maps grid lines to viewer
-//! rows through the scroll offset and clips to the columns shown. Plain data,
-//! unit-tested without a window.
+//! rows through `top` (the grid line on the first row shown: the clipped
+//! window's start less the scroll offset, `TerminalView::first_shown_line`)
+//! and clips to the columns shown. Plain data, unit-tested without a window.
 
 use shelbi_term::links::Link;
 use shelbi_term::search::Match;
@@ -24,39 +25,38 @@ pub struct Span {
     pub len: u16,
 }
 
-/// The grid line shown on viewer `row` when the view is scrolled `offset`
-/// lines up.
-fn line_of(row: u16, offset: usize) -> i32 {
-    row as i32 - offset as i32
+/// The grid line shown on viewer `row` when the first row shows line `top`.
+fn line_of(row: u16, top: i32) -> i32 {
+    top + row as i32
 }
 
-/// The cells `sel` covers among the `shown` rows and columns at scroll
-/// `offset`. One span per row it touches.
-pub fn selection_spans(sel: &Selection, offset: usize, shown: Size) -> Vec<Span> {
+/// The cells `sel` covers among the `shown` rows and columns, the first
+/// showing grid line `top`. One span per row it touches.
+pub fn selection_spans(sel: &Selection, top: i32, shown: Size) -> Vec<Span> {
     (0..shown.rows)
         .filter_map(|row| {
-            let (first, last) = sel.row_span(line_of(row, offset), shown.cols)?;
+            let (first, last) = sel.row_span(line_of(row, top), shown.cols)?;
             Some(Span { row, col: first, len: last - first + 1 })
         })
         .collect()
 }
 
 /// The cells a hovered link covers (for its underline).
-pub fn link_spans(link: &Link, offset: usize, shown: Size) -> Vec<Span> {
+pub fn link_spans(link: &Link, top: i32, shown: Size) -> Vec<Span> {
     (0..shown.rows)
         .filter_map(|row| {
-            let (first, last) = link.row_span(line_of(row, offset), shown.cols)?;
+            let (first, last) = link.row_span(line_of(row, top), shown.cols)?;
             Some(Span { row, col: first, len: last - first + 1 })
         })
         .collect()
 }
 
 /// The search matches on screen, each with whether it is the current one.
-pub fn match_spans(matches: &[Match], current: Option<Match>, offset: usize, shown: Size) -> Vec<(Span, bool)> {
+pub fn match_spans(matches: &[Match], current: Option<Match>, top: i32, shown: Size) -> Vec<(Span, bool)> {
     matches
         .iter()
         .filter_map(|m| {
-            let row = m.line + offset as i32;
+            let row = m.line - top;
             if row < 0 || row >= shown.rows as i32 || m.start_col >= shown.cols {
                 return None;
             }
@@ -115,7 +115,7 @@ mod tests {
         let mut sel = Selection::start(Point::new(-5, 0));
         sel.update(Point::new(-4, 4));
         assert!(selection_spans(&sel, 0, SHOWN).is_empty(), "off screen at the bottom");
-        assert_eq!(selection_spans(&sel, 5, SHOWN), vec![span(0, 0, 10), span(1, 0, 5)]);
+        assert_eq!(selection_spans(&sel, -5, SHOWN), vec![span(0, 0, 10), span(1, 0, 5)]);
     }
 
     #[test]
@@ -148,6 +148,27 @@ mod tests {
             vec![(span(0, 2, 3), true), (span(3, 8, 2), false)]
         );
         // Scrolled up one: the history match shows on row 0.
-        assert_eq!(match_spans(&matches, None, 1, SHOWN)[0], (span(0, 0, 3), false));
+        assert_eq!(match_spans(&matches, None, -1, SHOWN)[0], (span(0, 0, 3), false));
+    }
+
+    #[test]
+    fn a_window_clipped_to_the_bottom_shifts_every_overlay_up() {
+        // A taller session's window starting at grid line 3
+        // (dt-terminal-bottom-clipped): line 3 is viewer row 0.
+        let mut sel = Selection::start(Point::new(3, 1));
+        sel.update(Point::new(4, 2));
+        assert_eq!(selection_spans(&sel, 3, SHOWN), vec![span(0, 1, 9), span(1, 0, 3)]);
+        let link = Link {
+            target: LinkTarget::Url("https://x".into()),
+            start: Point::new(5, 0),
+            end: Point::new(5, 4),
+        };
+        assert_eq!(link_spans(&link, 3, SHOWN), vec![span(2, 0, 5)]);
+        let m = |line, start_col, end_col| Match { line, start_col, end_col };
+        assert_eq!(
+            match_spans(&[m(2, 0, 3), m(6, 1, 2)], None, 3, SHOWN),
+            vec![(span(3, 1, 1), false)],
+            "line 2 is above the window"
+        );
     }
 }

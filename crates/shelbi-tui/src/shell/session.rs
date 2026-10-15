@@ -530,6 +530,14 @@ impl SessionManager {
         }
     }
 
+    /// Make this client the live session's sizing client, so its PTY follows
+    /// our size (the outer terminal took focus).
+    pub fn claim_size(&self) {
+        if let Slot::Live(live) = &self.slot {
+            let _ = live.conn.claim_size();
+        }
+    }
+
     /// Paste text into the live session (the session brackets it if it can).
     pub fn send_paste(&self, text: &str) {
         if let Slot::Live(live) = &self.slot {

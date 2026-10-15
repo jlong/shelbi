@@ -24,9 +24,10 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::{CursorShape as VtCursorShape, Processor};
+use alacritty_terminal::vte::ansi::{Color, CursorShape as VtCursorShape, NamedColor, Processor};
 
 use crate::input::{KeyEncoding, MouseModes};
 use crate::render::{Cursor, CursorShape, Damage, Rgb, RowDamage};
@@ -231,6 +232,35 @@ impl TermEmulator {
         Some(Cursor { row: row as u16, col: point.column.0 as u16, shape, blinking: style.blinking })
     }
 
+    /// The lowest row of the live screen (0 = its top, whatever the scroll
+    /// position) that holds anything: a printed character, a non-default
+    /// background, reverse video, or the cursor. What a viewer with fewer rows
+    /// than the session keeps in view ([`crate::viewport::fit_showing`]).
+    pub fn content_bottom(&self) -> u16 {
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point.line.0.max(0) as u16;
+        let cols = grid.columns();
+        let filled = (0..grid.screen_lines()).rev().find(|&row| {
+            let line = &grid[Line(row as i32)];
+            (0..cols).any(|col| {
+                let cell = &line[Column(col)];
+                !matches!(cell.c, ' ' | '\0')
+                    || cell.bg != Color::Named(NamedColor::Background)
+                    || cell.flags.contains(Flags::INVERSE)
+            })
+        });
+        filled.map_or(cursor, |row| (row as u16).max(cursor))
+    }
+
+    /// The cursor's row on the live screen (0 = its top, whatever the scroll
+    /// position) when the cursor is shown.
+    pub fn cursor_screen_row(&self) -> Option<u16> {
+        let visible = self.term.mode().contains(TermMode::SHOW_CURSOR)
+            && self.term.cursor_style().shape != VtCursorShape::Hidden;
+        let line = self.term.grid().cursor.point.line.0;
+        (visible && line >= 0).then_some(line as u16)
+    }
+
     /// The viewport rows that changed since the last call, then forget them.
     ///
     /// A viewer calls this after feeding output and repaints only when it is
@@ -307,6 +337,40 @@ mod tests {
         let grid = e.grid();
         let row: String = (0..5).map(|c| grid[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(c)].c).collect();
         assert_eq!(row, "hello");
+    }
+
+    #[test]
+    fn content_bottom_is_the_lowest_filled_row_or_the_cursor() {
+        let mut e = emu();
+        assert_eq!(e.content_bottom(), 0, "a blank screen: the cursor's row");
+        // Text on row 3, cursor parked back up on row 1.
+        e.feed(b"\x1b[4;1Hstatus\x1b[2;1H");
+        assert_eq!(e.content_bottom(), 3);
+        // A row that is only a colored background counts (a status bar).
+        e.feed(b"\x1b[10;1H\x1b[44m\x1b[K\x1b[0m\x1b[2;1H");
+        assert_eq!(e.content_bottom(), 9);
+        // The cursor below everything counts too (a fresh prompt line).
+        e.feed(b"\x1b[20;1H");
+        assert_eq!(e.content_bottom(), 19);
+        assert_eq!(e.cursor_screen_row(), Some(19));
+        // Hiding the cursor hides it from the placement's cursor rule.
+        e.feed(b"\x1b[?25l");
+        assert_eq!(e.cursor_screen_row(), None);
+    }
+
+    #[test]
+    fn content_bottom_ignores_the_scroll_position() {
+        let mut e = emu();
+        for i in 0..60 {
+            e.feed(format!("line {i}\r\n").as_bytes());
+        }
+        e.feed(b"$ ");
+        let bottom = e.content_bottom();
+        assert_eq!(bottom, 23);
+        e.scroll(Scroll::Delta(10));
+        assert!(e.display_offset() > 0);
+        assert_eq!(e.content_bottom(), bottom, "the live screen, not the scrolled view");
+        assert_eq!(e.cursor_screen_row(), Some(23));
     }
 
     #[test]

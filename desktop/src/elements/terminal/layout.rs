@@ -238,6 +238,9 @@ pub fn layout_row(emu: &TermEmulator, row: u16, cols: u16, palette: &Palette) ->
 #[derive(Default)]
 pub struct RowCache {
     rows: Vec<Option<Arc<RowLayout>>>,
+    /// The viewport row the window starts at (non-zero when a shorter viewer
+    /// clips a taller session to its bottom rows).
+    first: u16,
     cols: u16,
     palette: Option<Palette>,
     /// Rows laid out since the counter was last read (for the frame stats).
@@ -246,27 +249,35 @@ pub struct RowCache {
 
 impl RowCache {
     /// Bring the cache up to date for a `rows` x `cols` window of the session
-    /// and return the rows. Rows outside `damage` keep their layout unless the
-    /// window or the palette changed.
+    /// starting at viewport row `first`, and return the rows (index 0 is
+    /// viewport row `first`). Rows outside `damage` keep their layout unless
+    /// the window or the palette changed.
     pub fn update(
         &mut self,
         emu: &TermEmulator,
+        first: u16,
         rows: u16,
         cols: u16,
         palette: &Palette,
         damage: &Damage,
     ) -> Vec<Arc<RowLayout>> {
         let reset = self.rows.len() != rows as usize
+            || self.first != first
             || self.cols != cols
             || self.palette.as_ref() != Some(palette)
             || matches!(damage, Damage::Full);
         if reset {
             self.rows = vec![None; rows as usize];
+            self.first = first;
             self.cols = cols;
             self.palette = Some(palette.clone());
         } else if let Damage::Rows(damaged) = damage {
+            // Damage is in viewport rows; the cache holds the window's.
             for d in damaged {
-                if let Some(slot) = self.rows.get_mut(d.row as usize) {
+                let Some(row) = d.row.checked_sub(first) else {
+                    continue;
+                };
+                if let Some(slot) = self.rows.get_mut(row as usize) {
                     *slot = None;
                 }
             }
@@ -277,7 +288,7 @@ impl RowCache {
                 if slot.is_none() {
                     self.rebuilt += 1;
                 }
-                slot.get_or_insert_with(|| Arc::new(layout_row(emu, row, cols, palette)))
+                slot.get_or_insert_with(|| Arc::new(layout_row(emu, first + row, cols, palette)))
                     .clone()
             })
             .collect()
@@ -459,7 +470,7 @@ mod tests {
         let p = palette(&e);
         let mut cache = RowCache::default();
         let d = e.take_damage();
-        let first = cache.update(&e, 4, 20, &p, &d);
+        let first = cache.update(&e, 0, 4, 20, &p, &d);
         assert_eq!(
             cache.take_rebuilt(),
             4,
@@ -469,7 +480,7 @@ mod tests {
         // Jump straight to row 2 (CUP), so row 1 is never touched.
         e.feed(b"\x1b[3;1Hchanged");
         let d = e.take_damage();
-        let second = cache.update(&e, 4, 20, &p, &d);
+        let second = cache.update(&e, 0, 4, 20, &p, &d);
         assert!(
             cache.take_rebuilt() <= 2,
             "only the cursor's old and new rows"
@@ -482,11 +493,41 @@ mod tests {
 
         // Nothing changed: at most the cursor's row is rebuilt.
         let d = e.take_damage();
-        cache.update(&e, 4, 20, &p, &d);
+        cache.update(&e, 0, 4, 20, &p, &d);
         assert!(cache.take_rebuilt() <= 1);
 
         // A different window size rebuilds everything.
-        cache.update(&e, 3, 20, &p, &Damage::Rows(vec![]));
+        cache.update(&e, 0, 3, 20, &p, &Damage::Rows(vec![]));
         assert_eq!(cache.take_rebuilt(), 3);
+    }
+
+    /// A window clipped to a taller session's bottom rows lays out those
+    /// rows, maps damage into the window, and starts over when the window
+    /// moves (`dt-terminal-bottom-clipped`).
+    #[test]
+    fn a_window_starting_below_the_top_lays_out_its_own_rows() {
+        let mut e = TermEmulator::new(Size::new(20, 6));
+        e.feed(b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+        let p = palette(&e);
+        let mut cache = RowCache::default();
+        let d = e.take_damage();
+        let rows = cache.update(&e, 3, 3, 20, &p, &d);
+        let text: Vec<&str> = rows.iter().map(|r| r.glyphs[0].text.as_str()).collect();
+        assert_eq!(text, ["r3", "r4", "r5"]);
+        cache.take_rebuilt();
+
+        // Damage on viewport row 5 is window row 2; row 1 (viewport 4) is
+        // reused, and damage above the window is ignored.
+        e.feed(b"\x1b[6;1Hzz\x1b[1;1Hqq");
+        let d = e.take_damage();
+        let again = cache.update(&e, 3, 3, 20, &p, &d);
+        assert!(Arc::ptr_eq(&rows[1], &again[1]), "an untouched row is reused");
+        assert_eq!(again[2].glyphs[0].text, "zz");
+
+        // The window moving rebuilds it.
+        cache.take_rebuilt();
+        let moved = cache.update(&e, 2, 3, 20, &p, &Damage::Rows(vec![]));
+        assert_eq!(cache.take_rebuilt(), 3);
+        assert_eq!(moved[0].glyphs[0].text, "r2");
     }
 }

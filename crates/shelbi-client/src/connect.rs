@@ -314,6 +314,16 @@ impl Connection {
         }
     }
 
+    /// Make this client the session's active (sizing) client, so the PTY
+    /// follows the viewport it last reported, without sending a key: an empty
+    /// [`Input`], which the session counts as activity and writes nothing for.
+    /// Every session binary treats it so (a sender of any input becomes the
+    /// sizing client), so it needs no capability. A viewer sends it when it
+    /// takes focus.
+    pub fn claim_size(&self) -> Result<(), ClientError> {
+        self.input(&[])
+    }
+
     /// Report this client's viewport size.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), ClientError> {
         self.send(&Frame::Resize(Resize { cols, rows }).encode()?)

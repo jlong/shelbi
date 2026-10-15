@@ -38,12 +38,17 @@ pub trait SessionIo: 'static {
     /// This client's viewport size. The session applies the most recently
     /// active client's size, debounced on its side too.
     fn resize(&self, size: Size);
+    /// Become the session's active client, so the PTY follows this viewer's
+    /// size without a key being sent (the pane took focus). A no-op for
+    /// fakes that don't care.
+    fn claim(&self) {}
 }
 
 enum Request {
     Input(Vec<u8>),
     Paste(String, bool),
     Resize(Size),
+    Claim,
 }
 
 /// The real [`SessionIo`]: requests queued to a writer thread that owns the
@@ -63,6 +68,10 @@ impl SessionIo for SessionLink {
 
     fn resize(&self, size: Size) {
         let _ = self.tx.send(Request::Resize(size));
+    }
+
+    fn claim(&self) {
+        let _ = self.tx.send(Request::Claim);
     }
 }
 
@@ -197,6 +206,7 @@ pub fn wire(
                         }
                     }
                     Request::Resize(size) => conn.resize(size.cols.max(1), size.rows.max(1)),
+                    Request::Claim => conn.claim_size(),
                 };
                 if sent.is_err() {
                     break;

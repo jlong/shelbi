@@ -30,7 +30,7 @@ use crate::links::{self, Link};
 use crate::scrollback::Scrollback;
 use crate::search::{Match, Search};
 use crate::selection::{Point, Selection, SelectionMode};
-use crate::viewport::Placement;
+use crate::viewport::{self, Placement};
 use crate::Size;
 
 /// A selection longer than this many lines isn't re-read after every batch of
@@ -281,6 +281,26 @@ impl TerminalView {
         }
     }
 
+    /// How this view's `session`-sized screen sits in a `viewer`: letterboxed
+    /// when the viewer is larger, clipped when it is smaller, with a clipped
+    /// window that keeps the screen's content (and the cursor) in view rather
+    /// than its top ([`viewport::fit_showing`]). Every client paints and maps
+    /// the pointer through this one placement.
+    pub fn placement(&self, session: Size, viewer: Size) -> Placement {
+        if viewer.rows >= session.rows {
+            // Nothing to anchor: skip the screen scan.
+            return viewport::fit(session, viewer);
+        }
+        viewport::fit_showing(session, viewer, self.emu.content_bottom(), self.emu.cursor_screen_row())
+    }
+
+    /// The grid line (0 = top of the live screen, negative = history) shown on
+    /// the first row of `placement`'s window at the current scroll position.
+    /// Viewer row `r` of the window shows line `first_shown_line + r`.
+    pub fn first_shown_line(&self, placement: &Placement) -> i32 {
+        placement.rows.src_start as i32 - self.emu.display_offset() as i32
+    }
+
     /// Translate a viewer cell to a grid [`Point`] for selection, accounting
     /// for the current scroll offset and the viewer's [`Placement`]. Returns
     /// `None` when the cell is in letterbox margin or outside a clipped window.
@@ -469,6 +489,42 @@ mod tests {
 
     fn view() -> TerminalView {
         TerminalView::new(Size::new(20, 5))
+    }
+
+    /// dt-terminal-bottom-clipped: a session sized by a taller client (30
+    /// rows) shown in a 10-row viewer, an agent's prompt and status line on
+    /// its last rows. Scrolled to the bottom, the window's last row is the
+    /// screen's last row; scrolling up walks back through the rows above it.
+    #[test]
+    fn a_shorter_viewer_shows_the_bottom_of_a_taller_session() {
+        let session = Size::new(40, 30);
+        let mut v = TerminalView::new(session);
+        for i in 0..40 {
+            v.feed(format!("output {i}\r\n").as_bytes());
+        }
+        v.feed(b"\x1b[29;1H\x1b[2K> prompt\r\n\x1b[2K-- status --\x1b[29;3H");
+        let viewer = Size::new(40, 10);
+        let p = v.placement(session, viewer);
+        assert_eq!(p.rows.src_start, 20);
+        assert_eq!(p.viewer_to_session(0, 9), Some((0, 29)));
+        assert_eq!(v.first_shown_line(&p), 20);
+        let grid = v.emulator().grid();
+        let row_text = |line: i32| -> String {
+            (0..12).map(|c| grid[Line(line)][Column(c)].c).collect::<String>().trim_end().to_string()
+        };
+        assert_eq!(row_text(v.first_shown_line(&p) + 9), "-- status --");
+        assert_eq!(row_text(v.first_shown_line(&p) + 8), "> prompt");
+
+        // Scrolled up three lines: the window moves up with it.
+        v.scroll_up(3);
+        let p = v.placement(session, viewer);
+        assert_eq!(v.first_shown_line(&p), 17);
+        // And back to the bottom: the status line is the last row again.
+        v.scroll_to_bottom();
+        let p = v.placement(session, viewer);
+        assert_eq!(v.first_shown_line(&p) + viewer.rows as i32 - 1, 29);
+        // A viewer at least as tall isn't anchored at all.
+        assert_eq!(v.placement(session, Size::new(40, 30)).rows.src_start, 0);
     }
 
     /// Produce enough output to build scrollback history on the normal screen.

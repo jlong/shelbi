@@ -3518,6 +3518,11 @@ impl ShellState {
     }
 
     fn forward_focus(&mut self, focused: bool) {
+        // Taking focus takes the session's size, as the desktop pane does: a
+        // taller client that typed last stops sizing what we're looking at.
+        if focused {
+            self.sessions.claim_size();
+        }
         if let Some(p) = self.sessions.live_pane_mut() {
             if let Some(bytes) = p.encode_focus(focused) {
                 self.sessions.send_input(&bytes);
