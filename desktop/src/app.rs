@@ -453,6 +453,10 @@ pub struct ShelbiWindow {
     /// Test seam: the Workspace view's deps, likewise.
     #[cfg(any(test, feature = "visual-check"))]
     workspace_deps: Option<WorkspaceDeps>,
+    /// `--bench-push`'s frame probe: each frame's render start, paint end
+    /// and column position.
+    #[cfg(feature = "visual-check")]
+    probe: Option<Rc<std::cell::RefCell<crate::bench_push::Probe>>>,
 }
 
 impl ShelbiWindow {
@@ -567,6 +571,8 @@ impl ShelbiWindow {
             review_deps: None,
             #[cfg(any(test, feature = "visual-check"))]
             workspace_deps: None,
+            #[cfg(feature = "visual-check")]
+            probe: None,
         };
         this.sync_selection();
         this
@@ -2742,6 +2748,8 @@ impl ShelbiWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        #[cfg(feature = "visual-check")]
+        let render_start = Instant::now();
         let theme = *theme;
         // The chat attaches the first time the shell paints with it routed
         // (bootstrap has no window to hand it); later changes go through
@@ -2757,6 +2765,15 @@ impl ShelbiWindow {
         let now = (self.clock)();
         self.sync_column(now);
         let frame = self.column.frame(now);
+        #[cfg(feature = "visual-check")]
+        let probe = self.probe.clone().map(|probe| {
+            probe.borrow_mut().begin(render_start, self.column.position(now), frame.animating);
+            gpui::canvas(|_, _, _| {}, move |_, _, _, _| probe.borrow_mut().end(Instant::now()))
+                .absolute()
+                .size_0()
+        });
+        #[cfg(not(feature = "visual-check"))]
+        let probe: Option<gpui::Empty> = None;
         if frame.animating {
             window.request_animation_frame();
         } else if self.column.target() == Occupant::Sidebar {
@@ -2942,6 +2959,7 @@ impl ShelbiWindow {
             })
             .child(shell.flex_1().min_h_0())
             .children(layer)
+            .children(probe)
             .into_any_element()
     }
 }
@@ -3023,6 +3041,37 @@ impl ShelbiWindow {
     /// What the leading column draws now.
     pub(crate) fn offscreen_column(&mut self) -> column_swap::Frame {
         self.column.frame((self.clock)())
+    }
+
+    /// `--bench-push`'s window: [`Self::offscreen`]'s, on the real clock,
+    /// with workspaces over `workspace` and every frame reported to `probe`.
+    pub(crate) fn bench(
+        project: &str,
+        model: SidebarModel,
+        review: ReviewDeps,
+        workspace: WorkspaceDeps,
+        probe: Rc<std::cell::RefCell<crate::bench_push::Probe>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut w = Self::offscreen(project, model, review, Rc::new(Instant::now), window, cx);
+        w.workspace_deps = Some(workspace);
+        w.probe = Some(probe);
+        w
+    }
+
+    /// Carry out `call` as a command dispatch would.
+    pub(crate) fn bench_perform(&mut self, call: HostCall, window: &mut Window, cx: &mut Context<Self>) {
+        self.perform(call, window, cx);
+    }
+
+    /// The open panel's Back.
+    pub(crate) fn bench_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Review) {
+            self.leave_review(window, cx);
+        } else {
+            self.leave_workspace(window, cx);
+        }
     }
 }
 
