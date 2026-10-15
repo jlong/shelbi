@@ -404,6 +404,8 @@ pub struct ShelbiWindow {
     /// The leading column's occupant (the sidebar, or the review or
     /// workspace panel in its place) and the push between them.
     column: ColumnSwap,
+    /// The push was still running as of the last frame.
+    column_moving: bool,
     /// The column's width while a panel (a review's or a workspace's) holds
     /// it with the sidebar collapsed, once the user drags it (else the
     /// default width).
@@ -453,6 +455,10 @@ pub struct ShelbiWindow {
     /// Test seam: the Workspace view's deps, likewise.
     #[cfg(any(test, feature = "visual-check"))]
     workspace_deps: Option<WorkspaceDeps>,
+    /// `--bench-push`'s frame probe: each frame's render start, paint end
+    /// and column position.
+    #[cfg(feature = "visual-check")]
+    probe: Option<Rc<std::cell::RefCell<crate::bench_push::Probe>>>,
 }
 
 impl ShelbiWindow {
@@ -542,6 +548,7 @@ impl ShelbiWindow {
             workspace_return: None,
             review: None,
             column: ColumnSwap::new(),
+            column_moving: false,
             collapsed_panel_cols: None,
             sidebar_scroll: ScrollHandle::new(),
             clock: Rc::new(Instant::now),
@@ -567,6 +574,8 @@ impl ShelbiWindow {
             review_deps: None,
             #[cfg(any(test, feature = "visual-check"))]
             workspace_deps: None,
+            #[cfg(feature = "visual-check")]
+            probe: None,
         };
         this.sync_selection();
         this
@@ -1075,7 +1084,12 @@ impl ShelbiWindow {
                     // dead one), as the chat does.
                     let row = self.workspace_row(&name);
                     let ws = self.ensure_workspace(window, cx);
-                    ws.update(cx, |ws, cx| ws.show(&name, row, cx));
+                    // Its pane attaches once the push has settled.
+                    let hold = self.push_ahead(Occupant::Workspace);
+                    ws.update(cx, |ws, cx| {
+                        ws.hold_content(hold, cx);
+                        ws.show(&name, row, cx)
+                    });
                 }
                 self.sync_chat(window, cx);
                 self.focus_main_view(window, cx);
@@ -1281,18 +1295,95 @@ impl ShelbiWindow {
         review.is_shown().then(|| review.task_id().map(str::to_string)).flatten()
     }
 
-    /// Open the review `info` describes in the main area.
+    /// Open the review `info` describes in the main area. The review the
+    /// main area already shows (its placeholder, put up the moment it was
+    /// asked for) is filled in where it stands: the push it started runs on.
     fn open_review(&mut self, info: ReviewInfo, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self.review_row(&info.task_id);
+        if self.shown_review(cx).as_deref() == Some(info.task_id.as_str()) {
+            if let Some(review) = self.review.clone() {
+                review.update(cx, |r, cx| r.show(info, row, cx));
+            }
+            cx.notify();
+            return;
+        }
         self.status = None;
         self.banner = None;
-        let row = self.review_row(&info.task_id);
         let review = self.ensure_review(window, cx);
+        let hold = self.push_ahead(Occupant::Review);
         self.route = Route::Review;
-        review.update(cx, |r, cx| r.show(info, row, cx));
+        review.update(cx, |r, cx| {
+            r.hold_content(hold, cx);
+            r.show(info, row, cx)
+        });
         self.client.focus_main();
         self.sync_chat(window, cx);
         self.focus_main_view(window, cx);
         cx.notify();
+    }
+
+    /// Put review `task` up at once, before the load flow has resolved it
+    /// (`dt-instant-panel-push`): the panel takes the column with what the
+    /// sidebar row knows and placeholders for the rest, so the push starts on
+    /// the next frame. The resolve fills it in ([`Self::open_review`]); a
+    /// failure, or a slot prompt dismissed, takes it back out
+    /// ([`Self::abandon_pending_review`]).
+    fn open_review_pending(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = None;
+        self.banner = None;
+        let row = self.review_row(task);
+        let review = self.ensure_review(window, cx);
+        let hold = self.push_ahead(Occupant::Review);
+        self.route = Route::Review;
+        review.update(cx, |r, cx| {
+            r.hold_content(hold, cx);
+            r.show_pending(task, row, cx)
+        });
+        self.client.focus_main();
+        self.sync_chat(window, cx);
+        self.focus_main_view(window, cx);
+        cx.notify();
+    }
+
+    /// The review put up before it resolved won't open after all (the load
+    /// failed, or the slot prompt was dismissed): the push reverses from
+    /// wherever it stands, back to the view it was opened over.
+    fn abandon_pending_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = matches!(self.route, Route::Review)
+            && self.review.as_ref().is_some_and(|r| r.read(cx).is_pending());
+        if pending {
+            self.leave_review(window, cx);
+        }
+    }
+
+    /// Whether showing `panel` runs the column's push (it isn't there yet, or
+    /// is still on its way): its content then waits for the push to settle.
+    fn push_ahead(&self, panel: Occupant) -> bool {
+        self.column.target() != panel || self.column_moving
+    }
+
+    /// The push has settled: the panel in the column attaches the content
+    /// that waited for it.
+    fn release_settled(&mut self, cx: &mut Context<Self>) {
+        match self.column.target() {
+            Occupant::Review => {
+                if let Some(review) = self.review.clone().filter(|r| r.read(cx).is_holding()) {
+                    review.update(cx, |r, cx| r.release_content(cx));
+                }
+            }
+            Occupant::Workspace => {
+                if let Some(ws) = self.workspace.clone().filter(|w| w.read(cx).is_holding()) {
+                    ws.update(cx, |w, cx| w.release_content(cx));
+                }
+            }
+            Occupant::Sidebar => {
+                // A chat that waited for the pop: one more frame attaches it.
+                let chat_waits = self.chat_wanted() && self.chat.as_ref().is_none_or(|c| !c.read(cx).is_shown());
+                if chat_waits {
+                    cx.notify();
+                }
+            }
+        }
     }
 
     /// Leave the review for the view it was opened over: the sidebar comes
@@ -1303,6 +1394,11 @@ impl ShelbiWindow {
     fn leave_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Review) {
             return;
+        }
+        // Left before it opened: whatever the load flow still has running for
+        // it opens nothing.
+        if let Some(task) = self.review.as_ref().and_then(|r| r.read(cx).task_id().map(str::to_string)) {
+            self.review_loader.cancel(&task);
         }
         let view = self.client.view().clone();
         if !self.tapped_return(&view, window, cx) {
@@ -1463,7 +1559,10 @@ impl ShelbiWindow {
         let wanted = self.chat_wanted();
         if wanted {
             let chat = self.ensure_chat(window, cx);
-            if !chat.read(cx).is_shown() {
+            // Coming back from a panel: the chat attaches once the column's
+            // pop has settled (the shell's next frame re-syncs it), not in
+            // its frames.
+            if !chat.read(cx).is_shown() && !self.push_ahead(Occupant::Sidebar) {
                 chat.update(cx, |chat, cx| chat.show(cx));
                 if self.client.focus() == Focus::Main {
                     let target = chat.read(cx).focus_target(cx);
@@ -1846,12 +1945,18 @@ impl ShelbiWindow {
 
     /// Close the overlay and hand keys back to where focus was.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overlay = None;
+        let closed = self.overlay.take();
         self.detecting = None;
         self.client.close_overlay();
         match self.client.focus() {
             Focus::Main => self.focus_main_view(window, cx),
             Focus::Sidebar => self.focus_handle.focus(window, cx),
+        }
+        // The slot prompt (or its busy / no-slot report) closed without a
+        // slot chosen (choosing one takes the overlay first): the review
+        // waiting behind it doesn't open.
+        if matches!(closed, Some(ActiveOverlay::ReviewConfirm { .. })) {
+            self.abandon_pending_review(window, cx);
         }
         cx.notify();
     }
@@ -1926,6 +2031,9 @@ impl ShelbiWindow {
                 }
             }
             OverlayEvent::LoadReview { task_id, slot } => {
+                // A slot was chosen: the review behind the prompt stays up
+                // while it loads.
+                self.overlay = None;
                 self.close_overlay(window, cx);
                 let step = self.review_loader.slot_chosen(&task_id, &slot);
                 self.run_load_step(step, window, cx);
@@ -2175,6 +2283,7 @@ impl ShelbiWindow {
             return;
         }
         let step = self.review_loader.open(&task_id);
+        self.open_review_pending(&task_id, window, cx);
         self.run_load_step(step, window, cx);
     }
 
@@ -2245,6 +2354,8 @@ impl ShelbiWindow {
             }
             LoadStep::Failed(message) => {
                 self.status = None;
+                // Back out first: returning to the view clears the banner.
+                self.abandon_pending_review(window, cx);
                 self.banner = Some(message.into());
             }
         }
@@ -2742,6 +2853,8 @@ impl ShelbiWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        #[cfg(feature = "visual-check")]
+        let render_start = Instant::now();
         let theme = *theme;
         // The chat attaches the first time the shell paints with it routed
         // (bootstrap has no window to hand it); later changes go through
@@ -2756,7 +2869,21 @@ impl ShelbiWindow {
         // the column).
         let now = (self.clock)();
         self.sync_column(now);
+        self.column.pace(now);
         let frame = self.column.frame(now);
+        self.column_moving = frame.animating;
+        if !frame.animating {
+            self.release_settled(cx);
+        }
+        #[cfg(feature = "visual-check")]
+        let probe = self.probe.clone().map(|probe| {
+            probe.borrow_mut().begin(render_start, self.column.position(now), frame.animating);
+            gpui::canvas(|_, _, _| {}, move |_, _, _, _| probe.borrow_mut().end(Instant::now()))
+                .absolute()
+                .size_0()
+        });
+        #[cfg(not(feature = "visual-check"))]
+        let probe: Option<gpui::Empty> = None;
         if frame.animating {
             window.request_animation_frame();
         } else if self.column.target() == Occupant::Sidebar {
@@ -2942,6 +3069,7 @@ impl ShelbiWindow {
             })
             .child(shell.flex_1().min_h_0())
             .children(layer)
+            .children(probe)
             .into_any_element()
     }
 }
@@ -3016,6 +3144,11 @@ impl ShelbiWindow {
         self.close_overlay(window, cx);
     }
 
+    /// Ask for review `task` before anything resolves it: its placeholder.
+    pub(crate) fn offscreen_open_pending(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_review_pending(task, window, cx);
+    }
+
     pub(crate) fn offscreen_review(&self) -> Option<Entity<ReviewView>> {
         self.review.clone()
     }
@@ -3023,6 +3156,37 @@ impl ShelbiWindow {
     /// What the leading column draws now.
     pub(crate) fn offscreen_column(&mut self) -> column_swap::Frame {
         self.column.frame((self.clock)())
+    }
+
+    /// `--bench-push`'s window: [`Self::offscreen`]'s, on the real clock,
+    /// with workspaces over `workspace` and every frame reported to `probe`.
+    pub(crate) fn bench(
+        project: &str,
+        model: SidebarModel,
+        review: ReviewDeps,
+        workspace: WorkspaceDeps,
+        probe: Rc<std::cell::RefCell<crate::bench_push::Probe>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut w = Self::offscreen(project, model, review, Rc::new(Instant::now), window, cx);
+        w.workspace_deps = Some(workspace);
+        w.probe = Some(probe);
+        w
+    }
+
+    /// Carry out `call` as a command dispatch would.
+    pub(crate) fn bench_perform(&mut self, call: HostCall, window: &mut Window, cx: &mut Context<Self>) {
+        self.perform(call, window, cx);
+    }
+
+    /// The open panel's Back.
+    pub(crate) fn bench_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Review) {
+            self.leave_review(window, cx);
+        } else {
+            self.leave_workspace(window, cx);
+        }
     }
 }
 

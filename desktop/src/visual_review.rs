@@ -4,6 +4,8 @@
 //! frame per state, plus a check that each state shows what it should:
 //!
 //! - `review-sidebar.png`: the sidebar before the review opens;
+//! - `review-pending.png`: the panel the moment a review is asked for, before
+//!   the load flow resolves it (the row's title, placeholders for the rest);
 //! - `review-push-mid.png`: half-way through the push in (the sidebar
 //!   leaving left, the panel coming in from the right, clipped to the column);
 //! - `review-serving.png`: a serving review, the panel in the sidebar's
@@ -282,6 +284,24 @@ impl Run {
         let column = self.column();
         self.expect("the sidebar holds the column", column == (true, false));
         self.save("review-sidebar.png");
+
+        // Asked for: the panel goes in at once, before the load flow has
+        // resolved it, with the row's title and placeholders.
+        self.handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_pending("cold-start", window, cx))
+            .unwrap();
+        self.advance(SLIDE);
+        self.advance(SLIDE);
+        let pending = self
+            .view()
+            .read_with(&self.cx, |v, _| v.is_pending() && v.model().is_some_and(|m| m.title == row(ReviewState::Serving).title));
+        self.expect("asked for, the panel shows the row's title and placeholders", pending);
+        self.save("review-pending.png");
+        self.handle
+            .update(&mut self.cx, |w, window, cx| w.bench_back(window, cx))
+            .unwrap();
+        self.advance(SLIDE);
+        self.advance(SLIDE);
         self.handle
             .update(&mut self.cx, |w, window, cx| w.offscreen_open_review(info(), window, cx))
             .unwrap();

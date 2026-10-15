@@ -713,6 +713,20 @@ impl ReviewLoader {
         LoadStep::Resolve(task.to_string())
     }
 
+    /// The user gave up opening `task` before it opened (the desktop's panel,
+    /// shown the moment the review is asked for, was left): a resolve still
+    /// running for it, or a `ReviewOpened` for a load it started, opens
+    /// nothing. A daemon load already sent runs on (its slot stays loaded),
+    /// and a failure of it still reports.
+    pub fn cancel(&mut self, task: &str) {
+        if self.resolving.as_deref() == Some(task) {
+            self.resolving = None;
+        }
+        if self.pending.as_deref() == Some(task) {
+            self.pending = None;
+        }
+    }
+
     /// The task this client loaded and is waiting to open.
     pub fn pending(&self) -> Option<&str> {
         self.pending.as_deref()
@@ -1072,6 +1086,31 @@ mod tests {
             l.resolved("t-3", Err("`t-3` is not a review task".into())),
             LoadStep::Failed("Couldn't open the review: `t-3` is not a review task".into())
         );
+    }
+
+    #[test]
+    fn a_cancelled_open_opens_nothing() {
+        // Left mid-resolve: its answer is dropped.
+        let mut l = ReviewLoader::default();
+        l.open("t-1");
+        l.cancel("t-1");
+        assert_eq!(l.resolved("t-1", serving()), LoadStep::None);
+
+        // Left while its load runs: the load's reply still lands (a failure
+        // still reports), but its `ReviewOpened` opens nothing.
+        l.open("t-1");
+        l.resolved("t-1", queued(&["review-1"], 1));
+        l.slot_chosen("t-1", "review-1");
+        l.cancel("t-1");
+        assert_eq!(l.loading(), Some("t-1"));
+        assert_eq!(l.pending(), None);
+        assert_eq!(l.loaded("t-1", Ok(())), LoadStep::None);
+        assert_eq!(l.review_opened("t-1"), LoadStep::None);
+
+        // Cancelling another task leaves this one alone.
+        l.open("t-2");
+        l.cancel("t-1");
+        assert!(matches!(l.resolved("t-2", serving()), LoadStep::Open(_)));
     }
 
     #[test]
