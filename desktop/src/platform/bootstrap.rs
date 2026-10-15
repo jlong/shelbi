@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use shelbi_client::ClientError;
+
 use super::control::{self, ControlHandle, RelaunchNotice};
 use super::daemon::{self, DaemonFailure};
 use super::discovery::{self, CliLocation, CliNotFound};
 use super::env::{self, Env};
-use super::version::{self, VersionCheck};
+use super::version::{self, ProtocolCheck, VersionCheck};
 
 /// How long `Connecting` keeps retrying a control socket that isn't there yet
 /// (the daemon binds its hub socket, which the start waits on, a moment
@@ -74,6 +76,9 @@ pub enum Failure {
     },
     /// Never [`VersionCheck::Match`].
     VersionMismatch(VersionCheck),
+    /// The control socket answered with another control protocol. `cli` is
+    /// the CLI bootstrap found (the one a restart would run).
+    ProtocolMismatch { cli: PathBuf, check: ProtocolCheck },
 }
 
 /// What [`Bootstrap::spawn`] publishes.
@@ -96,6 +101,15 @@ pub struct Connected {
     pub daemon_version: String,
 }
 
+/// Why [`Platform::connect`] has no connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// Nothing answered a hello before the deadline.
+    Unreachable { socket: PathBuf, error: String },
+    /// The daemon answered, with a control protocol other than the app's.
+    ProtocolMismatch { daemon: u32, app: u32 },
+}
+
 /// What bootstrap needs from the machine.
 pub trait Platform {
     /// The login-shell environment for the app's children.
@@ -105,10 +119,13 @@ pub trait Platform {
     fn home_dir(&self) -> Option<PathBuf>;
     fn is_executable(&self, path: &Path) -> bool;
     fn cli_version(&mut self, cli: &Path, env: &Env) -> Option<String>;
+    /// `shelbi __control-protocol`, when it answered (asked only after a
+    /// protocol mismatch).
+    fn cli_control_protocol(&mut self, cli: &Path, env: &Env) -> Option<u32>;
     /// Ensure a daemon is running, starting it with `<cli> daemon`.
     fn start_daemon(&mut self, cli: &Path, env: &Env) -> Result<(), DaemonFailure>;
     /// Connect to the control socket and complete the hello.
-    fn connect(&mut self, app_version: &str) -> Result<Connected, (PathBuf, String)>;
+    fn connect(&mut self, app_version: &str) -> Result<Connected, ConnectError>;
 }
 
 /// Run bootstrap to its end, calling `publish` with each state entered (the
@@ -145,11 +162,26 @@ pub fn run(
     enter(BootstrapState::Connecting { cli: cli.clone() });
     let connected = match platform.connect(app_version) {
         Ok(connected) => connected,
-        Err((socket, error)) => {
+        Err(ConnectError::Unreachable { socket, error }) => {
             return enter(BootstrapState::Failed(Failure::ControlUnreachable {
                 socket,
                 error,
             }))
+        }
+        // The socket answered. Which side is behind decides the fix, and only
+        // the CLI on disk can say whether a restart would help.
+        Err(ConnectError::ProtocolMismatch { daemon, app }) => {
+            let cli_protocol = platform.cli_control_protocol(&cli.path, &env);
+            tracing::warn!(
+                daemon,
+                app,
+                cli = ?cli_protocol,
+                "the daemon speaks another control protocol"
+            );
+            return enter(BootstrapState::Failed(Failure::ProtocolMismatch {
+                cli: cli.path,
+                check: version::check_protocol(app, cli_protocol, daemon),
+            }));
         }
     };
     match version::check(
@@ -228,13 +260,20 @@ impl Platform for SystemPlatform {
         discovery::cli_version(cli, env)
     }
 
+    fn cli_control_protocol(&mut self, cli: &Path, env: &Env) -> Option<u32> {
+        discovery::cli_control_protocol(cli, env)
+    }
+
     fn start_daemon(&mut self, cli: &Path, env: &Env) -> Result<(), DaemonFailure> {
         daemon::start(cli, env, self.daemon_deadline)
     }
 
-    fn connect(&mut self, app_version: &str) -> Result<Connected, (PathBuf, String)> {
-        let socket = shelbi_state::control_socket_path()
-            .map_err(|e| (PathBuf::from("~/.shelbi/control.sock"), e.to_string()))?;
+    fn connect(&mut self, app_version: &str) -> Result<Connected, ConnectError> {
+        let socket =
+            shelbi_state::control_socket_path().map_err(|e| ConnectError::Unreachable {
+                socket: PathBuf::from("~/.shelbi/control.sock"),
+                error: e.to_string(),
+            })?;
         let start = Instant::now();
         loop {
             match control::hello(&socket, app_version) {
@@ -244,8 +283,18 @@ impl Platform for SystemPlatform {
                         daemon_version: client.daemon_version,
                     })
                 }
+                // An answer, not an absence: retrying gets the same one.
+                Err(ClientError::ControlProtocolMismatch { daemon, client }) => {
+                    return Err(ConnectError::ProtocolMismatch {
+                        daemon,
+                        app: client,
+                    })
+                }
                 Err(e) if start.elapsed() >= CONNECT_DEADLINE => {
-                    return Err((socket, e.to_string()))
+                    return Err(ConnectError::Unreachable {
+                        socket,
+                        error: e.to_string(),
+                    })
                 }
                 Err(_) => std::thread::sleep(CONNECT_RETRY),
             }
@@ -314,8 +363,9 @@ mod tests {
         setting: Result<Option<PathBuf>, String>,
         executables: Vec<PathBuf>,
         cli_version: Option<String>,
+        cli_protocol: Option<u32>,
         start: Result<(), DaemonFailure>,
-        connect: Result<Connected, (PathBuf, String)>,
+        connect: Result<Connected, ConnectError>,
         started_with: Option<(PathBuf, Env)>,
     }
 
@@ -326,6 +376,7 @@ mod tests {
                 setting: Ok(None),
                 executables: vec![PathBuf::from("/opt/homebrew/bin/shelbi")],
                 cli_version: Some(daemon_version.into()),
+                cli_protocol: Some(6),
                 start: Ok(()),
                 connect: Ok(Connected {
                     socket: PathBuf::from("/h/control.sock"),
@@ -352,11 +403,14 @@ mod tests {
         fn cli_version(&mut self, _cli: &Path, _env: &Env) -> Option<String> {
             self.cli_version.clone()
         }
+        fn cli_control_protocol(&mut self, _cli: &Path, _env: &Env) -> Option<u32> {
+            self.cli_protocol
+        }
         fn start_daemon(&mut self, cli: &Path, env: &Env) -> Result<(), DaemonFailure> {
             self.started_with = Some((cli.to_path_buf(), env.clone()));
             self.start.clone()
         }
-        fn connect(&mut self, _app_version: &str) -> Result<Connected, (PathBuf, String)> {
+        fn connect(&mut self, _app_version: &str) -> Result<Connected, ConnectError> {
             self.connect.clone()
         }
     }
@@ -462,10 +516,10 @@ mod tests {
     #[test]
     fn an_unreachable_control_socket_fails_at_connecting() {
         let mut p = Scripted::healthy("0.10.0");
-        p.connect = Err((
-            PathBuf::from("/h/control.sock"),
-            "connection refused".into(),
-        ));
+        p.connect = Err(ConnectError::Unreachable {
+            socket: PathBuf::from("/h/control.sock"),
+            error: "connection refused".into(),
+        });
         let (seen, end) = run_scripted(&mut p, "0.10.0");
         assert_eq!(seen, ["env", "cli", "daemon", "connect", "failed"]);
         assert!(matches!(
@@ -487,6 +541,48 @@ mod tests {
             VersionCheck::AppNewer {
                 app: "0.11.0".into(),
                 cli: "0.10.0".into()
+            }
+        );
+    }
+
+    /// A daemon left on an older protocol, under a CLI that speaks the same
+    /// old one: the version strings match, so only the protocols tell.
+    #[test]
+    fn an_older_protocol_under_an_older_cli_fails_as_cli_older() {
+        let mut p = Scripted::healthy("0.10.0");
+        p.connect = Err(ConnectError::ProtocolMismatch { daemon: 4, app: 6 });
+        p.cli_protocol = Some(4);
+        let (seen, end) = run_scripted(&mut p, "0.10.0");
+        assert_eq!(seen, ["env", "cli", "daemon", "connect", "failed"]);
+        let BootstrapState::Failed(Failure::ProtocolMismatch { cli, check }) = end else {
+            panic!("expected ProtocolMismatch, got {end:?}")
+        };
+        assert_eq!(cli, PathBuf::from("/opt/homebrew/bin/shelbi"));
+        assert_eq!(
+            check,
+            ProtocolCheck::CliOlder {
+                app: 6,
+                cli: Some(4),
+                daemon: 4
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_protocol_under_a_current_cli_fails_as_a_stale_daemon() {
+        let mut p = Scripted::healthy("0.10.0");
+        p.connect = Err(ConnectError::ProtocolMismatch { daemon: 4, app: 6 });
+        p.cli_protocol = Some(6);
+        let (_, end) = run_scripted(&mut p, "0.10.0");
+        let BootstrapState::Failed(Failure::ProtocolMismatch { check, .. }) = end else {
+            panic!("expected ProtocolMismatch, got {end:?}")
+        };
+        assert_eq!(
+            check,
+            ProtocolCheck::DaemonStale {
+                app: 6,
+                cli: 6,
+                daemon: 4
             }
         );
     }

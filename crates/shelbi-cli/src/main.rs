@@ -367,6 +367,13 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__ensure-daemon")]
     EnsureDaemon,
+    /// (internal) Print the control-socket protocol this binary speaks, one
+    /// number on stdout. The desktop app asks the CLI it found, when a
+    /// daemon's hello reports another protocol, to tell a stale daemon from an
+    /// old CLI (they can share a version string). Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__control-protocol")]
+    ControlProtocol,
     /// (internal) Graceful-exit clear the orchestrator pane wrapper
     /// runs after the agent returns. Not for direct use.
     #[command(hide = true)]
@@ -528,6 +535,10 @@ fn main() -> Result<()> {
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::EnsureDaemon) => {
             shelbi_state::ensure_daemon_running().map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+        Some(Cmd::ControlProtocol) => {
+            println!("{}", shelbi_proto::control::CONTROL_PROTOCOL_VERSION);
+            Ok(())
         }
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
         Some(Cmd::OrchRecordExit {
@@ -1186,6 +1197,17 @@ mod cli_tests {
             .expect_err("--help exits through clap")
             .to_string();
         assert!(!help.contains("__session"), "internal entry leaked into help: {help}");
+    }
+
+    /// The desktop app's protocol probe parses and stays out of `--help`.
+    #[test]
+    fn control_protocol_entry_is_hidden_but_parseable() {
+        let cli = Cli::parse_from(["shelbi", "__control-protocol"]);
+        assert!(matches!(cli.cmd, Some(Cmd::ControlProtocol)));
+        let help = Cli::try_parse_from(["shelbi", "--help"])
+            .expect_err("--help exits through clap")
+            .to_string();
+        assert!(!help.contains("__control-protocol"), "internal entry leaked into help: {help}");
     }
 
     /// The user-facing `shelbi session` group parses each debug subcommand.

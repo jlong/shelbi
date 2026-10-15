@@ -49,6 +49,41 @@ pub fn check(app: &str, cli: Option<&str>, daemon: &str) -> VersionCheck {
     }
 }
 
+/// How the daemon's control protocol relates to the app's, when its hello
+/// reports a different one. Version strings can't tell these apart: a dev build
+/// shares its version string with the release before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolCheck {
+    /// The daemon speaks an older protocol, and the CLI on disk can't do
+    /// better (it speaks an older one too, or is too old to say): restarting
+    /// the daemon would start the same old binary. Upgrade the CLI, then
+    /// restart the daemon.
+    CliOlder {
+        app: u32,
+        /// `None` when the CLI predates `shelbi __control-protocol`.
+        cli: Option<u32>,
+        daemon: u32,
+    },
+    /// The CLI on disk speaks the app's protocol (or newer) but the running
+    /// daemon is an older binary, left over from before an upgrade: restart it.
+    DaemonStale { app: u32, cli: u32, daemon: u32 },
+    /// The daemon speaks a newer protocol than this running app: relaunch it.
+    AppOutdated { app: u32, daemon: u32 },
+}
+
+/// Classify a control-protocol mismatch. `cli` is what the CLI on disk
+/// reports (`shelbi __control-protocol`), when it answered.
+pub fn check_protocol(app: u32, cli: Option<u32>, daemon: u32) -> ProtocolCheck {
+    if daemon > app {
+        return ProtocolCheck::AppOutdated { app, daemon };
+    }
+    match cli {
+        // Restarting the daemon onto this CLI brings it up to the app.
+        Some(cli) if cli >= app => ProtocolCheck::DaemonStale { app, cli, daemon },
+        _ => ProtocolCheck::CliOlder { app, cli, daemon },
+    }
+}
+
 /// Semver precedence of two versions (`MAJOR.MINOR.PATCH[-pre][+build]`):
 /// numbers first, then a pre-release sorts below its release, then pre-release
 /// identifiers compare left to right (numeric ones numerically). Build
@@ -154,6 +189,57 @@ mod tests {
                 app: "0.11.0".into(),
                 daemon: "0.10.0".into()
             }
+        );
+    }
+
+    #[test]
+    fn an_older_daemon_with_an_older_cli_means_upgrade_the_cli() {
+        assert_eq!(
+            check_protocol(6, Some(4), 4),
+            ProtocolCheck::CliOlder {
+                app: 6,
+                cli: Some(4),
+                daemon: 4
+            }
+        );
+        // A CLI too old to report its protocol is older than this app.
+        assert_eq!(
+            check_protocol(6, None, 4),
+            ProtocolCheck::CliOlder {
+                app: 6,
+                cli: None,
+                daemon: 4
+            }
+        );
+        // Newer than the daemon but still short of the app: a restart alone
+        // wouldn't reach the app's protocol.
+        assert_eq!(
+            check_protocol(6, Some(5), 4),
+            ProtocolCheck::CliOlder {
+                app: 6,
+                cli: Some(5),
+                daemon: 4
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_daemon_under_a_current_cli_means_restart_the_daemon() {
+        assert_eq!(
+            check_protocol(6, Some(6), 4),
+            ProtocolCheck::DaemonStale {
+                app: 6,
+                cli: 6,
+                daemon: 4
+            }
+        );
+    }
+
+    #[test]
+    fn a_newer_daemon_protocol_means_relaunch() {
+        assert_eq!(
+            check_protocol(6, Some(6), 7),
+            ProtocolCheck::AppOutdated { app: 6, daemon: 7 }
         );
     }
 

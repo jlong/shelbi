@@ -19,13 +19,13 @@ use shelbi_proto::control::{self, ClientMsg, ServerMsg, CONTROL_PROTOCOL_VERSION
 use shelbi_proto::ProtoError;
 
 use super::bootstrap::{
-    Bootstrap, BootstrapEvent, BootstrapState, Failure, Platform, SystemPlatform,
+    Bootstrap, BootstrapEvent, BootstrapState, ConnectError, Failure, Platform, SystemPlatform,
 };
 use super::control::ControlError;
 use super::daemon::DaemonFailure;
 use super::discovery::CliSource;
 use super::env::{self, Env};
-use super::version::APP_VERSION;
+use super::version::{ProtocolCheck, APP_VERSION};
 
 /// The tests set process-wide env vars (`SHELBI_HOME`), so they run one at a
 /// time.
@@ -67,14 +67,30 @@ impl Sandbox {
     }
 
     /// Write the fake `shelbi`: `--version` prints `version`, `daemon` runs
-    /// `daemon_body`.
+    /// `daemon_body`, `__control-protocol` prints this build's protocol.
     fn write_cli(&self, version: &str, daemon_body: &str) -> PathBuf {
+        self.write_cli_speaking(version, Some(CONTROL_PROTOCOL_VERSION), daemon_body)
+    }
+
+    /// [`write_cli`](Self::write_cli) speaking control protocol `protocol`;
+    /// `None` is a CLI from before `__control-protocol` (a usage error).
+    fn write_cli_speaking(
+        &self,
+        version: &str,
+        protocol: Option<u32>,
+        daemon_body: &str,
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let cli = self.bin.join("shelbi");
+        let protocol = match protocol {
+            Some(p) => format!("echo {p}"),
+            None => "exit 2".to_string(),
+        };
         let script = format!(
             "#!/bin/sh\n\
              case \"$1\" in\n\
                --version) echo \"shelbi {version}\" ;;\n\
+               __control-protocol) {protocol} ;;\n\
                daemon) {daemon_body} ;;\n\
                *) exit 64 ;;\n\
              esac\n"
@@ -153,13 +169,13 @@ impl Platform for TestPlatform {
     fn cli_version(&mut self, cli: &Path, env: &Env) -> Option<String> {
         self.real.cli_version(cli, env)
     }
+    fn cli_control_protocol(&mut self, cli: &Path, env: &Env) -> Option<u32> {
+        self.real.cli_control_protocol(cli, env)
+    }
     fn start_daemon(&mut self, cli: &Path, env: &Env) -> Result<(), DaemonFailure> {
         self.real.start_daemon(cli, env)
     }
-    fn connect(
-        &mut self,
-        app_version: &str,
-    ) -> Result<super::bootstrap::Connected, (PathBuf, String)> {
+    fn connect(&mut self, app_version: &str) -> Result<super::bootstrap::Connected, ConnectError> {
         self.real.connect(app_version)
     }
 }
@@ -173,6 +189,8 @@ struct TestDaemon {
 
 struct Shared {
     version: Mutex<String>,
+    /// The control protocol its hello reports.
+    protocol: u32,
     subscribers: Mutex<Vec<UnixStream>>,
     stop: AtomicBool,
 }
@@ -180,8 +198,15 @@ struct Shared {
 impl TestDaemon {
     /// Serve `<home>/hub.sock` and `<home>/control.sock`.
     fn serve(home: &Path, version: &str) -> Self {
+        Self::serve_speaking(home, version, CONTROL_PROTOCOL_VERSION)
+    }
+
+    /// [`serve`](Self::serve), with a hello reporting control protocol
+    /// `protocol`.
+    fn serve_speaking(home: &Path, version: &str, protocol: u32) -> Self {
         let shared = Arc::new(Shared {
             version: Mutex::new(version.to_string()),
+            protocol,
             subscribers: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
         });
@@ -272,7 +297,7 @@ impl Shared {
         match msg {
             ClientMsg::Hello { .. } => {
                 let hello = ServerMsg::Hello {
-                    protocol: CONTROL_PROTOCOL_VERSION,
+                    protocol: self.protocol,
                     daemon_version: self.version.lock().unwrap().clone(),
                 };
                 let _ = stream.write_all(&control::encode(&hello).unwrap());
@@ -481,4 +506,58 @@ fn a_daemon_restarted_on_a_new_version_requires_a_relaunch() {
         ready.control.connect(),
         Err(ControlError::RelaunchRequired(_))
     ));
+}
+
+/// Boot against a running daemon whose hello reports an older control
+/// protocol (same version string), under a CLI written by `write_cli`, and
+/// return the failure.
+fn boot_against_an_older_protocol(sandbox: &Sandbox) -> Failure {
+    let old = CONTROL_PROTOCOL_VERSION - 2;
+    let _daemon = TestDaemon::serve_speaking(&sandbox.home, APP_VERSION, old);
+    let started = Instant::now();
+    let rx = Bootstrap::spawn(sandbox.platform(), APP_VERSION.to_string());
+    let events = events_until(&rx, Duration::from_secs(30), is_terminal);
+    // An answer is final: no waiting out the connect deadline.
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    match events.into_iter().last() {
+        Some(BootstrapEvent::State(BootstrapState::Failed(failure))) => failure,
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_older_daemon_protocol_under_an_older_cli_is_cli_older_not_unreachable() {
+    let sandbox = Sandbox::new("proto-cli");
+    // The Oct 13 CLI: same version string, no `__control-protocol`.
+    sandbox.write_cli_speaking(APP_VERSION, None, &sandbox.staying_daemon());
+    let failure = boot_against_an_older_protocol(&sandbox);
+    assert_eq!(
+        failure,
+        Failure::ProtocolMismatch {
+            cli: sandbox.bin.join("shelbi"),
+            check: ProtocolCheck::CliOlder {
+                app: CONTROL_PROTOCOL_VERSION,
+                cli: None,
+                daemon: CONTROL_PROTOCOL_VERSION - 2,
+            },
+        }
+    );
+}
+
+#[test]
+fn an_older_daemon_protocol_under_a_current_cli_is_a_stale_daemon() {
+    let sandbox = Sandbox::new("proto-stale");
+    sandbox.write_cli(APP_VERSION, &sandbox.staying_daemon());
+    let failure = boot_against_an_older_protocol(&sandbox);
+    assert_eq!(
+        failure,
+        Failure::ProtocolMismatch {
+            cli: sandbox.bin.join("shelbi"),
+            check: ProtocolCheck::DaemonStale {
+                app: CONTROL_PROTOCOL_VERSION,
+                cli: CONTROL_PROTOCOL_VERSION,
+                daemon: CONTROL_PROTOCOL_VERSION - 2,
+            },
+        }
+    );
 }
