@@ -1,15 +1,22 @@
 //! `shelbi-desktop --visual-review <dir>` (feature `visual-check`): the
 //! Review view rendered offscreen (real Metal frames, as `--visual-workspace`
-//! does) over fake sessions and a fake daemon, one frame per state, plus a
-//! check that each state shows what it should:
+//! does) in the real window shell over fake sessions and a fake daemon, one
+//! frame per state, plus a check that each state shows what it should:
 //!
-//! - `review-serving.png`: a serving review, the panel beside the reviewer;
+//! - `review-sidebar.png`: the sidebar before the review opens;
+//! - `review-push-mid.png`: half-way through the push in (the sidebar
+//!   leaving left, the panel coming in from the right, clipped to the column);
+//! - `review-serving.png`: a serving review, the panel in the sidebar's
+//!   column beside the reviewer;
 //! - `review-diff.png`: View Diff, the daemon's diff session;
 //! - `review-loading.png`: a slot still loading (waiting for its health
 //!   check), no URL location yet;
 //! - `review-merging.png`: an approve in flight, the panel inert;
-//! - `review-description.png`: the task description (More).
+//! - `review-description.png`: the task description (More);
+//! - `review-back-mid.png` and `review-back.png`: Back, half-way and done
+//!   (the sidebar as it was).
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -20,13 +27,15 @@ use gpui::{px, size, AnyWindowHandle, AppContext, Entity, VisualTestAppContext, 
 use shelbi_app::review::{ActiveView, PanelEffect, ReviewInfo, ReviewTarget};
 use shelbi_app::session::{self as app_session, ConnectFailure, ReconnectPolicy, Relauncher, RetryPolicy, SessionRef};
 use shelbi_app::theme::ThemePreference;
-use shelbi_app::view::{ReviewRow, ReviewState};
+use shelbi_app::view::{ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow};
 use shelbi_app::ReviewSessionOp;
 use shelbi_client::SessionEvent;
 use shelbi_term::Size;
 
+use crate::app::ShelbiWindow;
 use crate::elements::terminal::session::{Connected, SessionIo};
 use crate::theme::Theme;
+use crate::views::column_swap::SLIDE;
 use crate::views::review::{ReviewDeps, ReviewOps, ReviewView};
 use crate::views::session_view::{SessionConnector, SessionDeps};
 
@@ -141,9 +150,25 @@ const DIFF_SCREEN: &str = "\x1b[1mdiff --git a/src/boot.rs b/src/boot.rs\x1b[0m\
 \x1b[32m+    cache::warm(&config)?;\x1b[0m\r\n\
      serve(db, config.port)\r\n";
 
+fn sidebar_model() -> SidebarModel {
+    let mut m = SidebarModel::skeleton("demo");
+    m.workspaces = vec![WorkspaceRow {
+        name: "alpha".into(),
+        machine: "hub".into(),
+        is_remote: false,
+        current_task: Some("search-index".into()),
+        agent: Some("developer".into()),
+        badge: WorkspaceBadge::Working,
+    }];
+    m.reviews = vec![row(ReviewState::Serving)];
+    m.board_loading = false;
+    m
+}
+
 struct Run {
     cx: VisualTestAppContext,
-    handle: WindowHandle<ReviewView>,
+    handle: WindowHandle<ShelbiWindow>,
+    now: Rc<Cell<Instant>>,
     window: AnyWindowHandle,
     out: PathBuf,
     failures: usize,
@@ -164,9 +189,10 @@ pub fn run(out: PathBuf) -> ! {
         ("demo/ws/review-1".to_string(), REVIEWER_SCREEN.as_bytes().to_vec()),
         ("demo/review/review-1/diff".to_string(), DIFF_SCREEN.as_bytes().to_vec()),
     ]);
+    let now = Rc::new(Cell::new(Instant::now()));
+    let clock = now.clone();
     let handle = cx
         .open_offscreen_window(size(px(1200.0), px(700.0)), move |window, cx| {
-            let handle = window.window_handle();
             let deps = ReviewDeps {
                 ops: Arc::new(Ops),
                 sessions: Rc::new(move |_task| SessionDeps {
@@ -177,13 +203,14 @@ pub fn run(out: PathBuf) -> ! {
                     clock: Rc::new(Instant::now),
                 }),
             };
-            cx.new(|cx| ReviewView::new("demo", handle, deps, None, cx))
+            cx.new(|cx| ShelbiWindow::offscreen("demo", sidebar_model(), deps, Rc::new(move || clock.get()), window, cx))
         })
         .expect("open the offscreen window");
     let window: AnyWindowHandle = handle.into();
     let mut run = Run {
         cx,
         handle,
+        now,
         window,
         out,
         failures: 0,
@@ -195,9 +222,16 @@ pub fn run(out: PathBuf) -> ! {
 
 impl Run {
     fn update<R>(&mut self, f: impl FnOnce(&mut ReviewView, &mut gpui::Context<ReviewView>) -> R) -> R {
-        let r = self.handle.update(&mut self.cx, |v, _, cx| f(v, cx)).unwrap();
+        let view = self.view();
+        let r = view.update(&mut self.cx, f);
         self.settle();
         r
+    }
+
+    /// Move the column transition's clock on.
+    fn advance(&mut self, by: Duration) {
+        self.now.set(self.now.get() + by);
+        self.settle();
     }
 
     /// Let background work land and repaint.
@@ -212,8 +246,17 @@ impl Run {
         self.cx.run_until_parked();
     }
 
+    /// Which of the sidebar and the review panel the column draws now.
+    fn column(&mut self) -> (bool, bool) {
+        let f = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_column()).unwrap();
+        (f.sidebar.is_some(), f.review.is_some())
+    }
+
     fn view(&mut self) -> Entity<ReviewView> {
-        self.handle.update(&mut self.cx, |_, _, cx| cx.entity()).unwrap()
+        self.handle
+            .update(&mut self.cx, |w, _, _| w.offscreen_review())
+            .unwrap()
+            .expect("a review is open")
     }
 
     fn expect(&mut self, name: &str, ok: bool) {
@@ -234,8 +277,24 @@ impl Run {
     }
 
     fn all(&mut self) {
+        // The sidebar, then the push in.
+        self.settle();
+        let column = self.column();
+        self.expect("the sidebar holds the column", column == (true, false));
+        self.save("review-sidebar.png");
+        self.handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_review(info(), window, cx))
+            .unwrap();
+        self.advance(SLIDE / 2);
+        let column = self.column();
+        self.expect("mid-push both share the column", column == (true, true));
+        self.save("review-push-mid.png");
+        self.advance(SLIDE);
+
         // A serving review.
-        self.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        self.update(|v, cx| v.update_row(Some(row(ReviewState::Serving)), cx));
+        let column = self.column();
+        self.expect("the panel stands in the sidebar's column", column == (false, true));
         let model = self.view().read_with(&self.cx, |v, _| v.model().cloned());
         self.expect(
             "a serving review shows its server, health check and URL",
@@ -271,5 +330,15 @@ impl Run {
         // The description.
         self.update(|v, cx| v.apply(PanelEffect::ShowDescription, cx));
         self.save("review-description.png");
+        self.update(|v, cx| v.apply(PanelEffect::None, cx));
+
+        // Back: the reverse push, then the sidebar as it was.
+        self.update(|v, cx| v.apply(PanelEffect::Back, cx));
+        self.advance(SLIDE / 2);
+        self.save("review-back-mid.png");
+        self.advance(SLIDE);
+        let column = self.column();
+        self.expect("Back gives the column back to the sidebar", column == (true, false));
+        self.save("review-back.png");
     }
 }

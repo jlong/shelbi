@@ -30,11 +30,15 @@
 //! on demand. Like the chat, its terminals give the window the global chords.
 //!
 //! A review row (or the palette's `review:<id>`) opens the Review view
-//! ([`ReviewView`], `dt-review-view`) over the main area: the native review
-//! panel beside the review agent's chat, or its diff or editor. A queued
-//! review asks which free slot to load it onto first; the daemon loads it,
-//! and its `ReviewOpened` opens the view. Leaving the review returns to the
-//! view the main area showed before it.
+//! ([`ReviewView`], `dt-review-view`): the native review panel takes the
+//! sidebar's column (`dt-review-replaces-sidebar`, as in the TUI) and the
+//! main area shows the review agent's chat, or its diff or editor. Going in
+//! and coming back out push between the two in that column
+//! ([`column_swap`]: a slide and fade, a crossfade under Reduce Motion). A
+//! queued review asks which free slot to load it onto first; the daemon
+//! loads it, and its `ReviewOpened` opens the view. Leaving the review
+//! returns to the view the main area showed before it, with the sidebar as
+//! it was (selection, scroll, collapsed) and keys on it.
 //!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
@@ -42,12 +46,15 @@
 //! own window, so every project gets its own board.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use gpui::{
     actions, div, prelude::*, px, App, Bounds, Context, CursorStyle, Entity, FocusHandle,
-    Global, KeyDownEvent, MouseButton, MouseMoveEvent, PromptLevel, SharedString, Subscription, Task,
+    Global, KeyDownEvent, MouseButton, MouseMoveEvent, PromptLevel, ScrollHandle, SharedString,
+    Subscription, Task,
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use shelbi_app::command::{EditItem, ProjectItem};
@@ -83,6 +90,7 @@ use crate::projects::{self, Catalog};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
 use crate::theme::{self, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
+use crate::views::column_swap::{self, ColumnSwap, Layer, Motion, Occupant};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
@@ -384,6 +392,18 @@ pub struct ShelbiWindow {
     workspace: Option<Entity<WorkspaceView>>,
     /// The Review view, created the first time a review is opened.
     review: Option<Entity<ReviewView>>,
+    /// The leading column's occupant (the sidebar, or the review panel in
+    /// its place) and the push between them.
+    column: ColumnSwap,
+    /// The column's width while a review holds it with the sidebar
+    /// collapsed, once the user drags it (else the default width).
+    collapsed_review_cols: Option<u16>,
+    /// The sidebar's scroll, kept while the review panel stands in for it.
+    sidebar_scroll: ScrollHandle,
+    /// The column transition's clock and the system's Reduce Motion setting
+    /// (injectable for tests).
+    clock: Rc<dyn Fn() -> Instant>,
+    reduce_motion: Rc<dyn Fn() -> bool>,
     /// Opening a review: resolve, ask for a slot, load, open.
     review_loader: ReviewLoader,
     /// The blocking review work (resolve, load, the content sessions).
@@ -415,8 +435,11 @@ pub struct ShelbiWindow {
     /// Test seam: when set, [`Self::run`] records the host calls a command
     /// dispatches here instead of performing them, and the palette's inputs
     /// stay the ones the test set (no disk read).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "visual-check"))]
     tap: Option<std::rc::Rc<std::cell::RefCell<Vec<HostCall>>>>,
+    /// Test seam: the Review view's deps (fake sessions and daemon ops).
+    #[cfg(any(test, feature = "visual-check"))]
+    review_deps: Option<ReviewDeps>,
 }
 
 impl ShelbiWindow {
@@ -504,6 +527,11 @@ impl ShelbiWindow {
             flash_generation: 0,
             workspace: None,
             review: None,
+            column: ColumnSwap::new(),
+            collapsed_review_cols: None,
+            sidebar_scroll: ScrollHandle::new(),
+            clock: Rc::new(Instant::now),
+            reduce_motion: Rc::new(crate::platform::motion::reduce_motion),
             review_loader: ReviewLoader::default(),
             review_ops: Arc::new(crate::views::review::LiveOps),
             banner: None,
@@ -519,8 +547,10 @@ impl ShelbiWindow {
             _feed_task: None,
             _subscriptions: Vec::new(),
             drawn_once: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "visual-check"))]
             tap: None,
+            #[cfg(any(test, feature = "visual-check"))]
+            review_deps: None,
         };
         this.sync_selection();
         this
@@ -582,7 +612,7 @@ impl ShelbiWindow {
     /// Re-read the palette's (and the menus') inputs off the UI thread: other
     /// projects, edit targets, whether another client is attached.
     fn refresh_palette_inputs(&mut self, cx: &mut Context<Self>) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "visual-check"))]
         if self.tap.is_some() {
             return;
         }
@@ -963,7 +993,7 @@ impl ShelbiWindow {
     /// Run a registry command. While a relaunch is required (the CLI was
     /// upgraded under the app), commands that reach the daemon are refused.
     fn run(&mut self, kind: CommandKind, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "visual-check"))]
         if let Some(tap) = &self.tap {
             commands::dispatch_command(&kind, &mut *tap.borrow_mut());
             return;
@@ -1191,6 +1221,8 @@ impl ShelbiWindow {
             ops: self.review_ops.clone(),
             ..ReviewDeps::live(&project)
         };
+        #[cfg(any(test, feature = "visual-check"))]
+        let deps = self.review_deps.take().unwrap_or(deps);
         let review = cx.new(|cx| ReviewView::new(&project, handle, deps, sink, cx));
         let sub = cx.subscribe_in(&review, window, |this, _, ev: &ReviewEvent, window, cx| match ev {
             ReviewEvent::Focused => {
@@ -1200,8 +1232,7 @@ impl ShelbiWindow {
             // Approve, or Reject (which asks for the reason): the registry's
             // commands, through the same gates as the palette's.
             ReviewEvent::Command(kind) => this.run(kind.clone(), window, cx),
-            ReviewEvent::Back => this.leave_review(true, window, cx),
-            ReviewEvent::Closed => this.leave_review(false, window, cx),
+            ReviewEvent::Back | ReviewEvent::Closed => this.leave_review(window, cx),
         });
         self._subscriptions.push(sub);
         self.review = Some(review.clone());
@@ -1236,20 +1267,60 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Leave the review for the view it was opened over. Back (`back`) leaves
-    /// it loaded and hands keys to the sidebar, as the TUI's back button
-    /// does; a close or a decision goes back to the main area.
-    fn leave_review(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Leave the review for the view it was opened over: the sidebar comes
+    /// back into its column (the push's reverse) and takes the keys again, on
+    /// its selected row, as the TUI's back button does. Back leaves the
+    /// review loaded; a close or a decision has ended it already. A
+    /// collapsed sidebar stays collapsed, so keys go to the main area.
+    fn leave_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Review) {
             return;
         }
         let view = self.client.view().clone();
-        self.perform(HostCall::ShowView(view), window, cx);
-        if back {
+        if !self.tapped_return(&view, window, cx) {
+            self.perform(HostCall::ShowView(view), window, cx);
+        }
+        if !self.collapsed {
             self.client.focus_sidebar();
             self.focus_handle.focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// Under the test tap, leaving a review records the view it returns to
+    /// instead of building it (building one reads the project's state) and
+    /// only leaves the route. Returns whether it did.
+    fn tapped_return(&mut self, view: &View, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        #[cfg(any(test, feature = "visual-check"))]
+        if let Some(tap) = &self.tap {
+            tap.borrow_mut().push(HostCall::ShowView(view.clone()));
+            self.route = Route::View;
+            self.sync_chat(window, cx);
+            return true;
+        }
+        let _ = (view, window, cx);
+        false
+    }
+
+    /// Point the leading column at what the route wants (the review panel
+    /// while a review is open, else the sidebar), starting the push when that
+    /// changes: a slide, or a crossfade under Reduce Motion.
+    fn sync_column(&mut self, now: Instant) {
+        let want = if matches!(self.route, Route::Review) && self.review.is_some() {
+            Occupant::Review
+        } else {
+            Occupant::Sidebar
+        };
+        if want != self.column.target() {
+            let motion = if (self.reduce_motion)() { Motion::Fade } else { Motion::Slide };
+            self.column.show(want, motion, now);
+        }
+    }
+
+    /// Whether the review panel stands in the sidebar's column (or is on its
+    /// way in).
+    fn review_in_column(&self) -> bool {
+        self.column.target() == Occupant::Review
     }
 
     /// Hand the review its refreshed sidebar row (the live server state), and
@@ -1278,7 +1349,7 @@ impl ShelbiWindow {
             review.update(cx, |r, cx| r.hide(cx));
         }
         self.flash(format!("Review {task} closed."), cx);
-        self.leave_review(false, window, cx);
+        self.leave_review(window, cx);
     }
 
     /// A layout event from the daemon: a slot this client loaded is serving
@@ -1645,6 +1716,23 @@ impl ShelbiWindow {
         self.client.focus_main();
         self.focus_main_view(window, cx);
         cx.notify();
+    }
+
+    /// A divider drag asked for `width` columns: the user's sidebar width,
+    /// and the column's while a review holds it with the sidebar collapsed.
+    fn drag_column(&mut self, width: u16, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self.collapsed && self.review_in_column() && self.collapsed_review_cols != Some(width) {
+            self.collapsed_review_cols = Some(width);
+            changed = true;
+        }
+        if width != self.client.sidebar_width() {
+            self.client.set_sidebar_width(width);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -2149,7 +2237,7 @@ impl ShelbiWindow {
                         }
                         this.flash(format!("{} {id}.", decision.done), cx);
                         if shown {
-                            this.leave_review(false, window, cx);
+                            this.leave_review(window, cx);
                         }
                     }
                     Err(e) => match &review {
@@ -2196,7 +2284,14 @@ impl ShelbiWindow {
 
     /// Move keyboard focus to the sidebar (the `focus_sidebar` chord).
     fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.collapsed {
+        if matches!(self.route, Route::Review) {
+            // The review panel holds the sidebar's column: it takes the keys
+            // (the main area's, in the window's focus model).
+            if let Some(review) = self.review.clone() {
+                self.client.focus_main();
+                review.update(cx, |r, cx| r.focus_panel(window, cx));
+            }
+        } else if !self.collapsed {
             self.client.focus_sidebar();
             // Take keys back from a main view that holds focus.
             self.focus_handle.focus(window, cx);
@@ -2332,8 +2427,9 @@ impl ShelbiWindow {
             // Ctrl+C quits the TUI; here it's the terminal's (⌘Q quits).
             Some(GlobalAction::Quit | GlobalAction::OpenPalette) | None => {}
         }
-        if self.client.focus() != Focus::Sidebar || self.collapsed {
-            // The main area's views take their own keys once they land.
+        if self.client.focus() != Focus::Sidebar || self.collapsed || self.review_in_column() {
+            // The main area's views take their own keys once they land; the
+            // sidebar takes none while the review panel stands in for it.
             return;
         }
         let count = self.selectable_count();
@@ -2355,7 +2451,10 @@ impl ShelbiWindow {
 
     // --- rendering ---------------------------------------------------------
 
-    fn render_main(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The main area. `column_shown`: the leading column is up (the sidebar,
+    /// or the review panel in its place); without it the main area offers
+    /// the button that expands the sidebar.
+    fn render_main(&self, theme: &Theme, column_shown: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.route {
             Route::Settings(view) => div().size_full().child(view.clone()).into_any_element(),
             Route::Review => div()
@@ -2363,7 +2462,7 @@ impl ShelbiWindow {
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
-                .children(self.review.clone())
+                .children(self.review.clone().map(|r| r.update(cx, |r, cx| r.render_main(cx))))
                 .into_any_element(),
             // Every view draws natively; a view whose entity isn't built yet
             // (the first frame after routing) draws an empty main area.
@@ -2407,7 +2506,7 @@ impl ShelbiWindow {
             .overflow_hidden()
             .h_full()
             .bg(theme.canvas)
-            .when(self.collapsed, |main| {
+            .when(!column_shown, |main| {
                 main.child(
                     div().h(px(sidebar::TRAFFIC_LIGHT_INSET)).pl(px(80.0)).pt(px(8.0)).child(
                         div()
@@ -2594,30 +2693,77 @@ impl ShelbiWindow {
         let catalog_projects = self
             .switcher_open
             .then(|| cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default());
-        let sidebar = (!self.collapsed).then(|| {
-            sidebar::render(
-                SidebarProps {
-                    model: &self.model,
-                    selection: self.client.sidebar_selection(),
-                    focused: self.client.focus() == Focus::Sidebar,
-                    link: self.link,
-                    palette_chord: self.palette_chord.clone(),
-                    switcher: catalog_projects
-                        .as_deref()
-                        .map(|projects| (projects, self.project.as_str())),
-                    width: sidebar::width_px(self.client.sidebar_width(), window_width),
-                },
-                &theme,
-                cx,
-            )
+        // The leading column: the sidebar, or the review panel in its place,
+        // both while the push between them runs (clipped to the column).
+        let now = (self.clock)();
+        self.sync_column(now);
+        let frame = self.column.frame(now);
+        if frame.animating {
+            window.request_animation_frame();
+        } else if self.column.target() == Occupant::Sidebar {
+            self.collapsed_review_cols = None;
+        }
+        let column = column_swap::column(
+            &frame,
+            self.collapsed,
+            self.client.sidebar_width(),
+            self.collapsed_review_cols,
+        );
+        let column_shown = column.is_some();
+        let column = column.map(|c| {
+            let width = sidebar::width_px(c.width_cols, window_width);
+            let layer = |selector: &'static str, l: Layer| {
+                div()
+                    .debug_selector(move || selector.into())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(l.offset * width))
+                    .w(px(width))
+                    .opacity(l.opacity)
+            };
+            let sidebar = c.sidebar.map(|l| {
+                layer("column-sidebar", l).child(sidebar::render(
+                    SidebarProps {
+                        model: &self.model,
+                        selection: self.client.sidebar_selection(),
+                        focused: self.client.focus() == Focus::Sidebar,
+                        link: self.link,
+                        palette_chord: self.palette_chord.clone(),
+                        switcher: catalog_projects
+                            .as_deref()
+                            .map(|projects| (projects, self.project.as_str())),
+                        width,
+                        scroll: self.sidebar_scroll.clone(),
+                    },
+                    &theme,
+                    cx,
+                ))
+            });
+            let review = c
+                .review
+                .zip(self.review.clone())
+                .map(|(l, review)| layer("column-review", l).child(review));
+            div()
+                .id("leading-column")
+                .debug_selector(|| "leading-column".into())
+                .relative()
+                .flex_none()
+                .w(px(width))
+                .h_full()
+                .overflow_hidden()
+                .bg(theme.background)
+                .children(sidebar)
+                .children(review)
         });
         let divider_color = if self.dragging {
             theme.divider_active
         } else {
             theme.divider
         };
-        let handle = (!self.collapsed).then(|| {
-            // The right-edge divider, with a few pixels of grab room.
+        let handle = column_shown.then(|| {
+            // The column's right-edge divider, with a few pixels of grab
+            // room. It resizes whichever panel the column shows.
             div()
                 .id("sidebar-resize")
                 .debug_selector(|| "sidebar-resize".into())
@@ -2652,10 +2798,7 @@ impl ShelbiWindow {
                 if this.dragging {
                     let window_width = window.viewport_size().width.as_f32();
                     let width = sidebar::drag_width_cols(event.position.x.as_f32(), window_width);
-                    if width != this.client.sidebar_width() {
-                        this.client.set_sidebar_width(width);
-                        cx.notify();
-                    }
+                    this.drag_column(width, cx);
                 }
             }))
             .on_mouse_up(
@@ -2675,9 +2818,9 @@ impl ShelbiWindow {
             .font_family("Geist")
             .text_sm()
             .bg(theme.canvas)
-            .children(sidebar)
+            .children(column)
             .children(handle)
-            .child(self.render_main(&theme, cx));
+            .child(self.render_main(&theme, column_shown, cx));
 
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
@@ -2739,9 +2882,76 @@ impl ShelbiWindow {
     }
 }
 
+/// A bootstrap result that points nowhere: the shell renders, and nothing
+/// can reach a real CLI or daemon (the tap stops commands before they would).
+#[cfg(any(test, feature = "visual-check"))]
+fn inert_ready() -> Ready {
+    use crate::platform::control::ControlHandle;
+    use crate::platform::discovery::{Candidate, CliSource};
+    Ready {
+        cli: Candidate {
+            path: "/nonexistent/shelbi".into(),
+            source: CliSource::Setting,
+        },
+        cli_version: None,
+        env: Arc::new(Default::default()),
+        control: ControlHandle::new(
+            "/nonexistent/control.sock".into(),
+            APP_VERSION.into(),
+            APP_VERSION.into(),
+        ),
+    }
+}
+
+/// `--visual-review`'s window: the real shell over a fixture sidebar, with
+/// nothing live (no feed, bootstrap or daemon; commands and the view a review
+/// returns to are only recorded), reviews over `deps`, and the column
+/// transition on `clock`.
+#[cfg(feature = "visual-check")]
+impl ShelbiWindow {
+    pub(crate) fn offscreen(
+        project: &str,
+        model: SidebarModel,
+        deps: ReviewDeps,
+        clock: Rc<dyn Fn() -> Instant>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut w = Self::build(project, WindowState::default(), window, cx);
+        w.boot = Boot::Ready(Box::new(inert_ready()));
+        w.model = model;
+        w.tap = Some(Default::default());
+        w.review_ops = deps.ops.clone();
+        w.review_deps = Some(deps);
+        w.clock = clock;
+        w.reduce_motion = Rc::new(|| false);
+        // A native view with no entity yet: nothing attaches or reads.
+        w.client.set_view(View::Machines);
+        w.sync_selection();
+        w
+    }
+
+    pub(crate) fn offscreen_open_review(&mut self, info: ReviewInfo, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_review(info, window, cx);
+    }
+
+    pub(crate) fn offscreen_review(&self) -> Option<Entity<ReviewView>> {
+        self.review.clone()
+    }
+
+    /// What the leading column draws now.
+    pub(crate) fn offscreen_column(&mut self) -> column_swap::Frame {
+        self.column.frame((self.clock)())
+    }
+}
+
 #[cfg(test)]
 #[path = "app_smoke.rs"]
 mod smoke;
+
+#[cfg(test)]
+#[path = "app_column_tests.rs"]
+mod column_tests;
 
 #[cfg(test)]
 mod tests {

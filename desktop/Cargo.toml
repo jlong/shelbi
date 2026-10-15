@@ -90,6 +90,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Image and file-promise drops onto a terminal (`src/drops/`): AppKit's
 # pasteboard, file promises and image reps, gpui's window via its raw handle.
+# The Reduce Motion setting (`platform::motion`) is NSWorkspace's.
 # All already in gpui's macOS tree, at the versions it resolves.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -110,11 +111,13 @@ objc2-foundation = { version = "0.3", features = [
     "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [
+    "NSAccessibility",
     "NSBitmapImageRep",
     "NSFilePromiseReceiver",
     "NSImageRep",
     "NSPasteboard",
     "NSPasteboardItem",
+    "NSWorkspace",
     "block2",
 ] }
 

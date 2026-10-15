@@ -86,6 +86,20 @@ paths on every `cargo test`.
   machine, so the desktop leaves it to the TUI and shows its palette chord in
   the sidebar's search box instead.
 - **Links**: the desktop's review URLs are clickable; the TUI prints them.
+- **The review panel takes the sidebar's place** in both clients: with a
+  review open the window is two columns, the panel then the session. The TUI
+  swaps them in place. The desktop pushes between them like two levels of a
+  navigation stack (`views/column_swap.rs`): going in, the sidebar slides out
+  to the left and fades while the panel slides in from the right; Back,
+  Close, a decision landing, or the task leaving review play the reverse. It
+  takes about 220ms, ease-out, clipped to the column, which keeps its width
+  so the session never moves; a second toggle mid-way turns it around from
+  where it stands. Under macOS Reduce Motion it is a crossfade with no
+  slide. The panel uses the user's sidebar width and the divider beside it
+  resizes it; with the sidebar collapsed it still opens in that column, at
+  the default width, and Back returns to the collapsed state. Leaving gives
+  the sidebar back with its selection, scroll and keyboard focus where they
+  were.
 - **Dropping files and images on a terminal pane** pastes the escaped paths
   followed by a space, in both clients, so Claude Code attaches a dropped
   image. The TUI gets that paste from its own terminal (Ghostty and
