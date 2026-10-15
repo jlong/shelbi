@@ -8,7 +8,9 @@
 //! - issues board and task detail: **`dt-issues-board`** (landed:
 //!   `issues.rs` draws the board over the toolkit-free `board_state.rs`,
 //!   `task_detail.rs` the detail, `markdown.rs` / `external_edit.rs` its
-//!   body helpers; drag and drop: **`dt-board-dnd`**)
+//!   body helpers; drag and drop: **`dt-board-dnd`**; which gesture scrolls
+//!   the board and which a column: **`dt-board-scroll-axes`**,
+//!   `board_scroll.rs`)
 //! - activity feed and machines: **`dt-activity-machines`** (landed:
 //!   `activity.rs` over the toolkit-free `activity_state.rs`, `machines.rs`
 //!   over `machines_state.rs`, both from `shelbi-app`'s shared models)
@@ -34,6 +36,7 @@
 
 pub mod activity;
 pub mod activity_state;
+pub mod board_scroll;
 pub mod bootstrap;
 pub mod board_state;
 pub mod chat;
