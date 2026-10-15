@@ -165,6 +165,7 @@ desktop/
                        --print-version (print_version.rs), the daily release check (update.rs)
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
   src/elements/        custom elements, chiefly the terminal (elements/terminal/)
+  src/drops/           image and file-promise drops onto a terminal (AppKit hooks on gpui's window)
   src/spike.rs         `--spike <session>`: one terminal element on one session
   src/visual_check.rs  `--visual-check <dir>` (feature `visual-check`): offscreen render + input checks
   src/bench/           `--bench-term` (feature `bench`): the terminal performance bench and its helpers
