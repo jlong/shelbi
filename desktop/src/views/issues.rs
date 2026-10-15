@@ -37,6 +37,7 @@ use shelbi_app::board::{self, BoardRead, ClosedPage};
 use shelbi_app::{CommandKind, ExecError, IssueCard, IssueColumn, TaskDetailModel};
 use shelbi_state::keymap::{format_chord, DisplayStyle, KanbanAction, Keymaps};
 
+use super::board_scroll;
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
@@ -580,18 +581,20 @@ impl IssuesView {
                 }
             })
             .collect();
-        div()
-            .id("board-columns")
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .gap_3()
-            .p_3()
-            .overflow_x_scroll()
-            .track_scroll(&self.board_scroll)
-            .children(children)
+        let board = board_scroll::board_row(
+            div()
+                .id("board-columns")
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .gap_3()
+                .p_3(),
+            &self.board_scroll,
+        )
+        .children(children);
+        board_scroll::with_shift_wheel(board, &self.board_scroll)
     }
 
     fn render_collapsed(
@@ -740,43 +743,44 @@ impl IssuesView {
                 this.apply_intents(intents, window, cx);
                 cx.notify();
             }));
-        let body = div()
-            .id(("column", ci))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.column_scrolls[ci])
-            .children(cards)
-            .when(empty && !(is_done && model.done_loading), |d| {
-                d.child(muted_row(theme, if model.loading { "Loading board…" } else { "(empty)" }))
-            })
-            .when(is_done && model.done_loading, |d| {
-                d.child(muted_row(theme, "Loading history…"))
-            })
-            .when(is_done && model.has_more_done, |d| {
-                let hint = "m";
-                d.child(
-                    div()
-                        .id("load-more")
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .text_color(theme.muted)
-                        .cursor_pointer()
-                        .child(if self.load_more_in_flight {
-                            "Loading…".to_string()
-                        } else {
-                            format!("Load more ({hint})")
-                        })
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.load_more();
-                            cx.notify();
-                        })),
-                )
-            });
+        let body = board_scroll::column_body(
+            div()
+                .id(("column", ci))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .flex_1()
+                .min_h_0(),
+            &self.column_scrolls[ci],
+        )
+        .children(cards)
+        .when(empty && !(is_done && model.done_loading), |d| {
+            d.child(muted_row(theme, if model.loading { "Loading board…" } else { "(empty)" }))
+        })
+        .when(is_done && model.done_loading, |d| {
+            d.child(muted_row(theme, "Loading history…"))
+        })
+        .when(is_done && model.has_more_done, |d| {
+            let hint = "m";
+            d.child(
+                div()
+                    .id("load-more")
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .cursor_pointer()
+                    .child(if self.load_more_in_flight {
+                        "Loading…".to_string()
+                    } else {
+                        format!("Load more ({hint})")
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.load_more();
+                        cx.notify();
+                    })),
+            )
+        });
         let theme = *theme;
         div()
             .id(("column-drop", ci))
