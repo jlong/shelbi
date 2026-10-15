@@ -35,7 +35,7 @@ use shelbi_app::view::{
 use shelbi_app::CommandKind;
 
 use super::machines_state::{Intent, MachinesState};
-use crate::assets::{heroicon, icons, IconSize};
+use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
 use crate::theme::Theme;
 
@@ -376,7 +376,7 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                     .hover(|s| s.text_color(theme.white))
                     .child(url)
                     .child(
-                        heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE, IconSize::Micro)
+                        heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE)
                             .text_color(theme.muted),
                     )
                     .on_click(move |_, _, cx| {

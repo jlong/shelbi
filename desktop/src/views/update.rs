@@ -5,7 +5,7 @@
 
 use gpui::{div, prelude::*, AnyElement, Global, IntoElement};
 
-use crate::assets::{heroicon, icons, IconSize};
+use crate::assets::{heroicon, icons};
 use crate::platform::update::UpdateNotice;
 use crate::theme::Theme;
 use crate::views::bootstrap::{command_box, APP_UPGRADE_COMMAND};
@@ -68,7 +68,7 @@ pub fn render_update_bar(
                 .items_center()
                 .gap_2()
                 .child(
-                    heroicon(icons::ARROW_DOWN_CIRCLE, IconSize::Standard).text_color(theme.white),
+                    heroicon(icons::ARROW_DOWN_CIRCLE).text_color(theme.white),
                 )
                 .child(notice.message())
                 .child(div().text_color(theme.muted).child("Upgrade with"))
@@ -80,7 +80,7 @@ pub fn render_update_bar(
                 .flex_none()
                 .cursor_pointer()
                 .child(
-                    heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.muted),
+                    heroicon(icons::X_MARK).text_color(theme.muted),
                 )
                 .on_click(move |_, window, cx| on_dismiss(window, cx)),
         )

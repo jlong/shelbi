@@ -32,7 +32,7 @@ use shelbi_app::CommandKind;
 use shelbi_state::keymap::{format_chord, ActivityAction, DisplayStyle};
 
 use super::activity_state::{ActivityState, Intent, Picker};
-use crate::assets::{heroicon, icons, IconSize};
+use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
 use crate::theme::Theme;
 
@@ -609,8 +609,8 @@ fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
         .cursor_pointer()
         .hover(|s| s.bg(theme.selection))
         .child(
-            div().w(IconSize::Micro.px()).flex_none().when(selected, |d| {
-                d.child(heroicon(icons::CHECK, IconSize::Micro).text_color(theme.white))
+            div().w(ICON_SIZE).flex_none().when(selected, |d| {
+                d.child(heroicon(icons::CHECK).text_color(theme.white))
             }),
         )
         .child(label)

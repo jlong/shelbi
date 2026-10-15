@@ -11,7 +11,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, ClipboardItem, FontWeight, IntoElement, SharedString,
 };
 
-use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
 use crate::platform::version::VersionCheck;
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
@@ -328,7 +328,7 @@ pub fn render_failure(
                 .items_center()
                 .gap_2()
                 .child(
-                    heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Standard)
+                    heroicon(icons::EXCLAMATION_TRIANGLE)
                         .text_color(theme.yellow),
                 )
                 .child(
@@ -389,7 +389,7 @@ pub fn render_failure(
                 .bg(theme.selection)
                 .text_color(theme.white)
                 .child(
-                    heroicon(action.icon(), IconSize::Mini).text_color(theme.white),
+                    heroicon(action.icon()).text_color(theme.white),
                 )
                 .child(action.label())
                 .on_click(move |_, window, cx| on_action(action, window, cx)),
@@ -421,7 +421,7 @@ pub fn render_relaunch_bar(
                 .gap_2()
                 .text_color(theme.yellow)
                 .child(
-                    heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Standard)
+                    heroicon(icons::EXCLAMATION_TRIANGLE)
                         .text_color(theme.yellow),
                 )
                 .child(relaunch_message(notice)),
@@ -482,7 +482,7 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
                 .flex_none()
                 .cursor_pointer()
                 .child(
-                    heroicon(icons::CLIPBOARD_DOCUMENT, IconSize::Mini).text_color(theme.muted),
+                    heroicon(icons::CLIPBOARD_DOCUMENT).text_color(theme.muted),
                 )
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))
