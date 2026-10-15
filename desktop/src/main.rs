@@ -11,6 +11,7 @@ mod assets;
 #[cfg(feature = "bench")]
 mod bench;
 mod commands;
+mod drops;
 mod elements;
 mod keys;
 mod menus;
@@ -152,6 +153,9 @@ fn main() {
             theme::init(cx);
             assets::load_fonts(cx);
             elements::terminal::TerminalSettings::init(cx);
+            // Image and file-promise drops onto a terminal pane (gpui's window
+            // takes only Finder drops on its own).
+            drops::install(cx);
 
             // The menu bar: the macOS-standard shortcuts now (⌘Q closes this
             // client only; the registry's Quit Shelbi, which stops every

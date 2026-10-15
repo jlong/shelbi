@@ -518,6 +518,9 @@ impl TerminalPane {
     }
 
     fn new(selector: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // gpui's window takes only Finder drops; let this one take image and
+        // file-promise drags too (`crate::drops`), so they reach `drop_paths`.
+        crate::drops::accept_in(window);
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
             cx.on_focus_in(&focus_handle, window, |this, window, cx| {
@@ -857,6 +860,8 @@ impl TerminalPane {
     /// Files dropped on the pane: paste their paths, as a terminal pastes a
     /// dropped file (`rt-drag-and-drop-paste-into-a-review-or-workspace-panel`),
     /// and take keyboard focus so the user can keep typing after the drop.
+    /// A Finder drop arrives straight from gpui; an image or file-promise drop
+    /// is first written to a file by `crate::drops`, then replayed here.
     fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         let text = input::dropped_paths_text(paths.paths());
         if text.is_empty() || self.io.is_none() {

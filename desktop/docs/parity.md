@@ -86,6 +86,16 @@ paths on every `cargo test`.
   machine, so the desktop leaves it to the TUI and shows its palette chord in
   the sidebar's search box instead.
 - **Links**: the desktop's review URLs are clickable; the TUI prints them.
+- **Dropping files and images on a terminal pane** pastes the escaped paths
+  followed by a space, in both clients, so Claude Code attaches a dropped
+  image. The TUI gets that paste from its own terminal (Ghostty and
+  Terminal.app turn a Finder file or a screenshot thumbnail into its path).
+  The desktop app builds it itself (`shelbi_term::input::dropped_paths_text`):
+  a Finder drop through gpui, and a screenshot thumbnail, browser, Preview or
+  other image-data or file-promise drop through `src/drops/`, which first
+  writes it to a file (`~/Library/Caches/<bundle id>/drops/`, PNG for raw
+  image data) and pastes that path. Every terminal pane takes drops (chat,
+  workspace agent and user shell, review).
 
 ## Known gaps
 

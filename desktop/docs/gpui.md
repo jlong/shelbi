@@ -233,6 +233,42 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   `simulate_event(FileDropEvent::Entered { .. })` then `Submit`. gpui-pre
   0.3.9's macOS platform delivers only file drags (`ExternalPaths`), so
   dragging plain text from another app onto a terminal does nothing.
+- **Image and file-promise drops** (`dt-drop-images-terminal`, `src/drops/`).
+  gpui-pre 0.3.9's `NSWindow` registers one dragged type,
+  `NSFilenamesPboardType`, and is itself the drag destination (its
+  `draggingEntered:` and friends live on the `GPUIWindow` class, which reads
+  only that type), so a screenshot thumbnail, a browser or Preview image, or
+  any file promise is refused before gpui sees it. Without forking gpui, the
+  app:
+  1. re-registers each window that holds a terminal pane for
+     `NSFilePromiseReceiver.readableDraggedTypes`, `public.png`,
+     `public.tiff`, `public.jpeg` and `public.file-url` (plus gpui's
+     `NSFilenamesPboardType`), from `TerminalPane::new`, through the window's
+     raw handle (`HasWindowHandle` gives the content `NSView`; its `window`
+     is the `NSWindow`);
+  2. replaces `GPUIWindow`'s `draggingEntered:`, `draggingUpdated:` and
+     `performDragOperation:` at startup (`method_setImplementation`, keeping
+     gpui's originals). A drag carrying `NSFilenamesPboardType` goes to gpui's
+     original untouched (a Finder drop is exactly what it was). Any other drag
+     the pasteboard can satisfy is answered Copy; on the drop its items become
+     files (file URLs as they are, image data as a PNG in
+     `~/Library/Caches/<bundle id>/drops/`, a promise received into a fresh
+     directory there, delivered only once every promised file exists);
+  3. replays the paths into the window as the event sequence gpui's own drop
+     sends (`Window::dispatch_event` with `FileDropEvent::Entered`, `Submit`,
+     `Exited`, at the drop point flipped by the content view's height), so
+     gpui's hit test finds the pane and the same `on_drop` listener pastes
+     them. A point on no pane takes nothing, and `Exited` clears the drag.
+
+  Coupling to watch on a gpui upgrade: the class name `GPUIWindow`, that the
+  window (not its view) is the destination, those three selectors' signatures,
+  and the content-view flip. A renamed class only logs a warning: Finder drops
+  keep working and the rest stay refused. `concludeDragOperation:` and
+  `draggingExited:` stay gpui's (they send `Exited`, harmless for our drags).
+  objc2's typed `NSFilePromiseReceiver::fileNames` panics on the nil AppKit
+  returns before a modern promise is received, so it's read untyped; every
+  hook runs under `catch_unwind` (a panic in an `extern "C"` hook would abort
+  the app).
 - **Measuring an element for a drag** (the Workspace view's split divider): a
   `canvas(prepaint, paint)` child with `absolute().size_full()` reports its
   bounds in prepaint; store them in the view and `cx.notify()` only when they

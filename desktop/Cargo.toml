@@ -88,6 +88,36 @@ unicode-width = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Image and file-promise drops onto a terminal (`src/drops/`): AppKit's
+# pasteboard, file promises and image reps, gpui's window via its raw handle.
+# All already in gpui's macOS tree, at the versions it resolves.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+raw-window-handle = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSBundle",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSGeometry",
+    "NSOperation",
+    "NSPathUtilities",
+    "NSString",
+    "NSURL",
+    "NSValue",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSBitmapImageRep",
+    "NSFilePromiseReceiver",
+    "NSImageRep",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "block2",
+] }
+
 [features]
 # `cargo run --features visual-check -- --visual-check <dir>`: render the
 # terminal element offscreen (gpui's Metal render-to-image, no screen or

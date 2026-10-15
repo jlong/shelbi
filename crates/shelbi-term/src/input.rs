@@ -203,7 +203,8 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 /// The text a drop of files onto a terminal pastes: each path with the
 /// characters a shell would split or expand backslash-escaped, joined by
-/// spaces, as Terminal.app and Ghostty paste a dropped file. A terminal-hosted
+/// spaces and followed by one more space, as Terminal.app and Ghostty paste a
+/// dropped file (so the user can keep typing after it). A terminal-hosted
 /// client (the TUI) receives exactly that paste from its terminal; the desktop
 /// app builds it here so a drop reads the same to the program (Claude Code
 /// attaches an image from such a path). Non-UTF-8 paths are converted lossily.
@@ -219,10 +220,10 @@ pub fn dropped_paths_text<P: AsRef<std::path::Path>>(paths: &[P]) -> String {
                 }
                 out.push(c);
             }
+            out.push(' ');
             out
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// Encode a focus change, if the program enabled focus reporting
@@ -628,10 +629,16 @@ mod tests {
 
     #[test]
     fn dropped_paths_are_escaped_like_a_terminal_drop() {
-        assert_eq!(dropped_paths_text(&["/tmp/shot.png"]), "/tmp/shot.png");
+        // One path: escaped, then the trailing space a terminal pastes.
+        assert_eq!(dropped_paths_text(&["/tmp/shot.png"]), "/tmp/shot.png ");
         assert_eq!(
-            dropped_paths_text(&["/Users/me/Screen Shot (1).png", "/tmp/a'b&c"]),
-            "/Users/me/Screen\\ Shot\\ \\(1\\).png /tmp/a\\'b\\&c"
+            dropped_paths_text(&["/Users/me/Screen Shot (1).png"]),
+            "/Users/me/Screen\\ Shot\\ \\(1\\).png "
+        );
+        // Several: space-separated, one trailing space.
+        assert_eq!(
+            dropped_paths_text(&["/Users/me/Screen Shot (1).png", "/tmp/a'b&c", "/tmp/c.png"]),
+            "/Users/me/Screen\\ Shot\\ \\(1\\).png /tmp/a\\'b\\&c /tmp/c.png "
         );
         assert_eq!(dropped_paths_text::<&str>(&[]), "");
     }

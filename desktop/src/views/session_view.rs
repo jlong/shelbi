@@ -1610,7 +1610,46 @@ mod tests {
         h.cx.simulate_event(gpui::FileDropEvent::Submit { position: center });
         h.settle();
         let input = h.session.wire.lock().unwrap().input.concat();
-        assert_eq!(String::from_utf8(input).unwrap(), "/tmp/Screen\\ Shot.png");
+        assert_eq!(String::from_utf8(input).unwrap(), "/tmp/Screen\\ Shot.png ");
+        let focused = h.cx.update(|window, cx| {
+            h.chat.read(cx).pane().unwrap().read(cx).focus_handle(cx).is_focused(window)
+        });
+        assert!(focused, "the drop focuses the terminal");
+    }
+
+    /// An image or file-promise drop, once `crate::drops` has written it to
+    /// files, is replayed as a file drop at the drop point: the pane under it
+    /// pastes every path; a point on no pane takes nothing and leaves no
+    /// drag behind.
+    #[gpui::test]
+    fn a_materialised_drop_is_replayed_into_the_pane_under_it(cx: &mut TestAppContext) {
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, 24))]);
+        h.update(|c, cx| c.show(cx));
+        h.cx.update(|window, cx| window.draw(cx).clear(cx));
+        h.settle();
+        let paths = vec![
+            std::path::PathBuf::from("/Users/me/Library/Caches/dev.shelbi.desktop/drops/drop-1.png"),
+            std::path::PathBuf::from("/tmp/Screenshot 2026-10-14 at 9.05 PM.png"),
+        ];
+
+        let outside = gpui::point(gpui::px(-40.0), gpui::px(-40.0));
+        h.cx.update(|window, cx| crate::drops::replay_drop(window, outside, paths.clone(), cx));
+        h.settle();
+        assert!(h.session.wire.lock().unwrap().input.is_empty(), "no pane, no paste");
+        assert!(!h.cx.update(|_, cx| cx.has_active_drag()), "the drag is cleared");
+
+        let center = h.cx.update(|window, _| {
+            let size = window.viewport_size();
+            gpui::point(size.width / 2.0, size.height / 2.0)
+        });
+        h.cx.update(|window, cx| crate::drops::replay_drop(window, center, paths, cx));
+        h.settle();
+        let input = h.session.wire.lock().unwrap().input.concat();
+        assert_eq!(
+            String::from_utf8(input).unwrap(),
+            "/Users/me/Library/Caches/dev.shelbi.desktop/drops/drop-1.png \
+             /tmp/Screenshot\\ 2026-10-14\\ at\\ 9.05\\ PM.png "
+        );
         let focused = h.cx.update(|window, cx| {
             h.chat.read(cx).pane().unwrap().read(cx).focus_handle(cx).is_focused(window)
         });

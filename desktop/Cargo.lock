@@ -6415,6 +6415,7 @@ version = "0.10.0"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
+ "block2 0.6.2",
  "chrono",
  "flate2",
  "futures",
@@ -6424,6 +6425,10 @@ dependencies = [
  "image",
  "libc",
  "markdown",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "shelbi-app",
