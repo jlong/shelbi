@@ -13,7 +13,7 @@ use gpui::{
 
 use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
-use crate::platform::version::VersionCheck;
+use crate::platform::version::{ProtocolCheck, VersionCheck};
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
 use crate::theme::Theme;
 
@@ -139,6 +139,7 @@ pub fn failure_screen(failure: &Failure) -> Screen {
             action: ScreenAction::Retry,
         },
         Failure::VersionMismatch(check) => version_screen(check),
+        Failure::ProtocolMismatch { cli, check } => protocol_screen(cli, check),
     }
 }
 
@@ -246,6 +247,75 @@ fn version_screen(check: &VersionCheck) -> Screen {
             fix: Vec::new(),
             details: None,
             action: ScreenAction::Retry,
+        },
+    }
+}
+
+/// A control-protocol mismatch: the daemon answered, so the screen names which
+/// side is behind rather than calling it unreachable.
+fn protocol_screen(cli: &Path, check: &ProtocolCheck) -> Screen {
+    let protocols = |rows: Vec<(&str, Option<u32>)>| {
+        let lines = rows
+            .into_iter()
+            .map(|(who, p)| match p {
+                Some(p) => format!("{who:<7} {p}"),
+                None => format!("{who:<7} (too old to report)"),
+            })
+            .collect();
+        Some(("Control protocols:".to_string(), lines))
+    };
+    match *check {
+        ProtocolCheck::CliOlder { app, cli: cli_p, daemon } => Screen {
+            title: "The shelbi CLI is older than this app".into(),
+            body: vec![match cli_p {
+                Some(cli_p) => format!(
+                    "{} speaks control protocol {cli_p}; this app needs {app}.",
+                    cli.display()
+                ),
+                None => format!(
+                    "The daemon speaks control protocol {daemon}; this app needs {app}. {} is too old to report its own.",
+                    cli.display()
+                ),
+            }],
+            fix: vec![FixStep::run(
+                format!("Upgrade the CLI ({UPGRADE_COMMAND}), then restart the daemon:"),
+                DAEMON_RESTART_COMMAND,
+            )],
+            details: protocols(vec![
+                ("app", Some(app)),
+                ("cli", cli_p),
+                ("daemon", Some(daemon)),
+            ]),
+            action: ScreenAction::Retry,
+        },
+        ProtocolCheck::DaemonStale { app, cli: cli_p, daemon } => Screen {
+            title: "The Shelbi daemon is out of date".into(),
+            body: vec![format!(
+                "The daemon is still running an older shelbi from before an upgrade: it speaks control protocol {daemon}, and {} speaks {cli_p}.",
+                cli.display()
+            )],
+            fix: vec![FixStep::run(
+                "Restart the daemon on the new version (agent sessions are separate processes and keep running), then try again:",
+                DAEMON_RESTART_COMMAND,
+            )],
+            details: protocols(vec![
+                ("app", Some(app)),
+                ("cli", Some(cli_p)),
+                ("daemon", Some(daemon)),
+            ]),
+            action: ScreenAction::Retry,
+        },
+        ProtocolCheck::AppOutdated { app, daemon } => Screen {
+            title: "Shelbi was updated".into(),
+            body: vec![format!(
+                "The daemon speaks control protocol {daemon}, newer than this app's {app}. Relaunch to use the new version."
+            )],
+            fix: vec![FixStep::run(
+                "If it still says this after relaunching, update the app:",
+                APP_UPGRADE_COMMAND,
+            )],
+            details: protocols(vec![("app", Some(app)), ("daemon", Some(daemon))]),
+            action: ScreenAction::Relaunch,
         },
     }
 }
@@ -593,6 +663,79 @@ mod tests {
             daemon: "0.10.0".into(),
         }));
         assert_eq!(commands(&screen), [DAEMON_RESTART_COMMAND]);
+    }
+
+    /// The daemon answered with an older protocol, and the CLI a restart
+    /// would run speaks it too: upgrade the CLI, never "unreachable".
+    #[test]
+    fn an_older_protocol_under_an_older_cli_names_the_cli_and_both_protocols() {
+        let screen = failure_screen(&Failure::ProtocolMismatch {
+            cli: PathBuf::from("/Users/me/bin/shelbi"),
+            check: ProtocolCheck::CliOlder {
+                app: 6,
+                cli: Some(4),
+                daemon: 4,
+            },
+        });
+        assert_eq!(screen.title, "The shelbi CLI is older than this app");
+        assert_eq!(
+            screen.body,
+            ["/Users/me/bin/shelbi speaks control protocol 4; this app needs 6."]
+        );
+        assert!(screen.fix[0].text.contains(UPGRADE_COMMAND), "{:?}", screen.fix);
+        assert_eq!(commands(&screen), [DAEMON_RESTART_COMMAND]);
+        assert_eq!(screen.action, ScreenAction::Retry);
+        let all = format!("{} {:?}", screen.title, screen.body);
+        assert!(!all.contains("reach") && !all.contains("didn't answer"), "{all}");
+    }
+
+    #[test]
+    fn a_cli_too_old_to_report_its_protocol_falls_back_to_the_daemons() {
+        let screen = failure_screen(&Failure::ProtocolMismatch {
+            cli: PathBuf::from("/Users/me/bin/shelbi"),
+            check: ProtocolCheck::CliOlder {
+                app: 6,
+                cli: None,
+                daemon: 4,
+            },
+        });
+        assert_eq!(screen.title, "The shelbi CLI is older than this app");
+        let body = &screen.body[0];
+        assert!(body.contains("protocol 4") && body.contains("needs 6"), "{body}");
+        assert!(body.contains("/Users/me/bin/shelbi"), "{body}");
+        assert_eq!(commands(&screen), [DAEMON_RESTART_COMMAND]);
+    }
+
+    /// The CLI was upgraded but the daemon wasn't restarted: the same restart
+    /// offer the version-string check gives.
+    #[test]
+    fn an_older_protocol_under_a_current_cli_offers_a_daemon_restart() {
+        let screen = failure_screen(&Failure::ProtocolMismatch {
+            cli: PathBuf::from("/opt/homebrew/bin/shelbi"),
+            check: ProtocolCheck::DaemonStale {
+                app: 6,
+                cli: 6,
+                daemon: 4,
+            },
+        });
+        let stale = failure_screen(&Failure::VersionMismatch(VersionCheck::DaemonStale {
+            app: "0.11.0".into(),
+            daemon: "0.10.0".into(),
+        }));
+        assert_eq!(screen.title, stale.title);
+        assert_eq!(screen.fix, stale.fix);
+        assert_eq!(commands(&screen), [DAEMON_RESTART_COMMAND]);
+        assert!(!screen.fix[0].text.contains(UPGRADE_COMMAND));
+        assert_eq!(screen.action, ScreenAction::Retry);
+    }
+
+    #[test]
+    fn a_newer_protocol_offers_a_relaunch() {
+        let screen = failure_screen(&Failure::ProtocolMismatch {
+            cli: PathBuf::from("/opt/homebrew/bin/shelbi"),
+            check: ProtocolCheck::AppOutdated { app: 6, daemon: 7 },
+        });
+        assert_eq!(screen.action, ScreenAction::Relaunch);
     }
 
     #[test]

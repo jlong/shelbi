@@ -162,8 +162,21 @@ pub fn config_path_label() -> String {
 /// it doesn't run or doesn't answer in time; the daemon's hello is then the
 /// only version the check has.
 pub fn cli_version(cli: &Path, env: &Env) -> Option<String> {
+    parse_cli_version(&cli_output(cli, "--version", env)?)
+}
+
+/// The control protocol the CLI speaks, from `shelbi __control-protocol`.
+/// `None` when it doesn't answer: a CLI from before that command existed
+/// (it exits with a usage error), or one that doesn't run.
+pub fn cli_control_protocol(cli: &Path, env: &Env) -> Option<u32> {
+    cli_output(cli, "__control-protocol", env)?.trim().parse().ok()
+}
+
+/// `<cli> <arg>`'s stdout under `env`, when it exits 0 within
+/// [`VERSION_TIMEOUT`].
+fn cli_output(cli: &Path, arg: &str, env: &Env) -> Option<String> {
     let mut child = Command::new(cli)
-        .arg("--version")
+        .arg(arg)
         .env_clear()
         .envs(env)
         .stdin(Stdio::null())
@@ -188,7 +201,7 @@ pub fn cli_version(cli: &Path, env: &Env) -> Option<String> {
     }
     let mut out = String::new();
     child.stdout.take()?.read_to_string(&mut out).ok()?;
-    parse_cli_version(&out)
+    Some(out)
 }
 
 /// The version in `shelbi --version` output: the first whitespace-separated
