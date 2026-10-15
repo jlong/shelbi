@@ -86,6 +86,7 @@ is left, and how it was verified.
 | `dt-icons-mini-outline` | Every icon is the Heroicons outline drawing at 20×20, through one size-free helper | [`status/dt-icons-mini-outline.md`](status/dt-icons-mini-outline.md) |
 | `dt-terminal-bottom-clipped` | A pane always reaches the session's last row: clipped windows keep the content's bottom, and taking focus takes the PTY's size | [`status/dt-terminal-bottom-clipped.md`](status/dt-terminal-bottom-clipped.md) |
 | `dt-workspace-sidebar` | The workspace panel takes the sidebar's column with the review's push; the header above the agent is gone | [`status/dt-workspace-sidebar.md`](status/dt-workspace-sidebar.md) |
+| `dt-instant-panel-push` | The panel's push starts on the input's next frame (before the review load answers) and its session attaches once it settles | [`status/dt-instant-panel-push.md`](status/dt-instant-panel-push.md) |
 | `dt-taskpage-theme` | The desktop's own palette and component shapes after the Taskpage design system, light and dark; the TUI keeps its colors | [`theme.md`](theme.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore

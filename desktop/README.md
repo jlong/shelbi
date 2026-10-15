@@ -171,6 +171,7 @@ desktop/
   src/spike.rs         `--spike <session>`: one terminal element on one session
   src/visual_check.rs  `--visual-check <dir>` (feature `visual-check`): offscreen render + input checks
   src/bench/           `--bench-term` (feature `bench`): the terminal performance bench and its helpers
+  src/bench_push.rs    `--bench-push` (feature `visual-check`): frame timing of the column push
 ```
 
 Which subtask fills what:
@@ -256,6 +257,16 @@ scripts/bench-term.sh                  # the bench: a real window, sandboxed ses
 scripts/bench-term.sh --input yes --source direct --skip-many   # one case
 scripts/multiclient-check.sh           # app + TUI + shelbi attach on one session, typing in turn
 scripts/idle-cpu.sh                    # the full app's idle CPU with one attached session
+```
+
+The column push (`dt-instant-panel-push`, numbers in
+`docs/status/dt-instant-panel-push.md`): input to the first moving frame, and
+each frame's time through the push, opening and leaving a review and a
+workspace over fake daemons:
+
+```sh
+cargo run --release --features visual-check -- --bench-push              # a real window, the display's frames
+cargo run --release --features visual-check -- --bench-push --offscreen  # no display needed (a locked screen)
 ```
 
 All three run in a sandboxed Shelbi root under `/tmp` with the hub's socket
