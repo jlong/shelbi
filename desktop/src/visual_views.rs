@@ -9,8 +9,10 @@
 //! SSH machine whose host can't resolve), a few tasks, a workspace status and
 //! an `events.log`, then opens each view through the real readers and saves
 //! frames: `activity.png`, `activity-zen.png` (the Zen kind filter),
-//! `activity-picker.png` (the project picker open), and `machines.png` once the
-//! unreachable remote's probe has landed. It prints one line per check and
+//! `activity-picker.png` (the project picker open), `machines.png` once the
+//! unreachable remote's probe has landed, and the issues board: `board.png`
+//! (a card selected), `board-dropdown.png` (the workflow filter open) and
+//! `board-detail.png` (a card's detail). It prints one line per check and
 //! exits non-zero if any failed.
 
 use std::path::PathBuf;
@@ -19,11 +21,10 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{px, size, AnyWindowHandle, AppContext, Entity, VisualTestAppContext};
-use shelbi_app::theme::ThemePreference;
 use shelbi_core::{Column, Issue};
 
-use crate::theme::Theme;
 use crate::views::activity::ActivityView;
+use crate::views::issues::IssuesView;
 use crate::views::machines::MachinesView;
 
 const PROJECT: &str = "demo";
@@ -44,7 +45,10 @@ pub fn run(out: PathBuf) -> ! {
 
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
-    cx.set_global(Theme::resolve(ThemePreference::Dark, gpui::WindowAppearance::Dark));
+    cx.update(|cx| {
+        crate::visual_check::install_theme(cx);
+        crate::assets::load_fonts(cx);
+    });
     let mut failures = 0;
     let mut expect = |name: &str, ok: bool| {
         println!("{}  {name}", if ok { "ok  " } else { "FAIL" });
@@ -109,6 +113,32 @@ pub fn run(out: PathBuf) -> ! {
     });
     expect("machines: the workspace-list state cell", cell == "in_progress: t1");
     save(&mut cx, window, &out, "machines.png");
+
+    // ---- Issues board ----
+    let (board, window) = open(&mut cx, |cx| cx.new(|cx| IssuesView::new(PROJECT.into(), cx)));
+    let loaded = wait(&mut cx, window, Duration::from_secs(10), |cx| {
+        board.update(cx, |v, cx| v.poll(cx));
+        board.update(cx, |v, _| {
+            v.state_mut().model().columns.iter().map(|c| c.cards.len()).sum::<usize>() >= 5
+        })
+    });
+    expect("board: the fixture tasks load into columns", loaded);
+    board.update(&mut cx, |v, cx| {
+        v.state_mut().select(1, 0);
+        cx.notify();
+    });
+    save(&mut cx, window, &out, "board.png");
+    board.update(&mut cx, |v, cx| {
+        v.state_mut().open_workflow_dropdown();
+        cx.notify();
+    });
+    save(&mut cx, window, &out, "board-dropdown.png");
+    board.update(&mut cx, |v, cx| {
+        v.state_mut().close_overlay();
+        v.state_mut().open_detail("t1");
+        cx.notify();
+    });
+    save(&mut cx, window, &out, "board-detail.png");
 
     let _ = std::fs::remove_dir_all(&home);
     println!("\n{failures} check(s) failed; frames saved under {}", out.display());
@@ -227,6 +257,9 @@ workspaces:
     task("t1", "Fix the login redirect loop", Column::in_progress(), Some("alpha"));
     task("r9", "Add the activity feed to the desktop app", Column::review(), Some("review"));
     task("d1", "Ship the board", Column::done(), None);
+    task("b1", "Write the theme docs for the desktop palette", Column::backlog(), None);
+    task("b2", "Sync the board's column widths with the TUI", Column::backlog(), None);
+    task("c1", "Restyle the command palette", Column::todo(), None);
     shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
         workspace: "alpha".into(),
         current_task: Some("t1".into()),

@@ -17,6 +17,7 @@ stub arms it implemented. `dt-parity-audit` removed the stub for good.
 | Doc | What it is |
 |---|---|
 | [`parity.md`](parity.md) | TUI parity: where each client shows every view-model field (guarded by a test), and the hand walk of every command in both clients |
+| [`theme.md`](theme.md) | The desktop's palette (Taskpage's roles, light and dark), its contrast rules, and the shared component shapes |
 | [`gpui.md`](gpui.md) | The gpui channel: what is pinned and why, the breakage log, gpui quirks met along the way |
 | [`status/desktop-app.md`](status/desktop-app.md) | The umbrella: foundation, and the record of the whole effort |
 
@@ -85,6 +86,7 @@ is left, and how it was verified.
 | `dt-icons-mini-outline` | Every icon is the Heroicons outline drawing at 20×20, through one size-free helper | [`status/dt-icons-mini-outline.md`](status/dt-icons-mini-outline.md) |
 | `dt-terminal-bottom-clipped` | A pane always reaches the session's last row: clipped windows keep the content's bottom, and taking focus takes the PTY's size | [`status/dt-terminal-bottom-clipped.md`](status/dt-terminal-bottom-clipped.md) |
 | `dt-workspace-sidebar` | The workspace panel takes the sidebar's column with the review's push; the header above the agent is gone | [`status/dt-workspace-sidebar.md`](status/dt-workspace-sidebar.md) |
+| `dt-taskpage-theme` | The desktop's own palette and component shapes after the Taskpage design system, light and dark; the TUI keeps its colors | [`theme.md`](theme.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

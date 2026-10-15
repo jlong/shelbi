@@ -6,6 +6,7 @@
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight};
 use shelbi_app::overlay::zen_intro::{self as zen, IntroFocus, IntroState};
 
+use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 use crate::views::overlay::{panel, with_overlay, zen_event, ActiveOverlay, OverlayEvent, OverlayHost};
 
@@ -38,9 +39,9 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
         .debug_selector(|| "zen-checkbox".into())
         .cursor_pointer()
         .when(checkbox_focused, |c| {
-            c.text_color(theme.ansi_white).font_weight(FontWeight::BOLD).underline()
+            c.text_color(theme.text_loud).font_weight(FontWeight::MEDIUM).underline()
         })
-        .when(!checkbox_focused, |c| c.text_color(theme.ansi_gray))
+        .when(!checkbox_focused, |c| c.text_color(theme.text))
         .child(format!(
             "{} {}",
             if state.dont_show_again { "[x]" } else { "[ ]" },
@@ -48,32 +49,20 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
         ))
         .on_click(cx.listener(on_control(IntroFocus::Checkbox)));
 
-    let button = |id: &'static str, label: &str, focused: bool, fill| {
-        div()
-            .id(id)
-            .debug_selector(move || id.into())
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .when(focused, |b| {
-                b.bg(fill)
-                    .text_color(if id == "zen-enable" { theme.on_color } else { theme.ansi_white })
-                    .font_weight(FontWeight::BOLD)
-            })
-            .when(!focused, |b| b.text_color(theme.ansi_dark_gray))
-            .child(format!("[ {label} ]"))
+    let button = |id: &'static str, label: &str, focused: bool, kind| {
+        style::button(id, label.to_string(), kind, focused, theme)
     };
 
-    panel("zen-intro", theme.divider, theme)
+    panel("zen-intro", theme)
         .w(px(WIDTH))
         .px_6()
         .py_4()
         .gap_3()
         .child(
             div()
-                .text_color(theme.ansi_cyan)
-                .font_weight(FontWeight::BOLD)
+                .text_base()
+                .text_color(theme.text_loud)
+                .font_weight(FontWeight::SEMIBOLD)
                 .child(zen::HEADING),
         )
         .child(
@@ -81,7 +70,7 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
                 .flex()
                 .flex_col()
                 .gap_3()
-                .text_color(theme.ansi_gray)
+                .text_color(theme.text)
                 .children(paragraphs),
         )
         .child(checkbox)
@@ -89,13 +78,14 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
             div()
                 .flex()
                 .flex_row()
+                .justify_end()
                 .gap_2()
                 .child(
-                    button("zen-cancel", zen::CANCEL, state.focus == IntroFocus::Cancel, theme.selection)
+                    button("zen-cancel", zen::CANCEL, state.focus == IntroFocus::Cancel, ButtonKind::Secondary)
                         .on_click(cx.listener(on_control(IntroFocus::Cancel))),
                 )
                 .child(
-                    button("zen-enable", zen::ENABLE, state.focus == IntroFocus::Enable, theme.ansi_green)
+                    button("zen-enable", zen::ENABLE, state.focus == IntroFocus::Enable, ButtonKind::Primary)
                         .on_click(cx.listener(on_control(IntroFocus::Enable))),
                 ),
         )

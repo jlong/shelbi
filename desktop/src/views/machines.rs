@@ -37,6 +37,7 @@ use shelbi_app::CommandKind;
 use super::machines_state::{Intent, MachinesState};
 use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
+use crate::theme::style;
 use crate::theme::Theme;
 
 /// How often the machines read re-runs. It reads the board index and each
@@ -169,7 +170,7 @@ impl MachinesView {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .text_color(theme.muted)
+                .text_color(theme.text_quiet)
                 .child(text)
                 .into_any_element()
         };
@@ -196,17 +197,22 @@ impl MachinesView {
             .py_2()
             .gap_4();
         for (mi, machine) in model.machines.iter().enumerate() {
+            // Each machine is a card on the main surface.
             let mut group = div()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
+                .p_2()
+                .rounded_lg()
+                .bg(theme.surface_raised)
+                .shadow(style::card_shadow(theme))
                 .child(machine_header(theme, machine));
             if machine.workspaces.is_empty() {
                 group = group.child(
                     div()
                         .pl_4()
                         .text_xs()
-                        .text_color(theme.muted)
+                        .text_color(theme.text_quiet)
                         .child("(no workspaces)"),
                 );
             }
@@ -245,9 +251,9 @@ impl Render for MachinesView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .text_sm()
-            .text_color(theme.gray)
+            .text_color(theme.text)
             .child(
                 div()
                     .flex()
@@ -255,19 +261,20 @@ impl Render for MachinesView {
                     .items_baseline()
                     .gap_3()
                     .px_4()
-                    .py_2()
+                    .py_3()
                     .border_b_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.rule)
                     .child(
                         div()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.white)
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_loud)
                             .child("Machines"),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted)
+                            .text_color(theme.text_quiet)
                             .child(self.state.title().to_string()),
                     ),
             )
@@ -278,11 +285,11 @@ impl Render for MachinesView {
                     .flex_row()
                     .gap_4()
                     .px_4()
-                    .py_1()
+                    .py_1p5()
                     .border_t_1()
-                    .border_color(theme.divider)
+                    .border_color(theme.rule)
                     .text_xs()
-                    .text_color(theme.muted)
+                    .text_color(theme.text_quiet)
                     .child(div().flex_1().child("↑/↓ select   enter open   r refresh"))
                     .child(format!(
                         "{count} workspace{}",
@@ -304,33 +311,33 @@ fn machine_header(theme: &Theme, m: &MachineRow) -> impl IntoElement {
             None => "ssh".to_string(),
         }
     };
-    let toned = |text: String, tone: Tone| div().text_color(theme.tone(tone)).child(text);
+    let toned = |text: String, tone: Tone| style::chip(text, Theme::tone_hue(tone), theme);
     div()
         .flex()
         .flex_row()
         .flex_wrap()
-        .items_baseline()
-        .gap_3()
-        .pb_1()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .pt_1()
+        .pb_2()
         .child(
             div()
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.white)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_loud)
                 .child(m.name.clone()),
         )
-        .child(div().text_xs().text_color(theme.muted).child(location))
+        .child(div().text_xs().text_color(theme.text_quiet).child(location))
         // Live reachability next to the ssh label: remotes only, the hub is
         // never probed.
         .when(!m.is_local, |d| {
             let (text, tone) = reachability_label(&m.reachability, 80);
-            d.child(toned(text, tone).text_xs())
+            d.child(toned(text, tone))
         })
-        .when(!m.tags.is_empty(), |d| {
-            d.child(toned(format!("[{}]", m.tags.join(", ")), Tone::WorkflowBadge).text_xs())
-        })
+        .children(m.tags.iter().map(|tag| style::chip(tag.clone(), crate::theme::Hue::Neutral, theme)))
         .when(!m.is_local, |d| {
             let (text, tone) = remote_binary_label(m.remote.as_ref());
-            d.child(toned(text, tone).text_xs())
+            d.child(div().text_xs().text_color(theme.tone(tone)).child(text))
         })
 }
 
@@ -338,15 +345,15 @@ fn machine_header(theme: &Theme, m: &MachineRow) -> impl IntoElement {
 fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::Div {
     let (badge, badge_tone) = workspace_state_badge(w.state);
     let task = match &w.assignment {
-        SlotAssignment::Idle => div().text_color(theme.muted).child("idle"),
+        SlotAssignment::Idle => div().text_color(theme.text_quiet).child("idle"),
         assignment => div()
             .flex()
             .flex_row()
             .min_w_0()
             .gap_2()
-            .child(div().flex_none().text_color(theme.gray).child(assignment.cell()))
+            .child(div().flex_none().text_color(theme.text).child(assignment.cell()))
             .when_some(w.task_title.clone(), |d, title| {
-                d.child(div().min_w_0().truncate().text_color(theme.white).child(title))
+                d.child(div().min_w_0().truncate().text_color(theme.text_loud).child(title))
             }),
     };
     let review = w.review.as_ref().map(|r| {
@@ -371,13 +378,13 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .text_color(theme.cyan)
+                    .text_color(theme.link)
                     .cursor_pointer()
-                    .hover(|s| s.text_color(theme.white))
+                    .hover(|s| s.text_color(theme.link_hover))
                     .child(url)
                     .child(
                         heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE)
-                            .text_color(theme.muted),
+                            .text_color(theme.icon),
                     )
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
@@ -391,35 +398,35 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
         .flex()
         .flex_row()
         .items_center()
+        .relative()
         .gap_3()
-        .pl_4()
-        .pr_2()
-        .py_1()
-        .rounded_md()
+        .px_2()
+        .py_1p5()
+        .rounded_lg()
         .cursor_pointer()
-        .when(selected, |d| d.bg(theme.selection))
-        .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+        .when(selected, |d| d.bg(theme.row_selected).child(style::selection_indicator(theme)))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.fill_subtle)))
         .child(
             div()
                 .w(px(150.0))
                 .flex_none()
                 .truncate()
-                .text_color(theme.white)
+                .text_color(theme.text_loud)
                 .child(w.name.clone()),
         )
         .child(
             div()
-                .w(px(76.0))
+                .w(px(96.0))
                 .flex_none()
-                .text_color(theme.tone(badge_tone))
-                .child(badge),
+                .flex()
+                .child(style::chip(badge, Theme::tone_hue(badge_tone), theme)),
         )
         .child(
             div()
                 .w(px(96.0))
                 .flex_none()
                 .truncate()
-                .text_color(theme.gray)
+                .text_color(theme.text)
                 .child(w.agent.clone().unwrap_or_else(|| "-".to_string())),
         )
         .child(div().flex_1().min_w_0().child(task))
@@ -430,7 +437,7 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                     .flex_none()
                     .truncate()
                     .text_xs()
-                    .text_color(theme.ansi_dark_gray)
+                    .text_color(theme.text_quiet)
                     .child(format!("{}{branch}", shelbi_app::activity::BRANCH_ICON)),
             )
         })

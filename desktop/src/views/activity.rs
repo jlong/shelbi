@@ -34,6 +34,7 @@ use shelbi_state::keymap::{format_chord, ActivityAction, DisplayStyle};
 use super::activity_state::{ActivityState, Intent, Picker};
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
+use crate::theme::style;
 use crate::theme::Theme;
 
 /// The TUI's activity refresh cadence.
@@ -185,17 +186,16 @@ impl ActivityView {
             div()
                 .id(id)
                 .debug_selector(move || id.into())
-                .px_2()
-                .py(px(2.0))
-                .rounded_md()
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(10.0))
+                .rounded_lg()
                 .cursor_pointer()
                 .text_xs()
-                .when(active, |d| {
-                    d.bg(theme.selection)
-                        .text_color(theme.white)
-                        .font_weight(FontWeight::BOLD)
-                })
-                .when(!active, |d| d.text_color(theme.muted).hover(|s| s.bg(theme.search)))
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(active, |d| d.bg(theme.fill).text_color(theme.text_loud))
+                .when(!active, |d| d.text_color(theme.text_quiet).hover(|s| s.bg(theme.fill_subtle)))
                 .child(label)
         };
         let mut pills = div().flex().flex_row().items_center().gap_1().child(
@@ -233,9 +233,9 @@ impl ActivityView {
             .flex_col()
             .gap_2()
             .px_4()
-            .py_2()
+            .py_3()
             .border_b_1()
-            .border_color(theme.divider)
+            .border_color(theme.rule)
             .child(
                 div()
                     .flex()
@@ -244,14 +244,15 @@ impl ActivityView {
                     .gap_3()
                     .child(
                         div()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.white)
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_loud)
                             .child("Activity"),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted)
+                            .text_color(theme.text_quiet)
                             .child(self.state.project.clone()),
                     ),
             )
@@ -292,7 +293,7 @@ impl ActivityView {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .text_color(theme.muted)
+                .text_color(theme.text_quiet)
                 .child(text)
                 .into_any_element()
         };
@@ -335,7 +336,7 @@ impl ActivityView {
             list = list.child(
                 div()
                     .py_4()
-                    .text_color(theme.muted)
+                    .text_color(theme.text_quiet)
                     .child(empty),
             );
         }
@@ -351,7 +352,7 @@ impl ActivityView {
             .gap_3()
             .py_3()
             .text_xs()
-            .text_color(theme.muted);
+            .text_color(theme.text_quiet);
         if self.state.is_loading_older() {
             row.child("Loading older events…").child(loaded)
         } else if self.state.has_older() {
@@ -394,12 +395,12 @@ impl ActivityView {
             .px_4()
             .py_1()
             .border_t_1()
-            .border_color(theme.divider)
+            .border_color(theme.rule)
             .text_xs()
-            .text_color(theme.muted)
+            .text_color(theme.text_quiet)
             .child(div().flex_1().truncate().child(hints))
             .when_some(self.state.status().map(str::to_string), |d, s| {
-                d.child(div().text_color(theme.ansi_light_red).child(s))
+                d.child(div().text_color(theme.orange).child(s))
             })
     }
 
@@ -440,7 +441,8 @@ impl ActivityView {
                     }))
             })
             .collect();
-        let dim: Hsla = theme.background.opacity(0.35);
+        // A menu dims nothing.
+        let dim: Hsla = gpui::transparent_black();
         Some(
             div()
                 .id("picker-backdrop")
@@ -489,9 +491,9 @@ impl Render for ActivityView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .text_sm()
-            .text_color(theme.gray)
+            .text_color(theme.text)
             .child(self.render_header(&theme, cx))
             .child(self.render_feed(&theme, cx))
             .child(self.render_footer(&theme))
@@ -511,10 +513,10 @@ fn day_header(theme: &Theme, label: &str) -> impl IntoElement {
         .pt_4()
         .pb_2()
         .text_xs()
-        .text_color(theme.ansi_dark_gray)
-        .child(div().w(px(12.0)).h(px(1.0)).bg(theme.divider))
+        .text_color(theme.text_quiet)
+        .child(div().w(px(12.0)).h(px(1.0)).bg(theme.rule))
         .child(label.to_string())
-        .child(div().flex_1().h(px(1.0)).bg(theme.divider))
+        .child(div().flex_1().h(px(1.0)).bg(theme.rule))
 }
 
 /// One feed row, laid out like the TUI's: the identity chip pinned left, the
@@ -528,8 +530,8 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
         .pr_2()
         .when_some(row.chip.as_ref(), |d, chip| {
             d.text_color(tone(chip.tone))
-                .when(chip.bold, |d| d.font_weight(FontWeight::BOLD))
-                .child(chip.text())
+                .font_weight(if chip.bold { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                .child(chip.label.clone())
         });
     let verb = div()
         .flex_none()
@@ -558,7 +560,7 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
             d.child(
                 div()
                     .text_xs()
-                    .text_color(theme.ansi_dark_gray)
+                    .text_color(theme.text_quiet)
                     .truncate()
                     .child(format!("{icon}{text}")),
             )
@@ -570,26 +572,22 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
         .gap_2()
         .pl_2()
         .when_some(row.pill.as_ref(), |d, pill| {
-            d.child(
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(tone(pill.tone))
-                    .child(pill.bracketed()),
-            )
+            d.child(style::chip(pill.text.clone(), Theme::tone_hue(pill.tone), theme))
         })
         .when(!row.time.is_empty(), |d| {
-            d.child(div().text_color(theme.ansi_dark_gray).child(row.time.clone()))
+            d.child(div().text_color(theme.text_quiet).child(row.time.clone()))
         });
     div()
         .flex()
         .flex_row()
         .items_start()
+        .relative()
         .px_2()
-        .py_1()
-        .rounded_md()
+        .py_1p5()
+        .rounded_lg()
         .cursor_pointer()
-        .when(selected, |d| d.bg(theme.selection))
-        .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+        .when(selected, |d| d.bg(theme.row_selected).child(style::selection_indicator(theme)))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.fill_subtle)))
         .child(chip)
         .child(verb)
         .child(message)
@@ -605,12 +603,12 @@ fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
         .mx_1()
         .px_2()
         .py_1()
-        .rounded_md()
+        .rounded_lg()
         .cursor_pointer()
-        .hover(|s| s.bg(theme.selection))
+        .hover(|s| s.bg(theme.fill_subtle))
         .child(
             div().w(ICON_SIZE).flex_none().when(selected, |d| {
-                d.child(heroicon(icons::CHECK).text_color(theme.white))
+                d.child(heroicon(icons::CHECK).text_color(theme.brand_text))
             }),
         )
         .child(label)

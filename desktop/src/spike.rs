@@ -22,7 +22,7 @@ impl Render for SpikeWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(&format!("Shelbi spike: {}", self.pane.read(cx).title()));
         let theme = *cx.global::<Theme>();
-        div().size_full().bg(theme.canvas).child(self.pane.clone())
+        div().size_full().bg(theme.surface).child(self.pane.clone())
     }
 }
 

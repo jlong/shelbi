@@ -61,10 +61,11 @@ use shelbi_app::WorkspaceSessionOp;
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent};
 use super::sidebar::TRAFFIC_LIGHT_INSET;
 use super::workspace_layout::{Split, DIVIDER_W};
-use crate::assets::{heroicon, icons, Icon, ICON_SIZE};
+use crate::assets::{heroicon, icons, Icon};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
-use crate::theme::Theme;
+use crate::theme::style::{self, IconButtonSize, NAV_ROW_H};
+use crate::theme::{Hue, Theme};
 
 /// Which content the left pane shows: the panel's view switch (the TUI's
 /// `WsView`).
@@ -751,9 +752,9 @@ impl WorkspaceView {
             // the sidebar's header is.
             .pt(px(TRAFFIC_LIGHT_INSET))
             .overflow_y_scroll()
-            .bg(theme.background)
+            .bg(theme.surface_recessed)
             .text_sm()
-            .text_color(theme.gray);
+            .text_color(theme.text);
         let Some(header) = self.header() else {
             return root;
         };
@@ -766,21 +767,27 @@ impl WorkspaceView {
         let panel = &self.panel;
         let focused = self.focus == WsFocus::Panel;
         let selected = |row: WsRow| focused && panel.selected_row() == Some(row);
-        let row_base = |id: &'static str, row: WsRow| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .rounded_md()
-                .cursor_pointer()
-                .when(selected(row), |d| d.bg(theme.selection))
-                .when(!selected(row), |d| d.hover(|s| s.bg(theme.search)))
-                .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
+        // `current`: the row is the view the main area shows (the raised
+        // chip); the keyboard's row carries the brand pill.
+        let row_state = |id: &'static str, row: WsRow, current: bool| {
+            style::row_state(
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .rounded_lg()
+                    .cursor_pointer(),
+                current,
+                selected(row),
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
         };
+        let row_base = |id: &'static str, row: WsRow| row_state(id, row, false);
         // A non-interactive line of the "where" block.
         let fact = |selector: &'static str, icon: Icon, text: String| {
             div()
@@ -792,7 +799,7 @@ impl WorkspaceView {
                 .px_2()
                 .h(px(26.0))
                 .min_w_0()
-                .child(heroicon(icon).text_color(theme.muted))
+                .child(heroicon(icon).text_color(theme.icon))
                 .child(div().min_w_0().truncate().child(text))
         };
 
@@ -805,17 +812,19 @@ impl WorkspaceView {
             .gap_3()
             .child(
                 row_base("ws-back", WsRow::Back)
-                    .size(ICON_SIZE + px(12.0))
+                    .size(px(IconButtonSize::Default.px()))
+                    .rounded_xl()
                     .justify_center()
                     .px_0()
-                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.gray)),
+                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.icon)),
             )
             .child(
                 div()
                     .debug_selector(|| "workspace-state".into())
                     .min_w_0()
                     .truncate()
-                    .font_weight(FontWeight::BOLD)
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.decoration(dec.color))
                     .child(format!("{} {}", dec.glyph, header.state.label())),
             );
@@ -831,8 +840,8 @@ impl WorkspaceView {
                     .debug_selector(|| "workspace-name".into())
                     .min_w_0()
                     .truncate()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.white)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_loud)
                     .child(header.name.clone()),
             )
             .when_some(header.agent.clone(), |d, role| {
@@ -840,7 +849,7 @@ impl WorkspaceView {
                     div()
                         .debug_selector(|| "workspace-role".into())
                         .flex_none()
-                        .text_color(theme.muted)
+                        .text_color(theme.text_quiet)
                         .child(format!("· {role}")),
                 )
             });
@@ -851,7 +860,7 @@ impl WorkspaceView {
                 .map(|d| shelbi_app::review::description_text(&d.body))
                 .unwrap_or_default();
             let more = panel.rows().contains(&WsRow::More).then(|| {
-                row_base("ws-more", WsRow::More).child(div().text_color(theme.cyan).child("More"))
+                row_base("ws-more", WsRow::More).child(div().text_color(theme.link).child("More"))
             });
             div()
                 .flex()
@@ -866,22 +875,22 @@ impl WorkspaceView {
                         .child(
                             div()
                                 .debug_selector(|| "workspace-title".into())
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme.white)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.text_loud)
                                 .child(header.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| id.clone())),
                         )
                         .child(
                             div()
                                 .debug_selector(|| "workspace-task-id".into())
                                 .text_xs()
-                                .text_color(theme.muted)
+                                .text_color(theme.text_quiet)
                                 .child(id),
                         )
                         .when(!preview.is_empty(), |d| {
                             d.child(
                                 div()
                                     .debug_selector(|| "workspace-description".into())
-                                    .text_color(theme.gray)
+                                    .text_color(theme.text)
                                     .text_ellipsis()
                                     .line_clamp(3)
                                     .child(preview),
@@ -904,7 +913,7 @@ impl WorkspaceView {
             if panel.rows().contains(&WsRow::Folder) {
                 row_base("ws-folder", WsRow::Folder)
                     .h(px(26.0))
-                    .child(heroicon(icons::FOLDER_OPEN).text_color(theme.muted))
+                    .child(heroicon(icons::FOLDER_OPEN).text_color(theme.icon))
                     .child(text)
                     .into_any_element()
             } else {
@@ -916,7 +925,7 @@ impl WorkspaceView {
                     .gap_2()
                     .px_2()
                     .h(px(26.0))
-                    .child(heroicon(icons::FOLDER_OPEN).text_color(theme.muted))
+                    .child(heroicon(icons::FOLDER_OPEN).text_color(theme.icon))
                     .child(text)
                     .into_any_element()
             }
@@ -953,12 +962,9 @@ impl WorkspaceView {
                 ContentView::Editor => ("ws-switch-editor", icons::PENCIL_SQUARE),
             };
             let on = active == item;
-            let color = if on { theme.white } else { theme.gray };
-            row_base(id, WsRow::Switch(item))
-                .h(px(30.0))
-                .text_color(color)
-                .when(on, |d| d.font_weight(FontWeight::BOLD).bg(theme.selection))
-                .child(heroicon(icon).text_color(color))
+            row_state(id, WsRow::Switch(item), on)
+                .h(px(NAV_ROW_H - 4.0))
+                .child(heroicon(icon).text_color(theme.icon))
                 .child(div().flex_1().min_w_0().truncate().child(item.label(&agent_name, &editor_name)))
                 .when(on && item != ContentView::Agent, |d| {
                     d.child(
@@ -966,9 +972,9 @@ impl WorkspaceView {
                             .id("ws-close-content")
                             .debug_selector(|| "ws-close-content".into())
                             .flex_none()
-                            .rounded_md()
-                            .hover(|s| s.bg(theme.search))
-                            .child(heroicon(icons::X_MARK).text_color(theme.muted))
+                            .rounded_lg()
+                            .hover(|s| s.bg(theme.fill_strong))
+                            .child(heroicon(icons::X_MARK).text_color(theme.icon))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close_content(cx);
@@ -977,22 +983,17 @@ impl WorkspaceView {
                 })
         });
         let shell = panel.rows().contains(&WsRow::Shell).then(|| {
-            let (state, color) = match (self.shell_open, self.shell_starting) {
-                (true, true) => ("starting", theme.muted),
-                (true, false) => ("on", theme.green),
-                (false, _) => ("off", theme.muted),
+            let (state, hue) = match (self.shell_open, self.shell_starting) {
+                (true, true) => ("starting", Hue::Gold),
+                (true, false) => ("on", Hue::Green),
+                (false, _) => ("off", Hue::Neutral),
             };
             row_base("ws-shell-toggle", WsRow::Shell)
-                .h(px(30.0))
-                .child(heroicon(icons::COMMAND_LINE).text_color(theme.gray))
+                .h(px(NAV_ROW_H - 4.0))
+                .child(heroicon(icons::COMMAND_LINE).text_color(theme.icon))
                 .child(div().flex_1().child("Shell"))
                 .child(
-                    div()
-                        .debug_selector(|| "ws-shell-state".into())
-                        .flex_none()
-                        .text_xs()
-                        .text_color(color)
-                        .child(state),
+                    style::chip(state, hue, theme).debug_selector(|| "ws-shell-state".into()),
                 )
         });
 
@@ -1006,7 +1007,7 @@ impl WorkspaceView {
                     div()
                         .debug_selector(|| "workspace-status".into())
                         .px_2()
-                        .text_color(theme.yellow)
+                        .text_color(theme.warning)
                         .child(line),
                 )
             })
@@ -1029,9 +1030,9 @@ impl WorkspaceView {
             })
             .child(self.content.clone());
         let divider_color = if self.dragging {
-            theme.divider_active
+            theme.icon
         } else {
-            theme.divider
+            theme.rule
         };
         let shell_side = self.shell_open.then(|| {
             let divider = div()
@@ -1063,7 +1064,7 @@ impl WorkspaceView {
                     if self.shell_starting {
                         d.items_center()
                             .justify_center()
-                            .text_color(theme.muted)
+                            .text_color(theme.text_quiet)
                             .child("Starting a shell…")
                     } else {
                         d.child(self.shell.clone())
@@ -1140,7 +1141,7 @@ impl WorkspaceView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                .bg(theme.scrim)
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx)))
                 .child(
                     div()
@@ -1151,10 +1152,7 @@ impl WorkspaceView {
                         .w(relative(0.8))
                         .h(relative(0.85))
                         .overflow_hidden()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme.divider)
-                        .bg(theme.canvas)
+                        .map(|d| style::popover(d, theme))
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -1170,22 +1168,24 @@ impl WorkspaceView {
                                         .flex_row()
                                         .gap_2()
                                         .min_w_0()
-                                        .child(div().text_color(theme.muted).child(id.clone()))
+                                        .child(div().text_color(theme.text_quiet).child(id.clone()))
                                         .child(
                                             div()
                                                 .truncate()
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.white)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.text_loud)
                                                 .child(title),
                                         ),
                                 )
                                 .child(
-                                    div()
-                                        .id("ws-description-close")
-                                        .cursor_pointer()
-                                        .p_0p5()
-                                        .child(heroicon(icons::X_MARK).text_color(theme.muted))
-                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx))),
+                                    style::icon_button(
+                                        "ws-description-close",
+                                        icons::X_MARK,
+                                        IconButtonSize::Default,
+                                        false,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx))),
                                 ),
                         )
                         .child(
@@ -1237,7 +1237,7 @@ impl WorkspaceView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .child(self.render_panes(&theme, cx))
             .children(self.render_description(&theme, cx))
             .into_any_element()

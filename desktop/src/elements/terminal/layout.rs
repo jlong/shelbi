@@ -314,7 +314,7 @@ mod tests {
 
     fn palette(e: &TermEmulator) -> Palette {
         Palette::resolve(
-            &TerminalPalette::for_tokens(&shelbi_app::theme::Theme::dark()),
+            &TerminalPalette::for_palette(&crate::theme::Palette::dark()),
             e,
         )
     }

@@ -32,6 +32,7 @@ use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePrefe
 
 use crate::elements::terminal::TerminalSettings;
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
+use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 
 /// The values the view edits, parsed from the inputs.
@@ -409,32 +410,31 @@ impl Render for SettingsView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(theme.white).child(label))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.text_loud).child(label))
                 .child(div().w(px(360.0)).child(Input::new(input)))
-                .child(div().text_xs().text_color(theme.muted).child(hint))
+                .child(div().text_xs().text_color(theme.text_quiet).child(hint))
         };
         let chip = |label: &'static str, value: ThemePreference, current: ThemePreference, cx: &mut Context<Self>| {
             let selected = value == current;
             div()
                 .id(label)
                 .debug_selector(move || format!("settings-theme-{label}"))
+                .flex()
+                .items_center()
+                .h(px(28.0))
                 .px_3()
-                .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .when(selected, |d| {
-                    d.bg(theme.selection)
-                        .text_color(theme.white)
-                        .font_weight(FontWeight::BOLD)
-                })
-                .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+                .font_weight(FontWeight::MEDIUM)
+                .when(selected, |d| style::nav_chip(d, &theme).text_color(theme.text_loud))
+                .when(!selected, |d| d.text_color(theme.text_quiet).hover(|s| s.text_color(theme.text_loud)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, window, cx| this.set_theme(value, window, cx)))
         };
         let status: Option<(SharedString, gpui::Hsla)> = match &self.state {
             SaveState::Idle => None,
-            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.muted)),
-            SaveState::Failed(e) => Some((e.clone().into(), theme.red)),
+            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.text_quiet)),
+            SaveState::Failed(e) => Some((e.clone().into(), theme.error)),
         };
         let current = self.theme;
         let option_as_meta = self.option_as_meta;
@@ -443,16 +443,15 @@ impl Render for SettingsView {
             div()
                 .id(label)
                 .debug_selector(move || format!("settings-option-{label}"))
+                .flex()
+                .items_center()
+                .h(px(28.0))
                 .px_3()
-                .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .when(selected, |d| {
-                    d.bg(theme.selection)
-                        .text_color(theme.white)
-                        .font_weight(FontWeight::BOLD)
-                })
-                .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+                .font_weight(FontWeight::MEDIUM)
+                .when(selected, |d| style::nav_chip(d, &theme).text_color(theme.text_loud))
+                .when(!selected, |d| d.text_color(theme.text_quiet).hover(|s| s.text_color(theme.text_loud)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
         };
@@ -469,18 +468,19 @@ impl Render for SettingsView {
                 .cursor_pointer()
                 .child(
                     div()
-                        .w(px(14.0))
-                        .h(px(14.0))
-                        .rounded_sm()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded_md()
                         .border_1()
-                        .border_color(theme.muted)
-                        .when(on, |d| d.bg(theme.white))
+                        .border_color(theme.rule_strong)
+                        .bg(theme.surface)
+                        .when(on, |d| d.bg(theme.brand).border_color(theme.brand))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(on, |d| d.text_color(theme.canvas).text_xs().child("✓")),
+                        .when(on, |d| d.text_color(theme.text_on_color).text_xs().child("✓")),
                 )
-                .child(div().text_color(if on { theme.white } else { theme.gray }).child(label))
+                .child(div().text_color(if on { theme.text_loud } else { theme.text }).child(label))
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
         };
         let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
@@ -495,12 +495,12 @@ impl Render for SettingsView {
             .p_8()
             .overflow_y_scroll()
             .text_sm()
-            .text_color(theme.gray)
+            .text_color(theme.text)
             .child(
                 div()
                     .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.white)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_loud)
                     .child("Settings"),
             )
             .child(
@@ -508,12 +508,16 @@ impl Render for SettingsView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(theme.white).child("Theme"))
+                    .child(style::heading("Theme", &theme))
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .gap_1()
+                            .self_start()
+                            .gap_0p5()
+                            .p_0p5()
+                            .rounded_lg()
+                            .bg(theme.fill)
                             .child(chip("Auto", ThemePreference::Auto, current, cx))
                             .child(chip("Dark", ThemePreference::Dark, current, cx))
                             .child(chip("Light", ThemePreference::Light, current, cx)),
@@ -521,7 +525,7 @@ impl Render for SettingsView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted)
+                            .text_color(theme.text_quiet)
                             .child("Shared with the TUI, which picks it up on its next start."),
                     ),
             )
@@ -540,18 +544,22 @@ impl Render for SettingsView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(theme.white).child("Option key in terminals"))
+                    .child(style::heading("Option key in terminals", &theme))
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .gap_1()
+                            .self_start()
+                            .gap_0p5()
+                            .p_0p5()
+                            .rounded_lg()
+                            .bg(theme.fill)
                             .child(option_chip("Types characters", OptionAsMeta::Off, cx))
                             .child(option_chip("Meta", OptionAsMeta::Both, cx))
                             .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
                             .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
                     )
-                    .child(div().text_xs().text_color(theme.muted).child(
+                    .child(div().text_xs().text_color(theme.text_quiet).child(
                         "Characters: Option+E, E types é, as in other Mac apps. Meta: \
                          Option+B sends Esc B, for shell word motion and Claude Code's \
                          Option shortcuts. Option with Enter, the arrows, Backspace, or \
@@ -569,33 +577,23 @@ impl Render for SettingsView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(theme.white).child("Key bindings"))
+                    .child(style::heading("Key bindings", &theme))
                     .child(
-                        div()
-                            .id("settings-open-keys")
-                            .debug_selector(|| "settings-open-keys".into())
-                            .w_auto()
+                        style::button("settings-open-keys", "Open keys.yaml", ButtonKind::Secondary, false, &theme)
                             .self_start()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(theme.search)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.selection))
-                            .child("Open keys.yaml")
                             .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted)
+                            .text_color(theme.text_quiet)
                             .child("Shared by the TUI and the desktop app."),
                     )
                     .children(conflicts.into_iter().map(|line| {
                         div()
                             .debug_selector(|| "settings-shortcut-conflict".into())
                             .text_xs()
-                            .text_color(theme.red)
+                            .text_color(theme.error)
                             .child(line)
                     })),
             )
@@ -604,7 +602,7 @@ impl Render for SettingsView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(theme.white).child("Notifications"))
+                    .child(style::heading("Notifications", &theme))
                     .child(toggle(
                         "A workspace is waiting for input or permission",
                         Switch::WorkspaceBlocked,
@@ -616,7 +614,7 @@ impl Render for SettingsView {
                         Switch::OrchestratorWaiting,
                         cx,
                     ))
-                    .child(div().text_xs().text_color(theme.muted).child(
+                    .child(div().text_xs().text_color(theme.text_quiet).child(
                         "Not shown for what's already on screen in the front window. \
                          macOS asks for permission the first time.",
                     )),
