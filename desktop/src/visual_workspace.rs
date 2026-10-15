@@ -3,12 +3,15 @@
 //! `--visual-check` does) over fake sessions and a fake daemon, one frame per
 //! state, plus a check that each state shows what it should:
 //!
-//! - `workspace-working.png`: a working workspace, header and agent;
+//! - `workspace-working.png`: a working workspace, its panel and agent;
 //! - `workspace-shell.png`: the user shell open beside the agent;
 //! - `workspace-description.png`: the task description (More);
-//! - `workspace-idle.png`: an idle workspace's placeholder;
+//! - `workspace-idle.png`: an idle workspace's reduced panel and placeholder;
 //! - `workspace-remote-reconnecting.png`: a remote workspace whose SSH
 //!   connection dropped, reconnecting.
+//!
+//! The view renders as its panel; a host lays it out in a sidebar-width
+//! column beside [`WorkspaceView::render_main`], as the window does.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,13 +19,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{unbounded, UnboundedSender};
-use gpui::{px, size, AnyWindowHandle, AppContext, Entity, VisualTestAppContext, WindowHandle};
+use gpui::{
+    div, prelude::*, px, size, AnyWindowHandle, AppContext, Context, Entity, VisualTestAppContext,
+    Window, WindowHandle,
+};
 use shelbi_app::session::{
     self as app_session, ConnectFailure, IdleInfo, ReconnectPolicy, Relauncher, RetryPolicy,
     SessionRef,
 };
 use shelbi_app::theme::ThemePreference;
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceRow};
+use shelbi_app::workspace_panel::{WsRow, WsSwitch};
 use shelbi_app::WorkspaceSessionOp;
 use shelbi_client::SessionEvent;
 use shelbi_term::Size;
@@ -145,9 +152,32 @@ const SHELL_SCREEN: &str = "\x1b[32mme@hub\x1b[0m \x1b[34m~/src/demo/.shelbi/wt/
 ## jlong/cold-start\r\n M src/boot.rs\r\n\
 \x1b[32mme@hub\x1b[0m \x1b[34m~/src/demo/.shelbi/wt/alpha\x1b[0m $ ";
 
+/// The window's layout in small: the panel in a sidebar-width column, the
+/// main area beside it.
+struct Host {
+    view: Entity<WorkspaceView>,
+}
+
+impl Render for Host {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let main = self.view.update(cx, |v, cx| v.render_main(cx));
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .font_family("Geist")
+            .text_sm()
+            .bg(theme.canvas)
+            .child(div().flex_none().w(px(300.0)).h_full().child(self.view.clone()))
+            .child(div().w(px(1.0)).h_full().bg(theme.divider))
+            .child(div().flex().flex_1().min_w_0().h_full().child(main))
+    }
+}
+
 struct Run {
     cx: VisualTestAppContext,
-    handle: WindowHandle<WorkspaceView>,
+    handle: WindowHandle<Host>,
     window: AnyWindowHandle,
     sessions: Arc<Sessions>,
     out: PathBuf,
@@ -186,11 +216,12 @@ pub fn run(out: PathBuf) -> ! {
                     clock: Rc::new(Instant::now),
                 }),
             };
-            cx.new(|cx| {
+            let view = cx.new(|cx| {
                 let mut v = WorkspaceView::new("demo", handle, deps, None, cx);
                 v.set_palette_chord("⌃P", cx);
                 v
-            })
+            });
+            cx.new(|_| Host { view })
         })
         .expect("open the offscreen window");
     let window: AnyWindowHandle = handle.into();
@@ -220,7 +251,11 @@ fn row(name: &str, machine: &str, remote: bool, task: Option<&str>, badge: Works
 
 impl Run {
     fn update<R>(&mut self, f: impl FnOnce(&mut WorkspaceView, &mut gpui::Window, &mut gpui::Context<WorkspaceView>) -> R) -> R {
-        let r = self.handle.update(&mut self.cx, f).unwrap();
+        let view = self.view();
+        let r = self
+            .handle
+            .update(&mut self.cx, |_, window, cx| view.update(cx, |v, cx| f(v, window, cx)))
+            .unwrap();
         self.settle();
         r
     }
@@ -238,7 +273,11 @@ impl Run {
     }
 
     fn view(&mut self) -> Entity<WorkspaceView> {
-        self.handle.update(&mut self.cx, |_, _, cx| cx.entity()).unwrap()
+        self.handle.update(&mut self.cx, |host, _, _| host.view.clone()).unwrap()
+    }
+
+    fn rows(&mut self) -> Vec<WsRow> {
+        self.view().read_with(&self.cx, |v, _| v.panel().rows().to_vec())
     }
 
     fn expect(&mut self, name: &str, ok: bool) {
@@ -266,10 +305,23 @@ impl Run {
         self.settle();
         let header = self.view().read_with(&self.cx, |v, _| v.header());
         self.expect(
-            "the header shows the task, branch and machine",
+            "the panel shows the task, branch and machine",
             header.as_ref().and_then(|h| h.task_line()).as_deref()
                 == Some("cold-start  Warm the application cache at startup")
                 && header.as_ref().map(|h| h.location_line()).as_deref() == Some("hub · jlong/cold-start"),
+        );
+        let rows = self.rows();
+        self.expect(
+            "the panel offers More, the folder, the view switch and the shell",
+            rows == [
+                WsRow::Back,
+                WsRow::More,
+                WsRow::Folder,
+                WsRow::Switch(WsSwitch::Agent),
+                WsRow::Switch(WsSwitch::Diff),
+                WsRow::Switch(WsSwitch::Editor),
+                WsRow::Shell,
+            ],
         );
 
         self.save("workspace-working.png");
@@ -293,6 +345,8 @@ impl Run {
         self.settle();
         let closed = !self.view().read_with(&self.cx, |v, _| v.shell_open());
         self.expect("switching workspaces closes the shell", closed);
+        let rows = self.rows();
+        self.expect("an idle workspace's panel is reduced", rows == [WsRow::Back, WsRow::Folder]);
         self.save("workspace-idle.png");
 
         // A remote workspace whose SSH connection drops.
@@ -308,6 +362,11 @@ impl Run {
         self.expect(
             "a dropped remote connection shows the reconnect notice",
             notice.is_some_and(|n| n.starts_with("Reconnecting to gpu-box")),
+        );
+        let rows = self.rows();
+        self.expect(
+            "a remote workspace's panel has no folder, diff or editor",
+            rows == [WsRow::Back, WsRow::More, WsRow::Switch(WsSwitch::Agent), WsRow::Shell],
         );
         self.save("workspace-remote-reconnecting.png");
     }

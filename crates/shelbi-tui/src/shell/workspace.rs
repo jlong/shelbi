@@ -385,6 +385,10 @@ fn map_effect(effect: WsEffect) -> WorkspaceAction {
         WsEffect::ShowDiff => WorkspaceAction::ShowContent(Some(ReviewRole::Diff)),
         WsEffect::ShowEditor => WorkspaceAction::ShowContent(Some(ReviewRole::Editor)),
         WsEffect::ShowDescription => WorkspaceAction::ShowDescription,
+        WsEffect::Close => WorkspaceAction::Close,
+        // The TUI's panel has no user-shell row (the desktop's), so this
+        // never comes out of it.
+        WsEffect::ToggleShell => WorkspaceAction::None,
     }
 }
 

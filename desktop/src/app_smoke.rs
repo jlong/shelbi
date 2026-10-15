@@ -139,6 +139,18 @@ impl Harness {
         self.draw();
     }
 
+    /// Click the middle of the element drawn with `selector`.
+    pub(super) fn click_selector(&mut self, selector: &'static str) {
+        self.draw();
+        let at = self
+            .cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is drawn"))
+            .center();
+        self.cx.simulate_click(at, gpui::Modifiers::none());
+        self.cx.run_until_parked();
+    }
+
     pub(super) fn take_calls(&self) -> Vec<HostCall> {
         std::mem::take(&mut *self.tap.borrow_mut())
     }
