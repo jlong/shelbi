@@ -32,7 +32,7 @@ const MIN_WIDTH: f32 = 360.0;
 /// The label column's fixed width (the Figma's 211px), so every description
 /// starts at the same x.
 const LABEL_W: f32 = 211.0;
-/// The icon slot.
+/// The glyph column: wide enough for a mini (20px) icon and its margin.
 const ICON_W: f32 = 28.0;
 /// A result row's height: the TUI's two-row pill.
 pub const ROW_H: f32 = 32.0;

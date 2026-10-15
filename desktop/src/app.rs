@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, prelude::*, px, svg, App, Bounds, Context, CursorStyle, Entity, FocusHandle,
+    actions, div, prelude::*, px, App, Bounds, Context, CursorStyle, Entity, FocusHandle,
     Global, KeyDownEvent, MouseButton, MouseMoveEvent, PromptLevel, SharedString, Subscription, Task,
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
@@ -74,7 +74,7 @@ use shelbi_state::keymap::{
     format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
 
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, IconSize};
 use crate::commands::{self, CommandHost};
 use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
 use crate::menus;
@@ -2413,13 +2413,13 @@ impl ShelbiWindow {
                         div()
                             .id("expand-sidebar")
                             .debug_selector(|| "expand-sidebar".into())
-                            .p_1()
+                            .p_0p5()
                             .w_auto()
                             .self_start()
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.search))
-                            .child(svg().path(icons::BARS_3).size(px(16.0)).text_color(theme.muted))
+                            .child(heroicon(icons::BARS_3, IconSize::Standard).text_color(theme.muted))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                     ),
                 )
@@ -2448,7 +2448,7 @@ impl ShelbiWindow {
                         div()
                             .id("dismiss-banner")
                             .cursor_pointer()
-                            .child(svg().path(icons::X_MARK).size(px(16.0)).text_color(theme.muted))
+                            .child(heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.muted))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.banner = None;
                                 cx.notify();

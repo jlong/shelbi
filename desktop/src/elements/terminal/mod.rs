@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    div, prelude::*, px, svg, Bounds, ClipboardItem, Context, EntityInputHandler, ExternalPaths,
+    div, prelude::*, px, Bounds, ClipboardItem, Context, EntityInputHandler, ExternalPaths,
     FocusHandle, Focusable, KeyDownEvent, MouseButton as GpuiMouseButton, Pixels, Point, Role,
     ScrollDelta, SharedString, Subscription, Task, UTF16Selection, Window,
 };
@@ -103,7 +103,7 @@ use search_bar::{BarKey, SearchBar};
 use session::SessionIo;
 pub use settings::TerminalSettings;
 
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, Icon, IconSize};
 use crate::theme::Theme;
 
 /// How long a viewport size must hold before it is reported to the session,
@@ -1597,7 +1597,7 @@ impl TerminalPane {
             Some(at) => (text[..at].to_string(), Some(text[at..].to_string())),
             None => (text, None),
         };
-        let icon_button = |id: &'static str, icon: &'static str, older: Option<bool>, cx: &mut Context<Self>| {
+        let icon_button = |id: &'static str, icon: Icon, older: Option<bool>, cx: &mut Context<Self>| {
             div()
                 .id(id)
                 .debug_selector(move || format!("terminal-search-{id}"))
@@ -1605,7 +1605,7 @@ impl TerminalPane {
                 .rounded_sm()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.selection))
-                .child(svg().path(icon).size_4().text_color(theme.gray))
+                .child(heroicon(icon, IconSize::Mini).text_color(theme.gray))
                 .on_click(cx.listener(move |this, _, _, cx| match older {
                     Some(older) => this.step_search(older, cx),
                     None => this.close_search(cx),
@@ -1631,7 +1631,7 @@ impl TerminalPane {
                 .border_color(theme.divider)
                 .bg(theme.search)
                 .text_sm()
-                .child(svg().path(icons::MAGNIFYING_GLASS).size_4().text_color(theme.muted))
+                .child(heroicon(icons::MAGNIFYING_GLASS, IconSize::Mini).text_color(theme.muted))
                 .child(
                     div()
                         .flex()
@@ -1688,7 +1688,7 @@ impl TerminalPane {
                 .text_color(theme.gray)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.selection))
-                .child(svg().path(icons::ARROW_DOWN).size_3().text_color(theme.gray))
+                .child(heroicon(icons::ARROW_DOWN, IconSize::Micro).text_color(theme.gray))
                 .child(label)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.view.scroll_to_bottom();

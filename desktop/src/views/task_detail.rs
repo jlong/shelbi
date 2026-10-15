@@ -8,7 +8,7 @@
 //! user's configured editor. Keys are the TUI popover's (`keys.yaml`
 //! `popover:`) plus the desktop's `s` / `a` / `e` / `E`.
 
-use gpui::{div, prelude::*, px, relative, svg, ClickEvent, Context, ElementId, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, relative, ClickEvent, Context, ElementId, FontWeight, SharedString};
 use gpui_kit::component::input::Textarea;
 use gpui_kit::component::text::TextView;
 use shelbi_app::TaskDetailModel;
@@ -16,7 +16,7 @@ use shelbi_state::keymap::PopoverAction;
 
 use super::issues::{backdrop, IssuesView};
 use super::markdown;
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, Icon, IconSize};
 use crate::theme::Theme;
 
 pub fn render(
@@ -220,13 +220,13 @@ pub fn render(
                 div()
                     .flex()
                     .flex_row()
+                    .items_start()
                     .gap_1()
                     .text_xs()
                     .text_color(theme.red)
                     .child(
-                        svg()
-                            .path(icons::EXCLAMATION_TRIANGLE)
-                            .size(px(12.0))
+                        heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Micro)
+                            .mt(px(2.0))
                             .text_color(theme.red),
                     )
                     .child(n),
@@ -327,7 +327,7 @@ fn text_button(theme: &Theme, id: &'static str, text: &str) -> gpui::Stateful<gp
 fn icon_button(
     theme: &Theme,
     id: &'static str,
-    icon: &'static str,
+    icon: Icon,
     text: &str,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -343,7 +343,7 @@ fn icon_button(
         .text_xs()
         .text_color(theme.gray)
         .cursor_pointer()
-        .child(svg().path(icon).size(px(12.0)).text_color(theme.muted))
+        .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
         .child(text.to_string())
 }
 

@@ -23,7 +23,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, svg, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
+    div, prelude::*, px, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
     KeyDownEvent, ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
@@ -35,7 +35,7 @@ use shelbi_app::view::{
 use shelbi_app::CommandKind;
 
 use super::machines_state::{Intent, MachinesState};
-use crate::assets::icons;
+use crate::assets::{heroicon, icons, IconSize};
 use crate::keys::chord_from_keystroke;
 use crate::theme::Theme;
 
@@ -45,7 +45,6 @@ use crate::theme::Theme;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// How often the view drains its refresher and the prober.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const ICON: f32 = 12.0;
 
 /// What the view asks of the window.
 #[derive(Debug, Clone)]
@@ -377,9 +376,7 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                     .hover(|s| s.text_color(theme.white))
                     .child(url)
                     .child(
-                        svg()
-                            .path(icons::ARROW_TOP_RIGHT_ON_SQUARE)
-                            .size(px(ICON))
+                        heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE, IconSize::Micro)
                             .text_color(theme.muted),
                     )
                     .on_click(move |_, _, cx| {

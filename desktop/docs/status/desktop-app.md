@@ -18,8 +18,9 @@
   `View`.
 - `src/theme.rs`: the TUI's token names with its dark values as gpui colors,
   plus one desktop-only `main_background` (#1c1c1c).
-- Icons are Heroicons (v2.2.0, 24px outline), vendored with their MIT
-  license under `assets/icons/heroicons/`.
+- Icons are Heroicons (v2.2.0), vendored with their MIT license under
+  `assets/icons/heroicons/`. Since `dt-icon-sizes` every icon renders at
+  24, 20 or 16px from the matching set (24 outline, 20 solid, 16 solid).
 - `.github/workflows/desktop-ci.yml` (manual only, `macos-14`) and the
   desktop version assertion in `scripts/release/check-version.sh`.
 
