@@ -53,7 +53,7 @@ use shelbi_app::{CommandKind, ReviewSessionOp};
 
 use super::session_view::{SessionDeps, SessionView, SessionViewEvent};
 use super::sidebar::TRAFFIC_LIGHT_INSET;
-use crate::assets::{heroicon, icons, IconSize};
+use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::Theme;
@@ -680,10 +680,10 @@ impl ReviewView {
             .gap_3()
             .child(
                 row_base("review-back", PanelRow::Back)
-                    .size(IconSize::Standard.px() + px(8.0))
+                    .size(ICON_SIZE + px(12.0))
                     .justify_center()
                     .px_0()
-                    .child(heroicon(icons::ARROW_LEFT, IconSize::Standard).text_color(theme.gray)),
+                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.gray)),
             )
             .child(
                 div()
@@ -727,7 +727,7 @@ impl ReviewView {
         let folder = (!model.is_remote()).then(|| {
             row_base("review-folder", PanelRow::Folder)
                 .h(px(26.0))
-                .child(heroicon(icons::FOLDER_OPEN, IconSize::Mini).text_color(theme.muted))
+                .child(heroicon(icons::FOLDER_OPEN).text_color(theme.muted))
                 .child(
                     div()
                         .min_w_0()
@@ -757,7 +757,7 @@ impl ReviewView {
                 .h(px(30.0))
                 .text_color(color)
                 .when(active, |d| d.font_weight(FontWeight::BOLD).bg(theme.selection))
-                .child(heroicon(icon, IconSize::Standard).text_color(color))
+                .child(heroicon(icon).text_color(color))
                 .child(item.label(&model.editor_name))
         });
 
@@ -779,7 +779,7 @@ impl ReviewView {
                         .h(px(28.0))
                         .text_color(theme.green)
                         .font_weight(FontWeight::BOLD)
-                        .child(heroicon(icons::CHECK, IconSize::Mini).text_color(theme.green))
+                        .child(heroicon(icons::CHECK).text_color(theme.green))
                         .child("Approve"),
                 )
                 .child(
@@ -787,7 +787,7 @@ impl ReviewView {
                         .h(px(28.0))
                         .text_color(theme.red)
                         .font_weight(FontWeight::BOLD)
-                        .child(heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.red))
+                        .child(heroicon(icons::X_MARK).text_color(theme.red))
                         .child("Reject"),
                 )
                 .into_any_element()
@@ -890,7 +890,7 @@ impl ReviewView {
                         .hover(|s| s.underline())
                         .child(div().min_w_0().truncate().child(url))
                         .child(
-                            heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE, IconSize::Micro)
+                            heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE)
                                 .text_color(theme.cyan),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -962,7 +962,8 @@ impl ReviewView {
                                     div()
                                         .id("review-description-close")
                                         .cursor_pointer()
-                                        .child(heroicon(icons::X_MARK, IconSize::Standard).text_color(theme.muted))
+                                        .p_0p5()
+                                        .child(heroicon(icons::X_MARK).text_color(theme.muted))
                                         .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
                                 ),
                         )

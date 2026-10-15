@@ -40,7 +40,7 @@ use shelbi_state::keymap::{format_chord, DisplayStyle, KanbanAction, Keymaps};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
-use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::assets::{heroicon, icons, Icon};
 use crate::keys::chord_from_keystroke;
 use crate::theme::Theme;
 
@@ -549,7 +549,7 @@ impl IssuesView {
             .child(div().flex_1())
             .when(self.state.has_pending(), |row| {
                 row.child(
-                    heroicon(icons::ARROW_PATH, IconSize::Mini).text_color(theme.muted),
+                    heroicon(icons::ARROW_PATH).text_color(theme.muted),
                 )
             })
             .child(
@@ -878,8 +878,8 @@ impl IssuesView {
                     .items_start()
                     .when(card.blocked, |d| {
                         d.child(
-                            heroicon(icons::LOCK_CLOSED, IconSize::Micro)
-                                .mt(px(3.0))
+                            heroicon(icons::LOCK_CLOSED)
+                                .mt(px(1.0))
                                 .text_color(theme.muted),
                         )
                     })
@@ -905,7 +905,7 @@ impl IssuesView {
                         .gap_1()
                         .text_xs()
                         .text_color(theme.muted)
-                        .child(heroicon(icons::ARROW_PATH, IconSize::Micro).text_color(theme.muted))
+                        .child(heroicon(icons::ARROW_PATH).text_color(theme.muted))
                         .child(p.label),
                 )
             })
@@ -920,8 +920,7 @@ impl IssuesView {
                         .text_xs()
                         .text_color(theme.red)
                         .child(
-                            heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Micro)
-                                .mt(px(2.0))
+                            heroicon(icons::EXCLAMATION_TRIANGLE)
                                 .text_color(theme.red),
                         )
                         // Wraps (a gated merge's refusal can be long); the
@@ -932,7 +931,7 @@ impl IssuesView {
                                 .id(SharedString::from(format!("dismiss-{}", card.id)))
                                 .flex_none()
                                 .cursor_pointer()
-                                .child(heroicon(icons::X_MARK, IconSize::Micro).mt(px(2.0)).text_color(theme.muted))
+                                .child(heroicon(icons::X_MARK).text_color(theme.muted))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     cx.stop_propagation();
                                     this.state.dismiss_notice(&id);
@@ -1239,7 +1238,7 @@ pub(super) fn chip(theme: &Theme, icon: Icon, label: String) -> gpui::Div {
         .text_xs()
         .text_color(theme.gray)
         .cursor_pointer()
-        .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
+        .child(heroicon(icon).text_color(theme.muted))
         .child(label)
 }
 

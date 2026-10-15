@@ -25,7 +25,7 @@ use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::ZenModeState;
 
-use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::assets::{heroicon, icons, Icon, ICON_SIZE};
 use crate::projects::ProjectEntry;
 use crate::refresh::DaemonLink;
 use crate::theme::Theme;
@@ -278,7 +278,7 @@ fn render_header<H: SidebarHost>(
                 .child(props.model.project_label.clone()),
         )
         .child(
-            heroicon(icons::CHEVRON_UP_DOWN, IconSize::Mini).text_color(theme.muted),
+            heroicon(icons::CHEVRON_UP_DOWN).text_color(theme.muted),
         )
         .on_click(cx.listener(|this, _, window, cx| {
             this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
@@ -298,7 +298,7 @@ fn render_header<H: SidebarHost>(
         .bg(theme.search)
         .cursor_pointer()
         .child(
-            heroicon(icons::MAGNIFYING_GLASS, IconSize::Mini).text_color(theme.gray),
+            heroicon(icons::MAGNIFYING_GLASS).text_color(theme.gray),
         )
         .child(div().flex_1().child("Search"))
         .child(div().flex_none().child(props.palette_chord.clone()))
@@ -343,8 +343,8 @@ fn render_switcher<H: SidebarHost>(
             .cursor_pointer()
             .hover(|s| s.bg(theme.selection))
             .child(
-                div().w(IconSize::Mini.px()).flex_none().when(is_current, |d| {
-                    d.child(heroicon(icons::CHECK, IconSize::Mini).text_color(theme.green))
+                div().w(ICON_SIZE).flex_none().when(is_current, |d| {
+                    d.child(heroicon(icons::CHECK).text_color(theme.green))
                 }),
             )
             .child(div().flex_1().min_w_0().truncate().child(p.label.clone()))
@@ -399,7 +399,7 @@ fn render_nav_row<H: SidebarHost>(
         .when(bright, |d| d.font_weight(FontWeight::BOLD))
         .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
         .child(
-            heroicon(nav_icon(view), IconSize::Standard).text_color(color),
+            heroicon(nav_icon(view)).text_color(color),
         )
         .child(label.clone())
         .on_click(cx.listener(move |this, _, window, cx| {
@@ -561,7 +561,7 @@ fn render_footer<H: SidebarHost>(
             .gap_1()
             .text_color(theme.yellow)
             .child(
-                heroicon(icons::SIGNAL_SLASH, IconSize::Micro).text_color(theme.yellow),
+                heroicon(icons::SIGNAL_SLASH).text_color(theme.yellow),
             )
             .child("Daemon unreachable · polling")
     });
@@ -576,11 +576,11 @@ fn render_footer<H: SidebarHost>(
         div()
             .id(id)
             .debug_selector(move || id.into())
-            .p_0p5()
+            .p_1()
             .rounded_md()
             .cursor_pointer()
             .hover(|s| s.bg(theme.search))
-            .child(heroicon(icon, IconSize::Standard).text_color(theme.muted))
+            .child(heroicon(icon).text_color(theme.muted))
     };
     let buttons = div()
         .flex()
@@ -597,8 +597,8 @@ fn render_footer<H: SidebarHost>(
                     .flex()
                     .items_center()
                     .justify_center()
-                    // An icon button's size: a standard icon and its padding.
-                    .size(IconSize::Standard.px() + px(4.0))
+                    // An icon button's size: the icon and its padding.
+                    .size(ICON_SIZE + px(8.0))
                     .rounded_md()
                     .bg(theme.error_button)
                     .text_color(theme.on_color)

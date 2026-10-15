@@ -86,7 +86,7 @@ use shelbi_state::keymap::{
     format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
 
-use crate::assets::{heroicon, icons, IconSize};
+use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
 use crate::menus;
@@ -2576,13 +2576,13 @@ impl ShelbiWindow {
                         div()
                             .id("expand-sidebar")
                             .debug_selector(|| "expand-sidebar".into())
-                            .p_0p5()
+                            .p_1()
                             .w_auto()
                             .self_start()
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.search))
-                            .child(heroicon(icons::BARS_3, IconSize::Standard).text_color(theme.muted))
+                            .child(heroicon(icons::BARS_3).text_color(theme.muted))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                     ),
                 )
@@ -2611,7 +2611,7 @@ impl ShelbiWindow {
                         div()
                             .id("dismiss-banner")
                             .cursor_pointer()
-                            .child(heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.muted))
+                            .child(heroicon(icons::X_MARK).text_color(theme.muted))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.banner = None;
                                 cx.notify();

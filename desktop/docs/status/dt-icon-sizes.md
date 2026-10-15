@@ -1,5 +1,7 @@
 # dt-icon-sizes: three icon sizes, each from its own Heroicons set
 
+Superseded by [`dt-icons-mini-outline`](dt-icons-mini-outline.md): every icon is now the outline drawing at 20×20.
+
 ## What landed
 
 Every icon in the app's own views renders at one of three sizes, and each

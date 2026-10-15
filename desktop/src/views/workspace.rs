@@ -61,7 +61,7 @@ use shelbi_app::WorkspaceSessionOp;
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent};
 use super::sidebar::TRAFFIC_LIGHT_INSET;
 use super::workspace_layout::{Split, DIVIDER_W};
-use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::assets::{heroicon, icons, Icon, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::Theme;
@@ -792,7 +792,7 @@ impl WorkspaceView {
                 .px_2()
                 .h(px(26.0))
                 .min_w_0()
-                .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
+                .child(heroicon(icon).text_color(theme.muted))
                 .child(div().min_w_0().truncate().child(text))
         };
 
@@ -805,10 +805,10 @@ impl WorkspaceView {
             .gap_3()
             .child(
                 row_base("ws-back", WsRow::Back)
-                    .size(IconSize::Standard.px() + px(8.0))
+                    .size(ICON_SIZE + px(12.0))
                     .justify_center()
                     .px_0()
-                    .child(heroicon(icons::ARROW_LEFT, IconSize::Standard).text_color(theme.gray)),
+                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.gray)),
             )
             .child(
                 div()
@@ -904,7 +904,7 @@ impl WorkspaceView {
             if panel.rows().contains(&WsRow::Folder) {
                 row_base("ws-folder", WsRow::Folder)
                     .h(px(26.0))
-                    .child(heroicon(icons::FOLDER_OPEN, IconSize::Mini).text_color(theme.muted))
+                    .child(heroicon(icons::FOLDER_OPEN).text_color(theme.muted))
                     .child(text)
                     .into_any_element()
             } else {
@@ -916,7 +916,7 @@ impl WorkspaceView {
                     .gap_2()
                     .px_2()
                     .h(px(26.0))
-                    .child(heroicon(icons::FOLDER_OPEN, IconSize::Mini).text_color(theme.muted))
+                    .child(heroicon(icons::FOLDER_OPEN).text_color(theme.muted))
                     .child(text)
                     .into_any_element()
             }
@@ -958,7 +958,7 @@ impl WorkspaceView {
                 .h(px(30.0))
                 .text_color(color)
                 .when(on, |d| d.font_weight(FontWeight::BOLD).bg(theme.selection))
-                .child(heroicon(icon, IconSize::Standard).text_color(color))
+                .child(heroicon(icon).text_color(color))
                 .child(div().flex_1().min_w_0().truncate().child(item.label(&agent_name, &editor_name)))
                 .when(on && item != ContentView::Agent, |d| {
                     d.child(
@@ -968,7 +968,7 @@ impl WorkspaceView {
                             .flex_none()
                             .rounded_md()
                             .hover(|s| s.bg(theme.search))
-                            .child(heroicon(icons::X_MARK, IconSize::Mini).text_color(theme.muted))
+                            .child(heroicon(icons::X_MARK).text_color(theme.muted))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close_content(cx);
@@ -984,7 +984,7 @@ impl WorkspaceView {
             };
             row_base("ws-shell-toggle", WsRow::Shell)
                 .h(px(30.0))
-                .child(heroicon(icons::COMMAND_LINE, IconSize::Standard).text_color(theme.gray))
+                .child(heroicon(icons::COMMAND_LINE).text_color(theme.gray))
                 .child(div().flex_1().child("Shell"))
                 .child(
                     div()
@@ -1183,7 +1183,8 @@ impl WorkspaceView {
                                     div()
                                         .id("ws-description-close")
                                         .cursor_pointer()
-                                        .child(heroicon(icons::X_MARK, IconSize::Standard).text_color(theme.muted))
+                                        .p_0p5()
+                                        .child(heroicon(icons::X_MARK).text_color(theme.muted))
                                         .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx))),
                                 ),
                         )

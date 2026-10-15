@@ -103,7 +103,7 @@ use search_bar::{BarKey, SearchBar};
 use session::SessionIo;
 pub use settings::TerminalSettings;
 
-use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::assets::{heroicon, icons, Icon};
 use crate::theme::Theme;
 
 /// How long a viewport size must hold before it is reported to the session,
@@ -1668,7 +1668,7 @@ impl TerminalPane {
                 .rounded_sm()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.selection))
-                .child(heroicon(icon, IconSize::Mini).text_color(theme.gray))
+                .child(heroicon(icon).text_color(theme.gray))
                 .on_click(cx.listener(move |this, _, _, cx| match older {
                     Some(older) => this.step_search(older, cx),
                     None => this.close_search(cx),
@@ -1694,7 +1694,7 @@ impl TerminalPane {
                 .border_color(theme.divider)
                 .bg(theme.search)
                 .text_sm()
-                .child(heroicon(icons::MAGNIFYING_GLASS, IconSize::Mini).text_color(theme.muted))
+                .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.muted))
                 .child(
                     div()
                         .flex()
@@ -1751,7 +1751,7 @@ impl TerminalPane {
                 .text_color(theme.gray)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.selection))
-                .child(heroicon(icons::ARROW_DOWN, IconSize::Micro).text_color(theme.gray))
+                .child(heroicon(icons::ARROW_DOWN).text_color(theme.gray))
                 .child(label)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.view.scroll_to_bottom();

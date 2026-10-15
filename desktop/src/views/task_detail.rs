@@ -16,7 +16,7 @@ use shelbi_state::keymap::PopoverAction;
 
 use super::issues::{backdrop, IssuesView};
 use super::markdown;
-use crate::assets::{heroicon, icons, Icon, IconSize};
+use crate::assets::{heroicon, icons, Icon};
 use crate::theme::Theme;
 
 pub fn render(
@@ -225,8 +225,7 @@ pub fn render(
                     .text_xs()
                     .text_color(theme.red)
                     .child(
-                        heroicon(icons::EXCLAMATION_TRIANGLE, IconSize::Micro)
-                            .mt(px(2.0))
+                        heroicon(icons::EXCLAMATION_TRIANGLE)
                             .text_color(theme.red),
                     )
                     .child(n),
@@ -343,7 +342,7 @@ fn icon_button(
         .text_xs()
         .text_color(theme.gray)
         .cursor_pointer()
-        .child(heroicon(icon, IconSize::Mini).text_color(theme.muted))
+        .child(heroicon(icon).text_color(theme.muted))
         .child(text.to_string())
 }
 

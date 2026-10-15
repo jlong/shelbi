@@ -81,7 +81,8 @@ is left, and how it was verified.
 |---|---|---|
 | `dt-parity-audit` | No stubs left; scenario tests for every command; a smoke test per front end; the field checklist; the hand walk; these docs | [`status/dt-parity-audit.md`](status/dt-parity-audit.md) |
 | `dt-merge-main` | `origin/main` merged into the umbrella: the four conflicts resolved, main's `orchestrator_status` shown in both clients | [`status/dt-merge-main.md`](status/dt-merge-main.md) |
-| `dt-icon-sizes` | Every icon at 24, 20 or 16px, each from the Heroicons set drawn for that size, through one helper | [`status/dt-icon-sizes.md`](status/dt-icon-sizes.md) |
+| `dt-icon-sizes` | Every icon at 24, 20 or 16px (superseded by `dt-icons-mini-outline`) | [`status/dt-icon-sizes.md`](status/dt-icon-sizes.md) |
+| `dt-icons-mini-outline` | Every icon is the Heroicons outline drawing at 20×20, through one size-free helper | [`status/dt-icons-mini-outline.md`](status/dt-icons-mini-outline.md) |
 | `dt-terminal-bottom-clipped` | A pane always reaches the session's last row: clipped windows keep the content's bottom, and taking focus takes the PTY's size | [`status/dt-terminal-bottom-clipped.md`](status/dt-terminal-bottom-clipped.md) |
 | `dt-workspace-sidebar` | The workspace panel takes the sidebar's column with the review's push; the header above the agent is gone | [`status/dt-workspace-sidebar.md`](status/dt-workspace-sidebar.md) |
 

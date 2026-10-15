@@ -6,69 +6,36 @@
 //! views; it is only the fallback that keeps gpui-kit components' internal
 //! glyphs (a checkbox tick, a dropdown caret) resolving.
 //!
-//! **An icon renders at exactly one of three sizes**, each drawn from the
-//! Heroicons set made for that grid, so an icon is never a scaled copy of a
-//! larger drawing:
+//! **Every icon is the Heroicons outline drawing at 20×20** ([`ICON_SIZE`]):
+//! toolbar and back buttons, the sidebar, panel rows, chips, card badges,
+//! activity and machine rows, the terminal search bar, the bootstrap and
+//! update screens. One look everywhere, no per-view sizing. Heroicons has no
+//! 20px outline set, so this is the `24/outline` drawing (a 1.5px stroke on a
+//! 24 grid) scaled to 20px, a 1.25px stroke: how the outline set reads at
+//! mini size on the web.
 //!
-//! | [`IconSize`] | Pixels | Heroicons set     | Use it for |
-//! |--------------|--------|-------------------|------------|
-//! | `Standard`   | 24×24  | `24/outline/`     | toolbar and header buttons, the sidebar's view icons, the bootstrap/update screens' status icons |
-//! | `Mini`       | 20×20  | `20/solid/`       | inline icons in rows, chips, buttons with a text label, the terminal search bar |
-//! | `Micro`      | 16×16  | `16/solid/`       | icons set inside dense text: card badges, activity/machine row markers, link arrows |
+//! Render one with [`heroicon`]`(icons::X_MARK)`; the SVG's `currentColor`
+//! stroke takes the element's `text_color`. No view calls `svg()` or sizes an
+//! icon itself (a test guards it). Lay a row out around the 20px icon; an
+//! icon button that needs a bigger hit area pads the icon rather than
+//! growing it.
 //!
-//! Render one with [`heroicon`]`(icons::X_MARK, IconSize::Mini)`; the SVG's
-//! `currentColor` takes the element's `text_color`. No view calls
-//! `svg()` or sets an icon's pixel size itself (a test guards it); pick the
-//! size by the icon's context, and grow the row around it rather than
-//! shrinking an icon below 16.
-//!
-//! To add an icon, copy its SVG from all three sets at the v2.2.0 tag
-//! (`optimized/24/outline/`, `optimized/20/solid/`, `optimized/16/solid/`)
-//! into `assets/icons/heroicons/{24,20,16}/`, then add a row to the
-//! `heroicons!` list below.
+//! To add an icon, copy its SVG from `optimized/24/outline/` at the v2.2.0
+//! tag into `assets/icons/heroicons/`, then add a row to the `heroicons!`
+//! list below.
 
 use std::borrow::Cow;
 
 use gpui::{px, svg, AssetSource, Pixels, Result, SharedString, Styled, Svg};
 
-/// The three sizes an icon renders at. See the module docs for which to use
-/// where.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IconSize {
-    /// 24×24, from Heroicons' 24px outline set.
-    Standard,
-    /// 20×20, from Heroicons' 20px solid ("mini") set.
-    Mini,
-    /// 16×16, from Heroicons' 16px solid ("micro") set.
-    Micro,
-}
+/// The width and height every icon renders at.
+pub const ICON_SIZE: Pixels = px(20.0);
 
-impl IconSize {
-    #[cfg(test)]
-    pub const ALL: [IconSize; 3] = [IconSize::Standard, IconSize::Mini, IconSize::Micro];
-
-    /// The icon's width and height.
-    pub fn px(self) -> Pixels {
-        px(self.grid())
-    }
-
-    /// The Heroicons grid the size draws from, in pixels.
-    const fn grid(self) -> f32 {
-        match self {
-            IconSize::Standard => 24.0,
-            IconSize::Mini => 20.0,
-            IconSize::Micro => 16.0,
-        }
-    }
-}
-
-/// One vendored Heroicon: the same symbol drawn once per [`IconSize`].
+/// One vendored Heroicon (its outline drawing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Icon {
     name: &'static str,
-    standard: &'static str,
-    mini: &'static str,
-    micro: &'static str,
+    path: &'static str,
 }
 
 impl Icon {
@@ -78,35 +45,16 @@ impl Icon {
         self.name
     }
 
-    /// The asset path of the drawing for `size`.
-    pub const fn path(self, size: IconSize) -> &'static str {
-        match size {
-            IconSize::Standard => self.standard,
-            IconSize::Mini => self.mini,
-            IconSize::Micro => self.micro,
-        }
+    /// The drawing's asset path.
+    pub const fn path(self) -> &'static str {
+        self.path
     }
 }
 
-/// `icon` at `size`: the only way Shelbi's views draw an icon.
-pub fn heroicon(icon: Icon, size: IconSize) -> Svg {
-    svg().path(icon.path(size)).size(size.px()).flex_none()
-}
-
-macro_rules! heroicon_file {
-    ($set:literal, $file:literal) => {
-        (
-            concat!("icons/heroicons/", $set, "/", $file, ".svg"),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/assets/icons/heroicons/",
-                $set,
-                "/",
-                $file,
-                ".svg"
-            )) as &[u8],
-        )
-    };
+/// `icon`, outline, at [`ICON_SIZE`]: the only way Shelbi's views draw an
+/// icon.
+pub fn heroicon(icon: Icon) -> Svg {
+    svg().path(icon.path()).size(ICON_SIZE).flex_none()
 }
 
 macro_rules! heroicons {
@@ -118,9 +66,7 @@ macro_rules! heroicons {
             $(
                 pub const $const: Icon = Icon {
                     name: $file,
-                    standard: concat!("icons/heroicons/24/", $file, ".svg"),
-                    mini: concat!("icons/heroicons/20/", $file, ".svg"),
-                    micro: concat!("icons/heroicons/16/", $file, ".svg"),
+                    path: concat!("icons/heroicons/", $file, ".svg"),
                 };
             )*
 
@@ -129,11 +75,17 @@ macro_rules! heroicons {
             pub const ALL: &[Icon] = &[$($const),*];
         }
 
-        /// Every vendored drawing, by asset path: three per icon.
+        /// Every vendored drawing, by asset path.
         const HEROICONS: &[(&str, &[u8])] = &[$(
-            heroicon_file!("24", $file),
-            heroicon_file!("20", $file),
-            heroicon_file!("16", $file),
+            (
+                concat!("icons/heroicons/", $file, ".svg"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/icons/heroicons/",
+                    $file,
+                    ".svg"
+                )) as &[u8],
+            ),
         )*];
     };
 }
@@ -324,27 +276,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_heroicon_loads_as_an_svg_in_all_three_sizes() {
+    fn every_heroicon_loads_as_an_outline_drawing_on_a_24_grid() {
         for icon in icons::ALL {
-            for size in IconSize::ALL {
-                let path = icon.path(size);
-                assert_eq!(
-                    path,
-                    format!("icons/heroicons/{}/{}.svg", size.grid() as u32, icon.name())
-                );
-                let bytes = Assets.load(path).unwrap().expect(path);
-                let svg = std::str::from_utf8(&bytes).expect(path);
-                assert!(svg.starts_with("<svg"), "{path} is an SVG");
-                // Drawn on its own grid, from the set made for that size:
-                // outline at 24, solid at 20 and 16.
-                let grid = size.grid() as u32;
-                assert!(
-                    svg.contains(&format!(r#"viewBox="0 0 {grid} {grid}""#)),
-                    "{path} is drawn on a {grid}px grid"
-                );
-                let outline = svg.contains(r#"fill="none""#) && svg.contains("stroke=");
-                assert_eq!(outline, size == IconSize::Standard, "{path}: outline only at 24px");
-            }
+            let path = icon.path();
+            assert_eq!(path, format!("icons/heroicons/{}.svg", icon.name()));
+            let bytes = Assets.load(path).unwrap().expect(path);
+            let svg = std::str::from_utf8(&bytes).expect(path);
+            assert!(svg.starts_with("<svg"), "{path} is an SVG");
+            assert!(svg.contains(r#"viewBox="0 0 24 24""#), "{path} is drawn on the 24px grid");
+            assert!(
+                svg.contains(r#"fill="none""#) && svg.contains(r#"stroke="currentColor""#),
+                "{path} is the outline drawing, stroked in currentColor"
+            );
         }
     }
 
@@ -352,19 +295,23 @@ mod tests {
     fn heroicons_are_listed() {
         let listed = Assets.list("icons/heroicons/").unwrap();
         assert_eq!(listed.len(), HEROICONS.len());
-        assert_eq!(HEROICONS.len(), icons::ALL.len() * IconSize::ALL.len());
+        assert_eq!(HEROICONS.len(), icons::ALL.len());
     }
 
     #[test]
-    fn icon_sizes_are_24_20_and_16_pixels() {
-        assert_eq!(IconSize::Standard.px(), px(24.0));
-        assert_eq!(IconSize::Mini.px(), px(20.0));
-        assert_eq!(IconSize::Micro.px(), px(16.0));
+    fn every_icon_draws_at_20_pixels() {
+        assert_eq!(ICON_SIZE, px(20.0));
+        for icon in icons::ALL {
+            let mut svg = heroicon(*icon);
+            let style = svg.style();
+            assert_eq!(style.size.width, Some(ICON_SIZE.into()), "{}", icon.name());
+            assert_eq!(style.size.height, Some(ICON_SIZE.into()), "{}", icon.name());
+            assert_eq!(style.flex_shrink, Some(0.0), "{} never squeezes", icon.name());
+        }
     }
 
     /// No view draws an SVG or sizes an icon itself: every icon goes through
-    /// [`heroicon`], so it renders at one of the three sizes, from the set
-    /// drawn for it.
+    /// [`heroicon`], so it renders as the outline drawing at 20px.
     #[test]
     fn only_the_icon_helper_draws_icons() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -388,7 +335,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "draw icons with assets::heroicon(icon, IconSize::…), not svg():\n{}",
+            "draw icons with assets::heroicon(icon), not svg():\n{}",
             offenders.join("\n")
         );
     }
