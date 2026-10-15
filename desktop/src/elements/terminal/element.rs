@@ -17,9 +17,11 @@
 //!   handler. (Modifier changes reach the pane's own div: gpui sends them
 //!   along the focus path, which ends at the focused pane, not this child.)
 //!
-//! The session grid is letterboxed (centered) or clipped (anchored top-left)
-//! into the viewer by `shelbi_term::viewport`, the same placement the TUI uses
-//! and the one mouse coordinates map back through.
+//! The session grid is letterboxed (centered) or clipped into the viewer by
+//! `TerminalView::placement`, the same placement the TUI uses and the one
+//! mouse coordinates map back through. A clipped window keeps the bottom of a
+//! taller session's content in view, so its rows start at viewport row
+//! `placement.rows.src_start`, not 0 (`dt-terminal-bottom-clipped`).
 
 use std::time::Instant;
 
@@ -173,6 +175,9 @@ impl Element for TerminalElement {
         let view = pane.view();
         let emu = view.emulator();
         let offset = emu.display_offset();
+        // The grid line on the first row shown, and the viewport row it is.
+        let top = view.first_shown_line(&geometry.placement);
+        let first = geometry.placement.rows.src_start;
         let text = window.text_system().clone();
 
         // Cell backgrounds, then highlights over them.
@@ -188,14 +193,14 @@ impl Element for TerminalElement {
         let search_color = rgb_hsla(theme.search_match);
         let current_color = rgb_hsla(theme.search_current);
         for (span, current) in
-            highlights::match_spans(view.search_matches(), view.search_current(), offset, shown)
+            highlights::match_spans(view.search_matches(), view.search_current(), top, shown)
         {
             let color = if current { current_color } else { search_color };
             quads.push((metrics.cell_bounds(origin, span.col, span.row, span.len), color));
         }
         if let Some(sel) = view.selection().filter(|s| !s.is_empty()) {
             let selection_color = rgb_hsla(theme.selection);
-            for span in highlights::selection_spans(&sel, offset, shown) {
+            for span in highlights::selection_spans(&sel, top, shown) {
                 quads.push((
                     metrics.cell_bounds(origin, span.col, span.row, span.len),
                     selection_color,
@@ -206,7 +211,7 @@ impl Element for TerminalElement {
         // A Cmd-hovered link's underline, along the bottom of its cells.
         let mut over = Vec::new();
         if let Some(link) = pane.hovered_link.as_ref() {
-            for span in highlights::link_spans(link, offset, shown) {
+            for span in highlights::link_spans(link, top, shown) {
                 let cells = metrics.cell_bounds(origin, span.col, span.row, span.len);
                 over.push((
                     Bounds {
@@ -234,14 +239,18 @@ impl Element for TerminalElement {
         // the pane isn't focused.
         let focused = pane.is_focused();
         let composing_here = pane.composition.is_some() && !pane.search_open();
+        // The cursor's viewport row, as a row of the window.
         let cursor = emu
             .cursor()
-            .filter(|c| c.row < shown.rows && c.col < shown.cols)
+            .and_then(|c| {
+                let row = c.row.checked_sub(first)?;
+                (row < shown.rows && c.col < shown.cols).then_some((c, row))
+            })
             .filter(|_| pane.is_live() && (pane.blink_on || !focused))
             .filter(|_| !composing_here)
-            .map(|c| {
+            .map(|(c, row)| {
                 let cell_origin = |col, row| metrics.cell_bounds(origin, col, row, 1).origin;
-                let cell = metrics.cell_bounds(origin, c.col, c.row, 1);
+                let cell = metrics.cell_bounds(origin, c.col, row, 1);
                 let shape = if focused {
                     c.shape
                 } else {
@@ -264,7 +273,7 @@ impl Element for TerminalElement {
                             ch.extend(marks);
                         }
                         let style = rows
-                            .get(c.row as usize)?
+                            .get(row as usize)?
                             .glyphs
                             .iter()
                             .find(|r| r.col <= c.col && c.col < r.col + r.cells)?
@@ -278,7 +287,7 @@ impl Element for TerminalElement {
                             wide,
                         };
                         Some((
-                            cell_origin(c.col, c.row),
+                            cell_origin(c.col, row),
                             shape_run(&text, &metrics, &single, rgb_hsla(theme.cursor_text)),
                         ))
                     })
@@ -311,7 +320,7 @@ impl Element for TerminalElement {
             .filter(|_| !pane.search_open())
             .and_then(|comp| {
                 let c = emu.cursor()?;
-                let at = metrics.cell_bounds(origin, c.col, c.row, 1).origin;
+                let at = metrics.cell_bounds(origin, c.col, c.row.checked_sub(first)?, 1).origin;
                 let color = palette.foreground();
                 let run = TextRun {
                     len: comp.text.len(),

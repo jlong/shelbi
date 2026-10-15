@@ -904,6 +904,8 @@ mod tests {
     struct Wire {
         input: Vec<Vec<u8>>,
         resizes: Vec<Size>,
+        /// Size claims (the pane took focus).
+        claims: u32,
     }
 
     struct FakeIo(Arc<Mutex<Wire>>);
@@ -917,6 +919,9 @@ mod tests {
         }
         fn resize(&self, size: Size) {
             self.0.lock().unwrap().resizes.push(size);
+        }
+        fn claim(&self) {
+            self.0.lock().unwrap().claims += 1;
         }
     }
 
@@ -1431,6 +1436,134 @@ mod tests {
         let resizes = h.session.wire.lock().unwrap().resizes.clone();
         assert!(!resizes.is_empty(), "the first size is reported at once");
         assert_ne!(resizes[0], Size::new(120, 40), "the window's own size, not the session's");
+    }
+
+    /// Draw a frame.
+    fn draw(h: &mut Harness) {
+        h.cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        h.settle();
+    }
+
+    fn pane_of(h: &mut Harness) -> Entity<TerminalPane> {
+        h.chat.read_with(&h.cx, |c, _| c.pane().unwrap().clone())
+    }
+
+    /// dt-terminal-bottom-clipped: the session is sized by a taller client
+    /// that was active last (the TUI in a bigger terminal), so its screen has
+    /// more rows than this pane. The pane shows the bottom of the session's
+    /// content (an agent's prompt and status line), scrolled to the bottom it
+    /// always returns there, and nothing sits under the pane's bottom edge.
+    #[gpui::test]
+    fn a_taller_active_client_still_shows_the_sessions_bottom_rows(cx: &mut TestAppContext) {
+        const ROWS: u16 = 300;
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, ROWS))]);
+        h.update(|c, cx| c.show(cx));
+        draw(&mut h);
+        // History first, then an agent's screen ending in its prompt and
+        // status line on the session's last two rows. The fake never resizes
+        // the session to the pane's report: the taller client stays active.
+        let mut out = Vec::new();
+        for i in 0..400 {
+            out.extend_from_slice(format!("output {i}\r\n").as_bytes());
+        }
+        out.extend_from_slice(format!("\x1b[{};1H\x1b[2K> prompt\r\n\x1b[2Kstatus line\x1b[{};3H", ROWS - 1, ROWS - 1).as_bytes());
+        h.session.push(SessionEvent::Output { seq: 1, data: out });
+        h.settle();
+        draw(&mut h);
+
+        let pane = pane_of(&mut h);
+        let (bounds, viewer, line_height, placement) =
+            pane.read_with(&h.cx, |p, _| p.last_frame()).expect("drawn");
+        assert!(viewer.rows < ROWS, "the pane is shorter than the session");
+        assert!(placement.is_clipped());
+        assert_eq!(
+            placement.viewer_to_session(placement.cols.pad_before, viewer.rows - 1),
+            Some((0, ROWS - 1)),
+            "the pane's last row is the session's last row"
+        );
+        let rows = pane.read_with(&h.cx, |p, _| p.shown_rows());
+        assert_eq!(rows.len(), viewer.rows as usize);
+        assert_eq!(rows[rows.len() - 2..], ["> prompt", "status line"]);
+        // Every shown row is inside the pane.
+        assert!(line_height * viewer.rows as f32 <= bounds.size.height);
+
+        // Scroll up into history, then back to the bottom (the wheel and the
+        // jump-to-bottom button both end in scroll_to_bottom).
+        pane.update(&mut h.cx, |p, _| p.terminal_view_mut().scroll_up(40));
+        draw(&mut h);
+        let rows = pane.read_with(&h.cx, |p, _| p.shown_rows());
+        assert_ne!(rows.last().map(String::as_str), Some("status line"));
+        pane.update(&mut h.cx, |p, _| p.terminal_view_mut().scroll_to_bottom());
+        draw(&mut h);
+        let rows = pane.read_with(&h.cx, |p, _| p.shown_rows());
+        assert_eq!(rows.last().map(String::as_str), Some("status line"));
+    }
+
+    /// dt-terminal-bottom-clipped: the grid's rows always fit inside the pane,
+    /// and the pane inside the window, after the window is resized to sizes
+    /// that are not whole rows.
+    #[gpui::test]
+    fn after_a_resize_every_row_fits_inside_the_pane(cx: &mut TestAppContext) {
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, 24))]);
+        h.update(|c, cx| c.show(cx));
+        let pane = pane_of(&mut h);
+        for (w, ht) in [(900.0, 611.0), (700.0, 433.3), (1200.0, 799.9), (640.0, 200.5)] {
+            h.cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(ht)));
+            draw(&mut h);
+            let (bounds, viewer, line_height, _) =
+                pane.read_with(&h.cx, |p, _| p.last_frame()).expect("drawn");
+            let window = h.cx.update(|window, _| window.viewport_size());
+            // The grid's last row ends inside the window (the element's own
+            // bounds may round up to the device pixel grid, a fraction of a
+            // pixel past a fractional window edge).
+            let grid_bottom = bounds.top() + line_height * viewer.rows as f32;
+            assert!(grid_bottom <= window.height, "{ht}: the last row ends inside the window");
+            assert!(bounds.bottom() < window.height + gpui::px(1.0), "{ht}: the pane ends at the window's edge");
+            assert!(
+                line_height * viewer.rows as f32 <= bounds.size.height,
+                "{ht}: {} rows of {line_height:?} fit {:?}",
+                viewer.rows,
+                bounds.size.height
+            );
+            assert!(
+                line_height * (viewer.rows + 1) as f32 > bounds.size.height,
+                "{ht}: and the pane has no room for another row"
+            );
+            h.advance(Duration::from_millis(500));
+            let reported = *h.session.wire.lock().unwrap().resizes.last().unwrap();
+            assert_eq!(reported, viewer, "{ht}: the session is told the grid that fits");
+        }
+    }
+
+    /// Taking focus claims the session's size (the PTY then follows this pane
+    /// even if another client typed last); typing does too, on the session's
+    /// side.
+    #[gpui::test]
+    fn focusing_the_pane_claims_the_session_size(cx: &mut TestAppContext) {
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, 60))]);
+        h.update(|c, cx| c.show(cx));
+        draw(&mut h);
+        h.cx.update(|window, _| window.activate_window());
+        h.settle();
+        assert_eq!(h.session.wire.lock().unwrap().claims, 0, "not focused yet");
+        h.cx.update(|window, cx| {
+            let target = h.chat.read(cx).focus_target(cx);
+            window.focus(&target, cx);
+        });
+        h.settle();
+        {
+            let wire = h.session.wire.lock().unwrap();
+            assert_eq!(wire.claims, 1, "focus claims the size");
+            assert!(!wire.resizes.is_empty(), "with the pane's size already reported");
+        }
+        // Another app takes the foreground, then this window comes back (the
+        // user typed in the TUI meanwhile): claimed again.
+        h.cx.deactivate_window();
+        h.cx.update(|window, _| window.activate_window());
+        h.settle();
+        assert_eq!(h.session.wire.lock().unwrap().claims, 2, "reactivating the window claims again");
     }
 
     #[gpui::test]

@@ -92,7 +92,7 @@ use shelbi_term::links::Link;
 use shelbi_term::render::Damage;
 use shelbi_term::selection::Point as SelPoint;
 use shelbi_term::view::TerminalView;
-use shelbi_term::viewport::{self, Placement};
+use shelbi_term::viewport::Placement;
 use shelbi_term::Size;
 
 pub use element::TerminalElement;
@@ -448,8 +448,8 @@ impl TerminalPane {
         &self.view
     }
 
-    /// The view, mutably (to start a search).
-    #[cfg(feature = "visual-check")]
+    /// The view, mutably (to start a search, or scroll in a test).
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn terminal_view_mut(&mut self) -> &mut TerminalView {
         &mut self.view
     }
@@ -515,6 +515,39 @@ impl TerminalPane {
     #[cfg(feature = "visual-check")]
     pub fn element_bounds(&self) -> Option<Bounds<Pixels>> {
         self.geometry.as_ref().map(|g| g.bounds)
+    }
+
+    /// The last frame's element bounds, viewer grid, cell height, and
+    /// placement (tests).
+    #[cfg(test)]
+    pub(crate) fn last_frame(&self) -> Option<(Bounds<Pixels>, Size, Pixels, Placement)> {
+        let (g, m) = (self.geometry.as_ref()?, self.metrics.as_ref()?);
+        Some((g.bounds, g.viewer, m.height, g.placement))
+    }
+
+    /// The text of each row the last frame's window showed, top to bottom,
+    /// trailing blanks trimmed (tests and the visual check).
+    #[cfg(any(test, feature = "visual-check"))]
+    pub(crate) fn shown_rows(&self) -> Vec<String> {
+        use alacritty_terminal::index::{Column, Line};
+        let Some(g) = self.geometry.as_ref() else {
+            return Vec::new();
+        };
+        let grid = self.view.emulator().grid();
+        let top = self.view.first_shown_line(&g.placement);
+        (0..g.placement.rows.len as i32)
+            .map(|row| {
+                let line = &grid[Line(top + row)];
+                (0..g.placement.cols.len as usize)
+                    .map(|c| match line[Column(c)].c {
+                        '\0' => ' ',
+                        c => c,
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     fn new(selector: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -598,13 +631,34 @@ impl TerminalPane {
         self.view = TerminalView::new(size);
         self.damage = Damage::Full;
         self.status = PaneStatus::Live;
-        // Claim our size at once if we've already been laid out.
+        // Report our size at once if we've already been laid out, and take
+        // the session's size if we have focus (a reattach after a restart).
         if let Some(viewer) = self.geometry.as_ref().map(|g| g.viewer) {
             io.resize(viewer);
             self.reported_size = Some(viewer);
         }
+        if self.focused {
+            io.claim();
+        }
         self.io = Some(io);
         cx.notify();
+    }
+
+    /// Make the PTY follow this pane's size: report a size still waiting out
+    /// the debounce, then claim the session's sizing (the session applies the
+    /// most recently active client's size). Sent when the pane takes focus,
+    /// so a taller client that typed last (the TUI in a bigger terminal, a
+    /// second window) stops sizing the session the user is now looking at.
+    fn claim_size(&mut self) {
+        let Some(io) = self.io.as_ref() else {
+            return;
+        };
+        if let Some(size) = self.pending_size.take() {
+            io.resize(size);
+            self.reported_size = Some(size);
+            self.resize_task = None;
+        }
+        io.claim();
     }
 
     /// The font or the Option key setting changed: re-measure the cell on
@@ -728,7 +782,7 @@ impl TerminalPane {
         viewer: Size,
         cx: &mut Context<Self>,
     ) {
-        let placement = viewport::fit(self.session_size, viewer);
+        let placement = self.view.placement(self.session_size, viewer);
         self.geometry = Some(Geometry {
             bounds,
             viewer,
@@ -753,6 +807,7 @@ impl TerminalPane {
         let damage = std::mem::replace(&mut self.damage, Damage::Rows(Vec::new()));
         let rows = self.rows.update(
             self.view.emulator(),
+            placement.rows.src_start,
             placement.rows.len,
             placement.cols.len,
             palette,
@@ -988,6 +1043,9 @@ impl TerminalPane {
             return;
         }
         self.focused = focused;
+        if focused {
+            self.claim_size();
+        }
         if let (Some(io), Some(bytes)) = (
             self.io.as_ref(),
             input::encode_focus(focused, self.view.emulator().focus_reporting()),
@@ -1499,7 +1557,12 @@ impl TerminalPane {
             .map(|row| {
                 let (m, g) = (self.metrics.as_ref()?, self.geometry.as_ref()?);
                 let origin = element::grid_origin(g, m);
-                let b = m.cell_bounds(origin, 0, row as u16, g.placement.cols.len);
+                // Rows outside a clipped window have no bounds on screen.
+                let shown = (row as u16).checked_sub(g.placement.rows.src_start)?;
+                if shown >= g.placement.rows.len {
+                    return None;
+                }
+                let b = m.cell_bounds(origin, 0, shown, g.placement.cols.len);
                 Some(Rect {
                     x0: f64::from(f32::from(b.left())) * scale,
                     y0: f64::from(f32::from(b.top())) * scale,
@@ -1898,7 +1961,8 @@ impl EntityInputHandler for TerminalPane {
         let text = self.composition.as_ref().map_or("", |c| c.text.as_str());
         let prefix = &text[utf16_to_byte_range(text, 0..range_utf16.start)];
         let cells = unicode_width::UnicodeWidthStr::width(prefix) as u16;
-        Some(metrics.cell_bounds(origin, cursor.col.saturating_add(cells), cursor.row, 1))
+        let row = cursor.row.checked_sub(g.placement.rows.src_start)?;
+        Some(metrics.cell_bounds(origin, cursor.col.saturating_add(cells), row, 1))
     }
 
     fn character_index_for_point(

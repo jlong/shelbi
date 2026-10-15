@@ -5,7 +5,7 @@
 //!
 //! This mirrors the single-session `shelbi session attach` client
 //! (`shelbi-cli/src/commands/session_attach.rs`): the same emulator, the same
-//! cell → ratatui style mapping, the same `viewport::fit` clip/letterbox, and
+//! cell → ratatui style mapping, the same `TerminalView::placement` clip/letterbox, and
 //! the same input encoding. The difference is that here the view lives in the
 //! shell's main area beside a sidebar rather than owning the whole screen, and
 //! the color mapping gains a truecolor → 256 downgrade for terminals (or outer
@@ -30,7 +30,6 @@ use shelbi_term::input::{self, Key, Modifiers};
 use shelbi_term::render::{CellAttrs, Underline};
 use shelbi_term::selection;
 use shelbi_term::view::TerminalView;
-use shelbi_term::viewport;
 use shelbi_term::Size;
 
 /// What a mouse event over the pane resolved to. The gesture rules (a drag
@@ -189,7 +188,7 @@ impl TerminalPane {
         let Some(ev) = map_mouse(m, pane_col, pane_row) else {
             return MouseOutcome::Ignored;
         };
-        let placement = viewport::fit(self.session_size, viewer);
+        let placement = self.view.placement(self.session_size, viewer);
         self.gesture.handle(&mut self.view, &ev, &placement)
     }
 
@@ -209,7 +208,7 @@ fn render_grid(
     truecolor: bool,
 ) -> Option<(u16, u16)> {
     let viewer = Size::new(area.width, area.height);
-    let placement = viewport::fit(session_size, viewer);
+    let placement = view.placement(session_size, viewer);
     // Blank the whole area first: letterbox margins and any stale cells.
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
@@ -222,8 +221,6 @@ fn render_grid(
     let emu = view.emulator();
     let grid = emu.grid();
     let offset = emu.display_offset() as i32;
-    let rrows = placement.rows;
-    let rcols = placement.cols;
     // The selection's grid-line coordinates line up with `display_iter`'s point
     // lines (both are screen-relative: line 0 is the top of the visible grid),
     // so a cell is highlighted exactly when the selection contains its point.
@@ -234,12 +231,13 @@ fn render_grid(
         if srow < 0 {
             continue;
         }
-        let (srow, scol) = (srow as u32, indexed.point.column.0 as u32);
-        if srow >= rrows.len as u32 || scol >= rcols.len as u32 {
+        // Outside a clipped window (which keeps the bottom of a taller
+        // session's content in view, not its top).
+        let Some((vcol, vrow)) = placement.session_to_viewer(indexed.point.column.0 as u16, srow as u16)
+        else {
             continue;
-        }
-        let vx = area.left() + rcols.pad_before + scol as u16;
-        let vy = area.top() + rrows.pad_before + srow as u16;
+        };
+        let (vx, vy) = (area.left() + vcol, area.top() + vrow);
         let Some(out) = buf.cell_mut((vx, vy)) else {
             continue;
         };
@@ -267,15 +265,10 @@ fn render_grid(
     if emu.mode().contains(TermMode::SHOW_CURSOR) {
         let cp = grid.cursor.point;
         let crow = cp.line.0 + offset;
-        let ccol = cp.column.0 as i32;
-        if crow >= 0
-            && (crow as u32) < rrows.len as u32
-            && ccol >= 0
-            && (ccol as u32) < rcols.len as u32
-        {
-            let vx = area.left() + rcols.pad_before + ccol as u16;
-            let vy = area.top() + rrows.pad_before + crow as u16;
-            return Some((vx, vy));
+        if crow >= 0 {
+            if let Some((vcol, vrow)) = placement.session_to_viewer(cp.column.0 as u16, crow as u16) {
+                return Some((area.left() + vcol, area.top() + vrow));
+            }
         }
     }
     None
@@ -647,9 +640,9 @@ mod tests {
 
     #[test]
     fn program_mouse_click_translates_through_a_clip() {
-        // Session 120x40 clipped into an 80x24 viewer (anchored top-left). The
-        // bottom-right visible cell (79, 23) maps straight through; the click
-        // forwards on release.
+        // Session 120x40 clipped into an 80x24 viewer (a blank screen, so the
+        // window keeps the top-left). The bottom-right visible cell (79, 23)
+        // maps straight through; the click forwards on release.
         let mut pane = TerminalPane::new(Size::new(120, 40));
         enable_sgr_mouse(&mut pane);
         let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 79, 23, KM::NONE);
@@ -663,6 +656,30 @@ mod tests {
                 assert_eq!(bytes, b"\x1b[<0;80;24M\x1b[<0;80;24m".to_vec())
             }
             other => panic!("a clipped-window click should forward, got {other:?}"),
+        }
+    }
+
+    /// dt-terminal-bottom-clipped: a session sized by a taller client shows
+    /// its bottom rows (an agent's prompt and status line) in a shorter pane,
+    /// and a click on the pane's last row reaches the session's last row.
+    #[test]
+    fn a_clipped_taller_session_renders_and_maps_its_bottom_rows() {
+        let mut pane = TerminalPane::new(Size::new(20, 40));
+        enable_sgr_mouse(&mut pane);
+        pane.view.feed(b"top\x1b[39;1H> prompt\r\nstatus line\x1b[39;3H");
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = Buffer::empty(area);
+        let cursor = pane.render(&mut buf, area, true);
+        let row = |y: u16| (0..20).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string();
+        assert_eq!(row(8), "> prompt");
+        assert_eq!(row(9), "status line");
+        assert_eq!(cursor, Some((2, 8)));
+        let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 9, KM::NONE);
+        pane.on_mouse(&down, 0, 9, Size::new(20, 10));
+        let up = mouse(MouseEventKind::Up(CtMouseButton::Left), 0, 9, KM::NONE);
+        match pane.on_mouse(&up, 0, 9, Size::new(20, 10)) {
+            MouseOutcome::Forward(bytes) => assert_eq!(bytes, b"\x1b[<0;1;40M\x1b[<0;1;40m".to_vec()),
+            other => panic!("the click forwards at the session's last row, got {other:?}"),
         }
     }
 

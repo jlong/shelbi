@@ -194,6 +194,7 @@ impl Check {
         self.find_bar();
         self.links();
         self.alt_screen();
+        self.taller_session();
         self.resize();
         self.timing();
     }
@@ -1265,6 +1266,53 @@ impl Check {
             format!("{clip:?}"),
         );
         self.feed(b"\x1b[?1l\x1b[?1049l");
+    }
+
+    /// dt-terminal-bottom-clipped: a session sized by a taller client (twice
+    /// the pane's rows) shows the bottom of its content, with the cursor,
+    /// a selection, and a search match on the rows they belong to.
+    fn taller_session(&mut self) {
+        let (w, h) = self.cell();
+        let viewer = Size::from_pixels(1000.0, 600.0, w, h);
+        let tall = Size::new(viewer.cols, viewer.rows * 2);
+        self.with_pane(|pane, _, cx| pane.session_resized(tall, cx))
+            .unwrap();
+        self.reset_screen();
+        let mut s = String::new();
+        for i in 0..tall.rows - 3 {
+            s.push_str(&format!("line {i}\r\n"));
+        }
+        s.push_str("needle in the output\r\n> prompt here\r\n\x1b[44m-- status line --\x1b[K\x1b[0m");
+        s.push_str(&format!("\x1b[{};15H", tall.rows - 1));
+        self.feed(s.as_bytes());
+        let rows = self.with_pane(|pane, _, _| pane.shown_rows()).unwrap();
+        self.expect(
+            "a taller session shows its bottom rows, not its top",
+            rows.len() == viewer.rows as usize
+                && rows[rows.len() - 3..] == ["needle in the output", "> prompt here", "-- status line --"],
+            format!("shown {:?}", &rows[rows.len().saturating_sub(3)..]),
+        );
+        // Select "prompt" on the pane's second-to-last row: the copy is the
+        // text under the pointer.
+        let row = viewer.rows - 2;
+        let (from, to) = (self.at(2, row), self.at(7, row));
+        self.drag(from, to, Modifiers::default());
+        let clip = self.clipboard();
+        self.expect(
+            "a drag on a clipped window selects the row under the pointer",
+            clip.as_deref() == Some("prompt"),
+            format!("copied {clip:?}"),
+        );
+        self.with_pane(|pane, _, _| {
+            pane.terminal_view_mut().start_search("needle", false);
+        })
+        .unwrap();
+        self.save("taller-session.png");
+        self.with_pane(|pane, _, _| pane.terminal_view_mut().clear_search())
+            .unwrap();
+        self.with_pane(|pane, _, cx| pane.session_resized(viewer, cx))
+            .unwrap();
+        self.reset_screen();
     }
 
     fn resize(&mut self) {
