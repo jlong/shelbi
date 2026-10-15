@@ -16,6 +16,13 @@
 //! swapped for the other) is tested without a frame loop. The window asks
 //! [`ColumnSwap::frame`] what to draw each frame and keeps requesting frames
 //! while it says it is animating.
+//!
+//! A swap from rest has its clock start at the first frame drawn for it, not
+//! at the input (`dt-instant-panel-push`): [`ColumnSwap::pace`] pins it
+//! there, one frame in, so that frame already moves, and caps the step to the
+//! second frame, so a slow first frame (the panel built, its first layout)
+//! never skips the fast opening of the ease-out curve. A swap turned around
+//! mid-way runs on the clock from the moment it turned.
 
 use std::time::{Duration, Instant};
 
@@ -61,6 +68,10 @@ impl Motion {
 pub const SLIDE: Duration = Duration::from_millis(220);
 /// A full crossfade (Reduce Motion): shorter, there is no distance to cover.
 pub const FADE: Duration = Duration::from_millis(150);
+
+/// The step a swap's first frame shows, and the most its second may add: one
+/// frame at 60Hz. At 120Hz the second frame comes sooner and is never capped.
+pub const FIRST_STEP: Duration = Duration::from_micros(16_667);
 
 /// Cubic ease-out: fast off the mark, settling into place.
 pub fn ease_out(t: f32) -> f32 {
@@ -113,6 +124,10 @@ struct Transition {
     started: Instant,
     duration: Duration,
     motion: Motion,
+    /// The frames [`ColumnSwap::pace`] has seen (it pins the first two), and
+    /// when the last of them was drawn.
+    paced: u8,
+    paced_at: Option<Instant>,
 }
 
 /// The column's occupant, the swap under way, if any, and the panel to push
@@ -192,7 +207,35 @@ impl ColumnSwap {
             started: now,
             duration: motion.duration().mul_f32(distance),
             motion,
+            // A swap from rest has its clock pinned to its first frames; one
+            // that turns around mid-way is already in motion, frames flowing.
+            paced: if from == 0.0 || from == 1.0 { 0 } else { 2 },
+            paced_at: None,
         });
+    }
+
+    /// A frame is being drawn at `now`: pin the clock of a swap from rest to
+    /// its first frames. The first frame of such a swap shows [`FIRST_STEP`] of it however
+    /// long ago the swap was asked for (the input, a slow frame before it),
+    /// and the second adds at most [`FIRST_STEP`] more however long the first
+    /// took to draw. From then on the swap runs on the clock. Call it before
+    /// [`Self::frame`].
+    pub fn pace(&mut self, now: Instant) {
+        let Some(t) = self.transition.as_mut() else {
+            return;
+        };
+        match (t.paced, t.paced_at) {
+            (0, _) => t.started = now.checked_sub(FIRST_STEP).unwrap_or(now),
+            (1, Some(last)) => {
+                let gap = now.saturating_duration_since(last);
+                if gap > FIRST_STEP {
+                    t.started += gap - FIRST_STEP;
+                }
+            }
+            _ => return,
+        }
+        t.paced += 1;
+        t.paced_at = Some(now);
     }
 
     /// Jump to the end of any swap under way (and of a queued push).
@@ -219,6 +262,11 @@ impl ColumnSwap {
         if let Some((panel, motion)) = self.queued.take() {
             self.panel = panel;
             self.start(panel, 0.0, motion, t.started + t.duration);
+            // It follows on from the pop, frames already running: its clock
+            // needs no pinning.
+            if let Some(next) = self.transition.as_mut() {
+                next.paced = 2;
+            }
             self.settle(now);
         }
     }
@@ -616,6 +664,96 @@ mod tests {
         let c = column(&swap.frame(t0 + SLIDE), true, 40, None).unwrap();
         assert_eq!(c.width_cols, shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH);
         assert_eq!((c.sidebar, c.review, c.workspace), (None, None, Some(Layer::REST)));
+    }
+
+    #[test]
+    fn the_clock_starts_at_the_first_frame_one_step_in() {
+        let mut swap = ColumnSwap::new();
+        let input = Instant::now();
+        swap.show(Occupant::Review, Motion::Slide, input);
+
+        // The first frame comes 90ms after the input (the panel was built in
+        // it): it shows one frame's step of the push, not 90ms of it.
+        let first = input + ms(90);
+        swap.pace(first);
+        let f = swap.frame(first);
+        assert!(f.animating);
+        let step = ease_out(FIRST_STEP.as_secs_f32() / SLIDE.as_secs_f32());
+        assert!(close(f.review.unwrap().opacity, step), "one step in: {:?}", f.review);
+        assert!(f.sidebar.unwrap().offset < 0.0, "the first frame already moves");
+
+        // The first frame took 70ms to draw: the second adds one step, not 70ms.
+        let second = first + ms(70);
+        swap.pace(second);
+        let at = swap.position(second);
+        let two = ease_out(2.0 * FIRST_STEP.as_secs_f32() / SLIDE.as_secs_f32());
+        assert!(close(at, two), "capped to two steps: {at} vs {two}");
+
+        // From then on it runs on the clock: a slow third frame is not capped.
+        let third = second + ms(50);
+        swap.pace(third);
+        let expect = ease_out((2.0 * FIRST_STEP.as_secs_f32() + 0.050) / SLIDE.as_secs_f32());
+        assert!(close(swap.position(third), expect));
+        let end = third + SLIDE;
+        swap.pace(end);
+        assert!(!swap.frame(end).animating);
+    }
+
+    #[test]
+    fn frames_on_time_are_never_held_back() {
+        // 60Hz frames: pacing changes nothing past the first step.
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Workspace, Motion::Slide, t0);
+        swap.pace(t0);
+        let mut now = t0;
+        let mut frames = 1;
+        while swap.frame(now).animating {
+            now += FIRST_STEP;
+            swap.pace(now);
+            frames += 1;
+            assert!(frames < 40, "it ends");
+        }
+        // 220ms at 16.7ms a frame, the first frame already one step in.
+        assert_eq!(frames, 14);
+    }
+
+    #[test]
+    fn a_swap_turned_around_mid_way_is_not_paced() {
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Review, Motion::Slide, t0);
+        swap.pace(t0);
+        swap.frame(t0);
+        let mid = t0 + ms(60);
+        swap.pace(mid);
+        let at = swap.position(mid);
+        swap.show(Occupant::Sidebar, Motion::Slide, mid);
+        swap.pace(mid);
+        assert!(close(swap.position(mid), at), "no step added at the turn");
+    }
+
+    #[test]
+    fn a_hop_through_the_sidebar_keeps_its_clock() {
+        // The second panel's push follows on from the pop: pacing it would
+        // hold the column at the sidebar for a step.
+        let mut swap = ColumnSwap::new();
+        let t0 = Instant::now();
+        swap.show(Occupant::Workspace, Motion::Slide, t0);
+        swap.finish();
+        swap.show(Occupant::Review, Motion::Slide, t0);
+        swap.pace(t0);
+        swap.frame(t0);
+        swap.pace(t0 + ms(16));
+        swap.frame(t0 + ms(16));
+        let pop_end = t0 + SLIDE - FIRST_STEP;
+        let later = pop_end + ms(50);
+        swap.pace(later);
+        swap.frame(later);
+        swap.pace(later + ms(16));
+        let f = swap.frame(later + ms(16));
+        let expect = ease_out(0.066 / SLIDE.as_secs_f32());
+        assert!(close(f.review.unwrap().opacity, expect), "{:?} vs {expect}", f.review);
     }
 
     #[test]

@@ -21,13 +21,20 @@ use shelbi_app::view::{ReviewState, WorkspaceBadge, WorkspaceRow};
 use super::smoke::Harness;
 use super::*;
 use crate::views::column_swap::SLIDE;
-use crate::views::review::tests::{fake_deps, info, row};
-use crate::views::workspace::tests::fake_deps as fake_workspace_deps;
+use std::sync::Arc;
+
+use shelbi_app::review::ReviewTarget;
+
+use crate::views::review::tests::{fake_deps, info, row, FakeOps, FakeSessions};
+use crate::views::workspace::tests::{fake_deps as fake_workspace_deps, FakeSessions as FakeWorkspaceSessions};
 
 struct Column {
     h: Harness,
     now: Rc<Cell<Instant>>,
     reduce_motion: Rc<Cell<bool>>,
+    sessions: Arc<FakeSessions>,
+    ws_sessions: Arc<FakeWorkspaceSessions>,
+    ops: Arc<FakeOps>,
 }
 
 impl Column {
@@ -39,13 +46,13 @@ impl Column {
         let mut h = Harness::open(cx);
         let now = Rc::new(Cell::new(Instant::now()));
         let reduce_motion = Rc::new(Cell::new(false));
-        let (deps, _sessions, ops) = fake_deps();
-        let (ws_deps, _ws_sessions, _ws_ops) = fake_workspace_deps();
-        let (n, r) = (now.clone(), reduce_motion.clone());
+        let (deps, sessions, ops) = fake_deps();
+        let (ws_deps, ws_sessions, _ws_ops) = fake_workspace_deps();
+        let (n, r, o) = (now.clone(), reduce_motion.clone(), ops.clone());
         h.window.update(&mut h.cx, |w, _| {
             w.clock = Rc::new(move || n.get());
             w.reduce_motion = Rc::new(move || r.get());
-            w.review_ops = ops;
+            w.review_ops = o;
             w.review_deps = Some(deps);
             w.workspace_deps = Some(ws_deps);
             w.model.reviews.push(row(ReviewState::Serving));
@@ -57,6 +64,9 @@ impl Column {
             h,
             now,
             reduce_motion,
+            sessions,
+            ws_sessions,
+            ops,
         };
         c.h.draw();
         c
@@ -116,6 +126,28 @@ impl Column {
         })
     }
 
+    /// Ask for review `t-1` as a click or Enter on its row does, and draw
+    /// the next frame, without letting background work (the load flow's
+    /// resolve) run: the frame the user sees before the daemon answers.
+    fn ask_for_review(&mut self) {
+        let window = self.h.window.clone();
+        self.h.cx.update(|win, cx| {
+            window.update(cx, |w, cx| w.perform(HostCall::LoadReview("t-1".into()), win, cx))
+        });
+        self.draw_only();
+    }
+
+    /// Draw a frame without running background work.
+    fn draw_only(&mut self) {
+        self.h.cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// Move the clock on and draw, background work still held.
+    fn advance_only(&mut self, by: Duration) {
+        self.now.set(self.now.get() + by);
+        self.draw_only();
+    }
+
     /// Move the transition's clock on and draw.
     fn advance(&mut self, by: Duration) {
         self.now.set(self.now.get() + by);
@@ -170,13 +202,15 @@ fn a_review_takes_the_sidebars_column_with_a_push(cx: &mut TestAppContext) {
     let column_w = c.width("leading-column");
     c.open_review();
 
-    // The first frame: both, the sidebar in place, the panel just right of
-    // the column (clipped away), the session already beside the column.
+    // The first frame: both, already one frame's step into the push (the
+    // sidebar a little left, the panel coming in from just right of the
+    // column), the session already beside the column.
     assert!(c.drawn("column-sidebar") && c.drawn("column-review"));
     assert_eq!(c.width("leading-column"), column_w, "the column keeps its width");
     let column_x = c.left("leading-column");
-    assert_eq!(c.left("column-sidebar"), column_x);
-    assert_eq!(c.left("column-review"), column_x + column_w);
+    assert!(c.left("column-sidebar") < column_x, "it moves on the first frame");
+    let first = c.left("column-review");
+    assert!(first > column_x + column_w / 2.0 && first < column_x + column_w);
     let session_x = c.left("review-view");
     assert!(session_x >= column_x + column_w, "the session sits right of the column");
 
@@ -416,10 +450,12 @@ fn a_workspace_takes_the_sidebars_column_with_a_push(cx: &mut TestAppContext) {
     let column_x = c.left("leading-column");
     c.open_workspace();
 
-    // The first frame: both, the panel just right of the column.
+    // The first frame: both, the panel one step in from just right of the
+    // column.
     assert!(c.drawn("column-sidebar") && c.drawn("column-workspace"));
     assert!(!c.drawn("column-review"));
-    assert_eq!(c.left("column-workspace"), column_x + column_w);
+    let first = c.left("column-workspace");
+    assert!(first > column_x + column_w / 2.0 && first < column_x + column_w);
     let session_x = c.left("workspace-view");
     assert!(session_x >= column_x + column_w, "the terminal sits right of the column");
 
@@ -521,6 +557,7 @@ fn the_back_button_and_a_toggle_mid_push(cx: &mut TestAppContext) {
 
     // The back button itself.
     c.h.click_selector("ws-back");
+    c.h.draw();
     c.advance(SLIDE);
     assert!(c.drawn("sidebar") && !c.drawn("column-workspace"));
 }
@@ -574,6 +611,7 @@ fn a_collapsed_sidebar_lends_its_column_to_the_workspace_panel(cx: &mut TestAppC
     c.advance(SLIDE);
     assert_eq!(c.width("workspace-panel"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
     c.h.key("escape");
+    c.h.draw();
     c.advance(SLIDE);
     assert!(!c.drawn("leading-column") && c.drawn("expand-sidebar"));
     assert!(c.read(|w, _| w.collapsed));
@@ -590,4 +628,119 @@ fn reduce_motion_crossfades_the_workspace_panel(cx: &mut TestAppContext) {
     assert_eq!(c.left("column-workspace"), column_x, "no slide");
     c.advance(crate::views::column_swap::FADE);
     assert!(!c.drawn("column-sidebar") && c.drawn("workspace-panel"));
+}
+
+// --- dt-instant-panel-push --------------------------------------------------
+
+#[gpui::test]
+fn the_push_starts_on_the_input_before_the_load_answers(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    let (column_x, column_w) = (c.left("leading-column"), c.width("leading-column"));
+
+    // The click's very next frame: the panel is in the column and moving,
+    // its title from the sidebar row and placeholders for the rest, though
+    // the resolve hasn't even run.
+    c.ask_for_review();
+    assert!(c.drawn("column-sidebar") && c.drawn("column-review"));
+    assert!(c.left("column-sidebar") < column_x, "moving on the first frame");
+    assert!(c.read(|w, cx| w.review.as_ref().unwrap().read(cx).is_pending()));
+    assert!(c.drawn("review-title") && c.drawn("review-loading"));
+    assert!(!c.drawn("review-approve"), "nothing to decide on yet");
+    c.advance_only(Duration::from_millis(50));
+    let before = c.left("column-review");
+    assert!(before > column_x && before < column_x + column_w);
+
+    // The resolve answers mid-push: the panel fills in where it stands, and
+    // the content waits for the push to settle.
+    c.h.cx.run_until_parked();
+    c.draw_only();
+    assert!(!c.read(|w, cx| w.review.as_ref().unwrap().read(cx).is_pending()));
+    assert!(c.drawn("review-server") && c.drawn("review-approve") && !c.drawn("review-loading"));
+    assert!((c.left("column-review") - before).abs() < 0.5, "no jump when it fills in");
+    assert!(c.sessions.attached().is_empty(), "no attach in the push's frames");
+
+    // Settled: the reviewer attaches.
+    c.advance(SLIDE);
+    assert!(!c.drawn("column-sidebar"));
+    c.h.cx.run_until_parked();
+    assert_eq!(c.sessions.attached(), vec!["alpha/ws/review-1".to_string()]);
+}
+
+#[gpui::test]
+fn a_load_that_fails_mid_push_turns_back_from_where_it_stands(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    *c.ops.resolve_with.lock().unwrap() = Some(Err("`t-1` is not a review task".into()));
+    c.ask_for_review();
+    c.advance_only(Duration::from_millis(60));
+    let at = c.left("column-review");
+
+    // The resolve fails: the push turns around where it is, no freeze, no
+    // jump, and the failure is reported.
+    c.h.cx.run_until_parked();
+    c.draw_only();
+    assert!((c.left("column-review") - at).abs() < 0.5, "no jump: {at} then {}", c.left("column-review"));
+    c.advance(Duration::from_millis(30));
+    assert!(c.left("column-review") > at, "now leaving right");
+    assert!(c.read(|w, _| w.banner.as_ref().is_some_and(|b| b.contains("not a review task"))));
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar") && !c.drawn("column-review"));
+    assert!(c.sessions.attached().is_empty(), "nothing attached");
+    assert_eq!(c.h.take_calls(), vec![HostCall::ShowView(View::Machines)], "back where it was");
+}
+
+#[gpui::test]
+fn a_slot_prompt_shows_over_the_panel_and_dismissing_it_backs_out(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    *c.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Queued {
+        title: "Cold-start cache".into(),
+        free_slots: vec!["review-1".into()],
+        total_slots: 1,
+    }));
+    c.ask_for_review();
+    c.h.cx.run_until_parked();
+    c.draw_only();
+    assert!(c.read(|w, _| matches!(w.overlay, Some(ActiveOverlay::ReviewConfirm { .. }))));
+    assert!(c.drawn("column-review"), "the panel stays up behind the prompt");
+    c.advance(SLIDE);
+    assert!(c.drawn("review-loading") && !c.drawn("column-sidebar"));
+
+    // Dismissed: no slot, so the panel backs out.
+    c.h.key("escape");
+    c.h.draw();
+    assert!(c.read(|w, _| w.overlay.is_none()));
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar") && !c.drawn("column-review"));
+}
+
+#[gpui::test]
+fn the_push_clock_starts_at_the_first_frame(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    let (column_x, column_w) = (c.left("leading-column"), c.width("leading-column"));
+    let (window, now) = (c.h.window.clone(), c.now.clone());
+    // The first frame comes 150ms after the input (a slow one, the panel
+    // built in it): it still shows the push's first step, not 150ms of it,
+    // which would have it nearly in.
+    c.h.cx.update(|win, cx| {
+        window.update(cx, |w, cx| w.perform(HostCall::LoadReview("t-1".into()), win, cx));
+        now.set(now.get() + Duration::from_millis(150));
+    });
+    c.draw_only();
+    let first = c.left("column-review");
+    let step = 1.0 - crate::views::column_swap::ease_out(1.0 / 60.0 / SLIDE.as_secs_f32());
+    assert!((first - (column_x + column_w * step)).abs() < 1.0, "one step in: {first}");
+    c.advance_only(Duration::from_millis(16));
+    assert!(c.left("column-review") < first, "and on from there");
+}
+
+#[gpui::test]
+fn a_workspace_attaches_once_its_push_settles(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_workspace();
+    assert!(c.drawn("column-workspace") && c.drawn("column-sidebar"));
+    assert!(c.ws_sessions.attached().is_empty(), "no attach in the push's frames");
+    c.advance(SLIDE / 2);
+    assert!(c.ws_sessions.attached().is_empty());
+    c.advance(SLIDE);
+    c.h.cx.run_until_parked();
+    assert_eq!(c.ws_sessions.attached(), vec!["alpha/ws/alpha-1".to_string()]);
 }

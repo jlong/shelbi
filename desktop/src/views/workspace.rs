@@ -43,6 +43,11 @@
 //!   the workspace was opened over, leaving its sessions as they are.
 //! - **Restart states** are the shared session view's (the Chat view's).
 //! - **Drop to paste.** Files dropped on either terminal paste their paths.
+//!
+//! While the window's column push runs, the window holds the agent pane's
+//! attach ([`WorkspaceView::hold_content`], `dt-instant-panel-push`): the
+//! panel draws at once, and the session's connect, replay and first layout
+//! land after the push has settled.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -196,6 +201,10 @@ pub struct WorkspaceView {
     /// Bumped whenever the shown workspace changes; a background result for
     /// an older one is dropped.
     generation: u64,
+    /// The window's push is running: the left pane waits to attach.
+    hold: bool,
+    /// The attach that waited for the push.
+    held: Option<SessionRef>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -267,6 +276,8 @@ impl WorkspaceView {
             status_line: None,
             description_open: false,
             generation: 0,
+            hold: false,
+            held: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -300,8 +311,42 @@ impl WorkspaceView {
         self.shown = true;
         self.set_row(row, cx);
         let target = self.agent_target();
-        self.content.update(cx, |c, cx| c.show_target(target, cx));
+        self.attach(target, cx);
         cx.notify();
+    }
+
+    /// Hold the left pane's attach until [`Self::release_content`] (the
+    /// window, while its push runs), or stop holding (attaching what waited).
+    pub fn hold_content(&mut self, hold: bool, cx: &mut Context<Self>) {
+        if hold {
+            self.hold = true;
+        } else {
+            self.release_content(cx);
+        }
+    }
+
+    /// The push has settled: attach the pane that waited for it.
+    pub fn release_content(&mut self, cx: &mut Context<Self>) {
+        self.hold = false;
+        if let Some(target) = self.held.take() {
+            if self.shown {
+                self.attach(target, cx);
+            }
+        }
+    }
+
+    /// An attach is waiting for the push to settle.
+    pub fn is_holding(&self) -> bool {
+        self.hold
+    }
+
+    /// Point the left pane at `target`, or keep it for after the push.
+    fn attach(&mut self, target: SessionRef, cx: &mut Context<Self>) {
+        if self.hold {
+            self.held = Some(target);
+            return;
+        }
+        self.content.update(cx, |c, cx| c.show_target(target, cx));
     }
 
     /// Hide the view: detach the panes and close the user shell.
@@ -312,6 +357,7 @@ impl WorkspaceView {
         self.shown = false;
         self.description_open = false;
         self.dragging = false;
+        self.held = None;
         self.close_panes(cx);
         cx.notify();
     }
@@ -593,7 +639,7 @@ impl WorkspaceView {
                         workspace,
                         role: role.as_str().to_string(),
                     };
-                    this.content.update(cx, |c, cx| c.show_target(target, cx));
+                    this.attach(target, cx);
                 }
                 Ok(()) => {}
                 Err(e) => {
@@ -608,7 +654,7 @@ impl WorkspaceView {
     fn show_agent(&mut self, cx: &mut Context<Self>) {
         self.panel.set_active(ContentView::Agent);
         let target = self.agent_target();
-        self.content.update(cx, |c, cx| c.show_target(target, cx));
+        self.attach(target, cx);
         cx.notify();
     }
 
@@ -1238,7 +1284,9 @@ impl WorkspaceView {
             .min_w_0()
             .size_full()
             .bg(theme.surface)
-            .child(self.render_panes(&theme, cx))
+            // Waiting for the push to settle: an empty canvas, not the
+            // pane's "no session" notice.
+            .children((self.held.is_none()).then(|| self.render_panes(&theme, cx)))
             .children(self.render_description(&theme, cx))
             .into_any_element()
     }
@@ -1290,7 +1338,7 @@ pub(crate) mod tests {
     }
 
     impl FakeSessions {
-        fn attached(&self) -> Vec<String> {
+        pub(crate) fn attached(&self) -> Vec<String> {
             self.attaches.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
         }
 

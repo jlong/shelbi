@@ -34,6 +34,14 @@
 //! - **Back** (the back button, Esc) leaves the review loaded and returns to
 //!   the previous view; **Close** (`q`) asks the daemon to end the editor,
 //!   diff and server sessions and free the slot's port, then returns too.
+//!
+//! The window opens the panel the moment the review is asked for, before the
+//! load flow has resolved it (`dt-instant-panel-push`): [`ReviewView::show_pending`]
+//! shows what the sidebar row knows (the title) with placeholders for the
+//! rest, and [`ReviewView::show`] fills it in when the resolve answers. While
+//! the column's push runs the window holds the content's attach
+//! ([`ReviewView::hold_content`]), so the session's connect, replay and
+//! first layout land after the push has settled, not in its frames.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -203,6 +211,9 @@ struct Shown {
     panel: ReviewPanelState,
     content: Entity<SessionView>,
     _content_events: Subscription,
+    /// The load flow has resolved the review: `info` is the daemon's, not
+    /// the placeholder built from the sidebar row.
+    resolved: bool,
 }
 
 /// The Review view for one project window. It shows one review at a time;
@@ -220,6 +231,10 @@ pub struct ReviewView {
     /// Bumped whenever the shown review changes; a background result for an
     /// older one is dropped.
     generation: u64,
+    /// The window's push is running: the content waits to attach.
+    hold: bool,
+    /// The attach that waited for the push.
+    held: Option<SessionRef>,
     focus_handle: FocusHandle,
 }
 
@@ -244,6 +259,8 @@ impl ReviewView {
             focus: ReviewFocus::Panel,
             description_open: false,
             generation: 0,
+            hold: false,
+            held: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -255,6 +272,83 @@ impl ReviewView {
 
     pub fn is_shown(&self) -> bool {
         self.shown
+    }
+
+    /// The shown review is only the placeholder: the load flow hasn't
+    /// resolved it yet.
+    pub fn is_pending(&self) -> bool {
+        self.shown && self.review.as_ref().is_some_and(|r| !r.resolved)
+    }
+
+    /// Hold the content's attach until [`Self::release_content`] (the window,
+    /// while its push runs), or stop holding (attaching what waited).
+    pub fn hold_content(&mut self, hold: bool, cx: &mut Context<Self>) {
+        if hold {
+            self.hold = true;
+        } else {
+            self.release_content(cx);
+        }
+    }
+
+    /// The push has settled: attach the content that waited for it.
+    pub fn release_content(&mut self, cx: &mut Context<Self>) {
+        self.hold = false;
+        if let Some(target) = self.held.take() {
+            if self.shown {
+                self.attach(target, cx);
+            }
+        }
+    }
+
+    /// An attach is waiting for the push to settle.
+    pub fn is_holding(&self) -> bool {
+        self.hold
+    }
+
+    /// Show `task` at once, before the load flow has resolved it: the panel
+    /// with what its sidebar `row` knows (the title, the slot, the server's
+    /// state) and placeholders for the rest, the content still empty.
+    /// [`Self::show`] fills it in. The review already shown (re-entering it)
+    /// keeps what it had until then, its content re-attaching.
+    pub fn show_pending(&mut self, task: &str, row: Option<ReviewRow>, cx: &mut Context<Self>) {
+        if self.task_id() == Some(task) {
+            if let Some(r) = self.review.as_mut() {
+                if row.is_some() {
+                    r.row = row;
+                    r.model = ReviewPanelModel::build(&r.info, r.row.as_ref());
+                    r.panel.sync(&r.model);
+                }
+            }
+            self.shown = true;
+            if self.review.as_ref().is_some_and(|r| r.resolved) {
+                self.show_active(cx);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(old) = self.review.take() {
+            old.content.update(cx, |c, cx| c.hide(cx));
+        }
+        self.generation += 1;
+        self.description_open = false;
+        self.focus = ReviewFocus::Panel;
+        self.held = None;
+        let info = ReviewInfo {
+            task_id: task.to_string(),
+            slot: row.as_ref().and_then(|r| r.workspace.clone()).unwrap_or_default(),
+            title: row.as_ref().map(|r| r.title.clone()).unwrap_or_default(),
+            body: String::new(),
+            worktree: String::new(),
+            editor_name: String::new(),
+            review_url: None,
+            has_health_check: false,
+            remote_machine: None,
+        };
+        let mut shown = self.build(info, row, cx);
+        shown.resolved = false;
+        self.review = Some(shown);
+        self.shown = true;
+        cx.notify();
     }
 
     /// The panel as shown now.
@@ -271,7 +365,12 @@ impl ReviewView {
     /// task again re-attaches its content (re-entering a review; a failed
     /// view re-opens); another task starts fresh on Reviewer.
     pub fn show(&mut self, info: ReviewInfo, row: Option<ReviewRow>, cx: &mut Context<Self>) {
-        let same = self.task_id() == Some(info.task_id.as_str());
+        // A placeholder is replaced outright: its content was built for the
+        // slot the sidebar row guessed, and never attached.
+        let same = self
+            .review
+            .as_ref()
+            .is_some_and(|r| r.resolved && r.info.task_id == info.task_id);
         if !same {
             if let Some(old) = self.review.take() {
                 old.content.update(cx, |c, cx| c.hide(cx));
@@ -279,11 +378,14 @@ impl ReviewView {
             self.generation += 1;
             self.description_open = false;
             self.focus = ReviewFocus::Panel;
+            self.held = None;
             self.review = Some(self.build(info, row, cx));
         } else if let Some(r) = self.review.as_mut() {
-            // Fresh inputs (the description, the URL) for the same review.
+            // Fresh inputs (the description, the URL) for the same review,
+            // or the resolve filling in its placeholder.
             r.info = info;
             r.row = row;
+            r.resolved = true;
             r.model = ReviewPanelModel::build(&r.info, r.row.as_ref());
             r.panel.sync(&r.model);
         }
@@ -320,6 +422,7 @@ impl ReviewView {
             panel,
             content,
             _content_events: events,
+            resolved: true,
         }
     }
 
@@ -330,6 +433,7 @@ impl ReviewView {
         }
         self.shown = false;
         self.description_open = false;
+        self.held = None;
         if let Some(r) = &self.review {
             r.content.update(cx, |c, cx| c.hide(cx));
         }
@@ -476,6 +580,10 @@ impl ReviewView {
     }
 
     fn attach(&mut self, target: SessionRef, cx: &mut Context<Self>) {
+        if self.hold {
+            self.held = Some(target);
+            return;
+        }
         if let Some(r) = &self.review {
             r.content.update(cx, |c, cx| c.show_target(target, cx));
         }
@@ -540,6 +648,10 @@ impl ReviewView {
         let Some(task) = self.task_id().map(str::to_string) else {
             return;
         };
+        // A placeholder offers Back alone until the resolve fills it in.
+        if self.is_pending() && effect != PanelEffect::Back {
+            return;
+        }
         match effect {
             PanelEffect::None => {}
             PanelEffect::Back => cx.emit(ReviewEvent::Back),
@@ -808,6 +920,37 @@ impl ReviewView {
                 .into_any_element()
         };
 
+        let body: Vec<AnyElement> = if shown.resolved {
+            let mut body = vec![div().flex().flex_col().gap_1().child(task_info).children(more).into_any_element()];
+            body.extend(folder.map(IntoElement::into_any_element));
+            body.extend([
+                server.into_any_element(),
+                div().flex().flex_col().gap_0p5().children(switches).into_any_element(),
+                actions,
+            ]);
+            body
+        } else {
+            // The load flow hasn't answered yet: the title the sidebar row
+            // gave, and placeholders where the rest will land.
+            let placeholder = |selector: &'static str| {
+                div()
+                    .debug_selector(move || selector.into())
+                    .text_color(theme.text_quiet)
+                    .child("Loading…")
+            };
+            vec![
+                task_info.child(placeholder("review-loading")).into_any_element(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .px_2()
+                    .child(style::heading("Server", theme).pb_0p5())
+                    .child(placeholder("review-server-loading"))
+                    .into_any_element(),
+            ]
+        };
+
         div()
             .id("review-panel")
             .debug_selector(|| "review-panel".into())
@@ -827,11 +970,7 @@ impl ReviewView {
             .text_sm()
             .text_color(theme.text)
             .child(header)
-            .child(div().flex().flex_col().gap_1().child(task_info).children(more))
-            .children(folder)
-            .child(server)
-            .child(div().flex().flex_col().gap_0p5().children(switches))
-            .child(actions)
+            .children(body)
             .when_some(panel.status_line().map(str::to_string), |d, line| {
                 d.child(
                     div()
@@ -1022,7 +1161,10 @@ impl ReviewView {
             return root.into_any_element();
         };
         let description = self.render_description(shown, &theme, cx);
-        root.child(
+        // Not resolved yet, or waiting for the push to settle: an empty
+        // canvas, not the content's "no session" notice.
+        let waiting = !shown.resolved || self.held.is_some();
+        root.children((!waiting).then(|| {
             div()
                 .debug_selector(|| "review-content".into())
                 .flex()
@@ -1030,8 +1172,8 @@ impl ReviewView {
                 .min_w_0()
                 .min_h_0()
                 .h_full()
-                .child(shown.content.clone()),
-        )
+                .child(shown.content.clone())
+        }))
         .children(description)
         .into_any_element()
     }
@@ -1090,7 +1232,7 @@ pub(crate) mod tests {
     }
 
     impl FakeSessions {
-        fn attached(&self) -> Vec<String> {
+        pub(crate) fn attached(&self) -> Vec<String> {
             self.attaches.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
         }
     }
@@ -1129,11 +1271,16 @@ pub(crate) mod tests {
         ops: Mutex<Vec<(String, ReviewSessionOp)>>,
         fail_ops: Mutex<bool>,
         opened: Mutex<Vec<String>>,
+        /// What a resolve answers instead of serving [`info`].
+        pub(crate) resolve_with: Mutex<Option<Result<ReviewTarget, String>>>,
     }
 
     impl ReviewOps for FakeOps {
         fn resolve(&self, _project: &str, _task: &str) -> Result<ReviewTarget, String> {
-            Ok(ReviewTarget::Serving(info()))
+            match &*self.resolve_with.lock().unwrap() {
+                Some(answer) => answer.clone(),
+                None => Ok(ReviewTarget::Serving(info())),
+            }
         }
         fn session_op(&self, _project: &str, task: &str, op: ReviewSessionOp) -> Result<(), String> {
             self.ops.lock().unwrap().push((task.to_string(), op));

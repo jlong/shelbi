@@ -18,7 +18,9 @@
 //!
 //! Options: `--runs <n>` (default 5), `--latency-ms <n>` (default 400),
 //! `--replay-kb <n>` (default 256), `--resolve <project> <task>` (time the
-//! real resolve of `task`, read-only, and use its median as the latency).
+//! real resolve of `task`, read-only, and use its median as the latency),
+//! `--offscreen` (no display needed: a hidden window drawn on a 60Hz timer
+//! of the bench's own, for a locked screen; see [`drive_ticks`]).
 //!
 //! ```sh
 //! cargo run --release --features visual-check -- --bench-push
@@ -220,6 +222,7 @@ struct Options {
     runs: usize,
     latency: Duration,
     replay_kb: usize,
+    offscreen: bool,
 }
 
 fn parse(args: &[String]) -> Options {
@@ -227,6 +230,7 @@ fn parse(args: &[String]) -> Options {
         runs: 5,
         latency: Duration::from_millis(400),
         replay_kb: 256,
+        offscreen: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -239,6 +243,7 @@ fn parse(args: &[String]) -> Options {
             "--runs" => o.runs = num("--runs") as usize,
             "--latency-ms" => o.latency = Duration::from_millis(num("--latency-ms")),
             "--replay-kb" => o.replay_kb = num("--replay-kb") as usize,
+            "--offscreen" => o.offscreen = true,
             "--resolve" => {
                 let project = it.next().expect("--resolve <project> <task>").clone();
                 let task = it.next().expect("--resolve <project> <task>").clone();
@@ -362,21 +367,100 @@ fn report(pushes: &[Push], refresh: Duration) {
     }
 }
 
-/// Run it and exit.
-pub fn run(args: &[String]) -> ! {
-    let opts = parse(args);
-    println!(
-        "bench-push: {} run(s), resolve latency {:.0} ms, replay {} KiB",
-        opts.runs,
-        ms(opts.latency),
-        opts.replay_kb
-    );
-    let probe = Rc::new(RefCell::new(Probe::default()));
+/// The deps the bench window runs on.
+fn deps(opts: &Options) -> (ReviewDeps, WorkspaceDeps) {
     let sessions = Arc::new(Sessions {
         replay: replay(opts.replay_kb),
         streams: Mutex::new(Vec::new()),
     });
     let ops = Arc::new(Ops { latency: opts.latency });
+    let session_deps = Rc::new(move || SessionDeps {
+        connector: sessions.clone(),
+        relauncher: sessions.clone(),
+        retry: RetryPolicy::default(),
+        reconnect: ReconnectPolicy::default(),
+        clock: Rc::new(Instant::now),
+    });
+    let review = {
+        let d = session_deps.clone();
+        ReviewDeps {
+            ops: ops.clone(),
+            sessions: Rc::new(move |_task| d()),
+        }
+    };
+    let workspace = WorkspaceDeps {
+        ops,
+        sessions: session_deps,
+    };
+    (review, workspace)
+}
+
+/// What the bench does, and when (ms after the window is up): each run opens
+/// a review, goes back, opens a workspace and goes back.
+#[derive(Clone)]
+enum Step {
+    Perform(HostCall),
+    Back,
+}
+
+fn script(runs: usize) -> Vec<(u64, &'static str, Step, bool)> {
+    let mut steps = Vec::new();
+    let mut at = 1000;
+    for _ in 0..runs {
+        for (label, back, call) in [
+            ("review in", "review back", HostCall::LoadReview("cold-start".into())),
+            ("workspace in", "workspace back", HostCall::ShowView(View::Session("alpha".into()))),
+        ] {
+            steps.push((at, label, Step::Perform(call), false));
+            at += 1400;
+            steps.push((at, back, Step::Back, true));
+            at += 700;
+        }
+    }
+    steps
+}
+
+fn take(step: Step, w: &mut ShelbiWindow, window: &mut gpui::Window, cx: &mut gpui::Context<ShelbiWindow>) {
+    match step {
+        Step::Perform(call) => w.bench_perform(call, window, cx),
+        Step::Back => w.bench_back(window, cx),
+    }
+}
+
+fn finish(frames: &[FrameMark], pushes: Vec<(&'static str, Instant, bool)>) {
+    println!("{} frame(s) drawn", frames.len());
+    if frames.len() < 10 {
+        println!("the window hardly drew: is the screen locked or asleep? (try --offscreen)");
+    }
+    let measured: Vec<Push> = pushes
+        .into_iter()
+        .map(|(label, input, leaving)| measure(label, input, frames, leaving))
+        .collect();
+    let mut intervals: Vec<Duration> = frames
+        .windows(2)
+        .filter(|w| w[0].animating && w[1].animating)
+        .map(|w| w[1].start - w[0].start)
+        .collect();
+    intervals.sort();
+    let refresh = intervals.get(intervals.len() / 2).copied().unwrap_or(FRAME);
+    report(&measured, refresh);
+}
+
+/// A 60Hz display's frame.
+const FRAME: Duration = Duration::from_micros(16_667);
+
+/// Run it and exit.
+pub fn run(args: &[String]) -> ! {
+    let opts = parse(args);
+    println!(
+        "bench-push: {} run(s), resolve latency {:.0} ms, replay {} KiB, {}",
+        opts.runs,
+        ms(opts.latency),
+        opts.replay_kb,
+        if opts.offscreen { "hidden window drawn at 60Hz by the bench" } else { "on screen" }
+    );
+    let probe = Rc::new(RefCell::new(Probe::default()));
+    let (review, workspace) = deps(&opts);
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .run(move |cx: &mut App| {
@@ -384,27 +468,6 @@ pub fn run(args: &[String]) -> ! {
             crate::theme::init(cx);
             crate::assets::load_fonts(cx);
             crate::elements::terminal::TerminalSettings::init(cx);
-            let session_deps = {
-                let s = sessions.clone();
-                Rc::new(move || SessionDeps {
-                    connector: s.clone(),
-                    relauncher: s.clone(),
-                    retry: RetryPolicy::default(),
-                    reconnect: ReconnectPolicy::default(),
-                    clock: Rc::new(Instant::now),
-                })
-            };
-            let review = {
-                let d = session_deps.clone();
-                ReviewDeps {
-                    ops: ops.clone(),
-                    sessions: Rc::new(move |_task| d()),
-                }
-            };
-            let workspace = WorkspaceDeps {
-                ops: ops.clone(),
-                sessions: session_deps,
-            };
             let p = probe.clone();
             let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
             let handle = cx
@@ -416,6 +479,7 @@ pub fn run(args: &[String]) -> ! {
                         // focus from whatever the user is doing.
                         kind: WindowKind::PopUp,
                         focus: false,
+                        show: !opts.offscreen,
                         ..Default::default()
                     },
                     move |window, cx| {
@@ -423,27 +487,15 @@ pub fn run(args: &[String]) -> ! {
                     },
                 )
                 .expect("open the bench window");
-            let runs = opts.runs;
+            let (runs, offscreen) = (opts.runs, opts.offscreen);
             let probe = probe.clone();
             cx.spawn(async move |cx| {
-                let pushes = drive(handle, runs, cx).await;
-                let frames = probe.borrow().frames.clone();
-                println!("{} frame(s) drawn", frames.len());
-                if frames.len() < 10 {
-                    println!("the window hardly drew: is the screen locked or asleep?");
-                }
-                let mut measured = Vec::new();
-                for (label, input, leaving) in pushes {
-                    measured.push(measure(label, input, &frames, leaving));
-                }
-                let mut intervals: Vec<Duration> = frames
-                    .windows(2)
-                    .filter(|w| w[0].animating && w[1].animating)
-                    .map(|w| w[1].start - w[0].start)
-                    .collect();
-                intervals.sort();
-                let refresh = intervals.get(intervals.len() / 2).copied().unwrap_or(Duration::from_micros(16_667));
-                report(&measured, refresh);
+                let pushes = if offscreen {
+                    drive_ticks(handle, runs, cx).await
+                } else {
+                    drive(handle, runs, cx).await
+                };
+                finish(&probe.borrow().frames, pushes);
                 cx.update(|cx| cx.quit());
             })
             .detach();
@@ -451,32 +503,61 @@ pub fn run(args: &[String]) -> ! {
     std::process::exit(0)
 }
 
-/// Open and leave a review, then a workspace, `runs` times. Returns each
-/// push's label, input time, and whether it went back to the sidebar.
+/// Run the script against the real display's frames.
 async fn drive(
     handle: WindowHandle<ShelbiWindow>,
     runs: usize,
     cx: &mut AsyncApp,
 ) -> Vec<(&'static str, Instant, bool)> {
     let mut pushes = Vec::new();
-    let wait = |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
-    wait(cx, 1000).await;
-    for _ in 0..runs {
-        for (label, call) in [
-            ("review in", HostCall::LoadReview("cold-start".into())),
-            ("workspace in", HostCall::ShowView(View::Session("alpha".into()))),
-        ] {
+    let started = Instant::now();
+    for (at, label, step, leaving) in script(runs) {
+        let due = started + Duration::from_millis(at);
+        cx.background_executor()
+            .timer(due.saturating_duration_since(Instant::now()))
+            .await;
+        let input = Instant::now();
+        handle.update(cx, |w, window, cx| take(step, w, window, cx)).ok();
+        pushes.push((label, input, leaving));
+    }
+    cx.background_executor().timer(Duration::from_millis(700)).await;
+    pushes
+}
+
+/// Run the script with no display (a locked screen, CI): the window is
+/// hidden, so macOS never draws it, and the bench draws it itself on a 60Hz
+/// timer of its own. The timer fires on the main thread, so work that holds
+/// the main thread between frames (a background result landing, a session's
+/// replay fed) makes the next frame late, as it would miss a vsync.
+async fn drive_ticks(
+    handle: WindowHandle<ShelbiWindow>,
+    runs: usize,
+    cx: &mut AsyncApp,
+) -> Vec<(&'static str, Instant, bool)> {
+    let mut steps = script(runs).into_iter().peekable();
+    let mut pushes = Vec::new();
+    let started = Instant::now();
+    let end = started + Duration::from_millis(steps.clone().last().map_or(0, |s| s.0) + 700);
+    let mut next = started;
+    while next < end {
+        cx.background_executor()
+            .timer(next.saturating_duration_since(Instant::now()))
+            .await;
+        let tick = Instant::now();
+        while let Some((_, label, step, leaving)) = steps.next_if(|s| started + Duration::from_millis(s.0) <= tick) {
             let input = Instant::now();
-            handle
-                .update(cx, |w, window, cx| w.bench_perform(call, window, cx))
-                .ok();
-            pushes.push((label, input, false));
-            wait(cx, 1400).await;
-            let back = if label == "review in" { "review back" } else { "workspace back" };
-            let input = Instant::now();
-            handle.update(cx, |w, window, cx| w.bench_back(window, cx)).ok();
-            pushes.push((back, input, true));
-            wait(cx, 700).await;
+            handle.update(cx, |w, window, cx| take(step, w, window, cx)).ok();
+            pushes.push((label, input, leaving));
+        }
+        // Through the untyped handle: drawing renders the root view, which
+        // a typed update would hold.
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .ok();
+        let done = Instant::now();
+        next += FRAME;
+        if next < done {
+            // Overran: the next vsync it can make.
+            next += FRAME * ((done - next).as_micros() / FRAME.as_micros() + 1) as u32;
         }
     }
     pushes
