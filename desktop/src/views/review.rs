@@ -53,9 +53,10 @@ use shelbi_app::{CommandKind, ReviewSessionOp};
 
 use super::session_view::{SessionDeps, SessionView, SessionViewEvent};
 use super::sidebar::TRAFFIC_LIGHT_INSET;
-use crate::assets::{heroicon, icons, ICON_SIZE};
+use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
+use crate::theme::style::{self, ButtonKind, IconButtonSize, NAV_ROW_H};
 use crate::theme::Theme;
 
 /// The blocking work behind a review, run on the background executor:
@@ -657,21 +658,27 @@ impl ReviewView {
         let server = self.render_server(model, theme, cx);
         let focused = self.focus == ReviewFocus::Panel;
         let selected = |row: PanelRow| focused && panel.selected_row() == Some(row);
-        let row_base = |id: &'static str, row: PanelRow| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .rounded_md()
-                .cursor_pointer()
-                .when(selected(row), |d| d.bg(theme.selection))
-                .when(!selected(row), |d| d.hover(|s| s.bg(theme.search)))
-                .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
+        // `current`: the row is the page the main area shows (the raised
+        // chip); the keyboard's row carries the brand pill.
+        let row_state = |id: &'static str, row: PanelRow, current: bool| {
+            style::row_state(
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .rounded_lg()
+                    .cursor_pointer(),
+                current,
+                selected(row),
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
         };
+        let row_base = |id: &'static str, row: PanelRow| row_state(id, row, false);
 
         let header = div()
             .flex()
@@ -680,16 +687,18 @@ impl ReviewView {
             .gap_3()
             .child(
                 row_base("review-back", PanelRow::Back)
-                    .size(ICON_SIZE + px(12.0))
+                    .size(px(IconButtonSize::Default.px()))
+                    .rounded_xl()
                     .justify_center()
                     .px_0()
-                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.gray)),
+                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.icon)),
             )
             .child(
                 div()
                     .debug_selector(|| "review-status".into())
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.cyan)
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.info)
                     .child(model.status_label.clone()),
             );
 
@@ -701,8 +710,8 @@ impl ReviewView {
             .child(
                 div()
                     .debug_selector(|| "review-title".into())
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.white)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_loud)
                     .child(if model.title.is_empty() {
                         model.task_id.clone()
                     } else {
@@ -713,7 +722,7 @@ impl ReviewView {
                 d.child(
                     div()
                         .debug_selector(|| "review-description".into())
-                        .text_color(theme.gray)
+                        .text_color(theme.text)
                         .text_ellipsis()
                         .line_clamp(3)
                         .child(model.description.clone()),
@@ -721,20 +730,20 @@ impl ReviewView {
             });
         let more = model.has_body().then(|| {
             row_base("review-more", PanelRow::More)
-                .child(div().text_color(theme.cyan).child("More"))
+                .child(div().text_color(theme.link).child("More"))
         });
 
         let folder = (!model.is_remote()).then(|| {
             row_base("review-folder", PanelRow::Folder)
                 .h(px(26.0))
-                .child(heroicon(icons::FOLDER_OPEN).text_color(theme.muted))
+                .child(heroicon(icons::FOLDER_OPEN).text_color(theme.icon))
                 .child(
                     div()
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis_start()
-                        .text_color(theme.gray)
+                        .text_color(theme.text)
                         .child(model.worktree.clone()),
                 )
         });
@@ -752,12 +761,9 @@ impl ReviewView {
                 ReviewSwitch::Editor => panel.active() == ActiveView::Editor,
                 ReviewSwitch::Browser => false,
             };
-            let color = if active { theme.white } else { theme.gray };
-            row_base(id, PanelRow::Switch(*item))
-                .h(px(30.0))
-                .text_color(color)
-                .when(active, |d| d.font_weight(FontWeight::BOLD).bg(theme.selection))
-                .child(heroicon(icon).text_color(color))
+            row_state(id, PanelRow::Switch(*item), active)
+                .h(px(NAV_ROW_H - 4.0))
+                .child(heroicon(icon).text_color(theme.icon))
                 .child(item.label(&model.editor_name))
         });
 
@@ -765,8 +771,8 @@ impl ReviewView {
             div()
                 .debug_selector(|| "review-merging".into())
                 .px_2()
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.yellow)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.warning)
                 .child("Merging the PR…")
                 .into_any_element()
         } else {
@@ -774,21 +780,30 @@ impl ReviewView {
                 .flex()
                 .flex_row()
                 .gap_2()
+                .px_2()
                 .child(
-                    row_base("review-approve", PanelRow::Approve)
-                        .h(px(28.0))
-                        .text_color(theme.green)
-                        .font_weight(FontWeight::BOLD)
-                        .child(heroicon(icons::CHECK).text_color(theme.green))
-                        .child("Approve"),
+                    style::button(
+                        "review-approve",
+                        "Approve",
+                        ButtonKind::Primary,
+                        selected(PanelRow::Approve),
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.click(PanelRow::Approve, window, cx)
+                    })),
                 )
                 .child(
-                    row_base("review-reject", PanelRow::Reject)
-                        .h(px(28.0))
-                        .text_color(theme.red)
-                        .font_weight(FontWeight::BOLD)
-                        .child(heroicon(icons::X_MARK).text_color(theme.red))
-                        .child("Reject"),
+                    style::button(
+                        "review-reject",
+                        "Reject",
+                        ButtonKind::Secondary,
+                        selected(PanelRow::Reject),
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.click(PanelRow::Reject, window, cx)
+                    })),
                 )
                 .into_any_element()
         };
@@ -808,9 +823,9 @@ impl ReviewView {
             // the sidebar's header is.
             .pt(px(TRAFFIC_LIGHT_INSET))
             .overflow_y_scroll()
-            .bg(theme.background)
+            .bg(theme.surface_recessed)
             .text_sm()
-            .text_color(theme.gray)
+            .text_color(theme.text)
             .child(header)
             .child(div().flex().flex_col().gap_1().child(task_info).children(more))
             .children(folder)
@@ -822,7 +837,7 @@ impl ReviewView {
                     div()
                         .debug_selector(|| "review-status-line".into())
                         .px_2()
-                        .text_color(theme.red)
+                        .text_color(theme.error)
                         .child(line),
                 )
             })
@@ -839,13 +854,7 @@ impl ReviewView {
             .flex_col()
             .gap_0p5()
             .px_2()
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted)
-                    .child(format!("Server · {}", model.slot)),
-            )
+            .child(style::heading(format!("Server · {}", model.slot), theme).pb_0p5())
             .child(
                 div()
                     .flex()
@@ -859,20 +868,20 @@ impl ReviewView {
                             .child(format!("{} {}", dec.glyph, sub_state_label(server.state))),
                     )
                     .when_some(server.location.clone(), |d, loc| {
-                        d.child(div().text_xs().text_color(theme.muted).child(loc))
+                        d.child(div().text_xs().text_color(theme.text_quiet).child(loc))
                     }),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(theme.muted)
+                    .text_color(theme.text_quiet)
                     .child(sub_state_detail(server.state)),
             )
             .child(
                 div()
                     .debug_selector(|| "review-health".into())
                     .text_xs()
-                    .text_color(theme.muted)
+                    .text_color(theme.text_quiet)
                     .child(server.health.label()),
             )
             .when_some(model.review_url.clone(), |d, url| {
@@ -886,12 +895,12 @@ impl ReviewView {
                         .gap_1()
                         .min_w_0()
                         .cursor_pointer()
-                        .text_color(theme.cyan)
-                        .hover(|s| s.underline())
+                        .text_color(theme.link)
+                        .hover(|s| s.underline().text_color(theme.link_hover))
                         .child(div().min_w_0().truncate().child(url))
                         .child(
                             heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE)
-                                .text_color(theme.cyan),
+                                .text_color(theme.icon),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             if !this.is_merging() {
@@ -919,7 +928,7 @@ impl ReviewView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                .bg(theme.scrim)
                 .on_click(cx.listener(move |this, _, _, cx| close(this, cx)))
                 .child(
                     div()
@@ -930,10 +939,7 @@ impl ReviewView {
                         .w(relative(0.8))
                         .h(relative(0.85))
                         .overflow_hidden()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme.divider)
-                        .bg(theme.canvas)
+                        .map(|d| style::popover(d, theme))
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -949,22 +955,24 @@ impl ReviewView {
                                         .flex_row()
                                         .gap_2()
                                         .min_w_0()
-                                        .child(div().text_color(theme.muted).child(model.task_id.clone()))
+                                        .child(div().text_color(theme.text_quiet).child(model.task_id.clone()))
                                         .child(
                                             div()
                                                 .truncate()
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.white)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.text_loud)
                                                 .child(model.title.clone()),
                                         ),
                                 )
                                 .child(
-                                    div()
-                                        .id("review-description-close")
-                                        .cursor_pointer()
-                                        .p_0p5()
-                                        .child(heroicon(icons::X_MARK).text_color(theme.muted))
-                                        .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
+                                    style::icon_button(
+                                        "review-description-close",
+                                        icons::X_MARK,
+                                        IconButtonSize::Default,
+                                        false,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
                                 ),
                         )
                         .child(
@@ -1009,7 +1017,7 @@ impl ReviewView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.canvas);
+            .bg(theme.surface);
         let Some(shown) = &self.review else {
             return root.into_any_element();
         };
@@ -1038,7 +1046,7 @@ impl Render for ReviewView {
             None => div()
                 .debug_selector(|| "review-panel-empty".into())
                 .size_full()
-                .bg(theme.background)
+                .bg(theme.surface_recessed)
                 .into_any_element(),
         }
     }

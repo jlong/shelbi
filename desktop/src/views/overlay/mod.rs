@@ -31,6 +31,7 @@ use shelbi_core::ConfigMode;
 use shelbi_palette::Entry;
 use shelbi_state::keymap::{Key, KeyChord, Keymaps};
 
+use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 
 /// What the window should do after an overlay took input.
@@ -321,10 +322,10 @@ pub fn with_overlay<H: OverlayHost>(
     cx.notify();
 }
 
-/// The dimmed backdrop's color: black at partial strength (a light theme's
-/// own background would lighten rather than dim).
+/// The dimmed backdrop's color: the palette's scrim (black at partial
+/// strength; a light theme's own background would lighten rather than dim).
 fn backdrop(theme: &Theme) -> Hsla {
-    gpui::hsla(0.0, 0.0, 0.0, if theme.is_dark() { 0.5 } else { 0.25 })
+    theme.scrim
 }
 
 /// Draw `overlay` over the whole window: a dimmed backdrop that swallows the
@@ -389,57 +390,47 @@ pub fn render_layer<H: OverlayHost>(
 /// The palette's offset from the top of the window (the TUI's two rows).
 pub const PALETTE_TOP: f32 = 40.0;
 
-/// A panel: the overlay's surface, bordered in `border`, that stops clicks on
-/// it from reaching the backdrop.
-pub fn panel(id: &'static str, border: Hsla, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .flex()
-        .flex_col()
-        .bg(theme.search)
-        .border_1()
-        .border_color(border)
-        .rounded_lg()
-        .shadow_lg()
-        .overflow_hidden()
-        .text_color(theme.foreground)
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+/// A panel: the overlay's raised surface (Taskpage's ring and shadow), that
+/// stops clicks on it from reaching the backdrop.
+pub fn panel(id: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    style::popover(
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .flex()
+            .flex_col()
+            .overflow_hidden(),
+        theme,
+    )
+    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
-/// A TUI-style button: its `[ Label ]` text in the accent, reversed (a solid
-/// accent block) while focused.
+/// A dialog button: a Taskpage button of `kind`, wearing the focus ring
+/// while it has the keyboard. A shared label's TUI brackets (`[ Load ]`)
+/// are the terminal's button shape, so they're dropped here.
 pub fn button(
     id: &'static str,
-    label: impl Into<gpui::SharedString>,
+    label: &str,
     focused: bool,
-    accent: Hsla,
+    kind: ButtonKind,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .px_1()
-        .rounded_sm()
-        .cursor_pointer()
-        .when(focused, |b| {
-            b.bg(accent)
-                .text_color(theme.on_color)
-                .font_weight(gpui::FontWeight::BOLD)
-        })
-        .when(!focused, |b| b.text_color(accent))
-        .child(label.into())
+    style::button(id, button_label(label), kind, focused, theme)
+}
+
+/// A shared button label without the TUI's brackets.
+pub fn button_label(label: &str) -> String {
+    label
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .to_string()
 }
 
 /// The panel's title line (the TUI's border title).
-pub fn title(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
-    div()
-        .px_4()
-        .pt_3()
-        .pb_1()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(color)
-        .child(text.into())
+pub fn title(text: impl Into<gpui::SharedString>, theme: &Theme) -> gpui::Div {
+    style::heading(text, theme).text_base().px_4().pt_4().pb_1()
 }
 
 /// The hint line at a panel's foot.
@@ -449,7 +440,7 @@ pub fn hint(text: impl Into<gpui::SharedString>, theme: &Theme) -> gpui::Div {
         .pb_3()
         .pt_1()
         .text_xs()
-        .text_color(theme.muted)
+        .text_color(theme.text_quiet)
         .child(text.into())
 }
 

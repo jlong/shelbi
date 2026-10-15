@@ -14,7 +14,10 @@
 //! - `review-merging.png`: an approve in flight, the panel inert;
 //! - `review-description.png`: the task description (More);
 //! - `review-back-mid.png` and `review-back.png`: Back, half-way and done
-//!   (the sidebar as it was).
+//!   (the sidebar as it was);
+//! - the overlays over the shell: `palette.png`, `dialog-review-confirm.png`,
+//!   `dialog-reject.png`, `dialog-zen.png`, `dialog-add-project.png` and
+//!   `dialog-error-log.png`.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -26,7 +29,6 @@ use futures::channel::mpsc::{unbounded, UnboundedSender};
 use gpui::{px, size, AnyWindowHandle, AppContext, Entity, VisualTestAppContext, WindowHandle};
 use shelbi_app::review::{ActiveView, PanelEffect, ReviewInfo, ReviewTarget};
 use shelbi_app::session::{self as app_session, ConnectFailure, ReconnectPolicy, Relauncher, RetryPolicy, SessionRef};
-use shelbi_app::theme::ThemePreference;
 use shelbi_app::view::{ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow};
 use shelbi_app::ReviewSessionOp;
 use shelbi_client::SessionEvent;
@@ -34,7 +36,6 @@ use shelbi_term::Size;
 
 use crate::app::ShelbiWindow;
 use crate::elements::terminal::session::{Connected, SessionIo};
-use crate::theme::Theme;
 use crate::views::column_swap::SLIDE;
 use crate::views::review::{ReviewDeps, ReviewOps, ReviewView};
 use crate::views::session_view::{SessionConnector, SessionDeps};
@@ -179,9 +180,8 @@ pub fn run(out: PathBuf) -> ! {
     std::fs::create_dir_all(&out).expect("create the output directory");
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
-    cx.set_global(Theme::resolve(ThemePreference::Dark, gpui::WindowAppearance::Dark));
     cx.update(|cx| {
-        gpui_kit::init(cx);
+        crate::visual_check::install_theme(cx);
         crate::assets::load_fonts(cx);
     });
     let sessions = Arc::new(Sessions::default());
@@ -340,5 +340,53 @@ impl Run {
         let column = self.column();
         self.expect("Back gives the column back to the sidebar", column == (true, false));
         self.save("review-back.png");
+
+        // The overlays over the shell.
+        use crate::views::overlay::ActiveOverlay;
+        use shelbi_app::overlay::error_log::Viewer;
+        use shelbi_app::overlay::review_confirm::Slot;
+        let slot = |name: &str, occupant: Option<&str>| Slot {
+            name: name.into(),
+            occupant: occupant.map(str::to_string),
+        };
+        let mut log = ActiveOverlay::error_log("demo");
+        if let ActiveOverlay::ErrorLog { viewer, .. } = &mut log {
+            let entry = |ts: &str, message: &str| shelbi_state::ErrorLogEntry {
+                ts: ts.into(),
+                message: message.into(),
+                source: None,
+            };
+            *viewer = Some(Viewer::new(vec![
+                (entry("2026-10-15T09:12:03Z", "ssh gpu.lan: connection refused"), true),
+                (entry("2026-10-15T08:40:51Z", "review-1: health check timed out after 30s"), false),
+            ]));
+        }
+        for (name, overlay) in [
+            ("palette.png", None),
+            (
+                "dialog-review-confirm.png",
+                Some(ActiveOverlay::review_confirm(
+                    "cold-start",
+                    "Warm the application cache at startup",
+                    vec![slot("review-1", None), slot("review-2", Some("fix-login"))],
+                    2,
+                )),
+            ),
+            ("dialog-reject.png", Some(ActiveOverlay::reject_reason("cold-start"))),
+            ("dialog-zen.png", Some(ActiveOverlay::zen_intro("demo"))),
+            (
+                "dialog-add-project.png",
+                Some(ActiveOverlay::add_project(std::path::Path::new("/Users/me/src/demo"))),
+            ),
+            ("dialog-error-log.png", Some(log)),
+        ] {
+            self.handle
+                .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(overlay, window, cx))
+                .unwrap();
+            self.save(name);
+            self.handle
+                .update(&mut self.cx, |w, window, cx| w.offscreen_close_overlay(window, cx))
+                .unwrap();
+        }
     }
 }

@@ -43,7 +43,8 @@ use super::external_edit::{self, EditorEvent};
 use super::task_detail;
 use crate::assets::{heroicon, icons, Icon};
 use crate::keys::chord_from_keystroke;
-use crate::theme::Theme;
+use crate::theme::style::{self, ButtonKind};
+use crate::theme::{Hue, Theme};
 
 /// The fallback refresh cadence (the TUI's).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
@@ -81,23 +82,21 @@ impl Render for CardGhost {
             .flex()
             .flex_col()
             .gap_1()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.gray)
-            .bg(theme.selection)
-            .opacity(0.9)
-            .shadow_lg()
+            .p_3()
+            .rounded_lg()
+            .bg(theme.surface_raised)
+            .shadow(style::popover_shadow(&theme))
+            .opacity(0.95)
             .text_sm()
             .child(
                 div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.white)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text_loud)
                     .line_clamp(2)
                     .text_ellipsis()
                     .child(self.title.clone()),
             )
-            .child(div().text_xs().text_color(theme.muted).child(self.id.clone()))
+            .child(div().text_xs().text_color(theme.text_quiet).child(self.id.clone()))
     }
 }
 
@@ -183,6 +182,18 @@ impl IssuesView {
     /// view is shown).
     pub fn request_focus(&mut self) {
         self.needs_focus = true;
+    }
+
+    /// The board's state, for the offscreen renders.
+    #[cfg(feature = "visual-check")]
+    pub fn state_mut(&mut self) -> &mut BoardState {
+        &mut self.state
+    }
+
+    /// Drain the board's reads now, for the offscreen renders.
+    #[cfg(feature = "visual-check")]
+    pub fn poll(&mut self, cx: &mut Context<Self>) {
+        self.tick(cx);
     }
 
     /// Open task `id`'s detail (from an Activity row). A task the board hasn't
@@ -519,13 +530,15 @@ impl IssuesView {
             .items_center()
             .gap_2()
             .px_4()
-            .py_2()
+            .h(px(56.0))
+            .flex_none()
             .border_b_1()
-            .border_color(theme.divider)
+            .border_color(theme.rule)
             .child(
                 div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.white)
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_loud)
                     .child(title),
             )
             .child(
@@ -545,17 +558,16 @@ impl IssuesView {
                     })),
             )
             .when_some(model.banner.clone(), |row, banner| {
-                row.child(div().text_xs().text_color(theme.muted).child(banner))
+                row.child(div().text_xs().text_color(theme.text_quiet).child(banner))
             })
             .child(div().flex_1())
             .when(self.state.has_pending(), |row| {
                 row.child(
-                    heroicon(icons::ARROW_PATH).text_color(theme.muted),
+                    heroicon(icons::ARROW_PATH).text_color(theme.icon),
                 )
             })
             .child(
-                chip(theme, icons::PLUS, "New issue".into())
-                    .id("new-issue")
+                style::icon_label_button("new-issue", icons::PLUS, "New issue", ButtonKind::Primary, theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         let intents = this.state.begin_add();
                         this.apply_intents(intents, window, cx);
@@ -623,13 +635,15 @@ impl IssuesView {
             .w(px(COLLAPSED_WIDTH))
             .h_full()
             .py_2()
-            .rounded_md()
+            .rounded_lg()
+            .bg(theme.surface_recessed)
             .border_1()
-            .border_color(if focused { theme.gray } else { theme.divider })
+            .border_color(if focused { theme.rule_strong } else { theme.rule })
             .text_xs()
-            .text_color(if focused { theme.white } else { theme.muted })
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if focused { theme.text_loud } else { theme.text_quiet })
             .cursor_pointer()
-            .child(div().font_weight(FontWeight::BOLD).child(col.cards.len().to_string()))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(col.cards.len().to_string()))
             .children(letters)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let intents = this.state.toggle_column(ci);
@@ -640,7 +654,7 @@ impl IssuesView {
             .when(drop.is_some() && !refused, |d| {
                 let theme = *theme;
                 d.drag_over::<CardDrag>(move |s, _, _, _| {
-                    s.bg(theme.selection).border_color(theme.white)
+                    s.bg(theme.fill).border_color(theme.focus_ring)
                 })
             })
             // A refused target still takes the drop, so the state can say why
@@ -705,22 +719,18 @@ impl IssuesView {
             .items_center()
             .gap_2()
             .px_1()
-            .pb_2()
+            .h(px(32.0))
+            .flex_none()
             .cursor_pointer()
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(if focused { theme.white } else { theme.muted })
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if focused { theme.text_loud } else { theme.text })
                     .when(focused, |d| d.underline())
                     .child(col.label.clone()),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(format!("{}", col.cards.len())),
-            )
+            .child(style::chip(format!("{}", col.cards.len()), Hue::Neutral, theme))
             // While a card is dragged, what a drop here does (in the header
             // row, so the cards don't shift when the drag starts).
             .children(
@@ -734,7 +744,7 @@ impl IssuesView {
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(theme.muted)
+                            .text_color(theme.text_quiet)
                             .child(text)
                     }),
             )
@@ -750,7 +760,10 @@ impl IssuesView {
                 .flex_col()
                 .gap_2()
                 .flex_1()
-                .min_h_0(),
+                .min_h_0()
+                // Room for the cards' rings and focus ring inside the
+                // scroll clip.
+                .p(px(2.0)),
             &self.column_scrolls[ci],
         )
         .children(cards)
@@ -768,7 +781,8 @@ impl IssuesView {
                     .px_2()
                     .py_1()
                     .text_xs()
-                    .text_color(theme.muted)
+                    .text_color(theme.link)
+                    .hover(|s| s.text_color(theme.link_hover))
                     .cursor_pointer()
                     .child(if self.load_more_in_flight {
                         "Loading…".to_string()
@@ -789,14 +803,18 @@ impl IssuesView {
             .flex_none()
             .w(px(COLUMN_WIDTH))
             .h_full()
-            .rounded_md()
+            .px_2()
+            .pt_1()
+            .pb_2()
+            .rounded_lg()
+            .bg(theme.surface_recessed)
             .border_1()
-            .border_color(gpui::transparent_black())
+            .border_color(theme.rule)
             .child(header)
             .child(body)
             .when(refused.is_some(), |d| d.opacity(0.35))
             .when(drop.is_some() && refused.is_none(), |d| {
-                d.drag_over::<CardDrag>(move |s, _, _, _| s.border_color(theme.gray))
+                d.drag_over::<CardDrag>(move |s, _, _, _| s.bg(theme.fill).border_color(theme.focus_ring))
             })
             // A refused target still takes the drop, so the state can say why
             // (it sends nothing).
@@ -829,24 +847,26 @@ impl IssuesView {
         };
         let ghost_title = SharedString::from(card.title.clone());
         let title_color = if card.blocked {
-            theme.muted
-        } else if selected {
-            theme.white
+            theme.text_quiet
         } else {
-            theme.gray
+            theme.text_loud
         };
         div()
             .id(SharedString::from(format!("card-{}", card.id)))
             .flex()
             .flex_col()
             .flex_none()
-            .gap_1()
-            .p_2()
+            .gap_1p5()
+            .p_3()
             .overflow_hidden()
-            .rounded_md()
-            .border_1()
-            .border_color(if selected { theme.gray } else { theme.divider })
-            .bg(if selected { theme.selection } else { theme.search })
+            .rounded_lg()
+            .bg(theme.surface_raised)
+            // The keyboard's card wears the focus ring.
+            .shadow(if selected {
+                vec![style::focus_shadow(theme)]
+            } else {
+                style::card_shadow(theme)
+            })
             .when(pending.is_some(), |d| d.opacity(0.65))
             // The card being dragged stays as a placeholder under its ghost.
             .when(dragged, |d| d.opacity(0.3))
@@ -884,7 +904,7 @@ impl IssuesView {
                         d.child(
                             heroicon(icons::LOCK_CLOSED)
                                 .mt(px(1.0))
-                                .text_color(theme.muted),
+                                .text_color(theme.text_quiet),
                         )
                     })
                     .child(
@@ -892,7 +912,7 @@ impl IssuesView {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(title_color)
                             .line_clamp(2)
                             .text_ellipsis()
@@ -908,8 +928,8 @@ impl IssuesView {
                         .items_center()
                         .gap_1()
                         .text_xs()
-                        .text_color(theme.muted)
-                        .child(heroicon(icons::ARROW_PATH).text_color(theme.muted))
+                        .text_color(theme.text_quiet)
+                        .child(heroicon(icons::ARROW_PATH).text_color(theme.icon))
                         .child(p.label),
                 )
             })
@@ -922,10 +942,10 @@ impl IssuesView {
                         .items_start()
                         .gap_1()
                         .text_xs()
-                        .text_color(theme.red)
+                        .text_color(theme.error)
                         .child(
                             heroicon(icons::EXCLAMATION_TRIANGLE)
-                                .text_color(theme.red),
+                                .text_color(theme.error),
                         )
                         // Wraps (a gated merge's refusal can be long); the
                         // status line carries it too.
@@ -935,7 +955,7 @@ impl IssuesView {
                                 .id(SharedString::from(format!("dismiss-{}", card.id)))
                                 .flex_none()
                                 .cursor_pointer()
-                                .child(heroicon(icons::X_MARK).text_color(theme.muted))
+                                .child(heroicon(icons::X_MARK).text_color(theme.icon))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     cx.stop_propagation();
                                     this.state.dismiss_notice(&id);
@@ -973,13 +993,13 @@ impl IssuesView {
             .flex_row()
             .gap_4()
             .px_4()
-            .py_1()
+            .py_1p5()
             .border_t_1()
-            .border_color(theme.divider)
+            .border_color(theme.rule)
             .text_xs()
-            .text_color(theme.muted)
+            .text_color(theme.text_quiet)
             .child(div().flex_1().truncate().child(hints))
-            .when_some(status, |d, s| d.child(div().text_color(theme.gray).child(s)))
+            .when_some(status, |d, s| d.child(div().text_color(theme.text).child(s)))
     }
 
     fn render_dropdown(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1034,7 +1054,9 @@ impl IssuesView {
             })
             .collect();
         Some(
+            // A dropdown dims nothing (a menu, not a dialog).
             backdrop(theme, cx)
+                .bg(gpui::transparent_black())
                 .child(panel(theme).w(px(280.0)).mt(px(48.0)).ml(px(16.0)).child(panel_title(theme, title)).children(items)),
         )
     }
@@ -1084,7 +1106,7 @@ impl IssuesView {
                     div()
                         .px_2()
                         .text_xs()
-                        .text_color(theme.muted)
+                        .text_color(theme.text_quiet)
                         .child("Enter adds it to Backlog · Esc cancels"),
                 ),
         ))
@@ -1118,9 +1140,9 @@ impl Render for IssuesView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .text_sm()
-            .text_color(theme.gray)
+            .text_color(theme.text)
             .child(self.render_header(&theme, cx))
             .child(board)
             .child(self.render_footer(&theme))
@@ -1160,7 +1182,7 @@ fn reorder_target(
     let theme = *theme;
     let target_id = target.id.clone();
     card.drag_over::<CardDrag>(move |s, _, _, _| {
-        let s = s.border_color(theme.white);
+        let s = s.border_color(theme.focus_ring);
         if ri < from {
             s.border_t_4()
         } else if ri > from {
@@ -1192,7 +1214,7 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
         .flex_col()
         .gap_1()
         .text_xs()
-        .text_color(theme.muted)
+        .text_color(theme.text_quiet)
         .when(show_wf || card.branch.is_some(), |d| {
             d.child(
                 div()
@@ -1202,15 +1224,7 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
                     .items_center()
                     .overflow_hidden()
                     .when(show_wf, |d| {
-                        d.child(
-                            div()
-                                .flex_none()
-                                .px_1()
-                                .rounded_sm()
-                                .bg(theme.workflow_badge_bg)
-                                .text_color(theme.workflow_badge_fg)
-                                .child(card.workflow_name.clone()),
-                        )
+                        d.child(style::chip(card.workflow_name.clone(), Hue::Blue, theme))
                     })
                     .when_some(card.branch.clone(), |d, b| {
                         d.child(div().truncate().child(format!("⎇ {b}")))
@@ -1229,47 +1243,38 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
         })
 }
 
+/// A filter control: a small secondary button with its icon.
 pub(super) fn chip(theme: &Theme, icon: Icon, label: String) -> gpui::Div {
+    let hover = theme.fill_strong;
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
+        .h(px(28.0))
         .px_2()
-        .py(px(2.0))
-        .rounded_md()
-        .bg(theme.search)
+        .rounded_lg()
+        .bg(theme.fill)
         .text_xs()
-        .text_color(theme.gray)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.text_loud)
         .cursor_pointer()
-        .child(heroicon(icon).text_color(theme.muted))
+        .hover(move |s| s.bg(hover))
+        .child(heroicon(icon).text_color(theme.icon))
         .child(label)
 }
 
 fn muted_row(theme: &Theme, text: &'static str) -> gpui::Div {
-    div().px_2().py_1().text_xs().text_color(theme.muted).child(text)
+    div().px_2().py_1().text_xs().text_color(theme.text_quiet).child(text)
 }
 
+/// A menu or popover: Taskpage's raised surface with its ring and shadow.
 pub(super) fn panel(theme: &Theme) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .py_2()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.divider)
-        .bg(theme.search)
-        .text_color(theme.foreground)
+    style::popover(div().flex().flex_col().py_2(), theme)
 }
 
 pub(super) fn panel_title(theme: &Theme, title: &str) -> impl IntoElement {
-    div()
-        .px_3()
-        .pb_1()
-        .text_xs()
-        .font_weight(FontWeight::BOLD)
-        .text_color(theme.muted)
-        .child(title.to_string())
+    style::heading(title.to_string(), theme).px_3().pt_1().pb_2()
 }
 
 fn option_row(theme: &Theme, selected: bool, label: String, count: Option<usize>) -> gpui::Div {
@@ -1280,17 +1285,18 @@ fn option_row(theme: &Theme, selected: bool, label: String, count: Option<usize>
         .mx_1()
         .px_2()
         .py_1()
-        .rounded_md()
+        .rounded_lg()
         .cursor_pointer()
-        .when(selected, |d| d.bg(theme.selection).text_color(theme.white))
+        .when(selected, |d| d.bg(theme.row_selected).text_color(theme.text_loud))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.fill_subtle)))
         .child(label)
-        .when_some(count, |d, n| d.child(div().text_color(theme.muted).child(n.to_string())))
+        .when_some(count, |d, n| d.child(div().text_color(theme.text_quiet).child(n.to_string())))
 }
 
 /// A full-size layer over the board that swallows clicks and closes the
 /// overlay when clicked outside its panel.
 pub(super) fn backdrop(theme: &Theme, cx: &mut Context<IssuesView>) -> gpui::Stateful<gpui::Div> {
-    let dim: Hsla = theme.background.opacity(0.55);
+    let dim: Hsla = theme.scrim;
     div()
         .id("backdrop")
         .absolute()

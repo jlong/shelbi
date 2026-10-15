@@ -15,6 +15,7 @@ use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
 use crate::platform::version::{ProtocolCheck, VersionCheck};
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
+use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 
 /// The CLI's install command.
@@ -366,13 +367,13 @@ pub fn render_progress(state: &BootstrapState, theme: &Theme) -> AnyElement {
                 .child(
                     div()
                         .text_xl()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.cyan)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.wordmark)
                         .child("Shelbi"),
                 )
-                .child(div().text_color(theme.gray).child(format!("{label}…")))
+                .child(div().text_color(theme.text).child(format!("{label}…")))
                 .when_some(detail, |col, detail| {
-                    col.child(div().text_xs().text_color(theme.muted).child(detail))
+                    col.child(div().text_xs().text_color(theme.text_quiet).child(detail))
                 }),
         )
         .into_any_element()
@@ -399,25 +400,25 @@ pub fn render_failure(
                 .gap_2()
                 .child(
                     heroicon(icons::EXCLAMATION_TRIANGLE)
-                        .text_color(theme.yellow),
+                        .text_color(theme.warning),
                 )
                 .child(
                     div()
                         .text_lg()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.white)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_loud)
                         .child(screen.title.clone()),
                 ),
         );
     for paragraph in &screen.body {
-        column = column.child(div().text_color(theme.gray).child(paragraph.clone()));
+        column = column.child(div().text_color(theme.text).child(paragraph.clone()));
     }
     for (ix, step) in screen.fix.iter().enumerate() {
         let mut block = div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(theme.gray).child(step.text.clone()));
+            .child(div().text_color(theme.text).child(step.text.clone()));
         if let Some(command) = &step.command {
             block = block.child(command_box(ix, command, theme));
         }
@@ -428,17 +429,19 @@ pub fn render_failure(
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(theme.muted).child(label.clone()));
+            .child(div().text_color(theme.text_quiet).child(label.clone()));
         if !lines.is_empty() {
             block = block.child(
                 div()
                     .flex()
                     .flex_col()
-                    .p_2()
-                    .rounded_md()
-                    .bg(theme.search)
+                    .p_3()
+                    .rounded_lg()
+                    .bg(theme.surface_sunken)
+                    .border_1()
+                    .border_color(theme.rule)
                     .text_xs()
-                    .text_color(theme.gray)
+                    .text_color(theme.text)
                     .children(lines.iter().map(|line| div().child(line.clone()))),
             );
         }
@@ -446,23 +449,14 @@ pub fn render_failure(
     }
     column = column.child(
         div().flex().flex_row().child(
-            div()
-                .id("bootstrap-action")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .bg(theme.selection)
-                .text_color(theme.white)
-                .child(
-                    heroicon(action.icon()).text_color(theme.white),
-                )
-                .child(action.label())
-                .on_click(move |_, window, cx| on_action(action, window, cx)),
+            style::icon_label_button(
+                "bootstrap-action",
+                action.icon(),
+                action.label(),
+                ButtonKind::Primary,
+                theme,
+            )
+            .on_click(move |_, window, cx| on_action(action, window, cx)),
         ),
     );
     centered(theme).child(column).into_any_element()
@@ -482,31 +476,24 @@ pub fn render_relaunch_bar(
         .gap_4()
         .px_4()
         .py_2()
-        .bg(theme.selection)
+        .bg(theme.notice)
+        .border_b_1()
+        .border_color(theme.rule)
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .text_color(theme.yellow)
+                .text_color(theme.text_loud)
                 .child(
                     heroicon(icons::EXCLAMATION_TRIANGLE)
-                        .text_color(theme.yellow),
+                        .text_color(theme.warning),
                 )
                 .child(relaunch_message(notice)),
         )
         .child(
-            div()
-                .id("relaunch")
-                .flex_none()
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .bg(theme.background)
-                .text_color(theme.white)
-                .child(ScreenAction::Relaunch.label())
+            style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Primary, false, theme)
                 .on_click(move |_, window, cx| on_relaunch(window, cx)),
         )
         .into_any_element()
@@ -523,7 +510,7 @@ fn centered(theme: &Theme) -> gpui::Stateful<gpui::Div> {
         .size_full()
         .p_8()
         .overflow_y_scroll()
-        .bg(theme.canvas)
+        .bg(theme.surface)
         .text_sm()
 }
 
@@ -536,14 +523,19 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
         .items_start()
         .justify_between()
         .gap_2()
-        .p_2()
-        .rounded_md()
-        .bg(theme.search)
+        .py_1p5()
+        .px_2()
+        .rounded_lg()
+        .bg(theme.surface_sunken)
+        .border_1()
+        .border_color(theme.rule)
+        .font_family("Geist Mono")
+        .text_xs()
         .child(
             div()
                 .flex()
                 .flex_col()
-                .text_color(theme.white)
+                .text_color(theme.text_loud)
                 .children(command.lines().map(|line| div().child(line.to_string()))),
         )
         .child(
@@ -552,7 +544,7 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
                 .flex_none()
                 .cursor_pointer()
                 .child(
-                    heroicon(icons::CLIPBOARD_DOCUMENT).text_color(theme.muted),
+                    heroicon(icons::CLIPBOARD_DOCUMENT).text_color(theme.icon),
                 )
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))

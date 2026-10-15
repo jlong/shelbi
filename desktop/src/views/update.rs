@@ -59,8 +59,10 @@ pub fn render_update_bar(
         .gap_4()
         .px_4()
         .py_2()
-        .bg(theme.selection)
-        .text_color(theme.white)
+        .bg(theme.blue_tint)
+        .border_b_1()
+        .border_color(theme.rule)
+        .text_color(theme.text_loud)
         .child(
             div()
                 .flex()
@@ -68,10 +70,10 @@ pub fn render_update_bar(
                 .items_center()
                 .gap_2()
                 .child(
-                    heroicon(icons::ARROW_DOWN_CIRCLE).text_color(theme.white),
+                    heroicon(icons::ARROW_DOWN_CIRCLE).text_color(theme.blue),
                 )
                 .child(notice.message())
-                .child(div().text_color(theme.muted).child("Upgrade with"))
+                .child(div().text_color(theme.text_quiet).child("Upgrade with"))
                 .child(command_box(0, APP_UPGRADE_COMMAND, theme)),
         )
         .child(
@@ -80,7 +82,7 @@ pub fn render_update_bar(
                 .flex_none()
                 .cursor_pointer()
                 .child(
-                    heroicon(icons::X_MARK).text_color(theme.muted),
+                    heroicon(icons::X_MARK).text_color(theme.icon),
                 )
                 .on_click(move |_, window, cx| on_dismiss(window, cx)),
         )

@@ -86,14 +86,15 @@ use shelbi_state::keymap::{
     format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
 
-use crate::assets::{heroicon, icons};
+use crate::assets::icons;
 use crate::commands::{self, CommandHost};
 use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
 use crate::menus;
 use crate::notify;
 use crate::projects::{self, Catalog};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
-use crate::theme::{self, Theme};
+use crate::theme::style::{self, IconButtonSize};
+use crate::theme::{self, Hue, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::column_swap::{self, ColumnSwap, Layer, Motion, Occupant};
 use crate::views::issues::{IssuesEvent, IssuesView};
@@ -2548,7 +2549,9 @@ impl ShelbiWindow {
                     .into_any_element()
             }
         };
-        let notice = |text: SharedString, color| {
+        // A band across the main area, tinted by what it says.
+        let notice = |text: SharedString, hue: Hue| {
+            let (fg, bg) = theme.hue(hue);
             div()
                 .flex()
                 .flex_row()
@@ -2556,8 +2559,10 @@ impl ShelbiWindow {
                 .justify_between()
                 .px_4()
                 .py_2()
-                .bg(theme.selection)
-                .text_color(color)
+                .bg(bg)
+                .border_b_1()
+                .border_color(theme.rule)
+                .text_color(fg)
                 .child(text)
         };
         div()
@@ -2569,26 +2574,18 @@ impl ShelbiWindow {
             .min_w_0()
             .overflow_hidden()
             .h_full()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .when(!column_shown, |main| {
                 main.child(
                     div().h(px(sidebar::TRAFFIC_LIGHT_INSET)).pl(px(80.0)).pt(px(8.0)).child(
-                        div()
-                            .id("expand-sidebar")
-                            .debug_selector(|| "expand-sidebar".into())
-                            .p_1()
-                            .w_auto()
+                        style::icon_button("expand-sidebar", icons::BARS_3, IconButtonSize::Default, false, theme)
                             .self_start()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.search))
-                            .child(heroicon(icons::BARS_3).text_color(theme.muted))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                     ),
                 )
             })
             .when_some(self.model.session_lost.clone(), |main, lost| {
-                main.child(notice(lost.into(), theme.red))
+                main.child(notice(lost.into(), Hue::Red))
             })
             // A newer release (platform::update), in the main column so it
             // clears the titlebar's traffic lights.
@@ -2603,15 +2600,12 @@ impl ShelbiWindow {
                 },
             )
             .when_some(self.status.clone(), |main, status| {
-                main.child(notice(status, theme.muted))
+                main.child(notice(status, Hue::Neutral))
             })
             .when_some(self.banner.clone(), |main, message| {
                 main.child(
-                    notice(message, theme.yellow).child(
-                        div()
-                            .id("dismiss-banner")
-                            .cursor_pointer()
-                            .child(heroicon(icons::X_MARK).text_color(theme.muted))
+                    notice(message, Hue::Gold).child(
+                        style::icon_button("dismiss-banner", icons::X_MARK, IconButtonSize::Small, false, theme)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.banner = None;
                                 cx.notify();
@@ -2821,15 +2815,15 @@ impl ShelbiWindow {
                 .w(px(width))
                 .h_full()
                 .overflow_hidden()
-                .bg(theme.background)
+                .bg(theme.surface_recessed)
                 .children(sidebar)
                 .children(review)
                 .children(workspace)
         });
         let divider_color = if self.dragging {
-            theme.divider_active
+            theme.icon
         } else {
-            theme.divider
+            theme.rule
         };
         let handle = column_shown.then(|| {
             // The column's right-edge divider, with a few pixels of grab
@@ -2842,7 +2836,7 @@ impl ShelbiWindow {
                 .flex_none()
                 .flex()
                 .justify_end()
-                .bg(theme.background)
+                .bg(theme.surface_recessed)
                 .cursor(CursorStyle::ResizeLeftRight)
                 .child(div().w(px(1.0)).h_full().bg(divider_color))
                 .on_mouse_down(
@@ -2887,7 +2881,7 @@ impl ShelbiWindow {
             .w_full()
             .font_family("Geist")
             .text_sm()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .children(column)
             .children(handle)
             .child(self.render_main(&theme, column_shown, cx));
@@ -3003,6 +2997,23 @@ impl ShelbiWindow {
 
     pub(crate) fn offscreen_open_review(&mut self, info: ReviewInfo, window: &mut Window, cx: &mut Context<Self>) {
         self.open_review(info, window, cx);
+    }
+
+    /// Open `overlay` (the palette when `None`) over the shell.
+    pub(crate) fn offscreen_open_overlay(
+        &mut self,
+        overlay: Option<ActiveOverlay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match overlay {
+            Some(overlay) => self.open_overlay(overlay, window, cx),
+            None => self.open_palette(window, cx),
+        }
+    }
+
+    pub(crate) fn offscreen_close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_overlay(window, cx);
     }
 
     pub(crate) fn offscreen_review(&self) -> Option<Entity<ReviewView>> {

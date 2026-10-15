@@ -8,6 +8,7 @@ use shelbi_app::overlay::review_reject::{
     RejectFocus, RejectPrompt, CANCEL_LABEL, HINT, LABEL, REJECT_LABEL, TITLE,
 };
 
+use crate::theme::style::ButtonKind;
 use crate::theme::Theme;
 use crate::views::overlay::{button, hint, panel, reject_event, title, with_overlay, ActiveOverlay, OverlayEvent, OverlayHost};
 
@@ -36,7 +37,6 @@ fn on_prompt<H: OverlayHost>(
 }
 
 pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Context<H>) -> AnyElement {
-    let accent = theme.ansi_red;
     let focused = prompt.focus() == RejectFocus::Text;
     let text = prompt.text();
     let (row, col) = text.cursor();
@@ -48,7 +48,7 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
             .flex()
             .flex_row()
             .whitespace_nowrap()
-            .text_color(theme.ansi_white);
+            .text_color(theme.text_loud);
         let s = |chars: &[char]| chars.iter().collect::<String>().replace(' ', "\u{00a0}");
         if !(focused && i == row) {
             return row_el.child(s(line));
@@ -59,8 +59,8 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
             .child(
                 div()
                     .debug_selector(|| "reject-caret".into())
-                    .bg(theme.foreground)
-                    .text_color(theme.search)
+                    .bg(theme.text_loud)
+                    .text_color(theme.surface_raised)
                     .child(under.replace(' ', "\u{00a0}")),
             )
             .child(s(line.get(col + 1..).unwrap_or(&[])))
@@ -72,9 +72,11 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
         .h(px(LINE_H * VISIBLE_LINES as f32 + 16.0))
         .px_2()
         .py_2()
+        .rounded_lg()
+        .bg(theme.surface)
         .border_1()
-        .rounded_md()
-        .border_color(if focused { theme.ansi_cyan } else { theme.ansi_dark_gray })
+        .border_color(theme.rule_strong)
+        .when(focused, |d| d.shadow(vec![crate::theme::style::focus_shadow(theme)]))
         .overflow_hidden()
         .cursor_text()
         .children(lines)
@@ -83,9 +85,9 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
             None
         })));
 
-    panel("review-reject", accent, theme)
+    panel("review-reject", theme)
         .w(px(WIDTH))
-        .child(title(TITLE, accent))
+        .child(title(TITLE, theme))
         .child(
             div()
                 .flex()
@@ -93,21 +95,21 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
                 .gap_2()
                 .px_4()
                 .pb_2()
-                .child(div().text_color(theme.ansi_gray).child(LABEL))
+                .child(div().text_color(theme.text).child(LABEL))
                 .child(area)
                 .child(
                     div()
                         .flex()
                         .flex_row()
-                        .justify_center()
-                        .gap_3()
+                        .justify_end()
+                        .gap_2()
                         .pt_1()
                         .child(
                             button(
                                 "reject-submit",
                                 REJECT_LABEL,
                                 prompt.focus() == RejectFocus::Reject,
-                                accent,
+                                ButtonKind::Danger,
                                 theme,
                             )
                             .on_click(cx.listener(on_prompt(|p| Some(p.click_reject())))),
@@ -117,7 +119,7 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
                                 "reject-cancel",
                                 CANCEL_LABEL,
                                 prompt.focus() == RejectFocus::Cancel,
-                                accent,
+                                ButtonKind::Secondary,
                                 theme,
                             )
                             .on_click(cx.listener(on_prompt(|p| Some(p.click_cancel())))),

@@ -119,10 +119,7 @@ pub fn run(out: PathBuf) -> ! {
     std::fs::create_dir_all(&out).expect("create the output directory");
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
-    cx.set_global(Theme::resolve(
-        ThemePreference::Dark,
-        gpui::WindowAppearance::Dark,
-    ));
+    cx.set_global(theme());
     cx.update(|cx| {
         crate::assets::load_fonts(cx);
         cx.set_global(TerminalSettings::default());
@@ -1411,8 +1408,55 @@ fn summarize(samples: &[Duration]) -> String {
     )
 }
 
-/// Parse `--visual-check <dir>`.
+/// Parse `--visual-check <dir>` (and the other `--visual-*` modes' dir).
+///
+/// Every visual run renders in both themes: with `SHELBI_VISUAL_THEME`
+/// unset, this runs the same command twice as child processes, once per
+/// theme (`dark`, then `light`), and exits with the combined result; each
+/// child renders into `<dir>/<theme>/` and paints with [`theme`]. Set the
+/// variable to render one theme only.
 pub fn out_dir(arg: Option<String>) -> PathBuf {
-    arg.map(PathBuf::from)
-        .unwrap_or_else(|| Path::new("visual-check").to_path_buf())
+    let dir = arg
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new("visual-check").to_path_buf());
+    if let Some(theme) = theme_name() {
+        return dir.join(theme);
+    }
+    let mut failed = false;
+    for theme in ["dark", "light"] {
+        println!("==== {theme} theme ====");
+        let status = std::process::Command::new(std::env::current_exe().expect("own path"))
+            .args(std::env::args_os().skip(1))
+            .env(THEME_VAR, theme)
+            .status()
+            .expect("run the themed visual check");
+        failed |= !status.success();
+    }
+    std::process::exit(if failed { 1 } else { 0 })
+}
+
+const THEME_VAR: &str = "SHELBI_VISUAL_THEME";
+
+fn theme_name() -> Option<&'static str> {
+    match std::env::var(THEME_VAR).ok()?.as_str() {
+        "light" => Some("light"),
+        _ => Some("dark"),
+    }
+}
+
+/// Install the run's theme with gpui-kit's widgets in step, as the app does
+/// (the views' harnesses; the terminal check needs only [`theme`]).
+pub fn install_theme(cx: &mut gpui::App) {
+    gpui_kit::init(cx);
+    crate::theme::install(theme(), cx);
+}
+
+/// The theme a visual run paints with: `SHELBI_VISUAL_THEME` (dark unless
+/// `light`).
+pub fn theme() -> Theme {
+    if theme_name() == Some("light") {
+        Theme::resolve(ThemePreference::Light, gpui::WindowAppearance::Light)
+    } else {
+        Theme::resolve(ThemePreference::Dark, gpui::WindowAppearance::Dark)
+    }
 }

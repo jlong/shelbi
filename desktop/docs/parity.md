@@ -76,11 +76,16 @@ paths on every `cargo test`.
 - **Quit confirmation**: the desktop confirms Quit Project and Quit Shelbi
   with a sheet (⌘Q only closes the client); the TUI runs them from the
   palette directly, as it always has.
-- **Color**: the desktop is strict monochrome, so the TUI's color-only cues
-  (a column header in its category color, a task status colored by category,
-  a dependency in green or red) have no color on the desktop. Where the
-  color carries information, the desktop says it another way (a done
-  dependency gets a `✓`).
+- **Color**: the desktop has its own palette, after the Taskpage design
+  system ([`theme.md`](theme.md)), in light and dark; the TUI keeps the
+  shared tokens (`shelbi_app::theme`) and its colors are unchanged. Colors
+  that carry meaning in both clients (a workspace's state glyph, a review's
+  sub-state, the Zen band, the activity feed's tones) map onto the Taskpage
+  hue for the same meaning (`Theme::tone`, `Theme::decoration`). The TUI's
+  other color-only cues (a column header in its category color, a task
+  status colored by category, a dependency in green or red) have no color on
+  the desktop; where the color carries information, the desktop says it
+  another way (a done dependency gets a `✓`).
 - **The first-run hint** ("Ctrl+P palette · type E to edit settings") is the
   TUI's onboarding copy in `SidebarModel.status_line`; it is claimed once per
   machine, so the desktop leaves it to the TUI and shows its palette chord in

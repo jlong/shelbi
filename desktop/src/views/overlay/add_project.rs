@@ -11,6 +11,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Pixels, Size};
 use shelbi_app::overlay::add_project::{Field, Form, HINT, TITLE};
 use shelbi_core::ConfigMode;
 
+use crate::theme::style;
 use crate::theme::Theme;
 use crate::views::overlay::{hint, panel, title, with_overlay, ActiveOverlay, OverlayEvent, OverlayHost};
 
@@ -42,9 +43,9 @@ fn label(text: &'static str, focused: bool, theme: &Theme) -> gpui::Div {
         .w(px(LABEL_W))
         .flex_none()
         .when(focused, |l| {
-            l.text_color(theme.ansi_white).font_weight(FontWeight::BOLD).underline()
+            l.text_color(theme.text_loud).font_weight(FontWeight::SEMIBOLD)
         })
-        .when(!focused, |l| l.text_color(theme.ansi_gray))
+        .when(!focused, |l| l.text_color(theme.text))
         .child(text)
 }
 
@@ -56,7 +57,7 @@ pub fn render<H: OverlayHost>(
     cx: &mut Context<H>,
 ) -> AnyElement {
     let (w, h) = panel_size(size);
-    let accent = theme.ansi_cyan;
+    let accent = theme.focus_ring;
     let text_field = |id: &'static str, name: &'static str, value: &str, field: Field| {
         let focused = form.focus() == field;
         div()
@@ -64,21 +65,37 @@ pub fn render<H: OverlayHost>(
             .debug_selector(move || id.into())
             .flex()
             .flex_row()
+            .items_center()
             .cursor_text()
             .child(label(name, focused, theme))
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_color(theme.foreground)
-                    .child(value.replace(' ', "\u{00a0}")),
+                    .items_center()
+                    .h(px(32.0))
+                    .px_2()
+                    .rounded_lg()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.rule_strong)
+                    .when(focused, |d| d.shadow(vec![style::focus_shadow(theme)]))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(value.replace(' ', "\u{00a0}")),
+                    )
+                    .when(focused, |f| f.child(div().text_color(accent).child("▏"))),
             )
-            .when(focused, |f| f.child(div().text_color(accent).child("▏")))
             .on_click(cx.listener(on_field(field)))
     };
     let option = |text: &'static str, on: bool| {
         div()
-            .text_color(if on { theme.ansi_white } else { theme.ansi_dark_gray })
+            .text_color(if on { theme.text_loud } else { theme.text_quiet })
             .child(format!("({}) {text}", if on { "•" } else { "\u{00a0}" }))
     };
     let config_focused = form.focus() == Field::Config;
@@ -97,18 +114,18 @@ pub fn render<H: OverlayHost>(
     let detected = form.detected().map(|d| {
         div()
             .debug_selector(|| "add-project-detected".into())
-            .text_color(if d.is_ok() { theme.ansi_green } else { theme.ansi_yellow })
+            .text_color(if d.is_ok() { theme.success } else { theme.warning })
             .child(d.message())
     });
     let preview = match form.preview() {
         Some((slug, path)) => div()
             .flex()
             .flex_row()
-            .child(div().text_color(theme.ansi_gray).child("Folder / id:\u{00a0}"))
-            .child(div().text_color(accent).font_weight(FontWeight::BOLD).child(slug))
-            .child(div().text_color(theme.ansi_dark_gray).child(format!("\u{00a0}\u{00a0}\u{00a0}({path})"))),
+            .child(div().text_color(theme.text).child("Folder / id:\u{00a0}"))
+            .child(div().text_color(theme.text_loud).font_weight(FontWeight::SEMIBOLD).child(slug))
+            .child(div().text_color(theme.text_quiet).child(format!("\u{00a0}\u{00a0}\u{00a0}({path})"))),
         None => div()
-            .text_color(theme.ansi_dark_gray)
+            .text_color(theme.text_quiet)
             .child("Folder / id: (type a name to see the derived id)"),
     };
     // The error row is always reserved so the hints never reflow.
@@ -116,18 +133,18 @@ pub fn render<H: OverlayHost>(
         .debug_selector(|| "add-project-status".into())
         .min_h(px(20.0));
     let status = match (busy, form.error()) {
-        (true, _) => status.text_color(theme.muted).child("Creating project…"),
+        (true, _) => status.text_color(theme.text_quiet).child("Creating project…"),
         (false, Some(msg)) => status
-            .text_color(theme.ansi_red)
-            .font_weight(FontWeight::BOLD)
+            .text_color(theme.error)
+            .font_weight(FontWeight::MEDIUM)
             .child(format!("✗ {msg}")),
         (false, None) => status,
     };
 
-    panel("add-project", accent, theme)
+    panel("add-project", theme)
         .w(px(w))
         .h(px(h))
-        .child(title(TITLE, accent))
+        .child(title(TITLE, theme))
         .child(
             div()
                 .flex()

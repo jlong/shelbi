@@ -17,6 +17,7 @@ use shelbi_state::keymap::PopoverAction;
 use super::issues::{backdrop, IssuesView};
 use super::markdown;
 use crate::assets::{heroicon, icons, Icon};
+use crate::theme::style;
 use crate::theme::Theme;
 
 pub fn render(
@@ -49,8 +50,8 @@ pub fn render(
             div()
                 .flex_1()
                 .text_lg()
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.white)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_loud)
                 .child(d.title.clone()),
         )
         .child(
@@ -213,7 +214,7 @@ pub fn render(
         .gap_1()
         .px_5()
         .when_some(pending, |d, p| {
-            d.child(div().text_xs().text_color(theme.muted).child(p))
+            d.child(div().text_xs().text_color(theme.text_quiet).child(p))
         })
         .when_some(notice, |d, n| {
             d.child(
@@ -223,10 +224,10 @@ pub fn render(
                     .items_start()
                     .gap_1()
                     .text_xs()
-                    .text_color(theme.red)
+                    .text_color(theme.error)
                     .child(
                         heroicon(icons::EXCLAMATION_TRIANGLE)
-                            .text_color(theme.red),
+                            .text_color(theme.error),
                     )
                     .child(n),
             )
@@ -275,16 +276,13 @@ pub fn render(
         .h(relative(0.85))
         .min_w_0()
         .overflow_hidden()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.divider)
-        .bg(theme.canvas)
+        .map(|d| style::popover(d, theme))
         .on_click(|_, _, cx| cx.stop_propagation())
         .child(header)
         .child(fields)
         .child(actions)
         .child(status_rows)
-        .child(div().h(px(1.0)).mx_5().mb_3().bg(theme.divider))
+        .child(div().h(px(1.0)).mx_5().mb_3().bg(theme.rule))
         .child(body);
 
     backdrop(theme, cx)
@@ -297,7 +295,7 @@ fn label(theme: &Theme, text: &str) -> impl IntoElement {
     div()
         .w(px(88.0))
         .flex_none()
-        .text_color(theme.muted)
+        .text_color(theme.text_quiet)
         .child(text.to_string())
 }
 
@@ -307,20 +305,29 @@ fn field(theme: &Theme, name: &str, value: String) -> impl IntoElement {
         .flex_row()
         .gap_2()
         .child(label(theme, name))
-        .child(div().text_color(theme.gray).child(value))
+        .child(div().text_color(theme.text).child(value))
 }
 
 fn text_button(theme: &Theme, id: &'static str, text: &str) -> gpui::Stateful<gpui::Div> {
+    small_button(theme, id).child(text.to_string())
+}
+
+/// A small secondary button, empty.
+fn small_button(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+    let hover = theme.fill_strong;
     div()
         .id(id)
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(theme.search)
+        .flex()
+        .items_center()
+        .h(px(28.0))
+        .px(px(10.0))
+        .rounded_lg()
+        .bg(theme.fill)
         .text_xs()
-        .text_color(theme.gray)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.text_loud)
         .cursor_pointer()
-        .child(text.to_string())
+        .hover(move |s| s.bg(hover))
 }
 
 fn icon_button(
@@ -329,20 +336,10 @@ fn icon_button(
     icon: Icon,
     text: &str,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
+    small_button(theme, id)
         .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(theme.search)
-        .text_xs()
-        .text_color(theme.gray)
-        .cursor_pointer()
-        .child(heroicon(icon).text_color(theme.muted))
+        .pl_2()
+        .child(heroicon(icon).text_color(theme.icon))
         .child(text.to_string())
 }
 

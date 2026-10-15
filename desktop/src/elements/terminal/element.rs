@@ -361,9 +361,9 @@ impl Element for TerminalElement {
         // The scrollbar thumb, over the right edge.
         let scrollbar = pane.scrollbar_thumb().map(|thumb| {
             let color = if pane.scrollbar_active() || pane.scrollbar_hovered {
-                cx.global::<Theme>().gray
+                cx.global::<Theme>().icon
             } else {
-                cx.global::<Theme>().muted.opacity(0.6)
+                cx.global::<Theme>().icon_secondary.opacity(0.6)
             };
             (
                 Bounds {

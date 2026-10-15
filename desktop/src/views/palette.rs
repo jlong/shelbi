@@ -17,12 +17,14 @@ use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, FontWeight, Hsla, Pixels,
-    ScrollHandle, SharedString, Size,
+    ScrollHandle, Size,
 };
 use shelbi_app::overlay::palette::{Palette, PaletteFocus, ProjectIndicator};
 use shelbi_palette::{DecorationColor, Entry, EntryKind};
 use shelbi_state::keymap::{format_chord, DisplayStyle, Keymaps};
 
+use crate::assets::{heroicon, icons};
+use crate::theme::style;
 use crate::theme::Theme;
 use crate::views::overlay::{palette_event, panel, with_overlay, ActiveOverlay, OverlayHost, PALETTE_TOP};
 
@@ -69,7 +71,7 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (String, Hsla) {
     match &entry.decoration {
         Some(d) => {
             let color = match d.color {
-                DecorationColor::Default => theme.foreground,
+                DecorationColor::Default => theme.text,
                 other => theme.decoration(other),
             };
             (d.glyph.clone(), color)
@@ -77,9 +79,9 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (String, Hsla) {
         None => {
             let glyph = entry.kind.icon();
             let color = if glyph == EntryKind::Action.icon() {
-                theme.ansi_yellow
+                theme.gold
             } else {
-                theme.ansi_dark_gray
+                theme.text_quiet
             };
             (glyph.to_string(), color)
         }
@@ -108,7 +110,7 @@ pub fn render<H: OverlayHost>(
     let results = palette.results();
     let selected = palette.selected_in(results.len());
     let commands_focused = palette.focus() == PaletteFocus::Commands;
-    // The band sits inside 16px of padding on each side.
+    // The commands sit 16px in from each side (the band's 8px and the list's).
     let projects_w = projects_width(width - 32.0, !palette.projects().is_empty());
 
     let commands = if results.is_empty() {
@@ -116,7 +118,7 @@ pub fn render<H: OverlayHost>(
             .id("palette-results")
             .px_2()
             .py_1()
-            .text_color(theme.muted)
+            .text_color(theme.text_quiet)
             .child("No matching commands")
     } else {
         let rows: Vec<AnyElement> = results
@@ -126,10 +128,13 @@ pub fn render<H: OverlayHost>(
                 render_row(i, entry, commands_focused && i == selected, theme, cx)
             })
             .collect();
+        // Its own 8px gutter, so the rows' selection pill isn't clipped by
+        // the scroll.
         div()
             .id("palette-results")
             .flex()
             .flex_col()
+            .px_2()
             .overflow_y_scroll()
             .track_scroll(scroll)
             .children(rows)
@@ -141,13 +146,14 @@ pub fn render<H: OverlayHost>(
         .flex_1()
         .min_h_0()
         .gap_4()
-        .px_4()
+        .px_2()
+        .pt_2()
         .child(div().flex_1().min_w_0().flex().flex_col().min_h_0().child(commands.flex_1().min_h_0()))
         .when_some(projects_w, |band, w| {
             band.child(render_projects(palette, w, theme, cx))
         });
 
-    panel("palette", theme.muted, theme)
+    panel("palette", theme)
         .w(px(width))
         .max_h(px(max_h))
         .child(search_line(palette.query(), theme))
@@ -159,43 +165,47 @@ pub fn render<H: OverlayHost>(
                 .pt_2()
                 .pb_3()
                 .text_xs()
-                .text_color(theme.muted)
+                .text_color(theme.text_quiet)
                 .child(palette.footer(&close_chord(keymaps))),
         )
         .into_any_element()
 }
 
-/// The `❯` line: the dim placeholder behind a green block cursor, or the
-/// query followed by the cursor.
+/// The search line: a magnifying glass, then the query (or the quiet
+/// placeholder) with the caret in the focus color, over a rule.
 fn search_line(query: &str, theme: &Theme) -> gpui::Div {
-    let cursor = |text: SharedString| {
+    let cursor = || {
         div()
             .debug_selector(|| "palette-cursor".into())
-            .bg(theme.green)
-            .text_color(theme.on_color)
-            .min_w(px(8.0))
-            .h(px(18.0))
-            .child(text)
+            .flex_none()
+            .w(px(2.0))
+            .h(px(20.0))
+            .rounded_full()
+            .bg(theme.focus_ring)
     };
     let line = div()
         .debug_selector(|| "palette-query".into())
         .flex()
         .flex_row()
         .items_center()
+        .gap(px(2.0))
+        .h(px(52.0))
         .px_4()
-        .pt_3()
-        .pb_3()
-        .text_color(theme.foreground)
-        .child(div().pr_2().child("❯"));
+        .border_b_1()
+        .border_color(theme.rule)
+        .text_base()
+        .text_color(theme.text_loud)
+        .child(
+            heroicon(icons::MAGNIFYING_GLASS)
+                .mr_2()
+                .text_color(theme.icon),
+        );
     if query.is_empty() {
-        let mut chars = PLACEHOLDER.chars();
-        let first: String = chars.by_ref().take(1).collect();
-        let rest: String = chars.collect();
-        line.child(cursor(first.into()))
-            .child(div().text_color(theme.muted).child(rest))
+        line.child(cursor())
+            .child(div().text_color(theme.text_quiet).child(PLACEHOLDER))
     } else {
         line.child(div().whitespace_nowrap().child(query.replace(' ', "\u{00a0}")))
-            .child(cursor(SharedString::default()))
+            .child(cursor())
     }
 }
 
@@ -215,12 +225,13 @@ fn render_row<H: OverlayHost>(
         .flex_row()
         .items_center()
         .flex_none()
+        .relative()
         .h(px(ROW_H))
         .px_1()
-        .rounded_md()
+        .rounded_lg()
         .cursor_pointer()
-        .when(selected, |row| row.bg(theme.selection))
-        .when(!selected, |row| row.hover(|s| s.bg(theme.background)))
+        .when(selected, |row| row.bg(theme.row_selected).child(style::selection_indicator(theme)))
+        .when(!selected, |row| row.hover(|s| s.bg(theme.fill_subtle)))
         .child(
             div()
                 .w(px(ICON_W))
@@ -237,10 +248,10 @@ fn render_row<H: OverlayHost>(
                 .truncate()
                 .when(selected, |l| {
                     l.debug_selector(|| "palette-selected".into())
-                        .text_color(theme.ansi_white)
-                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.text_loud)
+                        .font_weight(FontWeight::MEDIUM)
                 })
-                .when(!selected, |l| l.text_color(theme.foreground))
+                .when(!selected, |l| l.text_color(theme.text))
                 .child(entry.label.clone()),
         )
         .child(
@@ -249,11 +260,22 @@ fn render_row<H: OverlayHost>(
                 .min_w_0()
                 .pl_2()
                 .truncate()
-                .text_color(theme.muted)
+                .text_color(theme.text_quiet)
                 .child(entry.subtitle.clone().unwrap_or_default()),
         )
         .when_some(entry.shortcut.clone(), |row, shortcut| {
-            row.child(div().flex_none().pl_2().pr_1().text_color(theme.muted).child(shortcut))
+            row.child(
+                div()
+                    .flex_none()
+                    .ml_2()
+                    .mr_1()
+                    .px_1()
+                    .rounded_md()
+                    .bg(theme.fill)
+                    .text_xs()
+                    .text_color(theme.text_quiet)
+                    .child(shortcut),
+            )
         })
         .on_click(cx.listener(move |this: &mut H, _, window, cx| {
             with_overlay(this, window, cx, |o| match o {
@@ -279,8 +301,8 @@ fn render_projects<H: OverlayHost>(
         .enumerate()
         .map(|(i, p)| {
             let color = match p.indicator {
-                ProjectIndicator::Active | ProjectIndicator::LoadedIdle => theme.green,
-                ProjectIndicator::Unloaded => theme.ansi_dark_gray,
+                ProjectIndicator::Active | ProjectIndicator::LoadedIdle => theme.success,
+                ProjectIndicator::Unloaded => theme.text_quiet,
             };
             let glyph = div()
                 .w(px(16.0))
@@ -309,7 +331,7 @@ fn render_projects<H: OverlayHost>(
         div()
             .w(px(16.0))
             .flex_none()
-            .text_color(theme.ansi_dark_gray)
+            .text_color(theme.text_quiet)
             .child("+")
             .into_any_element(),
         "Add project".into(),
@@ -323,7 +345,7 @@ fn render_projects<H: OverlayHost>(
         .flex_none()
         .flex()
         .flex_col()
-        .child(div().px_2().pb_1().text_color(theme.muted).child("Projects"))
+        .child(style::heading("Projects", theme).px_2().pb_1())
         .children(rows)
         .into_any_element()
 }
@@ -344,13 +366,19 @@ fn project_row<H: OverlayHost>(
         .flex_row()
         .items_center()
         .gap_1()
-        .h(px(26.0))
+        .relative()
+        .h(px(ROW_H))
         .px_2()
-        .rounded_md()
+        .rounded_lg()
         .cursor_pointer()
-        .text_color(theme.foreground)
-        .when(selected, |r| r.bg(theme.selection).font_weight(FontWeight::BOLD))
-        .when(!selected, |r| r.hover(|s| s.bg(theme.background)))
+        .text_color(theme.text)
+        .when(selected, |r| {
+            r.bg(theme.row_selected)
+                .text_color(theme.text_loud)
+                .font_weight(FontWeight::MEDIUM)
+                .child(style::selection_indicator(theme))
+        })
+        .when(!selected, |r| r.hover(|s| s.bg(theme.fill_subtle)))
         .child(glyph)
         .child(div().truncate().child(label))
         .on_click(cx.listener(move |this: &mut H, _, window, cx| {
@@ -401,9 +429,9 @@ mod tests {
             gpui::WindowAppearance::Dark,
         );
         let action = icon_for(&entry(EntryKind::Action, None), &theme);
-        assert_eq!(action, ("⚡".to_string(), theme.ansi_yellow));
+        assert_eq!(action, ("⚡".to_string(), theme.gold));
         let view = icon_for(&entry(EntryKind::View, None), &theme);
-        assert_eq!(view, ("◉".to_string(), theme.ansi_dark_gray));
+        assert_eq!(view, ("◉".to_string(), theme.text_quiet));
         let nav = icon_for(
             &entry(
                 EntryKind::View,

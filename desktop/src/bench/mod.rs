@@ -322,7 +322,7 @@ impl Render for BenchRoot {
         div()
             .relative()
             .size_full()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .child(content)
             .children(overlay)
             .child(

@@ -47,12 +47,12 @@ pub fn render<H: OverlayHost>(
     let body = match viewer {
         None => div()
             .id("error-log-body")
-            .text_color(theme.muted)
+            .text_color(theme.text_quiet)
             .child("Loading…"),
         Some(viewer) if viewer.rows.is_empty() => div()
             .id("error-log-body")
             .debug_selector(|| "error-log-empty".into())
-            .text_color(theme.ansi_dark_gray)
+            .text_color(theme.text_quiet)
             .child(EMPTY),
         Some(viewer) => div()
             .id("error-log-body")
@@ -73,8 +73,7 @@ pub fn render<H: OverlayHost>(
                             .flex_none()
                             .when(*unread, |m| {
                                 m.debug_selector(move || format!("error-log-unread-{i}"))
-                                    .text_color(theme.error_marker)
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.error)
                                     .child("●")
                             }),
                     )
@@ -82,28 +81,34 @@ pub fn render<H: OverlayHost>(
                         div()
                             .w(px(132.0))
                             .flex_none()
-                            .text_color(theme.ansi_dark_gray)
+                            .text_color(theme.text_quiet)
                             .child(format_ts(entry)),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_color(theme.ansi_white)
+                            .text_color(theme.text_loud)
                             .child(entry.message.clone()),
                     )
             })),
     };
     let small_button = |id: &'static str, label: &'static str| {
+        let hover = theme.fill_strong;
         div()
             .id(id)
             .debug_selector(move || id.into())
-            .px_2()
-            .rounded_md()
+            .flex()
+            .items_center()
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded_lg()
+            .bg(theme.fill)
             .cursor_pointer()
             .text_xs()
-            .text_color(theme.muted)
-            .hover(|s| s.bg(theme.selection).text_color(theme.foreground))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.text_loud)
+            .hover(move |s| s.bg(hover))
             .child(label)
     };
     let header = div()
@@ -112,7 +117,7 @@ pub fn render<H: OverlayHost>(
         .items_center()
         .justify_between()
         .pr_3()
-        .child(title("Error log", theme.ansi_yellow))
+        .child(title("Error log", theme))
         .child(
             div()
                 .flex()
@@ -142,7 +147,7 @@ pub fn render<H: OverlayHost>(
                     },
                 ))),
         );
-    panel("error-log", theme.ansi_yellow, theme)
+    panel("error-log", theme)
         .w(px(w))
         .h(px(h))
         .child(header)

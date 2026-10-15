@@ -27,7 +27,6 @@ use shelbi_app::session::{
     self as app_session, ConnectFailure, IdleInfo, ReconnectPolicy, Relauncher, RetryPolicy,
     SessionRef,
 };
-use shelbi_app::theme::ThemePreference;
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceRow};
 use shelbi_app::workspace_panel::{WsRow, WsSwitch};
 use shelbi_app::WorkspaceSessionOp;
@@ -168,9 +167,9 @@ impl Render for Host {
             .size_full()
             .font_family("Geist")
             .text_sm()
-            .bg(theme.canvas)
+            .bg(theme.surface)
             .child(div().flex_none().w(px(300.0)).h_full().child(self.view.clone()))
-            .child(div().w(px(1.0)).h_full().bg(theme.divider))
+            .child(div().w(px(1.0)).h_full().bg(theme.rule))
             .child(div().flex().flex_1().min_w_0().h_full().child(main))
     }
 }
@@ -189,9 +188,8 @@ pub fn run(out: PathBuf) -> ! {
     std::fs::create_dir_all(&out).expect("create the output directory");
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
-    cx.set_global(Theme::resolve(ThemePreference::Dark, gpui::WindowAppearance::Dark));
     cx.update(|cx| {
-        gpui_kit::init(cx);
+        crate::visual_check::install_theme(cx);
         crate::assets::load_fonts(cx);
     });
     let sessions = Arc::new(Sessions::default());

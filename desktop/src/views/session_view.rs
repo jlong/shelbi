@@ -854,7 +854,7 @@ impl Render for SessionView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.canvas);
+            .bg(theme.surface);
         if let Slot::Live(pane) = &self.slot {
             return root.child(pane.clone());
         }
@@ -865,9 +865,9 @@ impl Render for SessionView {
                 |(i, line)| {
                     let row = div().min_h(gpui::px(18.0)).child(line);
                     if i == 0 {
-                        row.font_weight(FontWeight::BOLD).text_color(theme.white)
+                        row.font_weight(FontWeight::SEMIBOLD).text_color(theme.text_loud)
                     } else {
-                        row.text_color(theme.muted)
+                        row.text_color(theme.text_quiet)
                     }
                 },
             ));
@@ -879,7 +879,7 @@ impl Render for SessionView {
                 // the main area.
                 .max_w_full()
                 .text_center()
-                .text_color(theme.muted)
+                .text_color(theme.text_quiet)
                 .child(self.notice().unwrap_or_default()),
         )
     }

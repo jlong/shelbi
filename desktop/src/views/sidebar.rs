@@ -28,6 +28,7 @@ use shelbi_state::ZenModeState;
 use crate::assets::{heroicon, icons, Icon, ICON_SIZE};
 use crate::projects::ProjectEntry;
 use crate::refresh::DaemonLink;
+use crate::theme::style::{self, IconButtonSize, LIST_ROW_H, NAV_ROW_H};
 use crate::theme::Theme;
 
 /// Width of one TUI column in the window, so the shared nav model's widths
@@ -37,8 +38,9 @@ pub const COLUMN_PX: f32 = 9.0;
 /// Room left above the title for the macOS traffic lights.
 pub const TRAFFIC_LIGHT_INSET: f32 = 38.0;
 
-const ROW_H: f32 = 26.0;
-const NAV_ROW_H: f32 = 30.0;
+/// A section heading's row (Taskpage's `Nav.Heading`: 20px above, 4px
+/// below).
+const SECTION_H: f32 = 32.0;
 
 /// The sidebar's displayed width in pixels: the user's chosen `width_cols`,
 /// clamped to the window (at least 24 columns, at most half the window).
@@ -229,11 +231,11 @@ pub fn render<H: SidebarHost>(
         .w(px(props.width))
         .h_full()
         .flex_none()
-        .bg(theme.background)
-        .text_color(theme.gray)
+        .bg(theme.surface_recessed)
+        .text_color(theme.text)
         .text_sm()
         .child(render_header(&props, theme, cx))
-        .child(div().flex().flex_col().px_2().pt_2().children(nav))
+        .child(div().flex().flex_col().px_2().pt(px(12.0)).children(nav))
         .child(
             div()
                 .id("sidebar-rest")
@@ -264,21 +266,22 @@ fn render_header<H: SidebarHost>(
         .items_center()
         .gap_1()
         .px_2()
-        .py_1()
-        .rounded_md()
+        .h(px(32.0))
+        .rounded_lg()
         .cursor_pointer()
-        .hover(|s| s.bg(theme.search))
+        .hover(|s| s.bg(theme.fill))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(theme.cyan)
-                .font_weight(FontWeight::BOLD)
+                .text_base()
+                .text_color(theme.wordmark)
+                .font_weight(FontWeight::SEMIBOLD)
                 .child(props.model.project_label.clone()),
         )
         .child(
-            heroicon(icons::CHEVRON_UP_DOWN).text_color(theme.muted),
+            heroicon(icons::CHEVRON_UP_DOWN).text_color(theme.icon),
         )
         .on_click(cx.listener(|this, _, window, cx| {
             this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
@@ -293,15 +296,25 @@ fn render_header<H: SidebarHost>(
         .gap_2()
         .mt_2()
         .px_2()
-        .h(px(28.0))
-        .rounded_md()
-        .bg(theme.search)
+        .h(px(32.0))
+        .rounded_lg()
+        .bg(theme.surface_raised)
+        .shadow(style::card_shadow(theme))
+        .text_color(theme.text_quiet)
         .cursor_pointer()
         .child(
-            heroicon(icons::MAGNIFYING_GLASS).text_color(theme.gray),
+            heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon),
         )
         .child(div().flex_1().child("Search"))
-        .child(div().flex_none().child(props.palette_chord.clone()))
+        .child(
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_md()
+                .bg(theme.fill)
+                .text_xs()
+                .child(props.palette_chord.clone()),
+        )
         .on_click(cx.listener(|this, _, window, cx| {
             this.sidebar_event(SidebarEvent::OpenSearch, window, cx)
         }));
@@ -338,32 +351,39 @@ fn render_switcher<H: SidebarHost>(
             .items_center()
             .gap_2()
             .px_2()
-            .h(px(ROW_H))
-            .rounded_md()
+            .h(px(LIST_ROW_H))
+            .rounded_lg()
             .cursor_pointer()
-            .hover(|s| s.bg(theme.selection))
+            .hover(|s| s.bg(theme.fill_subtle))
             .child(
                 div().w(ICON_SIZE).flex_none().when(is_current, |d| {
-                    d.child(heroicon(icons::CHECK).text_color(theme.green))
+                    d.child(heroicon(icons::CHECK).text_color(theme.brand_text))
                 }),
             )
-            .child(div().flex_1().min_w_0().truncate().child(p.label.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(is_current, |d| d.font_weight(FontWeight::MEDIUM).text_color(theme.text_loud))
+                    .child(p.label.clone()),
+            )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
             }))
     });
-    div()
-        .id("sidebar-switcher")
-        .debug_selector(|| "sidebar-switcher".into())
-        .flex()
-        .flex_col()
-        .mt_1()
-        .p_1()
-        .rounded_md()
-        .bg(theme.search)
-        .text_color(theme.foreground)
+    style::popover(
+        div()
+            .id("sidebar-switcher")
+            .debug_selector(|| "sidebar-switcher".into())
+            .flex()
+            .flex_col()
+            .mt_1()
+            .p_1(),
+        theme,
+    )
         .when(projects.is_empty(), |d| {
-            d.child(div().px_2().text_color(theme.muted).child("Loading…"))
+            d.child(div().px_2().text_color(theme.text_quiet).child("Loading…"))
         })
         .children(rows)
 }
@@ -379,33 +399,39 @@ fn render_nav_row<H: SidebarHost>(
         return div().into_any_element();
     };
     let selected = ordinal == Some(props.selection);
-    let bright = selected && props.focused;
-    let color = if bright { theme.white } else { theme.gray };
     let selector = row_selector(row);
     let ord = ordinal.unwrap_or_default();
+    // Taskpage's nav item: 40px, the chip inset 2px top and bottom, the
+    // content 8px inside it.
     div()
         .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector)
+        .relative()
         .flex()
         .flex_row()
         .items_center()
         .gap_2()
         .px_2()
-        .h(px(NAV_ROW_H))
-        .rounded_md()
+        .my(px(2.0))
+        .h(px(NAV_ROW_H - 4.0))
+        .rounded_lg()
         .cursor_pointer()
-        .text_color(color)
-        .when(selected, |d| d.bg(theme.selection).child(selection_marker()))
-        .when(bright, |d| d.font_weight(FontWeight::BOLD))
-        .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+        .text_color(theme.text)
+        .map(|d| selected_row(d, selected, props.focused, theme))
         .child(
-            heroicon(nav_icon(view)).text_color(color),
+            heroicon(nav_icon(view)).text_color(theme.icon),
         )
         .child(label.clone())
         .on_click(cx.listener(move |this, _, window, cx| {
             this.sidebar_event(SidebarEvent::Activate(ord), window, cx)
         }))
         .into_any_element()
+}
+
+/// Paint a row selected (the raised chip, the brand pill while the sidebar
+/// has keyboard focus) or hoverable.
+fn selected_row(d: gpui::Stateful<gpui::Div>, selected: bool, focused: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    style::row_state(d, selected, selected && focused, theme).when(selected, |d| d.child(selection_marker()))
 }
 
 /// A zero-size marker inside the selected row, so a test can find the
@@ -435,31 +461,29 @@ fn render_row<H: SidebarHost>(
         })
         .flex_none();
     match row {
-        SidebarRow::Blank => base.h(px(10.0)).into_any_element(),
+        SidebarRow::Blank => base.h(px(8.0)).into_any_element(),
         SidebarRow::Section(_) => base
             .px_2()
-            .pt_1()
-            .h(px(ROW_H))
+            .pt(px(12.0))
+            .pb(px(4.0))
+            .h(px(SECTION_H))
             .flex()
-            .items_center()
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.muted)
-            .child(text.label)
+            .items_end()
+            .child(style::heading(text.label, theme))
             .into_any_element(),
         SidebarRow::Loading => base
             .px_2()
-            .h(px(ROW_H))
+            .h(px(LIST_ROW_H))
             .flex()
             .items_center()
             .italic()
-            .text_color(theme.muted)
+            .text_color(theme.text_quiet)
             .child(text.label)
             .into_any_element(),
         SidebarRow::ConfigError(_) => base
             .px_2()
             .py_1()
-            .text_color(theme.red)
+            .text_color(theme.error)
             .child(text.label)
             .into_any_element(),
         SidebarRow::Nav { .. } => base.into_any_element(),
@@ -488,7 +512,7 @@ fn render_row<H: SidebarHost>(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .h(px(ROW_H))
+                .h(px(LIST_ROW_H - 4.0))
                 .when(indent, |d| d.pl(px(2.0 * COLUMN_PX)))
                 .when_some(text.badge, |d, (glyph, color)| {
                     d.child(
@@ -496,30 +520,33 @@ fn render_row<H: SidebarHost>(
                             .w(px(12.0))
                             .flex_none()
                             .text_color(color)
-                            .when(serving, |b| b.font_weight(FontWeight::BOLD))
-                            .when(loading_badge, |b| b.text_color(theme.muted))
+                            .when(serving, |b| b.font_weight(FontWeight::SEMIBOLD))
+                            .when(loading_badge, |b| b.text_color(theme.text_quiet))
                             .child(glyph),
                     )
                 })
                 .child(div().flex_1().min_w_0().truncate().child(text.label))
                 .when_some(text.right, |d, right| {
-                    d.child(div().flex_none().text_color(theme.muted).child(right))
+                    d.child(div().flex_none().text_color(theme.text_quiet).child(right))
                 });
-            base.flex()
+            base.relative()
+                .flex()
                 .flex_col()
                 .px_2()
-                .rounded_md()
+                .my(px(2.0))
+                .rounded_lg()
                 .cursor_pointer()
-                .when(selected, |d| d.bg(theme.selection).child(selection_marker()))
-                .when(!selected, |d| d.hover(|s| s.bg(theme.search)))
+                .text_color(theme.text)
+                .map(|d| selected_row(d, selected, props.focused, theme))
                 .child(line)
                 .when_some(text.branch, |d, branch| {
                     d.child(
                         div()
                             .pl(px(2.0 * COLUMN_PX))
-                            .pb_1()
+                            .pb_1p5()
                             .text_xs()
-                            .text_color(theme.muted)
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(theme.text_quiet)
                             .truncate()
                             .child(branch),
                     )
@@ -540,16 +567,16 @@ fn render_footer<H: SidebarHost>(
     let model = props.model;
     let version = model.daemon_version_line.clone().map(|line| {
         let color = if model.daemon_version_mismatch {
-            theme.red
+            theme.error
         } else {
-            theme.muted
+            theme.text_quiet
         };
         div().text_color(color).child(line)
     });
     let banner = model.board_banner.clone().map(|banner| {
         let stale = banner.contains("stale") || banner.contains("no daemon");
         div()
-            .text_color(if stale { theme.yellow } else { theme.muted })
+            .text_color(if stale { theme.warning } else { theme.text_quiet })
             .child(banner)
     });
     let polling = (props.link == Some(DaemonLink::Polling)).then(|| {
@@ -559,9 +586,9 @@ fn render_footer<H: SidebarHost>(
             .flex_row()
             .items_center()
             .gap_1()
-            .text_color(theme.yellow)
+            .text_color(theme.warning)
             .child(
-                heroicon(icons::SIGNAL_SLASH).text_color(theme.yellow),
+                heroicon(icons::SIGNAL_SLASH).text_color(theme.warning),
             )
             .child("Daemon unreachable · polling")
     });
@@ -573,14 +600,7 @@ fn render_footer<H: SidebarHost>(
     });
 
     let icon_button = |id: &'static str, icon: Icon| {
-        div()
-            .id(id)
-            .debug_selector(move || id.into())
-            .p_1()
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.search))
-            .child(heroicon(icon).text_color(theme.muted))
+        style::icon_button(id, icon, IconButtonSize::Large, false, theme)
     };
     let buttons = div()
         .flex()
@@ -597,12 +617,12 @@ fn render_footer<H: SidebarHost>(
                     .flex()
                     .items_center()
                     .justify_center()
-                    // An icon button's size: the icon and its padding.
-                    .size(ICON_SIZE + px(8.0))
-                    .rounded_md()
-                    .bg(theme.error_button)
-                    .text_color(theme.on_color)
-                    .font_weight(FontWeight::BOLD)
+                    // An icon button's square.
+                    .size(px(IconButtonSize::Large.px()))
+                    .rounded_xl()
+                    .bg(theme.error_fill)
+                    .text_color(theme.text_on_color)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
                     .child("!")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -651,14 +671,16 @@ fn render_footer<H: SidebarHost>(
         .child(
             div()
                 .h(px(24.0))
+                .mx_2()
                 .flex()
                 .items_center()
-                .px_3()
+                .px_2()
+                .rounded_lg()
                 .when(matches!(model.zen_mode, ZenModeState::On), |d| {
                     d.debug_selector(|| "sidebar-zen-band".into())
                         .bg(theme.zen)
-                        .text_color(theme.on_color)
-                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.text_on_color)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .child("ZEN MODE ON")
                 }),
         )
@@ -675,9 +697,9 @@ fn footer_status(model: &SidebarModel, theme: &Theme) -> Option<(String, Hsla)> 
         return None;
     }
     let color = if model.orchestrator_status.is_some() {
-        theme.ansi_red
+        theme.error
     } else {
-        theme.yellow
+        theme.warning
     };
     Some((line, color))
 }
@@ -714,12 +736,12 @@ mod tests {
         let mut model = SidebarModel::skeleton("demo");
         assert_eq!(footer_status(&model, &t), None, "no status, no row");
         model.status_line = "Indexing".into();
-        assert_eq!(footer_status(&model, &t), Some(("Indexing".into(), t.yellow)));
+        assert_eq!(footer_status(&model, &t), Some(("Indexing".into(), t.warning)));
         // The supervisor's failure takes the row, in the TUI's words.
         model.orchestrator_status = Some("supervisor gave up: spawn refused".into());
         assert_eq!(
             footer_status(&model, &t),
-            Some(("Orchestrator: supervisor gave up: spawn refused".into(), t.ansi_red))
+            Some(("Orchestrator: supervisor gave up: spawn refused".into(), t.error))
         );
     }
 
@@ -743,7 +765,7 @@ mod tests {
             right_label: "idle".into(),
             indent: true,
         };
-        assert_eq!(row_text(&idle, &t).badge, Some(("·".into(), t.muted)));
+        assert_eq!(row_text(&idle, &t).badge, Some(("·".into(), t.text_quiet)));
 
         for (badge, glyph) in [
             (WorkspaceBadge::AwaitingInput, "?"),
