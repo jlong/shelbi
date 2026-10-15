@@ -443,14 +443,14 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // have their own threads). Ends the project's sessions, drains
                 // its quit barrier, marks it closed, then acks.
                 state.inner.lifecycle.quit_project(&project);
-                let _ = tx.send(ServerMsg::Done { request_id });
+                let _ = tx.send(ServerMsg::Done { request_id, state: None });
             }
             ClientMsg::QuitShelbi { request_id } => {
                 // Close every project and end all sessions, ACK the client, then
                 // stop the daemon — acking before the stop so the reply isn't
                 // lost to the shutdown race.
                 state.inner.lifecycle.quit_shelbi();
-                let _ = tx.send(ServerMsg::Done { request_id });
+                let _ = tx.send(ServerMsg::Done { request_id, state: None });
                 state.inner.lifecycle.stop_daemon();
             }
             ClientMsg::ReloadClients { request_id } => {
@@ -458,7 +458,7 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 state.broadcast_all(&ServerMsg::Reexec {
                     reason: "shelbi reload".to_string(),
                 });
-                let _ = tx.send(ServerMsg::Done { request_id });
+                let _ = tx.send(ServerMsg::Done { request_id, state: None });
             }
             ClientMsg::ReviewSession(req) => {
                 // Detached like a mutation: the daemon owns the review sessions'
@@ -574,7 +574,12 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
 
     match (state.inner.apply)(&req.project, &req.id, &req.kind, &mut sink, &mut recheck) {
         Ok(note) => {
-            let _ = tx.send(ServerMsg::Done { request_id });
+            // The requester learns the revision its own change produced, so a
+            // follow-up on the same issue isn't refused as stale.
+            let _ = tx.send(ServerMsg::Done {
+                request_id,
+                state: note.state(),
+            });
             // Announce to the other connected clients.
             state.broadcast(origin, &note);
         }
@@ -631,7 +636,7 @@ fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
     };
     match result {
         Ok(()) => {
-            let _ = tx.send(ServerMsg::Done { request_id });
+            let _ = tx.send(ServerMsg::Done { request_id, state: None });
         }
         Err(e) => {
             let _ = tx.send(ServerMsg::Failed {
@@ -675,7 +680,7 @@ fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>
     };
     match result {
         Ok(()) => {
-            let _ = tx.send(ServerMsg::Done { request_id });
+            let _ = tx.send(ServerMsg::Done { request_id, state: None });
         }
         Err(e) => {
             let _ = tx.send(ServerMsg::Failed {
@@ -1037,7 +1042,9 @@ mod tests {
         let sock = sock.to_path_buf();
         thread::spawn(move || {
             let mut client = ControlClient::connect(&sock, "test").unwrap();
-            client.mutate(&req(request_id, "t1", kind, expected), &mut |_s, _t| {})
+            client
+                .mutate(&req(request_id, "t1", kind, expected), &mut |_s, _t| {})
+                .map(|_| ())
         })
     }
 

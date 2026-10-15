@@ -24,6 +24,12 @@
 //! the drop. While a move or reorder is in flight the board shows the card
 //! where it is headed, dimmed with a pending row; a refusal drops that overlay,
 //! so the card snaps back to where it really is, with the daemon's message.
+//!
+//! The board's reads lag its own changes (they come from the daemon's board
+//! index), so an acked mutation keeps the `(status, revision)` the daemon
+//! reported it produced ([`Pending::landed`]). A follow-up on the same card
+//! sends that state rather than the read's pre-change one, which the daemon
+//! would refuse as changed elsewhere (`dt-board-stale-after-own-mutation`).
 
 use std::collections::BTreeMap;
 
@@ -95,8 +101,18 @@ pub enum Scroll {
 pub struct Pending {
     /// What the card says while it waits (`Moving to REVIEW…`).
     pub label: String,
-    /// The card's read state when the mutation was sent.
+    /// The state the mutation was sent against: the card's read state, or the
+    /// state this client's own previous change landed at.
     pub sent_from: ExpectedState,
+    /// The card's read state when the first of this client's unsettled
+    /// changes to it was sent. Reads that still show it (or anything between
+    /// it and [`Pending::landed`]) predate this client's own changes.
+    pub read_from: ExpectedState,
+    /// The `(status, revision)` the daemon reported the mutation produced,
+    /// once acked (`None` before the ack, or from a daemon that doesn't
+    /// report it). A follow-up mutation expects this state, and a read at or
+    /// past its revision settles the change.
+    pub landed: Option<ExpectedState>,
     /// For a move, the target status: the board shows the move settled once a
     /// read has the card there.
     pub to_status: Option<String>,
@@ -107,10 +123,14 @@ pub struct Pending {
     /// a reorder's column). Every card whose priority shifts gets a new
     /// revision, so the column's other cards wait for this one to land rather
     /// than send a state the daemon would refuse as changed elsewhere.
-    pub renumbers: Option<String>,
+    /// A follow-up keeps its predecessor's columns until the reads catch up.
+    pub renumbers: Vec<String>,
     /// The daemon acknowledged it; the card stays pending until a read shows
     /// the change (so a read already in flight can't flash the old state).
     pub acked: bool,
+    /// The acked change this one follows, put back if this one fails, so the
+    /// card keeps the state its landed change produced.
+    prev: Option<Box<Pending>>,
 }
 
 /// A mutation ready to send, from [`BoardState::begin_mutation`].
@@ -348,10 +368,12 @@ impl BoardState {
         }
     }
 
-    /// Drop acked mutations a read now confirms: a move once the card sits in
-    /// its target status, a reorder once it sits at its slot (or its revision
-    /// moved on), anything else once the card's revision moved on (or the card
-    /// is gone, e.g. filtered out).
+    /// Drop acked mutations a read now confirms: one whose landed state the
+    /// daemon reported once the card's read revision reaches it; otherwise a
+    /// move once the card sits in its target status, a reorder once it sits at
+    /// its slot (or its revision moved on), anything else once the card's
+    /// revision moved on. A card gone from the read (e.g. filtered out) drops
+    /// it too.
     fn settle_pending(&mut self) {
         let tasks = self.input.tasks();
         self.pending.retain(|id, p| {
@@ -364,7 +386,11 @@ impl BoardState {
             let Some(tf) = tasks.iter().find(|tf| &tf.task.id == id) else {
                 return false;
             };
-            let revised = tf.task.updated_at.to_rfc3339() != p.sent_from.updated_at;
+            let read_rev = tf.task.updated_at.to_rfc3339();
+            if let Some(landed) = &p.landed {
+                return !revision_at_or_after(&read_rev, &landed.updated_at);
+            }
+            let revised = read_rev != p.read_from.updated_at;
             match (&p.to_status, p.to_slot) {
                 (Some(to), _) => tf.task.column.as_str() != to,
                 (None, Some(slot)) => !revised && board::current_slot(&tasks, id) != Some(slot),
@@ -974,10 +1000,16 @@ impl BoardState {
                             status: String::new(),
                             updated_at: String::new(),
                         },
+                        read_from: ExpectedState {
+                            status: String::new(),
+                            updated_at: String::new(),
+                        },
+                        landed: None,
                         to_status: None,
                         to_slot: None,
-                        renumbers: None,
+                        renumbers: Vec::new(),
                         acked: false,
+                        prev: None,
                     },
                 );
                 self.status = Some(format!("adding “{title}”…"));
@@ -990,7 +1022,13 @@ impl BoardState {
             }
             _ => return Err(Vec::new()),
         };
-        if self.pending.contains_key(&id) {
+        // A change the daemon hasn't answered yet blocks a second one; an
+        // acked one whose landed state we know is followed on from that state.
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|p| !p.acked || p.landed.is_none())
+        {
             self.status = Some(format!("{id}: a change is already in progress"));
             return Err(Vec::new());
         }
@@ -998,10 +1036,11 @@ impl BoardState {
             CommandKind::EditIssue { .. } => self.staged_edits.remove(&id),
             _ => None,
         };
-        let expected = match &staged {
+        let seen = match &staged {
             Some(s) => s.expected.clone(),
             None => self.model.card(&id).map(IssueCard::expected),
         };
+        let expected = seen.map(|seen| self.own_expected(&id, seen));
         let Some(sent_from) = expected.clone() else {
             self.status = Some(format!("{id} is no longer on the board"));
             return Err(vec![Intent::Refresh]);
@@ -1014,11 +1053,27 @@ impl BoardState {
             ));
             return Err(Vec::new());
         }
-        let renumbers = match kind {
+        let mut renumbers = match kind {
             CommandKind::MoveIssue { .. }
             | CommandKind::StartIssue { .. }
-            | CommandKind::PrioritizeIssue { .. } => Some(sent_from.status.clone()),
-            _ => None,
+            | CommandKind::PrioritizeIssue { .. } => vec![sent_from.status.clone()],
+            _ => Vec::new(),
+        };
+        // A follow-up on this client's own landed change: until the reads
+        // catch up, the card still shows where that change put it, its
+        // columns still wait, and a failure puts it back.
+        let prev = self.pending.remove(&id).map(Box::new);
+        let (read_from, to_status, to_slot) = match &prev {
+            Some(p) => {
+                for column in &p.renumbers {
+                    if !renumbers.contains(column) {
+                        renumbers.push(column.clone());
+                    }
+                }
+                let to_slot = if to_status.is_none() { to_slot.or(p.to_slot) } else { None };
+                (p.read_from.clone(), to_status.or_else(|| p.to_status.clone()), to_slot)
+            }
+            None => (sent_from.clone(), to_status, to_slot),
         };
         self.notices.remove(&id);
         self.pending.insert(
@@ -1026,10 +1081,13 @@ impl BoardState {
             Pending {
                 label,
                 sent_from,
+                read_from,
+                landed: None,
                 to_status,
                 to_slot,
                 renumbers,
                 acked: false,
+                prev,
             },
         );
         self.rebuild();
@@ -1042,21 +1100,39 @@ impl BoardState {
     }
 
     /// The daemon answered `id`'s mutation. An ack leaves the card pending
-    /// until a read shows the change; a refusal (another client changed it
-    /// first) or failure clears the pending state, pins the daemon's message
-    /// on the card, and re-reads so the board shows the real state.
-    pub fn finish_mutation(&mut self, id: &str, result: Result<(), ExecError>) -> Vec<Intent> {
+    /// until a read shows the change, holding the state the daemon says the
+    /// change landed at, so the card's next mutation can be sent against it
+    /// at once (the card shows in the landed status meanwhile). A refusal
+    /// (another client changed it first) or failure clears the pending state
+    /// (back to the acked change it followed, if any), pins the daemon's
+    /// message on the card, and re-reads so the board shows the real state.
+    pub fn finish_mutation(
+        &mut self,
+        id: &str,
+        result: Result<Option<ExpectedState>, ExecError>,
+    ) -> Vec<Intent> {
         match result {
-            Ok(()) => {
+            Ok(landed) => {
                 if let Some(p) = self.pending.get_mut(id) {
                     p.acked = true;
+                    p.prev = None;
+                    if let Some(landed) = landed.filter(|_| id != ADD_KEY) {
+                        // A reorder stays where its slot overlay put it.
+                        if p.to_slot.is_none() {
+                            p.to_status = Some(landed.status.clone());
+                        }
+                        p.landed = Some(landed);
+                        self.rebuild();
+                    }
                 }
                 if id == ADD_KEY {
                     self.status = Some("issue added".into());
                 }
             }
             Err(e) => {
-                self.pending.remove(id);
+                if let Some(prev) = self.pending.remove(id).and_then(|p| p.prev) {
+                    self.pending.insert(id.to_string(), *prev);
+                }
                 let message = match &e {
                     ExecError::Conflict(detail) => {
                         format!("Not applied: it changed elsewhere ({detail})")
@@ -1077,12 +1153,35 @@ impl BoardState {
         vec![Intent::Refresh]
     }
 
+    /// The state a mutation of `id` should expect, given the state the user
+    /// acted on (`seen`). When `seen` predates this client's own acked change
+    /// to the card (it lies between the read that change was sent from and
+    /// the state it landed at), the daemon already holds the landed state, so
+    /// that is what to send. Anything else, such as an editor opened on a
+    /// state from before another client's change, is sent as seen, and a
+    /// change made elsewhere is still refused.
+    fn own_expected(&self, id: &str, seen: ExpectedState) -> ExpectedState {
+        match self.pending.get(id) {
+            Some(Pending {
+                acked: true,
+                landed: Some(landed),
+                read_from,
+                ..
+            }) if revision_at_or_after(&seen.updated_at, &read_from.updated_at)
+                && revision_at_or_after(&landed.updated_at, &seen.updated_at) =>
+            {
+                landed.clone()
+            }
+            _ => seen,
+        }
+    }
+
     /// The label of the stored column `status` when another card's in-flight
     /// change is renumbering it.
     fn renumbering(&self, id: &str, status: &str) -> Option<String> {
         self.pending
             .iter()
-            .any(|(other, p)| other != id && p.renumbers.as_deref() == Some(status))
+            .any(|(other, p)| other != id && p.renumbers.iter().any(|c| c == status))
             .then(|| {
                 self.model
                     .columns
@@ -1220,6 +1319,18 @@ impl BoardState {
 
 /// `id`'s stored column, in priority order, with `id` moved to `slot`: the
 /// order a reorder lands (the store's `set_task_priority`).
+/// Is revision `a` (an RFC3339 `updated_at`) the same as or later than `b`?
+/// Unparseable revisions compare only as equal.
+fn revision_at_or_after(a: &str, b: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(a), Ok(b)) => a >= b,
+        _ => a == b,
+    }
+}
+
 fn reordered_column(tasks: &[shelbi_state::IssueFile], id: &str, slot: u32) -> Vec<String> {
     let Some(card) = tasks.iter().find(|tf| tf.task.id == id) else {
         return Vec::new();
@@ -1480,13 +1591,154 @@ mod tests {
             to_status: "in-progress".into(),
         };
         b.begin_mutation(&kind).unwrap();
-        b.finish_mutation("A", Ok(()));
+        b.finish_mutation("A", Ok(None));
         assert!(b.pending("A").unwrap().acked);
         // A read from before the daemon applied it: still pending.
         b.apply_open(read(vec![issue("A", "todo")]));
         assert!(b.pending("A").is_some());
         b.apply_open(read(vec![issue("A", "in-progress")]));
         assert!(b.pending("A").is_none());
+    }
+
+    /// A revision `secs` seconds after [`issue`]'s, as a card reports it.
+    fn rev(secs: i64) -> String {
+        (issue("A", "todo").task.updated_at + chrono::Duration::seconds(secs)).to_rfc3339()
+    }
+
+    fn at(status: &str, secs: i64) -> ExpectedState {
+        ExpectedState {
+            status: status.into(),
+            updated_at: rev(secs),
+        }
+    }
+
+    /// `issue(id, status)` as a read `secs` seconds after [`issue`]'s.
+    fn issue_at(id: &str, status: &str, secs: i64) -> IssueFile {
+        let mut tf = issue(id, status);
+        tf.task.updated_at += chrono::Duration::seconds(secs);
+        tf
+    }
+
+    #[test]
+    fn an_own_mutation_updates_the_cards_expected_revision() {
+        let mut b = board(vec![issue("A", "todo")]);
+        let start = CommandKind::StartIssue { id: "A".into() };
+        let job = b
+            .begin_mutation(&CommandKind::AssignIssue {
+                id: "A".into(),
+                workspace: "alpha".into(),
+            })
+            .unwrap();
+        assert_eq!(job.expected, Some(at("todo", 0)));
+        // Until the daemon answers, a second change still waits.
+        assert!(b.begin_mutation(&start).is_err());
+
+        // The assign lands at a new revision; no read has seen it yet.
+        b.finish_mutation("A", Ok(Some(at("todo", 5))));
+        // Start goes at once, against the state the assign produced rather
+        // than the read's (which the daemon would refuse as changed elsewhere).
+        let job = b.begin_mutation(&start).unwrap();
+        assert_eq!(job.expected, Some(at("todo", 5)));
+        // A read from before the assign landed settles nothing.
+        b.apply_open(read(vec![issue("A", "todo")]));
+        assert!(b.pending("A").is_some());
+
+        // Start lands too; the card shows in its landed status before a read.
+        b.finish_mutation("A", Ok(Some(at("in-progress", 6))));
+        assert_eq!(b.model().card("A").unwrap().status_id, "in-progress");
+        // A read that shows only the assign still predates the start: the
+        // card keeps the start's state for its next change.
+        b.apply_open(read(vec![issue_at("A", "todo", 5)]));
+        assert!(b.pending("A").is_some());
+        assert_eq!(b.model().card("A").unwrap().status_id, "in-progress");
+        let seen = b.model().card("A").unwrap().expected();
+        assert_eq!(b.own_expected("A", seen), at("in-progress", 6));
+
+        // The read catches up: settled, and the card is the read's again.
+        b.apply_open(read(vec![issue_at("A", "in-progress", 6)]));
+        assert!(b.pending("A").is_none());
+        assert_eq!(b.model().card("A").unwrap().expected(), at("in-progress", 6));
+    }
+
+    #[test]
+    fn a_follow_up_keeps_its_predecessors_column_waiting() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        b.begin_mutation(&CommandKind::StartIssue { id: "A".into() })
+            .unwrap();
+        b.finish_mutation("A", Ok(Some(at("in-progress", 5))));
+        // A's follow-up rides on the landed start...
+        let job = b
+            .begin_mutation(&CommandKind::AssignIssue {
+                id: "A".into(),
+                workspace: "alpha".into(),
+            })
+            .unwrap();
+        assert_eq!(job.expected, Some(at("in-progress", 5)));
+        // ...and B, renumbered by the start, still waits for a read.
+        assert!(b
+            .begin_mutation(&CommandKind::StartIssue { id: "B".into() })
+            .is_err());
+        assert!(b.status.as_deref().unwrap().contains("waiting for the last change"));
+        b.finish_mutation("A", Ok(Some(at("in-progress", 6))));
+        b.apply_open(read(vec![issue_at("A", "in-progress", 6), issue_at("B", "todo", 5)]));
+        assert!(b.pending("A").is_none());
+        let job = b
+            .begin_mutation(&CommandKind::StartIssue { id: "B".into() })
+            .unwrap();
+        assert_eq!(job.expected.unwrap().updated_at, rev(5));
+    }
+
+    #[test]
+    fn a_change_made_elsewhere_after_an_own_change_is_still_refused() {
+        let mut b = board(vec![issue("A", "todo")]);
+        // The editor opens on the card as read.
+        b.begin_edit("A");
+        let assign = CommandKind::AssignIssue {
+            id: "A".into(),
+            workspace: "alpha".into(),
+        };
+        b.begin_mutation(&assign).unwrap();
+        b.finish_mutation("A", Ok(Some(at("todo", 5))));
+
+        // Another client moved it after the assign: the daemon refuses the
+        // start sent against the assign's landed state.
+        let job = b
+            .begin_mutation(&CommandKind::StartIssue { id: "A".into() })
+            .unwrap();
+        assert_eq!(job.expected, Some(at("todo", 5)));
+        let out = b.finish_mutation(
+            "A",
+            Err(ExecError::Conflict(format!(
+                "you saw `todo` rev {}, it is now `review` rev {}",
+                rev(5),
+                rev(7)
+            ))),
+        );
+        assert_eq!(out, vec![Intent::Refresh]);
+        assert!(b.notice("A").unwrap().starts_with("Not applied: it changed elsewhere"));
+        // The card keeps the assign it did land.
+        let p = b.pending("A").unwrap();
+        assert!(p.acked);
+        assert_eq!(p.landed, Some(at("todo", 5)));
+
+        // The re-read shows the other client's change: it settles the assign,
+        // and the card's next change is sent against what the read shows.
+        b.apply_open(read(vec![issue_at("A", "review", 7)]));
+        assert!(b.pending("A").is_none());
+        let job = b
+            .begin_mutation(&CommandKind::StartIssue { id: "A".into() })
+            .unwrap();
+        assert_eq!(job.expected, Some(at("review", 7)));
+        b.finish_mutation("A", Ok(Some(at("in-progress", 8))));
+
+        // An edit staged against the state from before the other client's
+        // change isn't taken for this client's own: it goes as the editor saw
+        // it, and the daemon refuses it.
+        b.save_edit("A", "new body".into());
+        let job = b
+            .begin_mutation(&CommandKind::EditIssue { id: "A".into() })
+            .unwrap();
+        assert_eq!(job.expected, Some(at("todo", 0)));
     }
 
     #[test]
@@ -1509,7 +1761,7 @@ mod tests {
         assert_eq!(job.body.as_deref(), Some("new body"));
         assert_eq!(job.expected.unwrap().status, "todo");
         // An EditIssue with nothing staged (from the palette) opens the editor.
-        b.finish_mutation("A", Ok(()));
+        b.finish_mutation("A", Ok(None));
         let mut later = issue("A", "todo");
         later.task.updated_at += chrono::Duration::seconds(1);
         b.apply_open(read(vec![later]));
@@ -1683,7 +1935,7 @@ mod tests {
         assert!(!b.begin_drag("R"), "a pending card can't be dragged again");
 
         // Accepted: stays pending (and in place) until a read shows it.
-        b.finish_mutation("R", Ok(()));
+        b.finish_mutation("R", Ok(None));
         b.apply_open(shipped_read(vec![issue("R", "review")]));
         assert_eq!(ids_in(&b, "done"), ["R"]);
         assert!(b.pending("R").is_some());
@@ -1750,7 +2002,7 @@ mod tests {
         let status = b.status.clone().unwrap();
         assert!(status.contains("waiting for the last change in TO DO"), "{status}");
 
-        b.finish_mutation("C", Ok(()));
+        b.finish_mutation("C", Ok(None));
         let mut after = vec![prio("C", "todo", 0), prio("A", "todo", 1), prio("B", "todo", 2)];
         for tf in &mut after {
             tf.task.updated_at += chrono::Duration::seconds(1);

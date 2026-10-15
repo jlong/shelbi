@@ -461,6 +461,17 @@ pub struct ChangeNote {
     pub updated_at: String,
 }
 
+impl ChangeNote {
+    /// The post-change `(status, revision)`, the shape a follow-up mutation
+    /// expects; `None` when the issue was gone by the time it was re-read.
+    pub fn state(&self) -> Option<ExpectedState> {
+        (!self.status.is_empty()).then(|| ExpectedState {
+            status: self.status.clone(),
+            updated_at: self.updated_at.clone(),
+        })
+    }
+}
+
 /// Daemon → client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
@@ -476,8 +487,18 @@ pub enum ServerMsg {
         stream: Stream,
         text: String,
     },
-    /// The mutation finished successfully.
-    Done { request_id: u64 },
+    /// The request finished successfully. For an issue mutation, `state` is
+    /// the issue's `(status, revision)` right after the change, so the client
+    /// that made it can send its next mutation of the same issue against it
+    /// instead of the pre-change state it read (which the daemon would refuse
+    /// as stale). `None` for every other request, for a mutation whose issue
+    /// is gone, and from a daemon older than the field; it is optional on the
+    /// wire both ways, so it needs no protocol version.
+    Done {
+        request_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<ExpectedState>,
+    },
     /// The mutation failed (or was refused).
     Failed {
         request_id: u64,
@@ -587,7 +608,7 @@ mod tests {
 
     #[test]
     fn decode_reports_incomplete_until_the_whole_frame_is_present() {
-        let bytes = encode(&ServerMsg::Done { request_id: 1 }).unwrap();
+        let bytes = encode(&ServerMsg::Done { request_id: 1, state: None }).unwrap();
         // Just the length prefix, no payload yet.
         let err = decode::<ServerMsg>(&bytes[..LEN_PREFIX]).unwrap_err();
         assert!(matches!(err, ProtoError::Incomplete { .. }));
@@ -699,6 +720,31 @@ mod tests {
     }
 
     #[test]
+    fn done_carries_the_post_change_state_and_omits_it_when_absent() {
+        let state = ExpectedState {
+            status: "in-progress".into(),
+            updated_at: "2026-10-15T10:00:05Z".into(),
+        };
+        let msg = ServerMsg::Done {
+            request_id: 3,
+            state: Some(state),
+        };
+        let (back, _): (ServerMsg, usize) = decode(&encode(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
+
+        // A bare Done (a daemon that predates the field, or a non-mutation
+        // reply) still decodes, with no state; and one without a state is
+        // written without the key, so an older client reads it unchanged.
+        let old = br#"{"Done":{"request_id":4}}"#;
+        let mut frame = (old.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(old);
+        let (back, _): (ServerMsg, usize) = decode(&frame).unwrap();
+        assert_eq!(back, ServerMsg::Done { request_id: 4, state: None });
+        let bytes = encode(&ServerMsg::Done { request_id: 4, state: None }).unwrap();
+        assert_eq!(&bytes[LEN_PREFIX..], old);
+    }
+
+    #[test]
     fn two_frames_decode_back_to_back() {
         let mut buf = encode(&ServerMsg::Line {
             request_id: 1,
@@ -706,11 +752,11 @@ mod tests {
             text: "→ launching".into(),
         })
         .unwrap();
-        buf.extend(encode(&ServerMsg::Done { request_id: 1 }).unwrap());
+        buf.extend(encode(&ServerMsg::Done { request_id: 1, state: None }).unwrap());
         let (first, n1): (ServerMsg, usize) = decode(&buf).unwrap();
         let (second, n2): (ServerMsg, usize) = decode(&buf[n1..]).unwrap();
         assert!(matches!(first, ServerMsg::Line { .. }));
-        assert!(matches!(second, ServerMsg::Done { request_id: 1 }));
+        assert!(matches!(second, ServerMsg::Done { request_id: 1, .. }));
         assert_eq!(n1 + n2, buf.len());
     }
 }

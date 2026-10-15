@@ -47,7 +47,10 @@ fn run_via_daemon(project: &str, id: &str, kind: MutationKind) -> Result<()> {
         Stream::Stdout => println!("{text}"),
         Stream::Stderr => eprintln!("{text}"),
     };
-    client.mutate(&req, &mut on_line).map_err(map_client_err)
+    client
+        .mutate(&req, &mut on_line)
+        .map(|_| ())
+        .map_err(map_client_err)
 }
 
 /// Connect to the control socket, retrying briefly: `ensure_daemon_running`

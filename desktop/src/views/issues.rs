@@ -34,7 +34,9 @@ use gpui::{
 use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
 use shelbi_app::board::{self, BoardRead, ClosedPage};
-use shelbi_app::{CommandKind, ExecError, IssueCard, IssueColumn, TaskDetailModel};
+use shelbi_app::{
+    CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
+};
 use shelbi_state::keymap::{format_chord, DisplayStyle, KanbanAction, Keymaps};
 
 use super::board_scroll;
@@ -104,7 +106,8 @@ impl Render for CardGhost {
 enum Done {
     Mutation {
         id: String,
-        result: Result<(), ExecError>,
+        /// The ack carries the issue's post-change state, when reported.
+        result: Result<Option<ExpectedState>, ExecError>,
     },
     More(Result<ClosedPage, String>),
     Persisted(Result<(), String>),
