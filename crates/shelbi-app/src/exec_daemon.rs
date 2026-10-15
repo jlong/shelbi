@@ -36,7 +36,7 @@ pub fn execute_mutation(
         MutationKind::Add(_) => None,
         _ => read_expected(&project, &id),
     };
-    route(&project, &id, expected, kind, on_line)
+    route(&project, &id, expected, kind, on_line).map(|_| ())
 }
 
 /// [`execute_mutation`] with the expected state supplied by the caller: the
@@ -46,11 +46,16 @@ pub fn execute_mutation(
 /// snapshot the daemon refuses the mutation ([`ExecError::Conflict`]) instead
 /// of applying it to state the user never saw. `None` sends no expectation
 /// (the daemon applies unconditionally); `add` ignores it.
+///
+/// On success it returns the issue's `(status, revision)` right after the
+/// change, when the daemon reports one: the state this client's next mutation
+/// of the same issue should expect, since its read still shows the state
+/// before its own change until the board re-reads.
 pub fn execute_mutation_expecting(
     mutation: &Mutation,
     expected: Option<ExpectedState>,
     on_line: &mut dyn FnMut(Stream, &str),
-) -> ExecOutcome {
+) -> Result<Option<ExpectedState>, ExecError> {
     let (project, id, kind) = map_to_kind(mutation)?;
     let expected = match &kind {
         MutationKind::Add(_) => None,
@@ -212,14 +217,14 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
 }
 
 /// Ensure the daemon, connect, send the mutation, and map the result to an
-/// [`ExecError`].
+/// [`ExecError`]. `Ok` carries the issue's post-change state, when reported.
 fn route(
     project: &str,
     id: &str,
     expected: Option<ExpectedState>,
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
-) -> ExecOutcome {
+) -> Result<Option<ExpectedState>, ExecError> {
     shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
     let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
     let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)

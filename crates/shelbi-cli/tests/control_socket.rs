@@ -324,6 +324,70 @@ fn a_board_move_from_a_stale_card_is_refused_after_a_cli_move() {
     assert_eq!(read_card(&home).status_id, "todo");
 }
 
+/// `dt-board-stale-after-own-mutation`: the daemon's `Done` carries the
+/// issue's post-change `(status, revision)`, so the client that made a change
+/// sends its next mutation of the same issue against it, back to back, while
+/// its read still shows the state from before (which is refused). A change
+/// made by another client in between is still refused.
+#[test]
+fn a_mutation_reports_its_landed_state_for_the_next_one() {
+    let mut home = Home::new("landed");
+    home.write_issue("t1", "backlog");
+    home.start_daemon();
+    let on_disk = |home: &Home| {
+        let text =
+            std::fs::read_to_string(home.path.join("projects/p/tasks/t1.md")).unwrap();
+        let tf = shelbi_state::parse_task_file(&text).unwrap();
+        ExpectedState {
+            status: tf.task.column.as_str().to_string(),
+            updated_at: tf.task.updated_at.to_rfc3339(),
+        }
+    };
+
+    let mut client = connect(&home.control).unwrap();
+    let landed = client
+        .mutate(&move_req(1, "t1", "todo", Some(expected_backlog())), &mut discard())
+        .unwrap()
+        .expect("a mutation's Done carries the landed state");
+    assert_eq!(landed, on_disk(&home), "the landed state is the issue's real one");
+    assert_eq!(landed.status, "todo");
+
+    // The read the client made before its change is now stale...
+    let err = client
+        .mutate(&move_req(2, "t1", "backlog", Some(expected_backlog())), &mut discard())
+        .unwrap_err();
+    use shelbi_proto::control::MutationError;
+    assert!(
+        matches!(err, shelbi_client::ClientError::Mutation(MutationError::Stale { .. })),
+        "{err:?}"
+    );
+    // ...but the landed state is current, so the follow-up goes through.
+    // (Moves between backlog and todo only: they run no transition actions.)
+    let next = client
+        .mutate(&move_req(3, "t1", "backlog", Some(landed)), &mut discard())
+        .unwrap()
+        .unwrap();
+    assert_eq!(next, on_disk(&home));
+    assert_eq!(next.status, "backlog");
+
+    // Another client changes it; the landed state no longer holds.
+    let mut other = connect(&home.control).unwrap();
+    other
+        .mutate(&move_req(1, "t1", "todo", None), &mut discard())
+        .unwrap();
+    let err = client
+        .mutate(&move_req(4, "t1", "backlog", Some(next)), &mut discard())
+        .unwrap_err();
+    match err {
+        shelbi_client::ClientError::Mutation(shelbi_proto::control::MutationError::Stale {
+            actual,
+            ..
+        }) => assert_eq!(actual.status, "todo"),
+        other => panic!("expected the other client's change to refuse it, got {other:?}"),
+    }
+    assert_eq!(home.column_of("t1"), "todo");
+}
+
 #[test]
 fn a_prioritize_reorders_the_column_and_a_stale_sibling_reorder_is_refused() {
     let mut home = Home::new("prio");

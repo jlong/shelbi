@@ -154,11 +154,6 @@ Found by this audit and not closed by it; each is a follow-up.
 - **The TUI board sends no expected state** with a move or reorder, so it has
   no protection against overwriting a change another client just made; the
   desktop sends `(status, revision)` on every mutation.
-- **Desktop: a second mutation on the same card within one refresh is
-  refused as stale.** Assign then Start, back to back, failed with "it
-  changed elsewhere" (the card's revision had moved under the first, which
-  this client made); Start succeeded once the board refreshed. The board
-  should take the revision its own mutation produced.
 - **The TUI's workspace panel shows less than the desktop's** (workspace
   name, live state, machine, branch, task id, remote marker). Its status is
   the task's column, so a workspace waiting for input still reads IN
