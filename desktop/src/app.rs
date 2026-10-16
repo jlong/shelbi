@@ -91,8 +91,9 @@ use crate::commands::{self, CommandHost};
 use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
 use crate::menus;
 use crate::notify;
-use crate::projects::{self, Catalog};
+use crate::projects::{self, Catalog, ProjectEntry};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
+use crate::theme::motion::{SharedTrack, SlideTrack};
 use crate::theme::style::{self, IconButtonSize};
 use crate::theme::{self, Hue, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
@@ -372,12 +373,19 @@ pub struct ShelbiWindow {
     _bootstrap: Option<Task<()>>,
     /// Re-resolves the theme when the system appearance changes.
     _appearance: Subscription,
+    /// Re-reads Reduce Motion each time the window comes forward.
+    _motion: Subscription,
     client: ClientState,
     model: SidebarModel,
     link: Option<DaemonLink>,
     collapsed: bool,
     dragging: bool,
-    switcher_open: bool,
+    /// The project switcher's menu.
+    switcher: sidebar::Switcher,
+    /// When the open overlay opened, for its slide-and-fade in.
+    overlay_opened: Option<Instant>,
+    /// The sidebar's rows, measured for the selection chip's slide.
+    nav_track: SharedTrack,
     route: Route,
     /// The Issues board for this window's project, created the first time it
     /// is shown.
@@ -528,13 +536,18 @@ impl ShelbiWindow {
             boot: Boot::InFlight(BootstrapState::ResolvingEnv),
             _bootstrap: None,
             _appearance: theme::follow_system(window, cx),
+            _motion: cx.observe_window_activation(window, |_, _, cx| {
+                theme::motion::sync_reduce_motion(cx)
+            }),
             palette_chord: palette_chord(&keymaps),
             client,
             model,
             link: None,
             collapsed: window_state.sidebar_collapsed,
             dragging: false,
-            switcher_open: false,
+            switcher: sidebar::Switcher::default(),
+            overlay_opened: None,
+            nav_track: SlideTrack::shared(),
             route: Route::View,
             issues: None,
             chat: None,
@@ -1099,7 +1112,7 @@ impl ShelbiWindow {
                 issues.update(cx, |v, cx| v.run_issue_command(&kind, window, cx));
             }
             HostCall::SwitchProject(project) => {
-                self.switcher_open = false;
+                self.switcher.close((self.clock)());
                 if project != self.project {
                     let project = project.clone();
                     // Open the target's window after this update finishes,
@@ -1715,7 +1728,8 @@ impl ShelbiWindow {
     }
 
     fn open_switcher(&mut self, cx: &mut Context<Self>) {
-        self.switcher_open = true;
+        let current = self.switcher_projects(cx).iter().position(|p| p.name == self.project);
+        self.switcher.open(current.unwrap_or(0), (self.clock)());
         // Re-read the project list off the UI thread; repaint when it lands.
         if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
             let (tx, rx) = futures::channel::oneshot::channel();
@@ -1729,6 +1743,35 @@ impl ShelbiWindow {
             })
             .detach();
         }
+    }
+
+    /// The projects the switcher lists (the catalog's, empty until it has
+    /// loaded).
+    fn switcher_projects(&self, cx: &App) -> Vec<ProjectEntry> {
+        cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default()
+    }
+
+    /// A key while the switcher is open: ↑↓ (and Tab) move its keyboard row,
+    /// Enter picks it, Esc closes. `false` for any other key (it goes on as
+    /// usual).
+    fn switcher_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let projects = self.switcher_projects(cx);
+        // The projects, then "Add project…".
+        let count = projects.len() + 1;
+        match code {
+            Key::Up | Key::BackTab => self.switcher.step(-1, count),
+            Key::Down | Key::Tab => self.switcher.step(1, count),
+            Key::Esc => self.switcher.close((self.clock)()),
+            Key::Enter => {
+                let event = match projects.get(self.switcher.highlight) {
+                    Some(p) => SidebarEvent::SwitchTo(p.name.clone()),
+                    None => SidebarEvent::AddProject,
+                };
+                self.sidebar_event(event, window, cx);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn detach_others(&mut self, cx: &mut Context<Self>) {
@@ -1937,8 +1980,11 @@ impl ShelbiWindow {
     /// focus to return to are left as they were.
     fn open_overlay(&mut self, overlay: ActiveOverlay, window: &mut Window, cx: &mut Context<Self>) {
         self.client.open_overlay(overlay.nav());
+        if self.overlay.is_none() {
+            self.overlay_opened = Some((self.clock)());
+        }
         self.overlay = Some(overlay);
-        self.switcher_open = false;
+        self.switcher.close((self.clock)());
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -2578,8 +2624,7 @@ impl ShelbiWindow {
             cx.stop_propagation();
             return;
         }
-        if chord.code == Key::Esc && self.switcher_open {
-            self.switcher_open = false;
+        if self.switcher.is_open() && self.switcher_key(chord.code, window, cx) {
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2803,8 +2848,8 @@ impl SidebarHost for ShelbiWindow {
             }
             SidebarEvent::OpenSearch => self.open_palette(window, cx),
             SidebarEvent::ToggleSwitcher => {
-                if self.switcher_open {
-                    self.switcher_open = false;
+                if self.switcher.is_open() {
+                    self.switcher.close((self.clock)());
                 } else {
                     self.run(
                         CommandKind::SwitchProject {
@@ -2815,8 +2860,13 @@ impl SidebarHost for ShelbiWindow {
                     );
                 }
             }
+            SidebarEvent::CloseSwitcher => self.switcher.close((self.clock)()),
             SidebarEvent::SwitchTo(project) => {
                 self.run(CommandKind::SwitchProject { project }, window, cx)
+            }
+            SidebarEvent::AddProject => {
+                self.switcher.close((self.clock)());
+                self.run(CommandKind::AddProject, window, cx)
             }
             SidebarEvent::OpenErrors => self.run(CommandKind::OpenErrorLog, window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
@@ -2861,13 +2911,29 @@ impl ShelbiWindow {
         // `perform`. Idempotent.
         self.sync_chat(window, cx);
         let window_width = window.viewport_size().width.as_f32();
-        let catalog_projects = self
-            .switcher_open
-            .then(|| cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default());
+        let now = (self.clock)();
+        let reduce_motion = (self.reduce_motion)();
+        let switcher_phase = self.switcher.phase(now, reduce_motion);
+        if self.switcher.animating(now, reduce_motion) {
+            window.request_animation_frame();
+        }
+        let catalog_projects = switcher_phase.map(|_| self.switcher_projects(cx));
+        // The nav selection chip: slide it to the selected row when the
+        // selection moves (keys, clicks, route changes alike).
+        let chip = {
+            let mut track = self.nav_track.borrow_mut();
+            let key = sidebar::selected_key(&self.model, self.client.sidebar_selection());
+            let reduce = self.reduce_motion.clone();
+            track.select(key, now, move || reduce());
+            let chip = track.frame(now);
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
         // The leading column: the sidebar, or a review's or workspace's panel
         // in its place, both while the push between them runs (clipped to
         // the column).
-        let now = (self.clock)();
         self.sync_column(now);
         self.column.pace(now);
         let frame = self.column.frame(now);
@@ -2916,11 +2982,20 @@ impl ShelbiWindow {
                         focused: self.client.focus() == Focus::Sidebar,
                         link: self.link,
                         palette_chord: self.palette_chord.clone(),
-                        switcher: catalog_projects
-                            .as_deref()
-                            .map(|projects| (projects, self.project.as_str())),
+                        switcher: catalog_projects.as_deref().zip(switcher_phase).map(
+                            |(projects, phase)| sidebar::SwitcherProps {
+                                projects,
+                                current: self.project.as_str(),
+                                highlight: self.switcher.highlight,
+                                phase,
+                            },
+                        ),
+                        switcher_button: self.switcher.button.clone(),
+                        switcher_open: self.switcher.is_open(),
                         width,
                         scroll: self.sidebar_scroll.clone(),
+                        track: self.nav_track.clone(),
+                        chip,
                     },
                     &theme,
                     cx,
@@ -3016,7 +3091,19 @@ impl ShelbiWindow {
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
         let layer = self.overlay.as_ref().map(|o| {
-            overlay::render_layer(o, window.viewport_size(), &self.keymaps, &theme, cx)
+            let entering = if reduce_motion {
+                None
+            } else {
+                self.overlay_opened.and_then(|at| {
+                    let t = now.saturating_duration_since(at).as_secs_f32()
+                        / theme::motion::DIALOG_IN.as_secs_f32();
+                    (t < 1.0).then(|| theme::motion::ease_out_expo(t))
+                })
+            };
+            if entering.is_some() {
+                window.request_animation_frame();
+            }
+            overlay::render_layer(o, window.viewport_size(), entering, &self.keymaps, &theme, cx)
         });
         // Edit ▸ Cut / Copy / Paste / Select All: a focused terminal handles
         // them itself; an open overlay takes paste (and the error log's copy)
@@ -3144,6 +3231,32 @@ impl ShelbiWindow {
         self.close_overlay(window, cx);
     }
 
+    /// Open the project switcher over the catalog as installed (no refresh
+    /// from disk), or close it.
+    pub(crate) fn offscreen_switcher(&mut self, open: bool, cx: &mut Context<Self>) {
+        let now = (self.clock)();
+        if open {
+            let current = self.switcher_projects(cx).iter().position(|p| p.name == self.project);
+            self.switcher.open(current.unwrap_or(0), now);
+        } else {
+            self.switcher.close(now);
+        }
+        cx.notify();
+    }
+
+    /// A key to the open switcher.
+    pub(crate) fn offscreen_switcher_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher_key(code, window, cx);
+        cx.notify();
+    }
+
+    /// Move the sidebar's selection to the `ordinal`-th selectable row.
+    pub(crate) fn offscreen_select(&mut self, ordinal: usize, cx: &mut Context<Self>) {
+        let count = self.selectable_count();
+        self.client.select(ordinal, count);
+        cx.notify();
+    }
+
     /// Ask for review `task` before anything resolves it: its placeholder.
     pub(crate) fn offscreen_open_pending(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.open_review_pending(task, window, cx);
@@ -3197,6 +3310,10 @@ mod smoke;
 #[cfg(test)]
 #[path = "app_column_tests.rs"]
 mod column_tests;
+
+#[cfg(test)]
+#[path = "app_design_tests.rs"]
+mod design_tests;
 
 #[cfg(test)]
 mod tests {

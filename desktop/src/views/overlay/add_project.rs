@@ -80,7 +80,7 @@ pub fn render<H: OverlayHost>(
                     .rounded_lg()
                     .bg(theme.surface)
                     .border_1()
-                    .border_color(theme.rule_strong)
+                    .border_color(theme.input_border)
                     .when(focused, |d| d.shadow(vec![style::focus_shadow(theme)]))
                     .child(
                         div()

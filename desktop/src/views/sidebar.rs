@@ -18,8 +18,13 @@
 //! The width is the shared nav model's, in TUI columns ([`COLUMN_PX`] each),
 //! clamped by `shelbi_app::nav::clamp_sidebar_width`.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Instant;
+
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, ScrollHandle, SharedString, Window,
+    deferred, div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Hsla, Pixels,
+    ScrollHandle, SharedString, Window,
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
@@ -28,6 +33,7 @@ use shelbi_state::ZenModeState;
 use crate::assets::{heroicon, icons, Icon, ICON_SIZE};
 use crate::projects::ProjectEntry;
 use crate::refresh::DaemonLink;
+use crate::theme::motion::{self, SharedTrack};
 use crate::theme::style::{self, IconButtonSize, LIST_ROW_H, NAV_ROW_H};
 use crate::theme::Theme;
 
@@ -65,8 +71,12 @@ pub enum SidebarEvent {
     OpenSearch,
     /// Show or hide the project switcher.
     ToggleSwitcher,
+    /// Close the switcher (a click outside it).
+    CloseSwitcher,
     /// Switch to (open or focus the window of) a project.
     SwitchTo(String),
+    /// The switcher's "Add project…".
+    AddProject,
     /// The unread-errors button.
     OpenErrors,
     OpenSettings,
@@ -89,12 +99,107 @@ pub struct SidebarProps<'a> {
     pub link: Option<DaemonLink>,
     /// The palette-open chord shown in the search box (`⌃P`).
     pub palette_chord: String,
-    /// The project switcher, when open: every project and the current one.
-    pub switcher: Option<(&'a [ProjectEntry], &'a str)>,
+    /// The project switcher's menu while it shows (opening, open or
+    /// closing).
+    pub switcher: Option<SwitcherProps<'a>>,
+    /// Where the switcher's button lands, for the menu's outside click.
+    pub switcher_button: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The switcher is open (its button holds its pressed fill).
+    pub switcher_open: bool,
     pub width: f32,
     /// The rows' scroll, owned by the window so it outlives frames the
     /// sidebar isn't drawn in (a review panel standing in for it).
     pub scroll: ScrollHandle,
+    /// The selectable rows, measured for the selection chip's slide.
+    pub track: SharedTrack,
+    /// The sliding selection chip's bounds while it moves between rows.
+    pub chip: Option<Bounds<Pixels>>,
+}
+
+/// The switcher menu, as one frame draws it.
+pub struct SwitcherProps<'a> {
+    /// Every project, most recently launched first.
+    pub projects: &'a [ProjectEntry],
+    /// The current project's id.
+    pub current: &'a str,
+    /// The keyboard's row: an index into the projects, or `projects.len()`
+    /// for "Add project…".
+    pub highlight: usize,
+    /// How shown the menu is: 0 (hidden) to 1, eased.
+    pub phase: f32,
+}
+
+/// The switcher button's height (ContextStore's `SpacePicker`).
+pub const SWITCHER_H: f32 = 36.0;
+/// The menu's gap below the button.
+const MENU_GAP: f32 = 6.0;
+
+/// The project switcher's state, owned by the window: open or closed, when
+/// that last changed (for the slide-and-fade), and the keyboard's row.
+#[derive(Debug, Default)]
+pub struct Switcher {
+    open: bool,
+    changed: Option<Instant>,
+    pub highlight: usize,
+    /// The button's bounds as last painted.
+    pub button: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+impl Switcher {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Open with the keyboard on `highlight` (the current project).
+    pub fn open(&mut self, highlight: usize, now: Instant) {
+        if !self.open {
+            self.open = true;
+            self.changed = Some(now);
+        }
+        self.highlight = highlight;
+    }
+
+    pub fn close(&mut self, now: Instant) {
+        if self.open {
+            self.open = false;
+            self.changed = Some(now);
+        }
+    }
+
+    /// Move the keyboard's row by `delta` among `count` rows, wrapping.
+    pub fn step(&mut self, delta: isize, count: usize) {
+        if count > 0 {
+            self.highlight = (self.highlight as isize + delta).rem_euclid(count as isize) as usize;
+        }
+    }
+
+    /// How shown the menu is at `now` (0..=1 on Taskpage's curve), `None`
+    /// once it has finished closing. Instant under `reduce_motion`.
+    pub fn phase(&self, now: Instant, reduce_motion: bool) -> Option<f32> {
+        let t = match self.changed {
+            Some(at) if !reduce_motion => {
+                now.saturating_duration_since(at).as_secs_f32() / motion::MENU_IN.as_secs_f32()
+            }
+            _ => 1.0,
+        };
+        let eased = motion::ease_out_expo(t.min(1.0));
+        if self.open {
+            Some(eased)
+        } else if t < 1.0 {
+            Some(1.0 - eased)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the menu is mid-transition at `now` (the window keeps
+    /// drawing frames).
+    pub fn animating(&self, now: Instant, reduce_motion: bool) -> bool {
+        !reduce_motion
+            && self
+                .changed
+                .is_some_and(|at| now.saturating_duration_since(at) < motion::MENU_IN)
+    }
 }
 
 /// One row's text, as the TUI draws it: the badge glyph and its color, the
@@ -216,6 +321,15 @@ pub fn render<H: SidebarHost>(
         .zip(&ordinals)
         .map(|(row, ord)| render_nav_row(row, *ord, &props, theme, cx))
         .collect::<Vec<_>>();
+    // While the selection chip slides it is drawn here, under every row.
+    let chip = props
+        .chip
+        .map(|bounds| {
+            motion::floating_chip(bounds, |d| {
+                style::nav_chip_layer(d, theme)
+                    .when(props.focused, |d| d.child(style::selection_indicator(theme)))
+            })
+        });
     let rest = rows[nav_n..]
         .iter()
         .zip(&ordinals[nav_n..])
@@ -231,9 +345,12 @@ pub fn render<H: SidebarHost>(
         .w(px(props.width))
         .h_full()
         .flex_none()
+        .relative()
         .bg(theme.surface_recessed)
         .text_color(theme.text)
         .text_sm()
+        .child(motion::origin_probe(&props.track))
+        .children(chip)
         .child(render_header(&props, theme, cx))
         .child(div().flex().flex_col().px_2().pt(px(12.0)).children(nav))
         .child(
@@ -258,134 +375,172 @@ fn render_header<H: SidebarHost>(
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
-    let title = div()
+    let open = props.switcher_open;
+    let button_probe = {
+        let cell = props.switcher_button.clone();
+        gpui::canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+    };
+    let label = props.model.project_label.clone();
+    // ContextStore's `SpacePicker`: the badge, the name and the up-down
+    // chevron on a quiet fill that strengthens on hover and while open.
+    let rest = if open {
+        theme.control_fill_pressed
+    } else {
+        theme.control_fill
+    };
+    let button = div()
         .id("sidebar-project-title")
         .debug_selector(|| "sidebar-project-title".into())
         .flex()
         .flex_row()
         .items_center()
-        .gap_1()
+        .gap_2()
         .px_2()
-        .h(px(32.0))
+        .h(px(SWITCHER_H))
         .rounded_lg()
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.fill))
+        .border_1()
+        .border_color(if open { theme.control_border_hover } else { theme.control_border })
+        .cursor_pointer();
+    let button = motion::fill_layer(
+        button,
+        "sidebar-project-title",
+        px(7.0),
+        [rest, theme.control_fill_hover, theme.control_fill_pressed],
+    )
+    .child(button_probe)
+    .child(style::project_badge(&label, 24.0))
+    .child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_loud)
+            .child(label.clone()),
+    )
+    .child(heroicon(icons::CHEVRON_UP_DOWN).text_color(if open { theme.text_loud } else { theme.text_quiet }))
+    .on_click(cx.listener(|this, _, window, cx| {
+        this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
+    }));
+
+    let search = style::search_box("sidebar-search", &props.palette_chord, theme)
+        .mt_2()
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.sidebar_event(SidebarEvent::OpenSearch, window, cx)
+        }));
+
+    // The menu floats over the sidebar, 6px under the button and at least
+    // its width: drawn after everything (`deferred`), so nothing below it
+    // moves and nothing paints over it.
+    let menu = props.switcher.as_ref().map(|switcher| {
+        let top = TRAFFIC_LIGHT_INSET + SWITCHER_H + MENU_GAP;
+        deferred(
+            div()
+                .absolute()
+                .top(px(top + (1.0 - switcher.phase) * motion::SLIDE_PX))
+                .left(px(8.0))
+                .min_w(px((props.width - 16.0).max(0.0)))
+                .opacity(switcher.phase)
+                .child(render_switcher(switcher, props.switcher_button.clone(), theme, cx)),
+        )
+        .with_priority(1)
+    });
+
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .px_2()
+        .pt(px(TRAFFIC_LIGHT_INSET))
+        .child(button)
+        .child(search)
+        .children(menu)
+}
+
+/// The switcher's menu: a row per project (its badge, its name, a check on
+/// the current one), a rule, then "Add project…". The keyboard's row wears
+/// the selection fill.
+fn render_switcher<H: SidebarHost>(
+    switcher: &SwitcherProps<'_>,
+    button: Rc<Cell<Option<Bounds<Pixels>>>>,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> impl IntoElement {
+    let rows = switcher.projects.iter().enumerate().map(|(ix, p)| {
+        let is_current = p.name == switcher.current;
+        let name = p.name.clone();
+        style::menu_row(
+            SharedString::from(format!("sidebar-project-{}", p.name)),
+            switcher.highlight == ix,
+            theme,
+        )
+        .child(style::project_badge(&p.label, 24.0))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_base()
-                .text_color(theme.wordmark)
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(props.model.project_label.clone()),
+                .when(is_current, |d| d.font_weight(FontWeight::MEDIUM).text_color(theme.text_loud))
+                .child(p.label.clone()),
         )
-        .child(
-            heroicon(icons::CHEVRON_UP_DOWN).text_color(theme.icon),
-        )
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
-        }));
-
-    let search = div()
-        .id("sidebar-search")
-        .debug_selector(|| "sidebar-search".into())
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .mt_2()
-        .px_2()
-        .h(px(32.0))
-        .rounded_lg()
-        .bg(theme.surface_raised)
-        .shadow(style::card_shadow(theme))
-        .text_color(theme.text_quiet)
-        .cursor_pointer()
-        .child(
-            heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon),
-        )
-        .child(div().flex_1().child("Search"))
+        .child(div().w(ICON_SIZE).flex_none().when(is_current, |d| {
+            d.child(heroicon(icons::CHECK).text_color(theme.brand_text))
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
+        }))
+    });
+    let add_ix = switcher.projects.len();
+    let add = style::menu_row("sidebar-add-project", switcher.highlight == add_ix, theme)
         .child(
             div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(24.0))
                 .flex_none()
-                .px_1()
-                .rounded_md()
-                .bg(theme.fill)
-                .text_xs()
-                .child(props.palette_chord.clone()),
+                .child(heroicon(icons::PLUS).text_color(theme.icon)),
         )
+        .child(div().flex_1().child("Add project…"))
         .on_click(cx.listener(|this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::OpenSearch, window, cx)
+            this.sidebar_event(SidebarEvent::AddProject, window, cx)
         }));
-
-    div()
-        .flex()
-        .flex_col()
-        .px_2()
-        .pt(px(TRAFFIC_LIGHT_INSET))
-        .child(title)
-        .when_some(props.switcher, |header, (projects, current)| {
-            header.child(render_switcher(projects, current, theme, cx))
-        })
-        .child(search)
-}
-
-fn render_switcher<H: SidebarHost>(
-    projects: &[ProjectEntry],
-    current: &str,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> impl IntoElement {
-    let rows = projects.iter().enumerate().map(|(ix, p)| {
-        let is_current = p.name == current;
-        let name = p.name.clone();
-        div()
-            .id(("sidebar-project", ix))
-            .debug_selector({
-                let name = p.name.clone();
-                move || format!("sidebar-project-{name}")
-            })
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .h(px(LIST_ROW_H))
-            .rounded_lg()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.fill_subtle))
-            .child(
-                div().w(ICON_SIZE).flex_none().when(is_current, |d| {
-                    d.child(heroicon(icons::CHECK).text_color(theme.brand_text))
-                }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .when(is_current, |d| d.font_weight(FontWeight::MEDIUM).text_color(theme.text_loud))
-                    .child(p.label.clone()),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
-            }))
-    });
     style::popover(
         div()
             .id("sidebar-switcher")
             .debug_selector(|| "sidebar-switcher".into())
             .flex()
             .flex_col()
-            .mt_1()
-            .p_1(),
+            .p_1()
+            .occlude(),
         theme,
     )
-        .when(projects.is_empty(), |d| {
-            d.child(div().px_2().text_color(theme.text_quiet).child("Loading…"))
-        })
-        .children(rows)
+    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+        // A press on the button toggles it closed through its click.
+        if button.get().is_some_and(|b| b.contains(&event.position)) {
+            return;
+        }
+        this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
+    }))
+    .when(switcher.projects.is_empty(), |d| {
+        d.child(
+            div()
+                .px_2()
+                .h(px(LIST_ROW_H))
+                .flex()
+                .items_center()
+                .text_color(theme.text_quiet)
+                .child("Loading projects…"),
+        )
+    })
+    .children(rows)
+    .child(div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.rule))
+    .child(add)
 }
 
 fn render_nav_row<H: SidebarHost>(
@@ -417,9 +572,9 @@ fn render_nav_row<H: SidebarHost>(
         .rounded_lg()
         .cursor_pointer()
         .text_color(theme.text)
-        .map(|d| selected_row(d, selected, props.focused, theme))
+        .map(|d| selected_row(d, &row_selector(row), selected, props, theme))
         .child(
-            heroicon(nav_icon(view)).text_color(theme.icon),
+            heroicon(nav_icon(view)).text_color(if selected { theme.text_loud } else { theme.icon }),
         )
         .child(label.clone())
         .on_click(cx.listener(move |this, _, window, cx| {
@@ -429,9 +584,30 @@ fn render_nav_row<H: SidebarHost>(
 }
 
 /// Paint a row selected (the raised chip, the brand pill while the sidebar
-/// has keyboard focus) or hoverable.
-fn selected_row(d: gpui::Stateful<gpui::Div>, selected: bool, focused: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    style::row_state(d, selected, selected && focused, theme).when(selected, |d| d.child(selection_marker()))
+/// has keyboard focus) or hoverable, and measure it for the chip's slide.
+/// While the chip slides, the floating one stands in for the row's own.
+fn selected_row(
+    d: gpui::Stateful<gpui::Div>,
+    key: &str,
+    selected: bool,
+    props: &SidebarProps<'_>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let inline = props.chip.is_none();
+    style::row_state(d, key.to_string(), selected, selected && props.focused && inline, inline, theme)
+        .child(motion::probe(&props.track, key.to_string()))
+        .when(selected, |d| d.child(selection_marker()))
+}
+
+/// The selection chip's key for the selected row: its selector, so the chip
+/// follows the item (not its ordinal) when rows come and go.
+pub fn selected_key(model: &SidebarModel, selection: usize) -> Option<SharedString> {
+    model
+        .rows()
+        .iter()
+        .filter(|r| r.is_selectable())
+        .nth(selection)
+        .map(|r| row_selector(r).into())
 }
 
 /// A zero-size marker inside the selected row, so a test can find the
@@ -537,7 +713,7 @@ fn render_row<H: SidebarHost>(
                 .rounded_lg()
                 .cursor_pointer()
                 .text_color(theme.text)
-                .map(|d| selected_row(d, selected, props.focused, theme))
+                .map(|d| selected_row(d, &selector, selected, props, theme))
                 .child(line)
                 .when_some(text.branch, |d, branch| {
                     d.child(
@@ -621,6 +797,13 @@ fn render_footer<H: SidebarHost>(
                     .size(px(IconButtonSize::Large.px()))
                     .rounded_xl()
                     .bg(theme.error_fill)
+                    .border_1()
+                    .border_color(theme.danger_border)
+                    .tooltip(style::tooltip(format!(
+                        "{} unread error{}",
+                        model.unread_errors,
+                        if model.unread_errors == 1 { "" } else { "s" }
+                    )))
                     .text_color(theme.text_on_color)
                     .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
@@ -632,12 +815,16 @@ fn render_footer<H: SidebarHost>(
         })
         .child(div().flex_1())
         .child(
-            icon_button("sidebar-settings", icons::COG_6_TOOTH).on_click(cx.listener(
+            icon_button("sidebar-settings", icons::COG_6_TOOTH)
+                .tooltip(style::tooltip("Settings"))
+                .on_click(cx.listener(
                 |this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSettings, window, cx),
             )),
         )
         .child(
-            icon_button("sidebar-collapse", icons::CHEVRON_DOUBLE_LEFT).on_click(cx.listener(
+            icon_button("sidebar-collapse", icons::CHEVRON_DOUBLE_LEFT)
+                .tooltip(style::tooltip("Hide the sidebar"))
+                .on_click(cx.listener(
                 |this, _, window, cx| this.sidebar_event(SidebarEvent::Collapse, window, cx),
             )),
         );
@@ -906,8 +1093,12 @@ mod render_tests {
                     link: self.link,
                     palette_chord: "⌃P".into(),
                     switcher: None,
+                    switcher_button: Default::default(),
+                    switcher_open: false,
                     width: 252.0,
                     scroll: gpui::ScrollHandle::new(),
+                    track: motion::SlideTrack::shared(),
+                    chip: None,
                 },
                 &theme,
                 cx,

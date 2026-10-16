@@ -17,8 +17,8 @@ use shelbi_state::keymap::PopoverAction;
 use super::issues::{backdrop, IssuesView};
 use super::markdown;
 use crate::assets::{heroicon, icons, Icon};
-use crate::theme::style;
-use crate::theme::Theme;
+use crate::theme::style::{self, ButtonKind, IconButtonSize};
+use crate::theme::{Hue, Theme};
 
 pub fn render(
     view: &IssuesView,
@@ -43,19 +43,23 @@ pub fn render(
         .flex_row()
         .items_start()
         .gap_2()
-        .px_5()
+        .pl_5()
+        .pr_3()
         .pt_4()
-        .pb_2()
+        .pb_3()
         .child(
             div()
                 .flex_1()
+                .min_w_0()
+                .pt(px(4.0))
                 .text_lg()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text_loud)
                 .child(d.title.clone()),
         )
         .child(
-            icon_button(theme, "detail-close", icons::X_MARK, &format!("Close ({close_hint})"))
+            style::icon_button("detail-close", icons::X_MARK, IconButtonSize::Default, false, theme)
+                .tooltip(style::tooltip(format!("Close ({close_hint})")))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if this.editor.is_some() {
                         this.cancel_editor(cx);
@@ -66,21 +70,37 @@ pub fn render(
                 })),
         );
 
-    let mut fields = div().flex().flex_col().gap_1().px_5().pb_3().text_sm();
+    let mut fields = div().flex().flex_col().gap(px(6.0)).px_5().pb_4().text_sm();
     fields = fields.child(field(theme, "id", d.id.clone()));
-    fields = fields.child(field(
-        theme,
-        "status",
-        format!("{}   priority {}", d.status_label, d.priority),
-    ));
-    fields = fields.child(field(theme, "workflow", d.workflow_name.clone()));
-    fields = fields.child(field(
-        theme,
-        "workspace",
-        d.assignee
-            .as_ref()
-            .map_or_else(|| "unassigned".to_string(), |w| format!("@{w}")),
-    ));
+    fields = fields.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(label(theme, "status"))
+            .child(style::chip(d.status_label.clone(), Hue::Neutral, theme))
+            .child(div().text_color(theme.text_quiet).child(format!("priority {}", d.priority))),
+    );
+    fields = fields.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(label(theme, "workflow"))
+            .child(style::chip(d.workflow_name.clone(), Hue::Blue, theme)),
+    );
+    fields = fields.child(match &d.assignee {
+        Some(w) => field(theme, "workspace", format!("@{w}")).into_any_element(),
+        None => div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(label(theme, "workspace"))
+            .child(div().text_color(theme.text_quiet).child("Unassigned"))
+            .into_any_element(),
+    });
     if let Some(b) = &d.branch {
         fields = fields.child(field(theme, "branch", b.clone()));
     }
@@ -105,8 +125,12 @@ pub fn render(
                 .child(
                     div()
                         .id("pr-link")
-                        .underline()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.link)
+                        .hover(|s| s.underline())
                         .cursor_pointer()
+                        .tooltip(style::tooltip(url.clone()))
                         .child(url)
                         .on_click(move |_, _, cx| cx.open_url(&open)),
                 ),
@@ -129,7 +153,7 @@ pub fn render(
         .px_5()
         .pb_3()
         .child(
-            text_button(theme, "detail-left", &format!("← Move ({left_hint})")).on_click(
+            action(theme, "detail-left", Some(icons::ARROW_LEFT), "Move", &left_hint, ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     let intents = this.state.detail_move(false);
                     this.apply_intents(intents, window, cx);
@@ -138,7 +162,7 @@ pub fn render(
             ),
         )
         .child(
-            text_button(theme, "detail-right", &format!("Move → ({right_hint})")).on_click(
+            action(theme, "detail-right", Some(icons::ARROW_RIGHT), "Move", &right_hint, ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     let intents = this.state.detail_move(true);
                     this.apply_intents(intents, window, cx);
@@ -147,7 +171,7 @@ pub fn render(
             ),
         )
         .child(
-            icon_button(theme, "detail-start", icons::PLAY, "Start (s)").on_click(cx.listener(
+            action(theme, "detail-start", Some(icons::PLAY), "Start", "s", ButtonKind::Secondary).on_click(cx.listener(
                 |this, _: &ClickEvent, window, cx| {
                     if let Some(id) = this.state.detail_id().map(str::to_string) {
                         let intents = this.state.start(&id);
@@ -158,7 +182,7 @@ pub fn render(
             )),
         )
         .child(
-            icon_button(theme, "detail-assign", icons::USER, "Assign (a)").on_click(cx.listener(
+            action(theme, "detail-assign", Some(icons::USER), "Assign", "a", ButtonKind::Secondary).on_click(cx.listener(
                 |this, _: &ClickEvent, window, cx| {
                     if let Some(id) = this.state.detail_id().map(str::to_string) {
                         let intents = this.state.begin_assign(&id);
@@ -170,7 +194,7 @@ pub fn render(
         )
         .when(!editing, |row| {
             row.child(
-                icon_button(theme, "detail-edit", icons::PENCIL_SQUARE, "Edit (e)").on_click(
+                action(theme, "detail-edit", Some(icons::PENCIL_SQUARE), "Edit", "e", ButtonKind::Secondary).on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| {
                         if let Some(id) = this.state.detail_id().map(str::to_string) {
                             let intents = this.state.begin_edit(&id);
@@ -182,11 +206,13 @@ pub fn render(
             )
         })
         .child(
-            icon_button(
+            action(
                 theme,
                 "detail-editor",
-                icons::ARROW_TOP_RIGHT_ON_SQUARE,
-                "Open in editor (E)",
+                Some(icons::ARROW_TOP_RIGHT_ON_SQUARE),
+                "Open in editor",
+                "⇧E",
+                ButtonKind::Secondary,
             )
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 if let Some(id) = this.state.detail_id().map(str::to_string) {
@@ -197,12 +223,12 @@ pub fn render(
         )
         .when(editing, |row| {
             row.child(
-                text_button(theme, "detail-save", "Save (⌘S)").on_click(cx.listener(
+                action(theme, "detail-save", None, "Save", "⌘S", ButtonKind::Primary).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| this.save_editor(cx),
                 )),
             )
             .child(
-                text_button(theme, "detail-cancel", "Cancel (Esc)").on_click(cx.listener(
+                action(theme, "detail-cancel", None, "Cancel", "Esc", ButtonKind::Quiet).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| this.cancel_editor(cx),
                 )),
             )
@@ -241,12 +267,31 @@ pub fn render(
             .pb_4()
             .child(Textarea::new(state).h_full())
             .into_any_element()
+    } else if d.body.trim().is_empty() {
+        // An empty state with its action.
+        div()
+            .id("detail-body")
+            .debug_selector(|| "detail-empty".into())
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap_2()
+            .px_5()
+            .pb_4()
+            .child(div().text_color(theme.text_quiet).child("This issue has no description yet."))
+            .child(
+                action(theme, "detail-add-description", Some(icons::PENCIL_SQUARE), "Write one", "e", ButtonKind::Secondary)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if let Some(id) = this.state.detail_id().map(str::to_string) {
+                            let intents = this.state.begin_edit(&id);
+                            this.apply_intents(intents, window, cx);
+                            cx.notify();
+                        }
+                    })),
+            )
+            .into_any_element()
     } else {
-        let text = if d.body.trim().is_empty() {
-            "_No description._".to_string()
-        } else {
-            d.body.clone()
-        };
+        let text = d.body.clone();
         div()
             .id("detail-body")
             .flex_1()
@@ -276,13 +321,13 @@ pub fn render(
         .h(relative(0.85))
         .min_w_0()
         .overflow_hidden()
-        .map(|d| style::popover(d, theme))
+        .map(|d| style::dialog(d, theme))
         .on_click(|_, _, cx| cx.stop_propagation())
         .child(header)
         .child(fields)
         .child(actions)
         .child(status_rows)
-        .child(div().h(px(1.0)).mx_5().mb_3().bg(theme.rule))
+        .child(div().h(px(1.0)).mx_5().mt_1().mb_4().bg(theme.rule))
         .child(body);
 
     backdrop(theme, cx)
@@ -308,39 +353,26 @@ fn field(theme: &Theme, name: &str, value: String) -> impl IntoElement {
         .child(div().text_color(theme.text).child(value))
 }
 
-fn text_button(theme: &Theme, id: &'static str, text: &str) -> gpui::Stateful<gpui::Div> {
-    small_button(theme, id).child(text.to_string())
-}
-
-/// A small secondary button, empty.
-fn small_button(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
-    let hover = theme.fill_strong;
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h(px(28.0))
-        .px(px(10.0))
-        .rounded_lg()
-        .bg(theme.fill)
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.text_loud)
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover))
-}
-
-fn icon_button(
+/// A compact action: a 28px Taskpage button, its icon, its label and the
+/// key that does the same thing, as keycaps.
+fn action(
     theme: &Theme,
     id: &'static str,
-    icon: Icon,
+    icon: Option<Icon>,
     text: &str,
+    key: &str,
+    kind: ButtonKind,
 ) -> gpui::Stateful<gpui::Div> {
-    small_button(theme, id)
-        .gap_1()
-        .pl_2()
-        .child(heroicon(icon).text_color(theme.icon))
+    let fg = style::button_colors(kind, theme).text;
+    style::button_base(id, kind, false, theme)
+        .debug_selector(move || id.into())
+        .h(px(28.0))
+        .px(px(10.0))
+        .gap(px(6.0))
+        .text_xs()
+        .when_some(icon, |b, icon| b.pl(px(8.0)).child(heroicon(icon).text_color(fg)))
         .child(text.to_string())
+        .when(!key.is_empty(), |b| b.child(style::keycaps(key, theme)))
 }
 
 /// One dependency as the detail lists it: `id [status]`, a `✓` once it's

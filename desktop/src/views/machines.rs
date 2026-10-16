@@ -37,7 +37,7 @@ use shelbi_app::CommandKind;
 use super::machines_state::{Intent, MachinesState};
 use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
-use crate::theme::style;
+use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 
 /// How often the machines read re-runs. It reads the board index and each
@@ -182,7 +182,19 @@ impl MachinesView {
         }
         let model = self.state.model();
         if model.machines.is_empty() {
-            return placeholder("No machines declared for this project.".into());
+            return style::empty_state(
+                "machines-empty",
+                "No machines are declared for this project yet. Add them under `machines:` in its config, then refresh.",
+                Some(
+                    style::icon_label_button("machines-refresh", icons::ARROW_PATH, "Refresh", ButtonKind::Secondary, theme)
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            this.refresh();
+                            cx.notify();
+                        })),
+                ),
+                theme,
+            )
+            .into_any_element();
         }
         let mut body = div()
             .id("machines-list")
@@ -332,7 +344,16 @@ fn machine_header(theme: &Theme, m: &MachineRow) -> impl IntoElement {
         // never probed.
         .when(!m.is_local, |d| {
             let (text, tone) = reachability_label(&m.reachability, 80);
-            d.child(toned(text, tone))
+            // The chip is cut at 80 characters; the whole reason is a hover
+            // away.
+            let (full, _) = reachability_label(&m.reachability, usize::MAX);
+            d.child(
+                div()
+                    .id(gpui::SharedString::from(format!("reachability-{}", m.name)))
+                    .min_w_0()
+                    .when(full != text, |d| d.tooltip(style::tooltip(full)))
+                    .child(toned(text, tone)),
+            )
         })
         .children(m.tags.iter().map(|tag| style::chip(tag.clone(), crate::theme::Hue::Neutral, theme)))
         .when(!m.is_local, |d| {

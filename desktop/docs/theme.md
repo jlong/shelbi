@@ -8,7 +8,11 @@ unchanged; the desktop no longer reads them.
 - `src/theme/palette.rs`: Taskpage's hue scales and the roles below, a light
   and a dark value each, with the contrast tests.
 - `src/theme/style.rs`: the component shapes every view shares (nav chip,
-  buttons, icon buttons, popovers, chips, the selection pill).
+  buttons, icon buttons, dropdowns, segmented controls, the search box and
+  its keycaps, project badges, popovers, dialogs, chips, the selection pill,
+  empty states, tooltips).
+- `src/theme/motion.rs`: Taskpage's motion: its easing curve, the spring the
+  selection chip slides on, and the fades every hover and press runs.
 - `src/theme/mod.rs`: the resolved `Theme` global (views read
   `theme.text_quiet`, `theme.surface_recessed`, ...), the mapping from the
   shared view models' meanings onto Taskpage hues, the terminal palette, and
@@ -43,10 +47,24 @@ Taskpage has no dark theme, so this one is derived to read as the same family:
   chip tints are the hue's 500 step at 18%.
 - **Fills, rules and rings** are slate-400 at low alpha, so they work on any
   dark surface.
-- **The selected nav row** is a lifted surface with a subtle 1px ring, not a
-  white chip.
+- **Controls carry a boundary.** Light's buttons, dropdowns, the search box
+  and segmented controls are Taskpage's fill-only slate-300, and their labels
+  identify them. On dark a fill that light would need a white label to clear
+  4.5:1 on, so instead every control keeps a quiet fill and a 1px
+  `control_border` (slate-400 at 42%) that clears 3:1 on every dark surface,
+  strengthening on hover and while pressed or open.
+- **The selected tab or segment** is a lifted surface (`tab_selected`, a step
+  above the selected nav row) with a 1px ring at 3:1 against its track, a
+  loud label and semibold weight: never only a tint.
+- **The selected nav row** is a lifted surface with a 1px ring, not a white
+  chip.
 - **The brand fill** stays pink-600 (white text on it keeps 5:1); as a
-  foreground (the selection pill, the focus ring) it is pink-400.
+  foreground (the selection pill, the focus ring) it is pink-400. Its hover
+  darkens to pink-700 with a pink-400 boundary, since pink-700 alone falls
+  under 3:1 on the dark surfaces.
+- **The danger fill** is red-500 (white text 5.2:1) with a red-400 boundary.
+- **The Zen band** is `#00803f`, between green-700 and -600: white text keeps
+  5:1 and the band 3:1 against the column.
 
 ## Contrast
 
@@ -56,28 +74,66 @@ four surfaces, the selected chip and the hover and selection fills; every hue
 used as text on the surfaces; every chip's text on its own tint; and text on
 the brand, Zen and error fills. Icons and the focus ring are tested at 3:1
 (WCAG 1.4.11). `text_faint` is exempt (placeholders, disabled and decorative
-text). `src/theme/mod.rs` tests the terminal's default foreground at AA and
+text).
+
+`controls_clear_contrast_in_every_state` covers the controls on the main,
+leading and raised surfaces, at rest, hovered and pressed: the loud and normal
+labels at 4.5:1 on the control's fill, the icon at 3:1 (loud once hovered),
+and on dark the control's outer edge (its border over its fill) at 3:1
+against the surface. It checks the selected segment (its label at 4.5:1, it
+sits lighter than its track, and on dark its ring at 3:1 against the track),
+the primary and danger buttons (white labels at 4.5:1 in every state, their
+edges at 3:1 on dark), a text field's border at 3:1 in both themes, the focus
+ring at 3:1, the Zen band at 3:1 on dark, and the search box's keycap label.
+`project_badges_carry_white_initials` checks every badge fill at 4.5:1 under
+white initials. `src/theme/mod.rs` tests the terminal's default foreground at AA and
 its ANSI hues at 3:1 on the new terminal background.
 
 ## Component shapes (`src/theme/style.rs`)
 
 | Component | Shape |
 |---|---|
-| Corners | 8px everywhere (`rounded_lg`); 12px on the 32 and 40px icon buttons |
-| Nav row | 40px tall (a 36px chip inset 2px), content 8px inside, 20px icon, 8px gap; the current row is the raised chip, loud and medium weight |
+| Corners | 8px everywhere (`rounded_lg`); 12px on the 32 and 40px icon buttons and the search box; 6px on segments, badges and keycaps |
+| Project switcher | ContextStore's `SpacePicker`: 36px, 8px across, 8px corners, a 24px initials badge, the name at 13px medium, the up-down chevron in the quiet color; the control fill, stronger on hover and pressed while open. Its menu is a popover 6px below, at least the button's width, drawn over the sidebar (nothing moves): 36px rows of badge, name and a check on the current project, a rule, then "Add project…"; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
+| Project badge | Two-letter initials (two words, camel case split), bold white, on a Taskpage hue picked from the name ([`badge_fill`]) |
+| Search box | Taskpage's `SearchBox`: the control fill with 12px corners, 4px gap, a magnifying glass, "Search" in the normal text color growing to fill, then the palette chord as keycaps; hover fades to the hover fill |
+| Keycaps | Taskpage's `Shortcut`: one 18px cap per key, 11px medium uppercase, `keycap` with a 1px `keycap_edge` drop |
+| Nav row | 40px tall (a 36px chip inset 2px), content 8px inside, 20px icon, 8px gap; the current row is the raised chip, loud and medium weight, its icon loud |
+| Selection chip | One chip for the current row; when the selection moves (keys, clicks, route changes) it slides to the new row on a spring with a slight overshoot (`NAV_SPRING`, about 250ms) before the row takes it back. The sidebar, the review and workspace panels' view switches, and every segmented control |
 | List row (leading column) | 32px; the same chip when selected |
-| Current-selection indicator | A 3x16px brand pill at the row's leading edge, on the keyboard's row (the sidebar while focused, the panels' keyboard row, the palette, lists) |
+| Current-selection indicator | A 3x16px brand pill at the row's leading edge, on the keyboard's row (the sidebar while focused, the panels' keyboard row, the palette, lists); it rides the sliding chip |
 | Section heading | `text-sm` semibold, loud |
-| Button | 32px tall, semibold, 2px border; primary = brand fill with white text, secondary = slate fill with loud text, danger = the error fill; the keyboard's button wears a 2px focus ring |
-| Icon button | 24, 32 or 40px square, the icon role at rest, `fill_strong` and a loud icon on hover, `fill` while active |
-| Menu, popover, palette, dialog | `surface_raised`, 8px corners, a 1px ring and `shadow-lg`; dialogs over the scrim, menus over nothing |
+| Button | 32px tall, semibold, a 1px boundary; primary = brand fill with white text, secondary = the control fill and boundary with loud text, danger = the error fill with its own boundary, quiet = no fill until hovered; fills fade on hover and press; the keyboard's button wears a 2px focus ring. Compact actions (the card detail, the error log) are 28px and `text-xs`, with their key as keycaps |
+| Dropdown | A button that opens a menu (the board's and activity's filters): the control fill and boundary, an icon, a medium label, a chevron; pressed while its menu is open, and the menu opens 6px under it |
+| Segmented control | A track (the control fill and boundary, 2px inside) of 24px segments (28px in Settings); the selected one is `tab_selected` with its ring and `shadow-nav`, loud and semibold; the others normal text, a fill fading in on hover |
+| Icon button | 24, 32 or 40px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the control fill while active; a tooltip names it where the icon alone might not |
+| Text field | `input_border` (3:1 in both themes), 8px corners; the focus ring while it has the keyboard |
+| Menu, popover | `surface_raised`, 8px corners, a 1px ring and `shadow-lg`; menu rows fade a fill in on hover |
+| Palette, dialog | Taskpage's command dialog: over the scrim (slate-700 at 50%, no blur in gpui), `surface_raised`, 8px corners, a 1px ring and `shadow-xl`. The palette sits a fifth of the way down the window, 672px wide (`max-w-2xl`: Taskpage's `max-w-xl` plus room for the Projects column) |
 | Chip, badge | 20px, 6px across, `text-xs` medium, the hue's text on its tint |
+| Empty state | A quiet sentence on why there is nothing, and the action that changes it (clear the filters, refresh, write a description); an empty board column is a dashed well saying a card can be dragged in |
+| Tooltip | A small popover, `text-xs`, on icon buttons and on text cut short (a long reachability error, a PR link) |
 | Board | Columns on `surface_recessed` with a rule border; cards raised with a ring and a 1px drop; the keyboard's card wears the focus ring; drop targets light up in the focus color |
-| Terminal | Background and frame are the main surface; the find bar and "Jump to bottom" are popovers |
+| Terminal | Background and frame are the main surface; the grid is inset 12px from the leading edge and 8px top and bottom; the find bar and "Jump to bottom" are popovers |
 | Spacing | Taskpage's 8px scale (2, 4, 6, 8, 10, 12, 16, 20, 24, 32) |
 
-Taskpage's popover motion (400ms on `cubic-bezier(0.16, 1, 0.3, 1)`) is not
-adopted yet: the desktop's menus and popovers open without animation.
+## Motion (`src/theme/motion.rs`)
+
+- **Menus and dialogs** open with Taskpage's slide-and-fade: 8px of travel up
+  into place and opacity, on `cubic-bezier(0.16, 1, 0.3, 1)`: 200ms for the
+  project switcher's menu (in and out) and the board's and Activity's filter
+  menus (in), 400ms for the palette and dialogs, their scrim fading with
+  them.
+- **The selection chip** slides between rows on a damped spring (damping
+  ratio 0.75 at 22 rad/s: framer-motion's `bounce: 0.25`), reaching its row
+  in about 200ms with a 3% overshoot and settling by 350ms. A retarget
+  mid-slide starts from where the chip is, with its velocity.
+- **Hover and press** fade a control's fill over about 200ms (a critically
+  damped spring, no overshoot), Taskpage's `transition-colors`.
+- **Reduce Motion** (System Settings ▸ Accessibility ▸ Display) makes all of
+  it instant. The app hands the setting to gpui at launch and each time a
+  window comes forward, so gpui's own animations end where they would; the
+  chip and the menus read it when they start.
 
 ## Shared meanings
 
@@ -118,8 +174,23 @@ until a new role has its row here, with the values the palette really has.
 | Role | Light | Dark | Used for |
 |---|---|---|---|
 | `fill_subtle` | `#f2f3f7` | `#e3e5ed0d` | Row and menu-row hover |
-| `fill` | `#eceef3` | `#e3e5ed14` | Secondary buttons, an active icon button, segmented controls, a row's hover in the leading column |
-| `fill_strong` | `#e3e5ed` | `#e3e5ed1f` | Icon-button hover, secondary-button hover |
+| `fill` | `#eceef3` | `#e3e5ed14` | A row's hover in the leading column, the keyboard's row |
+| `fill_strong` | `#e3e5ed` | `#e3e5ed1f` | A row's pressed fill |
+
+### Controls
+
+| Role | Light | Dark | Used for |
+|---|---|---|---|
+| `control_fill` | `#eceef3` | `#e3e5ed1a` | Secondary buttons, dropdowns, the search box, the project switcher, a segmented control's track, an active icon button |
+| `control_fill_hover` | `#e3e5ed` | `#e3e5ed29` | Their hover; an icon button's hover |
+| `control_fill_pressed` | `#acb4cf73` | `#e3e5ed38` | Pressed, or open (a dropdown or the switcher with its menu showing) |
+| `control_border` | `#eceef3` | `#e3e5ed6b` | A control's 1px boundary: invisible in light (fill only, as Taskpage), 3:1 on every dark surface |
+| `control_border_hover` | `#e3e5ed` | `#e3e5ed94` | The boundary on hover, pressed and open |
+| `input_border` | `#7b85a7` | `#e3e5ed6b` | A text field's border, a checkbox's (3:1 in both themes) |
+| `tab_selected` | `#ffffff` | `#3a3f4f` | The selected segment of a segmented control |
+| `tab_selected_ring` | `#2e334514` | `#e3e5ed80` | Its 1px ring (3:1 against the track in dark) |
+| `keycap` | `#ffffff` | `#e3e5ed24` | A keycap in a shortcut hint |
+| `keycap_edge` | `#7b85a74d` | `#00000099` | The keycap's 1px bottom edge |
 
 ### Text
 
@@ -151,6 +222,7 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `brand` | `#db0a60` | `#db0a60` | The primary button |
 | `brand_hover` | `#b40041` | `#b40041` | Its hover |
+| `brand_hover_border` | `#b40041` | `#ff66ab` | Its boundary on hover |
 | `brand_text` | `#db0a60` | `#ff66ab` | The current-selection pill, the current project's check |
 | `accent` | `#0007a7` | `#8fb4ff` | Taskpage's accent (blue) |
 | `link` | `#2830f1` | `#8fb4ff` | Links, More |
@@ -193,16 +265,17 @@ until a new role has its row here, with the values the palette really has.
 
 | Role | Light | Dark | Used for |
 |---|---|---|---|
-| `zen` | `#00753d` | `#00753d` | The `ZEN MODE ON` band |
-| `error_fill` | `#db0000` | `#aa0101` | The unread-errors button, the Reject (danger) button |
+| `zen` | `#00753d` | `#00803f` | The `ZEN MODE ON` band |
+| `error_fill` | `#db0000` | `#db0000` | The unread-errors button, the danger button |
+| `danger_border` | `#db0000` | `#ff3737` | The danger button's boundary |
 | `notice` | `#fff0bc` | `#e0b10929` | The relaunch band |
 
 ### Selection
 
 | Role | Light | Dark | Used for |
 |---|---|---|---|
-| `nav_selected` | `#ffffff` | `#262a35` | The selected nav row: the raised chip |
-| `nav_selected_ring` | `#00000008` | `#e3e5ed14` | Its 1px ring |
+| `nav_selected` | `#ffffff` | `#2a2e3a` | The selected nav row: the raised chip (it slides) |
+| `nav_selected_ring` | `#00000008` | `#e3e5ed24` | Its 1px ring |
 | `nav_shadow` | `#1419470d` | `#0000004d` | Its 2px drop (`shadow-nav`) |
 | `row_selected` | `#eceef3` | `#e3e5ed1a` | The keyboard's row in a list, palette or menu |
 | `text_selection` | `#cadbfe` | `#2c3a5e` | The terminal's selection |
@@ -215,10 +288,23 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `ring` | `#2e33450d` | `#e3e5ed14` | The 1px ring around raised surfaces |
 | `shadow` | `#0000001a` | `#00000066` | `shadow-lg` under menus, popovers, dialogs |
-| `scrim` | `#00000040` | `#00000080` | The backdrop behind a dialog |
+| `scrim` | `#444c6580` | `#131418b3` | The backdrop behind the palette and dialogs (Taskpage's slate-700, stronger for the missing blur) |
+
+### Project badges
+
+Not roles: the same eight fills in both themes, picked per project by
+`badge_fill` (an FNV-1a hash of the name), each dark enough for white
+initials at 4.5:1: pink-600 `#db0a60`, blue-600 `#2830f1`, purple-700
+`#7019c0`, green-700 `#00753d`, cyan `#0c699c`, orange-700 `#9d4100`, red-600
+`#aa0101`, gold-700 `#856700`. There is no project logo yet, so every project
+gets its initials.
 ## Renders
 
 Every `--visual-*` mode renders both themes: with `SHELBI_VISUAL_THEME`
 unset it runs itself once per theme into `<dir>/dark/` and `<dir>/light/`;
 set it to `dark` or `light` for one. `--visual-views` includes the issues
-board (`board.png`, `board-dropdown.png`, `board-detail.png`).
+board (`board.png`, `board-dropdown.png`, `board-detail.png`), Settings, the
+bootstrap screens and the notice bars; `--visual-review` the project
+switcher (`sidebar-switcher-mid.png`, `sidebar-switcher.png`), the nav chip
+mid-slide (`sidebar-slide-mid.png`) and the palette sliding in
+(`palette-entering.png`).

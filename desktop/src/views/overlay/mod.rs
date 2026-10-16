@@ -322,8 +322,8 @@ pub fn with_overlay<H: OverlayHost>(
     cx.notify();
 }
 
-/// The dimmed backdrop's color: the palette's scrim (black at partial
-/// strength; a light theme's own background would lighten rather than dim).
+/// The dimmed backdrop's color: the palette's scrim (Taskpage's slate-700
+/// at partial strength; black-700 in dark).
 fn backdrop(theme: &Theme) -> Hsla {
     theme.scrim
 }
@@ -332,9 +332,14 @@ fn backdrop(theme: &Theme) -> Hsla {
 /// mouse, with the overlay's panel on it. `size` is the window's size in
 /// pixels, which the panels size themselves against (as the TUI's overlays
 /// size against the terminal).
+///
+/// `entering` is the entrance's progress (0..=1, eased) while the overlay
+/// slides in (Taskpage's slide-up-and-fade for the panel, a fade for the
+/// scrim), `None` once it is in.
 pub fn render_layer<H: OverlayHost>(
     overlay: &ActiveOverlay,
     size: gpui::Size<gpui::Pixels>,
+    entering: Option<f32>,
     keymaps: &Keymaps,
     theme: &Theme,
     cx: &mut Context<H>,
@@ -359,6 +364,12 @@ pub fn render_layer<H: OverlayHost>(
         }
     };
     let closes = overlay.closes_on_backdrop();
+    let phase = entering.unwrap_or(1.0);
+    let panel = div()
+        .relative()
+        .top(px((1.0 - phase) * crate::theme::motion::SLIDE_PX))
+        .opacity(phase)
+        .child(panel);
     div()
         .id("overlay-layer")
         .debug_selector(|| "overlay-layer".into())
@@ -367,11 +378,11 @@ pub fn render_layer<H: OverlayHost>(
         .left_0()
         .size_full()
         .occlude()
-        .bg(backdrop(theme))
+        .bg(backdrop(theme).opacity(phase))
         .flex()
         .flex_col()
         .items_center()
-        .when(top_aligned, |d| d.justify_start().pt(px(PALETTE_TOP)))
+        .when(top_aligned, |d| d.justify_start().pt(px(palette_top(size.height.as_f32()))))
         .when(!top_aligned, |d| d.justify_center())
         .font_family("Geist")
         .text_sm()
@@ -387,13 +398,16 @@ pub fn render_layer<H: OverlayHost>(
         .into_any_element()
 }
 
-/// The palette's offset from the top of the window (the TUI's two rows).
-pub const PALETTE_TOP: f32 = 40.0;
+/// The palette's offset from the top of a window `window_h` tall: Taskpage's
+/// command dialog sits a fifth of the way down (`pt-[20vh]`), at least 40px.
+pub fn palette_top(window_h: f32) -> f32 {
+    (window_h * 0.2).max(40.0).round()
+}
 
 /// A panel: the overlay's raised surface (Taskpage's ring and shadow), that
 /// stops clicks on it from reaching the backdrop.
 pub fn panel(id: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    style::popover(
+    style::dialog(
         div()
             .id(id)
             .debug_selector(move || id.into())
@@ -657,7 +671,7 @@ mod render_tests {
             div()
                 .relative()
                 .size_full()
-                .children(self.overlay.as_ref().map(|o| render_layer(o, size, &keymaps, &theme, cx)))
+                .children(self.overlay.as_ref().map(|o| render_layer(o, size, None, &keymaps, &theme, cx)))
         }
     }
 
@@ -774,7 +788,8 @@ mod render_tests {
         assert!(cx.debug_bounds("palette-footer").is_some());
         // Top-aligned, not centered.
         let panel = cx.debug_bounds("palette").unwrap();
-        assert_eq!(panel.top(), px(PALETTE_TOP));
+        let window_h = cx.update(|window, _| window.viewport_size().height.as_f32());
+        assert_eq!(panel.top(), px(palette_top(window_h)));
     }
 
     #[gpui::test]

@@ -1,13 +1,15 @@
 //! The command palette, drawn.
 //!
-//! The TUI's look (`crates/shelbi-tui/src/overlay/palette.rs`): a panel
-//! top-aligned a little below the window's top, 70% of the window wide, as
-//! tall as its current results (so it grows and shrinks as the query filters,
-//! scrolling inside once it reaches the window's height), in the `search`
-//! fill with a muted border. A `❯` search line with a green block cursor (or
-//! the dim placeholder), then the results: an icon slot, a fixed-width label,
-//! the dim description and a right-aligned shortcut, the selected row on the
-//! `selection` pill; a Projects column on the right; a dim footer hint.
+//! Taskpage's command dialog (`components/Chrome/SearchBox.tsx`): over a
+//! slate scrim, a fifth of the way down the window, a raised panel with 8px
+//! corners, `shadow-xl` and a ring, that slides up and fades in. It is as
+//! tall as its current results (so it grows and shrinks as the query
+//! filters, scrolling inside once it reaches the window's foot). The TUI's
+//! content, in Taskpage's shapes: the search line (a magnifying glass, the
+//! query or the quiet placeholder, the caret in the focus color), then the
+//! results: an icon slot, a fixed-width label, the quiet description and the
+//! shortcut's keycaps, the selected row on the selection fill with the brand
+//! pill; a Projects column on the right; a quiet footer hint.
 //!
 //! The rows are the registry's entries (`CommandRegistry::entries`) filtered
 //! by `shelbi_palette::search`, through the shared state machine
@@ -26,11 +28,13 @@ use shelbi_state::keymap::{format_chord, DisplayStyle, Keymaps};
 use crate::assets::{heroicon, icons};
 use crate::theme::style;
 use crate::theme::Theme;
-use crate::views::overlay::{palette_event, panel, with_overlay, ActiveOverlay, OverlayHost, PALETTE_TOP};
+use crate::theme::motion::fill_layer;
+use crate::views::overlay::{palette_event, palette_top, panel, with_overlay, ActiveOverlay, OverlayHost};
 
-/// The panel's share of the window width, and its floor.
-const WIDTH_PCT: f32 = 0.70;
-const MIN_WIDTH: f32 = 360.0;
+/// The panel's width: Taskpage's dialog is `max-w-xl` (576px); the
+/// desktop's carries a Projects column beside the commands, so it runs one
+/// step wider (`max-w-2xl`, 672px).
+const MAX_WIDTH: f32 = 672.0;
 /// The label column's fixed width (the Figma's 211px), so every description
 /// starts at the same x.
 const LABEL_W: f32 = 211.0;
@@ -48,9 +52,10 @@ pub const PLACEHOLDER: &str = "Type a command or search";
 /// The active project's breathing period (the TUI's).
 const PULSE: Duration = Duration::from_millis(1143);
 
-/// The panel's width in a window `window_w` wide.
+/// The panel's width in a window `window_w` wide: 672px, a narrower window
+/// keeping 16px either side.
 pub fn panel_width(window_w: f32) -> f32 {
-    (window_w * WIDTH_PCT).max(MIN_WIDTH).min((window_w - 32.0).max(0.0))
+    (window_w - 32.0).clamp(0.0, MAX_WIDTH)
 }
 
 /// The Projects column's width for a results band `band_w` wide, or `None`
@@ -106,7 +111,8 @@ pub fn render<H: OverlayHost>(
     cx: &mut gpui::Context<H>,
 ) -> AnyElement {
     let width = panel_width(size.width.as_f32());
-    let max_h = (size.height.as_f32() - 2.0 * PALETTE_TOP).max(120.0);
+    let top = palette_top(size.height.as_f32());
+    let max_h = (size.height.as_f32() - top - 40.0).max(120.0);
     let results = palette.results();
     let selected = palette.selected_in(results.len());
     let commands_focused = palette.focus() == PaletteFocus::Commands;
@@ -161,9 +167,11 @@ pub fn render<H: OverlayHost>(
         .child(
             div()
                 .debug_selector(|| "palette-footer".into())
+                .mt_2()
                 .px_4()
-                .pt_2()
-                .pb_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.rule)
                 .text_xs()
                 .text_color(theme.text_quiet)
                 .child(palette.footer(&close_chord(keymaps))),
@@ -218,7 +226,8 @@ fn render_row<H: OverlayHost>(
 ) -> AnyElement {
     let (glyph, glyph_color) = icon_for(entry, theme);
     let id = entry.id.clone();
-    div()
+    let key = format!("palette-row-{id}");
+    let row = div()
         .id(("palette-row", index))
         .debug_selector(move || format!("palette-row-{id}"))
         .flex()
@@ -229,9 +238,14 @@ fn render_row<H: OverlayHost>(
         .h(px(ROW_H))
         .px_1()
         .rounded_lg()
-        .cursor_pointer()
-        .when(selected, |row| row.bg(theme.row_selected).child(style::selection_indicator(theme)))
-        .when(!selected, |row| row.hover(|s| s.bg(theme.fill_subtle)))
+        .cursor_pointer();
+    let row = if selected {
+        row.bg(theme.row_selected).child(style::selection_indicator(theme))
+    } else {
+        let clear = theme.fill_subtle.opacity(0.0);
+        fill_layer(row, key, px(8.0), [clear, theme.fill_subtle, theme.fill])
+    };
+    row
         .child(
             div()
                 .w(px(ICON_W))
@@ -264,18 +278,7 @@ fn render_row<H: OverlayHost>(
                 .child(entry.subtitle.clone().unwrap_or_default()),
         )
         .when_some(entry.shortcut.clone(), |row, shortcut| {
-            row.child(
-                div()
-                    .flex_none()
-                    .ml_2()
-                    .mr_1()
-                    .px_1()
-                    .rounded_md()
-                    .bg(theme.fill)
-                    .text_xs()
-                    .text_color(theme.text_quiet)
-                    .child(shortcut),
-            )
+            row.child(style::keycaps(&shortcut, theme).ml_2().mr_1())
         })
         .on_click(cx.listener(move |this: &mut H, _, window, cx| {
             with_overlay(this, window, cx, |o| match o {
@@ -359,7 +362,8 @@ fn project_row<H: OverlayHost>(
     cx: &mut Context<H>,
 ) -> AnyElement {
     let name = label.clone();
-    div()
+    let key = format!("palette-project-{name}");
+    let row = div()
         .id(("palette-project", index))
         .debug_selector(move || format!("palette-project-{name}"))
         .flex()
@@ -371,14 +375,17 @@ fn project_row<H: OverlayHost>(
         .px_2()
         .rounded_lg()
         .cursor_pointer()
-        .text_color(theme.text)
-        .when(selected, |r| {
-            r.bg(theme.row_selected)
-                .text_color(theme.text_loud)
-                .font_weight(FontWeight::MEDIUM)
-                .child(style::selection_indicator(theme))
-        })
-        .when(!selected, |r| r.hover(|s| s.bg(theme.fill_subtle)))
+        .text_color(theme.text);
+    let row = if selected {
+        row.bg(theme.row_selected)
+            .text_color(theme.text_loud)
+            .font_weight(FontWeight::MEDIUM)
+            .child(style::selection_indicator(theme))
+    } else {
+        let clear = theme.fill_subtle.opacity(0.0);
+        fill_layer(row, key, px(8.0), [clear, theme.fill_subtle, theme.fill])
+    };
+    row
         .child(glyph)
         .child(div().truncate().child(label))
         .on_click(cx.listener(move |this: &mut H, _, window, cx| {
@@ -408,9 +415,9 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_is_seventy_percent_wide_with_a_floor() {
-        assert_eq!(panel_width(1000.0), 700.0);
-        assert_eq!(panel_width(400.0), 360.0, "the floor");
+    fn the_panel_is_taskpages_dialog_width_with_a_floor() {
+        assert_eq!(panel_width(1400.0), 672.0, "max-w-2xl");
+        assert_eq!(panel_width(600.0), 568.0, "16px either side");
         assert_eq!(panel_width(300.0), 268.0, "capped to the window");
     }
 

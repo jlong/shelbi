@@ -12,8 +12,10 @@
 //! `activity-picker.png` (the project picker open), `machines.png` once the
 //! unreachable remote's probe has landed, and the issues board: `board.png`
 //! (a card selected), `board-dropdown.png` (the workflow filter open) and
-//! `board-detail.png` (a card's detail). It prints one line per check and
-//! exits non-zero if any failed.
+//! `board-detail.png` (a card's detail); then `settings.png`, the bootstrap
+//! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
+//! notice bars (`notice-bars.png`: the update and relaunch bars). It prints
+//! one line per check and exits non-zero if any failed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,6 +88,8 @@ pub fn run(out: PathBuf) -> ! {
         v.state_mut().toggle_picker(crate::views::activity_state::Picker::Project);
         cx.notify();
     });
+    // Let the menu's slide-and-fade finish.
+    wait(&mut cx, window, Duration::from_millis(300), |_| false);
     save(&mut cx, window, &out, "activity-picker.png");
 
     // ---- Machines ----
@@ -132,6 +136,7 @@ pub fn run(out: PathBuf) -> ! {
         v.state_mut().open_workflow_dropdown();
         cx.notify();
     });
+    wait(&mut cx, window, Duration::from_millis(300), |_| false);
     save(&mut cx, window, &out, "board-dropdown.png");
     board.update(&mut cx, |v, cx| {
         v.state_mut().close_overlay();
@@ -139,6 +144,64 @@ pub fn run(out: PathBuf) -> ! {
         cx.notify();
     });
     save(&mut cx, window, &out, "board-detail.png");
+
+    // ---- Settings, the bootstrap screens and the notice bars ----
+    let window = open_with_window(&mut cx, |window, cx| {
+        cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
+    });
+    save(&mut cx, window, &out, "settings.png");
+    let (_, window) = open(&mut cx, |cx| {
+        cx.new(|_| Screen(Box::new(|theme, _| {
+            crate::views::bootstrap::render_progress(
+                &crate::platform::bootstrap::BootstrapState::FindingCli,
+                theme,
+            )
+        })))
+    });
+    save(&mut cx, window, &out, "bootstrap-progress.png");
+    let (_, window) = open(&mut cx, |cx| {
+        cx.new(|_| Screen(Box::new(|theme, _| {
+            use crate::platform::bootstrap::Failure;
+            use crate::platform::discovery::CliNotFound;
+            let failure = Failure::CliNotFound(CliNotFound {
+                searched: vec![
+                    PathBuf::from("/opt/homebrew/bin/shelbi"),
+                    PathBuf::from("/usr/local/bin/shelbi"),
+                    PathBuf::from("~/.cargo/bin/shelbi"),
+                ],
+                setting: None,
+                config_error: None,
+            });
+            crate::views::bootstrap::render_failure(
+                &crate::views::bootstrap::failure_screen(&failure),
+                theme,
+                |_, _, _| {},
+            )
+        })))
+    });
+    save(&mut cx, window, &out, "bootstrap-failure.png");
+    let (_, window) = open(&mut cx, |cx| {
+        cx.new(|_| Screen(Box::new(|theme, _| {
+            use gpui::{div, IntoElement, ParentElement, Styled};
+            let notice = crate::platform::update::UpdateNotice {
+                current: "0.9.0".into(),
+                latest: "0.9.2".into(),
+            };
+            let relaunch = crate::platform::control::RelaunchNotice {
+                app_version: "0.9.0".into(),
+                daemon_version: Some("0.9.2".into()),
+                reason: "The daemon was upgraded.".into(),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(crate::views::update::render_update_bar(&notice, theme, |_, _| {}))
+                .child(crate::views::bootstrap::render_relaunch_bar(&relaunch, theme, |_, _| {}))
+                .into_any_element()
+        })))
+    });
+    save(&mut cx, window, &out, "notice-bars.png");
 
     let _ = std::fs::remove_dir_all(&home);
     println!("\n{failures} check(s) failed; frames saved under {}", out.display());
@@ -158,6 +221,38 @@ fn open<V: gpui::Render + 'static>(
         })
         .expect("open the offscreen window");
     (entity.expect("the view"), handle.into())
+}
+
+/// [`open`] for a view that needs the window to build.
+fn open_with_window<V: gpui::Render + 'static>(
+    cx: &mut VisualTestAppContext,
+    build: impl FnOnce(&mut gpui::Window, &mut gpui::App) -> Entity<V>,
+) -> AnyWindowHandle {
+    cx.open_offscreen_window(size(px(1100.0), px(640.0)), build)
+        .expect("open the offscreen window")
+        .into()
+}
+
+/// A frame of free-standing pieces (a bootstrap screen, the bars) on the
+/// main surface.
+struct Screen(Box<PaintScreen>);
+
+type PaintScreen = dyn Fn(&crate::theme::Theme, &mut gpui::Window) -> gpui::AnyElement;
+
+impl gpui::Render for Screen {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{div, ParentElement, Styled};
+        let theme = *cx.global::<crate::theme::Theme>();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.surface)
+            .text_color(theme.text)
+            .font_family("Geist")
+            .text_sm()
+            .child((self.0)(&theme, window))
+    }
 }
 
 /// Pump frames until `done` or the deadline.

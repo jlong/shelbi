@@ -4,6 +4,11 @@
 //! frame per state, plus a check that each state shows what it should:
 //!
 //! - `review-sidebar.png`: the sidebar before the review opens;
+//! - `sidebar-switcher-mid.png` and `sidebar-switcher.png`: the project
+//!   switcher's menu sliding in over the sidebar, then open with the
+//!   keyboard a row down;
+//! - `sidebar-slide-mid.png` and `sidebar-slide.png`: the nav selection chip
+//!   part-way to Issues, then landed;
 //! - `review-pending.png`: the panel the moment a review is asked for, before
 //!   the load flow resolves it (the row's title, placeholders for the rest);
 //! - `review-push-mid.png`: half-way through the push in (the sidebar
@@ -17,7 +22,8 @@
 //! - `review-description.png`: the task description (More);
 //! - `review-back-mid.png` and `review-back.png`: Back, half-way and done
 //!   (the sidebar as it was);
-//! - the overlays over the shell: `palette.png`, `dialog-review-confirm.png`,
+//! - the overlays over the shell: `palette-entering.png` (the palette
+//!   sliding in), `palette.png`, `dialog-review-confirm.png`,
 //!   `dialog-reject.png`, `dialog-zen.png`, `dialog-add-project.png` and
 //!   `dialog-error-log.png`.
 
@@ -185,6 +191,14 @@ pub fn run(out: PathBuf) -> ! {
     cx.update(|cx| {
         crate::visual_check::install_theme(cx);
         crate::assets::load_fonts(cx);
+        let entry = |name: &str, label: &str| crate::projects::ProjectEntry {
+            name: name.into(),
+            label: label.into(),
+        };
+        cx.set_global(crate::projects::Catalog::with(
+            vec![entry("demo", "demo"), entry("shelbi", "Shelbi"), entry("contextstore", "ContextStore")],
+            Vec::new(),
+        ));
     });
     let sessions = Arc::new(Sessions::default());
     sessions.screens.lock().unwrap().extend([
@@ -285,6 +299,30 @@ impl Run {
         self.expect("the sidebar holds the column", column == (true, false));
         self.save("review-sidebar.png");
 
+        // The project switcher: sliding in, then open a row down.
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_switcher(true, cx)).unwrap();
+        self.advance(Duration::from_millis(50));
+        self.save("sidebar-switcher-mid.png");
+        self.advance(Duration::from_millis(400));
+        self.handle
+            .update(&mut self.cx, |w, window, cx| {
+                w.offscreen_switcher_key(shelbi_state::keymap::Key::Down, window, cx)
+            })
+            .unwrap();
+        self.settle();
+        self.save("sidebar-switcher.png");
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_switcher(false, cx)).unwrap();
+        self.advance(Duration::from_millis(400));
+
+        // The nav chip sliding from Orchestrator to Issues, and back.
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_select(1, cx)).unwrap();
+        self.advance(Duration::from_millis(70));
+        self.save("sidebar-slide-mid.png");
+        self.advance(Duration::from_millis(600));
+        self.save("sidebar-slide.png");
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_select(0, cx)).unwrap();
+        self.advance(Duration::from_millis(600));
+
         // Asked for: the panel goes in at once, before the load flow has
         // resolved it, with the row's title and placeholders.
         self.handle
@@ -381,6 +419,14 @@ impl Run {
                 (entry("2026-10-15T08:40:51Z", "review-1: health check timed out after 30s"), false),
             ]));
         }
+        self.handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(None, window, cx))
+            .unwrap();
+        self.advance(Duration::from_millis(60));
+        self.save("palette-entering.png");
+        self.handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_close_overlay(window, cx))
+            .unwrap();
         for (name, overlay) in [
             ("palette.png", None),
             (
@@ -403,6 +449,7 @@ impl Run {
             self.handle
                 .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(overlay, window, cx))
                 .unwrap();
+            self.advance(Duration::from_millis(500));
             self.save(name);
             self.handle
                 .update(&mut self.cx, |w, window, cx| w.offscreen_close_overlay(window, cx))

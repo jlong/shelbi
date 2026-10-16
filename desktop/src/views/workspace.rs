@@ -51,6 +51,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     canvas, div, prelude::*, px, relative, AnyElement, AnyWindowHandle, Bounds, Context,
@@ -69,6 +70,7 @@ use super::workspace_layout::{Split, DIVIDER_W};
 use crate::assets::{heroicon, icons, Icon};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
+use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, IconButtonSize, NAV_ROW_H};
 use crate::theme::{Hue, Theme};
 
@@ -171,6 +173,8 @@ pub enum WorkspaceEvent {
 /// The Workspace view for one project window. It shows one workspace at a
 /// time; selecting another retargets it.
 pub struct WorkspaceView {
+    /// The view switches, measured for the current one's sliding chip.
+    switch_track: SharedTrack,
     project: String,
     ops: Arc<dyn WorkspaceOps>,
     /// The workspace shown (kept while hidden, so showing it again re-attaches).
@@ -260,6 +264,7 @@ impl WorkspaceView {
             project: project.to_string(),
             ops: deps.ops,
             workspace: None,
+            switch_track: SlideTrack::shared(),
             shown: false,
             row: None,
             details: None,
@@ -782,7 +787,7 @@ impl WorkspaceView {
 
     // --- rendering ---------------------------------------------------------
 
-    fn render_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_panel(&self, chip: Option<Bounds<Pixels>>, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let root = div()
             .id("workspace-panel")
             .debug_selector(|| "workspace-panel".into())
@@ -827,8 +832,10 @@ impl WorkspaceView {
                     .px_2()
                     .rounded_lg()
                     .cursor_pointer(),
+                id,
                 current,
-                selected(row),
+                selected(row) && chip.is_none(),
+                chip.is_none(),
                 theme,
             )
             .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
@@ -1010,17 +1017,13 @@ impl WorkspaceView {
             let on = active == item;
             row_state(id, WsRow::Switch(item), on)
                 .h(px(NAV_ROW_H - 4.0))
-                .child(heroicon(icon).text_color(theme.icon))
+                .child(motion::probe(&self.switch_track, id))
+                .child(heroicon(icon).text_color(if on { theme.text_loud } else { theme.icon }))
                 .child(div().flex_1().min_w_0().truncate().child(item.label(&agent_name, &editor_name)))
                 .when(on && item != ContentView::Agent, |d| {
                     d.child(
-                        div()
-                            .id("ws-close-content")
-                            .debug_selector(|| "ws-close-content".into())
-                            .flex_none()
-                            .rounded_lg()
-                            .hover(|s| s.bg(theme.fill_strong))
-                            .child(heroicon(icons::X_MARK).text_color(theme.icon))
+                        style::icon_button("ws-close-content", icons::X_MARK, IconButtonSize::Small, false, theme)
+                            .tooltip(style::tooltip("Close"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close_content(cx);
@@ -1046,7 +1049,21 @@ impl WorkspaceView {
         root.child(div().flex().flex_col().gap_1().child(status).child(identity))
             .children(task)
             .child(place)
-            .child(div().flex().flex_col().gap_0p5().children(switches))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(motion::origin_probe(&self.switch_track))
+                    .children(chip.map(|b| {
+                        motion::floating_chip(b, |d| {
+                            style::nav_chip_layer(d, theme)
+                                .when(focused, |d| d.child(style::selection_indicator(theme)))
+                        })
+                    }))
+                    .children(switches),
+            )
             .children(shell)
             .when_some(self.status_line.clone(), |d, line| {
                 d.child(
@@ -1294,9 +1311,24 @@ impl WorkspaceView {
 
 /// The view itself renders as the panel; the window sizes and places it.
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        self.render_panel(&theme, cx)
+        // The current view switch's chip slides when the main area changes.
+        let chip = {
+            let key = self.header().map(|_| match self.panel.active() {
+                ContentView::Agent => "ws-switch-agent",
+                ContentView::Diff => "ws-switch-diff",
+                ContentView::Editor => "ws-switch-editor",
+            });
+            let mut track = self.switch_track.borrow_mut();
+            track.select(key.map(SharedString::from), Instant::now(), || cx.reduce_motion());
+            let chip = track.frame(Instant::now());
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
+        self.render_panel(chip, &theme, cx)
     }
 }
 

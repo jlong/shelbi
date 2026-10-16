@@ -13,6 +13,7 @@
 //! the system switches between light and dark while the app runs; `dark` and
 //! `light` pin the theme and the window chrome with it.
 
+pub mod motion;
 pub mod palette;
 pub mod style;
 
@@ -280,7 +281,7 @@ fn kit_colors(c: &mut gpui_kit::component::ThemeColor, t: &Theme) {
     c.background = t.surface;
     c.foreground = t.text;
     c.border = t.rule_strong;
-    c.input = t.rule_strong;
+    c.input = t.input_border;
     c.ring = t.focus_ring;
     c.caret = t.text_loud;
     c.selection = t.text_selection;
@@ -295,9 +296,9 @@ fn kit_colors(c: &mut gpui_kit::component::ThemeColor, t: &Theme) {
     c.primary_hover = t.brand_hover;
     c.primary_active = t.brand_hover;
     c.primary_foreground = t.text_on_color;
-    c.secondary = t.fill;
-    c.secondary_hover = t.fill_strong;
-    c.secondary_active = t.fill_strong;
+    c.secondary = t.control_fill;
+    c.secondary_hover = t.control_fill_hover;
+    c.secondary_active = t.control_fill_pressed;
     c.secondary_foreground = t.text_loud;
     c.link = t.link;
     c.link_hover = t.link_hover;

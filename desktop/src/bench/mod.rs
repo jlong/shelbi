@@ -310,7 +310,7 @@ impl Render for BenchRoot {
         self.probe.borrow_mut().frame_start = Some(Instant::now());
         let theme = *cx.global::<Theme>();
         let overlay = self.overlay.as_ref().map(|o| {
-            crate::views::overlay::render_layer(o, window.viewport_size(), &self.keymaps, &theme, cx)
+            crate::views::overlay::render_layer(o, window.viewport_size(), None, &self.keymaps, &theme, cx)
         });
         let palette_open = self.overlay.is_some();
         let probe = self.probe.clone();

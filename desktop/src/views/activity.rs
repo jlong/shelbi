@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
-    Hsla, KeyDownEvent, ScrollHandle, SharedString, Task, Window,
+    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
+    Hsla, KeyDownEvent, Pixels, ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::activity::{
     read_activity_window, ActivityData, ActivityKind, ActivityMetaCache, FeedItem, FeedRow,
@@ -34,7 +34,8 @@ use shelbi_state::keymap::{format_chord, ActivityAction, DisplayStyle};
 use super::activity_state::{ActivityState, Intent, Picker};
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
-use crate::theme::style;
+use crate::theme::motion::{self, SharedTrack, SlideTrack};
+use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 
 /// The TUI's activity refresh cadence.
@@ -55,6 +56,11 @@ pub enum ActivityEvent {
 }
 
 pub struct ActivityView {
+    /// The pickers' controls, measured so their menus open under them.
+    project_anchor: style::Anchor,
+    workspace_anchor: style::Anchor,
+    /// The kind filter's segments, measured for the selected one's slide.
+    kind_track: SharedTrack,
     state: ActivityState,
     focus: FocusHandle,
     needs_focus: bool,
@@ -97,6 +103,9 @@ impl ActivityView {
             needs_focus: true,
             refresher,
             window,
+            kind_track: SlideTrack::shared(),
+            project_anchor: Default::default(),
+            workspace_anchor: Default::default(),
             last_refresh: Instant::now(),
             scroll: ScrollHandle::new(),
             display_style: DisplayStyle::detect(),
@@ -180,40 +189,33 @@ impl ActivityView {
 
     // ---- rendering --------------------------------------------------------
 
-    fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(
+        &self,
+        chip: Option<Bounds<Pixels>>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let filter = &self.state.filter;
-        let pill = |id: &'static str, label: &'static str, active: bool| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .flex()
-                .items_center()
-                .h(px(28.0))
-                .px(px(10.0))
-                .rounded_lg()
-                .cursor_pointer()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .when(active, |d| d.bg(theme.fill).text_color(theme.text_loud))
-                .when(!active, |d| d.text_color(theme.text_quiet).hover(|s| s.bg(theme.fill_subtle)))
-                .child(label)
+        // A segmented control: "All" or any set of kinds. While one segment
+        // is selected alone, its chip slides to the next one picked.
+        let track = &self.kind_track;
+        let segment = |id: &'static str, label: &'static str, active: bool| {
+            style::segment(id, label, active, chip.is_none(), theme)
+                .child(motion::probe(track, id))
         };
-        let mut pills = div().flex().flex_row().items_center().gap_1().child(
-            pill("kind-all", "All", filter.is_all()).on_click(cx.listener(
+        let mut pills = style::segment_track(theme)
+            .debug_selector(|| "activity-kinds".into())
+            .child(motion::origin_probe(track))
+            .children(chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, theme))))
+            .child(segment("kind-all", "All", filter.is_all()).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| {
                     this.state.clear_kinds(Utc::now());
                     cx.notify();
                 },
-            )),
-        );
+            )));
         for kind in ActivityKind::ALL {
-            let id = match kind {
-                ActivityKind::Tasks => "kind-tasks",
-                ActivityKind::Zen => "kind-zen",
-                ActivityKind::Workspaces => "kind-workspaces",
-                ActivityKind::System => "kind-system",
-            };
-            pills = pills.child(pill(id, kind.label(), filter.has_kind(kind)).on_click(
+            let id = kind_id(kind);
+            pills = pills.child(segment(id, kind.label(), filter.has_kind(kind)).on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.state.toggle_kind(kind, Utc::now());
                     cx.notify();
@@ -265,18 +267,28 @@ impl ActivityView {
                     .gap_3()
                     .child(pills)
                     .child(
-                        super::issues::chip(theme, icons::FUNNEL, project_label)
-                            .id("project-picker")
-                            .debug_selector(|| "project-picker".into())
+                        style::dropdown(
+                            "project-picker",
+                            icons::FUNNEL,
+                            project_label,
+                            self.state.picker == Some(Picker::Project),
+                            theme,
+                        )
+                            .child(style::anchor_probe(&self.project_anchor))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.state.toggle_picker(Picker::Project);
                                 cx.notify();
                             })),
                     )
                     .child(
-                        super::issues::chip(theme, icons::USER, workspace_label)
-                            .id("workspace-picker")
-                            .debug_selector(|| "workspace-picker".into())
+                        style::dropdown(
+                            "workspace-picker",
+                            icons::USER,
+                            workspace_label,
+                            self.state.picker == Some(Picker::Workspace),
+                            theme,
+                        )
+                            .child(style::anchor_probe(&self.workspace_anchor))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.state.toggle_picker(Picker::Workspace);
                                 cx.notify();
@@ -303,7 +315,18 @@ impl ActivityView {
         if let Some(empty) = feed.empty {
             // A filter can hide every loaded row while older ones may match.
             if !(self.state.has_older() && !self.state.filter.is_unfiltered()) {
-                return placeholder(empty.into());
+                // Filtered to nothing: the way back is clearing the filters.
+                let clear = (!self.state.filter.is_unfiltered()).then(|| {
+                    style::button("activity-clear-filters", "Clear filters", ButtonKind::Secondary, false, theme)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            let now = Utc::now();
+                            this.state.clear_kinds(now);
+                            this.state.set_project(None, now);
+                            this.state.set_workspace(None, now);
+                            cx.notify();
+                        }))
+                });
+                return style::empty_state("activity-empty", empty, clear, theme).into_any_element();
             }
         }
         let mut list = div()
@@ -357,9 +380,7 @@ impl ActivityView {
             row.child("Loading older events…").child(loaded)
         } else if self.state.has_older() {
             row.child(
-                super::issues::chip(theme, icons::ARROW_PATH, "Load older".into())
-                    .id("load-older")
-                    .debug_selector(|| "load-older".into())
+                style::icon_label_button("load-older", icons::ARROW_PATH, "Load older", ButtonKind::Secondary, theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.load_older(cx))),
             )
             .child(loaded)
@@ -406,20 +427,20 @@ impl ActivityView {
 
     fn render_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let picker = self.state.picker?;
-        let (title, all_label, current, options, left) = match picker {
+        let (title, all_label, current, options, anchor) = match picker {
             Picker::Project => (
                 "Project",
                 "All projects",
                 self.state.filter.project.clone(),
                 self.state.projects().to_vec(),
-                px(16.0),
+                &self.project_anchor,
             ),
             Picker::Workspace => (
                 "Workspace",
                 "All workspaces",
                 self.state.filter.workspace.clone(),
                 self.state.workspaces().to_vec(),
-                px(180.0),
+                &self.workspace_anchor,
             ),
         };
         let choice = move |this: &mut Self, value: Option<String>| match picker {
@@ -455,20 +476,22 @@ impl ActivityView {
                     this.state.picker = None;
                     cx.notify();
                 }))
-                .child(
-                    super::issues::panel(theme)
+                .child(style::below(
+                    anchor,
+                    gpui::point(px(16.0), px(84.0)),
+                    style::menu_entrance(
+                        "picker-menu",
+                        super::issues::panel(theme)
                         .id("picker-panel")
                         .debug_selector(|| "picker-panel".into())
-                        .absolute()
-                        .top(px(76.0))
-                        .left(left)
                         .w(px(260.0))
                         .max_h(px(360.0))
                         .overflow_y_scroll()
                         .on_click(|_, _, cx: &mut App| cx.stop_propagation())
                         .child(super::issues::panel_title(theme, title))
                         .children(items),
-                ),
+                    ),
+                )),
         )
     }
 }
@@ -480,6 +503,17 @@ impl Render for ActivityView {
             window.focus(&self.focus, cx);
         }
         let theme = *cx.global::<Theme>();
+        // The selected kind segment, when exactly one is.
+        let chip = {
+            let key = selected_kind_id(&self.state.filter);
+            let mut track = self.kind_track.borrow_mut();
+            track.select(key.map(SharedString::from), Instant::now(), || cx.reduce_motion());
+            let chip = track.frame(Instant::now());
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
         div()
             .id("activity")
             .track_focus(&self.focus)
@@ -494,7 +528,7 @@ impl Render for ActivityView {
             .bg(theme.surface)
             .text_sm()
             .text_color(theme.text)
-            .child(self.render_header(&theme, cx))
+            .child(self.render_header(chip, &theme, cx))
             .child(self.render_feed(&theme, cx))
             .child(self.render_footer(&theme))
             .children(self.render_picker(&theme, cx))
@@ -502,6 +536,29 @@ impl Render for ActivityView {
 }
 
 // ---- pieces -----------------------------------------------------------------
+
+/// A kind's segment id.
+fn kind_id(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::Tasks => "kind-tasks",
+        ActivityKind::Zen => "kind-zen",
+        ActivityKind::Workspaces => "kind-workspaces",
+        ActivityKind::System => "kind-system",
+    }
+}
+
+/// The one selected segment's id ("All", or a kind picked alone); `None`
+/// when several kinds are (each draws its own chip).
+fn selected_kind_id(filter: &shelbi_app::activity::ActivityFilter) -> Option<&'static str> {
+    if filter.is_all() {
+        return Some("kind-all");
+    }
+    let mut picked = ActivityKind::ALL.into_iter().filter(|k| filter.has_kind(*k));
+    match (picked.next(), picked.next()) {
+        (Some(one), None) => Some(kind_id(one)),
+        _ => None,
+    }
+}
 
 /// `── Today ─────`: the day label, then a rule to the edge.
 fn day_header(theme: &Theme, label: &str) -> impl IntoElement {
