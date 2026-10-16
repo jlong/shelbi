@@ -512,11 +512,7 @@ pub fn probe_review_slot_serving(
 ) -> Option<ReviewServing> {
     let machine = project.machine(&workspace.machine)?;
     let host = machine.host();
-    let tf = shelbi_state::issue_store_for_project(project)
-        .ok()?
-        .get(task_id)
-        .ok()
-        .flatten()?;
+    let tf = load_task_for_probe(project, task_id)?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task).ok()?;
     let port = workspace.slot.and_then(|s| u16::try_from(s).ok());
     let recipe = workflow.resolved_review_recipe(port)?;
@@ -540,6 +536,25 @@ pub fn probe_review_slot_serving(
     }
 }
 
+/// Read `task_id` for a per-tick review probe, which only needs the card's
+/// workflow. A remote board serves it from the daemon-published board index
+/// ([`shelbi_state::indexed_issue`], no API call); only an id the open index
+/// doesn't carry falls back to a live `get`. The poller probes every review slot
+/// each tick, twice when the probe can't confirm serving, and the sidebar probes
+/// on every refresh, so a live `get` here meant a steady stream of conditional
+/// GETs for an issue that hadn't changed. `None` on any read failure.
+fn load_task_for_probe(project: &Project, task_id: &str) -> Option<shelbi_state::IssueFile> {
+    if let Some(tf) = shelbi_state::indexed_issue(&project.name, &project.issue_tracker, task_id)
+    {
+        return Some(tf);
+    }
+    shelbi_state::issue_store_for_project(project)
+        .ok()?
+        .get(task_id)
+        .ok()
+        .flatten()
+}
+
 /// Whether the task's resolved workflow declares a review server with a
 /// `ready:` health check — the signal the poller probes (see
 /// [`probe_review_slot_serving`]) to confirm the branch is actually serving.
@@ -552,9 +567,7 @@ pub fn probe_review_slot_serving(
 /// load the task or its workflow degrades to `false` (no health check to wait
 /// on) rather than propagating.
 pub fn review_workflow_has_health_check(project: &Project, task_id: &str) -> bool {
-    let Ok(Some(tf)) = shelbi_state::issue_store_for_project(project)
-        .and_then(|store| store.get(task_id))
-    else {
+    let Some(tf) = load_task_for_probe(project, task_id) else {
         return false;
     };
     let Ok(workflow) = shelbi_state::load_task_workflow(&project.name, project, &tf.task) else {
@@ -7201,6 +7214,85 @@ mod tests {
         let section = render_review_recipe_section(&recipe, false);
         assert!(section.contains("no assigned slot"), "{section}");
         assert!(section.contains("Do NOT guess a port"), "{section}");
+    }
+
+    /// The poller probes every review slot each tick (twice when the probe can't
+    /// confirm serving) and the sidebar probes on every refresh. On a GitHub
+    /// board each probe used to be a live conditional `get` of the review task,
+    /// a steady stream of GETs for an issue that hadn't changed. The probe only
+    /// needs the card's workflow, so an id the published index carries must be
+    /// served from it with no `gh` call; only an id the index lacks falls back.
+    #[test]
+    fn review_probes_read_the_task_from_the_board_index_not_gh() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("probe-index");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut project = fixture_project();
+        project.name = format!("probe-index-{}", std::process::id());
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = chrono::Utc::now();
+        let task = shelbi_core::Issue {
+            id: "t-rev".into(),
+            title: "t-rev".into(),
+            column: shelbi_core::Column::review(),
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            params: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![shelbi_state::IssueFile {
+            task,
+            body: String::new(),
+            tracker_assignees: Vec::new(),
+        }]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index(&project.name, &idx).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |_args: &[&str]| {
+            rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(String::new())
+        });
+
+        for _ in 0..20 {
+            assert!(load_task_for_probe(&project, "t-rev").is_some());
+            let _ = review_workflow_has_health_check(&project, "t-rev");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an indexed review task is probed with no gh call"
+        );
+
+        // An id the open index doesn't carry still takes the live read.
+        let _ = load_task_for_probe(&project, "t-not-indexed");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "an id missing from the index falls back to a live get"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn fixture_project() -> Project {
