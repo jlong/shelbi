@@ -99,7 +99,7 @@ impl Catalog {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn with(projects: Vec<ProjectEntry>, skeletons: Vec<SidebarModel>) -> Catalog {
         let catalog = Catalog::default();
         {

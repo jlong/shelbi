@@ -75,7 +75,7 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
         .rounded_lg()
         .bg(theme.surface)
         .border_1()
-        .border_color(theme.rule_strong)
+        .border_color(theme.input_border)
         .when(focused, |d| d.shadow(vec![crate::theme::style::focus_shadow(theme)]))
         .overflow_hidden()
         .cursor_text()

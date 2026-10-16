@@ -45,10 +45,11 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, AnyWindowHandle, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, SharedString, Subscription, Window,
+    div, prelude::*, px, relative, AnyElement, AnyWindowHandle, Bounds, Context, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, Hsla, Pixels, SharedString, Subscription, Window,
 };
 use gpui_kit::component::text::TextView;
 use shelbi_app::review::{
@@ -64,6 +65,7 @@ use super::sidebar::TRAFFIC_LIGHT_INSET;
 use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
+use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, IconButtonSize, NAV_ROW_H};
 use crate::theme::Theme;
 
@@ -219,6 +221,8 @@ struct Shown {
 /// The Review view for one project window. It shows one review at a time;
 /// opening another retargets it.
 pub struct ReviewView {
+    /// The view switches, measured for the current one's sliding chip.
+    switch_track: SharedTrack,
     project: String,
     window: AnyWindowHandle,
     ops: Arc<dyn ReviewOps>,
@@ -255,6 +259,7 @@ impl ReviewView {
             sessions: deps.sessions,
             sink,
             review: None,
+            switch_track: SlideTrack::shared(),
             shown: false,
             focus: ReviewFocus::Panel,
             description_open: false,
@@ -764,7 +769,13 @@ impl ReviewView {
 
     // --- rendering ---------------------------------------------------------
 
-    fn render_panel(&self, shown: &Shown, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_panel(
+        &self,
+        shown: &Shown,
+        chip: Option<Bounds<Pixels>>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let model = &shown.model;
         let panel = &shown.panel;
         let server = self.render_server(model, theme, cx);
@@ -784,8 +795,10 @@ impl ReviewView {
                     .px_2()
                     .rounded_lg()
                     .cursor_pointer(),
+                id,
                 current,
-                selected(row),
+                selected(row) && chip.is_none(),
+                chip.is_none(),
                 theme,
             )
             .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
@@ -875,7 +888,8 @@ impl ReviewView {
             };
             row_state(id, PanelRow::Switch(*item), active)
                 .h(px(NAV_ROW_H - 4.0))
-                .child(heroicon(icon).text_color(theme.icon))
+                .child(motion::probe(&self.switch_track, id))
+                .child(heroicon(icon).text_color(if active { theme.text_loud } else { theme.icon }))
                 .child(item.label(&model.editor_name))
         });
 
@@ -925,7 +939,21 @@ impl ReviewView {
             body.extend(folder.map(IntoElement::into_any_element));
             body.extend([
                 server.into_any_element(),
-                div().flex().flex_col().gap_0p5().children(switches).into_any_element(),
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(motion::origin_probe(&self.switch_track))
+                    .children(chip.map(|b| {
+                        motion::floating_chip(b, |d| {
+                            style::nav_chip_layer(d, theme).when(focused, |d| {
+                                d.child(style::selection_indicator(theme))
+                            })
+                        })
+                    }))
+                    .children(switches)
+                    .into_any_element(),
                 actions,
             ]);
             body
@@ -1180,11 +1208,31 @@ impl ReviewView {
 }
 
 /// The view itself renders as the panel; the window sizes and places it.
+/// The id of the view switch for what the main area shows, if one is.
+fn active_switch_id(panel: &ReviewPanelState) -> Option<&'static str> {
+    Some(match panel.active() {
+        ActiveView::Chat => "review-switch-chat",
+        ActiveView::Diff => "review-switch-diff",
+        ActiveView::Editor => "review-switch-editor",
+    })
+}
+
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        // The current view switch's chip slides when the main area changes.
+        let chip = {
+            let key = self.review.as_ref().and_then(|r| active_switch_id(&r.panel));
+            let mut track = self.switch_track.borrow_mut();
+            track.select(key.map(SharedString::from), Instant::now(), || cx.reduce_motion());
+            let chip = track.frame(Instant::now());
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
         match &self.review {
-            Some(shown) => self.render_panel(shown, &theme, cx).into_any_element(),
+            Some(shown) => self.render_panel(shown, chip, &theme, cx).into_any_element(),
             None => div()
                 .debug_selector(|| "review-panel-empty".into())
                 .size_full()

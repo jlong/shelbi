@@ -520,11 +520,12 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
     div()
         .flex()
         .flex_row()
-        .items_start()
         .justify_between()
         .gap_2()
-        .py_1p5()
-        .px_2()
+        .items_center()
+        .py_1()
+        .pl_3()
+        .pr_1()
         .rounded_lg()
         .bg(theme.surface_sunken)
         .border_1()
@@ -539,16 +540,17 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
                 .children(command.lines().map(|line| div().child(line.to_string()))),
         )
         .child(
-            div()
-                .id(("copy-command", ix))
-                .flex_none()
-                .cursor_pointer()
-                .child(
-                    heroicon(icons::CLIPBOARD_DOCUMENT).text_color(theme.icon),
-                )
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))
-                }),
+            style::icon_button(
+                SharedString::from(format!("copy-command-{ix}")),
+                icons::CLIPBOARD_DOCUMENT,
+                style::IconButtonSize::Small,
+                false,
+                theme,
+            )
+            .tooltip(style::tooltip("Copy"))
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))
+            }),
         )
 }
 

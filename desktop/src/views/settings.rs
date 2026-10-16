@@ -22,6 +22,7 @@
 //! client's settings). Every read and write runs on the background executor.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
     div, prelude::*, px, Context, Entity, EventEmitter, FontWeight, SharedString, Subscription,
@@ -32,6 +33,7 @@ use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePrefe
 
 use crate::elements::terminal::TerminalSettings;
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
+use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 
@@ -166,6 +168,9 @@ pub enum SettingsEvent {
 
 /// The settings view.
 pub struct SettingsView {
+    /// The two segmented controls, measured for their selection's slide.
+    theme_track: SharedTrack,
+    option_track: SharedTrack,
     font_family: Entity<InputState>,
     font_size: Entity<InputState>,
     cli_path: Entity<InputState>,
@@ -208,6 +213,8 @@ impl SettingsView {
             notifications: Switches::default(),
             conflicts: Vec::new(),
             loaded: false,
+            theme_track: SlideTrack::shared(),
+            option_track: SlideTrack::shared(),
             state: SaveState::Idle,
             _subscriptions: subscriptions,
         };
@@ -402,9 +409,43 @@ fn open_keys_yaml() -> Result<(), String> {
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
+/// A theme choice's segment label.
+fn theme_label(value: ThemePreference) -> &'static str {
+    match value {
+        ThemePreference::Auto => "Auto",
+        ThemePreference::Dark => "Dark",
+        ThemePreference::Light => "Light",
+    }
+}
+
+/// An Option-key choice's segment label.
+fn option_label(value: OptionAsMeta) -> &'static str {
+    match value {
+        OptionAsMeta::Off => "Types characters",
+        OptionAsMeta::Both => "Meta",
+        OptionAsMeta::Left => "Left is Meta",
+        OptionAsMeta::Right => "Right is Meta",
+    }
+}
+
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        // The segmented controls' chips slide to a new choice.
+        let now = Instant::now();
+        let slide = |track: &SharedTrack, key: String| {
+            let mut track = track.borrow_mut();
+            track.select(Some(key.into()), now, || cx.reduce_motion());
+            let chip = track.frame(now);
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
+        let chips = (
+            slide(&self.theme_track, format!("settings-theme-{}", theme_label(self.theme))),
+            slide(&self.option_track, format!("settings-option-{}", option_label(self.option_as_meta))),
+        );
         let field = |label: &'static str, hint: &'static str, input: &Entity<InputState>| {
             div()
                 .flex()
@@ -414,21 +455,14 @@ impl Render for SettingsView {
                 .child(div().w(px(360.0)).child(Input::new(input)))
                 .child(div().text_xs().text_color(theme.text_quiet).child(hint))
         };
+        let theme_chip = chips.0;
         let chip = |label: &'static str, value: ThemePreference, current: ThemePreference, cx: &mut Context<Self>| {
-            let selected = value == current;
-            div()
-                .id(label)
-                .debug_selector(move || format!("settings-theme-{label}"))
-                .flex()
-                .items_center()
+            let id = SharedString::from(format!("settings-theme-{label}"));
+            style::segment(id.clone(), label, value == current, theme_chip.is_none(), &theme)
                 .h(px(28.0))
                 .px_3()
-                .rounded_md()
-                .cursor_pointer()
-                .font_weight(FontWeight::MEDIUM)
-                .when(selected, |d| style::nav_chip(d, &theme).text_color(theme.text_loud))
-                .when(!selected, |d| d.text_color(theme.text_quiet).hover(|s| s.text_color(theme.text_loud)))
-                .child(label)
+                .text_sm()
+                .child(motion::probe(&self.theme_track, id))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_theme(value, window, cx)))
         };
         let status: Option<(SharedString, gpui::Hsla)> = match &self.state {
@@ -438,21 +472,14 @@ impl Render for SettingsView {
         };
         let current = self.theme;
         let option_as_meta = self.option_as_meta;
+        let option_chip_slide = chips.1;
         let option_chip = |label: &'static str, value: OptionAsMeta, cx: &mut Context<Self>| {
-            let selected = value == option_as_meta;
-            div()
-                .id(label)
-                .debug_selector(move || format!("settings-option-{label}"))
-                .flex()
-                .items_center()
+            let id = SharedString::from(format!("settings-option-{label}"));
+            style::segment(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
                 .h(px(28.0))
                 .px_3()
-                .rounded_md()
-                .cursor_pointer()
-                .font_weight(FontWeight::MEDIUM)
-                .when(selected, |d| style::nav_chip(d, &theme).text_color(theme.text_loud))
-                .when(!selected, |d| d.text_color(theme.text_quiet).hover(|s| s.text_color(theme.text_loud)))
-                .child(label)
+                .text_sm()
+                .child(motion::probe(&self.option_track, id))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
         };
         let switches = self.notifications;
@@ -470,9 +497,9 @@ impl Render for SettingsView {
                     div()
                         .w(px(16.0))
                         .h(px(16.0))
-                        .rounded_md()
+                        .rounded(px(4.0))
                         .border_1()
-                        .border_color(theme.rule_strong)
+                        .border_color(theme.input_border)
                         .bg(theme.surface)
                         .when(on, |d| d.bg(theme.brand).border_color(theme.brand))
                         .flex()
@@ -493,6 +520,7 @@ impl Render for SettingsView {
             .gap_6()
             .size_full()
             .p_8()
+            .bg(theme.surface)
             .overflow_y_scroll()
             .text_sm()
             .text_color(theme.text)
@@ -510,14 +538,10 @@ impl Render for SettingsView {
                     .gap_1()
                     .child(style::heading("Theme", &theme))
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
+                        style::segment_track(&theme)
                             .self_start()
-                            .gap_0p5()
-                            .p_0p5()
-                            .rounded_lg()
-                            .bg(theme.fill)
+                            .child(motion::origin_probe(&self.theme_track))
+                            .children(theme_chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, &theme))))
                             .child(chip("Auto", ThemePreference::Auto, current, cx))
                             .child(chip("Dark", ThemePreference::Dark, current, cx))
                             .child(chip("Light", ThemePreference::Light, current, cx)),
@@ -546,14 +570,10 @@ impl Render for SettingsView {
                     .gap_1()
                     .child(style::heading("Option key in terminals", &theme))
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
+                        style::segment_track(&theme)
                             .self_start()
-                            .gap_0p5()
-                            .p_0p5()
-                            .rounded_lg()
-                            .bg(theme.fill)
+                            .child(motion::origin_probe(&self.option_track))
+                            .children(option_chip_slide.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, &theme))))
                             .child(option_chip("Types characters", OptionAsMeta::Off, cx))
                             .child(option_chip("Meta", OptionAsMeta::Both, cx))
                             .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))

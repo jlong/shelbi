@@ -7,6 +7,7 @@ use gpui::{div, prelude::*, AnyElement, Global, IntoElement};
 
 use crate::assets::{heroicon, icons};
 use crate::platform::update::UpdateNotice;
+use crate::theme::style;
 use crate::theme::Theme;
 use crate::views::bootstrap::{command_box, APP_UPGRADE_COMMAND};
 
@@ -77,13 +78,8 @@ pub fn render_update_bar(
                 .child(command_box(0, APP_UPGRADE_COMMAND, theme)),
         )
         .child(
-            div()
-                .id("dismiss-update")
-                .flex_none()
-                .cursor_pointer()
-                .child(
-                    heroicon(icons::X_MARK).text_color(theme.icon),
-                )
+            style::icon_button("dismiss-update", icons::X_MARK, style::IconButtonSize::Small, false, theme)
+                .tooltip(style::tooltip("Dismiss"))
                 .on_click(move |_, window, cx| on_dismiss(window, cx)),
         )
         .into_any_element()

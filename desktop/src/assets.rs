@@ -97,6 +97,7 @@ heroicons! {
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
     ARROW_LEFT = "arrow-left";
+    ARROW_RIGHT = "arrow-right";
     ARROW_PATH = "arrow-path";
     ARROW_TOP_RIGHT_ON_SQUARE = "arrow-top-right-on-square";
     CLIPBOARD_DOCUMENT = "clipboard-document";

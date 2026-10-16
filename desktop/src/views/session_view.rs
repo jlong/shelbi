@@ -842,6 +842,11 @@ impl Focusable for SessionView {
     }
 }
 
+/// The terminal grid's inset from the main area's leading edge, and from
+/// its top and bottom.
+pub const TERMINAL_INSET_X: f32 = 12.0;
+pub const TERMINAL_INSET_Y: f32 = 8.0;
+
 impl Render for SessionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -856,7 +861,14 @@ impl Render for SessionView {
             .size_full()
             .bg(theme.surface);
         if let Slot::Live(pane) = &self.slot {
-            return root.child(pane.clone());
+            // The grid keeps clear of the frame's edges (the column divider,
+            // the window's corner): 12px on the leading side, 8px top and
+            // bottom.
+            return root
+                .pl(gpui::px(TERMINAL_INSET_X))
+                .pt(gpui::px(TERMINAL_INSET_Y))
+                .pb(gpui::px(TERMINAL_INSET_Y))
+                .child(pane.clone());
         }
         if let Some(lines) = self.idle_lines() {
             // The TUI's idle placeholder: top-left, the name bold in the

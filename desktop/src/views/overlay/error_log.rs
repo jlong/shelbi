@@ -7,11 +7,12 @@
 //! does that); until the read lands it says "Loading…".
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight, Pixels, ScrollHandle,
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Pixels, ScrollHandle,
     Size,
 };
 use shelbi_app::overlay::error_log::{format_ts, Viewer, EMPTY, HINT};
 
+use crate::theme::style;
 use crate::theme::Theme;
 use crate::views::overlay::{hint, panel, title, with_overlay, ActiveOverlay, OverlayEvent, OverlayHost};
 
@@ -93,23 +94,12 @@ pub fn render<H: OverlayHost>(
                     )
             })),
     };
+    // Compact secondary buttons (28px).
     let small_button = |id: &'static str, label: &'static str| {
-        let hover = theme.fill_strong;
-        div()
-            .id(id)
-            .debug_selector(move || id.into())
-            .flex()
-            .items_center()
+        style::button(id, label, style::ButtonKind::Secondary, false, theme)
             .h(px(28.0))
             .px(px(10.0))
-            .rounded_lg()
-            .bg(theme.fill)
-            .cursor_pointer()
             .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.text_loud)
-            .hover(move |s| s.bg(hover))
-            .child(label)
     };
     let header = div()
         .flex()

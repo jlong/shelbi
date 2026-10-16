@@ -166,6 +166,32 @@ palette! {
     /// An icon button's hover, the secondary button's hover.
     fill_strong,
 
+    // ---- Controls (buttons, dropdowns, segmented controls, the search box) --
+    /// A control's resting fill: the secondary button, a dropdown, the search
+    /// box, a segmented control's track. Taskpage's slate-300.
+    control_fill,
+    /// A control's hover fill (slate-400).
+    control_fill_hover,
+    /// A control while pressed or open (a dropdown with its menu showing).
+    control_fill_pressed,
+    /// A control's 1px boundary. Invisible in light (Taskpage's controls are
+    /// fill only, and their labels identify them); in dark it is what makes
+    /// the control visible, so it clears 3:1 on every surface.
+    control_border,
+    /// The boundary on hover and while pressed.
+    control_border_hover,
+    /// A text field's 1px boundary: 3:1 in both themes, since a field has no
+    /// label inside it to identify it.
+    input_border,
+    /// The selected tab or segment: a lifted surface over the track.
+    tab_selected,
+    /// The selected segment's 1px ring.
+    tab_selected_ring,
+    /// A keycap in a shortcut hint (Taskpage's `Shortcut`).
+    keycap,
+    /// The keycap's 1px bottom edge.
+    keycap_edge,
+
     // ---- Text ---------------------------------------------------------------
     /// Headings, titles, the selected row's label.
     text_loud,
@@ -196,6 +222,10 @@ palette! {
     brand,
     /// The primary button's hover.
     brand_hover,
+    /// The primary button's boundary on hover: the hover fill in light; in
+    /// dark the lighter pink, since the darker hover fill alone falls under
+    /// 3:1 on the dark surfaces.
+    brand_hover_border,
     /// The brand as a foreground on a surface: the current-selection
     /// indicator.
     brand_text,
@@ -262,6 +292,8 @@ palette! {
     zen,
     /// The unread-errors button and other solid danger fills.
     error_fill,
+    /// A danger button's boundary (3:1 on every surface it sits on).
+    danger_border,
     /// A soft warning band (a status or a notice over the main area).
     notice,
 
@@ -308,6 +340,18 @@ impl Palette {
             fill: step(&SLATE, 300),
             fill_strong: step(&SLATE, 400),
 
+            control_fill: step(&SLATE, 300),
+            control_fill_hover: step(&SLATE, 400),
+            control_fill_pressed: step(&SLATE, 500).alpha(45),
+            // Fill only, as in Taskpage: the boundary takes the fill's color.
+            control_border: step(&SLATE, 300),
+            control_border_hover: step(&SLATE, 400),
+            input_border: step(&SLATE, 600),
+            tab_selected: WHITE,
+            tab_selected_ring: ink.alpha(8),
+            keycap: WHITE,
+            keycap_edge: step(&SLATE, 600).alpha(30),
+
             text_loud: ink,
             text: ink,
             // Taskpage's `quiet` is black-600 at 65%, which lands at 4.3:1 on
@@ -326,6 +370,7 @@ impl Palette {
             // Taskpage hovers at brand/80, which drops white text to 4:1; the
             // next step down keeps it AA.
             brand_hover: step(&PINK, 700),
+            brand_hover_border: step(&PINK, 700),
             brand_text: step(&PINK, 600),
             accent: step(&BLUE, 700),
             link: step(&BLUE, 600),
@@ -358,6 +403,7 @@ impl Palette {
 
             zen: step(&GREEN, 700),
             error_fill: step(&RED, 500),
+            danger_border: step(&RED, 500),
             notice: step(&GOLD, 100),
 
             nav_selected: WHITE,
@@ -370,7 +416,9 @@ impl Palette {
 
             ring: ink.alpha(5),
             shadow: Rgba::hex(0x000000).alpha(10),
-            scrim: Rgba::hex(0x000000).alpha(25),
+            // Taskpage's `bg-slate-700/40 backdrop-blur-sm`; gpui has no
+            // backdrop blur, so the scrim is a little stronger instead.
+            scrim: step(&SLATE, 700).alpha(50),
         }
     }
 
@@ -393,6 +441,19 @@ impl Palette {
             fill: ink.alpha(8),
             fill_strong: ink.alpha(12),
 
+            // A lighter fill than the hover fills, and a boundary that clears
+            // 3:1 on every dark surface: a control reads as a control.
+            control_fill: ink.alpha(10),
+            control_fill_hover: ink.alpha(16),
+            control_fill_pressed: ink.alpha(22),
+            control_border: ink.alpha(42),
+            control_border_hover: ink.alpha(58),
+            input_border: ink.alpha(42),
+            tab_selected: DARK_TAB,
+            tab_selected_ring: ink.alpha(50),
+            keycap: ink.alpha(14),
+            keycap_edge: Rgba::hex(0x000000).alpha(60),
+
             text_loud: step(&SLATE, 100),
             text: ink,
             text_quiet: ink.alpha(62),
@@ -409,6 +470,7 @@ impl Palette {
             // foreground on dark it moves up to pink-400.
             brand: step(&PINK, 600),
             brand_hover: step(&PINK, 700),
+            brand_hover_border: step(&PINK, 400),
             brand_text: step(&PINK, 400),
             accent: step(&BLUE, 400),
             link: step(&BLUE, 400),
@@ -439,12 +501,15 @@ impl Palette {
             orange_tint: tint(&ORANGE),
             neutral_tint: ink.alpha(10),
 
-            zen: step(&GREEN, 700),
-            error_fill: step(&RED, 600),
+            zen: DARK_ZEN,
+            // Red-500, not -600: white text keeps 5:1 and the fill keeps
+            // 3:1 on the main surface; the border carries it on raised ones.
+            error_fill: step(&RED, 500),
+            danger_border: step(&RED, 400),
             notice: step(&GOLD, 500).alpha(16),
 
             nav_selected: DARK_SELECTED,
-            nav_selected_ring: ink.alpha(8),
+            nav_selected_ring: ink.alpha(14),
             nav_shadow: Rgba::hex(0x000000).alpha(30),
             row_selected: ink.alpha(10),
             text_selection: Rgba::hex(0x2c3a5e),
@@ -453,7 +518,7 @@ impl Palette {
 
             ring: ink.alpha(8),
             shadow: Rgba::hex(0x000000).alpha(40),
-            scrim: Rgba::hex(0x000000).alpha(50),
+            scrim: step(&BLACK, 700).alpha(70),
         }
     }
 
@@ -472,9 +537,39 @@ const CYAN_650: Rgba = Rgba::hex(0x0c699c);
 const DARK_SURFACE: Rgba = Rgba::hex(0x181a20);
 /// A raised dark surface (cards, menus): 40% of the way.
 const DARK_RAISED: Rgba = Rgba::hex(0x22252e);
-/// The dark selected nav row: 50% of the way, one lift above
+/// The dark selected nav row: 60% of the way, a clear lift above
 /// [`DARK_RAISED`].
-const DARK_SELECTED: Rgba = Rgba::hex(0x262a35);
+const DARK_SELECTED: Rgba = Rgba::hex(0x2a2e3a);
+/// The dark selected tab or segment: a step above the selected nav row, so
+/// it stands off its track.
+const DARK_TAB: Rgba = Rgba::hex(0x3a3f4f);
+/// The dark Zen band: between green-700 and green-600, so white text keeps
+/// 5:1 and the band keeps 3:1 against the dark surfaces.
+const DARK_ZEN: Rgba = Rgba::hex(0x00803f);
+
+/// The project badges' fills (the switcher's initials): Taskpage hues dark
+/// enough for white initials, picked per project by [`badge_fill`].
+pub const PROJECT_BADGES: [Rgba; 8] = [
+    hues::step(&hues::PINK, 600),
+    hues::step(&hues::BLUE, 600),
+    hues::step(&hues::PURPLE, 700),
+    hues::step(&hues::GREEN, 700),
+    CYAN_650,
+    hues::step(&hues::ORANGE, 700),
+    hues::step(&hues::RED, 600),
+    hues::step(&hues::GOLD, 700),
+];
+
+/// The badge fill for a project, chosen from its name (FNV-1a), so a
+/// project keeps its color across launches and machines.
+pub fn badge_fill(name: &str) -> Rgba {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    PROJECT_BADGES[hash as usize % PROJECT_BADGES.len()]
+}
 
 #[cfg(test)]
 mod tests {
@@ -606,6 +701,122 @@ mod tests {
                 assert!(ring >= 3.0, "{:?} focus ring {ring:.2}", p.appearance);
             }
         }
+    }
+
+    /// The surfaces a control sits on: the main area, the leading column,
+    /// and a raised card, menu or dialog.
+    fn control_surfaces(p: &Palette) -> [(&'static str, Rgba); 3] {
+        [
+            ("surface", p.surface),
+            ("surface_recessed", p.surface_recessed),
+            ("surface_raised", p.surface_raised),
+        ]
+    }
+
+    fn ratio(fg: Rgba, bg: Rgba) -> f64 {
+        fg.over(bg.rgb).contrast_ratio(bg.rgb)
+    }
+
+    /// Every control state on every surface: a label at 4.5:1 on the
+    /// control's fill, and (dark) the control's outer edge at 3:1 against the
+    /// surface (WCAG 1.4.11). Light keeps Taskpage's fill-only controls, whose
+    /// labels identify them, so its edges aren't held to 3:1; its labels are.
+    #[test]
+    fn controls_clear_contrast_in_every_state() {
+        for p in [Palette::light(), Palette::dark()] {
+            let dark = p.appearance == Appearance::Dark;
+            let mut failures = Vec::new();
+            let mut check = |what: String, r: f64, min: f64| {
+                if r < min {
+                    failures.push(format!("{what}: {r:.2} < {min}"));
+                }
+            };
+            // (state, fill, border)
+            let states = [
+                ("rest", p.control_fill, p.control_border),
+                ("hover", p.control_fill_hover, p.control_border_hover),
+                ("pressed", p.control_fill_pressed, p.control_border_hover),
+            ];
+            for (sname, s) in control_surfaces(&p) {
+                for (state, fill, border) in states {
+                    let filled = flatten(fill, s);
+                    let edge = flatten(border, filled);
+                    for (lname, label) in [("text_loud", p.text_loud), ("text", p.text)] {
+                        check(format!("{lname} on {state} control over {sname}"), ratio(label, filled), AA);
+                    }
+                    // An icon at rest in the icon role; hovered or pressed it
+                    // turns loud (Taskpage's `hover:text-loud`).
+                    let icon = if state == "rest" { p.icon } else { p.text_loud };
+                    check(format!("icon on {state} control over {sname}"), ratio(icon, filled), 3.0);
+                    if dark {
+                        check(format!("{state} control edge on {sname}"), ratio(edge, s), 3.0);
+                    }
+                }
+                // The selected segment over its track.
+                let track = flatten(p.control_fill, s);
+                let tab = flatten(p.tab_selected, track);
+                check(format!("text_loud on tab_selected over {sname}"), ratio(p.text_loud, tab), AA);
+                check(format!("text on the track over {sname}"), ratio(p.text, track), AA);
+                if dark {
+                    let ring = flatten(p.tab_selected_ring, tab);
+                    check(format!("tab_selected ring on the track over {sname}"), ratio(ring, track), 3.0);
+                }
+                assert!(
+                    p.tab_selected.over(track.rgb).relative_luminance() > track.rgb.relative_luminance(),
+                    "{:?}: the selected segment is lifted above its track",
+                    p.appearance
+                );
+                // Filled buttons: the label on the fill in every state, and
+                // the edge against the surface.
+                for (name, fill, border) in [
+                    ("brand", p.brand, p.brand),
+                    ("brand_hover", p.brand_hover, p.brand_hover_border),
+                    ("error_fill", p.error_fill, p.danger_border),
+                ] {
+                    check(format!("text_on_color on {name}"), ratio(p.text_on_color, fill), AA);
+                    if dark {
+                        check(format!("{name} button edge on {sname}"), ratio(border, s), 3.0);
+                    }
+                }
+                // A text field's boundary, in both themes.
+                check(format!("input_border on {sname}"), ratio(p.input_border, s), 3.0);
+                // The focus ring around any control.
+                check(format!("focus_ring on {sname}"), ratio(p.focus_ring, s), 3.0);
+                // The Zen band, a status band on the leading column.
+                if dark {
+                    check(format!("zen band on {sname}"), ratio(p.zen, s), 3.0);
+                }
+            }
+            // The search box's keycap: its label on the keycap over the box.
+            let boxed = flatten(p.control_fill, p.surface_recessed);
+            check("text on keycap".into(), ratio(p.text, flatten(p.keycap, boxed)), AA);
+            // The sidebar's selected chip stands off the column in dark.
+            if dark {
+                let chip = flatten(p.nav_selected, p.surface_recessed);
+                let ring = flatten(p.nav_selected_ring, chip);
+                assert!(ratio(ring, p.surface_recessed) > ratio(chip, p.surface_recessed));
+            }
+            assert!(
+                failures.is_empty(),
+                "{:?} controls:\n{}",
+                p.appearance,
+                failures.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn project_badges_carry_white_initials() {
+        for fill in PROJECT_BADGES {
+            let r = ratio(Rgba::hex(0xffffff), fill);
+            assert!(r >= AA, "white on {}: {r:.2}", fill.css());
+        }
+        assert_eq!(badge_fill("shelbi"), badge_fill("shelbi"), "stable");
+        let distinct: std::collections::HashSet<_> = ["shelbi", "contextstore", "taskpage", "demo"]
+            .iter()
+            .map(|n| badge_fill(n))
+            .collect();
+        assert!(distinct.len() >= 3, "names spread over the hues");
     }
 
     #[test]

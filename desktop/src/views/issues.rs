@@ -43,7 +43,7 @@ use super::board_scroll;
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
-use crate::assets::{heroicon, icons, Icon};
+use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::{Hue, Theme};
@@ -114,6 +114,9 @@ enum Done {
 }
 
 pub struct IssuesView {
+    /// The filter controls, measured so their menus open under them.
+    workflow_anchor: style::Anchor,
+    workspace_anchor: style::Anchor,
     pub(super) state: BoardState,
     pub(super) focus: FocusHandle,
     needs_focus: bool,
@@ -172,6 +175,8 @@ impl IssuesView {
             load_more_in_flight: false,
             board_scroll: ScrollHandle::new(),
             column_scrolls: Vec::new(),
+            workflow_anchor: Default::default(),
+            workspace_anchor: Default::default(),
             detail_scroll: ScrollHandle::new(),
             editor: None,
             add_input: None,
@@ -545,16 +550,28 @@ impl IssuesView {
                     .child(title),
             )
             .child(
-                chip(theme, icons::FUNNEL, model.workflow_filter_label.clone())
-                    .id("workflow-chip")
+                style::dropdown(
+                    "workflow-chip",
+                    icons::FUNNEL,
+                    model.workflow_filter_label.clone(),
+                    matches!(self.state.mode, Mode::WorkflowDropdown { .. }),
+                    theme,
+                )
+                    .child(style::anchor_probe(&self.workflow_anchor))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.state.open_workflow_dropdown();
                         cx.notify();
                     })),
             )
             .child(
-                chip(theme, icons::USER, model.workspace_filter_label.clone())
-                    .id("workspace-chip")
+                style::dropdown(
+                    "workspace-chip",
+                    icons::USER,
+                    model.workspace_filter_label.clone(),
+                    matches!(self.state.mode, Mode::WorkspaceDropdown { .. }),
+                    theme,
+                )
+                    .child(style::anchor_probe(&self.workspace_anchor))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.state.open_workspace_dropdown();
                         cx.notify();
@@ -771,7 +788,27 @@ impl IssuesView {
         )
         .children(cards)
         .when(empty && !(is_done && model.done_loading), |d| {
-            d.child(muted_row(theme, if model.loading { "Loading board…" } else { "(empty)" }))
+            d.child(if model.loading {
+                muted_row(theme, "Loading board…").into_any_element()
+            } else {
+                // An empty column: what goes here and how to put it there.
+                div()
+                    .debug_selector(|| "column-empty".into())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(72.0))
+                    .px_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_dashed()
+                    .border_color(theme.rule_strong)
+                    .text_xs()
+                    .text_center()
+                    .text_color(theme.text_quiet)
+                    .child("No issues. Drag a card here.")
+                    .into_any_element()
+            })
         })
         .when(is_done && model.done_loading, |d| {
             d.child(muted_row(theme, "Loading history…"))
@@ -1056,11 +1093,28 @@ impl IssuesView {
                     }))
             })
             .collect();
+        let anchor = if workflow {
+            &self.workflow_anchor
+        } else {
+            &self.workspace_anchor
+        };
         Some(
-            // A dropdown dims nothing (a menu, not a dialog).
-            backdrop(theme, cx)
-                .bg(gpui::transparent_black())
-                .child(panel(theme).w(px(280.0)).mt(px(48.0)).ml(px(16.0)).child(panel_title(theme, title)).children(items)),
+            // A dropdown dims nothing (a menu, not a dialog). It opens 6px
+            // under the control that opened it.
+            backdrop(theme, cx).bg(gpui::transparent_black()).child(style::below(
+                anchor,
+                gpui::point(px(16.0), px(48.0)),
+                style::menu_entrance(
+                    if workflow { "workflow-menu" } else { "workspace-menu" },
+                    panel(theme)
+                        .id("dropdown-panel")
+                        .debug_selector(|| "dropdown-panel".into())
+                        .min_w(px(240.0))
+                        .max_w(px(360.0))
+                        .child(panel_title(theme, title))
+                        .children(items),
+                ),
+            )),
         )
     }
 
@@ -1244,27 +1298,6 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
                     .when_some(deps, |d, deps| d.child(div().truncate().child(deps))),
             )
         })
-}
-
-/// A filter control: a small secondary button with its icon.
-pub(super) fn chip(theme: &Theme, icon: Icon, label: String) -> gpui::Div {
-    let hover = theme.fill_strong;
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .h(px(28.0))
-        .px_2()
-        .rounded_lg()
-        .bg(theme.fill)
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.text_loud)
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover))
-        .child(heroicon(icon).text_color(theme.icon))
-        .child(label)
 }
 
 fn muted_row(theme: &Theme, text: &'static str) -> gpui::Div {

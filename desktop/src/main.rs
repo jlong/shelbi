@@ -163,6 +163,7 @@ fn main() {
             // follows it).
             gpui_kit::init(cx);
             theme::init(cx);
+            theme::motion::sync_reduce_motion(cx);
             assets::load_fonts(cx);
             elements::terminal::TerminalSettings::init(cx);
             // Image and file-promise drops onto a terminal pane (gpui's window
