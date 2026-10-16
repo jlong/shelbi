@@ -40,8 +40,6 @@ pub enum CommandKind {
     FocusWorkspace { workspace: String },
     /// Load a task into a review slot and show it.
     LoadReview { task_id: String },
-    /// Focus an already-running (legacy spawned) agent session.
-    FocusSession { session: String },
     /// Toggle Zen Mode for the current project.
     ToggleZen,
     /// Open the per-project error log.
@@ -50,6 +48,9 @@ pub enum CommandKind {
     SwitchProject { project: String },
     /// Begin the add-project flow.
     AddProject,
+    /// Open another window on the current project. Offered only by a client
+    /// that has windows to open ([`CommandModel::multi_window`]).
+    NewWindow,
     /// Detach this client (leave Shelbi running in the background).
     Detach,
     /// Detach every other client attached to this session.
@@ -70,6 +71,11 @@ pub enum CommandKind {
     RejectReview { id: String, reason: String },
     EditIssue { id: String },
     AddIssue { title: String },
+    /// Reorder an issue within its column: land it at absolute slot
+    /// `position` (0 is the top) of the column's priority order. The board
+    /// computes the slot from the unfiltered column
+    /// ([`crate::board::reorder_slot`]).
+    PrioritizeIssue { id: String, position: u32 },
 }
 
 /// A registry command: metadata + typed arguments. Built by the registry
@@ -119,6 +125,7 @@ impl Command {
                 | CommandKind::RejectReview { .. }
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
+                | CommandKind::PrioritizeIssue { .. }
         )
     }
 
@@ -153,15 +160,13 @@ impl CommandKind {
                 project: p(),
                 task_id: task_id.clone(),
             },
-            CommandKind::FocusSession { session } => Effect::FocusSession {
-                session: session.clone(),
-            },
             CommandKind::ToggleZen => Effect::Mutate(Mutation::ToggleZen { project: p() }),
             CommandKind::OpenErrorLog => Effect::OpenErrorLog { project: p() },
             CommandKind::SwitchProject { project } => Effect::SwitchProject {
                 project: project.clone(),
             },
             CommandKind::AddProject => Effect::AddProject,
+            CommandKind::NewWindow => Effect::NewWindow { project: p() },
             CommandKind::Detach => Effect::Detach,
             CommandKind::DetachOtherClients => Effect::DetachOtherClients,
             CommandKind::QuitProject => Effect::QuitProject { project: p() },
@@ -203,6 +208,13 @@ impl CommandKind {
                 title: title.clone(),
                 workflow: None,
             }),
+            CommandKind::PrioritizeIssue { id, position } => {
+                Effect::Mutate(Mutation::PrioritizeIssue {
+                    project: p(),
+                    id: id.clone(),
+                    position: *position,
+                })
+            }
         }
     }
 }
@@ -257,14 +269,6 @@ pub struct ReviewItem {
     pub decoration: Option<Decoration>,
 }
 
-/// A legacy spawned-agent row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentItem {
-    pub session: String,
-    pub title: String,
-    pub decoration: Option<Decoration>,
-}
-
 /// Another registered project (switch target).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectItem {
@@ -294,7 +298,6 @@ pub struct CommandModel {
     pub views: Vec<ViewItem>,
     pub workspaces: Vec<WorkspaceItem>,
     pub reviews: Vec<ReviewItem>,
-    pub legacy_agents: Vec<AgentItem>,
     /// Other registered projects (switch targets) — excludes the current
     /// project.
     pub other_projects: Vec<ProjectItem>,
@@ -302,6 +305,9 @@ pub struct CommandModel {
     /// Whether any *other* client is attached to this session right now. Gates
     /// the "Detach Other Clients" command (hidden when this is the only client).
     pub other_clients_attached: bool,
+    /// Whether this client opens more than one window (the desktop app).
+    /// Gates "New Window": the TUI is one terminal, so it never lists it.
+    pub multi_window: bool,
 }
 
 /// The one-line description shown beside a nav view in the command palette's
@@ -338,7 +344,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// legacy agents, the error-log action, switch-project targets,
+    /// the review decisions (approve / reject), the error-log action, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -412,19 +418,36 @@ impl CommandRegistry {
             });
         }
 
-        // Legacy spawned agents.
-        for a in &model.legacy_agents {
+        // Review decisions, one pair per review task. Hidden until the user
+        // types (the review rows above are the everyday entries): `appr` or
+        // the task's title surfaces them. Approve runs straight away (it has no
+        // confirmation in either client); reject needs a reason first, so the
+        // registry carries an empty one and the host opens the reason prompt.
+        for r in &model.reviews {
             out.push(Command {
-                id: format!("agent:{}", a.session),
-                title: a.title.clone(),
-                kind: CommandKind::FocusSession {
-                    session: a.session.clone(),
+                id: format!("action:approve-review:{}", r.task_id),
+                title: format!("Approve {}", r.title),
+                kind: CommandKind::ApproveReview {
+                    id: r.task_id.clone(),
                 },
-                entry_kind: EntryKind::Agent,
-                decoration: a.decoration.clone(),
-                subtitle: None,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Accept the review and merge it".to_string()),
                 shortcut: None,
-                hidden_until_query: false,
+                hidden_until_query: true,
+            });
+            out.push(Command {
+                id: format!("action:reject-review:{}", r.task_id),
+                title: format!("Reject {}", r.title),
+                kind: CommandKind::RejectReview {
+                    id: r.task_id.clone(),
+                    reason: String::new(),
+                },
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Send it back with a reason".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
             });
         }
 
@@ -483,6 +506,20 @@ impl CommandRegistry {
             shortcut: None,
             hidden_until_query: true,
         });
+
+        // New window (hidden until query), only for a client that has them.
+        if model.multi_window {
+            out.push(Command {
+                id: "action:new-window".to_string(),
+                title: "New Window".to_string(),
+                kind: CommandKind::NewWindow,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Open another window on this project".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+        }
 
         // Edit targets (hidden until query).
         for e in &model.edit_targets {
@@ -605,14 +642,20 @@ impl CommandKind {
                 task_id: task_id.to_string(),
             });
         }
-        if let Some(session) = id.strip_prefix("agent:") {
-            return Some(CommandKind::FocusSession {
-                session: session.to_string(),
-            });
-        }
         if let Some(slug) = id.strip_prefix("action:switch-project:") {
             return Some(CommandKind::SwitchProject {
                 project: slug.to_string(),
+            });
+        }
+        if let Some(task) = id.strip_prefix("action:approve-review:") {
+            return Some(CommandKind::ApproveReview {
+                id: task.to_string(),
+            });
+        }
+        if let Some(task) = id.strip_prefix("action:reject-review:") {
+            return Some(CommandKind::RejectReview {
+                id: task.to_string(),
+                reason: String::new(),
             });
         }
         if let Some(agent) = id.strip_prefix("edit:agent:") {
@@ -627,6 +670,7 @@ impl CommandKind {
                 project: String::new(),
             }),
             "action:add-project" => Some(CommandKind::AddProject),
+            "action:new-window" => Some(CommandKind::NewWindow),
             "action:detach" => Some(CommandKind::Detach),
             "action:detach-others" => Some(CommandKind::DetachOtherClients),
             "action:quit-project" => Some(CommandKind::QuitProject),
@@ -696,11 +740,6 @@ mod tests {
                 subtitle: Some("local:9222".into()),
                 decoration: None,
             }],
-            legacy_agents: vec![AgentItem {
-                session: "scratch".into(),
-                title: "scratch".into(),
-                decoration: None,
-            }],
             other_projects: vec![ProjectItem {
                 slug: "beta".into(),
                 label: "Beta".into(),
@@ -719,6 +758,7 @@ mod tests {
             // commands are present (and covered by the round-trip test); the
             // gating is exercised separately below.
             other_clients_attached: true,
+            multi_window: true,
         }
     }
 
@@ -733,11 +773,13 @@ mod tests {
             "action:toggle-zen",
             "workspace:alpha-1",
             "review:T-12",
-            "agent:scratch",
+            "action:approve-review:T-12",
+            "action:reject-review:T-12",
             "action:error-log",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
+            "action:new-window",
             "edit:project",
             "edit:agent:developer",
             "action:detach",
@@ -787,6 +829,28 @@ mod tests {
             .find(|c| c.id() == id)
             .map(|c| c.decoration.is_none())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn new_window_is_offered_only_by_a_multi_window_client() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        m.multi_window = true;
+        let cmd = reg.resolve("action:new-window", &m).expect("offered");
+        assert_eq!(cmd.kind(), &CommandKind::NewWindow);
+        assert_eq!(
+            cmd.effect("alpha"),
+            Effect::NewWindow {
+                project: "alpha".into()
+            }
+        );
+        assert_eq!(
+            CommandKind::from_id("action:new-window"),
+            Some(CommandKind::NewWindow)
+        );
+        // The TUI is one terminal: it has no window to open.
+        m.multi_window = false;
+        assert!(reg.resolve("action:new-window", &m).is_none());
     }
 
     #[test]
@@ -852,6 +916,33 @@ mod tests {
                 task_id: "T-12".into()
             }
         );
+    }
+
+    #[test]
+    fn prioritize_issue_is_a_daemon_mutation_with_the_slot() {
+        let kind = CommandKind::PrioritizeIssue {
+            id: "t1".into(),
+            position: 2,
+        };
+        assert_eq!(
+            kind.effect_with_project("alpha"),
+            Effect::Mutate(Mutation::PrioritizeIssue {
+                project: "alpha".into(),
+                id: "t1".into(),
+                position: 2,
+            })
+        );
+        let cmd = Command {
+            id: String::new(),
+            title: String::new(),
+            kind,
+            entry_kind: EntryKind::Action,
+            decoration: None,
+            subtitle: None,
+            shortcut: None,
+            hidden_until_query: false,
+        };
+        assert!(cmd.is_mutating());
     }
 
     #[test]
@@ -978,6 +1069,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("from_id failed for {}", cmd.id()));
             assert_eq!(&parsed, cmd.kind(), "kind mismatch for id {}", cmd.id());
         }
+    }
+
+    #[test]
+    fn review_decisions_are_offered_per_review_and_hidden_until_typed() {
+        let reg = CommandRegistry::new();
+        let m = model();
+        let approve = reg.resolve("action:approve-review:T-12", &m).unwrap();
+        assert_eq!(approve.title(), "Approve Fix the thing");
+        assert!(approve.hidden_until_query());
+        assert!(approve.is_mutating());
+        assert_eq!(
+            approve.effect("alpha"),
+            Effect::Mutate(Mutation::ApproveReview {
+                project: "alpha".into(),
+                id: "T-12".into()
+            })
+        );
+        let reject = reg.resolve("action:reject-review:T-12", &m).unwrap();
+        assert_eq!(reject.title(), "Reject Fix the thing");
+        // The reason is collected by the host's prompt, not the registry.
+        assert_eq!(
+            reject.kind(),
+            &CommandKind::RejectReview {
+                id: "T-12".into(),
+                reason: String::new()
+            }
+        );
+        // Typing surfaces them; a blank query doesn't.
+        let entries = reg.entries(&m);
+        let blank = shelbi_palette::search(&entries, "");
+        assert!(blank.iter().all(|(e, _)| !e.id.starts_with("action:approve-review")));
+        let typed = shelbi_palette::search(&entries, "reject fix");
+        assert_eq!(typed[0].0.id, "action:reject-review:T-12");
     }
 
     #[test]

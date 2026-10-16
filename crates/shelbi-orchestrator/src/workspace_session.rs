@@ -17,8 +17,18 @@
 //! server to reap (a dev workspace runs no review server), so close only ends
 //! the editor/diff sessions.
 //!
-//! Local workspaces only: a remote workspace has no local session to spawn, so a
-//! remote workspace here is a clear `Err` the client surfaces on its status line.
+//! The editor and diff are local workspaces only: a remote workspace has no
+//! local session to spawn, so a remote workspace there is a clear `Err` the
+//! client surfaces on its status line.
+//!
+//! The workspace's **user shell** (`<project>/ws/<workspace>/shell`, the
+//! desktop Workspace view's split beside the agent, `dt-workspace-view`) is
+//! managed here too, [`ensure_user_shell`] / [`close_user_shell`], and works on
+//! any machine: a remote workspace's shell is spawned there over SSH and the
+//! client reaches it through the machine's relay. It never occupies the
+//! workspace's slot (that is `<project>/ws/<workspace>`), so dispatch ignores it.
+
+use std::path::Path;
 
 use shelbi_core::{Column, Error, Host, Result};
 
@@ -77,9 +87,30 @@ fn in_progress_task_for(
         .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace)))
 }
 
-/// Resolve the workspace panel's inputs for `workspace`. Errors when the
-/// workspace is unknown or remote (no local session to open).
-pub fn workspace_open_info(project_name: &str, workspace: &str) -> Result<WorkspaceOpenInfo> {
+/// Everything a client's workspace view shows about a workspace, on any
+/// machine: where it lives, its worktree, and the task it is working.
+#[derive(Debug, Clone)]
+pub struct WorkspaceDetails {
+    /// The machine the workspace is declared on.
+    pub machine: String,
+    /// Whether that machine is reached over SSH.
+    pub is_remote: bool,
+    /// Absolute workspace worktree path (on the workspace's machine).
+    pub worktree: String,
+    /// Display name of the resolved editor (`Vim`, `Helix`, …).
+    pub editor_name: String,
+    /// The branch the workspace is on: its in-progress task's branch, else (a
+    /// local workspace) the worktree's checked-out branch. `None` when unknown.
+    pub branch: Option<String>,
+    /// The in-progress task on this workspace, from the published board index
+    /// (see [`in_progress_task_for`]).
+    pub task: Option<Box<shelbi_state::IssueFile>>,
+}
+
+/// Resolve a workspace's [`WorkspaceDetails`], local or remote. Errors only
+/// when the workspace or its machine is unknown. Blocking (a config load, the
+/// board index, and for a local idle workspace one `git rev-parse`).
+pub fn workspace_details(project_name: &str, workspace: &str) -> Result<WorkspaceDetails> {
     let project = shelbi_state::load_project(project_name)?;
     let ws = project
         .workspace(workspace)
@@ -87,20 +118,41 @@ pub fn workspace_open_info(project_name: &str, workspace: &str) -> Result<Worksp
     let machine = project
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
-    if machine.host() != Host::Local {
+    let host = machine.host();
+    let worktree = crate::workspace::workspace_worktree(machine, ws);
+    let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
+    let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)?;
+    let branch = task
+        .as_ref()
+        .and_then(|t| t.task.branch.clone())
+        .or_else(|| {
+            host.is_local()
+                .then(|| crate::workspace::worktree_current_branch(&host, &worktree))
+                .flatten()
+        });
+    Ok(WorkspaceDetails {
+        machine: ws.machine.clone(),
+        is_remote: !host.is_local(),
+        worktree: worktree.to_string_lossy().to_string(),
+        editor_name,
+        branch,
+        task: task.map(Box::new),
+    })
+}
+
+/// Resolve the workspace panel's inputs for `workspace`. Errors when the
+/// workspace is unknown or remote (no local session to open).
+pub fn workspace_open_info(project_name: &str, workspace: &str) -> Result<WorkspaceOpenInfo> {
+    let details = workspace_details(project_name, workspace)?;
+    if details.is_remote {
         return Err(Error::Other(format!(
             "workspace `{workspace}` is remote; open it over SSH"
         )));
     }
-    let worktree = crate::workspace::workspace_worktree(machine, ws)
-        .to_string_lossy()
-        .to_string();
-    let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
-    let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)?;
     Ok(WorkspaceOpenInfo {
-        worktree,
-        editor_name,
-        task: task.map(Box::new),
+        worktree: details.worktree,
+        editor_name: details.editor_name,
+        task: details.task,
     })
 }
 
@@ -177,6 +229,113 @@ pub fn close_content(project_name: &str, workspace: &str) -> Result<()> {
     Ok(())
 }
 
+/// The role token of a workspace's user shell, the last segment of its
+/// session name.
+pub const SHELL_ROLE: &str = "shell";
+
+/// The session name of `workspace`'s user shell:
+/// `<project>/ws/<workspace>/shell`, beside the editor and diff content
+/// sessions (and, like them, distinct from the agent's slot session).
+pub fn shell_session_name(project_name: &str, workspace: &str) -> String {
+    format!("{project_name}/ws/{workspace}/{SHELL_ROLE}")
+}
+
+/// What a user shell runs, and where: `(cwd, argv)`. A local shell starts in
+/// the worktree (the machine's `work_dir` when the worktree is gone, as after a
+/// handoff) as a login shell of the daemon's `$SHELL`. A remote one can't test
+/// the remote filesystem from here, so it starts in `work_dir` and `cd`s into
+/// the worktree on the remote, then execs the *remote* login shell.
+fn user_shell_command(
+    remote: bool,
+    worktree: &Path,
+    work_dir: &Path,
+    local_shell: &str,
+    worktree_exists: bool,
+) -> (std::path::PathBuf, Vec<String>) {
+    if remote {
+        let script = format!(
+            "cd {wt} 2>/dev/null || cd {wd}; exec \"${{SHELL:-/bin/sh}}\" -l",
+            wt = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+            wd = shelbi_agent::shell_escape(&work_dir.to_string_lossy()),
+        );
+        (work_dir.to_path_buf(), vec!["sh".into(), "-c".into(), script])
+    } else {
+        let cwd = if worktree_exists { worktree } else { work_dir };
+        (cwd.to_path_buf(), vec![local_shell.to_string(), "-l".into()])
+    }
+}
+
+/// Ensure `workspace`'s user shell is spawned and live, on the workspace's own
+/// machine, so a client can attach a terminal to it. Idempotent: a shell
+/// already live under the name is reused. Untagged (no task), so it is never
+/// mistaken for the workspace's agent.
+pub fn ensure_user_shell(project_name: &str, workspace: &str) -> Result<()> {
+    let project = shelbi_state::load_project(project_name)?;
+    let ws = project
+        .workspace(workspace)
+        .ok_or_else(|| Error::Other(format!("unknown workspace `{workspace}`")))?;
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    let host = machine.host();
+    let name = shell_session_name(project_name, workspace);
+    let backend = SessionProcessBackend;
+    if backend
+        .live_session_names(&host)
+        .map(|names| names.iter().any(|n| n == &name))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let worktree = crate::workspace::workspace_worktree(machine, ws);
+    let local_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let (cwd, child_argv) = user_shell_command(
+        host.is_ssh(),
+        &worktree,
+        &machine.work_dir,
+        &local_shell,
+        host.is_local() && worktree.is_dir(),
+    );
+    let (cols, rows) = SessionProcessBackend::default_size();
+    let spec = shelbi_session::SpawnSpec {
+        name,
+        cwd,
+        cols,
+        rows,
+        task: None,
+        raw_output_log: false,
+        child_argv,
+    };
+    if host.is_ssh() {
+        let bin = crate::remote_session::resolve_remote_bin(&ws.machine)?;
+        crate::remote_session::spawn_remote_session(&host, &bin, &spec)
+    } else {
+        backend.spawn_session(spec).map(|_| ())
+    }
+}
+
+/// SIGHUP: what a terminal sends its shell when it closes. An interactive
+/// shell ignores the session's default SIGTERM.
+const SIGHUP: i32 = 1;
+
+/// End `workspace`'s user shell, on whichever machine it runs, as closing its
+/// terminal would (SIGHUP, which the shell passes on to its jobs). Idempotent
+/// and best-effort: an already-gone shell is fine.
+pub fn close_user_shell(project_name: &str, workspace: &str) -> Result<()> {
+    let project = shelbi_state::load_project(project_name)?;
+    let ws = project
+        .workspace(workspace)
+        .ok_or_else(|| Error::Other(format!("unknown workspace `{workspace}`")))?;
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    SessionProcessBackend.signal_by_name(
+        &machine.host(),
+        &shell_session_name(project_name, workspace),
+        Some(SIGHUP),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +361,36 @@ mod tests {
         let editor = content_session_name("myapp", "alpha", ReviewContentRole::Editor);
         assert_ne!(agent, editor);
         assert!(editor.starts_with(&format!("{agent}/")));
+    }
+
+    #[test]
+    fn shell_session_name_sits_beside_the_content_sessions() {
+        assert_eq!(shell_session_name("myapp", "alpha"), "myapp/ws/alpha/shell");
+        assert_ne!(
+            shell_session_name("myapp", "alpha"),
+            content_session_name("myapp", "alpha", ReviewContentRole::Editor)
+        );
+    }
+
+    #[test]
+    fn a_local_shell_starts_in_the_worktree_or_the_work_dir() {
+        let (wt, wd) = (Path::new("/w/alpha"), Path::new("/w"));
+        let (cwd, argv) = user_shell_command(false, wt, wd, "/bin/zsh", true);
+        assert_eq!((cwd.as_path(), argv), (wt, vec!["/bin/zsh".to_string(), "-l".into()]));
+        let (cwd, _) = user_shell_command(false, wt, wd, "/bin/zsh", false);
+        assert_eq!(cwd.as_path(), wd, "a pruned worktree falls back to work_dir");
+    }
+
+    #[test]
+    fn a_remote_shell_cds_on_the_remote_and_runs_its_own_shell() {
+        let (cwd, argv) =
+            user_shell_command(true, Path::new("/home/u/wt/a b"), Path::new("/home/u"), "/bin/zsh", false);
+        assert_eq!(cwd, Path::new("/home/u"));
+        assert_eq!(argv[..2], ["sh".to_string(), "-c".to_string()]);
+        assert_eq!(
+            argv[2],
+            "cd '/home/u/wt/a b' 2>/dev/null || cd /home/u; exec \"${SHELL:-/bin/sh}\" -l"
+        );
     }
 
     use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};

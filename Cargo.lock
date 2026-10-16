@@ -1730,6 +1730,7 @@ dependencies = [
  "shelbi-proto",
  "shelbi-state",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -1773,6 +1774,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shelbi-agent",
+ "shelbi-app",
  "shelbi-client",
  "shelbi-core",
  "shelbi-proto",

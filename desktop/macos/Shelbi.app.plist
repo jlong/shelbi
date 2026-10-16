@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shelbi.app's Contents/Info.plist. scripts/bundle.sh copies it into the
+  bundle with @VERSION@ replaced by desktop/Cargo.toml's version.
+
+  This is the bundle's plist, not macos/Info.plist: that one is embedded in
+  the bare binary (build.rs) so `cargo run` reads "Shelbi" in the menu bar,
+  and must NOT carry a CFBundleIdentifier (an unbundled process that claims
+  one aborts in gpui's notification setup). Inside the .app the bundle's
+  plist wins, and the identifier here is what notifications, the Dock, and
+  Gatekeeper key off.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Shelbi</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.shelbi.desktop</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Shelbi</string>
+	<key>CFBundleDisplayName</key>
+	<string>Shelbi</string>
+	<key>CFBundleIconFile</key>
+	<string>Shelbi</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 John W. Long. MIT License.</string>
+	<!-- Notifications (dt-menus-notifications): agents finishing, reviews
+	     waiting. macOS asks for permission on first use and shows these. -->
+	<key>NSUserNotificationAlertStyle</key>
+	<string>banner</string>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>Shelbi notifies you when an agent finishes, needs your input, or a review is ready.</string>
+</dict>
+</plist>

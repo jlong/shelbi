@@ -1,0 +1,32 @@
+//! Platform integration: everything the app needs from the machine before it
+//! can talk to Shelbi.
+//!
+//! The app is a client of the `shelbi` CLI package: it embeds neither the
+//! daemon nor the session process. Launched from Finder it has no shell
+//! `PATH`, so [`Bootstrap`] resolves the login-shell environment ([`env`]),
+//! finds `shelbi` ([`discovery`]), has it start the daemon ([`daemon`]),
+//! connects to the control socket and checks the versions match exactly
+//! ([`control`], [`version`]), and fails at the step that broke with what its
+//! screen needs to name the fix. `views::bootstrap` renders each state.
+//!
+//! `--print-version` ([`print_version`]) is bootstrap's headless check, and
+//! [`update`] the once-a-day new-release check. Native menus and system
+//! notifications (`dt-menus-notifications`) are platform concerns too, but
+//! live where that subtask puts them; the app bundle is `scripts/bundle.sh`.
+
+pub mod bootstrap;
+pub mod control;
+pub mod daemon;
+pub mod discovery;
+pub mod env;
+pub mod motion;
+pub mod print_version;
+pub mod relaunch;
+pub mod update;
+pub mod version;
+
+#[cfg(test)]
+mod integration_tests;
+
+pub use bootstrap::{Bootstrap, BootstrapEvent, BootstrapState, Failure, Ready, SystemPlatform};
+pub use control::RelaunchNotice;

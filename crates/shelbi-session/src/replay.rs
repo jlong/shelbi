@@ -150,7 +150,10 @@ fn paint_screen_absolute(out: &mut Vec<u8>, grid: &Grid<Cell>, cols: usize) {
 /// Emit one row's cells, from a reset pen, coalescing runs of like-styled cells
 /// behind a single SGR. Trailing cells that are indistinguishable from a fresh
 /// default cell are dropped: the client leaves those positions default, which is
-/// exactly what they are, and a blank-padded screen stays small.
+/// exactly what they are, and a blank-padded screen stays small. The row ends
+/// on a reset pen: the CRLF that follows may scroll, and a scroll fills the new
+/// line with the current background (background-color erase), so a row ending
+/// on a colored cell would otherwise paint the blank row below it.
 fn emit_row(out: &mut Vec<u8>, row: &Row<Cell>, cols: usize) {
     out.extend_from_slice(b"\x1b[0m");
     let mut pen = Pen::default();
@@ -186,6 +189,9 @@ fn emit_row(out: &mut Vec<u8>, row: &Row<Cell>, cols: usize) {
             }
         }
         col += 1;
+    }
+    if pen != Pen::default() {
+        out.extend_from_slice(b"\x1b[0m");
     }
 }
 

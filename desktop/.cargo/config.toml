@@ -1,0 +1,5 @@
+# macOS floor for the desktop app: the current and previous major at release
+# time (macOS 26 and 15 today). rustc reads this when it links, so every
+# `cargo` command run from `desktop/` targets the same floor.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"

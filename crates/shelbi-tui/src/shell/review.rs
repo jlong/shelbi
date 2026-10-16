@@ -113,7 +113,7 @@ impl ReviewInterface {
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
-            super::relaunch::ReviewRelauncher {
+            shelbi_app::session::ReviewRelauncher {
                 project: project.to_string(),
                 task: task_id.clone(),
             },
@@ -190,6 +190,17 @@ impl ReviewInterface {
         if self.panel.merging {
             self.panel.spinner = self.panel.spinner.wrapping_add(1);
         }
+    }
+
+    /// Follow the task's sidebar row: the panel's server line shows its
+    /// sub-state and location. Returns whether anything changed.
+    pub fn set_server(&mut self, row: Option<&shelbi_app::view::ReviewRow>) -> bool {
+        let server = row.map(|r| (r.state, r.location.clone()));
+        if self.panel.server == server {
+            return false;
+        }
+        self.panel.server = server;
+        true
     }
 
     /// Put a message on the panel's status line (effect failures, notes).
@@ -432,7 +443,7 @@ impl ReviewInterface {
             MainState::Restarting(attempt, max) => super::render_placeholder(
                 buf,
                 content_rect,
-                &format!("Session exited — restarting ({attempt}/{max})…"),
+                &shelbi_app::session::restarting_notice(attempt, max),
             ),
             MainState::GaveUp(last_line) => super::render_placeholder(
                 buf,
@@ -474,15 +485,18 @@ pub fn reveal_folder(project: &str, task: &str) -> Result<(), String> {
 fn map_effect(effect: PanelEffect) -> ReviewAction {
     match effect {
         PanelEffect::None => ReviewAction::None,
-        PanelEffect::FocusDashboard => ReviewAction::Back,
+        PanelEffect::Back => ReviewAction::Back,
         PanelEffect::ShowChat => ReviewAction::ShowContent(None),
         PanelEffect::ShowDiff => ReviewAction::ShowContent(Some(ReviewRole::Diff)),
-        PanelEffect::ShowVim => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
+        PanelEffect::ShowEditor => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
         PanelEffect::OpenBrowser => ReviewAction::OpenBrowser,
         PanelEffect::RevealFolder => ReviewAction::RevealFolder,
         PanelEffect::ShowDescription => ReviewAction::ShowDescription,
         PanelEffect::Approve => ReviewAction::Approve,
         PanelEffect::RejectPrompt => ReviewAction::Reject,
+        // The TUI handles `q` itself (`request_quit`); the shared table's Close
+        // means the same teardown.
+        PanelEffect::Close => ReviewAction::Close,
     }
 }
 

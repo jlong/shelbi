@@ -479,10 +479,16 @@ pub fn title(host: &Host, name: &str) -> Result<String> {
 /// Kill the remote session's child process group (best-effort: an already-gone
 /// session is fine).
 pub fn kill(host: &Host, name: &str) -> Result<()> {
+    signal(host, name, None)
+}
+
+/// [`kill`] with an explicit signal for the child's process group (`None` is
+/// the session's default, SIGTERM).
+pub fn signal(host: &Host, name: &str, signal: Option<i32>) -> Result<()> {
     let bin = relay_bin_for_host(host);
     let result = with_channel(host, &bin, |ch| {
         let conn = open_connection(ch, name)?;
-        conn.kill(None)
+        conn.kill(signal)
     });
     match result {
         Ok(()) => Ok(()),
@@ -542,6 +548,86 @@ pub fn live_session_names(host: &Host) -> Result<Vec<String>> {
                 .collect()
         })
         .map_err(|e| Error::Other(format!("listing remote sessions on `{}`: {e}", host_label(host))))
+}
+
+/// A remote session attached for streaming through its machine's relay: a
+/// client's terminal view over a session on another machine. The relay is the
+/// one this process caches for the machine, so every view over that machine
+/// shares one SSH connection.
+pub struct RemoteAttach {
+    pub conn: Connection,
+    /// The output/event stream, starting with the attach replay. It ends when
+    /// the session closes the connection or the relay dies (an SSH drop wakes
+    /// every stream on the channel with EOF).
+    pub events: shelbi_client::SessionEvents,
+    /// The session's grid size at attach time.
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Why [`attach`] didn't yield a live remote session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteAttachError {
+    /// The machine couldn't be reached (its relay won't start or died). The
+    /// session may well still be running: a client keeps reconnecting.
+    Unreachable(String),
+    /// The machine answered and has no live session by that name. `exited` is
+    /// whether a dead one is on record there (it ran and stopped) rather than
+    /// none ever having run (an idle workspace).
+    NoSession { exited: bool },
+    /// Anything else (a handshake or attach that failed past discovery).
+    Failed(String),
+}
+
+impl std::fmt::Display for RemoteAttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteAttachError::Unreachable(m) | RemoteAttachError::Failed(m) => f.write_str(m),
+            RemoteAttachError::NoSession { .. } => f.write_str("no live remote session"),
+        }
+    }
+}
+
+/// Attach to the live session `name` on `host` through the machine's relay,
+/// with a full replay, for streaming into a client's terminal view. A relay
+/// that turns out dead is replaced once (the SSH-drop recovery path), so a
+/// client reattaching after a drop gets a fresh relay; a session that kept
+/// running replays its screen and carries on. Blocking: run it off the UI
+/// thread.
+pub fn attach(host: &Host, name: &str) -> std::result::Result<RemoteAttach, RemoteAttachError> {
+    let bin = relay_bin_for_host(host);
+    let unreachable = |e: ClientError| match e {
+        ClientError::RelayUnreachable => {
+            RemoteAttachError::Unreachable(format!("`{}` is unreachable", host_label(host)))
+        }
+        other => RemoteAttachError::Unreachable(format!("relay to `{}` failed: {other}", host_label(host))),
+    };
+    let sessions = with_channel(host, &bin, |ch| ch.list_sessions()).map_err(unreachable)?;
+    let Some(session) = sessions.iter().find(|s| s.alive && s.name == name) else {
+        return Err(RemoteAttachError::NoSession {
+            exited: sessions.iter().any(|s| s.name == name),
+        });
+    };
+    let (conn, events) = with_channel(host, &bin, |ch| {
+        let stream = ch.open(&session.short_id)?;
+        Connection::connect(Box::new(stream), None, capability::ALL)
+    })
+    .map_err(|e| match e {
+        ClientError::RelayUnreachable => unreachable(e),
+        other => RemoteAttachError::Failed(format!("attaching to `{name}` on `{}`: {other}", host_label(host))),
+    })?;
+    let (cols, rows) = match conn.info() {
+        Ok(info) => (info.cols.max(1), info.rows.max(1)),
+        Err(_) => (80, 24),
+    };
+    conn.attach(None)
+        .map_err(|e| RemoteAttachError::Failed(format!("attaching to `{name}`: {e}")))?;
+    Ok(RemoteAttach {
+        conn,
+        events,
+        cols,
+        rows,
+    })
 }
 
 /// Build the default-size `SpawnSpec` for a remote dispatch launch line. The

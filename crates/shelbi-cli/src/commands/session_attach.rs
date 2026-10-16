@@ -12,8 +12,9 @@
 //! - **Sizing.** On attach, and on every local resize, we report our terminal
 //!   size to the session. The session follows the most-recently-active client,
 //!   so when we are active it takes our size and fills the terminal; when
-//!   another client is active and larger/smaller, [`viewport::fit`] clips or
-//!   letterboxes its grid into ours.
+//!   another client is active and larger/smaller,
+//!   [`TerminalView::placement`] clips (keeping the bottom of the session's
+//!   content in view) or letterboxes its grid into ours.
 //! - **Input.** Keys, mouse, paste, and focus are encoded through
 //!   [`shelbi_term::input`] and written to the session; the client emulator
 //!   never answers terminal queries (only the session, beside the real PTY,
@@ -53,7 +54,7 @@ use shelbi_client::{Connection, DiscoveredSession, SessionEvent};
 use shelbi_proto::capability;
 use shelbi_term::input::{self, Key, Modifiers};
 use shelbi_term::view::TerminalView;
-use shelbi_term::viewport::{self, Placement};
+use shelbi_term::viewport::Placement;
 use shelbi_term::Size;
 
 /// Seconds the detach hint stays on the bottom row after attach.
@@ -356,6 +357,8 @@ fn handle_event(
             *dirty = true;
         }
         Event::FocusGained => {
+            // Taking focus takes the session's size.
+            let _ = conn.claim_size();
             if let Some(b) = input::encode_focus(true, view.emulator().focus_reporting()) {
                 let _ = conn.input(&b);
             }
@@ -444,11 +447,10 @@ fn handle_mouse(
         },
         input::MouseOwner::Program => {
             if let Some(ev) = map_mouse(&m) {
-                let modes = input::MouseModes {
-                    reporting,
-                    sgr: mode.contains(TermMode::SGR_MOUSE),
-                };
-                let placement = viewport::fit(session_size, viewer);
+                // The emulator's modes: drags and motion only where the
+                // program asked for them.
+                let modes = view.emulator().mouse_modes();
+                let placement = view.placement(session_size, viewer);
                 if let Some(bytes) = input::encode_mouse(&ev, modes, &placement) {
                     let _ = conn.input(&bytes);
                 }
@@ -498,7 +500,7 @@ fn draw(
     term.draw(|frame| {
         let area = frame.area();
         let viewer = Size::new(area.width, area.height);
-        let placement = viewport::fit(session_size, viewer);
+        let placement = view.placement(session_size, viewer);
         let cursor = render_grid(frame.buffer_mut(), area, view, &placement);
         if hint {
             render_hint(frame.buffer_mut(), area, detach);
@@ -532,22 +534,19 @@ fn render_grid(
     let emu = view.emulator();
     let grid = emu.grid();
     let offset = emu.display_offset() as i32;
-    let rrows = placement.rows;
-    let rcols = placement.cols;
 
     for indexed in grid.display_iter() {
         let srow = indexed.point.line.0 + offset;
         if srow < 0 {
             continue;
         }
-        let (srow, scol) = (srow as u32, indexed.point.column.0 as u32);
-        // Clip window: `src_start` is always 0, so a session cell is visible
-        // only while it is inside `len` on each axis.
-        if srow >= rrows.len as u32 || scol >= rcols.len as u32 {
+        // Outside a clipped window (which keeps the bottom of a taller
+        // session's content in view, not its top).
+        let Some((vcol, vrow)) = placement.session_to_viewer(indexed.point.column.0 as u16, srow as u16)
+        else {
             continue;
-        }
-        let vx = area.left() + rcols.pad_before + scol as u16;
-        let vy = area.top() + rrows.pad_before + srow as u16;
+        };
+        let (vx, vy) = (area.left() + vcol, area.top() + vrow);
         let Some(out) = buf.cell_mut((vx, vy)) else {
             continue;
         };
@@ -568,15 +567,10 @@ fn render_grid(
     if emu.mode().contains(TermMode::SHOW_CURSOR) {
         let cp = grid.cursor.point;
         let crow = cp.line.0 + offset;
-        let ccol = cp.column.0 as i32;
-        if crow >= 0
-            && (crow as u32) < rrows.len as u32
-            && ccol >= 0
-            && (ccol as u32) < rcols.len as u32
-        {
-            let vx = area.left() + rcols.pad_before + ccol as u16;
-            let vy = area.top() + rrows.pad_before + crow as u16;
-            return Some((vx, vy));
+        if crow >= 0 {
+            if let Some((vcol, vrow)) = placement.session_to_viewer(cp.column.0 as u16, crow as u16) {
+                return Some((area.left() + vcol, area.top() + vrow));
+            }
         }
     }
     None
@@ -727,6 +721,7 @@ impl Drop for RawGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_term::viewport;
 
     fn cell(c: char, fg: VtColor, bg: VtColor, flags: Flags) -> Cell {
         Cell {
@@ -848,5 +843,25 @@ mod tests {
         assert_eq!(buf.cell((5, 0)).unwrap().symbol(), "F");
         // Column 6+ does not exist in this viewer (clipped).
         assert!(buf.cell((6, 0)).is_none());
+    }
+
+    /// A shorter viewer than a full session shows the session's bottom rows
+    /// (an agent's prompt and status line), not its top
+    /// (`dt-terminal-bottom-clipped`).
+    #[test]
+    fn a_shorter_viewer_renders_the_bottom_of_the_session() {
+        let session = Size::new(10, 6);
+        let mut view = TerminalView::new(session);
+        view.feed(b"row0\r\nrow1\r\nrow2\r\nrow3\r\n> in\r\nstatus\x1b[5;3H");
+        let short = Size::new(10, 3);
+        let area = Rect::new(0, 0, short.cols, short.rows);
+        let mut buf = Buffer::empty(area);
+        let placement = view.placement(session, short);
+        let cursor = render_grid(&mut buf, area, &view, &placement);
+        let row = |y: u16| (0..6).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect::<String>();
+        assert_eq!(row(0), "row3  ");
+        assert_eq!(row(1), "> in  ");
+        assert_eq!(row(2), "status");
+        assert_eq!(cursor, Some((2, 1)), "the cursor maps into the window");
     }
 }

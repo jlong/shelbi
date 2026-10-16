@@ -12,146 +12,33 @@
 //! returns an [`ErrorLogOutcome`] so the caller performs the IO (clearing the
 //! log) and closes its own loop.
 //!
-//! [`handle_key`]: Viewer::handle_key
+//! [`handle_key`]: fn@handle_key
 
-use chrono::{DateTime, Local};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use shelbi_state::ErrorLogEntry;
+use crate::theme::palette;
 
-/// Column where an entry's message starts (and where its wrapped continuation
-/// lines align): `● ` marker (2) + `YYYY-MM-DD HH:MM` (16) + 2 spaces.
-pub const MESSAGE_INDENT: usize = 20;
+// The viewer state, its keys, and the row layout are shared with the desktop
+// app (`shelbi_app::overlay::error_log`).
+pub use shelbi_app::overlay::error_log::{
+    format_ts, wrap, ErrorLogOutcome, Viewer, EMPTY, HINT, MESSAGE_INDENT,
+};
 
-/// What a key did to the viewer. `Continue` keeps the overlay open; `Close`
-/// dismisses it; `Clear` asks the caller to wipe the on-disk log (the caller
-/// then calls [`shelbi_state::clear_errors`] and [`Viewer::clear`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorLogOutcome {
-    Continue,
-    Close,
-    Clear,
-}
-
-/// The viewer's mutable state: the entries (newest-first) with their unread
-/// flag, plus the current scroll offset in rendered lines. Kept separate from
-/// any event loop so the scroll/clear logic is unit-testable without a terminal.
-pub struct Viewer {
-    /// `(entry, was_unread_when_opened)`, newest first.
-    pub rows: Vec<(ErrorLogEntry, bool)>,
-    /// First rendered line shown at the top of the viewport.
-    scroll: usize,
-}
-
-impl Viewer {
-    pub fn new(rows: Vec<(ErrorLogEntry, bool)>) -> Self {
-        Self { rows, scroll: 0 }
+/// Feed one crossterm key to the viewer ([`Viewer::handle_key`]). The caller
+/// performs the clear IO when this returns [`ErrorLogOutcome::Clear`].
+pub fn handle_key(viewer: &mut Viewer, k: KeyEvent) -> ErrorLogOutcome {
+    match crate::keymap::chord_from_event(k) {
+        Some(chord) => viewer.handle_key(chord),
+        None => ErrorLogOutcome::Continue,
     }
-
-    pub fn scroll(&self) -> usize {
-        self.scroll
-    }
-
-    /// Clamp the scroll offset so it never scrolls past the last line. `total`
-    /// is the rendered line count, `visible` the viewport height.
-    pub fn clamp(&mut self, total: usize, visible: usize) {
-        let max = total.saturating_sub(visible);
-        if self.scroll > max {
-            self.scroll = max;
-        }
-    }
-
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
-    }
-
-    pub fn scroll_down(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_add(n);
-    }
-
-    pub fn scroll_top(&mut self) {
-        self.scroll = 0;
-    }
-
-    /// Empty the live view after the on-disk log is cleared.
-    pub fn clear(&mut self) {
-        self.rows.clear();
-        self.scroll = 0;
-    }
-
-    /// Handle one key press. Pure except for the viewer's own scroll state; the
-    /// caller performs the clear IO when this returns [`ErrorLogOutcome::Clear`].
-    pub fn handle_key(&mut self, k: KeyEvent) -> ErrorLogOutcome {
-        match k.code {
-            KeyCode::Esc | KeyCode::Char('q') => return ErrorLogOutcome::Close,
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_up(1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_down(1),
-            KeyCode::PageUp => self.scroll_up(10),
-            KeyCode::PageDown => self.scroll_down(10),
-            KeyCode::Home => self.scroll_top(),
-            KeyCode::Char('c') => return ErrorLogOutcome::Clear,
-            _ => {}
-        }
-        ErrorLogOutcome::Continue
-    }
-}
-
-/// Format an entry's stored RFC3339 timestamp as local `YYYY-MM-DD HH:MM` for
-/// display, falling back to the raw string when it doesn't parse.
-fn format_ts(entry: &ErrorLogEntry) -> String {
-    match DateTime::parse_from_rfc3339(&entry.ts) {
-        Ok(dt) => dt
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string(),
-        Err(_) => entry.ts.clone(),
-    }
-}
-
-/// Word-wrap `text` to `width` columns, hard-splitting any single word longer
-/// than the width so nothing overflows. Always returns at least one (possibly
-/// empty) line.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if word.chars().count() > width {
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-            }
-            let mut chunk = String::new();
-            for ch in word.chars() {
-                if chunk.chars().count() == width {
-                    lines.push(std::mem::take(&mut chunk));
-                }
-                chunk.push(ch);
-            }
-            current = chunk;
-            continue;
-        }
-        let sep = usize::from(!current.is_empty());
-        if current.chars().count() + sep + word.chars().count() > width {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-        } else {
-            if sep == 1 {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-    }
-    lines.push(current);
-    lines
 }
 
 /// Build the full list of rendered lines for the log, newest first. Each entry
@@ -161,8 +48,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'static>> {
     if rows.is_empty() {
         return vec![Line::from(Span::styled(
-            "No errors logged.",
-            Style::default().fg(Color::DarkGray),
+            EMPTY,
+            Style::default().fg(palette().ansi_dark_gray),
         ))];
     }
     let msg_width = width.saturating_sub(MESSAGE_INDENT).max(1);
@@ -171,10 +58,10 @@ pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'st
         let marker = if *unread { "● " } else { "  " };
         let marker_style = if *unread {
             Style::default()
-                .fg(Color::Rgb(210, 120, 120))
+                .fg(palette().error_marker)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         };
         let ts = format_ts(entry);
         let msg_lines = wrap(&entry.message, msg_width);
@@ -182,13 +69,13 @@ pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'st
             if i == 0 {
                 out.push(Line::from(vec![
                     Span::styled(marker.to_string(), marker_style),
-                    Span::styled(format!("{ts}  "), Style::default().fg(Color::DarkGray)),
-                    Span::styled(chunk.clone(), Style::default().fg(Color::White)),
+                    Span::styled(format!("{ts}  "), Style::default().fg(palette().ansi_dark_gray)),
+                    Span::styled(chunk.clone(), Style::default().fg(palette().ansi_white)),
                 ]));
             } else {
                 out.push(Line::from(vec![
                     Span::raw(" ".repeat(MESSAGE_INDENT)),
-                    Span::styled(chunk.clone(), Style::default().fg(Color::White)),
+                    Span::styled(chunk.clone(), Style::default().fg(palette().ansi_white)),
                 ]));
             }
         }
@@ -202,7 +89,7 @@ pub fn render(f: &mut Frame, area: Rect, viewer: &mut Viewer) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(palette().ansi_yellow))
         .title(" Error log ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -216,13 +103,13 @@ pub fn render(f: &mut Frame, area: Rect, viewer: &mut Viewer) {
     viewer.clamp(lines.len(), visible);
 
     f.render_widget(
-        Paragraph::new(lines).scroll((viewer.scroll as u16, 0)),
+        Paragraph::new(lines).scroll((viewer.scroll() as u16, 0)),
         body,
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑/↓ scroll · c clear · esc close",
-            Style::default().fg(Color::DarkGray),
+            HINT,
+            Style::default().fg(palette().ansi_dark_gray),
         ))),
         rows[1],
     );
@@ -231,7 +118,7 @@ pub fn render(f: &mut Frame, area: Rect, viewer: &mut Viewer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn entry(ts: &str, message: &str) -> ErrorLogEntry {
         ErrorLogEntry {
@@ -255,6 +142,35 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The viewer (border, title, unread and read entries with their
+    /// timestamps and wrapped messages, the footer) and its empty state are
+    /// readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut viewer = Viewer::new(vec![
+                (
+                    entry(
+                        "2026-09-26T14:02:00.000000000Z",
+                        "merge failed: PR #9 is not mergeable: the merge commit cannot be cleanly created",
+                    ),
+                    true,
+                ),
+                (entry("2026-09-25T17:40:00.000000000Z", "dispatch failed: workspace busy"), false),
+            ]);
+            let mut term = Terminal::new(TestBackend::new(70, 16)).unwrap();
+            term.draw(|f| render(f, f.area(), &mut viewer)).unwrap();
+            crate::theme::assert_light_readable("error-log", term.backend().buffer());
+
+            let mut empty = Viewer::new(Vec::new());
+            let mut term = Terminal::new(TestBackend::new(70, 16)).unwrap();
+            term.draw(|f| render(f, f.area(), &mut empty)).unwrap();
+            crate::theme::assert_light_readable("error-log-empty", term.backend().buffer());
+        });
     }
 
     #[test]
@@ -313,16 +229,16 @@ mod tests {
     #[test]
     fn keys_scroll_close_and_request_clear() {
         let mut v = Viewer::new(vec![(entry("2026-09-26T14:02:00Z", "boom"), true)]);
-        assert_eq!(v.handle_key(key(KeyCode::Down)), ErrorLogOutcome::Continue);
+        assert_eq!(handle_key(&mut v, key(KeyCode::Down)), ErrorLogOutcome::Continue);
         assert_eq!(v.scroll(), 1);
-        assert_eq!(v.handle_key(key(KeyCode::Up)), ErrorLogOutcome::Continue);
+        assert_eq!(handle_key(&mut v, key(KeyCode::Up)), ErrorLogOutcome::Continue);
         assert_eq!(v.scroll(), 0);
-        assert_eq!(v.handle_key(key(KeyCode::Char('c'))), ErrorLogOutcome::Clear);
+        assert_eq!(handle_key(&mut v, key(KeyCode::Char('c'))), ErrorLogOutcome::Clear);
         // The viewer does not clear itself; the caller does after the IO.
         assert_eq!(v.rows.len(), 1);
         v.clear();
         assert!(v.rows.is_empty());
-        assert_eq!(v.handle_key(key(KeyCode::Esc)), ErrorLogOutcome::Close);
-        assert_eq!(v.handle_key(key(KeyCode::Char('q'))), ErrorLogOutcome::Close);
+        assert_eq!(handle_key(&mut v, key(KeyCode::Esc)), ErrorLogOutcome::Close);
+        assert_eq!(handle_key(&mut v, key(KeyCode::Char('q'))), ErrorLogOutcome::Close);
     }
 }

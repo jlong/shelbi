@@ -34,54 +34,20 @@ use crate::panel::{
     BACK_BTN_WIDTH, PAD,
 };
 
+// The rows, their activation and the effects are the shared panel
+// navigation (`shelbi_app::workspace_panel`), so the TUI and the desktop
+// navigate the workspace panel by one state machine. The TUI asks for no
+// user-shell row (the desktop's), so `WsEffect::ToggleShell` never comes
+// out of it.
+use shelbi_app::workspace_panel::{
+    activate_row, description_effect, panel_rows, WsPanelShape, WsRow as PanelRow,
+    WsSwitch as SwitchItem,
+};
 /// Which content view the workspace interface is currently showing. Drives the
 /// nav highlight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WsView {
-    /// The workspace's agent session (the default).
-    Agent,
-    Diff,
-    Editor,
-}
-
-/// A view-switcher entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SwitchItem {
-    Agent,
-    Diff,
-    Editor,
-}
-
-/// One keyboard-navigable row. The task-info block is not a nav row (reached by
-/// click / `m`), so the nav cycle stays stable regardless of description wrap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PanelRow {
-    Back,
-    /// The `More` link in the task-info block — opens the full task-description
-    /// popover. Present only when the task has a body.
-    More,
-    Folder,
-    Switch(SwitchItem),
-}
-
+pub use shelbi_app::workspace_panel::WsSwitch as WsView;
 /// What the host loop should do after a panel interaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WsEffect {
-    None,
-    /// Back button / Esc: return to the main nav sidebar, leaving the workspace
-    /// interface's content sessions loaded.
-    Back,
-    /// Reveal the workspace worktree folder in the OS file manager.
-    RevealFolder,
-    /// Bind the workspace's agent session into the content slot.
-    ShowAgent,
-    /// Ensure + bind the diff session for the worktree.
-    ShowDiff,
-    /// Ensure + bind the editor session for the worktree.
-    ShowEditor,
-    /// Open the full task-description popover over the main area.
-    ShowDescription,
-}
+pub use shelbi_app::workspace_panel::WsEffect;
 
 /// The status label + colour shown beside the back button, derived from the
 /// task's column/state by the host (`IN PROGRESS` yellow, `READY FOR REVIEW`
@@ -150,21 +116,16 @@ impl WorkspacePanel {
         panel
     }
 
-    /// The keyboard-navigable rows, top to bottom.
+    /// The keyboard-navigable rows, top to bottom: Back, `More` (only with a
+    /// body, in reading order with the task-info block it belongs to), the
+    /// folder, then the view switch.
     fn rows(&self) -> Vec<PanelRow> {
-        let mut rows = vec![PanelRow::Back];
-        // `More` sits right under the back button, in reading order with the
-        // task-info block it belongs to, and only when there's a body to open.
-        if !self.description.trim().is_empty() {
-            rows.push(PanelRow::More);
-        }
-        rows.extend([
-            PanelRow::Folder,
-            PanelRow::Switch(SwitchItem::Agent),
-            PanelRow::Switch(SwitchItem::Diff),
-            PanelRow::Switch(SwitchItem::Editor),
-        ]);
-        rows
+        panel_rows(&WsPanelShape {
+            has_body: !self.description.trim().is_empty(),
+            folder: true,
+            switches: vec![SwitchItem::Agent, SwitchItem::Diff, SwitchItem::Editor],
+            shell: false,
+        })
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].
@@ -191,20 +152,7 @@ impl WorkspacePanel {
     }
 
     fn step(&mut self, delta: i32) {
-        let n = self.rows().len();
-        if n == 0 {
-            return;
-        }
-        let idx = self.selected.min(n - 1);
-        self.selected = if delta < 0 {
-            if idx == 0 {
-                n - 1
-            } else {
-                idx - 1
-            }
-        } else {
-            (idx + 1) % n
-        };
+        self.selected = shelbi_app::review::step_selection(self.selected, self.rows().len(), delta);
     }
 
     /// Activate the selected row (Enter / Space).
@@ -213,36 +161,20 @@ impl WorkspacePanel {
         let Some(row) = rows.get(self.selected) else {
             return WsEffect::None;
         };
-        self.activate_row(row.clone())
+        self.activate_row(*row)
     }
 
     fn activate_row(&mut self, row: PanelRow) -> WsEffect {
-        match row {
-            PanelRow::Back => WsEffect::Back,
-            PanelRow::More => self.request_description(),
-            PanelRow::Folder => WsEffect::RevealFolder,
-            PanelRow::Switch(SwitchItem::Agent) => {
-                self.active_view = WsView::Agent;
-                WsEffect::ShowAgent
-            }
-            PanelRow::Switch(SwitchItem::Diff) => {
-                self.active_view = WsView::Diff;
-                WsEffect::ShowDiff
-            }
-            PanelRow::Switch(SwitchItem::Editor) => {
-                self.active_view = WsView::Editor;
-                WsEffect::ShowEditor
-            }
+        let (effect, view) = activate_row(row, !self.description.trim().is_empty());
+        if let Some(view) = view {
+            self.active_view = view;
         }
+        effect
     }
 
     /// Ask to open the task-description popover (the `More` link / `m` key).
     pub fn request_description(&self) -> WsEffect {
-        if self.description.trim().is_empty() {
-            WsEffect::None
-        } else {
-            WsEffect::ShowDescription
-        }
+        description_effect(!self.description.trim().is_empty())
     }
 
     /// Map a click at (`column`, `row`) to an effect.
@@ -262,7 +194,7 @@ impl WorkspacePanel {
             if in_rect(rect, column, row) {
                 if let Some(r) = rows.get(idx) {
                     self.selected = idx;
-                    return self.activate_row(r.clone());
+                    return self.activate_row(*r);
                 }
             }
         }
@@ -442,7 +374,7 @@ fn switch_entry(app: &WorkspacePanel, item: SwitchItem) -> NavEntry {
 mod tests {
     use super::*;
     use crate::panel::BACK_BUTTON_LINE;
-    use crate::theme::{ACCENT_CYAN, SELECTION_BG, STATUS_YELLOW};
+    use crate::theme::palette;
     use ratatui::{backend::TestBackend, Terminal};
 
     const BODY: &str = "## Summary\n\nWarm the application cache during startup so the first request can reuse the same data as subsequent requests.\n\n## Acceptance criteria\n\n- Initialize the cache once before accepting traffic.";
@@ -450,7 +382,7 @@ mod tests {
     fn in_progress() -> WsStatus {
         WsStatus {
             text: "IN PROGRESS".into(),
-            color: STATUS_YELLOW,
+            color: palette().yellow,
         }
     }
 
@@ -493,6 +425,53 @@ mod tests {
             .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
     }
 
+    /// The panel in each status color (in progress, ready for review, done,
+    /// a custom status) and with the back button, More, and a switch
+    /// selected, plus a status line, is readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            let statuses = [
+                ("in-progress", "IN PROGRESS", palette().yellow),
+                ("review", "READY FOR REVIEW", palette().cyan),
+                ("done", "DONE", palette().green),
+                ("custom", "BLOCKED", palette().muted),
+            ];
+            for (i, (name, text, color)) in statuses.into_iter().enumerate() {
+                let mut app = WorkspacePanel::new(
+                    "/Users/j/my-project/.shelbi/wt/alpha",
+                    "Vim".to_string(),
+                    "Developer".to_string(),
+                    "Cold-start cache",
+                    BODY,
+                    WsStatus {
+                        text: text.into(),
+                        color,
+                    },
+                );
+                app.status_line = "agent restarted".into();
+                let rows = app.rows();
+                app.selected = [
+                    PanelRow::Back,
+                    PanelRow::More,
+                    PanelRow::Folder,
+                    PanelRow::Switch(SwitchItem::Diff),
+                ]
+                .iter()
+                .filter_map(|want| rows.iter().position(|r| r == want))
+                .nth(i)
+                .unwrap_or(0);
+                let mut term = Terminal::new(TestBackend::new(44, 28)).unwrap();
+                term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+                crate::theme::assert_light_readable(
+                    &format!("workspace-panel-{name}"),
+                    term.backend().buffer(),
+                );
+            }
+        });
+    }
+
     #[test]
     fn renders_status_task_info_worktree_and_switches() {
         let mut app = panel();
@@ -519,7 +498,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let y = BACK_BUTTON_LINE;
         let x = (0..buf.area.width)
-            .find(|&x| buf[(x, y)].symbol() == "I" && buf[(x, y)].fg == STATUS_YELLOW)
+            .find(|&x| buf[(x, y)].symbol() == "I" && buf[(x, y)].fg == palette().yellow)
             .expect("the 'IN PROGRESS' I should be the status yellow");
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "status is bold");
         // The back-arrow glyph shares the row.
@@ -537,7 +516,7 @@ mod tests {
             "b",
             WsStatus {
                 text: "READY FOR REVIEW".into(),
-                color: ACCENT_CYAN,
+                color: palette().cyan,
             },
         );
         let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
@@ -545,7 +524,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let y = BACK_BUTTON_LINE;
         let found = (0..buf.area.width)
-            .any(|x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == ACCENT_CYAN);
+            .any(|x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == palette().cyan);
         assert!(found, "the status header carries its configured colour");
     }
 
@@ -562,9 +541,9 @@ mod tests {
         // main sidebar); the gutters stay transparent.
         assert_eq!(buf[(0, agent_y)].bg, Color::Reset, "left gutter is transparent");
         assert_eq!(buf[(width - 1, agent_y)].bg, Color::Reset, "right gutter is transparent");
-        assert_eq!(buf[(1, agent_y)].bg, SELECTION_BG, "the fill starts one column in");
+        assert_eq!(buf[(1, agent_y)].bg, palette().selection, "the fill starts one column in");
         for x in (width - 4)..(width - 1) {
-            assert_eq!(buf[(x, agent_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
+            assert_eq!(buf[(x, agent_y)].bg, palette().selection, "right-edge padding carries the fill, col {x}");
         }
     }
 
@@ -600,7 +579,7 @@ mod tests {
         let more_y = row_y(&rows, "More") as u16;
         let more_x = rows[more_y as usize].find("More").unwrap() as u16;
         let cell = &buf[(more_x, more_y)];
-        assert_eq!(cell.bg, SELECTION_BG, "focused More carries the selection fill");
+        assert_eq!(cell.bg, palette().selection, "focused More carries the selection fill");
         assert_eq!(cell.fg, Color::White, "focused More brightens to white");
         assert!(cell.modifier.contains(Modifier::BOLD), "focused More is bold");
     }

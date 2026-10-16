@@ -74,6 +74,91 @@ It deliberately omits a `version` stanza. Homebrew scans the version out of the
 runs on every formula PR) fails the formula when an explicit `version` merely
 repeats it.
 
+## Desktop App Cask
+
+The tap also carries the desktop app as a cask, `Casks/shelbi-desktop.rb`:
+
+```bash
+brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop
+brew upgrade --cask shelbi-desktop    # what the app's update notice shows
+```
+
+Name both. The cask depends on the formula, but current Homebrew only loads a
+third-party tap's formulae and casks that were named on the command line (or
+trusted with `brew trust --tap jlong/shelbi`), so `brew install --cask
+jlong/shelbi/shelbi-desktop` alone stops with "Refusing to load formula
+jlong/shelbi/shelbi from untrusted tap".
+
+The release workflow's `desktop-release` job builds, signs, notarizes, and
+staples `Shelbi.app` with `desktop/scripts/bundle.sh` and attaches
+`Shelbi-<version>-arm64.zip` and `Shelbi-<version>-arm64.zip.sha256` to the
+GitHub release. When (and only when) that build was notarized, the
+`homebrew-pr` job runs `scripts/release/update-homebrew-cask.rb` to rewrite
+the cask's `version` and `sha256` in the same tap PR that bumps the formula,
+creating `Casks/` on the first run. An un-notarized build never reaches the
+cask, so the tap only ever points at an app Gatekeeper accepts.
+
+The generated cask:
+
+- downloads `https://github.com/jlong/shelbi/releases/download/v#{version}/Shelbi-#{version}-arm64.zip`
+  and verifies its SHA256
+- `depends_on formula: "jlong/shelbi/shelbi"` (the app is a client of the CLI
+  and its daemon, and requires the same version), `depends_on arch: :arm64`,
+  and `depends_on macos: :sequoia` (Sequoia or later; current Homebrew deprecates
+  the `">= :sequoia"` string form)
+- installs `app "Shelbi.app"`
+- `zap`s the app's own files: `~/.shelbi/projects/*/desktop-window.json` (each
+  project's window frame) and `~/.shelbi/desktop-update-check.json` (the
+  once-a-day update check). Everything else under `~/.shelbi` belongs to the
+  formula and is left alone.
+- has a `livecheck` on the latest GitHub release.
+
+Signing needs five secrets (`MACOS_CERTIFICATE_P12`,
+`MACOS_CERTIFICATE_PASSWORD`, `NOTARY_KEY_P8`, `NOTARY_KEY_ID`,
+`NOTARY_ISSUER_ID`); [docs/release.md](../release.md#secrets) says what each
+holds. Until all five exist the job builds an unsigned app with a warning,
+stays green, and the cask is not touched.
+
+After the tap PR merges, `desktop-verify-install` taps on a clean `macos-15`
+runner, installs the formula and the cask, checks `spctl --assess` and the
+stapled ticket, clears the quarantine (a quarantined first launch waits on
+macOS's "downloaded from the Internet" confirmation), and launches the
+installed app with `open -W --stdout <file> -a /Applications/Shelbi.app --args
+--print-version`, which prints `Shelbi <version>` and the `shelbi` it found
+(`shelbi CLI: /opt/homebrew/bin/shelbi <version> (matches)`) and exits.
+
+**Tap CI.** The tap's `tap-ci.yml` only triggers on `Formula/**` and only
+audits the formula. A release PR that bumps both still runs it (the formula
+changed), but the cask itself goes unaudited. To cover it, add `Casks/**` to
+both `paths` filters and these steps to the `test` job:
+
+```yaml
+      - name: Audit cask
+        if: hashFiles('Casks/shelbi-desktop.rb') != ''
+        run: brew audit --strict --online --cask jlong/shelbi/shelbi-desktop
+
+      - name: Install cask
+        if: hashFiles('Casks/shelbi-desktop.rb') != ''
+        run: brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop
+```
+
+### Building and testing the cask by hand
+
+```bash
+# A signed + notarized build (see desktop/README.md for the credentials):
+desktop/scripts/bundle.sh
+
+# Generate the cask into a scratch copy of the tap, pointing at the local zip:
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' desktop/Cargo.toml | head -1)
+ruby scripts/release/update-homebrew-cask.rb \
+  --tap-dir /path/to/homebrew-shelbi-copy \
+  --version "$version" \
+  --sha256-file "desktop/target/bundle/Shelbi-$version-arm64.zip.sha256" \
+  --url "file://$PWD/desktop/target/bundle/Shelbi-$version-arm64.zip"
+```
+
+`--url` is for local testing only; the release job never passes it.
+
 ## Unresolved Naming Decision
 
 The source plan leaves final ownership open: `jlong/*` vs `shelbi/*`. This

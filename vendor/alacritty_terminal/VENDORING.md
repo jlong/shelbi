@@ -38,7 +38,13 @@ vendored version.
 2. **`src/term/mod.rs` — `TabStops` made `pub`** so `Term::tabs()` can expose
    it. Its fields stay private; callers read stops via its `Index<Column>`
    impl.
-3. **`Cargo.toml` — removed the `[[test]] name = "ref"` target**, and the
+3. **`src/selection.rs` — `Selection::anchor()`** (search `SHELBI FORK`): a
+   read-only accessor for the point a selection started at. `shelbi-term`
+   keeps the user's selection in `Term::selection` (so it rotates with
+   scrolling and clears when the text under it is erased) and needs the
+   rotated anchor to re-anchor a drag that crosses back over its start.
+   Additive, no behavior change.
+4. **`Cargo.toml` — removed the `[[test]] name = "ref"` target**, and the
    `tests/` directory is not vendored. Upstream's reference suite is backed by a
    large recording tree (`tests/ref/*.recording`) that Shelbi does not run. The
    library builds unaffected. `src/grid/tests.rs` (a `#[cfg(test)]` unit module)

@@ -16,8 +16,7 @@ use std::collections::HashMap;
 ///
 /// `Issues`, `Activity`, and `Machines` are native (in-process) views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
-/// orchestrator chat, a workspace agent, a legacy spawned agent, or a
-/// review editor/diff session.
+/// orchestrator chat, a workspace agent, or a review editor/diff session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
     Issues,
@@ -77,7 +76,8 @@ pub enum Focus {
 pub enum Overlay {
     /// The command palette.
     Palette,
-    /// Confirm approving (accepting) a review task.
+    /// Pick the review slot to load a queued review task onto ("Load for
+    /// review").
     ReviewConfirm { task_id: String },
     /// Collect a reason for rejecting a review task.
     RejectReason { task_id: String },
@@ -85,6 +85,8 @@ pub enum Overlay {
     ErrorLog,
     /// The first-run Zen Mode intro.
     ZenIntro,
+    /// The add-project form.
+    AddProject,
 }
 
 /// One client's view of Shelbi. Each attached UI (and each desktop window)
@@ -257,6 +259,13 @@ impl ClientState {
         self.sidebar_selection = (self.sidebar_selection + 1).min(max);
     }
 
+    /// Select the `index`-th selectable row directly (a click), clamped like
+    /// [`select_down`](Self::select_down) so it never points past the last of
+    /// `row_count` rows.
+    pub fn select(&mut self, index: usize, row_count: usize) {
+        self.sidebar_selection = index.min(row_count.saturating_sub(1));
+    }
+
     /// Clamp the selection into range after the sidebar's row list changes
     /// (e.g. a workspace appeared or a review task cleared).
     pub fn clamp_selection(&mut self, row_count: usize) {
@@ -406,6 +415,12 @@ mod tests {
         // Row list shrinks (a workspace vanished): selection clamps in.
         c.clamp_selection(2);
         assert_eq!(c.sidebar_selection(), 1);
+
+        // A click selects a row directly, clamped to the list.
+        c.select(1, 5);
+        assert_eq!(c.sidebar_selection(), 1);
+        c.select(9, 5);
+        assert_eq!(c.sidebar_selection(), 4);
 
         // An empty row list parks the selection at 0.
         c.clamp_selection(0);

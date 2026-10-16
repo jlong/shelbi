@@ -178,8 +178,8 @@ mod tests {
     #[test]
     fn default_keymap_a_resets_filter() {
         let (mut app, km) = default_app_and_keymaps();
-        app.filter.zen = true;
-        app.filter.workspaces = true;
+        app.filter.toggle_kind(crate::activity::ActivityKind::Zen);
+        app.filter.toggle_kind(crate::activity::ActivityKind::Workspaces);
         app.scroll = 9;
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('a')), &km);
         assert!(app.filter.is_all(), "a should clear both pills");
@@ -189,9 +189,9 @@ mod tests {
     #[test]
     fn default_keymap_z_toggles_zen_filter_not_zen_mode() {
         let (mut app, km) = default_app_and_keymaps();
-        assert!(!app.filter.zen);
+        assert!(!app.filter.has_kind(crate::activity::ActivityKind::Zen));
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('z')), &km);
-        assert!(app.filter.zen, "plain z toggles the Zen filter pill");
+        assert!(app.filter.has_kind(crate::activity::ActivityKind::Zen), "plain z toggles the Zen filter pill");
         // Plain `z` must NOT touch Zen Mode (status line would say so).
         assert!(
             !app.status_line.starts_with("zen"),
@@ -226,7 +226,7 @@ mod tests {
         let (mut app, km) = default_app_and_keymaps();
         handle_activity_key(&mut app, ev(KeyCode::Char('z'), KeyModifiers::ALT), &km);
         assert!(
-            !app.filter.zen,
+            !app.filter.has_kind(crate::activity::ActivityKind::Zen),
             "Alt+Z must NOT toggle the activity Zen filter"
         );
         assert_eq!(
@@ -243,12 +243,12 @@ mod tests {
         let (mut app, km) = default_app_and_keymaps();
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('w')), &km);
         assert!(
-            app.filter.workspaces,
+            app.filter.has_kind(crate::activity::ActivityKind::Workspaces),
             "w should flip the workspaces pill on"
         );
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('w')), &km);
         assert!(
-            !app.filter.workspaces,
+            !app.filter.has_kind(crate::activity::ActivityKind::Workspaces),
             "w should flip the workspaces pill off"
         );
     }
@@ -298,14 +298,14 @@ mod tests {
         let mut app = ActivityApp::new("demo");
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('z')), &km);
         assert!(
-            !app.filter.zen,
+            !app.filter.has_kind(crate::activity::ActivityKind::Zen),
             "plain z must not toggle the Zen filter when remapped to shift-z"
         );
 
         // Shift+Z fires the action.
         handle_activity_key(&mut app, ev(KeyCode::Char('Z'), KeyModifiers::SHIFT), &km);
         assert!(
-            app.filter.zen,
+            app.filter.has_kind(crate::activity::ActivityKind::Zen),
             "shift-z override must drive the Zen filter toggle"
         );
     }

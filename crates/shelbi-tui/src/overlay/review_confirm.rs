@@ -18,110 +18,26 @@
 //! fold the key/mouse decision and its application into one step so both callers
 //! share the driver, not just the renderer.
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use crate::theme::palette;
 
-/// One review-tagged slot as the dialog sees it: the workspace name and, when
-/// occupied, the title of the task currently loaded on it (shown in quotes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Slot {
-    pub name: String,
-    /// The occupying task's title, or `None` when the slot is free.
-    pub occupant: Option<String>,
-}
+// The dialog's state machine is shared with the desktop app
+// (`shelbi_app::overlay::review_confirm`).
+pub use shelbi_app::overlay::review_confirm::{ConfirmFocus as Focus, Outcome, Slot, Step};
+use shelbi_app::overlay::review_confirm::{self as shared, CANCEL_LABEL, LOAD_LABEL};
 
-/// Which control currently has focus. In the picker the list and the two
-/// buttons all take focus; the confirm variant only uses the buttons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    List,
-    Load,
-    Cancel,
-}
-
-/// What a key press means. Split from any event loop so the decision table is
-/// unit-testable. `Activate` resolves against the focused control; `Up`/`Down`
-/// move the list selection; `Focus*`/`Toggle*` move the highlight without
-/// closing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Decision {
-    Load,
-    Cancel,
-    Activate,
-    Up,
-    Down,
-    FocusLoad,
-    FocusCancel,
-    ToggleFocus,
-    Ignore,
-}
-
-/// Map a key to a decision. With no slots (`has_slots` false) the popup is
-/// informational, so every key dismisses (cancel) and nothing loads. `is_picker`
-/// distinguishes the multi-slot picker (Up/Down navigate the list) from the
-/// single-slot confirm.
-fn decide(code: KeyCode, has_slots: bool, is_picker: bool) -> Decision {
-    if !has_slots {
-        return Decision::Cancel;
-    }
-    match code {
-        KeyCode::Char('l') | KeyCode::Char('L') => Decision::Load,
-        KeyCode::Char('c')
-        | KeyCode::Char('C')
-        | KeyCode::Char('n')
-        | KeyCode::Char('N')
-        | KeyCode::Char('q')
-        | KeyCode::Esc => Decision::Cancel,
-        // `y` is a confirm shortcut only in the yes/no variant; in the picker
-        // it's ambiguous (which slot?), so it's ignored there.
-        KeyCode::Char('y') | KeyCode::Char('Y') if !is_picker => Decision::Load,
-        KeyCode::Enter | KeyCode::Char(' ') => Decision::Activate,
-        KeyCode::Up | KeyCode::Char('k') if is_picker => Decision::Up,
-        KeyCode::Down | KeyCode::Char('j') if is_picker => Decision::Down,
-        KeyCode::Left => Decision::FocusLoad,
-        KeyCode::Right => Decision::FocusCancel,
-        KeyCode::Tab | KeyCode::BackTab => Decision::ToggleFocus,
-        _ => Decision::Ignore,
-    }
-}
-
-/// The dialog's resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// Load the review task onto this slot (the workspace name).
-    Load(String),
-    Cancel,
-}
-
-/// Result of feeding one key/click into the dialog: keep it open, or resolve it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Step {
-    Continue,
-    Done(Outcome),
-}
-
-/// The default no-slots line: the project declares no `review`-tagged workspace.
-const NO_WORKSPACE: &str = "No review workspace is configured.";
-
-/// The interactive dialog state.
+/// The interactive dialog: the shared state machine plus the cell geometry a
+/// click hit-tests against.
+#[derive(Debug, Clone)]
 pub struct Dialog {
-    title: String,
-    slots: Vec<Slot>,
-    /// Highlighted slot in the picker (always a valid index when `slots` is
-    /// non-empty; ignored for the confirm/informational variants).
-    selected: usize,
-    focus: Focus,
-    /// The line shown in the no-slots informational variant. `None` falls back
-    /// to [`NO_WORKSPACE`]; the single-process TUI overrides it with "every
-    /// review slot is busy" when slots exist but none are free
-    /// (`rt-tui-review-load-queued`). Unused by the slot-bearing variants.
-    empty_message: Option<String>,
+    inner: shared::Dialog,
 }
 
 impl Dialog {
@@ -129,13 +45,8 @@ impl Dialog {
     /// Up/Down/Enter act on slots immediately); the confirm starts on
     /// `[ Load ]`.
     pub fn new(title: impl Into<String>, slots: Vec<Slot>) -> Self {
-        let is_picker = slots.len() > 1;
         Dialog {
-            title: title.into(),
-            slots,
-            selected: 0,
-            focus: if is_picker { Focus::List } else { Focus::Load },
-            empty_message: None,
+            inner: shared::Dialog::new(title, slots),
         }
     }
 
@@ -145,50 +56,26 @@ impl Dialog {
     /// of `rt-tui-review-load-queued`).
     pub fn informational(title: impl Into<String>, message: impl Into<String>) -> Self {
         Dialog {
-            title: title.into(),
-            slots: Vec::new(),
-            selected: 0,
-            focus: Focus::Load,
-            empty_message: Some(message.into()),
+            inner: shared::Dialog::informational(title, message),
         }
     }
 
     pub fn is_picker(&self) -> bool {
-        self.slots.len() > 1
+        self.inner.is_picker()
     }
 
     pub fn has_slots(&self) -> bool {
-        !self.slots.is_empty()
+        self.inner.has_slots()
     }
 
     /// Feed one key press. Applies navigation/focus changes in place and
     /// returns [`Step::Done`] when the dialog resolves (Load / Cancel).
     pub fn handle_key(&mut self, code: KeyCode) -> Step {
-        match decide(code, self.has_slots(), self.is_picker()) {
-            Decision::Load => Step::Done(self.load_selected()),
-            Decision::Cancel => Step::Done(Outcome::Cancel),
-            Decision::Activate => Step::Done(self.activate()),
-            Decision::Up => {
-                self.move_selected(true);
-                Step::Continue
-            }
-            Decision::Down => {
-                self.move_selected(false);
-                Step::Continue
-            }
-            Decision::FocusLoad => {
-                self.focus = Focus::Load;
-                Step::Continue
-            }
-            Decision::FocusCancel => {
-                self.focus = Focus::Cancel;
-                Step::Continue
-            }
-            Decision::ToggleFocus => {
-                self.toggle_focus();
-                Step::Continue
-            }
-            Decision::Ignore => Step::Continue,
+        match crate::keymap::chord_from_event(KeyEvent::new(code, KeyModifiers::NONE)) {
+            Some(chord) => self.inner.handle_key(chord),
+            // A key outside the chord vocabulary still dismisses the no-slots
+            // report, as any key does.
+            None => self.inner.dismiss_if_empty(),
         }
     }
 
@@ -198,51 +85,10 @@ impl Dialog {
             return Step::Done(Outcome::Cancel);
         }
         match hit_test(self, area, col, row) {
-            Some(Hit::Slot(i)) => {
-                self.selected = i;
-                self.focus = Focus::List;
-                Step::Continue
-            }
-            Some(Hit::Load) => Step::Done(self.load_selected()),
-            Some(Hit::Cancel) => Step::Done(Outcome::Cancel),
+            Some(Hit::Slot(i)) => self.inner.click_slot(i),
+            Some(Hit::Load) => self.inner.click_load(),
+            Some(Hit::Cancel) => self.inner.click_cancel(),
             None => Step::Continue,
-        }
-    }
-
-    /// Move the list highlight, saturating at the ends.
-    fn move_selected(&mut self, up: bool) {
-        if self.slots.is_empty() {
-            return;
-        }
-        if up {
-            self.selected = self.selected.saturating_sub(1);
-        } else if self.selected + 1 < self.slots.len() {
-            self.selected += 1;
-        }
-        self.focus = Focus::List;
-    }
-
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Load => Focus::Cancel,
-            Focus::Cancel | Focus::List => Focus::Load,
-        };
-    }
-
-    /// Resolve an `Activate` (Enter/Space) against the current focus. Focus on
-    /// the list activates the highlighted slot (so Enter on a row loads it).
-    fn activate(&self) -> Outcome {
-        match self.focus {
-            Focus::Cancel => Outcome::Cancel,
-            Focus::Load | Focus::List => self.load_selected(),
-        }
-    }
-
-    /// The chosen slot name, or Cancel when there are none.
-    fn load_selected(&self) -> Outcome {
-        match self.slots.get(self.selected) {
-            Some(slot) => Outcome::Load(slot.name.clone()),
-            None => Outcome::Cancel,
         }
     }
 
@@ -276,7 +122,7 @@ fn layout(inner: Rect, dialog: &Dialog) -> DialogLayout {
     let mut y = inner.y + 2;
     let mut slot_rows = Vec::new();
     if dialog.is_picker() {
-        for _ in &dialog.slots {
+        for _ in dialog.inner.slots() {
             slot_rows.push(y);
             y += 1;
         }
@@ -319,8 +165,6 @@ fn button_row(inner: Rect, y: u16) -> (Rect, Rect) {
     )
 }
 
-const LOAD_LABEL: &str = "[ Load ]";
-const CANCEL_LABEL: &str = "[ Cancel ]";
 
 /// Map a click at `(col, row)` to the control under it, or `None` for dead
 /// space. `area` is the whole popup area (the border is drawn on it; geometry is
@@ -350,51 +194,51 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Load for review ");
+        .border_style(Style::default().fg(palette().ansi_cyan))
+        .title(format!(" {} ", shared::TITLE));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let title_line = Line::from(Span::styled(
-        dialog.title.clone(),
+        dialog.inner.title().to_string(),
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD),
     ));
 
     let mut body: Vec<Line> = vec![title_line, Line::raw("")];
     if !dialog.has_slots() {
         body.push(Line::from(Span::styled(
-            dialog.empty_message.as_deref().unwrap_or(NO_WORKSPACE),
-            Style::default().fg(Color::Yellow),
+            dialog.inner.empty_message().to_string(),
+            Style::default().fg(palette().ansi_yellow),
         )));
         body.push(Line::raw(""));
-        body.push(Line::from(button("[ Dismiss ]", true)).centered());
+        body.push(Line::from(button(shared::DISMISS_LABEL, true)).centered());
         f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), inner);
         return;
     }
 
     if dialog.is_picker() {
-        for (i, slot) in dialog.slots.iter().enumerate() {
-            body.push(slot_line(slot, i == dialog.selected));
+        for (i, slot) in dialog.inner.slots().iter().enumerate() {
+            body.push(slot_line(slot, i == dialog.inner.selected()));
         }
         body.push(Line::raw(""));
     } else {
-        let slot = &dialog.slots[0];
+        let slot = &dialog.inner.slots()[0];
         body.push(Line::from(vec![
-            Span::styled("Load onto review workspace ", Style::default().fg(Color::Gray)),
+            Span::styled("Load onto review workspace ", Style::default().fg(palette().ansi_gray)),
             Span::styled(
                 slot.name.clone(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette().ansi_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("?", Style::default().fg(Color::Gray)),
+            Span::styled("?", Style::default().fg(palette().ansi_gray)),
         ]));
         if let Some(occ) = &slot.occupant {
             body.push(Line::from(Span::styled(
                 format!("(returns \"{occ}\" to the queue)"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             )));
         } else {
             body.push(Line::raw(""));
@@ -403,9 +247,9 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
 
     body.push(
         Line::from(vec![
-            button(LOAD_LABEL, dialog.focus == Focus::Load),
+            button(LOAD_LABEL, dialog.inner.focus() == Focus::Load),
             Span::raw("      "),
-            button(CANCEL_LABEL, dialog.focus == Focus::Cancel),
+            button(CANCEL_LABEL, dialog.inner.focus() == Focus::Cancel),
         ])
         .centered(),
     );
@@ -417,19 +261,16 @@ fn slot_line(slot: &Slot, selected: bool) -> Line<'static> {
     let marker = if selected { "> " } else { "  " };
     let name_style = if selected {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette().ansi_cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(palette().ansi_white)
     };
-    let state = match &slot.occupant {
-        Some(title) => format!("  (serving \"{title}\")"),
-        None => "  (free)".to_string(),
-    };
+    let state = slot.state_note();
     Line::from(vec![
         Span::raw(marker),
         Span::styled(slot.name.clone(), name_style),
-        Span::styled(state, Style::default().fg(Color::DarkGray)),
+        Span::styled(state, Style::default().fg(palette().ansi_dark_gray)),
     ])
 }
 
@@ -438,10 +279,10 @@ fn slot_line(slot: &Slot, selected: bool) -> Line<'static> {
 fn button(label: &str, focused: bool) -> Span<'_> {
     let style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette().ansi_cyan)
             .add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette().ansi_cyan)
     };
     Span::styled(label.to_string(), style)
 }
@@ -463,6 +304,46 @@ mod tests {
         Dialog::new("t", slots(n))
     }
 
+    /// The picker (slots, an occupied slot, the highlighted row, each
+    /// button focused), the one-slot confirm, and the informational variant
+    /// are readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let picker_with = |focus: KeyCode| {
+            let mut s = slots(3);
+            s[1].occupant = Some("Fix login".into());
+            let mut d = Dialog::new("t", s);
+            d.handle_key(KeyCode::Down);
+            d.handle_key(KeyCode::Down);
+            d.handle_key(focus);
+            d
+        };
+        // Up keeps the list focused (on the last slot after the two Downs);
+        // Left / Right focus the buttons.
+        let picker = {
+            let mut d = picker_with(KeyCode::Up);
+            d.handle_key(KeyCode::Down);
+            d
+        };
+        let (load, cancel) = (picker_with(KeyCode::Left), picker_with(KeyCode::Right));
+        let cases = [
+            ("review-confirm-picker", picker),
+            ("review-confirm-load", load),
+            ("review-confirm-cancel", cancel),
+            ("review-confirm-single", dialog(1)),
+            ("review-confirm-busy", Dialog::informational("Fix login", "Every review slot is busy.")),
+        ];
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, d) in &cases {
+                let mut term = Terminal::new(TestBackend::new(70, 16)).unwrap();
+                term.draw(|f| d.render(f, f.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
+    }
+
     #[test]
     fn slot_count_selects_the_confirm_or_picker_shape() {
         assert!(!dialog(0).is_picker());
@@ -474,14 +355,21 @@ mod tests {
     #[test]
     fn confirm_shortcut_keys_load_immediately_in_the_single_slot_variant() {
         for code in [KeyCode::Char('y'), KeyCode::Char('Y'), KeyCode::Char('l')] {
-            assert_eq!(decide(code, true, false), Decision::Load, "{code:?}");
+            assert_eq!(
+                dialog(1).handle_key(code),
+                Step::Done(Outcome::Load("review-1".into())),
+                "{code:?}"
+            );
         }
     }
 
     #[test]
     fn y_is_ignored_in_the_picker_but_l_still_loads() {
-        assert_eq!(decide(KeyCode::Char('y'), true, true), Decision::Ignore);
-        assert_eq!(decide(KeyCode::Char('l'), true, true), Decision::Load);
+        assert_eq!(dialog(2).handle_key(KeyCode::Char('y')), Step::Continue);
+        assert_eq!(
+            dialog(2).handle_key(KeyCode::Char('l')),
+            Step::Done(Outcome::Load("review-1".into()))
+        );
     }
 
     #[test]
@@ -492,23 +380,20 @@ mod tests {
             KeyCode::Char('n'),
             KeyCode::Char('q'),
         ] {
-            assert_eq!(decide(code, true, true), Decision::Cancel, "{code:?}");
+            assert_eq!(dialog(2).handle_key(code), Step::Done(Outcome::Cancel), "{code:?}");
         }
     }
 
     #[test]
     fn arrows_navigate_the_list_only_in_the_picker() {
-        assert_eq!(decide(KeyCode::Up, true, true), Decision::Up);
-        assert_eq!(decide(KeyCode::Down, true, true), Decision::Down);
-        assert_eq!(decide(KeyCode::Up, true, false), Decision::Ignore);
-        assert_eq!(decide(KeyCode::Down, true, false), Decision::Ignore);
-    }
-
-    #[test]
-    fn enter_and_space_activate_the_focus() {
-        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
-            assert_eq!(decide(code, true, true), Decision::Activate, "{code:?}");
-        }
+        let mut d = dialog(1);
+        assert_eq!(d.handle_key(KeyCode::Down), Step::Continue);
+        assert_eq!(d.handle_key(KeyCode::Up), Step::Continue);
+        assert_eq!(
+            d.handle_key(KeyCode::Enter),
+            Step::Done(Outcome::Load("review-1".into())),
+            "the confirm's arrows leave focus on Load"
+        );
     }
 
     #[test]
@@ -521,31 +406,24 @@ mod tests {
             KeyCode::Up,
             KeyCode::Esc,
             KeyCode::Char('x'),
+            // Outside the chord vocabulary, still a dismiss.
+            KeyCode::Null,
         ] {
-            assert_eq!(decide(code, false, false), Decision::Cancel, "{code:?}");
+            assert_eq!(dialog(0).handle_key(code), Step::Done(Outcome::Cancel), "{code:?}");
         }
     }
 
     #[test]
     fn handle_key_navigates_and_resolves() {
         let mut d = dialog(3);
-        // Down moves the highlight without resolving.
+        // Down moves the highlight without resolving; `l` loads it.
         assert_eq!(d.handle_key(KeyCode::Down), Step::Continue);
-        assert_eq!(d.selected, 1);
-        // `l` loads the highlighted slot.
         assert_eq!(
             d.handle_key(KeyCode::Char('l')),
             Step::Done(Outcome::Load("review-2".into()))
         );
-        // Esc cancels.
         let mut d = dialog(1);
         assert_eq!(d.handle_key(KeyCode::Esc), Step::Done(Outcome::Cancel));
-    }
-
-    #[test]
-    fn handle_key_on_no_slots_dismisses() {
-        let mut d = dialog(0);
-        assert_eq!(d.handle_key(KeyCode::Char('x')), Step::Done(Outcome::Cancel));
     }
 
     #[test]
@@ -556,7 +434,6 @@ mod tests {
         let d = Dialog::informational("Fix login", "Every review slot is busy.");
         assert!(!d.has_slots());
         assert!(!d.is_picker());
-        assert_eq!(d.empty_message.as_deref(), Some("Every review slot is busy."));
         for code in [KeyCode::Enter, KeyCode::Char('l'), KeyCode::Esc, KeyCode::Char('x')] {
             let mut d = Dialog::informational("t", "busy");
             assert_eq!(d.handle_key(code), Step::Done(Outcome::Cancel), "{code:?}");
@@ -576,7 +453,6 @@ mod tests {
     #[test]
     fn enter_on_cancel_focus_cancels() {
         let mut d = dialog(2);
-        // Tab from the list toggles to Load; a second resolves via Right→Cancel.
         d.handle_key(KeyCode::Right); // focus Cancel
         assert_eq!(d.handle_key(KeyCode::Enter), Step::Done(Outcome::Cancel));
     }
@@ -592,11 +468,9 @@ mod tests {
         let inner = Block::default().borders(Borders::ALL).inner(area);
         let l = layout(inner, &dialog(2));
 
-        // Clicking the second slot row selects it (Continue).
+        // Clicking the second slot row selects it (Continue), so Load loads it.
         let mut d = dialog(2);
         assert_eq!(d.handle_click(area, inner.x + 1, l.slot_rows[1]), Step::Continue);
-        assert_eq!(d.selected, 1);
-        // Clicking Load resolves to loading the selected slot.
         assert_eq!(
             d.handle_click(area, l.load.x, l.load.y),
             Step::Done(Outcome::Load("review-2".into()))

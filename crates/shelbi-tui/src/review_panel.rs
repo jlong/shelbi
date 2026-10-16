@@ -5,7 +5,7 @@
 //!
 //! - a **square back button** at the very top (a back-arrow glyph, no label)
 //!   that switches focus back to the dashboard window without tearing the
-//!   still-loaded review down — see [`PanelEffect::FocusDashboard`]. With the
+//!   still-loaded review down — see [`PanelEffect::Back`]. With the
 //!   **review status** (`Ready for review`) in the accent cyan on the button's
 //!   own row, two columns to its right,
 //! - **task info**: the task title (bold white) and the first few lines of the
@@ -41,73 +41,13 @@ use crate::panel::{
     render_status_line, render_task_info, reserve_status_area, NavEntry, BACK_BLOCK_H,
     BACK_BTN_WIDTH, PAD,
 };
-use crate::theme::{ACCENT_CYAN, ACTION_RED, PALETTE_GREEN};
+use crate::theme::palette;
 
-/// Which middle-pane view is currently shown. `Browser` isn't a persistent
-/// view — it opens the system browser — so only `Chat` / `Diff` / `Vim` are
-/// ever the *active* highlighted entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveView {
-    Chat,
-    Diff,
-    Vim,
-}
-
-/// The view-switcher entries. `Diff` sits directly below `Chat`; `Browser`
-/// renders only when a review URL is configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwitchItem {
-    Chat,
-    Diff,
-    Vim,
-    Browser,
-}
-
-/// One selectable panel row — the keyboard-navigable targets. The task-info
-/// block (title / description / `More`) is **not** a nav row: it is reached by
-/// click or the `m` key, so the nav cycle stays stable regardless of how the
-/// description wraps.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PanelRow {
-    /// The square back button at the top.
-    Back,
-    /// The `More` link in the task-info block — opens the full task-description
-    /// popover. Present only when the task has a body.
-    More,
-    /// The worktree folder name — click to reveal in the file manager.
-    Folder,
-    /// A middle-pane view switch.
-    Switch(SwitchItem),
-    Approve,
-    Reject,
-}
-
-/// What the host loop should do after a panel interaction. The panel never
-/// performs side effects itself so its logic stays unit-testable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PanelEffect {
-    /// Nothing to do (e.g. moved the selection).
-    None,
-    /// Switch the active window back to the dashboard, leaving the review
-    /// interface loaded.
-    FocusDashboard,
-    /// Swap the reviewer-chat pane into the content slot.
-    ShowChat,
-    /// Open the OS-configured diff tool over the review branch's changes.
-    ShowDiff,
-    /// Swap the editor pane into the content slot.
-    ShowVim,
-    /// Open the configured review URL in the system browser.
-    OpenBrowser,
-    /// Reveal the review worktree folder in the OS file manager.
-    RevealFolder,
-    /// Open the full task-description popover over the main area.
-    ShowDescription,
-    /// Accept: move the task out of review via the normal accept transition.
-    Approve,
-    /// Open the reject-reason overlay.
-    RejectPrompt,
-}
+// The panel's rows, effects and content views are the shared review model's
+// (`shelbi_app::review`), so the TUI and the desktop navigate the panel by one
+// table. `SwitchItem` keeps its local name for the view-switcher entries.
+pub use shelbi_app::review::{ActiveView, PanelEffect, PanelRow};
+pub use shelbi_app::view::ReviewSwitch as SwitchItem;
 
 /// The review panel's full state.
 pub struct ReviewPanel {
@@ -137,6 +77,10 @@ pub struct ReviewPanel {
     hit_targets: Vec<(Rect, usize)>,
     /// Screen rect of the `More` link, when rendered (task has a body).
     more_hit: Option<Rect>,
+    /// The slot's server, live from the task's sidebar row: its sub-state and
+    /// `machine:port`. `None` until the shell has a row for the task. The
+    /// desktop's Review view shows the same (`render_server`).
+    pub server: Option<(shelbi_app::view::ReviewState, Option<String>)>,
 }
 
 impl ReviewPanel {
@@ -161,6 +105,7 @@ impl ReviewPanel {
             spinner: 0,
             hit_targets: Vec::new(),
             more_hit: None,
+            server: None,
         };
         // Focus the Chat switch initially — it's the default middle-pane view.
         panel.selected = panel
@@ -175,24 +120,13 @@ impl ReviewPanel {
     /// description's wrapped height (the task-info block is drawn outside this
     /// list).
     fn rows(&self) -> Vec<PanelRow> {
-        let mut rows = vec![PanelRow::Back];
+        let mut switches = vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Editor];
+        if self.has_review_url {
+            switches.push(SwitchItem::Browser);
+        }
         // `More` sits right under the back button, in reading order with the
         // task-info block it belongs to, and only when there's a body to open.
-        if !self.description.trim().is_empty() {
-            rows.push(PanelRow::More);
-        }
-        rows.extend([
-            PanelRow::Folder,
-            PanelRow::Switch(SwitchItem::Chat),
-            PanelRow::Switch(SwitchItem::Diff),
-            PanelRow::Switch(SwitchItem::Vim),
-        ]);
-        if self.has_review_url {
-            rows.push(PanelRow::Switch(SwitchItem::Browser));
-        }
-        rows.push(PanelRow::Approve);
-        rows.push(PanelRow::Reject);
-        rows
+        shelbi_app::review::panel_rows(!self.description.trim().is_empty(), true, &switches)
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].
@@ -219,20 +153,7 @@ impl ReviewPanel {
     }
 
     fn step(&mut self, delta: i32) {
-        let n = self.rows().len();
-        if n == 0 {
-            return;
-        }
-        let idx = self.selected.min(n - 1);
-        self.selected = if delta < 0 {
-            if idx == 0 {
-                n - 1
-            } else {
-                idx - 1
-            }
-        } else {
-            (idx + 1) % n
-        };
+        self.selected = shelbi_app::review::step_selection(self.selected, self.rows().len(), delta);
     }
 
     /// Activate the selected row (Enter / Space).
@@ -241,44 +162,25 @@ impl ReviewPanel {
         let Some(row) = rows.get(self.selected) else {
             return PanelEffect::None;
         };
-        self.activate_row(row.clone())
+        self.activate_row(*row)
     }
 
+    /// Activate `row` through the shared table, which also declines Approve /
+    /// Reject while the gated merge is already in flight — a replayed or
+    /// double press (Enter *or* click) is dropped.
     fn activate_row(&mut self, row: PanelRow) -> PanelEffect {
-        match row {
-            PanelRow::Back => PanelEffect::FocusDashboard,
-            PanelRow::More => self.request_description(),
-            PanelRow::Folder => PanelEffect::RevealFolder,
-            PanelRow::Switch(SwitchItem::Chat) => {
-                self.active_view = ActiveView::Chat;
-                PanelEffect::ShowChat
-            }
-            PanelRow::Switch(SwitchItem::Diff) => {
-                self.active_view = ActiveView::Diff;
-                PanelEffect::ShowDiff
-            }
-            PanelRow::Switch(SwitchItem::Vim) => {
-                self.active_view = ActiveView::Vim;
-                PanelEffect::ShowVim
-            }
-            PanelRow::Switch(SwitchItem::Browser) => PanelEffect::OpenBrowser,
-            // Decline Approve / Reject while the gated merge is already in
-            // flight — a replayed or double press (Enter *or* click) is dropped.
-            PanelRow::Approve if self.merging => PanelEffect::None,
-            PanelRow::Approve => PanelEffect::Approve,
-            PanelRow::Reject if self.merging => PanelEffect::None,
-            PanelRow::Reject => PanelEffect::RejectPrompt,
+        let has_body = !self.description.trim().is_empty();
+        let (effect, view) = shelbi_app::review::activate_row(row, has_body, self.merging);
+        if let Some(view) = view {
+            self.active_view = view;
         }
+        effect
     }
 
     /// Ask to open the task-description popover (the `More` link / `m` key).
     /// Returns [`PanelEffect::None`] when the task has no body.
     pub fn request_description(&self) -> PanelEffect {
-        if self.description.trim().is_empty() {
-            PanelEffect::None
-        } else {
-            PanelEffect::ShowDescription
-        }
+        shelbi_app::review::description_effect(!self.description.trim().is_empty())
     }
 
     /// Map a click at (`column`, `row`) to an effect.
@@ -298,7 +200,7 @@ impl ReviewPanel {
             if in_rect(rect, column, row) {
                 if let Some(r) = rows.get(idx) {
                     self.selected = idx;
-                    return self.activate_row(r.clone());
+                    return self.activate_row(*r);
                 }
             }
         }
@@ -352,7 +254,7 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         },
         app.selected == 0, // Back is always rows[0].
         "Ready for review",
-        Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD),
+        Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
     );
     let btn_w = (BACK_BTN_WIDTH as u16).min(area.width.saturating_sub(PAD)).max(1);
     push_hit(
@@ -426,6 +328,23 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         y += 1;
     }
 
+    // 3b. The slot's server: its sub-state and location, live.
+    if let Some((state, location)) = &app.server {
+        if y < bottom {
+            y = advance_blank(y, bottom);
+        }
+        if y < bottom {
+            let line = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            render_server_line(f, *state, location.as_deref(), line);
+            y += 1;
+        }
+    }
+
     // blank
     y = advance_blank(y, bottom);
 
@@ -479,29 +398,49 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
     }
 }
 
+/// The server line: the sub-state's glyph and name (`serving`, `loading`,
+/// `pending-load`) in its color, then the location.
+fn render_server_line(
+    f: &mut Frame,
+    state: shelbi_app::view::ReviewState,
+    location: Option<&str>,
+    area: Rect,
+) {
+    let dec = state.decoration();
+    let mut spans = vec![Span::styled(
+        format!("{} {}", dec.glyph, shelbi_app::review::sub_state_label(state)),
+        Style::default().fg(crate::sidebar::decoration_to_color(dec.color)),
+    )];
+    if let Some(location) = location {
+        spans.push(Span::styled(
+            format!("  {location}"),
+            Style::default().fg(palette().ansi_dark_gray),
+        ));
+    }
+    let x = area.x + PAD;
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x,
+            y: area.y,
+            width: area.width.saturating_sub(PAD),
+            height: 1,
+        },
+    );
+}
+
 /// Build the nav entry (glyph, label, active) for one review switch.
 fn switch_entry(app: &ReviewPanel, item: SwitchItem) -> NavEntry {
-    let (glyph, label, active) = match item {
-        SwitchItem::Chat => (
-            "🤓",
-            "Reviewer".to_string(),
-            app.active_view == ActiveView::Chat,
-        ),
-        SwitchItem::Diff => (
-            "🔀",
-            "View Diff".to_string(),
-            app.active_view == ActiveView::Diff,
-        ),
-        SwitchItem::Vim => (
-            "✍️",
-            format!("Edit in {}", app.editor_name),
-            app.active_view == ActiveView::Vim,
-        ),
-        SwitchItem::Browser => ("🌐", "Open Browser".to_string(), false),
+    // The labels are the shared model's, so both clients word them alike.
+    let (glyph, active) = match item {
+        SwitchItem::Chat => ("🤓", app.active_view == ActiveView::Chat),
+        SwitchItem::Diff => ("🔀", app.active_view == ActiveView::Diff),
+        SwitchItem::Editor => ("✍️", app.active_view == ActiveView::Editor),
+        SwitchItem::Browser => ("🌐", false),
     };
     NavEntry {
         glyph,
-        label,
+        label: item.label(&app.editor_name),
         active,
     }
 }
@@ -523,7 +462,7 @@ fn render_actions(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("{} merging PR…", spinner_frame(app.spinner)),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(palette().ansi_yellow).add_modifier(Modifier::BOLD),
             ))),
             Rect {
                 x: x0,
@@ -550,8 +489,8 @@ fn render_actions(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
     let slack = width.saturating_sub(aw + rw);
     let gap = ACTIONS_GAP.min(slack).max(1);
 
-    let approve_style = action_style(PALETTE_GREEN, approve_sel);
-    let reject_style = action_style(ACTION_RED, reject_sel);
+    let approve_style = action_style(palette().green, approve_sel);
+    let reject_style = action_style(palette().red, reject_sel);
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -619,26 +558,14 @@ fn spinner_frame(tick: usize) -> char {
 /// Resolve the concrete review URL to open for `task_id` (with `$PORT` /
 /// `$SLOT` substituted), or `None` when none is configured.
 pub(crate) fn review_url(project_name: &str, task_id: &str) -> Option<String> {
-    let project = shelbi_state::load_project(project_name).ok()?;
-    let store = shelbi_state::issue_store_for_project(&project).ok()?;
-    let tf = store.get(task_id).ok().flatten()?;
-    let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task).ok()?;
-    let template = workflow.review_url_for_status(tf.task.column.as_str())?;
-    let port = tf
-        .task
-        .assigned_to
-        .as_deref()
-        .and_then(|ws| project.workspace(ws))
-        .and_then(|ws| ws.slot)
-        .and_then(|s| u16::try_from(s).ok());
-    Some(shelbi_core::substitute_review_url(template, port))
+    shelbi_orchestrator::review_session::review_url(project_name, task_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::panel::BACK_BUTTON_LINE;
-    use crate::theme::SELECTION_BG;
+    use crate::theme::palette;
     use ratatui::{backend::TestBackend, Terminal};
 
     const BODY: &str = "## Summary\n\nWarm the application cache during startup so the first request can reuse the same data as subsequent requests.\n\n## Acceptance criteria\n\n- Initialize the cache once before accepting traffic.";
@@ -679,6 +606,22 @@ mod tests {
         rows.iter()
             .position(|r| r.contains(needle))
             .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn the_server_line_follows_the_sidebar_row() {
+        use shelbi_app::view::ReviewState;
+        let mut app = panel(true);
+        let out = render(&mut app, 44, 30);
+        assert!(!out.contains("serving"), "no row yet, no server line: {out}");
+        app.server = Some((ReviewState::Serving, Some("hub:4101".into())));
+        let rows = render_lines(&mut app, 44, 30);
+        let y = row_y(&rows, "serving");
+        assert!(rows[y].contains("hub:4101"), "location beside the state: {}", rows[y]);
+        assert!(y > row_y(&rows, "wt/review"), "under the folder row");
+        assert!(y < row_y(&rows, "Reviewer"), "above the switcher");
+        app.server = Some((ReviewState::Loading, None));
+        assert!(render(&mut app, 44, 30).contains("loading"));
     }
 
     #[test]
@@ -723,7 +666,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let y = BACK_BUTTON_LINE;
         let x = (0..buf.area.width)
-            .find(|&x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == ACCENT_CYAN)
+            .find(|&x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == palette().cyan)
             .expect("the 'Ready for review' R should be accent cyan");
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "status is bold");
     }
@@ -735,15 +678,15 @@ mod tests {
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let x = PAD; // button starts at the 2-col pad
-        assert_eq!(buf[(x, BACK_BUTTON_LINE)].bg, SELECTION_BG, "arrow row carries the button fill");
+        assert_eq!(buf[(x, BACK_BUTTON_LINE)].bg, palette().selection, "arrow row carries the button fill");
         assert_eq!(
             buf[(x, BACK_BUTTON_LINE - 1)].fg,
-            SELECTION_BG,
+            palette().selection,
             "bleed above carries the fill colour so it reads square"
         );
         assert_eq!(
             buf[(x, BACK_BUTTON_LINE + 1)].fg,
-            SELECTION_BG,
+            palette().selection,
             "bleed below carries the fill colour so it reads square"
         );
     }
@@ -754,9 +697,9 @@ mod tests {
         let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Back)).unwrap();
         assert_eq!(idx, 0, "back button leads the panel");
         app.selected = idx;
-        assert_eq!(app.activate(), PanelEffect::FocusDashboard);
+        assert_eq!(app.activate(), PanelEffect::Back);
         let _ = render(&mut app, 30, 24);
-        assert_eq!(app.click(PAD, BACK_BUTTON_LINE), PanelEffect::FocusDashboard);
+        assert_eq!(app.click(PAD, BACK_BUTTON_LINE), PanelEffect::Back);
     }
 
     #[test]
@@ -786,6 +729,33 @@ mod tests {
             c.fg == Color::Red && !c.symbol().trim().is_empty()
         });
         assert!(red, "status row should be red:\n{out}");
+    }
+
+    /// The panel (status header, task info, More, the worktree line, the
+    /// switches, Approve / Reject plain and reverse-video, the red status
+    /// line) is readable on a light terminal in each selection.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, row) in [
+                ("review-panel-approve", PanelRow::Approve),
+                ("review-panel-reject", PanelRow::Reject),
+                ("review-panel-more", PanelRow::More),
+                ("review-panel-folder", PanelRow::Folder),
+            ] {
+                let mut app = panel(true);
+                app.status_line = "approve failed: PR #9 is not mergeable".to_string();
+                app.selected = app
+                    .rows()
+                    .iter()
+                    .position(|r| std::mem::discriminant(r) == std::mem::discriminant(&row))
+                    .unwrap();
+                let mut term = Terminal::new(TestBackend::new(44, 30)).unwrap();
+                term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]
@@ -862,9 +832,9 @@ mod tests {
         // main sidebar: gutter columns transparent, the inner region filled.
         assert_eq!(buf[(0, chat_y)].bg, Color::Reset, "left gutter is transparent");
         assert_eq!(buf[(width - 1, chat_y)].bg, Color::Reset, "right gutter is transparent");
-        assert_eq!(buf[(1, chat_y)].bg, SELECTION_BG, "the fill starts one column in");
+        assert_eq!(buf[(1, chat_y)].bg, palette().selection, "the fill starts one column in");
         for x in (width - 4)..(width - 1) {
-            assert_eq!(buf[(x, chat_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
+            assert_eq!(buf[(x, chat_y)].bg, palette().selection, "right-edge padding carries the fill, col {x}");
         }
         assert_eq!(buf[(0, chat_y)].symbol(), " ", "column 0 is the indent gutter");
     }
@@ -897,9 +867,9 @@ mod tests {
     fn activating_chat_and_vim_returns_switch_effects_and_marks_active() {
         let mut app = panel(true);
         assert_eq!(app.active_view, ActiveView::Chat);
-        select_switch(&mut app, SwitchItem::Vim);
-        assert_eq!(app.activate(), PanelEffect::ShowVim);
-        assert_eq!(app.active_view, ActiveView::Vim);
+        select_switch(&mut app, SwitchItem::Editor);
+        assert_eq!(app.activate(), PanelEffect::ShowEditor);
+        assert_eq!(app.active_view, ActiveView::Editor);
         select_switch(&mut app, SwitchItem::Chat);
         assert_eq!(app.activate(), PanelEffect::ShowChat);
         assert_eq!(app.active_view, ActiveView::Chat);
@@ -928,7 +898,7 @@ mod tests {
             .collect();
         assert_eq!(
             switches,
-            vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Vim, SwitchItem::Browser]
+            vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Editor, SwitchItem::Browser]
         );
     }
 
@@ -987,7 +957,7 @@ mod tests {
         let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
         let more_y = row_y(&rows, "More") as u16;
         let more_x = rows[more_y as usize].find("More").unwrap() as u16;
-        assert_eq!(buf[(more_x, more_y)].fg, ACCENT_CYAN, "More is accent cyan");
+        assert_eq!(buf[(more_x, more_y)].fg, palette().cyan, "More is accent cyan");
     }
 
     #[test]
@@ -1030,7 +1000,7 @@ mod tests {
         let more_y = row_y(&rows, "More") as u16;
         let more_x = rows[more_y as usize].find("More").unwrap() as u16;
         let cell = &buf[(more_x, more_y)];
-        assert_eq!(cell.bg, SELECTION_BG, "focused More carries the selection fill");
+        assert_eq!(cell.bg, palette().selection, "focused More carries the selection fill");
         assert_eq!(cell.fg, Color::White, "focused More brightens to white");
         assert!(cell.modifier.contains(Modifier::BOLD), "focused More is bold");
     }
@@ -1160,8 +1130,8 @@ mod tests {
     #[test]
     fn selected_action_renders_reverse_video_tint() {
         for (tint, needle, item) in [
-            (PALETTE_GREEN, "Approve", PanelRow::Approve),
-            (ACTION_RED, "Reject", PanelRow::Reject),
+            (palette().green, "Approve", PanelRow::Approve),
+            (palette().red, "Reject", PanelRow::Reject),
         ] {
             let width = 44u16;
             let mut app = panel(true);
@@ -1194,7 +1164,7 @@ mod tests {
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
-        for (tint, needle) in [(PALETTE_GREEN, "Approve"), (ACTION_RED, "Reject")] {
+        for (tint, needle) in [(palette().green, "Approve"), (palette().red, "Reject")] {
             let y = row_y(&rows, needle) as u16;
             let col = rows[y as usize].find(needle).unwrap() as u16;
             let cell = &buf[(col, y)];

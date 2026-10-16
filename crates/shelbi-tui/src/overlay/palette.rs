@@ -24,7 +24,7 @@
 
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -34,8 +34,16 @@ use ratatui::{
 };
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::PaletteAction;
+
+// The palette's state machine and project indicators are shared with the
+// desktop app (`shelbi_app::overlay::palette`).
+pub use shelbi_app::overlay::palette::{
+    project_indicator, PaletteFocus as Focus, PaletteStep, ProjectEntry, ProjectIndicator,
+};
+use shelbi_app::overlay::palette as shared;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::palette;
 use crate::decoration_to_color;
 use crate::sidebar::{bleed_block_lines, nav_lines};
 use crate::theme;
@@ -71,40 +79,16 @@ const CHROME_ROWS: u16 = 6;
 // Project indicators (Projects column status glyphs)
 // ---------------------------------------------------------------------------
 
-/// A project row's liveness indicator in the Projects column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectIndicator {
-    /// The current/open project (active) — filled green disc, pulsing.
-    Active,
-    /// Loaded but not the current project — green ring, no fill.
-    LoadedIdle,
-    /// Not loaded — neutral/gray ring.
-    Unloaded,
-}
-
-/// Resolve a project's indicator from its two live inputs. Not-loaded
-/// dominates: a project with no live session shows the neutral ring even if a
-/// stale active-category task lingers on disk, because nothing is progressing
-/// it.
-pub fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
-    if !loaded {
-        ProjectIndicator::Unloaded
-    } else if active {
-        ProjectIndicator::Active
-    } else {
-        ProjectIndicator::LoadedIdle
-    }
-}
-
 /// Leading status glyph + color for a project row, given its indicator and the
 /// current pulse `phase`. The Figma uses a filled `●` for the active project, a
 /// `○` ring for every other (green when loaded, gray when not).
 pub fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static str, Color) {
-    match indicator {
-        ProjectIndicator::Active => ("●", theme::project_pulse_color(phase)),
-        ProjectIndicator::LoadedIdle => ("○", theme::PROJECT_STATUS_GREEN),
-        ProjectIndicator::Unloaded => ("○", theme::PROJECT_STATUS_NEUTRAL),
-    }
+    let color = match indicator {
+        ProjectIndicator::Active => theme::project_pulse_color(phase),
+        ProjectIndicator::LoadedIdle => palette().green,
+        ProjectIndicator::Unloaded => palette().ansi_dark_gray,
+    };
+    (indicator.glyph(), color)
 }
 
 /// Current pulse phase in `[0.0, 1.0)`, derived from how long the picker has
@@ -153,7 +137,7 @@ pub struct PaletteView<'a> {
 }
 
 /// Paint the palette into `area` (the content-sized overlay rect [`palette_rect`]
-/// computes). The rect is the panel: a solid [`theme::PALETTE_BG`] fill wrapped
+/// computes). The rect is the panel: a solid `palette().search` fill wrapped
 /// in a muted single-line border, content inset one column inside the border.
 pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     // A filled panel wrapped in the muted single-line border (the Figma
@@ -161,8 +145,8 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     // reads as one surface — and draws the border in the same pass.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::PALETTE_MUTED))
-        .style(Style::default().bg(theme::PALETTE_BG));
+        .border_style(Style::default().fg(palette().muted))
+        .style(Style::default().bg(palette().search));
     f.render_widget(block, area);
 
     let rows = panel_rows(area);
@@ -182,7 +166,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No matching commands",
-                Style::default().fg(theme::PALETTE_MUTED),
+                Style::default().fg(palette().muted),
             ))),
             commands_area,
         );
@@ -203,7 +187,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
             content,
             commands_focused.then_some(selected),
             commands_area.width as usize,
-            theme::SELECTION_BG,
+            palette().selection,
         );
         // Scroll the band to keep the selected pill visible when the list is
         // taller than the band (the half-block pitch doubles the row count).
@@ -220,7 +204,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             view.footer.to_string(),
-            Style::default().fg(theme::PALETTE_MUTED),
+            Style::default().fg(palette().muted),
         ))),
         rows[4],
     );
@@ -311,8 +295,8 @@ pub fn palette_rect(area: Rect, result_count: usize, project_count: Option<usize
 /// The search line: a `❯` prompt, then a green block cursor and the dim
 /// placeholder (empty query) or the typed query followed by the block cursor.
 fn search_line(query: &str) -> Line<'static> {
-    let prompt = Span::styled("❯ ", Style::default().fg(theme::PALETTE_FG));
-    let cursor = Style::default().bg(theme::PALETTE_GREEN).fg(Color::White);
+    let prompt = Span::styled("❯ ", Style::default().fg(palette().foreground));
+    let cursor = Style::default().bg(palette().green).fg(palette().on_color);
     if query.is_empty() {
         const PLACEHOLDER: &str = "Type a command or search";
         let mut chars = PLACEHOLDER.chars();
@@ -321,12 +305,12 @@ fn search_line(query: &str) -> Line<'static> {
         Line::from(vec![
             prompt,
             Span::styled(first, cursor),
-            Span::styled(rest, Style::default().fg(theme::PALETTE_MUTED)),
+            Span::styled(rest, Style::default().fg(palette().muted)),
         ])
     } else {
         Line::from(vec![
             prompt,
-            Span::styled(query.to_string(), Style::default().fg(theme::PALETTE_FG)),
+            Span::styled(query.to_string(), Style::default().fg(palette().foreground)),
             Span::styled(" ", cursor),
         ])
     }
@@ -364,9 +348,9 @@ fn icon_for(e: &Entry) -> (String, Color) {
         None => {
             let glyph = e.kind.icon();
             let color = if glyph == EntryKind::Action.icon() {
-                Color::Yellow
+                palette().ansi_yellow
             } else {
-                Color::DarkGray
+                palette().ansi_dark_gray
             };
             (glyph.to_string(), color)
         }
@@ -378,7 +362,7 @@ fn icon_for(e: &Entry) -> (String, Color) {
 /// aligned to a fixed x and truncated with `…` when it won't fit, and a
 /// right-aligned dim shortcut hint. Each row is padded to `row_width` so the
 /// selection fill spans the whole commands column; on the selected row the
-/// solid [`theme::SELECTION_BG`] fill is baked into every span (the shared
+/// solid `palette().selection` fill is baked into every span (the shared
 /// [`bleed_block_lines`] then bleeds that fill into the half-rows above and
 /// below). `selected` is the highlighted index when the commands column holds
 /// focus.
@@ -403,10 +387,10 @@ fn build_result_lines(
             let label_pad = LABEL_W.saturating_sub(UnicodeWidthStr::width(label.as_str()));
             let label_style = if is_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(palette().ansi_white)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::PALETTE_FG)
+                Style::default().fg(palette().foreground)
             };
 
             let mut spans = vec![
@@ -437,11 +421,11 @@ fn build_result_lines(
             }
             spans.push(Span::styled(
                 desc,
-                Style::default().fg(theme::PALETTE_MUTED),
+                Style::default().fg(palette().muted),
             ));
             if short_w > 0 {
                 spans.push(Span::raw(" ".repeat(filler + 1)));
-                spans.push(Span::styled(short, Style::default().fg(theme::PALETTE_MUTED)));
+                spans.push(Span::styled(short, Style::default().fg(palette().muted)));
             } else if filler > 0 {
                 spans.push(Span::raw(" ".repeat(filler)));
             }
@@ -451,7 +435,7 @@ fn build_result_lines(
             // label keeps its white/bold foreground; the description stays dim.
             if is_selected {
                 for s in &mut spans {
-                    s.style = s.style.bg(theme::SELECTION_BG);
+                    s.style = s.style.bg(palette().selection);
                 }
             }
 
@@ -473,7 +457,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "Projects",
-            Style::default().fg(theme::PALETTE_MUTED),
+            Style::default().fg(palette().muted),
         ))),
         rows[0],
     );
@@ -489,7 +473,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
         .collect();
     items.push(project_row_line(
         "+",
-        theme::PROJECT_STATUS_NEUTRAL,
+        palette().ansi_dark_gray,
         "Add project",
         width,
     ));
@@ -497,7 +481,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     // Selection patches background + weight only (never a foreground color) so a
     // loaded project's green ring keeps its status color under the bar.
     let highlight = Style::default()
-        .bg(theme::SELECTION_BG)
+        .bg(palette().selection)
         .add_modifier(Modifier::BOLD);
     let list = List::new(items).highlight_style(highlight);
     let mut s = ListState::default();
@@ -518,7 +502,7 @@ fn project_row_line(glyph: &str, glyph_color: Color, label: &str, width: usize) 
     let pad = width.saturating_sub(text_w);
     ListItem::new(Line::from(vec![
         Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
-        Span::styled(format!(" {label}"), Style::default().fg(theme::PALETTE_FG)),
+        Span::styled(format!(" {label}"), Style::default().fg(palette().foreground)),
         Span::raw(" ".repeat(pad)),
     ]))
 }
@@ -555,48 +539,13 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 // The in-process overlay state
 // ---------------------------------------------------------------------------
 
-/// A switch-target project for the Projects column: its slug (for the
-/// switch-project entry id), display label, and resolved status indicator.
-#[derive(Debug, Clone)]
-pub struct ProjectEntry {
-    pub slug: String,
-    pub label: String,
-    pub indicator: ProjectIndicator,
-}
-
-/// Which column holds focus inside the open palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Commands,
-    Projects,
-}
-
-/// What feeding one key into the in-process palette resolved to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaletteStep {
-    /// Keep the overlay open (filtered, moved selection, edited the query).
-    Continue,
-    /// Close the overlay and return focus to the agent (Escape / the palette
-    /// chord again).
-    Close,
-    /// Close the overlay and move focus to the sidebar (Tab).
-    FocusSidebar,
-    /// Run this entry's command, then close the overlay.
-    Activate(Entry),
-}
-
-/// The in-process command palette overlay. Holds the current query, the command
-/// selection, the switch-target projects, and which column holds focus; the
-/// host (the shell) supplies the entries from
+/// The in-process command palette overlay: the shared state machine
+/// ([`shared::Palette`]) plus when it opened (the active project's pulse phase).
+/// The host (the shell) supplies the entries from
 /// [`shelbi_app::CommandRegistry::entries`] and the projects, and turns an
 /// activated [`Entry`] into a command effect.
 pub struct Palette {
-    query: String,
-    selected: usize,
-    entries: Vec<Entry>,
-    projects: Vec<ProjectEntry>,
-    focus: Focus,
-    project_selected: usize,
+    inner: shared::Palette,
     opened_at: Instant,
 }
 
@@ -605,12 +554,7 @@ impl Palette {
     /// column (empty hides the column).
     pub fn new(entries: Vec<Entry>, projects: Vec<ProjectEntry>) -> Self {
         Self {
-            query: String::new(),
-            selected: 0,
-            entries,
-            projects,
-            focus: Focus::Commands,
-            project_selected: 0,
+            inner: shared::Palette::new(entries, projects),
             opened_at: Instant::now(),
         }
     }
@@ -618,20 +562,30 @@ impl Palette {
     /// Replace the entry list (a background refresh landed) without disturbing
     /// the query; the renderer re-clamps the selection.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
-        self.entries = entries;
+        self.inner.set_entries(entries);
     }
 
     pub fn query(&self) -> &str {
-        &self.query
+        self.inner.query()
     }
 
     pub fn selected(&self) -> usize {
-        self.selected
+        self.inner.selected()
+    }
+
+    /// Focus the Projects column (the bare "Switch Project").
+    pub fn focus_projects(&mut self) {
+        self.inner.focus_projects();
+    }
+
+    /// Whether the Projects column holds focus.
+    pub fn projects_focused(&self) -> bool {
+        self.inner.focus() == shared::PaletteFocus::Projects
     }
 
     /// The fuzzy-filtered results for the current query.
     pub fn results(&self) -> Vec<(Entry, u16)> {
-        shelbi_palette::search(&self.entries, &self.query)
+        self.inner.results()
     }
 
     /// The overlay rect for the current content within `area`, via
@@ -639,113 +593,20 @@ impl Palette {
     /// query filters the list.
     pub fn overlay_rect(&self, area: Rect) -> Rect {
         let result_count = self.results().len();
-        let project_count = (!self.projects.is_empty()).then_some(self.projects.len());
+        let projects = self.inner.projects().len();
+        let project_count = (projects > 0).then_some(projects);
         palette_rect(area, result_count, project_count)
-    }
-
-    /// The highest selectable index in the Projects column: one past the last
-    /// project (the trailing "Add project" row).
-    fn projects_max(&self) -> usize {
-        self.projects.len()
-    }
-
-    /// Synthesize the [`Entry`] activated by Enter on the focused project row.
-    /// A project row maps to its `action:switch-project:<slug>` entry; the
-    /// trailing row maps to `action:add-project`. The shell resolves either id
-    /// through the registry, so no new effect plumbing is needed.
-    fn project_entry(&self) -> Entry {
-        let (id, label) = match self.projects.get(self.project_selected) {
-            Some(p) => (format!("action:switch-project:{}", p.slug), p.label.clone()),
-            None => ("action:add-project".to_string(), "Add project".to_string()),
-        };
-        Entry {
-            id,
-            label,
-            kind: EntryKind::Action,
-            subtitle: None,
-            shortcut: None,
-            decoration: None,
-            hidden_until_query: false,
-        }
     }
 
     /// Feed one key press. `action` is the palette-mode binding the host
     /// resolved from its keymap (so Close/Activate/Nav/Backspace honor the
     /// user's `keys.yaml`); Tab, Space, the arrow keys, and unbound printable
-    /// chars are handled by raw key code so they behave regardless of bindings.
+    /// chars are handled by raw key so they behave regardless of bindings
+    /// ([`shared::Palette::handle_key`]).
     pub fn handle_key(&mut self, ev: KeyEvent, action: Option<PaletteAction>) -> PaletteStep {
-        // Tab leaves the palette for the sidebar (plan focus model). Handled
-        // ahead of the keymap so a user binding can't shadow it.
-        if ev.code == KeyCode::Tab && ev.modifiers.is_empty() {
-            return PaletteStep::FocusSidebar;
-        }
-        // Right/Left move focus into and out of the Projects column.
-        if ev.code == KeyCode::Right && ev.modifiers.is_empty() {
-            if self.focus == Focus::Commands && !self.projects.is_empty() {
-                self.focus = Focus::Projects;
-                self.project_selected = 0;
-            }
-            return PaletteStep::Continue;
-        }
-        if ev.code == KeyCode::Left && ev.modifiers.is_empty() {
-            self.focus = Focus::Commands;
-            return PaletteStep::Continue;
-        }
-        // Space always types into the query (even if a keymap binds it); this
-        // also pulls focus back to the commands column.
-        if ev.code == KeyCode::Char(' ')
-            && (ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT)
-        {
-            self.type_char(' ');
-            return PaletteStep::Continue;
-        }
-
-        match action {
-            Some(PaletteAction::Close) => PaletteStep::Close,
-            Some(PaletteAction::Activate) => {
-                if self.focus == Focus::Projects {
-                    return PaletteStep::Activate(self.project_entry());
-                }
-                match self.results().get(self.selected) {
-                    Some((entry, _)) => PaletteStep::Activate(entry.clone()),
-                    None => PaletteStep::Continue,
-                }
-            }
-            Some(PaletteAction::NavUp) => {
-                if self.focus == Focus::Projects {
-                    self.project_selected = self.project_selected.saturating_sub(1);
-                } else {
-                    self.selected = self.selected.saturating_sub(1);
-                }
-                PaletteStep::Continue
-            }
-            Some(PaletteAction::NavDown) => {
-                if self.focus == Focus::Projects {
-                    if self.project_selected < self.projects_max() {
-                        self.project_selected += 1;
-                    }
-                } else {
-                    let count = self.results().len();
-                    if self.selected + 1 < count {
-                        self.selected += 1;
-                    }
-                }
-                PaletteStep::Continue
-            }
-            Some(PaletteAction::Backspace) => {
-                self.query.pop();
-                self.selected = 0;
-                self.focus = Focus::Commands;
-                PaletteStep::Continue
-            }
-            None => {
-                if let KeyCode::Char(c) = ev.code {
-                    if ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT {
-                        self.type_char(c);
-                    }
-                }
-                PaletteStep::Continue
-            }
+        match crate::keymap::chord_from_event(ev) {
+            Some(chord) => self.inner.handle_key(chord, action),
+            None => PaletteStep::Continue,
         }
     }
 
@@ -755,9 +616,10 @@ impl Palette {
     /// selects that item and activates it. A click outside the commands column
     /// (the Projects column, the search line, the footer, or the blank area
     /// below a short list) leaves the palette open unchanged.
+    ///
+    /// [`overlay_rect`]: Palette::overlay_rect
     pub fn handle_click(&mut self, rect: Rect, col: u16, row: u16) -> PaletteStep {
-        let results = self.results();
-        let n = results.len();
+        let n = self.results().len();
         if n == 0 {
             return PaletteStep::Continue;
         }
@@ -765,7 +627,7 @@ impl Palette {
         if rows.len() < 3 {
             return PaletteStep::Continue;
         }
-        let (commands_area, _) = split_results(rows[2], !self.projects.is_empty());
+        let (commands_area, _) = split_results(rows[2], !self.inner.projects().is_empty());
         // Horizontal + vertical bounds of the commands band.
         if col < commands_area.x
             || col >= commands_area.x.saturating_add(commands_area.width)
@@ -778,42 +640,31 @@ impl Palette {
         // full `2n + 1`-row bleed block. Each item owns a 2-row band (its
         // bleed-above and its label row), so `line / 2` resolves the item; the
         // final trailing bleed row clamps to the last item.
-        let selected = self.selected.min(n - 1);
+        let selected = self.inner.selected_in(n);
         let band_h = commands_area.height as usize;
         let off = command_scroll_offset(n, selected, band_h);
         let line = (row - commands_area.y) as usize + off;
         if line >= nav_lines(n) {
             return PaletteStep::Continue;
         }
-        let item = (line / 2).min(n - 1);
-        self.selected = item;
-        self.focus = Focus::Commands;
-        PaletteStep::Activate(results[item].0.clone())
-    }
-
-    /// Type a character into the query, resetting the command selection and
-    /// pulling focus back to the commands column (typing filters commands).
-    fn type_char(&mut self, c: char) {
-        self.query.push(c);
-        self.selected = 0;
-        self.focus = Focus::Commands;
+        self.inner.click_item((line / 2).min(n - 1))
     }
 
     /// The Projects column view, or `None` when there are no projects.
     fn projects_view(&self) -> Option<ProjectsColumn> {
-        if self.projects.is_empty() {
+        let projects = self.inner.projects();
+        if projects.is_empty() {
             return None;
         }
         Some(ProjectsColumn {
-            rows: self
-                .projects
+            rows: projects
                 .iter()
                 .map(|p| ProjectRow {
                     label: p.label.clone(),
                     indicator: p.indicator,
                 })
                 .collect(),
-            selected: (self.focus == Focus::Projects).then_some(self.project_selected),
+            selected: self.inner.project_selection(),
             phase: pulse_phase(self.opened_at),
         })
     }
@@ -821,18 +672,14 @@ impl Palette {
     /// Paint the overlay into `area`.
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let results = self.results();
-        let footer = if self.projects.is_empty() {
-            "↑↓ navigate · Enter activate · Esc / Ctrl+P close"
-        } else {
-            "↑↓ navigate · → projects · Enter activate · Esc / Ctrl+P close"
-        };
+        let footer = self.inner.footer("Ctrl+P");
         let view = PaletteView {
-            query: &self.query,
+            query: self.inner.query(),
             results: &results,
-            selected: self.selected,
-            commands_focused: self.focus == Focus::Commands,
+            selected: self.inner.selected(),
+            commands_focused: self.inner.focus() == Focus::Commands,
             projects: self.projects_view(),
-            footer,
+            footer: &footer,
         };
         render(f, area, &view);
     }
@@ -841,6 +688,7 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use shelbi_palette::{Decoration, DecorationColor};
 
     fn entry(id: &str, label: &str) -> Entry {
@@ -970,13 +818,13 @@ mod tests {
         assert_eq!(active_glyph, "●");
         let (idle_glyph, idle_color) = project_status_style(ProjectIndicator::LoadedIdle, 0.0);
         assert_eq!(idle_glyph, "○");
-        assert_eq!(idle_color, theme::PROJECT_STATUS_GREEN);
+        assert_eq!(idle_color, palette().green);
         // The unloaded project is a gray ring (design `#666`), distinguished
         // from the loaded ring by color, not glyph.
         let (unloaded_glyph, unloaded_color) =
             project_status_style(ProjectIndicator::Unloaded, 0.0);
         assert_eq!(unloaded_glyph, "○");
-        assert_eq!(unloaded_color, theme::PROJECT_STATUS_NEUTRAL);
+        assert_eq!(unloaded_color, palette().ansi_dark_gray);
     }
 
     #[test]
@@ -996,7 +844,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(p.results().len(), 2);
-        p.selected = 1;
+        p.inner.set_selected(1);
         for c in "zen".chars() {
             assert_eq!(p.handle_key(key(KeyCode::Char(c)), None), PaletteStep::Continue);
         }
@@ -1005,6 +853,75 @@ mod tests {
         let hits = p.results();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.id, "action:toggle-zen");
+    }
+
+    /// The palette (panel fill, border, prompt + placeholder or typed query
+    /// with the green cursor, command rows with every decoration color,
+    /// descriptions and shortcuts, the selected row, the Projects column in
+    /// each indicator state, the Add row, the footer) is readable on a light
+    /// terminal, with the commands and then the projects column focused.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let decorated = |id: &str, label: &str, glyph: &str, color: DecorationColor| Entry {
+            decoration: Some(Decoration {
+                glyph: glyph.into(),
+                color,
+            }),
+            ..entry_full(id, label, "Jump to it", Some("⌃G"))
+        };
+        let results: Vec<(Entry, u16)> = vec![
+            (entry_full("view:orch", "Chat", "Talk with the Orchestrator", Some("⌃O")), 0),
+            (entry_full("view:tasks", "Issues", "Queue up and manage work", None), 0),
+            (decorated("workspace:alpha", "alpha", "⏵", DecorationColor::Green), 0),
+            (decorated("workspace:bravo", "bravo", "?", DecorationColor::Yellow), 0),
+            (decorated("workspace:charlie", "charlie", "⚠", DecorationColor::Red), 0),
+            (decorated("review:a", "Palette fix", "✓", DecorationColor::Cyan), 0),
+            (decorated("review:b", "Nav fix", "▶", DecorationColor::Muted), 0),
+            (decorated("review:c", "Copy", "·", DecorationColor::DarkGray), 0),
+            (decorated("x:gray", "Gray", "•", DecorationColor::Gray), 0),
+            (decorated("x:blue", "Blue", "•", DecorationColor::Blue), 0),
+        ];
+        let projects = |selected: Option<usize>| ProjectsColumn {
+            rows: vec![
+                ProjectRow {
+                    label: "Website".into(),
+                    indicator: ProjectIndicator::Active,
+                },
+                ProjectRow {
+                    label: "Shelbi".into(),
+                    indicator: ProjectIndicator::LoadedIdle,
+                },
+                ProjectRow {
+                    label: "Archive".into(),
+                    indicator: ProjectIndicator::Unloaded,
+                },
+            ],
+            selected,
+            // Near the pulse's peak: its trough is meant to fade into the panel.
+            phase: 0.5,
+        };
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, query, selected, projects_selected) in [
+                ("palette-commands", "", 1, None),
+                ("palette-query", "ch", 2, None),
+                ("palette-projects", "", 0, Some(1)),
+                ("palette-add-project", "", 0, Some(3)),
+            ] {
+                let view = PaletteView {
+                    query,
+                    results: &results,
+                    selected,
+                    commands_focused: projects_selected.is_none(),
+                    projects: Some(projects(projects_selected)),
+                    footer: "↑↓ select · → projects · Ctrl+P close",
+                };
+                let mut term = Terminal::new(TestBackend::new(100, 18)).unwrap();
+                term.draw(|f| render(f, f.area(), &view)).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]
@@ -1050,7 +967,7 @@ mod tests {
         assert!(text.contains('│') && text.contains('─'), "border edges: {text}");
         assert_eq!(
             buf[(0, 0)].fg,
-            theme::PALETTE_MUTED,
+            palette().muted,
             "the border renders in the muted color"
         );
         assert_eq!(buf[(0, 0)].symbol(), "┌", "top-left corner glyph");
@@ -1110,18 +1027,18 @@ mod tests {
             vec![entry("view:tasks", "Issues")],
             vec![project("website", "Website", ProjectIndicator::Active)],
         );
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
         assert_eq!(p.handle_key(key(KeyCode::Right), None), PaletteStep::Continue);
-        assert_eq!(p.focus, Focus::Projects);
+        assert_eq!(p.inner.focus(), Focus::Projects);
         assert_eq!(p.handle_key(key(KeyCode::Left), None), PaletteStep::Continue);
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
     }
 
     #[test]
     fn right_is_a_noop_without_projects() {
         let mut p = Palette::new(vec![entry("view:tasks", "Issues")], Vec::new());
         p.handle_key(key(KeyCode::Right), None);
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
     }
 
     #[test]
@@ -1163,9 +1080,9 @@ mod tests {
             vec![project("website", "Website", ProjectIndicator::Active)],
         );
         p.handle_key(key(KeyCode::Right), None);
-        assert_eq!(p.focus, Focus::Projects);
+        assert_eq!(p.inner.focus(), Focus::Projects);
         p.handle_key(key(KeyCode::Char('i')), None);
-        assert_eq!(p.focus, Focus::Commands);
+        assert_eq!(p.inner.focus(), Focus::Commands);
         assert_eq!(p.query(), "i");
     }
 
@@ -1180,7 +1097,7 @@ mod tests {
         for _ in 0..5 {
             p.handle_key(key(KeyCode::Down), Some(PaletteAction::NavDown));
         }
-        assert_eq!(p.project_selected, 1);
+        assert_eq!(p.inner.project_selection(), Some(1));
     }
 
     #[test]
@@ -1275,7 +1192,7 @@ mod tests {
                 if cell.symbol() == "○" {
                     assert_eq!(
                         cell.fg,
-                        theme::PROJECT_STATUS_GREEN,
+                        palette().green,
                         "the selected loaded-idle ring must stay green"
                     );
                     found = true;
@@ -1482,7 +1399,7 @@ mod tests {
 
         // Solid fill: the selected content row carries the selection background.
         assert!(
-            (0..buf.area.width).any(|x| buf[(x, chat_y)].bg == theme::SELECTION_BG),
+            (0..buf.area.width).any(|x| buf[(x, chat_y)].bg == palette().selection),
             "the selected row has the solid fill"
         );
         // Lower-half-block (`▄`) bleed row directly above the selection, drawn
@@ -1490,7 +1407,7 @@ mod tests {
         let above = chat_y - 1;
         assert!(
             (0..buf.area.width).any(|x| {
-                buf[(x, above)].symbol() == "▄" && buf[(x, above)].fg == theme::SELECTION_BG
+                buf[(x, above)].symbol() == "▄" && buf[(x, above)].fg == palette().selection
             }),
             "a ▄ bleed row sits above the selection: {}",
             dump(&buf)
@@ -1499,7 +1416,7 @@ mod tests {
         let below = chat_y + 1;
         assert!(
             (0..buf.area.width).any(|x| {
-                buf[(x, below)].symbol() == "▀" && buf[(x, below)].fg == theme::SELECTION_BG
+                buf[(x, below)].symbol() == "▀" && buf[(x, below)].fg == palette().selection
             }),
             "a ▀ bleed row sits below the selection: {}",
             dump(&buf)
@@ -1510,7 +1427,7 @@ mod tests {
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
                 let c = &buf[(x, y)];
-                if (c.symbol() == "▄" || c.symbol() == "▀") && c.fg == theme::SELECTION_BG {
+                if (c.symbol() == "▄" || c.symbol() == "▀") && c.fg == palette().selection {
                     assert!(
                         x < website_x,
                         "bleed stays in the commands column (x={x}, website_x={website_x})"
@@ -1522,7 +1439,7 @@ mod tests {
         for x in website_x..buf.area.width {
             assert_ne!(
                 buf[(x, web_y)].bg,
-                theme::SELECTION_BG,
+                palette().selection,
                 "a Projects row must carry no command selection fill"
             );
         }
@@ -1553,7 +1470,7 @@ mod tests {
         // clean-separator check is the row *above* Chat, which belongs to no
         // selection now.)
         assert!(
-            (0..buf.area.width).all(|x| buf[(x, chat_y)].bg != theme::SELECTION_BG),
+            (0..buf.area.width).all(|x| buf[(x, chat_y)].bg != palette().selection),
             "the deselected row has no leftover fill: {}",
             dump(&buf)
         );
@@ -1565,7 +1482,7 @@ mod tests {
         );
         // The newly selected Issues row carries the fill and its bleed rows.
         assert!(
-            (0..buf.area.width).any(|x| buf[(x, issues_y)].bg == theme::SELECTION_BG),
+            (0..buf.area.width).any(|x| buf[(x, issues_y)].bg == palette().selection),
             "the new selection is filled: {}",
             dump(&buf)
         );

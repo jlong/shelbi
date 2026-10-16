@@ -209,6 +209,52 @@ pub struct ResolvedProjectRoot {
 // Add-project form validation
 // ---------------------------------------------------------------------------
 
+/// The add-project form's "Detected:" line for the repo path `root` (as
+/// typed, resolved against `cwd`): the git-repo check [`validate_root`] does.
+/// Runs git, so callers keep it off any UI thread they can.
+pub fn detect_root(cwd: &Path, root: &str) -> shelbi_app::overlay::add_project::Detected {
+    use shelbi_app::overlay::add_project::Detected;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return Detected::NotFound;
+    }
+    match validate_root(&absolutize(cwd, Path::new(trimmed))) {
+        RootValidation::Ok => Detected::GitRepo,
+        RootValidation::NotGitRepo => Detected::NotGitRepo,
+        RootValidation::NotExists | RootValidation::NotDirectory => Detected::NotFound,
+    }
+}
+
+/// Why [`add_project`] didn't create the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddProjectError {
+    /// The form's input doesn't validate: show it on the form and keep it open.
+    Invalid(String),
+    /// Validation passed but scaffolding failed.
+    Failed(String),
+}
+
+/// Run a `Mutation::AddProject`: validate the form's values (resolving the
+/// repo path against `cwd`), then scaffold the project with a `file_system`
+/// board, the way the TUI's form does. Returns the new project's slug.
+/// Blocking (file IO and git); run it off the UI thread.
+pub fn add_project(
+    name: &str,
+    root: &str,
+    mode: ConfigMode,
+    cwd: &Path,
+) -> std::result::Result<String, AddProjectError> {
+    let resolved = validate_add_project(name, root, cwd).map_err(AddProjectError::Invalid)?;
+    scaffold_project(
+        &resolved,
+        mode,
+        &IssueTrackerConfig::default(),
+        &mut NullReporter,
+    )
+    .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e}")))?;
+    Ok(resolved.name)
+}
+
 /// Validate the "Add project" form (a name + a repo path, resolved against
 /// `cwd`) into a ready-to-scaffold [`ResolvedProjectRoot`], or a user-facing
 /// inline error string. Any human-readable name is accepted — it's slugified
@@ -871,6 +917,43 @@ mod tests {
         assert_eq!(ok.name, "my-app");
         assert_eq!(ok.display_name.as_deref(), Some("My App"));
         assert_eq!(ok.path, PathBuf::from("/tmp"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn add_project_runs_the_forms_mutation_and_reports_bad_input_as_invalid() {
+        use shelbi_app::overlay::add_project::Detected;
+        let _g = lock_env();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let repo = home.join("web");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        // The form's "Detected:" line, for a relative path against `cwd`.
+        assert_eq!(detect_root(&home, "web"), Detected::GitRepo);
+        assert_eq!(detect_root(&home, "projects"), Detected::NotGitRepo);
+        assert_eq!(detect_root(&home, "nope"), Detected::NotFound);
+        assert_eq!(detect_root(&home, "  "), Detected::NotFound);
+
+        // Bad input stays on the form; nothing is written.
+        assert_eq!(
+            add_project("", "web", ConfigMode::Global, &home),
+            Err(AddProjectError::Invalid("Enter a project name.".into()))
+        );
+        assert!(!home.join("projects/web.yaml").exists());
+
+        // Good input scaffolds and names the new project.
+        assert_eq!(
+            add_project("Web", "web", ConfigMode::Global, &home),
+            Ok("web".to_string())
+        );
+        assert!(home.join("projects/web.yaml").exists());
+        // The second time the name is taken.
+        assert!(matches!(
+            add_project("web", "web", ConfigMode::Global, &home),
+            Err(AddProjectError::Invalid(msg)) if msg.contains("already")
+        ));
 
         std::env::remove_var("SHELBI_HOME");
     }

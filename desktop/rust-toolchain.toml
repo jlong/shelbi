@@ -1,0 +1,10 @@
+# Pinned exactly so local builds and `.github/workflows/desktop-ci.yml` (which
+# installs the channel named here) compile with the same rustc. The weekly
+# `gpui-pre` snapshots track a recent Zed, which tracks recent stable Rust, so
+# bump this together with a gpui upgrade (log it in docs/gpui.md). The root
+# workspace is unaffected: its own floor stays `rust-version = "1.88"`.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-apple-darwin"]
+profile = "minimal"

@@ -1,0 +1,48 @@
+name: desktop-ci
+
+# Build, lint, and test the gpui desktop app (`desktop/`, its own Cargo
+# workspace). Manual only for now: run it from the Actions tab against a
+# branch or tag. It never runs on push or pull_request, so it can't slow or
+# block the main CI (`app-ci.yml`, which never sees `desktop/`).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build
+        required: true
+        default: main
+
+jobs:
+  desktop:
+    # arm64: the first release is macOS on Apple silicon only.
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Install exactly the toolchain `desktop/rust-toolchain.toml` pins (with
+      # its clippy component); rustup reads the file from the working
+      # directory, so every later cargo step uses it too.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo clippy --version
+
+      - name: Cache desktop/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - name: Build
+        run: cargo build
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

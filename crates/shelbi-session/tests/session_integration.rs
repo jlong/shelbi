@@ -885,3 +885,55 @@ fn connect_and_hang_probes_do_not_leak() {
     std::env::remove_var("SHELBI_HELLO_TIMEOUT_MS");
     sess.kill_and_join().unwrap();
 }
+
+/// An empty `input` frame claims the PTY size: it makes its sender the active
+/// (sizing) client without writing anything to the child. Clients send one
+/// when they take focus, so the PTY follows the viewer the user is looking at
+/// even before they type (`dt-terminal-bottom-clipped`); every session binary
+/// already behaves this way, which is what lets a new client rely on it.
+#[test]
+fn an_empty_input_claims_the_pty_size() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let size_file = dir.path().join("size");
+    let script = format!(
+        "while :; do stty size > {f}.tmp 2>/dev/null && mv {f}.tmp {f}; sleep 0.05; done",
+        f = size_file.display()
+    );
+    let mut sess = RunningSession::start(
+        "demo/ws/claim",
+        dir.path(),
+        80,
+        24,
+        vec!["/bin/sh".into(), "-c".into(), script],
+    );
+    let pty_size = || std::fs::read_to_string(&size_file).ok().map(|s| s.trim().to_string());
+    let send = |stream: &mut UnixStream, frame: Frame| {
+        stream.write_all(&frame.encode().unwrap()).unwrap();
+        stream.flush().unwrap();
+    };
+    let resize = |cols, rows| Frame::Resize(shelbi_proto::Resize { cols, rows });
+    let claim = || Frame::Input(shelbi_proto::Input { data: Vec::new() });
+
+    // Client A: a tall viewer that types, so the PTY takes its size.
+    let mut a = sess.connect();
+    client_hello(&mut a);
+    send(&mut a, resize(100, 50));
+    send(&mut a, claim());
+    wait_for(SETTLE, || (pty_size()? == "50 100").then_some(()))
+        .expect("the active client's size reaches the PTY");
+
+    // Client B reports a shorter viewport: A is still active, so nothing moves.
+    let mut b = sess.connect();
+    client_hello(&mut b);
+    send(&mut b, resize(90, 30));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pty_size().as_deref(), Some("50 100"), "a resize alone doesn't take the size");
+
+    // B claims with an empty input: the PTY follows B.
+    send(&mut b, claim());
+    wait_for(SETTLE, || (pty_size()? == "30 90").then_some(()))
+        .expect("an empty input makes its sender the sizing client");
+
+    sess.kill_and_join().expect("session exits on kill");
+}

@@ -9,6 +9,16 @@
 //! Matches are reported per grid row and do not span a wrapped-row boundary;
 //! this is a deliberate simplification over the emulator's logical-line model
 //! and is adequate for locating output on screen.
+//!
+//! ## Stepping
+//!
+//! Matches are kept in buffer order (oldest history line first).
+//! [`Search::next_match`] steps toward the live bottom and
+//! [`Search::prev_match`] back into history, both wrapping. A search usually
+//! starts from the newest match a viewer can see
+//! ([`Search::select_last_at_or_before`]) and steps back from there; a viewer
+//! binds Enter to the older match and Shift+Enter to the newer one. After the
+//! buffer changes, [`Search::rerun`] re-scans and keeps the current match.
 
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
@@ -99,6 +109,46 @@ impl Search {
                 start += 1;
             }
         }
+    }
+
+    /// Re-scan `grid` after its content changed, keeping the current match
+    /// if a match is still at the same place, else the match at the same
+    /// position counted from the newest (new output adds matches at the
+    /// bottom, so that keeps the user near what they were looking at).
+    pub fn rerun(&mut self, grid: &Grid<Cell>) {
+        let previous = self.current();
+        let from_newest = self.current.map(|i| self.matches.len() - 1 - i);
+        self.run(grid);
+        if self.matches.is_empty() {
+            return;
+        }
+        self.current = match previous.and_then(|p| self.matches.iter().position(|m| *m == p)) {
+            Some(i) => Some(i),
+            None => match from_newest {
+                Some(back) => Some(self.matches.len().saturating_sub(1 + back)),
+                None => Some(0),
+            },
+        };
+    }
+
+    /// Make the newest match on or above grid line `line` current (the
+    /// newest match overall when none is), and return it.
+    pub fn select_last_at_or_before(&mut self, line: i32) -> Option<Match> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let i = self
+            .matches
+            .iter()
+            .rposition(|m| m.line <= line)
+            .unwrap_or(self.matches.len() - 1);
+        self.current = Some(i);
+        self.current()
+    }
+
+    /// The current match's index in [`Search::matches`].
+    pub fn current_index(&self) -> Option<usize> {
+        self.current
     }
 
     /// All matches, in top-to-bottom order.
@@ -198,5 +248,60 @@ mod tests {
         s.run(term.grid());
         assert_eq!(s.len(), 1);
         assert_eq!(s.matches()[0].start_col, 12);
+    }
+
+    #[test]
+    fn select_last_at_or_before_picks_the_newest_visible_match() {
+        let term = mock_term("x\r\nfoo\r\nx\r\nfoo\r\nfoo");
+        let mut s = Search::new("foo", false);
+        s.run(term.grid());
+        assert_eq!(s.select_last_at_or_before(3).unwrap().line, 3);
+        assert_eq!(s.current_index(), Some(1));
+        assert_eq!(s.select_last_at_or_before(10).unwrap().line, 4);
+        // Nothing at or above line 0: fall back to the newest overall.
+        assert_eq!(s.select_last_at_or_before(0).unwrap().line, 4);
+    }
+
+    #[test]
+    fn stepping_back_from_the_newest_walks_into_history_and_wraps() {
+        let term = mock_term("foo 1\r\nfoo 2\r\nfoo 3");
+        let mut s = Search::new("foo", false);
+        s.run(term.grid());
+        s.select_last_at_or_before(i32::MAX);
+        let back: Vec<i32> = (0..4).map(|_| s.prev_match().unwrap().line).collect();
+        assert_eq!(back, vec![1, 0, 2, 1], "older, older, wrap to newest, older");
+        assert_eq!(s.next_match().unwrap().line, 2, "Shift+Enter steps newer");
+    }
+
+    #[test]
+    fn rerun_keeps_the_current_match() {
+        let term = mock_term("foo a\r\nfoo b\r\nfoo c");
+        let mut s = Search::new("foo", false);
+        s.run(term.grid());
+        s.next_match();
+        let before = s.current();
+        s.rerun(term.grid());
+        assert_eq!(s.current(), before);
+    }
+
+    #[test]
+    fn rerun_falls_back_to_the_same_place_from_the_newest() {
+        let mut s = Search::new("foo", false);
+        s.run(mock_term("foo a\r\nfoo b\r\nfoo c").grid());
+        s.select_last_at_or_before(i32::MAX);
+        s.prev_match(); // the second newest (line 1)
+        // The buffer changed under it: matches now at lines 1, 2, 3.
+        s.rerun(mock_term("bar\r\nxfoo\r\nxfoo\r\nxfoo").grid());
+        assert_eq!(s.current().unwrap().line, 2, "still the second newest");
+        assert_eq!(s.current_index(), Some(1));
+    }
+
+    #[test]
+    fn rerun_with_no_matches_left_clears_the_current() {
+        let mut s = Search::new("foo", false);
+        s.run(mock_term("foo").grid());
+        s.rerun(mock_term("bar").grid());
+        assert!(s.is_empty());
+        assert_eq!(s.current(), None);
     }
 }

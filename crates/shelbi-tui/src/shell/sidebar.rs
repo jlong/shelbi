@@ -27,14 +27,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap};
 
 use shelbi_app::nav::View;
-use shelbi_app::view::{ReviewState, SidebarModel, WorkspaceBadge};
+use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::keymap::{DisplayStyle, GlobalAction, Keymaps};
 use shelbi_state::ZenModeState;
 
 use super::session::SessionRef;
 use crate::keymap::format_chord_or_unbound;
 use crate::sidebar::{decoration_to_color, nav_lines, BLEED_ABOVE, BLEED_BELOW};
-use crate::theme::{ACCENT, BUSY_GREEN, MUTED, SEARCH_BG, SELECTION_BG, TEXT, TEXT_SELECTED};
+use crate::theme::palette;
 use shelbi_palette::DecorationColor;
 use unicode_width::UnicodeWidthStr;
 
@@ -44,16 +44,11 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) const FIRST_RUN_HINT: &str = "Ctrl+P palette · type E to edit settings";
 
 /// The unread-errors button: a solid 5-wide × 3-tall block anchored to the
-/// footer's bottom-left corner, a single bold `!` in its center cell.
+/// footer's bottom-left corner, a single bold `!` in its center cell. Its fill
+/// is the theme's `error_button`, a reddish gray muted enough to read as
+/// chrome and warm enough to signal something's wrong.
 const ERROR_BUTTON_W: u16 = 5;
 const ERROR_BUTTON_H: u16 = 3;
-/// Reddish-gray fill — muted enough to read as chrome, warm enough to signal
-/// something's wrong, legible in both light and dark terminals.
-const ERROR_BUTTON_BG: Color = Color::Rgb(110, 70, 70);
-
-/// Fill for the `ZEN MODE ON` band — the Figma `color/zen` token (#007f00), a
-/// deep green that reads as a steady "on" bar behind bold white text.
-const ZEN_BAND_BG: Color = Color::Rgb(0, 127, 0);
 /// Rows the footer status reserves for the orchestrator supervisor's failure.
 const ORCH_STATUS_ROWS: u16 = 3;
 
@@ -119,7 +114,7 @@ enum Row {
     Workspace {
         name: String,
         badge: WorkspaceBadge,
-        agent: Option<String>,
+        right_label: String,
         indent: bool,
         target: RowTarget,
     },
@@ -182,10 +177,7 @@ impl SidebarView {
             daemon_version_mismatch: model.daemon_version_mismatch,
             // A dead orchestrator the supervisor couldn't bring back outranks
             // the launch-time hint: it is why the Orchestrator view won't load.
-            status_line: match &model.orchestrator_status {
-                Some(status) => format!("Orchestrator: {status}"),
-                None => model.status_line.clone(),
-            },
+            status_line: model.footer_status(),
             status_is_orchestrator_failure: model.orchestrator_status.is_some(),
             zen_mode: model.zen_mode,
             unread_errors: model.unread_errors,
@@ -418,7 +410,7 @@ impl SidebarView {
         };
         Paragraph::new(Line::from(Span::styled(
             self.project_label.clone(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
         )))
         .render(title_rect.inner(LIST_INDENT), buf);
 
@@ -457,7 +449,7 @@ impl SidebarView {
                 }
             })
             .collect();
-        let lines = crate::sidebar::bleed_block_lines(content, selected, width, SELECTION_BG);
+        let lines = crate::sidebar::bleed_block_lines(content, selected, width, palette().selection);
         Paragraph::new(lines).render(inner, buf);
     }
 
@@ -477,7 +469,7 @@ impl SidebarView {
                 state.select(Some(r - nav_n));
             }
         }
-        let list = List::new(items).highlight_style(Style::default().bg(SELECTION_BG));
+        let list = List::new(items).highlight_style(Style::default().bg(palette().selection));
         StatefulWidget::render(list, area, buf, &mut state);
     }
 
@@ -514,11 +506,11 @@ impl SidebarView {
         let mut idx = 0;
         if has_status {
             let style = if self.status_is_orchestrator_failure {
-                Style::default().fg(Color::Red)
+                Style::default().fg(palette().ansi_red)
             } else if self.status_line == FIRST_RUN_HINT {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(palette().ansi_dark_gray)
             } else {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(palette().ansi_yellow)
             };
             Paragraph::new(Line::from(Span::styled(self.status_line.clone(), style)))
                 .wrap(Wrap { trim: true })
@@ -565,15 +557,15 @@ impl SidebarView {
         let mut spans: Vec<Span> = Vec::new();
         if let Some(line) = self.daemon_version_line.clone() {
             let style = if self.daemon_version_mismatch {
-                Style::default().fg(Color::Red)
+                Style::default().fg(palette().ansi_red)
             } else {
-                Style::default().fg(MUTED)
+                Style::default().fg(palette().muted)
             };
             spans.push(Span::styled(line, style));
         }
         if let Some(banner) = &self.board_banner {
             let stale = banner.contains("stale") || banner.contains("no daemon");
-            let color = if stale { Color::Yellow } else { MUTED };
+            let color = if stale { palette().ansi_yellow } else { palette().muted };
             let prefix = if spans.is_empty() { "" } else { "  " };
             spans.push(Span::styled(
                 format!("{prefix}{banner}"),
@@ -597,8 +589,8 @@ impl SidebarView {
             return;
         }
         let style = Style::default()
-            .bg(ZEN_BAND_BG)
-            .fg(Color::White)
+            .bg(palette().zen)
+            .fg(palette().on_color)
             .add_modifier(Modifier::BOLD);
         let width = area.width as usize;
         let label = "ZEN MODE ON";
@@ -638,134 +630,62 @@ const LIST_INDENT: Margin = Margin {
     vertical: 0,
 };
 
-/// Build the ordered row list from the model, mirroring the old renderer's
-/// `rows()`: a fixed nav, then the machine-grouped workspace pool (or the
-/// config-error / loading placeholder), then the Ready / Queued review
-/// sections. Each section header and its rows drop together when empty.
+/// Build the ordered row list from the model. The layout itself (which rows,
+/// in which order, with which labels) is [`SidebarModel::rows`], shared with the
+/// desktop app; this only attaches the TUI's glyphs and routes.
 fn build_rows(model: &SidebarModel) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
-    for nav in &model.nav {
-        rows.push(Row::Nav {
-            glyph: nav_glyph(&nav.label),
-            label: nav.label.clone(),
-            target: target_from_view(&nav.view),
-        });
-    }
-
-    // Cold board, nothing loaded yet: a dim "Loading…" placeholder.
-    if model.board_loading {
-        rows.push(Row::Blank);
-        rows.push(Row::Loading);
-        return rows;
-    }
-
-    if let Some(message) = &model.config_error {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Workspaces".into()));
-        rows.push(Row::ConfigError(message.clone()));
-    } else if !model.workspaces.is_empty() {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Workspaces".into()));
-        // Group by machine when the project declares more than one; a
-        // single-machine project collapses to a flat list.
-        let machines: Vec<&str> = {
-            let mut seen: Vec<&str> = Vec::new();
-            for w in &model.workspaces {
-                if !seen.iter().any(|m| *m == w.machine) {
-                    seen.push(&w.machine);
-                }
-            }
-            seen
-        };
-        let grouped = machines.len() > 1;
-        if grouped {
-            for machine in &machines {
-                let machine_str = *machine;
-                let on_machine: Vec<_> = model
-                    .workspaces
-                    .iter()
-                    .filter(|w| w.machine == machine_str)
-                    .collect();
-                let total = on_machine.len();
-                let active = on_machine
-                    .iter()
-                    .filter(|w| w.current_task.is_some())
-                    .count();
-                let collapsed = model.collapsed_machines.contains(machine_str);
-                rows.push(Row::MachineGroup {
-                    name: machine_str.to_string(),
-                    collapsed,
-                    total,
-                    active,
-                    target: RowTarget::Machine(machine_str.to_string()),
-                });
-                if collapsed {
-                    continue;
-                }
-                for w in on_machine {
-                    rows.push(Row::Workspace {
-                        name: w.name.clone(),
-                        badge: w.badge,
-                        agent: w.agent.clone(),
-                        indent: true,
-                        target: RowTarget::Session(SessionRef::Workspace(w.name.clone())),
-                    });
-                }
-            }
-        } else {
-            for w in &model.workspaces {
-                rows.push(Row::Workspace {
-                    name: w.name.clone(),
-                    badge: w.badge,
-                    agent: w.agent.clone(),
-                    indent: false,
-                    target: RowTarget::Session(SessionRef::Workspace(w.name.clone())),
-                });
-            }
-        }
-    }
-
-    // Ready for Review — Serving / Loading rows (already on a slot).
-    let ready: Vec<_> = model
-        .reviews
-        .iter()
-        .filter(|r| !matches!(r.state, ReviewState::Pending))
-        .collect();
-    if !ready.is_empty() {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Ready for Review".into()));
-        for r in ready {
-            rows.push(Row::Review {
-                title: r.title.clone(),
-                branch: r.branch.clone(),
-                location: r.location.clone(),
-                state: r.state,
-                target: RowTarget::Review(r.task_id.clone()),
-            });
-        }
-    }
-
-    // Queued for Review — Pending rows (waiting for a free slot).
-    let queued: Vec<_> = model
-        .reviews
-        .iter()
-        .filter(|r| matches!(r.state, ReviewState::Pending))
-        .collect();
-    if !queued.is_empty() {
-        rows.push(Row::Blank);
-        rows.push(Row::Section("Queued for Review".into()));
-        for r in queued {
-            rows.push(Row::Review {
-                title: r.title.clone(),
-                branch: r.branch.clone(),
-                location: r.location.clone(),
-                state: r.state,
-                target: RowTarget::Review(r.task_id.clone()),
-            });
-        }
-    }
-
-    rows
+    model
+        .rows()
+        .into_iter()
+        .map(|row| match row {
+            SidebarRow::Nav { label, view } => Row::Nav {
+                glyph: nav_glyph(&label),
+                label,
+                target: target_from_view(&view),
+            },
+            SidebarRow::Section(label) => Row::Section(label),
+            SidebarRow::ConfigError(message) => Row::ConfigError(message),
+            SidebarRow::Blank => Row::Blank,
+            SidebarRow::Loading => Row::Loading,
+            SidebarRow::MachineGroup {
+                name,
+                collapsed,
+                total,
+                active,
+            } => Row::MachineGroup {
+                target: RowTarget::Machine(name.clone()),
+                name,
+                collapsed,
+                total,
+                active,
+            },
+            SidebarRow::Workspace {
+                name,
+                badge,
+                right_label,
+                indent,
+            } => Row::Workspace {
+                target: RowTarget::Session(SessionRef::Workspace(name.clone())),
+                name,
+                badge,
+                right_label,
+                indent,
+            },
+            SidebarRow::Review {
+                task_id,
+                title,
+                branch,
+                location,
+                state,
+            } => Row::Review {
+                title,
+                branch,
+                location,
+                state,
+                target: RowTarget::Review(task_id),
+            },
+        })
+        .collect()
 }
 
 /// One nav item row. Selected rows fill edge to edge with the selection
@@ -781,14 +701,14 @@ fn nav_item_line(
     let text = format!(" {glyph} {label}");
     if selected {
         let pad = width.saturating_sub(text.chars().count());
-        let fg = if focused { TEXT_SELECTED } else { TEXT };
-        let mut style = Style::default().fg(fg).bg(SELECTION_BG);
+        let fg = if focused { palette().white } else { palette().gray };
+        let mut style = Style::default().fg(fg).bg(palette().selection);
         if focused {
             style = style.add_modifier(Modifier::BOLD);
         }
         Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style))
     } else {
-        Line::from(Span::styled(text, Style::default().fg(TEXT)))
+        Line::from(Span::styled(text, Style::default().fg(palette().gray)))
     }
 }
 
@@ -797,10 +717,10 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
         Row::Nav { .. } => ListItem::new(Line::raw("")), // nav never reaches the rest-list
         Row::Section(label) => ListItem::new(Line::from(Span::styled(
             format!("— {label} —"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ))),
         Row::ConfigError(message) => {
-            let style = Style::default().fg(Color::Red);
+            let style = Style::default().fg(palette().ansi_red);
             let lines: Vec<Line> = config_error_lines(message, width)
                 .into_iter()
                 .map(|l| Line::from(Span::styled(l, style)))
@@ -810,7 +730,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
         Row::Blank => ListItem::new(Line::raw("")),
         Row::Loading => ListItem::new(Line::from(Span::styled(
             "  Loading…",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            Style::default().fg(palette().muted).add_modifier(Modifier::ITALIC),
         ))),
         Row::MachineGroup {
             name,
@@ -824,7 +744,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             let left = vec![Span::styled(format!("{glyph} {name}"), header_style)];
             if *collapsed {
                 let right_label = format!("({total}, {active} active)");
-                let spans = right_align(left, right_label, Style::default().fg(MUTED), width);
+                let spans = right_align(left, right_label, Style::default().fg(palette().muted), width);
                 ListItem::new(Line::from(spans))
             } else {
                 ListItem::new(Line::from(left))
@@ -833,7 +753,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
         Row::Workspace {
             name,
             badge,
-            agent,
+            right_label,
             indent,
             ..
         } => {
@@ -846,14 +766,10 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 ),
                 Span::styled(name.clone(), name_style(selected, focused)),
             ];
-            let right_label = match agent {
-                Some(a) => title_case(a),
-                // A skeleton row (state not read yet) claims no state at all
-                // rather than a misleading "idle"; the `…` badge carries it.
-                None if *badge == WorkspaceBadge::Loading => String::new(),
-                None => "idle".to_string(),
-            };
-            let spans = right_align(left, right_label, Style::default().fg(MUTED), width);
+            // A skeleton row (state not read yet) carries an empty label rather
+            // than a misleading "idle"; the `…` badge carries it.
+            let spans =
+                right_align(left, right_label.clone(), Style::default().fg(palette().muted), width);
             ListItem::new(Line::from(spans))
         }
         Row::Review {
@@ -881,14 +797,14 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 Some(loc) => right_align(
                     vec![badge, title_span],
                     loc.clone(),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(palette().muted),
                     width,
                 ),
                 None => vec![badge, title_span],
             };
             // The `⎇ branch` line is muted in every state; the selection fill
             // (not a text change) marks a selected review row.
-            let branch_style = Style::default().fg(MUTED);
+            let branch_style = Style::default().fg(palette().muted);
             // Branch line: a 2-col indent, the `⎇` glyph, then the branch
             // truncated with `…` to fit (matching the Figma review row).
             const BRANCH_INDENT: &str = "  ";
@@ -910,7 +826,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
 /// highlight style) marks the selection. Kept as a fn so every list row routes
 /// its name through one place.
 fn name_style(_selected: bool, _focused: bool) -> Style {
-    Style::default().fg(TEXT)
+    Style::default().fg(palette().gray)
 }
 
 /// Colour for a row badge glyph (the workspace `⏵`/`·`, the review `✓`/`·`),
@@ -920,10 +836,10 @@ fn name_style(_selected: bool, _focused: bool) -> Style {
 /// [`decoration_to_color`] mapping.
 fn badge_color(c: DecorationColor) -> Color {
     match c {
-        DecorationColor::Green => BUSY_GREEN,
-        DecorationColor::DarkGray => MUTED,
-        DecorationColor::Cyan => ACCENT,
-        DecorationColor::Gray => TEXT,
+        DecorationColor::Green => palette().green,
+        DecorationColor::DarkGray => palette().muted,
+        DecorationColor::Cyan => palette().cyan,
+        DecorationColor::Gray => palette().gray,
         other => decoration_to_color(other),
     }
 }
@@ -946,16 +862,6 @@ fn right_align(
     out.push(Span::raw(" ".repeat(pad)));
     out.push(Span::styled(right, right_style));
     out
-}
-
-/// Uppercase the first character of a lowercase identifier (`developer` →
-/// `Developer`). Empty input is preserved.
-pub(crate) fn title_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 /// Truncate `s` to at most `max` columns (by char count), appending `…` when it
@@ -998,7 +904,7 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     // Top / bottom half-block bleed rows: the fill as the glyph's foreground on
     // the terminal's default (transparent) background, exactly like the nav
     // selection bleed.
-    let bleed_style = Style::default().fg(SEARCH_BG);
+    let bleed_style = Style::default().fg(palette().search);
     if label_y > top {
         Paragraph::new(Line::from(Span::styled(BLEED_ABOVE.repeat(width), bleed_style)))
             .render(Rect { y: top, height: 1, ..area }, buf);
@@ -1021,7 +927,7 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     // dimmed — the Figma search box reads them at the same weight.
     let mut spans = vec![Span::styled(
         label.to_string(),
-        Style::default().fg(TEXT).bg(SEARCH_BG),
+        Style::default().fg(palette().gray).bg(palette().search),
     )];
     // Append the chord hint only when the label, the chord, and a one-column
     // right inset all fit. The chord sits one column in from the box's right
@@ -1030,11 +936,11 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     const RIGHT_INSET: usize = 1;
     if chord_w > 0 && label_w + chord_w + RIGHT_INSET <= width {
         let pad = width - label_w - chord_w - RIGHT_INSET;
-        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(SEARCH_BG)));
-        spans.push(Span::styled(chord.to_string(), Style::default().fg(TEXT).bg(SEARCH_BG)));
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(palette().search)));
+        spans.push(Span::styled(chord.to_string(), Style::default().fg(palette().gray).bg(palette().search)));
         spans.push(Span::styled(
             " ".repeat(RIGHT_INSET),
-            Style::default().bg(SEARCH_BG),
+            Style::default().bg(palette().search),
         ));
     }
     Paragraph::new(Line::from(spans)).render(Rect { y: label_y, height: 1, ..area }, buf);
@@ -1045,7 +951,7 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     // half a cell of fill rather than a full one. Setting bg leaves the symbols
     // and fg intact.
     for x in area.left()..area.right() {
-        buf[(x, label_y)].set_bg(SEARCH_BG);
+        buf[(x, label_y)].set_bg(palette().search);
     }
 }
 
@@ -1056,8 +962,8 @@ fn render_error_button(buf: &mut Buffer, area: Rect) {
         return;
     }
     let style = Style::default()
-        .bg(ERROR_BUTTON_BG)
-        .fg(Color::White)
+        .bg(palette().error_button)
+        .fg(palette().on_color)
         .add_modifier(Modifier::BOLD);
     let mid_col = (area.width / 2) as usize;
     let mid_row = area.height / 2;
@@ -1140,15 +1046,8 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn nav_glyph(label: &str) -> &'static str {
-    match label {
-        // "Orchestrator" is the orchestrator-chat nav item (was "Chat"); the
-        // glyph is unchanged.
-        "Orchestrator" => "💬",
-        "Issues" => "📋",
-        "Activity" => "⚡",
-        "Machines" => "🖥",
-        _ => "•",
-    }
+    // Shared with the palette's nav decorations (and the desktop app).
+    shelbi_app::command_model::nav_glyph(label)
 }
 
 /// Map a shelbi-app nav `View` to a shell route. The orchestrator chat is the
@@ -1364,9 +1263,9 @@ mod tests {
         // single-width cells.)
         assert_eq!(buf[(0, issues_y)].bg, Color::Reset, "left gutter stays transparent, not the fill");
         assert_eq!(buf[(width - 1, issues_y)].bg, Color::Reset, "right gutter stays transparent, not the fill");
-        assert_eq!(buf[(1, issues_y)].bg, SELECTION_BG, "the inset starts one column in with the selection fill");
+        assert_eq!(buf[(1, issues_y)].bg, palette().selection, "the inset starts one column in with the selection fill");
         for x in (width - 4)..(width - 1) {
-            assert_eq!(buf[(x, issues_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
+            assert_eq!(buf[(x, issues_y)].bg, palette().selection, "right-edge padding carries the fill, col {x}");
         }
 
         // Bleed rows above and below span only the inset region.
@@ -1374,7 +1273,7 @@ mod tests {
         let below = issues_y + 1;
         for x in 1..(width - 1) {
             assert_eq!(buf[(x, above)].symbol(), BLEED_ABOVE, "bleed above is U+2584, col {x}");
-            assert_eq!(buf[(x, above)].fg, SELECTION_BG, "bleed above carries the fill as fg, col {x}");
+            assert_eq!(buf[(x, above)].fg, palette().selection, "bleed above carries the fill as fg, col {x}");
             assert_eq!(buf[(x, below)].symbol(), BLEED_BELOW, "bleed below is U+2580, col {x}");
         }
         assert_eq!(buf[(0, above)].symbol(), " ", "the bleed gutter stays blank");
@@ -1389,13 +1288,13 @@ mod tests {
 
         // Selected label: white + bold. Unselected label: #bababa, no fill.
         let issues_x = rows[issues_y as usize].find('I').unwrap() as u16;
-        assert_eq!(buf[(issues_x, issues_y)].fg, TEXT_SELECTED, "selected nav label is white");
+        assert_eq!(buf[(issues_x, issues_y)].fg, palette().white, "selected nav label is white");
         assert!(
             buf[(issues_x, issues_y)].modifier.contains(Modifier::BOLD),
             "selected nav label is bold"
         );
         let chat_x = rows[chat_y].find('O').unwrap() as u16;
-        assert_eq!(buf[(chat_x, chat_y as u16)].fg, TEXT, "unselected nav label is #bababa");
+        assert_eq!(buf[(chat_x, chat_y as u16)].fg, palette().gray, "unselected nav label is #bababa");
         assert_eq!(buf[(chat_x, chat_y as u16)].bg, Color::Reset, "unselected nav label has no fill");
         assert!(
             !buf[(chat_x, chat_y as u16)].modifier.contains(Modifier::BOLD),
@@ -1600,7 +1499,7 @@ mod tests {
         let check = cell("✓");
         assert_eq!(
             check.fg,
-            crate::theme::ACCENT,
+            palette().cyan,
             "serving ✓ is the Figma cyan accent",
         );
         assert!(
@@ -1611,7 +1510,7 @@ mod tests {
         let play = cell("▶");
         assert_eq!(
             play.fg,
-            crate::theme::MUTED,
+            palette().muted,
             "loading ▶ renders in the muted #7a7a7a tint",
         );
         assert_eq!(play.fg, Color::Rgb(122, 122, 122), "muted is #7a7a7a");
@@ -1667,18 +1566,18 @@ mod tests {
         assert!(rows[alpha_y].contains('⏵'), "busy row carries the ⏵ glyph, got: {:?}", rows[alpha_y]);
         assert!(rows[alpha_y].contains("Developer"), "busy row right-aligns the agent, got: {:?}", rows[alpha_y]);
         let glyph_x = rows[alpha_y].find('⏵').unwrap() as u16;
-        assert_eq!(buf[(glyph_x, alpha_y as u16)].fg, BUSY_GREEN, "busy glyph is the #5acd25 green");
+        assert_eq!(buf[(glyph_x, alpha_y as u16)].fg, palette().green, "busy glyph is the #5acd25 green");
         // The workspace name and its right-aligned agent are #bababa / #7a7a7a.
         let name_x = rows[alpha_y].find("alpha").unwrap() as u16;
-        assert_eq!(buf[(name_x, alpha_y as u16)].fg, TEXT, "workspace name is #bababa");
+        assert_eq!(buf[(name_x, alpha_y as u16)].fg, palette().gray, "workspace name is #bababa");
         let dev_x = rows[alpha_y].find("Developer").unwrap() as u16;
-        assert_eq!(buf[(dev_x, alpha_y as u16)].fg, MUTED, "agent label is muted #7a7a7a");
+        assert_eq!(buf[(dev_x, alpha_y as u16)].fg, palette().muted, "agent label is muted #7a7a7a");
 
         let charlie_y = row_y(&rows, "charlie");
         assert!(rows[charlie_y].contains('·'), "idle row carries the · glyph, got: {:?}", rows[charlie_y]);
         assert!(rows[charlie_y].contains("idle"), "idle row shows the idle placeholder, got: {:?}", rows[charlie_y]);
         let bullet_x = rows[charlie_y].find('·').unwrap() as u16;
-        assert_eq!(buf[(bullet_x, charlie_y as u16)].fg, MUTED, "idle bullet is muted #7a7a7a");
+        assert_eq!(buf[(bullet_x, charlie_y as u16)].fg, palette().muted, "idle bullet is muted #7a7a7a");
     }
 
     /// The selected workspace row fills with `color/selection` (#3f3f3f), inset
@@ -1707,12 +1606,12 @@ mod tests {
 
         let alpha_y = row_y(&rows, "alpha") as u16;
         assert_eq!(buf[(0, alpha_y)].bg, Color::Reset, "the left gutter stays transparent");
-        assert_eq!(buf[(1, alpha_y)].bg, SELECTION_BG, "the fill starts one column in");
+        assert_eq!(buf[(1, alpha_y)].bg, palette().selection, "the fill starts one column in");
         // The fill runs to roughly one column before the divider column.
-        assert_eq!(buf[(width - 2, alpha_y)].bg, SELECTION_BG, "the fill extends to the right inset");
+        assert_eq!(buf[(width - 2, alpha_y)].bg, palette().selection, "the fill extends to the right inset");
         // Text colour is unchanged under the fill.
         let name_x = rows[alpha_y as usize].find("alpha").unwrap() as u16;
-        assert_eq!(buf[(name_x, alpha_y)].fg, TEXT, "selected workspace name keeps #bababa");
+        assert_eq!(buf[(name_x, alpha_y)].fg, palette().gray, "selected workspace name keeps #bababa");
 
         // The unselected row below has no fill.
         let charlie_y = row_y(&rows, "charlie") as u16;
@@ -1747,7 +1646,7 @@ mod tests {
         let title_y = row_y(&rows, "My project");
         assert_eq!(title_y, 1, "project title is on the second row, got:\n{joined}");
         let title_x = rows[title_y].find('M').unwrap() as u16;
-        assert_eq!(buf[(title_x, title_y as u16)].fg, ACCENT, "title is the accent cyan #00a6b2");
+        assert_eq!(buf[(title_x, title_y as u16)].fg, palette().cyan, "title is the accent cyan #00a6b2");
         assert!(rows[2].trim().is_empty(), "a blank row sits below the title, got: {:?}", rows[2]);
 
         // Search box with the magnifier, label, and the mac/linux palette chord.
@@ -1765,22 +1664,22 @@ mod tests {
         // leading gutter cell and the whole single-width region past the emoji,
         // which proves the bar spans the full box width.
         let sy = search_y as u16;
-        assert_eq!(buf[(1, sy)].bg, SEARCH_BG, "search box fills the leading cell");
+        assert_eq!(buf[(1, sy)].bg, palette().search, "search box fills the leading cell");
         for x in 5..39u16 {
-            assert_eq!(buf[(x, sy)].bg, SEARCH_BG, "search box fills its row, col {x}");
+            assert_eq!(buf[(x, sy)].bg, palette().search, "search box fills its row, col {x}");
         }
         // The label and the shortcut are both the normal #bababa (not dimmed).
         // (Column math, not `str::find`, since the double-width 🔍 makes byte
         // offsets diverge from columns.) The label " 🔍 Search" renders from the
         // box's inset left edge (x=1): space (1), 🔍 (2–3), space (4), S (5).
-        assert_eq!(buf[(5, sy)].fg, TEXT, "search label 'S' is #bababa");
+        assert_eq!(buf[(5, sy)].fg, palette().gray, "search label 'S' is #bababa");
         // The shortcut is right-aligned; scan in from the right for its last
         // glyph (past the one trailing space of inner padding).
         let chord_cell_x = (6..40u16)
             .rev()
             .find(|&x| buf[(x, sy)].symbol().trim() != "")
             .expect("the shortcut renders a glyph");
-        assert_eq!(buf[(chord_cell_x, sy)].fg, TEXT, "search shortcut is #bababa, not dimmed");
+        assert_eq!(buf[(chord_cell_x, sy)].fg, palette().gray, "search shortcut is #bababa, not dimmed");
 
         // The box is 2 rows tall, drawn with the half-block bleed: a `▄` row of
         // lower-half blocks above the label and a `▀` row of upper-half blocks
@@ -1791,10 +1690,10 @@ mod tests {
         let bottom_y = sy + 1;
         for x in 1..39u16 {
             assert_eq!(buf[(x, top_y)].symbol(), "▄", "top bleed row is lower-half blocks, col {x}");
-            assert_eq!(buf[(x, top_y)].fg, SEARCH_BG, "top bleed carries the fill as fg, col {x}");
+            assert_eq!(buf[(x, top_y)].fg, palette().search, "top bleed carries the fill as fg, col {x}");
             assert_eq!(buf[(x, top_y)].bg, Color::Reset, "top bleed keeps the default background, col {x}");
             assert_eq!(buf[(x, bottom_y)].symbol(), "▀", "bottom bleed row is upper-half blocks, col {x}");
-            assert_eq!(buf[(x, bottom_y)].fg, SEARCH_BG, "bottom bleed carries the fill as fg, col {x}");
+            assert_eq!(buf[(x, bottom_y)].fg, palette().search, "bottom bleed carries the fill as fg, col {x}");
         }
         // A blank half-row margin sits above the box (below the title).
         assert!(rows[(top_y - 1) as usize].trim().is_empty(), "blank margin above the box, got: {:?}", rows[(top_y - 1) as usize]);
@@ -1846,7 +1745,7 @@ mod tests {
         );
         assert_eq!(
             buf[(box_right, sy)].bg,
-            SEARCH_BG,
+            palette().search,
             "the one-column right inset is part of the box fill"
         );
     }
@@ -1931,7 +1830,7 @@ mod tests {
         let y = row_y(&rows, "Orchestrator: supervisor") as u16;
         let x = rows[y as usize].find("Orchestrator: supervisor").unwrap() as u16;
         let buf = term.backend().buffer().clone();
-        assert_eq!(buf[(x, y)].fg, Color::Red);
+        assert_eq!(buf[(x, y)].fg, palette().ansi_red);
 
         // Healthy orchestrator: no status, the hint comes back.
         model.orchestrator_status = None;
@@ -2022,7 +1921,7 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
-        assert_ne!(buf[(0, 15)].bg, ERROR_BUTTON_BG, "no button block without unread errors");
+        assert_ne!(buf[(0, 15)].bg, palette().error_button, "no button block without unread errors");
 
         // With unread errors: a 5×3 block anchored bottom-left, `!` centered.
         let mut model = empty_model();
@@ -2041,7 +1940,7 @@ mod tests {
             for dx in 0..ERROR_BUTTON_W {
                 assert_eq!(
                     buf[(dx, top + dy)].bg,
-                    ERROR_BUTTON_BG,
+                    palette().error_button,
                     "button cell ({dx},{dy}) carries the reddish-gray fill"
                 );
             }
@@ -2049,6 +1948,41 @@ mod tests {
         let cx = ERROR_BUTTON_W / 2;
         let cy = top + ERROR_BUTTON_H / 2;
         assert_eq!(buf[(cx, cy)].symbol(), "!", "the `!` sits in the center cell");
+    }
+
+    /// Every sidebar element (nav selection, workspaces in each badge state,
+    /// reviews in each state, the search box, the Zen band, the unread-errors
+    /// button, the status and version lines) is readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        let mut model = empty_model();
+        model.workspaces = vec![
+            ws("alpha", "hub", Some("t-1"), Some("developer"), WorkspaceBadge::Working),
+            ws("bravo", "hub", Some("t-2"), Some("qa"), WorkspaceBadge::AwaitingInput),
+            ws("charlie", "hub", Some("t-3"), Some("developer"), WorkspaceBadge::AwaitingPermission),
+            ws("delta", "devbox", Some("t-4"), Some("developer"), WorkspaceBadge::Paused),
+            ws("echo", "devbox", None, None, WorkspaceBadge::Idle),
+        ];
+        model.reviews = vec![
+            review("palette", "Palette fuzzy-match fix", "shelbi/pf", Some("hub:3000"), ReviewState::Serving),
+            review("nav", "Homepage nav fix", "shelbi/nav", None, ReviewState::Loading),
+            review("onboarding", "Rework onboarding", "shelbi/ob", None, ReviewState::Pending),
+        ];
+        model.zen_mode = ZenModeState::On;
+        model.unread_errors = 2;
+        model.status_line = "3 open · 1 review".into();
+        model.daemon_version_line = Some("shelbi 0.10.0".into());
+        let view = SidebarView::build(&model);
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut term = Terminal::new(TestBackend::new(40, 48)).unwrap();
+            term.draw(|f| {
+                let area = f.area();
+                view.render(f.buffer_mut(), area, 1, true, &default_chrome())
+            })
+            .unwrap();
+            crate::theme::assert_light_readable("shell-sidebar", term.backend().buffer());
+        });
     }
 
     // --- hit-testing --------------------------------------------------------

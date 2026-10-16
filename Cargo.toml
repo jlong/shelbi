@@ -21,7 +21,11 @@ default-members = ["crates/shelbi-cli"]
 # spike). They are path dependencies of workspace crates but NOT workspace
 # members, so `cargo clippy --workspace -- -D warnings` never lints upstream
 # code and `cargo test --workspace` never runs their suites.
-exclude = ["vendor"]
+#
+# `desktop` is the gpui desktop app, its OWN Cargo workspace (own Cargo.lock
+# and rust-toolchain.toml): gpui's dependency tree must never move this
+# lockfile or this workspace's Rust floor. See desktop/README.md.
+exclude = ["vendor", "desktop"]
 
 [workspace.package]
 version = "0.10.0"

@@ -13,58 +13,22 @@
 //! [`render_intro`] paints into any caller-supplied [`Rect`]. The caller owns
 //! the event loop and the one-shot flag.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
+use crate::theme::palette;
 
-/// Which control has keyboard focus inside the intro popover.
-/// Tab cycles forward through these three in the order written; BackTab
-/// cycles backwards. Enter / Space activates the focused control —
-/// toggling the checkbox or firing the corresponding button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntroFocus {
-    Checkbox,
-    Cancel,
-    Enable,
-}
+// The state machine is shared with the desktop app (`shelbi_app::overlay`).
+pub use shelbi_app::overlay::zen_intro::{IntroFocus, IntroOutcome, IntroState};
+use shelbi_app::overlay::zen_intro as shared;
 
-/// Mutable state the popover renderer reads each frame. Constructed via
-/// [`IntroState::default`] — spec calls for the Enable Zen button to
-/// own initial focus (the user just clicked Enable, are you sure?) and
-/// the checkbox starts unchecked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntroState {
-    pub focus: IntroFocus,
-    pub dont_show_again: bool,
-}
-
-impl Default for IntroState {
-    fn default() -> Self {
-        Self {
-            focus: IntroFocus::Enable,
-            dont_show_again: false,
-        }
-    }
-}
-
-/// Result of feeding a key into the popover state machine. The caller
-/// drives the loop: `Continue` keeps redrawing, `Cancelled` /
-/// `Confirmed` exit and the caller looks at `state.dont_show_again` to
-/// decide whether to persist the global flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntroOutcome {
-    Continue,
-    Cancelled,
-    Confirmed,
-}
-
-/// Step the popover state machine. Pure function — no IO, no terminal,
-/// so every key path is covered by the unit tests below.
+/// Step the popover state machine ([`shared::step_intro`]) with a crossterm
+/// key. Pure, so every key path is unit-tested below.
 ///
 /// Bindings (spec):
 /// - `Tab` cycles Checkbox → Cancel → Enable → Checkbox; `BackTab`
@@ -74,33 +38,9 @@ pub enum IntroOutcome {
 ///   the Cancel button, or fires Enable.
 /// - `Esc` is equivalent to Cancel regardless of focus.
 pub fn step_intro(state: &mut IntroState, key: KeyEvent) -> IntroOutcome {
-    match key.code {
-        KeyCode::Esc => IntroOutcome::Cancelled,
-        KeyCode::Tab | KeyCode::Right => {
-            state.focus = match state.focus {
-                IntroFocus::Checkbox => IntroFocus::Cancel,
-                IntroFocus::Cancel => IntroFocus::Enable,
-                IntroFocus::Enable => IntroFocus::Checkbox,
-            };
-            IntroOutcome::Continue
-        }
-        KeyCode::BackTab | KeyCode::Left => {
-            state.focus = match state.focus {
-                IntroFocus::Checkbox => IntroFocus::Enable,
-                IntroFocus::Cancel => IntroFocus::Checkbox,
-                IntroFocus::Enable => IntroFocus::Cancel,
-            };
-            IntroOutcome::Continue
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => match state.focus {
-            IntroFocus::Checkbox => {
-                state.dont_show_again = !state.dont_show_again;
-                IntroOutcome::Continue
-            }
-            IntroFocus::Cancel => IntroOutcome::Cancelled,
-            IntroFocus::Enable => IntroOutcome::Confirmed,
-        },
-        _ => IntroOutcome::Continue,
+    match crate::keymap::chord_from_event(key) {
+        Some(chord) => shared::step_intro(state, chord),
+        None => IntroOutcome::Continue,
     }
 }
 
@@ -133,38 +73,29 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
         .split(area);
 
     let heading = Paragraph::new(Line::from(Span::styled(
-        "Enable Zen Mode?",
+        shared::HEADING,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette().ansi_cyan)
             .add_modifier(Modifier::BOLD),
     )));
     f.render_widget(heading, layout[0]);
 
-    let body = Paragraph::new(
-        "Zen Mode lets the orchestrator act autonomously:\n\
-         \n  \
-         • Auto-promotes ready tasks to dispatch\n  \
-         • Auto-merges completed tasks that pass your project's checks \
-         (build/test + diff size + danger paths)\n\
-         \n\
-         You can pause it (palette → Pause Zen) or turn it off any time. \
-         Edit CLAUDE.md to tune what qualifies as in-scope or what gates merges.",
-    )
-    .style(Style::default().fg(Color::Gray))
+    let body = Paragraph::new(shared::BODY)
+    .style(Style::default().fg(palette().ansi_gray))
     .wrap(Wrap { trim: true });
     f.render_widget(body, layout[2]);
 
     let checkbox_glyph = if state.dont_show_again { "[x]" } else { "[ ]" };
     let checkbox_style = if state.focus == IntroFocus::Checkbox {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().ansi_gray)
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("{checkbox_glyph} Don't show this again"),
+            format!("{checkbox_glyph} {}", shared::CHECKBOX),
             checkbox_style,
         ))),
         layout[3],
@@ -172,24 +103,24 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
 
     let cancel_style = if state.focus == IntroFocus::Cancel {
         Style::default()
-            .bg(crate::theme::SELECTION_BG)
-            .fg(Color::White)
+            .bg(palette().selection)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette().ansi_dark_gray)
     };
     let enable_style = if state.focus == IntroFocus::Enable {
         Style::default()
-            .bg(Color::Green)
-            .fg(Color::White)
+            .bg(palette().ansi_green)
+            .fg(palette().on_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette().ansi_dark_gray)
     };
     let buttons = Paragraph::new(Line::from(vec![
-        Span::styled("  [ Cancel ]  ", cancel_style),
+        Span::styled(format!("  [ {} ]  ", shared::CANCEL), cancel_style),
         Span::raw("  "),
-        Span::styled("  [ Enable Zen ]  ", enable_style),
+        Span::styled(format!("  [ {} ]  ", shared::ENABLE), enable_style),
     ]));
     f.render_widget(buttons, layout[5]);
 }
@@ -197,10 +128,33 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The intro (title, body, the checkbox, Cancel and Enable Zen each
+    /// focused) is readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, focus, checked) in [
+                ("zen-intro-enable", IntroFocus::Enable, false),
+                ("zen-intro-cancel", IntroFocus::Cancel, true),
+                ("zen-intro-checkbox", IntroFocus::Checkbox, true),
+            ] {
+                let state = IntroState {
+                    focus,
+                    dont_show_again: checked,
+                };
+                let mut term = Terminal::new(TestBackend::new(70, 20)).unwrap();
+                term.draw(|f| render_intro(f, f.area(), &state)).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]

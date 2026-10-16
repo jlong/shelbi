@@ -291,6 +291,30 @@ fn scrollback_history_roundtrips() {
     }
 }
 
+/// A row whose last painted cell has a background color, replayed where the
+/// CRLF after it scrolls (scrollback present): the new bottom line must come
+/// up blank. The emulator fills a line a scroll brings in with the current
+/// background (background-color erase), so the replay must not still be on
+/// that row's color when it scrolls (found by the desktop bench's
+/// second-client check on a Claude Code stream: diff-highlight greens bled
+/// into the blank cells below them).
+#[test]
+fn a_colored_row_end_does_not_bleed_into_the_rows_below() {
+    let mut a = Emu::new(COLS, 6);
+    for i in 0..20 {
+        if i % 3 == 0 {
+            a.feed(format!("added {i} \x1b[48;2;2;40;0m+ x \x1b[0m\r\n").as_bytes());
+        } else {
+            a.feed(format!("plain {i}\r\n").as_bytes());
+        }
+    }
+    assert!(a.term.grid().history_size() > 0, "precondition: history exists");
+    let b = replay_into_fresh(&a);
+    if let Some(d) = diff(a.term.grid(), b.term.grid()) {
+        panic!("a row's background bled into the replay: {d}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scroll region, tab stops, and charsets are carried.
 // ---------------------------------------------------------------------------

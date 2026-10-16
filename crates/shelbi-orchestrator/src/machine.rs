@@ -518,22 +518,10 @@ pub enum MachineProbe {
     Reachable(ReachableProbe),
 }
 
-/// Live reachability of a remote machine, surfaced in the machines view next to
-/// its `ssh <host>` label. Produced by the background prober
-/// ([`probe_reachability`]); a local machine is always reachable and never
-/// probed, so this only ever describes a remote.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Reachability {
-    /// Not probed yet (startup), or a probe is in flight — the initial state the
-    /// view shows as "checking".
-    #[default]
-    Unknown,
-    /// The last probe connected and the host answered.
-    Reachable,
-    /// The last probe failed; carries a short human reason (SSH timeout, auth
-    /// failure, connection refused, …) so the view can show *why*.
-    Unreachable { error: String },
-}
+/// Live reachability of a remote machine. Defined in `shelbi-core` so the
+/// toolkit-free machines model (`shelbi-app`) can carry it; re-exported here
+/// beside [`probe_reachability`], which produces it.
+pub use shelbi_core::Reachability;
 
 /// What a successful probe found on a reachable machine.
 #[derive(Debug, Clone)]
@@ -716,6 +704,25 @@ pub fn probe_machine(exec: &dyn RemoteExec, hub: &Version) -> MachineProbe {
             MachineProbe::Reachable(parse_probe_output(&out.stdout, hub))
         }
     }
+}
+
+/// Wall-clock bound on one machines-view reachability probe. Short so a wedged
+/// host fails fast into [`Reachability::Unreachable`] rather than holding the
+/// prober thread for the install-sized default `SshExec` deadline.
+pub const REACHABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The machines views' live probe of `host`: an SSH `true` with a
+/// [`REACHABILITY_PROBE_DEADLINE`], through [`probe_reachability`] and the
+/// shared `shelbi_ssh` transport (the same ControlMaster and reverse forward
+/// the poller uses). Blocking: run it on a reachability prober's thread
+/// (`shelbi_app::reachability`), never a UI thread. Shared by the TUI and the
+/// desktop app.
+pub fn probe_host_reachability(host: &str) -> Reachability {
+    let target = Host::Ssh {
+        host: host.to_string(),
+    };
+    let exec = SshExec::with_deadline(target, host.to_string(), REACHABILITY_PROBE_DEADLINE);
+    probe_reachability(&exec)
 }
 
 /// A lightweight "is this host answering right now" probe for the machines
