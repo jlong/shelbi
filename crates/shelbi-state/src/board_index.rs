@@ -466,6 +466,32 @@ pub fn read_board_index_viewer_login(
     Ok(read_valid_board_index(project, expected.as_deref()).and_then(|idx| idx.viewer_login))
 }
 
+/// One **open** issue from the daemon-published board index, for a remote
+/// backend: the zero-API-call lookup a per-tick probe takes before falling back
+/// to a live `get`.
+///
+/// Serves the issue whatever the index's freshness (warm or stale), so it is
+/// only for callers that read slow-changing fields (the card's workflow, its
+/// title) and tolerate a tick of lag; a correctness-critical read (dispatch, a
+/// transition) keeps the live `get`. The local assignment overlay is folded in,
+/// since the index's `assigned_to` is captured at publish time. `None` for a
+/// `file_system` backend (its `get` is already a cheap file read), for a
+/// missing / torn / identity-mismatched index, and for an id the open index
+/// does not carry (a closed issue, or one added since the last tick), so the
+/// caller's live read still covers those.
+pub fn indexed_issue(project: &str, cfg: &IssueTrackerConfig, id: &str) -> Option<IssueFile> {
+    if !cfg.backend.is_remote() {
+        return None;
+    }
+    let expected = expected_board_repo(cfg);
+    let mut tf = read_valid_board_index(project, expected.as_deref())?
+        .board
+        .into_iter()
+        .find(|tf| tf.task.id == id)?;
+    tf.task.assigned_to = crate::get_task_assignment(project, id).ok().flatten();
+    Some(tf)
+}
+
 /// The shared read every **list** consumer uses instead of sweeping the backend
 /// itself: the board the daemon published, tagged with its freshness. This is
 /// the consumer-side half of `Plans/github-issue-caching-and-rate-limits.md` §5

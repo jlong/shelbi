@@ -504,16 +504,34 @@ pub struct ReviewSlotLayout {
 /// local assignment overlay for a remote backend (assignment lives in the hub's
 /// overlay, never on the remote), and the card's `assigned_to` for a
 /// `file_system` backend.
+///
+/// The board comes from the daemon-published board index
+/// ([`shelbi_state::read_board_with_cfg`]), never a backend sweep: the TUI runs
+/// this about once a second while a review is open (the close-reconcile), and it
+/// used to call `list()`, a live `state=all --paginate` read of the whole issue
+/// history that burned the GitHub REST quota in under an hour on an idle board.
+/// The review column is never terminal, so the open board is all it needs. Only
+/// a [`shelbi_state::BoardState::Warm`] board answers: a stale or cold index
+/// can't prove a review has closed, so it reads as an error and the caller
+/// keeps its current layout (the same rule the poller's destructive passes
+/// follow).
 pub fn review_layout_state(project_name: &str) -> Result<Vec<ReviewSlotLayout>> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let board = match shelbi_state::read_board_with_cfg(project_name, &project.issue_tracker)? {
+        shelbi_state::BoardState::Warm(board) => board,
+        shelbi_state::BoardState::Stale(_) | shelbi_state::BoardState::Cold => {
+            return Err(Error::Other(format!(
+                "board index for `{project_name}` is not fresh; review layout unknown"
+            )));
+        }
+    };
     let overlay = if project.issue_tracker.backend.is_remote() {
         shelbi_state::task_assignments(project_name).unwrap_or_default()
     } else {
         std::collections::BTreeMap::new()
     };
     let mut out = Vec::new();
-    for tf in store.list()? {
+    for tf in board {
         if tf.task.column != Column::review() {
             continue;
         }
@@ -668,6 +686,84 @@ mod tests {
             "only the review-column task on the review-tagged slot is laid out"
         );
 
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The TUI runs [`review_layout_state`] about once a second while a review
+    /// is open (the close-reconcile). On a GitHub board it used to call
+    /// `list()`, a live `issues?state=all --paginate` sweep of the whole issue
+    /// history (~17 REST calls per pass on a 1,700-issue repo), which drained
+    /// the 5,000/hour core quota in under an hour on an idle board. It must read
+    /// the daemon-published board index instead and spawn **no** `gh` at all,
+    /// and a stale index must read as "unknown" (an error), never as "closed".
+    #[test]
+    fn review_layout_state_reads_the_board_index_and_spawns_no_gh() {
+        let _lock = crate::test_lock::acquire();
+        let proj = format!("review-layout-gh-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-rls-gh-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut project = demo_project(&proj);
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        shelbi_state::save_project(&project).unwrap();
+        // Assignment on a remote board lives in the local overlay.
+        shelbi_state::set_task_assignment(&proj, "t-rev", Some("review-1")).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |_args: &[&str]| {
+            rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(String::new())
+        });
+
+        let issue = |id: &str, column: Column| shelbi_state::IssueFile {
+            task: task_on(id, "review-1", column),
+            body: String::new(),
+            tracker_assignees: Vec::new(),
+        };
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![
+            issue("t-rev", Column::review()),
+            issue("t-dev", Column::in_progress()),
+        ]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index(&proj, &idx).unwrap();
+
+        // An hour of idle reconcile passes, compressed: every one is answered
+        // from the index.
+        for _ in 0..60 {
+            assert_eq!(
+                review_layout_state(&proj).unwrap(),
+                vec![ReviewSlotLayout {
+                    workspace: "review-1".into(),
+                    task: "t-rev".into(),
+                }],
+            );
+        }
+
+        // A stale index can't prove the review closed: unknown, not empty.
+        idx.stale = true;
+        shelbi_state::write_board_index(&proj, &idx).unwrap();
+        assert!(review_layout_state(&proj).is_err(), "a stale index is not a definitive read");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the review close-reconcile must never call gh"
+        );
+
+        shelbi_state::clear_test_gh_runner();
         match prev_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
             None => std::env::remove_var("SHELBI_HOME"),
