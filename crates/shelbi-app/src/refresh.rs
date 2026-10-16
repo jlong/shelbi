@@ -127,6 +127,19 @@ impl RefreshHandle {
         self.snapshot_rx.recv_timeout(timeout).ok()
     }
 
+    /// Stop the worker without waiting for it: a read in flight finishes on
+    /// the worker's own thread and its result is dropped. For a host tearing
+    /// a view down on its UI thread (the desktop's project switch), where a
+    /// join could wait on a slow read. Idempotent; a later [`Self::stop`] (or
+    /// the drop) has nothing left to join.
+    pub fn stop_without_waiting(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(tx) = self.request_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(self.join.take());
+    }
+
     /// Stop the worker and join its thread. Idempotent; also runs on drop.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -224,6 +237,19 @@ impl<T> Refresher<T> {
     /// Block up to `timeout` for the next result.
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<T> {
         self.snapshot_rx.recv_timeout(timeout).ok()
+    }
+
+    /// Stop the worker without waiting for it: a read in flight finishes on
+    /// the worker's own thread and its result is dropped. For a host tearing
+    /// a view down on its UI thread (the desktop's project switch), where a
+    /// join could wait on a slow read. Idempotent; a later [`Self::stop`] (or
+    /// the drop) has nothing left to join.
+    pub fn stop_without_waiting(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(tx) = self.request_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(self.join.take());
     }
 
     /// Stop the worker and join its thread. Idempotent; also runs on drop.
@@ -359,5 +385,25 @@ mod tests {
         assert!(!handle.request());
         // A second stop is a no-op.
         handle.stop();
+    }
+
+    #[test]
+    fn stopping_without_waiting_returns_before_a_slow_read_finishes() {
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
+        let mut worker = spawn_worker(move |_| {
+            flag.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        assert!(worker.request());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the read never started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let t0 = Instant::now();
+        worker.stop_without_waiting();
+        drop(worker);
+        assert!(t0.elapsed() < Duration::from_millis(100), "took {:?}", t0.elapsed());
     }
 }

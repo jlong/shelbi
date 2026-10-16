@@ -340,6 +340,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::OpenErrorLog => Placement::View,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
+        CommandKind::NewWindow => Placement::File,
         CommandKind::OpenEditor { .. } => Placement::File,
         CommandKind::Detach => Placement::App,
         CommandKind::DetachOtherClients => Placement::App,
@@ -448,9 +449,16 @@ fn file_menu<'a, I: Iterator<Item = &'a Command>>(
             _ => {}
         }
     }
+    // ⌘⇧N: the window takes the chord itself (`crate::keys::NEW_WINDOW`);
+    // here it labels the item.
+    let new_window = KeyChord::parse(crate::keys::NEW_WINDOW)
+        .ok()
+        .and_then(|c| shortcut(&c));
     MenuSpec {
         title: "File".into(),
         items: vec![
+            slot("action:new-window", "New Window", new_window),
+            MenuEntry::Separator,
             slot("action:add-project", "Add Project…", None),
             slot("action:switch-project", "Switch Project…", None),
             submenu("Open Project", projects, "No Other Projects"),
@@ -572,8 +580,9 @@ fn go_menu<'a, I: Iterator<Item = &'a Command>>(
 }
 
 fn window_menu() -> MenuSpec {
-    // AppKit appends the open project windows itself (this is the app's
-    // Windows menu), each titled with its project, the key one checked.
+    // AppKit appends the open windows itself (this is the app's Windows
+    // menu), each titled with the project it shows now (the title follows a
+    // switch), the key one checked.
     MenuSpec {
         title: "Window".into(),
         items: vec![
@@ -720,6 +729,7 @@ mod tests {
                 title: "Edit Project Settings".into(),
             }],
             other_clients_attached: true,
+            multi_window: true,
         }
     }
 
@@ -869,6 +879,21 @@ mod tests {
     }
 
     #[test]
+    fn file_opens_a_new_window_on_cmd_shift_n() {
+        let tree = build(&fixture(), &defaults(), WindowFacts::default());
+        let file = tree.menu("File").unwrap();
+        assert_eq!(
+            titles(&file.items)[..4],
+            ["New Window", "-", "Add Project…", "Switch Project…"]
+        );
+        let item = find(&tree, "New Window");
+        assert!(item.enabled);
+        assert_eq!(item.action, MenuAction::Command("action:new-window".into()));
+        let shortcut = item.shortcut.as_ref().unwrap();
+        assert_eq!((shortcut.keystroke.as_str(), shortcut.display.as_str()), ("shift-cmd-n", "⇧⌘N"));
+    }
+
+    #[test]
     fn file_names_projects_by_label() {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
         let item = find(&tree, "API");
@@ -978,6 +1003,7 @@ mod tests {
         assert_eq!(place(&CommandKind::ToggleZen), Placement::View);
         assert_eq!(place(&CommandKind::QuitShelbi), Placement::App);
         assert_eq!(place(&CommandKind::AddProject), Placement::File);
+        assert_eq!(place(&CommandKind::NewWindow), Placement::File);
         assert_eq!(place(&CommandKind::ApproveReview { id: s() }), Placement::GoReview);
         assert_eq!(place(&CommandKind::StartIssue { id: s() }), Placement::Board);
     }

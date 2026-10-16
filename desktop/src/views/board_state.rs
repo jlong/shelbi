@@ -254,7 +254,6 @@ impl BoardState {
         &self.input
     }
 
-    #[cfg(test)]
     pub fn filters(&self) -> &BoardFilters {
         &self.filters
     }

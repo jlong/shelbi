@@ -238,8 +238,8 @@ impl ColumnSwap {
         t.paced_at = Some(now);
     }
 
-    /// Jump to the end of any swap under way (and of a queued push).
-    #[cfg(test)]
+    /// Jump to the end of any swap under way (and of a queued push): a
+    /// switch restoring a panel puts it straight back.
     pub fn finish(&mut self) {
         self.transition = None;
         if let Some((panel, _)) = self.queued.take() {

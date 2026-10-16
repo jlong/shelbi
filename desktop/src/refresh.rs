@@ -2,7 +2,8 @@
 //! here, off gpui's UI thread, and crosses to the foreground as [`FeedEvent`]s
 //! over an async channel a window's foreground task awaits.
 //!
-//! Per project window, one [`ProjectFeed`]:
+//! Per project, one [`ProjectFeed`], shared by every window that shows the
+//! project (`crate::feeds`):
 //!
 //! - a [`shelbi_app::spawn_refresher`] worker that runs the injected reader
 //!   (the shared `shelbi_orchestrator::sidebar_model::read_sidebar_model`) and
@@ -207,6 +208,22 @@ impl ProjectFeed {
             tracing::error!(error = %e, "could not start the refresh feed");
         }
         (feed, events_rx)
+    }
+
+    /// A feed with no thread behind it (gpui tests, whose scheduler rejects
+    /// wakes from other threads): it never reads, and its stop flag says
+    /// whether it has been dropped.
+    #[cfg(test)]
+    pub fn inert() -> (ProjectFeed, UnboundedReceiver<FeedEvent>, Arc<AtomicBool>) {
+        let (events_tx, events_rx) = unbounded();
+        let (wake_tx, _) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let feed = ProjectFeed {
+            wake: wake_tx,
+            stop: stop.clone(),
+            events: events_tx,
+        };
+        (feed, events_rx, stop)
     }
 
     /// Ask for a refresh now. Never blocks; coalesces with any pending one.

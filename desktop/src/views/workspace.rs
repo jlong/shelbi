@@ -136,6 +136,7 @@ impl WorkspaceOps for LiveOps {
 }
 
 /// What the view needs from the outside world.
+#[derive(Clone)]
 pub struct WorkspaceDeps {
     pub ops: Arc<dyn WorkspaceOps>,
     /// Builds the deps of each of the view's two session panes.
@@ -1372,6 +1373,17 @@ pub(crate) mod tests {
     impl FakeSessions {
         pub(crate) fn attached(&self) -> Vec<String> {
             self.attaches.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
+        }
+
+        /// The attaches still connected (their pane hasn't dropped them).
+        pub(crate) fn live(&self) -> Vec<String> {
+            self.attaches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, tx)| !tx.is_closed())
+                .map(|(n, _)| n.clone())
+                .collect()
         }
 
         /// The newest attach of `name`.

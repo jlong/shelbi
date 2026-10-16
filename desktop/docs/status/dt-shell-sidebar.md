@@ -29,8 +29,9 @@
   the window's project the first time it is shown (so each project window has
   its own board); Enter on a card opens task detail inside the main area, and
   the board's mutations come back through the window's dispatch.
-- **One window per project.** `SwitchProject` opens the target project's
-  window, or focuses it if open. The project switcher is the project title's
+- **One window per project** (superseded by `dt-switch-project-in-window`:
+  a switch now retargets the current window). `SwitchProject` opens the
+  target project's window, or focuses it if open. The project switcher is the project title's
   dropdown (the list is `shelbi_state::list_projects`, the TUI switcher's
   source). A new window paints the target's chrome on its first frame from the
   prefetched config skeleton (else the bare skeleton) and data cascades in.

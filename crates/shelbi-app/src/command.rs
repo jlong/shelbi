@@ -48,6 +48,9 @@ pub enum CommandKind {
     SwitchProject { project: String },
     /// Begin the add-project flow.
     AddProject,
+    /// Open another window on the current project. Offered only by a client
+    /// that has windows to open ([`CommandModel::multi_window`]).
+    NewWindow,
     /// Detach this client (leave Shelbi running in the background).
     Detach,
     /// Detach every other client attached to this session.
@@ -163,6 +166,7 @@ impl CommandKind {
                 project: project.clone(),
             },
             CommandKind::AddProject => Effect::AddProject,
+            CommandKind::NewWindow => Effect::NewWindow { project: p() },
             CommandKind::Detach => Effect::Detach,
             CommandKind::DetachOtherClients => Effect::DetachOtherClients,
             CommandKind::QuitProject => Effect::QuitProject { project: p() },
@@ -301,6 +305,9 @@ pub struct CommandModel {
     /// Whether any *other* client is attached to this session right now. Gates
     /// the "Detach Other Clients" command (hidden when this is the only client).
     pub other_clients_attached: bool,
+    /// Whether this client opens more than one window (the desktop app).
+    /// Gates "New Window": the TUI is one terminal, so it never lists it.
+    pub multi_window: bool,
 }
 
 /// The one-line description shown beside a nav view in the command palette's
@@ -500,6 +507,20 @@ impl CommandRegistry {
             hidden_until_query: true,
         });
 
+        // New window (hidden until query), only for a client that has them.
+        if model.multi_window {
+            out.push(Command {
+                id: "action:new-window".to_string(),
+                title: "New Window".to_string(),
+                kind: CommandKind::NewWindow,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Open another window on this project".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+        }
+
         // Edit targets (hidden until query).
         for e in &model.edit_targets {
             out.push(Command {
@@ -649,6 +670,7 @@ impl CommandKind {
                 project: String::new(),
             }),
             "action:add-project" => Some(CommandKind::AddProject),
+            "action:new-window" => Some(CommandKind::NewWindow),
             "action:detach" => Some(CommandKind::Detach),
             "action:detach-others" => Some(CommandKind::DetachOtherClients),
             "action:quit-project" => Some(CommandKind::QuitProject),
@@ -736,6 +758,7 @@ mod tests {
             // commands are present (and covered by the round-trip test); the
             // gating is exercised separately below.
             other_clients_attached: true,
+            multi_window: true,
         }
     }
 
@@ -756,6 +779,7 @@ mod tests {
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
+            "action:new-window",
             "edit:project",
             "edit:agent:developer",
             "action:detach",
@@ -805,6 +829,28 @@ mod tests {
             .find(|c| c.id() == id)
             .map(|c| c.decoration.is_none())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn new_window_is_offered_only_by_a_multi_window_client() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        m.multi_window = true;
+        let cmd = reg.resolve("action:new-window", &m).expect("offered");
+        assert_eq!(cmd.kind(), &CommandKind::NewWindow);
+        assert_eq!(
+            cmd.effect("alpha"),
+            Effect::NewWindow {
+                project: "alpha".into()
+            }
+        );
+        assert_eq!(
+            CommandKind::from_id("action:new-window"),
+            Some(CommandKind::NewWindow)
+        );
+        // The TUI is one terminal: it has no window to open.
+        m.multi_window = false;
+        assert!(reg.resolve("action:new-window", &m).is_none());
     }
 
     #[test]

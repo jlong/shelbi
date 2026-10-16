@@ -186,6 +186,29 @@ impl IssuesView {
         }
     }
 
+    /// The board's workflow filter (what a project switch saves).
+    pub fn workflow_filter(&self) -> Option<String> {
+        self.state.filters().workflow.clone()
+    }
+
+    /// Put back the workflow filter a project was left with, quietly (no
+    /// status note: the user didn't just choose it).
+    pub fn restore_workflow_filter(&mut self, filter: Option<String>, cx: &mut Context<Self>) {
+        if self.state.filters().workflow != filter {
+            self.state.set_workflow_filter(filter);
+            self.state.status = None;
+            cx.notify();
+        }
+    }
+
+    /// The window is dropping this view (a project switch): stop its
+    /// background reads without waiting on one in flight, so the UI thread
+    /// never joins a slow read.
+    pub fn stop_workers(&mut self) {
+        self.open_refresher.stop_without_waiting();
+        self.closed_refresher.stop_without_waiting();
+    }
+
     /// Take keyboard focus on the next frame (the window calls this when the
     /// view is shown).
     pub fn request_focus(&mut self) {

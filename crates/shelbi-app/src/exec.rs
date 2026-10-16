@@ -35,6 +35,9 @@ pub enum Effect {
     /// Begin the add-project flow (the host collects the form, then calls
     /// [`Mutation::AddProject`]).
     AddProject,
+    /// Open another window on `project` (a multi-window client only; the
+    /// registry never offers it to the TUI).
+    NewWindow { project: String },
     /// Detach this client: stop rendering and drop its connections, leaving
     /// every session and agent running (the palette's "Detach"; the same
     /// client-local stop `q` performs).

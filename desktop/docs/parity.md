@@ -41,7 +41,8 @@ paths on every `cargo test`.
 | Zen toggle | `action:toggle-zen` | First off-to-on shows the intro; confirm turned Zen on; again turned it off | Same; the View menu item relabels on/off |
 | Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) |
 | Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The sidebar's project switcher (File ▸ Switch Project…) |
-| Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | Opens (or focuses) `pb`'s own window (File ▸ Open Project ▸ pb) |
+| Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | The window switches to `pb` in place, and back to where `pa` was left (File ▸ Open Project ▸ pb; `dt-switch-project-in-window`) |
+| New Window | `action:new-window` | Not offered: the registry lists it only for a multi-window client (`CommandModel::multi_window`); the TUI's arm says to run `shelbi` in another terminal | A second window on the current project, cascaded (File ▸ New Window, ⌘⇧N, and the palette) |
 | Add project | `action:add-project` | Form with detection and the derived id; cancelled before creating (submit would launch a real agent) | Same (File ▸ Add Project…) |
 | Edit Project Settings | `edit:project` | Made real here: the editor ran on `projects/pa.yaml` with the terminal handed over (checked with `vi`), then the shell repainted | Made real here: the editor ran on the same path ("Opened pa.yaml in …") |
 | Edit an agent | `edit:agent:<name>` | `agents/developer/instructions.md` | Same path |
@@ -49,7 +50,7 @@ paths on every `cargo test`.
 | Edit Workflows | `edit:workflows` | The `workflows/` directory | Same path |
 | Detach | `action:detach` | The TUI exits; every session keeps running | The app quits; every session keeps running |
 | Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
-| Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends, the window closes; `pb` kept running |
+| Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to another open project, or shows the empty-state chooser; `pb` kept running |
 | Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
 | Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop) |
 | Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column) |
@@ -65,10 +66,25 @@ paths on every `cargo test`.
 - **Native menus** with `keys.yaml` key equivalents, and **system
   notifications**: desktop only. Every menu item runs a registry command
   through the same dispatch as the palette.
-- **One window per project** in the desktop app: switching to a project opens
-  or focuses its window; the TUI switches its one screen. A bare "Switch
-  Project" opens each client's switcher (the TUI's palette Projects column,
-  the desktop's sidebar switcher).
+- **Windows** (`dt-switch-project-in-window`): both clients switch projects
+  in place: the TUI its one screen, the desktop the current window (its
+  frame, size and sidebar width stay; the outgoing project's views and
+  sessions are torn down and the target's sidebar skeleton paints on the next
+  frame, its main view attaching after that frame). The desktop also opens
+  more windows (File ▸ New Window, ⌘⇧N), each switching on its own; two may
+  show one project and share its feed (`crate::feeds`), the first of them
+  posting its notifications. A notification goes to a window already showing
+  its project, else switches the frontmost. Window frames persist per window
+  slot (`~/.shelbi/desktop-windows.json`), and a launch reopens the windows
+  that were open, each on its last project (the first launch after the change
+  migrates the old per-project frame to one window). Where a project was left
+  (view, focus, sidebar selection and scroll, open review, board workflow
+  filter) persists per project (`projects/<name>/desktop-view.json`) and is
+  restored by a switch back in either window; the TUI's `ClientState`
+  remembers only the view, in memory. Quitting the shown project keeps the
+  window: it moves to another open project or the empty-state chooser. A
+  bare "Switch Project" opens each client's switcher (the TUI's palette
+  Projects column, the desktop's sidebar switcher).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the
@@ -186,7 +202,7 @@ equivalent datum.
 ### `SidebarModel`
 | Field | TUI | Desktop |
 |---|---|---|
-| `project_label` | sidebar header title (`shell/sidebar.rs` `render_header`) | sidebar header title (`views/sidebar.rs` `render_header`); window title (`app.rs` `set_window_title`, set once at window build); "Quit X?" prompt (`app.rs` `confirm_quit_project`); notification bodies (`notify.rs` `observe_sidebar`, `observe_orchestrator`) |
+| `project_label` | sidebar header title (`shell/sidebar.rs` `render_header`) | sidebar header title (`views/sidebar.rs` `render_header`); window title, and so the Window menu's list (`app.rs` `set_window_title`, at window build and on every switch); "Quit X?" prompt (`app.rs` `confirm_quit_project`); notification bodies (`notify.rs` `observe_sidebar`, `observe_orchestrator`) |
 | `nav` | nav block rows, glyph picked from the label (`shell/sidebar.rs` `render_nav`, `nav_glyph`); palette view entries | nav rows, Heroicon picked from the view (`views/sidebar.rs` `render_nav_row`, `nav_icon`); palette view entries; Go menu (`menus/tree.rs`) |
 | `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows (`views/sidebar.rs` `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) |
 | `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for Review sections (`views/sidebar.rs` `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) |
