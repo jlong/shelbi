@@ -93,6 +93,8 @@ fn fixture() -> CommandModel {
             },
         ],
         other_clients_attached: true,
+        // The desktop's model: it opens windows, so New Window is listed.
+        multi_window: true,
     }
 }
 
@@ -196,7 +198,8 @@ impl Executor for Scenario {
             | Effect::Detach
             | Effect::DetachOtherClients
             | Effect::QuitProject { .. }
-            | Effect::QuitShelbi => Performed::Host(effect.clone()),
+            | Effect::QuitShelbi
+            | Effect::NewWindow { .. } => Performed::Host(effect.clone()),
         };
         self.performed.push(performed);
         Ok(())
@@ -224,6 +227,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::OpenErrorLog => "the_error_log_opens_its_overlay",
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
         CommandKind::AddProject => "add_project_collects_the_form_then_mutates",
+        CommandKind::NewWindow => "new_window_reaches_the_host_on_a_multi_window_client",
         CommandKind::Detach => "detach_and_quit_reach_the_host",
         CommandKind::DetachOtherClients => "detach_and_quit_reach_the_host",
         CommandKind::QuitProject => "detach_and_quit_reach_the_host",
@@ -267,6 +271,7 @@ fn every_command_kind_has_a_scenario() {
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
+            "action:new-window",
             "edit:project",
             "edit:agent:developer",
             "edit:zenmode",
@@ -511,6 +516,26 @@ fn detach_and_quit_reach_the_host() {
     let mut m = fixture();
     m.other_clients_attached = false;
     assert!(CommandRegistry::new().resolve("action:detach-others", &m).is_none());
+}
+
+#[test]
+fn new_window_reaches_the_host_on_a_multi_window_client() {
+    // The desktop opens another window on the current project; this client's
+    // own state (its project, view and focus) is untouched.
+    let mut s = Scenario::new();
+    let effect = Effect::NewWindow {
+        project: PROJECT.into(),
+    };
+    assert_eq!(s.invoke("action:new-window"), effect);
+    assert_eq!(s.last(), &Performed::Host(effect));
+    assert_eq!(s.client.project(), Some(PROJECT));
+    assert_eq!(s.client.view(), &View::Session("orch".into()));
+    assert_eq!(s.client.overlay(), None);
+    // The TUI's model never lists it: it is one terminal, with no window to
+    // open.
+    let mut m = fixture();
+    m.multi_window = false;
+    assert!(CommandRegistry::new().resolve("action:new-window", &m).is_none());
 }
 
 /// A scratch Shelbi root shared by the tests in this binary (set once, so

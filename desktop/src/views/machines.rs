@@ -99,6 +99,13 @@ impl MachinesView {
         }
     }
 
+    /// The window is dropping this view (a project switch): stop its
+    /// background reads without waiting on one in flight, so the UI thread
+    /// never joins a slow read.
+    pub fn stop_workers(&mut self) {
+        self.refresher.stop_without_waiting();
+    }
+
     pub fn request_focus(&mut self) {
         self.needs_focus = true;
     }

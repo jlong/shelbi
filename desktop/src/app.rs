@@ -1,17 +1,34 @@
-//! The root view of a project window: the sidebar | main area split.
+//! The root view of a Shelbi window: the sidebar | main area split.
 //!
-//! One window per project ([`Shell`] keeps the registry). A window owns its
-//! project's `shelbi_app::nav::ClientState`, the source of truth for what the
-//! main area shows, where keyboard focus sits, the sidebar selection and the
-//! sidebar width; its sidebar model, fed by the project's
-//! [`ProjectFeed`](crate::refresh::ProjectFeed); and its persisted
-//! [`WindowState`].
+//! A window shows one project at a time and switches projects in place
+//! (`dt-switch-project-in-window`): the sidebar's switcher, the palette, the
+//! File menu and a notification click all retarget the current window rather
+//! than opening another. File ▸ New Window (⌘⇧N) opens a second window, which
+//! switches on its own; two windows may show the same project and share its
+//! feed ([`crate::feeds`]). [`Shell`] keeps the open windows and their slots.
+//!
+//! A window owns its project's `shelbi_app::nav::ClientState`, the source of
+//! truth for what the main area shows, where keyboard focus sits, the sidebar
+//! selection and the sidebar width; its sidebar model, fed by the project's
+//! shared [`ProjectFeed`](crate::refresh::ProjectFeed); and its persisted
+//! [`WindowState`] (per window slot, so a window keeps its frame across
+//! switches).
+//!
+//! A switch tears the window's project-bound views down (chat, board,
+//! activity, machines, review and workspace panels, their sessions, the feed
+//! subscription), saving where the outgoing project was left
+//! ([`ProjectViewState`]), and paints the target's prefetched sidebar skeleton
+//! on the next frame with its own saved view state. The heavy part (building
+//! the main area's view and attaching its sessions) waits for that frame to be
+//! drawn ([`SwitchHold`]), the way a panel's content waits for its push
+//! (`dt-instant-panel-push`). Quitting the project a window shows switches it
+//! to another open project, or to the empty-state chooser.
 //!
 //! The app's first window runs bootstrap (`crate::platform`: the login
 //! environment, finding the CLI, starting the daemon, the version check) and
 //! shows its progress and failure screens until it is `Ready`; the `Ready`
-//! result is kept in [`Shell`], so every later window (a project switch) skips
-//! straight to the shell. The shell's first frame paints the target project's
+//! result is kept in [`Shell`], so every later window (File ▸ New Window)
+//! skips straight to the shell. The shell's first frame paints the target project's
 //! chrome from memory (its prefetched config skeleton, else the bare skeleton)
 //! and never waits on disk, git, SSH or the daemon: the feed's first snapshot
 //! replaces it, and bringing up the project's orchestrator runs on the
@@ -47,20 +64,18 @@
 //!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
-//! first time it is shown. A project switch opens (or focuses) the target's
-//! own window, so every project gets its own board.
+//! first time it is shown, and rebuilt for the new project after a switch.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, prelude::*, px, App, Bounds, Context, CursorStyle, Entity, FocusHandle,
-    Global, KeyDownEvent, MouseButton, MouseMoveEvent, PromptLevel, ScrollHandle, SharedString,
-    Subscription, Task,
-    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
+    actions, div, prelude::*, px, AnyWindowHandle, App, Bounds, Context, CursorStyle, Entity,
+    FocusHandle, Global, KeyDownEvent, MouseButton, MouseMoveEvent, PromptLevel, ScrollHandle,
+    SharedString, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowId, WindowOptions,
 };
 use shelbi_app::command::{EditItem, ProjectItem};
 use shelbi_app::nav::{ClientState, Focus, View};
@@ -86,13 +101,14 @@ use shelbi_state::keymap::{
     format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
 
-use crate::assets::icons;
+use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
-use crate::keys::{chord_from_keystroke, overlay_chord, paste_chords};
+use crate::feeds::{FeedHub, FeedSubscription};
+use crate::keys::{chord_from_keystroke, is_new_window, overlay_chord, paste_chords};
 use crate::menus;
 use crate::notify;
 use crate::projects::{self, Catalog, ProjectEntry};
-use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, ProjectFeed, SessionNoticeKind};
+use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, SessionNoticeKind};
 use crate::theme::motion::{SharedTrack, SlideTrack};
 use crate::theme::style::{self, IconButtonSize};
 use crate::theme::{self, Hue, Theme};
@@ -105,7 +121,7 @@ use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
-use crate::window_state::{Frame, WindowState};
+use crate::window_state::{self, Frame, LaunchWindow, ProjectViewState, WindowSession, WindowState};
 
 actions!(
     shelbi_window,
@@ -114,7 +130,7 @@ actions!(
         ToggleSidebar,
         /// Open the settings view (⌘,).
         OpenSettings,
-        /// Close this project's window (⌘W). The project keeps running.
+        /// Close this window (⌘W). Its project keeps running.
         CloseWindow,
     ]
 );
@@ -123,65 +139,153 @@ const DEFAULT_WIDTH: f32 = 1200.0;
 const DEFAULT_HEIGHT: f32 = 800.0;
 /// Shown while the project's orchestrator comes up.
 const STARTUP_STATUS: &str = "Starting the orchestrator…";
+/// How far a new window sits off the one it was opened from.
+const CASCADE: f32 = 28.0;
+/// The title of a window with no project (the empty-state chooser).
+const CHOOSER_TITLE: &str = "Shelbi";
 
-/// App-wide shell state: one window per project, the attached-client id, the
-/// control-socket watcher feeds register with, and bootstrap's result once a
-/// window has reached it.
+/// App-wide shell state: the open windows (each in its slot), the
+/// attached-client id, the control-socket watcher feeds register with,
+/// bootstrap's result once a window has reached it, and the window slots
+/// ([`WindowSession`]) a launch restores.
 #[derive(Default)]
 pub struct Shell {
-    windows: HashMap<String, WindowHandle<ShelbiWindow>>,
+    windows: Vec<OpenWindow>,
     pub client_id: String,
     pub control: Option<ControlWatcher>,
     ready: Option<Ready>,
+    session: WindowSession,
+    /// Bumped per session change; a save writes only the newest.
+    session_generation: u64,
+    /// Whether the session and view states are saved to disk (the app's
+    /// shell; a test's default one saves nothing).
+    persist: bool,
+    /// Test seam: windows open inert (no bootstrap, feed or disk reads).
+    #[cfg(test)]
+    inert_windows: bool,
+}
+
+/// An open window and the slot its frame is saved in.
+#[derive(Debug, Clone, Copy)]
+struct OpenWindow {
+    handle: WindowHandle<ShelbiWindow>,
+    slot: usize,
 }
 
 impl Global for Shell {}
 
 impl Shell {
-    pub fn new(client_id: String, control: Option<ControlWatcher>) -> Self {
+    pub fn new(client_id: String, control: Option<ControlWatcher>, session: WindowSession) -> Self {
         Shell {
-            windows: HashMap::new(),
+            windows: Vec::new(),
             client_id,
             control,
             ready: None,
+            session,
+            session_generation: 0,
+            persist: true,
+            #[cfg(test)]
+            inert_windows: false,
         }
     }
 }
 
-/// Open `project`'s window, or focus it if it already has one.
-pub fn open_or_focus(project: &str, cx: &mut App) {
-    let existing = cx
+/// Open the windows a launch restores (`window_state::launch_plan`).
+pub fn open_launch_windows(plan: Vec<LaunchWindow>, cx: &mut App) {
+    for w in plan {
+        open_window(&w.project, w.slot, w.state, None, cx);
+    }
+}
+
+/// The open Shelbi windows, in the order they opened.
+fn shelbi_windows(cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
+    cx.try_global::<Shell>()
+        .map(|s| s.windows.iter().map(|w| w.handle).collect())
+        .unwrap_or_default()
+}
+
+/// The frontmost Shelbi window: the key one, else the top of the platform's
+/// window stack, else the first opened.
+fn frontmost(cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
+    let ours = shelbi_windows(cx);
+    let find = |any: AnyWindowHandle| {
+        ours.iter()
+            .find(|h| h.window_id() == any.window_id())
+            .copied()
+    };
+    cx.active_window()
+        .and_then(find)
+        .or_else(|| cx.window_stack()?.into_iter().find_map(find))
+        .or_else(|| ours.first().copied())
+}
+
+/// The windows showing `project`, in the order they opened. `me`, the window
+/// asking (mid-update, so it can't be read), counts as showing it.
+fn windows_showing(project: &str, me: Option<WindowId>, cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
+    shelbi_windows(cx)
+        .into_iter()
+        .filter(|h| Some(h.window_id()) == me || h.read(cx).is_ok_and(|w| w.shows(project)))
+        .collect()
+}
+
+/// File ▸ New Window: another window on `project`, cascaded off the
+/// frontmost one (whose sidebar width and collapse it takes), in the lowest
+/// free slot.
+pub fn open_new_window(project: &str, cx: &mut App) {
+    let mut state = WindowState::default();
+    let mut cascade = None;
+    if let Some(from) = frontmost(cx) {
+        let _ = from.update(cx, |w, window, _| {
+            state.sidebar_width = w.window_state.sidebar_width;
+            state.sidebar_collapsed = w.window_state.sidebar_collapsed;
+            cascade = Some(window.window_bounds().get_bounds());
+        });
+    }
+    let taken: Vec<usize> = cx
         .try_global::<Shell>()
-        .and_then(|s| s.windows.get(project).copied());
-    if let Some(handle) = existing {
-        if handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-        {
-            return;
-        }
-    }
-    open_window(project, cx);
+        .map(|s| s.windows.iter().map(|w| w.slot).collect())
+        .unwrap_or_default();
+    let slot = WindowSession::free_slot(&taken);
+    let bounds = cascade.map(|mut b| {
+        b.origin.x += px(CASCADE);
+        b.origin.y += px(CASCADE);
+        b
+    });
+    open_window(project, slot, state, bounds, cx);
 }
 
-/// A clicked notification: bring its project's window up and open the item.
+/// A clicked notification: the window already showing its project comes up
+/// (else the frontmost one, switched to it) and opens the item.
 pub fn open_notice_tag(tag: &str, cx: &mut App) {
     let Some((project, target)) = notify::parse_tag(tag) else {
         return;
     };
-    open_or_focus(&project, cx);
-    let handle = cx
-        .try_global::<Shell>()
-        .and_then(|s| s.windows.get(&project).copied());
-    if let Some(handle) = handle {
-        let _ = handle.update(cx, |this, window, cx| this.open_notice(target, window, cx));
-    }
+    let Some(handle) = windows_showing(&project, None, cx)
+        .first()
+        .copied()
+        .or_else(|| frontmost(cx))
+    else {
+        return;
+    };
+    let _ = handle.update(cx, |this, window, cx| {
+        window.activate_window();
+        if !this.shows(&project) {
+            this.switch_to(&project, window, cx);
+        }
+        this.open_notice(target, window, cx);
+    });
 }
 
-fn open_window(project: &str, cx: &mut App) {
-    // A small local JSON read, before the window exists; it decides the frame.
-    let state = WindowState::load(project);
-    let bounds = match state.frame {
+/// Open a window on `project` in `slot`: at `bounds` when given (a cascade),
+/// else at the slot's saved frame, else centered.
+fn open_window(
+    project: &str,
+    slot: usize,
+    state: WindowState,
+    bounds: Option<Bounds<gpui::Pixels>>,
+    cx: &mut App,
+) {
+    let bounds = bounds.unwrap_or_else(|| match state.frame {
         Some(f) if f.width >= 400.0 && f.height >= 300.0 => Bounds {
             origin: gpui::point(px(f.x), px(f.y)),
             size: gpui::size(px(f.width), px(f.height)),
@@ -191,12 +295,17 @@ fn open_window(project: &str, cx: &mut App) {
                 Bounds::centered(None, gpui::size(px(DEFAULT_WIDTH), px(DEFAULT_HEIGHT)), cx);
             // Cascade a new window off the ones already open, so it doesn't
             // land exactly on top of them.
-            let offset = px(28.0 * cx.windows().len() as f32);
+            let offset = px(CASCADE * cx.windows().len() as f32);
             b.origin.x += offset;
             b.origin.y += offset;
             b
         }
-    };
+    });
+    if !cx.has_global::<Shell>() {
+        cx.set_global(Shell::default());
+    }
+    #[cfg(test)]
+    let inert = cx.global::<Shell>().inert_windows;
     let project_name = project.to_string();
     let opened = cx.open_window(
         WindowOptions {
@@ -211,19 +320,71 @@ fn open_window(project: &str, cx: &mut App) {
             app_id: Some("co.32pixels.shelbi".into()),
             ..Default::default()
         },
-        move |window, cx| cx.new(|cx| ShelbiWindow::new(&project_name, state, window, cx)),
+        move |window, cx| {
+            cx.new(|cx| {
+                #[cfg(test)]
+                if inert {
+                    return ShelbiWindow::inert(&project_name, slot, state, window, cx);
+                }
+                ShelbiWindow::new(&project_name, slot, state, window, cx)
+            })
+        },
     );
     match opened {
         Ok(handle) => {
-            if !cx.has_global::<Shell>() {
-                cx.set_global(Shell::default());
-            }
-            cx.global_mut::<Shell>()
-                .windows
-                .insert(project.to_string(), handle);
+            cx.global_mut::<Shell>().windows.push(OpenWindow { handle, slot });
+            let _ = handle.update(cx, |w, _, cx| w.record_slot(cx));
         }
-        Err(e) => tracing::error!(project, error = %e, "could not open the project window"),
+        Err(e) => tracing::error!(project, error = %e, "could not open a window"),
     }
+}
+
+/// A window closed (`on_window_closed`): forget it. With others still open,
+/// its slot isn't reopened at the next launch; the last window closing quits
+/// the app with its slot still open, so the next launch brings it back.
+pub fn window_closed(id: WindowId, cx: &mut App) {
+    if !cx.has_global::<Shell>() {
+        return;
+    }
+    let shell = cx.global_mut::<Shell>();
+    let Some(at) = shell.windows.iter().position(|w| w.handle.window_id() == id) else {
+        return;
+    };
+    let closed = shell.windows.remove(at);
+    if !shell.windows.is_empty() {
+        shell.session.close(closed.slot);
+        save_session(cx);
+    }
+}
+
+/// Save the window slots off the UI thread. Only the newest of overlapping
+/// saves writes.
+fn save_session(cx: &mut App) {
+    if !persists(cx) {
+        return;
+    }
+    let shell = cx.global_mut::<Shell>();
+    shell.session_generation += 1;
+    let generation = shell.session_generation;
+    let session = shell.session.clone();
+    cx.background_executor()
+        .spawn(async move {
+            static SAVED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+            let mut saved = SAVED.lock().unwrap_or_else(|p| p.into_inner());
+            if generation <= *saved {
+                return;
+            }
+            match session.save() {
+                Ok(()) => *saved = generation,
+                Err(e) => tracing::warn!(error = %e, "could not save the window slots"),
+            }
+        })
+        .detach();
+}
+
+/// Whether the app saves its window and view state (see [`Shell::persist`]).
+fn persists(cx: &App) -> bool {
+    cx.try_global::<Shell>().is_some_and(|s| s.persist)
 }
 
 /// Where the window is in reaching Shelbi.
@@ -252,6 +413,7 @@ pub enum HostCall {
     ShowView(View),
     IssueCommand(CommandKind),
     SwitchProject(String),
+    NewWindow,
     OpenSwitcher,
     Detach,
     DetachOthers,
@@ -279,6 +441,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_project_switcher(&mut self) {
         self.push(HostCall::OpenSwitcher);
+    }
+    fn new_window(&mut self) {
+        self.push(HostCall::NewWindow);
     }
     fn detach(&mut self) {
         self.push(HostCall::Detach);
@@ -365,9 +530,37 @@ impl PaletteInputs {
     }
 }
 
-/// A project window's root view.
+/// A window switching projects waits for one frame before it builds the main
+/// area's view and attaches its sessions: the frame shows the target's
+/// sidebar (its prefetched skeleton, with its saved selection) at once.
+#[derive(Debug, Clone, PartialEq)]
+struct SwitchHold {
+    /// A frame has rendered since the switch.
+    rendered: bool,
+    /// The review the project was left with open.
+    review: Option<String>,
+}
+
+/// The sidebar position a switch restores once the rows it names exist (the
+/// skeleton may not have them yet; the feed's first snapshot will).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingRows {
+    selected: Option<String>,
+    scroll_y: f32,
+}
+
+/// A Shelbi window's root view.
 pub struct ShelbiWindow {
+    /// The project the window shows (meaningless while [`Self::chooser`]).
     project: String,
+    /// The window slot its frame is saved in.
+    slot: usize,
+    /// No project is shown: the empty-state chooser (the last open project
+    /// was quit). Its keyboard row.
+    chooser: bool,
+    chooser_highlight: usize,
+    /// This window's handle, once it has one (notices check it).
+    handle: Option<AnyWindowHandle>,
     boot: Boot,
     /// Drains bootstrap's channel into this view; replaced on retry.
     _bootstrap: Option<Task<()>>,
@@ -390,6 +583,8 @@ pub struct ShelbiWindow {
     /// The Issues board for this window's project, created the first time it
     /// is shown.
     issues: Option<Entity<IssuesView>>,
+    /// The workflow filter the project was left with, for its board.
+    pending_workflow_filter: Option<String>,
     /// The orchestrator chat, created the first time it is shown.
     chat: Option<Entity<ChatView>>,
     /// The Activity feed and the Machines view, likewise created on first show.
@@ -426,6 +621,12 @@ pub struct ShelbiWindow {
     reduce_motion: Rc<dyn Fn() -> bool>,
     /// Opening a review: resolve, ask for a slot, load, open.
     review_loader: ReviewLoader,
+    /// A review a switch reopened (the project was left with it open): if
+    /// it no longer opens, it backs out quietly, with no prompt or banner.
+    quiet_review: Option<String>,
+    /// The switch's first frame is still to come or to finish.
+    switch_hold: Option<SwitchHold>,
+    pending_rows: Option<PendingRows>,
     /// The blocking review work (resolve, load, the content sessions).
     review_ops: Arc<dyn ReviewOps>,
     /// The "Not implemented yet" (or failure) banner.
@@ -446,9 +647,12 @@ pub struct ShelbiWindow {
     /// Bumped on every state change worth saving; a debounced save only
     /// writes if no newer change followed it.
     save_generation: u64,
-    _feed: Option<ProjectFeed>,
+    _feed: Option<FeedSubscription>,
     _feed_task: Option<Task<()>>,
+    /// The window's own subscriptions (bounds, activation, quit).
     _subscriptions: Vec<Subscription>,
+    /// The project-bound views' subscriptions, dropped with them on a switch.
+    _view_subscriptions: Vec<Subscription>,
     /// The shell has been drawn at least once (gpui has a frame to answer
     /// action-availability questions from).
     drawn_once: bool,
@@ -463,6 +667,9 @@ pub struct ShelbiWindow {
     /// Test seam: the Workspace view's deps, likewise.
     #[cfg(any(test, feature = "visual-check"))]
     workspace_deps: Option<WorkspaceDeps>,
+    /// Test seam: builds the chat's deps (each chat a switch builds).
+    #[cfg(any(test, feature = "visual-check"))]
+    chat_deps: Option<Rc<dyn Fn() -> ChatDeps>>,
     /// `--bench-push`'s frame probe: each frame's render start, paint end
     /// and column position.
     #[cfg(feature = "visual-check")]
@@ -472,12 +679,22 @@ pub struct ShelbiWindow {
 impl ShelbiWindow {
     pub fn new(
         project: &str,
+        slot: usize,
         window_state: WindowState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let shared_ready = cx.try_global::<Shell>().and_then(|s| s.ready.clone());
         let mut this = Self::build(project, window_state, window, cx);
+        this.slot = slot;
+        // Where the project was left (a small local read: a new window may
+        // open before the catalog has prefetched it).
+        let saved = if persists(cx) {
+            ProjectViewState::load(project)
+        } else {
+            ProjectViewState::default()
+        };
+        this.adopt_view_state(saved);
         // The feed and keymaps only read local state: start them now, so the
         // shell has data the moment bootstrap is done.
         this.start_feed(window, cx);
@@ -502,9 +719,41 @@ impl ShelbiWindow {
                 this.on_activated(cx);
             }
         }));
+        // Quitting (⌘Q, Detach) closes no window one by one: save where this
+        // one's project was left now.
+        this._subscriptions.push(cx.on_app_quit(|this, cx| {
+            if let Some((project, state)) = this.view_state_to_save(cx) {
+                if let Err(e) = state.save(&project) {
+                    tracing::warn!(error = %e, "could not save the project's view state");
+                }
+            }
+            async {}
+        }));
         this.load_notify_prefs(cx);
         window.set_window_title(&this.model.project_label);
         this
+    }
+
+    /// A window that reaches nothing (a test's): the shell over the
+    /// catalog's skeleton, commands and the palette's inputs recorded by a
+    /// tap, no feed, bootstrap or disk.
+    #[cfg(test)]
+    pub(crate) fn inert(
+        project: &str,
+        slot: usize,
+        window_state: WindowState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut w = Self::build(project, window_state, window, cx);
+        w.slot = slot;
+        w.boot = Boot::Ready(Box::new(inert_ready()));
+        w.tap = Some(Default::default());
+        // A native view with no entity yet: nothing attaches or reads.
+        w.client.set_view(View::Machines);
+        w.sync_selection();
+        window.set_window_title(&w.model.project_label);
+        w
     }
 
     /// The window's state with nothing started: no feed, no bootstrap, the
@@ -533,6 +782,10 @@ impl ShelbiWindow {
 
         let mut this = ShelbiWindow {
             project: project.to_string(),
+            slot: 0,
+            chooser: false,
+            chooser_highlight: 0,
+            handle: Some(window.window_handle()),
             boot: Boot::InFlight(BootstrapState::ResolvingEnv),
             _bootstrap: None,
             _appearance: theme::follow_system(window, cx),
@@ -550,6 +803,7 @@ impl ShelbiWindow {
             nav_track: SlideTrack::shared(),
             route: Route::View,
             issues: None,
+            pending_workflow_filter: None,
             chat: None,
             activity: None,
             machines: None,
@@ -567,6 +821,9 @@ impl ShelbiWindow {
             clock: Rc::new(Instant::now),
             reduce_motion: Rc::new(crate::platform::motion::reduce_motion),
             review_loader: ReviewLoader::default(),
+            quiet_review: None,
+            switch_hold: None,
+            pending_rows: None,
             review_ops: Arc::new(crate::views::review::LiveOps),
             banner: None,
             status: None,
@@ -580,6 +837,7 @@ impl ShelbiWindow {
             _feed: None,
             _feed_task: None,
             _subscriptions: Vec::new(),
+            _view_subscriptions: Vec::new(),
             drawn_once: false,
             #[cfg(any(test, feature = "visual-check"))]
             tap: None,
@@ -587,6 +845,8 @@ impl ShelbiWindow {
             review_deps: None,
             #[cfg(any(test, feature = "visual-check"))]
             workspace_deps: None,
+            #[cfg(any(test, feature = "visual-check"))]
+            chat_deps: None,
             #[cfg(feature = "visual-check")]
             probe: None,
         };
@@ -624,13 +884,26 @@ impl ShelbiWindow {
     /// last [`PaletteInputs`].
     fn command_model(&self) -> shelbi_app::command::CommandModel {
         let inputs = &self.palette_inputs;
-        shelbi_app::command_model::command_model_from(
+        let mut model = shelbi_app::command_model::command_model_from(
             &self.project,
             &self.model,
             inputs.others_attached,
             inputs.other_projects.clone(),
             inputs.edit_targets.clone(),
-        )
+        );
+        // This client opens windows: File ▸ New Window and the palette's.
+        model.multi_window = true;
+        if self.chooser {
+            // No project: only what needs none (switch, add, detach, quit
+            // Shelbi).
+            model.project = None;
+            model.views.clear();
+            model.workspaces.clear();
+            model.reviews.clear();
+            model.edit_targets.clear();
+            model.multi_window = false;
+        }
+        model
     }
 
     /// Read the notification switches off the UI thread.
@@ -660,12 +933,16 @@ impl ShelbiWindow {
             .try_global::<Shell>()
             .map(|s| s.client_id.clone())
             .unwrap_or_default();
+        let reading = project.clone();
         let read = cx
             .background_executor()
             .spawn(async move { PaletteInputs::read(&project, control, &client_id) });
         cx.spawn(async move |this, cx| {
             let inputs = read.await;
             this.update(cx, |this, cx| {
+                if !this.shows(&reading) {
+                    return;
+                }
                 this.palette_inputs = inputs;
                 let entries = this.palette_entries();
                 let projects = this.palette_inputs.projects.clone();
@@ -686,7 +963,9 @@ impl ShelbiWindow {
         for tag in changes.cleared {
             cx.dismiss_system_notification(&tag);
         }
-        if changes.notices.is_empty() {
+        // Two windows on one project see the same changes: the first one
+        // showing it posts, so a notice never comes twice.
+        if changes.notices.is_empty() || !self.posts_notices(cx) {
             return;
         }
         let screen = notify::Screen {
@@ -716,6 +995,17 @@ impl ShelbiWindow {
         }
     }
 
+    /// Whether this window posts its project's notices: it is the first open
+    /// window showing the project.
+    fn posts_notices(&self, cx: &App) -> bool {
+        let Some(me) = self.handle.map(|h| h.window_id()) else {
+            return true;
+        };
+        windows_showing(&self.project, Some(me), cx)
+            .first()
+            .is_none_or(|first| first.window_id() == me)
+    }
+
     /// What the main area shows, as notices see it.
     fn showing(&self) -> notify::Showing {
         if !matches!(self.route, Route::View) {
@@ -731,6 +1021,9 @@ impl ShelbiWindow {
 
     /// Open what a clicked notification is about.
     pub fn open_notice(&mut self, target: notify::Target, window: &mut Window, cx: &mut Context<Self>) {
+        // The notice says where to go: a switch it came with restores nothing.
+        self.switch_hold = None;
+        self.pending_rows = None;
         match target {
             notify::Target::Workspace(workspace) => {
                 // Select its sidebar row too, so the window says where it went.
@@ -750,12 +1043,11 @@ impl ShelbiWindow {
         }
     }
 
-    /// Spawn the project's feed and pump its events into this view.
+    /// Subscribe to the project's feed (shared with any other window on the
+    /// project) and pump its events into this view.
     fn start_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (feed, mut events) = ProjectFeed::spawn(&self.project);
-        if let Some(control) = cx.try_global::<Shell>().and_then(|s| s.control.clone()) {
-            control.watch(&self.project, &feed);
-        }
+        let hub = FeedHub::global(cx);
+        let (feed, mut events) = hub.subscribe(&self.project, cx);
         self._feed = Some(feed);
         self._feed_task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -783,6 +1075,7 @@ impl ShelbiWindow {
                     self.model = model;
                     self.apply_notices(changes, cx);
                     self.sync_selection();
+                    self.apply_pending_rows();
                     // An open palette follows the live state, query kept.
                     let entries = self.palette_entries();
                     if let Some(ActiveOverlay::Palette { palette, .. }) = &mut self.overlay {
@@ -824,12 +1117,16 @@ impl ShelbiWindow {
     /// Read the user's merged keymaps (`keys.yaml`) off the UI thread.
     fn load_keymaps(&mut self, cx: &mut Context<Self>) {
         let project = self.project.clone();
+        let reading = project.clone();
         let read = cx
             .background_executor()
             .spawn(async move { shelbi_state::keymap::load_keymaps(Some(&project)).0 });
         cx.spawn(async move |this, cx| {
             let keymaps = read.await;
             this.update(cx, |this, cx| {
+                if !this.shows(&reading) {
+                    return;
+                }
                 this.palette_chord = palette_chord(&keymaps);
                 this.keymaps = keymaps;
                 if let Some(ws) = this.workspace.clone() {
@@ -943,12 +1240,17 @@ impl ShelbiWindow {
         let env = ready.env.clone();
         let project = self.project.clone();
         self.status = Some(STARTUP_STATUS.into());
+        let opening = project.clone();
         let open = cx
             .background_executor()
             .spawn(async move { projects::open_project(&project, &cli, &env) });
         cx.spawn(async move |this, cx| {
             let result = open.await;
             this.update(cx, |this, cx| {
+                // The window switched away meanwhile: not its news.
+                if !this.shows(&opening) {
+                    return;
+                }
                 this.status = match result {
                     Ok(()) => None,
                     Err(message) => Some(message.into()),
@@ -965,6 +1267,335 @@ impl ShelbiWindow {
             .ok();
         })
         .detach();
+    }
+
+    // --- switching projects ------------------------------------------------
+
+    /// Whether the window shows `project` (not the chooser).
+    pub fn shows(&self, project: &str) -> bool {
+        !self.chooser && self.project == project
+    }
+
+    /// Switch this window to `project` in place. The outgoing project's
+    /// view state is saved and its views torn down (their sessions detach;
+    /// the daemon's stay); the target's prefetched sidebar paints on the next
+    /// frame with its own saved selection, and its main view is built (and
+    /// attached) once that frame is drawn. The window keeps its frame, size
+    /// and sidebar width. Another window already showing `project` doesn't
+    /// matter: two windows may show one project.
+    pub fn switch_to(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher.close((self.clock)());
+        if self.shows(project) {
+            return;
+        }
+        self.remember_view_state(cx);
+        self.teardown_project(window, cx);
+        self.chooser = false;
+        self.project = project.to_string();
+        self.client.switch_project(project);
+        self.model = cx
+            .try_global::<Catalog>()
+            .map(|c| c.first_frame_sidebar(project))
+            .unwrap_or_else(|| SidebarModel::skeleton(project));
+        self.notifier = notify::Tracker::new(project);
+        self.palette_inputs = PaletteInputs::default();
+        window.set_window_title(&self.model.project_label);
+        let saved = cx
+            .try_global::<Catalog>()
+            .map(|c| c.view_state(project))
+            .unwrap_or_default();
+        self.adopt_view_state(saved);
+        self.start_feed(window, cx);
+        if !self.offline() {
+            self.load_keymaps(cx);
+            self.open_project(cx);
+            self.refresh_palette_inputs(cx);
+        }
+        self.record_slot(cx);
+        self.sync_menus(cx);
+        cx.notify();
+    }
+
+    /// Show no project: the empty-state chooser (the project the window
+    /// showed was quit and no other is open). The window stays open.
+    fn show_chooser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chooser {
+            return;
+        }
+        self.remember_view_state(cx);
+        self.teardown_project(window, cx);
+        self.chooser = true;
+        self.chooser_highlight = 0;
+        self.model = SidebarModel::skeleton("");
+        self.palette_inputs = PaletteInputs::default();
+        window.set_window_title(CHOOSER_TITLE);
+        // The list to choose from, re-read off the UI thread.
+        if let Some(catalog) = cx.try_global::<Catalog>().cloned().filter(|_| !self.offline()) {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            catalog.refresh(move || {
+                let _ = tx.send(());
+            });
+            cx.spawn(async move |this, cx| {
+                if rx.await.is_ok() {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+            })
+            .detach();
+        }
+        self.record_slot(cx);
+        self.sync_menus(cx);
+        cx.notify();
+    }
+
+    /// Drop everything bound to the shown project: its overlay, its views
+    /// and their sessions and subscriptions, the review flow, the panel in
+    /// the column, the feed subscription, its notes.
+    fn teardown_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Whatever the review flow still has running opens nothing.
+        if let Some(task) = self.review_loader.pending().map(str::to_string) {
+            self.review_loader.cancel(&task);
+        }
+        self.review_loader = ReviewLoader::default();
+        self.overlay = None;
+        self.overlay_opened = None;
+        self.detecting = None;
+        self.client.close_overlay();
+        // Detach the sessions now (the daemon's stay), then drop the views.
+        if let Some(chat) = self.chat.take() {
+            chat.update(cx, |chat, cx| chat.hide(cx));
+        }
+        if let Some(ws) = self.workspace.take() {
+            ws.update(cx, |ws, cx| ws.hide(cx));
+        }
+        if let Some(review) = self.review.take() {
+            review.update(cx, |r, cx| r.hide(cx));
+        }
+        // The native views' background reads stop without a join, so a slow
+        // read in flight never holds the switch up.
+        if let Some(issues) = self.issues.take() {
+            issues.update(cx, |v, _| v.stop_workers());
+        }
+        if let Some(activity) = self.activity.take() {
+            activity.update(cx, |v, _| v.stop_workers());
+        }
+        if let Some(machines) = self.machines.take() {
+            machines.update(cx, |v, _| v.stop_workers());
+        }
+        self._view_subscriptions.clear();
+        self.route = Route::View;
+        self.workspace_return = None;
+        self.column = ColumnSwap::new();
+        self.column_moving = false;
+        self.collapsed_panel_cols = None;
+        self.sidebar_scroll = ScrollHandle::new();
+        self.nav_track = SlideTrack::shared();
+        self.switch_hold = None;
+        self.pending_rows = None;
+        self.pending_workflow_filter = None;
+        self.quiet_review = None;
+        self.banner = None;
+        self.status = None;
+        self.flash_generation += 1;
+        self._feed_task = None;
+        self._feed = None;
+        self.link = None;
+        self.focus_handle.focus(window, cx);
+    }
+
+    /// Where the shown project is left: its view, focus, sidebar selection
+    /// and scroll, open review and board filter. `None` for the chooser.
+    fn view_state_to_save(&self, cx: &App) -> Option<(String, ProjectViewState)> {
+        if self.chooser {
+            return None;
+        }
+        let state = ProjectViewState {
+            view: Some(self.client.view().as_view_id()),
+            sidebar_focused: self.client.focus() == Focus::Sidebar,
+            selected: self
+                .target_at(self.client.sidebar_selection())
+                .map(|t| row_key(&t)),
+            scroll_y: self.sidebar_scroll.offset().y.as_f32(),
+            review: self.shown_review(cx),
+            workspace_return: self.workspace_return.as_ref().map(View::as_view_id),
+            workflow_filter: self
+                .issues
+                .as_ref()
+                .map(|i| i.read(cx).workflow_filter())
+                .unwrap_or_else(|| self.pending_workflow_filter.clone()),
+        };
+        Some((self.project.clone(), state))
+    }
+
+    /// Remember where the shown project is left: in the catalog at once (a
+    /// switch back reads it from memory) and on disk off the UI thread.
+    fn remember_view_state(&mut self, cx: &mut Context<Self>) {
+        let Some((project, state)) = self.view_state_to_save(cx) else {
+            return;
+        };
+        if let Some(catalog) = cx.try_global::<Catalog>() {
+            catalog.remember_view(&project, state.clone());
+        }
+        if self.offline() || !persists(cx) {
+            return;
+        }
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = state.save(&project) {
+                    tracing::warn!(error = %e, "could not save the project's view state");
+                }
+            })
+            .detach();
+    }
+
+    /// Take on where a project was left: its view and focus, the panel's
+    /// Back, the sidebar position (once its rows exist), the board filter.
+    /// The main view itself is built after the next frame ([`SwitchHold`]).
+    fn adopt_view_state(&mut self, saved: ProjectViewState) {
+        let view = saved
+            .view
+            .as_deref()
+            .map(View::from_view_id)
+            .unwrap_or_else(|| View::Session("orch".into()));
+        self.client.set_view(view);
+        if saved.sidebar_focused && !self.collapsed {
+            self.client.focus_sidebar();
+        } else {
+            self.client.focus_main();
+        }
+        self.workspace_return = saved.workspace_return.as_deref().map(View::from_view_id);
+        self.pending_workflow_filter = saved.workflow_filter;
+        self.pending_rows = Some(PendingRows {
+            selected: saved.selected,
+            scroll_y: saved.scroll_y,
+        });
+        self.apply_pending_rows();
+        self.switch_hold = Some(SwitchHold {
+            rendered: false,
+            review: saved.review,
+        });
+    }
+
+    /// Put the sidebar back where the project was left once the row it names
+    /// is there: on the skeleton already, or when a snapshot brings it. A
+    /// row that is gone once the board has loaded is let go.
+    fn apply_pending_rows(&mut self) {
+        let Some(pending) = self.pending_rows.clone() else {
+            return;
+        };
+        let found = pending.selected.as_deref().and_then(|key| {
+            (0..self.selectable_count())
+                .find(|&i| self.target_at(i).is_some_and(|t| row_key(&t) == key))
+        });
+        match found {
+            Some(ordinal) => {
+                let count = self.selectable_count();
+                self.client.select(ordinal, count);
+            }
+            None if pending.selected.is_some() && self.model.board_loading => return,
+            None => {}
+        }
+        self.sidebar_scroll
+            .set_offset(gpui::point(px(0.0), px(pending.scroll_y)));
+        self.pending_rows = None;
+    }
+
+    /// The switch's frame is drawn: build the main area's view and attach its
+    /// sessions, and reopen the review the project was left with.
+    fn finish_switch(&mut self, hold: SwitchHold, window: &mut Window, cx: &mut Context<Self>) {
+        let mut view = self.client.view().clone();
+        // A workspace the project no longer declares (its rows are known, and
+        // it isn't among them) gives way to the chat.
+        if let Some(name) = workspace_name(&view) {
+            if !self.model.workspaces.is_empty() && self.workspace_row(name).is_none() {
+                view = View::Session("orch".into());
+                self.workspace_return = None;
+            }
+        }
+        let sidebar_focused = self.client.focus() == Focus::Sidebar;
+        if workspace_name(&view).is_some() {
+            // The workspace panel is where it was: no push to it.
+            self.column.show(Occupant::Workspace, Motion::Fade, (self.clock)());
+            self.column.finish();
+        }
+        self.perform(HostCall::ShowView(view), window, cx);
+        if let Some(task) = hold.review {
+            self.quiet_review = Some(task.clone());
+            self.load_review(task, window, cx);
+        }
+        if sidebar_focused && !self.panel_in_column() {
+            self.client.focus_sidebar();
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Record this window's slot (its project and frame) and save the slots.
+    fn record_slot(&mut self, cx: &mut Context<Self>) {
+        let entry = window_state::Slot {
+            project: (!self.chooser).then(|| self.project.clone()),
+            open: true,
+            state: self.window_state.clone(),
+        };
+        if cx.has_global::<Shell>() {
+            cx.global_mut::<Shell>().session.set(self.slot, entry);
+        }
+        save_session(cx);
+    }
+
+    /// Close this window (⌘W), saving where its project was left. The save
+    /// is written here, not off the thread: closing the last window quits the
+    /// app, which wouldn't wait for it.
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((project, state)) = self.view_state_to_save(cx) {
+            if let Some(catalog) = cx.try_global::<Catalog>() {
+                catalog.remember_view(&project, state.clone());
+            }
+            if !self.offline() && persists(cx) {
+                if let Err(e) = state.save(&project) {
+                    tracing::warn!(error = %e, "could not save the project's view state");
+                }
+            }
+        }
+        window.remove_window();
+    }
+
+    /// The project the shown one was quit: this window moves to another open
+    /// project, or to the chooser when none is left.
+    fn after_quit_project(&mut self, quit: String, window: &mut Window, cx: &mut Context<Self>) {
+        let offline = self.offline();
+        let next = cx.background_executor().spawn(async move {
+            if offline {
+                return None;
+            }
+            shelbi_state::list_open_projects()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| *p != quit)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let next = next.await;
+            this.update_in(cx, |this, window, cx| this.leave_quit_project(next, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Move off a quit project: to `next`, else the chooser.
+    fn leave_quit_project(&mut self, next: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        match next {
+            Some(project) => self.switch_to(&project, window, cx),
+            None => self.show_chooser(window, cx),
+        }
+    }
+
+    /// Test seam: in a test window (the tap), nothing reaches disk, the CLI
+    /// or the daemon.
+    fn offline(&self) -> bool {
+        #[cfg(any(test, feature = "visual-check"))]
+        if self.tap.is_some() {
+            return true;
+        }
+        false
     }
 
     fn selectable_count(&self) -> usize {
@@ -1111,13 +1742,14 @@ impl ShelbiWindow {
                 let issues = self.ensure_issues(window, cx);
                 issues.update(cx, |v, cx| v.run_issue_command(&kind, window, cx));
             }
-            HostCall::SwitchProject(project) => {
-                self.switcher.close((self.clock)());
-                if project != self.project {
-                    let project = project.clone();
-                    // Open the target's window after this update finishes,
-                    // so the new window's first frame isn't nested in ours.
-                    cx.defer(move |cx| open_or_focus(&project, cx));
+            // In place: this window becomes the target's.
+            HostCall::SwitchProject(project) => self.switch_to(&project, window, cx),
+            HostCall::NewWindow => {
+                if !self.chooser {
+                    let project = self.project.clone();
+                    // After this update, so the new window's first frame
+                    // isn't nested in ours.
+                    cx.defer(move |cx| open_new_window(&project, cx));
                 }
             }
             HostCall::OpenSwitcher => self.open_switcher(cx),
@@ -1190,7 +1822,10 @@ impl ShelbiWindow {
             let IssuesEvent::Command(kind) = ev;
             this.run(kind.clone(), window, cx);
         });
-        self._subscriptions.push(sub);
+        self._view_subscriptions.push(sub);
+        if let Some(filter) = self.pending_workflow_filter.take() {
+            issues.update(cx, |v, cx| v.restore_workflow_filter(Some(filter), cx));
+        }
         self.issues = Some(issues.clone());
         issues
     }
@@ -1203,8 +1838,10 @@ impl ShelbiWindow {
         let project = self.project.clone();
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
-        let chat =
-            cx.new(|cx| ChatView::orchestrator(&project, handle, ChatDeps::live(&project), sink, cx));
+        let deps = ChatDeps::live(&project);
+        #[cfg(any(test, feature = "visual-check"))]
+        let deps = self.chat_deps.as_ref().map(|make| make()).unwrap_or(deps);
+        let chat = cx.new(|cx| ChatView::orchestrator(&project, handle, deps, sink, cx));
         let sub = cx.subscribe(&chat, |this, _, ev: &ChatEvent, cx| match ev {
             // A click in the terminal moves the window's focus model to the
             // main area, so the sidebar stops taking keys.
@@ -1216,7 +1853,7 @@ impl ShelbiWindow {
             // restarts instead.
             ChatEvent::Ended => {}
         });
-        self._subscriptions.push(sub);
+        self._view_subscriptions.push(sub);
         self.chat = Some(chat.clone());
         self.update_chat_supervisor_status(cx);
         chat
@@ -1246,7 +1883,7 @@ impl ShelbiWindow {
         let chord = self.palette_chord.clone();
         let deps = WorkspaceDeps::live(&project);
         #[cfg(any(test, feature = "visual-check"))]
-        let deps = self.workspace_deps.take().unwrap_or(deps);
+        let deps = self.workspace_deps.clone().unwrap_or(deps);
         let ws = cx.new(|cx| {
             let mut ws = WorkspaceView::new(&project, handle, deps, sink, cx);
             ws.set_palette_chord(&chord, cx);
@@ -1259,7 +1896,7 @@ impl ShelbiWindow {
             }
             WorkspaceEvent::Back => this.leave_workspace(window, cx),
         });
-        self._subscriptions.push(sub);
+        self._view_subscriptions.push(sub);
         self.workspace = Some(ws.clone());
         ws
     }
@@ -1289,7 +1926,7 @@ impl ShelbiWindow {
             ReviewEvent::Command(kind) => this.run(kind.clone(), window, cx),
             ReviewEvent::Back | ReviewEvent::Closed => this.leave_review(window, cx),
         });
-        self._subscriptions.push(sub);
+        self._view_subscriptions.push(sub);
         self.review = Some(review.clone());
         review
     }
@@ -1312,6 +1949,7 @@ impl ShelbiWindow {
     /// main area already shows (its placeholder, put up the moment it was
     /// asked for) is filled in where it stands: the push it started runs on.
     fn open_review(&mut self, info: ReviewInfo, window: &mut Window, cx: &mut Context<Self>) {
+        self.quiet_review = None;
         let row = self.review_row(&info.task_id);
         if self.shown_review(cx).as_deref() == Some(info.task_id.as_str()) {
             if let Some(review) = self.review.clone() {
@@ -1561,6 +2199,9 @@ impl ShelbiWindow {
     /// Whether the main area should show the chat right now.
     fn chat_wanted(&self) -> bool {
         matches!(self.boot, Boot::Ready(_))
+            && !self.chooser
+            // A switch builds (and attaches) it after its first frame.
+            && self.switch_hold.is_none()
             && matches!(self.route, Route::View)
             && is_chat(self.client.view())
     }
@@ -1645,7 +2286,7 @@ impl ShelbiWindow {
                 ActivityEvent::Command(kind) => this.run(kind.clone(), window, cx),
             }
         });
-        self._subscriptions.push(sub);
+        self._view_subscriptions.push(sub);
         self.activity = Some(activity.clone());
         activity
     }
@@ -1665,7 +2306,7 @@ impl ShelbiWindow {
             let MachinesEvent::Command(kind) = ev;
             this.run(kind.clone(), window, cx);
         });
-        self._subscriptions.push(sub);
+        self._view_subscriptions.push(sub);
         self.machines = Some(machines.clone());
         machines
     }
@@ -1774,6 +2415,76 @@ impl ShelbiWindow {
         true
     }
 
+    /// A key on the chooser: ↑↓ (and Tab) move its row, Enter opens it (the
+    /// last row is Add Project). `false` for any other key.
+    fn chooser_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let projects = self.switcher_projects(cx);
+        let count = projects.len() + 1;
+        match code {
+            Key::Up | Key::BackTab => {
+                self.chooser_highlight = (self.chooser_highlight + count - 1) % count
+            }
+            Key::Down | Key::Tab => self.chooser_highlight = (self.chooser_highlight + 1) % count,
+            Key::Enter => match projects.get(self.chooser_highlight) {
+                Some(p) => {
+                    let project = p.name.clone();
+                    self.run(CommandKind::SwitchProject { project }, window, cx)
+                }
+                None => self.run(CommandKind::AddProject, window, cx),
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    /// The empty-state chooser: no project is open in this window. Every
+    /// project (the catalog's), and Add Project.
+    fn render_chooser(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let projects = self.switcher_projects(cx);
+        let add_ix = projects.len();
+        let rows = projects.into_iter().enumerate().map(|(ix, p)| {
+            let name = p.name.clone();
+            style::menu_row(format!("chooser-{}", p.name), ix == self.chooser_highlight, theme)
+                .child(style::project_badge(&p.label, 20.0))
+                .child(p.label.clone())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let project = name.clone();
+                    this.run(CommandKind::SwitchProject { project }, window, cx)
+                }))
+        });
+        let add = style::menu_row("chooser-add", add_ix == self.chooser_highlight, theme)
+            .child(heroicon(icons::PLUS).text_color(theme.icon))
+            .child("Add Project…")
+            .on_click(cx.listener(|this, _, window, cx| this.run(CommandKind::AddProject, window, cx)));
+        div()
+            .id("chooser")
+            .debug_selector(|| "chooser".into())
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .size_full()
+            .p_8()
+            .overflow_y_scroll()
+            .bg(theme.surface)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w(px(360.0))
+                    .max_w_full()
+                    .child(style::heading("No project open", theme))
+                    .child(
+                        div()
+                            .text_color(theme.text_quiet)
+                            .child("Choose a project for this window."),
+                    )
+                    .child(div().flex().flex_col().gap_1().children(rows).child(add)),
+            )
+            .into_any_element()
+    }
+
     fn detach_others(&mut self, cx: &mut Context<Self>) {
         let client_id = cx
             .try_global::<Shell>()
@@ -1809,11 +2520,12 @@ impl ShelbiWindow {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Quit {}?", self.model.project_label),
-            Some("This stops the project's agents and closes its window. Other projects keep running."),
+            Some("This stops the project's agents. Other projects keep running."),
             &["Quit Project", "Cancel"],
             cx,
         );
         let project = self.project.clone();
+        let quit_project = project.clone();
         let control = self.ready().map(|r| r.control.clone());
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
@@ -1845,7 +2557,22 @@ impl ShelbiWindow {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| match quit {
-                Ok(()) => window.remove_window(),
+                // Every window that showed it moves on (this one included),
+                // staying open.
+                Ok(()) => {
+                    let me = window.window_handle().window_id();
+                    for other in windows_showing(&quit_project, Some(me), cx) {
+                        if other.window_id() != me {
+                            let quit = quit_project.clone();
+                            cx.defer(move |cx| {
+                                let _ = other.update(cx, |w, window, cx| {
+                                    w.after_quit_project(quit, window, cx)
+                                });
+                            });
+                        }
+                    }
+                    this.after_quit_project(quit_project.clone(), window, cx);
+                }
                 Err(e) => {
                     if let Some(chat) = &this.chat {
                         chat.update(cx, |chat, _| chat.clear_deliberate_close());
@@ -1909,7 +2636,7 @@ impl ShelbiWindow {
             let sub = cx.subscribe(&view, |this, _, event: &SettingsEvent, cx| match event {
                 SettingsEvent::Saved => this.load_notify_prefs(cx),
             });
-            self._subscriptions.push(sub);
+            self._view_subscriptions.push(sub);
             self.route = Route::Settings(view);
         }
         self.sync_chat(window, cx);
@@ -1947,7 +2674,7 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Save the window state off the UI thread, debounced so a window drag
+    /// Save the window's slot off the UI thread, debounced so a window drag
     /// (a bounds change per frame) writes once when it settles.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.save_generation += 1;
@@ -1957,19 +2684,12 @@ impl ShelbiWindow {
             .timer(std::time::Duration::from_millis(400));
         cx.spawn(async move |this, cx| {
             timer.await;
-            let Ok(Some((state, project))) = this.update(cx, |this, _| {
-                (this.save_generation == generation)
-                    .then(|| (this.window_state.clone(), this.project.clone()))
-            }) else {
-                return;
-            };
-            let saved = cx
-                .background_executor()
-                .spawn(async move { state.save(&project) })
-                .await;
-            if let Err(e) = saved {
-                tracing::warn!(error = %e, "could not save the window state");
-            }
+            this.update(cx, |this, cx| {
+                if this.save_generation == generation {
+                    this.record_slot(cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2278,7 +2998,8 @@ impl ShelbiWindow {
     }
 
     /// Run the form's `Mutation::AddProject` off the UI thread. A validation
-    /// error goes back on the form; success opens the new project's window.
+    /// error goes back on the form; success switches this window to the new
+    /// project.
     fn submit_add_project(
         &mut self,
         name: String,
@@ -2305,7 +3026,8 @@ impl ShelbiWindow {
                     if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
                         catalog.refresh(|| {});
                     }
-                    cx.defer(move |cx| open_or_focus(&slug, cx));
+                    // The new project takes this window.
+                    this.switch_to(&slug, window, cx);
                 }
                 Err(AddProjectError::Invalid(msg)) | Err(AddProjectError::Failed(msg)) => {
                     if let Some(ActiveOverlay::AddProject { form, busy }) = &mut this.overlay {
@@ -2352,6 +3074,15 @@ impl ShelbiWindow {
                 .detach();
             }
             LoadStep::Open(info) => self.open_review(*info, window, cx),
+            // A review a switch reopened that would need a prompt (it left
+            // its slot meanwhile): back out quietly instead.
+            LoadStep::AskSlot { task, .. } | LoadStep::NoSlots { task, .. } | LoadStep::Busy { task, .. }
+                if self.quiet_review.as_deref() == Some(task.as_str()) =>
+            {
+                self.quiet_review = None;
+                self.review_loader.cancel(&task);
+                self.abandon_pending_review(window, cx);
+            }
             LoadStep::AskSlot {
                 task,
                 title,
@@ -2402,7 +3133,10 @@ impl ShelbiWindow {
                 self.status = None;
                 // Back out first: returning to the view clears the banner.
                 self.abandon_pending_review(window, cx);
-                self.banner = Some(message.into());
+                // A review a switch reopened that's gone says nothing.
+                if self.quiet_review.take().is_none() {
+                    self.banner = Some(message.into());
+                }
             }
         }
         cx.notify();
@@ -2548,7 +3282,7 @@ impl ShelbiWindow {
             MenuAction::App(command) => match command {
                 AppCommand::About => self.show_about(window, cx),
                 AppCommand::Settings => self.open_settings(window, cx),
-                AppCommand::CloseWindow => window.remove_window(),
+                AppCommand::CloseWindow => self.close_window(window, cx),
                 AppCommand::Minimize => window.minimize_window(),
                 AppCommand::Zoom => window.zoom_window(),
                 AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
@@ -2619,6 +3353,19 @@ impl ShelbiWindow {
         let Some(chord) = chord else {
             return;
         };
+        // File ▸ New Window, ahead of a focused terminal or the chooser.
+        if is_new_window(&chord) {
+            self.run(CommandKind::NewWindow, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.chooser {
+            if self.chooser_key(chord.code, window, cx) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
         if shelbi_app::overlay::opens_palette(&self.keymaps, &chord) {
             self.open_palette(window, cx);
             cx.stop_propagation();
@@ -2786,15 +3533,28 @@ fn workspace_name(view: &View) -> Option<&str> {
     }
 }
 
+/// A sidebar row by what it opens (`view:tasks`, `workspace:alpha`,
+/// `review:T-1`, `machine:hub`): how a project's saved selection names it.
+fn row_key(target: &SidebarTarget) -> String {
+    match target {
+        SidebarTarget::View(view) => format!("view:{}", view.as_view_id()),
+        SidebarTarget::Workspace(name) => format!("workspace:{name}"),
+        SidebarTarget::Review(task) => format!("review:{task}"),
+        SidebarTarget::Machine(name) => format!("machine:{name}"),
+    }
+}
+
 /// Whether the window takes `chord` away from a focused terminal: the focus
-/// moves (Ctrl+H / Ctrl+L by default), the Zen toggle (Option+Z), and every
-/// palette chord (the configured one plus the reserved Ctrl+Space and Cmd+K).
+/// moves (Ctrl+H / Ctrl+L by default), the Zen toggle (Option+Z), every
+/// palette chord (the configured one plus the reserved Ctrl+Space and Cmd+K),
+/// and New Window (⌘⇧N).
 /// Everything else is the session's.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
     matches!(
         keymaps.global.dispatch(chord),
         Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain | GlobalAction::ZenToggle)
     ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
+        || is_new_window(&chord)
 }
 
 /// The palette-open chord as the search box shows it (`⌃P`).
@@ -2910,6 +3670,17 @@ impl ShelbiWindow {
         // (bootstrap has no window to hand it); later changes go through
         // `perform`. Idempotent.
         self.sync_chat(window, cx);
+        // A switch (or a new window): this frame paints the project's
+        // sidebar; the next builds its main view and attaches its sessions.
+        if let Some(hold) = self.switch_hold.as_mut() {
+            if hold.rendered {
+                let hold = self.switch_hold.take().expect("held");
+                cx.defer_in(window, move |this, window, cx| this.finish_switch(hold, window, cx));
+            } else {
+                hold.rendered = true;
+                window.request_animation_frame();
+            }
+        }
         let window_width = window.viewport_size().width.as_f32();
         let now = (self.clock)();
         let reduce_motion = (self.reduce_motion)();
@@ -3059,7 +3830,7 @@ impl ShelbiWindow {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.dragging {
                     let window_width = window.viewport_size().width.as_f32();
@@ -3083,10 +3854,14 @@ impl ShelbiWindow {
             .w_full()
             .font_family("Geist")
             .text_sm()
-            .bg(theme.surface)
-            .children(column)
-            .children(handle)
-            .child(self.render_main(&theme, column_shown, cx));
+            .bg(theme.surface);
+        let shell = if self.chooser {
+            let chooser = self.render_chooser(&theme, cx);
+            shell.child(chooser)
+        } else {
+            let main = self.render_main(&theme, column_shown, cx);
+            shell.children(column).children(handle).child(main)
+        };
 
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
@@ -3314,6 +4089,10 @@ mod column_tests;
 #[cfg(test)]
 #[path = "app_design_tests.rs"]
 mod design_tests;
+
+#[cfg(test)]
+#[path = "app_window_tests.rs"]
+mod window_tests;
 
 #[cfg(test)]
 mod tests {

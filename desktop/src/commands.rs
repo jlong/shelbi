@@ -27,8 +27,10 @@ pub trait CommandHost {
     /// the user was looking at and sends it with `execute_mutation` off the UI
     /// thread.
     fn issue_command(&mut self, kind: &CommandKind);
-    /// Open (or focus) `project`'s window.
+    /// Switch this window to `project` (in place: no new window).
     fn switch_project(&mut self, project: &str);
+    /// Open another window on this window's project.
+    fn new_window(&mut self);
     /// Show the project switcher.
     fn open_project_switcher(&mut self);
     /// Leave: close the app, leaving every session and agent running.
@@ -73,7 +75,7 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::LoadReview { task_id } => host.load_review(task_id),
         CommandKind::ToggleZen => host.toggle_zen(),
         CommandKind::OpenErrorLog => host.open_error_log(),
-        // One window per project: open the target's, or focus it. A bare
+        // The window switches in place (dt-switch-project-in-window). A bare
         // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
             if project.is_empty() {
@@ -83,6 +85,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
             }
         }
         CommandKind::AddProject => host.open_add_project(),
+        // File ▸ New Window (⌘⇧N): another window, on this project, that
+        // switches on its own.
+        CommandKind::NewWindow => host.new_window(),
         CommandKind::Detach => host.detach(),
         CommandKind::DetachOtherClients => host.detach_other_clients(),
         CommandKind::QuitProject => host.quit_project(),
@@ -124,6 +129,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::OpenEditor { .. } => false,
         // Only this client lets go.
         CommandKind::Detach => false,
+        // Another window on a project already open.
+        CommandKind::NewWindow => false,
         // May launch the workspace's agent.
         CommandKind::FocusWorkspace { .. } => true,
         CommandKind::LoadReview { .. } => true,
@@ -192,6 +199,9 @@ mod tests {
         }
         fn open_project_switcher(&mut self) {
             self.0.push("switcher".into());
+        }
+        fn new_window(&mut self) {
+            self.0.push("new-window".into());
         }
         fn detach(&mut self) {
             self.0.push("detach".into());
@@ -270,6 +280,7 @@ mod tests {
             ),
             (CommandKind::SwitchProject { project: s("web") }, "switch:web"),
             (CommandKind::AddProject, "add-project"),
+            (CommandKind::NewWindow, "new-window"),
             (CommandKind::Detach, "detach"),
             (CommandKind::DetachOtherClients, "detach-others"),
             (CommandKind::QuitProject, "quit-project"),
@@ -355,6 +366,7 @@ mod tests {
                 "show:machines",
                 "show:orch",
                 "error-log",
+                "new-window",
                 "detach",
                 "editor:edit:project",
                 "editor:edit:agent:dev",

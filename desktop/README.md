@@ -9,8 +9,9 @@ background refresh) and talk to the same daemon and sessions. The plan is
 Status: feature parity with the TUI. Every command in the shared registry
 runs in both clients (`docs/parity.md` records the walk), every view renders
 natively, and no not-implemented path is left. On launch the app finds the
-`shelbi` CLI, starts the daemon, and checks versions; each project gets its
-own window with the sidebar, the Orchestrator chat, the Issues board and task
+`shelbi` CLI, starts the daemon, and checks versions; a window shows one
+project at a time and switches projects in place (File ▸ New Window, ⌘⇧N,
+opens another), with the sidebar, the Orchestrator chat, the Issues board and task
 detail, Activity, Machines, the Workspace view (an agent with a user shell
 beside it, local or remote), and the Review view; the command palette and the
 overlays (error log, add project, load for review, reject, Zen intro); native
@@ -52,9 +53,14 @@ desktop:
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
 | `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. |
 
-Per-project window state (frame, sidebar width, sidebar collapsed) lives in
-`~/.shelbi/projects/<project>/desktop-window.json`. Environment:
-`SHELBI_PROJECT` picks the launch project, `RUST_LOG` the log level (default
+Window state (frame, sidebar width, sidebar collapsed) is saved per window
+slot in `~/.shelbi/desktop-windows.json`, with the project each window last
+showed and whether it was open: a launch reopens the windows that were open.
+Where each project was left (view, sidebar selection and scroll, open review,
+board filter) is in `~/.shelbi/projects/<project>/desktop-view.json`, so a
+switch back lands there. (The old per-project `desktop-window.json` is read
+once, by the first launch after the change.) Environment:
+`SHELBI_PROJECT` (or a project argument) picks the first window's project, `RUST_LOG` the log level (default
 `warn`), `SHELBI_DESKTOP_UPDATE_CHECK=0` turns the update check off, and
 `SHELBI_DESKTOP_UPDATE_URL` points it at a fixture (see Update notice).
 
@@ -152,14 +158,17 @@ desktop/
   src/menus/           the menu bar: tree.rs builds it as data from the CommandModel + keymaps
                        (pure, tested); mod.rs converts it to gpui menus and owns their actions
   src/notify.rs        system notifications: transitions to notices, when to post or suppress (pure)
-  src/app.rs           a project window's root view: sidebar | main area, routing
-                       through ClientState, one window per project (Shell)
+  src/app.rs           a window's root view: sidebar | main area, routing through
+                       ClientState; the open windows and their slots (Shell); switching
+                       a window's project in place
   src/app_smoke.rs     the smoke test: every registry command via the palette and the menus
+  src/app_window_tests.rs  the window model: switch in place, A→B→A, New Window, notices, quit, launch
   src/keys.rs          gpui keystrokes to shelbi_state::keymap KeyChords (so keys.yaml applies)
-  src/refresh.rs       the refresh pipeline: per-window feed (refresher, change
+  src/refresh.rs       the refresh pipeline: a project's feed (refresher, change
                        subscription, polling fallback) and the control-socket watcher
+  src/feeds.rs         one feed per project, shared by the windows that show it
   src/projects.rs      the project catalog (+ skeleton prefetch) and opening a project
-  src/window_state.rs  per-project window frame and sidebar width/collapse
+  src/window_state.rs  window slots (frame, sidebar), the launch plan, per-project view state
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)

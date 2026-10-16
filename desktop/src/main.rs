@@ -15,6 +15,7 @@ mod bench_push;
 mod commands;
 mod drops;
 mod elements;
+mod feeds;
 mod keys;
 mod menus;
 mod notify;
@@ -37,13 +38,16 @@ mod window_state;
 use gpui::App;
 
 use crate::app::Shell;
+use crate::feeds::FeedHub;
 use crate::projects::Catalog;
 use crate::refresh::ControlWatcher;
+use crate::window_state::{launch_plan, WindowSession, WindowState};
 
 /// What the command line asked for.
 enum Mode {
-    /// The app, on the launch project (`projects::launch_project` reads the
-    /// optional project argument itself).
+    /// The app: the windows that were open, each on its project
+    /// (`window_state::launch_plan`); an optional project argument takes the
+    /// first one.
     App,
     /// `--spike <session>`: one terminal element on one session, bypassing
     /// the project shell.
@@ -147,11 +151,24 @@ fn main() {
             _ => bench::run(args),
         }
     }
-    // The launch project: a local read before any window exists (the spike
-    // has none).
-    let launch = match mode {
-        Mode::App => projects::launch_project(),
-        _ => None,
+    // The windows to open: local reads before any window exists (the spike
+    // has none). The window slots, else (the first launch after the
+    // upgrade) one window on the launch project with its old frame.
+    let (session, plan) = match mode {
+        Mode::App => {
+            let session = WindowSession::load();
+            let named = projects::named_project();
+            let known = projects::project_names();
+            let plan = launch_plan(
+                session.as_ref(),
+                named.as_deref(),
+                projects::launch_project().as_deref(),
+                &|p| known.contains(p),
+                &WindowState::load_legacy,
+            );
+            (session.unwrap_or_default(), plan)
+        }
+        _ => (WindowSession::default(), Vec::new()),
     };
 
     gpui_platform::application()
@@ -183,15 +200,16 @@ fn main() {
                 ),
                 cx,
             );
-            // A clicked notification focuses its project's window and opens
-            // the item. (Notifications only post from the bundled app: an
+            // A clicked notification brings up the window showing its project
+            // (else switches the frontmost one) and opens the item. (Notifications only post from the bundled app: an
             // unbundled `cargo run` has no notification center.)
             cx.on_system_notification_response(|response, cx| {
                 app::open_notice_tag(&response.tag, cx);
             });
 
             // Closing the last window quits the app (its agents keep running).
-            cx.on_window_closed(|cx, _| {
+            cx.on_window_closed(|cx, id| {
+                app::window_closed(id, cx);
                 if cx.windows().is_empty() {
                     cx.quit();
                 }
@@ -213,23 +231,24 @@ fn main() {
             // project's feed. The app's attached-client registration (and its
             // detach / relaunch pushes) is bootstrap's control watch, under
             // this id.
+            let control = ControlWatcher::spawn();
+            cx.set_global(FeedHub::live(Some(control.clone())));
             cx.set_global(Shell::new(
                 shelbi_client::fresh_client_id(),
-                Some(ControlWatcher::spawn()),
+                Some(control),
+                session,
             ));
 
             // Once a day, off-thread: is there a newer release? Every
             // project window shows the notice when there is.
             views::update::spawn_check(cx);
 
-            match launch {
-                Some(project) => app::open_or_focus(&project, cx),
-                None => {
-                    tracing::error!("no Shelbi project found: run `shelbi init` in a repository");
-                    cx.quit();
-                    return;
-                }
+            if plan.is_empty() {
+                tracing::error!("no Shelbi project found: run `shelbi init` in a repository");
+                cx.quit();
+                return;
             }
+            app::open_launch_windows(plan, cx);
             cx.activate(true);
         });
 }

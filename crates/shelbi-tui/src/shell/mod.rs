@@ -2174,6 +2174,14 @@ impl ShellState {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.overlay = Some(ActiveOverlay::add_project(&cwd));
             }
+            // The registry lists New Window only for a multi-window client
+            // (`CommandModel::multi_window`, the desktop app); this terminal
+            // is one window, so say where another one comes from.
+            Effect::NewWindow { .. } => {
+                self.status = Some(
+                    "New Window is a desktop command: run shelbi in another terminal".to_string(),
+                )
+            }
             Effect::Detach => self.quit(QuitAction::CloseUi),
             Effect::DetachOtherClients => self.detach_other_clients(),
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),

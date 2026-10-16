@@ -125,6 +125,7 @@ pub fn command_model_from(
         other_projects,
         edit_targets,
         other_clients_attached,
+        multi_window: false,
     }
 }
 

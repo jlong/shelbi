@@ -7,7 +7,10 @@
 //! background thread and kept in memory, so a project switch paints the
 //! target's chrome on its very first frame without touching disk: the
 //! prefetched skeleton when there is one, else the zero-IO
-//! [`SidebarModel::skeleton`]. Data cascades in from the window's feed.
+//! [`SidebarModel::skeleton`]. Data cascades in from the window's feed. Each
+//! project's saved [`ProjectViewState`] (where it was left) is prefetched the
+//! same way, so switching back to a project restores its view without a disk
+//! read on the switch.
 //!
 //! Opening a project brings up its orchestrator and records it open (the
 //! record the daemon's per-project poller watches), the way the TUI's startup
@@ -21,6 +24,7 @@ use gpui::Global;
 use shelbi_app::view::SidebarModel;
 
 use crate::platform::env::Env;
+use crate::window_state::ProjectViewState;
 
 /// One project the switcher lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +39,10 @@ pub struct ProjectEntry {
 struct CatalogInner {
     projects: Vec<ProjectEntry>,
     skeletons: std::collections::HashMap<String, SidebarModel>,
+    views: std::collections::HashMap<String, ProjectViewState>,
+    /// Projects whose view state this process has set: a refresh never
+    /// replaces those with what it read (the write may not have landed).
+    remembered: std::collections::HashSet<String>,
 }
 
 /// The app-wide project catalog, installed as a gpui global. Cheap to clone;
@@ -66,6 +74,23 @@ impl Catalog {
             .unwrap_or_else(|| SidebarModel::skeleton(project))
     }
 
+    /// Where `project` was left, from memory only (the default when it was
+    /// never left, or the catalog hasn't loaded).
+    pub fn view_state(&self, project: &str) -> ProjectViewState {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|inner| inner.views.get(project).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Remember where `project` was left (the caller saves it to disk).
+    pub fn remember_view(&self, project: &str, state: ProjectViewState) {
+        let mut inner = self.lock();
+        inner.views.insert(project.to_string(), state);
+        inner.remembered.insert(project.to_string());
+    }
+
     /// Re-read the catalog on a background thread, then call `done` there.
     pub fn refresh(&self, done: impl FnOnce() + Send + 'static) {
         let inner = self.inner.clone();
@@ -87,10 +112,19 @@ impl Catalog {
                             .map(|m| (p.name.clone(), m))
                     })
                     .collect();
+                let views: Vec<(String, ProjectViewState)> = projects
+                    .iter()
+                    .map(|p| (p.name.clone(), ProjectViewState::load(&p.name)))
+                    .collect();
                 {
                     let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
                     guard.projects = projects;
                     guard.skeletons = skeletons;
+                    for (name, view) in views {
+                        if !guard.remembered.contains(&name) {
+                            guard.views.insert(name, view);
+                        }
+                    }
                 }
                 done();
             });
@@ -119,6 +153,26 @@ impl Catalog {
     }
 }
 
+/// The project named on the command line (the first argument), else by
+/// `$SHELBI_PROJECT`.
+pub fn named_project() -> Option<String> {
+    std::env::args()
+        .nth(1)
+        .filter(|a| !a.starts_with('-'))
+        .or_else(|| std::env::var("SHELBI_PROJECT").ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+}
+
+/// The registered projects' names (blocking: a directory read).
+pub fn project_names() -> std::collections::HashSet<String> {
+    shelbi_state::list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.name)
+        .collect()
+}
+
 /// The project a fresh launch opens, picked the way a terminal user would land
 /// on one:
 ///
@@ -130,13 +184,7 @@ impl Catalog {
 ///
 /// Reads disk, so it runs once, before the first window opens.
 pub fn launch_project() -> Option<String> {
-    let named = std::env::args()
-        .nth(1)
-        .filter(|a| !a.starts_with('-'))
-        .or_else(|| std::env::var("SHELBI_PROJECT").ok())
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
-    named
+    named_project()
         .or_else(|| {
             let cwd = std::env::current_dir().ok()?;
             shelbi_state::resolve_project_for_cwd(&cwd).ok().flatten()
@@ -208,5 +256,17 @@ mod tests {
         let bare = catalog.first_frame_sidebar("api");
         assert_eq!(bare.project_label, "api");
         assert!(bare.board_loading);
+    }
+
+    #[test]
+    fn a_remembered_view_state_is_served_from_memory() {
+        let catalog = Catalog::default();
+        assert_eq!(catalog.view_state("web"), ProjectViewState::default());
+        let state = ProjectViewState {
+            view: Some("tasks".into()),
+            ..Default::default()
+        };
+        catalog.remember_view("web", state.clone());
+        assert_eq!(catalog.view_state("web"), state);
     }
 }

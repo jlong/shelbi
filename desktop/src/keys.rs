@@ -12,6 +12,16 @@
 use gpui::Keystroke;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
+/// File ▸ New Window, the macOS standard (⌘⇧N), as a `keys.yaml` chord. The
+/// window takes it before a focused terminal can (`crate::app`), and the
+/// menu shows it on the item.
+pub const NEW_WINDOW: &str = "shift-super-n";
+
+/// Whether `chord` is [`NEW_WINDOW`].
+pub fn is_new_window(chord: &KeyChord) -> bool {
+    KeyChord::parse(NEW_WINDOW).is_ok_and(|c| c.canonical() == chord.canonical())
+}
+
 /// Translate a gpui [`Keystroke`] into a [`KeyChord`], or `None` for a key
 /// outside Shelbi's chord vocabulary (a bare modifier, a media key). Such keys
 /// can never be bound, so `None` means "no chord".
@@ -145,6 +155,14 @@ mod tests {
         chord_from_keystroke(&ks(spec, key_char))
             .map(|c| c.canonical())
             .unwrap_or_else(|| "<none>".into())
+    }
+
+    #[test]
+    fn cmd_shift_n_is_new_window() {
+        let chord = |spec| chord_from_keystroke(&ks(spec, Some("n"))).unwrap();
+        assert!(is_new_window(&chord("cmd-shift-n")));
+        assert!(!is_new_window(&chord("cmd-n")));
+        assert!(!is_new_window(&chord("ctrl-shift-n")));
     }
 
     #[test]
