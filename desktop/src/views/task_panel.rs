@@ -30,7 +30,7 @@ pub const DESCRIPTION_LINES: usize = 5;
 
 /// The back button: a 28pt square on the overlay fill (deepening on hover
 /// and press), 6pt corners, the left arrow. `keyboard` marks it the
-/// keyboard's row.
+/// keyboard's row with the focus ring and glow.
 pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<Div> {
     let radius = px(NAV_RADIUS);
     let d = div()
@@ -46,7 +46,7 @@ pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<
         .cursor_pointer();
     fill_layer(d, id, radius, [theme.background, theme.background_hover, theme.background_active])
         .child(heroicon(icons::ARROW_LEFT).text_color(theme.button_icon))
-        .when(keyboard, |d| d.child(style::selection_indicator(theme)))
+        .when(keyboard, |d| d.shadow(style::focus_shadow(theme)))
 }
 
 /// The panel's first row (Figma's "Project and search"): the back button,
@@ -127,7 +127,7 @@ pub fn summary(
 
 /// The More link under the description (Less once it expanded): X-Small /
 /// Medium in `text/link`, the hover color on hover. `keyboard` marks it the
-/// keyboard's row.
+/// keyboard's row with the selection fill.
 pub fn more_link(id: &'static str, expanded: bool, keyboard: bool, theme: &Theme) -> Stateful<Div> {
     let hover = theme.link_hover;
     div()
@@ -141,7 +141,20 @@ pub fn more_link(id: &'static str, expanded: bool, keyboard: bool, theme: &Theme
         .type_style(Type::XSmallMedium)
         .text_color(theme.link)
         .hover(move |s| s.text_color(hover))
-        .when(keyboard, |d| d.child(style::selection_indicator(theme)))
+        .when(keyboard, |d| {
+            // The selection fill as the worktree row draws it, 12pt in: a
+            // layer under the label, out of the layout so nothing moves.
+            d.child(
+                div()
+                    .absolute()
+                    .left(px(-6.0))
+                    .right(px(-6.0))
+                    .top(px(-4.0))
+                    .bottom(px(-4.0))
+                    .rounded(px(NAV_RADIUS))
+                    .bg(theme.background),
+            )
+        })
         .child(if expanded { "Less" } else { "More" })
 }
 
@@ -187,9 +200,7 @@ pub fn worktree_row(
                 .gap(px(8.0))
                 .p(px(6.0))
                 .rounded(px(NAV_RADIUS))
-                .when(keyboard, |d| {
-                    d.bg(theme.background).child(style::selection_indicator(theme))
-                })
+                .when(keyboard, |d| d.bg(theme.background))
                 .child(heroicon(icons::FOLDER).text_color(theme.icon))
                 .child(
                     div()

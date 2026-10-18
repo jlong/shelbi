@@ -1079,7 +1079,6 @@ impl ReviewView {
             .children(chip.map(|b| {
                 motion::floating_chip(b, |d| {
                     style::nav_chip(d.rounded(px(NAV_RADIUS)), theme)
-                        .when(focused, |d| d.child(style::selection_indicator(theme)))
                 })
             }))
             .children(views);
@@ -1176,7 +1175,7 @@ impl ReviewView {
             .relative()
             .cursor_default()
             .text_color(theme.muted)
-            .when(keyboard, |d| d.bg(theme.background).child(style::selection_indicator(theme)))
+            .when(keyboard, |d| d.bg(theme.background))
             .tooltip(style::tooltip(tip));
         let waiting = div()
             .debug_selector(|| "review-server-state".into())

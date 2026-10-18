@@ -14,7 +14,7 @@ doesn't read them.
   `.type_style(...)`) and the component shapes every view shares (nav chip,
   buttons, icon buttons, dropdowns, segmented controls, keycaps and the
   sidebar's plain hotkeys, project badges, popovers, dialogs, chips, the
-  selection pill, the focus ring and glow, empty states, tooltips).
+  focus ring and glow, empty states, tooltips).
 - `src/theme/motion.rs`: the motion: the easing curve, the spring the
   selection chip slides on, and the fades every hover and press runs.
 - `src/theme/mod.rs`: the resolved `Theme` global (views read `theme.muted`,
@@ -34,7 +34,7 @@ The sidebar is a lighter tint of it (`#acb4cf` at 10% over the canvas,
 read as wells cut into the canvas. Body text is `theme.foreground` (a near
 white at 70%), titles `theme.white` (`#f8f8fa`), secondary text
 `theme.gray`, quiet text `theme.muted` (`#777a86`). The accent (the
-selected nav icon, the selection pill) is cyan `#62cdf6`, as is the focus
+selected nav icon) is cyan `#62cdf6`, as is the focus
 ring.
 
 **Light.** The main surface is white, the sidebar a light gray-blue tint
@@ -133,10 +133,9 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Shadow blurs | Every Figma (or CSS) blur goes through `style::figma_blur`: Figma's blur is twice the Gaussian's sigma and gpui's `blur_radius` is the sigma, so `shadow/raised card`'s 4 draws as 2, the palette's 15 as 7.5, and the popover and dialog drops likewise |
 | Selection chip | One chip for the current row; when the selection moves (keys, clicks, route changes) it slides to the new row on a spring with a slight overshoot before the row takes it back. The sidebar, the review and workspace panels' view switches, and every segmented control |
 | List row (leading column) | The review and workspace panels: 32px, Small (13 / 18); the same chip when selected. The sidebar's rows follow the Navigation component (see `views/sidebar.rs`): 8px across, 4px above and below, a 12px state glyph |
-| Current-selection indicator | A 3x16px `accent` pill at the row's leading edge, on the keyboard's row |
 | Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
 | Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `success_label` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
-| Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, text fields) |
+| Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, the task panels' back button on the keyboard's row, text fields) |
 | Dropdown | A button that opens a menu (the board's filters): the Figma Button at X-Small with a left icon, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the 18px icon (`icons::FUNNEL_BUTTON`, in `button_icon`) sits in Figma's 14px Icon slot (`icon_slot`), which makes the button 26px tall; pressed while its menu is open (the icon keeps its color), and the menu opens 6px under it |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
@@ -246,7 +245,7 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `icon` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: icons at rest |
 | `button_icon` | `#acb4cf99` | `#7b85a7e5` | The Button component's icon stroke (the board's filters and New issue): `#acb4cf` at 60% in Dark, `theme.gray` in Light |
-| `accent` | `#62cdf6` | `#f21478` | `icon/select`: the selected nav icon, the selection pill, the current project's check |
+| `accent` | `#62cdf6` | `#f21478` | `icon/select`: the selected nav icon, the current project's check |
 | `icon_cyan` | `#62cdf6` | `#31ade9` | `icon/cyan`: ready for review |
 | `icon_green` | `#31d924` | `#5ac351` | `icon/green`: a working workspace |
 | `icon_yellow` | `#ffdd64` | `#ffca0d` | `icon/yellow`: awaiting input |

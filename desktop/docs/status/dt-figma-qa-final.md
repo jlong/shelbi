@@ -224,8 +224,9 @@ Kept behavior over the mockup:
 14. **Issue detail**: the move keys read `H` / `L` (bound), not `l` / `r`.
 15. **Copy**: "Detach" (not "Detatch"); the palette reads "Turn Zen Mode off"
     with Zen on.
-16. **Task panels**: the active Diff / Editor row keeps its ×; the keyboard's
-    pill on the focused row; the expanded description is one stream.
+16. **Task panels**: the active Diff / Editor row keeps its ×; the expanded
+    description is one stream. (The keyboard's accent pill is gone app-wide
+    since `dt-remove-selection-pill`.)
 17. **Machines**: an idle slot's runner is `—`.
 
 Rendering and platform residuals:

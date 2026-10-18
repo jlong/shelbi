@@ -305,8 +305,7 @@ palette! {
     icon,
     /// A button's icon (the Button component's: dimmer than `icon` in Dark).
     button_icon,
-    /// The selected nav icon and the current-selection marker: cyan in
-    /// Dark, pink in Light (`icon/select`).
+    /// The selected nav icon: cyan in Dark, pink in Light (`icon/select`).
     accent,
     /// A ready-for-review check (`icon/cyan`).
     icon_cyan,
