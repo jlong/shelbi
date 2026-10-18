@@ -33,8 +33,8 @@ theme: auto                          # auto (follows the system), dark, light; s
 editor: code --wait                  # edit:* commands, "Open in editor", Cmd+click; then $EDITOR, then vim
 desktop:
   cli_path: ~/src/shelbi/target/debug/shelbi   # skip discovery (login PATH, Homebrew, ~/.cargo/bin)
-  terminal_font_family: Geist Mono   # the default; bundled with the app
-  terminal_font_size: 13             # points, 6 to 72
+  terminal_font_family: Source Code Pro   # the default; bundled with the app
+  terminal_font_size: 14             # points, 6 to 72
   option_as_meta: false              # true, left, or right (Ghostty's shape)
   notifications:                     # every kind is on unless switched off
     workspace_blocked: true          # an agent waits for input or a permission
@@ -47,8 +47,8 @@ desktop:
 | `theme` | `auto` | Color theme. `auto` follows the system appearance live (the TUI reads `auto` as dark). |
 | `editor` | `$EDITOR`, then `vim` | The editor for `edit:*` commands, a task's "Open in editor", and Cmd+click on a path. A terminal editor opens in Terminal.app; a GUI editor directly. |
 | `desktop.cli_path` | discovered | The `shelbi` the app runs. A leading `~/` is expanded. |
-| `desktop.terminal_font_family` | Geist Mono | Terminal font. |
-| `desktop.terminal_font_size` | 13 | Terminal font size in points (6 to 72). |
+| `desktop.terminal_font_family` | Source Code Pro | Terminal font. |
+| `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72), on 18pt rows at the default. |
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
 | `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. |
@@ -149,7 +149,7 @@ desktop/
   scripts/render-icon.sh  assets/icon/shelbi.svg -> shelbi-1024.png
   assets/icon/         the app icon: SVG source + the 1024px PNG master bundle.sh cuts into .icns
   assets/icons/        vendored Heroicons + their LICENSE
-  assets/fonts/        Geist (UI) and Geist Mono (terminal), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
+  assets/fonts/        Geist (UI), Source Code Pro (terminal) and Geist Mono (terminal fallback), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
   docs/README.md       the status index: every subtask's status doc
   docs/parity.md       the TUI parity record: view-model fields, the command walk
@@ -217,7 +217,7 @@ TUI's rules where the TUI has the feature (the shared code is
 | Links | Hold Cmd to underline a URL or a `path[:line[:col]]` under the pointer; Cmd+click opens a URL in the browser and a file in your editor at that line (the `editor` setting, then `$EDITOR`, then `vim`; terminal editors open in Terminal.app). Relative paths resolve against the session's working directory. |
 | Keys | The TUI's encoder (kitty protocol, DECCKM). Option types characters and dead keys unless `option_as_meta` says otherwise; Option with Enter, arrows, Backspace, or Delete is always Meta. IME composition draws at the cursor. |
 | Mouse | Clicks, drags (`?1002`), and motion (`?1003`) reach a program that asks for them, SGR or X10 encoded. Alt hands a drag to a reporting program. |
-| Fonts | `terminal_font_family` / `terminal_font_size`, live. Geist Mono and Symbols Nerd Font Mono are bundled; a glyph the font lacks falls back to Geist Mono, then the Nerd symbols, then Menlo, then the system (CJK, emoji). |
+| Fonts | `terminal_font_family` / `terminal_font_size`, live. Source Code Pro (the default, 14 on 18), Geist Mono and Symbols Nerd Font Mono are bundled; a glyph the font lacks falls back to Source Code Pro, then Geist Mono, then the Nerd symbols, then Menlo, then the system (CJK, emoji). |
 
 ### Accessibility
 

@@ -47,6 +47,7 @@ use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::{Hue, Theme};
+use crate::theme::style::{Type, Typography};
 
 /// The fallback refresh cadence (the TUI's).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
@@ -86,10 +87,10 @@ impl Render for CardGhost {
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(theme.surface_raised)
+            .bg(theme.raised)
             .shadow(style::popover_shadow(&theme))
             .opacity(0.95)
-            .text_sm()
+            .type_style(Type::Base)
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
@@ -98,7 +99,7 @@ impl Render for CardGhost {
                     .text_ellipsis()
                     .child(self.title.clone()),
             )
-            .child(div().text_xs().text_color(theme.text_quiet).child(self.id.clone()))
+            .child(div().type_style(Type::XSmall).text_color(theme.muted).child(self.id.clone()))
     }
 }
 
@@ -564,11 +565,10 @@ impl IssuesView {
             .h(px(56.0))
             .flex_none()
             .border_b_1()
-            .border_color(theme.rule)
+            .border_color(theme.divider)
             .child(
                 div()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .type_style(Type::BaseSemibold)
                     .text_color(theme.text_loud)
                     .child(title),
             )
@@ -601,7 +601,7 @@ impl IssuesView {
                     })),
             )
             .when_some(model.banner.clone(), |row, banner| {
-                row.child(div().text_xs().text_color(theme.text_quiet).child(banner))
+                row.child(div().type_style(Type::XSmall).text_color(theme.muted).child(banner))
             })
             .child(div().flex_1())
             .when(self.state.has_pending(), |row| {
@@ -679,12 +679,11 @@ impl IssuesView {
             .h_full()
             .py_2()
             .rounded_lg()
-            .bg(theme.surface_recessed)
+            .bg(theme.canvas)
             .border_1()
-            .border_color(if focused { theme.rule_strong } else { theme.rule })
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(if focused { theme.text_loud } else { theme.text_quiet })
+            .border_color(if focused { theme.divider_strong } else { theme.divider })
+            .type_style(Type::XSmallMedium)
+            .text_color(if focused { theme.text_loud } else { theme.muted })
             .cursor_pointer()
             .child(div().font_weight(FontWeight::SEMIBOLD).child(col.cards.len().to_string()))
             .children(letters)
@@ -697,7 +696,7 @@ impl IssuesView {
             .when(drop.is_some() && !refused, |d| {
                 let theme = *theme;
                 d.drag_over::<CardDrag>(move |s, _, _, _| {
-                    s.bg(theme.fill).border_color(theme.focus_ring)
+                    s.bg(theme.background).border_color(theme.focus_ring)
                 })
             })
             // A refused target still takes the drop, so the state can say why
@@ -767,9 +766,8 @@ impl IssuesView {
             .cursor_pointer()
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if focused { theme.text_loud } else { theme.text })
+                    .type_style(Type::BaseSemibold)
+                    .text_color(if focused { theme.text_loud } else { theme.foreground })
                     .when(focused, |d| d.underline())
                     .child(col.label.clone()),
             )
@@ -786,8 +784,8 @@ impl IssuesView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_xs()
-                            .text_color(theme.text_quiet)
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
                             .child(text)
                     }),
             )
@@ -825,10 +823,10 @@ impl IssuesView {
                     .rounded_lg()
                     .border_1()
                     .border_dashed()
-                    .border_color(theme.rule_strong)
-                    .text_xs()
+                    .border_color(theme.divider_strong)
+                    .type_style(Type::XSmall)
                     .text_center()
-                    .text_color(theme.text_quiet)
+                    .text_color(theme.muted)
                     .child("No issues. Drag a card here.")
                     .into_any_element()
             })
@@ -843,7 +841,7 @@ impl IssuesView {
                     .id("load-more")
                     .px_2()
                     .py_1()
-                    .text_xs()
+                    .type_style(Type::XSmall)
                     .text_color(theme.link)
                     .hover(|s| s.text_color(theme.link_hover))
                     .cursor_pointer()
@@ -870,14 +868,14 @@ impl IssuesView {
             .pt_1()
             .pb_2()
             .rounded_lg()
-            .bg(theme.surface_recessed)
+            .bg(theme.canvas)
             .border_1()
-            .border_color(theme.rule)
+            .border_color(theme.divider)
             .child(header)
             .child(body)
             .when(refused.is_some(), |d| d.opacity(0.35))
             .when(drop.is_some() && refused.is_none(), |d| {
-                d.drag_over::<CardDrag>(move |s, _, _, _| s.bg(theme.fill).border_color(theme.focus_ring))
+                d.drag_over::<CardDrag>(move |s, _, _, _| s.bg(theme.background).border_color(theme.focus_ring))
             })
             // A refused target still takes the drop, so the state can say why
             // (it sends nothing).
@@ -910,7 +908,7 @@ impl IssuesView {
         };
         let ghost_title = SharedString::from(card.title.clone());
         let title_color = if card.blocked {
-            theme.text_quiet
+            theme.muted
         } else {
             theme.text_loud
         };
@@ -923,10 +921,10 @@ impl IssuesView {
             .p_3()
             .overflow_hidden()
             .rounded_lg()
-            .bg(theme.surface_raised)
+            .bg(theme.card)
             // The keyboard's card wears the focus ring.
             .shadow(if selected {
-                vec![style::focus_shadow(theme)]
+                style::focus_shadow(theme)
             } else {
                 style::card_shadow(theme)
             })
@@ -967,7 +965,7 @@ impl IssuesView {
                         d.child(
                             heroicon(icons::LOCK_CLOSED)
                                 .mt(px(1.0))
-                                .text_color(theme.text_quiet),
+                                .text_color(theme.muted),
                         )
                     })
                     .child(
@@ -990,8 +988,8 @@ impl IssuesView {
                         .flex_row()
                         .items_center()
                         .gap_1()
-                        .text_xs()
-                        .text_color(theme.text_quiet)
+                        .type_style(Type::XSmall)
+                        .text_color(theme.muted)
                         .child(heroicon(icons::ARROW_PATH).text_color(theme.icon))
                         .child(p.label),
                 )
@@ -1004,7 +1002,7 @@ impl IssuesView {
                         .flex_row()
                         .items_start()
                         .gap_1()
-                        .text_xs()
+                        .type_style(Type::XSmall)
                         .text_color(theme.error)
                         .child(
                             heroicon(icons::EXCLAMATION_TRIANGLE)
@@ -1058,11 +1056,11 @@ impl IssuesView {
             .px_4()
             .py_1p5()
             .border_t_1()
-            .border_color(theme.rule)
-            .text_xs()
-            .text_color(theme.text_quiet)
+            .border_color(theme.divider)
+            .type_style(Type::XSmall)
+            .text_color(theme.muted)
             .child(div().flex_1().truncate().child(hints))
-            .when_some(status, |d, s| d.child(div().text_color(theme.text).child(s)))
+            .when_some(status, |d, s| d.child(div().text_color(theme.foreground).child(s)))
     }
 
     fn render_dropdown(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1185,8 +1183,8 @@ impl IssuesView {
                 .child(
                     div()
                         .px_2()
-                        .text_xs()
-                        .text_color(theme.text_quiet)
+                        .type_style(Type::XSmall)
+                        .text_color(theme.muted)
                         .child("Enter adds it to Backlog · Esc cancels"),
                 ),
         ))
@@ -1220,9 +1218,9 @@ impl Render for IssuesView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.surface)
-            .text_sm()
-            .text_color(theme.text)
+            .bg(theme.canvas)
+            .type_style(Type::Base)
+            .text_color(theme.foreground)
             .child(self.render_header(&theme, cx))
             .child(board)
             .child(self.render_footer(&theme))
@@ -1293,8 +1291,8 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
         .flex()
         .flex_col()
         .gap_1()
-        .text_xs()
-        .text_color(theme.text_quiet)
+        .type_style(Type::XSmall)
+        .text_color(theme.muted)
         .when(show_wf || card.branch.is_some(), |d| {
             d.child(
                 div()
@@ -1324,7 +1322,7 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
 }
 
 fn muted_row(theme: &Theme, text: &'static str) -> gpui::Div {
-    div().px_2().py_1().text_xs().text_color(theme.text_quiet).child(text)
+    div().px_2().py_1().type_style(Type::XSmall).text_color(theme.muted).child(text)
 }
 
 /// A menu or popover: Taskpage's raised surface with its ring and shadow.
@@ -1347,9 +1345,9 @@ fn option_row(theme: &Theme, selected: bool, label: String, count: Option<usize>
         .rounded_lg()
         .cursor_pointer()
         .when(selected, |d| d.bg(theme.row_selected).text_color(theme.text_loud))
-        .when(!selected, |d| d.hover(|s| s.bg(theme.fill_subtle)))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.background)))
         .child(label)
-        .when_some(count, |d, n| d.child(div().text_color(theme.text_quiet).child(n.to_string())))
+        .when_some(count, |d, n| d.child(div().text_color(theme.muted).child(n.to_string())))
 }
 
 /// A full-size layer over the board that swallows clicks and closes the

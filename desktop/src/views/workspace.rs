@@ -73,6 +73,7 @@ use crate::refresh::SessionSink;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, IconButtonSize, NAV_ROW_H};
 use crate::theme::{Hue, Theme};
+use crate::theme::style::{Type, Typography};
 
 /// Which content the left pane shows: the panel's view switch (the TUI's
 /// `WsView`).
@@ -804,9 +805,9 @@ impl WorkspaceView {
             // the sidebar's header is.
             .pt(px(TRAFFIC_LIGHT_INSET))
             .overflow_y_scroll()
-            .bg(theme.surface_recessed)
-            .text_sm()
-            .text_color(theme.text);
+            .bg(theme.sidebar)
+            .type_style(Type::Base)
+            .text_color(theme.foreground);
         let Some(header) = self.header() else {
             return root;
         };
@@ -877,8 +878,7 @@ impl WorkspaceView {
                     .debug_selector(|| "workspace-state".into())
                     .min_w_0()
                     .truncate()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .type_style(Type::BaseSemibold)
                     .text_color(theme.decoration(dec.color))
                     .child(format!("{} {}", dec.glyph, header.state.label())),
             );
@@ -903,7 +903,7 @@ impl WorkspaceView {
                     div()
                         .debug_selector(|| "workspace-role".into())
                         .flex_none()
-                        .text_color(theme.text_quiet)
+                        .text_color(theme.muted)
                         .child(format!("· {role}")),
                 )
             });
@@ -936,15 +936,15 @@ impl WorkspaceView {
                         .child(
                             div()
                                 .debug_selector(|| "workspace-task-id".into())
-                                .text_xs()
-                                .text_color(theme.text_quiet)
+                                .type_style(Type::XSmall)
+                                .text_color(theme.muted)
                                 .child(id),
                         )
                         .when(!preview.is_empty(), |d| {
                             d.child(
                                 div()
                                     .debug_selector(|| "workspace-description".into())
-                                    .text_color(theme.text)
+                                    .text_color(theme.foreground)
                                     .text_ellipsis()
                                     .line_clamp(3)
                                     .child(preview),
@@ -1034,7 +1034,7 @@ impl WorkspaceView {
         });
         let shell = panel.rows().contains(&WsRow::Shell).then(|| {
             let (state, hue) = match (self.shell_open, self.shell_starting) {
-                (true, true) => ("starting", Hue::Gold),
+                (true, true) => ("starting", Hue::Yellow),
                 (true, false) => ("on", Hue::Green),
                 (false, _) => ("off", Hue::Neutral),
             };
@@ -1096,7 +1096,7 @@ impl WorkspaceView {
         let divider_color = if self.dragging {
             theme.icon
         } else {
-            theme.rule
+            theme.divider
         };
         let shell_side = self.shell_open.then(|| {
             let divider = div()
@@ -1128,7 +1128,7 @@ impl WorkspaceView {
                     if self.shell_starting {
                         d.items_center()
                             .justify_center()
-                            .text_color(theme.text_quiet)
+                            .text_color(theme.muted)
                             .child("Starting a shell…")
                     } else {
                         d.child(self.shell.clone())
@@ -1232,7 +1232,7 @@ impl WorkspaceView {
                                         .flex_row()
                                         .gap_2()
                                         .min_w_0()
-                                        .child(div().text_color(theme.text_quiet).child(id.clone()))
+                                        .child(div().text_color(theme.muted).child(id.clone()))
                                         .child(
                                             div()
                                                 .truncate()
@@ -1301,7 +1301,7 @@ impl WorkspaceView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.surface)
+            .bg(theme.canvas)
             // Waiting for the push to settle: an empty canvas, not the
             // pane's "no session" notice.
             .children((self.held.is_none()).then(|| self.render_panes(&theme, cx)))

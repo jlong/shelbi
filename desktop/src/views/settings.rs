@@ -36,6 +36,7 @@ use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
+use crate::theme::style::{Type, Typography};
 
 /// The values the view edits, parsed from the inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -191,8 +192,8 @@ impl SettingsView {
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
-        let font_family = input("Geist Mono", window, cx);
-        let font_size = input("13", window, cx);
+        let font_family = input("Source Code Pro", window, cx);
+        let font_size = input("14", window, cx);
         let cli_path = input("Found automatically", window, cx);
         let subscriptions = [&font_family, &font_size, &cli_path]
             .into_iter()
@@ -453,7 +454,7 @@ impl Render for SettingsView {
                 .gap_1()
                 .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.text_loud).child(label))
                 .child(div().w(px(360.0)).child(Input::new(input)))
-                .child(div().text_xs().text_color(theme.text_quiet).child(hint))
+                .child(div().type_style(Type::XSmall).text_color(theme.muted).child(hint))
         };
         let theme_chip = chips.0;
         let chip = |label: &'static str, value: ThemePreference, current: ThemePreference, cx: &mut Context<Self>| {
@@ -461,13 +462,13 @@ impl Render for SettingsView {
             style::segment(id.clone(), label, value == current, theme_chip.is_none(), &theme)
                 .h(px(28.0))
                 .px_3()
-                .text_sm()
+                .type_style(Type::Base)
                 .child(motion::probe(&self.theme_track, id))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_theme(value, window, cx)))
         };
         let status: Option<(SharedString, gpui::Hsla)> = match &self.state {
             SaveState::Idle => None,
-            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.text_quiet)),
+            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.muted)),
             SaveState::Failed(e) => Some((e.clone().into(), theme.error)),
         };
         let current = self.theme;
@@ -478,7 +479,7 @@ impl Render for SettingsView {
             style::segment(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
                 .h(px(28.0))
                 .px_3()
-                .text_sm()
+                .type_style(Type::Base)
                 .child(motion::probe(&self.option_track, id))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
         };
@@ -500,14 +501,16 @@ impl Render for SettingsView {
                         .rounded(px(4.0))
                         .border_1()
                         .border_color(theme.input_border)
-                        .bg(theme.surface)
-                        .when(on, |d| d.bg(theme.brand).border_color(theme.brand))
+                        .bg(theme.canvas)
+                        // Figma's checked box: the loud color, the mark
+                        // in the canvas.
+                        .when(on, |d| d.bg(theme.text_loud).border_color(theme.text_loud))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(on, |d| d.text_color(theme.text_on_color).text_xs().child("✓")),
+                        .when(on, |d| d.text_color(theme.canvas).type_style(Type::XSmall).child("✓")),
                 )
-                .child(div().text_color(if on { theme.text_loud } else { theme.text }).child(label))
+                .child(div().text_color(if on { theme.text_loud } else { theme.foreground }).child(label))
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
         };
         let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
@@ -520,14 +523,13 @@ impl Render for SettingsView {
             .gap_6()
             .size_full()
             .p_8()
-            .bg(theme.surface)
+            .bg(theme.canvas)
             .overflow_y_scroll()
-            .text_sm()
-            .text_color(theme.text)
+            .type_style(Type::Base)
+            .text_color(theme.foreground)
             .child(
                 div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .type_style(Type::Heading)
                     .text_color(theme.text_loud)
                     .child("Settings"),
             )
@@ -548,14 +550,14 @@ impl Render for SettingsView {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_quiet)
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
                             .child("Shared with the TUI, which picks it up on its next start."),
                     ),
             )
             .child(field(
                 "Terminal font",
-                "The font family for terminals. Blank uses Geist Mono.",
+                "The font family for terminals. Blank uses Source Code Pro.",
                 &self.font_family,
             ))
             .child(field(
@@ -579,7 +581,7 @@ impl Render for SettingsView {
                             .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
                             .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
                     )
-                    .child(div().text_xs().text_color(theme.text_quiet).child(
+                    .child(div().type_style(Type::XSmall).text_color(theme.muted).child(
                         "Characters: Option+E, E types é, as in other Mac apps. Meta: \
                          Option+B sends Esc B, for shell word motion and Claude Code's \
                          Option shortcuts. Option with Enter, the arrows, Backspace, or \
@@ -605,14 +607,14 @@ impl Render for SettingsView {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_quiet)
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
                             .child("Shared by the TUI and the desktop app."),
                     )
                     .children(conflicts.into_iter().map(|line| {
                         div()
                             .debug_selector(|| "settings-shortcut-conflict".into())
-                            .text_xs()
+                            .type_style(Type::XSmall)
                             .text_color(theme.error)
                             .child(line)
                     })),
@@ -634,7 +636,7 @@ impl Render for SettingsView {
                         Switch::OrchestratorWaiting,
                         cx,
                     ))
-                    .child(div().text_xs().text_color(theme.text_quiet).child(
+                    .child(div().type_style(Type::XSmall).text_color(theme.muted).child(
                         "Not shown for what's already on screen in the front window. \
                          macOS asks for permission the first time.",
                     )),

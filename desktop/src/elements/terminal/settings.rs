@@ -16,8 +16,8 @@ pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<u16> = 6..=72;
 /// The terminal settings in effect.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalSettings {
-    /// The font family (Geist Mono unless set; a family that isn't installed
-    /// falls back to Geist Mono when the font is measured).
+    /// The font family (Source Code Pro unless set; a family that isn't
+    /// installed falls back to Source Code Pro when the font is measured).
     pub font_family: String,
     /// The font size in points.
     pub font_size: f32,
@@ -96,11 +96,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_geist_mono_13_and_option_types_characters() {
+    fn defaults_are_source_code_pro_14_and_option_types_characters() {
         let s = TerminalSettings::from_config(&DesktopConfig::default());
         assert_eq!(s, TerminalSettings::default());
-        assert_eq!(s.font_family, "Geist Mono");
-        assert_eq!(s.font_size, 13.0);
+        assert_eq!(s.font_family, "Source Code Pro");
+        assert_eq!(s.font_size, 14.0);
         assert_eq!(s.option_as_meta, OptionAsMeta::Off);
     }
 
@@ -123,6 +123,6 @@ mod tests {
             ..DesktopConfig::default()
         };
         let s = TerminalSettings::from_config(&cfg);
-        assert_eq!((s.font_family.as_str(), s.font_size), ("Geist Mono", 72.0));
+        assert_eq!((s.font_family.as_str(), s.font_size), ("Source Code Pro", 72.0));
     }
 }

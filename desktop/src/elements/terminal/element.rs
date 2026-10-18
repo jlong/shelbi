@@ -363,7 +363,7 @@ impl Element for TerminalElement {
             let color = if pane.scrollbar_active() || pane.scrollbar_hovered {
                 cx.global::<Theme>().icon
             } else {
-                cx.global::<Theme>().icon_secondary.opacity(0.6)
+                cx.global::<Theme>().muted.opacity(0.6)
             };
             (
                 Bounds {

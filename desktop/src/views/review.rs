@@ -68,6 +68,7 @@ use crate::refresh::SessionSink;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, IconButtonSize, NAV_ROW_H};
 use crate::theme::Theme;
+use crate::theme::style::{Type, Typography};
 
 /// The blocking work behind a review, run on the background executor:
 /// resolving and loading a review task, the daemon's content sessions, and the
@@ -821,8 +822,7 @@ impl ReviewView {
             .child(
                 div()
                     .debug_selector(|| "review-status".into())
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .type_style(Type::BaseSemibold)
                     .text_color(theme.info)
                     .child(model.status_label.clone()),
             );
@@ -847,7 +847,7 @@ impl ReviewView {
                 d.child(
                     div()
                         .debug_selector(|| "review-description".into())
-                        .text_color(theme.text)
+                        .text_color(theme.foreground)
                         .text_ellipsis()
                         .line_clamp(3)
                         .child(model.description.clone()),
@@ -868,7 +868,7 @@ impl ReviewView {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis_start()
-                        .text_color(theme.text)
+                        .text_color(theme.foreground)
                         .child(model.worktree.clone()),
                 )
         });
@@ -963,7 +963,7 @@ impl ReviewView {
             let placeholder = |selector: &'static str| {
                 div()
                     .debug_selector(move || selector.into())
-                    .text_color(theme.text_quiet)
+                    .text_color(theme.muted)
                     .child("Loading…")
             };
             vec![
@@ -994,9 +994,9 @@ impl ReviewView {
             // the sidebar's header is.
             .pt(px(TRAFFIC_LIGHT_INSET))
             .overflow_y_scroll()
-            .bg(theme.surface_recessed)
-            .text_sm()
-            .text_color(theme.text)
+            .bg(theme.sidebar)
+            .type_style(Type::Base)
+            .text_color(theme.foreground)
             .child(header)
             .children(body)
             .when_some(panel.status_line().map(str::to_string), |d, line| {
@@ -1035,20 +1035,20 @@ impl ReviewView {
                             .child(format!("{} {}", dec.glyph, sub_state_label(server.state))),
                     )
                     .when_some(server.location.clone(), |d, loc| {
-                        d.child(div().text_xs().text_color(theme.text_quiet).child(loc))
+                        d.child(div().type_style(Type::XSmall).text_color(theme.muted).child(loc))
                     }),
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(theme.text_quiet)
+                    .type_style(Type::XSmall)
+                    .text_color(theme.muted)
                     .child(sub_state_detail(server.state)),
             )
             .child(
                 div()
                     .debug_selector(|| "review-health".into())
-                    .text_xs()
-                    .text_color(theme.text_quiet)
+                    .type_style(Type::XSmall)
+                    .text_color(theme.muted)
                     .child(server.health.label()),
             )
             .when_some(model.review_url.clone(), |d, url| {
@@ -1122,7 +1122,7 @@ impl ReviewView {
                                         .flex_row()
                                         .gap_2()
                                         .min_w_0()
-                                        .child(div().text_color(theme.text_quiet).child(model.task_id.clone()))
+                                        .child(div().text_color(theme.muted).child(model.task_id.clone()))
                                         .child(
                                             div()
                                                 .truncate()
@@ -1184,7 +1184,7 @@ impl ReviewView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.surface);
+            .bg(theme.canvas);
         let Some(shown) = &self.review else {
             return root.into_any_element();
         };
@@ -1236,7 +1236,7 @@ impl Render for ReviewView {
             None => div()
                 .debug_selector(|| "review-panel-empty".into())
                 .size_full()
-                .bg(theme.surface_recessed)
+                .bg(theme.sidebar)
                 .into_any_element(),
         }
     }

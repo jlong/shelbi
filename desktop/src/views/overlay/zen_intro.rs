@@ -9,6 +9,7 @@ use shelbi_app::overlay::zen_intro::{self as zen, IntroFocus, IntroState};
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
 use crate::views::overlay::{panel, with_overlay, zen_event, ActiveOverlay, OverlayEvent, OverlayHost};
+use crate::theme::style::{Type, Typography};
 
 const WIDTH: f32 = 560.0;
 
@@ -41,7 +42,7 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
         .when(checkbox_focused, |c| {
             c.text_color(theme.text_loud).font_weight(FontWeight::MEDIUM).underline()
         })
-        .when(!checkbox_focused, |c| c.text_color(theme.text))
+        .when(!checkbox_focused, |c| c.text_color(theme.foreground))
         .child(format!(
             "{} {}",
             if state.dont_show_again { "[x]" } else { "[ ]" },
@@ -60,9 +61,8 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
         .gap_3()
         .child(
             div()
-                .text_base()
+                .type_style(Type::BaseSemibold)
                 .text_color(theme.text_loud)
-                .font_weight(FontWeight::SEMIBOLD)
                 .child(zen::HEADING),
         )
         .child(
@@ -70,7 +70,7 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
                 .flex()
                 .flex_col()
                 .gap_3()
-                .text_color(theme.text)
+                .text_color(theme.foreground)
                 .children(paragraphs),
         )
         .child(checkbox)

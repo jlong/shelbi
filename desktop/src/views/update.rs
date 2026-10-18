@@ -62,7 +62,7 @@ pub fn render_update_bar(
         .py_2()
         .bg(theme.blue_tint)
         .border_b_1()
-        .border_color(theme.rule)
+        .border_color(theme.divider)
         .text_color(theme.text_loud)
         .child(
             div()
@@ -74,7 +74,7 @@ pub fn render_update_bar(
                     heroicon(icons::ARROW_DOWN_CIRCLE).text_color(theme.blue),
                 )
                 .child(notice.message())
-                .child(div().text_color(theme.text_quiet).child("Upgrade with"))
+                .child(div().text_color(theme.muted).child("Upgrade with"))
                 .child(command_box(0, APP_UPGRADE_COMMAND, theme)),
         )
         .child(

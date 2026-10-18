@@ -16,26 +16,34 @@ use gpui::{
 };
 use shelbi_term::Size;
 
-/// The default terminal font family: Geist Mono, Shelbi's monospace face,
-/// bundled with the app (`assets::load_fonts`), so it is always available.
-/// A configured family that isn't installed falls back to it.
-pub const PRIMARY_FAMILY: &str = "Geist Mono";
+/// The default terminal font family: Source Code Pro (Figma's
+/// "Desktop/Terminal"), bundled with the app (`assets::load_fonts`), so it
+/// is always available. A configured family that isn't installed falls back
+/// to it.
+pub const PRIMARY_FAMILY: &str = "Source Code Pro";
+
+/// Geist Mono, Shelbi's earlier terminal face, still bundled: the first
+/// glyph fallback after the primary, and the measured family if even Source
+/// Code Pro were missing.
+pub const BUNDLED_FALLBACK_FAMILY: &str = "Geist Mono";
 
 /// The bundled symbol font for the private-use icons (Powerline, Devicons,
 /// and the rest of the Nerd Fonts set) that prompts and agents print.
 pub const SYMBOLS_FAMILY: &str = "Symbols Nerd Font Mono";
 
 /// The system monospace face: the last explicit fallback, for anything else
-/// Geist Mono lacks (box drawing, technical symbols). CJK and emoji fall
+/// the bundled faces lack (box drawing, technical symbols). CJK and emoji fall
 /// through to the system's own cascade after it.
 pub const FALLBACK_FAMILY: &str = "Menlo";
 
-/// The default terminal font size in logical pixels.
-pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+/// The default terminal font size in logical pixels (Figma: 14).
+pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
-/// The least line height, as a multiple of the font size, so rows never
-/// crowd (some fonts report a tight ascent + descent).
-pub const MIN_LINE_HEIGHT: f32 = 1.25;
+/// The least line height, as a multiple of the font size: Figma's 18 / 14,
+/// so the default is a 14pt face on 18pt rows. It is a floor, not a fixed
+/// leading: a font whose ascent + descent is taller keeps its own, so rows
+/// never crowd.
+pub const MIN_LINE_HEIGHT: f32 = 18.0 / 14.0;
 
 /// One cell's size in logical pixels, plus the font it was measured from.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,13 +92,14 @@ impl CellMetrics {
     }
 
     /// Measure the terminal font `family` at `size` in `window`. A family
-    /// that isn't installed falls back to Geist Mono (bundled), and if even
-    /// that is missing (a test without the app's fonts) to Menlo.
+    /// that isn't installed falls back to Source Code Pro, then Geist Mono
+    /// (both bundled), and if even those are missing (a test without the
+    /// app's fonts) to Menlo.
     pub fn measure(window: &Window, family: &str, size: f32) -> Self {
         let text = window.text_system();
         let names = text.all_font_names();
         let installed = |f: &str| names.iter().any(|n| n == f);
-        let family = [family, PRIMARY_FAMILY]
+        let family = [family, PRIMARY_FAMILY, BUNDLED_FALLBACK_FAMILY]
             .into_iter()
             .find(|f| installed(f))
             .unwrap_or_else(|| {
@@ -108,7 +117,9 @@ impl CellMetrics {
         // baseline), so take its magnitude.
         let natural =
             f32::from(text.ascent(id, font_size)) + f32::from(text.descent(id, font_size)).abs();
-        let height = px(natural.max(size * MIN_LINE_HEIGHT).ceil());
+        // Rounded off float noise first: 14 x 18/14 must stay 18, not 19.
+        let floor = (size * MIN_LINE_HEIGHT * 1000.0).round() / 1000.0;
+        let height = px(natural.max(floor).ceil());
         Self {
             width,
             height,
@@ -173,8 +184,8 @@ impl CellMetrics {
 /// would merge glyphs ("->" into one arrow) and break the one-glyph-per-cell
 /// grid the element paints.
 ///
-/// A glyph the family lacks comes from [`fallbacks`] (Geist Mono, the Nerd
-/// symbols, Menlo), then from the system's cascade (CJK, emoji), so nothing
+/// A glyph the family lacks comes from [`fallbacks`] (Source Code Pro,
+/// Geist Mono, the Nerd symbols, Menlo), then from the system's cascade (CJK, emoji), so nothing
 /// renders as a missing-glyph box that any installed font can draw.
 pub fn terminal_font(family: &str) -> Font {
     Font {
@@ -189,10 +200,10 @@ pub fn terminal_font(family: &str) -> Font {
     }
 }
 
-/// The explicit fallback chain for `family`, in order: Geist Mono (unless
-/// it is the family), the Nerd symbols, then Menlo.
+/// The explicit fallback chain for `family`, in order: Source Code Pro and
+/// Geist Mono (each unless it is the family), the Nerd symbols, then Menlo.
 pub fn fallbacks(family: &str) -> Vec<String> {
-    [PRIMARY_FAMILY, SYMBOLS_FAMILY, FALLBACK_FAMILY]
+    [PRIMARY_FAMILY, BUNDLED_FALLBACK_FAMILY, SYMBOLS_FAMILY, FALLBACK_FAMILY]
         .into_iter()
         .filter(|f| *f != family)
         .map(str::to_string)
@@ -204,9 +215,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallbacks_put_geist_mono_first_then_symbols_then_menlo() {
-        assert_eq!(fallbacks("Berkeley Mono"), vec!["Geist Mono", "Symbols Nerd Font Mono", "Menlo"]);
-        assert_eq!(fallbacks("Geist Mono"), vec!["Symbols Nerd Font Mono", "Menlo"]);
+    fn fallbacks_put_the_bundled_faces_first_then_symbols_then_menlo() {
+        assert_eq!(
+            fallbacks("Berkeley Mono"),
+            vec!["Source Code Pro", "Geist Mono", "Symbols Nerd Font Mono", "Menlo"]
+        );
+        assert_eq!(fallbacks("Source Code Pro"), vec!["Geist Mono", "Symbols Nerd Font Mono", "Menlo"]);
+        assert_eq!(fallbacks("Geist Mono"), vec!["Source Code Pro", "Symbols Nerd Font Mono", "Menlo"]);
+    }
+
+    #[test]
+    fn the_default_is_figma_terminal_14_on_18() {
+        assert_eq!(PRIMARY_FAMILY, "Source Code Pro");
+        assert_eq!(DEFAULT_FONT_SIZE, 14.0);
+        let floor = (DEFAULT_FONT_SIZE * MIN_LINE_HEIGHT * 1000.0).round() / 1000.0;
+        assert_eq!(floor.ceil(), 18.0);
     }
 
     #[test]

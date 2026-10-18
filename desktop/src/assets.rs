@@ -135,10 +135,20 @@ const GEIST: &[&[u8]] = &[
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Bold.ttf")),
 ];
 
-/// Geist Mono, the terminal typeface (SIL Open Font License 1.1, vendored
-/// with its license under `assets/fonts/geist-mono/`, from the `geist` npm
-/// package 1.7.2): regular, bold, and their italics, so the terminal's SGR
-/// bold and italic use real faces, not synthesized ones.
+/// Source Code Pro, the terminal typeface (SIL Open Font License 1.1,
+/// vendored with its license under `assets/fonts/source-code-pro/`, from
+/// Adobe's release branch): regular, bold, and their italics, so the
+/// terminal's SGR bold and italic use real faces, not synthesized ones.
+const SOURCE_CODE_PRO: &[&[u8]] = &[
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/source-code-pro/SourceCodePro-Regular.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/source-code-pro/SourceCodePro-Bold.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/source-code-pro/SourceCodePro-It.ttf")),
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/source-code-pro/SourceCodePro-BoldIt.ttf")),
+];
+
+/// Geist Mono, the terminal's first fallback (SIL Open Font License 1.1,
+/// vendored with its license under `assets/fonts/geist-mono/`, from the
+/// `geist` npm package 1.7.2): regular, bold, and their italics.
 const GEIST_MONO: &[&[u8]] = &[
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist-mono/GeistMono-Regular.ttf")),
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist-mono/GeistMono-Bold.ttf")),
@@ -157,16 +167,19 @@ const NERD_SYMBOLS: &[u8] = include_bytes!(concat!(
 ));
 
 /// Register the vendored fonts, so views can set `font_family("Geist")` and
-/// the terminal can use Geist Mono and its symbol fallback on any machine.
+/// the terminal can use Source Code Pro, Geist Mono and the symbol fallback
+/// on any machine.
 ///
 /// gpui keeps added fonts in its own (font-kit) memory source, which resolves
 /// a primary family but not a **fallback**: CoreText resolves a font's
-/// cascade list by name among the fonts *it* knows. So the terminal's
-/// fallbacks (Geist Mono, the Nerd symbols) are also registered with CoreText
-/// for this process.
+/// cascade list by name among the fonts *it* knows. So the terminal faces
+/// (Source Code Pro is a fallback behind a configured family, then Geist
+/// Mono, the Nerd symbols) are also registered with CoreText for this
+/// process.
 pub fn load_fonts(cx: &mut gpui::App) {
     let fonts = GEIST
         .iter()
+        .chain(SOURCE_CODE_PRO)
         .chain(GEIST_MONO)
         .chain(std::iter::once(&NERD_SYMBOLS))
         .map(|bytes| Cow::Borrowed(*bytes))
@@ -174,7 +187,11 @@ pub fn load_fonts(cx: &mut gpui::App) {
     if let Err(e) = cx.text_system().add_fonts(fonts) {
         tracing::warn!(error = %e, "could not load the bundled fonts");
     }
-    for bytes in GEIST_MONO.iter().chain(std::iter::once(&NERD_SYMBOLS)) {
+    for bytes in SOURCE_CODE_PRO
+        .iter()
+        .chain(GEIST_MONO)
+        .chain(std::iter::once(&NERD_SYMBOLS))
+    {
         if let Err(e) = coretext::register_font(bytes) {
             tracing::warn!(error = %e, "could not register a bundled font for fallback");
         }

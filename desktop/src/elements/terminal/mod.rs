@@ -45,8 +45,8 @@
 //!   pointer is underlined; Cmd+click opens it ([`open`]).
 //! - **Mouse forwarding**: clicks, drags, and motion reach a program that
 //!   reports them, in whichever mode it asked for (`shelbi_term::gesture`).
-//! - **Fonts**: family and size from the settings, applied live; Geist Mono
-//!   (bundled) by default and as the first fallback.
+//! - **Fonts**: family and size from the settings, applied live; Source Code
+//!   Pro (bundled) by default, Geist Mono (bundled) as the first fallback.
 //! - **Accessibility**: the pane is an AccessKit `Terminal` node whose
 //!   children are the visible rows as text, with the cursor as the text
 //!   selection, so VoiceOver can read the screen.
@@ -1667,7 +1667,7 @@ impl TerminalPane {
                 .p_0p5()
                 .rounded_lg()
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.fill_strong))
+                .hover(|s| s.bg(theme.background_hover))
                 .child(heroicon(icon).text_color(theme.icon))
                 .on_click(cx.listener(move |this, _, _, cx| match older {
                     Some(older) => this.step_search(older, cx),
@@ -1702,13 +1702,13 @@ impl TerminalPane {
                         .overflow_hidden()
                         .text_color(theme.text_loud)
                         .when(typed.is_empty() && marked.is_none(), |d| {
-                            d.child(div().text_color(theme.text_quiet).child("Find"))
+                            d.child(div().text_color(theme.muted).child("Find"))
                         })
                         .child(typed)
                         .when_some(marked, |d, m| d.child(div().underline().child(m)))
                         .child(div().w(px(2.0)).h(px(16.0)).rounded_full().bg(theme.focus_ring)),
                 )
-                .child(div().flex_none().text_xs().text_color(theme.text_quiet).child(status))
+                .child(div().flex_none().text_xs().text_color(theme.muted).child(status))
                 .child(icon_button("older", icons::CHEVRON_UP, Some(true), cx))
                 .child(icon_button("newer", icons::CHEVRON_DOWN, Some(false), cx))
                 .child(icon_button("close", icons::X_MARK, None, cx)),
@@ -1745,7 +1745,7 @@ impl TerminalPane {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_loud)
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.fill_subtle))
+                .hover(|s| s.bg(theme.background))
                 .child(heroicon(icons::ARROW_DOWN).text_color(theme.icon))
                 .child(label)
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -1791,7 +1791,7 @@ impl Render for TerminalPane {
             .on_action(cx.listener(|this, _: &crate::menus::SelectAll, _, cx| this.select_all(cx)))
             .relative()
             .size_full()
-            .bg(theme.surface)
+            .bg(theme.canvas)
             .child(TerminalElement::new(cx.entity()))
             .children(search_bar)
             .children(jump)
@@ -1804,10 +1804,10 @@ impl Render for TerminalPane {
                         .right_0()
                         .px_3()
                         .py_1p5()
-                        .bg(theme.surface_recessed)
+                        .bg(theme.sidebar)
                         .border_t_1()
-                        .border_color(theme.rule)
-                        .text_color(theme.text_quiet)
+                        .border_color(theme.divider)
+                        .text_color(theme.muted)
                         .text_sm()
                         .child(notice),
                 )

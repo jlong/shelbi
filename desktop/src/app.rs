@@ -122,6 +122,7 @@ use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{self, Frame, LaunchWindow, ProjectViewState, WindowSession, WindowState};
+use crate::theme::style::{Type, Typography};
 
 actions!(
     shelbi_window,
@@ -2466,7 +2467,7 @@ impl ShelbiWindow {
             .size_full()
             .p_8()
             .overflow_y_scroll()
-            .bg(theme.surface)
+            .bg(theme.canvas)
             .child(
                 div()
                     .flex()
@@ -2477,7 +2478,7 @@ impl ShelbiWindow {
                     .child(style::heading("No project open", theme))
                     .child(
                         div()
-                            .text_color(theme.text_quiet)
+                            .text_color(theme.muted)
                             .child("Choose a project for this window."),
                     )
                     .child(div().flex().flex_col().gap_1().children(rows).child(add)),
@@ -3464,7 +3465,7 @@ impl ShelbiWindow {
                 .py_2()
                 .bg(bg)
                 .border_b_1()
-                .border_color(theme.rule)
+                .border_color(theme.divider)
                 .text_color(fg)
                 .child(text)
         };
@@ -3477,7 +3478,7 @@ impl ShelbiWindow {
             .min_w_0()
             .overflow_hidden()
             .h_full()
-            .bg(theme.surface)
+            .bg(theme.canvas)
             .when(!column_shown, |main| {
                 main.child(
                     div().h(px(sidebar::TRAFFIC_LIGHT_INSET)).pl(px(80.0)).pt(px(8.0)).child(
@@ -3507,7 +3508,7 @@ impl ShelbiWindow {
             })
             .when_some(self.banner.clone(), |main, message| {
                 main.child(
-                    notice(message, Hue::Gold).child(
+                    notice(message, Hue::Yellow).child(
                         style::icon_button("dismiss-banner", icons::X_MARK, IconButtonSize::Small, false, theme)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.banner = None;
@@ -3788,7 +3789,7 @@ impl ShelbiWindow {
                 .w(px(width))
                 .h_full()
                 .overflow_hidden()
-                .bg(theme.surface_recessed)
+                .bg(theme.sidebar)
                 .children(sidebar)
                 .children(review)
                 .children(workspace)
@@ -3796,7 +3797,7 @@ impl ShelbiWindow {
         let divider_color = if self.dragging {
             theme.icon
         } else {
-            theme.rule
+            theme.divider
         };
         let handle = column_shown.then(|| {
             // The column's right-edge divider, with a few pixels of grab
@@ -3809,7 +3810,7 @@ impl ShelbiWindow {
                 .flex_none()
                 .flex()
                 .justify_end()
-                .bg(theme.surface_recessed)
+                .bg(theme.sidebar)
                 .cursor(CursorStyle::ResizeLeftRight)
                 .child(div().w(px(1.0)).h_full().bg(divider_color))
                 .on_mouse_down(
@@ -3853,8 +3854,8 @@ impl ShelbiWindow {
             .flex_row()
             .w_full()
             .font_family("Geist")
-            .text_sm()
-            .bg(theme.surface);
+            .type_style(Type::Base)
+            .bg(theme.canvas);
         let shell = if self.chooser {
             let chooser = self.render_chooser(&theme, cx);
             shell.child(chooser)

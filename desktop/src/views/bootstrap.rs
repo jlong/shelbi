@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, FontWeight, IntoElement, SharedString,
+    div, prelude::*, px, AnyElement, ClipboardItem, IntoElement, SharedString,
 };
 
 use crate::assets::{heroicon, icons, Icon};
@@ -17,6 +17,7 @@ use crate::platform::version::{ProtocolCheck, VersionCheck};
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
+use crate::theme::style::{Type, Typography};
 
 /// The CLI's install command.
 pub const INSTALL_COMMAND: &str = "brew install jlong/shelbi/shelbi";
@@ -366,14 +367,13 @@ pub fn render_progress(state: &BootstrapState, theme: &Theme) -> AnyElement {
                 .gap_2()
                 .child(
                     div()
-                        .text_xl()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.wordmark)
+                        .type_style(Type::Heading)
+                        .text_color(theme.accent)
                         .child("Shelbi"),
                 )
-                .child(div().text_color(theme.text).child(format!("{label}…")))
+                .child(div().text_color(theme.foreground).child(format!("{label}…")))
                 .when_some(detail, |col, detail| {
-                    col.child(div().text_xs().text_color(theme.text_quiet).child(detail))
+                    col.child(div().type_style(Type::XSmall).text_color(theme.muted).child(detail))
                 }),
         )
         .into_any_element()
@@ -404,21 +404,20 @@ pub fn render_failure(
                 )
                 .child(
                     div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .type_style(Type::Heading)
                         .text_color(theme.text_loud)
                         .child(screen.title.clone()),
                 ),
         );
     for paragraph in &screen.body {
-        column = column.child(div().text_color(theme.text).child(paragraph.clone()));
+        column = column.child(div().text_color(theme.foreground).child(paragraph.clone()));
     }
     for (ix, step) in screen.fix.iter().enumerate() {
         let mut block = div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(theme.text).child(step.text.clone()));
+            .child(div().text_color(theme.foreground).child(step.text.clone()));
         if let Some(command) = &step.command {
             block = block.child(command_box(ix, command, theme));
         }
@@ -429,7 +428,7 @@ pub fn render_failure(
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(theme.text_quiet).child(label.clone()));
+            .child(div().text_color(theme.muted).child(label.clone()));
         if !lines.is_empty() {
             block = block.child(
                 div()
@@ -437,11 +436,11 @@ pub fn render_failure(
                     .flex_col()
                     .p_3()
                     .rounded_lg()
-                    .bg(theme.surface_sunken)
+                    .bg(theme.well)
                     .border_1()
-                    .border_color(theme.rule)
-                    .text_xs()
-                    .text_color(theme.text)
+                    .border_color(theme.divider)
+                    .type_style(Type::XSmall)
+                    .text_color(theme.foreground)
                     .children(lines.iter().map(|line| div().child(line.clone()))),
             );
         }
@@ -478,7 +477,7 @@ pub fn render_relaunch_bar(
         .py_2()
         .bg(theme.notice)
         .border_b_1()
-        .border_color(theme.rule)
+        .border_color(theme.divider)
         .child(
             div()
                 .flex()
@@ -510,8 +509,8 @@ fn centered(theme: &Theme) -> gpui::Stateful<gpui::Div> {
         .size_full()
         .p_8()
         .overflow_y_scroll()
-        .bg(theme.surface)
-        .text_sm()
+        .bg(theme.canvas)
+        .type_style(Type::Base)
 }
 
 /// A command in a monospace box with a copy button.
@@ -527,11 +526,11 @@ pub(crate) fn command_box(ix: usize, command: &str, theme: &Theme) -> impl IntoE
         .pl_3()
         .pr_1()
         .rounded_lg()
-        .bg(theme.surface_sunken)
+        .bg(theme.well)
         .border_1()
-        .border_color(theme.rule)
-        .font_family("Geist Mono")
-        .text_xs()
+        .border_color(theme.divider)
+        .font_family(crate::elements::terminal::metrics::PRIMARY_FAMILY)
+        .type_style(Type::XSmall)
         .child(
             div()
                 .flex()

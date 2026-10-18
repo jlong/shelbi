@@ -45,7 +45,7 @@ fn label(text: &'static str, focused: bool, theme: &Theme) -> gpui::Div {
         .when(focused, |l| {
             l.text_color(theme.text_loud).font_weight(FontWeight::SEMIBOLD)
         })
-        .when(!focused, |l| l.text_color(theme.text))
+        .when(!focused, |l| l.text_color(theme.foreground))
         .child(text)
 }
 
@@ -78,15 +78,15 @@ pub fn render<H: OverlayHost>(
                     .h(px(32.0))
                     .px_2()
                     .rounded_lg()
-                    .bg(theme.surface)
+                    .bg(theme.canvas)
                     .border_1()
                     .border_color(theme.input_border)
-                    .when(focused, |d| d.shadow(vec![style::focus_shadow(theme)]))
+                    .when(focused, |d| d.shadow(style::focus_shadow(theme)))
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child(value.replace(' ', "\u{00a0}")),
                     )
                     .when(focused, |f| f.child(div().text_color(accent).child("▏"))),
@@ -95,7 +95,7 @@ pub fn render<H: OverlayHost>(
     };
     let option = |text: &'static str, on: bool| {
         div()
-            .text_color(if on { theme.text_loud } else { theme.text_quiet })
+            .text_color(if on { theme.text_loud } else { theme.muted })
             .child(format!("({}) {text}", if on { "•" } else { "\u{00a0}" }))
     };
     let config_focused = form.focus() == Field::Config;
@@ -121,11 +121,11 @@ pub fn render<H: OverlayHost>(
         Some((slug, path)) => div()
             .flex()
             .flex_row()
-            .child(div().text_color(theme.text).child("Folder / id:\u{00a0}"))
+            .child(div().text_color(theme.foreground).child("Folder / id:\u{00a0}"))
             .child(div().text_color(theme.text_loud).font_weight(FontWeight::SEMIBOLD).child(slug))
-            .child(div().text_color(theme.text_quiet).child(format!("\u{00a0}\u{00a0}\u{00a0}({path})"))),
+            .child(div().text_color(theme.muted).child(format!("\u{00a0}\u{00a0}\u{00a0}({path})"))),
         None => div()
-            .text_color(theme.text_quiet)
+            .text_color(theme.muted)
             .child("Folder / id: (type a name to see the derived id)"),
     };
     // The error row is always reserved so the hints never reflow.
@@ -133,7 +133,7 @@ pub fn render<H: OverlayHost>(
         .debug_selector(|| "add-project-status".into())
         .min_h(px(20.0));
     let status = match (busy, form.error()) {
-        (true, _) => status.text_color(theme.text_quiet).child("Creating project…"),
+        (true, _) => status.text_color(theme.muted).child("Creating project…"),
         (false, Some(msg)) => status
             .text_color(theme.error)
             .font_weight(FontWeight::MEDIUM)

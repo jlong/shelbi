@@ -37,6 +37,7 @@ use crate::keys::chord_from_keystroke;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
+use crate::theme::style::{Type, Typography};
 
 /// The TUI's activity refresh cadence.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
@@ -263,7 +264,7 @@ impl ActivityView {
             .px_4()
             .py_3()
             .border_b_1()
-            .border_color(theme.rule)
+            .border_color(theme.divider)
             .child(
                 div()
                     .flex()
@@ -272,15 +273,14 @@ impl ActivityView {
                     .gap_3()
                     .child(
                         div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .type_style(Type::BaseSemibold)
                             .text_color(theme.text_loud)
                             .child("Activity"),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_quiet)
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
                             .child(self.state.project.clone()),
                     ),
             )
@@ -331,7 +331,7 @@ impl ActivityView {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .text_color(theme.text_quiet)
+                .text_color(theme.muted)
                 .child(text)
                 .into_any_element()
         };
@@ -385,7 +385,7 @@ impl ActivityView {
             list = list.child(
                 div()
                     .py_4()
-                    .text_color(theme.text_quiet)
+                    .text_color(theme.muted)
                     .child(empty),
             );
         }
@@ -400,8 +400,8 @@ impl ActivityView {
             .items_center()
             .gap_3()
             .py_3()
-            .text_xs()
-            .text_color(theme.text_quiet);
+            .type_style(Type::XSmall)
+            .text_color(theme.muted);
         if self.state.is_loading_older() {
             row.child("Loading older events…").child(loaded)
         } else if self.state.has_older() {
@@ -442,12 +442,12 @@ impl ActivityView {
             .px_4()
             .py_1()
             .border_t_1()
-            .border_color(theme.rule)
-            .text_xs()
-            .text_color(theme.text_quiet)
+            .border_color(theme.divider)
+            .type_style(Type::XSmall)
+            .text_color(theme.muted)
             .child(div().flex_1().truncate().child(hints))
             .when_some(self.state.status().map(str::to_string), |d, s| {
-                d.child(div().text_color(theme.orange).child(s))
+                d.child(div().text_color(theme.red).child(s))
             })
     }
 
@@ -551,9 +551,9 @@ impl Render for ActivityView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.surface)
-            .text_sm()
-            .text_color(theme.text)
+            .bg(theme.canvas)
+            .type_style(Type::Base)
+            .text_color(theme.foreground)
             .child(self.render_header(chip, &theme, cx))
             .child(self.render_feed(&theme, cx))
             .child(self.render_footer(&theme))
@@ -595,11 +595,11 @@ fn day_header(theme: &Theme, label: &str) -> impl IntoElement {
         .gap_2()
         .pt_4()
         .pb_2()
-        .text_xs()
-        .text_color(theme.text_quiet)
-        .child(div().w(px(12.0)).h(px(1.0)).bg(theme.rule))
+        .type_style(Type::XSmall)
+        .text_color(theme.muted)
+        .child(div().w(px(12.0)).h(px(1.0)).bg(theme.divider))
         .child(label.to_string())
-        .child(div().flex_1().h(px(1.0)).bg(theme.rule))
+        .child(div().flex_1().h(px(1.0)).bg(theme.divider))
 }
 
 /// One feed row, laid out like the TUI's: the identity chip pinned left, the
@@ -642,8 +642,8 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
             let (icon, text) = sec.parts();
             d.child(
                 div()
-                    .text_xs()
-                    .text_color(theme.text_quiet)
+                    .type_style(Type::XSmall)
+                    .text_color(theme.muted)
                     .truncate()
                     .child(format!("{icon}{text}")),
             )
@@ -658,7 +658,7 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
             d.child(style::chip(pill.text.clone(), Theme::tone_hue(pill.tone), theme))
         })
         .when(!row.time.is_empty(), |d| {
-            d.child(div().text_color(theme.text_quiet).child(row.time.clone()))
+            d.child(div().text_color(theme.muted).child(row.time.clone()))
         });
     div()
         .flex()
@@ -670,7 +670,7 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
         .rounded_lg()
         .cursor_pointer()
         .when(selected, |d| d.bg(theme.row_selected).child(style::selection_indicator(theme)))
-        .when(!selected, |d| d.hover(|s| s.bg(theme.fill_subtle)))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.background)))
         .child(chip)
         .child(verb)
         .child(message)
@@ -688,10 +688,10 @@ fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
         .py_1()
         .rounded_lg()
         .cursor_pointer()
-        .hover(|s| s.bg(theme.fill_subtle))
+        .hover(|s| s.bg(theme.background))
         .child(
             div().w(ICON_SIZE).flex_none().when(selected, |d| {
-                d.child(heroicon(icons::CHECK).text_color(theme.brand_text))
+                d.child(heroicon(icons::CHECK).text_color(theme.accent))
             }),
         )
         .child(label)

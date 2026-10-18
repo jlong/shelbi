@@ -48,7 +48,7 @@ impl Render for ClientRoot {
                 m.height * self.grid.rows as f32 + px(0.5),
             )
         });
-        let holder = div().bg(theme.surface).child(self.pane.clone());
+        let holder = div().bg(theme.canvas).child(self.pane.clone());
         match fixed {
             Some((w, h)) => holder.w(w).h(h),
             None => holder.size_full(),

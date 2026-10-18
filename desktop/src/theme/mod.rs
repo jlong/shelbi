@@ -1,12 +1,13 @@
-//! The desktop's colors: its own palette ([`palette`]), Taskpage's hues and
-//! semantic roles, with the component shapes that go with them ([`style`]).
+//! The desktop's colors: its own palette ([`palette`]), the Figma design
+//! system's tokens as semantic roles, with the type styles and component
+//! shapes that go with them ([`style`]).
 //!
 //! The TUI keeps the shared tokens ([`shelbi_app::theme`]); the desktop no
-//! longer paints them. Views read roles (`theme.surface_recessed`,
-//! `theme.text_quiet`, `theme.icon`), never a hue or a TUI token name. Where a
-//! shared view model names a meaning (a [`Tone`], a badge's
-//! [`DecorationColor`]), [`Theme::tone`] and [`Theme::decoration`] map it onto
-//! the Taskpage hue for the same meaning.
+//! longer paints them. Views read roles (`theme.sidebar`, `theme.muted`,
+//! `theme.icon`), never a hue or a TUI token name. Where a shared view model
+//! names a meaning (a [`Tone`], a badge's [`DecorationColor`]),
+//! [`Theme::tone`] and [`Theme::decoration`] map it onto the Figma color for
+//! the same meaning.
 //!
 //! The `theme:` setting (`~/.shelbi/config.yaml`) picks the theme. `auto`
 //! follows the window's appearance, and [`follow_system`] re-resolves it when
@@ -27,7 +28,7 @@ use shelbi_term::render::Rgb as TermRgb;
 pub use palette::{Palette, Rgba};
 
 /// The resolved theme, installed as a gpui [`Global`]. Views read the roles
-/// through it (`cx.global::<Theme>().text_quiet`).
+/// through it (`cx.global::<Theme>().muted`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     /// The setting this theme was resolved from, kept so an appearance change
@@ -54,12 +55,11 @@ impl Global for Theme {}
 pub enum Hue {
     Neutral,
     Green,
-    Gold,
+    Yellow,
     Cyan,
     Blue,
-    Purple,
+    Magenta,
     Red,
-    Orange,
 }
 
 impl Theme {
@@ -79,18 +79,18 @@ impl Theme {
     }
 
     /// The color a shared view model names by [`Tone`] (an activity row's
-    /// chip, a machines badge): the Taskpage hue for the TUI hue's meaning.
+    /// tag, a machines badge): the Figma log color for the TUI hue's
+    /// meaning (Activity's `theme.ansi_*`).
     pub fn tone(&self, tone: Tone) -> Hsla {
         match tone {
             Tone::White => self.text_loud,
-            Tone::Gray | Tone::WorkflowBadge => self.text,
-            Tone::DarkGray => self.text_quiet,
-            Tone::Red => self.red,
-            Tone::LightRed => self.orange,
+            Tone::Gray | Tone::WorkflowBadge => self.foreground,
+            Tone::DarkGray => self.dark_gray,
+            Tone::Red | Tone::LightRed => self.red,
             Tone::Green => self.green,
-            Tone::Yellow => self.gold,
+            Tone::Yellow => self.yellow,
             Tone::Blue => self.blue,
-            Tone::Magenta => self.purple,
+            Tone::Magenta => self.magenta,
             Tone::Cyan => self.cyan,
         }
     }
@@ -99,12 +99,11 @@ impl Theme {
     pub fn tone_hue(tone: Tone) -> Hue {
         match tone {
             Tone::White | Tone::Gray | Tone::DarkGray | Tone::WorkflowBadge => Hue::Neutral,
-            Tone::Red => Hue::Red,
-            Tone::LightRed => Hue::Orange,
+            Tone::Red | Tone::LightRed => Hue::Red,
             Tone::Green => Hue::Green,
-            Tone::Yellow => Hue::Gold,
+            Tone::Yellow => Hue::Yellow,
             Tone::Blue => Hue::Blue,
-            Tone::Magenta => Hue::Purple,
+            Tone::Magenta => Hue::Magenta,
             Tone::Cyan => Hue::Cyan,
         }
     }
@@ -112,27 +111,28 @@ impl Theme {
     /// A hue's text color and its chip tint.
     pub fn hue(&self, hue: Hue) -> (Hsla, Hsla) {
         match hue {
-            Hue::Neutral => (self.text, self.neutral_tint),
+            Hue::Neutral => (self.workflow_badge_text, self.workflow_badge),
             Hue::Green => (self.green, self.green_tint),
-            Hue::Gold => (self.gold, self.gold_tint),
+            Hue::Yellow => (self.yellow, self.yellow_tint),
             Hue::Cyan => (self.cyan, self.cyan_tint),
             Hue::Blue => (self.blue, self.blue_tint),
-            Hue::Purple => (self.purple, self.purple_tint),
+            Hue::Magenta => (self.magenta, self.magenta_tint),
             Hue::Red => (self.red, self.red_tint),
-            Hue::Orange => (self.orange, self.orange_tint),
         }
     }
 
     /// The color a shared badge decoration paints in, for the meaning the TUI
-    /// sidebar's `badge_color` gives it (busy green, muted bullet, ready
-    /// cyan, normal text; the rest through the matching hues).
+    /// sidebar's `badge_color` gives it: the Navigation component's status
+    /// icons (busy `icon/green`, ready `icon/cyan`, awaiting input
+    /// `icon/yellow`, an idle bullet muted), normal text, and the log hues
+    /// for the rest.
     pub fn decoration(&self, color: DecorationColor) -> Hsla {
         match color {
-            DecorationColor::Green => self.green,
-            DecorationColor::DarkGray | DecorationColor::Muted => self.text_quiet,
-            DecorationColor::Cyan => self.cyan,
-            DecorationColor::Gray | DecorationColor::Default => self.text,
-            DecorationColor::Yellow => self.gold,
+            DecorationColor::Green => self.icon_green,
+            DecorationColor::DarkGray | DecorationColor::Muted => self.muted,
+            DecorationColor::Cyan => self.icon_cyan,
+            DecorationColor::Gray | DecorationColor::Default => self.foreground,
+            DecorationColor::Yellow => self.icon_yellow,
             DecorationColor::Red => self.red,
             DecorationColor::Blue => self.blue,
         }
@@ -157,26 +157,28 @@ pub fn hsla(color: Rgba) -> Hsla {
 ///
 /// In the TUI these are the user's own terminal's palette, which a window
 /// doesn't have. The defaults come from the palette's roles (the background
-/// is `surface`, the main area the terminal sits in, so a pane is part of the
-/// window rather than a hole in it; the selection is `text_selection`; the
-/// matches `search_match` / `search_current`), so they follow the theme. The
-/// ANSI sixteen are a terminal palette rather than UI roles: Ghostty's
-/// defaults (Tomorrow Night) in the dark theme, the palette the TUI's colors
-/// were tuned against, so a session reads the same in both clients, and a
-/// GitHub-light style set in the light theme, with "white" darkened so it
-/// shows on white. Indexed colors 16..=255 are the fixed xterm cube and ramp
+/// is `canvas`, the main area the terminal sits in, so a pane is part of the
+/// window rather than a hole in it; the foreground `foreground`, bold text's
+/// loud color `text_loud`; the selection is `text_selection`; the matches
+/// `search_match` / `search_current`), so they follow the theme. The ANSI
+/// sixteen take the Figma terminal colors where Figma has them (green and
+/// cyan output from the Orchestrator frame's `theme.green` / `theme.cyan`;
+/// yellow, blue, magenta and bright black from `theme.ansi_*`), and keep a
+/// terminal palette for the rest: Ghostty's defaults (Tomorrow Night) in the
+/// dark theme, a GitHub-light style set in the light theme, with "white"
+/// darkened so it shows on white. Indexed colors 16..=255 are the fixed xterm cube and ramp
 /// ([`shelbi_term::render::xterm_256`]) and true color passes through. A
 /// program's own OSC 4/10/11/12 redefinitions win over these at render time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerminalPalette {
-    /// The default foreground (`Foreground`): the `text` role.
+    /// The default foreground (`Foreground`): the `foreground` role.
     pub foreground: TermRgb,
-    /// The default background (`Background`): the `surface` role.
+    /// The default background (`Background`): the `canvas` role.
     pub background: TermRgb,
     /// The cursor fill (and the beam / underline / outline color):
     /// `text_loud`.
     pub cursor: TermRgb,
-    /// The glyph color under a block cursor: `surface`.
+    /// The glyph color under a block cursor: `canvas`.
     pub cursor_text: TermRgb,
     /// The selection highlight behind selected cells: `text_selection`.
     pub selection: TermRgb,
@@ -193,31 +195,44 @@ impl TerminalPalette {
     /// The terminal palette for a resolved palette. Every default is opaque:
     /// a translucent role is flattened over the terminal's background.
     pub fn for_palette(palette: &Palette) -> Self {
-        let under = palette.surface.rgb;
+        let under = palette.canvas.rgb;
         let c = |role: Rgba| {
             let rgb = role.over(under);
             TermRgb::new(rgb.r, rgb.g, rgb.b)
         };
-        let ansi = if palette.appearance == Appearance::Dark {
+        let mut ansi = if palette.appearance == Appearance::Dark {
             [
                 0x1d1f21, 0xcc6666, 0xb5bd68, 0xf0c674, 0x81a2be, 0xb294bb, 0x8abeb7, 0xc5c8c6,
                 0x666666, 0xd54e53, 0xb9ca4a, 0xe7c547, 0x7aa6da, 0xc397d8, 0x70c0b1, 0xeaeaea,
             ]
+            .map(TermRgb::hex)
         } else {
             [
                 0x24292f, 0xcf222e, 0x116329, 0x7d4e00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
                 0x57606a, 0xa40e26, 0x1a7f37, 0x9a6700, 0x218bff, 0xa475f9, 0x3192aa, 0x8c959f,
             ]
+            .map(TermRgb::hex)
         };
+        // The Figma terminal colors, in their ANSI slots.
+        for (slot, role) in [
+            (2, palette.theme_green),
+            (3, palette.yellow),
+            (4, palette.blue),
+            (5, palette.magenta),
+            (6, palette.theme_cyan),
+            (8, palette.dark_gray),
+        ] {
+            ansi[slot] = c(role);
+        }
         Self {
-            foreground: c(palette.text),
-            background: c(palette.surface),
+            foreground: c(palette.foreground),
+            background: c(palette.canvas),
             cursor: c(palette.text_loud),
-            cursor_text: c(palette.surface),
+            cursor_text: c(palette.canvas),
             selection: c(palette.text_selection),
             search_match: c(palette.search_match),
             search_current: c(palette.search_current),
-            ansi: ansi.map(TermRgb::hex),
+            ansi,
         }
     }
 }
@@ -278,37 +293,37 @@ pub(crate) fn install(theme: Theme, cx: &mut App) {
 
 /// gpui-kit's widget colors from our roles.
 fn kit_colors(c: &mut gpui_kit::component::ThemeColor, t: &Theme) {
-    c.background = t.surface;
-    c.foreground = t.text;
-    c.border = t.rule_strong;
+    c.background = t.canvas;
+    c.foreground = t.foreground;
+    c.border = t.divider_strong;
     c.input = t.input_border;
     c.ring = t.focus_ring;
     c.caret = t.text_loud;
     c.selection = t.text_selection;
-    c.muted = t.fill_subtle;
-    c.muted_foreground = t.text_quiet;
-    c.accent = t.fill_subtle;
+    c.muted = t.background;
+    c.muted_foreground = t.muted;
+    c.accent = t.background;
     c.accent_foreground = t.text_loud;
-    c.popover = t.surface_raised;
-    c.popover_foreground = t.text;
+    c.popover = t.raised;
+    c.popover_foreground = t.foreground;
     c.overlay = t.scrim;
-    c.primary = t.brand;
-    c.primary_hover = t.brand_hover;
-    c.primary_active = t.brand_hover;
-    c.primary_foreground = t.text_on_color;
-    c.secondary = t.control_fill;
-    c.secondary_hover = t.control_fill_hover;
-    c.secondary_active = t.control_fill_pressed;
+    c.primary = t.success_fill;
+    c.primary_hover = t.success_fill_hover;
+    c.primary_active = t.success_fill_active;
+    c.primary_foreground = t.success;
+    c.secondary = t.background;
+    c.secondary_hover = t.background_hover;
+    c.secondary_active = t.background_active;
     c.secondary_foreground = t.text_loud;
     c.link = t.link;
     c.link_hover = t.link_hover;
     c.link_active = t.link_hover;
-    c.list_hover = t.fill_subtle;
+    c.list_hover = t.background;
     c.list_active = t.row_selected;
-    c.scrollbar_thumb = t.icon_secondary;
+    c.scrollbar_thumb = t.muted;
     c.scrollbar_thumb_hover = t.icon;
-    c.danger = t.error_fill;
-    c.danger_foreground = t.text_on_color;
+    c.danger = t.danger_fill;
+    c.danger_foreground = t.error;
     c.success = t.success;
     c.warning = t.warning;
     c.info = t.info;
@@ -362,11 +377,11 @@ mod tests {
     #[test]
     fn the_desktop_no_longer_paints_the_tui_tokens() {
         // The TUI's dark main area was #1c1c1c and its sidebar pure black;
-        // the desktop's are Taskpage's black scale now.
+        // the desktop's are Figma's blue-slate canvas and its lighter tint.
         let t = Theme::resolve(ThemePreference::Dark, WindowAppearance::Light);
         assert!(t.is_dark());
-        assert_eq!(rgba8(t.surface_recessed), (0x13, 0x14, 0x18, 0xff));
-        assert_eq!(rgba8(t.surface), (0x18, 0x1a, 0x20, 0xff));
+        assert_eq!(rgba8(t.sidebar), (0x2c, 0x31, 0x40, 0xff));
+        assert_eq!(rgba8(t.canvas), (0x1e, 0x23, 0x30, 0xff));
         let tui = shelbi_app::theme::Theme::dark();
         assert_eq!(tui.canvas.rgb, shelbi_app::theme::Rgb::hex(0x1c1c1c), "TUI unchanged");
     }
@@ -375,14 +390,19 @@ mod tests {
     fn terminal_palette_follows_the_theme() {
         for system in [WindowAppearance::Dark, WindowAppearance::Light] {
             let t = Theme::resolve(ThemePreference::Auto, system);
-            assert_eq!(rgb_hsla(t.terminal.background), t.surface, "the main surface");
-            assert_eq!(rgb_hsla(t.terminal.foreground), t.text);
+            assert_eq!(rgb_hsla(t.terminal.background), t.canvas, "the main surface");
             assert_eq!(rgb_hsla(t.terminal.cursor), t.text_loud);
-            assert_eq!(rgb_hsla(t.terminal.cursor_text), t.surface);
-            assert_eq!(rgb_hsla(t.terminal.search_current), t.search_current);
+            assert_eq!(rgb_hsla(t.terminal.cursor_text), t.canvas);
         }
         let dark = Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark).terminal;
+        assert_eq!(dark.background, TermRgb::hex(0x1e2330), "theme.canvas");
+        // theme.foreground (#f2f3f7 at 70%) over the canvas: the Orchestrator
+        // frame's body text (#b2b5bb in the PNG, a unit off in green).
+        assert_eq!(dark.foreground, TermRgb::hex(0xb2b4bb));
         assert_eq!(dark.ansi[1], TermRgb::hex(0xcc6666), "Ghostty's red");
+        assert_eq!(dark.ansi[2], TermRgb::hex(0x5acd25), "theme.green");
+        assert_eq!(dark.ansi[6], TermRgb::hex(0x00a6b2), "theme.cyan");
+        assert_eq!(dark.ansi[4], TermRgb::hex(0x4a8fd7), "theme.ansi_blue");
         let light = Theme::resolve(ThemePreference::Light, WindowAppearance::Light).terminal;
         assert_ne!(
             light.ansi[7], light.background,
@@ -414,14 +434,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_meanings_map_onto_taskpage_hues() {
+    fn shared_meanings_map_onto_figma_colors() {
         let t = Theme::resolve(ThemePreference::Light, WindowAppearance::Light);
-        assert_eq!(t.decoration(DecorationColor::Green), t.green, "working");
-        assert_eq!(t.decoration(DecorationColor::Cyan), t.cyan, "ready");
-        assert_eq!(t.decoration(DecorationColor::Yellow), t.gold, "awaiting input");
-        assert_eq!(t.decoration(DecorationColor::Muted), t.text_quiet, "idle");
-        assert_eq!(t.tone(Tone::Magenta), t.purple, "handoff");
-        assert_eq!(t.tone(Tone::Yellow), t.gold);
+        assert_eq!(t.decoration(DecorationColor::Green), t.icon_green, "working");
+        assert_eq!(t.decoration(DecorationColor::Cyan), t.icon_cyan, "ready");
+        assert_eq!(t.decoration(DecorationColor::Yellow), t.icon_yellow, "awaiting input");
+        assert_eq!(t.decoration(DecorationColor::Muted), t.muted, "idle");
+        assert_eq!(t.tone(Tone::Magenta), t.magenta, "[review]");
+        assert_eq!(t.tone(Tone::Green), t.green, "[done]");
+        assert_eq!(t.tone(Tone::Yellow), t.yellow, "[in progress]");
+        assert_eq!(t.tone(Tone::Blue), t.blue, "[ready]");
         assert_eq!(t.hue(Theme::tone_hue(Tone::Blue)).0, t.tone(Tone::Blue));
     }
 

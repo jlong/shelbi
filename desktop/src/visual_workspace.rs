@@ -37,6 +37,7 @@ use crate::elements::terminal::session::{Connected, SessionIo};
 use crate::theme::Theme;
 use crate::views::session_view::{SessionConnector, SessionDeps};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceOps, WorkspaceView};
+use crate::theme::style::{Type, Typography};
 
 struct NullIo;
 impl SessionIo for NullIo {
@@ -166,10 +167,10 @@ impl Render for Host {
             .flex_row()
             .size_full()
             .font_family("Geist")
-            .text_sm()
-            .bg(theme.surface)
+            .type_style(Type::Base)
+            .bg(theme.canvas)
             .child(div().flex_none().w(px(300.0)).h_full().child(self.view.clone()))
-            .child(div().w(px(1.0)).h_full().bg(theme.rule))
+            .child(div().w(px(1.0)).h_full().bg(theme.divider))
             .child(div().flex().flex_1().min_w_0().h_full().child(main))
     }
 }
