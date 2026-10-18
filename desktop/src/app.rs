@@ -2729,9 +2729,10 @@ impl ShelbiWindow {
     }
 
     /// The palette's entries for the current state: the registry over the
-    /// live sidebar model and the last [`PaletteInputs`].
-    fn palette_entries(&self) -> Vec<shelbi_palette::Entry> {
-        CommandRegistry::new().entries(&self.command_model())
+    /// live sidebar model and the last [`PaletteInputs`], in the desktop's
+    /// copy and order.
+    pub(crate) fn palette_entries(&self) -> Vec<shelbi_palette::Entry> {
+        crate::views::palette::present(CommandRegistry::new().entries(&self.command_model()))
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4009,6 +4010,12 @@ impl ShelbiWindow {
             Some(overlay) => self.open_overlay(overlay, window, cx),
             None => self.open_palette(window, cx),
         }
+    }
+
+    /// Stand in for the palette's Projects column read (an offscreen window
+    /// doesn't read its inputs).
+    pub(crate) fn offscreen_palette_projects(&mut self, projects: Vec<PaletteProject>) {
+        self.palette_inputs.projects = projects;
     }
 
     pub(crate) fn offscreen_close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {

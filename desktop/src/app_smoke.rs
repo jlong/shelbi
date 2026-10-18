@@ -160,6 +160,18 @@ impl Harness {
         CommandRegistry::new().commands(&model)
     }
 
+    /// The palette's name for the command `id` (the desktop's copy, which
+    /// renames some registry titles).
+    fn palette_label(&self, id: &str) -> String {
+        self.window.read_with(&self.cx, |w, _| {
+            w.palette_entries()
+                .into_iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("the palette offers {id}"))
+                .label
+        })
+    }
+
     /// The open palette's selected result id and the position of `id` in
     /// its results.
     fn palette_position(&self, id: &str) -> (usize, usize) {
@@ -209,7 +221,7 @@ fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
         h.focus_window();
         h.key("ctrl-space");
         assert!(h.overlay_open(), "Ctrl+Space opens the palette for {}", command.id());
-        h.key(&keystrokes_for(command.title()));
+        h.key(&keystrokes_for(&h.palette_label(command.id())));
         // Walk the selection onto the entry, as a user would when the query
         // ranks a sibling first.
         for _ in 0..commands.len() {

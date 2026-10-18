@@ -129,7 +129,8 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Text field | The canvas inside a 1px `input_border` (`theme.divider`), as Settings draws it |
 | Checkbox | 16px; checked, the loud color with the mark in the canvas (Settings) |
 | Menu, popover | `raised`, 8px corners, a 1px `ring` and a soft drop |
-| Palette, dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
+| Palette | The Command palette frame: over the `scrim`, 200px down, 788px wide (a 580px commands column, a 160px Projects column, 16px between and either side); `raised`, 8px corners, no ring, `palette_shadow` (0 10 15 -3). A 44px query line (`❯`, a 2x18px `link` caret, the placeholder `muted`), 32px rows (6px across and between, 6px corners: a 20px `icon`, the name in a 220px column in Base medium `foreground`, the description in Base `muted`; the selected row on `background`, its name Base semibold `text_loud`, its description `foreground`), 26px project rows, an X-Small `muted` footer |
+| Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
 | Card | `card` with `shadow/raised card` |
 | Chip, badge | 20px, 6px across, X-Small medium, the hue's text on its tint; a workflow name is `workflow_badge_text` on `workflow_badge` |
 | Zen pill | `zen` (the Success fill) with a `success` (`text/green`) label |
@@ -321,6 +322,7 @@ component's Success and Danger styles follow.
 | `ring` | `#acb4cf1a` | `#0a1e5108` | Measured (Issue detail's edge): the 1px ring around raised surfaces |
 | `shadow` | `#0a1e5105` | `#0a1e5105` | `shadow/raised card`'s drops (menus, popovers and dialogs too) |
 | `shadow_ring` | `#0a1e5108` | `#0a1e5108` | `shadow/raised card`'s 1px ring |
+| `palette_shadow` | `#00000040` | `#00000040` | The Command palette's drop effect (`0 10 15 -3`): the palette over the scrim |
 | `scrim` | `#02030359` | `#444c65a6` | Measured (Command palette): the backdrop behind the palette and dialogs |
 
 ### Project badges

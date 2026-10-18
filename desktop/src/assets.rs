@@ -23,6 +23,11 @@
 //! To add an icon, copy its SVG from `optimized/24/outline/` at the v2.2.0
 //! tag into `assets/icons/heroicons/`, then add a row to the `heroicons!`
 //! list below.
+//!
+//! The one exception: a few drawings John made in the Figma file where
+//! Heroicons has none (the palette's Zen toggle, error log and finish
+//! flag). They live under `assets/icons/figma/` (see its README), on the
+//! Figma's 20pt grid, and render through the same [`heroicon`] helper.
 
 use std::borrow::Cow;
 
@@ -58,8 +63,11 @@ pub fn heroicon(icon: Icon) -> Svg {
 }
 
 macro_rules! heroicons {
-    ($($const:ident = $file:literal;)*) => {
-        /// The vendored Heroicons.
+    (
+        $($const:ident = $file:literal;)*
+        @figma { $($fconst:ident = $ffile:literal;)* }
+    ) => {
+        /// The vendored icons.
         pub mod icons {
             use super::Icon;
 
@@ -69,15 +77,21 @@ macro_rules! heroicons {
                     path: concat!("icons/heroicons/", $file, ".svg"),
                 };
             )*
+            $(
+                pub const $fconst: Icon = Icon {
+                    name: $ffile,
+                    path: concat!("icons/figma/", $ffile, ".svg"),
+                };
+            )*
 
             /// Every vendored icon.
             #[cfg(test)]
-            pub const ALL: &[Icon] = &[$($const),*];
+            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)*];
         }
 
         /// Every vendored drawing, by asset path.
-        const HEROICONS: &[(&str, &[u8])] = &[$(
-            (
+        const HEROICONS: &[(&str, &[u8])] = &[
+            $((
                 concat!("icons/heroicons/", $file, ".svg"),
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -85,8 +99,17 @@ macro_rules! heroicons {
                     $file,
                     ".svg"
                 )) as &[u8],
-            ),
-        )*];
+            ),)*
+            $((
+                concat!("icons/figma/", $ffile, ".svg"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/icons/figma/",
+                    $ffile,
+                    ".svg"
+                )) as &[u8],
+            ),)*
+        ];
     };
 }
 
@@ -124,6 +147,14 @@ heroicons! {
     CHEVRON_DOWN = "chevron-down";
     ARROWS_RIGHT_LEFT = "arrows-right-left";
     SHARE = "share";
+    CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
+    RECTANGLE_STACK = "rectangle-stack";
+    @figma {
+        TOGGLE_OFF = "toggle-off";
+        TOGGLE_ON = "toggle-on";
+        PAGE_CURL = "page-curl";
+        FLAG_FINISH = "flag-finish";
+    }
 }
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its
@@ -297,10 +328,15 @@ mod tests {
     fn every_heroicon_loads_as_an_outline_drawing_on_a_24_grid() {
         for icon in icons::ALL {
             let path = icon.path();
-            assert_eq!(path, format!("icons/heroicons/{}.svg", icon.name()));
             let bytes = Assets.load(path).unwrap().expect(path);
             let svg = std::str::from_utf8(&bytes).expect(path);
             assert!(svg.starts_with("<svg"), "{path} is an SVG");
+            if path == format!("icons/figma/{}.svg", icon.name()) {
+                assert!(svg.contains(r#"viewBox="0 0 20 20""#), "{path} is on the Figma's 20pt grid");
+                assert!(svg.contains("currentColor"), "{path} paints in currentColor");
+                continue;
+            }
+            assert_eq!(path, format!("icons/heroicons/{}.svg", icon.name()));
             assert!(svg.contains(r#"viewBox="0 0 24 24""#), "{path} is drawn on the 24px grid");
             assert!(
                 svg.contains(r#"fill="none""#) && svg.contains(r#"stroke="currentColor""#),
@@ -311,8 +347,9 @@ mod tests {
 
     #[test]
     fn heroicons_are_listed() {
-        let listed = Assets.list("icons/heroicons/").unwrap();
-        assert_eq!(listed.len(), HEROICONS.len());
+        let listed = Assets.list("icons/heroicons/").unwrap().len()
+            + Assets.list("icons/figma/").unwrap().len();
+        assert_eq!(listed, HEROICONS.len());
         assert_eq!(HEROICONS.len(), icons::ALL.len());
     }
 
