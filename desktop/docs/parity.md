@@ -178,7 +178,8 @@ Found by this audit and not closed by it; each is a follow-up.
   here) but not the health check or the sub-state detail, and always shows
   Diff and Editor (it has no remote flag for a review slot).
 - **Board details shown in one client only**: the desktop shows a card's
-  assignee and dependencies on the card, "Loading history…" in the done
+  excerpt, workflow badge (even on a one-workflow board) and dependencies on
+  the card, "Loading history…" in the done
   column, and the task's workflow and PR link in the detail; the TUI shows
   a board total ("N total") and resolves the detail's status and branch
   differently (stored column and raw branch, against the desktop's resolved
@@ -275,15 +276,15 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | Field | TUI | Desktop |
 |---|---|---|
 | `columns` | equivalent `app.all_columns` + `column_tasks()`, drawn as lanes (`kanban.rs` `render_columns`) | lanes (`views/issues.rs` `render_board`) |
-| `title` | equivalent `display_label()` (display_name else slug) in title row "Issues · name" (`kanban.rs` `render_title`) | header title, falls back to project slug (`views/issues.rs` `render_header`) |
+| `title` | equivalent `display_label()` (display_name else slug) in title row "Issues · name" (`kanban.rs` `render_title`) | not shown: the Figma Issues frame has no board title (the sidebar's project switcher names the project) |
 | `loading` | equivalent `board_loading`: centered "Loading board…" overlay while no tasks (`kanban.rs` `render_full` / `render_loading_overlay`) | "Loading board…" row in each empty column (`views/issues.rs` `render_column`) |
 | `banner` | equivalent `board_banner` in title row, yellow when stale (`kanban.rs` `render_title`) | muted text in header (`views/issues.rs` `render_header`) |
 | `error` | equivalent: refresh error written to `status_line` (`kanban.rs` `fail_refresh`), shown in footer (`render_footer`) | footer status when no newer status (`views/issues.rs` `render_footer`) |
 | `done_loading` | not shown: no equivalent; done column shows "(empty)" until the closed page lands | "Loading history…" row in done column (`views/issues.rs` `render_column`) |
 | `has_more_done` | equivalent `has_more_done()`: "↓ load more (m)" row in done column (`kanban.rs` `render_column`) | "Load more (m)" clickable row in done column (`views/issues.rs` `render_column`) |
-| `show_workflow_badges` | equivalent computed locally via `show_card_workflow_label`, gates card badge (`kanban.rs` `render_columns` / `card_meta_line`) | gates card badge (`views/issues.rs` `render_board` / `card_meta`) |
-| `workflow_filter_label` | equivalent own text " Workflow: All ▾" chip, cyan when set, hidden unless more than one workflow (`kanban.rs` `workflow_chip_text` / `render_title`) | funnel chip, always shown (`views/issues.rs` `render_header`) |
-| `workspace_filter_label` | equivalent own text " Workspace: All ▾" chip, cyan when set (`kanban.rs` `filter_chip_text` / `render_title`) | user chip (`views/issues.rs` `render_header`) |
+| `show_workflow_badges` | equivalent computed locally via `show_card_workflow_label`, gates card badge (`kanban.rs` `render_columns` / `card_meta_line`) | not shown: the desktop card always carries its workflow badge, as the Figma card draws it (`views/issues.rs` `card_meta`) |
+| `workflow_filter_label` | equivalent own text " Workflow: All ▾" chip, cyan when set, hidden unless more than one workflow (`kanban.rs` `workflow_chip_text` / `render_title`) | funnel filter button, always shown (`views/issues.rs` `render_header`) |
+| `workspace_filter_label` | equivalent own text " Workspace: All ▾" chip, cyan when set (`kanban.rs` `filter_chip_text` / `render_title`) | funnel filter button (`views/issues.rs` `render_header`) |
 
 ### `ColumnDef`
 | Field | TUI | Desktop |
@@ -298,7 +299,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `status_id` | n/a (uses `ColumnDef.status_id`, see above) | not shown: toggle/drop/move key (`views/board_state.rs` `toggle_column`, `drop_target`) |
 | `status_name` | n/a (equivalent `ColumnDef.status_name` is the header source) | not shown: not used (header uses `label`) |
 | `label` | equivalent `column_label(status_name)` header, rotated in collapsed strip (`kanban.rs` `render_column`, `render_collapsed_column`) | column header; letters of collapsed strip (`views/issues.rs` `render_column`, `render_collapsed`) |
-| `category` | equivalent `ColumnDef.category`: header color (`kanban.rs` `category_color`) | not shown as color: only picks done column for history/load-more and done-insertion order (`views/issues.rs` `render_column`, `views/board_state.rs`) |
+| `category` | equivalent `ColumnDef.category`: header color (`kanban.rs` `category_color`) | the header's status glyph and its color (`theme/style.rs` `status_icon`, `status_heading`); also picks the done column for history/load-more and done-insertion order (`views/issues.rs` `render_column`, `render_collapsed`, `views/board_state.rs`) |
 | `collapsed` | equivalent `is_column_collapsed()` picks the collapsed strip (`kanban.rs` `render_columns`) | picks the collapsed strip (`views/issues.rs` `render_board`) |
 | `cards` | equivalent `column_tasks()`: cards + "(N)" count (`kanban.rs` `render_column`) | cards + count, "(empty)" (`views/issues.rs` `render_column`) |
 
@@ -307,11 +308,12 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 |---|---|---|
 | `id` | not shown on card (popover/hit key; shown in popover) | not shown on card: identity/key; shown in drag ghost (`views/issues.rs` `CardGhost`) |
 | `title` | card title, wraps to two lines (`kanban.rs` `render_column`) | card title, two-line clamp (`views/issues.rs` `render_card`) |
+| `summary` | not shown: the TUI card has no room for an excerpt; the body shows in the popover | excerpt under the title, four-line clamp (`views/issues.rs` `render_card`) |
 | `blocked` | equivalent `task.is_blocked`: lock prefix + dim title (`kanban.rs` `render_column`) | lock icon + muted title; "blocked by" deps label (`views/issues.rs` `render_card`, `card_meta`) |
-| `branch` | equivalent `card_branch()` "⎇ branch" on meta line (`kanban.rs` `card_meta_line`) | "⎇ branch" meta line (`views/issues.rs` `card_meta`) |
+| `branch` | equivalent `card_branch()` "⎇ branch" on meta line (`kanban.rs` `card_meta_line`) | branch after the workflow badge, muted (`views/issues.rs` `card_meta`) |
 | `workflow` | not shown: raw `task.workflow` only feeds workflow-name resolution | not shown: not used anywhere |
-| `workflow_name` | equivalent `task_workflow_name()` badge (`kanban.rs` `card_meta_line`) | workflow badge (`views/issues.rs` `card_meta`) |
-| `assignee` | not shown on card: `assigned_to` drives workspace filter and the footer "workspace" hint (`kanban.rs` `render_footer`) | "@ws" on meta line (`views/issues.rs` `card_meta`); assign picker mark |
+| `workflow_name` | equivalent `task_workflow_name()` badge (`kanban.rs` `card_meta_line`) | workflow badge on every card (`views/issues.rs` `card_meta`, `workflow_badge`) |
+| `assignee` | not shown on card: `assigned_to` drives workspace filter and the footer "workspace" hint (`kanban.rs` `render_footer`) | not shown on card (the Figma card has no assignee): detail's workspace row (`views/task_detail.rs` `render`); assign picker mark |
 | `priority` | not shown: ordering and reorder slots only | not shown: ordering only (sort in `board.rs`) |
 | `depends_on` | not shown on card (popover only) | "depends on / blocked by ids" meta line (`views/issues.rs` `card_meta`) |
 | `status_id` | n/a (bucketing via `resolved_status_id`) | not shown: written on optimistic move only (`views/board_state.rs` `apply_open`) |

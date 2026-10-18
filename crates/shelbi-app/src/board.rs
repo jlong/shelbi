@@ -296,6 +296,101 @@ pub fn card_branch(task: &Issue, workflows: &[Workflow], workflow_name: &str) ->
         })
 }
 
+/// The longest excerpt [`card_summary`] keeps (a card clamps it to a few
+/// lines anyway).
+const SUMMARY_MAX_CHARS: usize = 280;
+
+/// A card's excerpt: the first prose paragraph of an issue's markdown body,
+/// as plain text. Headings, code fences, HTML comments and rules are skipped;
+/// list and quote markers, emphasis, inline code ticks and link targets are
+/// dropped; the lines join with single spaces. Empty when the body has no
+/// prose.
+pub fn card_summary(body: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_fence = !in_fence;
+            if !words.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let skipped = line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("<!--")
+            || line.chars().all(|c| matches!(c, '-' | '*' | '_' | ' '));
+        if in_fence || skipped {
+            if !words.is_empty() {
+                break;
+            }
+            continue;
+        }
+        words.extend(plain_inline(strip_block_marker(line)).split_whitespace().map(str::to_string));
+    }
+    let text = words.join(" ");
+    match text.char_indices().nth(SUMMARY_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
+        None => text,
+    }
+}
+
+/// `line` without a leading list, task-list or quote marker.
+fn strip_block_marker(line: &str) -> &str {
+    let mut rest = line;
+    while let Some(r) = rest.strip_prefix('>') {
+        rest = r.trim_start();
+    }
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(r) = rest.strip_prefix(bullet) {
+            rest = r;
+            break;
+        }
+    }
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        if let Some(r) = rest[digits..].strip_prefix(". ") {
+            rest = r;
+        }
+    }
+    for task in ["[ ] ", "[x] ", "[X] "] {
+        if let Some(r) = rest.strip_prefix(task) {
+            rest = r;
+            break;
+        }
+    }
+    rest
+}
+
+/// Inline markdown as plain text: `[text](url)` and `![alt](url)` keep their
+/// text, `**`, `__` and backticks go.
+fn plain_inline(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let (before, from) = rest.split_at(open);
+        let link = from[1..].find("](").and_then(|close| {
+            let target = &from[1 + close + 2..];
+            target.find(')').map(|end| (&from[1..1 + close], &target[end + 1..]))
+        });
+        match link {
+            Some((text, after)) => {
+                out.push_str(before.strip_suffix('!').unwrap_or(before));
+                out.push_str(text);
+                rest = after;
+            }
+            None => {
+                out.push_str(before);
+                out.push('[');
+                rest = &from[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("**", "").replace("__", "").replace('`', "")
+}
+
 /// Merge the open board with the terminal history: the open board first (in its
 /// priority order), then the first closed page, then any user-paged extras,
 /// deduped by id with the open board winning. The board index deliberately
@@ -1162,5 +1257,28 @@ mod tests {
             tf.task.priority = 0;
         }
         assert_eq!(current_slot(&tasks, "b"), Some(1));
+    }
+
+    #[test]
+    fn card_summary_is_the_first_prose_paragraph_as_plain_text() {
+        assert_eq!(
+            card_summary("# Desktop application\n\nBuild a **native** client\nwith `gpui`.\n\nSecond paragraph."),
+            "Build a native client with gpui."
+        );
+        assert_eq!(
+            card_summary("<!-- note -->\n## Problem\n\nSee [the docs](https://x.y/z) and ![a shot](s.png).\n"),
+            "See the docs and a shot."
+        );
+        assert_eq!(card_summary("- [ ] first item\n- [x] second\n\nlater"), "first item second");
+        assert_eq!(card_summary("> quoted\n> line"), "quoted line");
+        assert_eq!(card_summary("```sh\ncargo test\n```\n\nAfter the fence."), "After the fence.");
+        assert_eq!(card_summary("---\n\n1. Numbered step"), "Numbered step");
+        assert_eq!(card_summary("an [unclosed bracket"), "an [unclosed bracket");
+        assert_eq!(card_summary("## Only a heading\n\n"), "");
+        assert_eq!(card_summary(""), "");
+        let long = "word ".repeat(100);
+        let summary = card_summary(&long);
+        assert!(summary.ends_with('…'), "{summary}");
+        assert!(summary.chars().count() <= SUMMARY_MAX_CHARS + 1);
     }
 }

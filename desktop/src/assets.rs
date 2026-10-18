@@ -24,10 +24,17 @@
 //! tag into `assets/icons/heroicons/`, then add a row to the `heroicons!`
 //! list below.
 //!
-//! The one exception: a few drawings John made in the Figma file where
+//! One exception: a few drawings John made in the Figma file where
 //! Heroicons has none (the palette's Zen toggle, error log and finish
 //! flag). They live under `assets/icons/figma/` (see its README), on the
 //! Figma's 20pt grid, and render through the same [`heroicon`] helper.
+//!
+//! The other exception is the **status glyphs** ([`status_glyph`]): the Figma
+//! file's own `status-*` drawings (a dashed circle for backlog, an open one
+//! for to do, a circle filling up through in progress and review to a solid
+//! done), 16×16 on a 16 grid, vendored under `assets/icons/status/` in
+//! `currentColor`. Heroicons has no status set. Views draw them through
+//! `theme::style::status_icon`, which tints each glyph.
 
 use std::borrow::Cow;
 
@@ -61,6 +68,75 @@ impl Icon {
 pub fn heroicon(icon: Icon) -> Svg {
     svg().path(icon.path()).size(ICON_SIZE).flex_none()
 }
+
+/// The width and height a status glyph renders at.
+pub const STATUS_GLYPH_SIZE: Pixels = px(16.0);
+
+/// A workflow status's glyph, as the Figma file draws it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusGlyph {
+    /// `status-backlog`: a dashed circle.
+    Backlog,
+    /// `status-todo`: an open circle.
+    Todo,
+    /// `status-2-of-4`: the circle half filled.
+    InProgress,
+    /// `status-3-of-4`: three quarters filled.
+    Review,
+    /// `status-complete`: filled.
+    Done,
+    /// Not drawn in Figma: the open circle struck through.
+    Canceled,
+}
+
+impl StatusGlyph {
+    /// Every glyph.
+    #[cfg(test)]
+    pub const ALL: [StatusGlyph; 6] = [
+        StatusGlyph::Backlog,
+        StatusGlyph::Todo,
+        StatusGlyph::InProgress,
+        StatusGlyph::Review,
+        StatusGlyph::Done,
+        StatusGlyph::Canceled,
+    ];
+
+    /// The drawing's asset path.
+    pub const fn path(self) -> &'static str {
+        match self {
+            StatusGlyph::Backlog => "icons/status/backlog.svg",
+            StatusGlyph::Todo => "icons/status/todo.svg",
+            StatusGlyph::InProgress => "icons/status/in-progress.svg",
+            StatusGlyph::Review => "icons/status/review.svg",
+            StatusGlyph::Done => "icons/status/done.svg",
+            StatusGlyph::Canceled => "icons/status/canceled.svg",
+        }
+    }
+}
+
+/// `glyph` at [`STATUS_GLYPH_SIZE`], in the element's `text_color`.
+pub fn status_glyph(glyph: StatusGlyph) -> Svg {
+    svg().path(glyph.path()).size(STATUS_GLYPH_SIZE).flex_none()
+}
+
+macro_rules! status_glyphs {
+    ($($file:literal),*) => {
+        /// The status glyphs, by asset path.
+        const STATUS_GLYPHS: &[(&str, &[u8])] = &[$(
+            (
+                concat!("icons/status/", $file, ".svg"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/icons/status/",
+                    $file,
+                    ".svg"
+                )) as &[u8],
+            ),
+        )*];
+    };
+}
+
+status_glyphs!("backlog", "todo", "in-progress", "review", "done", "canceled");
 
 macro_rules! heroicons {
     (
@@ -303,7 +379,7 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some((_, bytes)) = HEROICONS.iter().find(|(p, _)| *p == path) {
+        if let Some((_, bytes)) = HEROICONS.iter().chain(STATUS_GLYPHS).find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         gpui_kit::assets::Assets.load(path)
@@ -312,6 +388,7 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut out: Vec<SharedString> = HEROICONS
             .iter()
+            .chain(STATUS_GLYPHS)
             .filter(|(p, _)| p.starts_with(path))
             .map(|(p, _)| SharedString::from(*p))
             .collect();
@@ -342,6 +419,22 @@ mod tests {
                 svg.contains(r#"fill="none""#) && svg.contains(r#"stroke="currentColor""#),
                 "{path} is the outline drawing, stroked in currentColor"
             );
+        }
+    }
+
+    #[test]
+    fn every_status_glyph_loads_on_a_16_grid_in_current_color() {
+        assert_eq!(STATUS_GLYPHS.len(), StatusGlyph::ALL.len());
+        assert_eq!(Assets.list("icons/status/").unwrap().len(), STATUS_GLYPHS.len());
+        for glyph in StatusGlyph::ALL {
+            let path = glyph.path();
+            let bytes = Assets.load(path).unwrap().expect(path);
+            let svg = std::str::from_utf8(&bytes).expect(path);
+            assert!(svg.starts_with("<svg"), "{path} is an SVG");
+            assert!(svg.contains(r#"viewBox="0 0 16 16""#), "{path} is drawn on the 16px grid");
+            assert!(svg.contains("currentColor"), "{path} takes the element's color");
+            let mut el = status_glyph(glyph);
+            assert_eq!(el.style().size.width, Some(STATUS_GLYPH_SIZE.into()), "{path}");
         }
     }
 
