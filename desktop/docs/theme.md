@@ -130,6 +130,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Hotkey (sidebar) | The Navigation component's: the chord's keys as plain text (`⌘O`), 2px apart, X-Small in `gray`, 4px either side, no caps |
 | Nav row | The Navigation component's: 34px tall, 6px inside, 6px gap, the 20px icon (`icon`; `accent` when selected), the label (Base, `foreground`) growing, the hotkey; the current row is the chip, loud and medium weight |
 | Nav chip | The canvas; in Light lifted with `shadow/raised card` (0 4 4, 0 11 0 -8, 0 3 0 -1, and a 1px ring), in Dark flat |
+| Shadow blurs | Every Figma (or CSS) blur goes through `style::figma_blur`: Figma's blur is twice the Gaussian's sigma and gpui's `blur_radius` is the sigma, so `shadow/raised card`'s 4 draws as 2, the palette's 15 as 7.5, and the popover and dialog drops likewise |
 | Selection chip | One chip for the current row; when the selection moves (keys, clicks, route changes) it slides to the new row on a spring with a slight overshoot before the row takes it back. The sidebar, the review and workspace panels' view switches, and every segmented control |
 | List row (leading column) | The review and workspace panels: 32px, Small (13 / 18); the same chip when selected. The sidebar's rows follow the Navigation component (see `views/sidebar.rs`): 8px across, 4px above and below, a 12px state glyph |
 | Current-selection indicator | A 3x16px `accent` pill at the row's leading edge, on the keyboard's row |
@@ -237,6 +238,7 @@ until a new role has its row here, with the values the palette really has.
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
 | `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
+| `table_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Machines frame sets it (opaque, both modes): a workspace row's runner and task |
 
 ### Icons
 
@@ -389,7 +391,6 @@ with its worst ratio. **Flagged for John.**
 | dark | magenta on magenta_tint | 4.19 | `[review]` on its (derived) chip tint |
 | dark | red on red_tint | 4.39 | The Danger pink on its (derived) chip tint |
 | dark | text_loud on selection | 4.08 | `theme.white` on the selected segment (`theme.selection`) over the sidebar; 4.46 on the canvas |
-| dark | gray on selection | 2.12 | The selected Machines row (`theme.selection` over the canvas, as drawn): the runner and the task in `theme.gray` |
 | dark | theme_green on selection | 2.30 | The same row: `working` and `● reachable` in `theme.green` |
 | dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan`. The lowest pairing the desktop draws |
 | dark | success_label on hover button | 4.35 | the Success label (`#86d580`) on the Success button's (derived dark) hover |
@@ -400,6 +401,7 @@ with its worst ratio. **Flagged for John.**
 | dark | button_icon on | 2.58 | The Button component's icon (`#acb4cf` at 60%) on a button's fill over the sidebar; decorative beside the button's label |
 | dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
 | dark | form_text on | 2.53 | The Settings frame's `theme.gray` override, `#7b85a7`: a field's value and an unselected choice 4.30 on the canvas, "Open keys.yaml" 2.53 on its `theme.search` fill |
+| dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
 | light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
@@ -415,6 +417,7 @@ with its worst ratio. **Flagged for John.**
 | light | button_icon on | 2.81 | `theme.gray` as the Button component's icon, on a button's fill; decorative beside the label |
 | light | input_border on | 1.06 | `theme.divider` as a field's edge |
 | light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
+| light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 
 ## Renders
 

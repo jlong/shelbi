@@ -37,7 +37,7 @@ use shelbi_app::board::{self, BoardRead, ClosedPage};
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
 };
-use shelbi_state::keymap::{format_chord, DisplayStyle, KanbanAction, Keymaps};
+use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 
 use super::board_scroll;
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
@@ -560,7 +560,7 @@ impl IssuesView {
     }
 
     pub(super) fn hint(&self, chord: Option<&shelbi_state::keymap::KeyChord>) -> String {
-        chord.map_or_else(|| "–".to_string(), |c| format_chord(c, self.display_style))
+        chord.map_or_else(|| "–".to_string(), |c| crate::keys::chord_text(c, self.display_style))
     }
 
     fn keymaps(&self) -> &Keymaps {

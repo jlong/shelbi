@@ -289,9 +289,9 @@ close inspection pass `--2x` (`--visual-figma /tmp/vf2 --2x`): each window
 then opens on the first Retina display (visible there while it renders, above
 other windows, without taking focus) and the native 2880x2048 frame is kept.
 With no Retina display attached (a closed laptop on external monitors) it says
-so and the frames come at 1x. Export the Figma frames at 2x (Figma's export
-panel, or the Figma MCP's `get_screenshot` on the node IDs in the README
-there) into a directory to pass as the diff's ref-dir.
+so and the frames come at 1x. Export the Figma frames at 2x from Figma's
+export panel into a directory to pass as the diff's ref-dir (the Figma MCP's
+`get_screenshot` stops at a frame's own 1x size).
 
 `scripts/figma-diff.sh <render-dir> [ref-dir]` (ImageMagick 7; ref-dir
 defaults to the folder above) writes `<screen>-<theme>-side.png` (reference
@@ -304,6 +304,25 @@ default 6). The references' rounded window corners sit on Figma's canvas and
 are masked out (`CORNER`, default 28 px). A render of another size is scaled to
 the reference's first. A region as large as the frame means the background
 itself differs.
+
+The real window, once (`dt-figma-qa-final`):
+
+```sh
+scripts/bundle.sh                                     # Shelbi.app (ad-hoc signed without the Developer ID)
+scripts/figma-window-walk.sh --offscreen /tmp/vf      # ~3 min; needs an unlocked screen
+```
+
+`scripts/figma-window-walk.sh` launches the bundled app in a real 1440x1024
+window over the same mockup content (`--visual-figma-fixtures <root>` writes
+it into a sandboxed Shelbi root under `/tmp`; hub and control socket
+variables unset; `claude` and `codex` are a fake agent there), walks every
+screen in Auto, then Dark, then Light (switched live with Settings' theme
+segments), captures each window with `screencapture -l`, checks the font
+picker and ⌘= / ⌘0 against the saved settings, and diffs the captures against
+the references (and against `--visual-figma`'s frames with `--offscreen`).
+It needs Screen Recording and Accessibility for the terminal, and it takes
+the keyboard and pointer for a few minutes. Output and options: the script's
+header.
 
 ### Performance and concurrent clients
 

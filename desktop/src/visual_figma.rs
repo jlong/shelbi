@@ -25,7 +25,9 @@
 //! collapsed, Zen off, the sidebar hidden), the issue detail's
 //! ([`DETAIL_ACTIONS`] hovered, a long body scrolled) and the task panels'
 //! (`state-review-*`, `state-workspace-*`: More, each view's ⌘N, Approve
-//! and Reject hovered and pressed). `SHELBI_VISUAL_ONLY=panels` renders
+//! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
+//! the remote down, its row selected; `machines-idle-selected`,
+//! `machines-review-selected`). `SHELBI_VISUAL_ONLY=panels` renders
 //! just the Review and Workspace screens and those states.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
@@ -512,7 +514,7 @@ pub fn run(out: PathBuf, theme: &'static str, native: bool) -> ! {
     let now = pinned_now();
     write_fixtures(&home, now);
     crate::views::activity::pin_clock(now);
-    crate::views::machines::stub_reachable();
+    crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
 
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
@@ -553,6 +555,27 @@ pub fn run(out: PathBuf, theme: &'static str, native: bool) -> ! {
         run.out.display()
     );
     std::process::exit(if run.failures == 0 { 0 } else { 1 })
+}
+
+/// `--visual-figma-fixtures <root>`: the mockups' content (the projects,
+/// the board, the Activity events, the workspaces' states) written into
+/// `root` as a Shelbi root, timed from the real clock so the Activity ages
+/// read as drawn while the real app shows it. `scripts/figma-window-walk.sh`
+/// opens it in the bundled app. Exits.
+pub fn export_fixtures(root: PathBuf) -> ! {
+    std::fs::create_dir_all(&root).expect("create the Shelbi root");
+    // SAFETY: single-threaded here, before any reader thread starts.
+    unsafe {
+        std::env::set_var("SHELBI_HOME", &root);
+        std::env::set_var("SHELBI_ROOT", &root);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        std::env::remove_var("SHELBI_CONTROL_SOCK");
+        std::env::remove_var("SHELBI_HUB_ADDR");
+        std::env::remove_var("SHELBI_PROJECT");
+    }
+    write_fixtures(&root, Utc::now());
+    println!("fixtures for project {PROJECT} written under {}", root.display());
+    std::process::exit(0)
 }
 
 /// 15:00 local on 2026-10-17, the mockups' "today".
@@ -765,6 +788,31 @@ impl Run {
         self.save(handle, screen);
     }
 
+    /// The Machines view with every remote answering `reachability` and
+    /// workspace row `selected` selected, saved as `screen`.
+    fn machines(&mut self, screen: &str, reachability: shelbi_core::Reachability, selected: usize) {
+        crate::views::machines::stub_reachability(reachability.clone());
+        let handle = self.open();
+        self.click(handle, View::Machines);
+        let machines = self.views(handle).2.expect("the Machines view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| {
+            machines.read_with(cx, |v, _| {
+                v.state().model().workspace_count() == 5
+                    && v.state().model().machines.get(1).is_some_and(|m| m.reachability == reachability)
+            })
+        });
+        if let Some(e) = machines.read_with(&self.cx, |v, _| v.state().error().map(str::to_string)) {
+            println!("      read error: {e}");
+        }
+        self.expect(&format!("{screen}: five workspaces, the gpu box {reachability:?}"), loaded);
+        machines.update(&mut self.cx, |v, cx| {
+            v.state_mut().select_row(selected);
+            cx.notify();
+        });
+        self.save(handle, screen);
+        crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
+    }
+
     /// Save the window as `<screen>-<theme>.png` and close it.
     fn save(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
         self.capture(handle, screen);
@@ -880,27 +928,25 @@ impl Run {
         self.save(handle, "workspace-idle");
         self.sidebar = sidebar_model();
 
-        // Machines, the remote reachable.
-        let handle = self.open();
-        self.click(handle, View::Machines);
-        let machines = self.views(handle).2.expect("the Machines view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| {
-            machines.read_with(cx, |v, _| {
-                v.state().model().workspace_count() == 5
-                    && v.state().model().machines.get(1).is_some_and(|m| {
-                        m.reachability == shelbi_core::Reachability::Reachable
-                    })
-            })
-        });
-        if let Some(e) = machines.read_with(&self.cx, |v, _| v.state().error().map(str::to_string)) {
-            println!("      read error: {e}");
+        // Machines, the remote reachable. Its frame titles the two
+        // in-progress tasks shorter than the Issues frame does: the mockups
+        // disagree, so retitle them for this screen only.
+        let titles: Vec<(&str, String)> = MACHINES_TITLES
+            .iter()
+            .map(|(id, title)| (*id, retitle(id, title)))
+            .collect();
+        self.machines("machines", shelbi_core::Reachability::Reachable, 0);
+        // States the frame doesn't draw: the remote down (its row selected),
+        // and an idle row and the review slot selected.
+        let down = shelbi_core::Reachability::Unreachable {
+            error: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
+        };
+        self.machines("machines-unreachable", down, 4);
+        self.machines("machines-idle-selected", shelbi_core::Reachability::Reachable, 2);
+        self.machines("machines-review-selected", shelbi_core::Reachability::Reachable, 3);
+        for (id, title) in &titles {
+            retitle(id, title);
         }
-        self.expect("machines: five workspaces, the gpu box reachable", loaded);
-        machines.update(&mut self.cx, |v, cx| {
-            v.state_mut().select_row(0);
-            cx.notify();
-        });
-        self.save(handle, "machines");
 
         // Settings.
         let handle = self.open();
@@ -1265,6 +1311,20 @@ client owns presentation and native interaction.\n";
 
 fn day(d: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, d, 12, 0, 0).single().expect("a fixture date")
+}
+
+/// The in-progress tasks' titles as the Machines frame draws them.
+const MACHINES_TITLES: [(&str, &str); 2] = [
+    ("project-switcher", "Add project switching"),
+    ("session-reconnect", "Session reconnect"),
+];
+
+/// Give fixture task `id` a new title; the old one comes back.
+fn retitle(id: &str, title: &str) -> String {
+    let mut file = shelbi_state::load_task(PROJECT, id).expect("a fixture task");
+    let old = std::mem::replace(&mut file.task.title, title.into());
+    shelbi_state::save_task(PROJECT, &file.task, &file.body).expect("retitle a fixture task");
+    old
 }
 
 fn save_task(id: &str, title: &str, body: &str, column: Column, priority: i64, assigned: Option<&str>) {

@@ -361,6 +361,7 @@ heroicons! {
     @small {
         FUNNEL_SMALL = "funnel";
         USER_SMALL = "user";
+        COMMAND_LINE_SMALL = "command-line";
     }
     @button {
         FUNNEL_BUTTON = "funnel";

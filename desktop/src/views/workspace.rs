@@ -1048,16 +1048,18 @@ impl WorkspaceView {
             None => header.location_line(),
         };
         let open = self.shell_open;
+        // The frame's Shell: 8 across, 4 down, 8 between a 14pt icon and the
+        // X-Small label (24pt tall).
         let shell = style::button_base("ws-shell-button", style::ButtonKind::Quiet, false, theme)
             .h(px(24.0))
-            .px_1p5()
-            .gap_1p5()
+            .px_2()
+            .gap_2()
             .when(open, |d| d.bg(theme.background))
             .type_style(Type::XSmall)
             .text_color(if open { theme.text_loud } else { theme.muted })
             .tooltip(style::tooltip(if open { "Close the shell" } else { "Open a shell in the worktree" }))
             .on_click(cx.listener(|this, _, window, cx| this.toggle_shell(window, cx)))
-            .child(heroicon(icons::COMMAND_LINE).text_color(if open { theme.text_loud } else { theme.muted }))
+            .child(heroicon(icons::COMMAND_LINE_SMALL).text_color(if open { theme.text_loud } else { theme.muted }))
             .child("Shell");
         Some(
             div()

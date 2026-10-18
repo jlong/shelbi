@@ -65,6 +65,9 @@ pub mod figma {
     /// `theme.gray` as the Activity frame sets it: `#7b85a7`, opaque, in
     /// both modes (the log's titles and the `you` actor).
     pub const GRAY_ACTIVITY: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
+    /// `theme.gray` as the Machines frame sets it: `#7b85a7`, opaque, in
+    /// both modes (a workspace row's runner and task).
+    pub const GRAY_MACHINES: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
     /// `icon/select`: the selected nav icon, the accent.
     pub const ICON_SELECT: Pair = pair(0x62cdf6ff, 0xf21478ff);
     pub const ICON_CYAN: Pair = pair(0x62cdf6ff, 0x31ade9ff);
@@ -293,6 +296,9 @@ palette! {
     /// The Activity log's titles and its `you` actor (the Activity frame's
     /// `theme.gray`).
     log_text,
+    /// A Machines workspace row's runner and task (the Machines frame's
+    /// `theme.gray`).
+    table_text,
 
     // ---- Icons --------------------------------------------------------------
     /// Icons at rest (`theme.gray`).
@@ -478,6 +484,7 @@ impl Palette {
             muted: pick(MUTED),
             text_on_color: Rgba::hex(0xffffff),
             log_text: pick(GRAY_ACTIVITY),
+            table_text: pick(GRAY_MACHINES),
 
             icon: pick(GRAY),
             button_icon: pick(BUTTON_ICON),
@@ -600,7 +607,6 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "magenta on magenta_tint"),
     ("dark", "red on red_tint"),
     ("dark", "text_loud on selection"),
-    ("dark", "gray on selection"),
     ("dark", "theme_green on selection"),
     ("dark", "theme_cyan on selection"),
     ("dark", "success_label on hover button"),
@@ -611,6 +617,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "input_border on"),
     ("dark", "form_text on"),
     ("dark", "button_icon on"),
+    ("dark", "table_text on"),
     ("light", "muted on"),
     ("light", "gray on"),
     ("light", "log_text on"),
@@ -626,6 +633,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "input_border on"),
     ("light", "form_text on"),
     ("light", "button_icon on"),
+    ("light", "table_text on"),
 ];
 
 #[cfg(test)]
@@ -718,6 +726,9 @@ mod tests {
             flatten(p.search, p.canvas),
             AA,
         );
+        // A Machines row's runner and task, on the canvas (the selected
+        // row's band is checked below).
+        check("table_text on canvas".into(), p.table_text, p.canvas, AA);
         // The Machines states and reachability: drawn on the canvas only.
         for (name, fg) in [("theme_green", p.theme_green), ("theme_cyan", p.theme_cyan)] {
             check(format!("{name} on canvas"), fg, p.canvas, AA);
@@ -786,7 +797,7 @@ mod tests {
         // The selected Machines row: every cell on the selection band.
         let band = flatten(p.selection, p.canvas);
         for (name, fg) in [
-            ("gray", p.gray),
+            ("table_text", p.table_text),
             ("muted", p.muted),
             ("dark_gray", p.dark_gray),
             ("theme_green", p.theme_green),
@@ -905,6 +916,8 @@ mod tests {
         both(d.text_loud, l.text_loud, (0xf8f8faff, 0x020303ff));
         both(d.gray, l.gray, (0xacb4cfe5, 0x7b85a7e5));
         both(d.muted, l.muted, (0x777a86ff, 0x444c65a6));
+        // The Machines frame's `theme.gray`, opaque in both modes.
+        both(d.table_text, l.table_text, (0x7b85a7ff, 0x7b85a7ff));
         both(d.accent, l.accent, (0x62cdf6ff, 0xf21478ff));
         both(d.focus_ring, l.focus_ring, (0x62cdf6ff, 0x31ade9ff));
         both(d.focus_glow, l.focus_glow, (0x12adff33, 0x12adff33));

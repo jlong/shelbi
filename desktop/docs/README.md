@@ -99,6 +99,19 @@ is left, and how it was verified.
 | `dt-figma-terminal-screens` | The Orchestrator, Workspace and Review terminals take the Figma frames' insets and colors (bold loud, dim muted, `theme.red`); an idle workspace keeps the sidebar and shows the Figma idle page with a Shell button | [`status/dt-figma-terminal-screens.md`](status/dt-figma-terminal-screens.md) |
 | `dt-figma-settings` | Settings restyled to the Figma frame in both themes; a terminal font picker (bundled faces plus installed monospaced families, each previewed in itself) and a size stepper (8 to 32) replace the free-text fields | [`status/dt-figma-settings.md`](status/dt-figma-settings.md) |
 | `dt-figma-machines` | The Machines view drawn to the Figma Machines frame in both themes: plain headings, a remote's metadata line, flat rows with the runner and `<status>: <title>`, the shortcuts footer | [`status/dt-figma-machines.md`](status/dt-figma-machines.md) |
+| `dt-figma-sidebar` | The sidebar is the Figma Navigation component's Default state: its sections and rows, the Changelog item (the Activity view, desktop-only label), ⌘O / ⌘I / ⌘L and ⌘1-9, the traffic lights' position | [`status/dt-figma-sidebar.md`](status/dt-figma-sidebar.md) |
+| `dt-figma-issue-detail` | The issue detail (the card's modal over the board) restyled to the Figma Issue detail frame in both themes: header, action buttons, metadata, body, checklist | [`status/dt-figma-issue-detail.md`](status/dt-figma-issue-detail.md) |
+| `dt-figma-task-panels` | The Workspace and Review panels are the Navigation component's Workspace and Review states, inside the sidebar's chrome | [`status/dt-figma-task-panels.md`](status/dt-figma-task-panels.md) |
+| `dt-figma-qa-palette` | Pixel QA of the command palette: the drop's blur as gpui's sigma, the scrim, row and footer metrics | [`status/dt-figma-qa-palette.md`](status/dt-figma-qa-palette.md) |
+| `dt-figma-qa-activity` | Pixel QA of Activity: 14pt picker icons (the small Heroicons), title wrapping; found Figma's text set in Geist 1.2 | [`status/dt-figma-qa-activity.md`](status/dt-figma-qa-activity.md) |
+| `dt-figma-qa-settings` | Pixel QA of Settings: the frame's 12pt check, field icons in `form_text`, the copy | [`status/dt-figma-qa-settings.md`](status/dt-figma-qa-settings.md) |
+| `dt-figma-qa-issues-board` | Pixel QA of the Issues board: focus ring and glow, 18pt button icons (`button_icon` role), card shadows | [`status/dt-figma-qa-issues-board.md`](status/dt-figma-qa-issues-board.md) |
+| `dt-figma-qa-machines` | Pixel QA of Machines: the frame's gray as the `table_text` role, the undrawn states rendered | [`status/dt-figma-qa-machines.md`](status/dt-figma-qa-machines.md) |
+| `dt-figma-qa-terminal-screens` | Pixel QA of the Orchestrator, Workspace, Review and idle terminals: crisp box-drawing lines, the idle page | [`status/dt-figma-qa-terminal-screens.md`](status/dt-figma-qa-terminal-screens.md) |
+| `dt-figma-qa-sidebar` | Pixel QA of the sidebar: font smoothing off for the app (dark text weight), exact-width hotkey text | [`status/dt-figma-qa-sidebar.md`](status/dt-figma-qa-sidebar.md) |
+| `dt-figma-qa-issue-detail` | Pixel QA of the issue detail: 18pt action icons, the modal's metrics and colors | [`status/dt-figma-qa-issue-detail.md`](status/dt-figma-qa-issue-detail.md) |
+| `dt-figma-qa-task-panels` | Pixel QA of the task panels: a shaped line clamp, the 1pt column divider (the main area at x 281), the dark Success label | [`status/dt-figma-qa-task-panels.md`](status/dt-figma-qa-task-panels.md) |
+| `dt-figma-qa-final` | Final pixel QA of all 20 frames at 1x and 2x, the real window in both themes with live theme switching, shared components across screens, the bundled fonts; the departures list for John | [`status/dt-figma-qa-final.md`](status/dt-figma-qa-final.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one
