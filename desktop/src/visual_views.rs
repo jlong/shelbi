@@ -9,8 +9,11 @@
 //! SSH machine whose host can't resolve), a few tasks, a workspace status and
 //! an `events.log`, then opens each view through the real readers and saves
 //! frames: `activity.png`, `activity-zen.png` (the Zen kind filter),
-//! `activity-picker.png` (the project picker open), `machines.png` once the
-//! unreachable remote's probe has landed, and the issues board: `board.png`
+//! `activity-tasks.png`, `activity-workspaces.png`, `activity-system.png`
+//! (each other kind alone; the Tasks feed has a title too long for a line),
+//! `activity-picker.png` and `activity-workspace-picker.png` (each picker
+//! open), `machines.png` once the unreachable remote's probe has landed,
+//! and the issues board: `board.png`
 //! (a card selected), `board-dropdown.png` (the workflow filter open) and
 //! `board-detail.png` (a card's detail); then `settings.png`, Settings with its
 //! font picker open (`settings-font-picker.png`), the other choices
@@ -34,6 +37,8 @@ use crate::views::machines::MachinesView;
 use crate::theme::style::{Type, Typography};
 
 const PROJECT: &str = "demo";
+/// A task title too long for one line of the feed (how a row wraps it).
+const LONG_TITLE: &str = "Keep the terminal's scroll position anchored while a long-running agent streams output, and follow new output only when the view is already scrolled to the bottom";
 
 pub fn run(out: PathBuf) -> ! {
     std::fs::create_dir_all(&out).expect("create the output directory");
@@ -86,15 +91,43 @@ pub fn run(out: PathBuf) -> ! {
     });
     let zen: usize = activity.read_with(&cx, |v, _| v.state().feed().rows().count());
     expect("activity: the Zen filter keeps the zen rows only", zen == 2);
-    save(&mut cx, window, &out, "activity-zen.png");
-    activity.update(&mut cx, |v, cx| {
-        v.state_mut().clear_kinds(Utc::now());
-        v.state_mut().toggle_picker(crate::views::activity_state::Picker::Project);
-        cx.notify();
-    });
-    // Let the menu's slide-and-fade finish.
+    // Let the selected chip's slide finish.
     wait(&mut cx, window, Duration::from_millis(300), |_| false);
-    save(&mut cx, window, &out, "activity-picker.png");
+    save(&mut cx, window, &out, "activity-zen.png");
+    // Every other kind picked alone, for its selected segment.
+    for (kind, name) in [
+        (shelbi_app::activity::ActivityKind::Tasks, "activity-tasks.png"),
+        (shelbi_app::activity::ActivityKind::Workspaces, "activity-workspaces.png"),
+        (shelbi_app::activity::ActivityKind::System, "activity-system.png"),
+    ] {
+        activity.update(&mut cx, |v, cx| {
+            v.state_mut().clear_kinds(Utc::now());
+            v.state_mut().toggle_kind(kind, Utc::now());
+            cx.notify();
+        });
+        wait(&mut cx, window, Duration::from_millis(300), |_| false);
+        if kind == shelbi_app::activity::ActivityKind::Tasks {
+            let long = activity.read_with(&cx, |v, _| {
+                v.state().feed().rows().any(|r| r.title == LONG_TITLE)
+            });
+            expect("activity: the long title's row is in the Tasks feed", long);
+        }
+        save(&mut cx, window, &out, name);
+    }
+    for (picker, name) in [
+        (crate::views::activity_state::Picker::Project, "activity-picker.png"),
+        (crate::views::activity_state::Picker::Workspace, "activity-workspace-picker.png"),
+    ] {
+        activity.update(&mut cx, |v, cx| {
+            v.state_mut().clear_kinds(Utc::now());
+            v.state_mut().picker = None;
+            v.state_mut().toggle_picker(picker);
+            cx.notify();
+        });
+        // Let the menu's slide-and-fade finish.
+        wait(&mut cx, window, Duration::from_millis(300), |_| false);
+        save(&mut cx, window, &out, name);
+    }
 
     // ---- Machines ----
     let (machines, window) = open(&mut cx, |cx| cx.new(|cx| MachinesView::new(PROJECT.into(), cx)));
@@ -405,6 +438,7 @@ workspaces:
     task("b1", "Write the theme docs for the desktop palette", Column::backlog(), None);
     task("b2", "Sync the board's column widths with the TUI", Column::backlog(), None);
     task("c1", "Restyle the command palette", Column::todo(), None);
+    task("t2", LONG_TITLE, Column::in_progress(), None);
     shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
         workspace: "alpha".into(),
         current_task: Some("t1".into()),
@@ -419,6 +453,7 @@ workspaces:
         format!("{} project=demo task=r9 workflow=default todo -> in_progress reason=user:cli", at(95)),
         format!("{} project=demo task=r9 workflow=default in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff", at(52)),
         format!("{} project=demo workspace=alpha working -> awaiting_input", at(40)),
+        format!("{} project=demo task=t2 workflow=default todo -> in_progress reason=user:cli", at(35)),
         format!("{} ssh reverse-forward host=gpu.invalid mode=tcp status=failed detail=master_open_failed", at(30)),
         format!("{} ssh reverse-forward host=gpu.invalid mode=tcp status=failed detail=master_open_failed", at(25)),
         format!("{} project=demo task=d1 workflow=default review -> done reason=zen:failed-checks cmd=\"cargo test\" exit=101", at(20)),

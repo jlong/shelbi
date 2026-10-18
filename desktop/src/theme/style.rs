@@ -649,8 +649,10 @@ pub fn filter_segment(
     d.child(label.into())
 }
 
-/// The Activity frame's pickers: `theme.search`'s fill, the icon and an
-/// X-Small gray label, 24px tall and no chevron; pressed while `open`.
+/// The Activity frame's pickers: `theme.search`'s fill, a 14px icon (pass
+/// a small one, `icons::FUNNEL_SMALL`) and an X-Small label, 24px tall and
+/// no chevron; pressed while `open`. Icon and label are `log_text`: the
+/// frame sets `theme.gray` to the log's opaque `#7b85a7` in both modes.
 pub fn filter_dropdown(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -676,10 +678,10 @@ pub fn filter_dropdown(
         .px(px(8.0))
         .rounded(px(6.0))
         .type_style(Type::XSmall)
-        .text_color(theme.gray)
+        .text_color(theme.log_text)
         .cursor_pointer();
     fill_layer(d, id, px(6.0), [rest, theme.background_active, theme.selection])
-        .child(heroicon(icon).text_color(theme.icon))
+        .child(heroicon(icon).text_color(theme.log_text))
         .child(div().whitespace_nowrap().child(label.into()))
 }
 
