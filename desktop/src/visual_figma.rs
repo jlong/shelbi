@@ -832,7 +832,21 @@ impl Run {
         self.click(handle, orch);
         self.settle(handle);
         handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(None, window, cx))
+            .update(&mut self.cx, |w, window, cx| {
+                // The frame's Projects column: two open, one not.
+                use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
+                let project = |slug: &str, label: &str, indicator| ProjectEntry {
+                    slug: slug.into(),
+                    label: label.into(),
+                    indicator,
+                };
+                w.offscreen_palette_projects(vec![
+                    project("shelbi", "Shelbi", ProjectIndicator::LoadedIdle),
+                    project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle),
+                    project("32pixels", "32pixels", ProjectIndicator::Unloaded),
+                ]);
+                w.offscreen_open_overlay(None, window, cx)
+            })
             .unwrap();
         self.save(handle, "command-palette");
 

@@ -4,7 +4,9 @@
 //! fuzzy-filtered by [`shelbi_palette::search`], beside a Projects column. Its
 //! focus model: typing filters, `↑`/`↓` move the selection, `→` moves focus
 //! into the Projects column (and `←` back), Enter activates, Tab hands focus to
-//! the sidebar, and Escape (or the palette chord) closes. Activating a project
+//! the sidebar (or, in a client that asks for it with
+//! [`Palette::tab_switches_columns`], moves between the two columns), and
+//! Escape (or the palette chord) closes. Activating a project
 //! row yields its `action:switch-project:<slug>` entry (the trailing row,
 //! `action:add-project`), so the host runs it through the registry like any
 //! other entry.
@@ -88,6 +90,7 @@ pub struct Palette {
     projects: Vec<ProjectEntry>,
     focus: PaletteFocus,
     project_selected: usize,
+    tab_columns: bool,
 }
 
 impl Palette {
@@ -101,7 +104,16 @@ impl Palette {
             projects,
             focus: PaletteFocus::Commands,
             project_selected: 0,
+            tab_columns: false,
         }
+    }
+
+    /// Make Tab move focus between the commands and the Projects column
+    /// (the desktop's palette) instead of handing it to the sidebar. A
+    /// palette with no Projects column still hands Tab to the sidebar.
+    pub fn tab_switches_columns(mut self) -> Self {
+        self.tab_columns = true;
+        self
     }
 
     /// Replace the entries (a background refresh landed), keeping the query.
@@ -176,6 +188,8 @@ impl Palette {
     pub fn footer(&self, close: &str) -> String {
         if self.projects.is_empty() {
             format!("↑↓ navigate · Enter activate · Esc / {close} close")
+        } else if self.tab_columns {
+            format!("↑↓ navigate · Enter activate · Tab projects · Esc / {close} close")
         } else {
             format!("↑↓ navigate · → projects · Enter activate · Esc / {close} close")
         }
@@ -206,10 +220,20 @@ impl Palette {
     /// Space, the arrows and unbound printable characters are matched on the
     /// chord itself so they behave whatever is bound.
     pub fn handle_key(&mut self, chord: KeyChord, action: Option<PaletteAction>) -> PaletteStep {
-        // Tab leaves for the sidebar, ahead of the keymap so no binding can
-        // shadow it.
+        // Tab leaves for the sidebar (or crosses to the other column), ahead
+        // of the keymap so no binding can shadow it.
         if is_bare(&chord, Key::Tab) {
-            return PaletteStep::FocusSidebar;
+            if !self.tab_columns || self.projects.is_empty() {
+                return PaletteStep::FocusSidebar;
+            }
+            match self.focus {
+                PaletteFocus::Commands => {
+                    self.focus = PaletteFocus::Projects;
+                    self.project_selected = 0;
+                }
+                PaletteFocus::Projects => self.focus = PaletteFocus::Commands,
+            }
+            return PaletteStep::Continue;
         }
         if is_bare(&chord, Key::Right) {
             if self.focus == PaletteFocus::Commands && !self.projects.is_empty() {
@@ -418,6 +442,28 @@ mod tests {
         press(&mut p, key(Key::Right));
         press(&mut p, ch('a'));
         assert_eq!(p.focus(), PaletteFocus::Commands);
+    }
+
+    #[test]
+    fn tab_can_switch_columns_instead() {
+        let mut p =
+            Palette::new(vec![entry("a", "Alpha")], vec![project("web")]).tab_switches_columns();
+        assert_eq!(press(&mut p, key(Key::Tab)), PaletteStep::Continue);
+        assert_eq!(p.project_selection(), Some(0));
+        press(&mut p, key(Key::Down));
+        assert_eq!(p.project_selection(), Some(1), "down reaches Add project");
+        assert_eq!(press(&mut p, key(Key::Tab)), PaletteStep::Continue);
+        assert_eq!(p.focus(), PaletteFocus::Commands);
+        // Tab again lands on the first project, as Right does.
+        press(&mut p, key(Key::Tab));
+        assert_eq!(p.project_selection(), Some(0));
+        assert_eq!(
+            p.footer("⌃P"),
+            "↑↓ navigate · Enter activate · Tab projects · Esc / ⌃P close"
+        );
+        // With no Projects column, Tab still hands focus to the sidebar.
+        let mut bare = Palette::new(vec![entry("a", "Alpha")], Vec::new()).tab_switches_columns();
+        assert_eq!(press(&mut bare, key(Key::Tab)), PaletteStep::FocusSidebar);
     }
 
     #[test]

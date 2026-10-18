@@ -102,6 +102,9 @@ pub mod figma {
     /// `shadow/raised card`'s colors: the three drops, and the 1px ring.
     pub const SHADOW: Pair = pair(0x0a1e5105, 0x0a1e5105);
     pub const SHADOW_RING: Pair = pair(0x0a1e5108, 0x0a1e5108);
+    /// The Command palette's drop (an effect, `0 10 15 -3`, not a
+    /// variable): black at 25% in both modes.
+    pub const PALETTE_SHADOW: Pair = pair(0x00000040, 0x00000040);
 
     /// Colors Figma draws without a variable, measured from the 1x frames
     /// (1 px = 1 pt) and named for where they appear.
@@ -392,6 +395,8 @@ palette! {
     shadow,
     /// `shadow/raised card`'s 1px ring.
     shadow_ring,
+    /// The command palette's drop, over the scrim.
+    palette_shadow,
     /// The backdrop behind a modal overlay.
     scrim,
 }
@@ -508,6 +513,7 @@ impl Palette {
             ring: pick(RING),
             shadow: pick(SHADOW),
             shadow_ring: pick(SHADOW_RING),
+            palette_shadow: pick(PALETTE_SHADOW),
             scrim: pick(SCRIM),
         }
     }

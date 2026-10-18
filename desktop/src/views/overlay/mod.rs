@@ -93,7 +93,9 @@ pub enum ActiveOverlay {
 impl ActiveOverlay {
     pub fn palette(entries: Vec<Entry>, projects: Vec<ProjectEntry>) -> Self {
         ActiveOverlay::Palette {
-            palette: Palette::new(entries, projects),
+            // Tab crosses to the Projects column, as the frame's footer says
+            // (the TUI's Tab still goes to the sidebar).
+            palette: Palette::new(entries, projects).tab_switches_columns(),
             scroll: ScrollHandle::new(),
         }
     }
@@ -399,10 +401,10 @@ pub fn render_layer<H: OverlayHost>(
         .into_any_element()
 }
 
-/// The palette's offset from the top of a window `window_h` tall: Taskpage's
-/// command dialog sits a fifth of the way down (`pt-[20vh]`), at least 40px.
+/// The palette's offset from the top of a window `window_h` tall: the
+/// frame's 200pt, a fifth of the way down a shorter window, at least 40pt.
 pub fn palette_top(window_h: f32) -> f32 {
-    (window_h * 0.2).max(40.0).round()
+    (window_h * 0.2).clamp(40.0, 200.0).round()
 }
 
 /// A panel: the overlay's raised surface (Taskpage's ring and shadow), that
@@ -509,7 +511,28 @@ mod tests {
         for close in ["esc", "ctrl-p", "ctrl-space", "super-k"] {
             assert_eq!(o.handle_key(chord(close), &keymaps()), OverlayEvent::Close, "{close}");
         }
+        // No Projects column: Tab hands focus to the sidebar.
         assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::FocusSidebar);
+    }
+
+    #[test]
+    fn tab_crosses_into_the_projects_column_and_back() {
+        let project = ProjectEntry {
+            slug: "web".into(),
+            label: "Web".into(),
+            indicator: shelbi_app::overlay::palette::ProjectIndicator::Unloaded,
+        };
+        let mut o = ActiveOverlay::palette(vec![entry("view:tasks", "Issues")], vec![project]);
+        assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::Stay);
+        let ActiveOverlay::Palette { palette, .. } = &o else { unreachable!() };
+        assert_eq!(palette.project_selection(), Some(0));
+        assert_eq!(
+            o.handle_key(chord("enter"), &keymaps()),
+            OverlayEvent::RunEntry(entry("action:switch-project:web", "Web"))
+        );
+        o.handle_key(chord("tab"), &keymaps());
+        let ActiveOverlay::Palette { palette, .. } = &o else { unreachable!() };
+        assert_eq!(palette.project_selection(), None, "back on the commands");
     }
 
     #[test]
@@ -742,7 +765,10 @@ mod render_tests {
             indicator,
         })
         .collect();
-        ActiveOverlay::palette(CommandRegistry::new().entries(&model), projects)
+        ActiveOverlay::palette(
+            crate::views::palette::present(CommandRegistry::new().entries(&model)),
+            projects,
+        )
     }
 
     struct PaletteProject(&'static str, &'static str, ProjectIndicator);
@@ -755,7 +781,6 @@ mod render_tests {
             "view:tasks",
             "view:machines",
             "action:toggle-zen",
-            "review:T-9",
             "action:error-log",
             "action:detach",
             "action:quit-project",
@@ -773,7 +798,8 @@ mod render_tests {
             last = Some(bounds.top());
         }
         // Hidden-until-typed entries aren't drawn on a blank query.
-        for hidden in ["action:switch-project:beta", "action:approve-review:T-9"] {
+        // The review rows, too: the frame's list is the commands alone.
+        for hidden in ["action:switch-project:beta", "action:approve-review:T-9", "review:T-9"] {
             let selector: &'static str = Box::leak(format!("palette-row-{hidden}").into_boxed_str());
             assert!(cx.debug_bounds(selector).is_none(), "{hidden} waits for a query");
         }
