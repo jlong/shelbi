@@ -2574,37 +2574,63 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     //    It must be dropped before pane startup: the pane wrapper may call
     //    ensure_workspace_worktree while this function waits for readiness.
     let git_worktree_lock = shelbi_state::lock_git_worktrees(&spec.project.name)?;
+    //    A review slot only serves the branch, so it takes the branch tip as
+    //    a detached HEAD (`sync_review_worktree`): a branch checked out in
+    //    the hub checkout or another worktree must never block a review
+    //    load. `served` carries the commit it checked out.
     //    A failure here (dirty worktree, unreachable origin during the
     //    fresh-cut fetch, git error) aborts the dispatch before any pane
     //    is touched — surface it in events.log so `shelbi events tail`
     //    and the orchestrator see the stall, not just the CLI caller.
-    if let Err(e) = sync_worktree(
-        spec.project,
-        &host,
-        &machine,
-        &worktree,
-        spec.branch,
-        spec.project.base_branch(),
-    ) {
-        if let Err(log_err) = shelbi_state::append_dispatch_event(
-            &spec.project.name,
-            spec.task_id,
-            &spec.workspace.name,
-            "sync-failed",
-            &e.to_string(),
-        ) {
-            eprintln!("shelbi: failed to record dispatch sync failure in events.log: {log_err}");
+    let review_slot = spec.project.effective_tags(spec.workspace).contains("review");
+    let synced = if review_slot {
+        sync_review_worktree(
+            &host,
+            &machine,
+            &worktree,
+            spec.branch,
+            spec.project.base_branch(),
+        )
+        .map(Some)
+    } else {
+        sync_worktree(
+            spec.project,
+            &host,
+            &machine,
+            &worktree,
+            spec.branch,
+            spec.project.base_branch(),
+        )
+        .map(|()| None)
+    };
+    let served = match synced {
+        Ok(served) => served,
+        Err(e) => {
+            if let Err(log_err) = shelbi_state::append_dispatch_event(
+                &spec.project.name,
+                spec.task_id,
+                &spec.workspace.name,
+                "sync-failed",
+                &e.to_string(),
+            ) {
+                eprintln!("shelbi: failed to record dispatch sync failure in events.log: {log_err}");
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
 
     // 1b. Branch-discipline check (bug-worker-commit-landed-on-hub-main-
     //     checkout): the launch cwd's HEAD must be attached to the task
     //     branch before any agent starts. `sync_worktree` is supposed to
     //     guarantee this, so a mismatch means something raced or healed
     //     wrong — abort the dispatch rather than launch an agent whose
-    //     commits would land on the wrong ref.
-    if let Err(e) = verify_worktree_on_branch(&host, &worktree, spec.branch) {
+    //     commits would land on the wrong ref. A review slot is checked by
+    //     the commit it serves instead, since it is detached by design.
+    let verified = match &served {
+        Some(sha) => verify_worktree_at_commit(&host, &worktree, sha),
+        None => verify_worktree_on_branch(&host, &worktree, spec.branch),
+    };
+    if let Err(e) = verified {
         if let Err(log_err) = shelbi_state::append_dispatch_event(
             &spec.project.name,
             spec.task_id,
@@ -6226,42 +6252,7 @@ fn sync_worktree(
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let wt_str = worktree.to_string_lossy().into_owned();
 
-    // Shelbi ContextStore
-    // docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5:
-    // a dispatch killed after the worktree *dir* was created but before
-    // its `.git` gitlink was written leaves `<wt>` present-but-invalid.
-    // Every later `git worktree add <wt>` then aborts with "already exists"
-    // and wedges the workspace forever. Prune stale bookkeeping first, then
-    // — if the dir is present without a valid `.git` — force-remove any
-    // lingering registration and delete the dir so the `add` below starts
-    // from a clean slate. Both cleanups are best-effort: a `remove` that
-    // finds nothing registered is a harmless non-zero exit.
-    let _ = shelbi_ssh::run(host, ["git", "-C", &repo, "worktree", "prune"]);
-
-    let has_git = shelbi_ssh::run(host, ["test", "-d", &format!("{wt_str}/.git")])
-        .map_err(Error::Io)?
-        .status
-        .success()
-        || shelbi_ssh::run(host, ["test", "-f", &format!("{wt_str}/.git")])
-            .map_err(Error::Io)?
-            .status
-            .success();
-
-    if !has_git {
-        let dir_present = shelbi_ssh::run(host, ["test", "-d", &wt_str])
-            .map_err(Error::Io)?
-            .status
-            .success();
-        if dir_present {
-            let _ = shelbi_ssh::run(
-                host,
-                ["git", "-C", &repo, "worktree", "remove", "--force", &wt_str],
-            );
-            let _ = shelbi_ssh::run(host, ["rm", "-rf", &wt_str]);
-        }
-    }
-
-    let worktree_exists = has_git;
+    let worktree_exists = prune_and_heal_worktree_dir(host, &repo, &wt_str)?;
 
     let branch_exists =
         shelbi_ssh::run(host, ["git", "-C", &repo, "rev-parse", "--verify", branch])
@@ -6313,24 +6304,8 @@ fn sync_worktree(
         return Ok(());
     }
 
-    // Already exists — make sure it's clean and on the right branch. Ignore
-    // shelbi's own footprint: `.claude/` deploy files (settings.json,
-    // agent-instructions.md, skills/, the review marker) we rewrite on every
-    // dispatch, and `.shelbi/` runtime scratch (`.shelbi/messages/` inter-agent
-    // mail). Without the carve-out a repo that commits `.claude/` would be
-    // permanently "dirty" after the first dispatch, and an idle worktree whose
-    // only untracked entry is our own scratch would be wrongly rejected as
-    // "uncommitted user work". Mirrors `rebase_workspace_branch_onto_default`.
-    let dirty =
-        shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain", "-z"])?;
-    let user_dirty = user_dirty_porcelain_lines(&dirty);
-    if !user_dirty.is_empty() {
-        return Err(Error::Other(format!(
-            "workspace worktree at {wt_str} has uncommitted changes — \
-             commit, stash, or discard before assigning a new task:\n{}",
-            user_dirty.join("\n")
-        )));
-    }
+    // Already exists — make sure it's clean and on the right branch.
+    require_clean_worktree(host, &wt_str)?;
 
     let current = shelbi_ssh::run_capture(
         host,
@@ -6370,6 +6345,212 @@ fn sync_worktree(
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
+    }
+    Ok(())
+}
+
+/// Prune stale worktree bookkeeping and heal a present-but-invalid worktree
+/// dir, returning whether a valid worktree already exists at `wt_str`.
+///
+/// Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5:
+/// a dispatch killed after the worktree *dir* was created but before its
+/// `.git` gitlink was written leaves `<wt>` present-but-invalid. Every later
+/// `git worktree add <wt>` then aborts with "already exists" and wedges the
+/// workspace forever. Prune stale bookkeeping first, then — if the dir is
+/// present without a valid `.git` — force-remove any lingering registration
+/// and delete the dir so the caller's `add` starts from a clean slate. Both
+/// cleanups are best-effort: a `remove` that finds nothing registered is a
+/// harmless non-zero exit.
+fn prune_and_heal_worktree_dir(host: &Host, repo: &str, wt_str: &str) -> Result<bool> {
+    let _ = shelbi_ssh::run(host, ["git", "-C", repo, "worktree", "prune"]);
+
+    let has_git = shelbi_ssh::run(host, ["test", "-d", &format!("{wt_str}/.git")])
+        .map_err(Error::Io)?
+        .status
+        .success()
+        || shelbi_ssh::run(host, ["test", "-f", &format!("{wt_str}/.git")])
+            .map_err(Error::Io)?
+            .status
+            .success();
+
+    if !has_git {
+        let dir_present = shelbi_ssh::run(host, ["test", "-d", wt_str])
+            .map_err(Error::Io)?
+            .status
+            .success();
+        if dir_present {
+            let _ = shelbi_ssh::run(
+                host,
+                ["git", "-C", repo, "worktree", "remove", "--force", wt_str],
+            );
+            let _ = shelbi_ssh::run(host, ["rm", "-rf", wt_str]);
+        }
+    }
+    Ok(has_git)
+}
+
+/// Bail when an existing worktree holds uncommitted user work, so switching
+/// it to another task never silently loses changes. Ignores shelbi's own
+/// footprint: `.claude/` deploy files (settings.json, agent-instructions.md,
+/// skills/, the review marker) we rewrite on every dispatch, and `.shelbi/`
+/// runtime scratch (`.shelbi/messages/` inter-agent mail). Without the
+/// carve-out a repo that commits `.claude/` would be permanently "dirty" after
+/// the first dispatch, and an idle worktree whose only untracked entry is our
+/// own scratch would be wrongly rejected as "uncommitted user work". Mirrors
+/// `rebase_workspace_branch_onto_default`.
+fn require_clean_worktree(host: &Host, wt_str: &str) -> Result<()> {
+    let dirty =
+        shelbi_ssh::run_capture(host, ["git", "-C", wt_str, "status", "--porcelain", "-z"])?;
+    let user_dirty = user_dirty_porcelain_lines(&dirty);
+    if !user_dirty.is_empty() {
+        return Err(Error::Other(format!(
+            "workspace worktree at {wt_str} has uncommitted changes — \
+             commit, stash, or discard before assigning a new task:\n{}",
+            user_dirty.join("\n")
+        )));
+    }
+    Ok(())
+}
+
+/// The review-slot counterpart of [`sync_worktree`]: put the worktree on the
+/// task branch's tip as a **detached HEAD** and return the commit it serves.
+///
+/// A review slot only serves the branch; it never commits, so it doesn't need
+/// to hold the branch ref. Holding it is actively harmful: git refuses to
+/// check a branch out in two worktrees, so a plain `git checkout <branch>`
+/// dies with `fatal: '<branch>' is already used by worktree at ...` whenever
+/// the branch is live anywhere else in the repository — the hub checkout the
+/// user switched onto to build and install, or a worker's worktree. Detaching
+/// side-steps that entirely, and leaves the branch free for the merge /
+/// branch-delete primitives that run after review.
+///
+/// The served commit is the branch's current **remote** tip: `origin/<branch>`
+/// after a fetch, since the handoff pushes the branch before it reaches review
+/// and a worker on another machine only updates origin. When there is no
+/// origin, the fetch fails, or the branch isn't on origin, the local branch
+/// tip is served instead (the pre-detach behavior, which never fetched). A
+/// branch that exists nowhere yet serves the freshly-fetched base, matching
+/// the old path that cut the branch off it.
+///
+/// Like [`sync_worktree`], bails on a worktree holding uncommitted user work.
+fn sync_review_worktree(
+    host: &Host,
+    machine: &Machine,
+    worktree: &std::path::Path,
+    branch: &str,
+    default_branch: &str,
+) -> Result<String> {
+    let repo = machine.work_dir.to_string_lossy().into_owned();
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    let worktree_exists = prune_and_heal_worktree_dir(host, &repo, &wt_str)?;
+    if worktree_exists {
+        require_clean_worktree(host, &wt_str)?;
+    }
+
+    let target = resolve_review_checkout_target(host, &repo, branch, default_branch)?;
+    let sha = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &repo, "rev-parse", "--verify", &format!("{target}^{{commit}}")],
+    )?
+    .trim()
+    .to_string();
+
+    let (argv, out) = if worktree_exists {
+        let argv: Vec<String> = vec![
+            "git".into(),
+            "-C".into(),
+            wt_str.clone(),
+            "checkout".into(),
+            "--detach".into(),
+            sha.clone(),
+        ];
+        let out = shelbi_ssh::run(host, &argv);
+        (argv, out)
+    } else {
+        let argv: Vec<String> = vec![
+            "git".into(),
+            "-C".into(),
+            repo.clone(),
+            "worktree".into(),
+            "add".into(),
+            "--detach".into(),
+            wt_str.clone(),
+            sha.clone(),
+        ];
+        let out = worktree_add_with_recovery(host, &repo, &wt_str, &argv);
+        (argv, out)
+    };
+    let out = out.map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: argv.join(" "),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(sha)
+}
+
+/// The ref a review slot should serve for `branch` — see
+/// [`sync_review_worktree`] for the precedence and why.
+fn resolve_review_checkout_target(
+    host: &Host,
+    repo: &str,
+    branch: &str,
+    default_branch: &str,
+) -> Result<String> {
+    let has_origin = shelbi_ssh::run(
+        host,
+        ["git", "-C", repo, "config", "--get", "remote.origin.url"],
+    )
+    .map_err(Error::Io)?
+    .status
+    .success();
+    if has_origin {
+        // An explicit refspec so the remote-tracking ref updates even on a
+        // clone with a narrowed `remote.origin.fetch`. Resilient for the same
+        // flaky-ControlMaster reason as `resolve_fresh_cut_base`.
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let fetch = shelbi_ssh::run_resilient(host, ["git", "-C", repo, "fetch", "origin", &refspec])
+            .map_err(Error::Io)?;
+        if fetch.status.success() {
+            return Ok(format!("refs/remotes/origin/{branch}"));
+        }
+    }
+    let local = format!("refs/heads/{branch}");
+    let local_exists = shelbi_ssh::run(
+        host,
+        ["git", "-C", repo, "rev-parse", "--verify", "--quiet", &local],
+    )
+    .map_err(Error::Io)?
+    .status
+    .success();
+    if local_exists {
+        return Ok(local);
+    }
+    resolve_fresh_cut_base(host, repo, default_branch)
+}
+
+/// Assert the worktree's HEAD is at `sha` — the review-slot form of
+/// [`verify_worktree_on_branch`]. A review slot is deliberately detached (see
+/// [`sync_review_worktree`]), so it is checked by commit rather than by branch
+/// name.
+pub(crate) fn verify_worktree_at_commit(
+    host: &Host,
+    worktree: &std::path::Path,
+    sha: &str,
+) -> Result<()> {
+    let wt_str = worktree.to_string_lossy().into_owned();
+    let head = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "rev-parse", "HEAD"])?;
+    let head = head.trim();
+    if head != sha {
+        return Err(Error::Other(format!(
+            "refusing to serve review: worktree at {wt_str} has HEAD at `{head}` \
+             but the load checked out `{sha}` — re-run the review load after \
+             checking the worktree",
+        )));
     }
     Ok(())
 }
@@ -13867,61 +14048,7 @@ mod sync_worktree_freshcut_tests {
         let prev_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut runners = std::collections::BTreeMap::new();
-        runners.insert(
-            "claude".to_string(),
-            shelbi_core::AgentRunnerSpec {
-                command: "claude".into(),
-                flags: vec![],
-                prompt_injection: None,
-                dialog_signatures: vec![],
-                integration: None,
-            },
-        );
-        let project = Project { session: Default::default(),
-            name: "synccut".into(),
-            label: None,
-            display_name: None,
-            repo: machine_repo.to_string_lossy().into(),
-            default_branch: "main".into(),
-            default_workflow: None,
-            config_mode: None,
-            machines: vec![Machine {
-                name: "hub".into(),
-                kind: MachineKind::Local,
-                work_dir: machine_repo.clone(),
-                host: None,
-                tags: Vec::new(),
-                forward: None,
-            }],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
-            agent_runners: runners,
-            editor: None,
-            github_url: None,
-            workspaces: vec![WorkspaceSpec {
-                name: "alice".into(),
-                machine: "hub".into(),
-                tags: Vec::new(),
-                slot: None,
-            }],
-            workspace_poll_interval_secs: 5,
-            github_reconcile_interval_secs: 900,
-            // NOT "auto": keeps `require_auto_mode_supported` from probing
-            // the host's claude binary — this test is about the sync step.
-            workspace_permissions_mode: Some("acceptEdits".into()),
-            workspace_settings_template: None,
-            zen: shelbi_core::ZenConfig::default(),
-            heartbeat: shelbi_core::HeartbeatConfig::default(),
-            git: shelbi_core::GitConfig::default(),
-            review: shelbi_core::ReviewConfig::default(),
-            runners: Default::default(),
-            agents: Default::default(),
-            issue_tracker: Default::default(),
-            disk: shelbi_core::DiskConfig::default(),
-            detected_shapes: Vec::new(),
-        };
+        let project = dispatch_project(&machine_repo, "claude", Vec::new());
 
         let result = start_workspace_on_task(StartSpec {
             project: &project,
@@ -13954,6 +14081,281 @@ mod sync_worktree_freshcut_tests {
             !ref_exists(&machine_repo, "refs/heads/shelbi/task-ev"),
             "no branch may be cut when the dispatch aborts"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A one-machine (`hub`) project with a single workspace `alice` carrying
+    /// `tags`, whose runner launches `runner_command` — enough for
+    /// [`start_workspace_on_task`] to reach the worktree sync.
+    fn dispatch_project(machine_repo: &std::path::Path, runner_command: &str, tags: Vec<String>) -> Project {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            shelbi_core::AgentRunnerSpec {
+                command: runner_command.into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+                integration: None,
+            },
+        );
+        Project { session: Default::default(),
+            name: "synccut".into(),
+            label: None,
+            display_name: None,
+            repo: machine_repo.to_string_lossy().into(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: machine_repo.to_path_buf(),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![WorkspaceSpec {
+                name: "alice".into(),
+                machine: "hub".into(),
+                tags,
+                slot: None,
+            }],
+            workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
+            // NOT "auto": keeps `require_auto_mode_supported` from probing
+            // the host's claude binary — these tests are about the sync step.
+            workspace_permissions_mode: Some("acceptEdits".into()),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
+            issue_tracker: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    fn head_ref(wt: &std::path::Path) -> String {
+        let out = run_git_in(wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_git_ok(&out, "worktree HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The observed `review-load-branch-in-use` shape: task branch
+    /// `shelbi/feat` is pushed to origin and checked out in the machine's own
+    /// (hub) checkout, and another clone has since advanced it on origin, so
+    /// the remote tip is ahead of the hub's local ref. Returns
+    /// `(root, machine_repo, remote_tip)`.
+    fn branch_in_use_fixture(label: &str) -> (PathBuf, PathBuf, String) {
+        let (root, machine, _fresh, _stale) = stale_clone_fixture(label);
+        assert_git_ok(
+            &run_git_in(&machine, &["checkout", "-q", "-b", "shelbi/feat"]),
+            "hub checks out the task branch",
+        );
+        commit_file(&machine, "feat.txt", "v1\n", "feat v1");
+        assert_git_ok(
+            &run_git_in(&machine, &["push", "-q", "origin", "shelbi/feat"]),
+            "push task branch",
+        );
+
+        let writer = root.join("writer");
+        assert_git_ok(&run_git_in(&writer, &["fetch", "-q", "origin"]), "writer fetch");
+        assert_git_ok(
+            &run_git_in(
+                &writer,
+                &["checkout", "-q", "-b", "shelbi/feat", "origin/shelbi/feat"],
+            ),
+            "writer checks out the task branch",
+        );
+        commit_file(&writer, "feat.txt", "v2\n", "feat v2");
+        assert_git_ok(
+            &run_git_in(&writer, &["push", "-q", "origin", "shelbi/feat"]),
+            "writer pushes past the hub",
+        );
+        let remote_tip = rev_parse(&writer, "HEAD");
+        assert_ne!(
+            rev_parse(&machine, "refs/heads/shelbi/feat"),
+            remote_tip,
+            "fixture must put origin ahead of the hub's local branch"
+        );
+        (root, machine, remote_tip)
+    }
+
+    #[test]
+    fn review_sync_serves_remote_tip_while_branch_is_checked_out_in_hub() {
+        // review-load-branch-in-use: an existing review worktree (idle,
+        // detached at main) loads a branch the hub checkout holds. A plain
+        // `git checkout <branch>` dies with "already used by worktree"; the
+        // review sync must detach at the remote tip instead.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (root, machine, remote_tip) = branch_in_use_fixture("review-in-use");
+        let wt = root.join("wt-review");
+        assert_git_ok(
+            &run_git_in(
+                &machine,
+                &["worktree", "add", "-q", "--detach", wt.to_str().unwrap(), "main"],
+            ),
+            "idle review worktree",
+        );
+        // The bug's precondition: the named checkout is refused.
+        assert!(
+            !run_git_in(&wt, &["checkout", "-q", "shelbi/feat"]).status.success(),
+            "fixture must reproduce git refusing the in-use branch"
+        );
+
+        let served = sync_review_worktree(
+            &Host::Local,
+            &machine_at(&machine),
+            &wt,
+            "shelbi/feat",
+            "main",
+        )
+        .expect("review sync must not be blocked by the hub holding the branch");
+
+        assert_eq!(served, remote_tip, "review serves the branch's remote tip");
+        assert_eq!(rev_parse(&wt, "HEAD"), remote_tip);
+        assert_eq!(head_ref(&wt), "HEAD", "review worktree is detached");
+        assert_eq!(
+            head_ref(&machine),
+            "shelbi/feat",
+            "the hub checkout keeps its branch"
+        );
+        verify_worktree_at_commit(&Host::Local, &wt, &served).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review_sync_creates_a_missing_worktree_detached_at_remote_tip() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (root, machine, remote_tip) = branch_in_use_fixture("review-missing");
+        let wt = root.join("wt-review");
+
+        let served = sync_review_worktree(
+            &Host::Local,
+            &machine_at(&machine),
+            &wt,
+            "shelbi/feat",
+            "main",
+        )
+        .expect("review sync must create the worktree detached");
+
+        assert_eq!(served, remote_tip);
+        assert_eq!(rev_parse(&wt, "HEAD"), remote_tip);
+        assert_eq!(head_ref(&wt), "HEAD");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review_sync_without_origin_serves_the_local_branch_tip() {
+        // Local-only project: no origin to fetch, so the local branch is the
+        // source of truth — still detached, still unblocked by the main
+        // checkout holding it.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let root = fresh_root("review-no-origin");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert_git_ok(&run_git_in(&repo, &["init", "-q", "-b", "main"]), "git init");
+        commit_file(&repo, "README.md", "# repo\n", "initial");
+        assert_git_ok(
+            &run_git_in(&repo, &["checkout", "-q", "-b", "shelbi/feat"]),
+            "main checkout holds the task branch",
+        );
+        commit_file(&repo, "feat.txt", "v1\n", "feat v1");
+        let local_tip = rev_parse(&repo, "shelbi/feat");
+        let wt = root.join("wt-review");
+
+        let served = sync_review_worktree(
+            &Host::Local,
+            &machine_at(&repo),
+            &wt,
+            "shelbi/feat",
+            "main",
+        )
+        .expect("no-origin review sync must serve the local branch");
+
+        assert_eq!(served, local_tip);
+        assert_eq!(rev_parse(&wt, "HEAD"), local_tip);
+        assert_eq!(head_ref(&wt), "HEAD");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review_load_dispatch_passes_sync_while_branch_is_checked_out_elsewhere() {
+        // End to end through `start_workspace_on_task`, the chokepoint every
+        // review load funnels through: a `review`-tagged slot loading a
+        // branch the hub checkout holds gets past the sync and the
+        // post-checkout verification. The runner binary is deliberately
+        // missing so the dispatch stops at the next step, before any pane.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let (root, machine_repo, remote_tip) = branch_in_use_fixture("review-dispatch");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = dispatch_project(
+            &machine_repo,
+            "shelbi-test-missing-runner-binary",
+            vec!["review".into()],
+        );
+        let wt = workspace_worktree(&project.machines[0], &project.workspaces[0]);
+
+        let result = start_workspace_on_task(StartSpec {
+            project: &project,
+            workspace: &project.workspaces[0],
+            task_id: "task-rv",
+            branch: "shelbi/feat",
+            task_body: "",
+            agent: None,
+            launch_override: None,
+        });
+
+        let events = std::fs::read_to_string(home.join("events.log")).unwrap_or_default();
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+
+        let err = result.expect_err("the missing runner binary must stop the dispatch");
+        assert!(
+            err.to_string().contains("shelbi-test-missing-runner-binary"),
+            "dispatch must fail at the runner check, past the sync: {err}"
+        );
+        assert!(
+            !events.contains("status=sync-failed") && !events.contains("status=branch-mismatch"),
+            "review load must not fail its worktree sync: {events}"
+        );
+        assert_eq!(rev_parse(&wt, "HEAD"), remote_tip);
+        assert_eq!(head_ref(&wt), "HEAD");
+        assert_eq!(head_ref(&machine_repo), "shelbi/feat");
 
         let _ = std::fs::remove_dir_all(&root);
     }
