@@ -89,6 +89,7 @@ is left, and how it was verified.
 | `dt-instant-panel-push` | The panel's push starts on the input's next frame (before the review load answers) and its session attaches once it settles | [`status/dt-instant-panel-push.md`](status/dt-instant-panel-push.md) |
 | `dt-board-stale-after-own-mutation` | A card's second change goes right after its first: the daemon's reply carries the state the change landed at, and the board sends the next one against it | [`status/dt-board-stale-after-own-mutation.md`](status/dt-board-stale-after-own-mutation.md) |
 | `dt-switch-project-in-window` | A project switch retargets the current window in place, restoring where the project was left; File ▸ New Window (⌘⇧N) opens more; window frames per slot, restored at launch | [`status/dt-switch-project-in-window.md`](status/dt-switch-project-in-window.md) |
+| `dt-figma-visual-harness` | `--visual-figma` renders the ten Figma mockup screens in both themes over the mockups' content; `scripts/figma-diff.sh` diffs them against the reference PNGs; the baseline report | [`status/dt-figma-visual-harness.md`](status/dt-figma-visual-harness.md) |
 | `dt-taskpage-theme` | The desktop's own palette and component shapes after the Taskpage design system, light and dark; the TUI keeps its colors | [`theme.md`](theme.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore

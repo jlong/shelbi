@@ -244,6 +244,14 @@ impl ActivityState {
         }
     }
 
+    /// Select feed item `ix` without opening it (`--visual-figma`).
+    #[cfg(feature = "visual-check")]
+    pub fn select_item(&mut self, ix: usize) {
+        if matches!(self.feed.items.get(ix), Some(FeedItem::Row(_))) {
+            self.selected = Some(ix);
+        }
+    }
+
     /// Select feed item `ix` (a click) and open it.
     pub fn click(&mut self, ix: usize) -> Vec<Intent> {
         if !matches!(self.feed.items.get(ix), Some(FeedItem::Row(_))) {

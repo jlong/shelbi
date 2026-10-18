@@ -1416,11 +1416,19 @@ fn summarize(samples: &[Duration]) -> String {
 /// child renders into `<dir>/<theme>/` and paints with [`theme`]. Set the
 /// variable to render one theme only.
 pub fn out_dir(arg: Option<String>) -> PathBuf {
+    let (dir, theme) = per_theme(arg);
+    dir.join(theme)
+}
+
+/// [`out_dir`]'s re-run, for a mode that names its frames by theme itself
+/// (`--visual-figma`'s `<screen>-<theme>.png`): the directory as given and
+/// the theme this run paints.
+pub fn per_theme(arg: Option<String>) -> (PathBuf, &'static str) {
     let dir = arg
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("visual-check").to_path_buf());
     if let Some(theme) = theme_name() {
-        return dir.join(theme);
+        return (dir, theme);
     }
     let mut failed = false;
     for theme in ["dark", "light"] {

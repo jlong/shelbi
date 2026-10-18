@@ -106,6 +106,14 @@ impl MachinesState {
             .is_some_and(|&p| p == (mi, wi))
     }
 
+    /// Select the `ix`-th workspace row (`--visual-figma`).
+    #[cfg(feature = "visual-check")]
+    pub fn select_row(&mut self, ix: usize) {
+        if ix < self.positions.len() {
+            self.selected = Some(ix);
+        }
+    }
+
     pub fn selected_workspace(&self) -> Option<&MachineWorkspace> {
         let &(mi, wi) = self.positions.get(self.selected?)?;
         self.model.machines.get(mi)?.workspaces.get(wi)
