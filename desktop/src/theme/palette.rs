@@ -104,6 +104,10 @@ pub mod figma {
     pub const SUCCESS_FILL: Pair = pair(0x5ac3512e, 0x5ac3511f);
     pub const SUCCESS_FILL_HOVER: Pair = pair(0x5ac35147, 0x5ac35138);
     pub const SUCCESS_FILL_ACTIVE: Pair = pair(0x5ac35161, 0x5ac35152);
+    /// The Success style's label and icon: `#86d580` in Dark (the dark
+    /// Review frame's Approve, an override of `text/green`), `text/green` in
+    /// Light.
+    pub const SUCCESS_LABEL: Pair = pair(0x86d580ff, 0x00753dff);
     /// The Danger style: `#f21478` at the same alphas.
     pub const DANGER_FILL: Pair = pair(0xf214782e, 0xf214781f);
     pub const DANGER_FILL_HOVER: Pair = pair(0xf2147847, 0xf2147838);
@@ -382,6 +386,8 @@ palette! {
     success_fill_hover,
     /// The Success button pressed.
     success_fill_active,
+    /// The Success button's label and icon.
+    success_label,
     /// The Danger button, and the unread-errors button.
     danger_fill,
     /// The Danger button hovered.
@@ -518,6 +524,7 @@ impl Palette {
             success_fill: pick(SUCCESS_FILL),
             success_fill_hover: pick(SUCCESS_FILL_HOVER),
             success_fill_active: pick(SUCCESS_FILL_ACTIVE),
+            success_label: pick(SUCCESS_LABEL),
             danger_fill: pick(DANGER_FILL),
             danger_fill_hover: pick(DANGER_FILL_HOVER),
             danger_fill_active: pick(DANGER_FILL_ACTIVE),
@@ -596,8 +603,8 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "gray on selection"),
     ("dark", "theme_green on selection"),
     ("dark", "theme_cyan on selection"),
-    ("dark", "success on hover button"),
-    ("dark", "success on pressed button"),
+    ("dark", "success_label on hover button"),
+    ("dark", "success_label on pressed button"),
     ("dark", "error on rest button"),
     ("dark", "error on hover button"),
     ("dark", "error on pressed button"),
@@ -610,7 +617,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "icon on"),
     ("light", "link on"),
     ("light", "green on green_tint"),
-    ("light", "success on pressed button"),
+    ("light", "success_label on pressed button"),
     ("light", "error on pressed button"),
     ("light", "focus_ring on"),
     ("light", "dark_gray on selection"),
@@ -744,8 +751,8 @@ mod tests {
                     [p.background, p.background_hover, p.background_active],
                 ),
                 (
-                    "success",
-                    p.success,
+                    "success_label",
+                    p.success_label,
                     [p.success_fill, p.success_fill_hover, p.success_fill_active],
                 ),
                 (

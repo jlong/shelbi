@@ -148,6 +148,9 @@ const DEFAULT_HEIGHT: f32 = 800.0;
 const STARTUP_STATUS: &str = "Starting the orchestrator…";
 /// How far a new window sits off the one it was opened from.
 const CASCADE: f32 = 28.0;
+/// How wide the column divider's grab room is: its own point and the
+/// column's last four.
+const RESIZE_GRAB: f32 = 5.0;
 /// The title of a window with no project (the empty-state chooser).
 const CHOOSER_TITLE: &str = "Shelbi";
 
@@ -3946,27 +3949,29 @@ impl ShelbiWindow {
             theme.divider
         };
         let handle = column_shown.then(|| {
-            // The column's right-edge divider, with a few pixels of grab
-            // room. It resizes whichever panel the column shows.
-            div()
-                .id("sidebar-resize")
-                .debug_selector(|| "sidebar-resize".into())
-                .w(px(5.0))
-                .h_full()
-                .flex_none()
-                .flex()
-                .justify_end()
-                .bg(theme.sidebar)
-                .cursor(CursorStyle::ResizeLeftRight)
-                .child(div().w(px(1.0)).h_full().bg(divider_color))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.dragging = true;
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                )
+            // The column's right-edge divider: 1pt in the layout, as Figma
+            // draws it (the main area starts right after it), its grab room
+            // laid over the column's edge. It resizes whichever panel the
+            // column shows.
+            div().relative().w(px(1.0)).h_full().flex_none().bg(divider_color).child(
+                div()
+                    .id("sidebar-resize")
+                    .debug_selector(|| "sidebar-resize".into())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(RESIZE_GRAB))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dragging = true;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
         });
 
         let shell = div()

@@ -22,8 +22,11 @@
 //! machines, settings and command-palette, plus the palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
-//! collapsed, Zen off, the sidebar hidden) and the issue detail's
-//! ([`DETAIL_ACTIONS`] hovered, a long body scrolled).
+//! collapsed, Zen off, the sidebar hidden), the issue detail's
+//! ([`DETAIL_ACTIONS`] hovered, a long body scrolled) and the task panels'
+//! (`state-review-*`, `state-workspace-*`: More, each view's ⌘N, Approve
+//! and Reject hovered and pressed). `SHELBI_VISUAL_ONLY=panels` renders
+//! just the Review and Workspace screens and those states.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -61,6 +64,9 @@ use crate::views::session_view::{SessionConnector, SessionDeps};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceOps};
 
 const PROJECT: &str = "my-project";
+/// `SHELBI_VISUAL_ONLY=panels` renders only the Review and Workspace
+/// screens and their panels' states.
+const ONLY_VAR: &str = "SHELBI_VISUAL_ONLY";
 /// The reference PNGs' size, in points.
 const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 1024;
@@ -198,7 +204,7 @@ fn worktree(name: &str) -> String {
 const UMBRELLA_TITLE: &str = "Desktop application (umbrella)";
 const UMBRELLA_BODY: &str = "Build a native desktop client for Shelbi. This should share state with the TUI \
 through a persistent daemon running in the background. Use Alacritty for the terminal. Use GPUI for the \
-interface. Don't stop until every view matches the TUI and the reviews pass.\n\n## Acceptance criteria\n\n\
+interface. Don’t stop until every view matches the TUI and the reviews pass.\n\n## Acceptance criteria\n\n\
 - [x] Native sidebar and project navigation\n- [x] Terminal rendering, selection, search, and keyboard input\n\
 - [x] Issues board and task details\n- [x] Workspace and review views with live sessions\n\
 - [ ] Final visual review and packaging\n";
@@ -561,6 +567,8 @@ fn pinned_now() -> DateTime<Utc> {
 impl Run {
     /// A fresh window on the fixture project.
     fn open(&mut self) -> WindowHandle<ShelbiWindow> {
+        // A pressed button in the last window must not stay pressed here.
+        crate::theme::motion::reset_pointers();
         let retina = if self.native && !self.warned { self.open_on_retina() } else { None };
         if self.native && retina.is_none() && !self.warned {
             self.warned = true;
@@ -783,6 +791,13 @@ impl Run {
 
     fn all(&mut self) {
         let orch = View::Session("orch".into());
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "panels") {
+            // Just the task panels, for QA on them.
+            self.review(&orch, "review", |_, _| {});
+            self.workspace(&orch, "workspace", |_, _| {});
+            self.panel_states(&orch);
+            return;
+        }
 
         // The orchestrator chat.
         let handle = self.open();
@@ -847,27 +862,9 @@ impl Run {
         });
         self.save(handle, "activity");
 
-        // The Review panel in the sidebar's column, the reviewer beside it.
-        let handle = self.open();
-        self.click(handle, orch.clone());
-        handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_review(review_info(), window, cx))
-            .unwrap();
-        self.settle(handle);
-        let review = handle.update(&mut self.cx, |w, _, _| w.offscreen_review()).unwrap();
-        self.expect("review: the panel opens", review.is_some());
-        if let Some(review) = review {
-            review.update(&mut self.cx, |v, cx| {
-                v.update_row(Some(sidebar_model().reviews[0].clone()), cx)
-            });
-        }
-        self.save(handle, "review");
-
-        // A working workspace, then an idle one.
-        let handle = self.open();
-        self.click(handle, orch.clone());
-        self.click(handle, View::Session("alpha".into()));
-        self.save(handle, "workspace");
+        self.review(&orch, "review", |_, _| {});
+        self.workspace(&orch, "workspace", |_, _| {});
+        self.panel_states(&orch);
         // The idle frame shows charlie idle (no task), while every other
         // frame's sidebar has it awaiting input on a task: the mockups
         // disagree, and an idle page belongs to a task-less workspace.
@@ -928,6 +925,87 @@ impl Run {
             .filter(|s| !self.out.join(format!("{s}-{}.png", self.theme)).exists())
             .collect();
         self.expect(&format!("all {} screens saved", SCREENS.len()), missing.is_empty());
+    }
+
+    /// The Review panel in the sidebar's column, the reviewer beside it,
+    /// saved as `screen` after `then` acts on the open window.
+    fn review(&mut self, orch: &View, screen: &str, then: impl FnOnce(&mut Self, WindowHandle<ShelbiWindow>)) {
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_review(review_info(), window, cx))
+            .unwrap();
+        self.settle(handle);
+        let review = handle.update(&mut self.cx, |w, _, _| w.offscreen_review()).unwrap();
+        self.expect(&format!("{screen}: the panel opens"), review.is_some());
+        if let Some(review) = review {
+            review.update(&mut self.cx, |v, cx| {
+                v.update_row(Some(sidebar_model().reviews[0].clone()), cx)
+            });
+        }
+        self.settle(handle);
+        then(self, handle);
+        self.save(handle, screen);
+    }
+
+    /// A working workspace, saved as `screen` after `then` acts on the
+    /// open window.
+    fn workspace(&mut self, orch: &View, screen: &str, then: impl FnOnce(&mut Self, WindowHandle<ShelbiWindow>)) {
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        self.click(handle, View::Session("alpha".into()));
+        self.settle(handle);
+        then(self, handle);
+        self.save(handle, screen);
+    }
+
+    /// The task panels' states the frames don't draw
+    /// (`state-{review,workspace}-<name>-<theme>.png`; no reference, checked
+    /// by eye): the description expanded by More, each view picked with its
+    /// ⌘N, and Approve and Reject hovered and pressed.
+    fn panel_states(&mut self, orch: &View) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        // Points inside the frames' controls (State=Review / Workspace):
+        // More at (18, 230), Approve 91x28 at (12, 560), Reject 80x28 at
+        // (115, 560).
+        let more = point(px(30.0), px(236.0));
+        let approve = point(px(57.0), px(574.0));
+        let reject = point(px(155.0), px(574.0));
+        let click = |run: &mut Self, handle: WindowHandle<ShelbiWindow>, at| {
+            run.cx.simulate_click(handle.into(), at, Modifiers::none());
+            run.settle(handle);
+        };
+        let keys = |keys: &'static str| {
+            move |run: &mut Self, handle: WindowHandle<ShelbiWindow>| {
+                run.cx.simulate_keystrokes(handle.into(), keys);
+                run.settle(handle);
+            }
+        };
+
+        self.review(orch, "state-review-more", |run, handle| click(run, handle, more));
+        for n in 2..=5 {
+            let chord: &'static str = ["", "", "cmd-2", "cmd-3", "cmd-4", "cmd-5"][n];
+            self.review(orch, &format!("state-review-view-{n}"), keys(chord));
+        }
+        for (name, at) in [("approve", approve), ("reject", reject)] {
+            self.review(orch, &format!("state-review-{name}-hover"), |run, handle| {
+                run.cx.simulate_mouse_move(handle.into(), at, None, Modifiers::none());
+                run.settle(handle);
+            });
+            self.review(orch, &format!("state-review-{name}-pressed"), |run, handle| {
+                run.cx.simulate_mouse_move(handle.into(), at, None, Modifiers::none());
+                run.cx.simulate_mouse_down(handle.into(), at, MouseButton::Left, Modifiers::none());
+                run.settle(handle);
+            });
+        }
+
+        // The workspace panel's worktree row is 8pt taller, so More is too.
+        self.workspace(orch, "state-workspace-more", |run, handle| click(run, handle, more));
+        for n in 2..=4 {
+            let chord: &'static str = ["", "", "cmd-2", "cmd-3", "cmd-4"][n];
+            self.workspace(orch, &format!("state-workspace-view-{n}"), keys(chord));
+        }
     }
 
     /// The terminal states the frames don't draw, over the orchestrator

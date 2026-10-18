@@ -300,7 +300,7 @@ fn kit_colors(c: &mut gpui_kit::component::ThemeColor, t: &Theme) {
     c.primary = t.success_fill;
     c.primary_hover = t.success_fill_hover;
     c.primary_active = t.success_fill_active;
-    c.primary_foreground = t.success;
+    c.primary_foreground = t.success_label;
     c.secondary = t.background;
     c.secondary_hover = t.background_hover;
     c.secondary_active = t.background_active;

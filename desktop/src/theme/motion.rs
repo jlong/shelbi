@@ -271,6 +271,13 @@ thread_local! {
     static POINTERS: RefCell<HashMap<SharedString, Pointer>> = RefCell::new(HashMap::new());
 }
 
+/// Forget every control's pointer state, so a fresh offscreen window starts
+/// with nothing hovered or pressed (the state is keyed by id, not window).
+#[cfg(feature = "visual-check")]
+pub fn reset_pointers() {
+    POINTERS.with(|p| p.borrow_mut().clear());
+}
+
 fn pointer(key: &SharedString) -> Pointer {
     POINTERS.with(|p| p.borrow().get(key).copied().unwrap_or_default())
 }

@@ -219,8 +219,8 @@ impl ReviewPanelModel {
 }
 
 /// A markdown body as one stream of plain prose: headings dropped (they label
-/// sections, they aren't prose), list and blockquote markers and inline-code
-/// backticks stripped, whitespace collapsed. Emphasis markers are left alone
+/// sections, they aren't prose), list, task-list (`[x]`) and blockquote
+/// markers and inline-code backticks stripped, whitespace collapsed. Emphasis markers are left alone
 /// so identifiers like `snake_case` survive. The TUI wraps this into its
 /// three-line preview; the desktop clamps it.
 pub fn description_text(body: &str) -> String {
@@ -241,8 +241,16 @@ fn strip_block_markers(line: &str) -> String {
     if t.starts_with('#') {
         return String::new();
     }
-    t = strip_list_marker(t);
-    t.replace('`', "")
+    let item = strip_list_marker(t);
+    if item.len() < t.len() {
+        // A task list item's checkbox, as GitHub draws it.
+        for checkbox in ["[ ] ", "[x] ", "[X] "] {
+            if let Some(rest) = item.strip_prefix(checkbox) {
+                return rest.trim_start().replace('`', "");
+            }
+        }
+    }
+    item.replace('`', "")
 }
 
 /// Strip a single leading list marker (`- `, `* `, `+ `, or an ordered
@@ -1162,5 +1170,6 @@ mod tests {
     fn description_text_strips_block_markdown() {
         assert_eq!(description_text(""), "");
         assert_eq!(description_text("# Title\n\n1. one\n2) two\n* three"), "one two three");
+        assert_eq!(description_text("- [x] done\n- [ ] open\n[x] prose"), "done open [x] prose");
     }
 }
