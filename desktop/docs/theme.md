@@ -139,12 +139,14 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Dropdown | A button that opens a menu (the board's filters): the Figma Button at X-Small with a left icon, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the 18px icon (`icons::FUNNEL_BUTTON`, in `button_icon`) sits in Figma's 14px Icon slot (`icon_slot`), which makes the button 26px tall; pressed while its menu is open (the icon keeps its color), and the menu opens 6px under it |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
-| Segmented control | No track: segments in a bare row 4px apart, the selected one on the `selection` chip, which slides between them. Settings' (`choice_track` / `choice`): 26px, 12px across, Base; the selected one Base medium and loud, the others `form_text`, a fill fading in on hover. Activity's kind filter is its own (below) |
+| Segmented control | The Segmented Control component (`elements::controls::segmented_track` / `segment`): a `search` track, 4px in, 10px corners; items 24px, 12px across, Base in `form_text`, a fill fading in on hover; the selected one Base medium and loud on the canvas with `shadow/raised card`'s drops (`selected_segment`), which slides between items. Activity's kind filter is its own (below) |
 | Activity filters | The Activity frame's own: kind segments in a bare row 4px apart (no track), 24px, 8px across, X-Small, muted, the selected one `selection` and loud; then, 16px on, the pickers: `search`'s fill, a 14px icon (the small Heroicons, `icons::FUNNEL_SMALL`, `USER_SMALL`: 1.5px stroke at 14px, as Figma draws them), 8px, an X-Small label, no chevron, icon and label in `log_text` (`filter_segment`, `filter_dropdown`) |
 | Icon button | 24 or 32px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the overlay fill while active |
-| Text field | `field`: 360 x 32, 10px across, 6px corners, the canvas inside a 1px `input_border` (`theme.divider`), Base in `gray`, as Settings draws it; the font picker and the size stepper wear the same shape |
-| Form button | `form_button`: Settings' "Open keys.yaml": `theme.search`, 26px, 12px across, Base in `gray` |
-| Checkbox | 14px, 2px corners; checked, the loud color with the mark in the canvas; unchecked, a 1px `muted` edge (Settings) |
+| Labeled control | The Labeled Control component (`labeled_control`): the label (Base, loud), the control, then an optional helper (X-Small, `form_hint`), 6px apart, at most 640px wide. Every Settings row |
+| Textbox | The Textbox component (`textbox`): 32px, the `textbox` well (5px corners, 8px across) inside a 1px `input_border` (6px corners), Base in `form_text`, a placeholder in `form_hint`; focused, the edge is `focus_ring` with a 3px `focus_glow` band just outside it, and the caret is `focus_ring` |
+| Picker | The Picker component (`picker`): a growing textbox, 8px, a form button; 400px. The font picker ("Choose font") and the Shelbi CLI ("Browse") |
+| Form button | `form_button`: the Button component's Default style at the Base size: 32px, 12px across, 6px corners, Base medium, loud, on `background`. `form_icon_button`: its 32px square Icon Button, the 20px icon in `button_icon` (the size stepper's − and +) |
+| Checkbox | The Check, Checkbox and Checkbox List components (`check`, `checkbox`, `checkbox_list`): a 12px box with 2px corners stroked 1px outside (as Figma strokes it: 14px edge to edge, 3px corners), unchecked the `textbox` well in an `input_border` edge, checked `check_fill` with the 12pt mark in white; the label Base, loud when checked and `form_text` when not, 8px on, 2px in; focused, the edge turns `focus_ring` (`check_fill` checked) with a 3px glow around it (`focus_glow`, `check_glow` checked). The list stacks them 4px apart, 4px in |
 | Menu, popover | `raised`, 8px corners, a 1px `ring` and a soft drop |
 | Palette | The Command palette frame: over the `scrim`, 200px down, 788px wide (a 580px commands column, a 160px Projects column, 16px between and either side); `raised`, 8px corners, no ring, `palette_shadow` (0 10 15 -3). A 44px query line (`❯`, a 2x18px `link` caret, the placeholder `muted`), 32px rows (6px across and between, 6px corners: a 20px `icon`, the name in a 220px column in Base medium `foreground`, the description in Base `muted`; the selected row on `background`, its name Base semibold `text_loud`, its description `foreground`), 26px project rows, an X-Small `muted` footer |
 | Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
@@ -212,7 +214,8 @@ until a new role has its row here, with the values the palette really has.
 | `sidebar` | `#2c3140` | `#f9f9fc` | Measured (the Navigation fill): the sidebar, the review and workspace panels |
 | `card` | `#020303` | `#ffffff` | Measured (Issues): a board card |
 | `raised` | `#2c3140` | `#f9f9fc` | Measured (Command palette): the palette, menus, popovers, tooltips |
-| `well` | `#1e2330` | `#ffffff` | `theme.canvas`: a text field, a command box |
+| `well` | `#1e2330` | `#ffffff` | `theme.canvas`: the bootstrap screen's command box |
+| `textbox` | `#020303` | `#ffffff` | The Textbox component's well (the dark Settings frame draws `#020303`; white in Light), and an unchecked box's fill |
 
 ### Overlay fills
 
@@ -233,7 +236,8 @@ until a new role has its row here, with the values the palette really has.
 | `text_loud` | `#f8f8fa` | `#020303` | `theme.white`: titles, the selected row, a workspace name |
 | `foreground` | `#f2f3f7b2` | `#020303b2` | `theme.foreground`: body text and labels |
 | `gray` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: hotkeys, secondary text |
-| `form_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Settings frame overrides it (opaque, both modes): a field's value, an unselected choice, a form button's label |
+| `form_text` | `#f2f3f7d9` | `#020303b2` | `theme.foreground` as the Settings frame and the form components set it: a textbox's value, an unselected segment or checkbox |
+| `form_hint` | `#f2f3f78c` | `#444c6580` | `theme.muted` as the Settings frame and the form components set it: a labeled control's helper, a textbox's placeholder |
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
 | `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
@@ -257,7 +261,7 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `divider` | `#acb4cf1a` | `#acb4cf1a` | `theme.divider`: dividers and hairlines |
 | `divider_strong` | `#acb4cf33` | `#acb4cf33` | The Issues frame's `theme.divider`: the board's rules |
-| `input_border` | `#acb4cf1a` | `#acb4cf1a` | `theme.divider` (Settings): a text field's border |
+| `input_border` | `#acb4cf4d` | `#acb4cf80` | `theme.divider` as the Settings frame and the form components set it: a textbox's and an unchecked box's edge |
 
 ### Links and focus
 
@@ -267,6 +271,8 @@ until a new role has its row here, with the values the palette really has.
 | `link_hover` | `#f8f8fa` | `#020303` | `theme.white`: a hovered link |
 | `focus_ring` | `#62cdf6` | `#31ade9` | `focus/default/ring`: the 1px focus ring, the find caret, drop targets |
 | `focus_glow` | `#12adff33` | `#12adff33` | `focus/default/focus-glow`: the 4px glow outside it |
+| `check_fill` | `#31ade9` | `#f21478` | `checkbox/select/background` and `/border`: a checked box (Dark from the Settings frame, Light from the components page), and a focused checked box's ring |
+| `check_glow` | `#12adff33` | `#ff66ab33` | `checkbox/select/focus-glow` (Light); Figma has no Dark value, so Dark keeps `focus/default/focus-glow` |
 
 ### Meaning
 
@@ -398,8 +404,8 @@ with its worst ratio. **Flagged for John.**
 | dark | error on hover button | 3.94 | The same, hovered |
 | dark | error on pressed button | 3.53 | The same, pressed |
 | dark | button_icon on | 2.58 | The Button component's icon (`#acb4cf` at 60%) on a button's fill over the sidebar; decorative beside the button's label |
-| dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
-| dark | form_text on | 2.53 | The Settings frame's `theme.gray` override, `#7b85a7`: a field's value and an unselected choice 4.30 on the canvas, "Open keys.yaml" 2.53 on its `theme.search` fill |
+| dark | input_border on | 1.76 | `theme.divider` (`#acb4cf` at 30%) as a textbox's edge (Settings); the textbox also differs by its near-black well and its label |
+| dark | text_on_color on check_fill | 2.53 | The check mark (white) on the dark checked box (`#31ade9`), as the Settings frame draws it; the box itself is 6.19 on the canvas |
 | dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
@@ -414,8 +420,8 @@ with its worst ratio. **Flagged for John.**
 | light | theme_green on selection | 4.02 | The same row: `working` in `theme.green` (5.0 on white) |
 | light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
 | light | button_icon on | 2.81 | `theme.gray` as the Button component's icon, on a button's fill; decorative beside the label |
-| light | input_border on | 1.06 | `theme.divider` as a field's edge |
-| light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
+| light | input_border on | 1.38 | `theme.divider` (`#acb4cf` at 50%) as a textbox's edge |
+| light | form_hint on | 2.46 | The form components' `theme.muted` (`#444c65` at 50%): a helper line, a placeholder |
 | light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 
 ## Renders

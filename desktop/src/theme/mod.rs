@@ -288,7 +288,9 @@ fn kit_colors(c: &mut gpui_kit::component::ThemeColor, t: &Theme) {
     c.border = t.divider_strong;
     c.input = t.input_border;
     c.ring = t.focus_ring;
-    c.caret = t.text_loud;
+    // The Textbox component draws its cursor in `focus/default/ring` (the
+    // palette's own caret is the same family, `text/cyan`).
+    c.caret = t.focus_ring;
     c.selection = t.text_selection;
     c.muted = t.background;
     c.muted_foreground = t.muted;

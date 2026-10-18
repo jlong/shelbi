@@ -56,10 +56,23 @@ pub mod figma {
     pub const WHITE: Pair = pair(0xf8f8faff, 0x020303ff);
     /// `theme.gray`: secondary text, hotkeys, icons.
     pub const GRAY: Pair = pair(0xacb4cfe5, 0x7b85a7e5);
-    /// `theme.gray` as the Settings frame overrides it: `#7b85a7`, opaque,
-    /// in both modes (a field's value, an unselected choice, a form
-    /// button's label).
-    pub const GRAY_SETTINGS: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
+    /// `theme.foreground` as the Settings frame and the form components
+    /// set it: `#f2f3f7` at 85% in Dark, the usual `#020303b2` in Light (a
+    /// textbox's value, an unselected segment or checkbox).
+    pub const FOREGROUND_FORM: Pair = pair(0xf2f3f7d9, 0x020303b2);
+    /// `theme.muted` as the Settings frame and the form components set it
+    /// (a labeled control's helper, a textbox's placeholder).
+    pub const MUTED_FORM: Pair = pair(0xf2f3f78c, 0x444c6580);
+    /// `theme.divider` as the Settings frame and the form components set
+    /// it: a textbox's and an unchecked box's 1px edge.
+    pub const DIVIDER_FORM: Pair = pair(0xacb4cf4d, 0xacb4cf80);
+    /// `checkbox/select/background` (and `/border`): a checked box. The
+    /// Settings frame gives Dark's, the components page Light's.
+    pub const CHECKBOX_SELECT: Pair = pair(0x31ade9ff, 0xf21478ff);
+    /// `checkbox/select/focus-glow`: a focused checked box. Figma defines
+    /// it in Light only; Dark keeps `focus/default/focus-glow`, the cyan
+    /// its checked box already is.
+    pub const CHECKBOX_SELECT_GLOW: Pair = pair(0x12adff33, 0xff66ab33);
     /// `theme.muted`: quiet text (section headers, branches, hints).
     pub const MUTED: Pair = pair(0x777a86ff, 0x444c65a6);
     /// `theme.gray` as the Activity frame sets it: `#7b85a7`, opaque, in
@@ -137,6 +150,10 @@ pub mod figma {
         /// The Issues board's cards: near black on the dark canvas, white
         /// (with the raised-card shadow) in Light.
         pub const CARD: Pair = pair(0x020303ff, 0xffffffff);
+        /// The Textbox component's well: near black in the dark Settings
+        /// frame (its `theme.canvas` binding draws `#020303` there), white
+        /// in Light.
+        pub const TEXTBOX: Pair = pair(0x020303ff, 0xffffffff);
         /// The command palette's surface: the sidebar's tint.
         pub const RAISED: Pair = pair(0x2c3140ff, 0xf9f9fcff);
         /// The dark Issue detail's 1px edge (`#acb4cf` at ~5% would read as
@@ -254,8 +271,11 @@ palette! {
     /// A surface lifted over the window: the command palette, menus,
     /// popovers, tooltips.
     raised,
-    /// A text field's well (Settings: the canvas, inside a divider).
+    /// A command box's well (the bootstrap screen: the canvas, inside a
+    /// divider).
     well,
+    /// The Textbox component's well, and an unchecked box's fill.
+    textbox,
 
     // ---- Overlay fills (the `theme.background` family) ---------------------
     /// The overlay fill at rest: buttons, dropdowns, chips, count badges,
@@ -284,10 +304,12 @@ palette! {
     foreground,
     /// Secondary text: hotkeys, metadata (`theme.gray`).
     gray,
-    /// A settings control's text: a field's value, an unselected choice, a
-    /// form button's label (`theme.gray` as the Settings frame overrides
-    /// it).
+    /// A form control's text: a textbox's value, an unselected segment or
+    /// checkbox (`theme.foreground` as the form components set it).
     form_text,
+    /// A form's quiet text: a labeled control's helper, a textbox's
+    /// placeholder (`theme.muted` as the form components set it).
+    form_hint,
     /// Quiet text: section headers, branches, timestamps, hints, idle
     /// states, placeholders (`theme.muted`).
     muted,
@@ -321,7 +343,8 @@ palette! {
     divider,
     /// The board's stronger rules (the Issues frame's `theme.divider`).
     divider_strong,
-    /// A text field's 1px boundary (Settings: `theme.divider`).
+    /// A textbox's and an unchecked box's 1px edge (`theme.divider` as the
+    /// form components set it).
     input_border,
 
     // ---- Links and focus ----------------------------------------------------
@@ -333,6 +356,11 @@ palette! {
     focus_ring,
     /// The glow outside the ring (`focus/default/focus-glow`).
     focus_glow,
+    /// A checked box (`checkbox/select/background`), and a focused one's
+    /// ring.
+    check_fill,
+    /// A focused checked box's glow (`checkbox/select/focus-glow`).
+    check_glow,
 
     // ---- Meaning ------------------------------------------------------------
     /// Success, done, approve (`text/green`).
@@ -467,6 +495,7 @@ impl Palette {
             card: pick(CARD),
             raised: pick(RAISED),
             well: canvas,
+            textbox: pick(TEXTBOX),
 
             background,
             background_hover: pick(BACKGROUND_HOVER),
@@ -479,7 +508,8 @@ impl Palette {
             text_loud: pick(WHITE),
             foreground: pick(FOREGROUND),
             gray: pick(GRAY),
-            form_text: pick(GRAY_SETTINGS),
+            form_text: pick(FOREGROUND_FORM),
+            form_hint: pick(MUTED_FORM),
             muted: pick(MUTED),
             text_on_color: Rgba::hex(0xffffff),
             log_text: pick(GRAY_ACTIVITY),
@@ -495,12 +525,14 @@ impl Palette {
 
             divider: pick(DIVIDER),
             divider_strong: pick(DIVIDER_STRONG),
-            input_border: pick(DIVIDER),
+            input_border: pick(DIVIDER_FORM),
 
             link: pick(TEXT_LINK),
             link_hover: pick(WHITE),
             focus_ring: pick(FOCUS_RING),
             focus_glow: pick(FOCUS_GLOW),
+            check_fill: pick(CHECKBOX_SELECT),
+            check_glow: pick(CHECKBOX_SELECT_GLOW),
 
             success: pick(TEXT_GREEN),
             warning: yellow,
@@ -614,7 +646,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "error on hover button"),
     ("dark", "error on pressed button"),
     ("dark", "input_border on"),
-    ("dark", "form_text on"),
+    ("dark", "text_on_color on check_fill"),
     ("dark", "button_icon on"),
     ("dark", "table_text on"),
     ("light", "muted on"),
@@ -630,7 +662,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "theme_green on selection"),
     ("light", "theme_cyan on selection"),
     ("light", "input_border on"),
-    ("light", "form_text on"),
+    ("light", "form_hint on"),
     ("light", "button_icon on"),
     ("light", "table_text on"),
 ];
@@ -789,10 +821,20 @@ mod tests {
             check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
             check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
         }
-        // Settings' controls, on the canvas they sit on: a field's value, an
-        // unselected choice, and a form button's label on its fill.
-        check("form_text on canvas".into(), p.form_text, p.well, AA);
-        check("form_text on form button".into(), p.form_text, flatten(p.search, p.canvas), AA);
+        // The form components, on the canvas they sit on: a textbox's value
+        // in its well, an unselected segment on the track, a checkbox's
+        // label, a helper and a placeholder.
+        let track = flatten(p.search, p.canvas);
+        check("form_text on textbox".into(), p.form_text, p.textbox, AA);
+        check("form_text on segment track".into(), p.form_text, track, AA);
+        check("form_text on canvas".into(), p.form_text, p.canvas, AA);
+        check("text_loud on selected segment".into(), p.text_loud, p.canvas, AA);
+        check("form_hint on canvas".into(), p.form_hint, p.canvas, AA);
+        check("form_hint on textbox".into(), p.form_hint, p.textbox, AA);
+        // Non-text: a textbox's and a box's edge, a checked box and its mark.
+        check("input_border on textbox".into(), p.input_border, p.textbox, NON_TEXT);
+        check("check_fill on canvas".into(), p.check_fill, p.canvas, NON_TEXT);
+        check("text_on_color on check_fill".into(), p.text_on_color, p.check_fill, NON_TEXT);
         // The selected Machines row: every cell on the selection band.
         let band = flatten(p.selection, p.canvas);
         for (name, fg) in [
@@ -920,6 +962,12 @@ mod tests {
         both(d.accent, l.accent, (0x62cdf6ff, 0xf21478ff));
         both(d.focus_ring, l.focus_ring, (0x62cdf6ff, 0x31ade9ff));
         both(d.focus_glow, l.focus_glow, (0x12adff33, 0x12adff33));
+        // The form components (the dark Settings frame, the components page).
+        both(d.form_text, l.form_text, (0xf2f3f7d9, 0x020303b2));
+        both(d.form_hint, l.form_hint, (0xf2f3f78c, 0x444c6580));
+        both(d.input_border, l.input_border, (0xacb4cf4d, 0xacb4cf80));
+        both(d.textbox, l.textbox, (0x020303ff, 0xffffffff));
+        both(d.check_fill, l.check_fill, (0x31ade9ff, 0xf21478ff));
         both(d.workflow_badge, l.workflow_badge, (0x3a4258ff, 0xd3d8e4ff));
         both(d.success, l.success, (0x31d924ff, 0x00753dff));
         both(d.theme_green, l.theme_green, (0x5acd25ff, 0x367b16ff));

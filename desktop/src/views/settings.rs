@@ -13,13 +13,15 @@
 //! - `theme:` (`auto | dark | light`), shared with the TUI, which reads it on
 //!   its next start;
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
-//!   reads.
+//!   reads, typed or chosen with Browse.
 //!
 //! - `desktop.notifications`: which system notifications the app posts.
 //!
 //! A button opens `keys.yaml` (the key bindings both clients share) in the
 //! user's default text editor; below it, any binding macOS already owns (⌘W,
 //! ⌘Space, ...) is reported, since it can't reach Shelbi.
+//!
+//! The rows are the Figma form components (`elements::controls`).
 //!
 //! Saves go through [`shelbi_state::update_user_config`], which keeps every
 //! key this view doesn't own (the zen chord, the review editor, a newer
@@ -29,24 +31,28 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, Context, Div, Entity, EventEmitter, Focusable, SharedString, Subscription,
-    Window,
+    div, prelude::*, px, Context, Entity, EventEmitter, Focusable, PathPromptOptions, SharedString,
+    Subscription, Window,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 
 use super::font_picker::{FontPicker, FontPickerEvent};
-use crate::assets::{check_mark, icons};
+use crate::assets::icons;
+use crate::elements::controls;
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::TerminalSettings;
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{self, IconButtonSize, Type, Typography};
+use crate::theme::style::{Type, Typography};
 use crate::theme::Theme;
 
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
+
+/// The size field's width (the frame's, room for `32pt`).
+const SIZE_FIELD_W: f32 = 76.0;
 
 /// The values the view edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,7 +232,7 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let font_family = cx.new(|cx| FontPicker::new(PRIMARY_FAMILY.to_string(), window, cx));
-        let font_size_input = cx.new(|cx| InputState::new(window, cx).default_value(DEFAULT_SIZE.to_string()));
+        let font_size_input = cx.new(|cx| InputState::new(window, cx).default_value(size_text(DEFAULT_SIZE)));
         let cli_path = cx.new(|cx| InputState::new(window, cx).placeholder("Found automatically"));
         let subscriptions = vec![
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
@@ -342,7 +348,7 @@ impl SettingsView {
         let typing = self.font_size_input.read(cx).focus_handle(cx).is_focused(window);
         if !typing {
             self.font_size_input
-                .update(cx, |s, cx| s.set_value(size.to_string(), window, cx));
+                .update(cx, |s, cx| s.set_value(size_text(size), window, cx));
         }
         cx.notify();
     }
@@ -352,7 +358,7 @@ impl SettingsView {
         let size = clamp_size(size);
         self.font_size = size;
         self.font_size_input
-            .update(cx, |s, cx| s.set_value(size.to_string(), window, cx));
+            .update(cx, |s, cx| s.set_value(size_text(size), window, cx));
         self.save(cx);
         cx.notify();
     }
@@ -364,18 +370,20 @@ impl SettingsView {
         }
     }
 
-    /// Take the typed size: a new number is clamped into the range and
-    /// saved, the current size (even a hand-set one outside the range) is
-    /// left alone, and anything else puts the current size back.
+    /// Take the typed size (`15` or `15pt`): a new number is clamped into
+    /// the range and saved, the current size (even a hand-set one outside
+    /// the range) is left alone, and anything else puts the current size
+    /// back, with its unit.
     fn commit_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self.font_size_input.read(cx).value().trim().parse::<i32>();
+        let typed = parse_size(&self.font_size_input.read(cx).value());
         match typed {
-            Ok(size) if size == self.font_size as i32 => {}
-            Ok(size) if clamp_size(size) != self.font_size => self.set_size(size, window, cx),
+            Some(size) if size != self.font_size as i32 && clamp_size(size) != self.font_size => {
+                self.set_size(size, window, cx)
+            }
             _ => {
                 let size = self.font_size;
                 self.font_size_input
-                    .update(cx, |s, cx| s.set_value(size.to_string(), window, cx));
+                    .update(cx, |s, cx| s.set_value(size_text(size), window, cx));
             }
         }
     }
@@ -443,6 +451,33 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Choose the `shelbi` binary in a file dialog; the choice fills the
+    /// field and is saved.
+    fn browse_cli(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.cli_path
+                    .update(cx, |s, cx| s.set_value(path.display().to_string(), window, cx));
+                this.save(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Open `keys.yaml` in the default text editor, creating a commented stub
     /// first when there is none (an editor won't open a missing file).
     fn open_keys(&mut self, cx: &mut Context<Self>) {
@@ -471,6 +506,13 @@ impl SettingsView {
     pub(crate) fn offscreen_font_picker_ready(&self, cx: &gpui::App) -> bool {
         let picker = self.font_family.read(cx);
         picker.is_open() && picker.fonts_loaded()
+    }
+
+    /// Focus the Shelbi CLI field (`--visual-figma`'s focused textbox).
+    pub(crate) fn offscreen_focus_cli(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.cli_path.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     /// Whether `config.yaml` has been read into the form.
@@ -548,25 +590,24 @@ fn option_label(value: OptionAsMeta) -> &'static str {
     }
 }
 
-/// A settings section, as the Settings frame stacks it: its label (Base,
-/// loud), the control, then the helper (X-Small, muted), 4px apart.
-fn section(label: &'static str, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().type_style(Type::Base).text_color(theme.text_loud).child(label))
+/// The size field's text: the size and its unit, as the frame writes it
+/// (`14pt`).
+fn size_text(size: u16) -> String {
+    format!("{size}pt")
 }
 
-/// A section's helper line.
-fn helper(text: &'static str, theme: &Theme) -> Div {
-    div().type_style(Type::XSmall).text_color(theme.muted).child(text)
+/// A typed size: a whole number of points, with or without the `pt` the
+/// field shows.
+fn parse_size(text: &str) -> Option<i32> {
+    let text = text.trim();
+    let text = text.strip_suffix("pt").unwrap_or(text).trim_end();
+    text.parse().ok()
 }
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        // The segmented controls' chips slide to a new choice.
+        // The segmented controls' selections slide to a new choice.
         let now = Instant::now();
         let slide = |track: &SharedTrack, key: String| {
             let mut track = track.borrow_mut();
@@ -584,13 +625,13 @@ impl Render for SettingsView {
         let theme_chip = chips.0;
         let chip = |label: &'static str, value: ThemePreference, current: ThemePreference, cx: &mut Context<Self>| {
             let id = SharedString::from(format!("settings-theme-{label}"));
-            style::choice(id.clone(), label, value == current, theme_chip.is_none(), &theme)
+            controls::segment(id.clone(), label, value == current, theme_chip.is_none(), &theme)
                 .child(motion::probe(&self.theme_track, id))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_theme(value, window, cx)))
         };
         let status: Option<(SharedString, gpui::Hsla)> = match &self.state {
             SaveState::Idle => None,
-            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.muted)),
+            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.form_hint)),
             SaveState::Failed(e) => Some((e.clone().into(), theme.error)),
         };
         let current = self.theme;
@@ -598,32 +639,35 @@ impl Render for SettingsView {
         let option_chip_slide = chips.1;
         let option_chip = |label: &'static str, value: OptionAsMeta, cx: &mut Context<Self>| {
             let id = SharedString::from(format!("settings-option-{label}"));
-            style::choice(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
+            controls::segment(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
                 .child(motion::probe(&self.option_track, id))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
         };
-        // The size stepper: the typed field with − and + at its end, each
-        // dimmed (and inert) at its end of the range; ↑ / ↓ step it too.
+        let floating = |bounds| motion::floating_chip(bounds, |d| controls::selected_segment(d, &theme));
+        // The size stepper: the typed field, then − and +, each dimmed (and
+        // inert) at its end of the range; ↑ / ↓ step it too.
         let size = self.font_size;
         let step = |id: &'static str, icon, delta: i32, cx: &mut Context<Self>| {
             let inert = step_size(size, delta).is_none();
-            style::tinted_icon_button(id, icon, IconButtonSize::Small, false, theme.form_text, &theme)
-                .when(inert, |d| d.opacity(0.4).cursor_default())
+            controls::form_icon_button(id, icon, inert, &theme)
                 .on_click(cx.listener(move |this, _, window, cx| this.step(delta, window, cx)))
         };
-        let size_field = style::field(
-            div()
-                .id("settings-font-size")
-                .debug_selector(|| "settings-font-size".into())
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1(),
+        let size_focused = self.font_size_input.read(cx).focus_handle(cx).is_focused(window);
+        let size_field = controls::textbox(
+            div().flex_1().min_w_0().child(
+                Input::new(&self.font_size_input)
+                    .appearance(false)
+                    .h_full()
+                    .px_0()
+                    .type_style(Type::Base)
+                    .text_color(theme.form_text),
+            ),
+            size_focused,
             &theme,
         )
-        // The typed text carries the field's inset itself.
-        .pl_0()
-        .pr(px(4.0))
+        .id("settings-font-size")
+        .debug_selector(|| "settings-font-size".into())
+        .w(px(SIZE_FIELD_W))
         .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
             this.step(1, window, cx);
             cx.stop_propagation();
@@ -631,52 +675,36 @@ impl Render for SettingsView {
         .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
             this.step(-1, window, cx);
             cx.stop_propagation();
-        }))
-        .child(
-            div().flex_1().child(
-                Input::new(&self.font_size_input)
-                    .appearance(false)
-                    .h(px(30.0))
-                    .px(px(10.0))
-                    .type_style(Type::Base)
-                    .text_color(theme.form_text),
-            ),
-        )
-        .child(step("settings-font-size-down", icons::MINUS, -1, cx))
-        .child(step("settings-font-size-up", icons::PLUS, 1, cx));
+        }));
+        let stepper = div()
+            .flex()
+            .flex_row()
+            .gap(px(controls::CONTROL_GAP))
+            .child(size_field)
+            .child(step("settings-font-size-down", icons::MINUS, -1, cx))
+            .child(step("settings-font-size-up", icons::PLUS, 1, cx));
+        let cli_focused = self.cli_path.read(cx).focus_handle(cx).is_focused(window);
+        let cli = controls::picker(
+            controls::textbox(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.cli_path)
+                        .appearance(false)
+                        .h_full()
+                        .px_0()
+                        .type_style(Type::Base)
+                        .text_color(theme.form_text),
+                ),
+                cli_focused,
+                &theme,
+            )
+            .debug_selector(|| "settings-cli-path".into())
+            .flex_1(),
+            controls::form_button("settings-cli-browse", "Browse", &theme)
+                .on_click(cx.listener(|this, _, window, cx| this.browse_cli(window, cx))),
+        );
         let switches = self.notifications;
         let toggle = |label: &'static str, switch: Switch, cx: &mut Context<Self>| {
-            let on = switches.get(switch);
-            div()
-                .id(label)
-                .debug_selector(move || format!("settings-notify-{label}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .cursor_pointer()
-                .child(
-                    // Figma's checkbox: 14px, 2px corners; checked, the
-                    // loud color with Figma's 12pt check in the canvas.
-                    div()
-                        .size(px(14.0))
-                        .flex_none()
-                        .rounded(px(2.0))
-                        .border_1()
-                        .border_color(theme.muted)
-                        .bg(theme.canvas)
-                        .when(on, |d| d.bg(theme.text_loud).border_color(theme.text_loud))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(on, |d| d.child(check_mark().text_color(theme.canvas))),
-                )
-                .child(
-                    div()
-                        .type_style(Type::Base)
-                        .text_color(if on { theme.text_loud } else { theme.foreground })
-                        .child(label),
-                )
+            controls::checkbox(format!("settings-notify-{label}"), label, switches.get(switch), false, &theme)
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
         };
         let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
@@ -699,76 +727,67 @@ impl Render for SettingsView {
                     .text_color(theme.text_loud)
                     .child("Settings"),
             )
+            .child(controls::labeled_control(
+                "Theme",
+                controls::segmented_track(&theme)
+                    .w(px(controls::CONTROL_W))
+                    .child(motion::origin_probe(&self.theme_track))
+                    .children(theme_chip.map(floating))
+                    .child(chip("Auto", ThemePreference::Auto, current, cx))
+                    .child(chip("Dark", ThemePreference::Dark, current, cx))
+                    .child(chip("Light", ThemePreference::Light, current, cx)),
+                Some("Shared with the TUI, which picks it up on its next start.".into()),
+                &theme,
+            ))
+            .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
+            .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
+            .child(controls::labeled_control(
+                "Option key in terminals",
+                controls::segmented_track(&theme)
+                    .child(motion::origin_probe(&self.option_track))
+                    .children(option_chip_slide.map(floating))
+                    .child(option_chip("Types characters", OptionAsMeta::Off, cx))
+                    .child(option_chip("Meta", OptionAsMeta::Both, cx))
+                    .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
+                    .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
+                Some(
+                    "Characters: Option+E, E types é, as in other Mac apps. Meta: \
+                     Option+B sends Esc B, for shell word motion and Claude Code’s \
+                     Option shortcuts. Option with Enter, the arrows, Backspace, or \
+                     Delete is Meta either way."
+                        .into(),
+                ),
+                &theme,
+            ))
+            .child(controls::labeled_control(
+                "Shelbi CLI",
+                cli,
+                Some(
+                    "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
+                     in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch."
+                        .into(),
+                ),
+                &theme,
+            ))
             .child(
-                section("Theme", &theme)
-                    .child(
-                        style::choice_track()
-                            .self_start()
-                            .child(motion::origin_probe(&self.theme_track))
-                            .children(theme_chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, &theme))))
-                            .child(chip("Auto", ThemePreference::Auto, current, cx))
-                            .child(chip("Dark", ThemePreference::Dark, current, cx))
-                            .child(chip("Light", ThemePreference::Light, current, cx)),
-                    )
-                    .child(helper("Shared with the TUI, which picks it up on its next start.", &theme)),
+                controls::labeled_control(
+                    "Key bindings",
+                    controls::form_button("settings-open-keys", "Open keys.yaml", &theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
+                    Some("Shared by the TUI and the desktop app.".into()),
+                    &theme,
+                )
+                .children(conflicts.into_iter().map(|line| {
+                    div()
+                        .debug_selector(|| "settings-shortcut-conflict".into())
+                        .type_style(Type::XSmall)
+                        .text_color(theme.error)
+                        .child(line)
+                })),
             )
-            .child(
-                section("Terminal font", &theme)
-                    .child(div().self_start().child(self.font_family.clone()))
-                    .child(helper("The font family for terminals.", &theme)),
-            )
-            .child(
-                section("Terminal font size", &theme)
-                    .child(div().self_start().child(size_field))
-                    .child(helper("In points.", &theme)),
-            )
-            .child(
-                section("Option key in terminals", &theme)
-                    .child(
-                        style::choice_track()
-                            .self_start()
-                            .child(motion::origin_probe(&self.option_track))
-                            .children(option_chip_slide.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, &theme))))
-                            .child(option_chip("Types characters", OptionAsMeta::Off, cx))
-                            .child(option_chip("Meta", OptionAsMeta::Both, cx))
-                            .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
-                            .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
-                    )
-                    .child(helper(
-                        "Characters: Option+E, E types é, as in other Mac apps. Meta: \
-                         Option+B sends Esc B, for shell word motion and Claude Code’s \
-                         Option shortcuts. Option with Enter, the arrows, Backspace, or \
-                         Delete is Meta either way.",
-                        &theme,
-                    )),
-            )
-            .child(
-                section("Shelbi CLI", &theme)
-                    .child(style::field(Input::new(&self.cli_path), &theme))
-                    .child(helper(
-                        "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
-                         in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch.",
-                        &theme,
-                    )),
-            )
-            .child(
-                section("Key bindings", &theme)
-                    .child(
-                        style::form_button("settings-open-keys", "Open keys.yaml", &theme)
-                            .self_start()
-                            .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
-                    )
-                    .child(helper("Shared by the TUI and the desktop app.", &theme))
-                    .children(conflicts.into_iter().map(|line| {
-                        div()
-                            .debug_selector(|| "settings-shortcut-conflict".into())
-                            .type_style(Type::XSmall)
-                            .text_color(theme.error)
-                            .child(line)
-                    })),
-            )
-            .child(
-                section("Notifications", &theme)
+            .child(controls::labeled_control(
+                "Notifications",
+                controls::checkbox_list()
                     .child(toggle(
                         "A workspace is waiting for input or permission",
                         Switch::WorkspaceBlocked,
@@ -779,14 +798,15 @@ impl Render for SettingsView {
                         "The orchestrator is waiting for an answer",
                         Switch::OrchestratorWaiting,
                         cx,
-                    ))
-                    .child(helper(
-                        "Not shown for what’s already on screen in the front window. \
-                         macOS asks for permission the first time.",
-                        &theme,
                     )),
-            )
-            .children(status.map(|(text, color)| div().text_color(color).child(text)))
+                Some(
+                    "Not shown for what’s already on screen in the front window. \
+                     macOS asks for permission the first time."
+                        .into(),
+                ),
+                &theme,
+            ))
+            .children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
     }
 }
 
@@ -839,6 +859,15 @@ mod tests {
         let shown = SettingsValues::from_config(&UserConfig::default());
         assert_eq!((shown.font_family.as_str(), shown.font_size), ("Source Code Pro", 14));
         assert_eq!(shown, SettingsValues::default());
+    }
+
+    #[test]
+    fn the_size_field_shows_its_unit_and_takes_a_size_with_or_without_it() {
+        assert_eq!(size_text(14), "14pt");
+        assert_eq!(parse_size("14pt"), Some(14));
+        assert_eq!(parse_size(" 15 "), Some(15));
+        assert_eq!(parse_size("16 pt"), Some(16));
+        assert_eq!((parse_size("pt"), parse_size("big")), (None, None));
     }
 
     #[test]

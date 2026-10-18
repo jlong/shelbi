@@ -1,4 +1,5 @@
-//! Settings' terminal font picker: a dropdown in a settings field's shape.
+//! Settings' terminal font picker: the Picker component (the family in a
+//! textbox, then "Choose font"), opening a list under it.
 //!
 //! Open, it lists the bundled faces (Source Code Pro, the default, then
 //! Geist Mono), a rule, then the installed monospaced families
@@ -19,8 +20,9 @@ use gpui::{
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
 
 use crate::assets::{heroicon, icons, ICON_SIZE};
+use crate::elements::controls;
 use crate::elements::terminal::fonts::{self, Choice, InstalledFonts};
-use crate::theme::style::{self, Anchor, Type, Typography, BUTTON_H, FIELD_W};
+use crate::theme::style::{self, Anchor, Type, Typography, BUTTON_H};
 use crate::theme::Theme;
 
 /// How tall the open list grows before it scrolls.
@@ -45,8 +47,8 @@ pub struct FontPicker {
     highlight: usize,
     focus: FocusHandle,
     scroll: ScrollHandle,
-    /// Where the field last painted, so a press on it toggles rather than
-    /// counting as a press outside the open list.
+    /// Where the picker (textbox and button) last painted, so a press on it
+    /// toggles rather than counting as a press outside the open list.
     field: Anchor,
     _subscriptions: Vec<Subscription>,
 }
@@ -289,45 +291,44 @@ impl Render for FontPicker {
         let theme = *cx.global::<Theme>();
         let focused = self.focus.is_focused(window);
         let not_installed = self.not_installed();
-        let field = style::field(
-            div()
-                .id("settings-font-picker")
-                .debug_selector(|| "settings-font-picker".into())
-                .relative()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .pr(px(6.0))
-                .cursor_pointer()
-                .track_focus(&self.focus)
-                .when(focused || self.open, |d| {
-                    d.border_color(theme.focus_ring).shadow(style::focus_shadow(&theme))
-                }),
-            &theme,
-        )
-        .child(style::anchor_probe(&self.field))
-        .child(div().flex_1().min_w_0().truncate().child(self.family.clone()))
-        .when(not_installed, |d| {
-            d.child(
-                div()
-                    .debug_selector(|| "settings-font-not-installed".into())
-                    .flex_none()
-                    .type_style(Type::XSmall)
-                    .text_color(theme.muted)
-                    .child("Not installed"),
-            )
-        })
-        .child(heroicon(icons::CHEVRON_DOWN).text_color(if self.open { theme.text_loud } else { theme.form_text }))
-        .on_key_down(cx.listener(Self::field_key))
-        .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)));
+        // The Picker: the family in a textbox, "Choose font" after it; a
+        // press on either toggles the list.
+        let family = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().min_w_0().truncate().child(self.family.clone()))
+            .when(not_installed, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "settings-font-not-installed".into())
+                        .flex_none()
+                        .type_style(Type::XSmall)
+                        .text_color(theme.form_hint)
+                        .child("Not installed"),
+                )
+            });
+        let field = controls::textbox(family, focused || self.open, &theme)
+            .id("settings-font-picker")
+            .debug_selector(|| "settings-font-picker".into())
+            .flex_1()
+            .cursor_pointer()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::field_key))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)));
+        let choose = controls::form_button("settings-font-choose", "Choose font", &theme)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)));
+        let field = controls::picker(field, choose).child(style::anchor_probe(&self.field));
 
-        // The list floats 6px under the field, its width, drawn after
+        // The list floats 6px under the picker, its width, drawn after
         // everything (`deferred`) so nothing below it moves.
         let field_bounds = self.field.clone();
         let list = self.open.then(|| {
             deferred(
-                div().absolute().top(px(BUTTON_H + 6.0)).left_0().w(px(FIELD_W)).child(
+                div().absolute().top(px(BUTTON_H + 6.0)).left_0().w(px(controls::CONTROL_W)).child(
                     style::popover(
                         div()
                             .id("settings-font-menu")
@@ -354,7 +355,7 @@ impl Render for FontPicker {
                         cx.stop_propagation();
                     }))
                     .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                        // A press on the field toggles it closed through its click.
+                        // A press on the picker toggles it closed through its click.
                         if field_bounds.get().is_some_and(|b| b.contains(&event.position)) {
                             return;
                         }
