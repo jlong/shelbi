@@ -17,7 +17,11 @@
 //! rows that must land on Figma's positions (the sidebar's hotkeys).
 //! [`clamped_text`] wraps and clamps with the real shaper, its last line
 //! filled to the ellipsis (the task panels' description).
+//!
+//! [`controls`] holds the Figma form components (segmented control,
+//! labeled control, textbox, picker, checkbox) every form composes.
 
 pub mod clamped_text;
+pub mod controls;
 pub mod exact_text;
 pub mod terminal;

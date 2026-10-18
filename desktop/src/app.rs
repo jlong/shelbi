@@ -4337,6 +4337,14 @@ impl ShelbiWindow {
         self.open_settings(window, cx);
     }
 
+    /// The settings view, while it is shown.
+    pub(crate) fn offscreen_settings(&self) -> Option<Entity<SettingsView>> {
+        match &self.route {
+            Route::Settings(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
     /// Show task `id`'s detail on the board.
     pub(crate) fn offscreen_open_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.open_task(id, window, cx);

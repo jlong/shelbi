@@ -22,8 +22,9 @@
 //!   button's icon in ([`icon_slot`]);
 //! - a workflow status's glyph ([`status_icon`]) and heading
 //!   ([`status_heading`]: the board's column headers, the task panels);
-//! - controls that open something ([`dropdown`]), segmented controls
-//!   ([`filter_track`], [`choice_track`]);
+//! - controls that open something ([`dropdown`]), the Activity filter's
+//!   segments ([`filter_track`]); the form controls (segmented control,
+//!   textbox, picker, checkbox) are `elements::controls`;
 //! - the sidebar's (the Navigation component's) 6px corners
 //!   ([`NAV_RADIUS`]) and plain-text shortcut hints ([`hotkey`]);
 //! - a project's initials badge ([`project_badge`]);
@@ -135,11 +136,18 @@ pub fn figma_blur(blur: f32) -> Pixels {
 /// Figma's `shadow/raised card`: three soft drops (0 4 4, 0 11 0 -8,
 /// 0 3 0 -1) and a 1px ring. The selected nav chip and the board's cards.
 pub fn raised_card_shadow(theme: &Theme) -> Vec<BoxShadow> {
+    let mut shadow = raised_drops(theme);
+    shadow.push(ring_shadow(theme.shadow_ring));
+    shadow
+}
+
+/// `shadow/raised card`'s three drops without its ring: a segmented
+/// control's selected item.
+pub fn raised_drops(theme: &Theme) -> Vec<BoxShadow> {
     vec![
         BoxShadow::new(px(0.0), px(4.0), theme.shadow).blur_radius(figma_blur(4.0)),
         BoxShadow::new(px(0.0), px(11.0), theme.shadow).spread_radius(px(-8.0)),
         BoxShadow::new(px(0.0), px(3.0), theme.shadow).spread_radius(px(-1.0)),
-        ring_shadow(theme.shadow_ring),
     ]
 }
 
@@ -756,100 +764,6 @@ pub fn filter_dropdown(
     fill_layer(d, id, px(6.0), [rest, theme.background_active, theme.selection])
         .child(heroicon(icon).text_color(theme.log_text))
         .child(div().whitespace_nowrap().child(label.into()))
-}
-
-/// Settings' segmented control, as the Settings frame draws it: no track,
-/// the choices 4px apart. Its choices go in as children ([`choice`]), with
-/// the same sliding-chip probes as a [`filter_track`].
-pub fn choice_track() -> Div {
-    div().relative().flex().flex_row().items_center().gap(px(4.0))
-}
-
-/// One choice of a [`choice_track`]: 26px, 12px across, 6px corners, Base
-/// in `form_text`; selected, Base medium and loud on the [`segment_chip`]
-/// (unless `chip_inline` is false while a sliding chip stands in).
-/// Unselected, a fill fades in on hover.
-pub fn choice(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    selected: bool,
-    chip_inline: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let id: SharedString = id.into();
-    let selector = id.clone();
-    let d = div()
-        .id(id.clone())
-        .debug_selector(move || selector.to_string())
-        .relative()
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(26.0))
-        .px(px(12.0))
-        .rounded(px(6.0))
-        .cursor_pointer();
-    let d = if selected {
-        let d = d.type_style(Type::BaseMedium).text_color(theme.text_loud);
-        if chip_inline {
-            segment_chip(d, theme)
-        } else {
-            d
-        }
-    } else {
-        let clear = theme.background_hover.opacity(0.0);
-        fill_layer(
-            d.type_style(Type::Base).text_color(theme.form_text),
-            id,
-            px(6.0),
-            [clear, theme.background_hover, theme.background_active],
-        )
-    };
-    d.child(label.into())
-}
-
-/// The width of a settings field (the Settings frame's text fields).
-pub const FIELD_W: f32 = 360.0;
-
-/// Paint `el` as a settings field: 360 x 32, 10px across, 6px corners, the
-/// canvas inside a 1px divider, its text Base in `form_text`. A gpui-kit
-/// `Input` takes it too (it refines its own style with this).
-pub fn field<E: Styled>(el: E, theme: &Theme) -> E {
-    el.w(px(FIELD_W))
-        .h(px(BUTTON_H))
-        .px(px(10.0))
-        .rounded(px(6.0))
-        .bg(theme.well)
-        .border_1()
-        .border_color(theme.input_border)
-        .type_style(Type::Base)
-        .text_color(theme.form_text)
-}
-
-/// A button in a settings form, as the Settings frame draws "Open
-/// keys.yaml": `theme.search`, 26px, 12px across, 6px corners, Base in
-/// `form_text`. Hover and press fade to the stronger overlay fills.
-pub fn form_button(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let id: SharedString = id.into();
-    let selector = id.clone();
-    let d = div()
-        .id(id.clone())
-        .debug_selector(move || selector.to_string())
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(26.0))
-        .px(px(12.0))
-        .rounded(px(6.0))
-        .type_style(Type::Base)
-        .text_color(theme.form_text)
-        .cursor_pointer();
-    fill_layer(d, id, px(6.0), [theme.search, theme.background_active, theme.selection])
-        .child(label.into())
 }
 
 /// The modifier glyphs a chord starts with.

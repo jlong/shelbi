@@ -27,8 +27,12 @@
 //! (`state-review-*`, `state-workspace-*`: More, each view's ⌘N, Approve
 //! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
 //! the remote down, its row selected; `machines-idle-selected`,
-//! `machines-review-selected`). `SHELBI_VISUAL_ONLY=panels` renders
-//! just the Review and Workspace screens and those states.
+//! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
+//! a focused textbox), and the form components' sheets
+//! (`components/<name>-<theme>.png`, against the components page's PNGs).
+//! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
+//! screens and those states; `=settings` just Settings, its state and the
+//! components.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -67,7 +71,7 @@ use crate::views::workspace::{WorkspaceDeps, WorkspaceOps};
 
 const PROJECT: &str = "my-project";
 /// `SHELBI_VISUAL_ONLY=panels` renders only the Review and Workspace
-/// screens and their panels' states.
+/// screens and their panels' states; `=settings` only Settings.
 const ONLY_VAR: &str = "SHELBI_VISUAL_ONLY";
 /// The reference PNGs' size, in points.
 const WIDTH: u32 = 1440;
@@ -99,6 +103,86 @@ pub const PALETTE_STATES: [(&str, &str); 4] = [
 /// The issue detail's actions, left to right, by the name of the render
 /// with each one hovered (`issue-detail-hover-<name>`).
 pub const DETAIL_ACTIONS: [&str; 6] = ["move-left", "move-right", "start", "assign", "edit", "editor"];
+
+// ---- the form components ---------------------------------------------------
+
+/// The components page's sheets, named as its PNGs, with their sizes: every
+/// state of the Textbox and the Checkbox, a Segmented Control, a Labeled
+/// Control and a Picker; plus a Checkbox List (no PNG: checked by eye).
+const COMPONENT_SHEETS: [(&str, f32, f32); 6] = [
+    ("textbox", 234.0, 210.0),
+    ("checkbox", 126.0, 154.0),
+    ("segmented-control", 167.0, 32.0),
+    ("labeled-control", 400.0, 56.0),
+    ("picker", 400.0, 32.0),
+    ("checkbox-list", 200.0, 74.0),
+];
+
+/// One component sheet, by name.
+struct Sheet(&'static str);
+
+impl gpui::Render for Sheet {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        use crate::elements::controls;
+        use gpui::{div, IntoElement, ParentElement, Styled};
+        let theme = *cx.global::<crate::theme::Theme>();
+        let page = if theme.is_dark() {
+            theme.canvas
+        } else {
+            gpui::rgb(0xf5f5f5).into()
+        };
+        // A variant at its sheet position (the sheet's 1px dashed edge, then
+        // 16px).
+        let at = |x: f32, y: f32, el: gpui::AnyElement| div().absolute().left(px(x)).top(px(y)).child(el);
+        let text = |s: &'static str, placeholder: bool| {
+            div()
+                .text_color(if placeholder { theme.form_hint } else { theme.form_text })
+                .child(s)
+        };
+        let textbox = |focused: bool, placeholder: bool| {
+            controls::textbox(text("Textbox", placeholder), focused, &theme)
+                .w(px(200.0))
+                .into_any_element()
+        };
+        let checkbox = |selected: bool, focused: bool| {
+            controls::checkbox("sheet-checkbox", "Checkbox", selected, focused, &theme).into_any_element()
+        };
+        let sheet = div().relative().size_full().bg(page);
+        match self.0 {
+            "textbox" => sheet
+                .child(at(17.0, 17.0, textbox(false, true)))
+                .child(at(17.0, 65.0, textbox(true, true)))
+                .child(at(17.0, 113.0, textbox(false, false)))
+                .child(at(17.0, 161.0, textbox(true, false))),
+            "checkbox" => sheet
+                .child(at(17.0, 17.0, checkbox(false, false)))
+                .child(at(17.0, 51.0, checkbox(false, true)))
+                .child(at(17.0, 85.0, checkbox(true, false)))
+                .child(at(17.0, 119.0, checkbox(true, true))),
+            "segmented-control" => sheet.child(
+                controls::segmented_track(&theme)
+                    .child(controls::segment("sheet-item-1", "Item", false, true, &theme))
+                    .child(controls::segment("sheet-item-2", "Item", false, true, &theme))
+                    .child(controls::segment("sheet-item-3", "Item", false, true, &theme)),
+            ),
+            "labeled-control" => sheet.child(
+                controls::labeled_control("Label", textbox(false, true), None, &theme)
+                    .w(px(controls::CONTROL_W)),
+            ),
+            "picker" => sheet.child(controls::picker(
+                controls::textbox(text("Textbox", true), false, &theme).flex_1(),
+                controls::form_button("sheet-browse", "Browse", &theme),
+            )),
+            _ => sheet.child(
+                controls::checkbox_list()
+                    .w(px(200.0))
+                    .child(checkbox(false, false))
+                    .child(checkbox(false, false))
+                    .child(checkbox(false, false)),
+            ),
+        }
+    }
+}
 
 // ---- sessions -------------------------------------------------------------
 
@@ -837,6 +921,65 @@ impl Run {
         println!("saved {} ({}x{})", path.display(), image.width(), image.height());
     }
 
+    fn settings(&mut self) {
+        let handle = self.open();
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(window, cx))
+            .unwrap();
+        self.save(handle, "settings");
+
+        // The Shelbi CLI field focused: the textbox's ring and glow, the
+        // caret in the ring's color.
+        let handle = self.open();
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                w.offscreen_open_settings(window, cx);
+                if let Some(settings) = w.offscreen_settings() {
+                    settings.update(cx, |v, cx| v.offscreen_focus_cli(window, cx));
+                }
+            })
+            .unwrap();
+        self.save(handle, "state-settings-cli-focused");
+        self.components();
+    }
+
+    /// The form components as the Figma components page draws them, each
+    /// at its variant sheet's size and positions:
+    /// `components/<name>-<theme>.png`, beside the page's
+    /// `components/<name>.png` (Light). Light sits on the page's `#f5f5f5`,
+    /// Dark on the canvas.
+    fn components(&mut self) {
+        let dir = self.out.join("components");
+        std::fs::create_dir_all(&dir).expect("create the components directory");
+        for (name, w, h) in COMPONENT_SHEETS {
+            crate::theme::motion::reset_pointers();
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(w), px(h)), |_, cx| cx.new(|_| Sheet(name)))
+                .expect("open the offscreen window");
+            let window: AnyWindowHandle = handle.into();
+            for _ in 0..3 {
+                self.cx.run_until_parked();
+                self.cx
+                    .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            }
+            let image = self.cx.capture_screenshot(window).expect("render to image");
+            let image = if self.native || image.width() == w as u32 {
+                image
+            } else {
+                image::imageops::resize(&image, w as u32, h as u32, image::imageops::FilterType::Triangle)
+            };
+            let path = dir.join(format!("{name}-{}.png", self.theme));
+            image.save(&path).expect("save the sheet");
+            println!("saved {} ({}x{})", path.display(), image.width(), image.height());
+            self.cx
+                .update_window(window, |_, window, _| window.remove_window())
+                .unwrap();
+            self.cx.run_until_parked();
+        }
+    }
+
     fn all(&mut self) {
         let orch = View::Session("orch".into());
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "panels") {
@@ -844,6 +987,11 @@ impl Run {
             self.review(&orch, "review", |_, _| {});
             self.workspace(&orch, "workspace", |_, _| {});
             self.panel_states(&orch);
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "settings") {
+            self.settings();
             return;
         }
 
@@ -948,12 +1096,7 @@ impl Run {
             retitle(id, title);
         }
 
-        // Settings.
-        let handle = self.open();
-        handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(window, cx))
-            .unwrap();
-        self.save(handle, "settings");
+        self.settings();
 
         // The palette over the orchestrator.
         self.palette(&orch, "", "command-palette");
