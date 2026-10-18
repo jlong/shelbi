@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use gpui::{
     div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
     Hsla, KeyDownEvent, Pixels, ScrollHandle, SharedString, Task, Window,
@@ -42,6 +42,25 @@ use crate::theme::Theme;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 /// How often the view drains its refresher.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The clock the feed's relative times and day groups read: the wall clock,
+/// or the time `--visual-figma` pinned so its frames read as the mockups do.
+fn now() -> DateTime<Utc> {
+    #[cfg(feature = "visual-check")]
+    if let Some(at) = PINNED_NOW.get() {
+        return *at;
+    }
+    Utc::now()
+}
+
+#[cfg(feature = "visual-check")]
+static PINNED_NOW: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+
+/// Pin [`now`] for the rest of the process (`--visual-figma`).
+#[cfg(feature = "visual-check")]
+pub fn pin_clock(at: DateTime<Utc>) {
+    let _ = PINNED_NOW.set(at);
+}
 /// The identity-chip column's width, so messages line up across rows (the
 /// TUI's 9-cell chip column). A wider chip pushes only its own row over.
 const CHIP_WIDTH: f32 = 84.0;
@@ -128,7 +147,7 @@ impl ActivityView {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         if let Some(data) = self.refresher.latest() {
-            self.state.apply(data, Utc::now());
+            self.state.apply(data, now());
             cx.notify();
         }
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
@@ -163,7 +182,7 @@ impl ActivityView {
         let Some(chord) = chord_from_keystroke(&ev.keystroke) else {
             return;
         };
-        let Some(intents) = self.state.handle_key(chord, Utc::now()) else {
+        let Some(intents) = self.state.handle_key(chord, now()) else {
             return;
         };
         cx.stop_propagation();
@@ -216,7 +235,7 @@ impl ActivityView {
             .children(chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, theme))))
             .child(segment("kind-all", "All", filter.is_all()).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| {
-                    this.state.clear_kinds(Utc::now());
+                    this.state.clear_kinds(now());
                     cx.notify();
                 },
             )));
@@ -224,7 +243,7 @@ impl ActivityView {
             let id = kind_id(kind);
             pills = pills.child(segment(id, kind.label(), filter.has_kind(kind)).on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.state.toggle_kind(kind, Utc::now());
+                    this.state.toggle_kind(kind, now());
                     cx.notify();
                 }),
             ));
@@ -326,7 +345,7 @@ impl ActivityView {
                 let clear = (!self.state.filter.is_unfiltered()).then(|| {
                     style::button("activity-clear-filters", "Clear filters", ButtonKind::Secondary, false, theme)
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            let now = Utc::now();
+                            let now = now();
                             this.state.clear_kinds(now);
                             this.state.set_project(None, now);
                             this.state.set_workspace(None, now);
@@ -451,8 +470,8 @@ impl ActivityView {
             ),
         };
         let choice = move |this: &mut Self, value: Option<String>| match picker {
-            Picker::Project => this.state.set_project(value, Utc::now()),
-            Picker::Workspace => this.state.set_workspace(value, Utc::now()),
+            Picker::Project => this.state.set_project(value, now()),
+            Picker::Workspace => this.state.set_workspace(value, now()),
         };
         let mut rows = vec![(all_label.to_string(), None)];
         rows.extend(options.into_iter().map(|o| (o.clone(), Some(o))));

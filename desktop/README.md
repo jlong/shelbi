@@ -257,6 +257,54 @@ cargo run --features visual-check -- --visual-check /tmp/vc   # offscreen: frame
 cargo run --features visual-check -- --visual-workspace /tmp/vw   # offscreen: the Workspace view's states, fake sessions
 ```
 
+### Pixel QA against the Figma mockups
+
+The redesign's target is John's Figma file; its 1x frame exports (and the
+frame list, tokens and decisions) live in
+`~/.shelbi/projects/shelbi/design-refs/desktop-figma/`. Two tools compare the
+app against them:
+
+```sh
+cd desktop
+cargo run --features visual-check -- --visual-figma /tmp/vf   # 20 frames: 10 screens x 2 themes
+scripts/figma-diff.sh /tmp/vf                                 # diff each against its reference
+```
+
+`--visual-figma <dir>` renders every mockup screen through the real window
+shell (`ShelbiWindow`) at 1440x1024, offscreen, with no screen, daemon or user
+state: a sandboxed `SHELBI_HOME` under `/tmp` (hub and control socket variables
+unset), fake sessions and a fake daemon. The fixtures carry the mockups' own
+content: "My project", the sidebar's reviews and workspaces, the board's
+cards and counts, the Activity events (the clock pinned to 2026-10-17 15:00
+local, so relative times and day groups read as drawn), the Machines rows
+(the `gpu` SSH box answers reachable without a probe), and the terminal
+transcripts with their SGR colors (redrawn at the pane's size, so footers sit
+on the last rows). Frames are named as the references are,
+`<screen>-<theme>.png` for orchestrator, issues, issue-detail, activity,
+review, workspace, workspace-idle, machines, settings and command-palette;
+`SHELBI_VISUAL_THEME=dark|light` renders one theme. The hidden window draws
+at the main display's backing scale; a 2x frame is downsampled, so the saved
+frames are always 1x and line up with the references pixel for pixel. For
+close inspection pass `--2x` (`--visual-figma /tmp/vf2 --2x`): each window
+then opens on the first Retina display (visible there while it renders, above
+other windows, without taking focus) and the native 2880x2048 frame is kept.
+With no Retina display attached (a closed laptop on external monitors) it says
+so and the frames come at 1x. Export the Figma frames at 2x (Figma's export
+panel, or the Figma MCP's `get_screenshot` on the node IDs in the README
+there) into a directory to pass as the diff's ref-dir.
+
+`scripts/figma-diff.sh <render-dir> [ref-dir]` (ImageMagick 7; ref-dir
+defaults to the folder above) writes `<screen>-<theme>-side.png` (reference
+left, render right), `-heat.png` (the per-pixel difference, red to yellow,
+over the dimmed reference) and `-overlay.png` (50/50 blend) into
+`<render-dir>/diff/`, and prints a table, also saved as `diff/report.txt`: the
+share of pixels differing by more than `FUZZ`% (default 10) and the bounding
+boxes of the largest regions of differing pixels (merged across `GROW` px,
+default 6). The references' rounded window corners sit on Figma's canvas and
+are masked out (`CORNER`, default 28 px). A render of another size is scaled to
+the reference's first. A region as large as the frame means the background
+itself differs.
+
 ### Performance and concurrent clients
 
 `dt-terminal-perf-multiclient` (numbers in `docs/status/dt-terminal-perf-multiclient.md`):

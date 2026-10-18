@@ -47,6 +47,26 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// How often the view drains its refresher and the prober.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Probe `host` over SSH, or (`--visual-figma`, whose fixture hosts don't
+/// exist) answer reachable without a probe.
+fn probe(host: &str) -> shelbi_core::Reachability {
+    #[cfg(feature = "visual-check")]
+    if FIXTURE_HOSTS_REACHABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return shelbi_core::Reachability::Reachable;
+    }
+    shelbi_orchestrator::machine::probe_host_reachability(host)
+}
+
+#[cfg(feature = "visual-check")]
+static FIXTURE_HOSTS_REACHABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Answer every remote reachable without probing it, for the rest of the
+/// process (`--visual-figma`).
+#[cfg(feature = "visual-check")]
+pub fn stub_reachable() {
+    FIXTURE_HOSTS_REACHABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// What the view asks of the window.
 #[derive(Debug, Clone)]
 pub enum MachinesEvent {
@@ -77,9 +97,7 @@ impl MachinesView {
         let prober = ReachabilityProber::spawn(
             REACHABILITY_CADENCE,
             REACHABILITY_BACKOFF_MAX,
-            |_machine: &str, host: &str| {
-                shelbi_orchestrator::machine::probe_host_reachability(host)
-            },
+            |_machine: &str, host: &str| probe(host),
         );
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
@@ -166,6 +184,11 @@ impl MachinesView {
     #[cfg(feature = "visual-check")]
     pub fn state(&self) -> &MachinesState {
         &self.state
+    }
+
+    #[cfg(feature = "visual-check")]
+    pub fn state_mut(&mut self) -> &mut MachinesState {
+        &mut self.state
     }
 
     // ---- rendering --------------------------------------------------------

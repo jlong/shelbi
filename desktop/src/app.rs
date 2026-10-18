@@ -3957,6 +3957,14 @@ fn inert_ready() -> Ready {
     }
 }
 
+/// The board, the Activity feed and the Machines view, each once shown.
+#[cfg(feature = "visual-check")]
+pub(crate) type NativeViews = (
+    Option<Entity<IssuesView>>,
+    Option<Entity<ActivityView>>,
+    Option<Entity<MachinesView>>,
+);
+
 /// `--visual-review`'s window: the real shell over a fixture sidebar, with
 /// nothing live (no feed, bootstrap or daemon; commands and the view a review
 /// returns to are only recorded), reviews over `deps`, and the column
@@ -4061,6 +4069,48 @@ impl ShelbiWindow {
         w.workspace_deps = Some(workspace);
         w.probe = Some(probe);
         w
+    }
+
+    /// `--visual-figma`'s window: [`Self::offscreen`]'s, with workspaces
+    /// over `workspace` and the orchestrator chat over `chat`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn figma(
+        project: &str,
+        model: SidebarModel,
+        review: ReviewDeps,
+        workspace: WorkspaceDeps,
+        chat: Rc<dyn Fn() -> ChatDeps>,
+        clock: Rc<dyn Fn() -> Instant>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut w = Self::offscreen(project, model, review, clock, window, cx);
+        w.workspace_deps = Some(workspace);
+        w.chat_deps = Some(chat);
+        w
+    }
+
+    /// Move the sidebar's selection to the row that opens `target`, as a
+    /// click on it would (a no-op when no row does).
+    pub(crate) fn offscreen_select_target(&mut self, target: &SidebarTarget, cx: &mut Context<Self>) {
+        let rows = self.model.rows();
+        if let Some(ordinal) = rows.iter().filter_map(|r| r.target()).position(|t| t == *target) {
+            self.offscreen_select(ordinal, cx);
+        }
+    }
+
+    pub(crate) fn offscreen_open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+    }
+
+    /// Show task `id`'s detail on the board.
+    pub(crate) fn offscreen_open_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_task(id, window, cx);
+    }
+
+    /// The native views shown so far.
+    pub(crate) fn offscreen_views(&self) -> NativeViews {
+        (self.issues.clone(), self.activity.clone(), self.machines.clone())
     }
 
     /// Carry out `call` as a command dispatch would.

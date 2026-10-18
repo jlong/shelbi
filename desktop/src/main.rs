@@ -28,6 +28,8 @@ mod views;
 #[cfg(feature = "visual-check")]
 mod visual_check;
 #[cfg(feature = "visual-check")]
+mod visual_figma;
+#[cfg(feature = "visual-check")]
 mod visual_views;
 #[cfg(feature = "visual-check")]
 mod visual_review;
@@ -71,6 +73,11 @@ enum Mode {
     /// sessions, one frame per state (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     VisualReview(Option<String>),
+    /// `--visual-figma [dir] [--2x]`: render every Figma mockup screen in
+    /// the real shell over the mockups' own content, at the reference PNGs'
+    /// size (feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    VisualFigma(Option<String>, bool),
     /// `--bench-push [options]`: time the leading column's push in a real
     /// window over fake daemons (feature `visual-check`).
     #[cfg(feature = "visual-check")]
@@ -98,6 +105,12 @@ fn parse_args() -> Mode {
         Some("--visual-workspace") => Mode::VisualWorkspace(args.next()),
         #[cfg(feature = "visual-check")]
         Some("--visual-review") => Mode::VisualReview(args.next()),
+        #[cfg(feature = "visual-check")]
+        Some("--visual-figma") => {
+            let rest: Vec<String> = args.collect();
+            let dir = rest.iter().find(|a| !a.starts_with("--")).cloned();
+            Mode::VisualFigma(dir, rest.iter().any(|a| a == "--2x"))
+        }
         #[cfg(feature = "visual-check")]
         Some("--bench-push") => Mode::BenchPush(args.collect()),
         #[cfg(feature = "bench")]
@@ -137,6 +150,11 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::VisualReview(dir) = mode {
         visual_review::run(visual_check::out_dir(dir));
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::VisualFigma(dir, native) = mode {
+        let (dir, theme) = visual_check::per_theme(dir);
+        visual_figma::run(dir, theme, native);
     }
     #[cfg(feature = "visual-check")]
     if let Mode::BenchPush(args) = &mode {
