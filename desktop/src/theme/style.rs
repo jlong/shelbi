@@ -30,8 +30,6 @@
 //! - every hover and press fades over about 200ms ([`motion::fill_layer`]);
 //! - menus, popovers and the palette raised with a ring and a soft drop
 //!   ([`popover`]);
-//! - the accent pill marking the keyboard-current row
-//!   ([`selection_indicator`]);
 //! - the keyboard focus as Figma draws it: a 1px `focus/default/ring` and a
 //!   4px `focus/default/focus-glow` ([`focus_shadow`]).
 //!
@@ -217,23 +215,9 @@ pub fn popover<E: Styled>(el: E, theme: &Theme) -> E {
         .text_color(theme.foreground)
 }
 
-/// The accent pill at a row's leading edge marking the keyboard-current row.
-/// Absolutely positioned: the row needs `.relative()`.
-pub fn selection_indicator(theme: &Theme) -> Div {
-    div()
-        .absolute()
-        .left(px(-6.0))
-        .top_0()
-        .bottom_0()
-        .flex()
-        .items_center()
-        .child(div().w(px(3.0)).h(px(16.0)).rounded_full().bg(theme.accent))
-}
-
 /// Paint a row in a nav list by its state: the raised chip while it is the
-/// current page (`current`), the accent pill while it is the keyboard's row
-/// (`keyboard`, over a fill when it isn't also current), else a fill that
-/// fades in on hover. `key` names the row for its fade, `radius` its corners
+/// current page (`current`), the selection fill while it is the keyboard's
+/// row (`keyboard`) and not also current, else a fill that fades in on hover. `key` names the row for its fade, `radius` its corners
 /// (the Navigation component's are [`NAV_RADIUS`]). `chip_inline: false`
 /// leaves the current row's chip to a sliding one ([`motion::SlideTrack`])
 /// while it moves, keeping the row's loud label.
@@ -247,7 +231,7 @@ pub fn row_state_rounded(
     theme: &Theme,
 ) -> Stateful<Div> {
     let d = d.relative();
-    let d = if current {
+    if current {
         let d = d.text_color(theme.text_loud).font_weight(FontWeight::MEDIUM);
         if chip_inline {
             nav_chip(d, theme)
@@ -259,8 +243,7 @@ pub fn row_state_rounded(
     } else {
         let clear = theme.background.opacity(0.0);
         fill_layer(d, key, radius, [clear, theme.background, theme.background_hover])
-    };
-    d.when(keyboard, |d| d.child(selection_indicator(theme)))
+    }
 }
 
 /// The Navigation component's corners: its rows, chip and buttons.

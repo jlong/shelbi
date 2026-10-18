@@ -326,9 +326,6 @@ pub struct SidebarProps<'a> {
     /// The selected row's selectable-row ordinal over [`layout`]'s rows, or
     /// `None` when what the main area shows has no row.
     pub selection: Option<usize>,
-    /// Keyboard focus is in the sidebar (the selected row wears the accent
-    /// pill).
-    pub focused: bool,
     pub link: Option<DaemonLink>,
     /// The palette-open chord, for the Search button's tooltip (`⌃P`).
     pub palette_chord: String,
@@ -666,7 +663,6 @@ pub fn render<H: SidebarHost>(
     let chip = props.chip.map(|bounds| {
         motion::floating_chip(bounds, |d| {
             style::nav_chip(d.rounded(px(NAV_RADIUS)), theme)
-                .when(props.focused, |d| d.child(style::selection_indicator(theme)))
         })
     });
     let rest = entries[nav_n..]
@@ -978,7 +974,7 @@ fn render_nav_row<H: SidebarHost>(
 /// The component's nav item (the sidebar's nav, the task panels' views):
 /// 34pt, 6pt in, the icon, the label growing, then `trailing` (the hotkey);
 /// `current` turns the icon to the accent. `d` comes painted with its state
-/// (the chip and its loud, medium label, the keyboard pill, the hover fill),
+/// (the chip and its loud, medium label, the keyboard's fill, the hover fill),
 /// so the content lands over the fill.
 pub fn nav_item(
     d: gpui::Stateful<gpui::Div>,
@@ -1003,9 +999,9 @@ pub fn nav_item(
         .children(trailing)
 }
 
-/// Paint a row selected (the chip, the accent pill while the sidebar has
-/// keyboard focus) or hoverable, and measure it for the chip's slide. While
-/// the chip slides, the floating one stands in for the row's own.
+/// Paint a row selected (the chip) or hoverable, and measure it for the
+/// chip's slide. While the chip slides, the floating one stands in for the
+/// row's own.
 fn selected_row(
     d: gpui::Stateful<gpui::Div>,
     key: &str,
@@ -1018,7 +1014,7 @@ fn selected_row(
         d,
         key.to_string(),
         selected,
-        selected && props.focused && inline,
+        false,
         inline,
         px(NAV_RADIUS),
         theme,
@@ -1783,7 +1779,6 @@ mod render_tests {
                     model: &self.model,
                     collapsed: &collapsed,
                     selection: Some(self.selection),
-                    focused: true,
                     link: self.link,
                     palette_chord: "⌃P".into(),
                     switcher: None,

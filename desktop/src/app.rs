@@ -3935,7 +3935,6 @@ impl ShelbiWindow {
                         model: &self.model,
                         collapsed: &self.collapsed_sections,
                         selection,
-                        focused: self.client.focus() == Focus::Sidebar,
                         link: self.link,
                         palette_chord: self.palette_chord.clone(),
                         switcher: catalog_projects.as_deref().zip(switcher_phase).map(

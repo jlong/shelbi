@@ -9,7 +9,7 @@ use shelbi_app::overlay::review_confirm::{
     ConfirmFocus, Dialog, CANCEL_LABEL, DISMISS_LABEL, LOAD_LABEL, TITLE,
 };
 
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::ButtonKind;
 use crate::theme::Theme;
 use crate::views::overlay::{button, confirm_event, panel, title, with_overlay, ActiveOverlay, OverlayEvent, OverlayHost};
 
@@ -78,7 +78,7 @@ pub fn render<H: OverlayHost>(dialog: &Dialog, theme: &Theme, cx: &mut Context<H
                         .rounded_lg()
                         .cursor_pointer()
                         .when(selected && dialog.focus() == ConfirmFocus::List, |r| {
-                            r.bg(theme.row_selected).child(style::selection_indicator(theme))
+                            r.bg(theme.row_selected)
                         })
                         .when(!selected, |r| r.hover(|s| s.bg(theme.background)))
                         .child(

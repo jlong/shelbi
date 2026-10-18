@@ -966,7 +966,6 @@ impl WorkspaceView {
                 .children(chip.map(|b| {
                     motion::floating_chip(b, |d| {
                         style::nav_chip(d.rounded(px(NAV_RADIUS)), theme)
-                            .when(focused, |d| d.child(style::selection_indicator(theme)))
                     })
                 }))
                 .children(views)
