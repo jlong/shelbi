@@ -16,13 +16,14 @@ use shelbi_state::{DesktopConfig, OptionAsMeta};
 
 use super::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 
-/// The smallest and largest font size the terminal accepts (points), the
-/// same range the settings view validates.
+/// The smallest and largest font size the terminal accepts (points), for a
+/// `config.yaml` edited by hand.
 pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<u16> = 6..=72;
 
-/// The range ⌘+ and ⌘− step within (points). A size set in Settings may lie
-/// outside it; a step from there lands back inside, or does nothing when it
-/// would move the wrong way.
+/// The range ⌘+ and ⌘− and the settings view's size stepper step within
+/// (points). A size set in `config.yaml` by hand may lie outside it; a zoom
+/// step from there lands back inside, or does nothing when it would move
+/// the wrong way.
 pub const ZOOM_RANGE: std::ops::RangeInclusive<u16> = 8..=32;
 
 /// One font zoom step: View ▸ Bigger (⌘+), Smaller (⌘−), Actual Size (⌘0).

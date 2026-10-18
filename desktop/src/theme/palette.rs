@@ -53,6 +53,10 @@ pub mod figma {
     pub const WHITE: Pair = pair(0xf8f8faff, 0x020303ff);
     /// `theme.gray`: secondary text, hotkeys, icons.
     pub const GRAY: Pair = pair(0xacb4cfe5, 0x7b85a7e5);
+    /// `theme.gray` as the Settings frame overrides it: `#7b85a7`, opaque,
+    /// in both modes (a field's value, an unselected choice, a form
+    /// button's label).
+    pub const GRAY_SETTINGS: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
     /// `theme.muted`: quiet text (section headers, branches, hints).
     pub const MUTED: Pair = pair(0x777a86ff, 0x444c65a6);
     /// `theme.gray` as the Activity frame sets it: `#7b85a7`, opaque, in
@@ -266,6 +270,10 @@ palette! {
     foreground,
     /// Secondary text: hotkeys, metadata (`theme.gray`).
     gray,
+    /// A settings control's text: a field's value, an unselected choice, a
+    /// form button's label (`theme.gray` as the Settings frame overrides
+    /// it).
+    form_text,
     /// Quiet text: section headers, branches, timestamps, hints, idle
     /// states, placeholders (`theme.muted`).
     muted,
@@ -452,6 +460,7 @@ impl Palette {
             text_loud: pick(WHITE),
             foreground: pick(FOREGROUND),
             gray: pick(GRAY),
+            form_text: pick(GRAY_SETTINGS),
             muted: pick(MUTED),
             text_on_color: Rgba::hex(0xffffff),
             log_text: pick(GRAY_ACTIVITY),
@@ -581,6 +590,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "error on hover button"),
     ("dark", "error on pressed button"),
     ("dark", "input_border on"),
+    ("dark", "form_text on"),
     ("light", "muted on"),
     ("light", "gray on"),
     ("light", "log_text on"),
@@ -591,6 +601,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "error on pressed button"),
     ("light", "focus_ring on"),
     ("light", "input_border on"),
+    ("light", "form_text on"),
 ];
 
 #[cfg(test)]
@@ -727,6 +738,10 @@ mod tests {
             check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
             check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
         }
+        // Settings' controls, on the canvas they sit on: a field's value, an
+        // unselected choice, and a form button's label on its fill.
+        check("form_text on canvas".into(), p.form_text, p.well, AA);
+        check("form_text on form button".into(), p.form_text, flatten(p.search, p.canvas), AA);
         check(
             "success on zen over sidebar".into(),
             p.success,

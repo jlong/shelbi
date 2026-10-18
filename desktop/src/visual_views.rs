@@ -12,7 +12,8 @@
 //! `activity-picker.png` (the project picker open), `machines.png` once the
 //! unreachable remote's probe has landed, and the issues board: `board.png`
 //! (a card selected), `board-dropdown.png` (the workflow filter open) and
-//! `board-detail.png` (a card's detail); then `settings.png`, the bootstrap
+//! `board-detail.png` (a card's detail); then `settings.png`, Settings with its
+//! font picker open (`settings-font-picker.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
 //! notice bars (`notice-bars.png`: the update and relaunch bars). It prints
 //! one line per check and exits non-zero if any failed.
@@ -151,6 +152,21 @@ pub fn run(out: PathBuf) -> ! {
         cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
     });
     save(&mut cx, window, &out, "settings.png");
+    // The font picker open, once the installed families are read.
+    let settings = window
+        .update(&mut cx, |root, _, _| root.downcast::<crate::views::settings::SettingsView>())
+        .expect("the settings window")
+        .expect("the settings view");
+    window
+        .update(&mut cx, |_, window, cx| {
+            settings.update(cx, |v, cx| v.offscreen_open_font_picker(window, cx))
+        })
+        .expect("open the font picker");
+    let listed = wait(&mut cx, window, Duration::from_secs(10), |cx| {
+        settings.read_with(cx, |v, cx| v.offscreen_font_picker_ready(cx))
+    });
+    expect("settings: the font picker lists the installed fonts", listed);
+    save(&mut cx, window, &out, "settings-font-picker.png");
     let (_, window) = open(&mut cx, |cx| {
         cx.new(|_| Screen(Box::new(|theme, _| {
             crate::views::bootstrap::render_progress(

@@ -95,8 +95,9 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
   Regular, Bold, Italic, Bold Italic, so SGR bold and italic use real faces.
   The default is 14pt on 18pt rows (`MIN_LINE_HEIGHT` is 18/14, a floor: a
   taller font keeps its own leading). Geist Mono stays bundled as the first
-  glyph fallback, then Symbols Nerd Font Mono, then Menlo. Settings reads
-  "Blank uses Source Code Pro".
+  glyph fallback, then Symbols Nerd Font Mono, then Menlo. Settings picks
+  the family from a list of the bundled faces and the installed monospaced
+  families (`elements/terminal/fonts.rs`), each row set in its own font.
 - **Colors**: the background is `canvas`, the default foreground
   `foreground` (flattened over the canvas: `#b2b4bb` dark), bold text in the
   default foreground `text_loud` (`theme.white`, the frames' bold prompt
@@ -136,11 +137,12 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Dropdown | A button that opens a menu (the board's and Activity's filters): the Figma Button at X-Small with a left icon, 24px tall, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the icon sits in Figma's 14px Icon slot (`icon_slot`); pressed while its menu is open, and the menu opens 6px under it |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
-| Segmented control | A track (the overlay fill, 2px inside) of 24px segments (28px in Settings), X-Small medium; the selected one is `selection` and loud; the others `foreground`, a fill fading in on hover |
+| Segmented control | No track: segments in a bare row 4px apart, the selected one on the `selection` chip, which slides between them. Settings' (`choice_track` / `choice`): 26px, 12px across, Base; the selected one Base medium and loud, the others `form_text`, a fill fading in on hover. Activity's kind filter is its own (below) |
 | Activity filters | The Activity frame's own: kind segments in a bare row 4px apart (no track), 24px, 8px across, X-Small, muted, the selected one `selection` and loud; then, 16px on, the pickers: `search`'s fill, the icon, an X-Small `gray` label, no chevron (`filter_segment`, `filter_dropdown`) |
 | Icon button | 24, 32 or 40px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the overlay fill while active |
-| Text field | The canvas inside a 1px `input_border` (`theme.divider`), as Settings draws it |
-| Checkbox | 16px; checked, the loud color with the mark in the canvas (Settings) |
+| Text field | `field`: 360 x 32, 10px across, 6px corners, the canvas inside a 1px `input_border` (`theme.divider`), Base in `gray`, as Settings draws it; the font picker and the size stepper wear the same shape |
+| Form button | `form_button`: Settings' "Open keys.yaml": `theme.search`, 26px, 12px across, Base in `gray` |
+| Checkbox | 14px, 2px corners; checked, the loud color with the mark in the canvas; unchecked, a 1px `muted` edge (Settings) |
 | Menu, popover | `raised`, 8px corners, a 1px `ring` and a soft drop |
 | Palette | The Command palette frame: over the `scrim`, 200px down, 788px wide (a 580px commands column, a 160px Projects column, 16px between and either side); `raised`, 8px corners, no ring, `palette_shadow` (0 10 15 -3). A 44px query line (`❯`, a 2x18px `link` caret, the placeholder `muted`), 32px rows (6px across and between, 6px corners: a 20px `icon`, the name in a 220px column in Base medium `foreground`, the description in Base `muted`; the selected row on `background`, its name Base semibold `text_loud`, its description `foreground`), 26px project rows, an X-Small `muted` footer |
 | Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
@@ -229,6 +231,7 @@ until a new role has its row here, with the values the palette really has.
 | `text_loud` | `#f8f8fa` | `#020303` | `theme.white`: titles, the selected row, a workspace name |
 | `foreground` | `#f2f3f7b2` | `#020303b2` | `theme.foreground`: body text and labels |
 | `gray` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: hotkeys, secondary text |
+| `form_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Settings frame overrides it (opaque, both modes): a field's value, an unselected choice, a form button's label |
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
 | `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor |
@@ -250,7 +253,7 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `divider` | `#acb4cf1a` | `#acb4cf1a` | `theme.divider`: dividers and hairlines |
 | `divider_strong` | `#acb4cf33` | `#acb4cf33` | The Issues frame's `theme.divider`: the board's rules |
-| `input_border` | `#acb4cf1a` | `#acb4cf1a` | `theme.divider` (Settings): a text field's and checkbox's border |
+| `input_border` | `#acb4cf1a` | `#acb4cf1a` | `theme.divider` (Settings): a text field's border |
 
 ### Links and focus
 
@@ -388,6 +391,7 @@ with its worst ratio. **Flagged for John.**
 | dark | error on hover button | 3.94 | The same, hovered |
 | dark | error on pressed button | 3.53 | The same, pressed |
 | dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
+| dark | form_text on | 2.53 | The Settings frame's `theme.gray` override, `#7b85a7`: a field's value and an unselected choice 4.30 on the canvas, "Open keys.yaml" 2.53 on its `theme.search` fill |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
 | light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
@@ -398,6 +402,7 @@ with its worst ratio. **Flagged for John.**
 | light | error on pressed button | 3.98 | `#b40041` on the Danger button pressed |
 | light | focus_ring on | 2.41 | `focus/default/ring` `#31ade9`: 2.53 on white; the 4px glow widens it |
 | light | input_border on | 1.06 | `theme.divider` as a field's edge |
+| light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
 
 ## Renders
 
