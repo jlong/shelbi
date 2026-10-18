@@ -1149,6 +1149,7 @@ mod tests {
             location: location.map(str::to_string),
             workspace: None,
             state,
+            number: None,
         }
     }
 

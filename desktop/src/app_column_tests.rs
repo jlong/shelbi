@@ -369,13 +369,13 @@ fn the_panel_uses_the_users_width_and_the_divider_resizes_it(cx: &mut TestAppCon
     c.h.cx.simulate_mouse_up(point(gpui::px(300.0), divider.y), MouseButton::Left, Modifiers::none());
     c.h.draw();
     let dragged = c.read(|w, _| w.client.sidebar_width());
-    assert_eq!(dragged, 33);
-    assert_eq!(c.width("review-panel"), sidebar_px(33), "the panel follows the drag");
+    assert_eq!(dragged, 30);
+    assert_eq!(c.width("review-panel"), sidebar_px(30), "the panel follows the drag");
 
     // The sidebar comes back at the dragged width: one column, one width.
     c.back();
     c.advance(SLIDE);
-    assert_eq!(c.width("sidebar"), sidebar_px(33));
+    assert_eq!(c.width("sidebar"), sidebar_px(30));
 }
 
 #[gpui::test]
@@ -398,7 +398,7 @@ fn a_collapsed_sidebar_lends_its_column_and_stays_collapsed(cx: &mut TestAppCont
     c.h.cx.simulate_mouse_move(point(gpui::px(300.0), divider.y), MouseButton::Left, Modifiers::none());
     c.h.cx.simulate_mouse_up(point(gpui::px(300.0), divider.y), MouseButton::Left, Modifiers::none());
     c.h.draw();
-    assert_eq!(c.width("review-panel"), sidebar_px(33));
+    assert_eq!(c.width("review-panel"), sidebar_px(30));
 
     // Back: the panel leaves and the column with it; still collapsed.
     c.back();

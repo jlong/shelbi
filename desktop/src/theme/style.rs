@@ -16,14 +16,15 @@
 //!   the Figma Button component's Default (`theme.background`), Success
 //!   (green tint, `text/green`) and Danger (pink tint) styles, quiet only a
 //!   hover fill;
-//! - quiet icon buttons ([`icon_button`]) 24/32/40px on a hover fill;
+//! - quiet icon buttons ([`icon_button`]) 24/32px on a hover fill;
 //! - toolbar actions ([`toolbar_button`]) and the icon slot Figma lays a
 //!   button's icon in ([`icon_slot`]);
 //! - a workflow status's glyph ([`status_icon`]) and heading
 //!   ([`status_heading`]: the board's column headers, the task panels);
 //! - controls that open something ([`dropdown`]), segmented controls
-//!   ([`filter_track`], [`choice_track`]) and the sidebar's search box
-//!   ([`search_box`], with the Hotkey [`keycaps`]);
+//!   ([`filter_track`], [`choice_track`]), shortcut keycaps ([`keycaps`]);
+//! - the sidebar's (the Navigation component's) 6px corners
+//!   ([`NAV_RADIUS`]) and plain-text shortcut hints ([`hotkey`]);
 //! - a project's initials badge ([`project_badge`]);
 //! - every hover and press fades over about 200ms ([`motion::fill_layer`]);
 //! - menus, popovers and the palette raised with a ring and a soft drop
@@ -37,14 +38,14 @@
 //! Spacing follows Figma's scale (2, 4, 6, 8, 12, 16).
 
 use gpui::{
-    div, point, prelude::*, px, AnyView, App, BoxShadow, Div, FontWeight, Hsla,
+    div, point, prelude::*, px, AnyView, App, BoxShadow, Div, FontWeight, Hsla, Pixels,
     SharedString, Stateful, Svg, Window,
 };
 use shelbi_core::StatusCategory;
 
 use super::motion::fill_layer;
 use super::{hsla, palette, Hue, Theme};
-use crate::assets::{heroicon, icons, status_glyph, Icon, StatusGlyph};
+use crate::assets::{heroicon, status_glyph, Icon, StatusGlyph};
 
 /// The UI typeface every [`Type`] is set in.
 pub const UI_FAMILY: &str = "Geist";
@@ -190,9 +191,16 @@ fn ring_shadow(color: Hsla) -> BoxShadow {
     }
 }
 
-/// Paint `el` as the selected nav row: the raised chip.
+/// Paint `el` as the selected nav row: the canvas chip, lifted with the
+/// raised-card shadow in Light (the Navigation component draws the dark chip
+/// flat).
 pub fn nav_chip<E: Styled>(el: E, theme: &Theme) -> E {
-    el.bg(theme.nav_selected).shadow(raised_card_shadow(theme))
+    let el = el.bg(theme.nav_selected);
+    if theme.is_dark() {
+        el
+    } else {
+        el.shadow(raised_card_shadow(theme))
+    }
 }
 
 /// Paint `el` as a raised surface: a menu, a popover, the palette, a dialog.
@@ -230,6 +238,20 @@ pub fn row_state(
     chip_inline: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
+    row_state_rounded(d, key, current, keyboard, chip_inline, px(8.0), theme)
+}
+
+/// [`row_state`] for a row with `radius` corners (the sidebar's rows are
+/// [`NAV_RADIUS`]), so the hover fill fits them.
+pub fn row_state_rounded(
+    d: Stateful<Div>,
+    key: impl Into<SharedString>,
+    current: bool,
+    keyboard: bool,
+    chip_inline: bool,
+    radius: Pixels,
+    theme: &Theme,
+) -> Stateful<Div> {
     let d = d.relative();
     let d = if current {
         let d = d.text_color(theme.text_loud).font_weight(FontWeight::MEDIUM);
@@ -242,7 +264,7 @@ pub fn row_state(
         d.bg(theme.background)
     } else {
         let clear = theme.background.opacity(0.0);
-        fill_layer(d, key, px(8.0), [clear, theme.background, theme.background_hover])
+        fill_layer(d, key, radius, [clear, theme.background, theme.background_hover])
     };
     d.when(keyboard, |d| d.child(selection_indicator(theme)))
 }
@@ -250,6 +272,25 @@ pub fn row_state(
 /// The sliding chip's paint: [`nav_chip`]'s, with its corners.
 pub fn nav_chip_layer(d: Div, theme: &Theme) -> Div {
     nav_chip(d.rounded_lg(), theme)
+}
+
+/// The Navigation component's corners: its rows, chip and buttons.
+pub const NAV_RADIUS: f32 = 6.0;
+
+/// The Navigation component's Hotkey: a chord's keys as plain text glyphs
+/// (`⌘O` is ⌘ and O, 2px apart), X-Small in gray, 4px either side. No
+/// keycaps.
+pub fn hotkey(chord: &str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(2.0))
+        .px(px(4.0))
+        .type_style(Type::XSmall)
+        .text_color(theme.gray)
+        .children(split_chord(chord))
 }
 
 /// A row in a menu or popover list (the project switcher): 32px, 8px
@@ -418,8 +459,6 @@ pub enum IconButtonSize {
     Small,
     /// 32px, 12px corners.
     Default,
-    /// 40px, 12px corners.
-    Large,
 }
 
 impl IconButtonSize {
@@ -427,7 +466,6 @@ impl IconButtonSize {
         match self {
             IconButtonSize::Small => 24.0,
             IconButtonSize::Default => 32.0,
-            IconButtonSize::Large => 40.0,
         }
     }
 }
@@ -818,33 +856,6 @@ pub fn split_chord(chord: &str) -> Vec<String> {
         keys.push(rest.to_uppercase());
     }
     keys
-}
-
-/// The sidebar's search box: the overlay fill (12px corners) fading to its
-/// hover, a magnifying glass, "Search" growing to fill, and the shortcut's
-/// keycaps.
-pub fn search_box(id: impl Into<SharedString>, chord: &str, theme: &Theme) -> Stateful<Div> {
-    let id: SharedString = id.into();
-    let selector = id.clone();
-    let d = div()
-        .id(id.clone())
-        .debug_selector(move || selector.to_string())
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .w_full()
-        .h(px(32.0))
-        .pl(px(8.0))
-        .pr(px(6.0))
-        .rounded_xl()
-        .type_style(Type::Base)
-        .text_color(theme.foreground)
-        .cursor_pointer();
-    fill_layer(d, id, px(12.0), [theme.background, theme.background_hover, theme.background_active])
-        .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon))
-        .child(div().flex_1().child("Search"))
-        .when(!chord.is_empty(), |d| d.child(keycaps(chord, theme)))
 }
 
 /// A project's badge: its two-letter initials, bold and white, on a hue

@@ -195,6 +195,7 @@ fn sidebar_model() -> SidebarModel {
         location: Some("hub:4101".into()),
         workspace: Some("review-1".into()),
         state: ReviewState::Serving,
+        number: None,
     }];
     m.board_loading = false;
     m

@@ -82,7 +82,8 @@ Where today's views show something else, no fixture can make them agree; these
 are design changes for the restyle tasks, or inconsistencies inside the
 mockups:
 
-- **Fields the views don't show (yet):** the sidebar's `#401` and ⌘ shortcuts;
+- **Fields the views don't show (yet):** the sidebar's `#401` and ⌘ shortcuts
+  (shown since `dt-figma-sidebar`, and the fixture's reviews carry `#401`);
   Machines' runner column ("Codex", "Claude": the view shows the agent, e.g.
   `developer`) and task titles in the assignment cell (the view shows
   `in_progress: <id>` then the title); the issue detail's date-only created /

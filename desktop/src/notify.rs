@@ -348,6 +348,7 @@ mod tests {
             location: None,
             workspace: None,
             state: ReviewState::Pending,
+            number: None,
         }
     }
 

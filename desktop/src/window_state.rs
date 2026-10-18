@@ -252,6 +252,8 @@ pub struct ProjectViewState {
     /// The board's workflow filter (its workspace filter is saved by the
     /// board itself, shared with the TUI).
     pub workflow_filter: Option<String>,
+    /// The sidebar sections collapsed (`ready`, `queued`, `workspaces`).
+    pub collapsed_sections: Vec<String>,
 }
 
 impl ProjectViewState {
@@ -485,6 +487,7 @@ mod tests {
             review: Some("T-9".into()),
             workspace_return: Some("tasks".into()),
             workflow_filter: Some("task".into()),
+            collapsed_sections: vec!["queued".into()],
         };
         write_json(&path, &view).unwrap();
         assert_eq!(load_json::<ProjectViewState>(&path), view);

@@ -10,7 +10,8 @@
 //! keys in `crate::views::issues` both go through here.
 
 use gpui::Keystroke;
-use shelbi_state::keymap::{Key, KeyChord, Mods};
+use shelbi_app::nav::View;
+use shelbi_state::keymap::{format_chord, DisplayStyle, Key, KeyChord, Mods};
 
 use crate::elements::terminal::FontZoom;
 
@@ -45,6 +46,56 @@ pub fn font_zoom(chord: &KeyChord) -> Option<FontZoom> {
         Key::Char('0') if !shift => Some(FontZoom::ActualSize),
         _ => None,
     }
+}
+
+/// What one of the sidebar's own chords opens: the Navigation component's
+/// hotkeys, the desktop's fixed bindings (not `keys.yaml`'s, which the TUI
+/// shares).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavChord {
+    /// ⌘O, ⌘I, ⌘L: the Orchestrator, Issues and Changelog (Activity) views.
+    View(View),
+    /// ⌘1 to ⌘9: the sidebar row the hint numbers (reviews, then working
+    /// workspaces).
+    Row(u8),
+}
+
+/// The nav views' chords, as `keys.yaml` chord strings.
+const NAV_VIEW_CHORDS: &[(&str, &str)] = &[("orch", "super-o"), ("tasks", "super-i"), ("activity", "super-l")];
+
+/// The chord that opens `view` from anywhere in the window. `None` for a
+/// view without one (Machines).
+pub fn nav_view_chord(view: &View) -> Option<KeyChord> {
+    let id = view.as_view_id();
+    NAV_VIEW_CHORDS
+        .iter()
+        .find(|(v, _)| *v == id)
+        .and_then(|(_, spec)| KeyChord::parse(spec).ok())
+}
+
+/// [`nav_view_chord`] as the sidebar and the Go menu show it (`⌘O`).
+pub fn nav_view_hotkey(view: &View) -> Option<String> {
+    nav_view_chord(view).map(|c| format_chord(&c, DisplayStyle::Mac))
+}
+
+/// A numbered row's hint (`⌘3`).
+pub fn row_hotkey(n: u8) -> String {
+    format!("⌘{n}")
+}
+
+/// Whether `chord` is one of the sidebar's own chords, and what it opens.
+pub fn nav_chord(chord: &KeyChord) -> Option<NavChord> {
+    if chord.mods != Mods::SUPER {
+        return None;
+    }
+    if let Key::Char(c @ '1'..='9') = chord.code {
+        return Some(NavChord::Row(c as u8 - b'0'));
+    }
+    let canonical = chord.canonical();
+    NAV_VIEW_CHORDS.iter().find_map(|(view, spec)| {
+        let bound = KeyChord::parse(spec).ok()?;
+        (bound.canonical() == canonical).then(|| NavChord::View(View::from_view_id(view)))
+    })
 }
 
 /// Translate a gpui [`Keystroke`] into a [`KeyChord`], or `None` for a key
@@ -223,6 +274,25 @@ mod tests {
         ] {
             assert_eq!(font_zoom(&KeyChord::parse(spec).unwrap()), Some(step), "{spec}");
         }
+    }
+
+    #[test]
+    fn the_sidebar_chords_open_the_nav_views_and_numbered_rows() {
+        let chord = |spec, typed| chord_from_keystroke(&ks(spec, Some(typed))).unwrap();
+        assert_eq!(nav_chord(&chord("cmd-o", "o")), Some(NavChord::View(View::Session("orch".into()))));
+        assert_eq!(nav_chord(&chord("cmd-i", "i")), Some(NavChord::View(View::Issues)));
+        assert_eq!(nav_chord(&chord("cmd-l", "l")), Some(NavChord::View(View::Activity)));
+        assert_eq!(nav_chord(&chord("cmd-1", "1")), Some(NavChord::Row(1)));
+        assert_eq!(nav_chord(&chord("cmd-9", "9")), Some(NavChord::Row(9)));
+        assert_eq!(nav_chord(&chord("cmd-0", "0")), None);
+        assert_eq!(nav_chord(&chord("cmd-shift-o", "O")), None);
+        assert_eq!(nav_chord(&chord("ctrl-o", "o")), None);
+        assert_eq!(nav_chord(&chord("o", "o")), None);
+        assert_eq!(nav_view_hotkey(&View::Session("orch".into())).as_deref(), Some("⌘O"));
+        assert_eq!(nav_view_hotkey(&View::Issues).as_deref(), Some("⌘I"));
+        assert_eq!(nav_view_hotkey(&View::Activity).as_deref(), Some("⌘L"));
+        assert_eq!(nav_view_hotkey(&View::Machines), None);
+        assert_eq!(row_hotkey(4), "⌘4");
     }
 
     #[test]

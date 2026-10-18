@@ -764,6 +764,7 @@ mod tests {
             location: (state == ReviewState::Serving).then(|| "hub:4101".to_string()),
             workspace: Some("review-1".into()),
             state,
+            number: None,
         }
     }
 

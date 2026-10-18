@@ -84,14 +84,14 @@ fn the_switcher_menu_floats_over_the_sidebar(cx: &mut TestAppContext) {
     let search = d.bounds("sidebar-search").unwrap();
     let issues = d.bounds("sidebar-nav-Issues").unwrap();
     let button = d.bounds("sidebar-project-title").unwrap();
-    assert_eq!(button.size.height, px(36.0), "ContextStore's 36px button");
+    assert_eq!(button.size.height, px(28.0), "the component's 28pt trigger");
 
     d.open_switcher();
     let menu = d.bounds("sidebar-switcher").expect("the menu shows");
-    assert_eq!(d.bounds("sidebar-search").unwrap(), search, "the search box doesn't move");
+    assert_eq!(d.bounds("sidebar-search").unwrap(), search, "the search button doesn't move");
     assert_eq!(d.bounds("sidebar-nav-Issues").unwrap(), issues, "the nav doesn't move");
     assert_eq!(menu.top(), button.bottom() + px(6.0), "6px under the button");
-    assert!(menu.size.width >= button.size.width, "at least the button's width");
+    assert!(menu.size.width >= button.size.width, "at least the trigger's width");
     for name in ["sidebar-project-alpha", "sidebar-project-beta", "sidebar-project-gamma", "sidebar-add-project"] {
         assert!(d.bounds(name).is_some(), "{name} is listed");
     }
@@ -148,7 +148,9 @@ fn the_switcher_takes_the_keyboard(cx: &mut TestAppContext) {
 fn a_click_outside_closes_the_switcher(cx: &mut TestAppContext) {
     let mut d = Design::open(cx);
     d.open_switcher();
-    let elsewhere = d.bounds("sidebar-nav-Activity").unwrap().center();
+    // The main area, clear of the menu (which floats over the nav).
+    let sidebar = d.bounds("sidebar").unwrap();
+    let elsewhere = gpui::point(sidebar.right() + px(80.0), sidebar.center().y);
     d.h.cx.simulate_click(elsewhere, Modifiers::none());
     d.h.cx.run_until_parked();
     assert!(!d.switcher_open());

@@ -28,7 +28,7 @@
 //!
 //! One exception: a few drawings John made in the Figma file where
 //! Heroicons has none (the palette's Zen toggle, error log and finish
-//! flag). They live under `assets/icons/figma/` (see its README), on the
+//! flag, the sidebar's toggle). They live under `assets/icons/figma/` (see its README), on the
 //! Figma's 20pt grid, and render through the same [`heroicon`] helper.
 //!
 //! Where the Figma file draws an icon at **14pt** (the Activity pickers'
@@ -44,6 +44,11 @@
 //! done), 16×16 on a 16 grid, vendored under `assets/icons/status/` in
 //! `currentColor`. Heroicons has no status set. Views draw them through
 //! `theme::style::status_icon`, which tints each glyph.
+//!
+//! And the sidebar's 12pt [`glyphs`] (the Navigation component's state
+//! glyphs for working, awaiting input, idle and ready for review, and its
+//! section chevron), under `assets/icons/glyphs/`: drawn at Figma's 12pt
+//! with [`glyph`], since [`heroicon`] draws only at 20pt and 14pt.
 //!
 //! The last is the **checkbox mark** ([`check_mark`]): Settings' checked
 //! box draws the Figma file's `Icon / check` (node 2169:675), the Heroicons
@@ -247,7 +252,6 @@ macro_rules! heroicons {
 
 heroicons! {
     CHAT_BUBBLE_LEFT_RIGHT = "chat-bubble-left-right";
-    VIEW_COLUMNS = "view-columns";
     BOLT = "bolt";
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
@@ -267,8 +271,6 @@ heroicons! {
     MAGNIFYING_GLASS = "magnifying-glass";
     COG_6_TOOTH = "cog-6-tooth";
     CHEVRON_UP_DOWN = "chevron-up-down";
-    CHEVRON_DOUBLE_LEFT = "chevron-double-left";
-    BARS_3 = "bars-3";
     CHECK = "check";
     SIGNAL_SLASH = "signal-slash";
     ARROW_DOWN_CIRCLE = "arrow-down-circle";
@@ -287,12 +289,72 @@ heroicons! {
         TOGGLE_ON = "toggle-on";
         PAGE_CURL = "page-curl";
         FLAG_FINISH = "flag-finish";
+        SIDEBAR = "sidebar";
     }
     @small {
         FUNNEL_SMALL = "funnel";
         USER_SMALL = "user";
     }
 }
+
+/// One of the sidebar's Figma glyphs: its drawing and the size it renders
+/// at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Glyph {
+    name: &'static str,
+    size: u16,
+}
+
+impl Glyph {
+    #[cfg(test)]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    /// The width and height it renders at.
+    pub fn size(self) -> Pixels {
+        px(f32::from(self.size))
+    }
+
+    fn path(self) -> String {
+        format!("icons/glyphs/{}.svg", self.name)
+    }
+}
+
+/// `glyph` at its Figma size, in the element's `text_color` (a one-color
+/// drawing, like a Heroicon).
+pub fn glyph(glyph: Glyph) -> Svg {
+    svg().path(glyph.path()).size(glyph.size()).flex_none()
+}
+
+/// The sidebar's 12pt Figma glyphs (see the module docs).
+pub mod glyphs {
+    use super::Glyph;
+
+    /// A workspace whose agent is working (green).
+    pub const PLAY: Glyph = Glyph { name: "play", size: 12 };
+    /// A review being served (cyan).
+    pub const CHECK: Glyph = Glyph { name: "check", size: 12 };
+    /// An idle workspace, a queued review.
+    pub const DOT: Glyph = Glyph { name: "dot", size: 12 };
+    /// A workspace awaiting input: a yellow disc with the `?` cut out, over
+    /// a dark disc so the mark reads on either theme.
+    pub const QUESTION: Glyph = Glyph { name: "question", size: 12 };
+    /// A section header's collapse chevron.
+    pub const CHEVRON_DOWN: Glyph = Glyph { name: "chevron-down", size: 12 };
+
+    #[cfg(test)]
+    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN];
+}
+
+/// Every glyph drawing, by asset path.
+const GLYPHS: &[(&str, &[u8])] = &[
+    ("icons/glyphs/play.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/play.svg"))),
+    ("icons/glyphs/check.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/check.svg"))),
+    ("icons/glyphs/dot.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/dot.svg"))),
+    ("icons/glyphs/question.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/question.svg"))),
+    ("icons/glyphs/chevron-down.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chevron-down.svg"))),
+];
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its
 /// license under `assets/fonts/geist/`, from the `geist` npm package 1.7.2).
@@ -444,6 +506,7 @@ impl AssetSource for Assets {
             .iter()
             .chain(STATUS_GLYPHS)
             .chain([&CHECK_MARK])
+            .chain(GLYPHS)
             .find(|(p, _)| *p == path)
         {
             return Ok(Some(Cow::Borrowed(bytes)));
@@ -456,6 +519,7 @@ impl AssetSource for Assets {
             .iter()
             .chain(STATUS_GLYPHS)
             .chain([&CHECK_MARK])
+            .chain(GLYPHS)
             .filter(|(p, _)| p.starts_with(path))
             .map(|(p, _)| SharedString::from(*p))
             .collect();
@@ -532,6 +596,22 @@ mod tests {
     }
 
     #[test]
+    fn every_glyph_loads_in_current_color() {
+        assert_eq!(GLYPHS.len(), glyphs::ALL.len());
+        for g in glyphs::ALL {
+            let path = g.path();
+            let bytes = Assets.load(&path).unwrap().expect(&path);
+            let svg = std::str::from_utf8(&bytes).expect(&path);
+            assert!(svg.starts_with("<svg"), "{path} is an SVG");
+            let grid = g.size().as_f32() as u32;
+            assert!(svg.contains(&format!(r#"viewBox="0 0 {grid} {grid}""#)), "{path} is drawn at its size");
+            assert!(svg.contains("currentColor"), "{path} takes the element's color");
+            let mut el = glyph(*g);
+            assert_eq!(el.style().size.width, Some(g.size().into()), "{}", g.name());
+        }
+    }
+
+    #[test]
     fn heroicons_are_listed() {
         let listed = Assets.list("icons/heroicons/").unwrap().len()
             + Assets.list("icons/figma/").unwrap().len()
@@ -573,14 +653,14 @@ mod tests {
             }
             let text = std::fs::read_to_string(&path).unwrap();
             for (n, line) in text.lines().enumerate() {
-                if line.contains("svg()") || line.contains("icons/heroicons") {
+                if line.contains("svg()") || line.contains("icons/heroicons") || line.contains("icons/glyphs/") {
                     offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "draw icons with assets::heroicon(icon), not svg():\n{}",
+            "draw icons with assets::heroicon(icon) or assets::glyph(g), not svg():\n{}",
             offenders.join("\n")
         );
     }

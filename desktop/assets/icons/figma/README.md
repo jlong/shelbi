@@ -10,3 +10,5 @@ palette frame (2171:752) and drawn on its 20pt grid with the outline set's
   "Turn Zen Mode off" (Figma draws only the off state).
 - `page-curl.svg`: the error log (component 2236:24177).
 - `flag-finish.svg`: Quit Shelbi (a filled drawing).
+- `sidebar.svg`: the Toggle sidebar button (the Navigation component's
+  titlebar, 2164:4; the collapsed sidebar's toggle in the main area).
