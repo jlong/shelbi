@@ -9,15 +9,16 @@
 //!   Heading 20/28, all Geist;
 //! - 8px corners everywhere ([`gpui::Styled::rounded_lg`]), 12px on the
 //!   larger icon buttons;
-//! - nav rows 40px tall with the content 8px inside, labels medium weight,
-//!   the selected row a raised chip ([`nav_chip`]: the canvas with Figma's
-//!   `shadow/raised card`);
+//! - nav rows painted by state ([`row_state_rounded`]), the selected row a
+//!   raised chip ([`nav_chip`]: the canvas with Figma's `shadow/raised
+//!   card`);
 //! - buttons medium weight on the overlay fill, no boundary ([`button`]):
 //!   the Figma Button component's Default (`theme.background`), Success
 //!   (green tint, `text/green`) and Danger (pink tint) styles, quiet only a
 //!   hover fill;
 //! - quiet icon buttons ([`icon_button`]) 24/32px on a hover fill;
-//! - toolbar actions ([`toolbar_button`]) and the icon slot Figma lays a
+//! - toolbar actions ([`toolbar_button`], [`small_icon_button`]), the
+//!   X-Small button ([`xsmall_button`]) and the icon slot Figma lays a
 //!   button's icon in ([`icon_slot`]);
 //! - a workflow status's glyph ([`status_icon`]) and heading
 //!   ([`status_heading`]: the board's column headers, the task panels);
@@ -29,7 +30,6 @@
 //! - every hover and press fades over about 200ms ([`motion::fill_layer`]);
 //! - menus, popovers and the palette raised with a ring and a soft drop
 //!   ([`popover`]);
-//! - chips tinted from one hue ([`chip`]);
 //! - the accent pill marking the keyboard-current row
 //!   ([`selection_indicator`]);
 //! - the keyboard focus as Figma draws it: a 1px `focus/default/ring` and a
@@ -44,7 +44,7 @@ use gpui::{
 use shelbi_core::StatusCategory;
 
 use super::motion::fill_layer;
-use super::{hsla, palette, Hue, Theme};
+use super::{hsla, palette, Theme};
 use crate::assets::{heroicon, status_glyph, Icon, StatusGlyph};
 
 /// The UI typeface every [`Type`] is set in.
@@ -119,9 +119,6 @@ pub trait Typography: Styled + Sized {
 
 impl<E: Styled> Typography for E {}
 
-/// A nav row's height. The chip inside is inset 2px top
-/// and bottom.
-pub const NAV_ROW_H: f32 = 40.0;
 /// A list row's height in the leading column (workspaces, machine groups,
 /// project rows): a 32px control height, so a long list stays
 /// scannable.
@@ -227,22 +224,10 @@ pub fn selection_indicator(theme: &Theme) -> Div {
 /// Paint a row in a nav list by its state: the raised chip while it is the
 /// current page (`current`), the accent pill while it is the keyboard's row
 /// (`keyboard`, over a fill when it isn't also current), else a fill that
-/// fades in on hover. `key` names the row for its fade. `chip_inline: false`
+/// fades in on hover. `key` names the row for its fade, `radius` its corners
+/// (the Navigation component's are [`NAV_RADIUS`]). `chip_inline: false`
 /// leaves the current row's chip to a sliding one ([`motion::SlideTrack`])
 /// while it moves, keeping the row's loud label.
-pub fn row_state(
-    d: Stateful<Div>,
-    key: impl Into<SharedString>,
-    current: bool,
-    keyboard: bool,
-    chip_inline: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    row_state_rounded(d, key, current, keyboard, chip_inline, px(8.0), theme)
-}
-
-/// [`row_state`] for a row with `radius` corners (the sidebar's rows are
-/// [`NAV_RADIUS`]), so the hover fill fits them.
 pub fn row_state_rounded(
     d: Stateful<Div>,
     key: impl Into<SharedString>,
@@ -267,11 +252,6 @@ pub fn row_state_rounded(
         fill_layer(d, key, radius, [clear, theme.background, theme.background_hover])
     };
     d.when(keyboard, |d| d.child(selection_indicator(theme)))
-}
-
-/// The sliding chip's paint: [`nav_chip`]'s, with its corners.
-pub fn nav_chip_layer(d: Div, theme: &Theme) -> Div {
-    nav_chip(d.rounded_lg(), theme)
 }
 
 /// The Navigation component's corners: its rows, chip and buttons.
@@ -548,10 +528,38 @@ pub fn toolbar_button(
     label: impl Into<SharedString>,
     theme: &Theme,
 ) -> Stateful<Div> {
-    button_base(id, ButtonKind::Secondary, false, theme)
+    small_icon_button(id, icon, label, ButtonKind::Secondary, false, theme)
+}
+
+/// The Figma Button at Small in any style, 28px tall, with a left icon (the
+/// board's New issue, the Review panel's Approve and Reject): the Default
+/// style's icon is `button_icon`, a tinted style's the label's color.
+pub fn small_icon_button(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    focused: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let icon_color = match kind {
+        ButtonKind::Secondary => theme.button_icon,
+        _ => button_colors(kind, theme).text,
+    };
+    button_base(id, kind, focused, theme)
         .h(px(28.0))
         .gap(px(4.0))
-        .child(icon_slot(icon, 12.0, theme.button_icon))
+        .child(icon_slot(icon, 12.0, icon_color))
+        .child(label.into())
+}
+
+/// The Figma Button at X-Small, Default style, label only: 8px across, 4px
+/// down, X-Small/Medium loud on the overlay fill (the task panels' Open).
+pub fn xsmall_button(id: impl Into<SharedString>, label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    button_base(id, ButtonKind::Secondary, false, theme)
+        .h(px(24.0))
+        .px(px(8.0))
+        .type_style(Type::XSmallMedium)
         .child(label.into())
 }
 
@@ -616,20 +624,38 @@ pub fn status_heading(
     current: bool,
     theme: &Theme,
 ) -> Div {
+    let color = if current { theme.text_loud } else { theme.muted };
+    status_heading_in(status_icon(category, theme), label, color)
+}
+
+/// [`status_heading`] with its glyph and label colors chosen by the caller:
+/// the task panels draw the label in `theme.foreground` and In progress's
+/// glyph in `icon/cyan` ([`panel_status_icon`]).
+pub fn status_heading_in(icon: Svg, label: impl Into<SharedString>, color: Hsla) -> Div {
     div()
         .flex()
         .flex_row()
         .flex_none()
         .items_center()
         .gap(px(8.0))
-        .child(status_icon(category, theme))
+        .child(icon)
         .child(
             div()
                 .whitespace_nowrap()
                 .type_style(Type::XSmallSemibold)
-                .text_color(if current { theme.text_loud } else { theme.muted })
+                .text_color(color)
                 .child(label.into().to_uppercase()),
         )
+}
+
+/// A status's glyph as the task panels draw it (the Navigation component's
+/// State=Workspace and State=Review): [`status_icon`]'s, except In progress
+/// is `icon/cyan` in both themes where the board uses `icon/select`.
+pub fn panel_status_icon(category: StatusCategory, theme: &Theme) -> Svg {
+    match category {
+        StatusCategory::Active => status_glyph(StatusGlyph::InProgress).text_color(theme.icon_cyan),
+        other => status_icon(other, theme),
+    }
 }
 
 /// The selected segment: `theme.selection` (Activity's and Settings'
@@ -978,23 +1004,6 @@ impl gpui::Render for Tooltip {
             .max_w(px(360.0))
             .child(self.0.clone())
     }
-}
-
-/// A chip: a short label on a hue's tint, in the hue's text color.
-pub fn chip(label: impl Into<SharedString>, hue: Hue, theme: &Theme) -> Div {
-    let (fg, bg) = theme.hue(hue);
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(4.0))
-        .h(px(20.0))
-        .px(px(6.0))
-        .rounded_lg()
-        .bg(bg)
-        .text_color(fg)
-        .type_style(Type::XSmallMedium)
-        .child(label.into())
 }
 
 #[cfg(test)]

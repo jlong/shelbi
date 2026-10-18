@@ -54,10 +54,6 @@ pub const COLUMN_PX: f32 = 10.0;
 /// centered on them, the sidebar's Search and Toggle sidebar buttons.
 pub const TITLEBAR_H: f32 = 52.0;
 
-/// Room left above a panel's content (the review and workspace panels) for
-/// the traffic lights: the titlebar row.
-pub const TRAFFIC_LIGHT_INSET: f32 = TITLEBAR_H;
-
 /// The macOS standard window buttons' frames (14pt squares, measured on
 /// macOS 26), so their circles center where Figma draws them.
 const TRAFFIC_LIGHT_BUTTON: f32 = 14.0;
@@ -95,6 +91,9 @@ const MENU_GAP: f32 = 6.0;
 const TOOLBAR_BUTTON: f32 = 32.0;
 /// The Zen pill's height.
 const ZEN_PILL_H: f32 = 42.0;
+/// The Zen pill's height under a task panel (State=Workspace and
+/// State=Review draw it 32pt).
+pub const PANEL_ZEN_PILL_H: f32 = 32.0;
 
 /// The sidebar's displayed width in pixels: the user's chosen `width_cols`,
 /// clamped to the window (at least 24 columns, at most half the window).
@@ -691,7 +690,7 @@ pub fn render<H: SidebarHost>(
         .type_style(Type::Base)
         .child(motion::origin_probe(&props.track))
         .children(chip)
-        .child(render_titlebar(&props, theme, cx))
+        .child(render_titlebar(&props.palette_chord, theme, cx))
         .child(render_project(&props, theme, cx))
         .child(
             div()
@@ -716,21 +715,46 @@ pub fn render<H: SidebarHost>(
                 .track_scroll(&props.scroll)
                 .children(rest),
         )
-        .child(render_footer(&props, theme, cx))
+        .child(render_footer(props.model, props.link, ZEN_PILL_H, theme, cx))
+        .into_any_element()
+}
+
+/// The leading column with a task panel in the sidebar's place (the
+/// Navigation component's State=Workspace and State=Review): the sidebar's
+/// titlebar and footer around `panel`, the Zen pill at the 32pt those states
+/// draw.
+pub fn render_panel_column<H: SidebarHost>(
+    panel: impl IntoElement,
+    model: &SidebarModel,
+    link: Option<DaemonLink>,
+    palette_chord: &str,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .bg(theme.sidebar)
+        .text_color(theme.foreground)
+        .type_style(Type::Base)
+        .child(render_titlebar(palette_chord, theme, cx))
+        .child(div().flex().flex_col().flex_1().min_h_0().child(panel))
+        .child(render_footer(model, link, PANEL_ZEN_PILL_H, theme, cx))
         .into_any_element()
 }
 
 /// The titlebar row: room for the traffic lights, then Search (the palette)
 /// and Toggle sidebar, right-aligned.
 fn render_titlebar<H: SidebarHost>(
-    props: &SidebarProps<'_>,
+    palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
-    let search_tip = if props.palette_chord.is_empty() {
+    let search_tip = if palette_chord.is_empty() {
         "Search".to_string()
     } else {
-        format!("Search ({})", props.palette_chord)
+        format!("Search ({palette_chord})")
     };
     div()
         .flex()
@@ -938,30 +962,45 @@ fn render_nav_row<H: SidebarHost>(
     let selected = ordinal == Some(props.selection);
     let selector = row_selector(row);
     let ord = ordinal.unwrap_or_default();
-    // The component's nav item: 34pt, 6pt in, the icon, the label growing,
-    // the hotkey; the selected one a chip with the accent icon and a loud,
-    // medium label.
-    div()
+    let painted = div()
         .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector)
-        .relative()
+        .text_color(theme.foreground)
+        .map(|d| selected_row(d, &row_selector(row), selected, props, theme));
+    let hotkey = nav_view_hotkey(view).map(|chord| style::hotkey(&chord, theme).into_any_element());
+    nav_item(painted, nav_icon(view), nav_label(view, label), hotkey, selected, theme)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.sidebar_event(SidebarEvent::Activate(ord), window, cx)
+        }))
+        .into_any_element()
+}
+
+/// The component's nav item (the sidebar's nav, the task panels' views):
+/// 34pt, 6pt in, the icon, the label growing, then `trailing` (the hotkey);
+/// `current` turns the icon to the accent. `d` comes painted with its state
+/// (the chip and its loud, medium label, the keyboard pill, the hover fill),
+/// so the content lands over the fill.
+pub fn nav_item(
+    d: gpui::Stateful<gpui::Div>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    trailing: Option<AnyElement>,
+    current: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    d.relative()
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
         .gap(px(6.0))
         .px(px(6.0))
         .h(px(NAV_ITEM_H))
         .rounded(px(NAV_RADIUS))
         .cursor_pointer()
-        .text_color(theme.foreground)
-        .map(|d| selected_row(d, &row_selector(row), selected, props, theme))
-        .child(heroicon(nav_icon(view)).text_color(if selected { theme.accent } else { theme.icon }))
-        .child(div().flex_1().min_w_0().truncate().child(nav_label(view, label)))
-        .children(nav_view_hotkey(view).map(|chord| style::hotkey(&chord, theme)))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::Activate(ord), window, cx)
-        }))
-        .into_any_element()
+        .child(heroicon(icon).text_color(if current { theme.accent } else { theme.icon }))
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .children(trailing)
 }
 
 /// Paint a row selected (the chip, the accent pill while the sidebar has
@@ -1254,11 +1293,12 @@ fn render_row<H: SidebarHost>(
 }
 
 fn render_footer<H: SidebarHost>(
-    props: &SidebarProps<'_>,
+    model: &SidebarModel,
+    link: Option<DaemonLink>,
+    pill_h: f32,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
-    let model = props.model;
     // The version line says something only when it needs a look (the daemon
     // and the CLI disagree, or the board is stale); otherwise it waits in the
     // Settings button's tooltip, as the component draws no version.
@@ -1273,7 +1313,7 @@ fn render_footer<H: SidebarHost>(
             .text_color(if stale { theme.warning } else { theme.muted })
             .child(banner)
     });
-    let polling = (props.link == Some(DaemonLink::Polling)).then(|| {
+    let polling = (link == Some(DaemonLink::Polling)).then(|| {
         div()
             .debug_selector(|| "sidebar-polling".into())
             .flex()
@@ -1361,7 +1401,7 @@ fn render_footer<H: SidebarHost>(
             )
         })
         .child(toolbar)
-        .child(render_zen_pill(model.zen_mode, theme, cx))
+        .child(render_zen_pill(model.zen_mode, pill_h, theme, cx))
 }
 
 /// The Zen pill: full width, fully rounded. On, it is the Success tint over
@@ -1369,6 +1409,7 @@ fn render_footer<H: SidebarHost>(
 /// with "Zen mode off". A click toggles Zen.
 fn render_zen_pill<H: SidebarHost>(
     zen: ZenModeState,
+    height: f32,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
@@ -1383,7 +1424,7 @@ fn render_zen_pill<H: SidebarHost>(
         .items_center()
         .justify_center()
         .w_full()
-        .h(px(ZEN_PILL_H))
+        .h(px(height))
         .px_2()
         .rounded_full()
         .overflow_hidden()
@@ -1394,7 +1435,7 @@ fn render_zen_pill<H: SidebarHost>(
     } else {
         [theme.background, theme.background_hover, theme.background_active]
     };
-    fill_layer(d, id, px(ZEN_PILL_H / 2.0), fills)
+    fill_layer(d, id, px(height / 2.0), fills)
         .when(on, |d| d.child(div().debug_selector(|| "sidebar-zen-band".into()).absolute().size_0()))
         .child(
             div()

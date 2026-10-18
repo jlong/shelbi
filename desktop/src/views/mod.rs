@@ -26,6 +26,9 @@
 //!   and `overlay/`, over the shared `shelbi_app::overlay` state machines)
 //! - the review panel taking the sidebar's column, with the push between
 //!   them: **`dt-review-replaces-sidebar`** (`column_swap`)
+//! - the Workspace and Review panels drawn to the Navigation component's
+//!   task states, with the pieces they share: **`dt-figma-task-panels`**
+//!   (`task_panel`)
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
@@ -55,6 +58,7 @@ pub mod overlay;
 pub mod palette;
 pub mod review;
 pub mod task_detail;
+pub mod task_panel;
 pub mod settings;
 pub mod sidebar;
 pub mod update;

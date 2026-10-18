@@ -497,6 +497,9 @@ fn map_effect(effect: PanelEffect) -> ReviewAction {
         // The TUI handles `q` itself (`request_quit`); the shared table's Close
         // means the same teardown.
         PanelEffect::Close => ReviewAction::Close,
+        // The TUI's panel has no user-shell row (the desktop's), so this
+        // never comes out of it.
+        PanelEffect::ToggleShell => ReviewAction::None,
     }
 }
 

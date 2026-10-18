@@ -4,20 +4,29 @@
 //! The panel takes the navigation sidebar's column while a review is open
 //! (`dt-review-replaces-sidebar`, as the TUI's panel replaces its sidebar):
 //! the view renders as the panel, at whatever width the window's column
-//! gives it, and the window puts [`ReviewView::render_main`] (the content and
-//! the description popover) in the main area beside it.
+//! gives it, and the window puts [`ReviewView::render_main`] (the content,
+//! and the user shell beside it when open) in the main area beside it.
 //!
 //! It follows the TUI's review interface (`crates/shelbi-tui/src/shell/review.rs`,
 //! `review_panel.rs`):
 //!
 //! - **The panel** is drawn from [`ReviewPanelModel`] and driven by the shared
-//!   [`ReviewPanelState`] (the TUI panel's rows, keys and merge gate): the
-//!   back button and the "Ready for review" status, the task's title and a
-//!   description preview with `More` (the full description in a popover), the
-//!   worktree (click to reveal it in Finder), the review slot's **server**
-//!   (its sub-state: pending-load, loading or serving; the health check; the
-//!   URL, clickable), the view switch (Reviewer / View Diff / Edit in
-//!   <editor> / Open Browser when a URL exists), and Approve / Reject.
+//!   [`ReviewPanelState`] (the TUI panel's rows, keys and merge gate), as the
+//!   Navigation component's State=Review (`dt-figma-task-panels`, the pieces
+//!   in [`super::task_panel`]; the window keeps the sidebar's titlebar and
+//!   footer around it): the back button and the task's column (REVIEW), the
+//!   title and the description clamped to five lines with `More` expanding
+//!   it in place, the worktree with Open (reveal it in Finder), the views
+//!   numbered ⌘1 to ⌘N (Reviewer / View Diff / Edit in <editor> / Web
+//!   Browser when a URL exists / Shell), then Actions: Approve and Reject.
+//!   The review slot's **server** has no block of its own: until it serves,
+//!   the Web Browser row is inert and says "loading…" where its hint sits,
+//!   its tooltip carrying the sub-state and the health check; serving, the
+//!   tooltip is the URL.
+//! - **The user shell** (Shell) opens beside the content in the slot's
+//!   worktree, as the Workspace view's does (`WorkspaceSessionOp::EnsureShell`
+//!   on the slot, a workspace too; the split is
+//!   [`super::workspace_layout::render_split`]). Leaving the review closes it.
 //! - **The content** is one [`SessionView`]: Reviewer is the review agent's
 //!   session (`<project>/ws/<slot>`); View Diff and Edit in <editor> are the
 //!   daemon's `<project>/review/<slot>/<role>` sessions, ensured through
@@ -48,27 +57,27 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, AnyWindowHandle, Bounds, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, Pixels, SharedString, Subscription, Window,
+    div, prelude::*, px, AnyElement, AnyWindowHandle, Bounds, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Pixels, SharedString, Subscription, Window,
 };
-use gpui_kit::component::text::TextView;
 use shelbi_app::review::{
     sub_state_detail, sub_state_label, ActiveView, PanelEffect, PanelRow, ReviewInfo,
     ReviewPanelModel, ReviewPanelState, ReviewSwitch, ReviewTarget,
 };
 use shelbi_app::session::{ReviewRelauncher, SessionRef};
-use shelbi_app::view::ReviewRow;
-use shelbi_app::{CommandKind, ReviewSessionOp};
+use shelbi_app::view::{ReviewRow, ReviewState};
+use shelbi_app::{CommandKind, ReviewSessionOp, WorkspaceSessionOp};
+use shelbi_core::{Column, StatusCategory};
 
-use super::session_view::{SessionDeps, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X};
-use super::sidebar::TRAFFIC_LIGHT_INSET;
-use crate::assets::{heroicon, icons};
+use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X};
+use super::task_panel;
+use super::workspace_layout::{render_split, ShellSplit};
+use crate::assets::{icons, Icon};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{self, ButtonKind, IconButtonSize, NAV_ROW_H};
+use crate::theme::style::{self, ButtonKind, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
-use crate::theme::style::{Type, Typography};
 
 /// The blocking work behind a review, run on the background executor:
 /// resolving and loading a review task, the daemon's content sessions, and the
@@ -84,6 +93,9 @@ pub trait ReviewOps: Send + Sync {
     fn open_url(&self, url: &str) -> Result<(), String>;
     /// Show `path` in Finder.
     fn reveal(&self, path: &str) -> Result<(), String>;
+    /// Start or stop the user shell in review slot `slot`'s worktree (the
+    /// workspace's `EnsureShell` / `CloseShell`: a slot is a workspace).
+    fn shell_op(&self, project: &str, slot: &str, op: WorkspaceSessionOp) -> Result<(), String>;
 }
 
 /// The real thing: the orchestrator's review state, the daemon's control
@@ -143,6 +155,12 @@ impl ReviewOps for LiveOps {
 
     fn reveal(&self, path: &str) -> Result<(), String> {
         run_open(path)
+    }
+
+    fn shell_op(&self, project: &str, slot: &str, op: WorkspaceSessionOp) -> Result<(), String> {
+        shelbi_app::workspace_session(project, slot, op, &mut |_, _| {})
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -232,7 +250,16 @@ pub struct ReviewView {
     review: Option<Shown>,
     shown: bool,
     focus: ReviewFocus,
+    /// The description shows in full (More), not clamped.
     description_open: bool,
+    /// The user shell beside the content (Shell), in the slot's worktree.
+    shell: Entity<SessionView>,
+    shell_open: bool,
+    /// The daemon is starting the shell (the pane shows "Starting a shell…").
+    shell_starting: bool,
+    /// The content | shell split, and its divider's drag.
+    split: ShellSplit,
+    _shell_events: Subscription,
     /// Bumped whenever the shown review changes; a background result for an
     /// older one is dropped.
     generation: u64,
@@ -253,11 +280,33 @@ impl ReviewView {
         sink: Option<SessionSink>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let shell = cx.new(|cx| {
+            let mut v = SessionView::new(project, SessionRef::workspace_shell(""), "", window, (deps.sessions)(""), None, cx);
+            v.set_on_death(OnDeath::Close);
+            v
+        });
+        let shell_events = cx.subscribe(&shell, |this, _, ev: &SessionViewEvent, cx| match ev {
+            SessionViewEvent::Focused => {
+                this.focus = ReviewFocus::Content;
+                cx.emit(ReviewEvent::Focused);
+            }
+            // The user exited the shell: close the split.
+            SessionViewEvent::Ended => {
+                this.shell_open = false;
+                this.shell_starting = false;
+                cx.notify();
+            }
+        });
         Self {
             project: project.to_string(),
             window,
             ops: deps.ops,
             sessions: deps.sessions,
+            shell,
+            shell_open: false,
+            shell_starting: false,
+            split: ShellSplit::default(),
+            _shell_events: shell_events,
             sink,
             review: None,
             switch_track: SlideTrack::shared(),
@@ -332,6 +381,7 @@ impl ReviewView {
             cx.notify();
             return;
         }
+        self.close_shell(cx);
         if let Some(old) = self.review.take() {
             old.content.update(cx, |c, cx| c.hide(cx));
         }
@@ -378,6 +428,7 @@ impl ReviewView {
             .as_ref()
             .is_some_and(|r| r.resolved && r.info.task_id == info.task_id);
         if !same {
+            self.close_shell(cx);
             if let Some(old) = self.review.take() {
                 old.content.update(cx, |c, cx| c.hide(cx));
             }
@@ -402,7 +453,8 @@ impl ReviewView {
 
     fn build(&self, info: ReviewInfo, row: Option<ReviewRow>, cx: &mut Context<Self>) -> Shown {
         let model = ReviewPanelModel::build(&info, row.as_ref());
-        let panel = ReviewPanelState::new(&model);
+        // The desktop offers the user shell beside the content (Shell ⌘5).
+        let panel = ReviewPanelState::with_shell(&model, true);
         let deps = (self.sessions)(&info.task_id);
         let (window, sink, project) = (self.window, self.sink.clone(), self.project.clone());
         let slot = info.slot.clone();
@@ -441,6 +493,8 @@ impl ReviewView {
         self.shown = false;
         self.description_open = false;
         self.held = None;
+        self.split.dragging = false;
+        self.close_shell(cx);
         if let Some(r) = &self.review {
             r.content.update(cx, |c, cx| c.hide(cx));
         }
@@ -532,6 +586,7 @@ impl ReviewView {
     /// Whether keyboard focus is in the view (its panel or its terminal).
     pub fn contains_focus(&self, window: &Window, cx: &gpui::App) -> bool {
         self.focus_handle.is_focused(window)
+            || self.shell.read(cx).contains_focus(window, cx)
             || self
                 .review
                 .as_ref()
@@ -674,7 +729,12 @@ impl ReviewView {
                 self.set_status(None, cx);
                 self.select_view(ActiveView::Editor, cx);
             }
-            PanelEffect::OpenBrowser => self.open_url(cx),
+            // Inert until the slot's server is serving (the row says so).
+            PanelEffect::OpenBrowser => {
+                if self.model().is_some_and(|m| m.server.state == ReviewState::Serving) {
+                    self.open_url(cx);
+                }
+            }
             PanelEffect::RevealFolder => {
                 let Some(path) = self
                     .review
@@ -687,10 +747,13 @@ impl ReviewView {
                 };
                 self.run_opener("reveal the folder", move |ops| ops.reveal(&path), cx);
             }
+            // More expands the description in place; Less (the same row)
+            // clamps it again.
             PanelEffect::ShowDescription => {
-                self.description_open = true;
+                self.description_open = !self.description_open;
                 cx.notify();
             }
+            PanelEffect::ToggleShell => self.toggle_shell(cx),
             PanelEffect::Approve => cx.emit(ReviewEvent::Command(CommandKind::ApproveReview { id: task })),
             PanelEffect::RejectPrompt => cx.emit(ReviewEvent::Command(CommandKind::RejectReview {
                 id: task,
@@ -720,6 +783,108 @@ impl ReviewView {
         cx.emit(ReviewEvent::Closed);
     }
 
+    /// ⌘N (the window's chord while the panel holds the column): the
+    /// panel's N-th view, as its hints number them. Focus stays where it is.
+    pub fn view_shortcut(&mut self, n: u8, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(r) = self.review.as_mut() else {
+            return;
+        };
+        let row = (n as usize)
+            .checked_sub(1)
+            .and_then(|i| r.panel.rows().iter().copied().filter(|row| is_view_row(*row)).nth(i));
+        if let Some(row) = row {
+            let effect = r.panel.click(row);
+            self.apply(effect, cx);
+            cx.notify();
+        }
+    }
+
+    // --- the user shell ----------------------------------------------------
+
+    /// Open or close the user shell beside the content.
+    pub fn toggle_shell(&mut self, cx: &mut Context<Self>) {
+        if self.shell_open {
+            self.close_shell(cx);
+        } else {
+            self.open_shell(cx);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn shell_open(&self) -> bool {
+        self.shell_open
+    }
+
+    fn open_shell(&mut self, cx: &mut Context<Self>) {
+        let Some(slot) = self.review.as_ref().map(|r| r.info.slot.clone()).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        self.shell_open = true;
+        self.shell_starting = true;
+        self.set_status(None, cx);
+        self.shell_op(WorkspaceSessionOp::EnsureShell, cx, move |this, result, cx| {
+            if !this.shell_open {
+                return;
+            }
+            this.shell_starting = false;
+            match result {
+                Ok(()) => {
+                    let target = SessionRef::workspace_shell(&slot);
+                    this.shell.update(cx, |s, cx| s.show_target(target, cx));
+                }
+                Err(e) => {
+                    this.shell_open = false;
+                    this.set_status(Some(format!("couldn't open a shell: {e}")), cx);
+                }
+            }
+        });
+    }
+
+    fn close_shell(&mut self, cx: &mut Context<Self>) {
+        if !self.shell_open {
+            return;
+        }
+        self.shell_open = false;
+        self.shell_starting = false;
+        self.shell.update(cx, |s, cx| s.hide(cx));
+        self.shell_op(WorkspaceSessionOp::CloseShell, cx, |_, result, _| {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "couldn't close the review's user shell");
+            }
+        });
+    }
+
+    /// Run a shell op for the shown review's slot off the UI thread, then
+    /// `done` with its result (dropped if the view has moved on).
+    fn shell_op(
+        &mut self,
+        op: WorkspaceSessionOp,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Result<(), String>, &mut Context<Self>) + 'static,
+    ) {
+        let Some(slot) = self.review.as_ref().map(|r| r.info.slot.clone()).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let ops = self.ops.clone();
+        let project = self.project.clone();
+        let generation = self.generation;
+        let work = cx
+            .background_executor()
+            .spawn(async move { ops.shell_op(&project, &slot, op) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    done(this, result, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// A click on a panel row.
     fn click(&mut self, row: PanelRow, window: &mut Window, cx: &mut Context<Self>) {
         self.focus = ReviewFocus::Panel;
@@ -733,12 +898,6 @@ impl ReviewView {
 
     /// A key while the panel has focus.
     fn panel_key(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.description_open && event.keystroke.key == "escape" {
-            self.description_open = false;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
         let Some(chord) = chord_from_keystroke(&event.keystroke) else {
             return;
         };
@@ -780,206 +939,207 @@ impl ReviewView {
     ) -> impl IntoElement {
         let model = &shown.model;
         let panel = &shown.panel;
-        let server = self.render_server(model, theme, cx);
         let focused = self.focus == ReviewFocus::Panel;
         let selected = |row: PanelRow| focused && panel.selected_row() == Some(row);
-        // `current`: the row is the page the main area shows (the raised
-        // chip); the keyboard's row carries the brand pill.
-        let row_state = |id: &'static str, row: PanelRow, current: bool| {
-            style::row_state(
-                div()
-                    .id(id)
-                    .debug_selector(move || id.into())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .rounded_lg()
-                    .cursor_pointer(),
-                id,
-                current,
-                selected(row) && chip.is_none(),
-                chip.is_none(),
-                theme,
-            )
-            .on_click(cx.listener(move |this, _, window, cx| this.click(row, window, cx)))
+        let listen = |row: PanelRow| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, window, cx| this.click(row, window, cx))
         };
-        let row_base = |id: &'static str, row: PanelRow| row_state(id, row, false);
 
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .child(
-                row_base("review-back", PanelRow::Back)
-                    .size(px(IconButtonSize::Default.px()))
-                    .rounded_xl()
-                    .justify_center()
-                    .px_0()
-                    .child(heroicon(icons::ARROW_LEFT).text_color(theme.icon)),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "review-status".into())
-                    .type_style(Type::BaseSemibold)
-                    .text_color(theme.info)
-                    .child(model.status_label.clone()),
-            );
+        // The back button and the task's status (its column: Review).
+        let back = task_panel::back_button("review-back", selected(PanelRow::Back), theme)
+            .on_click(listen(PanelRow::Back));
+        let status_label = Column::review().default_status_name().to_string();
+        let status = task_panel::status_row(back, Some((StatusCategory::Handoff, status_label.as_str())), theme);
 
-        let task_info = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_2()
-            .child(
-                div()
-                    .debug_selector(|| "review-title".into())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_loud)
-                    .child(if model.title.is_empty() {
-                        model.task_id.clone()
-                    } else {
-                        model.title.clone()
-                    }),
-            )
-            .when(!model.description.is_empty(), |d| {
-                d.child(
-                    div()
-                        .debug_selector(|| "review-description".into())
-                        .text_color(theme.foreground)
-                        .text_ellipsis()
-                        .line_clamp(3)
-                        .child(model.description.clone()),
-                )
-            });
-        let more = model.has_body().then(|| {
-            row_base("review-more", PanelRow::More)
-                .child(div().text_color(theme.link).child("More"))
+        // The issue summary: the title, five lines of description, More.
+        let title = if model.title.is_empty() {
+            model.task_id.clone()
+        } else {
+            model.title.clone()
+        };
+        let more = (shown.resolved && model.has_body()).then(|| {
+            task_panel::more_link("review-more", self.description_open, selected(PanelRow::More), theme)
+                .on_click(listen(PanelRow::More))
         });
+        let summary = task_panel::summary(
+            ("review-title", "review-description"),
+            title,
+            model.description.clone(),
+            more,
+            self.description_open,
+            theme,
+        );
 
-        let folder = (!model.is_remote()).then(|| {
-            row_base("review-folder", PanelRow::Folder)
-                .h(px(26.0))
-                .child(heroicon(icons::FOLDER_OPEN).text_color(theme.icon))
+        if !shown.resolved {
+            // The load flow hasn't answered yet: what the sidebar row gave,
+            // and a placeholder where the rest will land.
+            return self
+                .panel_root(theme, cx)
+                .child(status)
+                .child(summary)
                 .child(
                     div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis_start()
-                        .text_color(theme.foreground)
-                        .child(model.worktree.clone()),
-                )
+                        .debug_selector(|| "review-loading".into())
+                        .px(px(18.0))
+                        .type_style(Type::XSmall)
+                        .text_color(theme.muted)
+                        .child("Loading…"),
+                );
+        }
+
+        // The worktree, with Open when it can be revealed (a local slot).
+        let folder = (!model.worktree.is_empty()).then(|| {
+            let open = (!model.is_remote()).then(|| {
+                task_panel::open_button("review-folder", theme).on_click(listen(PanelRow::Folder))
+            });
+            task_panel::worktree_row("review-worktree", &model.worktree, open, selected(PanelRow::Folder), 0.0, theme)
         });
 
-        let switches = model.switch_items.iter().map(|item| {
-            let (id, icon) = match item {
-                ReviewSwitch::Chat => ("review-switch-chat", icons::CHAT_BUBBLE_LEFT_RIGHT),
-                ReviewSwitch::Diff => ("review-switch-diff", icons::ARROWS_RIGHT_LEFT),
-                ReviewSwitch::Editor => ("review-switch-editor", icons::PENCIL_SQUARE),
-                ReviewSwitch::Browser => ("review-switch-browser", icons::GLOBE_ALT),
+        // The views: Reviewer, its diff and editor, the browser, the shell,
+        // ⌘1…⌘N.
+        let serving = model.server.state == ReviewState::Serving;
+        let mut shortcut = 0u8;
+        let mut views = Vec::new();
+        for row in panel.rows().iter().copied() {
+            let n = if is_view_row(row) {
+                shortcut += 1;
+                (shortcut <= 9).then_some(shortcut)
+            } else {
+                None
             };
-            let active = match item {
-                ReviewSwitch::Chat => panel.active() == ActiveView::Chat,
-                ReviewSwitch::Diff => panel.active() == ActiveView::Diff,
-                ReviewSwitch::Editor => panel.active() == ActiveView::Editor,
-                ReviewSwitch::Browser => false,
-            };
-            row_state(id, PanelRow::Switch(*item), active)
-                .h(px(NAV_ROW_H - 4.0))
-                .child(motion::probe(&self.switch_track, id))
-                .child(heroicon(icon).text_color(if active { theme.text_loud } else { theme.icon }))
-                .child(item.label(&model.editor_name))
-        });
+            match row {
+                PanelRow::Switch(item) => {
+                    let (id, icon) = switch_id_icon(item);
+                    let current = match item {
+                        ReviewSwitch::Chat => panel.active() == ActiveView::Chat,
+                        ReviewSwitch::Diff => panel.active() == ActiveView::Diff,
+                        ReviewSwitch::Editor => panel.active() == ActiveView::Editor,
+                        ReviewSwitch::Browser => false,
+                    };
+                    let label = switch_label(item, &model.editor_name);
+                    if item == ReviewSwitch::Browser && !serving {
+                        views.push(self.render_waiting_browser(model, selected(row), theme).into_any_element());
+                        continue;
+                    }
+                    let painted = style::row_state_rounded(
+                        div().id(id).debug_selector(move || id.into()),
+                        id,
+                        current,
+                        selected(row) && chip.is_none(),
+                        chip.is_none(),
+                        px(NAV_RADIUS),
+                        theme,
+                    )
+                    .child(motion::probe(&self.switch_track, id))
+                    .when_some(
+                        (item == ReviewSwitch::Browser).then(|| model.review_url.clone()).flatten(),
+                        |d, url| d.tooltip(style::tooltip(url)),
+                    );
+                    views.push(
+                        task_panel::view_row(painted, icon, label, n, None, current, theme)
+                            .on_click(listen(row))
+                            .into_any_element(),
+                    );
+                }
+                PanelRow::Shell => {
+                    let open = self.shell_open;
+                    let painted = style::row_state_rounded(
+                        div().id("review-shell-toggle").debug_selector(|| "review-shell-toggle".into()),
+                        "review-shell-toggle",
+                        false,
+                        selected(row),
+                        true,
+                        px(NAV_RADIUS),
+                        theme,
+                    )
+                    // Open, the toggle holds the overlay fill and a loud label.
+                    .when(open, |d| d.bg(theme.background).text_color(theme.text_loud))
+                    .tooltip(style::tooltip(if open { "Close the shell" } else { "Open a shell in the worktree" }));
+                    let starting = self.shell_starting.then(|| {
+                        div()
+                            .debug_selector(|| "review-shell-state".into())
+                            .flex_none()
+                            .px(px(4.0))
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
+                            .child("starting…")
+                            .into_any_element()
+                    });
+                    views.push(
+                        task_panel::view_row(painted, icons::COMMAND_LINE, "Shell", n, starting, false, theme)
+                            .on_click(listen(row))
+                            .into_any_element(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let views = task_panel::views_block()
+            .child(motion::origin_probe(&self.switch_track))
+            .children(chip.map(|b| {
+                motion::floating_chip(b, |d| {
+                    style::nav_chip(d.rounded(px(NAV_RADIUS)), theme)
+                        .when(focused, |d| d.child(style::selection_indicator(theme)))
+                })
+            }))
+            .children(views);
 
+        // Actions: Approve and Reject, or the merge in flight.
         let actions = if panel.is_merging() {
             div()
                 .debug_selector(|| "review-merging".into())
-                .px_2()
-                .font_weight(FontWeight::SEMIBOLD)
+                .px(px(20.0))
+                .py(px(8.0))
+                .type_style(Type::SmallMedium)
                 .text_color(theme.warning)
                 .child("Merging the PR…")
-                .into_any_element()
         } else {
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
-                .px_2()
+                .flex_none()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(12.0))
+                .py(px(8.0))
                 .child(
-                    style::button(
+                    style::small_icon_button(
                         "review-approve",
+                        icons::CHECK,
                         "Approve",
                         ButtonKind::Primary,
                         selected(PanelRow::Approve),
                         theme,
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.click(PanelRow::Approve, window, cx)
-                    })),
+                    .on_click(listen(PanelRow::Approve)),
                 )
                 .child(
-                    style::button(
+                    style::small_icon_button(
                         "review-reject",
+                        icons::X_MARK,
                         "Reject",
-                        ButtonKind::Secondary,
+                        ButtonKind::Danger,
                         selected(PanelRow::Reject),
                         theme,
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.click(PanelRow::Reject, window, cx)
-                    })),
+                    .on_click(listen(PanelRow::Reject)),
                 )
-                .into_any_element()
         };
 
-        let body: Vec<AnyElement> = if shown.resolved {
-            let mut body = vec![div().flex().flex_col().gap_1().child(task_info).children(more).into_any_element()];
-            body.extend(folder.map(IntoElement::into_any_element));
-            body.extend([
-                server.into_any_element(),
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(motion::origin_probe(&self.switch_track))
-                    .children(chip.map(|b| {
-                        motion::floating_chip(b, |d| {
-                            style::nav_chip_layer(d, theme).when(focused, |d| {
-                                d.child(style::selection_indicator(theme))
-                            })
-                        })
-                    }))
-                    .children(switches)
-                    .into_any_element(),
-                actions,
-            ]);
-            body
-        } else {
-            // The load flow hasn't answered yet: the title the sidebar row
-            // gave, and placeholders where the rest will land.
-            let placeholder = |selector: &'static str| {
-                div()
-                    .debug_selector(move || selector.into())
-                    .text_color(theme.muted)
-                    .child("Loading…")
-            };
-            vec![
-                task_info.child(placeholder("review-loading")).into_any_element(),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .px_2()
-                    .child(style::heading("Server", theme).pb_0p5())
-                    .child(placeholder("review-server-loading"))
-                    .into_any_element(),
-            ]
-        };
+        self.panel_root(theme, cx)
+            .child(status)
+            .child(summary)
+            .children(folder)
+            .child(views)
+            .child(task_panel::section_header("Actions", theme))
+            .child(actions)
+            .when_some(panel.status_line().map(str::to_string), |d, line| {
+                d.child(task_panel::note("review-status-line", line, theme.error))
+            })
+    }
 
+    /// The panel's frame: focus, keys, the scroll.
+    fn panel_root(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id("review-panel")
             .debug_selector(|| "review-panel".into())
@@ -989,179 +1149,45 @@ impl ReviewView {
             .flex()
             .flex_col()
             .size_full()
-            .gap_4()
-            .p_3()
-            // The window's leading column: clear of the traffic lights, as
-            // the sidebar's header is.
-            .pt(px(TRAFFIC_LIGHT_INSET))
             .overflow_y_scroll()
-            .bg(theme.sidebar)
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(header)
-            .children(body)
-            .when_some(panel.status_line().map(str::to_string), |d, line| {
-                d.child(
-                    div()
-                        .debug_selector(|| "review-status-line".into())
-                        .px_2()
-                        .text_color(theme.error)
-                        .child(line),
-                )
-            })
     }
 
-    /// The review slot's server: its sub-state, the health check and the URL.
-    fn render_server(&self, model: &ReviewPanelModel, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The Web Browser row while the slot's server isn't serving yet: muted
+    /// and inert, "loading…" where its ⌘N hint sits, the server's sub-state
+    /// and health check in its tooltip (the Server block Figma dropped).
+    fn render_waiting_browser(
+        &self,
+        model: &ReviewPanelModel,
+        keyboard: bool,
+        theme: &Theme,
+    ) -> gpui::Stateful<gpui::Div> {
         let server = &model.server;
-        let dec = server.state.decoration();
-        let state_color: Hsla = theme.decoration(dec.color);
-        div()
-            .debug_selector(|| "review-server".into())
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .px_2()
-            .child(style::heading(format!("Server · {}", model.slot), theme).pb_0p5())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .debug_selector(|| "review-server-state".into())
-                            .text_color(state_color)
-                            .child(format!("{} {}", dec.glyph, sub_state_label(server.state))),
-                    )
-                    .when_some(server.location.clone(), |d, loc| {
-                        d.child(div().type_style(Type::XSmall).text_color(theme.muted).child(loc))
-                    }),
-            )
-            .child(
-                div()
-                    .type_style(Type::XSmall)
-                    .text_color(theme.muted)
-                    .child(sub_state_detail(server.state)),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "review-health".into())
-                    .type_style(Type::XSmall)
-                    .text_color(theme.muted)
-                    .child(server.health.label()),
-            )
-            .when_some(model.review_url.clone(), |d, url| {
-                d.child(
-                    div()
-                        .id("review-url")
-                        .debug_selector(|| "review-url".into())
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .min_w_0()
-                        .cursor_pointer()
-                        .text_color(theme.link)
-                        .hover(|s| s.underline().text_color(theme.link_hover))
-                        .child(div().min_w_0().truncate().child(url))
-                        .child(
-                            heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE)
-                                .text_color(theme.icon),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.is_merging() {
-                                this.open_url(cx);
-                            }
-                        })),
-                )
-            })
-    }
-
-    fn render_description(&self, shown: &Shown, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.description_open {
-            return None;
+        let mut tip = format!("{}: {}", sub_state_label(server.state), sub_state_detail(server.state));
+        tip.push_str(&format!(" · {}", server.health.label()));
+        if let Some(url) = &model.review_url {
+            tip.push_str(&format!(" · {url}"));
         }
-        let model = &shown.model;
-        let close = |this: &mut Self, cx: &mut Context<Self>| {
-            this.description_open = false;
-            cx.notify();
-        };
-        Some(
-            div()
-                .id("review-description-backdrop")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.scrim)
-                .on_click(cx.listener(move |this, _, _, cx| close(this, cx)))
-                .child(
-                    div()
-                        .id("review-description-popover")
-                        .debug_selector(|| "review-description-popover".into())
-                        .flex()
-                        .flex_col()
-                        .w(relative(0.8))
-                        .h(relative(0.85))
-                        .overflow_hidden()
-                        .map(|d| style::popover(d, theme))
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .px_5()
-                                .py_3()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .gap_2()
-                                        .min_w_0()
-                                        .child(div().text_color(theme.muted).child(model.task_id.clone()))
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(theme.text_loud)
-                                                .child(model.title.clone()),
-                                        ),
-                                )
-                                .child(
-                                    style::icon_button(
-                                        "review-description-close",
-                                        icons::X_MARK,
-                                        IconButtonSize::Default,
-                                        false,
-                                        theme,
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("review-description-body")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .px_5()
-                                .pb_4()
-                                .child(
-                                    TextView::markdown(
-                                        ElementId::Name(SharedString::from(format!("review-body-{}", model.task_id))),
-                                        model.body.clone(),
-                                    )
-                                    .w_full()
-                                    .selectable(true),
-                                ),
-                        ),
-                ),
-        )
+        let id = "review-switch-browser";
+        let d = div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .relative()
+            .cursor_default()
+            .text_color(theme.muted)
+            .when(keyboard, |d| d.bg(theme.background).child(style::selection_indicator(theme)))
+            .tooltip(style::tooltip(tip));
+        let waiting = div()
+            .debug_selector(|| "review-server-state".into())
+            .flex_none()
+            .px(px(4.0))
+            .type_style(Type::XSmall)
+            .text_color(theme.muted)
+            .child("loading…")
+            .into_any_element();
+        task_panel::view_row(d, icons::GLOBE_ALT, switch_label(ReviewSwitch::Browser, ""), None, Some(waiting), false, theme)
+            .cursor_default()
     }
 }
 
@@ -1172,8 +1198,8 @@ impl Focusable for ReviewView {
 }
 
 impl ReviewView {
-    /// The main area beside the panel: the content terminal, and the
-    /// description popover over it when open. Empty when nothing was shown.
+    /// The main area beside the panel: the content terminal, and the user
+    /// shell beside it when open. Empty when nothing was shown.
     pub fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
         let root = div()
@@ -1189,26 +1215,65 @@ impl ReviewView {
         let Some(shown) = &self.review else {
             return root.into_any_element();
         };
-        let description = self.render_description(shown, &theme, cx);
         // Not resolved yet, or waiting for the push to settle: an empty
         // canvas, not the content's "no session" notice.
         let waiting = !shown.resolved || self.held.is_some();
-        root.children((!waiting).then(|| {
-            div()
-                .debug_selector(|| "review-content".into())
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .h_full()
-                .child(shown.content.clone())
-        }))
-        .children(description)
-        .into_any_element()
+        let content = div()
+            .debug_selector(|| "review-content".into())
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .child(shown.content.clone())
+            .into_any_element();
+        let shell = self.shell_open.then(|| {
+            if self.shell_starting {
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.muted)
+                    .child("Starting a shell…")
+                    .into_any_element()
+            } else {
+                self.shell.clone().into_any_element()
+            }
+        });
+        let panes = (!waiting).then(|| {
+            render_split("review", &self.split, |this: &mut Self| &mut this.split, content, shell, &theme, cx)
+        });
+        root.children(panes).into_any_element()
     }
 }
 
-/// The view itself renders as the panel; the window sizes and places it.
+/// Whether `row` is one of the views (numbered ⌘1…⌘N): the view switch and
+/// the shell.
+fn is_view_row(row: PanelRow) -> bool {
+    matches!(row, PanelRow::Switch(_) | PanelRow::Shell)
+}
+
+/// A view switch entry's element id and icon (Reviewer is the sidebar's
+/// chat bubble, as its Orchestrator row).
+fn switch_id_icon(item: ReviewSwitch) -> (&'static str, Icon) {
+    match item {
+        ReviewSwitch::Chat => ("review-switch-chat", icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS),
+        ReviewSwitch::Diff => ("review-switch-diff", icons::ARROWS_RIGHT_LEFT),
+        ReviewSwitch::Editor => ("review-switch-editor", icons::PENCIL_SQUARE),
+        ReviewSwitch::Browser => ("review-switch-browser", icons::GLOBE_ALT),
+    }
+}
+
+/// A view switch entry's label: the shared one, except the browser reads
+/// "Web Browser" here (the component's; the TUI keeps "Open Browser").
+fn switch_label(item: ReviewSwitch, editor_name: &str) -> String {
+    match item {
+        ReviewSwitch::Browser => "Web Browser".to_string(),
+        other => other.label(editor_name),
+    }
+}
+
 /// The id of the view switch for what the main area shows, if one is.
 fn active_switch_id(panel: &ReviewPanelState) -> Option<&'static str> {
     Some(match panel.active() {
@@ -1320,6 +1385,8 @@ pub(crate) mod tests {
         ops: Mutex<Vec<(String, ReviewSessionOp)>>,
         fail_ops: Mutex<bool>,
         opened: Mutex<Vec<String>>,
+        /// Every shell op: the slot and the op.
+        shell_ops: Mutex<Vec<(String, WorkspaceSessionOp)>>,
         /// What a resolve answers instead of serving [`info`].
         pub(crate) resolve_with: Mutex<Option<Result<ReviewTarget, String>>>,
     }
@@ -1345,6 +1412,10 @@ pub(crate) mod tests {
         }
         fn reveal(&self, path: &str) -> Result<(), String> {
             self.opened.lock().unwrap().push(path.to_string());
+            Ok(())
+        }
+        fn shell_op(&self, _project: &str, slot: &str, op: WorkspaceSessionOp) -> Result<(), String> {
+            self.shell_ops.lock().unwrap().push((slot.to_string(), op));
             Ok(())
         }
     }
@@ -1532,27 +1603,32 @@ pub(crate) mod tests {
         assert_eq!(model.server.health, HealthCheck::Passed);
 
         h.draw();
+        // State=Review: back and the status, the summary, the worktree with
+        // Open, the five views, Actions.
         for selector in [
             "review-panel",
             "review-back",
-            "review-status",
+            "task-panel-status",
             "review-title",
             "review-description",
             "review-more",
+            "review-worktree",
             "review-folder",
-            "review-server",
-            "review-server-state",
-            "review-health",
-            "review-url",
             "review-switch-chat",
             "review-switch-diff",
             "review-switch-editor",
             "review-switch-browser",
+            "review-shell-toggle",
             "review-approve",
             "review-reject",
             "review-content",
         ] {
             assert!(h.cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+        }
+        // Figma dropped the Server block: serving, the browser row shows its
+        // ⌘4 hint, not a state.
+        for selector in ["review-server", "review-health", "review-url", "review-server-state"] {
+            assert!(h.cx.debug_bounds(selector).is_none(), "{selector} is not drawn");
         }
         let panel = h.cx.debug_bounds("review-panel").unwrap();
         let content = h.cx.debug_bounds("review-content").unwrap();
@@ -1614,20 +1690,87 @@ pub(crate) mod tests {
     #[gpui::test]
     fn browser_opens_the_url_and_the_folder_reveals(cx: &mut TestAppContext) {
         let mut h = open(cx);
-        h.update(|v, cx| v.show(info(), None, cx));
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
         h.click("review-switch-browser");
-        h.click("review-url");
         h.click("review-folder");
-        assert_eq!(
-            *h.ops.opened.lock().unwrap(),
-            vec!["http://localhost:4101", "http://localhost:4101", "/w/review-1"]
-        );
+        assert_eq!(*h.ops.opened.lock().unwrap(), vec!["http://localhost:4101", "/w/review-1"]);
         assert_eq!(
             h.view.read_with(&h.cx, |v, _| v.panel().unwrap().active()),
             ActiveView::Chat,
             "the browser is not a content view"
         );
         assert_eq!(h.sessions.attached(), vec!["demo/ws/review-1"]);
+    }
+
+    #[gpui::test]
+    fn the_browser_waits_for_the_server_to_serve(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Loading)), cx));
+        h.draw();
+        assert!(h.cx.debug_bounds("review-server-state").is_some(), "loading… where ⌘4 sits");
+        h.click("review-switch-browser");
+        assert!(h.ops.opened.lock().unwrap().is_empty(), "inert until serving");
+        // The server came up: the row opens the URL.
+        h.update(|v, cx| v.update_row(Some(row(ReviewState::Serving)), cx));
+        h.draw();
+        assert!(h.cx.debug_bounds("review-server-state").is_none());
+        h.click("review-switch-browser");
+        assert_eq!(*h.ops.opened.lock().unwrap(), vec!["http://localhost:4101"]);
+    }
+
+    #[gpui::test]
+    fn the_shell_opens_beside_the_reviewer_in_the_slot(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        h.click("review-shell-toggle");
+        assert!(h.view.read_with(&h.cx, |v, _| v.shell_open()));
+        assert_eq!(
+            *h.ops.shell_ops.lock().unwrap(),
+            vec![("review-1".to_string(), WorkspaceSessionOp::EnsureShell)]
+        );
+        assert!(h.sessions.attached().contains(&"demo/ws/review-1/shell".to_string()));
+        h.draw();
+        assert!(h.cx.debug_bounds("review-shell-pane").is_some());
+        assert!(h.cx.debug_bounds("review-split-divider").is_some());
+        assert_eq!(
+            h.view.read_with(&h.cx, |v, _| v.panel().unwrap().active()),
+            ActiveView::Chat,
+            "the reviewer stays in the content pane"
+        );
+        // ⌘5 is the shell: it closes.
+        h.cx.update(|window, cx| h.view.update(cx, |v, cx| v.view_shortcut(5, window, cx)));
+        h.cx.run_until_parked();
+        assert!(!h.view.read_with(&h.cx, |v, _| v.shell_open()));
+        assert_eq!(
+            h.ops.shell_ops.lock().unwrap().last(),
+            Some(&("review-1".to_string(), WorkspaceSessionOp::CloseShell))
+        );
+        // Leaving the review closes an open shell.
+        h.click("review-shell-toggle");
+        h.update(|v, cx| v.hide(cx));
+        assert_eq!(h.ops.shell_ops.lock().unwrap().len(), 4);
+        assert_eq!(
+            h.ops.shell_ops.lock().unwrap().last().map(|(_, op)| op.clone()),
+            Some(WorkspaceSessionOp::CloseShell)
+        );
+    }
+
+    #[gpui::test]
+    fn view_shortcuts_pick_the_numbered_views(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        let shortcut = |h: &mut Harness, n: u8| {
+            h.cx.update(|window, cx| h.view.update(cx, |v, cx| v.view_shortcut(n, window, cx)));
+            h.cx.run_until_parked();
+        };
+        shortcut(&mut h, 2);
+        assert_eq!(h.ops(), vec![ReviewSessionOp::Ensure { role: ReviewRole::Diff }], "⌘2 is View Diff");
+        shortcut(&mut h, 4);
+        assert_eq!(*h.ops.opened.lock().unwrap(), vec!["http://localhost:4101"], "⌘4 is Web Browser");
+        shortcut(&mut h, 1);
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel().unwrap().active()), ActiveView::Chat);
+        shortcut(&mut h, 6);
+        assert!(h.events().is_empty(), "no sixth view, and never Approve: {:?}", h.events());
     }
 
     #[gpui::test]
@@ -1641,7 +1784,6 @@ pub(crate) mod tests {
         h.update(|v, cx| v.show(no_url, Some(row(ReviewState::Serving)), cx));
         h.draw();
         assert!(h.cx.debug_bounds("review-switch-browser").is_none());
-        assert!(h.cx.debug_bounds("review-url").is_none());
         let health = h.view.read_with(&h.cx, |v, _| v.model().unwrap().server.health);
         assert_eq!(health, HealthCheck::NotDeclared);
     }
@@ -1675,13 +1817,15 @@ pub(crate) mod tests {
         assert!(h.cx.debug_bounds("review-approve").is_none());
         h.click("review-switch-diff");
         h.click("review-back");
-        h.click("review-url");
+        h.click("review-switch-browser");
+        h.click("review-shell-toggle");
         h.focus_panel();
         h.key("q");
         h.key("escape");
         assert!(h.events().is_empty(), "no Back, Close or decision: {:?}", h.events());
         assert!(h.ops().is_empty(), "no view switch reached the daemon");
         assert!(h.ops.opened.lock().unwrap().is_empty());
+        assert!(h.ops.shell_ops.lock().unwrap().is_empty(), "no shell either");
         assert_eq!(h.status_line().as_deref(), Some(shelbi_app::review::MERGE_IN_PROGRESS));
 
         // The decision failed: the panel is live again.
@@ -1702,12 +1846,11 @@ pub(crate) mod tests {
         h.key("j");
         h.key("enter");
         assert_eq!(h.ops(), vec![ReviewSessionOp::Ensure { role: ReviewRole::Diff }]);
+        // `m` expands the description in place, and again clamps it.
         h.key("m");
         assert!(h.view.read_with(&h.cx, |v, _| v.description_open));
-        h.draw();
-        assert!(h.cx.debug_bounds("review-description-popover").is_some());
-        h.key("escape");
-        assert!(!h.view.read_with(&h.cx, |v, _| v.description_open), "Esc closes the popover first");
+        h.key("m");
+        assert!(!h.view.read_with(&h.cx, |v, _| v.description_open));
         assert!(h.events().is_empty());
         h.key("escape");
         assert_eq!(h.events(), vec![ReviewEvent::Back]);

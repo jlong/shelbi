@@ -54,7 +54,6 @@ impl Global for Theme {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hue {
     Neutral,
-    Green,
     Yellow,
     Red,
 }
@@ -96,7 +95,6 @@ impl Theme {
     pub fn hue(&self, hue: Hue) -> (Hsla, Hsla) {
         match hue {
             Hue::Neutral => (self.workflow_badge_text, self.workflow_badge),
-            Hue::Green => (self.green, self.green_tint),
             Hue::Yellow => (self.yellow, self.yellow_tint),
             Hue::Red => (self.red, self.red_tint),
         }

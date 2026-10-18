@@ -281,7 +281,6 @@ macro_rules! heroicons {
 }
 
 heroicons! {
-    CHAT_BUBBLE_LEFT_RIGHT = "chat-bubble-left-right";
     BOLT = "bolt";
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
@@ -308,13 +307,12 @@ heroicons! {
     SIGNAL_SLASH = "signal-slash";
     ARROW_DOWN_CIRCLE = "arrow-down-circle";
     COMMAND_LINE = "command-line";
-    FOLDER_OPEN = "folder-open";
+    FOLDER = "folder";
     GLOBE_ALT = "globe-alt";
     ARROW_DOWN = "arrow-down";
     CHEVRON_UP = "chevron-up";
     CHEVRON_DOWN = "chevron-down";
     ARROWS_RIGHT_LEFT = "arrows-right-left";
-    SHARE = "share";
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
     @figma {

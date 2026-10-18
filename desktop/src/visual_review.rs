@@ -116,6 +116,10 @@ impl ReviewOps for Ops {
     fn reveal(&self, _path: &str) -> Result<(), String> {
         Ok(())
     }
+
+    fn shell_op(&self, _project: &str, _slot: &str, _op: shelbi_app::WorkspaceSessionOp) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn info() -> ReviewInfo {
@@ -356,7 +360,7 @@ impl Run {
         self.expect("the panel stands in the sidebar's column", column == (false, true));
         let model = self.view().read_with(&self.cx, |v, _| v.model().cloned());
         self.expect(
-            "a serving review shows its server, health check and URL",
+            "a serving review's model carries its server, health check and URL",
             model.as_ref().is_some_and(|m| {
                 m.server.state == ReviewState::Serving
                     && m.server.location.as_deref() == Some("hub:4101")

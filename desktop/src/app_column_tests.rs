@@ -684,7 +684,7 @@ fn the_push_starts_on_the_input_before_the_load_answers(cx: &mut TestAppContext)
     c.h.cx.run_until_parked();
     c.draw_only();
     assert!(!c.read(|w, cx| w.review.as_ref().unwrap().read(cx).is_pending()));
-    assert!(c.drawn("review-server") && c.drawn("review-approve") && !c.drawn("review-loading"));
+    assert!(c.drawn("review-switch-chat") && c.drawn("review-approve") && !c.drawn("review-loading"));
     assert!((c.left("column-review") - before).abs() < 0.5, "no jump when it fills in");
     assert!(c.sessions.attached().is_empty(), "no attach in the push's frames");
 
@@ -772,4 +772,37 @@ fn a_workspace_attaches_once_its_push_settles(cx: &mut TestAppContext) {
     c.advance(SLIDE);
     c.h.cx.run_until_parked();
     assert_eq!(c.ws_sessions.attached(), vec!["alpha/ws/alpha-1".to_string()]);
+}
+
+#[gpui::test]
+fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_review();
+    c.advance(SLIDE);
+    assert!(c.drawn("review-panel") && !c.drawn("column-sidebar"));
+    // The Navigation component's titlebar and footer stay around the panel,
+    // the Zen pill at State=Review's 32pt.
+    for selector in ["sidebar-search", "sidebar-collapse", "sidebar-settings", "sidebar-zen"] {
+        assert!(c.drawn(selector), "{selector} is drawn around the panel");
+    }
+    assert_eq!(c.bounds("sidebar-zen").unwrap().size.height, gpui::px(32.0));
+    c.h.take_calls();
+
+    // ⌘2 is the panel's View Diff, not the hidden sidebar's second row.
+    c.h.key("cmd-2");
+    let active = c.review().read_with(&c.h.cx, |r, _| r.panel().unwrap().active());
+    assert_eq!(active, shelbi_app::review::ActiveView::Diff);
+    assert!(c.h.take_calls().is_empty(), "no sidebar row opened");
+
+    // The same for the workspace panel: ⌘3 is Edit in <editor>.
+    c.back();
+    c.advance(SLIDE);
+    c.open_workspace();
+    c.advance(SLIDE);
+    assert!(c.drawn("workspace-panel") && c.drawn("sidebar-zen"));
+    c.h.take_calls();
+    c.h.key("cmd-3");
+    let active = c.workspace().read_with(&c.h.cx, |w, _| w.panel().active());
+    assert_eq!(active, crate::views::workspace::ContentView::Editor);
+    assert!(c.h.take_calls().is_empty(), "no sidebar row opened");
 }
