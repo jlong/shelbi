@@ -92,6 +92,7 @@ is left, and how it was verified.
 | `dt-figma-visual-harness` | `--visual-figma` renders the ten Figma mockup screens in both themes over the mockups' content; `scripts/figma-diff.sh` diffs them against the reference PNGs; the baseline report | [`status/dt-figma-visual-harness.md`](status/dt-figma-visual-harness.md) |
 | `dt-taskpage-theme` | The desktop's own palette and component shapes after the Taskpage design system, light and dark (superseded by `dt-figma-theme`) | [`theme.md`](theme.md) |
 | `dt-figma-theme` | The Figma design system's palette, type styles and Source Code Pro terminal font replace Taskpage's, in both themes | [`status/dt-figma-theme.md`](status/dt-figma-theme.md) |
+| `dt-figma-activity` | The Activity view restyled to the Figma frame in both themes: header with the display name, the frame's filter controls, day groups, rows colored by actor kind and status, current-status tags, the "available" and "started" desktop labels | [`status/dt-figma-activity.md`](status/dt-figma-activity.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

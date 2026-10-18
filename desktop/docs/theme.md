@@ -122,8 +122,9 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Section heading | Base medium, loud |
 | Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `text/green` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions (the card detail, the error log) are 28px and X-Small, with their key as keycaps |
 | Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control (the board's keyboard card, a dialog's keyboard button, text fields) |
-| Dropdown | A button that opens a menu (the board's and Activity's filters): the overlay fill, an icon, an X-Small medium label, a chevron; pressed while its menu is open, and the menu opens 6px under it |
+| Dropdown | A button that opens a menu (the board's filters): the overlay fill, an icon, an X-Small medium label, a chevron; pressed while its menu is open, and the menu opens 6px under it |
 | Segmented control | A track (the overlay fill, 2px inside) of 24px segments (28px in Settings), X-Small medium; the selected one is `selection` and loud; the others `foreground`, a fill fading in on hover |
+| Activity filters | The Activity frame's own: kind segments in a bare row 4px apart (no track), 24px, 8px across, X-Small, muted, the selected one `selection` and loud; then, 16px on, the pickers: `search`'s fill, the icon, an X-Small `gray` label, no chevron (`filter_segment`, `filter_dropdown`) |
 | Icon button | 24, 32 or 40px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the overlay fill while active |
 | Text field | The canvas inside a 1px `input_border` (`theme.divider`), as Settings draws it |
 | Checkbox | 16px; checked, the loud color with the mark in the canvas (Settings) |
@@ -216,6 +217,7 @@ until a new role has its row here, with the values the palette really has.
 | `gray` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: hotkeys, secondary text |
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
+| `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor |
 
 ### Icons
 
@@ -356,6 +358,7 @@ with its worst ratio. **Flagged for John.**
 |---|---|---|---|
 | dark | muted on | 2.10 | `theme.muted` `#777a86`: 3.67 on the canvas, 3.03 on the sidebar, 2.10 on a hovered row there. Section headers, branches, idle labels |
 | dark | dark_gray on | 3.10 | `theme.ansi_dark_gray`: Activity's timestamps, 3.76 on the canvas |
+| dark | log_text on | 2.96 | The Activity frame's `theme.gray` `#7b85a7`: the log's titles, 4.30 on the canvas, 2.96 on the selected row |
 | dark | info on | 3.83 | `theme.ansi_blue` as the info color: AA on the canvas (4.7), short on the sidebar and raised surfaces |
 | dark | blue on | 3.61 | The same blue as `[ready]`, and on its chip tint |
 | dark | gray on background | 3.84 | `theme.gray` (hotkeys) on a hovered row over the sidebar |
@@ -371,6 +374,7 @@ with its worst ratio. **Flagged for John.**
 | dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
+| light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
 | light | icon on | 2.97 | Icons in `theme.gray` on the sidebar (3.12 on white) |
 | light | link on | 3.69 | `text/link` `#1989c4`: 3.88 on white |
 | light | green on green_tint | 4.30 | `[done]` on its (derived) chip tint |

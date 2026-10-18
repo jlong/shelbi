@@ -571,6 +571,90 @@ pub fn segment_chip<E: Styled>(el: E, theme: &Theme) -> E {
     el.bg(theme.selection).rounded(px(6.0))
 }
 
+/// The Activity frame's kind filter: its segments in a bare row, 4px apart,
+/// with no track behind them. Children go in as for [`segment_track`].
+pub fn filter_track() -> Div {
+    div().relative().flex().flex_row().items_center().gap(px(4.0))
+}
+
+/// One kind filter: X-Small, 8px in, 24px tall; muted at rest, loud on the
+/// selected chip ([`segment_chip`], unless `chip_inline` is false while a
+/// sliding chip stands in). Unselected, a fill fades in on hover.
+pub fn filter_segment(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    chip_inline: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(24.0))
+        .px(px(8.0))
+        .rounded(px(6.0))
+        .type_style(Type::XSmall)
+        .cursor_pointer();
+    let d = if selected {
+        let d = d.text_color(theme.text_loud);
+        if chip_inline {
+            segment_chip(d, theme)
+        } else {
+            d
+        }
+    } else {
+        let clear = theme.background_hover.opacity(0.0);
+        fill_layer(
+            d.text_color(theme.muted),
+            id,
+            px(6.0),
+            [clear, theme.background_hover, theme.background_active],
+        )
+    };
+    d.child(label.into())
+}
+
+/// The Activity frame's pickers: `theme.search`'s fill, the icon and an
+/// X-Small gray label, 24px tall and no chevron; pressed while `open`.
+pub fn filter_dropdown(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    open: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let rest = if open {
+        theme.background_active
+    } else {
+        theme.search
+    };
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(24.0))
+        .px(px(8.0))
+        .rounded(px(6.0))
+        .type_style(Type::XSmall)
+        .text_color(theme.gray)
+        .cursor_pointer();
+    fill_layer(d, id, px(6.0), [rest, theme.background_active, theme.selection])
+        .child(heroicon(icon).text_color(theme.icon))
+        .child(div().whitespace_nowrap().child(label.into()))
+}
+
 /// The Button component's Hotkey: one small keycap per key of `chord` (`⌘K`
 /// is ⌘ and K), X-Small in gray, on the canvas with a 1px bottom edge.
 pub fn keycaps(chord: &str, theme: &Theme) -> Div {

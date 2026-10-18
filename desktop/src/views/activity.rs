@@ -1,6 +1,9 @@
 //! The Activity feed, rendered from the shared feed model
-//! (`shelbi_app::activity`): the same rows, order and glyphs as the TUI's
-//! Activity view (`crates/shelbi-tui/src/activity.rs`), laid out natively.
+//! (`shelbi_app::activity`): the same rows and order as the TUI's Activity
+//! view (`crates/shelbi-tui/src/activity.rs`), laid out natively after the
+//! Figma Activity frame and worded by the desktop's labels
+//! (`activity_labels.rs`: actor colors, current-status tags, "available"
+//! and the daemon's "started").
 //!
 //! The view is a thin gpui shell over [`ActivityState`] (`activity_state.rs`).
 //! Its data comes from the shared activity reader on its own background
@@ -21,17 +24,18 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
-    Hsla, KeyDownEvent, Pixels, ScrollHandle, SharedString, Task, Window,
+    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle, Hsla,
+    KeyDownEvent, Pixels, ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::activity::{
-    read_activity_window, ActivityData, ActivityKind, ActivityMetaCache, FeedItem, FeedRow,
-    RowTarget,
+    read_activity_window, ActivityData, ActivityKind, ActivityMetaCache, FeedItem, RowTarget,
 };
+use shelbi_app::theme::Tone;
 use shelbi_app::CommandKind;
 use shelbi_state::keymap::{format_chord, ActivityAction, DisplayStyle};
 
-use super::activity_state::{ActivityState, Intent, Picker};
+use super::activity_labels::{Actor, Line};
+use super::activity_state::{ActivityState, Intent, Picker, ProjectInfo};
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
@@ -62,9 +66,9 @@ static PINNED_NOW: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new
 pub fn pin_clock(at: DateTime<Utc>) {
     let _ = PINNED_NOW.set(at);
 }
-/// The identity-chip column's width, so messages line up across rows (the
-/// TUI's 9-cell chip column). A wider chip pushes only its own row over.
-const CHIP_WIDTH: f32 = 84.0;
+/// The actor column's width, so messages line up across rows (the TUI's
+/// 9-cell chip column). A wider actor pushes only its own row over.
+const ACTOR_WIDTH: f32 = 84.0;
 
 /// What the feed asks of the window.
 #[derive(Debug, Clone)]
@@ -84,7 +88,8 @@ pub struct ActivityView {
     state: ActivityState,
     focus: FocusHandle,
     needs_focus: bool,
-    refresher: shelbi_app::Refresher<ActivityData>,
+    /// Each read is the log's window and the project's config beside it.
+    refresher: shelbi_app::Refresher<(ActivityData, ProjectInfo)>,
     /// The line window the refresher reads with; "load older" grows it.
     window: Arc<AtomicUsize>,
     last_refresh: Instant,
@@ -108,7 +113,8 @@ impl ActivityView {
         let cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
         let (p, w) = (project.clone(), window.clone());
         let refresher = shelbi_app::spawn_worker(move |_| {
-            read_activity_window(&p, &cache, w.load(Ordering::Acquire))
+            let data = read_activity_window(&p, &cache, w.load(Ordering::Acquire));
+            (data, ProjectInfo::read(&p))
         });
         refresher.request();
         let poll = cx.spawn(async move |this, cx| loop {
@@ -147,7 +153,8 @@ impl ActivityView {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
-        if let Some(data) = self.refresher.latest() {
+        if let Some((data, info)) = self.refresher.latest() {
+            self.state.set_project_info(info);
             self.state.apply(data, now());
             cx.notify();
         }
@@ -223,14 +230,14 @@ impl ActivityView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let filter = &self.state.filter;
-        // A segmented control: "All" or any set of kinds. While one segment
-        // is selected alone, its chip slides to the next one picked.
+        // The kind filter: "All" or any set of kinds. While one segment is
+        // selected alone, its chip slides to the next one picked.
         let track = &self.kind_track;
         let segment = |id: &'static str, label: &'static str, active: bool| {
-            style::segment(id, label, active, chip.is_none(), theme)
+            style::filter_segment(id, label, active, chip.is_none(), theme)
                 .child(motion::probe(track, id))
         };
-        let mut pills = style::segment_track(theme)
+        let mut kinds = style::filter_track()
             .debug_selector(|| "activity-kinds".into())
             .child(motion::origin_probe(track))
             .children(chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, theme))))
@@ -242,7 +249,7 @@ impl ActivityView {
             )));
         for kind in ActivityKind::ALL {
             let id = kind_id(kind);
-            pills = pills.child(segment(id, kind.label(), filter.has_kind(kind)).on_click(
+            kinds = kinds.child(segment(id, kind.label(), filter.has_kind(kind)).on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.state.toggle_kind(kind, now());
                     cx.notify();
@@ -260,20 +267,21 @@ impl ActivityView {
         div()
             .flex()
             .flex_col()
+            .flex_none()
             .gap_2()
             .px_4()
-            .py_3()
+            .py_2()
             .border_b_1()
             .border_color(theme.divider)
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .items_baseline()
-                    .gap_3()
+                    .items_center()
+                    .gap_2()
                     .child(
                         div()
-                            .type_style(Type::BaseSemibold)
+                            .type_style(Type::BaseMedium)
                             .text_color(theme.text_loud)
                             .child("Activity"),
                     )
@@ -281,7 +289,7 @@ impl ActivityView {
                         div()
                             .type_style(Type::XSmall)
                             .text_color(theme.muted)
-                            .child(self.state.project.clone()),
+                            .child(self.state.title().to_string()),
                     ),
             )
             .child(
@@ -290,35 +298,38 @@ impl ActivityView {
                     .flex_row()
                     .flex_wrap()
                     .items_center()
-                    .gap_3()
-                    .child(pills)
+                    .gap_1()
+                    .child(kinds)
+                    // The frame's filter gap: 16pt from the kinds to the
+                    // pickers, 4pt between them.
+                    .child(div().w(px(8.0)).flex_none())
                     .child(
-                        style::dropdown(
+                        style::filter_dropdown(
                             "project-picker",
                             icons::FUNNEL,
                             project_label,
                             self.state.picker == Some(Picker::Project),
                             theme,
                         )
-                            .child(style::anchor_probe(&self.project_anchor))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.state.toggle_picker(Picker::Project);
-                                cx.notify();
-                            })),
+                        .child(style::anchor_probe(&self.project_anchor))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.state.toggle_picker(Picker::Project);
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        style::dropdown(
+                        style::filter_dropdown(
                             "workspace-picker",
                             icons::USER,
                             workspace_label,
                             self.state.picker == Some(Picker::Workspace),
                             theme,
                         )
-                            .child(style::anchor_probe(&self.workspace_anchor))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.state.toggle_picker(Picker::Workspace);
-                                cx.notify();
-                            })),
+                        .child(style::anchor_probe(&self.workspace_anchor))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.state.toggle_picker(Picker::Workspace);
+                            cx.notify();
+                        })),
                     ),
             )
     }
@@ -364,14 +375,13 @@ impl ActivityView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_4()
-            .pb_2();
+            .px_4();
         for (ix, item) in feed.items.iter().enumerate() {
             list = list.child(match item {
                 FeedItem::Day(label) => day_header(theme, label).into_any_element(),
                 FeedItem::Row(row) => {
                     let selected = self.state.selected == Some(ix);
-                    feed_row(theme, row, selected)
+                    feed_row(theme, &self.state.line(row), selected)
                         .id(("activity-row", ix))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             let intents = this.state.click(ix);
@@ -394,12 +404,14 @@ impl ActivityView {
 
     fn render_paging(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let loaded = format!("{} events loaded", self.state.loaded_events());
+        // "Start of the log   8 events loaded": the frame's three spaces.
         let row = div()
             .flex()
             .flex_row()
+            .flex_none()
             .items_center()
-            .gap_3()
-            .py_3()
+            .gap(px(10.0))
+            .py_4()
             .type_style(Type::XSmall)
             .text_color(theme.muted);
         if self.state.is_loading_older() {
@@ -438,9 +450,11 @@ impl ActivityView {
         div()
             .flex()
             .flex_row()
-            .gap_4()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(26.0))
             .px_4()
-            .py_1()
             .border_t_1()
             .border_color(theme.divider)
             .type_style(Type::XSmall)
@@ -586,41 +600,64 @@ fn selected_kind_id(filter: &shelbi_app::activity::ActivityFilter) -> Option<&'s
     }
 }
 
-/// `── Today ─────`: the day label, then a rule to the edge.
+/// `── Today ─────`: the day label on its rule, 40pt tall.
 fn day_header(theme: &Theme, label: &str) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
         .gap_2()
-        .pt_4()
-        .pb_2()
+        .h(px(40.0))
         .type_style(Type::XSmall)
-        .text_color(theme.muted)
+        .text_color(theme.dark_gray)
         .child(div().w(px(12.0)).h(px(1.0)).bg(theme.divider))
         .child(label.to_string())
         .child(div().flex_1().h(px(1.0)).bg(theme.divider))
 }
 
-/// One feed row, laid out like the TUI's: the identity chip pinned left, the
-/// dim verb, the title (wrapping, never truncated) with its trail and the dim
-/// secondary line under it, and the state pill + time pinned right.
-fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
-    let tone = |t| theme.tone(t);
-    let chip = div()
+/// A shared tone as the log paints it: the neutral tones in the log's gray
+/// and its dark gray, every hue as the theme has it.
+fn log_tone(theme: &Theme, tone: Tone) -> Hsla {
+    match tone {
+        Tone::White | Tone::Gray | Tone::WorkflowBadge => theme.log_text,
+        Tone::DarkGray => theme.dark_gray,
+        hue => theme.tone(hue),
+    }
+}
+
+/// The actor column's color for each kind of actor, as the frame draws it.
+fn actor_color(theme: &Theme, actor: Actor) -> Hsla {
+    match actor {
+        Actor::Zen => theme.green,
+        Actor::You => theme.log_text,
+        Actor::Machine => theme.muted,
+        Actor::Review => theme.theme_cyan,
+        Actor::Workspace(tone) => log_tone(theme, tone),
+    }
+}
+
+/// One feed row, laid out like the TUI's: the actor pinned left, the muted
+/// verb, the title (wrapping, never truncated) with its trail and the
+/// X-Small second line under it, and the status tag + time pinned right.
+/// Selected, it sits on the background fill.
+fn feed_row(theme: &Theme, line: &Line, selected: bool) -> gpui::Div {
+    let actor = div()
         .flex_none()
-        .min_w(px(CHIP_WIDTH))
+        .min_w(px(ACTOR_WIDTH))
         .pr_2()
-        .when_some(row.chip.as_ref(), |d, chip| {
-            d.text_color(tone(chip.tone))
-                .font_weight(if chip.bold { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
-                .child(chip.label.clone())
+        .when_some(line.actor.as_ref(), |d, (label, actor)| {
+            d.text_color(actor_color(theme, *actor)).child(label.clone())
         });
+    // A verb in the shared dim tone reads muted; a system row's status tint
+    // (`unreachable` in red) stays.
+    let verb_color = match line.verb_tone {
+        Tone::Gray | Tone::DarkGray | Tone::White => theme.muted,
+        hue => theme.tone(hue),
+    };
     let verb = div()
         .flex_none()
-        .when(!row.verb.is_empty(), |d| {
-            d.pr_2().text_color(tone(row.verb_tone)).child(row.verb.clone())
-        });
+        .when(!line.verb.is_empty(), |d| d.pr_2().text_color(verb_color).child(line.verb.clone()));
     let message = div()
         .flex()
         .flex_col()
@@ -629,21 +666,21 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
         .gap(px(2.0))
         .child(
             div()
-                .text_color(tone(row.title_tone))
-                .child(row.title.clone())
-                .when_some(row.trail.as_ref(), |d, (text, t)| {
-                    d.child(div().text_color(tone(*t)).child(text.clone()))
-                })
                 .flex()
                 .flex_row()
-                .flex_wrap(),
+                .flex_wrap()
+                .text_color(log_tone(theme, line.title_tone))
+                .child(line.title.clone())
+                .when_some(line.trail.as_ref(), |d, (text, t)| {
+                    d.child(div().text_color(log_tone(theme, *t)).child(text.clone()))
+                }),
         )
-        .when_some(row.secondary.as_ref(), |d, sec| {
+        .when_some(line.secondary.as_ref(), |d, sec| {
             let (icon, text) = sec.parts();
             d.child(
                 div()
                     .type_style(Type::XSmall)
-                    .text_color(theme.muted)
+                    .text_color(theme.dark_gray)
                     .truncate()
                     .child(format!("{icon}{text}")),
             )
@@ -652,26 +689,32 @@ fn feed_row(theme: &Theme, row: &FeedRow, selected: bool) -> gpui::Div {
         .flex()
         .flex_row()
         .flex_none()
+        .items_center()
         .gap_2()
         .pl_2()
-        .when_some(row.pill.as_ref(), |d, pill| {
-            d.child(style::chip(pill.text.clone(), Theme::tone_hue(pill.tone), theme))
+        .when_some(line.tag.as_ref(), |d, (text, tone)| {
+            d.child(
+                div()
+                    .type_style(Type::BaseMedium)
+                    .text_color(log_tone(theme, *tone))
+                    .child(format!("[{text}]")),
+            )
         })
-        .when(!row.time.is_empty(), |d| {
-            d.child(div().text_color(theme.muted).child(row.time.clone()))
+        .when(!line.time.is_empty(), |d| {
+            d.child(div().text_color(theme.dark_gray).child(line.time.clone()))
         });
     div()
         .flex()
         .flex_row()
+        .flex_none()
         .items_start()
-        .relative()
         .px_2()
-        .py_1p5()
-        .rounded_lg()
+        .py_1()
+        .rounded(px(6.0))
         .cursor_pointer()
-        .when(selected, |d| d.bg(theme.row_selected).child(style::selection_indicator(theme)))
+        .when(selected, |d| d.bg(theme.row_selected))
         .when(!selected, |d| d.hover(|s| s.bg(theme.background)))
-        .child(chip)
+        .child(actor)
         .child(verb)
         .child(message)
         .child(right)

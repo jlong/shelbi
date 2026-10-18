@@ -35,6 +35,7 @@
 //! `crate::commands`; they never hold domain logic of their own.
 
 pub mod activity;
+pub mod activity_labels;
 pub mod activity_state;
 pub mod board_scroll;
 pub mod bootstrap;
