@@ -19,13 +19,14 @@
 //! Each screen gets a fresh 1440x1024 window and is saved as
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
-//! machines, settings and command-palette, plus the palette states the
-//! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye).
-//! With `SHELBI_VISUAL_THEME` unset
-//! it runs once per theme. Frames are saved at 1x (the references' scale),
-//! downsampled from the window's backing scale; `--2x` opens each window on
-//! a Retina display instead and keeps the native 2x frame for close
-//! inspection. It prints one line per check and exits
+//! machines, settings and command-palette, plus the states the frames don't
+//! draw (no reference: checked by eye): the palette's ([`PALETTE_STATES`]),
+//! and Machines' `machines-unreachable` (the remote down, its row
+//! selected), `machines-idle-selected` and `machines-review-selected`. With
+//! `SHELBI_VISUAL_THEME` unset it runs once per theme. Frames are saved at
+//! 1x (the references' scale), downsampled from the window's backing scale;
+//! `--2x` opens each window on a Retina display instead and keeps the native
+//! 2x frame for close inspection. It prints one line per check and exits
 //! non-zero if any failed.
 
 use std::cell::Cell;
@@ -493,7 +494,7 @@ pub fn run(out: PathBuf, theme: &'static str, native: bool) -> ! {
     let now = pinned_now();
     write_fixtures(&home, now);
     crate::views::activity::pin_clock(now);
-    crate::views::machines::stub_reachable();
+    crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
 
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
@@ -744,6 +745,31 @@ impl Run {
         self.save(handle, screen);
     }
 
+    /// The Machines view with every remote answering `reachability` and
+    /// workspace row `selected` selected, saved as `screen`.
+    fn machines(&mut self, screen: &str, reachability: shelbi_core::Reachability, selected: usize) {
+        crate::views::machines::stub_reachability(reachability.clone());
+        let handle = self.open();
+        self.click(handle, View::Machines);
+        let machines = self.views(handle).2.expect("the Machines view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| {
+            machines.read_with(cx, |v, _| {
+                v.state().model().workspace_count() == 5
+                    && v.state().model().machines.get(1).is_some_and(|m| m.reachability == reachability)
+            })
+        });
+        if let Some(e) = machines.read_with(&self.cx, |v, _| v.state().error().map(str::to_string)) {
+            println!("      read error: {e}");
+        }
+        self.expect(&format!("{screen}: five workspaces, the gpu box {reachability:?}"), loaded);
+        machines.update(&mut self.cx, |v, cx| {
+            v.state_mut().select_row(selected);
+            cx.notify();
+        });
+        self.save(handle, screen);
+        crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
+    }
+
     /// Save the window as `<screen>-<theme>.png` and close it.
     fn save(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
         self.settle(handle);
@@ -863,27 +889,25 @@ impl Run {
         self.save(handle, "workspace-idle");
         self.sidebar = sidebar_model();
 
-        // Machines, the remote reachable.
-        let handle = self.open();
-        self.click(handle, View::Machines);
-        let machines = self.views(handle).2.expect("the Machines view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| {
-            machines.read_with(cx, |v, _| {
-                v.state().model().workspace_count() == 5
-                    && v.state().model().machines.get(1).is_some_and(|m| {
-                        m.reachability == shelbi_core::Reachability::Reachable
-                    })
-            })
-        });
-        if let Some(e) = machines.read_with(&self.cx, |v, _| v.state().error().map(str::to_string)) {
-            println!("      read error: {e}");
+        // Machines, the remote reachable. Its frame titles the two
+        // in-progress tasks shorter than the Issues frame does: the mockups
+        // disagree, so retitle them for this screen only.
+        let titles: Vec<(&str, String)> = MACHINES_TITLES
+            .iter()
+            .map(|(id, title)| (*id, retitle(id, title)))
+            .collect();
+        self.machines("machines", shelbi_core::Reachability::Reachable, 0);
+        // States the frame doesn't draw: the remote down (its row selected),
+        // and an idle row and the review slot selected.
+        let down = shelbi_core::Reachability::Unreachable {
+            error: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
+        };
+        self.machines("machines-unreachable", down, 4);
+        self.machines("machines-idle-selected", shelbi_core::Reachability::Reachable, 2);
+        self.machines("machines-review-selected", shelbi_core::Reachability::Reachable, 3);
+        for (id, title) in &titles {
+            retitle(id, title);
         }
-        self.expect("machines: five workspaces, the gpu box reachable", loaded);
-        machines.update(&mut self.cx, |v, cx| {
-            v.state_mut().select_row(0);
-            cx.notify();
-        });
-        self.save(handle, "machines");
 
         // Settings.
         let handle = self.open();
@@ -984,6 +1008,20 @@ client owns presentation and native interaction.\n";
 
 fn day(d: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, d, 12, 0, 0).single().expect("a fixture date")
+}
+
+/// The in-progress tasks' titles as the Machines frame draws them.
+const MACHINES_TITLES: [(&str, &str); 2] = [
+    ("project-switcher", "Add project switching"),
+    ("session-reconnect", "Session reconnect"),
+];
+
+/// Give fixture task `id` a new title; the old one comes back.
+fn retitle(id: &str, title: &str) -> String {
+    let mut file = shelbi_state::load_task(PROJECT, id).expect("a fixture task");
+    let old = std::mem::replace(&mut file.task.title, title.into());
+    shelbi_state::save_task(PROJECT, &file.task, &file.body).expect("retitle a fixture task");
+    old
 }
 
 fn save_task(id: &str, title: &str, body: &str, column: Column, priority: i64, assigned: Option<&str>) {
