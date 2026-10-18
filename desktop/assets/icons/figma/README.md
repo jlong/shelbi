@@ -5,6 +5,8 @@ Heroicons has no drawing for these, so they come from John's Figma file
 palette frame (2171:752) and drawn on its 20pt grid with the outline set's
 1.25pt stroke. Each paints in `currentColor`.
 
+- `play-solid.svg`: the Issue detail's Start button (frame 2172:722, a
+  filled drawing on the frame's 18pt grid, scaled to 20pt).
 - `toggle-off.svg`: the Zen Mode toggle (component 2220:24162).
 - `toggle-on.svg`: the same drawing with the knob on the right, for
   "Turn Zen Mode off" (Figma draws only the off state).

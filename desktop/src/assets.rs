@@ -289,6 +289,7 @@ heroicons! {
     ARROW_RIGHT = "arrow-right";
     ARROW_PATH = "arrow-path";
     ARROW_TOP_RIGHT_ON_SQUARE = "arrow-top-right-on-square";
+    ARROW_UP_RIGHT = "arrow-up-right";
     CLIPBOARD_DOCUMENT = "clipboard-document";
     EXCLAMATION_TRIANGLE = "exclamation-triangle";
     /// The drawing `FUNNEL_SMALL` and `FUNNEL_BUTTON` widen; no view draws
@@ -297,7 +298,6 @@ heroicons! {
     FUNNEL = "funnel";
     LOCK_CLOSED = "lock-closed";
     PENCIL_SQUARE = "pencil-square";
-    PLAY = "play";
     PLUS = "plus";
     MINUS = "minus";
     USER = "user";
@@ -318,6 +318,7 @@ heroicons! {
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
     @figma {
+        PLAY_SOLID = "play-solid";
         TOGGLE_OFF = "toggle-off";
         TOGGLE_ON = "toggle-on";
         PAGE_CURL = "page-curl";

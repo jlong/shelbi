@@ -126,7 +126,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Project switcher | The Navigation component's trigger: 28px, 8px across, 6px corners, the name (Base medium, `foreground`) and the up-down chevron in the muted color; clear at rest, the hover fill, pressed while open. Its menu is a popover 6px below: rows of badge, name and a check on the current project, a rule, then "Add project…"; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
 | Project badge | Two-letter initials (two words, camel case split), bold white, on a fill picked from the name (`badge_fill`); the switcher's menu rows |
 | Toolbar button | The sidebar's titlebar (Search, Toggle sidebar) and footer (Settings): 32px square, 8px corners, the 20px icon in `icon`, the hover fill fading in and a loud icon on hover |
-| Keycaps | The Button component's Hotkey: one cap per key, X-Small in `gray`, on the canvas with a 1px `keycap_edge` drop (the palette, the card detail) |
+| Keycaps | The Button component's Hotkey: one cap holding the key as written (`s`, `E`, `⌘S`), X-Small in `gray`, 16px tall with 4px corners, on the canvas with a 1px `button_keycap_edge` drop (the card detail's action buttons) |
 | Hotkey (sidebar) | The Navigation component's: the chord's keys as plain text (`⌘O`), 2px apart, X-Small in `gray`, 4px either side, no caps |
 | Nav row | The Navigation component's: 34px tall, 6px inside, 6px gap, the 20px icon (`icon`; `accent` when selected), the label (Base, `foreground`) growing, the hotkey; the current row is the chip, loud and medium weight |
 | Nav chip | The canvas; in Light lifted with `shadow/raised card` (0 4 4, 0 11 0 -8, 0 3 0 -1, and a 1px ring), in Dark flat |
@@ -134,7 +134,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | List row (leading column) | The review and workspace panels: 32px, Small (13 / 18); the same chip when selected. The sidebar's rows follow the Navigation component (see `views/sidebar.rs`): 8px across, 4px above and below, a 12px state glyph |
 | Current-selection indicator | A 3x16px `accent` pill at the row's leading edge, on the keyboard's row |
 | Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
-| Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `text/green` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions (the card detail, the error log) are 28px and X-Small, with their key as keycaps |
+| Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `text/green` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
 | Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, text fields) |
 | Dropdown | A button that opens a menu (the board's filters): the Figma Button at X-Small with a left icon, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the 18px icon (`icons::FUNNEL_BUTTON`, in `button_icon`) sits in Figma's 14px Icon slot (`icon_slot`), which makes the button 26px tall; pressed while its menu is open (the icon keeps its color), and the menu opens 6px under it |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
@@ -224,7 +224,7 @@ until a new role has its row here, with the values the palette really has.
 | `selection` | `#acb4cf8c` | `#acb4cf66` | `theme.selection`: the selected segment |
 | `search` | `#acb4cf40` | `#acb4cf29` | `theme.search`: Activity's filter chips |
 | `keycap` | `#1e2330` | `#ffffff` | The Hotkey's fill (`theme.canvas`) |
-| `keycap_edge` | `#acb4cf99` | `#acb4cf99` | The Hotkey's 1px drop |
+| `button_keycap_edge` | `#0203038c` | `#acb4cf99` | The Hotkey's 1px drop inside a button (the Issue detail frame's `theme.search`) |
 
 ### Text
 

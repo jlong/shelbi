@@ -56,7 +56,6 @@ pub enum Hue {
     Neutral,
     Green,
     Yellow,
-    Blue,
     Red,
 }
 
@@ -99,7 +98,6 @@ impl Theme {
             Hue::Neutral => (self.workflow_badge_text, self.workflow_badge),
             Hue::Green => (self.green, self.green_tint),
             Hue::Yellow => (self.yellow, self.yellow_tint),
-            Hue::Blue => (self.blue, self.blue_tint),
             Hue::Red => (self.red, self.red_tint),
         }
     }
@@ -455,7 +453,6 @@ mod tests {
         assert_eq!(t.tone(Tone::Green), t.green, "[done]");
         assert_eq!(t.tone(Tone::Yellow), t.yellow, "[in progress]");
         assert_eq!(t.tone(Tone::Blue), t.blue, "[ready]");
-        assert_eq!(t.hue(Hue::Blue).0, t.tone(Tone::Blue));
     }
 
     #[test]

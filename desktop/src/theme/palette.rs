@@ -47,6 +47,9 @@ pub mod figma {
     pub const DIVIDER: Pair = pair(0xacb4cf1a, 0xacb4cf1a);
     /// `theme.divider` as the Issues frame overrides it (the board's rules).
     pub const DIVIDER_STRONG: Pair = pair(0xacb4cf33, 0xacb4cf33);
+    /// `theme.search` as the Issue detail frame sets it: its buttons'
+    /// Hotkey drop (near black at 55% in Dark, `#acb4cf` at 60% in Light).
+    pub const SEARCH_DETAIL: Pair = pair(0x0203038c, 0xacb4cf99);
     /// `theme.foreground`: body text.
     pub const FOREGROUND: Pair = pair(0xf2f3f7b2, 0x020303b2);
     /// `theme.white`: loud text (near black in Light, despite the name).
@@ -263,8 +266,9 @@ palette! {
     /// A keycap in a shortcut hint (the Button component's Hotkey: the
     /// canvas).
     keycap,
-    /// The keycap's 1px bottom edge.
-    keycap_edge,
+    /// A keycap's 1px bottom edge inside a button (the Issue detail's
+    /// action buttons).
+    button_keycap_edge,
 
     // ---- Text ---------------------------------------------------------------
     /// Headings, titles, the selected row's label (`theme.white`).
@@ -459,8 +463,7 @@ impl Palette {
             selection: pick(SELECTION),
             search: pick(SEARCH),
             keycap: canvas,
-            // The Button component's Hotkey drop: `#acb4cf` at 60%.
-            keycap_edge: Rgba::hexa(0xacb4cf99),
+            button_keycap_edge: pick(SEARCH_DETAIL),
 
             text_loud: pick(WHITE),
             foreground: pick(FOREGROUND),

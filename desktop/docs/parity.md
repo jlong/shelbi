@@ -352,7 +352,8 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | "id" field (`views/task_detail.rs` `render`) |
 | `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | panel header (`views/task_detail.rs` `render`) |
 | `status_id` | not shown (popover keyed by task id) | not shown: not used |
-| `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | "status" field (`views/task_detail.rs` `render`) |
+| `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | not shown: `status_name` instead (the Figma frame spells the status as the workflow does) |
+| `status_name` | not shown: the popover shows the column label (`status_label`) | "status" field (`views/task_detail.rs` `render`) |
 | `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | not shown: not used |
 | `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | "priority N" in status field (`views/task_detail.rs` `render`) |
 | `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | "workspace" field, "unassigned" when none (`views/task_detail.rs` `render`) |
