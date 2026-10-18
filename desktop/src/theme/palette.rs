@@ -584,6 +584,9 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "magenta on magenta_tint"),
     ("dark", "red on red_tint"),
     ("dark", "text_loud on selection"),
+    ("dark", "gray on selection"),
+    ("dark", "theme_green on selection"),
+    ("dark", "theme_cyan on selection"),
     ("dark", "success on hover button"),
     ("dark", "success on pressed button"),
     ("dark", "error on rest button"),
@@ -600,6 +603,9 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "success on pressed button"),
     ("light", "error on pressed button"),
     ("light", "focus_ring on"),
+    ("light", "dark_gray on selection"),
+    ("light", "theme_green on selection"),
+    ("light", "theme_cyan on selection"),
     ("light", "input_border on"),
     ("light", "form_text on"),
 ];
@@ -687,6 +693,10 @@ mod tests {
             flatten(p.row_selected, p.canvas),
             AA,
         );
+        // The Machines states and reachability: drawn on the canvas only.
+        for (name, fg) in [("theme_green", p.theme_green), ("theme_cyan", p.theme_cyan)] {
+            check(format!("{name} on canvas"), fg, p.canvas, AA);
+        }
         // A chip's text on its tint, over a card and the canvas.
         for (name, fg, tint) in [
             ("green on green_tint", p.green, p.green_tint),
@@ -742,6 +752,17 @@ mod tests {
         // unselected choice, and a form button's label on its fill.
         check("form_text on canvas".into(), p.form_text, p.well, AA);
         check("form_text on form button".into(), p.form_text, flatten(p.search, p.canvas), AA);
+        // The selected Machines row: every cell on the selection band.
+        let band = flatten(p.selection, p.canvas);
+        for (name, fg) in [
+            ("gray", p.gray),
+            ("muted", p.muted),
+            ("dark_gray", p.dark_gray),
+            ("theme_green", p.theme_green),
+            ("theme_cyan", p.theme_cyan),
+        ] {
+            check(format!("{name} on selection over canvas"), fg, band, AA);
+        }
         check(
             "success on zen over sidebar".into(),
             p.success,

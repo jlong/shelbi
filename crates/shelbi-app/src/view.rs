@@ -1056,12 +1056,33 @@ pub struct MachineWorkspace {
     /// `agent:` (default `developer`), `review` for a serving review slot.
     /// `None` when idle.
     pub agent: Option<String>,
+    /// The agent CLI that task's agent runs on (`Claude`, `Codex`, or a
+    /// generic runner's command name), resolved the way dispatch resolves
+    /// it. `None` when idle.
+    pub runner: Option<String>,
     /// The assigned task's title, when the board has it.
     pub task_title: Option<String>,
     /// The assigned task's branch.
     pub branch: Option<String>,
     /// For a review slot holding a review task: its server state and URL.
     pub review: Option<ReviewSlot>,
+}
+
+impl MachineWorkspace {
+    /// The assignment as `<status>: <task title>` (`in_progress: Add project
+    /// switching`, `review: Desktop application`), or `idle`. Falls back to
+    /// the ids ([`SlotAssignment::cell`]) when the board has no title, or
+    /// when a diverged board assigns several in-progress tasks.
+    pub fn task_cell(&self) -> String {
+        let title = self.task_title.as_deref();
+        match (&self.assignment, title) {
+            (SlotAssignment::InProgress(ids), Some(title)) if ids.len() == 1 => {
+                format!("in_progress: {title}")
+            }
+            (SlotAssignment::Review(_), Some(title)) => format!("review: {title}"),
+            (assignment, _) => assignment.cell(),
+        }
+    }
 }
 
 /// A workspace's assignment, matching `shelbi workspace list`'s STATE cell.
@@ -1138,6 +1159,8 @@ pub struct MachinesInput {
     pub branches: HashMap<String, String>,
     /// Task id -> title, for tasks in neither `in_progress` (review tasks).
     pub titles: HashMap<String, String>,
+    /// Task id -> the runner its agent launches on (`Claude`, `Codex`, ...).
+    pub runners: HashMap<String, String>,
 }
 
 /// The default agent `shelbi workspace list` shows for a task with no
@@ -1271,6 +1294,7 @@ fn machine_workspace(input: &MachinesInput, w: &WorkspaceSpec, is_review_slot: b
                 .and_then(|tf| tf.task.branch.clone())
         })
     });
+    let runner = task.as_deref().and_then(|id| input.runners.get(id).cloned());
     MachineWorkspace {
         name: w.name.clone(),
         is_review_slot,
@@ -1278,6 +1302,7 @@ fn machine_workspace(input: &MachinesInput, w: &WorkspaceSpec, is_review_slot: b
         current_task: status.and_then(|s| s.current_task.clone()),
         assignment,
         agent,
+        runner,
         task_title,
         branch,
         review: review.filter(|_| mine.is_empty()),
@@ -1781,6 +1806,9 @@ mod tests {
         branches.insert("r9".to_string(), "jlong/r9".to_string());
         let mut titles = HashMap::new();
         titles.insert("r9".to_string(), "Review me".to_string());
+        let mut runners = HashMap::new();
+        runners.insert("t1".to_string(), "Codex".to_string());
+        runners.insert("r9".to_string(), "Claude".to_string());
         MachinesInput {
             display_name: Some("Demo".into()),
             machines: vec![
@@ -1799,6 +1827,7 @@ mod tests {
             review_slots,
             branches,
             titles,
+            runners,
         }
     }
 
@@ -1847,6 +1876,8 @@ mod tests {
         assert_eq!(alpha.branch.as_deref(), Some("jlong/t1"));
         assert_eq!(alpha.state, Some(WorkspaceState::AwaitingInput));
         assert!(alpha.review.is_none());
+        assert_eq!(alpha.runner.as_deref(), Some("Codex"));
+        assert_eq!(alpha.task_cell(), "in_progress: Task t1");
 
         let review = &model.machines[0].workspaces[1];
         assert!(review.is_review_slot);
@@ -1854,6 +1885,8 @@ mod tests {
         assert_eq!(review.agent.as_deref(), Some(REVIEW_SLOT_AGENT));
         assert_eq!(review.task_title.as_deref(), Some("Review me"));
         assert_eq!(review.branch.as_deref(), Some("jlong/r9"));
+        assert_eq!(review.runner.as_deref(), Some("Claude"));
+        assert_eq!(review.task_cell(), "review: Review me");
         let slot = review.review.as_ref().expect("a review slot");
         assert_eq!(slot.label(), "serving");
         assert_eq!(slot.url.as_deref(), Some("http://localhost:3001"));
@@ -1862,6 +1895,8 @@ mod tests {
         assert_eq!(idle.assignment, SlotAssignment::Idle);
         assert_eq!(idle.assignment.cell(), "idle");
         assert!(idle.agent.is_none() && idle.branch.is_none() && idle.state.is_none());
+        assert!(idle.runner.is_none());
+        assert_eq!(idle.task_cell(), "idle");
     }
 
     #[test]
@@ -1875,6 +1910,7 @@ mod tests {
         let alpha = &model.machines[0].workspaces[0];
         assert_eq!(alpha.agent.as_deref(), Some(DEFAULT_TASK_AGENT));
         assert_eq!(alpha.assignment.cell(), "in_progress: t1, t2");
+        assert_eq!(alpha.task_cell(), "in_progress: t1, t2", "no one title for two tasks");
     }
 
     #[test]

@@ -179,7 +179,7 @@ this foundation sets the palette, the type styles and the shared shapes.
 ## Shared meanings
 
 The shared view models name colors by meaning (the activity feed's `Tone`, a
-badge's `DecorationColor`). `Theme::tone`, `Theme::tone_hue` and
+badge's `DecorationColor`). `Theme::tone` and
 `Theme::decoration` map each onto the Figma color for the same meaning:
 Activity's log colors (`theme.ansi_*`) for tones, the Navigation component's
 status icons for sidebar badges.
@@ -375,8 +375,8 @@ with its worst ratio. **Flagged for John.**
 
 | Theme | Pairing | Worst | Why |
 |---|---|---|---|
-| dark | muted on | 2.10 | `theme.muted` `#777a86`: 3.67 on the canvas, 3.03 on the sidebar, 2.10 on a hovered row there. Section headers, branches, idle labels |
-| dark | dark_gray on | 3.10 | `theme.ansi_dark_gray`: Activity's timestamps, 3.76 on the canvas |
+| dark | muted on | 1.11 | `theme.muted` `#777a86`: 3.67 on the canvas, 3.03 on the sidebar, 2.10 on a hovered row there. Section headers, branches, idle labels. 1.11 is an idle state on the selected Machines row (`theme.selection`), a row the frame doesn't draw selected |
+| dark | dark_gray on | 1.13 | `theme.ansi_dark_gray`: Activity's timestamps, 3.76 on the canvas, 3.10 on the sidebar. 1.13 is the branch on the selected Machines row, as the frame draws it |
 | dark | log_text on | 2.96 | The Activity frame's `theme.gray` `#7b85a7`: the log's titles, 4.30 on the canvas, 2.96 on the selected row |
 | dark | info on | 3.83 | `theme.ansi_blue` as the info color: AA on the canvas (4.7), short on the sidebar and raised surfaces |
 | dark | blue on | 3.61 | The same blue as `[ready]`, and on its chip tint |
@@ -385,6 +385,9 @@ with its worst ratio. **Flagged for John.**
 | dark | magenta on magenta_tint | 4.19 | `[review]` on its (derived) chip tint |
 | dark | red on red_tint | 4.39 | The Danger pink on its (derived) chip tint |
 | dark | text_loud on selection | 4.08 | `theme.white` on the selected segment (`theme.selection`) over the sidebar; 4.46 on the canvas |
+| dark | gray on selection | 2.12 | The selected Machines row (`theme.selection` over the canvas, as drawn): the runner and the task in `theme.gray` |
+| dark | theme_green on selection | 2.30 | The same row: `working` and `● reachable` in `theme.green` |
+| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan`. The lowest pairing the desktop draws |
 | dark | success on hover button | 4.07 | `text/green` on the Success button's (derived dark) hover |
 | dark | success on pressed button | 3.35 | `text/green` on the Success button pressed |
 | dark | error on rest button | 4.30 | The Danger label on the Danger fill over the sidebar (AA over the canvas) |
@@ -401,6 +404,9 @@ with its worst ratio. **Flagged for John.**
 | light | success on pressed button | 4.36 | `text/green` on the Success button pressed |
 | light | error on pressed button | 3.98 | `#b40041` on the Danger button pressed |
 | light | focus_ring on | 2.41 | `focus/default/ring` `#31ade9`: 2.53 on white; the 4px glow widens it |
+| light | dark_gray on selection | 4.08 | The selected Machines row: the branch in `theme.ansi_dark_gray` |
+| light | theme_green on selection | 4.02 | The same row: `working` in `theme.green` (5.0 on white) |
+| light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
 | light | input_border on | 1.06 | `theme.divider` as a field's edge |
 | light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
 

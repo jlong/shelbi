@@ -1,11 +1,13 @@
 //! The Machines view: every machine the project declares, with its
 //! workspaces, rendered from the shared [`shelbi_app::view::MachinesModel`].
 //!
-//! Each machine's header shows where it is (`local` or `ssh <host>`), its live
-//! reachability (remotes only), its tags, and its recorded remote `shelbi`
-//! binary. Each workspace row shows its observed state, the agent and task
-//! `shelbi workspace list` reports, the task's branch, and for a review slot
-//! the review server's state and URL (click the URL to open it).
+//! Drawn to the Figma Machines frame (`dt-figma-machines`). Each machine's
+//! heading shows where it is (`local` or `ssh <host>`) and its live
+//! reachability (remotes only), with its tags and recorded remote `shelbi`
+//! binary on the line under it. Each workspace row shows its observed state,
+//! the runner its task's agent launches on, the task as `<status>: <title>`,
+//! the task's branch, and for a review slot a server still starting and the
+//! review URL (click the URL to open it).
 //!
 //! Two background sources, neither on the UI thread:
 //!
@@ -23,14 +25,14 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, EventEmitter, FocusHandle, FontWeight,
+    div, prelude::*, px, ClickEvent, Context, EventEmitter, FocusHandle,
     KeyDownEvent, ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
 use shelbi_app::theme::Tone;
 use shelbi_app::view::{
     reachability_label, remote_binary_label, workspace_state_badge, MachineRow, MachineWorkspace,
-    MachinesModel, SlotAssignment,
+    MachinesModel,
 };
 use shelbi_app::CommandKind;
 
@@ -227,6 +229,8 @@ impl MachinesView {
             )
             .into_any_element();
         }
+        // The Machines frame: machines 16 apart, each a heading (plus a
+        // remote's metadata line) over its workspace rows, 2 apart.
         let mut body = div()
             .id("machines-list")
             .debug_selector(|| "machines-list".into())
@@ -240,16 +244,13 @@ impl MachinesView {
             .py_2()
             .gap_4();
         for (mi, machine) in model.machines.iter().enumerate() {
-            // Each machine is a card on the main surface.
             let mut group = div()
                 .flex()
                 .flex_col()
+                .flex_none()
                 .gap(px(2.0))
-                .p_2()
-                .rounded_lg()
-                .bg(theme.card)
-                .shadow(style::card_shadow(theme))
-                .child(machine_header(theme, machine));
+                .child(machine_header(theme, machine))
+                .when_some(machine_metadata(theme, machine), |d, line| d.child(line));
             if machine.workspaces.is_empty() {
                 group = group.child(
                     div()
@@ -284,6 +285,7 @@ impl Render for MachinesView {
         }
         let theme = *cx.global::<Theme>();
         let count = self.state.model().workspace_count();
+        let divider = || div().h(px(1.0)).flex_none().bg(theme.divider);
         div()
             .id("machines")
             .track_focus(&self.focus)
@@ -297,19 +299,19 @@ impl Render for MachinesView {
             .bg(theme.canvas)
             .type_style(Type::Base)
             .text_color(theme.foreground)
+            // The toolbar: the view's name, loud, then the project's, muted.
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .items_baseline()
-                    .gap_3()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(37.0))
                     .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(theme.divider)
                     .child(
                         div()
-                            .type_style(Type::BaseSemibold)
+                            .type_style(Type::BaseMedium)
                             .text_color(theme.text_loud)
                             .child("Machines"),
                     )
@@ -320,30 +322,41 @@ impl Render for MachinesView {
                             .child(self.state.title().to_string()),
                     ),
             )
+            .child(divider())
             .child(self.render_body(&theme, cx))
+            .child(divider())
+            // The shortcuts: key hints left, the workspace count right.
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_4()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(26.0))
                     .px_4()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(theme.divider)
                     .type_style(Type::XSmall)
                     .text_color(theme.muted)
-                    .child(div().flex_1().child("↑/↓ select   enter open   r refresh"))
-                    .child(format!(
+                    .child(div().flex_1().min_w_0().truncate().child("↑/↓ select   enter open   r refresh"))
+                    .child(div().flex_none().child(format!(
                         "{count} workspace{}",
                         if count == 1 { "" } else { "s" }
-                    )),
+                    ))),
             )
     }
 }
 
 // ---- pieces -----------------------------------------------------------------
 
-/// `gpu   ssh gpu.lan   ● reachable   [gpu, linux]   /usr/local/bin/shelbi v0.10.0`
+/// The column widths of a workspace row: name, state, runner (the
+/// Machines frame's).
+const NAME_W: f32 = 150.0;
+const STATE_W: f32 = 76.0;
+const RUNNER_W: f32 = 96.0;
+
+/// A machine's heading: `gpu   ssh gpu.lan   ● reachable`. The name is loud,
+/// where it is muted, and a remote's live reachability follows in its tone
+/// (green reachable, red with the reason when not, muted while checking).
 fn machine_header(theme: &Theme, m: &MachineRow) -> impl IntoElement {
     let location = if m.is_local {
         "local".to_string()
@@ -353,73 +366,122 @@ fn machine_header(theme: &Theme, m: &MachineRow) -> impl IntoElement {
             None => "ssh".to_string(),
         }
     };
-    let toned = |text: String, tone: Tone| style::chip(text, Theme::tone_hue(tone), theme);
     div()
         .flex()
         .flex_row()
-        .flex_wrap()
+        .flex_none()
         .items_center()
-        .gap_2()
-        .px_2()
-        .pt_1()
-        .pb_2()
+        .gap_3()
+        .h(px(24.0))
+        .min_w_0()
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
+                .flex_none()
+                .type_style(Type::BaseMedium)
                 .text_color(theme.text_loud)
                 .child(m.name.clone()),
         )
-        .child(div().type_style(Type::XSmall).text_color(theme.muted).child(location))
-        // Live reachability next to the ssh label: remotes only, the hub is
-        // never probed.
+        .child(div().flex_none().type_style(Type::XSmall).text_color(theme.muted).child(location))
+        // Remotes only: the hub is never probed.
         .when(!m.is_local, |d| {
             let (text, tone) = reachability_label(&m.reachability, 80);
-            // The chip is cut at 80 characters; the whole reason is a hover
+            // The label is cut at 80 characters; the whole reason is a hover
             // away.
             let (full, _) = reachability_label(&m.reachability, usize::MAX);
             d.child(
                 div()
                     .id(gpui::SharedString::from(format!("reachability-{}", m.name)))
                     .min_w_0()
+                    .truncate()
+                    .type_style(Type::XSmall)
+                    .text_color(machines_tone(theme, tone))
                     .when(full != text, |d| d.tooltip(style::tooltip(full)))
-                    .child(toned(text, tone)),
+                    .child(text),
             )
-        })
-        .children(m.tags.iter().map(|tag| style::chip(tag.clone(), crate::theme::Hue::Neutral, theme)))
-        .when(!m.is_local, |d| {
-            let (text, tone) = remote_binary_label(m.remote.as_ref());
-            d.child(div().type_style(Type::XSmall).text_color(theme.tone(tone)).child(text))
         })
 }
 
-/// One workspace: name, observed state, agent, task, branch, review server.
-fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::Div {
-    let (badge, badge_tone) = workspace_state_badge(w.state);
-    let task = match &w.assignment {
-        SlotAssignment::Idle => div().text_color(theme.muted).child("idle"),
-        assignment => div()
+/// The line under a machine's heading: its tags, then (remotes) the
+/// recorded `shelbi` binary, `[gpu, linux]   /usr/local/bin/shelbi v0.10.0`.
+/// `None` for a local machine with no tags.
+fn machine_metadata(theme: &Theme, m: &MachineRow) -> Option<gpui::Div> {
+    if m.is_local && m.tags.is_empty() {
+        return None;
+    }
+    let binary = (!m.is_local).then(|| {
+        let (text, tone) = remote_binary_label(m.remote.as_ref());
+        // A resolved binary is metadata; incompatible or missing is a problem.
+        let color = if tone == Tone::Green {
+            theme.muted
+        } else {
+            machines_tone(theme, tone)
+        };
+        div().min_w_0().truncate().text_color(color).child(text)
+    });
+    Some(
+        div()
             .flex()
             .flex_row()
-            .min_w_0()
+            .flex_none()
+            .items_center()
             .gap_2()
-            .child(div().flex_none().text_color(theme.foreground).child(assignment.cell()))
-            .when_some(w.task_title.clone(), |d, title| {
-                d.child(div().min_w_0().truncate().text_color(theme.text_loud).child(title))
-            }),
-    };
-    let review = w.review.as_ref().map(|r| {
-        let tone = if r.label() == "serving" {
-            Tone::Cyan
-        } else {
-            Tone::DarkGray
-        };
+            .h(px(24.0))
+            .min_w_0()
+            .type_style(Type::XSmall)
+            .when(!m.tags.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.workflow_badge_text)
+                        .child(format!("[{}]", m.tags.join(", "))),
+                )
+            })
+            .children(binary),
+    )
+}
+
+/// A shared model's [`Tone`] in the Machines frame's colors: green and cyan
+/// are the frame's `theme.green` / `theme.cyan`, idle is muted, the rest
+/// keep their log hues.
+fn machines_tone(theme: &Theme, tone: Tone) -> gpui::Hsla {
+    match tone {
+        Tone::Green => theme.theme_green,
+        Tone::Cyan => theme.theme_cyan,
+        Tone::DarkGray => theme.muted,
+        Tone::Yellow => theme.warning,
+        tone => theme.tone(tone),
+    }
+}
+
+/// The state cell: the observed state, except that a review slot serving its
+/// task reads `review` (the Machines frame); a slot still starting its server
+/// says so in the review cell.
+fn state_cell(w: &MachineWorkspace) -> (&'static str, Tone) {
+    match w.state {
+        Some(shelbi_state::WorkspaceState::Serving) => ("review", Tone::Cyan),
+        state => workspace_state_badge(state),
+    }
+}
+
+/// One workspace: name, state, runner, `<status>: <task title>`, a review
+/// slot's server, and the branch right-aligned.
+fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::Div {
+    let (state, state_tone) = state_cell(w);
+    let review = w.review.as_ref().and_then(|r| {
+        // A serving slot already reads `review` in the state cell; say only
+        // what that doesn't: a server still starting, and its URL.
+        let starting = (r.label() != "serving").then(|| r.label());
+        if starting.is_none() && r.url.is_none() {
+            return None;
+        }
         let mut cell = div()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
             .gap_2()
-            .child(div().text_color(theme.tone(tone)).child(r.label()));
+            .type_style(Type::XSmall)
+            .when_some(starting, |d, label| d.child(div().text_color(theme.muted).child(label)));
         if let Some(url) = r.url.clone() {
             let open = url.clone();
             cell = cell.child(
@@ -433,33 +495,31 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.link_hover))
                     .child(url)
-                    .child(
-                        heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE)
-                            .text_color(theme.icon),
-                    )
+                    .child(heroicon(icons::ARROW_TOP_RIGHT_ON_SQUARE).text_color(theme.icon))
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         cx.open_url(&open);
                     }),
             );
         }
-        cell
+        Some(cell)
     });
     div()
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
-        .relative()
         .gap_3()
-        .px_2()
-        .py_1p5()
-        .rounded_lg()
+        .h(px(30.0))
+        .pl_4()
+        .pr_2()
+        .rounded(px(6.0))
         .cursor_pointer()
-        .when(selected, |d| d.bg(theme.row_selected).child(style::selection_indicator(theme)))
+        .when(selected, |d| d.bg(theme.selection))
         .when(!selected, |d| d.hover(|s| s.bg(theme.background)))
         .child(
             div()
-                .w(px(150.0))
+                .w(px(NAME_W))
                 .flex_none()
                 .truncate()
                 .text_color(theme.text_loud)
@@ -467,20 +527,35 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
         )
         .child(
             div()
-                .w(px(96.0))
+                .w(px(STATE_W))
                 .flex_none()
-                .flex()
-                .child(style::chip(badge, Theme::tone_hue(badge_tone), theme)),
+                .truncate()
+                .text_color(machines_tone(theme, state_tone))
+                .child(state),
         )
         .child(
             div()
-                .w(px(96.0))
+                .w(px(RUNNER_W))
                 .flex_none()
                 .truncate()
-                .text_color(theme.foreground)
-                .child(w.agent.clone().unwrap_or_else(|| "-".to_string())),
+                .text_color(theme.gray)
+                .child(w.runner.clone().unwrap_or_else(|| "—".to_string())),
         )
-        .child(div().flex_1().min_w_0().child(task))
+        // The task by title; its id (what `shelbi workspace list` prints) on
+        // hover.
+        .child({
+            let cell = w.task_cell();
+            let ids = w.assignment.cell();
+            div()
+                .id(SharedString::from(format!("machine-task-{}", w.name)))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme.gray)
+                .when(ids != cell, |d| d.tooltip(style::tooltip(ids)))
+                .child(cell)
+        })
+        .children(review)
         .when_some(w.branch.clone(), |d, branch| {
             d.child(
                 div()
@@ -488,9 +563,8 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                     .flex_none()
                     .truncate()
                     .type_style(Type::XSmall)
-                    .text_color(theme.muted)
+                    .text_color(theme.dark_gray)
                     .child(format!("{}{branch}", shelbi_app::activity::BRANCH_ICON)),
             )
         })
-        .children(review)
 }

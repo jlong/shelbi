@@ -993,6 +993,14 @@ agent_runners:
   codex:
     command: codex
     flags: []
+  claude:
+    command: claude
+    flags: []
+agents:
+  developer:
+    runner: codex
+  review:
+    runner: claude
 machines:
   - name: hub
     kind: local
@@ -1058,6 +1066,11 @@ workspaces:
     status("alpha", Some("project-switcher"), shelbi_state::WorkspaceState::Working);
     status("bravo", Some("session-reconnect"), shelbi_state::WorkspaceState::Working);
     status("review", Some("desktop-app"), shelbi_state::WorkspaceState::Serving);
+    // The review slot has confirmed its server (Machines: `review`, not
+    // `starting`).
+    let review_marker = home.join("work/.shelbi/wt/review/.shelbi");
+    std::fs::create_dir_all(&review_marker).unwrap();
+    std::fs::write(review_marker.join("shelbi-review-loaded"), "desktop-app\n").unwrap();
 
     shelbi_state::machine_state::save_machine_record(
         "gpu",
