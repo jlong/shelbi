@@ -21,6 +21,12 @@
 //! the hub (daemon, panes, CLI), not just the one that hit the limit. The file
 //! is keyed by a **hash** of the token, never the token itself.
 //!
+//! Not every refusal earns a wait for the window's reset (see
+//! [`plan_rate_limit_park`]): a *secondary* limit parks for its `Retry-After`,
+//! and a refusal whose reset can't be trusted (quota left, a past reset, or a
+//! retry right after a park expired that names a fresh window's reset) parks
+//! for a short escalating backoff instead of a whole extra hour.
+//!
 //! ## Two budgets, per token, hub-wide (plan Phase 3 §6)
 //!
 //! GitHub prices GraphQL reads (the board index and single-issue fetches) on a
@@ -59,6 +65,29 @@ pub const UNREACHABLE_WINDOW_START_SECS: i64 = 15;
 /// ~900/min the un-parked retry loop produced on the 2026-09-08 incident.
 pub const UNREACHABLE_WINDOW_CAP_SECS: i64 = 300;
 
+/// First (shortest) window a rate-limited read parks for when the response's own
+/// reset can't be trusted: a retry just after a park expired that is still
+/// refused, a refusal with quota left, or a secondary limit naming no
+/// `Retry-After`. Doubles on each consecutive such park (see
+/// [`plan_rate_limit_park`]) up to [`RATE_LIMIT_BACKOFF_CAP_SECS`].
+pub const RATE_LIMIT_BACKOFF_START_SECS: i64 = 30;
+
+/// Ceiling the escalating rate-limit backoff doubles up to: 5 minutes, so a
+/// misread limit costs a handful of attempts, never a whole parked hour.
+pub const RATE_LIMIT_BACKOFF_CAP_SECS: i64 = 300;
+
+/// Floor for a secondary limit that names no `Retry-After`: GitHub asks clients
+/// to wait at least a minute before retrying one.
+pub const SECONDARY_LIMIT_MIN_SECS: i64 = 60;
+
+/// A reset at least this far out (55 minutes) belongs to a window that only just
+/// started, which cannot have spent its quota yet.
+pub const FRESH_WINDOW_SECS: i64 = 55 * 60;
+
+/// How recently a tier's last park must have expired for a fresh refusal to
+/// count as "still limited right after the reset" rather than a new exhaustion.
+pub const PARK_EXPIRED_GRACE_SECS: i64 = 300;
+
 /// Which of a token's two independent budgets a call concerns: GraphQL reads
 /// (the board index and single-issue fetches) or REST requests (writes and the
 /// REST fallback list). Selects the [`BudgetTier`] every tier-aware function
@@ -88,6 +117,12 @@ pub struct BudgetTier {
     /// [`park_verdict`] reports not-parked and reads resume — no file rewrite
     /// needed.
     pub parked_until: Option<i64>,
+    /// The current rate-limit backoff window (seconds) when the last park was a
+    /// short backoff rather than a wait for the reset — doubled on each
+    /// consecutive backoff park up to the cap, cleared on a reset park or the
+    /// first successful read ([`clear_read_backoff`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_secs: Option<i64>,
 }
 
 /// A token's connection-level circuit breaker — separate from the two budget
@@ -328,6 +363,175 @@ pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
     tier.parked_until = Some(effective.max(now + 1));
     write_state(key, &state);
     true
+}
+
+/// How a rate-limit park chose its expiry — the `park=` token on the
+/// `board rate-limited` events.log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkMode {
+    /// Wait for the primary window's reset.
+    Reset,
+    /// Wait out the server's `Retry-After` (a secondary limit).
+    RetryAfter,
+    /// A short escalating backoff: the response's reset couldn't be trusted.
+    Backoff,
+}
+
+impl ParkMode {
+    /// The `park=` token for the events.log line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParkMode::Reset => "reset",
+            ParkMode::RetryAfter => "retry-after",
+            ParkMode::Backoff => "backoff",
+        }
+    }
+}
+
+/// The park a rate-limited read decided on: until when, how that was chosen,
+/// and the backoff window to persist (`Some` only for [`ParkMode::Backoff`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkDecision {
+    /// Epoch seconds reads stay parked until.
+    pub until: i64,
+    /// How `until` was chosen.
+    pub mode: ParkMode,
+    /// The backoff window this park used, persisted so the next one doubles.
+    pub backoff_secs: Option<i64>,
+}
+
+/// The pure rate-limit park decision for `tier`, given what the refusing
+/// response said (`hit`), the resolved primary `reset` (the response's header,
+/// the `/rate_limit` probe, the recorded reset, or the short default, in that
+/// order), and the current epoch. Split out so every branch is unit-testable
+/// without the file.
+///
+/// - A **secondary** limit parks for its `Retry-After`, or a short backoff
+///   (at least [`SECONDARY_LIMIT_MIN_SECS`]) when it names none. The primary
+///   reset is irrelevant to it.
+/// - A **primary** limit parks until `reset`, unless that reset can't be
+///   trusted, in which case it parks for a short escalating backoff:
+///   - the response still had quota (`remaining > 0`), so the quota isn't what
+///     refused it;
+///   - the reset is already past (GitHub hasn't rolled the window yet);
+///   - the reset is a fresh window's (at least [`FRESH_WINDOW_SECS`] away) and
+///     the tier's previous park expired within [`PARK_EXPIRED_GRACE_SECS`]:
+///     the retry right after a reset was refused, but the window that just
+///     started has its whole quota, so waiting for *its* reset would park
+///     reads for an hour for nothing (the 2026-10-18 incident).
+///
+/// A reset park never moves a known reset earlier: if the tier already
+/// recorded a later `reset_at`, the park honors that (see [`park`]).
+pub fn plan_rate_limit_park(
+    tier: &BudgetTier,
+    hit: &crate::gh_retry::RateLimitHit,
+    reset: i64,
+    now: i64,
+) -> ParkDecision {
+    use crate::gh_retry::RateLimitKind;
+    let backoff = |floor: i64| {
+        let next = match tier.backoff_secs {
+            Some(prev) if prev > 0 => (prev * 2).min(RATE_LIMIT_BACKOFF_CAP_SECS),
+            _ => RATE_LIMIT_BACKOFF_START_SECS,
+        }
+        .max(floor);
+        ParkDecision {
+            until: now + next,
+            mode: ParkMode::Backoff,
+            backoff_secs: Some(next),
+        }
+    };
+    if hit.kind == RateLimitKind::Secondary {
+        return match hit.retry_after_secs {
+            Some(secs) => ParkDecision {
+                until: now + secs.max(1),
+                mode: ParkMode::RetryAfter,
+                backoff_secs: tier.backoff_secs,
+            },
+            None => backoff(SECONDARY_LIMIT_MIN_SECS),
+        };
+    }
+    let quota_left = hit.remaining.is_some_and(|r| r > 0);
+    let stale_reset = reset <= now;
+    let just_expired = tier
+        .parked_until
+        .is_some_and(|p| p <= now && now - p <= PARK_EXPIRED_GRACE_SECS);
+    let fresh_window = reset - now >= FRESH_WINDOW_SECS;
+    if quota_left || stale_reset || (fresh_window && just_expired) {
+        return backoff(0);
+    }
+    let effective = match tier.reset_at {
+        Some(prev) => prev.max(reset),
+        None => reset,
+    };
+    ParkDecision {
+        until: effective.max(now + 1),
+        mode: ParkMode::Reset,
+        backoff_secs: None,
+    }
+}
+
+/// Park `budget` for `key` after a rate-limited read, choosing the expiry with
+/// [`plan_rate_limit_park`]. Returns the decision **iff this call transitioned
+/// the budget from not-parked to parked** (the caller logs one `board
+/// rate-limited` line per park); a call that finds the budget already parked
+/// returns `None` and rewrites nothing.
+///
+/// The response's own `remaining` / `reset_at` are recorded into the tier too,
+/// so the governor and write reserve see what the refusal reported. A reset
+/// park records the effective (never-earlier) reset as before.
+pub fn park_rate_limited(
+    key: &str,
+    budget: Budget,
+    hit: &crate::gh_retry::RateLimitHit,
+    reset: i64,
+    now: i64,
+) -> Option<ParkDecision> {
+    let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return None, // couldn't lock: act as already-parked
+        held => held,
+    };
+    let mut state = read_state(key);
+    if park_verdict(state.tier(budget), now).is_some() {
+        return None; // already parked this window
+    }
+    let decision = plan_rate_limit_park(state.tier(budget), hit, reset, now);
+    let tier = state.tier_mut(budget);
+    if hit.remaining.is_some() {
+        tier.remaining = hit.remaining;
+    }
+    match decision.mode {
+        // `until` is the effective (never-earlier) reset: past resets go to
+        // backoff, so it is never the `now + 1` clamp here.
+        ParkMode::Reset => tier.reset_at = Some(decision.until),
+        ParkMode::RetryAfter | ParkMode::Backoff => {
+            if hit.reset_at.is_some() {
+                tier.reset_at = hit.reset_at;
+            }
+        }
+    }
+    tier.parked_until = Some(decision.until);
+    tier.backoff_secs = decision.backoff_secs;
+    write_state(key, &state);
+    Some(decision)
+}
+
+/// Reset `budget`'s rate-limit backoff after a successful read, so the next
+/// misread limit starts at the short window again. Only rewrites the file when
+/// there is a backoff to clear, so a healthy read never pays a write.
+pub fn clear_read_backoff(key: &str, budget: Budget) {
+    let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return,
+        held => held,
+    };
+    let mut state = read_state(key);
+    if state.tier(budget).backoff_secs.is_none() {
+        return;
+    }
+    state.tier_mut(budget).backoff_secs = None;
+    write_state(key, &state);
 }
 
 /// The pure unreachable-park decision: the epoch reads are parked until on a
@@ -617,6 +821,7 @@ mod tests {
             remaining,
             reset_at,
             parked_until: None,
+            backoff_secs: None,
         }
     }
 
@@ -711,6 +916,7 @@ mod tests {
             remaining: Some(4_999),
             reset_at: Some(9_000),
             parked_until: Some(4_000),
+            backoff_secs: None,
         };
         assert_eq!(
             tick_plan(&parked, &thresholds(), 1_000),
@@ -926,6 +1132,116 @@ mod tests {
         let state = read_state(&key);
         assert_eq!(state.rest.remaining, Some(199), "the last REST record landed");
         assert_eq!(state.graphql.parked_until, Some(reset), "park not clobbered");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    fn hit(
+        kind: crate::gh_retry::RateLimitKind,
+        remaining: Option<i64>,
+        retry_after_secs: Option<i64>,
+    ) -> crate::gh_retry::RateLimitHit {
+        crate::gh_retry::RateLimitHit {
+            kind,
+            remaining,
+            reset_at: None,
+            retry_after_secs,
+        }
+    }
+
+    #[test]
+    fn plan_parks_a_spent_primary_window_until_its_reset() {
+        use crate::gh_retry::RateLimitKind::Primary;
+        let now = 1_000;
+        let d = plan_rate_limit_park(&BudgetTier::default(), &hit(Primary, Some(0), None), now + 600, now);
+        assert_eq!((d.until, d.mode, d.backoff_secs), (now + 600, ParkMode::Reset, None));
+        // No prior park: even a fresh window's reset is honored for a spent quota.
+        let d = plan_rate_limit_park(&BudgetTier::default(), &hit(Primary, Some(0), None), now + 3_600, now);
+        assert_eq!(d.mode, ParkMode::Reset);
+    }
+
+    #[test]
+    fn plan_backs_off_a_refusal_right_after_a_park_expired_into_a_fresh_window() {
+        use crate::gh_retry::RateLimitKind::Primary;
+        let now = 1_601;
+        let tier = BudgetTier {
+            parked_until: Some(1_600),
+            reset_at: Some(1_600),
+            ..Default::default()
+        };
+        let d = plan_rate_limit_park(&tier, &hit(Primary, None, None), now + 3_600, now);
+        assert_eq!(d.mode, ParkMode::Backoff);
+        assert_eq!(d.until, now + RATE_LIMIT_BACKOFF_START_SECS);
+
+        // Long after the last park expired, a fresh-window refusal is a real one.
+        let later = 1_600 + PARK_EXPIRED_GRACE_SECS + 1;
+        let d = plan_rate_limit_park(&tier, &hit(Primary, Some(0), None), later + 3_600, later);
+        assert_eq!(d.mode, ParkMode::Reset);
+    }
+
+    #[test]
+    fn plan_backs_off_a_primary_refusal_with_quota_left_or_a_past_reset() {
+        use crate::gh_retry::RateLimitKind::Primary;
+        let now = 5_000;
+        let tier = BudgetTier::default();
+        let d = plan_rate_limit_park(&tier, &hit(Primary, Some(4_999), None), now + 3_590, now);
+        assert_eq!(d.mode, ParkMode::Backoff, "quota left: not a spent window");
+        let d = plan_rate_limit_park(&tier, &hit(Primary, Some(0), None), now - 1, now);
+        assert_eq!(d.mode, ParkMode::Backoff, "a past reset: the window hasn't rolled yet");
+        assert_eq!(d.until, now + RATE_LIMIT_BACKOFF_START_SECS);
+    }
+
+    #[test]
+    fn plan_backoff_doubles_up_to_the_cap() {
+        use crate::gh_retry::RateLimitKind::Primary;
+        let now = 5_000;
+        let mut tier = BudgetTier::default();
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let d = plan_rate_limit_park(&tier, &hit(Primary, Some(1), None), now + 3_600, now);
+            seen.push(d.backoff_secs.unwrap());
+            tier.backoff_secs = d.backoff_secs;
+        }
+        assert_eq!(seen, vec![30, 60, 120, 240, 300, 300]);
+    }
+
+    #[test]
+    fn plan_parks_a_secondary_limit_for_retry_after_or_at_least_a_minute() {
+        use crate::gh_retry::RateLimitKind::Secondary;
+        let now = 7_000;
+        let tier = BudgetTier::default();
+        let d = plan_rate_limit_park(&tier, &hit(Secondary, Some(4_000), Some(45)), now + 3_000, now);
+        assert_eq!((d.until, d.mode), (now + 45, ParkMode::RetryAfter));
+        let d = plan_rate_limit_park(&tier, &hit(Secondary, None, None), now + 3_000, now);
+        assert_eq!(d.mode, ParkMode::Backoff);
+        assert_eq!(d.until, now + SECONDARY_LIMIT_MIN_SECS);
+    }
+
+    #[test]
+    fn park_rate_limited_parks_once_and_success_clears_the_backoff() {
+        use crate::gh_retry::RateLimitKind::Primary;
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!("shelbi-budget-backoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("SHELBI_HOME", &home);
+        let key = token_key("tok-backoff");
+        let now = 9_000;
+
+        let first = park_rate_limited(&key, Budget::Rest, &hit(Primary, Some(3), None), now + 3_600, now);
+        assert_eq!(first.map(|d| d.mode), Some(ParkMode::Backoff));
+        assert_eq!(
+            park_rate_limited(&key, Budget::Rest, &hit(Primary, Some(3), None), now + 3_600, now + 1),
+            None,
+            "already parked: no second transition"
+        );
+        assert_eq!(read_state(&key).rest.remaining, Some(3), "the refusal's remaining is recorded");
+        assert_eq!(read_state(&key).rest.backoff_secs, Some(RATE_LIMIT_BACKOFF_START_SECS));
+        assert_eq!(read_state(&key).graphql, BudgetTier::default(), "other tier untouched");
+
+        clear_read_backoff(&key, Budget::Rest);
+        assert_eq!(read_state(&key).rest.backoff_secs, None);
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

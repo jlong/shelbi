@@ -28,10 +28,19 @@
 //!    them to acknowledge, so "closed" means "no job for this project is still
 //!    running."
 //!
+//! While a composition runs it holds a [`QuitInFlight`] guard, taken *before*
+//! step 1. The daemon's idle-exit monitor treats a quit in flight as activity
+//! ([`quit_in_flight`]): marking the last open project closed would otherwise
+//! look like "nothing open" while the quit is still waiting on the
+//! orchestrator's handoff, and the daemon would exit mid-quit, orphaning the
+//! very sessions step 2 was about to end.
+//!
 //! Session termination is behind the [`Sessions`] seam so the composition —
 //! the ordering, the per-project scoping, the barrier wait — is unit-testable
 //! without standing up real session processes. [`BackendSessions`] is the
 //! production implementation over [`crate::session_backend::backend`].
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use shelbi_core::{Host, MachineKind};
 
@@ -47,6 +56,37 @@ pub trait Sessions {
     /// Best-effort end the session named `name` (kill its child's process
     /// group). An already-gone session is fine.
     fn kill(&self, name: &str);
+}
+
+/// Quit compositions currently running in this process.
+static QUITS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Marks a quit composition as running for as long as it is held. Drop-based,
+/// so a panicking quit still releases it and can't pin the daemon alive.
+#[must_use = "the quit only counts as in flight while the guard is held"]
+pub struct QuitInFlight(());
+
+impl QuitInFlight {
+    /// Count a quit as in flight until the returned guard drops.
+    pub fn enter() -> Self {
+        QUITS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for QuitInFlight {
+    fn drop(&mut self) {
+        QUITS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether any quit composition is running in this process. The guard is
+/// taken before the open flag is cleared and released only after the sessions
+/// are ended and the barrier drained, so a caller that reads the open-project
+/// set *first* and this *second* never sees "nothing open, no quit running"
+/// while a quit is still between those two points.
+pub fn quit_in_flight() -> bool {
+    QUITS_IN_FLIGHT.load(Ordering::SeqCst) > 0
 }
 
 /// Whether a session `name` belongs to `project` under the backend's naming
@@ -102,6 +142,10 @@ fn quit_project_inner(
     sessions: &dyn Sessions,
     before_end_sessions: impl FnOnce(),
 ) -> QuitProjectOutcome {
+    // Held across every step: closing the last open project must not let the
+    // daemon idle-exit before the handoff and session teardown below finish.
+    let _in_flight = QuitInFlight::enter();
+
     // 1. Mark closed first (watchdog contract above).
     let _ = shelbi_state::set_project_open(project, false);
     let _ = shelbi_state::append_project_event(project, "closed", "user:quit-project");
@@ -135,6 +179,8 @@ pub fn quit_shelbi() -> QuitShelbiOutcome {
 /// (so no watchdog resurrects the daemon), end all sessions, and drain each
 /// project's quit barrier.
 pub fn quit_shelbi_with(sessions: &dyn Sessions) -> QuitShelbiOutcome {
+    let _in_flight = QuitInFlight::enter();
+
     // 1. Close every open project FIRST.
     let open = shelbi_state::list_open_projects().unwrap_or_default();
     for project in &open {
@@ -360,6 +406,57 @@ mod tests {
         assert!(out.drained, "the barrier drained after the job acknowledged");
         worker.join().unwrap();
         assert!(done.load(Ordering::SeqCst), "the cancelled job ran to completion");
+        drop(home);
+    }
+
+    /// A [`Sessions`] fake that records whether a quit was in flight at the
+    /// moment each session was ended.
+    struct InFlightAtKill {
+        live: Vec<String>,
+        in_flight_at_kill: Mutex<Vec<bool>>,
+    }
+    impl Sessions for InFlightAtKill {
+        fn live_names(&self) -> Vec<String> {
+            self.live.clone()
+        }
+        fn kill(&self, _name: &str) {
+            self.in_flight_at_kill.lock().unwrap().push(quit_in_flight());
+        }
+    }
+
+    #[test]
+    fn quit_project_stays_in_flight_through_handoff_and_session_teardown() {
+        // The daemon's idle exit defers while `quit_in_flight()` is true. It
+        // must already be true by the time the last open project reads closed
+        // (the handoff wait, here standing in for a handoff that times out),
+        // and still true while the orchestrator session is ended, so idle exit
+        // can only fire after the session is gone.
+        let home = Home::new("qp-inflight", &["solo"]);
+        shelbi_state::set_project_open("solo", true).unwrap();
+        let sessions = InFlightAtKill {
+            live: vec!["solo/orch".into()],
+            in_flight_at_kill: Mutex::new(Vec::new()),
+        };
+
+        let seen_during_handoff = Mutex::new(None);
+        let out = quit_project_inner("solo", &sessions, || {
+            // A timed-out handoff: the wait elapses with nothing written.
+            std::thread::sleep(Duration::from_millis(20));
+            *seen_during_handoff.lock().unwrap() = Some((
+                shelbi_state::list_open_projects().unwrap(),
+                quit_in_flight(),
+            ));
+        });
+
+        let (open, in_flight) = seen_during_handoff.into_inner().unwrap().unwrap();
+        assert!(open.is_empty(), "the project reads closed during the handoff");
+        assert!(in_flight, "a quit is in flight while the handoff is pending");
+        assert_eq!(
+            *sessions.in_flight_at_kill.lock().unwrap(),
+            vec![true],
+            "the orchestrator session is ended while the quit is still in flight",
+        );
+        assert_eq!(out.ended, vec!["solo/orch"]);
         drop(home);
     }
 

@@ -2166,19 +2166,32 @@ pub fn format_gib(bytes: u64) -> String {
     format!("{gib:.1}")
 }
 
-/// Append `<rfc3339> project=<name> board rate-limited until=<rfc3339>` to
-/// `~/.shelbi/events.log`. Emitted **once** per park window — when the first
-/// read 403/429 rate-limit response parks all board reads for a token until its
-/// reset — so the orchestrator (and `shelbi events tail`) sees a single line
-/// explaining why the board stopped advancing, instead of the thousand-per-hour
-/// 403 spam the un-parked retry loop produced. `until` is the reset time the
-/// park is honoring; board reads resume serving live once it passes.
-pub fn append_board_rate_limited_event(project: &str, until_rfc3339: &str) -> Result<()> {
+/// Append `<rfc3339> project=<name> board rate-limited until=<rfc3339>
+/// limit=<primary|secondary> remaining=<n|unknown> park=<reset|retry-after|backoff>`
+/// to `~/.shelbi/events.log`. Emitted **once** per park — when a read 403/429
+/// rate-limit response parks all board reads for a token — so the orchestrator
+/// (and `shelbi events tail`) sees a single line explaining why the board
+/// stopped advancing, instead of the thousand-per-hour 403 spam the un-parked
+/// retry loop produced. `until` is when the park expires and board reads resume
+/// serving live; `limit` is which GitHub limit tripped, `remaining` the quota
+/// the refusing response reported, and `park` how `until` was chosen (the
+/// window's reset, the server's `Retry-After`, or a short backoff).
+pub fn append_board_rate_limited_event(
+    project: &str,
+    until_rfc3339: &str,
+    limit: &str,
+    remaining: Option<i64>,
+    park: &str,
+) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let project = sanitize_field(project);
     let until = sanitize_field(until_rfc3339);
+    let limit = sanitize_field(limit);
+    let remaining = remaining.map_or_else(|| "unknown".to_string(), |r| r.to_string());
+    let park = sanitize_field(park);
     append_event_line(&format!(
-        "{ts} project={project} board rate-limited until={until}"
+        "{ts} project={project} board rate-limited until={until} limit={limit} \
+         remaining={remaining} park={park}"
     ))
 }
 

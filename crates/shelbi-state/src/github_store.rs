@@ -3363,9 +3363,12 @@ fn on_read_result(
                 }
             }
             // A live success proves the API is reachable again — clear the
-            // connection breaker so the next outage escalates from the start.
+            // connection breaker so the next outage escalates from the start,
+            // and this tier's rate-limit backoff so the next misread limit
+            // starts short again.
             if read_park_side_effects_enabled() {
                 crate::gh_budget::clear_unreachable(key);
+                crate::gh_budget::clear_read_backoff(key, budget);
             }
         }
         Err(e) => {
@@ -3382,15 +3385,32 @@ fn on_read_result(
             if !read_park_side_effects_enabled() {
                 return;
             }
-            if crate::gh_retry::is_rate_limit_error(e) {
+            if let Some(mut hit) = crate::gh_retry::rate_limit_hit(e) {
                 // The reset epoch is server-supplied (or a probe/recorded value),
                 // interpreted against the pre-call `now`, so this branch keeps
-                // `now` — not the observation-time clock.
-                let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
-                    .or_else(|| token.and_then(|t| probe_core_reset_and_record(t, key)))
+                // `now` — not the observation-time clock. A secondary limit that
+                // names its `Retry-After` parks for that alone, so it skips the
+                // `/rate_limit` probe the primary reset needs.
+                // The refusing page's own reset (the last header block) wins.
+                let header_reset = hit
+                    .reset_at
+                    .or_else(|| crate::gh_retry::rate_limit_reset_epoch(e, now));
+                let needs_probe = header_reset.is_none()
+                    && !(hit.kind == crate::gh_retry::RateLimitKind::Secondary
+                        && hit.retry_after_secs.is_some());
+                let probed = if needs_probe {
+                    token.and_then(|t| probe_core_reset_and_record(t, key))
+                } else {
+                    None
+                };
+                if hit.remaining.is_none() {
+                    hit.remaining = probed.and_then(|p| p.remaining);
+                }
+                let reset = header_reset
+                    .or_else(|| probed.and_then(|p| p.reset))
                     .or_else(|| crate::gh_budget::recorded_reset_after(key, budget, now))
                     .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
-                record_budget_park(project, key, budget, reset, now);
+                record_budget_park(project, key, budget, &hit, reset, now);
             } else if crate::gh_retry::is_connection_error(e) {
                 // The network is down — park (escalating) so a dead network costs
                 // a handful of attempts per window, not one per caller per tick.
@@ -3404,26 +3424,54 @@ fn on_read_result(
     }
 }
 
-/// Park `budget`'s tier until `reset`, logging the one `board rate-limited` line
-/// per window through the tier-specific helper (kept by name so their existing
-/// unit tests stand).
+/// Park `budget`'s tier after a rate-limited read (see
+/// [`crate::gh_budget::plan_rate_limit_park`] for how the expiry is chosen) and,
+/// iff this call transitioned the tier to parked, append the single `board
+/// rate-limited` events.log line for the park, naming which limit tripped, the
+/// remaining count the refusal reported, and how the expiry was chosen — so the
+/// cause is diagnosable from events.log alone.
 fn record_budget_park(
     project: &str,
     key: &str,
     budget: crate::gh_budget::Budget,
+    hit: &crate::gh_retry::RateLimitHit,
     reset: i64,
     now: i64,
 ) {
-    match budget {
-        crate::gh_budget::Budget::Rest => record_read_park(project, key, reset, now),
-        crate::gh_budget::Budget::Graphql => record_graphql_park(project, key, reset, now),
+    let Some(decision) = crate::gh_budget::park_rate_limited(key, budget, hit, reset, now) else {
+        return;
+    };
+    let until = DateTime::from_timestamp(decision.until, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    if let Err(ev) = crate::append_board_rate_limited_event(
+        project,
+        &until,
+        hit.kind.as_str(),
+        hit.remaining,
+        decision.mode.as_str(),
+    ) {
+        tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
     }
+    let tier = match budget {
+        crate::gh_budget::Budget::Rest => "rest",
+        crate::gh_budget::Budget::Graphql => "graphql",
+    };
+    tracing::warn!(
+        project = %project,
+        budget = tier,
+        until = %until,
+        limit = hit.kind.as_str(),
+        remaining = ?hit.remaining,
+        park = decision.mode.as_str(),
+        "GitHub read rate-limited; parking board reads for this token",
+    );
 }
 
 /// Park the token's reads after a connection-level failure (escalating window)
 /// and, iff this call transitioned the breaker from clear to parked, append the
 /// single `board unreachable` events.log line for the window. The network-down
-/// sibling of [`record_read_park`].
+/// sibling of [`record_budget_park`].
 fn record_read_unreachable(project: &str, key: &str, now: i64) {
     if let Some(until_epoch) = crate::gh_budget::park_unreachable(key, now) {
         let until = DateTime::from_timestamp(until_epoch, 0)
@@ -3436,27 +3484,6 @@ fn record_read_unreachable(project: &str, key: &str, now: i64) {
             project = %project,
             until = %until,
             "GitHub API unreachable (connection failure); parking board reads until the window expires",
-        );
-    }
-}
-
-/// Park the token keyed by `key` until `reset` and, iff this call is the one
-/// that transitioned it to parked, append the single `board rate-limited`
-/// events.log line for the window. Split out of [`park_aware_read`] so the park
-/// bookkeeping is unit-testable without a live `gh` call, and so the test-build
-/// opt-in gate has one place to wrap.
-fn record_read_park(project: &str, key: &str, reset: i64, now: i64) {
-    if crate::gh_budget::park(key, crate::gh_budget::Budget::Rest, reset, now) {
-        let until = DateTime::from_timestamp(reset, 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_default();
-        if let Err(ev) = crate::append_board_rate_limited_event(project, &until) {
-            tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
-        }
-        tracing::warn!(
-            project = %project,
-            until = %until,
-            "GitHub read rate-limited; parking board reads for this token until reset",
         );
     }
 }
@@ -3520,27 +3547,6 @@ fn graphql_caller(args: &[&str]) -> &'static str {
         "issue-fetch"
     } else {
         "graphql-read"
-    }
-}
-
-/// Park the token's **GraphQL** budget until `reset` and, iff this call is the
-/// one that transitioned it to parked, append the single `board rate-limited`
-/// events.log line for the window. The GraphQL sibling of [`record_read_park`];
-/// split out so the park bookkeeping is unit-testable and the test-build opt-in
-/// gate has one place to wrap.
-fn record_graphql_park(project: &str, key: &str, reset: i64, now: i64) {
-    if crate::gh_budget::park(key, crate::gh_budget::Budget::Graphql, reset, now) {
-        let until = DateTime::from_timestamp(reset, 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_default();
-        if let Err(ev) = crate::append_board_rate_limited_event(project, &until) {
-            tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
-        }
-        tracing::warn!(
-            project = %project,
-            until = %until,
-            "GitHub GraphQL rate-limited; parking board reads for this token until reset",
-        );
     }
 }
 
@@ -3625,8 +3631,9 @@ fn unreachable_park_error(project: &str, args: &[&str], until: i64) -> Error {
 /// endpoint (it never consumes quota and answers `200` even when the core budget
 /// is exhausted), and opportunistically record the response's rate-limit headers
 /// to the per-token budget file for the Phase 3 governor. Returns the core reset
-/// from the JSON body — the value a bare, headerless 403 could not carry.
-fn probe_core_reset_and_record(token: &SecretToken, key: &str) -> Option<i64> {
+/// and remaining from the JSON body — the values a bare, headerless 403 could
+/// not carry.
+fn probe_core_reset_and_record(token: &SecretToken, key: &str) -> Option<RateLimitProbeResource> {
     let out = run_gh_with_token(
         token,
         &["api", "--include", "-H", GH_REST_API_VERSION_HEADER, "-X", "GET", "rate_limit"],
@@ -3637,7 +3644,7 @@ fn probe_core_reset_and_record(token: &SecretToken, key: &str) -> Option<i64> {
     crate::gh_budget::record_rest_headers(key, &crate::gh_budget::parse_rate_limit_headers(&out));
     let body = http_response_body(&out);
     let probe: RateLimitProbe = serde_json::from_str(body).ok()?;
-    probe.resources.core.reset
+    Some(probe.resources.core)
 }
 
 /// Split the body off a `gh api --include` write response, recording the REST
@@ -3687,8 +3694,10 @@ struct RateLimitProbeResources {
 }
 
 #[derive(Deserialize)]
+#[derive(Clone, Copy)]
 struct RateLimitProbeResource {
     reset: Option<i64>,
+    remaining: Option<i64>,
 }
 
 /// Merge a failed `gh` invocation's `stderr` and `stdout` into one diagnostic
@@ -7099,7 +7108,14 @@ mod tests {
         // Opt in: the bookkeeping parks the token and writes exactly one line.
         set_test_park_side_effects(true);
         assert!(read_park_side_effects_enabled());
-        record_read_park("park-inert-proj", &key, reset, now);
+        record_budget_park(
+            "park-inert-proj",
+            &key,
+            crate::gh_budget::Budget::Rest,
+            &primary_hit(),
+            reset,
+            now,
+        );
         assert_eq!(
             crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Rest, now),
             Some(reset),
@@ -7195,8 +7211,9 @@ mod tests {
         let key = crate::gh_budget::token_key("tok-gql-park");
         let now = 2_000i64;
         let reset_epoch = now + 3_600;
-        record_graphql_park("gql-park-proj", &key, reset_epoch, now);
-        record_graphql_park("gql-park-proj", &key, reset_epoch, now + 10);
+        let gql = crate::gh_budget::Budget::Graphql;
+        record_budget_park("gql-park-proj", &key, gql, &primary_hit(), reset_epoch, now);
+        record_budget_park("gql-park-proj", &key, gql, &primary_hit(), reset_epoch, now + 10);
         assert_eq!(
             crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Graphql, now),
             Some(reset_epoch),
@@ -7382,6 +7399,213 @@ mod tests {
         assert!(!log.contains("outcome=err"), "a 304 is not a failed attempt: {log}");
 
         set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A hintless primary-limit hit (no headers), as a bare `API rate limit
+    /// exceeded` reports it.
+    fn primary_hit() -> crate::gh_retry::RateLimitHit {
+        crate::gh_retry::RateLimitHit {
+            kind: crate::gh_retry::RateLimitKind::Primary,
+            remaining: None,
+            reset_at: None,
+            retry_after_secs: None,
+        }
+    }
+
+    /// A runner that answers each call with the next scripted response (the
+    /// last one repeats), counting live calls.
+    fn scripted_runner(
+        script: Vec<Result<String>>,
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    ) -> impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static {
+        let script = std::sync::Mutex::new(std::collections::VecDeque::from(script));
+        move |_args: &[&str]| {
+            *calls.lock().unwrap() += 1;
+            let mut script = script.lock().unwrap();
+            if script.len() > 1 {
+                script.pop_front().unwrap()
+            } else {
+                match script.front().unwrap() {
+                    Ok(s) => Ok(s.clone()),
+                    Err(Error::Command { cmd, status, stderr }) => Err(Error::Command {
+                        cmd: cmd.clone(),
+                        status: status.clone(),
+                        stderr: stderr.clone(),
+                    }),
+                    Err(e) => panic!("unscriptable error {e}"),
+                }
+            }
+        }
+    }
+
+    /// A REST `--include` rate-limit refusal with the given headers.
+    fn rest_403(headers: &str, message: &str) -> Result<String> {
+        Err(Error::Command {
+            cmd: "gh api".to_string(),
+            status: "exit status: 1".to_string(),
+            stderr: format!("HTTP/2.0 403 Forbidden\n{headers}\n\n{{\"message\":\"{message}\"}}"),
+        })
+    }
+
+    /// The `board rate-limited` events.log lines for `project`.
+    fn rate_limited_lines(project: &str) -> Vec<String> {
+        std::fs::read_to_string(crate::events_log_path().unwrap())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(&format!("project={project}")) && l.contains("board rate-limited"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Regression (2026-10-18): the first park correctly waited for the window's
+    /// reset, but the retry one second after it was still refused and parked
+    /// until the *next* window's reset, an hour out, while the fresh window had
+    /// 4999 calls left. A refusal right after a park expired must park for a
+    /// short, doubling backoff instead, and a success must reset that backoff.
+    #[test]
+    fn a_retry_one_second_after_reset_still_limited_parks_for_a_short_backoff() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let reset = 1_600i64;
+        let next_reset = reset + 1 + 3_600;
+        let still_limited = rest_403(
+            &format!("x-ratelimit-remaining: 0\nx-ratelimit-reset: {next_reset}"),
+            "API rate limit exceeded",
+        );
+        let issue = rest_issue_json(3, "foo", "todo", "open", "", "b", "2026-08-02T00:00:00Z", false);
+        let script = vec![
+            // The window is genuinely spent: park until its reset.
+            rest_403(
+                &format!("x-ratelimit-remaining: 0\nx-ratelimit-reset: {reset}"),
+                "API rate limit exceeded",
+            ),
+            // One second after the reset, still refused, naming a fresh window.
+            still_limited,
+            // Still refused (a 429) after the first backoff, now with quota
+            // showing. (A 403 with quota left and no secondary text is a
+            // permission error, never a rate limit.)
+            Err(Error::Command {
+                cmd: "gh api".to_string(),
+                status: "exit status: 1".to_string(),
+                stderr: format!(
+                    "HTTP/2.0 429 Too Many Requests\nx-ratelimit-remaining: 4999\n\
+                     x-ratelimit-reset: {next_reset}\n\n{{}}"
+                ),
+            }),
+            Ok(rest_200_raw(&issue, Some(r#""v1""#))),
+        ];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let store = GitHubStore::with_governed_runner(
+            "owner/repo",
+            "tok-park-rolled",
+            scripted_runner(script, calls.clone()),
+        );
+        let key = crate::gh_budget::token_key("tok-park-rolled");
+        let rest = crate::gh_budget::Budget::Rest;
+
+        set_test_now(1_000);
+        assert!(store.fetch(3).is_err());
+        assert_eq!(crate::gh_budget::parked_until(&key, rest, 1_000), Some(reset));
+
+        set_test_now(reset + 1);
+        assert!(store.fetch(3).is_err());
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, rest, reset + 1),
+            Some(reset + 1 + crate::gh_budget::RATE_LIMIT_BACKOFF_START_SECS),
+            "still limited right after the reset parks for 30s, not until {next_reset}"
+        );
+
+        let t = reset + 1 + crate::gh_budget::RATE_LIMIT_BACKOFF_START_SECS + 1;
+        set_test_now(t);
+        assert!(store.fetch(3).is_err());
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, rest, t),
+            Some(t + 2 * crate::gh_budget::RATE_LIMIT_BACKOFF_START_SECS),
+            "a second consecutive backoff doubles"
+        );
+
+        let t = t + 2 * crate::gh_budget::RATE_LIMIT_BACKOFF_START_SECS + 1;
+        set_test_now(t);
+        store.fetch(3).unwrap().expect("the fresh window serves the read");
+        assert_eq!(
+            crate::gh_budget::read_state(&key).rest.backoff_secs,
+            None,
+            "a success resets the backoff"
+        );
+        assert_eq!(*calls.lock().unwrap(), 4, "one live call per park expiry");
+
+        let lines = rate_limited_lines("test-project");
+        assert_eq!(lines.len(), 3, "one line per park: {lines:?}");
+        assert!(
+            lines[0].contains("limit=primary remaining=0 park=reset"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("limit=primary remaining=0 park=backoff"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("limit=primary remaining=4999 park=backoff"),
+            "{}",
+            lines[2]
+        );
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A secondary limit parks for the server's `Retry-After`, not the primary
+    /// window's reset (which here is most of an hour away with quota to spare).
+    #[test]
+    fn a_secondary_limit_with_retry_after_parks_for_retry_after() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let now = 10_000i64;
+        let script = vec![rest_403(
+            &format!("retry-after: 120\nx-ratelimit-remaining: 4200\nx-ratelimit-reset: {}", now + 3_000),
+            "You have exceeded a secondary rate limit.",
+        )];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let store = GitHubStore::with_governed_runner(
+            "owner/repo",
+            "tok-park-secondary",
+            scripted_runner(script, calls.clone()),
+        );
+        let key = crate::gh_budget::token_key("tok-park-secondary");
+
+        set_test_now(now);
+        assert!(store.fetch(3).is_err());
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Rest, now),
+            Some(now + 120),
+            "parked for Retry-After, not the primary reset"
+        );
+        let lines = rate_limited_lines("test-project");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("limit=secondary remaining=4200 park=retry-after"),
+            "{}",
+            lines[0]
+        );
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

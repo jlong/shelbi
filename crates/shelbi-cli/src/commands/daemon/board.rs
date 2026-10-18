@@ -637,6 +637,7 @@ fn graphql_tier_for(project: &str, token_keys: &mut HashMap<String, Option<Strin
             remaining: idx.remaining.map(|r| r as i64),
             reset_at: idx.reset,
             parked_until: None,
+            backoff_secs: None,
         })
         .unwrap_or_default()
 }
@@ -1506,6 +1507,7 @@ issue_tracker:\n\
             remaining,
             reset_at,
             parked_until,
+            backoff_secs: None,
         }
     }
 
