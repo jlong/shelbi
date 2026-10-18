@@ -31,14 +31,14 @@ use gpui::{
     fill, outline, point, px, relative, size, App, BorderStyle, Bounds, ContentMask,
     CursorStyle as PointerStyle, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
     FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point,
     ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
     Window,
 };
 use shelbi_term::render::{CursorShape, Underline};
 use shelbi_term::Size;
 
-use super::highlights;
+use super::{boxdraw, highlights};
 use super::layout::{GlyphRun, Palette};
 use super::metrics::CellMetrics;
 use super::{scrollbar, Geometry, TerminalPane};
@@ -92,6 +92,9 @@ pub struct Frame {
     background: Hsla,
     quads: Vec<(Bounds<Pixels>, Hsla)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    /// Box-drawing lines ([`boxdraw`]): straight arms, then rounded corners.
+    box_quads: Vec<(Bounds<Pixels>, Hsla)>,
+    box_arcs: Vec<(Path<Pixels>, Hsla)>,
     /// Quads painted over the glyphs (a hovered link's underline).
     over: Vec<(Bounds<Pixels>, Hsla)>,
     cursor: Option<CursorPaint>,
@@ -231,6 +234,37 @@ impl Element for TerminalElement {
                 let shaped = shape_run(&text, &metrics, run, run.style.color);
                 let at = metrics.cell_bounds(origin, run.col, row as u16, 1).origin;
                 lines.push((at, shaped));
+            }
+        }
+
+        // Box drawing, as lines snapped to device pixels.
+        let (mut box_quads, mut box_arcs) = (Vec::new(), Vec::new());
+        let scale = window.scale_factor();
+        let light = boxdraw::light_thickness(metrics.font_size);
+        for (row, layout) in rows.iter().enumerate() {
+            for b in &layout.boxes {
+                let cell = metrics.cell_bounds(origin, b.col, row as u16, 1);
+                match boxdraw::draw(b.glyph, cell, light, scale) {
+                    boxdraw::Drawing::Quads(quads) => {
+                        box_quads.extend(quads.into_iter().map(|q| (q, b.color)))
+                    }
+                    boxdraw::Drawing::Arc(arc) => {
+                        let mut path = PathBuilder::stroke(arc.width);
+                        path.move_to(arc.from);
+                        path.line_to(arc.arc_start);
+                        path.arc_to(
+                            point(arc.radius, arc.radius),
+                            px(0.0),
+                            false,
+                            arc.clockwise,
+                            arc.arc_end,
+                        );
+                        path.line_to(arc.to);
+                        if let Ok(path) = path.build() {
+                            box_arcs.push((path, b.color));
+                        }
+                    }
+                }
             }
         }
 
@@ -392,6 +426,8 @@ impl Element for TerminalElement {
             background: palette.background(),
             quads,
             lines,
+            box_quads,
+            box_arcs,
             over,
             cursor,
             composition,
@@ -419,6 +455,12 @@ impl Element for TerminalElement {
             }
             for (at, line) in &frame.lines {
                 let _ = line.paint(*at, frame.line_height, TextAlign::Left, None, window, cx);
+            }
+            for (b, color) in &frame.box_quads {
+                window.paint_quad(fill(*b, *color));
+            }
+            for (path, color) in frame.box_arcs.drain(..) {
+                window.paint_path(path, color);
             }
             for (b, color) in &frame.over {
                 window.paint_quad(fill(*b, *color));

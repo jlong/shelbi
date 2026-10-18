@@ -47,6 +47,10 @@
 //!   reports them, in whichever mode it asked for (`shelbi_term::gesture`).
 //! - **Fonts**: family and size from the settings, applied live; Source Code
 //!   Pro (bundled) by default, Geist Mono (bundled) as the first fallback.
+//! - **Box drawing**: the common line and rounded-corner characters (`─ │ ╭
+//!   ┼`, light and heavy) are drawn as lines snapped to device pixels
+//!   ([`boxdraw`]), not taken from the font, so a box's border is one crisp
+//!   pixel and its cells join without seams.
 //! - **Accessibility**: the pane is an AccessKit `Terminal` node whose
 //!   children are the visible rows as text, with the cursor as the text
 //!   selection, so VoiceOver can read the screen.
@@ -61,6 +65,7 @@
 //! painting ([`layout`], [`highlights`], [`element`]), and the overlays.
 
 pub mod a11y;
+pub mod boxdraw;
 mod element;
 pub mod fonts;
 pub mod highlights;
@@ -105,6 +110,7 @@ use session::SessionIo;
 pub use settings::{FontZoom, TerminalSettings};
 
 use crate::assets::{heroicon, icons, Icon};
+use crate::theme::style::{Type, Typography};
 use crate::theme::Theme;
 
 /// How long a viewport size must hold before it is reported to the session,
@@ -473,6 +479,26 @@ impl TerminalPane {
         self.search
             .as_ref()
             .map(|bar| (bar.query().to_string(), bar.status(self.view.search_position())))
+    }
+
+    /// Open the find bar on `query`, as typing it would (`--visual-figma`'s
+    /// find state).
+    #[cfg(feature = "visual-check")]
+    pub fn offscreen_find(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.search = Some(SearchBar::new(Some(query)));
+        self.composition = None;
+        self.run_search(cx);
+        cx.notify();
+    }
+
+    /// Report a debounced resize now (gpui timers don't fire offscreen).
+    #[cfg(feature = "visual-check")]
+    pub fn offscreen_flush_resize(&mut self) {
+        if let (Some(io), Some(size)) = (self.io.as_ref(), self.pending_size.take()) {
+            io.resize(size);
+            self.reported_size = Some(size);
+            self.resize_task = None;
+        }
     }
 
     /// The link under the pointer (Cmd held).
@@ -1666,7 +1692,7 @@ impl TerminalPane {
                 .id(id)
                 .debug_selector(move || format!("terminal-search-{id}"))
                 .p_0p5()
-                .rounded_lg()
+                .rounded(px(6.0))
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.background_hover))
                 .child(heroicon(icon).text_color(theme.icon))
@@ -1691,7 +1717,7 @@ impl TerminalPane {
                 .px_2()
                 .py_1()
                 .map(|d| crate::theme::style::popover(d, theme))
-                .text_sm()
+                .type_style(Type::Base)
                 .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon))
                 .child(
                     div()
@@ -1709,7 +1735,7 @@ impl TerminalPane {
                         .when_some(marked, |d, m| d.child(div().underline().child(m)))
                         .child(div().w(px(2.0)).h(px(16.0)).rounded_full().bg(theme.focus_ring)),
                 )
-                .child(div().flex_none().text_xs().text_color(theme.muted).child(status))
+                .child(div().flex_none().type_style(Type::XSmall).text_color(theme.muted).child(status))
                 .child(icon_button("older", icons::CHEVRON_UP, Some(true), cx))
                 .child(icon_button("newer", icons::CHEVRON_DOWN, Some(false), cx))
                 .child(icon_button("close", icons::X_MARK, None, cx)),
@@ -1742,8 +1768,7 @@ impl TerminalPane {
                 .px_2()
                 .py_1()
                 .map(|d| crate::theme::style::popover(d, theme))
-                .text_xs()
-                .font_weight(gpui::FontWeight::MEDIUM)
+                .type_style(Type::XSmallMedium)
                 .text_color(theme.text_loud)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.background))
@@ -1809,7 +1834,7 @@ impl Render for TerminalPane {
                         .border_t_1()
                         .border_color(theme.divider)
                         .text_color(theme.muted)
-                        .text_sm()
+                        .type_style(Type::Small)
                         .child(notice),
                 )
             })

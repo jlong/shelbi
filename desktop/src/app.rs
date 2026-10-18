@@ -4129,6 +4129,11 @@ impl ShelbiWindow {
         self.open_task(id, window, cx);
     }
 
+    /// The orchestrator chat's terminal, once attached.
+    pub(crate) fn offscreen_chat_pane(&self, cx: &App) -> Option<Entity<crate::elements::terminal::TerminalPane>> {
+        self.chat.as_ref()?.read(cx).pane().cloned()
+    }
+
     /// The native views shown so far.
     pub(crate) fn offscreen_views(&self) -> NativeViews {
         (self.issues.clone(), self.activity.clone(), self.machines.clone())
