@@ -143,6 +143,7 @@ fn row(state: ReviewState) -> ReviewRow {
         location: (state == ReviewState::Serving).then(|| "hub:4101".into()),
         workspace: Some("review-1".into()),
         state,
+        number: None,
     }
 }
 

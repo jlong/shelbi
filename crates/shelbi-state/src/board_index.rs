@@ -450,6 +450,24 @@ pub fn read_valid_board_index(project: &str, expected_repo: Option<&str>) -> Opt
     read_board_index(project).filter(|idx| idx.identity_matches(expected_repo))
 }
 
+/// The tracker's issue number for each open issue of `project`, keyed by
+/// shelbi id ([`BoardIndex::numbers`]), read only when the index's identity and
+/// schema are current. Empty for a local (file-system) backend, which has no
+/// per-issue number, and for a missing or mismatched index. The sidebar labels
+/// its review rows with these (`#401`).
+pub fn read_board_index_numbers(
+    project: &str,
+    cfg: &IssueTrackerConfig,
+) -> std::collections::BTreeMap<String, i64> {
+    if !cfg.backend.is_remote() {
+        return Default::default();
+    }
+    let expected = expected_board_repo(cfg);
+    read_valid_board_index(project, expected.as_deref())
+        .map(|idx| idx.numbers)
+        .unwrap_or_default()
+}
+
 /// The authenticated account login the daemon stamped on `project`'s board index
 /// ([`BoardIndex::viewer_login`]), read only when the index's identity and schema
 /// are current. This is the zero-extra-API-call source the Zen ownership gate
@@ -1591,6 +1609,21 @@ mod tests {
             read_board_index_viewer_login("proj", &github_cfg()).unwrap(),
             None,
         );
+    }
+
+    #[test]
+    fn read_board_index_numbers_maps_ids_on_a_matching_remote_index_only() {
+        let _iso = IsolatedHome::new("index-numbers");
+        let mut idx = index_aged(vec![issue("a", "review", 0)], 0, false);
+        idx.numbers.insert("a".into(), 401);
+        write_board_index("proj", &idx).unwrap();
+        assert_eq!(read_board_index_numbers("proj", &github_cfg()).get("a"), Some(&401));
+        // A local backend has no tracker numbers, whatever is on disk.
+        assert!(read_board_index_numbers("proj", &IssueTrackerConfig::default()).is_empty());
+        // Another repository's index is not this project's.
+        idx.repo = Some(github_board_repo("other/repo"));
+        write_board_index("proj", &idx).unwrap();
+        assert!(read_board_index_numbers("proj", &github_cfg()).is_empty());
     }
 
     #[test]

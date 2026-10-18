@@ -32,7 +32,7 @@ paths on every `cargo test`.
 |---|---|---|---|
 | Orchestrator | `view:orch` | Chat attaches to the orchestrator session | Same (Go ▸ Orchestrator) |
 | Issues | `view:tasks` | Board | Board (Go ▸ Issues) |
-| Activity | `view:activity` | Feed | Feed (Go ▸ Activity; also via the palette) |
+| Activity | `view:activity` | Feed | Feed (Go ▸ Changelog, ⌘L, the sidebar's Changelog; also via the palette) |
 | Machines | `view:machines` | Machines view, palette-only | Machines view (Go ▸ Machines) |
 | Workspace | `workspace:<name>` | Idle placeholder for an idle workspace; the agent when one runs | Same (Go ▸ Workspaces ▸ dev) |
 | Open review | `review:<id>` | Serving task: the review interface (panel, live server line, reviewer session) | Queued task: the "Load for review" slot dialog (Go ▸ Reviews ▸ … ▸ Open Review); a serving one opens the Review view |
@@ -85,6 +85,18 @@ paths on every `cargo test`.
   window: it moves to another open project or the empty-state chooser. A
   bare "Switch Project" opens each client's switcher (the TUI's palette
   Projects column, the desktop's sidebar switcher).
+- **The sidebar** (`dt-figma-sidebar`): the desktop draws Figma's
+  Navigation component over the same rows (`SidebarModel::rows`, regrouped by
+  `views/sidebar.rs` `layout`): the review sections above Workspaces (the TUI
+  keeps Workspaces first), each section collapsible (remembered per project
+  in `desktop-view.json`), the Activity view labeled "Changelog" (the TUI and
+  the shared model keep "Activity"), fixed chords (⌘O Orchestrator, ⌘I Issues,
+  ⌘L Changelog, ⌘1 to ⌘9 the reviews then the working workspaces, each
+  hinted on its row and taken even from a focused terminal), a review's
+  tracker number on its second line, the version line only on a mismatch (it
+  is otherwise in the Settings button's tooltip), and a clickable Zen pill
+  ("Zen mode on" / "off") in place of the band. Machines is in neither
+  client's sidebar (the palette, and the desktop's Go menu).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the
@@ -204,25 +216,25 @@ equivalent datum.
 | Field | TUI | Desktop |
 |---|---|---|
 | `project_label` | sidebar header title (`shell/sidebar.rs` `render_header`) | sidebar header title (`views/sidebar.rs` `render_header`); window title, and so the Window menu's list (`app.rs` `set_window_title`, at window build and on every switch); "Quit X?" prompt (`app.rs` `confirm_quit_project`); notification bodies (`notify.rs` `observe_sidebar`, `observe_orchestrator`) |
-| `nav` | nav block rows, glyph picked from the label (`shell/sidebar.rs` `render_nav`, `nav_glyph`); palette view entries | nav rows, Heroicon picked from the view (`views/sidebar.rs` `render_nav_row`, `nav_icon`); palette view entries; Go menu (`menus/tree.rs`) |
-| `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows (`views/sidebar.rs` `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) |
-| `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for Review sections (`views/sidebar.rs` `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) |
+| `nav` | nav block rows, glyph picked from the label (`shell/sidebar.rs` `render_nav`, `nav_glyph`); palette view entries | nav rows, Heroicon picked from the view, with their ⌘O / ⌘I / ⌘L hints (`views/sidebar.rs` `render_nav_row`, `nav_icon`); palette view entries; Go menu with the same chords (`menus/tree.rs`) |
+| `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows, below the review sections, collapsible (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) |
+| `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for review sections with their count badges, collapsible, above Workspaces (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) |
 | `config_error` | red wrapped `! message` row under Workspaces (`shell/sidebar.rs` `render_row`, `config_error_lines`) | red `! message` row under Workspaces (`views/sidebar.rs` `render_row`); also gates review-closed reconcile (`app.rs` `update_review_row`) |
 | `board_loading` | italic "Loading…" placeholder row (`shell/sidebar.rs` `render_row`) | italic "Loading…" placeholder row (`views/sidebar.rs` `render_row`); also suppresses notifications on a cold skeleton (`notify.rs` `observe_sidebar`) and the review-closed reconcile (`app.rs` `update_review_row`) |
 | `collapsed_machines` | machine group `▸`/`▾` glyph, `(N, M active)` suffix, hidden rows (via `rows()`, `shell/sidebar.rs` `render_row`); toggled in `shell/mod.rs` | same glyph, suffix and hidden rows (via `rows()`, `views/sidebar.rs` `row_text`); toggled in `app.rs` |
-| `board_banner` | footer version row, yellow when stale (`shell/sidebar.rs` `render_version_row`) | footer version block, yellow when stale (`views/sidebar.rs` `render_footer`) |
-| `daemon_version_line` | footer version row (`shell/sidebar.rs` `render_version_row`) | footer version block (`views/sidebar.rs` `render_footer`) |
-| `daemon_version_mismatch` | paints the version segment red (`shell/sidebar.rs` `render_version_row`) | paints the version line red (`views/sidebar.rs` `render_footer`) |
+| `board_banner` | footer version row, yellow when stale (`shell/sidebar.rs` `render_version_row`) | footer notes above the buttons, yellow when stale (`views/sidebar.rs` `render_footer`) |
+| `daemon_version_line` | footer version row (`shell/sidebar.rs` `render_version_row`) | the Settings button's tooltip; in the footer notes only on a mismatch (`views/sidebar.rs` `render_footer`) |
+| `daemon_version_mismatch` | paints the version segment red (`shell/sidebar.rs` `render_version_row`) | shows the version line, red, in the footer notes (`views/sidebar.rs` `render_footer`) |
 | `status_line` | footer status row, muted for the first-run hint, else yellow (`shell/sidebar.rs` `render_footer`); stamped from the startup status in `shell/mod.rs` `apply_snapshot` | not shown: the footer would draw it, but the desktop never stamps it (the first-run hint is TUI onboarding copy; see Platform differences) |
-| `zen_mode` | green "ZEN MODE ON" band (`shell/sidebar.rs` `render_zen_row`); palette Zen toggle label | green "ZEN MODE ON" band (`views/sidebar.rs` `render_footer`); palette Zen toggle label; Zen menu item title (`menus/tree.rs`) |
+| `zen_mode` | green "ZEN MODE ON" band (`shell/sidebar.rs` `render_zen_row`); palette Zen toggle label | the footer's Zen pill, green "Zen mode on" or neutral "Zen mode off", a click toggles Zen (`views/sidebar.rs` `render_zen_pill`); palette Zen toggle label; Zen menu item title (`menus/tree.rs`) |
 | `unread_errors` | red `!` button in the footer when > 0 (`shell/sidebar.rs` `render_footer`, `render_error_button`) | red `!` button in the footer when > 0 (`views/sidebar.rs` `render_footer`) |
 | `session_lost` | full-width red top banner in every view (`shell/mod.rs` `render_session_lost_banner`) | red notice at the top of the main column (`app.rs` render, `notice`) |
-| `orchestrator_status` | red `Orchestrator: <status>` footer status row, 3 rows reserved so it wraps, taking the row over `status_line` (`shell/sidebar.rs` `render_footer`, text from `SidebarModel::footer_status`); Orchestrator view placeholder "Orchestrator is down. <status>. Select Orchestrator again to relaunch it." while its session is not live (`shell/mod.rs` `orchestrator_down_notice`) | red `Orchestrator: <status>` footer status row above the version line (`views/sidebar.rs` `render_footer`, `footer_status`); the same placeholder in the Chat view while the orchestrator is not live (`views/session_view.rs` `notice`, fed by `app.rs` `update_chat_supervisor_status`) |
+| `orchestrator_status` | red `Orchestrator: <status>` footer status row, 3 rows reserved so it wraps, taking the row over `status_line` (`shell/sidebar.rs` `render_footer`, text from `SidebarModel::footer_status`); Orchestrator view placeholder "Orchestrator is down. <status>. Select Orchestrator again to relaunch it." while its session is not live (`shell/mod.rs` `orchestrator_down_notice`) | red `Orchestrator: <status>` first of the footer notes, above the buttons (`views/sidebar.rs` `render_footer`, `footer_status`); the same placeholder in the Chat view while the orchestrator is not live (`views/session_view.rs` `notice`, fed by `app.rs` `update_chat_supervisor_status`) |
 
 ### `NavItem`
 | Field | TUI | Desktop |
 |---|---|---|
-| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text (`views/sidebar.rs` `render_nav_row`); palette entry title; Go menu item |
+| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text, "Changelog" for the Activity view (`views/sidebar.rs` `render_nav_row`, `nav_label`); palette entry title; Go menu item (also through `nav_label`) |
 | `view` | not shown: routing only, mapped to a session or native view (`shell/sidebar.rs` `target_from_view`) | picks the nav row's icon (`views/sidebar.rs` `nav_icon`); routing via `SidebarRow::target` |
 
 ### `WorkspaceRow`
@@ -232,18 +244,19 @@ equivalent datum.
 | `machine` | machine group header text when the project spans several machines (via `rows()`, `shell/sidebar.rs` `render_row`) | machine group header (via `rows()`, `views/sidebar.rs` `row_text`); panel machine row (`views/workspace.rs` `render_panel`); remote attach target (`views/workspace.rs` `set_row`) |
 | `is_remote` | not used (remote attach comes from session discovery, `shell/session.rs`) | panel machine row with a globe icon and `(remote)` (`views/workspace.rs` `render_panel`); routes the session through the remote relay and drops the Diff, Editor and folder rows (`views/workspace.rs` `set_row`, `panel_shape`) |
 | `current_task` | not shown as text in the sidebar; counts toward `M active` on a collapsed group (via `rows()`); palette workspace subtitle; gates opening the workspace panel (`shell/mod.rs` `workspace_has_task`) and the panel's IN PROGRESS/IDLE status (`shell/mod.rs` `ws_status_from_model`) | `M active` count (via `rows()`); palette subtitle; panel task id and the full panel vs the reduced idle one (`views/workspace.rs` `render_panel`, `panel_shape` via `has_task`); notification body (`notify.rs`) |
-| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
-| `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | colored state glyph in the row (`views/sidebar.rs` `render_row`); panel status glyph plus words beside the back button, e.g. `⏵ Working` (`views/workspace.rs` `render_panel`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) |
+| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label, X-Small semibold, then the row's ⌘N; "Idle", muted, without one (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
+| `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | the Navigation component's state glyph (green play, yellow `?`, quiet dot; the shared glyph for the states it doesn't draw) (`views/sidebar.rs` `workspace_glyph`); panel status glyph plus words beside the back button, e.g. `⏵ Working` (`views/workspace.rs` `render_panel`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) |
 
 ### `ReviewRow`
 | Field | TUI | Desktop |
 |---|---|---|
 | `task_id` | not shown: routing key for opening the review (`shell/sidebar.rs` `build_rows`, `RowTarget::Review`); palette command id | not shown in the row: routing key (via `SidebarRow::target`) and debug selector (`views/sidebar.rs` `row_selector`); shown in the "reached review" notification body (`notify.rs`) |
 | `title` | row first line, truncated with `…` (`shell/sidebar.rs` `render_row`); palette entry and Approve/Reject titles | row first line (`views/sidebar.rs` `row_text`); palette; Go > Reviews menu; notification title (`notify.rs`) |
-| `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`) | dim `⎇ branch` second line (`views/sidebar.rs` `row_text`, `render_row`) |
-| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | right-aligned `machine:port` (`views/sidebar.rs` `row_text`); review view server section (`views/review.rs` `render_server`) |
+| `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`) | muted second line after the number (`views/sidebar.rs` `row_text`, `render_row`) |
+| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | review view server section (`views/review.rs` `render_server`); not in the sidebar row, whose right side is its ⌘N hint (the Navigation component) |
 | `workspace` | not used | not used |
-| `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and badge glyph, bold ✓ when serving (`views/sidebar.rs` `render_row`); review view server sub-state and detail (`views/review.rs` `render_server`) |
+| `number` | not shown | `#401` before the branch on the row's second line (`views/sidebar.rs` `row_text`); filled from the board index for a GitHub-backed project (`shelbi-orchestrator` `sidebar_model`) |
+| `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); review view server sub-state and detail (`views/review.rs` `render_server`) |
 
 ### `WorkspaceDetailsInfo`
 The TUI never constructs this struct; its workspace panel reads the same facts from `workspace_session::workspace_open_info` into its own `WorkspacePanel` (`shell/mod.rs` `build_workspace_interface`). The TUI column describes that equivalent display.

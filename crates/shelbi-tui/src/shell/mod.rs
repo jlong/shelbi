@@ -7052,6 +7052,7 @@ mod tests {
                 location: None,
                 workspace: None,
                 state: shelbi_app::view::ReviewState::Pending,
+                number: None,
             }];
         }
         st.effect_tap = Some(Vec::new());

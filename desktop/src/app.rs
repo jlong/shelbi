@@ -68,6 +68,7 @@
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown, and rebuilt for the new project after a switch.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -107,7 +108,9 @@ use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::feeds::{FeedHub, FeedSubscription};
 use crate::elements::terminal::TerminalSettings;
-use crate::keys::{chord_from_keystroke, font_zoom, is_new_window, overlay_chord, paste_chords};
+use crate::keys::{
+    chord_from_keystroke, font_zoom, is_new_window, nav_chord, overlay_chord, paste_chords, NavChord,
+};
 use crate::menus;
 use crate::notify;
 use crate::projects::{self, Catalog, ProjectEntry};
@@ -319,7 +322,7 @@ fn open_window(
                 // The sidebar runs under a transparent title bar, the usual
                 // shape for a macOS sidebar app.
                 appears_transparent: true,
-                traffic_light_position: Some(gpui::point(px(12.0), px(12.0))),
+                traffic_light_position: Some(sidebar::traffic_light_position()),
             }),
             app_id: Some("co.32pixels.shelbi".into()),
             ..Default::default()
@@ -583,6 +586,9 @@ pub struct ShelbiWindow {
     overlay_opened: Option<Instant>,
     /// The sidebar's rows, measured for the selection chip's slide.
     nav_track: SharedTrack,
+    /// The sidebar sections the user has collapsed (saved per project with
+    /// the rest of where it was left).
+    collapsed_sections: BTreeSet<sidebar::Section>,
     route: Route,
     /// The Issues board for this window's project, created the first time it
     /// is shown.
@@ -805,6 +811,7 @@ impl ShelbiWindow {
             switcher: sidebar::Switcher::default(),
             overlay_opened: None,
             nav_track: SlideTrack::shared(),
+            collapsed_sections: BTreeSet::new(),
             route: Route::View,
             issues: None,
             pending_workflow_filter: None,
@@ -1031,7 +1038,7 @@ impl ShelbiWindow {
         match target {
             notify::Target::Workspace(workspace) => {
                 // Select its sidebar row too, so the window says where it went.
-                if let Some(ordinal) = self.model.rows().iter().filter_map(|r| r.target()).position(
+                if let Some(ordinal) = self.sidebar_entries().iter().filter_map(|e| e.row.target()).position(
                     |t| matches!(&t, SidebarTarget::Workspace(w) if *w == workspace),
                 ) {
                     let count = self.selectable_count();
@@ -1426,6 +1433,7 @@ impl ShelbiWindow {
                 .as_ref()
                 .map(|i| i.read(cx).workflow_filter())
                 .unwrap_or_else(|| self.pending_workflow_filter.clone()),
+            collapsed_sections: self.collapsed_sections.iter().map(|s| s.key().to_string()).collect(),
         };
         Some((self.project.clone(), state))
     }
@@ -1468,6 +1476,11 @@ impl ShelbiWindow {
         }
         self.workspace_return = saved.workspace_return.as_deref().map(View::from_view_id);
         self.pending_workflow_filter = saved.workflow_filter;
+        self.collapsed_sections = saved
+            .collapsed_sections
+            .iter()
+            .filter_map(|key| sidebar::Section::from_key(key))
+            .collect();
         self.pending_rows = Some(PendingRows {
             selected: saved.selected,
             scroll_y: saved.scroll_y,
@@ -1602,8 +1615,14 @@ impl ShelbiWindow {
         false
     }
 
+    /// The sidebar's rows as it draws them (the order and collapse the
+    /// keyboard walks).
+    fn sidebar_entries(&self) -> Vec<sidebar::Entry> {
+        sidebar::layout(&self.model, &self.collapsed_sections)
+    }
+
     fn selectable_count(&self) -> usize {
-        self.model.rows().iter().filter(|r| r.is_selectable()).count()
+        self.sidebar_entries().iter().filter(|e| e.row.is_selectable()).count()
     }
 
     /// Keep the selection on a row that exists, and on the current view's nav
@@ -1614,11 +1633,68 @@ impl ShelbiWindow {
     }
 
     fn target_at(&self, ordinal: usize) -> Option<SidebarTarget> {
-        self.model
-            .rows()
+        self.sidebar_entries()
             .iter()
-            .filter_map(|r| r.target())
+            .filter_map(|e| e.row.target())
             .nth(ordinal)
+    }
+
+    /// Collapse or expand a sidebar section, keeping the selection on its row
+    /// when that row is still drawn, and remember it for the project.
+    fn toggle_section(&mut self, section: sidebar::Section, cx: &mut Context<Self>) {
+        let selected = self.target_at(self.client.sidebar_selection());
+        if !self.collapsed_sections.remove(&section) {
+            self.collapsed_sections.insert(section);
+        }
+        self.reselect(selected);
+        self.remember_view_state(cx);
+        cx.notify();
+    }
+
+    /// Put the selection back on the row that opens `target` when it is
+    /// drawn, else keep it in range.
+    fn reselect(&mut self, target: Option<SidebarTarget>) {
+        let count = self.selectable_count();
+        let found = target.and_then(|t| {
+            self.sidebar_entries()
+                .iter()
+                .filter_map(|e| e.row.target())
+                .position(|other| other == t)
+        });
+        match found {
+            Some(ordinal) => self.client.select(ordinal, count),
+            None => self.client.clamp_selection(count),
+        }
+    }
+
+    /// A sidebar chord (⌘O ⌘I ⌘L, ⌘1 to ⌘9): open what it names, selecting
+    /// its row as a click would.
+    fn nav_chord(&mut self, chord: NavChord, window: &mut Window, cx: &mut Context<Self>) {
+        let target = match chord {
+            NavChord::View(view) => Some(SidebarTarget::View(view)),
+            NavChord::Row(n) => sidebar::layout(&self.model, &BTreeSet::new())
+                .into_iter()
+                .find(|e| e.shortcut == Some(n))
+                .and_then(|e| e.row.target()),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        // A collapsed section still answers its chords; the row just isn't
+        // there to select.
+        let ordinal = self
+            .sidebar_entries()
+            .iter()
+            .filter_map(|e| e.row.target())
+            .position(|t| t == target);
+        match ordinal {
+            Some(ordinal) => {
+                let count = self.selectable_count();
+                self.client.select(ordinal, count);
+                self.activate_selection(window, cx);
+            }
+            None => self.activate_target(target, window, cx),
+        }
     }
 
     /// Open the selected sidebar row.
@@ -1626,6 +1702,11 @@ impl ShelbiWindow {
         let Some(target) = self.target_at(self.client.sidebar_selection()) else {
             return;
         };
+        self.activate_target(target, window, cx);
+    }
+
+    /// Open what a sidebar row opens.
+    fn activate_target(&mut self, target: SidebarTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             SidebarTarget::View(view) => self.run(CommandKind::ShowView(view), window, cx),
             SidebarTarget::Workspace(workspace) => {
@@ -3380,6 +3461,13 @@ impl ShelbiWindow {
             }
             return;
         }
+        // The sidebar's own chords, from anywhere in the window.
+        if let Some(nav) = nav_chord(&chord) {
+            self.nav_chord(nav, window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if shelbi_app::overlay::opens_palette(&self.keymaps, &chord) {
             self.open_palette(window, cx);
             cx.stop_propagation();
@@ -3494,11 +3582,17 @@ impl ShelbiWindow {
             .bg(theme.canvas)
             .when(!column_shown, |main| {
                 main.child(
-                    div().h(px(sidebar::TRAFFIC_LIGHT_INSET)).pl(px(80.0)).pt(px(8.0)).child(
-                        style::icon_button("expand-sidebar", icons::BARS_3, IconButtonSize::Default, false, theme)
-                            .self_start()
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                    ),
+                    // Beside the traffic lights, centered on them.
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .h(px(sidebar::TITLEBAR_H))
+                        .pl(px(sidebar::TRAFFIC_LIGHTS_RIGHT + 8.0))
+                        .child(
+                            style::icon_button("expand-sidebar", icons::SIDEBAR, IconButtonSize::Default, false, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        ),
                 )
             })
             .when_some(self.model.session_lost.clone(), |main, lost| {
@@ -3561,7 +3655,8 @@ fn row_key(target: &SidebarTarget) -> String {
 /// Whether the window takes `chord` away from a focused terminal: the focus
 /// moves (Ctrl+H / Ctrl+L by default), the Zen toggle (Option+Z), every
 /// palette chord (the configured one plus the reserved Ctrl+Space and Cmd+K),
-/// New Window (⌘⇧N), and the terminal font zoom (⌘+ ⌘− ⌘0).
+/// New Window (⌘⇧N), the terminal font zoom (⌘+ ⌘− ⌘0), and the sidebar's
+/// chords (⌘O ⌘I ⌘L, ⌘1 to ⌘9).
 /// Everything else is the session's.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
     matches!(
@@ -3570,6 +3665,7 @@ fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord)
     ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
         || is_new_window(&chord)
         || font_zoom(&chord).is_some()
+        || nav_chord(&chord).is_some()
 }
 
 /// The palette-open chord as the search box shows it (`⌃P`).
@@ -3643,6 +3739,8 @@ impl SidebarHost for ShelbiWindow {
                 self.switcher.close((self.clock)());
                 self.run(CommandKind::AddProject, window, cx)
             }
+            SidebarEvent::ToggleSection(section) => self.toggle_section(section, cx),
+            SidebarEvent::ToggleZen => self.run(CommandKind::ToggleZen, window, cx),
             SidebarEvent::OpenErrors => self.run(CommandKind::OpenErrorLog, window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::Collapse => self.toggle_sidebar(cx),
@@ -3708,7 +3806,7 @@ impl ShelbiWindow {
         // selection moves (keys, clicks, route changes alike).
         let chip = {
             let mut track = self.nav_track.borrow_mut();
-            let key = sidebar::selected_key(&self.model, self.client.sidebar_selection());
+            let key = sidebar::selected_key(&self.sidebar_entries(), self.client.sidebar_selection());
             let reduce = self.reduce_motion.clone();
             track.select(key, now, move || reduce());
             let chip = track.frame(now);
@@ -3764,6 +3862,7 @@ impl ShelbiWindow {
                 layer("column-sidebar", l).child(sidebar::render(
                     SidebarProps {
                         model: &self.model,
+                        collapsed: &self.collapsed_sections,
                         selection: self.client.sidebar_selection(),
                         focused: self.client.focus() == Focus::Sidebar,
                         link: self.link,
@@ -4114,8 +4213,8 @@ impl ShelbiWindow {
     /// Move the sidebar's selection to the row that opens `target`, as a
     /// click on it would (a no-op when no row does).
     pub(crate) fn offscreen_select_target(&mut self, target: &SidebarTarget, cx: &mut Context<Self>) {
-        let rows = self.model.rows();
-        if let Some(ordinal) = rows.iter().filter_map(|r| r.target()).position(|t| t == *target) {
+        let entries = self.sidebar_entries();
+        if let Some(ordinal) = entries.iter().filter_map(|e| e.row.target()).position(|t| t == *target) {
             self.offscreen_select(ordinal, cx);
         }
     }
@@ -4169,6 +4268,10 @@ mod design_tests;
 #[cfg(test)]
 #[path = "app_window_tests.rs"]
 mod window_tests;
+
+#[cfg(test)]
+#[path = "app_sidebar_tests.rs"]
+mod sidebar_tests;
 
 #[cfg(test)]
 mod tests {

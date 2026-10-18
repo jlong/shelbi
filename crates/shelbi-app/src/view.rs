@@ -118,6 +118,10 @@ pub struct ReviewRow {
     pub workspace: Option<String>,
     /// Which lifecycle state drives the row's section and glyph.
     pub state: ReviewState,
+    /// The issue's number on its GitHub-backed tracker (`#401`), when it has
+    /// one. `None` on the file-system backend, or before the daemon's board
+    /// index has recorded it.
+    pub number: Option<i64>,
 }
 
 /// Per-workspace state glyph shown in the sidebar's badge column. The plain
@@ -629,6 +633,7 @@ impl SidebarModel {
                 location: None,
                 workspace: None,
                 state: ReviewState::Pending,
+                number: None,
             })
             .collect();
 
@@ -1501,6 +1506,7 @@ mod tests {
             location: None,
             workspace: None,
             state,
+            number: None,
         }
     }
 

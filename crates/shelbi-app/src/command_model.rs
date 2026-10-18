@@ -267,6 +267,7 @@ mod tests {
             location: None,
             workspace: None,
             state: ReviewState::Pending,
+            number: None,
         }];
         s.board_loading = false;
         s.zen_mode = shelbi_state::ZenModeState::On;

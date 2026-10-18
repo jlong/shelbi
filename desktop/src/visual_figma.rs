@@ -262,6 +262,8 @@ fn review_row(id: &str, title: &str, branch: &str, state: ReviewState) -> Review
         location: None,
         workspace: (state == ReviewState::Serving).then(|| "review".into()),
         state,
+        // The mockups number every review #401.
+        number: Some(401),
     }
 }
 

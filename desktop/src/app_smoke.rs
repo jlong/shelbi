@@ -53,6 +53,7 @@ pub(super) fn fixture_model() -> SidebarModel {
         location: None,
         workspace: None,
         state: ReviewState::Pending,
+        number: None,
     }];
     m.board_loading = false;
     m

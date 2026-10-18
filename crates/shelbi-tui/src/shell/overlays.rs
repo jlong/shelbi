@@ -887,6 +887,7 @@ mod tests {
                 location: None,
                 workspace: None,
                 state: ReviewState::Pending,
+                number: None,
             }],
             config_error: None,
             board_loading: false,

@@ -20,7 +20,7 @@ use shelbi_app::view::{
 use shelbi_core::Column;
 use shelbi_state::{
     daemon_version_status, fold_assignment_overlay, issue_store_for, load_project,
-    load_task_workflow, load_workspace_status, read_board_report, read_state,
+    load_task_workflow, load_workspace_status, read_board_index_numbers, read_board_report, read_state,
     sidebar_collapsed_machines, unread_error_count, DaemonVersionStatus, IssueFile, WorkspaceState,
     ZenModeState,
 };
@@ -85,10 +85,19 @@ pub fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
                 // Resolve review-slot ownership from the local assignment
                 // overlay, not the index's publish-time fold — a fresh load
                 // lands in the overlay first and the index can lag it.
+                let mut numbers = Default::default();
                 if let Ok(p) = load_project(project) {
                     fold_assignment_overlay(project, &p.issue_tracker, &mut review);
+                    // The desktop labels each review row with its tracker
+                    // number (`#401`); only a remote board has one.
+                    if !review.is_empty() {
+                        numbers = read_board_index_numbers(project, &p.issue_tracker);
+                    }
                 }
                 model.reviews = split_reviews(project, review);
+                for row in &mut model.reviews {
+                    row.number = numbers.get(&row.task_id).copied();
+                }
                 let in_progress: Vec<IssueFile> = board
                     .iter()
                     .filter(|f| f.task.column == Column::in_progress())
@@ -272,6 +281,7 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
                     location: None,
                     workspace: None,
                     state: ReviewState::Pending,
+                    number: None,
                 })
                 .collect();
         }
@@ -296,6 +306,7 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
             location,
             workspace,
             state,
+            number: None,
         }
     };
 

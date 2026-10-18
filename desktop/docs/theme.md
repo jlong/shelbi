@@ -12,9 +12,9 @@ doesn't read them.
   variable (`figma::measured`), the roles below, and the contrast tests.
 - `src/theme/style.rs`: the Figma text styles (`Type`, applied with
   `.type_style(...)`) and the component shapes every view shares (nav chip,
-  buttons, icon buttons, dropdowns, segmented controls, the search box and
-  its keycaps, project badges, popovers, dialogs, chips, the selection pill,
-  the focus ring and glow, empty states, tooltips).
+  buttons, icon buttons, dropdowns, segmented controls, keycaps and the
+  sidebar's plain hotkeys, project badges, popovers, dialogs, chips, the
+  selection pill, the focus ring and glow, empty states, tooltips).
 - `src/theme/motion.rs`: the motion: the easing curve, the spring the
   selection chip slides on, and the fades every hover and press runs.
 - `src/theme/mod.rs`: the resolved `Theme` global (views read `theme.muted`,
@@ -43,11 +43,12 @@ black (`#020303`) at 70% for body, opaque for titles. The accent is pink
 `#f21478`; the focus ring is `#31ade9`.
 
 **Both.** Controls (buttons, dropdowns, filter chips, count badges, the
-search box) are fill only: `theme.background`, a translucent slate
+toolbar buttons) are fill only: `theme.background`, a translucent slate
 (`#acb4cf` at 18% dark, 12% light) that tints whatever it sits on, with a
 hover and a pressed step 10 points stronger each. There are no control
-borders. The selected nav row is the canvas lifted with `shadow/raised card`;
-the selected segment is `theme.selection`.
+borders. The selected nav row is the canvas, lifted with `shadow/raised card`
+in Light (the Navigation component draws the dark chip flat); the selected
+segment is `theme.selection`.
 
 ## Figma tokens and roles
 
@@ -121,17 +122,18 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 
 | Component | Shape |
 |---|---|
-| Corners | 8px (`rounded_lg`) on rows and surfaces; 6px on buttons, dropdowns and segments (Figma's `6`); 12px on the 32 and 40px icon buttons and the search box; 4px on keycaps |
-| Project switcher | 36px, 8px across, 8px corners, a 24px initials badge, the name, the up-down chevron in the muted color; the overlay fill, stronger on hover and pressed while open. Its menu is a popover 6px below: rows of badge, name and a check on the current project, a rule, then "Add project…"; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
-| Project badge | Two-letter initials (two words, camel case split), bold white, on a fill picked from the name (`badge_fill`) |
-| Search box | The overlay fill with 12px corners, a magnifying glass, "Search" growing to fill, then the palette chord as keycaps; hover fades to the hover fill |
-| Keycaps | The Button component's Hotkey: one cap per key, X-Small in `gray`, on the canvas with a 1px `keycap_edge` drop |
-| Nav row | 40px tall (a 36px chip inset 2px), content 8px inside, 20px icon, 8px gap; the current row is the chip, loud and medium weight |
-| Nav chip | The canvas with `shadow/raised card` (0 4 4, 0 11 0 -8, 0 3 0 -1, and a 1px ring) |
+| Corners | 8px (`rounded_lg`) on panel rows and surfaces; 6px (`NAV_RADIUS`) on the sidebar's rows and chip, buttons, dropdowns and segments (Figma's `6`); 8px on the sidebar's 32px toolbar buttons; 12px on the 32px icon buttons; 4px on keycaps and count badges |
+| Project switcher | The Navigation component's trigger: 28px, 8px across, 6px corners, the name (Base medium, `foreground`) and the up-down chevron in the muted color; clear at rest, the hover fill, pressed while open. Its menu is a popover 6px below: rows of badge, name and a check on the current project, a rule, then "Add project…"; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
+| Project badge | Two-letter initials (two words, camel case split), bold white, on a fill picked from the name (`badge_fill`); the switcher's menu rows |
+| Toolbar button | The sidebar's titlebar (Search, Toggle sidebar) and footer (Settings): 32px square, 8px corners, the 20px icon in `icon`, the hover fill fading in and a loud icon on hover |
+| Keycaps | The Button component's Hotkey: one cap per key, X-Small in `gray`, on the canvas with a 1px `keycap_edge` drop (the palette, the card detail) |
+| Hotkey (sidebar) | The Navigation component's: the chord's keys as plain text (`⌘O`), 2px apart, X-Small in `gray`, 4px either side, no caps |
+| Nav row | The Navigation component's: 34px tall, 6px inside, 6px gap, the 20px icon (`icon`; `accent` when selected), the label (Base, `foreground`) growing, the hotkey; the current row is the chip, loud and medium weight |
+| Nav chip | The canvas; in Light lifted with `shadow/raised card` (0 4 4, 0 11 0 -8, 0 3 0 -1, and a 1px ring), in Dark flat |
 | Selection chip | One chip for the current row; when the selection moves (keys, clicks, route changes) it slides to the new row on a spring with a slight overshoot before the row takes it back. The sidebar, the review and workspace panels' view switches, and every segmented control |
-| List row (leading column) | 32px, Small (13 / 18); the same chip when selected |
+| List row (leading column) | The review and workspace panels: 32px, Small (13 / 18); the same chip when selected. The sidebar's rows follow the Navigation component (see `views/sidebar.rs`): 8px across, 4px above and below, a 12px state glyph |
 | Current-selection indicator | A 3x16px `accent` pill at the row's leading edge, on the keyboard's row |
-| Section heading | Base medium, loud |
+| Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
 | Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `text/green` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions (the card detail, the error log) are 28px and X-Small, with their key as keycaps |
 | Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control (the board's keyboard card, a dialog's keyboard button, text fields) |
 | Dropdown | A button that opens a menu (the board's and Activity's filters): the Figma Button at X-Small with a left icon, 24px tall, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the icon sits in Figma's 14px Icon slot (`icon_slot`); pressed while its menu is open, and the menu opens 6px under it |
@@ -139,7 +141,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
 | Segmented control | No track: segments in a bare row 4px apart, the selected one on the `selection` chip, which slides between them. Settings' (`choice_track` / `choice`): 26px, 12px across, Base; the selected one Base medium and loud, the others `form_text`, a fill fading in on hover. Activity's kind filter is its own (below) |
 | Activity filters | The Activity frame's own: kind segments in a bare row 4px apart (no track), 24px, 8px across, X-Small, muted, the selected one `selection` and loud; then, 16px on, the pickers: `search`'s fill, a 14px icon (the small Heroicons, `icons::FUNNEL_SMALL`, `USER_SMALL`: 1.5px stroke at 14px, as Figma draws them), 8px, an X-Small label, no chevron, icon and label in `log_text` (`filter_segment`, `filter_dropdown`) |
-| Icon button | 24, 32 or 40px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the overlay fill while active |
+| Icon button | 24 or 32px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the overlay fill while active |
 | Text field | `field`: 360 x 32, 10px across, 6px corners, the canvas inside a 1px `input_border` (`theme.divider`), Base in `gray`, as Settings draws it; the font picker and the size stepper wear the same shape |
 | Form button | `form_button`: Settings' "Open keys.yaml": `theme.search`, 26px, 12px across, Base in `gray` |
 | Checkbox | 14px, 2px corners; checked, the loud color with the mark in the canvas; unchecked, a 1px `muted` edge (Settings) |
@@ -148,7 +150,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
 | Card | `card` with `shadow/raised card`, 8px corners, 12px inside, 6px between the title (Base medium, two lines), the excerpt (X-Small on an 18px line, `foreground`, four lines) and the meta row (the workflow badge, 4px across with 2px corners, then the branch in `muted`); the keyboard's card wears the focus ring and glow instead of the shadow |
 | Chip, badge | 20px, 6px across, X-Small medium, the hue's text on its tint; a workflow name is `workflow_badge_text` on `workflow_badge` |
-| Zen pill | `zen` (the Success fill) with a `success` (`text/green`) label |
+| Zen pill | 42px, the sidebar's width inside 8px, fully rounded: `zen` (the Success fill) over the canvas with a `success` (`text/green`) "Zen mode on"; off, `background` over the canvas with "Zen mode off" in `foreground`. A click toggles Zen |
 | Empty state | A muted sentence on why there is nothing, and the action that changes it |
 | Tooltip | A small popover, X-Small |
 | Terminal | Background and frame are the canvas; the find bar and "Jump to bottom" are popovers |
@@ -216,7 +218,7 @@ until a new role has its row here, with the values the palette really has.
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `background` | `#acb4cf2e` | `#acb4cf1f` | `theme.background`: buttons, dropdowns, chips, count badges, the search box, a hovered row |
+| `background` | `#acb4cf2e` | `#acb4cf1f` | `theme.background`: buttons, dropdowns, chips, count badges, the Zen pill off, a hovered row |
 | `background_hover` | `#acb4cf47` | `#acb4cf38` | `button/default/background-hover` (dark derived): a control's hover |
 | `background_active` | `#acb4cf61` | `#acb4cf52` | `button/default/background-active` (dark derived): pressed, or open |
 | `selection` | `#acb4cf8c` | `#acb4cf66` | `theme.selection`: the selected segment |
@@ -348,8 +350,8 @@ Not roles: the same eight fills in both themes, picked per project by
 `badge_fill` (an FNV-1a hash of the name), each dark enough for white
 initials at 4.5:1: `#db0a60`, `#2830f1`, `#7019c0`, `#00753d`, `#0c699c`,
 `#9d4100`, `#aa0101`, `#856700`. The Figma Navigation component draws the
-project name without a badge; the switcher keeps its initials until the
-sidebar task restyles it.
+project name without a badge, so the switcher's trigger has none; its menu's
+rows keep their initials.
 
 ## Contrast
 

@@ -770,10 +770,12 @@ mod tests {
         ] {
             check(format!("{name} on selection over canvas"), fg, band, AA);
         }
+        // The Zen pill paints the canvas under its tint (the Navigation
+        // component's measured fill), so "Zen mode on" reads on that.
         check(
-            "success on zen over sidebar".into(),
+            "success on zen over canvas".into(),
             p.success,
-            flatten(p.zen, p.sidebar),
+            flatten(p.zen, p.canvas),
             AA,
         );
         check(
