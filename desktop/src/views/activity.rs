@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle, Hsla,
-    KeyDownEvent, Pixels, ScrollHandle, SharedString, Task, Window,
+    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle,
+    HighlightStyle, Hsla, KeyDownEvent, Pixels, ScrollHandle, SharedString, StyledText, Task,
+    Window,
 };
 use shelbi_app::activity::{
     read_activity_window, ActivityData, ActivityKind, ActivityMetaCache, FeedItem, RowTarget,
@@ -306,7 +307,7 @@ impl ActivityView {
                     .child(
                         style::filter_dropdown(
                             "project-picker",
-                            icons::FUNNEL,
+                            icons::FUNNEL_SMALL,
                             project_label,
                             self.state.picker == Some(Picker::Project),
                             theme,
@@ -320,7 +321,7 @@ impl ActivityView {
                     .child(
                         style::filter_dropdown(
                             "workspace-picker",
-                            icons::USER,
+                            icons::USER_SMALL,
                             workspace_label,
                             self.state.picker == Some(Picker::Workspace),
                             theme,
@@ -453,7 +454,9 @@ impl ActivityView {
             .flex_none()
             .items_center()
             .gap_2()
-            .h(px(26.0))
+            // The frame's 1px divider sits above the 26pt shortcuts bar,
+            // not inside it.
+            .h(px(27.0))
             .px_4()
             .border_t_1()
             .border_color(theme.divider)
@@ -658,6 +661,19 @@ fn feed_row(theme: &Theme, line: &Line, selected: bool) -> gpui::Div {
     let verb = div()
         .flex_none()
         .when(!line.verb.is_empty(), |d| d.pr_2().text_color(verb_color).child(line.verb.clone()));
+    // The title and its trail are one paragraph, so a long title wraps at
+    // the message column's edge (Figma's full-width text box) and the trail
+    // flows on after its last word.
+    let mut title = line.title.clone();
+    let trail = line.trail.as_ref().map(|(text, tone)| {
+        let start = title.len();
+        title.push_str(text);
+        let style = HighlightStyle {
+            color: Some(log_tone(theme, *tone)),
+            ..Default::default()
+        };
+        (start..title.len(), style)
+    });
     let message = div()
         .flex()
         .flex_col()
@@ -666,14 +682,9 @@ fn feed_row(theme: &Theme, line: &Line, selected: bool) -> gpui::Div {
         .gap(px(2.0))
         .child(
             div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
+                .w_full()
                 .text_color(log_tone(theme, line.title_tone))
-                .child(line.title.clone())
-                .when_some(line.trail.as_ref(), |d, (text, t)| {
-                    d.child(div().text_color(log_tone(theme, *t)).child(text.clone()))
-                }),
+                .child(StyledText::new(title).with_highlights(trail)),
         )
         .when_some(line.secondary.as_ref(), |d, sec| {
             let (icon, text) = sec.parts();

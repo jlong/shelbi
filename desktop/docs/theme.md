@@ -138,7 +138,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
 | Segmented control | No track: segments in a bare row 4px apart, the selected one on the `selection` chip, which slides between them. Settings' (`choice_track` / `choice`): 26px, 12px across, Base; the selected one Base medium and loud, the others `form_text`, a fill fading in on hover. Activity's kind filter is its own (below) |
-| Activity filters | The Activity frame's own: kind segments in a bare row 4px apart (no track), 24px, 8px across, X-Small, muted, the selected one `selection` and loud; then, 16px on, the pickers: `search`'s fill, the icon, an X-Small `gray` label, no chevron (`filter_segment`, `filter_dropdown`) |
+| Activity filters | The Activity frame's own: kind segments in a bare row 4px apart (no track), 24px, 8px across, X-Small, muted, the selected one `selection` and loud; then, 16px on, the pickers: `search`'s fill, a 14px icon (the small Heroicons, `icons::FUNNEL_SMALL`, `USER_SMALL`: 1.5px stroke at 14px, as Figma draws them), 8px, an X-Small label, no chevron, icon and label in `log_text` (`filter_segment`, `filter_dropdown`) |
 | Icon button | 24, 32 or 40px square, the icon role at rest, the hover fill fading in and a loud icon on hover, the overlay fill while active |
 | Text field | `field`: 360 x 32, 10px across, 6px corners, the canvas inside a 1px `input_border` (`theme.divider`), Base in `gray`, as Settings draws it; the font picker and the size stepper wear the same shape |
 | Form button | `form_button`: Settings' "Open keys.yaml": `theme.search`, 26px, 12px across, Base in `gray` |
@@ -234,8 +234,7 @@ until a new role has its row here, with the values the palette really has.
 | `form_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Settings frame overrides it (opaque, both modes): a field's value, an unselected choice, a form button's label |
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
-| `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor |
-| `table_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Machines frame sets it (opaque, both modes): a workspace row's runner and task |
+| `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
 
 ### Icons
 
@@ -378,7 +377,7 @@ with its worst ratio. **Flagged for John.**
 |---|---|---|---|
 | dark | muted on | 1.11 | `theme.muted` `#777a86`: 3.67 on the canvas, 3.03 on the sidebar, 2.10 on a hovered row there. Section headers, branches, idle labels. 1.11 is an idle state on the selected Machines row (`theme.selection`), a row the frame doesn't draw selected |
 | dark | dark_gray on | 1.13 | `theme.ansi_dark_gray`: Activity's timestamps, 3.76 on the canvas, 3.10 on the sidebar. 1.13 is the branch on the selected Machines row, as the frame draws it |
-| dark | log_text on | 2.96 | The Activity frame's `theme.gray` `#7b85a7`: the log's titles, 4.30 on the canvas, 2.96 on the selected row |
+| dark | log_text on | 2.53 | The Activity frame's `theme.gray` `#7b85a7`: the log's titles, 4.30 on the canvas, 2.96 on the selected row; the pickers' labels, 2.53 on their `search` fill |
 | dark | info on | 3.83 | `theme.ansi_blue` as the info color: AA on the canvas (4.7), short on the sidebar and raised surfaces |
 | dark | blue on | 3.61 | The same blue as `[ready]`, and on its chip tint |
 | dark | gray on background | 3.84 | `theme.gray` (hotkeys) on a hovered row over the sidebar |
@@ -386,8 +385,9 @@ with its worst ratio. **Flagged for John.**
 | dark | magenta on magenta_tint | 4.19 | `[review]` on its (derived) chip tint |
 | dark | red on red_tint | 4.39 | The Danger pink on its (derived) chip tint |
 | dark | text_loud on selection | 4.08 | `theme.white` on the selected segment (`theme.selection`) over the sidebar; 4.46 on the canvas |
+| dark | gray on selection | 2.12 | The selected Machines row (`theme.selection` over the canvas, as drawn): the runner and the task in `theme.gray` |
 | dark | theme_green on selection | 2.30 | The same row: `working` and `● reachable` in `theme.green` |
-| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan` |
+| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan`. The lowest pairing the desktop draws |
 | dark | success on hover button | 4.07 | `text/green` on the Success button's (derived dark) hover |
 | dark | success on pressed button | 3.35 | `text/green` on the Success button pressed |
 | dark | error on rest button | 4.30 | The Danger label on the Danger fill over the sidebar (AA over the canvas) |
@@ -395,7 +395,6 @@ with its worst ratio. **Flagged for John.**
 | dark | error on pressed button | 3.53 | The same, pressed |
 | dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
 | dark | form_text on | 2.53 | The Settings frame's `theme.gray` override, `#7b85a7`: a field's value and an unselected choice 4.30 on the canvas, "Open keys.yaml" 2.53 on its `theme.search` fill |
-| dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
 | light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
@@ -410,7 +409,6 @@ with its worst ratio. **Flagged for John.**
 | light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
 | light | input_border on | 1.06 | `theme.divider` as a field's edge |
 | light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
-| light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 
 ## Renders
 
