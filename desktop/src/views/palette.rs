@@ -23,11 +23,11 @@ use gpui::{
 };
 use shelbi_app::overlay::palette::{Palette, PaletteFocus, ProjectIndicator};
 use shelbi_palette::{DecorationColor, Entry};
-use shelbi_state::keymap::{format_chord, DisplayStyle, Keymaps};
+use shelbi_state::keymap::{DisplayStyle, Keymaps};
 
 use crate::assets::{heroicon, icons, Icon};
 use crate::theme::motion::fill_layer;
-use crate::theme::style::{Type, Typography};
+use crate::theme::style::{self, Type, Typography};
 use crate::theme::Theme;
 use crate::views::overlay::{palette_event, palette_top, with_overlay, ActiveOverlay};
 use crate::views::overlay::{OverlayEvent, OverlayHost};
@@ -155,19 +155,18 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
 pub fn close_chord(keymaps: &Keymaps) -> String {
     shelbi_app::overlay::palette_open_chords(keymaps)
         .first()
-        .map(|c| format_chord(c, DisplayStyle::Mac))
+        .map(|c| crate::keys::chord_text(c, DisplayStyle::Mac))
         .unwrap_or_default()
 }
 
-/// The palette's drop: the frame's `0 10 15 -3` effect. Figma's blur, like
-/// CSS's, is twice the Gaussian's sigma; gpui's `blur_radius` is the sigma
-/// itself, so the frame's 15 is 7.5 here (at 15 the drop spread twice as
-/// far as the frame's).
+/// The palette's drop: the frame's `0 10 15 -3` effect, its blur through
+/// [`style::figma_blur`] (at 15 the drop spread twice as far as the
+/// frame's).
 fn shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: theme.palette_shadow,
         offset: gpui::point(px(0.0), px(10.0)),
-        blur_radius: px(15.0 / 2.0),
+        blur_radius: style::figma_blur(15.0),
         spread_radius: px(-3.0),
         inset: false,
     }]

@@ -73,9 +73,18 @@ pub fn nav_view_chord(view: &View) -> Option<KeyChord> {
         .and_then(|(_, spec)| KeyChord::parse(spec).ok())
 }
 
+/// A chord as the window's own text spells it (key hints, footers, the
+/// palette): `style`'s spelling with Enter as Geist's `↵`, the glyph the
+/// Figma frames draw. The shared Mac spelling's `⏎` isn't in Geist, so it
+/// fell back to a heavier, wider symbol face. Native menus keep
+/// `format_chord`.
+pub fn chord_text(chord: &KeyChord, style: DisplayStyle) -> String {
+    format_chord(chord, style).replace('⏎', "↵")
+}
+
 /// [`nav_view_chord`] as the sidebar and the Go menu show it (`⌘O`).
 pub fn nav_view_hotkey(view: &View) -> Option<String> {
-    nav_view_chord(view).map(|c| format_chord(&c, DisplayStyle::Mac))
+    nav_view_chord(view).map(|c| chord_text(&c, DisplayStyle::Mac))
 }
 
 /// A numbered row's hint (`⌘3`).
@@ -225,6 +234,14 @@ mod tests {
         let mut k = Keystroke::parse(spec).expect(spec);
         k.key_char = key_char.map(str::to_string);
         k
+    }
+
+    #[test]
+    fn enter_reads_as_geists_return_glyph() {
+        let enter = KeyChord::parse("enter").unwrap();
+        assert_eq!(chord_text(&enter, DisplayStyle::Mac), "↵");
+        let save = KeyChord::parse("super-s").unwrap();
+        assert_eq!(chord_text(&save, DisplayStyle::Mac), format_chord(&save, DisplayStyle::Mac));
     }
 
     fn chord(spec: &str, key_char: Option<&str>) -> String {

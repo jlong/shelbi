@@ -127,25 +127,33 @@ pub const LIST_ROW_H: f32 = 32.0;
 /// A button's height at the medium size.
 pub const BUTTON_H: f32 = 32.0;
 
+/// A Figma (or CSS) blur as gpui's `blur_radius`: Figma's blur is twice the
+/// Gaussian's sigma, and gpui's `blur_radius` is the sigma itself, so a
+/// Figma value passed straight through draws twice as soft.
+pub fn figma_blur(blur: f32) -> Pixels {
+    px(blur / 2.0)
+}
+
 /// Figma's `shadow/raised card`: three soft drops (0 4 4, 0 11 0 -8,
 /// 0 3 0 -1) and a 1px ring. The selected nav chip and the board's cards.
 pub fn raised_card_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![
-        BoxShadow::new(px(0.0), px(4.0), theme.shadow).blur_radius(px(4.0)),
+        BoxShadow::new(px(0.0), px(4.0), theme.shadow).blur_radius(figma_blur(4.0)),
         BoxShadow::new(px(0.0), px(11.0), theme.shadow).spread_radius(px(-8.0)),
         BoxShadow::new(px(0.0), px(3.0), theme.shadow).spread_radius(px(-1.0)),
         ring_shadow(theme.shadow_ring),
     ]
 }
 
-/// A soft drop plus a 1px ring, for a menu or popover.
+/// A soft drop plus a 1px ring, for a menu or popover (CSS's `shadow-lg`
+/// values, whose blurs are Figma's kind).
 pub fn popover_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![
         BoxShadow::new(px(0.0), px(10.0), theme.shadow)
-            .blur_radius(px(15.0))
+            .blur_radius(figma_blur(15.0))
             .spread_radius(px(-3.0)),
         BoxShadow::new(px(0.0), px(4.0), theme.shadow)
-            .blur_radius(px(6.0))
+            .blur_radius(figma_blur(6.0))
             .spread_radius(px(-4.0)),
         ring_shadow(theme.ring),
     ]
@@ -156,10 +164,10 @@ pub fn popover_shadow(theme: &Theme) -> Vec<BoxShadow> {
 pub fn dialog_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![
         BoxShadow::new(px(0.0), px(20.0), theme.shadow)
-            .blur_radius(px(25.0))
+            .blur_radius(figma_blur(25.0))
             .spread_radius(px(-5.0)),
         BoxShadow::new(px(0.0), px(8.0), theme.shadow)
-            .blur_radius(px(10.0))
+            .blur_radius(figma_blur(10.0))
             .spread_radius(px(-6.0)),
         ring_shadow(theme.ring),
     ]

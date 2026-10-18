@@ -78,6 +78,11 @@ enum Mode {
     /// size (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     VisualFigma(Option<String>, bool),
+    /// `--visual-figma-fixtures <root>`: write `--visual-figma`'s mockup
+    /// content into a Shelbi root and exit, for the real-window walk
+    /// (`scripts/figma-window-walk.sh`; feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    VisualFigmaFixtures(String),
     /// `--bench-push [options]`: time the leading column's push in a real
     /// window over fake daemons (feature `visual-check`).
     #[cfg(feature = "visual-check")]
@@ -111,6 +116,11 @@ fn parse_args() -> Mode {
             let dir = rest.iter().find(|a| !a.starts_with("--")).cloned();
             Mode::VisualFigma(dir, rest.iter().any(|a| a == "--2x"))
         }
+        #[cfg(feature = "visual-check")]
+        Some("--visual-figma-fixtures") => match args.next() {
+            Some(root) => Mode::VisualFigmaFixtures(root),
+            None => usage("--visual-figma-fixtures needs a Shelbi root directory"),
+        },
         #[cfg(feature = "visual-check")]
         Some("--bench-push") => Mode::BenchPush(args.collect()),
         #[cfg(feature = "bench")]
@@ -157,6 +167,10 @@ fn main() {
     if let Mode::VisualFigma(dir, native) = mode {
         let (dir, theme) = visual_check::per_theme(dir);
         visual_figma::run(dir, theme, native);
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::VisualFigmaFixtures(root) = &mode {
+        visual_figma::export_fixtures(root.into());
     }
     #[cfg(feature = "visual-check")]
     if let Mode::BenchPush(args) = &mode {

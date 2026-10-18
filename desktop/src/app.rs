@@ -101,7 +101,7 @@ use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::update::{self as update_view, UpdateState};
 use shelbi_state::keymap::{
-    format_chord, DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
+    DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
 
 use crate::assets::{heroicon, icons};
@@ -148,8 +148,8 @@ const DEFAULT_HEIGHT: f32 = 800.0;
 const STARTUP_STATUS: &str = "Starting the orchestrator…";
 /// How far a new window sits off the one it was opened from.
 const CASCADE: f32 = 28.0;
-/// How wide the column divider's grab room is: its own point and the
-/// column's last four.
+/// How wide the column edge's grab room is: the column's last five points
+/// (the Review rule's own point and the column's last four).
 const RESIZE_GRAB: f32 = 5.0;
 /// The title of a window with no project (the empty-state chooser).
 const CHOOSER_TITLE: &str = "Shelbi";
@@ -3695,7 +3695,7 @@ fn palette_chord(keymaps: &Keymaps) -> String {
     keymaps
         .global
         .first_chord_for(GlobalAction::OpenPalette)
-        .map(|c| format_chord(c, DisplayStyle::Mac))
+        .map(|c| crate::keys::chord_text(c, DisplayStyle::Mac))
         .unwrap_or_default()
 }
 
@@ -3948,12 +3948,25 @@ impl ShelbiWindow {
         } else {
             theme.divider
         };
+        // Only the Review frames draw the column's 1pt rule (the reviewer
+        // starts at x 281); every other frame puts the main area right
+        // after the column at x 280, the fill change the only edge.
+        let rule = self.column.target() == Occupant::Review;
         let handle = column_shown.then(|| {
-            // The column's right-edge divider: 1pt in the layout, as Figma
-            // draws it (the main area starts right after it), its grab room
-            // laid over the column's edge. It resizes whichever panel the
-            // column shows.
-            div().relative().w(px(1.0)).h_full().flex_none().bg(divider_color).child(
+            // The column's right edge: the rule (in the layout, when shown)
+            // or nothing, with the grab room laid over the column's edge.
+            // It resizes whichever panel the column shows. A drag lights the
+            // edge either way.
+            div()
+                .relative()
+                .w(px(if rule { 1.0 } else { 0.0 }))
+                .h_full()
+                .flex_none()
+                .when(rule, |d| d.bg(divider_color))
+                .when(!rule && self.dragging, |d| {
+                    d.child(div().absolute().top_0().bottom_0().left(px(-1.0)).w(px(1.0)).bg(divider_color))
+                })
+                .child(
                 div()
                     .id("sidebar-resize")
                     .debug_selector(|| "sidebar-resize".into())

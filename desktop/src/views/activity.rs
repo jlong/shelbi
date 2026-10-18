@@ -33,7 +33,7 @@ use shelbi_app::activity::{
 };
 use shelbi_app::theme::Tone;
 use shelbi_app::CommandKind;
-use shelbi_state::keymap::{format_chord, ActivityAction, DisplayStyle};
+use shelbi_state::keymap::{ActivityAction, DisplayStyle};
 
 use super::activity_labels::{Actor, Line};
 use super::activity_state::{ActivityState, Intent, Picker, ProjectInfo};
@@ -433,7 +433,7 @@ impl ActivityView {
         let h = |a| {
             km.activity
                 .first_chord_for(a)
-                .map_or_else(|| "–".to_string(), |c| format_chord(c, self.display_style))
+                .map_or_else(|| "–".to_string(), |c| crate::keys::chord_text(c, self.display_style))
         };
         let hints = format!(
             "{}/{} select   enter open   {}/{} page   {} top   {} bottom   {} refresh   {}/{}/{} filter",
