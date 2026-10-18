@@ -62,6 +62,7 @@
 
 pub mod a11y;
 mod element;
+pub mod fonts;
 pub mod highlights;
 pub mod keys;
 pub mod layout;

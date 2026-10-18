@@ -22,7 +22,7 @@
 //! - a workflow status's glyph ([`status_icon`]) and heading
 //!   ([`status_heading`]: the board's column headers, the task panels);
 //! - controls that open something ([`dropdown`]), segmented controls
-//!   ([`segment_track`], [`segment`]) and the sidebar's search box
+//!   ([`filter_track`], [`choice_track`]) and the sidebar's search box
 //!   ([`search_box`], with the Hotkey [`keycaps`]);
 //! - a project's initials badge ([`project_badge`]);
 //! - every hover and press fades over about 200ms ([`motion::fill_layer`]);
@@ -578,67 +578,6 @@ pub fn status_heading(
         )
 }
 
-/// A segmented control's track: the overlay fill, 2px inside. Its segments
-/// go in as children ([`segment`]); give it `.relative()` children-first
-/// order with [`motion::origin_probe`] and, while one slides,
-/// [`motion::floating_chip`] painted by [`segment_chip`].
-pub fn segment_track(theme: &Theme) -> Div {
-    div()
-        .relative()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(2.0))
-        .p(px(2.0))
-        .rounded_lg()
-        .bg(theme.background)
-}
-
-/// One segment: 24px, its label medium and normal; selected, it is lifted
-/// ([`segment_chip`], unless `chip_inline` is false while a sliding chip
-/// stands in) with a loud semibold label. Unselected, a fill fades in on
-/// hover.
-pub fn segment(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    selected: bool,
-    chip_inline: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let id: SharedString = id.into();
-    let selector = id.clone();
-    let d = div()
-        .id(id.clone())
-        .debug_selector(move || selector.to_string())
-        .relative()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .h(px(24.0))
-        .px(px(10.0))
-        .rounded(px(6.0))
-        .type_style(Type::XSmallMedium)
-        .cursor_pointer();
-    let d = if selected {
-        let d = d.text_color(theme.text_loud);
-        if chip_inline {
-            segment_chip(d, theme)
-        } else {
-            d
-        }
-    } else {
-        let clear = theme.background_hover.opacity(0.0);
-        fill_layer(
-            d.text_color(theme.foreground),
-            id,
-            px(6.0),
-            [clear, theme.background_hover, theme.background_active],
-        )
-    };
-    d.child(label.into())
-}
-
 /// The selected segment: `theme.selection` (Activity's and Settings'
 /// segmented controls).
 pub fn segment_chip<E: Styled>(el: E, theme: &Theme) -> E {
@@ -646,7 +585,9 @@ pub fn segment_chip<E: Styled>(el: E, theme: &Theme) -> E {
 }
 
 /// The Activity frame's kind filter: its segments in a bare row, 4px apart,
-/// with no track behind them. Children go in as for [`segment_track`].
+/// with no track behind them. Its segments go in as children, after
+/// [`motion::origin_probe`] and, while one slides, a
+/// [`motion::floating_chip`] painted by [`segment_chip`].
 pub fn filter_track() -> Div {
     div().relative().flex().flex_row().items_center().gap(px(4.0))
 }
@@ -727,6 +668,100 @@ pub fn filter_dropdown(
     fill_layer(d, id, px(6.0), [rest, theme.background_active, theme.selection])
         .child(heroicon(icon).text_color(theme.icon))
         .child(div().whitespace_nowrap().child(label.into()))
+}
+
+/// Settings' segmented control, as the Settings frame draws it: no track,
+/// the choices 4px apart. Its choices go in as children ([`choice`]), with
+/// the same sliding-chip probes as a [`filter_track`].
+pub fn choice_track() -> Div {
+    div().relative().flex().flex_row().items_center().gap(px(4.0))
+}
+
+/// One choice of a [`choice_track`]: 26px, 12px across, 6px corners, Base
+/// in `form_text`; selected, Base medium and loud on the [`segment_chip`]
+/// (unless `chip_inline` is false while a sliding chip stands in).
+/// Unselected, a fill fades in on hover.
+pub fn choice(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    chip_inline: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(26.0))
+        .px(px(12.0))
+        .rounded(px(6.0))
+        .cursor_pointer();
+    let d = if selected {
+        let d = d.type_style(Type::BaseMedium).text_color(theme.text_loud);
+        if chip_inline {
+            segment_chip(d, theme)
+        } else {
+            d
+        }
+    } else {
+        let clear = theme.background_hover.opacity(0.0);
+        fill_layer(
+            d.type_style(Type::Base).text_color(theme.form_text),
+            id,
+            px(6.0),
+            [clear, theme.background_hover, theme.background_active],
+        )
+    };
+    d.child(label.into())
+}
+
+/// The width of a settings field (the Settings frame's text fields).
+pub const FIELD_W: f32 = 360.0;
+
+/// Paint `el` as a settings field: 360 x 32, 10px across, 6px corners, the
+/// canvas inside a 1px divider, its text Base in `form_text`. A gpui-kit
+/// `Input` takes it too (it refines its own style with this).
+pub fn field<E: Styled>(el: E, theme: &Theme) -> E {
+    el.w(px(FIELD_W))
+        .h(px(BUTTON_H))
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .bg(theme.well)
+        .border_1()
+        .border_color(theme.input_border)
+        .type_style(Type::Base)
+        .text_color(theme.form_text)
+}
+
+/// A button in a settings form, as the Settings frame draws "Open
+/// keys.yaml": `theme.search`, 26px, 12px across, 6px corners, Base in
+/// `form_text`. Hover and press fade to the stronger overlay fills.
+pub fn form_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(26.0))
+        .px(px(12.0))
+        .rounded(px(6.0))
+        .type_style(Type::Base)
+        .text_color(theme.form_text)
+        .cursor_pointer();
+    fill_layer(d, id, px(6.0), [theme.search, theme.background_active, theme.selection])
+        .child(label.into())
 }
 
 /// The Button component's Hotkey: one small keycap per key of `chord` (`⌘K`

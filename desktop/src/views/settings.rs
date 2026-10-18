@@ -3,9 +3,13 @@
 //! Stored in `~/.shelbi/config.yaml` through `shelbi_state::user_config`:
 //!
 //! - `desktop.terminal_font_family` / `desktop.terminal_font_size`: the
-//!   terminals' font, and `desktop.option_as_meta`: which Option keys are
-//!   Meta in terminals (the terminal element applies all three at once
-//!   through its `TerminalSettings` global);
+//!   terminals' font, chosen from a picker of the bundled and installed
+//!   monospaced fonts ([`FontPicker`]) and a size stepper (8 to 32 points),
+//!   and `desktop.option_as_meta`: which Option keys are Meta in terminals.
+//!   The terminal element applies all three at once through its
+//!   `TerminalSettings` global, which a change sets at once (before the
+//!   write), and which the view follows, so a size changed elsewhere shows
+//!   here too;
 //! - `theme:` (`auto | dark | light`), shared with the TUI, which reads it on
 //!   its next start;
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
@@ -25,24 +29,33 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, EventEmitter, FontWeight, SharedString, Subscription,
+    div, prelude::*, px, Context, Div, Entity, EventEmitter, Focusable, SharedString, Subscription,
     Window,
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 
+use super::font_picker::{FontPicker, FontPickerEvent};
+use crate::assets::icons;
+use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
+use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::TerminalSettings;
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::{self, IconButtonSize, Type, Typography};
 use crate::theme::Theme;
-use crate::theme::style::{Type, Typography};
 
-/// The values the view edits, parsed from the inputs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The terminal font size a fresh install uses, in whole points.
+const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
+
+/// The values the view edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
+    /// The terminal font family (Source Code Pro unless set).
     pub font_family: String,
-    pub font_size: String,
+    /// The terminal font size in points: within [`ZOOM_RANGE`] when set
+    /// here, anywhere in [`FONT_SIZE_RANGE`] when `config.yaml` says so.
+    pub font_size: u16,
     pub cli_path: String,
     pub theme: ThemePreference,
     pub option_as_meta: OptionAsMeta,
@@ -100,16 +113,42 @@ impl Switches {
     }
 }
 
-impl SettingsValues {
-    /// The values a config shows.
-    pub fn from_config(cfg: &UserConfig) -> SettingsValues {
+impl Default for SettingsValues {
+    fn default() -> Self {
         SettingsValues {
-            font_family: cfg.desktop.terminal_font_family.clone().unwrap_or_default(),
-            font_size: cfg
-                .desktop
-                .terminal_font_size
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
+            font_family: PRIMARY_FAMILY.to_string(),
+            font_size: DEFAULT_SIZE,
+            cli_path: String::new(),
+            theme: ThemePreference::default(),
+            option_as_meta: OptionAsMeta::default(),
+            notifications: Switches::default(),
+        }
+    }
+}
+
+/// `size` kept within [`ZOOM_RANGE`] (the stepper's range, and ⌘+ / ⌘−'s).
+pub fn clamp_size(size: i32) -> u16 {
+    size.clamp(*ZOOM_RANGE.start() as i32, *ZOOM_RANGE.end() as i32) as u16
+}
+
+/// The size one stepper step (`delta` points) moves `size` to, or `None`
+/// when it can't move that way: at a range end, or from a hand-set size
+/// outside the range that the step would only move further away from (the
+/// same rule as ⌘+ / ⌘−).
+pub fn step_size(size: u16, delta: i32) -> Option<u16> {
+    let next = clamp_size(size as i32 + delta);
+    let moved = if delta > 0 { next > size } else { next < size };
+    moved.then_some(next)
+}
+
+impl SettingsValues {
+    /// The values a config shows: the terminal font as the terminals use it
+    /// (a blank family is Source Code Pro).
+    pub fn from_config(cfg: &UserConfig) -> SettingsValues {
+        let terminal = TerminalSettings::from_config(&cfg.desktop);
+        SettingsValues {
+            font_family: terminal.font_family,
+            font_size: terminal.font_size.round() as u16,
             cli_path: cfg
                 .desktop
                 .cli_path
@@ -122,33 +161,28 @@ impl SettingsValues {
         }
     }
 
-    /// Write these values into `cfg`. Blank fields clear their key. Errors on
-    /// a font size that isn't a whole number of points in 6..=72.
-    pub fn apply(&self, cfg: &mut UserConfig) -> Result<(), String> {
+    /// Write these values into `cfg`. A blank CLI path clears its key; the
+    /// default font family and size aren't written (as Option's default
+    /// isn't), so `config.yaml` keeps only what was changed.
+    pub fn apply(&self, cfg: &mut UserConfig) {
         let blank = |s: &str| {
             let s = s.trim();
             (!s.is_empty()).then(|| s.to_string())
         };
-        let size = match blank(&self.font_size) {
-            None => None,
-            Some(s) => match s.parse::<u16>() {
-                Ok(n) if (6..=72).contains(&n) => Some(n),
-                _ => return Err(format!("Font size must be a number from 6 to 72, not `{s}`.")),
-            },
-        };
+        let family = blank(&self.font_family).filter(|f| f != PRIMARY_FAMILY);
+        let size = self.font_size.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
         let mut notifications = DesktopNotifications::default();
         let n = self.notifications;
         notifications.set(n.workspace_blocked, n.review_ready, n.orchestrator_waiting);
         cfg.desktop = DesktopConfig {
             cli_path: blank(&self.cli_path).map(PathBuf::from),
-            terminal_font_family: blank(&self.font_family),
-            terminal_font_size: size,
+            terminal_font_family: family,
+            terminal_font_size: (size != DEFAULT_SIZE).then_some(size),
             // Off is the default, so it isn't written.
             option_as_meta: (self.option_as_meta != OptionAsMeta::Off).then_some(self.option_as_meta),
             notifications,
         };
         cfg.theme = self.theme;
-        Ok(())
     }
 }
 
@@ -172,8 +206,10 @@ pub struct SettingsView {
     /// The two segmented controls, measured for their selection's slide.
     theme_track: SharedTrack,
     option_track: SharedTrack,
-    font_family: Entity<InputState>,
-    font_size: Entity<InputState>,
+    font_family: Entity<FontPicker>,
+    /// The terminal font size, and the field it is typed into.
+    font_size: u16,
+    font_size_input: Entity<InputState>,
     cli_path: Entity<InputState>,
     theme: ThemePreference,
     option_as_meta: OptionAsMeta,
@@ -189,28 +225,33 @@ pub struct SettingsView {
 
 impl SettingsView {
     pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
-        };
-        let font_family = input("Source Code Pro", window, cx);
-        let font_size = input("14", window, cx);
-        let cli_path = input("Found automatically", window, cx);
-        let mut subscriptions: Vec<Subscription> = [&font_family, &font_size, &cli_path]
-            .into_iter()
-            .map(|state| {
-                cx.subscribe_in(state, window, |this, _, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                        this.save(cx);
-                    }
-                })
-            })
-            .collect();
-        subscriptions.push(cx.observe_global_in::<TerminalSettings>(window, |this, window, cx| {
-            this.font_size_changed(window, cx)
-        }));
+        let font_family = cx.new(|cx| FontPicker::new(PRIMARY_FAMILY.to_string(), window, cx));
+        let font_size_input = cx.new(|cx| InputState::new(window, cx).default_value(DEFAULT_SIZE.to_string()));
+        let cli_path = cx.new(|cx| InputState::new(window, cx).placeholder("Found automatically"));
+        let subscriptions = vec![
+            cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.save(cx);
+                }
+            }),
+            cx.subscribe_in(&font_size_input, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.commit_size(window, cx);
+                }
+            }),
+            cx.subscribe(&font_family, |this, _, event: &FontPickerEvent, cx| match event {
+                FontPickerEvent::Picked(_) => this.save(cx),
+            }),
+            // The terminal font changed elsewhere (⌘+ / ⌘−, another
+            // window's settings): show it.
+            cx.observe_global_in::<TerminalSettings>(window, |this, window, cx| {
+                this.follow_terminal_settings(window, cx)
+            }),
+        ];
         let mut view = SettingsView {
             font_family,
-            font_size,
+            font_size: DEFAULT_SIZE,
+            font_size_input,
             cli_path,
             theme: ThemePreference::Auto,
             option_as_meta: OptionAsMeta::Off,
@@ -263,12 +304,11 @@ impl SettingsView {
                 match cfg {
                     Ok(cfg) => {
                         let values = SettingsValues::from_config(&cfg);
-                        let set = |state: &Entity<InputState>, value: String, window: &mut Window, cx: &mut Context<Self>| {
-                            state.update(cx, |s, cx| s.set_value(value, window, cx));
-                        };
-                        set(&this.font_family, values.font_family, window, cx);
-                        set(&this.font_size, values.font_size, window, cx);
-                        set(&this.cli_path, values.cli_path, window, cx);
+                        this.font_family
+                            .update(cx, |p, cx| p.set_family(values.font_family, cx));
+                        this.show_size(values.font_size, window, cx);
+                        this.cli_path
+                            .update(cx, |s, cx| s.set_value(values.cli_path, window, cx));
                         this.theme = values.theme;
                         this.option_as_meta = values.option_as_meta;
                         this.notifications = values.notifications;
@@ -285,30 +325,10 @@ impl SettingsView {
         .detach();
     }
 
-    /// The font size changed outside the form (View ▸ Bigger / Smaller /
-    /// Actual Size): show the new setting, so the form agrees with
-    /// `config.yaml` and its next save keeps the size.
-    fn font_size_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.loaded {
-            return;
-        }
-        let setting = TerminalSettings::current(cx).font_size_setting;
-        let shown = self.font_size.read(cx).value().trim().to_string();
-        let agrees = match setting {
-            None => shown.is_empty(),
-            Some(size) => shown.parse::<u16>() == Ok(size),
-        };
-        if !agrees {
-            let value = setting.map(|s| s.to_string()).unwrap_or_default();
-            self.font_size.update(cx, |s, cx| s.set_value(value, window, cx));
-            cx.notify();
-        }
-    }
-
     fn values(&self, cx: &Context<Self>) -> SettingsValues {
         SettingsValues {
-            font_family: self.font_family.read(cx).value().to_string(),
-            font_size: self.font_size.read(cx).value().to_string(),
+            font_family: self.font_family.read(cx).family().to_string(),
+            font_size: self.font_size,
             cli_path: self.cli_path.read(cx).value().to_string(),
             theme: self.theme,
             option_as_meta: self.option_as_meta,
@@ -316,43 +336,85 @@ impl SettingsView {
         }
     }
 
-    /// Validate and write the form off the UI thread.
+    /// Show `size` in the size field (unless it is being typed into).
+    fn show_size(&mut self, size: u16, window: &mut Window, cx: &mut Context<Self>) {
+        self.font_size = size;
+        let typing = self.font_size_input.read(cx).focus_handle(cx).is_focused(window);
+        if !typing {
+            self.font_size_input
+                .update(cx, |s, cx| s.set_value(size.to_string(), window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Set the font size (clamped into the range) and save it.
+    fn set_size(&mut self, size: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let size = clamp_size(size);
+        self.font_size = size;
+        self.font_size_input
+            .update(cx, |s, cx| s.set_value(size.to_string(), window, cx));
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Step the size by `delta` points, if it can move that way.
+    fn step(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(size) = step_size(self.font_size, delta) {
+            self.set_size(size as i32, window, cx);
+        }
+    }
+
+    /// Take the typed size: a new number is clamped into the range and
+    /// saved, the current size (even a hand-set one outside the range) is
+    /// left alone, and anything else puts the current size back.
+    fn commit_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.font_size_input.read(cx).value().trim().parse::<i32>();
+        match typed {
+            Ok(size) if size == self.font_size as i32 => {}
+            Ok(size) if clamp_size(size) != self.font_size => self.set_size(size, window, cx),
+            _ => {
+                let size = self.font_size;
+                self.font_size_input
+                    .update(cx, |s, cx| s.set_value(size.to_string(), window, cx));
+            }
+        }
+    }
+
+    /// The terminal settings changed: show their font and size.
+    fn follow_terminal_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = TerminalSettings::current(cx);
+        let size = settings.font_size.round() as u16;
+        if size != self.font_size {
+            self.show_size(size, window, cx);
+        }
+        self.font_family
+            .update(cx, |p, cx| p.set_family(settings.font_family, cx));
+    }
+
+    /// Apply the form to open terminals at once, then write it off the UI
+    /// thread.
     fn save(&mut self, cx: &mut Context<Self>) {
         if !self.loaded {
             return;
         }
         let values = self.values(cx);
-        // Validate on the UI thread so a bad value is reported without a write.
-        if let Err(message) = values.apply(&mut UserConfig::default()) {
-            self.state = SaveState::Failed(message);
-            cx.notify();
-            return;
-        }
         let applied = {
             let mut cfg = UserConfig::default();
-            let _ = values.apply(&mut cfg);
+            values.apply(&mut cfg);
             TerminalSettings::from_config(&cfg.desktop)
         };
+        // Open terminals pick up the font, its size and the Option key now.
+        TerminalSettings::set(applied, cx);
         let write = cx.background_executor().spawn(async move {
-            let mut invalid = None;
-            let result = shelbi_state::update_user_config(|cfg| {
-                if let Err(e) = values.apply(cfg) {
-                    invalid = Some(e);
-                }
-            });
-            match (result, invalid) {
-                (_, Some(e)) => Err(e),
-                (Ok(_), None) => Ok(()),
-                (Err(e), None) => Err(format!("Couldn't save config.yaml: {e}")),
-            }
+            shelbi_state::update_user_config(|cfg| values.apply(cfg))
+                .map(|_| ())
+                .map_err(|e| format!("Couldn't save config.yaml: {e}"))
         });
         cx.spawn(async move |this, cx| {
             let result = write.await;
             this.update(cx, |this, cx| {
                 this.state = match result {
                     Ok(()) => {
-                        // Open terminals pick up the font and Option key now.
-                        TerminalSettings::set(applied, cx);
                         cx.emit(SettingsEvent::Saved);
                         SaveState::Saved
                     }
@@ -395,6 +457,20 @@ impl SettingsView {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(feature = "visual-check")]
+impl SettingsView {
+    /// Open the font picker (`--visual-views`).
+    pub(crate) fn offscreen_open_font_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.font_family.update(cx, |p, cx| p.open(window, cx));
+    }
+
+    /// Whether the font picker is open with the installed families listed.
+    pub(crate) fn offscreen_font_picker_ready(&self, cx: &gpui::App) -> bool {
+        let picker = self.font_family.read(cx);
+        picker.is_open() && picker.fonts_loaded()
     }
 }
 
@@ -452,6 +528,21 @@ fn option_label(value: OptionAsMeta) -> &'static str {
     }
 }
 
+/// A settings section, as the Settings frame stacks it: its label (Base,
+/// loud), the control, then the helper (X-Small, muted), 4px apart.
+fn section(label: &'static str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().type_style(Type::Base).text_color(theme.text_loud).child(label))
+}
+
+/// A section's helper line.
+fn helper(text: &'static str, theme: &Theme) -> Div {
+    div().type_style(Type::XSmall).text_color(theme.muted).child(text)
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -470,22 +561,10 @@ impl Render for SettingsView {
             slide(&self.theme_track, format!("settings-theme-{}", theme_label(self.theme))),
             slide(&self.option_track, format!("settings-option-{}", option_label(self.option_as_meta))),
         );
-        let field = |label: &'static str, hint: &'static str, input: &Entity<InputState>| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.text_loud).child(label))
-                .child(div().w(px(360.0)).child(Input::new(input)))
-                .child(div().type_style(Type::XSmall).text_color(theme.muted).child(hint))
-        };
         let theme_chip = chips.0;
         let chip = |label: &'static str, value: ThemePreference, current: ThemePreference, cx: &mut Context<Self>| {
             let id = SharedString::from(format!("settings-theme-{label}"));
-            style::segment(id.clone(), label, value == current, theme_chip.is_none(), &theme)
-                .h(px(28.0))
-                .px_3()
-                .type_style(Type::Base)
+            style::choice(id.clone(), label, value == current, theme_chip.is_none(), &theme)
                 .child(motion::probe(&self.theme_track, id))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_theme(value, window, cx)))
         };
@@ -499,13 +578,52 @@ impl Render for SettingsView {
         let option_chip_slide = chips.1;
         let option_chip = |label: &'static str, value: OptionAsMeta, cx: &mut Context<Self>| {
             let id = SharedString::from(format!("settings-option-{label}"));
-            style::segment(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
-                .h(px(28.0))
-                .px_3()
-                .type_style(Type::Base)
+            style::choice(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
                 .child(motion::probe(&self.option_track, id))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
         };
+        // The size stepper: the typed field with − and + at its end, each
+        // dimmed (and inert) at its end of the range; ↑ / ↓ step it too.
+        let size = self.font_size;
+        let step = |id: &'static str, icon, delta: i32, cx: &mut Context<Self>| {
+            let inert = step_size(size, delta).is_none();
+            style::icon_button(id, icon, IconButtonSize::Small, false, &theme)
+                .when(inert, |d| d.opacity(0.4).cursor_default())
+                .on_click(cx.listener(move |this, _, window, cx| this.step(delta, window, cx)))
+        };
+        let size_field = style::field(
+            div()
+                .id("settings-font-size")
+                .debug_selector(|| "settings-font-size".into())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1(),
+            &theme,
+        )
+        // The typed text carries the field's inset itself.
+        .pl_0()
+        .pr(px(4.0))
+        .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+            this.step(1, window, cx);
+            cx.stop_propagation();
+        }))
+        .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+            this.step(-1, window, cx);
+            cx.stop_propagation();
+        }))
+        .child(
+            div().flex_1().child(
+                Input::new(&self.font_size_input)
+                    .appearance(false)
+                    .h(px(30.0))
+                    .px(px(10.0))
+                    .type_style(Type::Base)
+                    .text_color(theme.form_text),
+            ),
+        )
+        .child(step("settings-font-size-down", icons::MINUS, -1, cx))
+        .child(step("settings-font-size-up", icons::PLUS, 1, cx));
         let switches = self.notifications;
         let toggle = |label: &'static str, switch: Switch, cx: &mut Context<Self>| {
             let on = switches.get(switch);
@@ -518,22 +636,32 @@ impl Render for SettingsView {
                 .gap_2()
                 .cursor_pointer()
                 .child(
+                    // Figma's checkbox: 14px, 2px corners; checked, the
+                    // loud color with the mark in the canvas.
                     div()
-                        .w(px(16.0))
-                        .h(px(16.0))
-                        .rounded(px(4.0))
+                        .size(px(14.0))
+                        .flex_none()
+                        .rounded(px(2.0))
                         .border_1()
-                        .border_color(theme.input_border)
+                        .border_color(theme.muted)
                         .bg(theme.canvas)
-                        // Figma's checked box: the loud color, the mark
-                        // in the canvas.
                         .when(on, |d| d.bg(theme.text_loud).border_color(theme.text_loud))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(on, |d| d.text_color(theme.canvas).type_style(Type::XSmall).child("✓")),
+                        .when(on, |d| {
+                            d.text_color(theme.canvas)
+                                .type_style(Type::XSmallSemibold)
+                                .line_height(px(14.0))
+                                .child("✓")
+                        }),
                 )
-                .child(div().text_color(if on { theme.text_loud } else { theme.foreground }).child(label))
+                .child(
+                    div()
+                        .type_style(Type::Base)
+                        .text_color(if on { theme.text_loud } else { theme.foreground })
+                        .child(label),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
         };
         let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
@@ -557,13 +685,9 @@ impl Render for SettingsView {
                     .child("Settings"),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(style::heading("Theme", &theme))
+                section("Theme", &theme)
                     .child(
-                        style::segment_track(&theme)
+                        style::choice_track()
                             .self_start()
                             .child(motion::origin_probe(&self.theme_track))
                             .children(theme_chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, &theme))))
@@ -571,31 +695,22 @@ impl Render for SettingsView {
                             .child(chip("Dark", ThemePreference::Dark, current, cx))
                             .child(chip("Light", ThemePreference::Light, current, cx)),
                     )
-                    .child(
-                        div()
-                            .type_style(Type::XSmall)
-                            .text_color(theme.muted)
-                            .child("Shared with the TUI, which picks it up on its next start."),
-                    ),
+                    .child(helper("Shared with the TUI, which picks it up on its next start.", &theme)),
             )
-            .child(field(
-                "Terminal font",
-                "The font family for terminals. Blank uses Source Code Pro.",
-                &self.font_family,
-            ))
-            .child(field(
-                "Terminal font size",
-                "In points. Blank uses the default.",
-                &self.font_size,
-            ))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(style::heading("Option key in terminals", &theme))
+                section("Terminal font", &theme)
+                    .child(div().self_start().child(self.font_family.clone()))
+                    .child(helper("The font family for terminals.", &theme)),
+            )
+            .child(
+                section("Terminal font size", &theme)
+                    .child(div().self_start().child(size_field))
+                    .child(helper("In points.", &theme)),
+            )
+            .child(
+                section("Option key in terminals", &theme)
                     .child(
-                        style::segment_track(&theme)
+                        style::choice_track()
                             .self_start()
                             .child(motion::origin_probe(&self.option_track))
                             .children(option_chip_slide.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, &theme))))
@@ -604,36 +719,31 @@ impl Render for SettingsView {
                             .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
                             .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
                     )
-                    .child(div().type_style(Type::XSmall).text_color(theme.muted).child(
+                    .child(helper(
                         "Characters: Option+E, E types é, as in other Mac apps. Meta: \
                          Option+B sends Esc B, for shell word motion and Claude Code's \
                          Option shortcuts. Option with Enter, the arrows, Backspace, or \
                          Delete is Meta either way.",
+                        &theme,
                     )),
             )
-            .child(field(
-                "Shelbi CLI",
-                "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
-                 in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch.",
-                &self.cli_path,
-            ))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(style::heading("Key bindings", &theme))
+                section("Shelbi CLI", &theme)
+                    .child(style::field(Input::new(&self.cli_path), &theme))
+                    .child(helper(
+                        "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
+                         in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch.",
+                        &theme,
+                    )),
+            )
+            .child(
+                section("Key bindings", &theme)
                     .child(
-                        style::button("settings-open-keys", "Open keys.yaml", ButtonKind::Secondary, false, &theme)
+                        style::form_button("settings-open-keys", "Open keys.yaml", &theme)
                             .self_start()
                             .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
                     )
-                    .child(
-                        div()
-                            .type_style(Type::XSmall)
-                            .text_color(theme.muted)
-                            .child("Shared by the TUI and the desktop app."),
-                    )
+                    .child(helper("Shared by the TUI and the desktop app.", &theme))
                     .children(conflicts.into_iter().map(|line| {
                         div()
                             .debug_selector(|| "settings-shortcut-conflict".into())
@@ -643,11 +753,7 @@ impl Render for SettingsView {
                     })),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(style::heading("Notifications", &theme))
+                section("Notifications", &theme)
                     .child(toggle(
                         "A workspace is waiting for input or permission",
                         Switch::WorkspaceBlocked,
@@ -659,9 +765,10 @@ impl Render for SettingsView {
                         Switch::OrchestratorWaiting,
                         cx,
                     ))
-                    .child(div().type_style(Type::XSmall).text_color(theme.muted).child(
+                    .child(helper(
                         "Not shown for what's already on screen in the front window. \
                          macOS asks for permission the first time.",
+                        &theme,
                     )),
             )
             .children(status.map(|(text, color)| div().text_color(color).child(text)))
@@ -676,7 +783,7 @@ mod tests {
     fn values_round_trip_through_the_config() {
         let values = SettingsValues {
             font_family: "Berkeley Mono".into(),
-            font_size: " 14 ".into(),
+            font_size: 15,
             cli_path: "~/bin/shelbi".into(),
             theme: ThemePreference::Light,
             option_as_meta: OptionAsMeta::Left,
@@ -690,9 +797,9 @@ mod tests {
             editor: Some("hx".into()),
             ..Default::default()
         };
-        values.apply(&mut cfg).unwrap();
+        values.apply(&mut cfg);
         assert_eq!(cfg.desktop.terminal_font_family.as_deref(), Some("Berkeley Mono"));
-        assert_eq!(cfg.desktop.terminal_font_size, Some(14));
+        assert_eq!(cfg.desktop.terminal_font_size, Some(15));
         assert_eq!(
             cfg.desktop.cli_path.as_deref(),
             Some(std::path::Path::new("~/bin/shelbi"))
@@ -701,29 +808,40 @@ mod tests {
         assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
         assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
-        assert_eq!(back.font_size, "14");
-        assert_eq!(back.font_family, "Berkeley Mono");
-        assert_eq!(back.cli_path, "~/bin/shelbi");
-        assert_eq!(back.option_as_meta, OptionAsMeta::Left);
-        assert!(!back.notifications.review_ready);
-        assert!(back.notifications.workspace_blocked && back.notifications.orchestrator_waiting);
+        assert_eq!(back, values);
         assert_eq!(cfg.desktop.notifications.review_ready, Some(false));
         assert_eq!(cfg.desktop.notifications.workspace_blocked, None, "on is the default");
     }
 
     #[test]
-    fn blank_fields_clear_their_keys_and_bad_sizes_are_refused() {
+    fn defaults_are_not_written_and_a_bare_config_shows_them() {
         let mut cfg = UserConfig::default();
         cfg.desktop.terminal_font_size = Some(12);
-        SettingsValues::default().apply(&mut cfg).unwrap();
-        assert!(cfg.desktop.is_empty());
+        cfg.desktop.terminal_font_family = Some("Menlo".into());
+        SettingsValues::default().apply(&mut cfg);
+        assert!(cfg.desktop.is_empty(), "{:?}", cfg.desktop);
 
-        for bad in ["big", "0", "200", "13.5"] {
-            let values = SettingsValues {
-                font_size: bad.into(),
-                ..Default::default()
-            };
-            assert!(values.apply(&mut UserConfig::default()).is_err(), "{bad}");
-        }
+        let shown = SettingsValues::from_config(&UserConfig::default());
+        assert_eq!((shown.font_family.as_str(), shown.font_size), ("Source Code Pro", 14));
+        assert_eq!(shown, SettingsValues::default());
+    }
+
+    #[test]
+    fn the_stepper_stays_within_8_to_32_and_a_hand_set_size_is_kept() {
+        assert_eq!((clamp_size(2), clamp_size(8), clamp_size(32), clamp_size(200)), (8, 8, 32, 32));
+        assert_eq!((step_size(14, 1), step_size(14, -1)), (Some(15), Some(13)));
+        assert_eq!((step_size(32, 1), step_size(8, -1)), (None, None));
+        // From a hand-set 40, − lands back in range and + does nothing.
+        assert_eq!((step_size(40, -1), step_size(40, 1)), (Some(32), None));
+        assert_eq!((step_size(6, 1), step_size(6, -1)), (Some(8), None));
+
+        let mut cfg = UserConfig::default();
+        cfg.desktop.terminal_font_size = Some(40);
+        let shown = SettingsValues::from_config(&cfg);
+        assert_eq!(shown.font_size, 40);
+        shown.apply(&mut cfg);
+        assert_eq!(cfg.desktop.terminal_font_size, Some(40), "an unrelated save keeps it");
+        cfg.desktop.terminal_font_size = Some(400);
+        assert_eq!(SettingsValues::from_config(&cfg).font_size, 72);
     }
 }

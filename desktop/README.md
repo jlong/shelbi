@@ -34,7 +34,7 @@ editor: code --wait                  # edit:* commands, "Open in editor", Cmd+cl
 desktop:
   cli_path: ~/src/shelbi/target/debug/shelbi   # skip discovery (login PATH, Homebrew, ~/.cargo/bin)
   terminal_font_family: Source Code Pro   # the default; bundled with the app
-  terminal_font_size: 14             # points, 6 to 72
+  terminal_font_size: 14             # points, 6 to 72 (Settings and ⌘+ / ⌘− step within 8 to 32)
   option_as_meta: false              # true, left, or right (Ghostty's shape)
   notifications:                     # every kind is on unless switched off
     workspace_blocked: true          # an agent waits for input or a permission
@@ -47,8 +47,8 @@ desktop:
 | `theme` | `auto` | Color theme. `auto` follows the system appearance live (the TUI reads `auto` as dark). |
 | `editor` | `$EDITOR`, then `vim` | The editor for `edit:*` commands, a task's "Open in editor", and Cmd+click on a path. A terminal editor opens in Terminal.app; a GUI editor directly. |
 | `desktop.cli_path` | discovered | The `shelbi` the app runs. A leading `~/` is expanded. |
-| `desktop.terminal_font_family` | Source Code Pro | Terminal font. |
-| `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72), on 18pt rows at the default. ⌘+ / ⌘− / ⌘0 write it too. |
+| `desktop.terminal_font_family` | Source Code Pro | Terminal font. Settings picks it from the bundled faces and the installed monospaced families; one that isn't installed falls back to Source Code Pro. |
+| `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72; Settings' stepper and ⌘+ / ⌘− step it by 1 within 8 to 32), on 18pt rows at the default. ⌘+ / ⌘− / ⌘0 write it too. |
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
 | `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. |

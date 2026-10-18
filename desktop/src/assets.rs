@@ -206,6 +206,7 @@ heroicons! {
     PENCIL_SQUARE = "pencil-square";
     PLAY = "play";
     PLUS = "plus";
+    MINUS = "minus";
     USER = "user";
     MAGNIFYING_GLASS = "magnifying-glass";
     COG_6_TOOTH = "cog-6-tooth";
