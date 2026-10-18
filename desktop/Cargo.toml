@@ -107,6 +107,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSPathUtilities",
     "NSString",
     "NSURL",
+    "NSUserDefaults",
     "NSValue",
     "block2",
 ] }

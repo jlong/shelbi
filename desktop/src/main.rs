@@ -135,6 +135,8 @@ fn main() {
     if let Mode::PrintVersion = mode {
         std::process::exit(platform::print_version::run());
     }
+    // Before any window (or offscreen render) draws text.
+    platform::font_smoothing::apply();
     #[cfg(feature = "visual-check")]
     if let Mode::VisualCheck(dir) = mode {
         visual_check::run(visual_check::out_dir(dir));

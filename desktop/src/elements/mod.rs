@@ -12,5 +12,9 @@
 //! Licensing: Zed's `terminal` / `terminal_view` crates are GPL-3.0 and
 //! Shelbi is MIT, so their code can't be copied or depended on.
 //! `gpui-terminal` (MIT/Apache-2.0) is the permissive reference.
+//!
+//! [`exact_text`] is a one-line label at its shaped width, unrounded, for
+//! rows that must land on Figma's positions (the sidebar's hotkeys).
 
+pub mod exact_text;
 pub mod terminal;

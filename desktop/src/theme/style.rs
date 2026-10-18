@@ -46,6 +46,7 @@ use shelbi_core::StatusCategory;
 use super::motion::fill_layer;
 use super::{hsla, palette, Theme};
 use crate::assets::{heroicon, status_glyph, Icon, StatusGlyph};
+use crate::elements::exact_text::exact_text;
 
 /// The UI typeface every [`Type`] is set in.
 pub const UI_FAMILY: &str = "Geist";
@@ -259,7 +260,10 @@ pub const NAV_RADIUS: f32 = 6.0;
 
 /// The Navigation component's Hotkey: a chord's keys as plain text glyphs
 /// (`⌘O` is ⌘ and O, 2px apart), X-Small in gray, 4px either side. No
-/// keycaps.
+/// keycaps. Each key is laid out at its exact width ([`exact_text`]), as
+/// Figma does; the modifier glyphs, which Geist lacks, are the system
+/// font's, as in the frames (CoreText's own fallback for Geist draws a
+/// wider, heavier ⌘).
 pub fn hotkey(chord: &str, theme: &Theme) -> Div {
     div()
         .flex()
@@ -270,8 +274,19 @@ pub fn hotkey(chord: &str, theme: &Theme) -> Div {
         .px(px(4.0))
         .type_style(Type::XSmall)
         .text_color(theme.gray)
-        .children(split_chord(chord))
+        .children(split_chord(chord).into_iter().map(|key| {
+            let modifier = key.chars().all(|c| MODIFIERS.contains(&c));
+            let text = exact_text(key);
+            if modifier {
+                text.family(SYSTEM_FAMILY)
+            } else {
+                text
+            }
+        }))
 }
+
+/// gpui's name for the system UI font (SF on macOS).
+const SYSTEM_FAMILY: &str = ".SystemUIFont";
 
 /// A row in a menu or popover list (the project switcher): 32px, 8px
 /// inside, the keyboard's row on the selection fill, others fading a fill in
@@ -846,10 +861,12 @@ pub fn form_button(
         .child(label.into())
 }
 
+/// The modifier glyphs a chord starts with.
+const MODIFIERS: [char; 5] = ['⌘', '⌃', '⌥', '⇧', '⇪'];
+
 /// A chord's keys as macOS spells them: each modifier glyph its own cap,
 /// then the key (`⌃⇧P` → `⌃`, `⇧`, `P`).
 pub fn split_chord(chord: &str) -> Vec<String> {
-    const MODIFIERS: [char; 5] = ['⌘', '⌃', '⌥', '⇧', '⇪'];
     let mut keys = Vec::new();
     let mut rest = chord;
     while let Some(c) = rest.chars().next() {

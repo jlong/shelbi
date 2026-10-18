@@ -20,7 +20,9 @@
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
 //! machines, settings and command-palette, plus the palette states the
-//! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye).
+//! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye)
+//! and the sidebar states no frame draws (`state-sidebar-*`: sections
+//! collapsed, Zen off, the sidebar hidden).
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -907,6 +909,7 @@ impl Run {
         for (keys, screen) in PALETTE_STATES {
             self.palette(&orch, keys, screen);
         }
+        self.sidebar_states(&orch);
 
         let missing: Vec<&str> = SCREENS
             .iter()
@@ -979,6 +982,43 @@ impl Run {
                 TerminalSettings::zoom(FontZoom::ActualSize, cx);
             });
         }
+    }
+
+    /// The sidebar states the frames don't draw, over the orchestrator chat
+    /// (`state-sidebar-<name>-<theme>.png`; no reference, checked by eye):
+    /// the review sections collapsed, every section collapsed, Zen off, and
+    /// the sidebar hidden.
+    fn sidebar_states(&mut self, orch: &View) {
+        use crate::views::sidebar::Section;
+
+        for (name, sections) in [
+            ("reviews-collapsed", &[Section::Ready, Section::Queued][..]),
+            ("all-collapsed", &[Section::Ready, Section::Queued, Section::Workspaces][..]),
+        ] {
+            let handle = self.open();
+            self.click(handle, orch.clone());
+            handle
+                .update(&mut self.cx, |w, _, cx| {
+                    for section in sections {
+                        w.offscreen_toggle_section(*section, cx);
+                    }
+                })
+                .unwrap();
+            self.save(handle, &format!("state-sidebar-{name}"));
+        }
+
+        self.sidebar.zen_mode = shelbi_state::ZenModeState::Off;
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        self.save(handle, "state-sidebar-zen-off");
+        self.sidebar = sidebar_model();
+
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_toggle_sidebar(cx))
+            .unwrap();
+        self.save(handle, "state-sidebar-hidden");
     }
 
     fn views(&mut self, handle: WindowHandle<ShelbiWindow>) -> NativeViews {
