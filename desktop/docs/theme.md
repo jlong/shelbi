@@ -122,7 +122,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 
 | Component | Shape |
 |---|---|
-| Corners | 8px (`rounded_lg`) on panel rows and surfaces; 6px (`NAV_RADIUS`) on the sidebar's rows and chip, buttons, dropdowns and segments (Figma's `6`); 8px on the sidebar's 32px toolbar buttons; 12px on the 32px icon buttons; 4px on keycaps and count badges |
+| Corners | 8px (`rounded_lg`) on panel rows and surfaces; 12px on the board's cards; 6px (`NAV_RADIUS`) on the sidebar's rows and chip, buttons, dropdowns and segments (Figma's `6`); 8px on the sidebar's 32px toolbar buttons; 12px on the 32px icon buttons; 4px on keycaps and count badges |
 | Project switcher | The Navigation component's trigger: 28px, 8px across, 6px corners, the name (Base medium, `foreground`) and the up-down chevron in the muted color; clear at rest, the hover fill, pressed while open. Its menu is a popover 6px below: rows of badge, name and a check on the current project, a rule, then "Add project…"; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
 | Project badge | Two-letter initials (two words, camel case split), bold white, on a fill picked from the name (`badge_fill`); the switcher's menu rows |
 | Toolbar button | The sidebar's titlebar (Search, Toggle sidebar) and footer (Settings): 32px square, 8px corners, the 20px icon in `icon`, the hover fill fading in and a loud icon on hover |
@@ -135,8 +135,8 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Current-selection indicator | A 3x16px `accent` pill at the row's leading edge, on the keyboard's row |
 | Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
 | Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `text/green` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions (the card detail, the error log) are 28px and X-Small, with their key as keycaps |
-| Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control (the board's keyboard card, a dialog's keyboard button, text fields) |
-| Dropdown | A button that opens a menu (the board's and Activity's filters): the Figma Button at X-Small with a left icon, 24px tall, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the icon sits in Figma's 14px Icon slot (`icon_slot`); pressed while its menu is open, and the menu opens 6px under it |
+| Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, text fields) |
+| Dropdown | A button that opens a menu (the board's filters): the Figma Button at X-Small with a left icon, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the 18px icon (`icons::FUNNEL_BUTTON`, in `button_icon`) sits in Figma's 14px Icon slot (`icon_slot`), which makes the button 26px tall; pressed while its menu is open (the icon keeps its color), and the menu opens 6px under it |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
 | Segmented control | No track: segments in a bare row 4px apart, the selected one on the `selection` chip, which slides between them. Settings' (`choice_track` / `choice`): 26px, 12px across, Base; the selected one Base medium and loud, the others `form_text`, a fill fading in on hover. Activity's kind filter is its own (below) |
@@ -148,7 +148,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Menu, popover | `raised`, 8px corners, a 1px `ring` and a soft drop |
 | Palette | The Command palette frame: over the `scrim`, 200px down, 788px wide (a 580px commands column, a 160px Projects column, 16px between and either side); `raised`, 8px corners, no ring, `palette_shadow` (0 10 15 -3). A 44px query line (`❯`, a 2x18px `link` caret, the placeholder `muted`), 32px rows (6px across and between, 6px corners: a 20px `icon`, the name in a 220px column in Base medium `foreground`, the description in Base `muted`; the selected row on `background`, its name Base semibold `text_loud`, its description `foreground`), 26px project rows, an X-Small `muted` footer |
 | Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
-| Card | `card` with `shadow/raised card`, 8px corners, 12px inside, 6px between the title (Base medium, two lines), the excerpt (X-Small on an 18px line, `foreground`, four lines) and the meta row (the workflow badge, 4px across with 2px corners, then the branch in `muted`); the keyboard's card wears the focus ring and glow instead of the shadow |
+| Card | `card` with `shadow/raised card`, 12px corners, 12px inside, 6px between the title (Base medium, two lines), the excerpt (X-Small on an 18px line, `foreground`, four lines, 244px wide) and the meta row (the workflow badge, 4px across with 2px corners, then the branch in `muted`); the keyboard's card wears the focus ring and glow instead of the shadow |
 | Chip, badge | 20px, 6px across, X-Small medium, the hue's text on its tint; a workflow name is `workflow_badge_text` on `workflow_badge` |
 | Zen pill | 42px, the sidebar's width inside 8px, fully rounded: `zen` (the Success fill) over the canvas with a `success` (`text/green`) "Zen mode on"; off, `background` over the canvas with "Zen mode off" in `foreground`. A click toggles Zen |
 | Empty state | A muted sentence on why there is nothing, and the action that changes it |
@@ -243,6 +243,7 @@ until a new role has its row here, with the values the palette really has.
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
 | `icon` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: icons at rest |
+| `button_icon` | `#acb4cf99` | `#7b85a7e5` | The Button component's icon stroke (the board's filters and New issue): `#acb4cf` at 60% in Dark, `theme.gray` in Light |
 | `accent` | `#62cdf6` | `#f21478` | `icon/select`: the selected nav icon, the selection pill, the current project's check |
 | `icon_cyan` | `#62cdf6` | `#31ade9` | `icon/cyan`: ready for review |
 | `icon_green` | `#31d924` | `#5ac351` | `icon/green`: a working workspace |
@@ -395,6 +396,7 @@ with its worst ratio. **Flagged for John.**
 | dark | error on rest button | 4.30 | The Danger label on the Danger fill over the sidebar (AA over the canvas) |
 | dark | error on hover button | 3.94 | The same, hovered |
 | dark | error on pressed button | 3.53 | The same, pressed |
+| dark | button_icon on | 2.58 | The Button component's icon (`#acb4cf` at 60%) on a button's fill over the sidebar; decorative beside the button's label |
 | dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
 | dark | form_text on | 2.53 | The Settings frame's `theme.gray` override, `#7b85a7`: a field's value and an unselected choice 4.30 on the canvas, "Open keys.yaml" 2.53 on its `theme.search` fill |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
@@ -409,6 +411,7 @@ with its worst ratio. **Flagged for John.**
 | light | dark_gray on selection | 4.08 | The selected Machines row: the branch in `theme.ansi_dark_gray` |
 | light | theme_green on selection | 4.02 | The same row: `working` in `theme.green` (5.0 on white) |
 | light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
+| light | button_icon on | 2.81 | `theme.gray` as the Button component's icon, on a button's fill; decorative beside the label |
 | light | input_border on | 1.06 | `theme.divider` as a field's edge |
 | light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
 

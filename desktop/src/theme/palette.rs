@@ -68,6 +68,9 @@ pub mod figma {
     pub const ICON_GREEN: Pair = pair(0x31d924ff, 0x5ac351ff);
     pub const ICON_YELLOW: Pair = pair(0xffdd64ff, 0xffca0dff);
     pub const ICON_PURPLE: Pair = pair(0xe374ffff, 0xb247e7ff);
+    /// The Button component's icon (its drawings' stroke): `#acb4cf` at 60%
+    /// in Dark, `theme.gray` in Light.
+    pub const BUTTON_ICON: Pair = pair(0xacb4cf99, 0x7b85a7e5);
     /// `text/green`: success text, the Zen pill's label.
     pub const TEXT_GREEN: Pair = pair(0x31d924ff, 0x00753dff);
     /// `text/link` (Dark from the Review frame, Light from its light frame;
@@ -286,6 +289,8 @@ palette! {
     // ---- Icons --------------------------------------------------------------
     /// Icons at rest (`theme.gray`).
     icon,
+    /// A button's icon (the Button component's: dimmer than `icon` in Dark).
+    button_icon,
     /// The selected nav icon and the current-selection marker: cyan in
     /// Dark, pink in Light (`icon/select`).
     accent,
@@ -466,6 +471,7 @@ impl Palette {
             log_text: pick(GRAY_ACTIVITY),
 
             icon: pick(GRAY),
+            button_icon: pick(BUTTON_ICON),
             accent: pick(ICON_SELECT),
             icon_cyan: pick(ICON_CYAN),
             icon_green: pick(ICON_GREEN),
@@ -594,6 +600,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "error on pressed button"),
     ("dark", "input_border on"),
     ("dark", "form_text on"),
+    ("dark", "button_icon on"),
     ("light", "muted on"),
     ("light", "gray on"),
     ("light", "log_text on"),
@@ -608,6 +615,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "theme_cyan on selection"),
     ("light", "input_border on"),
     ("light", "form_text on"),
+    ("light", "button_icon on"),
 ];
 
 #[cfg(test)]
@@ -752,6 +760,12 @@ mod tests {
             check(format!("gray on keycap over {sname}"), p.gray, flatten(p.keycap, s), AA);
             // Non-text (WCAG 1.4.11): icons, the focus ring, a field's edge.
             check(format!("icon on {sname}"), p.icon, s, NON_TEXT);
+            check(
+                format!("button_icon on rest button over {sname}"),
+                p.button_icon,
+                flatten(p.background, s),
+                NON_TEXT,
+            );
             check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
             check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
         }
