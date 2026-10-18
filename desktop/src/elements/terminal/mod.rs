@@ -101,7 +101,7 @@ use layout::RowCache;
 use metrics::CellMetrics;
 use search_bar::{BarKey, SearchBar};
 use session::SessionIo;
-pub use settings::TerminalSettings;
+pub use settings::{FontZoom, TerminalSettings};
 
 use crate::assets::{heroicon, icons, Icon};
 use crate::theme::Theme;

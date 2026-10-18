@@ -195,7 +195,7 @@ impl SettingsView {
         let font_family = input("Source Code Pro", window, cx);
         let font_size = input("14", window, cx);
         let cli_path = input("Found automatically", window, cx);
-        let subscriptions = [&font_family, &font_size, &cli_path]
+        let mut subscriptions: Vec<Subscription> = [&font_family, &font_size, &cli_path]
             .into_iter()
             .map(|state| {
                 cx.subscribe_in(state, window, |this, _, event: &InputEvent, _, cx| {
@@ -205,6 +205,9 @@ impl SettingsView {
                 })
             })
             .collect();
+        subscriptions.push(cx.observe_global_in::<TerminalSettings>(window, |this, window, cx| {
+            this.font_size_changed(window, cx)
+        }));
         let mut view = SettingsView {
             font_family,
             font_size,
@@ -280,6 +283,26 @@ impl SettingsView {
             .ok();
         })
         .detach();
+    }
+
+    /// The font size changed outside the form (View ▸ Bigger / Smaller /
+    /// Actual Size): show the new setting, so the form agrees with
+    /// `config.yaml` and its next save keeps the size.
+    fn font_size_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.loaded {
+            return;
+        }
+        let setting = TerminalSettings::current(cx).font_size_setting;
+        let shown = self.font_size.read(cx).value().trim().to_string();
+        let agrees = match setting {
+            None => shown.is_empty(),
+            Some(size) => shown.parse::<u16>() == Ok(size),
+        };
+        if !agrees {
+            let value = setting.map(|s| s.to_string()).unwrap_or_default();
+            self.font_size.update(cx, |s, cx| s.set_value(value, window, cx));
+            cx.notify();
+        }
     }
 
     fn values(&self, cx: &Context<Self>) -> SettingsValues {

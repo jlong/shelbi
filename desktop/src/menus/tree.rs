@@ -91,6 +91,12 @@ pub enum AppCommand {
     Copy,
     Paste,
     SelectAll,
+    /// View ▸ Bigger (⌘+): the terminal font, a point larger.
+    FontBigger,
+    /// View ▸ Smaller (⌘−): the terminal font, a point smaller.
+    FontSmaller,
+    /// View ▸ Actual Size (⌘0): the terminal font back to the default.
+    FontActualSize,
     Documentation,
     ReportIssue,
 }
@@ -243,6 +249,18 @@ fn global_shortcut(keymaps: &Keymaps, action: GlobalAction) -> Option<Shortcut> 
         .find_map(menu_shortcut)
 }
 
+/// The terminal font zoom items' shortcuts (⌘+ ⌘− ⌘0). The window takes
+/// the chords itself (`crate::keys::font_zoom`); here they label the items.
+pub fn font_zoom_shortcut(command: AppCommand) -> Option<Shortcut> {
+    let spec = match command {
+        AppCommand::FontBigger => crate::keys::FONT_BIGGER,
+        AppCommand::FontSmaller => crate::keys::FONT_SMALLER,
+        AppCommand::FontActualSize => crate::keys::FONT_ACTUAL_SIZE,
+        _ => return None,
+    };
+    shortcut(&KeyChord::parse(spec).ok()?)
+}
+
 /// A [`FIXED_SHORTCUTS`] entry's shortcut.
 pub fn fixed_shortcut(command: AppCommand) -> Option<Shortcut> {
     let (_, spec) = FIXED_SHORTCUTS.iter().find(|(c, _)| *c == command)?;
@@ -263,8 +281,6 @@ pub fn keystroke(chord: &KeyChord) -> Option<String> {
     let mut mods = chord.mods;
     let key = match chord.code {
         Key::Char(' ') => "space".to_string(),
-        // A `-` key collides with the separator in gpui's syntax.
-        Key::Char('-') => return None,
         Key::Char(c) if c.is_ascii_uppercase() => {
             mods |= Mods::SHIFT;
             c.to_ascii_lowercase().to_string()
@@ -515,6 +531,12 @@ fn view_menu(
             keyed("Focus Sidebar", AppCommand::FocusSidebar, GlobalAction::FocusSidebar),
             keyed("Focus Main Area", AppCommand::FocusMain, GlobalAction::FocusMain),
             MenuEntry::Separator,
+            // The terminal font, in every terminal pane (the window zoom is
+            // Window ▸ Zoom).
+            app("Bigger", AppCommand::FontBigger),
+            app("Smaller", AppCommand::FontSmaller),
+            app("Actual Size", AppCommand::FontActualSize),
+            MenuEntry::Separator,
             slot(
                 "action:toggle-zen",
                 zen_title,
@@ -614,7 +636,7 @@ fn app_item(title: &str, command: AppCommand) -> MenuItemSpec {
         action: MenuAction::App(command),
         enabled: true,
         checked: false,
-        shortcut: fixed_shortcut(command),
+        shortcut: fixed_shortcut(command).or_else(|| font_zoom_shortcut(command)),
     }
 }
 
@@ -919,6 +941,46 @@ mod tests {
         assert_eq!(item.shortcut.as_ref().unwrap().keystroke, "ctrl-alt-shift-z");
         let palette = find(&tree, "Command Palette").shortcut.clone().unwrap();
         assert_eq!((palette.keystroke.as_str(), palette.display.as_str()), ("shift-cmd-p", "⇧⌘P"));
+    }
+
+    #[test]
+    fn view_has_the_terminal_font_zoom_beside_the_window_zoom() {
+        let tree = build(&fixture(), &defaults(), WindowFacts::default());
+        let view = tree.menu("View").unwrap();
+        assert_eq!(
+            titles(&view.items),
+            [
+                "Command Palette",
+                "Hide Sidebar",
+                "-",
+                "Focus Sidebar",
+                "Focus Main Area",
+                "-",
+                "Bigger",
+                "Smaller",
+                "Actual Size",
+                "-",
+                "Turn Zen Mode On",
+                "Error Log",
+            ]
+        );
+        for (title, command, keystroke, display) in [
+            ("Bigger", AppCommand::FontBigger, "cmd-+", "⌘+"),
+            ("Smaller", AppCommand::FontSmaller, "cmd--", "⌘-"),
+            ("Actual Size", AppCommand::FontActualSize, "cmd-0", "⌘0"),
+        ] {
+            let item = find(&tree, title);
+            assert!(item.enabled, "{title}");
+            assert_eq!(item.action, MenuAction::App(command));
+            let shortcut = item.shortcut.as_ref().unwrap();
+            assert_eq!(
+                (shortcut.keystroke.as_str(), shortcut.display.as_str()),
+                (keystroke, display)
+            );
+        }
+        // Window ▸ Zoom stays the window zoom.
+        assert_eq!(find(&tree, "Zoom").action, MenuAction::App(AppCommand::Zoom));
+        assert_eq!(titles(&tree.menu("Window").unwrap().items)[..2], ["Minimize", "Zoom"]);
     }
 
     #[test]
