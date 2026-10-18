@@ -28,6 +28,7 @@ use shelbi_core::{Column, Issue};
 use crate::views::activity::ActivityView;
 use crate::views::issues::IssuesView;
 use crate::views::machines::MachinesView;
+use crate::theme::style::{Type, Typography};
 
 const PROJECT: &str = "demo";
 
@@ -247,10 +248,10 @@ impl gpui::Render for Screen {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.surface)
-            .text_color(theme.text)
+            .bg(theme.canvas)
+            .text_color(theme.foreground)
             .font_family("Geist")
-            .text_sm()
+            .type_style(Type::Base)
             .child((self.0)(&theme, window))
     }
 }

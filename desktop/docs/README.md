@@ -17,7 +17,7 @@ stub arms it implemented. `dt-parity-audit` removed the stub for good.
 | Doc | What it is |
 |---|---|
 | [`parity.md`](parity.md) | TUI parity: where each client shows every view-model field (guarded by a test), and the hand walk of every command in both clients |
-| [`theme.md`](theme.md) | The desktop's palette (Taskpage's roles, light and dark), its contrast rules, and the shared component shapes |
+| [`theme.md`](theme.md) | The desktop's palette (the Figma tokens as roles, dark and light), its type styles, the terminal font, its contrast rules and exceptions, and the shared component shapes |
 | [`gpui.md`](gpui.md) | The gpui channel: what is pinned and why, the breakage log, gpui quirks met along the way |
 | [`status/desktop-app.md`](status/desktop-app.md) | The umbrella: foundation, and the record of the whole effort |
 
@@ -90,7 +90,8 @@ is left, and how it was verified.
 | `dt-board-stale-after-own-mutation` | A card's second change goes right after its first: the daemon's reply carries the state the change landed at, and the board sends the next one against it | [`status/dt-board-stale-after-own-mutation.md`](status/dt-board-stale-after-own-mutation.md) |
 | `dt-switch-project-in-window` | A project switch retargets the current window in place, restoring where the project was left; File ▸ New Window (⌘⇧N) opens more; window frames per slot, restored at launch | [`status/dt-switch-project-in-window.md`](status/dt-switch-project-in-window.md) |
 | `dt-figma-visual-harness` | `--visual-figma` renders the ten Figma mockup screens in both themes over the mockups' content; `scripts/figma-diff.sh` diffs them against the reference PNGs; the baseline report | [`status/dt-figma-visual-harness.md`](status/dt-figma-visual-harness.md) |
-| `dt-taskpage-theme` | The desktop's own palette and component shapes after the Taskpage design system, light and dark; the TUI keeps its colors | [`theme.md`](theme.md) |
+| `dt-taskpage-theme` | The desktop's own palette and component shapes after the Taskpage design system, light and dark (superseded by `dt-figma-theme`) | [`theme.md`](theme.md) |
+| `dt-figma-theme` | The Figma design system's palette, type styles and Source Code Pro terminal font replace Taskpage's, in both themes | [`status/dt-figma-theme.md`](status/dt-figma-theme.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

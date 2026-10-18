@@ -859,7 +859,7 @@ impl Render for SessionView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.surface);
+            .bg(theme.canvas);
         if let Slot::Live(pane) = &self.slot {
             // The grid keeps clear of the frame's edges (the column divider,
             // the window's corner): 12px on the leading side, 8px top and
@@ -879,7 +879,7 @@ impl Render for SessionView {
                     if i == 0 {
                         row.font_weight(FontWeight::SEMIBOLD).text_color(theme.text_loud)
                     } else {
-                        row.text_color(theme.text_quiet)
+                        row.text_color(theme.muted)
                     }
                 },
             ));
@@ -891,7 +891,7 @@ impl Render for SessionView {
                 // the main area.
                 .max_w_full()
                 .text_center()
-                .text_color(theme.text_quiet)
+                .text_color(theme.muted)
                 .child(self.notice().unwrap_or_default()),
         )
     }

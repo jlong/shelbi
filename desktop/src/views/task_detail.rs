@@ -8,7 +8,7 @@
 //! user's configured editor. Keys are the TUI popover's (`keys.yaml`
 //! `popover:`) plus the desktop's `s` / `a` / `e` / `E`.
 
-use gpui::{div, prelude::*, px, relative, ClickEvent, Context, ElementId, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, relative, ClickEvent, Context, ElementId, SharedString};
 use gpui_kit::component::input::Textarea;
 use gpui_kit::component::text::TextView;
 use shelbi_app::TaskDetailModel;
@@ -19,6 +19,7 @@ use super::markdown;
 use crate::assets::{heroicon, icons, Icon};
 use crate::theme::style::{self, ButtonKind, IconButtonSize};
 use crate::theme::{Hue, Theme};
+use crate::theme::style::{Type, Typography};
 
 pub fn render(
     view: &IssuesView,
@@ -52,8 +53,7 @@ pub fn render(
                 .flex_1()
                 .min_w_0()
                 .pt(px(4.0))
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
+                .type_style(Type::Heading)
                 .text_color(theme.text_loud)
                 .child(d.title.clone()),
         )
@@ -70,7 +70,7 @@ pub fn render(
                 })),
         );
 
-    let mut fields = div().flex().flex_col().gap(px(6.0)).px_5().pb_4().text_sm();
+    let mut fields = div().flex().flex_col().gap(px(6.0)).px_5().pb_4().type_style(Type::Base);
     fields = fields.child(field(theme, "id", d.id.clone()));
     fields = fields.child(
         div()
@@ -80,7 +80,7 @@ pub fn render(
             .gap_2()
             .child(label(theme, "status"))
             .child(style::chip(d.status_label.clone(), Hue::Neutral, theme))
-            .child(div().text_color(theme.text_quiet).child(format!("priority {}", d.priority))),
+            .child(div().text_color(theme.muted).child(format!("priority {}", d.priority))),
     );
     fields = fields.child(
         div()
@@ -98,7 +98,7 @@ pub fn render(
             .flex_row()
             .gap_2()
             .child(label(theme, "workspace"))
-            .child(div().text_color(theme.text_quiet).child("Unassigned"))
+            .child(div().text_color(theme.muted).child("Unassigned"))
             .into_any_element(),
     });
     if let Some(b) = &d.branch {
@@ -240,7 +240,7 @@ pub fn render(
         .gap_1()
         .px_5()
         .when_some(pending, |d, p| {
-            d.child(div().text_xs().text_color(theme.text_quiet).child(p))
+            d.child(div().type_style(Type::XSmall).text_color(theme.muted).child(p))
         })
         .when_some(notice, |d, n| {
             d.child(
@@ -249,7 +249,7 @@ pub fn render(
                     .flex_row()
                     .items_start()
                     .gap_1()
-                    .text_xs()
+                    .type_style(Type::XSmall)
                     .text_color(theme.error)
                     .child(
                         heroicon(icons::EXCLAMATION_TRIANGLE)
@@ -278,7 +278,7 @@ pub fn render(
             .gap_2()
             .px_5()
             .pb_4()
-            .child(div().text_color(theme.text_quiet).child("This issue has no description yet."))
+            .child(div().text_color(theme.muted).child("This issue has no description yet."))
             .child(
                 action(theme, "detail-add-description", Some(icons::PENCIL_SQUARE), "Write one", "e", ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -327,7 +327,7 @@ pub fn render(
         .child(fields)
         .child(actions)
         .child(status_rows)
-        .child(div().h(px(1.0)).mx_5().mt_1().mb_4().bg(theme.rule))
+        .child(div().h(px(1.0)).mx_5().mt_1().mb_4().bg(theme.divider))
         .child(body);
 
     backdrop(theme, cx)
@@ -340,7 +340,7 @@ fn label(theme: &Theme, text: &str) -> impl IntoElement {
     div()
         .w(px(88.0))
         .flex_none()
-        .text_color(theme.text_quiet)
+        .text_color(theme.muted)
         .child(text.to_string())
 }
 
@@ -350,7 +350,7 @@ fn field(theme: &Theme, name: &str, value: String) -> impl IntoElement {
         .flex_row()
         .gap_2()
         .child(label(theme, name))
-        .child(div().text_color(theme.text).child(value))
+        .child(div().text_color(theme.foreground).child(value))
 }
 
 /// A compact action: a 28px Taskpage button, its icon, its label and the
@@ -369,7 +369,7 @@ fn action(
         .h(px(28.0))
         .px(px(10.0))
         .gap(px(6.0))
-        .text_xs()
+        .type_style(Type::XSmall)
         .when_some(icon, |b, icon| b.pl(px(8.0)).child(heroicon(icon).text_color(fg)))
         .child(text.to_string())
         .when(!key.is_empty(), |b| b.child(style::keycaps(key, theme)))

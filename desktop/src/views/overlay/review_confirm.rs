@@ -80,14 +80,14 @@ pub fn render<H: OverlayHost>(dialog: &Dialog, theme: &Theme, cx: &mut Context<H
                         .when(selected && dialog.focus() == ConfirmFocus::List, |r| {
                             r.bg(theme.row_selected).child(style::selection_indicator(theme))
                         })
-                        .when(!selected, |r| r.hover(|s| s.bg(theme.fill_subtle)))
+                        .when(!selected, |r| r.hover(|s| s.bg(theme.background)))
                         .child(
                             div()
                                 .when(selected, |n| n.text_color(theme.text_loud).font_weight(FontWeight::SEMIBOLD))
                                 .when(!selected, |n| n.text_color(theme.text_loud))
                                 .child(slot.name.clone()),
                         )
-                        .child(div().text_color(theme.text_quiet).child(slot.state_note()))
+                        .child(div().text_color(theme.muted).child(slot.state_note()))
                         .on_click(cx.listener(on_dialog(move |d| d.click_slot(i)))),
                 );
             }
@@ -99,7 +99,7 @@ pub fn render<H: OverlayHost>(dialog: &Dialog, theme: &Theme, cx: &mut Context<H
                     .flex()
                     .flex_row()
                     .flex_wrap()
-                    .text_color(theme.text)
+                    .text_color(theme.foreground)
                     .child("Load onto review workspace\u{00a0}")
                     .child(
                         div()
@@ -112,7 +112,7 @@ pub fn render<H: OverlayHost>(dialog: &Dialog, theme: &Theme, cx: &mut Context<H
             if let Some(occupant) = &slot.occupant {
                 body = body.child(
                     div()
-                        .text_color(theme.text_quiet)
+                        .text_color(theme.muted)
                         .child(format!("(returns \"{occupant}\" to the queue)")),
                 );
             }

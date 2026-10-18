@@ -16,7 +16,7 @@
 //! - drives mouse events and checks the ownership rules (wheel and drag are
 //!   Shelbi's until the program reports the mouse; Shift reclaims them);
 //! - resizes the window and checks the debounced size report;
-//! - checks the fonts (Geist Mono bundled, every showcase glyph found in some
+//! - checks the fonts (Source Code Pro bundled, every showcase glyph found in some
 //!   font, a live font change re-measuring the grid), the find bar, word /
 //!   line / block selection, the scrollbar and "Jump to bottom", output not
 //!   yanking a scrolled-up view, Cmd-hover and Cmd+click links, the
@@ -673,20 +673,20 @@ impl Check {
     }
 
     fn fonts(&mut self) {
-        // The bundled Geist Mono is the default, with no system install.
+        // The bundled Source Code Pro is the default, with no system install.
         let family = self
             .with_pane(|pane, _, _| pane.metrics.as_ref().map(|m| m.font.family.to_string()))
             .unwrap();
         self.expect(
-            "the terminal font is the bundled Geist Mono",
-            family.as_deref() == Some("Geist Mono"),
+            "the terminal font is the bundled Source Code Pro",
+            family.as_deref() == Some("Source Code Pro"),
             format!("{family:?}"),
         );
 
         // Every glyph of the fallback showcase comes from some font: no
         // `.notdef` (glyph 0, the missing-glyph box).
         self.reset_screen();
-        let sample = "Geist Mono → 漢字かな한국어 👍🎉 ✓ │ ⏺ ✻ ⎿ \u{e0a0} \u{e0b0} \u{f121} \u{f07b} \u{e7a8}";
+        let sample = "Source Code Pro → 漢字かな한국어 👍🎉 ✓ │ ⏺ ✻ ⎿ \u{e0a0} \u{e0b0} \u{f121} \u{f07b} \u{e7a8}";
         self.feed(format!("{sample}\r\n").as_bytes());
         self.save("fallback.png");
         let missing = self
@@ -704,13 +704,13 @@ impl Check {
                         underline: None,
                         strikethrough: None,
                     };
-                    let line = text_system.shape_line(text, px(13.0), &[run], None);
+                    let line = text_system.shape_line(text, px(14.0), &[run], None);
                     line.runs.iter().flat_map(|r| r.glyphs.iter()).map(|g| g.id.0).collect()
                 };
                 let mut missing = Vec::new();
                 let mut private_use = Vec::new();
                 for ch in sample.chars().filter(|c| *c != ' ') {
-                    let got = glyphs(ch, terminal_font("Geist Mono"));
+                    let got = glyphs(ch, terminal_font("Source Code Pro"));
                     // A glyph no font has comes back as `.notdef` (glyph 0).
                     if got.is_empty() || got.contains(&0) {
                         missing.push(format!("{ch}: no glyph"));

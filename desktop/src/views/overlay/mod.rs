@@ -33,6 +33,7 @@ use shelbi_state::keymap::{Key, KeyChord, Keymaps};
 
 use crate::theme::style::{self, ButtonKind};
 use crate::theme::Theme;
+use crate::theme::style::{Type, Typography};
 
 /// What the window should do after an overlay took input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,7 +386,7 @@ pub fn render_layer<H: OverlayHost>(
         .when(top_aligned, |d| d.justify_start().pt(px(palette_top(size.height.as_f32()))))
         .when(!top_aligned, |d| d.justify_center())
         .font_family("Geist")
-        .text_sm()
+        .type_style(Type::Base)
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this: &mut H, _, window, cx| {
@@ -444,7 +445,7 @@ pub fn button_label(label: &str) -> String {
 
 /// The panel's title line (the TUI's border title).
 pub fn title(text: impl Into<gpui::SharedString>, theme: &Theme) -> gpui::Div {
-    style::heading(text, theme).text_base().px_4().pt_4().pb_1()
+    style::heading(text, theme).px_4().pt_4().pb_1()
 }
 
 /// The hint line at a panel's foot.
@@ -453,8 +454,8 @@ pub fn hint(text: impl Into<gpui::SharedString>, theme: &Theme) -> gpui::Div {
         .px_4()
         .pb_3()
         .pt_1()
-        .text_xs()
-        .text_color(theme.text_quiet)
+        .type_style(Type::XSmall)
+        .text_color(theme.muted)
         .child(text.into())
 }
 

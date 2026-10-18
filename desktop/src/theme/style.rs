@@ -1,28 +1,36 @@
-//! Taskpage's component shapes, in the palette's roles.
+//! The Figma design system's text styles ([`Type`]) and the component
+//! shapes every view shares, in the palette's roles.
 //!
 //! One place for the shapes every view shares, so a button or a selected row
 //! reads the same in the sidebar, a panel, the board and an overlay:
 //!
+//! - text in the Figma styles ([`Type`], applied with
+//!   [`Typography::type_style`]): Base 14/18, Small 13/18, X-Small 12/16,
+//!   Heading 20/28, all Geist;
 //! - 8px corners everywhere ([`gpui::Styled::rounded_lg`]), 12px on the
 //!   larger icon buttons;
 //! - nav rows 40px tall with the content 8px inside, labels medium weight,
-//!   the selected row a raised chip ([`nav_chip`]: white with Taskpage's
-//!   `shadow-nav` in light, a lifted surface with a 1px ring in dark);
-//! - buttons semibold with a 1px boundary ([`button`]): primary the brand
-//!   fill, secondary the control fill (a visible border in dark), danger the
-//!   error fill, quiet only a hover fill;
+//!   the selected row a raised chip ([`nav_chip`]: the canvas with Figma's
+//!   `shadow/raised card`);
+//! - buttons medium weight on the overlay fill, no boundary ([`button`]):
+//!   the Figma Button component's Default (`theme.background`), Success
+//!   (green tint, `text/green`) and Danger (pink tint) styles, quiet only a
+//!   hover fill;
 //! - quiet icon buttons ([`icon_button`]) 24/32/40px on a hover fill;
 //! - controls that open something ([`dropdown`]), segmented controls
 //!   ([`segment_track`], [`segment`]) and the sidebar's search box
-//!   ([`search_box`], with Taskpage's [`keycaps`]);
+//!   ([`search_box`], with the Hotkey [`keycaps`]);
 //! - a project's initials badge ([`project_badge`]);
 //! - every hover and press fades over about 200ms ([`motion::fill_layer`]);
-//! - menus, popovers and the palette raised with a ring and `shadow-lg`
+//! - menus, popovers and the palette raised with a ring and a soft drop
 //!   ([`popover`]);
 //! - chips tinted from one hue ([`chip`]);
-//! - the brand pill marking the keyboard-current row ([`selection_indicator`]).
+//! - the accent pill marking the keyboard-current row
+//!   ([`selection_indicator`]);
+//! - the keyboard focus as Figma draws it: a 1px `focus/default/ring` and a
+//!   4px `focus/default/focus-glow` ([`focus_shadow`]).
 //!
-//! Spacing follows Taskpage's 8px scale (2, 4, 6, 8, 10, 12, 16, 20, 24...).
+//! Spacing follows Figma's scale (2, 4, 6, 8, 12, 16).
 
 use gpui::{
     div, point, prelude::*, px, AnyView, App, BoxShadow, Div, FontWeight, Hsla,
@@ -33,25 +41,100 @@ use super::motion::fill_layer;
 use super::{hsla, palette, Hue, Theme};
 use crate::assets::{heroicon, icons, Icon};
 
-/// A nav row's height (Taskpage's `h-5`). The chip inside is inset 2px top
+/// The UI typeface every [`Type`] is set in.
+pub const UI_FAMILY: &str = "Geist";
+
+/// The Figma text styles (`Desktop/...`), all Geist. Views name one of these
+/// rather than a size, a line height and a weight apiece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    /// `Desktop/Heading`: 20 / 28, bold. A page or dialog title.
+    Heading,
+    /// `Desktop/Base/Regular`: 14 / 18. Body text, nav labels, card titles'
+    /// descriptions in a dialog.
+    Base,
+    /// `Desktop/Base/Medium`: 14 / 18, 500. The selected nav label, card
+    /// titles.
+    BaseMedium,
+    /// `Desktop/Base/Semibold`: 14 / 18, 600. The palette's current row.
+    BaseSemibold,
+    /// `Desktop/Small/Regular`: 13 / 18. Sidebar rows.
+    Small,
+    /// `Desktop/Small/Medium`: 13 / 18, 500. Section headers, button labels.
+    SmallMedium,
+    /// `Desktop/X-Small/Regular`: 12 / 16. Metadata, hotkeys, hints.
+    XSmall,
+    /// `Desktop/X-Small/Medium`: 12 / 16, 500. Chips, compact buttons.
+    XSmallMedium,
+    /// `Desktop/X-Small/Semibold`: 12 / 16, 600. A workspace's agent.
+    XSmallSemibold,
+}
+
+impl Type {
+    /// The font size in points.
+    pub fn size(self) -> f32 {
+        match self {
+            Type::Heading => 20.0,
+            Type::Base | Type::BaseMedium | Type::BaseSemibold => 14.0,
+            Type::Small | Type::SmallMedium => 13.0,
+            Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 12.0,
+        }
+    }
+
+    /// The line height in points.
+    pub fn line_height(self) -> f32 {
+        match self {
+            Type::Heading => 28.0,
+            Type::Base | Type::BaseMedium | Type::BaseSemibold | Type::Small | Type::SmallMedium => 18.0,
+            Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 16.0,
+        }
+    }
+
+    pub fn weight(self) -> FontWeight {
+        match self {
+            Type::Base | Type::Small | Type::XSmall => FontWeight::NORMAL,
+            Type::BaseMedium | Type::SmallMedium | Type::XSmallMedium => FontWeight::MEDIUM,
+            Type::BaseSemibold | Type::XSmallSemibold => FontWeight::SEMIBOLD,
+            Type::Heading => FontWeight::BOLD,
+        }
+    }
+}
+
+/// Set an element's text in a [`Type`]: Geist at the style's size, line
+/// height and weight.
+pub trait Typography: Styled + Sized {
+    fn type_style(self, ty: Type) -> Self {
+        self.font_family(UI_FAMILY)
+            .text_size(px(ty.size()))
+            .line_height(px(ty.line_height()))
+            .font_weight(ty.weight())
+    }
+}
+
+impl<E: Styled> Typography for E {}
+
+/// A nav row's height. The chip inside is inset 2px top
 /// and bottom.
 pub const NAV_ROW_H: f32 = 40.0;
 /// A list row's height in the leading column (workspaces, machine groups,
-/// project rows): Taskpage's 32px control height, so a long list stays
+/// project rows): a 32px control height, so a long list stays
 /// scannable.
 pub const LIST_ROW_H: f32 = 32.0;
 /// A button's height at the medium size.
 pub const BUTTON_H: f32 = 32.0;
 
-/// Taskpage's `shadow-nav`: a 2px drop and a 1px hairline ring.
-pub fn nav_shadow(theme: &Theme) -> Vec<BoxShadow> {
+/// Figma's `shadow/raised card`: three soft drops (0 4 4, 0 11 0 -8,
+/// 0 3 0 -1) and a 1px ring. The selected nav chip and the board's cards.
+pub fn raised_card_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![
-        BoxShadow::new(px(0.0), px(2.0), theme.nav_shadow),
-        ring_shadow(theme.nav_selected_ring),
+        BoxShadow::new(px(0.0), px(4.0), theme.shadow).blur_radius(px(4.0)),
+        BoxShadow::new(px(0.0), px(11.0), theme.shadow).spread_radius(px(-8.0)),
+        BoxShadow::new(px(0.0), px(3.0), theme.shadow).spread_radius(px(-1.0)),
+        ring_shadow(theme.shadow_ring),
     ]
 }
 
-/// Tailwind's `shadow-lg` plus a 1px ring (`ring-1 ring-black-600/5`).
+/// A soft drop plus a 1px ring, for a menu or popover.
 pub fn popover_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![
         BoxShadow::new(px(0.0), px(10.0), theme.shadow)
@@ -64,8 +147,8 @@ pub fn popover_shadow(theme: &Theme) -> Vec<BoxShadow> {
     ]
 }
 
-/// Tailwind's `shadow-xl` plus the 1px ring: a dialog over the scrim (the
-/// palette, confirmations).
+/// A deeper drop plus the 1px ring: a dialog over the scrim (the palette,
+/// confirmations).
 pub fn dialog_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![
         BoxShadow::new(px(0.0), px(20.0), theme.shadow)
@@ -78,20 +161,17 @@ pub fn dialog_shadow(theme: &Theme) -> Vec<BoxShadow> {
     ]
 }
 
-/// Paint `el` as a dialog: a raised surface with `shadow-xl`.
+/// Paint `el` as a dialog: a raised surface with the deeper drop.
 pub fn dialog<E: Styled>(el: E, theme: &Theme) -> E {
-    el.bg(theme.surface_raised)
+    el.bg(theme.raised)
         .rounded_lg()
         .shadow(dialog_shadow(theme))
-        .text_color(theme.text)
+        .text_color(theme.foreground)
 }
 
-/// A card's resting elevation: the ring and a 1px drop.
+/// A card's resting elevation: Figma's `shadow/raised card`.
 pub fn card_shadow(theme: &Theme) -> Vec<BoxShadow> {
-    vec![
-        BoxShadow::new(px(0.0), px(1.0), theme.nav_shadow),
-        ring_shadow(theme.ring),
-    ]
+    raised_card_shadow(theme)
 }
 
 /// A 1px ring drawn outside the box, so it takes no layout room.
@@ -107,18 +187,18 @@ fn ring_shadow(color: Hsla) -> BoxShadow {
 
 /// Paint `el` as the selected nav row: the raised chip.
 pub fn nav_chip<E: Styled>(el: E, theme: &Theme) -> E {
-    el.bg(theme.nav_selected).shadow(nav_shadow(theme))
+    el.bg(theme.nav_selected).shadow(raised_card_shadow(theme))
 }
 
 /// Paint `el` as a raised surface: a menu, a popover, the palette, a dialog.
 pub fn popover<E: Styled>(el: E, theme: &Theme) -> E {
-    el.bg(theme.surface_raised)
+    el.bg(theme.raised)
         .rounded_lg()
         .shadow(popover_shadow(theme))
-        .text_color(theme.text)
+        .text_color(theme.foreground)
 }
 
-/// The brand pill at a row's leading edge marking the keyboard-current row.
+/// The accent pill at a row's leading edge marking the keyboard-current row.
 /// Absolutely positioned: the row needs `.relative()`.
 pub fn selection_indicator(theme: &Theme) -> Div {
     div()
@@ -128,11 +208,11 @@ pub fn selection_indicator(theme: &Theme) -> Div {
         .bottom_0()
         .flex()
         .items_center()
-        .child(div().w(px(3.0)).h(px(16.0)).rounded_full().bg(theme.brand_text))
+        .child(div().w(px(3.0)).h(px(16.0)).rounded_full().bg(theme.accent))
 }
 
 /// Paint a row in a nav list by its state: the raised chip while it is the
-/// current page (`current`), the brand pill while it is the keyboard's row
+/// current page (`current`), the accent pill while it is the keyboard's row
 /// (`keyboard`, over a fill when it isn't also current), else a fill that
 /// fades in on hover. `key` names the row for its fade. `chip_inline: false`
 /// leaves the current row's chip to a sliding one ([`motion::SlideTrack`])
@@ -154,10 +234,10 @@ pub fn row_state(
             d
         }
     } else if keyboard {
-        d.bg(theme.fill)
+        d.bg(theme.background)
     } else {
-        let clear = theme.fill.opacity(0.0);
-        fill_layer(d, key, px(8.0), [clear, theme.fill, theme.fill_strong])
+        let clear = theme.background.opacity(0.0);
+        fill_layer(d, key, px(8.0), [clear, theme.background, theme.background_hover])
     };
     d.when(keyboard, |d| d.child(selection_indicator(theme)))
 }
@@ -184,20 +264,20 @@ pub fn menu_row(id: impl Into<SharedString>, selected: bool, theme: &Theme) -> S
         .px_2()
         .rounded_lg()
         .cursor_pointer()
-        .text_color(theme.text);
+        .type_style(Type::Base)
+        .text_color(theme.foreground);
     if selected {
         d.bg(theme.row_selected).text_color(theme.text_loud)
     } else {
-        let clear = theme.fill_subtle.opacity(0.0);
-        fill_layer(d, id, px(8.0), [clear, theme.fill_subtle, theme.fill])
+        let clear = theme.background.opacity(0.0);
+        fill_layer(d, id, px(8.0), [clear, theme.background, theme.background_hover])
     }
 }
 
-/// A section heading: Taskpage's `text-sm font-semibold`.
+/// A section heading: Base medium, loud.
 pub fn heading(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
-        .text_sm()
-        .font_weight(FontWeight::SEMIBOLD)
+        .type_style(Type::BaseMedium)
         .text_color(theme.text_loud)
         .child(text.into())
 }
@@ -205,18 +285,21 @@ pub fn heading(text: impl Into<SharedString>, theme: &Theme) -> Div {
 /// A button's look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonKind {
-    /// The brand fill with white text: the one main action.
+    /// The one main action: the Button component's Success style (a green
+    /// tint, `text/green`). Figma draws no solid brand button.
     Primary,
-    /// Slate fill with loud text: every other action.
+    /// Every other action: the Default style (`theme.background`, loud
+    /// text).
     Secondary,
-    /// A destructive action: the error fill.
+    /// A destructive action: the Danger style (a pink tint).
     Danger,
     /// A low-key action beside others: no fill until hovered.
     Quiet,
 }
 
-/// A Taskpage button: semibold, 8px corners, a 1px boundary, 14px across.
-/// `focused` draws the focus ring (keyboard focus in a dialog).
+/// A Figma button (Small): 13 / 18 medium, 6px corners, 12px across, the
+/// style's fill and no boundary. `focused` draws the focus ring and glow
+/// (keyboard focus in a dialog).
 pub fn button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -261,17 +344,13 @@ pub fn button_base(
         .items_center()
         .justify_center()
         .h(px(BUTTON_H))
-        .px(px(14.0))
-        .rounded_lg()
-        .border_1()
-        .border_color(c.border)
+        .px(px(12.0))
+        .rounded(px(6.0))
         .text_color(c.text)
-        .text_sm()
-        .font_weight(FontWeight::SEMIBOLD)
+        .type_style(Type::SmallMedium)
         .cursor_pointer()
-        .when(focused, |b| b.shadow(vec![focus_shadow(theme)]))
-        .hover(move |s| s.border_color(c.border_hover));
-    fill_layer(d, id, px(7.0), [c.fill, c.hover, c.pressed])
+        .when(focused, |b| b.shadow(focus_shadow(theme)));
+    fill_layer(d, id, px(6.0), [c.fill, c.hover, c.pressed])
 }
 
 /// A button kind's colors, in each state.
@@ -281,57 +360,50 @@ pub struct ButtonColors {
     pub hover: Hsla,
     pub pressed: Hsla,
     pub text: Hsla,
-    pub border: Hsla,
-    pub border_hover: Hsla,
 }
 
-/// A button kind's fill, text and boundary at rest, hovered and pressed.
+/// A button kind's fill and text at rest, hovered and pressed: the Button
+/// component's `background`, `background-hover` and `background-active`.
 pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
     match kind {
         ButtonKind::Primary => ButtonColors {
-            fill: theme.brand,
-            hover: theme.brand_hover,
-            pressed: theme.brand_hover,
-            text: theme.text_on_color,
-            border: theme.brand,
-            border_hover: theme.brand_hover_border,
+            fill: theme.success_fill,
+            hover: theme.success_fill_hover,
+            pressed: theme.success_fill_active,
+            text: theme.success,
         },
         ButtonKind::Secondary => ButtonColors {
-            fill: theme.control_fill,
-            hover: theme.control_fill_hover,
-            pressed: theme.control_fill_pressed,
+            fill: theme.background,
+            hover: theme.background_hover,
+            pressed: theme.background_active,
             text: theme.text_loud,
-            border: theme.control_border,
-            border_hover: theme.control_border_hover,
         },
         ButtonKind::Danger => ButtonColors {
-            fill: theme.error_fill,
-            hover: theme.error_fill.opacity(0.9),
-            pressed: theme.error_fill.opacity(0.8),
-            text: theme.text_on_color,
-            border: theme.danger_border,
-            border_hover: theme.danger_border,
+            fill: theme.danger_fill,
+            hover: theme.danger_fill_hover,
+            pressed: theme.danger_fill_active,
+            text: theme.error,
         },
         ButtonKind::Quiet => ButtonColors {
-            fill: theme.control_fill.opacity(0.0),
-            hover: theme.control_fill_hover,
-            pressed: theme.control_fill_pressed,
-            text: theme.text,
-            border: theme.control_border.opacity(0.0),
-            border_hover: theme.control_border,
+            fill: theme.background.opacity(0.0),
+            hover: theme.background_hover,
+            pressed: theme.background_active,
+            text: theme.foreground,
         },
     }
 }
 
-/// The keyboard-focus ring: 2px of the brand outside the control.
-pub fn focus_shadow(theme: &Theme) -> BoxShadow {
-    BoxShadow {
-        color: theme.focus_ring,
+/// The keyboard focus as Figma draws it: a 4px `focus/default/focus-glow`
+/// and, over it, the 1px `focus/default/ring`, both outside the control.
+pub fn focus_shadow(theme: &Theme) -> Vec<BoxShadow> {
+    let around = |color: Hsla, spread: f32| BoxShadow {
+        color,
         offset: point(px(0.0), px(0.0)),
         blur_radius: px(0.0),
-        spread_radius: px(2.0),
+        spread_radius: px(spread),
         inset: false,
-    }
+    };
+    vec![around(theme.focus_glow, 5.0), around(theme.focus_ring, 1.0)]
 }
 
 /// An icon button's square.
@@ -373,9 +445,9 @@ pub fn icon_button(
         _ => px(12.0),
     };
     let rest = if active {
-        theme.control_fill
+        theme.background
     } else {
-        theme.control_fill.opacity(0.0)
+        theme.background.opacity(0.0)
     };
     let d = div()
         .id(id.clone())
@@ -389,15 +461,15 @@ pub fn icon_button(
         .rounded(radius)
         .cursor_pointer();
     let group = id.clone();
-    fill_layer(d, id, radius, [rest, theme.control_fill_hover, theme.control_fill_pressed]).child(
+    fill_layer(d, id, radius, [rest, theme.background_hover, theme.background_active]).child(
         heroicon(icon)
             .text_color(color)
             .group_hover(group, move |s| s.text_color(hover_icon)),
     )
 }
 
-/// A control that opens a menu (the board's filters): the control fill and
-/// boundary, an icon, the label and a chevron; pressed while `open`.
+/// A control that opens a menu (the board's filters): the overlay fill, an
+/// icon, the label and a chevron; pressed while `open`.
 pub fn dropdown(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -407,12 +479,11 @@ pub fn dropdown(
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
-    let (rest, border) = if open {
-        (theme.control_fill_pressed, theme.control_border_hover)
+    let rest = if open {
+        theme.background_active
     } else {
-        (theme.control_fill, theme.control_border)
+        theme.background
     };
-    let border_hover = theme.control_border_hover;
     let d = div()
         .id(id.clone())
         .debug_selector(move || selector.to_string())
@@ -423,21 +494,17 @@ pub fn dropdown(
         .h(px(BUTTON_H))
         .pl(px(8.0))
         .pr(px(6.0))
-        .rounded_lg()
-        .border_1()
-        .border_color(border)
-        .hover(move |s| s.border_color(border_hover))
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
+        .rounded(px(6.0))
+        .type_style(Type::XSmallMedium)
         .text_color(theme.text_loud)
         .cursor_pointer();
-    fill_layer(d, id, px(7.0), [rest, theme.control_fill_hover, theme.control_fill_pressed])
+    fill_layer(d, id, px(6.0), [rest, theme.background_hover, theme.background_active])
         .child(heroicon(icon).text_color(theme.icon))
         .child(div().whitespace_nowrap().child(label.into()))
         .child(heroicon(icons::CHEVRON_DOWN).text_color(if open { theme.text_loud } else { theme.icon }))
 }
 
-/// A segmented control's track: the control fill, 2px inside. Its segments
+/// A segmented control's track: the overlay fill, 2px inside. Its segments
 /// go in as children ([`segment`]); give it `.relative()` children-first
 /// order with [`motion::origin_probe`] and, while one slides,
 /// [`motion::floating_chip`] painted by [`segment_chip`].
@@ -450,9 +517,7 @@ pub fn segment_track(theme: &Theme) -> Div {
         .gap(px(2.0))
         .p(px(2.0))
         .rounded_lg()
-        .bg(theme.control_fill)
-        .border_1()
-        .border_color(theme.control_border)
+        .bg(theme.background)
 }
 
 /// One segment: 24px, its label medium and normal; selected, it is lifted
@@ -479,40 +544,35 @@ pub fn segment(
         .h(px(24.0))
         .px(px(10.0))
         .rounded(px(6.0))
-        .text_xs()
+        .type_style(Type::XSmallMedium)
         .cursor_pointer();
     let d = if selected {
-        let d = d
-            .text_color(theme.text_loud)
-            .font_weight(FontWeight::SEMIBOLD);
+        let d = d.text_color(theme.text_loud);
         if chip_inline {
             segment_chip(d, theme)
         } else {
             d
         }
     } else {
-        let clear = theme.control_fill_hover.opacity(0.0);
+        let clear = theme.background_hover.opacity(0.0);
         fill_layer(
-            d.text_color(theme.text).font_weight(FontWeight::MEDIUM),
+            d.text_color(theme.foreground),
             id,
             px(6.0),
-            [clear, theme.control_fill_hover, theme.control_fill_pressed],
+            [clear, theme.background_hover, theme.background_active],
         )
     };
     d.child(label.into())
 }
 
-/// The selected segment's lift: the tab surface, its ring and Taskpage's
-/// `shadow-nav`.
+/// The selected segment: `theme.selection` (Activity's and Settings'
+/// segmented controls).
 pub fn segment_chip<E: Styled>(el: E, theme: &Theme) -> E {
-    el.bg(theme.tab_selected).rounded(px(6.0)).shadow(vec![
-        BoxShadow::new(px(0.0), px(1.0), theme.nav_shadow),
-        ring_shadow(theme.tab_selected_ring),
-    ])
+    el.bg(theme.selection).rounded(px(6.0))
 }
 
-/// Taskpage's `Shortcut`: one small keycap per key of `chord` (`⌘K` is ⌘
-/// and K), 12px medium, a 1px bottom edge.
+/// The Button component's Hotkey: one small keycap per key of `chord` (`⌘K`
+/// is ⌘ and K), X-Small in gray, on the canvas with a 1px bottom edge.
 pub fn keycaps(chord: &str, theme: &Theme) -> Div {
     let keys = split_chord(chord);
     div().flex().flex_row().flex_none().gap(px(2.0)).children(keys.into_iter().map(|key| {
@@ -523,12 +583,11 @@ pub fn keycaps(chord: &str, theme: &Theme) -> Div {
             .min_w(px(18.0))
             .h(px(18.0))
             .px(px(4.0))
-            .rounded(px(5.0))
+            .rounded(px(4.0))
             .bg(theme.keycap)
             .shadow(vec![BoxShadow::new(px(0.0), px(1.0), theme.keycap_edge)])
-            .text_size(px(11.0))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.text)
+            .type_style(Type::XSmall)
+            .text_color(theme.gray)
             .child(key)
     }))
 }
@@ -553,7 +612,7 @@ pub fn split_chord(chord: &str) -> Vec<String> {
     keys
 }
 
-/// Taskpage's `SearchBox`: the control fill (12px corners) fading to its
+/// The sidebar's search box: the overlay fill (12px corners) fading to its
 /// hover, a magnifying glass, "Search" growing to fill, and the shortcut's
 /// keycaps.
 pub fn search_box(id: impl Into<SharedString>, chord: &str, theme: &Theme) -> Stateful<Div> {
@@ -571,11 +630,10 @@ pub fn search_box(id: impl Into<SharedString>, chord: &str, theme: &Theme) -> St
         .pl(px(8.0))
         .pr(px(6.0))
         .rounded_xl()
-        .border_1()
-        .border_color(theme.control_border)
-        .text_color(theme.text)
+        .type_style(Type::Base)
+        .text_color(theme.foreground)
         .cursor_pointer();
-    fill_layer(d, id, px(11.0), [theme.control_fill, theme.control_fill_hover, theme.control_fill_pressed])
+    fill_layer(d, id, px(12.0), [theme.background, theme.background_hover, theme.background_active])
         .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon))
         .child(div().flex_1().child("Search"))
         .when(!chord.is_empty(), |d| d.child(keycaps(chord, theme)))
@@ -651,7 +709,7 @@ pub fn empty_state(
             div()
                 .max_w(px(360.0))
                 .text_center()
-                .text_color(theme.text_quiet)
+                .text_color(theme.muted)
                 .child(message.into()),
         )
         .children(action)
@@ -673,7 +731,7 @@ pub fn anchor_probe(anchor: &Anchor) -> impl IntoElement {
 }
 
 /// `menu` sliding up 8px into place and fading in over [`motion::MENU_IN`]
-/// on Taskpage's curve, each time it mounts (a menu is drawn only while
+/// on the motion curve, each time it mounts (a menu is drawn only while
 /// open, so every open slides). `id` names the menu.
 pub fn menu_entrance(id: &'static str, menu: impl IntoElement + 'static) -> impl IntoElement {
     use gpui::{Animation, AnimationExt};
@@ -713,10 +771,9 @@ impl gpui::Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         popover(div(), &theme)
-            .font_family("Geist")
             .px_2()
             .py_1()
-            .text_xs()
+            .type_style(Type::XSmall)
             .max_w(px(360.0))
             .child(self.0.clone())
     }
@@ -735,8 +792,7 @@ pub fn chip(label: impl Into<SharedString>, hue: Hue, theme: &Theme) -> Div {
         .rounded_lg()
         .bg(bg)
         .text_color(fg)
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
+        .type_style(Type::XSmallMedium)
         .child(label.into())
 }
 

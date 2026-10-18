@@ -381,7 +381,7 @@ mod tests {
             vec![BgRun {
                 col: 3,
                 len: 1,
-                color: hsla(0x81a2be)
+                color: hsla(0x4a8fd7)
             }]
         );
     }
