@@ -134,7 +134,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | List row (leading column) | The review and workspace panels: 32px, Small (13 / 18); the same chip when selected. The sidebar's rows follow the Navigation component (see `views/sidebar.rs`): 8px across, 4px above and below, a 12px state glyph |
 | Current-selection indicator | A 3x16px `accent` pill at the row's leading edge, on the keyboard's row |
 | Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
-| Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `text/green` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
+| Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `success_label` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
 | Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, text fields) |
 | Dropdown | A button that opens a menu (the board's filters): the Figma Button at X-Small with a left icon, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the 18px icon (`icons::FUNNEL_BUTTON`, in `button_icon`) sits in Figma's 14px Icon slot (`icon_slot`), which makes the button 26px tall; pressed while its menu is open (the icon keeps its color), and the menu opens 6px under it |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
@@ -314,6 +314,7 @@ component's Success and Danger styles follow.
 | `success_fill` | `#5ac3512e` | `#5ac3511f` | Button Success: the primary button |
 | `success_fill_hover` | `#5ac35147` | `#5ac35138` | `button/success/background-hover` (dark derived) |
 | `success_fill_active` | `#5ac35161` | `#5ac35152` | `button/success/background-active` (dark derived) |
+| `success_label` | `#86d580` | `#00753d` | Button Success's label and icon: `text/green` in Light, `#86d580` in the dark Review frame |
 | `danger_fill` | `#f214782e` | `#f214781f` | Button Danger: the danger button, the unread-errors button |
 | `danger_fill_hover` | `#f2147847` | `#f2147838` | `button/danger/background-hover` (dark derived) |
 | `danger_fill_active` | `#f2147861` | `#f2147852` | `button/danger/background-active` (dark derived) |
@@ -391,8 +392,8 @@ with its worst ratio. **Flagged for John.**
 | dark | gray on selection | 2.12 | The selected Machines row (`theme.selection` over the canvas, as drawn): the runner and the task in `theme.gray` |
 | dark | theme_green on selection | 2.30 | The same row: `working` and `● reachable` in `theme.green` |
 | dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan`. The lowest pairing the desktop draws |
-| dark | success on hover button | 4.07 | `text/green` on the Success button's (derived dark) hover |
-| dark | success on pressed button | 3.35 | `text/green` on the Success button pressed |
+| dark | success_label on hover button | 4.35 | the Success label (`#86d580`) on the Success button's (derived dark) hover |
+| dark | success_label on pressed button | 3.58 | the Success label on the Success button pressed |
 | dark | error on rest button | 4.30 | The Danger label on the Danger fill over the sidebar (AA over the canvas) |
 | dark | error on hover button | 3.94 | The same, hovered |
 | dark | error on pressed button | 3.53 | The same, pressed |
@@ -405,7 +406,7 @@ with its worst ratio. **Flagged for John.**
 | light | icon on | 2.97 | Icons in `theme.gray` on the sidebar (3.12 on white) |
 | light | link on | 3.69 | `text/link` `#1989c4`: 3.88 on white |
 | light | green on green_tint | 4.30 | `[done]` on its (derived) chip tint |
-| light | success on pressed button | 4.36 | `text/green` on the Success button pressed |
+| light | success_label on pressed button | 4.36 | `text/green` on the Success button pressed |
 | light | error on pressed button | 3.98 | `#b40041` on the Danger button pressed |
 | light | focus_ring on | 2.41 | `focus/default/ring` `#31ade9`: 2.53 on white; the 4px glow widens it |
 | light | dark_gray on selection | 4.08 | The selected Machines row: the branch in `theme.ansi_dark_gray` |

@@ -16,6 +16,7 @@ use shelbi_core::StatusCategory;
 
 use super::sidebar::nav_item;
 use crate::assets::{heroicon, icons, Icon};
+use crate::elements::clamped_text::clamped_text;
 use crate::keys::row_hotkey;
 use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, Type, Typography, NAV_RADIUS};
@@ -44,7 +45,7 @@ pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<
         .rounded(radius)
         .cursor_pointer();
     fill_layer(d, id, radius, [theme.background, theme.background_hover, theme.background_active])
-        .child(heroicon(icons::ARROW_LEFT).text_color(theme.icon))
+        .child(heroicon(icons::ARROW_LEFT).text_color(theme.button_icon))
         .when(keyboard, |d| d.child(style::selection_indicator(theme)))
 }
 
@@ -112,8 +113,13 @@ pub fn summary(
                     .type_style(Type::XSmall)
                     .line_height(px(18.0))
                     .text_color(theme.foreground)
-                    .when(!expanded, |d| d.text_ellipsis().line_clamp(DESCRIPTION_LINES))
-                    .child(description),
+                    .map(|d| {
+                        if expanded {
+                            d.child(description)
+                        } else {
+                            d.child(clamped_text(description, DESCRIPTION_LINES))
+                        }
+                    }),
             )
         })
         .children(more)

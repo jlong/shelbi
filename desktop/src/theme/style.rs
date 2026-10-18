@@ -411,7 +411,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             fill: theme.success_fill,
             hover: theme.success_fill_hover,
             pressed: theme.success_fill_active,
-            text: theme.success,
+            text: theme.success_label,
         },
         ButtonKind::Secondary => ButtonColors {
             fill: theme.background,

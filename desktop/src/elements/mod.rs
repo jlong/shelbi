@@ -15,6 +15,9 @@
 //!
 //! [`exact_text`] is a one-line label at its shaped width, unrounded, for
 //! rows that must land on Figma's positions (the sidebar's hotkeys).
+//! [`clamped_text`] wraps and clamps with the real shaper, its last line
+//! filled to the ellipsis (the task panels' description).
 
+pub mod clamped_text;
 pub mod exact_text;
 pub mod terminal;
