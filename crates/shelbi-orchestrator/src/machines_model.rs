@@ -71,10 +71,31 @@ pub fn read_machines_input(project_name: &str) -> anyhow::Result<MachinesInput> 
             .ok()
             .or_else(|| tf.task.branch.clone())
     };
+    // The runner a task's agent launches on, through the same seam dispatch
+    // uses (task `launch:` -> project `agents.<name>.runner` -> the agent's
+    // `preferred_runner` -> the fleet's launcher for that kind).
+    let runner_of = |tf: &IssueFile, ws: &shelbi_core::WorkspaceSpec, agent: &str| {
+        crate::workspace::resolve_workspace_launch(&project, ws, Some(agent), tf.task.launch.as_ref())
+            .ok()
+            .map(|launch| runner_label(&launch.runner))
+    };
     let mut branches = HashMap::new();
+    let mut runners = HashMap::new();
     for tf in &in_progress {
         if let Some(b) = branch_of(tf) {
             branches.insert(tf.task.id.clone(), b);
+        }
+        let agent = tf
+            .task
+            .param_str("agent")
+            .unwrap_or(shelbi_app::view::DEFAULT_TASK_AGENT);
+        let ws = tf
+            .task
+            .assigned_to
+            .as_deref()
+            .and_then(|name| project.workspace(name));
+        if let Some(r) = ws.and_then(|ws| runner_of(tf, ws, agent)) {
+            runners.insert(tf.task.id.clone(), r);
         }
     }
 
@@ -114,6 +135,9 @@ pub fn read_machines_input(project_name: &str) -> anyhow::Result<MachinesInput> 
             },
         );
         titles.insert(tf.task.id.clone(), tf.task.title.clone());
+        if let Some(r) = runner_of(tf, ws, shelbi_app::view::REVIEW_SLOT_AGENT) {
+            runners.insert(tf.task.id.clone(), r);
+        }
         if let Some(b) = branch_of(tf) {
             branches.insert(tf.task.id.clone(), b);
         }
@@ -138,5 +162,41 @@ pub fn read_machines_input(project_name: &str) -> anyhow::Result<MachinesInput> 
         review_slots,
         branches,
         titles,
+        runners,
     })
+}
+
+/// A runner's name as the Machines view shows it: `Claude`, `Codex`, or a
+/// generic runner's command name (`aider`).
+fn runner_label(spec: &shelbi_core::AgentRunnerSpec) -> String {
+    match shelbi_core::RunnerKind::detect(spec) {
+        shelbi_core::RunnerKind::Claude => "Claude".to_string(),
+        shelbi_core::RunnerKind::Codex => "Codex".to_string(),
+        shelbi_core::RunnerKind::Generic => std::path::Path::new(&spec.command)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&spec.command)
+            .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(yaml: &str) -> shelbi_core::AgentRunnerSpec {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn runners_read_as_their_cli() {
+        assert_eq!(runner_label(&spec("command: /usr/local/bin/claude")), "Claude");
+        assert_eq!(runner_label(&spec("command: codex")), "Codex");
+        // A wrapper pinned to a contract reads as that contract's CLI.
+        assert_eq!(
+            runner_label(&spec("command: my-wrapper\nintegration: codex")),
+            "Codex"
+        );
+        assert_eq!(runner_label(&spec("command: /opt/bin/aider")), "aider");
+    }
 }

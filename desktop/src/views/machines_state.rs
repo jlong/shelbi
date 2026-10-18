@@ -178,6 +178,7 @@ mod tests {
             current_task: None,
             assignment: SlotAssignment::Idle,
             agent: None,
+            runner: None,
             task_title: None,
             branch: None,
             review: None,

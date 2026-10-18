@@ -98,6 +98,7 @@ is left, and how it was verified.
 | `dt-terminal-font-zoom` | ⌘+ / ⌘− / ⌘0 (View ▸ Bigger, Smaller, Actual Size) step every terminal's font size and save it to the setting Settings edits | [`status/dt-terminal-font-zoom.md`](status/dt-terminal-font-zoom.md) |
 | `dt-figma-terminal-screens` | The Orchestrator, Workspace and Review terminals take the Figma frames' insets and colors (bold loud, dim muted, `theme.red`); an idle workspace keeps the sidebar and shows the Figma idle page with a Shell button | [`status/dt-figma-terminal-screens.md`](status/dt-figma-terminal-screens.md) |
 | `dt-figma-settings` | Settings restyled to the Figma frame in both themes; a terminal font picker (bundled faces plus installed monospaced families, each previewed in itself) and a size stepper (8 to 32) replace the free-text fields | [`status/dt-figma-settings.md`](status/dt-figma-settings.md) |
+| `dt-figma-machines` | The Machines view drawn to the Figma Machines frame in both themes: plain headings, a remote's metadata line, flat rows with the runner and `<status>: <title>`, the shortcuts footer | [`status/dt-figma-machines.md`](status/dt-figma-machines.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

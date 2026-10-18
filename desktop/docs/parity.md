@@ -361,13 +361,13 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 ### `MachineRow`
 | Field | TUI | Desktop |
 |---|---|---|
-| `name` | bold machine heading (`machines.rs` `machine_header_line`) | bold machine heading (`views/machines.rs` `machine_header`) |
+| `name` | bold machine heading (`machines.rs` `machine_header_line`) | machine heading, Base Medium, loud (`views/machines.rs` `machine_header`) |
 | `kind` | not shown: `is_local` is used instead | not shown: `is_local` is used instead |
 | `host` | `ssh <host>` location label (`machines.rs` `machine_header_line`); also feeds prober targets (`probe_targets`) | `ssh <host>` location label (`views/machines.rs` `machine_header`); also feeds prober targets |
 | `is_local` | "local" vs `ssh <host>`; gates reachability and binary badges (`machines.rs` `machine_header_line`) | same (`views/machines.rs` `machine_header`) |
-| `tags` | `[a, b]` badge in workflow-badge color (`machines.rs` `machine_header_line`) | `[a, b]` badge, `Tone::WorkflowBadge` (`views/machines.rs` `machine_header`) |
-| `remote` | remote binary `path vX` / incompatible / "not set up" badge, remotes only (`machines.rs` `machine_header_line`) | same badge, remotes only (`views/machines.rs` `machine_header`) |
-| `reachability` | reachable / checking / unreachable badge, remotes only, error truncated at 40 (`machines.rs` `reachability_span`) | same badge, remotes only, error truncated at 80 (`views/machines.rs` `machine_header`) |
+| `tags` | `[a, b]` badge in workflow-badge color (`machines.rs` `machine_header_line`) | `[a, b]` in the workflow badge's text color on the line under the heading (`views/machines.rs` `machine_metadata`) |
+| `remote` | remote binary `path vX` / incompatible / "not set up" badge, remotes only (`machines.rs` `machine_header_line`) | same text on the line under the heading, muted when resolved, remotes only (`views/machines.rs` `machine_metadata`) |
+| `reachability` | reachable / checking / unreachable badge, remotes only, error truncated at 40 (`machines.rs` `reachability_span`) | same label after the ssh host, remotes only, error truncated at 80 with the whole reason on hover (`views/machines.rs` `machine_header`) |
 | `workspaces` | one line per workspace, "(no workspaces)" when empty (`machines.rs` `render_body`) | one clickable row per workspace, "(no workspaces)" when empty (`views/machines.rs` `render_body`) |
 
 ### `MachineWorkspace`
@@ -375,19 +375,20 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 |---|---|---|
 | `name` | 18-char name column; also what Enter opens (`machines.rs` `workspace_line`, `selected_workspace`) | 150px name column; also what click/Enter focuses (`views/machines.rs` `workspace_row`, `views/machines_state.rs` `focus_selected`) |
 | `is_review_slot` | not shown: never read by the view | not shown: never read by the view (review rows are recognized via `review` / `assignment`) |
-| `state` | observed-state badge (`machines.rs` `workspace_line`) | observed-state badge (`views/machines.rs` `workspace_row`) |
+| `state` | observed-state badge (`machines.rs` `workspace_line`) | 76px observed-state column; a serving review slot reads `review` (the Figma frame) (`views/machines.rs` `state_cell`) |
 | `current_task` | not shown: the task cell uses `assignment`, as on the desktop (`dt-parity-audit`) | not shown: the task cell uses `assignment` instead |
-| `assignment` | `in_progress: <ids>` / `review: <id>` / "idle" cell (`machines.rs` `workspace_line`) | `in_progress: <ids>` / `review: <id>` / "idle" cell (`views/machines.rs` `workspace_row`) |
-| `agent` | agent column, `-` when idle (`machines.rs` `workspace_line`) | agent column, `-` when idle (`views/machines.rs` `workspace_row`) |
-| `task_title` | task title after the assignment cell (`machines.rs` `workspace_line`) | task title after the assignment cell (`views/machines.rs` `workspace_row`) |
-| `branch` | `⎇ branch` (`machines.rs` `workspace_line`) | branch with branch icon (`views/machines.rs` `workspace_row`) |
-| `review` | review server state and URL (`machines.rs` `workspace_line`) | review server state and clickable URL (`views/machines.rs` `workspace_row`) |
+| `assignment` | `in_progress: <ids>` / `review: <id>` / "idle" cell (`machines.rs` `workspace_line`) | `<status>: <title>` via `MachineWorkspace::task_cell`, the ids cell on hover (`views/machines.rs` `workspace_row`) |
+| `agent` | agent column, `-` when idle (`machines.rs` `workspace_line`) | not shown: the Figma frame's third column is the runner (`dt-figma-machines`) |
+| `runner` | not shown: the TUI keeps its agent column | 96px runner column (`Codex`, `Claude`), `—` when idle (`views/machines.rs` `workspace_row`) |
+| `task_title` | task title after the assignment cell (`machines.rs` `workspace_line`) | the title in the task cell, `<status>: <title>` (`MachineWorkspace::task_cell`, `views/machines.rs` `workspace_row`) |
+| `branch` | `⎇ branch` (`machines.rs` `workspace_line`) | `⎇ branch`, right-aligned (`views/machines.rs` `workspace_row`) |
+| `review` | review server state and URL (`machines.rs` `workspace_line`) | `starting` while the server isn't up, and the clickable URL (`views/machines.rs` `workspace_row`) |
 
 ### `ReviewSlot`
 | Field | TUI | Desktop |
 |---|---|---|
 | `task_id` | not shown directly: the same id appears via `assignment` (`review: <id>`) | not shown directly: the same id appears via `assignment` (`review: <id>`), which `MachinesModel::build` derives from this field (`views/machines.rs` `workspace_row`) |
-| `state` | "serving" (cyan) / "starting" (gray) via `ReviewSlot::label` (`machines.rs` `workspace_line`) | "serving" (cyan) / "starting" (gray) via `ReviewSlot::label` (`views/machines.rs` `workspace_row`) |
+| `state` | "serving" (cyan) / "starting" (gray) via `ReviewSlot::label` (`machines.rs` `workspace_line`) | "starting" (muted) via `ReviewSlot::label`; serving shows only as the state column's `review` (`views/machines.rs` `workspace_row`) |
 | `url` | URL after the state (`machines.rs` `workspace_line`); not clickable in a terminal | clickable URL with external-link icon, opens in browser (`views/machines.rs` `workspace_row`) |
 
 ### `MachinesInput`
@@ -404,6 +405,7 @@ Neither client builds or reads `MachinesInput`. Both call the shared reader `she
 | `review_slots` | via `review` (state + URL) and `assignment` (`machines.rs` `workspace_line`) | via `review` (state + URL) and `assignment` (`views/machines.rs` `workspace_row`) |
 | `branches` | via `branch` (`machines.rs` `workspace_line`) | via `branch` (`views/machines.rs` `workspace_row`) |
 | `titles` | via `task_title` (`machines.rs` `workspace_line`) | via `task_title` (`views/machines.rs` `workspace_row`) |
+| `runners` | not shown (via `runner`, which the TUI doesn't draw) | via `runner` (`views/machines.rs` `workspace_row`) |
 
 ### `ReviewPanelModel`
 The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it with `ReviewPanelModel::build`). The TUI does not consume this model: its `ReviewPanel` (`review_panel.rs`) is built from `ReviewOpenParams` (task id, slot, worktree, editor name, a `has_review_url` bool, and the `IssueFile`) in `shell/mod.rs` `build_review_interface`. The TUI column maps each field to the equivalent datum.
