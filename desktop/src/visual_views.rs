@@ -13,7 +13,9 @@
 //! unreachable remote's probe has landed, and the issues board: `board.png`
 //! (a card selected), `board-dropdown.png` (the workflow filter open) and
 //! `board-detail.png` (a card's detail); then `settings.png`, Settings with its
-//! font picker open (`settings-font-picker.png`), the bootstrap
+//! font picker open (`settings-font-picker.png`), the other choices
+//! selected with the size stepper at each end (`settings-size-min.png`,
+//! `settings-size-max.png`, `settings-option-right.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
 //! notice bars (`notice-bars.png`: the update and relaunch bars). It prints
 //! one line per check and exits non-zero if any failed.
@@ -167,6 +169,37 @@ pub fn run(out: PathBuf) -> ! {
     });
     expect("settings: the font picker lists the installed fonts", listed);
     save(&mut cx, window, &out, "settings-font-picker.png");
+    // The states the Figma frame doesn't draw: every other choice selected,
+    // and the size stepper at each end of its range (that end's button dim).
+    {
+        use shelbi_state::{OptionAsMeta, ThemePreference};
+        let states = [
+            ("settings-size-min.png", ThemePreference::Dark, OptionAsMeta::Both, 8),
+            ("settings-size-max.png", ThemePreference::Light, OptionAsMeta::Left, 32),
+            ("settings-option-right.png", ThemePreference::Auto, OptionAsMeta::Right, 14),
+        ];
+        for (name, theme, option, size) in states {
+            let window = open_with_window(&mut cx, |window, cx| {
+                cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
+            });
+            let settings = window
+                .update(&mut cx, |root, _, _| root.downcast::<crate::views::settings::SettingsView>())
+                .expect("the settings window")
+                .expect("the settings view");
+            // Once config.yaml is read (it would put the saved values back).
+            wait(&mut cx, window, Duration::from_secs(5), |cx| {
+                settings.read_with(cx, |v, _| v.offscreen_loaded())
+            });
+            window
+                .update(&mut cx, |_, window, cx| {
+                    settings.update(cx, |v, cx| v.offscreen_show(theme, option, size, window, cx))
+                })
+                .expect("show the state");
+            // The selection chips slide to their choices.
+            wait(&mut cx, window, Duration::from_millis(400), |_| false);
+            save(&mut cx, window, &out, name);
+        }
+    }
     let (_, window) = open(&mut cx, |cx| {
         cx.new(|_| Screen(Box::new(|theme, _| {
             crate::views::bootstrap::render_progress(
