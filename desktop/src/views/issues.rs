@@ -10,6 +10,11 @@
 //! state the card was read at, and its answer comes back over a channel the
 //! view polls.
 //!
+//! Each expanded column's cards are a virtualized list (`board_list.rs`): only
+//! the cards in view are built, so a board of a thousand done issues draws
+//! as fast as a small one. A background read that finds the board unchanged
+//! isn't folded in (the model isn't rebuilt every refresh).
+//!
 //! Commands leave the view as [`IssuesEvent::Command`] so the window runs them
 //! through the one exhaustive dispatch (`crate::commands`), which hands the
 //! issue mutations back to [`IssuesView::run_issue_command`].
@@ -23,11 +28,12 @@
 //! same registry command the keys send, so it goes through the window's
 //! dispatch and the daemon like any other move.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, relative, App, ClickEvent, Context, Entity, EventEmitter,
+    div, prelude::*, px, relative, AnyElement, App, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
     Window,
 };
@@ -39,7 +45,8 @@ use shelbi_app::{
 };
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 
-use super::board_scroll;
+use super::board_list::{self, ColumnList, Item};
+use super::board_scroll::{self, BoardScroll};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
@@ -141,16 +148,26 @@ pub struct IssuesView {
     pub(super) state: BoardState,
     pub(super) focus: FocusHandle,
     needs_focus: bool,
-    open_refresher: shelbi_app::Refresher<BoardRead>,
-    closed_refresher: shelbi_app::Refresher<Option<ClosedPage>>,
+    open_refresher: shelbi_app::Refresher<(BoardRead, u64)>,
+    closed_refresher: shelbi_app::Refresher<(Option<ClosedPage>, u64)>,
+    /// The fingerprints of the last reads folded in: a refresh that reads
+    /// the same board again (most of them) is not folded, which would
+    /// rebuild the whole model on the UI thread every 750 ms.
+    open_print: Option<u64>,
+    closed_print: Option<u64>,
+    /// The open detail's model, by issue id and the board generation it was
+    /// built at (building it merges every task on the board).
+    detail_cache: Option<(String, u64, Option<TaskDetailModel>)>,
     done_tx: Sender<Done>,
     done_rx: Receiver<Done>,
     editor_tx: Sender<EditorEvent>,
     editor_rx: Receiver<EditorEvent>,
     last_refresh: Instant,
     load_more_in_flight: bool,
-    board_scroll: ScrollHandle,
-    column_scrolls: Vec<ScrollHandle>,
+    board_scroll: BoardScroll,
+    /// Each expanded column's virtualized card list, by status id (a column
+    /// keeps its scroll position across a filter change or a collapse).
+    column_lists: HashMap<String, ColumnList>,
     pub(super) detail_scroll: ScrollHandle,
     /// The in-place body editor: the issue id and its text state.
     pub(super) editor: Option<(String, Entity<TextareaState>)>,
@@ -169,9 +186,17 @@ impl IssuesView {
             tracing::warn!("keys.yaml: {d:?}");
         }
         let p = project.clone();
-        let open_refresher = shelbi_app::spawn_worker(move |_| board::read_open_board(&p));
+        let open_refresher = shelbi_app::spawn_worker(move |_| {
+            let read = board::read_open_board(&p);
+            let print = fingerprint(&read);
+            (read, print)
+        });
         let p = project.clone();
-        let closed_refresher = shelbi_app::spawn_worker(move |_| board::read_closed_page(&p));
+        let closed_refresher = shelbi_app::spawn_worker(move |_| {
+            let page = board::read_closed_page(&p);
+            let print = fingerprint(&page);
+            (page, print)
+        });
         open_refresher.request();
         closed_refresher.request();
         let (done_tx, done_rx) = mpsc::channel();
@@ -188,14 +213,17 @@ impl IssuesView {
             needs_focus: true,
             open_refresher,
             closed_refresher,
+            open_print: None,
+            closed_print: None,
+            detail_cache: None,
             done_tx,
             done_rx,
             editor_tx,
             editor_rx,
             last_refresh: Instant::now(),
             load_more_in_flight: false,
-            board_scroll: ScrollHandle::new(),
-            column_scrolls: Vec::new(),
+            board_scroll: BoardScroll::default(),
+            column_lists: HashMap::new(),
             workflow_anchor: Default::default(),
             workspace_anchor: Default::default(),
             detail_scroll: ScrollHandle::new(),
@@ -248,6 +276,56 @@ impl IssuesView {
         self.tick(cx);
     }
 
+    /// Each column's category and card count (`--bench-board`).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_model_columns(&self) -> Vec<(shelbi_core::StatusCategory, usize)> {
+        self.state.model().columns.iter().map(|c| (c.category, c.cards.len())).collect()
+    }
+
+    /// What the board says about its load (`--bench-board`).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_status(&self) -> String {
+        let m = self.state.model();
+        format!("loading={} error={:?} status={:?} banner={:?}", m.loading, m.error, self.state.status, m.banner)
+    }
+
+    /// Column `ci`'s rectangle in the window as last drawn, scrolled
+    /// (`--bench-board`).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_column_rect(&self, ci: usize) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let b = self.board_scroll.handle.bounds_for_item(ci)?;
+        Some(gpui::Bounds::new(b.origin + self.board_scroll.handle.offset(), b.size))
+    }
+
+    /// One refresh of the board's reads (`--bench-board`): waits for both
+    /// reads, then times folding them in as the poll does. `changed` folds
+    /// them as reads that differ from the last ones.
+    #[cfg(feature = "visual-check")]
+    pub fn bench_refresh(&mut self, changed: bool, cx: &mut Context<Self>) -> Duration {
+        self.refresh();
+        let wait = Duration::from_secs(30);
+        let open = self.open_refresher.recv_timeout(wait);
+        let closed = self.closed_refresher.recv_timeout(wait);
+        if changed {
+            self.open_print = None;
+            self.closed_print = None;
+        }
+        let start = Instant::now();
+        if self.fold_reads(open, closed) {
+            cx.notify();
+        }
+        start.elapsed()
+    }
+
+    /// Put the keyboard's selection on row `ri` of column `ci`
+    /// (`--bench-board`).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_select(&mut self, ci: usize, ri: usize, cx: &mut Context<Self>) {
+        self.state.select(ci, ri);
+        self.scroll_selection_into_view();
+        cx.notify();
+    }
+
     /// Open task `id`'s detail (from an Activity row). A task the board hasn't
     /// loaded yet fills in when its read lands.
     pub fn open_task(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -258,15 +336,9 @@ impl IssuesView {
 
     /// Drain the refreshers and background results; re-read on the cadence.
     fn tick(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
-        if let Some(read) = self.open_refresher.latest() {
-            self.state.apply_open(read);
-            changed = true;
-        }
-        if let Some(page) = self.closed_refresher.latest() {
-            self.state.apply_closed(page);
-            changed = true;
-        }
+        let open = self.open_refresher.latest();
+        let closed = self.closed_refresher.latest();
+        let mut changed = self.fold_reads(open, closed);
         while let Ok(done) = self.done_rx.try_recv() {
             changed = true;
             match done {
@@ -278,8 +350,14 @@ impl IssuesView {
                     self.load_more_in_flight = false;
                     self.state.apply_more(page);
                 }
-                Done::Persisted(Err(e)) => self.state.status = Some(e),
-                Done::Persisted(Ok(())) => {}
+                Done::Persisted(result) => {
+                    // The next read is folded either way: it carries what
+                    // was persisted (or puts back what wasn't).
+                    self.open_print = None;
+                    if let Err(e) = result {
+                        self.state.status = Some(e);
+                    }
+                }
             }
         }
         while let Ok(ev) = self.editor_rx.try_recv() {
@@ -311,6 +389,22 @@ impl IssuesView {
         }
     }
 
+    /// Fold in the reads that arrived; true when the board changed. A read
+    /// the same as the last one folded changes nothing, unless a change is
+    /// in flight: a read is what settles it.
+    fn fold_reads(
+        &mut self,
+        open: Option<(BoardRead, u64)>,
+        closed: Option<(Option<ClosedPage>, u64)>,
+    ) -> bool {
+        let pending = self.state.has_pending();
+        let open = to_fold(open, &mut self.open_print, pending);
+        let closed = to_fold(closed, &mut self.closed_print, pending);
+        let changed = open.is_some() || closed.is_some();
+        self.state.apply_reads(open, closed);
+        changed
+    }
+
     /// A card was dropped: run what the state makes of it.
     fn handle_drop(&mut self, intents: Vec<Intent>, window: &mut Window, cx: &mut Context<Self>) {
         self.needs_focus = true;
@@ -322,6 +416,24 @@ impl IssuesView {
         self.open_refresher.request();
         self.closed_refresher.request();
         self.last_refresh = Instant::now();
+    }
+
+    /// The open detail's model, rebuilt only when the detail or the board
+    /// changes.
+    fn detail_model(&mut self) -> Option<TaskDetailModel> {
+        let Some(id) = self.state.detail_id() else {
+            self.detail_cache = None;
+            return None;
+        };
+        let generation = self.state.generation();
+        match &self.detail_cache {
+            Some((cached, at, model)) if cached == id && *at == generation => model.clone(),
+            _ => {
+                let model = TaskDetailModel::build(self.state.input(), id);
+                self.detail_cache = Some((id.to_string(), generation, model.clone()));
+                model
+            }
+        }
     }
 
     /// The window hands an issue mutation back here after dispatch.
@@ -552,10 +664,31 @@ impl IssuesView {
         cx.notify();
     }
 
-    fn scroll_selection_into_view(&self) {
-        self.board_scroll.scroll_to_item(self.state.selected_column);
-        if let Some(h) = self.column_scrolls.get(self.state.selected_column) {
-            h.scroll_to_item(self.state.selected_row);
+    fn scroll_selection_into_view(&mut self) {
+        self.board_scroll.handle.scroll_to_item(self.state.selected_column);
+        // The list learns of a model change at render; catch it up first so
+        // the row it reveals is the selected card's.
+        self.sync_column_lists();
+        let column = self.state.model().columns.get(self.state.selected_column);
+        if let Some(list) = column.and_then(|c| self.column_lists.get(&c.status_id)) {
+            list.reveal(self.state.selected_row);
+        }
+    }
+
+    /// Bring each expanded column's list in line with the model (a no-op for
+    /// a column that hasn't changed).
+    fn sync_column_lists(&mut self) {
+        let model = self.state.model();
+        for col in model.columns.iter().filter(|c| !c.collapsed) {
+            let rows = column_rows(col, model);
+            match self.column_lists.get_mut(&col.status_id) {
+                Some(list) => list.sync(col, &rows),
+                None => {
+                    let mut list = ColumnList::new();
+                    list.sync(col, &rows);
+                    self.column_lists.insert(col.status_id.clone(), list);
+                }
+            }
         }
     }
 
@@ -632,11 +765,11 @@ impl IssuesView {
     }
 
     fn render_board(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let columns = self.state.model().columns.clone();
-        while self.column_scrolls.len() < columns.len() {
-            self.column_scrolls.push(ScrollHandle::new());
-        }
-        let children: Vec<_> = columns
+        self.sync_column_lists();
+        let children: Vec<_> = self
+            .state
+            .model()
+            .columns
             .iter()
             .enumerate()
             .map(|(ci, col)| {
@@ -663,7 +796,7 @@ impl IssuesView {
             &self.board_scroll,
         )
         .children(children);
-        board_scroll::with_shift_wheel(board, &self.board_scroll)
+        board_scroll::with_board_wheel(board, &self.board_scroll)
     }
 
     fn render_collapsed(
@@ -735,36 +868,8 @@ impl IssuesView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let model = self.state.model();
         let focused = ci == self.state.selected_column;
-        let is_done = col.category == shelbi_core::StatusCategory::Done;
         let drop = self.state.dragging().map(|id| self.state.drop_target(id, ci));
-        // In the dragged card's own column each card is a reorder target; the
-        // row it was dragged from says which edge marks the landing spot.
-        let reorder_from = match drop {
-            Some(DropTarget::Reorder) => self
-                .state
-                .dragging()
-                .and_then(|id| col.cards.iter().position(|c| c.id == id)),
-            _ => None,
-        };
-        let cards: Vec<_> = col
-            .cards
-            .iter()
-            .enumerate()
-            .map(|(ri, card)| {
-                // While the detail is open the keyboard is in it, so the
-                // card under the scrim drops its focus ring (as the frame
-                // draws it).
-                let selected = focused && ri == self.state.selected_row && self.state.detail_id().is_none();
-                let card_el = self.render_card(card, ci, ri, selected, theme, cx);
-                match reorder_from {
-                    Some(from) => reorder_target(card_el, card, ci, ri, from, theme, cx)
-                        .into_any_element(),
-                    None => card_el.into_any_element(),
-                }
-            })
-            .collect();
         let refused = match &drop {
             Some(DropTarget::Refused(msg)) => Some(msg.clone()),
             _ => None,
@@ -774,7 +879,6 @@ impl IssuesView {
             Some(DropTarget::Move { merge: false }) => Some("Drop to move here"),
             _ => None,
         };
-        let empty = col.cards.is_empty();
         // The Figma column heading: the status glyph, the label in caps
         // (loud on the keyboard's column) and the count.
         let header = div()
@@ -817,74 +921,21 @@ impl IssuesView {
                 this.apply_intents(intents, window, cx);
                 cx.notify();
             }));
-        let body = board_scroll::column_body(
-            div()
-                .id(("column", ci))
-                .flex()
-                .flex_col()
-                .gap_2()
-                .flex_1()
-                .min_h_0()
-                // The clip reaches GLOW_ROOM past the column on the sides and
-                // top, so the focus glow shows while the cards keep the
-                // column's width; the bottom padding is the room under the
-                // last card once scrolled to the end.
-                .mx(px(-GLOW_ROOM))
-                .mt(px(-GLOW_ROOM))
-                .px(px(GLOW_ROOM))
-                .pt(px(GLOW_ROOM))
-                .pb_3(),
-            &self.column_scrolls[ci],
+        // Only the cards in view are built (`board_list.rs`); the list asks
+        // for each as it scrolls in.
+        let list_state = self.column_lists[&col.status_id].state.clone();
+        let cards = gpui::list(
+            list_state.clone(),
+            cx.processor(move |this, ix: usize, _window, cx| this.render_column_item(ci, ix, cx)),
         )
-        .children(cards)
-        .when(empty && !(is_done && model.done_loading), |d| {
-            d.child(if model.loading {
-                muted_row(theme, "Loading board…").into_any_element()
-            } else {
-                // An empty column: what goes here and how to put it there.
-                div()
-                    .debug_selector(|| "column-empty".into())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(72.0))
-                    .px_3()
-                    .rounded(px(CARD_RADIUS))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(theme.divider_strong)
-                    .type_style(Type::XSmall)
-                    .text_center()
-                    .text_color(theme.muted)
-                    .child("No issues. Drag a card here.")
-                    .into_any_element()
-            })
-        })
-        .when(is_done && model.done_loading, |d| {
-            d.child(muted_row(theme, "Loading history…"))
-        })
-        .when(is_done && model.has_more_done, |d| {
-            let hint = "m";
-            d.child(
-                div()
-                    .id("load-more")
-                    .px_2()
-                    .py_1()
-                    .type_style(Type::XSmall)
-                    .text_color(theme.link)
-                    .hover(|s| s.text_color(theme.link_hover))
-                    .cursor_pointer()
-                    .child(if self.load_more_in_flight {
-                        "Loading…".to_string()
-                    } else {
-                        format!("Load more ({hint})")
-                    })
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.load_more();
-                        cx.notify();
-                    })),
-            )
-        });
+        // The room under the last card once scrolled to the end.
+        .pb_3();
+        // The clip reaches GLOW_ROOM past the column on the sides and top, so
+        // the focus glow shows while the cards keep the column's width (each
+        // item pads itself back in).
+        let body = board_scroll::column_list(cards, &list_state, &self.board_scroll)
+            .mx(px(-GLOW_ROOM))
+            .mt(px(-GLOW_ROOM));
         let theme = *theme;
         // No well: the cards sit on the canvas under the heading. A legal
         // drop target lights up under the pointer.
@@ -911,6 +962,90 @@ impl IssuesView {
                     this.handle_drop(intents, window, cx);
                 }))
             })
+    }
+
+    /// Item `ix` of column `ci`'s list: a card (a reorder target while its
+    /// column's card is dragged), or a row under the cards. Each is padded
+    /// as the column's flex gap and glow room placed it: the glow's room
+    /// above the first, the 8px gap above the rest, the glow's room beside.
+    fn render_column_item(&self, ci: usize, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.global::<Theme>();
+        let model = self.state.model();
+        let Some(col) = model.columns.get(ci) else {
+            return div().into_any_element();
+        };
+        let el = match col.cards.get(ix) {
+            Some(card) => {
+                // While the detail is open the keyboard is in it, so the
+                // card under the scrim drops its focus ring (as the frame
+                // draws it).
+                let selected = ci == self.state.selected_column
+                    && ix == self.state.selected_row
+                    && self.state.detail_id().is_none();
+                let card_el = self.render_card(card, ci, ix, selected, &theme, cx);
+                // In the dragged card's own column each card is a reorder
+                // target; the row it was dragged from says which edge marks
+                // the landing spot.
+                let reorder_from = match self.state.dragging() {
+                    Some(id) if self.state.drop_target(id, ci) == DropTarget::Reorder => {
+                        col.cards.iter().position(|c| c.id == id)
+                    }
+                    _ => None,
+                };
+                match reorder_from {
+                    Some(from) => reorder_target(card_el, card, ci, ix, from, &theme, cx).into_any_element(),
+                    None => card_el.into_any_element(),
+                }
+            }
+            None => match column_rows(col, model).get(ix - col.cards.len()) {
+                Some(Item::Empty) if model.loading => muted_row(&theme, "Loading board…").into_any_element(),
+                // An empty column: what goes here and how to put it there.
+                Some(Item::Empty) => div()
+                    .debug_selector(|| "column-empty".into())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(72.0))
+                    .px_3()
+                    .rounded(px(CARD_RADIUS))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(theme.divider_strong)
+                    .type_style(Type::XSmall)
+                    .text_center()
+                    .text_color(theme.muted)
+                    .child("No issues. Drag a card here.")
+                    .into_any_element(),
+                Some(Item::LoadingHistory) => muted_row(&theme, "Loading history…").into_any_element(),
+                Some(Item::LoadMore) => {
+                    let hint = "m";
+                    div()
+                        .id("load-more")
+                        .px_2()
+                        .py_1()
+                        .type_style(Type::XSmall)
+                        .text_color(theme.link)
+                        .hover(|s| s.text_color(theme.link_hover))
+                        .cursor_pointer()
+                        .child(if self.load_more_in_flight {
+                            "Loading…".to_string()
+                        } else {
+                            format!("Load more ({hint})")
+                        })
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.load_more();
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
+                Some(Item::Card(_)) | None => div().into_any_element(),
+            },
+        };
+        div()
+            .px(px(GLOW_ROOM))
+            .pt(px(if ix == 0 { GLOW_ROOM } else { 8.0 }))
+            .child(el)
+            .into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1252,10 +1387,7 @@ impl Render for IssuesView {
             self.state.end_drag();
         }
         let theme = *cx.global::<Theme>();
-        let detail = self
-            .state
-            .detail_id()
-            .and_then(|id| TaskDetailModel::build(self.state.input(), id));
+        let detail = self.detail_model();
         let detail_missing = self.state.detail_id().is_some() && detail.is_none();
         let board = self.render_board(&theme, cx);
         div()
@@ -1294,6 +1426,45 @@ impl Render for IssuesView {
 }
 
 // ---- small pieces ------------------------------------------------------------
+
+/// A fingerprint of a background read (its debug rendering hashed, off the
+/// UI thread), to tell a refresh that read the same board again.
+fn fingerprint(value: &impl std::fmt::Debug) -> u64 {
+    use std::fmt::Write;
+    use std::hash::Hasher;
+    struct Feed(std::collections::hash_map::DefaultHasher);
+    impl Write for Feed {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut feed = Feed(Default::default());
+    let _ = write!(feed, "{value:?}");
+    feed.0.finish()
+}
+
+/// The read to fold of `arrived` (a read and its fingerprint): none when it
+/// matches `last`, the last one folded, unless a change is `pending` (a read
+/// is what settles it). Records the fingerprint of what it lets through.
+fn to_fold<T>(arrived: Option<(T, u64)>, last: &mut Option<u64>, pending: bool) -> Option<T> {
+    let (read, print) = arrived?;
+    if *last == Some(print) && !pending {
+        return None;
+    }
+    *last = Some(print);
+    Some(read)
+}
+
+/// The rows column `col` shows under its cards.
+fn column_rows(col: &IssueColumn, model: &shelbi_app::IssuesModel) -> Vec<Item> {
+    board_list::trailing(
+        col.cards.is_empty(),
+        col.category == shelbi_core::StatusCategory::Done,
+        model.done_loading,
+        model.has_more_done,
+    )
+}
 
 /// Make `card` (row `ri` of column `ci`, the dragged card's own column) a
 /// reorder target: hovering it marks the edge the dragged card lands on (above
@@ -1452,4 +1623,31 @@ pub(super) fn centered(
             .max_h(relative(0.9))
             .on_click(|_, _, cx: &mut App| cx.stop_propagation()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_like_the_last_is_not_folded_unless_a_change_is_in_flight() {
+        let mut last = None;
+        assert_eq!(to_fold(Some(("a", 1)), &mut last, false), Some("a"), "the first read");
+        assert_eq!(last, Some(1));
+        assert_eq!(to_fold(Some(("a", 1)), &mut last, false), None, "the same board again");
+        assert_eq!(to_fold(Some(("a", 1)), &mut last, true), Some("a"), "it may settle a change");
+        assert_eq!(to_fold(Some(("b", 2)), &mut last, false), Some("b"), "the board changed");
+        assert_eq!(to_fold::<&str>(None, &mut last, true), None, "nothing arrived");
+        assert_eq!(last, Some(2));
+        // A persisted filter clears it: the next read is folded either way.
+        let mut cleared = None;
+        assert_eq!(to_fold(Some(("b", 2)), &mut cleared, false), Some("b"));
+    }
+
+    #[test]
+    fn a_fingerprint_tells_reads_apart() {
+        let read = |title: &str| vec![("id-1", title.to_string()), ("id-2", "Other".to_string())];
+        assert_eq!(fingerprint(&read("Title")), fingerprint(&read("Title")));
+        assert_ne!(fingerprint(&read("Title")), fingerprint(&read("Retitled")));
+    }
 }

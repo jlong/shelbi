@@ -11,6 +11,8 @@ mod assets;
 #[cfg(feature = "bench")]
 mod bench;
 #[cfg(feature = "visual-check")]
+mod bench_board;
+#[cfg(feature = "visual-check")]
 mod bench_push;
 mod commands;
 mod drops;
@@ -87,6 +89,10 @@ enum Mode {
     /// window over fake daemons (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     BenchPush(Vec<String>),
+    /// `--bench-board [options]`: time the Issues board's frames on a large
+    /// fixture board, offscreen (feature `visual-check`).
+    #[cfg(feature = "visual-check")]
+    BenchBoard(Vec<String>),
     /// `--bench-term [options]`, `--bench-feed ...`, `--bench-record ...`:
     /// the terminal performance bench and its helpers (feature `bench`).
     #[cfg(feature = "bench")]
@@ -123,6 +129,8 @@ fn parse_args() -> Mode {
         },
         #[cfg(feature = "visual-check")]
         Some("--bench-push") => Mode::BenchPush(args.collect()),
+        #[cfg(feature = "visual-check")]
+        Some("--bench-board") => Mode::BenchBoard(args.collect()),
         #[cfg(feature = "bench")]
         Some(flag @ ("--bench-term" | "--bench-feed" | "--bench-record" | "--bench-client")) => {
             Mode::Bench(flag.to_string(), args.collect())
@@ -175,6 +183,10 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::BenchPush(args) = &mode {
         bench_push::run(args);
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::BenchBoard(args) = &mode {
+        bench_board::run(args);
     }
     #[cfg(feature = "bench")]
     if let Mode::Bench(flag, args) = &mode {
