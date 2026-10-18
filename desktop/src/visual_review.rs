@@ -298,7 +298,9 @@ impl Run {
     }
 
     fn all(&mut self) {
-        // The sidebar, then the push in.
+        // The sidebar, then the push in. The window shows Machines, which has
+        // no row: the Orchestrator row is selected as the keys would.
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_select(0, cx)).unwrap();
         self.settle();
         let column = self.column();
         self.expect("the sidebar holds the column", column == (true, false));

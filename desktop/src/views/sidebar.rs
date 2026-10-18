@@ -323,9 +323,9 @@ pub struct SidebarProps<'a> {
     pub model: &'a SidebarModel,
     /// The sections the user has collapsed.
     pub collapsed: &'a BTreeSet<Section>,
-    /// The selectable-row ordinal (`ClientState::sidebar_selection`), over
-    /// [`layout`]'s rows.
-    pub selection: usize,
+    /// The selected row's selectable-row ordinal over [`layout`]'s rows, or
+    /// `None` when what the main area shows has no row.
+    pub selection: Option<usize>,
     /// Keyboard focus is in the sidebar (the selected row wears the accent
     /// pill).
     pub focused: bool,
@@ -959,7 +959,7 @@ fn render_nav_row<H: SidebarHost>(
     let SidebarRow::Nav { label, view } = row else {
         return div().into_any_element();
     };
-    let selected = ordinal == Some(props.selection);
+    let selected = ordinal.is_some() && ordinal == props.selection;
     let selector = row_selector(row);
     let ord = ordinal.unwrap_or_default();
     let painted = div()
@@ -1108,7 +1108,7 @@ fn render_row<H: SidebarHost>(
             move || selector
         })
         .flex_none();
-    let selected = ordinal == Some(props.selection);
+    let selected = ordinal.is_some() && ordinal == props.selection;
     let ord = ordinal.unwrap_or_default();
     // A selectable row's frame: 8pt in, 4pt above and below, the chip's
     // corners, selectable and clickable.
@@ -1782,7 +1782,7 @@ mod render_tests {
                 SidebarProps {
                     model: &self.model,
                     collapsed: &collapsed,
-                    selection: self.selection,
+                    selection: Some(self.selection),
                     focused: true,
                     link: self.link,
                     palette_chord: "⌃P".into(),

@@ -205,7 +205,7 @@ fn a_to_b_to_a_restores_alpha_with_nothing_left_behind(cx: &mut TestAppContext) 
     let h = open(cx, &f, "alpha", 0);
     leave_alpha_on_its_workspace(cx, h);
     assert_eq!(live_attaches(&f, "alpha"), 1, "alpha's workspace agent is attached");
-    let workspace_row = read(cx, h, |w, _| w.client.sidebar_selection());
+    let workspace_row = read(cx, h, |w, cx| w.selected(cx));
 
     // A → B: alpha's views and sessions go, beta's chat comes. (Scrolled
     // just before: a test sidebar is too short to stay scrolled once drawn.)
@@ -218,6 +218,11 @@ fn a_to_b_to_a_restores_alpha_with_nothing_left_behind(cx: &mut TestAppContext) 
     assert_eq!(live_attaches(&f, "alpha"), 0, "alpha's agent detached");
     assert_eq!(live_attaches(&f, "beta"), 1);
     assert!(read(cx, h, |w, _| w.workspace.is_none()));
+    // Beta's sidebar has the row for beta's view selected, not alpha's row.
+    read(cx, h, |w, cx| {
+        assert_eq!(w.client.view(), &View::Session("orch".into()));
+        assert_eq!(w.selected(cx), Some(SidebarTarget::View(View::Session("orch".into()))));
+    });
 
     // B → A: alpha comes back as it was left, its sidebar scroll before
     // its first frame (which a test sidebar, too short to scroll, would undo).
@@ -232,9 +237,9 @@ fn a_to_b_to_a_restores_alpha_with_nothing_left_behind(cx: &mut TestAppContext) 
     cx.run_until_parked();
     draw(cx, h);
     draw(cx, h);
-    read(cx, h, |w, _| {
+    read(cx, h, |w, cx| {
         assert_eq!(w.client.view(), &View::Session("alpha-1".into()), "its view");
-        assert_eq!(w.client.sidebar_selection(), workspace_row, "its selection");
+        assert_eq!(w.selected(cx), workspace_row, "its selection");
         assert_eq!(w.workspace_return, Some(View::Session("orch".into())), "its panel's Back");
         assert_eq!(w.column.target(), Occupant::Workspace, "its panel");
         assert!(!w.column.is_animating(), "put straight back, no push");

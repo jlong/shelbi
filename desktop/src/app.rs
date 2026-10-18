@@ -8,8 +8,9 @@
 //! feed ([`crate::feeds`]). [`Shell`] keeps the open windows and their slots.
 //!
 //! A window owns its project's `shelbi_app::nav::ClientState`, the source of
-//! truth for what the main area shows, where keyboard focus sits, the sidebar
-//! selection and the sidebar width; its sidebar model, fed by the project's
+//! truth for what the main area shows, where keyboard focus sits and the
+//! sidebar width (the sidebar's selected row is derived from what the main
+//! area shows, `dt-back-syncs-sidebar`); its sidebar model, fed by the project's
 //! shared [`ProjectFeed`](crate::refresh::ProjectFeed); and its persisted
 //! [`WindowState`] (per window slot, so a window keeps its frame across
 //! switches).
@@ -62,7 +63,8 @@
 //! queued review asks which free slot to load it onto first; the daemon
 //! loads it, and its `ReviewOpened` opens the view. Leaving the review
 //! returns to the view the main area showed before it, with the sidebar as
-//! it was (selection, scroll, collapsed) and keys on it.
+//! it was (scroll, collapsed) and keys on it, its selection on that view's
+//! row.
 //!
 //! The Issues nav row routes the main area to the native board
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
@@ -551,8 +553,25 @@ struct SwitchHold {
     review: Option<String>,
 }
 
-/// The sidebar position a switch restores once the rows it names exist (the
-/// skeleton may not have them yet; the feed's first snapshot will).
+/// What the main area shows, as the sidebar's selection follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Shown {
+    View(View),
+    Review(Option<String>),
+    Settings,
+}
+
+/// A row the keys or a click put the selection on. It holds only while the
+/// main area shows what it showed then (`over`): any change to the main area
+/// hands the selection back to the row for what it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cursor {
+    row: SidebarTarget,
+    over: Shown,
+}
+
+/// The sidebar scroll a switch restores once the row it was left on exists
+/// (the skeleton may not have it yet; the feed's first snapshot will).
 #[derive(Debug, Clone, PartialEq)]
 struct PendingRows {
     selected: Option<String>,
@@ -589,6 +608,9 @@ pub struct ShelbiWindow {
     overlay_opened: Option<Instant>,
     /// The sidebar's rows, measured for the selection chip's slide.
     nav_track: SharedTrack,
+    /// Where the keys or a click moved the selection, until the main area
+    /// changes ([`Self::selected`]).
+    cursor: Option<Cursor>,
     /// The sidebar sections the user has collapsed (saved per project with
     /// the rest of where it was left).
     collapsed_sections: BTreeSet<sidebar::Section>,
@@ -764,7 +786,6 @@ impl ShelbiWindow {
         w.tap = Some(Default::default());
         // A native view with no entity yet: nothing attaches or reads.
         w.client.set_view(View::Machines);
-        w.sync_selection();
         window.set_window_title(&w.model.project_label);
         w
     }
@@ -793,7 +814,7 @@ impl ShelbiWindow {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let mut this = ShelbiWindow {
+        ShelbiWindow {
             project: project.to_string(),
             slot: 0,
             chooser: false,
@@ -814,6 +835,7 @@ impl ShelbiWindow {
             switcher: sidebar::Switcher::default(),
             overlay_opened: None,
             nav_track: SlideTrack::shared(),
+            cursor: None,
             collapsed_sections: BTreeSet::new(),
             route: Route::View,
             issues: None,
@@ -863,9 +885,7 @@ impl ShelbiWindow {
             chat_deps: None,
             #[cfg(feature = "visual-check")]
             probe: None,
-        };
-        this.sync_selection();
-        this
+        }
     }
 
     /// The window came to the front: the menu bar is now its, and the
@@ -1040,13 +1060,6 @@ impl ShelbiWindow {
         self.pending_rows = None;
         match target {
             notify::Target::Workspace(workspace) => {
-                // Select its sidebar row too, so the window says where it went.
-                if let Some(ordinal) = self.sidebar_entries().iter().filter_map(|e| e.row.target()).position(
-                    |t| matches!(&t, SidebarTarget::Workspace(w) if *w == workspace),
-                ) {
-                    let count = self.selectable_count();
-                    self.client.select(ordinal, count);
-                }
                 self.client.focus_main();
                 self.run(CommandKind::FocusWorkspace { workspace }, window, cx);
             }
@@ -1088,7 +1101,6 @@ impl ShelbiWindow {
                     let changes = self.notifier.observe_sidebar(&model);
                     self.model = model;
                     self.apply_notices(changes, cx);
-                    self.sync_selection();
                     self.apply_pending_rows();
                     // An open palette follows the live state, query kept.
                     let entries = self.palette_entries();
@@ -1396,13 +1408,14 @@ impl ShelbiWindow {
             machines.update(cx, |v, _| v.stop_workers());
         }
         self._view_subscriptions.clear();
-        self.route = Route::View;
+        self.set_route(Route::View);
         self.workspace_return = None;
         self.column = ColumnSwap::new();
         self.column_moving = false;
         self.collapsed_panel_cols = None;
         self.sidebar_scroll = ScrollHandle::new();
         self.nav_track = SlideTrack::shared();
+        self.cursor = None;
         self.switch_hold = None;
         self.pending_rows = None;
         self.pending_workflow_filter = None;
@@ -1425,9 +1438,7 @@ impl ShelbiWindow {
         let state = ProjectViewState {
             view: Some(self.client.view().as_view_id()),
             sidebar_focused: self.client.focus() == Focus::Sidebar,
-            selected: self
-                .target_at(self.client.sidebar_selection())
-                .map(|t| row_key(&t)),
+            selected: self.selected(cx).map(|t| row_key(&t)),
             scroll_y: self.sidebar_scroll.offset().y.as_f32(),
             review: self.shown_review(cx),
             workspace_return: self.workspace_return.as_ref().map(View::as_view_id),
@@ -1495,24 +1506,22 @@ impl ShelbiWindow {
         });
     }
 
-    /// Put the sidebar back where the project was left once the row it names
-    /// is there: on the skeleton already, or when a snapshot brings it. A
-    /// row that is gone once the board has loaded is let go.
+    /// Scroll the sidebar back where the project was left once the row it
+    /// was left on is there: on the skeleton already, or when a snapshot
+    /// brings it. A row that is gone once the board has loaded is let go.
+    /// The selection itself is the restored view's row ([`Self::selected`]).
     fn apply_pending_rows(&mut self) {
         let Some(pending) = self.pending_rows.clone() else {
             return;
         };
-        let found = pending.selected.as_deref().and_then(|key| {
-            (0..self.selectable_count())
-                .find(|&i| self.target_at(i).is_some_and(|t| row_key(&t) == key))
+        let listed = pending.selected.as_deref().is_some_and(|key| {
+            self.sidebar_entries()
+                .iter()
+                .filter_map(|e| e.row.target())
+                .any(|t| row_key(&t) == key)
         });
-        match found {
-            Some(ordinal) => {
-                let count = self.selectable_count();
-                self.client.select(ordinal, count);
-            }
-            None if pending.selected.is_some() && self.model.board_loading => return,
-            None => {}
+        if !listed && pending.selected.is_some() && self.model.board_loading {
+            return;
         }
         self.sidebar_scroll
             .set_offset(gpui::point(px(0.0), px(pending.scroll_y)));
@@ -1628,11 +1637,73 @@ impl ShelbiWindow {
         self.sidebar_entries().iter().filter(|e| e.row.is_selectable()).count()
     }
 
-    /// Keep the selection on a row that exists, and on the current view's nav
-    /// row when the selection is still at its starting place.
-    fn sync_selection(&mut self) {
+    /// Route the main area. Whatever it shows next has its row selected:
+    /// the keys' or a click's row is let go.
+    fn set_route(&mut self, route: Route) {
+        self.route = route;
+        self.cursor = None;
+    }
+
+    /// What the main area shows.
+    fn shown(&self, cx: &App) -> Shown {
+        match &self.route {
+            Route::View => Shown::View(self.client.view().clone()),
+            Route::Review => Shown::Review(self.review.as_ref().and_then(|r| r.read(cx).task_id().map(str::to_string))),
+            Route::Settings(_) => Shown::Settings,
+        }
+    }
+
+    /// The sidebar's selected row: the row for what the main area shows (the
+    /// Orchestrator's for the chat, a workspace's for its page), unless the
+    /// keys or a click have moved it since the main area last changed. None
+    /// when what it shows has no row drawn (Machines, Settings, a collapsed
+    /// section's row), so no stale row stays selected.
+    fn selected(&self, cx: &App) -> Option<SidebarTarget> {
+        let shown = self.shown(cx);
+        let targets: Vec<SidebarTarget> = self.sidebar_entries().iter().filter_map(|e| e.row.target()).collect();
+        if let Some(cursor) = self.cursor.as_ref().filter(|c| c.over == shown && targets.contains(&c.row)) {
+            return Some(cursor.row.clone());
+        }
+        targets.into_iter().find(|t| match (&shown, t) {
+            (Shown::View(view), SidebarTarget::View(row)) => view == row,
+            (Shown::View(View::Session(name)), SidebarTarget::Workspace(row)) => name == row,
+            (Shown::Review(Some(task)), SidebarTarget::Review(row)) => task == row,
+            _ => false,
+        })
+    }
+
+    /// [`Self::selected`] as a selectable-row ordinal.
+    fn selected_ordinal(&self, cx: &App) -> Option<usize> {
+        let selected = self.selected(cx)?;
+        self.sidebar_entries()
+            .iter()
+            .filter_map(|e| e.row.target())
+            .position(|t| t == selected)
+    }
+
+    /// Move the selection to `row` without opening it (the keys, a click
+    /// before it opens).
+    fn select_row(&mut self, row: SidebarTarget, cx: &App) {
+        let over = self.shown(cx);
+        self.cursor = Some(Cursor { row, over });
+    }
+
+    /// Move the selection one selectable row up or down. With nothing
+    /// selected, Down starts at the top and Up at the bottom.
+    fn step_selection(&mut self, down: bool, cx: &App) {
         let count = self.selectable_count();
-        self.client.clamp_selection(count);
+        if count == 0 {
+            return;
+        }
+        let ordinal = match (self.selected_ordinal(cx), down) {
+            (Some(i), true) => (i + 1).min(count - 1),
+            (Some(i), false) => i.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => count - 1,
+        };
+        if let Some(row) = self.target_at(ordinal) {
+            self.select_row(row, cx);
+        }
     }
 
     fn target_at(&self, ordinal: usize) -> Option<SidebarTarget> {
@@ -1642,32 +1713,15 @@ impl ShelbiWindow {
             .nth(ordinal)
     }
 
-    /// Collapse or expand a sidebar section, keeping the selection on its row
-    /// when that row is still drawn, and remember it for the project.
+    /// Collapse or expand a sidebar section, and remember it for the
+    /// project. The selection stays on its row while that row is drawn
+    /// (selection follows rows, not ordinals).
     fn toggle_section(&mut self, section: sidebar::Section, cx: &mut Context<Self>) {
-        let selected = self.target_at(self.client.sidebar_selection());
         if !self.collapsed_sections.remove(&section) {
             self.collapsed_sections.insert(section);
         }
-        self.reselect(selected);
         self.remember_view_state(cx);
         cx.notify();
-    }
-
-    /// Put the selection back on the row that opens `target` when it is
-    /// drawn, else keep it in range.
-    fn reselect(&mut self, target: Option<SidebarTarget>) {
-        let count = self.selectable_count();
-        let found = target.and_then(|t| {
-            self.sidebar_entries()
-                .iter()
-                .filter_map(|e| e.row.target())
-                .position(|other| other == t)
-        });
-        match found {
-            Some(ordinal) => self.client.select(ordinal, count),
-            None => self.client.clamp_selection(count),
-        }
     }
 
     /// A sidebar chord (⌘O ⌘I ⌘L, ⌘1 to ⌘9): open what it names, selecting
@@ -1699,36 +1753,25 @@ impl ShelbiWindow {
                 .find(|e| e.shortcut == Some(n))
                 .and_then(|e| e.row.target()),
         };
-        let Some(target) = target else {
-            return;
-        };
         // A collapsed section still answers its chords; the row just isn't
         // there to select.
-        let ordinal = self
-            .sidebar_entries()
-            .iter()
-            .filter_map(|e| e.row.target())
-            .position(|t| t == target);
-        match ordinal {
-            Some(ordinal) => {
-                let count = self.selectable_count();
-                self.client.select(ordinal, count);
-                self.activate_selection(window, cx);
-            }
-            None => self.activate_target(target, window, cx),
+        if let Some(target) = target {
+            self.activate_target(target, window, cx);
         }
     }
 
     /// Open the selected sidebar row.
     fn activate_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.target_at(self.client.sidebar_selection()) else {
+        let Some(target) = self.selected(cx) else {
             return;
         };
         self.activate_target(target, window, cx);
     }
 
-    /// Open what a sidebar row opens.
+    /// Open what a sidebar row opens, selecting it: what it opens takes the
+    /// selection from there (a review still loading keeps it on its row).
     fn activate_target(&mut self, target: SidebarTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_row(target.clone(), cx);
         match target {
             SidebarTarget::View(view) => self.run(CommandKind::ShowView(view), window, cx),
             SidebarTarget::Workspace(workspace) => {
@@ -1749,7 +1792,6 @@ impl ShelbiWindow {
         if !self.model.collapsed_machines.remove(&name) {
             self.model.collapsed_machines.insert(name.clone());
         }
-        self.sync_selection();
         let write = cx.background_executor().spawn(async move {
             shelbi_state::toggle_sidebar_machine_collapsed(&name).map_err(|e| e.to_string())
         });
@@ -1807,7 +1849,9 @@ impl ShelbiWindow {
                 } else if workspace_name(self.client.view()).is_none() {
                     self.workspace_return = Some(self.client.view().clone());
                 }
-                self.route = Route::View;
+                // The selection is the shown view's row again, even where
+                // the keys had moved it off the view already shown.
+                self.set_route(Route::View);
                 let chat = is_chat(&view);
                 match view {
                     View::Issues => {
@@ -2071,7 +2115,7 @@ impl ShelbiWindow {
         self.banner = None;
         let review = self.ensure_review(window, cx);
         let hold = self.push_ahead(Occupant::Review);
-        self.route = Route::Review;
+        self.set_route(Route::Review);
         review.update(cx, |r, cx| {
             r.hold_content(hold, cx);
             r.show(info, row, cx)
@@ -2094,7 +2138,7 @@ impl ShelbiWindow {
         let row = self.review_row(task);
         let review = self.ensure_review(window, cx);
         let hold = self.push_ahead(Occupant::Review);
-        self.route = Route::Review;
+        self.set_route(Route::Review);
         review.update(cx, |r, cx| {
             r.hold_content(hold, cx);
             r.show_pending(task, row, cx)
@@ -2198,7 +2242,7 @@ impl ShelbiWindow {
         #[cfg(any(test, feature = "visual-check"))]
         if let Some(tap) = &self.tap {
             tap.borrow_mut().push(HostCall::ShowView(view.clone()));
-            self.route = Route::View;
+            self.set_route(Route::View);
             if workspace_name(self.client.view()).is_some() {
                 // Leaving a workspace: the main area (and so the column)
                 // moves off it, though the view itself is only recorded.
@@ -2746,7 +2790,7 @@ impl ShelbiWindow {
                 SettingsEvent::Saved => this.load_notify_prefs(cx),
             });
             self._view_subscriptions.push(sub);
-            self.route = Route::Settings(view);
+            self.set_route(Route::Settings(view));
         }
         self.sync_chat(window, cx);
         self.banner = None;
@@ -3524,10 +3568,9 @@ impl ShelbiWindow {
             // sidebar takes none while a panel stands in for it.
             return;
         }
-        let count = self.selectable_count();
         match (self.keymaps.sidebar.dispatch(chord), chord.code) {
-            (Some(SidebarAction::NavUp), _) | (_, Key::BackTab) => self.client.select_up(),
-            (Some(SidebarAction::NavDown), _) | (_, Key::Tab) => self.client.select_down(count),
+            (Some(SidebarAction::NavUp), _) | (_, Key::BackTab) => self.step_selection(false, cx),
+            (Some(SidebarAction::NavDown), _) | (_, Key::Tab) => self.step_selection(true, cx),
             (Some(SidebarAction::Activate), _) => self.activate_selection(window, cx),
             (Some(SidebarAction::Refresh), _) => {
                 if let Some(feed) = &self._feed {
@@ -3735,9 +3778,9 @@ impl SidebarHost for ShelbiWindow {
     fn sidebar_event(&mut self, event: SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             SidebarEvent::Activate(ordinal) => {
-                let count = self.selectable_count();
-                self.client.select(ordinal, count);
-                self.activate_selection(window, cx);
+                if let Some(target) = self.target_at(ordinal) {
+                    self.activate_target(target, window, cx);
+                }
             }
             SidebarEvent::OpenSearch => self.open_palette(window, cx),
             SidebarEvent::ToggleSwitcher => {
@@ -3824,19 +3867,6 @@ impl ShelbiWindow {
             window.request_animation_frame();
         }
         let catalog_projects = switcher_phase.map(|_| self.switcher_projects(cx));
-        // The nav selection chip: slide it to the selected row when the
-        // selection moves (keys, clicks, route changes alike).
-        let chip = {
-            let mut track = self.nav_track.borrow_mut();
-            let key = sidebar::selected_key(&self.sidebar_entries(), self.client.sidebar_selection());
-            let reduce = self.reduce_motion.clone();
-            track.select(key, now, move || reduce());
-            let chip = track.frame(now);
-            if chip.is_some() {
-                window.request_animation_frame();
-            }
-            chip
-        };
         // The leading column: the sidebar, or a review's or workspace's panel
         // in its place, both while the push between them runs (clipped to
         // the column).
@@ -3844,6 +3874,24 @@ impl ShelbiWindow {
         self.column.pace(now);
         let frame = self.column.frame(now);
         self.column_moving = frame.animating;
+        // The nav selection chip: slide it to the selected row when the
+        // selection moves (keys, clicks, route changes alike) while the
+        // sidebar is in its column or leaving it; a sidebar coming back (or
+        // hidden) has it placed on its row directly.
+        let selection = self.selected_ordinal(cx);
+        let chip = {
+            let mut track = self.nav_track.borrow_mut();
+            let key = selection.and_then(|ordinal| sidebar::selected_key(&self.sidebar_entries(), ordinal));
+            let reduce = self.reduce_motion.clone();
+            let sidebar_target = self.column.target() == Occupant::Sidebar;
+            let place = self.collapsed || sidebar_target == frame.animating;
+            track.select(key, now, move || place || reduce());
+            let chip = track.frame(now);
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
         if !frame.animating {
             self.release_settled(cx);
         }
@@ -3886,7 +3934,7 @@ impl ShelbiWindow {
                     SidebarProps {
                         model: &self.model,
                         collapsed: &self.collapsed_sections,
-                        selection: self.client.sidebar_selection(),
+                        selection,
                         focused: self.client.focus() == Focus::Sidebar,
                         link: self.link,
                         palette_chord: self.palette_chord.clone(),
@@ -4154,7 +4202,6 @@ impl ShelbiWindow {
         w.reduce_motion = Rc::new(|| false);
         // A native view with no entity yet: nothing attaches or reads.
         w.client.set_view(View::Machines);
-        w.sync_selection();
         w
     }
 
@@ -4206,8 +4253,9 @@ impl ShelbiWindow {
 
     /// Move the sidebar's selection to the `ordinal`-th selectable row.
     pub(crate) fn offscreen_select(&mut self, ordinal: usize, cx: &mut Context<Self>) {
-        let count = self.selectable_count();
-        self.client.select(ordinal, count);
+        if let Some(row) = self.target_at(ordinal) {
+            self.select_row(row, cx);
+        }
         cx.notify();
     }
 
