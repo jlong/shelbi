@@ -911,6 +911,8 @@ pub struct TaskDetailModel {
     /// The stored status id and its display label (`IN PROGRESS`).
     pub status_id: String,
     pub status_label: String,
+    /// The status's name as the workflow spells it (`In Progress`).
+    pub status_name: String,
     pub category: StatusCategory,
     pub priority: u32,
     pub assignee: Option<String>,
@@ -946,12 +948,14 @@ impl TaskDetailModel {
             .iter()
             .find(|st| st.id == status_id);
         let task = &tf.task;
+        let status_name = status
+            .map(|st| st.name.clone())
+            .unwrap_or_else(|| task.column.default_status_name().to_string());
         Some(TaskDetailModel {
             id: task.id.clone(),
             title: task.title.clone(),
-            status_label: board::column_label(
-                status.map(|st| st.name.as_str()).unwrap_or(task.column.default_status_name()),
-            ),
+            status_label: board::column_label(&status_name),
+            status_name,
             category: status.map(|st| st.category).unwrap_or(task.column.category()),
             status_id,
             priority: task.priority,

@@ -22,7 +22,7 @@
 //! - a workflow status's glyph ([`status_icon`]) and heading
 //!   ([`status_heading`]: the board's column headers, the task panels);
 //! - controls that open something ([`dropdown`]), segmented controls
-//!   ([`filter_track`], [`choice_track`]), shortcut keycaps ([`keycaps`]);
+//!   ([`filter_track`], [`choice_track`]);
 //! - the sidebar's (the Navigation component's) 6px corners
 //!   ([`NAV_RADIUS`]) and plain-text shortcut hints ([`hotkey`]);
 //! - a project's initials badge ([`project_badge`]);
@@ -820,27 +820,6 @@ pub fn form_button(
         .child(label.into())
 }
 
-/// The Button component's Hotkey: one small keycap per key of `chord` (`⌘K`
-/// is ⌘ and K), X-Small in gray, on the canvas with a 1px bottom edge.
-pub fn keycaps(chord: &str, theme: &Theme) -> Div {
-    let keys = split_chord(chord);
-    div().flex().flex_row().flex_none().gap(px(2.0)).children(keys.into_iter().map(|key| {
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .min_w(px(18.0))
-            .h(px(18.0))
-            .px(px(4.0))
-            .rounded(px(4.0))
-            .bg(theme.keycap)
-            .shadow(vec![BoxShadow::new(px(0.0), px(1.0), theme.keycap_edge)])
-            .type_style(Type::XSmall)
-            .text_color(theme.gray)
-            .child(key)
-    }))
-}
-
 /// A chord's keys as macOS spells them: each modifier glyph its own cap,
 /// then the key (`⌃⇧P` → `⌃`, `⇧`, `P`).
 pub fn split_chord(chord: &str) -> Vec<String> {
@@ -1034,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn chords_split_into_keycaps() {
+    fn chords_split_into_keys() {
         assert_eq!(split_chord("⌃P"), ["⌃", "P"]);
         assert_eq!(split_chord("⌘⇧k"), ["⌘", "⇧", "K"]);
         assert_eq!(split_chord("Esc"), ["ESC"]);
