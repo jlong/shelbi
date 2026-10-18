@@ -753,7 +753,10 @@ impl IssuesView {
             .iter()
             .enumerate()
             .map(|(ri, card)| {
-                let selected = focused && ri == self.state.selected_row;
+                // While the detail is open the keyboard is in it, so the
+                // card under the scrim drops its focus ring (as the frame
+                // draws it).
+                let selected = focused && ri == self.state.selected_row && self.state.detail_id().is_none();
                 let card_el = self.render_card(card, ci, ri, selected, theme, cx);
                 match reorder_from {
                     Some(from) => reorder_target(card_el, card, ci, ri, from, theme, cx)
