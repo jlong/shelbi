@@ -56,7 +56,7 @@ fn the_numbered_chords_open_their_rows(cx: &mut TestAppContext) {
             workspace: "alpha-1".into()
         })
     );
-    let selected = h.window.read_with(&h.cx, |w, _| w.target_at(w.client.sidebar_selection()));
+    let selected = h.window.read_with(&h.cx, |w, cx| w.selected(cx));
     assert_eq!(selected, Some(SidebarTarget::Workspace("alpha-1".into())), "its row is selected");
     // Nothing is numbered 3.
     h.key("cmd-3");
@@ -127,7 +127,7 @@ fn collapsing_a_section_keeps_the_selection_on_its_row(cx: &mut TestAppContext) 
     h.take_calls();
     // Collapse the review section above the selected workspace.
     h.click_selector("sidebar-section-Queued for Review");
-    let selected = h.window.read_with(&h.cx, |w, _| w.target_at(w.client.sidebar_selection()));
+    let selected = h.window.read_with(&h.cx, |w, cx| w.selected(cx));
     assert_eq!(selected, Some(SidebarTarget::Workspace("alpha-1".into())));
 }
 

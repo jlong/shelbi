@@ -104,7 +104,6 @@ impl Harness {
                     w.tap = Some(window_tap);
                     // A native view with no entity yet: nothing attaches.
                     w.client.set_view(View::Machines);
-                    w.sync_selection();
                     w
                 })
             })

@@ -2,8 +2,9 @@
 //! (`dt-review-replaces-sidebar`, `dt-workspace-sidebar`): the panel takes the
 //! sidebar's column at the sidebar's width, the push between them runs both
 //! ways (and turns around mid-way), going from one panel to the other passes
-//! through the sidebar, and leaving gives the sidebar back as it was:
-//! selection, scroll, collapsed state and keys.
+//! through the sidebar, and leaving gives the sidebar back as it was (scroll,
+//! collapsed state and keys) with its selection on the main area's row
+//! (`dt-back-syncs-sidebar`).
 //!
 //! The window is the smoke test's headless one ([`Harness`]) with fake review
 //! and workspace sessions and daemon ops, an injected clock for the
@@ -86,10 +87,8 @@ impl Column {
     /// Select the review's sidebar row, then open the review (what Enter on
     /// it does once the load flow resolves it as serving).
     fn open_review(&mut self) {
-        let ordinal = self.ordinal_of(&SidebarTarget::Review("t-1".into()));
         self.update(|w, window, cx| {
-            let count = w.selectable_count();
-            w.client.select(ordinal, count);
+            w.select_row(SidebarTarget::Review("t-1".into()), cx);
             w.open_review(info(), window, cx);
         });
         self.h.draw();
@@ -99,10 +98,8 @@ impl Column {
     /// does: `FocusWorkspace` shows its session view; the tap only records
     /// commands, so the view is shown directly).
     fn open_workspace(&mut self) {
-        let ordinal = self.ordinal_of(&SidebarTarget::Workspace("alpha-1".into()));
         self.update(|w, window, cx| {
-            let count = w.selectable_count();
-            w.client.select(ordinal, count);
+            w.select_row(SidebarTarget::Workspace("alpha-1".into()), cx);
             w.client.focus_main();
             w.perform(HostCall::ShowView(View::Session("alpha-1".into())), window, cx);
         });
@@ -118,12 +115,9 @@ impl Column {
         self.h.cx.update(|window, cx| ws.read(cx).focus_handle(cx).is_focused(window))
     }
 
-    fn ordinal_of(&self, target: &SidebarTarget) -> usize {
-        self.read(|w, _| {
-            (0..w.selectable_count())
-                .find(|&i| w.target_at(i).as_ref() == Some(target))
-                .expect("the sidebar lists it")
-        })
+    /// The sidebar's selected row.
+    fn selected(&self) -> Option<SidebarTarget> {
+        self.read(|w, cx| w.selected(cx))
     }
 
     /// Ask for review `t-1` as a click or Enter on its row does, and draw
@@ -237,7 +231,6 @@ fn a_review_takes_the_sidebars_column_with_a_push(cx: &mut TestAppContext) {
 #[gpui::test]
 fn focus_moves_to_the_panel_and_back_to_the_sidebar_row(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);
-    let selected = c.ordinal_of(&SidebarTarget::Review("t-1".into()));
     c.open_review();
     c.advance(SLIDE);
     let review = c.review();
@@ -253,15 +246,18 @@ fn focus_moves_to_the_panel_and_back_to_the_sidebar_row(cx: &mut TestAppContext)
     assert!(c.left("column-sidebar") < c.left("leading-column"), "the sidebar returns from the left");
     c.advance(SLIDE);
     assert!(c.drawn("sidebar") && !c.drawn("column-review"));
-    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), selected, "selection kept");
+    // Machines, the view it opened over, has no row: none is selected.
+    assert_eq!(c.selected(), None, "no stale review row");
     assert_eq!(c.read(|w, _| w.client.focus()), Focus::Sidebar);
     let window_focused = c.h.cx.update(|window, cx| c.h.window.read(cx).focus_handle.is_focused(window));
     assert!(window_focused, "the sidebar's keys");
     assert_eq!(c.h.take_calls(), vec![HostCall::ShowView(View::Machines)], "back to the view it opened over");
 
-    // The sidebar's keys work again: Up moves its selection.
+    // The sidebar's keys work again: Up, with nothing selected, takes the
+    // bottom row.
     c.h.key("up");
-    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), selected - 1);
+    let last = c.read(|w, _| w.selectable_count()) - 1;
+    assert_eq!(c.selected(), c.read(|w, _| w.target_at(last)));
 }
 
 #[gpui::test]
@@ -269,14 +265,14 @@ fn the_sidebar_takes_no_keys_while_the_panel_stands_in(cx: &mut TestAppContext) 
     let mut c = Column::open(cx);
     c.open_review();
     c.advance(SLIDE);
-    let before = c.read(|w, _| w.client.sidebar_selection());
+    let before = c.selected();
     // Ctrl+H (focus the sidebar) focuses the panel in its column instead.
     c.update(|w, window, cx| w.focus_sidebar(window, cx));
     let review = c.review();
     let panel_focused = c.h.cx.update(|window, cx| review.read(cx).focus_handle(cx).is_focused(window));
     assert!(panel_focused);
     c.h.key("tab");
-    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), before, "the hidden sidebar didn't move");
+    assert_eq!(c.selected(), before, "the hidden sidebar didn't move");
 }
 
 #[gpui::test]
@@ -527,14 +523,13 @@ fn esc_on_the_workspace_panel_pushes_back_to_the_sidebar_as_it_was(cx: &mut Test
     let scrolled = point(gpui::px(0.0), gpui::px(-120.0));
     c.read(|w, _| w.sidebar_scroll.set_offset(scrolled));
     c.h.draw();
-    let selected = c.ordinal_of(&SidebarTarget::Workspace("alpha-1".into()));
     c.open_workspace();
     c.advance(SLIDE);
     assert!(c.workspace_panel_focused(), "the panel has the keys");
 
     // Arrow keys move the panel's selection, not the hidden sidebar's.
     c.h.key("down");
-    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), selected);
+    assert_eq!(c.selected(), Some(SidebarTarget::Workspace("alpha-1".into())));
 
     // Esc is Back: the reverse push, then the sidebar as it was.
     c.h.key("escape");
@@ -545,7 +540,7 @@ fn esc_on_the_workspace_panel_pushes_back_to_the_sidebar_as_it_was(cx: &mut Test
     assert!(c.left("column-sidebar") < c.left("leading-column"), "the sidebar returns from the left");
     c.advance(SLIDE);
     assert!(c.drawn("sidebar") && !c.drawn("column-workspace"));
-    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), selected, "the selection is still on it");
+    assert_eq!(c.selected(), None, "Machines, back in the main area, has no row");
     assert_eq!(c.read(|w, _| w.client.focus()), Focus::Sidebar);
     let window_focused = c.h.cx.update(|window, cx| c.h.window.read(cx).focus_handle.is_focused(window));
     assert!(window_focused, "the sidebar's keys");
@@ -596,11 +591,11 @@ fn the_sidebar_chord_focuses_the_workspace_panel(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);
     c.open_workspace();
     c.advance(SLIDE);
-    let before = c.read(|w, _| w.client.sidebar_selection());
+    let before = c.selected();
     c.update(|w, window, cx| w.focus_sidebar(window, cx));
     assert!(c.workspace_panel_focused());
     c.h.key("up");
-    assert_eq!(c.read(|w, _| w.client.sidebar_selection()), before, "the hidden sidebar didn't move");
+    assert_eq!(c.selected(), before, "the hidden sidebar didn't move");
 }
 
 #[gpui::test]
@@ -805,4 +800,155 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     let active = c.workspace().read_with(&c.h.cx, |w, _| w.panel().active());
     assert_eq!(active, crate::views::workspace::ContentView::Editor);
     assert!(c.h.take_calls().is_empty(), "no sidebar row opened");
+}
+
+// --- The sidebar's selection follows the main area (`dt-back-syncs-sidebar`):
+// its selected row is the row for what the main area shows, however the
+// main area got there.
+
+impl Column {
+    /// A window on the orchestrator chat (its sessions faked).
+    fn open_on_orchestrator(cx: &mut TestAppContext) -> Column {
+        let (ws_deps, _, _) = fake_workspace_deps();
+        Self::open_with(cx, move |w| {
+            w.chat_deps = Some(ws_deps.sessions.clone());
+            w.client.set_view(View::Session("orch".into()));
+        })
+    }
+
+    /// The row the selection marker is drawn in, by its selector.
+    fn marked_in(&mut self, row: &'static str) -> bool {
+        let marker = self.bounds("sidebar-selection").expect("a row is selected");
+        self.bounds(row).unwrap_or_else(|| panic!("{row} is drawn")).contains(&marker.origin)
+    }
+}
+
+fn orchestrator() -> Option<SidebarTarget> {
+    Some(SidebarTarget::View(View::Session("orch".into())))
+}
+
+#[gpui::test]
+fn back_from_a_review_selects_the_orchestrator_it_shows(cx: &mut TestAppContext) {
+    let mut c = Column::open_on_orchestrator(cx);
+    assert_eq!(c.selected(), orchestrator());
+    c.open_review();
+    assert_eq!(c.selected(), Some(SidebarTarget::Review("t-1".into())), "the review's row while it shows");
+    c.advance(SLIDE);
+
+    c.back();
+    assert_eq!(c.selected(), orchestrator(), "the main area's row, not the review's");
+    // The sidebar coming back has its chip on the row already: no slide.
+    assert!(c.drawn("column-sidebar"), "mid-pop");
+    assert!(!c.drawn("sliding-chip"), "placed, not slid");
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar") && !c.drawn("column-review"));
+    assert!(c.marked_in("sidebar-nav-Orchestrator"));
+    assert_eq!(c.read(|w, _| w.client.focus()), Focus::Sidebar, "keys back on the sidebar");
+}
+
+#[gpui::test]
+fn a_decision_close_or_the_row_leaving_selects_the_main_areas_row(cx: &mut TestAppContext) {
+    let mut c = Column::open_on_orchestrator(cx);
+
+    // A decision leaves the panel the way Back does, once it lands.
+    c.open_review();
+    c.advance(SLIDE);
+    c.update(|w, window, cx| w.leave_review(window, cx));
+    c.advance(SLIDE);
+    assert_eq!(c.selected(), orchestrator(), "after a decision");
+
+    // Close.
+    c.open_review();
+    c.advance(SLIDE);
+    let review = c.review();
+    c.h.cx.update(|_, cx| review.update(cx, |r, cx| r.apply(PanelEffect::Close, cx)));
+    c.h.cx.run_until_parked();
+    c.advance(SLIDE);
+    assert_eq!(c.selected(), orchestrator(), "after a close");
+
+    // The task left review elsewhere: its row goes, the panel with it.
+    c.open_review();
+    c.advance(SLIDE);
+    c.update(|w, window, cx| {
+        w.model.reviews.clear();
+        w.update_review_row(window, cx);
+    });
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar"));
+    assert_eq!(c.selected(), orchestrator(), "after the row left");
+    assert!(c.marked_in("sidebar-nav-Orchestrator"));
+}
+
+#[gpui::test]
+fn back_from_a_workspace_selects_the_view_it_returns_to(cx: &mut TestAppContext) {
+    let mut c = Column::open_with(cx, |w| w.client.set_view(View::Issues));
+    assert_eq!(c.selected(), Some(SidebarTarget::View(View::Issues)));
+    c.open_workspace();
+    assert_eq!(c.selected(), Some(SidebarTarget::Workspace("alpha-1".into())));
+    c.advance(SLIDE);
+    c.h.key("escape");
+    c.h.draw();
+    assert_eq!(c.selected(), Some(SidebarTarget::View(View::Issues)), "the workspace's row let go");
+    assert!(!c.drawn("sliding-chip"), "placed, not slid");
+    c.advance(SLIDE);
+    assert!(c.marked_in("sidebar-nav-Issues"));
+}
+
+#[gpui::test]
+fn navigation_that_skips_the_sidebar_moves_its_selection(cx: &mut TestAppContext) {
+    let (ws_deps, _, _) = fake_workspace_deps();
+    let mut c = Column::open_with(cx, move |w| {
+        w.chat_deps = Some(ws_deps.sessions.clone());
+        w.client.set_view(View::Issues);
+    });
+    c.h.focus_window();
+    assert!(c.marked_in("sidebar-nav-Issues"));
+
+    // A palette command, chord, menu item or notice lands as a `ShowView`:
+    // the chip slides to the new view's row, on its spring.
+    c.update(|w, window, cx| w.perform(HostCall::ShowView(View::Session("orch".into())), window, cx));
+    c.h.draw();
+    assert_eq!(c.selected(), orchestrator());
+    assert!(c.drawn("sliding-chip"), "a user-driven change slides");
+    c.advance(Duration::from_millis(600));
+    assert!(c.marked_in("sidebar-nav-Orchestrator"));
+
+    // The keys move the selection without opening anything; showing a view
+    // (even the one already shown) takes it back to that view's row.
+    c.update(|w, window, cx| {
+        w.client.focus_sidebar();
+        w.focus_handle.focus(window, cx);
+    });
+    c.h.key("down");
+    assert_eq!(c.selected(), Some(SidebarTarget::View(View::Issues)), "the keys' row");
+    c.update(|w, window, cx| w.perform(HostCall::ShowView(View::Session("orch".into())), window, cx));
+    assert_eq!(c.selected(), orchestrator(), "the main area's row again");
+
+    // A view changed under the sidebar (a notice for a workspace, ⌘2).
+    c.update(|w, window, cx| w.perform(HostCall::ShowView(View::Session("alpha-1".into())), window, cx));
+    assert_eq!(c.selected(), Some(SidebarTarget::Workspace("alpha-1".into())));
+}
+
+#[gpui::test]
+fn a_view_without_a_row_selects_none(cx: &mut TestAppContext) {
+    let mut c = Column::open_on_orchestrator(cx);
+    assert!(c.marked_in("sidebar-nav-Orchestrator"));
+    // Machines has no sidebar row (its entity isn't built here: it reads
+    // the machine state).
+    c.update(|w, _, cx| {
+        w.client.set_view(View::Machines);
+        cx.notify();
+    });
+    c.advance(Duration::from_millis(600));
+    assert_eq!(c.selected(), None);
+    assert!(!c.drawn("sidebar-selection"), "no stale row selected");
+    assert!(!c.drawn("sliding-chip"));
+
+    // Down, with nothing selected, starts at the top.
+    c.update(|w, window, cx| {
+        w.client.focus_sidebar();
+        w.focus_handle.focus(window, cx);
+    });
+    c.h.key("down");
+    assert_eq!(c.selected(), orchestrator());
 }

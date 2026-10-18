@@ -159,11 +159,16 @@ fn a_click_outside_closes_the_switcher(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_nav_chip_slides_to_the_new_row(cx: &mut TestAppContext) {
     let mut d = Design::open(cx);
+    d.update(|w, _, cx| {
+        let row = w.target_at(0).unwrap();
+        w.select_row(row, cx);
+        cx.notify();
+    });
     assert!(d.bounds("sliding-chip").is_none(), "at rest the row draws its own chip");
     let to = d.bounds("sidebar-nav-Issues").unwrap();
     d.update(|w, _, cx| {
-        let count = w.selectable_count();
-        w.client.select(1, count);
+        let row = w.target_at(1).unwrap();
+        w.select_row(row, cx);
         cx.notify();
     });
     // The slide's first frame sits on the old row (above Issues).
@@ -187,8 +192,8 @@ fn reduce_motion_moves_the_chip_at_once(cx: &mut TestAppContext) {
     let mut d = Design::open(cx);
     d.reduce_motion.set(true);
     d.update(|w, _, cx| {
-        let count = w.selectable_count();
-        w.client.select(1, count);
+        let row = w.target_at(1).unwrap();
+        w.select_row(row, cx);
         cx.notify();
     });
     assert!(d.bounds("sliding-chip").is_none(), "no slide under Reduce Motion");
