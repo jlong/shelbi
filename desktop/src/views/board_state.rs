@@ -221,6 +221,9 @@ pub struct BoardState {
     dragging: Option<String>,
     /// One line of feedback under the board.
     pub status: Option<String>,
+    /// Bumped on every model rebuild, so the view can keep what it derives
+    /// from the board (the detail's model) until the board changes.
+    generation: u64,
 }
 
 impl BoardState {
@@ -243,6 +246,7 @@ impl BoardState {
             edit_base: BTreeMap::new(),
             dragging: None,
             status: None,
+            generation: 0,
         }
     }
 
@@ -252,6 +256,12 @@ impl BoardState {
 
     pub fn input(&self) -> &BoardInput {
         &self.input
+    }
+
+    /// Which rebuild the model is from: it changes whenever the board's
+    /// reads or overlays do.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn filters(&self) -> &BoardFilters {
@@ -280,17 +290,32 @@ impl BoardState {
 
     // ---- folding reads ----------------------------------------------------
 
-    /// Fold an open-board read. The persisted workspace filter is reloaded
-    /// from it, so another client's (or the TUI's) filter change shows up.
+    /// Fold an open-board read alone.
+    #[cfg(test)]
     pub fn apply_open(&mut self, read: BoardRead) {
-        self.input.apply_open(read);
-        self.filters.workspace = self.input.workspace_filter.clone();
-        self.settle_pending();
-        self.rebuild();
+        self.apply_reads(Some(read), None);
     }
 
+    #[cfg(test)]
     pub fn apply_closed(&mut self, page: Option<ClosedPage>) {
-        self.input.apply_closed(page);
+        self.apply_reads(None, Some(page));
+    }
+
+    /// Fold the reads of one refresh (either may be absent) with one rebuild
+    /// of the model, not one per read. The persisted workspace filter is
+    /// reloaded from the open read, so another client's (or the TUI's)
+    /// filter change shows up.
+    pub fn apply_reads(&mut self, open: Option<BoardRead>, closed: Option<Option<ClosedPage>>) {
+        if open.is_none() && closed.is_none() {
+            return;
+        }
+        if let Some(read) = open {
+            self.input.apply_open(read);
+            self.filters.workspace = self.input.workspace_filter.clone();
+        }
+        if let Some(page) = closed {
+            self.input.apply_closed(page);
+        }
         self.settle_pending();
         self.rebuild();
     }
@@ -309,6 +334,7 @@ impl BoardState {
         // Keep the cursor on the same card across a rebuild when it still
         // exists (a read that reorders cards shouldn't move the selection).
         let selected = self.selected_card().map(|c| c.id.clone());
+        self.generation += 1;
         self.model = IssuesModel::build(&self.input, &self.filters);
         self.overlay_pending();
         if let Some(id) = selected {
@@ -325,7 +351,9 @@ impl BoardState {
     /// overlay is rebuilt from `pending` on every rebuild, so dropping a
     /// pending entry (a refusal) puts the card back where the read has it.
     fn overlay_pending(&mut self) {
-        let tasks = self.input.tasks();
+        // The merged board is a copy of every task: only made when there is
+        // something to overlay.
+        let tasks = if self.pending.is_empty() { Vec::new() } else { self.input.tasks() };
         for (id, p) in &self.pending {
             if let Some(to) = &p.to_status {
                 let Some((from, row)) = self.model.position(id) else {
@@ -374,6 +402,9 @@ impl BoardState {
     /// revision moved on. A card gone from the read (e.g. filtered out) drops
     /// it too.
     fn settle_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
         let tasks = self.input.tasks();
         self.pending.retain(|id, p| {
             if !p.acked {
@@ -1425,6 +1456,21 @@ mod tests {
 
     fn press(b: &mut BoardState, s: &str) -> Vec<Intent> {
         b.handle_key(key(s)).unwrap_or_default()
+    }
+
+    #[test]
+    fn one_refresh_folds_both_reads_with_one_rebuild() {
+        let mut b = board(vec![issue("A", "todo")]);
+        let before = b.generation();
+        let done = ClosedPage {
+            issues: vec![issue("D", "done")],
+            next_cursor: None,
+        };
+        b.apply_reads(Some(read(vec![issue("A", "todo"), issue("B", "todo")])), Some(Some(done)));
+        assert_eq!(b.generation(), before + 1, "one rebuild");
+        assert!(b.model().card("B").is_some() && b.model().card("D").is_some());
+        b.apply_reads(None, None);
+        assert_eq!(b.generation(), before + 1, "nothing read, nothing rebuilt");
     }
 
     #[test]

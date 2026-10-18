@@ -374,11 +374,17 @@ fn report(pushes: &[Push], refresh: Duration) {
 
 /// The deps the bench window runs on.
 fn deps(opts: &Options) -> (ReviewDeps, WorkspaceDeps) {
+    fake_deps(opts.latency, opts.replay_kb)
+}
+
+/// Fake review and workspace daemons answering after `latency`, over
+/// sessions that replay `replay_kb` KiB (`--bench-board` reuses them).
+pub(crate) fn fake_deps(latency: Duration, replay_kb: usize) -> (ReviewDeps, WorkspaceDeps) {
     let sessions = Arc::new(Sessions {
-        replay: replay(opts.replay_kb),
+        replay: replay(replay_kb),
         streams: Mutex::new(Vec::new()),
     });
-    let ops = Arc::new(Ops { latency: opts.latency });
+    let ops = Arc::new(Ops { latency });
     let session_deps = Rc::new(move || SessionDeps {
         connector: sessions.clone(),
         relauncher: sessions.clone(),

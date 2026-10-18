@@ -4299,6 +4299,12 @@ impl ShelbiWindow {
         w
     }
 
+    /// `--bench-board`'s window: [`Self::offscreen`]'s, with workspaces
+    /// over `workspace`.
+    pub(crate) fn bench_workspace_deps(&mut self, workspace: WorkspaceDeps) {
+        self.workspace_deps = Some(workspace);
+    }
+
     /// `--visual-figma`'s window: [`Self::offscreen`]'s, with workspaces
     /// over `workspace` and the orchestrator chat over `chat`.
     #[allow(clippy::too_many_arguments)]

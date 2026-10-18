@@ -7,40 +7,106 @@
 //! scrolls on one axis takes the *other* axis's delta when its own is zero: a
 //! vertical wheel over a column the column can't take (at its end, or too
 //! short to scroll) slid the whole board sideways, and a sideways swipe
-//! scrolled the column. [`board_row`] and [`column_body`] set
-//! `restrict_scroll_to_axis`, so each takes only its own axis; with it, gpui
-//! also locks each trackpad gesture (precise deltas) to its dominant axis,
-//! tracked per [`ScrollHandle`], so a vertical swipe with a little sideways
-//! drift doesn't move the board.
+//! scrolled the column. [`board_row`] sets `restrict_scroll_to_axis`, so the
+//! board takes only x; with it, gpui also locks each trackpad gesture
+//! (precise deltas) to its dominant axis, tracked per [`ScrollHandle`], so a
+//! vertical swipe with a little sideways drift doesn't move the board.
+//!
+//! A column is a gpui `list` (`board_list.rs`, `dt-board-perf`: only the
+//! cards in view are built), which only ever takes y but locks no gesture, so
+//! [`with_board_wheel`] does it for the columns: a trackpad gesture locked
+//! sideways scrolls the board and never reaches a column, and a vertical
+//! drift in it moves nothing. [`column_list`] steps a wheel mouse's lines at
+//! the window's line height, as the board's scroll containers do (a list
+//! steps 20px a line).
 //!
 //! Shift+wheel is the mouse's horizontal scroll. macOS already reports it as
 //! an x delta for a wheel mouse; where the delta still arrives vertical (a
-//! trackpad with shift held, or a platform that doesn't convert), [`ShiftWheel`]
-//! turns it into board-horizontal scroll before any column sees it.
+//! trackpad with shift held, or a platform that doesn't convert),
+//! [`with_board_wheel`] turns it into board-horizontal scroll before any
+//! column sees it.
+
+use std::cell::Cell;
+use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, AnyElement, DispatchPhase, Div, HitboxBehavior, Pixels,
-    ScrollHandle, ScrollWheelEvent, Stateful,
+    canvas, div, point, prelude::*, AnyElement, DispatchPhase, Div, HitboxBehavior, List,
+    ListSizingBehavior, ListState, OngoingScroll, Pixels, ScrollHandle, ScrollWheelEvent, Stateful,
 };
 
-/// The board row: scrolls on x only, tracked by `handle`.
-pub(super) fn board_row(row: Stateful<Div>, handle: &ScrollHandle) -> Stateful<Div> {
+/// The board's horizontal scroll: its handle, and the trackpad gesture the
+/// board's wheel layer is tracking (kept across frames).
+#[derive(Clone, Default)]
+pub(super) struct BoardScroll {
+    pub handle: ScrollHandle,
+    gesture: Rc<Cell<OngoingScroll>>,
+}
+
+/// The board row: scrolls on x only, tracked by `scroll`.
+pub(super) fn board_row(row: Stateful<Div>, scroll: &BoardScroll) -> Stateful<Div> {
     row.overflow_x_scroll()
         .restrict_scroll_to_axis()
-        .track_scroll(handle)
+        .track_scroll(&scroll.handle)
 }
 
-/// A column's card list: scrolls on y only, tracked by `handle`.
-pub(super) fn column_body(body: Stateful<Div>, handle: &ScrollHandle) -> Stateful<Div> {
-    body.overflow_y_scroll()
-        .restrict_scroll_to_axis()
-        .track_scroll(handle)
+/// A column's card list over `state`, filling a flex column (the returned
+/// wrapper takes the list's place in the layout). It scrolls on y only.
+pub(super) fn column_list(list: List, state: &ListState, board: &BoardScroll) -> Div {
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(list.with_sizing_behavior(ListSizingBehavior::Auto).flex_1().min_h_0())
+        .child(column_wheel(state.clone(), board.handle.clone()))
 }
 
-/// Wrap `board` (a [`board_row`] tracked by `handle`) so a shift+wheel that
-/// arrives vertical scrolls it horizontally. The wrapper takes the board's
-/// place in the layout (`flex_1`, shrinkable on both axes).
-pub(super) fn with_shift_wheel(board: impl IntoElement, handle: &ScrollHandle) -> Div {
+/// An invisible layer over a column's list that takes a wheel mouse's
+/// vertical lines (in the capture phase, before the list's own handler) and
+/// scrolls the list by them at the window's line height, the step the
+/// board's scroll containers take. Trackpad deltas and shift+wheel pass by.
+fn column_wheel(list: ListState, board: ScrollHandle) -> AnyElement {
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            let view = window.current_view();
+            window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                if phase != DispatchPhase::Capture
+                    || !hitbox.should_handle_scroll(window)
+                    || e.delta.precise()
+                    || e.modifiers.shift
+                {
+                    return;
+                }
+                let delta = e.delta.pixel_delta(window.line_height());
+                if delta.y == Pixels::ZERO {
+                    // A horizontal wheel: the board's, as before.
+                    return;
+                }
+                cx.stop_propagation();
+                list.scroll_by(-delta.y);
+                // The board took a wheel's x beside a column's y.
+                if delta.x != Pixels::ZERO {
+                    let offset = board.offset();
+                    board.set_offset(point(clamp_x(offset.x + delta.x, board.max_offset().x), offset.y));
+                }
+                cx.notify(view);
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
+
+/// Wrap `board` (a [`board_row`] tracked by `scroll`) in the board's wheel
+/// layer: a shift+wheel that arrives vertical scrolls it horizontally, and a
+/// trackpad gesture locked sideways scrolls only it. The wrapper takes the
+/// board's place in the layout (`flex_1`, shrinkable on both axes).
+pub(super) fn with_board_wheel(board: impl IntoElement, scroll: &BoardScroll) -> Div {
     div()
         .relative()
         .flex()
@@ -48,17 +114,18 @@ pub(super) fn with_shift_wheel(board: impl IntoElement, handle: &ScrollHandle) -
         .min_h_0()
         .min_w_0()
         .child(board)
-        .child(ShiftWheel(handle.clone()).into_element())
+        .child(BoardWheel(scroll.clone()).into_element())
 }
 
-/// An invisible layer over the board that catches shift+vertical wheel events
-/// in the capture phase (before the columns' and the board's own bubble-phase
-/// scroll handlers) and scrolls the board on x instead.
-struct ShiftWheel(ScrollHandle);
+/// An invisible layer over the board that catches wheel events in the
+/// capture phase (before the columns' and the board's own bubble-phase
+/// scroll handlers): shift+vertical wheel scrolls the board on x, and so
+/// does each step of a trackpad gesture locked to x, which no column sees.
+struct BoardWheel(BoardScroll);
 
-impl ShiftWheel {
+impl BoardWheel {
     fn into_element(self) -> AnyElement {
-        let handle = self.0;
+        let BoardScroll { handle, gesture } = self.0;
         canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |_, hitbox, window, _| {
@@ -68,8 +135,22 @@ impl ShiftWheel {
                         return;
                     }
                     let delta = e.delta.pixel_delta(window.line_height());
-                    let Some(dx) = shift_wheel_dx(e.modifiers.shift, delta) else {
-                        return;
+                    let dx = match shift_wheel_dx(e.modifiers.shift, delta) {
+                        Some(dx) => dx,
+                        None if e.delta.precise() => {
+                            // Every step of the gesture goes through the
+                            // lock, the ones let by too, so it locks where
+                            // the board's own does.
+                            let mut locked = delta;
+                            let mut g = gesture.get();
+                            g.filter(&mut locked, e.touch_phase);
+                            gesture.set(g);
+                            match sideways_dx(locked) {
+                                Some(dx) => dx,
+                                None => return,
+                            }
+                        }
+                        None => return,
                     };
                     cx.stop_propagation();
                     let offset = handle.offset();
@@ -96,6 +177,12 @@ fn shift_wheel_dx(shift: bool, delta: gpui::Point<Pixels>) -> Option<Pixels> {
     (shift && delta.y.abs() > delta.x.abs()).then_some(delta.y)
 }
 
+/// The board's x delta for a trackpad step after the gesture lock, when the
+/// lock left it only an x (the gesture is sideways); `None` otherwise.
+fn sideways_dx(locked: gpui::Point<Pixels>) -> Option<Pixels> {
+    (locked.y == Pixels::ZERO && locked.x != Pixels::ZERO).then_some(locked.x)
+}
+
 /// A board x offset kept within its scroll range (`-max..=0`; gpui offsets
 /// grow negative as content scrolls toward its end).
 fn clamp_x(x: Pixels, max: Pixels) -> Pixels {
@@ -116,16 +203,20 @@ mod tests {
     const ROWS: [usize; 5] = [30, 2, 30, 30, 30];
 
     /// A board laid out the way `IssuesView::render_board` lays it out: a row
-    /// of fixed-width columns, each a header over a scrolling card list.
+    /// of fixed-width columns, each a header over a list of cards.
     struct Board {
-        board: ScrollHandle,
-        columns: Vec<ScrollHandle>,
+        board: BoardScroll,
+        columns: Vec<ListState>,
     }
 
     impl Render for Board {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let columns = ROWS.iter().enumerate().map(|(ci, &rows)| {
-                let cards = (0..rows).map(|_| div().flex_none().h(px(ROW_H)));
+            let columns = ROWS.iter().enumerate().map(|(ci, _)| {
+                let cards = gpui::list(self.columns[ci].clone(), |_, _, _| {
+                    div().flex_none().h(px(ROW_H)).into_any_element()
+                })
+                // The cards' bottom room once scrolled to the end.
+                .pb_3();
                 div()
                     .flex()
                     .flex_col()
@@ -135,22 +226,10 @@ mod tests {
                     .min_h_0()
                     .child(div().flex_none().h(px(24.0)))
                     .child(
-                        column_body(
-                            div()
-                                .id(("column", ci))
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_h_0()
-                                // The focus glow's room past the column.
-                                .mx(px(-6.0))
-                                .mt(px(-6.0))
-                                .px(px(6.0))
-                                .pt(px(6.0))
-                                .pb_3(),
-                            &self.columns[ci],
-                        )
-                        .children(cards),
+                        column_list(cards, &self.columns[ci], &self.board)
+                            // The focus glow's room past the column.
+                            .mx(px(-6.0))
+                            .mt(px(-6.0)),
                     )
             });
             let board = board_row(
@@ -171,7 +250,7 @@ mod tests {
                 .flex()
                 .flex_col()
                 .size_full()
-                .child(with_shift_wheel(board, &self.board))
+                .child(with_board_wheel(board, &self.board))
         }
     }
 
@@ -192,8 +271,13 @@ mod tests {
                     },
                     |_, cx| {
                         cx.new(|_| Board {
-                            board: ScrollHandle::new(),
-                            columns: ROWS.iter().map(|_| ScrollHandle::new()).collect(),
+                            board: BoardScroll::default(),
+                            // Measured up front, so the tests know each
+                            // column's scroll range from the first frame.
+                            columns: ROWS
+                                .iter()
+                                .map(|&n| ListState::new(n, gpui::ListAlignment::Top, px(200.0)).measure_all())
+                                .collect(),
                         })
                     },
                 )
@@ -212,15 +296,15 @@ mod tests {
         }
 
         fn board(&mut self) -> Point<Pixels> {
-            self.view.read_with(&self.cx, |v, _| v.board.offset())
+            self.view.read_with(&self.cx, |v, _| v.board.handle.offset())
         }
 
         fn column(&mut self, ci: usize) -> Point<Pixels> {
-            self.view.read_with(&self.cx, |v, _| v.columns[ci].offset())
+            self.view.read_with(&self.cx, |v, _| v.columns[ci].scroll_px_offset_for_scrollbar())
         }
 
         fn max_column(&mut self, ci: usize) -> Point<Pixels> {
-            self.view.read_with(&self.cx, |v, _| v.columns[ci].max_offset())
+            self.view.read_with(&self.cx, |v, _| v.columns[ci].max_offset_for_scrollbar())
         }
 
         /// A point over column `ci`'s cards (columns 0-2 are on screen at x 0).
@@ -261,7 +345,7 @@ mod tests {
     #[gpui::test]
     fn the_fixture_scrolls_on_both_axes(cx: &mut TestAppContext) {
         let mut h = Harness::open(cx);
-        let max = h.view.read_with(&h.cx, |v, _| v.board.max_offset());
+        let max = h.view.read_with(&h.cx, |v, _| v.board.handle.max_offset());
         assert!(max.x > px(0.0), "the board overflows on x: {max:?}");
         assert!(h.max_column(0).y > px(0.0), "column 0 overflows");
         assert_eq!(h.max_column(1).y, px(0.0), "column 1 fits");
@@ -302,16 +386,31 @@ mod tests {
         h.wheel(at, 0.0, 5.0, Modifiers::default());
         assert_eq!(h.column(0), Point::default());
         assert_eq!(h.board(), Point::default());
-        // Down to the bottom and past it.
+        // Down to the bottom and past it (the list's range is its cards'
+        // and the bottom room under them).
         let max = h.max_column(0).y;
         for _ in 0..20 {
             h.wheel(at, 0.0, -10.0, Modifiers::default());
         }
-        assert_eq!(h.column(0).y, -max, "column 0 sits at its bottom");
+        let bottom = h.column(0).y;
+        assert!(bottom <= -max, "column 0 sits at its bottom: {bottom:?} vs {max:?}");
+        h.wheel(at, 0.0, -10.0, Modifiers::default());
+        assert_eq!(h.column(0).y, bottom, "no further");
         h.swipe(at, 0.0, -40.0, TouchPhase::Started);
         h.swipe(at, 0.0, -40.0, TouchPhase::Moved);
-        assert_eq!(h.column(0).y, -max);
+        assert_eq!(h.column(0).y, bottom);
         assert_eq!(h.board(), Point::default());
+    }
+
+    #[gpui::test]
+    fn a_wheel_line_steps_a_column_by_the_line_height(cx: &mut TestAppContext) {
+        let mut h = Harness::open(cx);
+        let at = h.over(0);
+        let line = h.cx.update(|window, _| window.line_height());
+        h.wheel(at, 0.0, -1.0, Modifiers::default());
+        assert_eq!(h.column(0).y, -line);
+        h.wheel(at, 0.0, 1.0, Modifiers::default());
+        assert_eq!(h.column(0).y, px(0.0));
     }
 
     #[gpui::test]
@@ -397,5 +496,9 @@ mod tests {
         assert_eq!(clamp_x(px(10.0), px(100.0)), px(0.0));
         assert_eq!(clamp_x(px(-150.0), px(100.0)), px(-100.0));
         assert_eq!(clamp_x(px(-40.0), px(100.0)), px(-40.0));
+        assert_eq!(sideways_dx(d(-12.0, 0.0)), Some(px(-12.0)));
+        assert_eq!(sideways_dx(d(0.0, -12.0)), None, "locked vertical");
+        assert_eq!(sideways_dx(d(-12.0, -3.0)), None, "unlocked");
+        assert_eq!(sideways_dx(d(0.0, 0.0)), None);
     }
 }

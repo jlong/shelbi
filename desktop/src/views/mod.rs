@@ -10,7 +10,8 @@
 //!   `task_detail.rs` the detail, `markdown.rs` / `external_edit.rs` its
 //!   body helpers; drag and drop: **`dt-board-dnd`**; which gesture scrolls
 //!   the board and which a column: **`dt-board-scroll-axes`**,
-//!   `board_scroll.rs`)
+//!   `board_scroll.rs`; each column a virtualized list so a board of a
+//!   thousand cards stays at frame rate: **`dt-board-perf`**, `board_list.rs`)
 //! - activity feed and machines: **`dt-activity-machines`** (landed:
 //!   `activity.rs` over the toolkit-free `activity_state.rs`, `machines.rs`
 //!   over `machines_state.rs`, both from `shelbi-app`'s shared models)
@@ -40,6 +41,7 @@
 pub mod activity;
 pub mod activity_labels;
 pub mod activity_state;
+pub mod board_list;
 pub mod board_scroll;
 pub mod bootstrap;
 pub mod board_state;
