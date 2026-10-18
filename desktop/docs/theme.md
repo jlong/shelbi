@@ -235,6 +235,7 @@ until a new role has its row here, with the values the palette really has.
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
 | `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor |
+| `table_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Machines frame sets it (opaque, both modes): a workspace row's runner and task |
 
 ### Icons
 
@@ -385,9 +386,8 @@ with its worst ratio. **Flagged for John.**
 | dark | magenta on magenta_tint | 4.19 | `[review]` on its (derived) chip tint |
 | dark | red on red_tint | 4.39 | The Danger pink on its (derived) chip tint |
 | dark | text_loud on selection | 4.08 | `theme.white` on the selected segment (`theme.selection`) over the sidebar; 4.46 on the canvas |
-| dark | gray on selection | 2.12 | The selected Machines row (`theme.selection` over the canvas, as drawn): the runner and the task in `theme.gray` |
 | dark | theme_green on selection | 2.30 | The same row: `working` and `● reachable` in `theme.green` |
-| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan`. The lowest pairing the desktop draws |
+| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan` |
 | dark | success on hover button | 4.07 | `text/green` on the Success button's (derived dark) hover |
 | dark | success on pressed button | 3.35 | `text/green` on the Success button pressed |
 | dark | error on rest button | 4.30 | The Danger label on the Danger fill over the sidebar (AA over the canvas) |
@@ -395,6 +395,7 @@ with its worst ratio. **Flagged for John.**
 | dark | error on pressed button | 3.53 | The same, pressed |
 | dark | input_border on | 1.22 | `theme.divider` as a field's edge (Settings); the field also differs by its canvas fill and its label |
 | dark | form_text on | 2.53 | The Settings frame's `theme.gray` override, `#7b85a7`: a field's value and an unselected choice 4.30 on the canvas, "Open keys.yaml" 2.53 on its `theme.search` fill |
+| dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
 | light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
@@ -409,6 +410,7 @@ with its worst ratio. **Flagged for John.**
 | light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
 | light | input_border on | 1.06 | `theme.divider` as a field's edge |
 | light | form_text on | 3.29 | The same `#7b85a7`: 3.65 on white, 3.29 on the form button's fill |
+| light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 
 ## Renders
 

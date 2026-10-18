@@ -51,23 +51,23 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Probe `host` over SSH, or (`--visual-figma`, whose fixture hosts don't
-/// exist) answer reachable without a probe.
+/// exist) answer the stubbed reachability without a probe.
 fn probe(host: &str) -> shelbi_core::Reachability {
     #[cfg(feature = "visual-check")]
-    if FIXTURE_HOSTS_REACHABLE.load(std::sync::atomic::Ordering::Relaxed) {
-        return shelbi_core::Reachability::Reachable;
+    if let Some(stub) = FIXTURE_HOSTS.lock().unwrap().clone() {
+        return stub;
     }
     shelbi_orchestrator::machine::probe_host_reachability(host)
 }
 
 #[cfg(feature = "visual-check")]
-static FIXTURE_HOSTS_REACHABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FIXTURE_HOSTS: std::sync::Mutex<Option<shelbi_core::Reachability>> = std::sync::Mutex::new(None);
 
-/// Answer every remote reachable without probing it, for the rest of the
-/// process (`--visual-figma`).
+/// Answer every remote `reachability` without probing it, for the rest of
+/// the process or the next call (`--visual-figma`).
 #[cfg(feature = "visual-check")]
-pub fn stub_reachable() {
-    FIXTURE_HOSTS_REACHABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+pub fn stub_reachability(reachability: shelbi_core::Reachability) {
+    *FIXTURE_HOSTS.lock().unwrap() = Some(reachability);
 }
 
 /// What the view asks of the window.
@@ -538,7 +538,7 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                 .w(px(RUNNER_W))
                 .flex_none()
                 .truncate()
-                .text_color(theme.gray)
+                .text_color(theme.table_text)
                 .child(w.runner.clone().unwrap_or_else(|| "—".to_string())),
         )
         // The task by title; its id (what `shelbi workspace list` prints) on
@@ -551,7 +551,7 @@ fn workspace_row(theme: &Theme, w: &MachineWorkspace, selected: bool) -> gpui::D
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(theme.gray)
+                .text_color(theme.table_text)
                 .when(ids != cell, |d| d.tooltip(style::tooltip(ids)))
                 .child(cell)
         })
