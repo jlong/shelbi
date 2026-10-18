@@ -98,12 +98,23 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
   glyph fallback, then Symbols Nerd Font Mono, then Menlo. Settings reads
   "Blank uses Source Code Pro".
 - **Colors**: the background is `canvas`, the default foreground
-  `foreground` (flattened over the canvas: `#b2b4bb` dark), the cursor
+  `foreground` (flattened over the canvas: `#b2b4bb` dark), bold text in the
+  default foreground `text_loud` (`theme.white`, the frames' bold prompt
+  lines), dim (SGR 2) text in it `muted` (`theme.muted`, their tool output
+  and footers; dim colored text keeps its hue at 60%), the cursor
   `text_loud`, the selection `text_selection` (`theme.selection`), matches
-  `search_match` (`theme.search`). ANSI green and cyan are `theme.green` and
-  `theme.cyan` (the Orchestrator frame's agent output), yellow, blue, magenta
-  and bright black `theme.ansi_*`; the other slots keep Tomorrow Night (dark)
-  and a GitHub-light set (light).
+  `search_match` (`theme.search`). ANSI red, green and cyan are `theme.red`,
+  `theme.green` and `theme.cyan` (the terminal frames' agent output: the
+  Workspace frame's removed line, its added lines and the Review frame's
+  checks, the Orchestrator's notices), yellow, blue, magenta and bright black
+  `theme.ansi_*`; the other slots keep Tomorrow Night (dark) and a
+  GitHub-light set (light). A program's OSC 10 foreground also colors its
+  bold and dim text.
+- **Inset**: the grid sits 16px in from the main area's leading and
+  trailing edges and 12px from its top and bottom (the Orchestrator and
+  Workspace frames); the Review frame's reviewer terminal 12px across
+  (`session_view::TERMINAL_INSET_*`). The Workspace frames draw a 1px
+  `divider` across the top of the main area.
 
 ## Component shapes (`src/theme/style.rs`)
 
@@ -265,6 +276,7 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `theme_green` | `#5acd25` | `#367b16` | `theme.green`: ANSI green in the terminal |
 | `theme_cyan` | `#00a6b2` | `#007a83` | `theme.cyan`: ANSI cyan in the terminal |
+| `theme_red` | `#e04f52` | `#c23b3e` | `theme.red`: ANSI red in the terminal |
 | `green` | `#5fb56d` | `#1a7f37` | `theme.ansi_green`: `[done]` |
 | `yellow` | `#dcb767` | `#8a5f04` | `theme.ansi_yellow`: `[in progress]` |
 | `blue` | `#4a8fd7` | `#2563c9` | `theme.ansi_blue`: `[ready]`, queued |

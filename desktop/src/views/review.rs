@@ -60,7 +60,7 @@ use shelbi_app::session::{ReviewRelauncher, SessionRef};
 use shelbi_app::view::ReviewRow;
 use shelbi_app::{CommandKind, ReviewSessionOp};
 
-use super::session_view::{SessionDeps, SessionView, SessionViewEvent};
+use super::session_view::{SessionDeps, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X};
 use super::sidebar::TRAFFIC_LIGHT_INSET;
 use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
@@ -413,6 +413,7 @@ impl ReviewView {
             // A review pane with no session says so; the dev slot's idle
             // placeholder doesn't fit it (the TUI's review interface).
             v.set_idle_placeholder(false);
+            v.set_inset_x(REVIEW_TERMINAL_INSET_X);
             v
         });
         let events = cx.subscribe(&content, |this, _, ev: &SessionViewEvent, cx| {

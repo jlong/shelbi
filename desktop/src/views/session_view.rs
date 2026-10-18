@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, AnyWindowHandle, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Subscription, Task, Window,
+    Subscription, Task, Window,
 };
 use shelbi_app::session::{
     self as app_session, ConnectFailure, DeathAction, IdleInfo, PersistentRelauncher,
@@ -61,6 +61,7 @@ use shelbi_term::Size;
 use crate::elements::terminal::session::{self as pane_session, Connected};
 use crate::elements::terminal::{PaneEvent, TerminalPane};
 use crate::refresh::SessionSink;
+use crate::theme::style::{Type, Typography};
 use crate::theme::Theme;
 
 /// How often a pane waiting out its restart backoff re-asks the controller
@@ -232,6 +233,9 @@ pub struct SessionView {
     /// Whether an idle workspace shows the TUI's dev-slot idle placeholder
     /// (else the plain "No live session" notice, as a review pane does).
     idle_placeholder: bool,
+    /// The terminal grid's inset from the main area's leading and trailing
+    /// edges ([`TERMINAL_INSET_X`] unless the host's frame says otherwise).
+    inset_x: f32,
     /// The daemon supervisor's reason a dead orchestrator is not coming back
     /// (the sidebar model's `orchestrator_status`); the orchestrator view's
     /// placeholder names it while the session is down.
@@ -285,6 +289,7 @@ impl SessionView {
             remote_machine: None,
             palette_chord: String::new(),
             idle_placeholder: true,
+            inset_x: TERMINAL_INSET_X,
             supervisor_status: None,
             slot: Slot::Empty,
             restart: RestartController::default(),
@@ -330,6 +335,12 @@ impl SessionView {
     /// default) or the plain "No live session for <name>" notice.
     pub fn set_idle_placeholder(&mut self, on: bool) {
         self.idle_placeholder = on;
+    }
+
+    /// The grid's inset from the leading and trailing edges, for a host
+    /// whose Figma frame draws another than [`TERMINAL_INSET_X`].
+    pub fn set_inset_x(&mut self, inset: f32) {
+        self.inset_x = inset;
     }
 
     /// The daemon supervisor's orchestrator failure, from the sidebar model.
@@ -842,10 +853,14 @@ impl Focusable for SessionView {
     }
 }
 
-/// The terminal grid's inset from the main area's leading edge, and from
-/// its top and bottom.
-pub const TERMINAL_INSET_X: f32 = 12.0;
-pub const TERMINAL_INSET_Y: f32 = 8.0;
+/// The terminal grid's inset from the main area's leading and trailing
+/// edges, and from its top and bottom: the Orchestrator and Workspace
+/// frames' 16 across and 12 down (Figma 2164:173, 2172:991). The Review
+/// frame's terminal sits 12 across ([`REVIEW_TERMINAL_INSET_X`]).
+pub const TERMINAL_INSET_X: f32 = 16.0;
+pub const TERMINAL_INSET_Y: f32 = 12.0;
+/// The Review frame's reviewer terminal inset across (Figma 2168:679).
+pub const REVIEW_TERMINAL_INSET_X: f32 = 12.0;
 
 impl Render for SessionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -861,28 +876,33 @@ impl Render for SessionView {
             .size_full()
             .bg(theme.canvas);
         if let Slot::Live(pane) = &self.slot {
-            // The grid keeps clear of the frame's edges (the column divider,
-            // the window's corner): 12px on the leading side, 8px top and
-            // bottom.
+            // The grid sits where the Figma frames draw it: clear of the
+            // column divider and the window's corner by the inset across,
+            // 12px from the top and bottom.
             return root
-                .pl(gpui::px(TERMINAL_INSET_X))
+                .pl(gpui::px(self.inset_x))
+                .pr(gpui::px(self.inset_x))
                 .pt(gpui::px(TERMINAL_INSET_Y))
                 .pb(gpui::px(TERMINAL_INSET_Y))
                 .child(pane.clone());
         }
         if let Some(lines) = self.idle_lines() {
-            // The TUI's idle placeholder: top-left, the name bold in the
-            // foreground, the rest muted.
-            return root.flex_col().p_4().gap_0p5().children(lines.into_iter().enumerate().map(
-                |(i, line)| {
+            // The TUI's idle placeholder, as the Workspace idle frame draws
+            // it (Figma 2174:1007): top-left, 16px in, 2px between lines,
+            // the name in Base Medium loud, the rest Base muted.
+            return root
+                .flex_col()
+                .p_4()
+                .gap_0p5()
+                .type_style(Type::Base)
+                .children(lines.into_iter().enumerate().map(|(i, line)| {
                     let row = div().min_h(gpui::px(18.0)).child(line);
                     if i == 0 {
-                        row.font_weight(FontWeight::SEMIBOLD).text_color(theme.text_loud)
+                        row.type_style(Type::BaseMedium).text_color(theme.text_loud)
                     } else {
                         row.text_color(theme.muted)
                     }
-                },
-            ));
+                }));
         }
         root.items_center().justify_center().px_4().child(
             div()

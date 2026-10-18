@@ -287,6 +287,15 @@ fn sidebar_model() -> SidebarModel {
     m
 }
 
+/// The sidebar with charlie idle: the Workspace idle frame's charlie.
+fn idle_charlie_model() -> SidebarModel {
+    let mut m = sidebar_model();
+    if let Some(row) = m.workspaces.iter_mut().find(|w| w.name == "charlie") {
+        *row = workspace_row("charlie", None, WorkspaceBadge::Idle);
+    }
+    m
+}
+
 // ---- the terminals --------------------------------------------------------
 
 const BOLD: &str = "\x1b[1m";
@@ -451,6 +460,8 @@ struct Run {
     /// `--2x` found no Retina display (said once; not looked for again).
     warned: bool,
     failures: usize,
+    /// The sidebar model the next window opens with.
+    sidebar: SidebarModel,
 }
 
 /// Run it for `theme`, saving `<screen>-<theme>.png` under `out`; exits
@@ -502,6 +513,7 @@ pub fn run(out: PathBuf, theme: &'static str, native: bool) -> ! {
         native,
         warned: false,
         failures: 0,
+        sidebar: sidebar_model(),
     };
     run.all();
     let _ = std::fs::remove_dir_all(&home);
@@ -580,6 +592,7 @@ impl Run {
     fn root(&self) -> impl FnOnce(&mut gpui::Window, &mut gpui::App) -> gpui::Entity<ShelbiWindow> + 'static {
         let sessions = self.sessions.clone();
         let now = self.now.clone();
+        let model = self.sidebar.clone();
         move |window, cx| {
             let session_deps = {
                 let sessions = sessions.clone();
@@ -605,7 +618,7 @@ impl Run {
             cx.new(|cx| {
                 ShelbiWindow::figma(
                     PROJECT,
-                    sidebar_model(),
+                    model,
                     review,
                     workspace,
                     session_deps,
@@ -793,10 +806,20 @@ impl Run {
         self.click(handle, orch.clone());
         self.click(handle, View::Session("alpha".into()));
         self.save(handle, "workspace");
+        // The idle frame shows charlie idle (no task), while every other
+        // frame's sidebar has it awaiting input on a task: the mockups
+        // disagree, and an idle page belongs to a task-less workspace.
+        self.sidebar = idle_charlie_model();
         let handle = self.open();
         self.click(handle, orch.clone());
         self.click(handle, View::Session("charlie".into()));
+        let page = handle
+            .update(&mut self.cx, |w, _, _| w.offscreen_column())
+            .map(|f| f.workspace.is_none())
+            .unwrap_or(false);
+        self.expect("workspace-idle: the sidebar stays, no panel pushes in", page);
         self.save(handle, "workspace-idle");
+        self.sidebar = sidebar_model();
 
         // Machines, the remote reachable.
         let handle = self.open();

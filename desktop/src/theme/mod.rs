@@ -158,12 +158,14 @@ pub fn hsla(color: Rgba) -> Hsla {
 /// In the TUI these are the user's own terminal's palette, which a window
 /// doesn't have. The defaults come from the palette's roles (the background
 /// is `canvas`, the main area the terminal sits in, so a pane is part of the
-/// window rather than a hole in it; the foreground `foreground`, bold text's
-/// loud color `text_loud`; the selection is `text_selection`; the matches
+/// window rather than a hole in it; the foreground `foreground`, bold text
+/// in the default color `text_loud` and dim text `muted`, as the terminal
+/// frames draw them; the selection is `text_selection`; the matches
 /// `search_match` / `search_current`), so they follow the theme. The ANSI
-/// sixteen take the Figma terminal colors where Figma has them (green and
-/// cyan output from the Orchestrator frame's `theme.green` / `theme.cyan`;
-/// yellow, blue, magenta and bright black from `theme.ansi_*`), and keep a
+/// sixteen take the Figma terminal colors where Figma has them (red, green
+/// and cyan output from the terminal frames' `theme.red` / `theme.green` /
+/// `theme.cyan`; yellow, blue, magenta and bright black from
+/// `theme.ansi_*`), and keep a
 /// terminal palette for the rest: Ghostty's defaults (Tomorrow Night) in the
 /// dark theme, a GitHub-light style set in the light theme, with "white"
 /// darkened so it shows on white. Indexed colors 16..=255 are the fixed xterm cube and ramp
@@ -173,6 +175,12 @@ pub fn hsla(color: Rgba) -> Hsla {
 pub struct TerminalPalette {
     /// The default foreground (`Foreground`): the `foreground` role.
     pub foreground: TermRgb,
+    /// Bold text in the default foreground (`BrightForeground`): the
+    /// `text_loud` role (`theme.white`, the frames' bold prompt lines).
+    pub bold_foreground: TermRgb,
+    /// Dim (SGR 2) text in the default foreground (`DimForeground`): the
+    /// `muted` role (the frames' tool output and footers).
+    pub dim_foreground: TermRgb,
     /// The default background (`Background`): the `canvas` role.
     pub background: TermRgb,
     /// The cursor fill (and the beam / underline / outline color):
@@ -215,6 +223,7 @@ impl TerminalPalette {
         };
         // The Figma terminal colors, in their ANSI slots.
         for (slot, role) in [
+            (1, palette.theme_red),
             (2, palette.theme_green),
             (3, palette.yellow),
             (4, palette.blue),
@@ -226,6 +235,8 @@ impl TerminalPalette {
         }
         Self {
             foreground: c(palette.foreground),
+            bold_foreground: c(palette.text_loud),
+            dim_foreground: c(palette.muted),
             background: c(palette.canvas),
             cursor: c(palette.text_loud),
             cursor_text: c(palette.canvas),
@@ -399,11 +410,22 @@ mod tests {
         // theme.foreground (#f2f3f7 at 70%) over the canvas: the Orchestrator
         // frame's body text (#b2b5bb in the PNG, a unit off in green).
         assert_eq!(dark.foreground, TermRgb::hex(0xb2b4bb));
-        assert_eq!(dark.ansi[1], TermRgb::hex(0xcc6666), "Ghostty's red");
+        assert_eq!(dark.ansi[1], TermRgb::hex(0xe04f52), "theme.red");
+        assert_eq!(dark.ansi[9], TermRgb::hex(0xd54e53), "Ghostty's bright red");
+        // Bold and dim default text: the frames' bold prompts (theme.white)
+        // and dim tool output (theme.muted).
+        assert_eq!(dark.bold_foreground, TermRgb::hex(0xf8f8fa));
+        assert_eq!(dark.dim_foreground, TermRgb::hex(0x777a86));
         assert_eq!(dark.ansi[2], TermRgb::hex(0x5acd25), "theme.green");
         assert_eq!(dark.ansi[6], TermRgb::hex(0x00a6b2), "theme.cyan");
         assert_eq!(dark.ansi[4], TermRgb::hex(0x4a8fd7), "theme.ansi_blue");
         let light = Theme::resolve(ThemePreference::Light, WindowAppearance::Light).terminal;
+        assert_eq!(light.ansi[1], TermRgb::hex(0xc23b3e), "theme.red");
+        assert_eq!(light.ansi[2], TermRgb::hex(0x367b16), "theme.green");
+        assert_eq!(light.ansi[6], TermRgb::hex(0x007a83), "theme.cyan");
+        assert_eq!(light.bold_foreground, TermRgb::hex(0x020303), "theme.white");
+        // theme.muted (#444c65 at 65%) over white.
+        assert_eq!(light.dim_foreground, TermRgb::hex(0x858a9b));
         assert_ne!(
             light.ansi[7], light.background,
             "ANSI white must show on the light surface"
@@ -412,14 +434,20 @@ mod tests {
 
     #[test]
     fn terminal_text_stays_legible_on_both_surfaces() {
-        // The default foreground and the ANSI foreground hues a CLI (Claude
-        // Code included) prints in, on the new background. 3:1 for the hues
-        // (a terminal palette, not UI text), AA for the default foreground.
+        // The default foreground (plain and bold), dim text and the ANSI
+        // foreground hues a CLI (Claude Code included) prints in, on the
+        // canvas. 3:1 for the hues and dim text (a terminal palette, not UI
+        // text), AA for the default foreground.
         for system in [WindowAppearance::Dark, WindowAppearance::Light] {
             let t = Theme::resolve(ThemePreference::Auto, system).terminal;
             let rgb = |c: TermRgb| shelbi_app::theme::Rgb::new(c.r, c.g, c.b);
             let bg = rgb(t.background);
             assert!(rgb(t.foreground).contrast_ratio(bg) >= 4.5, "{system:?} fg");
+            assert!(rgb(t.bold_foreground).contrast_ratio(bg) >= 4.5, "{system:?} bold fg");
+            // Dim text is de-emphasis by design (theme.muted): held to the
+            // hues' 3:1.
+            let dim = rgb(t.dim_foreground).contrast_ratio(bg);
+            assert!(dim >= 3.0, "{system:?} dim fg: {dim:.2}");
             for (i, c) in t.ansi.iter().enumerate() {
                 // Skip black (0) and its bright (8) in dark, white (7, 15) in
                 // light: the slot that matches the background by design.
