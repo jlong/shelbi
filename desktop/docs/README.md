@@ -96,6 +96,7 @@ is left, and how it was verified.
 | `dt-figma-palette` | The command palette restyled to the Figma Command palette frame in both themes: geometry, scrim, query line, rows, description column, Projects column, footer; the frame's default list and copy; Tab crosses into the Projects column | [`status/dt-figma-palette.md`](status/dt-figma-palette.md) |
 | `dt-figma-issues-board` | The Issues board restyled to the Figma Issues frame: filter toolbar, status-glyph column headers, cards with excerpts and workflow badges, the key-hint footer; the shared status glyphs | [`status/dt-figma-issues-board.md`](status/dt-figma-issues-board.md) |
 | `dt-terminal-font-zoom` | ⌘+ / ⌘− / ⌘0 (View ▸ Bigger, Smaller, Actual Size) step every terminal's font size and save it to the setting Settings edits | [`status/dt-terminal-font-zoom.md`](status/dt-terminal-font-zoom.md) |
+| `dt-figma-terminal-screens` | The Orchestrator, Workspace and Review terminals take the Figma frames' insets and colors (bold loud, dim muted, `theme.red`); an idle workspace keeps the sidebar and shows the Figma idle page with a Shell button | [`status/dt-figma-terminal-screens.md`](status/dt-figma-terminal-screens.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

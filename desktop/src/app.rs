@@ -46,8 +46,10 @@
 //! height, with the user's shell beside it on demand. Its panel (status,
 //! task, branch, worktree, machine, the view switch and the Shell toggle)
 //! takes the sidebar's column with the same push as a review's
-//! (`dt-workspace-sidebar`); its Back returns to the view the workspace was
-//! opened over. Going from a workspace to a review, or back, passes through
+//! (`dt-workspace-sidebar`) while the workspace works a task; its Back
+//! returns to the view the workspace was opened over. An idle workspace (no
+//! task) pushes nothing: the sidebar stays and the main area shows its idle
+//! page (`dt-figma-terminal-screens`). Going from a workspace to a review, or back, passes through
 //! the sidebar. Like the chat, its terminals give the window the global
 //! chords.
 //!
@@ -1514,7 +1516,7 @@ impl ShelbiWindow {
             }
         }
         let sidebar_focused = self.client.focus() == Focus::Sidebar;
-        if workspace_name(&view).is_some() {
+        if workspace_name(&view).is_some_and(|name| WorkspaceView::wants_panel(self.workspace_row(name).as_ref())) {
             // The workspace panel is where it was: no push to it.
             self.column.show(Occupant::Workspace, Motion::Fade, (self.clock)());
             self.column.finish();
@@ -1730,8 +1732,10 @@ impl ShelbiWindow {
                     // dead one), as the chat does.
                     let row = self.workspace_row(&name);
                     let ws = self.ensure_workspace(window, cx);
-                    // Its pane attaches once the push has settled.
-                    let hold = self.push_ahead(Occupant::Workspace);
+                    // Its pane attaches once the push has settled. An idle
+                    // workspace has no panel to push: its page shows at once.
+                    let hold =
+                        WorkspaceView::wants_panel(row.as_ref()) && self.push_ahead(Occupant::Workspace);
                     ws.update(cx, |ws, cx| {
                         ws.hold_content(hold, cx);
                         ws.show(&name, row, cx)
@@ -2105,13 +2109,13 @@ impl ShelbiWindow {
     }
 
     /// Point the leading column at what the route wants (the review panel
-    /// while a review is open, the workspace panel while a workspace is
-    /// shown, else the sidebar), starting the push when that changes: a
-    /// slide, or a crossfade under Reduce Motion.
-    fn sync_column(&mut self, now: Instant) {
+    /// while a review is open, the workspace panel while a workspace working
+    /// a task is shown, else the sidebar), starting the push when that
+    /// changes: a slide, or a crossfade under Reduce Motion.
+    fn sync_column(&mut self, now: Instant, cx: &App) {
         let workspace_shown = matches!(self.route, Route::View)
             && workspace_name(self.client.view()).is_some()
-            && self.workspace.is_some();
+            && self.workspace.as_ref().is_some_and(|w| w.read(cx).has_panel());
         let want = if matches!(self.route, Route::Review) && self.review.is_some() {
             Occupant::Review
         } else if workspace_shown {
@@ -3716,7 +3720,7 @@ impl ShelbiWindow {
         // The leading column: the sidebar, or a review's or workspace's panel
         // in its place, both while the push between them runs (clipped to
         // the column).
-        self.sync_column(now);
+        self.sync_column(now, cx);
         self.column.pace(now);
         let frame = self.column.frame(now);
         self.column_moving = frame.animating;

@@ -474,9 +474,38 @@ fn a_workspace_takes_the_sidebars_column_with_a_push(cx: &mut TestAppContext) {
     assert!(c.drawn("ws-switch-agent") && c.drawn("ws-shell-toggle"));
     let main = c.bounds("workspace-view").unwrap();
     let panes = c.bounds("ws-panes").unwrap();
-    assert_eq!(panes.origin.y, main.origin.y, "the agent terminal starts at the top");
+    assert_eq!(
+        panes.origin.y,
+        main.origin.y + gpui::px(1.0),
+        "the agent terminal starts at the top, under the frame's 1px rule"
+    );
     assert_eq!(main.origin.y, gpui::px(0.0));
     assert!(!c.drawn("workspace-header"));
+}
+
+#[gpui::test]
+fn an_idle_workspace_keeps_the_sidebar_and_a_task_pushes_the_panel(cx: &mut TestAppContext) {
+    // No task: the Workspace idle frame (Figma 2174:851) keeps the nav
+    // sidebar, and the main area shows the idle page.
+    let mut c = Column::open_with(cx, |w| {
+        w.model.workspaces[0].current_task = None;
+        w.model.workspaces[0].badge = WorkspaceBadge::Idle;
+    });
+    c.open_workspace();
+    c.advance(SLIDE);
+    assert!(c.drawn("sidebar") && !c.drawn("column-workspace"), "no push");
+    assert!(c.drawn("workspace-toolbar"), "the idle page's toolbar");
+    let ws = c.workspace();
+    assert!(!c.read(|_, cx| ws.read(cx).is_holding()), "nothing waits for a push");
+
+    // A dispatch gives it a task: the panel pushes in.
+    c.update(|w, _, _| w.model.workspaces[0].current_task = Some("t-1".into()));
+    c.update(|w, _, cx| w.update_workspace_row(cx));
+    c.h.draw();
+    assert!(c.drawn("column-workspace"), "the push starts");
+    c.advance(SLIDE);
+    assert!(c.drawn("workspace-panel") && !c.drawn("sidebar"));
+    assert!(!c.drawn("workspace-toolbar"));
 }
 
 #[gpui::test]

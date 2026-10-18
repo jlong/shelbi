@@ -35,10 +35,13 @@ const BACKGROUND: usize = NamedColor::Background as usize;
 const CURSOR: usize = NamedColor::Cursor as usize;
 
 /// Every color a cell can name, resolved for one frame: palette indices
-/// 0..=255 then the default foreground, background, and cursor.
+/// 0..=255 then the default foreground, background, and cursor; and the
+/// default foreground's bold and dim colors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     colors: Vec<Hsla>,
+    bold_foreground: Hsla,
+    dim_foreground: Hsla,
 }
 
 impl Palette {
@@ -55,8 +58,18 @@ impl Palette {
                 };
                 rgb_hsla(emu.color_override(i).unwrap_or(base))
             })
-            .collect();
-        Self { colors }
+            .collect::<Vec<_>>();
+        // A program that redefines the foreground (OSC 10) gets its own color
+        // for bold and dim text too.
+        let (bold_foreground, dim_foreground) = match emu.color_override(FOREGROUND) {
+            Some(fg) => (rgb_hsla(fg), dim(rgb_hsla(fg))),
+            None => (rgb_hsla(theme.bold_foreground), rgb_hsla(theme.dim_foreground)),
+        };
+        Self {
+            colors,
+            bold_foreground,
+            dim_foreground,
+        }
     }
 
     /// The default foreground.
@@ -67,6 +80,17 @@ impl Palette {
     /// The default background.
     pub fn background(&self) -> Hsla {
         self.colors[BACKGROUND]
+    }
+
+    /// Bold text in the default foreground: the theme's loud text, as the
+    /// Figma terminal frames draw their bold prompt lines.
+    pub fn bold_foreground(&self) -> Hsla {
+        self.bold_foreground
+    }
+
+    /// Dim (SGR 2) text in the default foreground: the theme's muted text.
+    pub fn dim_foreground(&self) -> Hsla {
+        self.dim_foreground
     }
 
     /// The cursor color.
@@ -82,8 +106,9 @@ impl Palette {
             VtColor::Named(n) => {
                 use NamedColor::*;
                 match n {
-                    Foreground | BrightForeground => self.foreground(),
-                    DimForeground => dim(self.foreground()),
+                    Foreground => self.foreground(),
+                    BrightForeground => self.bold_foreground(),
+                    DimForeground => self.dim_foreground(),
                     Background => self.background(),
                     Cursor => self.cursor(),
                     DimBlack | DimRed | DimGreen | DimYellow | DimBlue | DimMagenta | DimCyan
@@ -172,11 +197,20 @@ pub fn layout_row(emu: &TermEmulator, row: u16, cols: u16, palette: &Palette) ->
             continue;
         }
         let a = CellAttrs::from_flags(cell.flags);
-        let (mut fg, mut bg) = (palette.color(cell.fg), palette.color(cell.bg));
+        // Bold and dim text in the default foreground take the theme's loud
+        // and muted colors (the terminal frames' bold prompts and dim tool
+        // output); colored text keeps its color, dimmed by alpha.
+        let plain = !a.inverse && cell.fg == VtColor::Named(NamedColor::Foreground);
+        let mut fg = match (plain, a.dim, a.bold) {
+            (true, true, _) => palette.dim_foreground(),
+            (true, false, true) => palette.bold_foreground(),
+            _ => palette.color(cell.fg),
+        };
+        let mut bg = palette.color(cell.bg);
         if a.inverse {
             std::mem::swap(&mut fg, &mut bg);
         }
-        if a.dim {
+        if a.dim && !plain {
             fg = dim(fg);
         }
         let width = if a.wide { 2 } else { 1 };
@@ -373,7 +407,7 @@ mod tests {
         let p = palette(&e);
         let row = layout_row(&e, 0, 20, &p);
         let colors: Vec<Hsla> = row.glyphs.iter().map(|g| g.style.color).collect();
-        assert_eq!(colors[0], hsla(0xcc6666), "ANSI red from the theme");
+        assert_eq!(colors[0], hsla(0xe04f52), "ANSI red from the theme (theme.red)");
         assert_eq!(colors[1], hsla(0xff0000), "xterm 196");
         assert_eq!(colors[2], hsla(0x010203), "true color");
         assert_eq!(
@@ -443,11 +477,32 @@ mod tests {
 
     #[test]
     fn dim_and_hidden() {
-        let e = emu(b"\x1b[2mD\x1b[0;8mH");
+        let e = emu(b"\x1b[2mD\x1b[0;8mH\x1b[0;2;31mR");
         let p = palette(&e);
         let row = layout_row(&e, 0, 20, &p);
-        assert_eq!(row.glyphs.len(), 1, "hidden text paints nothing");
-        assert!(row.glyphs[0].style.color.a < p.foreground().a);
+        assert_eq!(row.glyphs.len(), 2, "hidden text paints nothing");
+        // Dim default text is the theme's muted (the frames' tool output).
+        assert_eq!(row.glyphs[0].style.color, hsla(0x777a86), "theme.muted");
+        // Dim colored text keeps its hue, faded.
+        let red = p.color(VtColor::Named(NamedColor::Red));
+        assert_eq!(row.glyphs[1].style.color.h, red.h);
+        assert!(row.glyphs[1].style.color.a < red.a);
+    }
+
+    #[test]
+    fn bold_default_text_is_the_loud_color() {
+        // The frames' bold prompt lines are theme.white; bold colored text
+        // keeps its color.
+        let e = emu(b"\x1b[1mB\x1b[0;1;32mG\x1b[0mP");
+        let p = palette(&e);
+        let row = layout_row(&e, 0, 20, &p);
+        assert_eq!(row.glyphs[0].style.color, hsla(0xf8f8fa), "theme.white");
+        assert_eq!(row.glyphs[1].style.color, hsla(0x5acd25), "theme.green");
+        assert_eq!(row.glyphs[2].style.color, p.foreground());
+        // A program's own foreground (OSC 10) wins for bold too.
+        let e = emu(b"\x1b]10;rgb:12/34/56\x07\x1b[1mB");
+        let row = layout_row(&e, 0, 20, &palette(&e));
+        assert_eq!(row.glyphs[0].style.color, hsla(0x123456));
     }
 
     #[test]

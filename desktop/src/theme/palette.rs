@@ -73,6 +73,9 @@ pub mod figma {
     pub const THEME_GREEN: Pair = pair(0x5acd25ff, 0x367b16ff);
     /// `theme.cyan`: cyan output in the terminal.
     pub const THEME_CYAN: Pair = pair(0x00a6b2ff, 0x007a83ff);
+    /// `theme.red`: red output in the terminal (the Workspace frame's
+    /// removed line).
+    pub const THEME_RED: Pair = pair(0xe04f52ff, 0xc23b3eff);
     /// `theme.ansi_*`: the Activity log's colors (status tags, actors,
     /// timestamps) and the terminal's ANSI slots.
     pub const ANSI_GREEN: Pair = pair(0x5fb56dff, 0x1a7f37ff);
@@ -320,6 +323,8 @@ palette! {
     theme_green,
     /// Cyan output in the terminal (`theme.cyan`).
     theme_cyan,
+    /// Red output in the terminal (`theme.red`).
+    theme_red,
     /// `[done]` (`theme.ansi_green`).
     green,
     /// `[in progress]` (`theme.ansi_yellow`).
@@ -474,6 +479,7 @@ impl Palette {
 
             theme_green: pick(THEME_GREEN),
             theme_cyan: pick(THEME_CYAN),
+            theme_red: pick(THEME_RED),
             green,
             yellow,
             blue,
@@ -837,6 +843,7 @@ mod tests {
         both(d.success, l.success, (0x31d924ff, 0x00753dff));
         both(d.theme_green, l.theme_green, (0x5acd25ff, 0x367b16ff));
         both(d.theme_cyan, l.theme_cyan, (0x00a6b2ff, 0x007a83ff));
+        both(d.theme_red, l.theme_red, (0xe04f52ff, 0xc23b3eff));
         both(d.link, l.link, (0x30c6ffff, 0x1989c4ff));
         // The frames' surfaces: a lighter sidebar than the dark canvas,
         // near-black cards on it; white and a gray-blue tint in Light.

@@ -7,7 +7,7 @@
 //! `workspace_panel.rs`) and its idle-workspace open (`rt-tui-idle-workspace-open`):
 //!
 //! - **The panel** takes the navigation sidebar's column while the workspace
-//!   is open, as the review panel does: the view renders as the panel, at
+//!   works a task, as the review panel does: the view renders as the panel, at
 //!   whatever width the window's column gives it, and the window puts
 //!   [`WorkspaceView::render_main`] (the terminals and the description
 //!   popover) in the main area beside it. It shows the back button and the
@@ -16,8 +16,13 @@
 //!   popover); the branch, the worktree folder (click to reveal it in Finder)
 //!   and the machine; then the view switch and the Shell toggle as rows. Its
 //!   rows, selection and keys are the shared [`WorkspacePanelState`] (the
-//!   TUI's panel navigates by the same functions). An idle workspace gets a
-//!   reduced panel: name, state and where it lives, no task, switch or shell.
+//!   TUI's panel navigates by the same functions).
+//! - **An idle workspace** (no task) leaves the navigation sidebar where it
+//!   is (Figma "Workspace idle", 2174:851): the main area shows its page, a
+//!   toolbar with the state and name, where it lives and a Shell button, a
+//!   divider, then the agent pane (the idle placeholder until a dispatch
+//!   starts a session). When a task arrives the panel pushes in; when it
+//!   ends the panel leaves (its reduced, task-less rows show while it goes).
 //! - **The agent.** Selecting a workspace attaches its agent session. An idle
 //!   workspace (no session) shows the TUI's idle placeholder and re-attaches
 //!   as soon as the sidebar row changes (a dispatch started a session), as the
@@ -400,9 +405,25 @@ impl WorkspaceView {
         self.content.update(cx, |c, _| c.clear_deliberate_close());
     }
 
+    /// Whether a workspace whose sidebar row is `row` shows the panel in
+    /// the sidebar's column: only while it works a task. An idle one keeps
+    /// the sidebar and shows its page in the main area.
+    pub fn wants_panel(row: Option<&WorkspaceRow>) -> bool {
+        row.is_some_and(|r| r.current_task.is_some())
+    }
+
+    /// Whether the shown workspace has the panel (see [`Self::wants_panel`]).
+    pub fn has_panel(&self) -> bool {
+        Self::wants_panel(self.row.as_ref())
+    }
+
     /// Where keyboard focus goes when the view takes it: the agent pane once
-    /// the user moved there, else the panel (as the review's).
+    /// the user moved there, else the panel (as the review's). Without the
+    /// panel (an idle workspace's page) it is the agent pane, as the chat's.
     pub fn focus_target(&self, cx: &gpui::App) -> FocusHandle {
+        if !self.has_panel() {
+            return self.content.read(cx).focus_target(cx);
+        }
         if self.focus == WsFocus::Content && self.content.read(cx).pane().is_some() {
             self.content.read(cx).focus_target(cx)
         } else {
@@ -1281,10 +1302,99 @@ impl Focusable for WorkspaceView {
 }
 
 impl WorkspaceView {
-    /// The main area beside the panel: the agent (or its diff or editor),
-    /// the user shell when open, and the description popover over them.
+    /// An idle workspace's toolbar (Figma 2174:996): the state and the name,
+    /// the Shell button at the trailing edge, then where it lives (`machine
+    /// · worktree`) in X-Small muted.
+    fn render_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let header = self.header()?;
+        let dec = header.state_decoration();
+        let mut machine = header.machine.clone();
+        if header.is_remote {
+            machine.push_str(" (remote)");
+        }
+        let worktree = self.details.as_ref().map(|d| home_relative(&d.worktree)).filter(|w| !w.is_empty());
+        let place = match worktree {
+            Some(path) if machine.is_empty() => path,
+            Some(path) => format!("{machine} · {path}"),
+            None => header.location_line(),
+        };
+        let open = self.shell_open;
+        let shell = style::button_base("ws-shell-button", style::ButtonKind::Quiet, false, theme)
+            .h(px(24.0))
+            .px_1p5()
+            .gap_1p5()
+            .when(open, |d| d.bg(theme.background))
+            .type_style(Type::XSmall)
+            .text_color(if open { theme.text_loud } else { theme.muted })
+            .tooltip(style::tooltip(if open { "Close the shell" } else { "Open a shell in the worktree" }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_shell(window, cx)))
+            .child(heroicon(icons::COMMAND_LINE).text_color(if open { theme.text_loud } else { theme.muted }))
+            .child("Shell");
+        Some(
+            div()
+                .debug_selector(|| "workspace-toolbar".into())
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap_1()
+                .px_4()
+                .py_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.0))
+                        .min_w_0()
+                        .type_style(Type::Base)
+                        .child(
+                            div()
+                                .debug_selector(|| "workspace-state".into())
+                                .flex_none()
+                                .text_color(theme.muted)
+                                .child(format!("{} {}", dec.glyph, header.state.label().to_lowercase())),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "workspace-name".into())
+                                .min_w_0()
+                                .truncate()
+                                .type_style(Type::BaseMedium)
+                                .text_color(theme.text_loud)
+                                .child(header.name.clone()),
+                        )
+                        .child(div().flex_1())
+                        .child(shell),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "workspace-place".into())
+                        .min_w_0()
+                        .truncate()
+                        .type_style(Type::XSmall)
+                        .text_color(theme.muted)
+                        .child(place),
+                )
+                .when_some(self.status_line.clone(), |d, line| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "workspace-status".into())
+                            .type_style(Type::XSmall)
+                            .text_color(theme.warning)
+                            .child(line),
+                    )
+                }),
+        )
+    }
+
+    /// The main area: the agent (or its diff or editor), the user shell when
+    /// open, and the description popover over them, under a divider (the
+    /// Workspace frames' 1px rule at the top, 2167:653). Without the panel,
+    /// the idle page's toolbar heads it.
     pub fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
+        let toolbar = if self.has_panel() { None } else { self.render_toolbar(&theme, cx) };
         div()
             .id("workspace-view")
             .debug_selector(|| "workspace-view".into())
@@ -1302,11 +1412,23 @@ impl WorkspaceView {
             .min_w_0()
             .size_full()
             .bg(theme.canvas)
+            .children(toolbar)
+            .child(div().flex_none().h(px(1.0)).bg(theme.divider))
             // Waiting for the push to settle: an empty canvas, not the
             // pane's "no session" notice.
             .children((self.held.is_none()).then(|| self.render_panes(&theme, cx)))
             .children(self.render_description(&theme, cx))
             .into_any_element()
+    }
+}
+
+/// `path` with the home directory written `~`, as the idle toolbar shows a
+/// worktree.
+fn home_relative(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+        _ => path.to_string(),
     }
 }
 
@@ -1692,11 +1814,12 @@ pub(crate) mod tests {
         assert!(h.cx.debug_bounds("ws-close-content").is_none(), "the agent has no ×");
         assert!(h.cx.debug_bounds("workspace-header").is_none(), "no header row");
 
-        // The terminal starts at the top of the main area.
+        // The terminal starts at the top of the main area, under the
+        // Workspace frame's 1px rule (Figma 2167:653).
         let main = h.cx.debug_bounds("workspace-view").unwrap();
         let panes = h.cx.debug_bounds("ws-panes").unwrap();
-        assert_eq!(panes.origin.y, main.origin.y, "nothing above the terminal");
-        assert_eq!(panes.size.height, main.size.height);
+        assert_eq!(panes.origin.y, main.origin.y + px(1.0), "only the rule above the terminal");
+        assert_eq!(panes.size.height, main.size.height - px(1.0));
 
         // The panel sits in its column, the panes beside it.
         let panel = h.cx.debug_bounds("workspace-panel").unwrap();
@@ -1804,6 +1927,56 @@ pub(crate) mod tests {
         h.draw();
         assert!(h.cx.debug_bounds("ws-switch-agent").is_some());
         assert!(h.cx.debug_bounds("ws-shell-toggle").is_some());
+    }
+
+    #[gpui::test]
+    fn an_idle_workspace_shows_its_page_without_the_panel(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.sessions.idle.lock().unwrap().push("demo/ws/alpha".into());
+        *h.ops.details.lock().unwrap() = Some(WorkspaceDetailsInfo {
+            branch: Some("main".into()),
+            worktree: "/w/alpha".into(),
+            ..WorkspaceDetailsInfo::default()
+        });
+        h.update(|v, cx| v.show("alpha", Some(row("alpha", None, WorkspaceBadge::Idle, false)), cx));
+        assert!(!h.view.read_with(&h.cx, |v, _| v.has_panel()), "no task, no panel");
+        h.draw();
+        // The page (Figma 2174:851): the toolbar, a rule, the placeholder.
+        let main = h.cx.debug_bounds("workspace-view").unwrap();
+        let toolbar = h.cx.debug_bounds("workspace-toolbar").expect("the toolbar is drawn");
+        let panes = h.cx.debug_bounds("ws-panes").unwrap();
+        assert_eq!(toolbar.origin.y, main.origin.y);
+        assert_eq!(toolbar.size.height, px(64.0), "8 + 28 + 4 + 16 + 8, as drawn");
+        assert_eq!(panes.origin.y, toolbar.bottom() + px(1.0), "under the 1px rule");
+        assert!(h.cx.debug_bounds("workspace-place").is_some());
+        // Focus goes to the agent pane's view, as the chat's does.
+        let target = h.view.read_with(&h.cx, |v, cx| v.focus_target(cx));
+        let content = h.view.read_with(&h.cx, |v, cx| v.content.read(cx).focus_target(cx));
+        assert_eq!(target, content);
+
+        // The Shell button opens the user shell beside the placeholder.
+        h.click("ws-shell-button");
+        h.cx.run_until_parked();
+        assert_eq!(h.ops(), vec![WorkspaceSessionOp::EnsureShell]);
+        assert_eq!(h.shell_phase(), SessionPhase::Live);
+        h.click("ws-shell-button");
+        h.cx.run_until_parked();
+        assert_eq!(h.ops(), vec![WorkspaceSessionOp::EnsureShell, WorkspaceSessionOp::CloseShell]);
+
+        // A dispatch gives it a task: the panel, and no toolbar.
+        h.sessions.idle.lock().unwrap().clear();
+        h.update(|v, cx| v.update_row(Some(working()), cx));
+        assert!(h.view.read_with(&h.cx, |v, _| v.has_panel()));
+        h.draw();
+        assert!(h.cx.debug_bounds("workspace-toolbar").is_none());
+    }
+
+    #[test]
+    fn the_idle_toolbar_writes_home_as_a_tilde() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(home_relative(&format!("{home}/Workspaces/wt/charlie")), "~/Workspaces/wt/charlie");
+        assert_eq!(home_relative("/srv/wt/charlie"), "/srv/wt/charlie");
+        assert_eq!(home_relative(&format!("{home}x/wt")), format!("{home}x/wt"), "only the whole directory");
     }
 
     #[gpui::test]
