@@ -59,6 +59,12 @@ const COLUMN_WIDTH: f32 = 272.0;
 const TITLE_OVERHANG: f32 = 6.0;
 /// How many lines a card's excerpt keeps (the Figma card's description).
 const SUMMARY_LINES: usize = 4;
+/// The excerpt's width: Figma's description box is 244px, 4px short of the
+/// card's content.
+const SUMMARY_WIDTH: f32 = 244.0;
+/// A card's corner radius (the Figma card's: 12px, rounder than a button's
+/// 6px).
+const CARD_RADIUS: f32 = 12.0;
 /// A collapsed column's width.
 const COLLAPSED_WIDTH: f32 = 36.0;
 /// The toolbar's height, its rule included (Figma: a 56px Board toolbar over
@@ -68,7 +74,7 @@ const TOOLBAR_H: f32 = 57.0;
 /// over a 28px row).
 const FOOTER_H: f32 = 29.0;
 /// How far a column's scroll clip reaches past the column on every side, so
-/// the selected card's focus glow (5px outside it) isn't cut off while the
+/// the selected card's focus glow (4px outside it) isn't cut off while the
 /// cards keep the column's full width.
 const GLOW_ROOM: f32 = 6.0;
 
@@ -100,7 +106,7 @@ impl Render for CardGhost {
             .flex_col()
             .gap_1()
             .p_3()
-            .rounded_lg()
+            .rounded(px(CARD_RADIUS))
             .bg(theme.card)
             .shadow(style::popover_shadow(&theme))
             .opacity(0.95)
@@ -581,7 +587,7 @@ impl IssuesView {
             .child(
                 style::dropdown(
                     "workflow-chip",
-                    icons::FUNNEL,
+                    icons::FUNNEL_BUTTON,
                     model.workflow_filter_label.clone(),
                     matches!(self.state.mode, Mode::WorkflowDropdown { .. }),
                     theme,
@@ -595,7 +601,7 @@ impl IssuesView {
             .child(
                 style::dropdown(
                     "workspace-chip",
-                    icons::FUNNEL,
+                    icons::FUNNEL_BUTTON,
                     model.workspace_filter_label.clone(),
                     matches!(self.state.mode, Mode::WorkspaceDropdown { .. }),
                     theme,
@@ -840,7 +846,7 @@ impl IssuesView {
                     .justify_center()
                     .h(px(72.0))
                     .px_3()
-                    .rounded_lg()
+                    .rounded(px(CARD_RADIUS))
                     .border_1()
                     .border_dashed()
                     .border_color(theme.divider_strong)
@@ -936,10 +942,14 @@ impl IssuesView {
             .gap(px(6.0))
             .p_3()
             .overflow_hidden()
-            .rounded_lg()
+            .rounded(px(CARD_RADIUS))
             .bg(theme.card)
-            // The keyboard's card wears the focus ring and glow.
-            .shadow(if selected {
+            // The keyboard's card wears the focus ring and glow. The dragged
+            // card's placeholder wears neither: a shadow is a filled box under
+            // the card and would show through its dimmed fill.
+            .shadow(if dragged {
+                Vec::new()
+            } else if selected {
                 style::focus_shadow(theme)
             } else {
                 style::card_shadow(theme)
@@ -1004,6 +1014,7 @@ impl IssuesView {
             .when(!card.summary.is_empty(), |d| {
                 d.child(
                     div()
+                        .w(px(SUMMARY_WIDTH))
                         .overflow_hidden()
                         .type_style(Type::XSmall)
                         .line_height(px(18.0))
@@ -1360,14 +1371,17 @@ fn workflow_badge(name: String, theme: &Theme) -> gpui::Div {
 }
 
 /// A legal drop target under a dragged card: the overlay fill and the focus
-/// ring's color drawn as a 1px ring outside it (no border, so nothing moves).
+/// ring's color drawn as a 1px ring just inside it (no border, so nothing
+/// moves). The ring is an inset shadow, painted over the fill: a drop shadow
+/// is a filled box under the element and would show through the
+/// translucent overlay fill as a solid block of the ring's color.
 fn drop_highlight(s: gpui::StyleRefinement, theme: &Theme) -> gpui::StyleRefinement {
     s.bg(theme.background).shadow(vec![gpui::BoxShadow {
         color: theme.focus_ring,
         offset: gpui::point(px(0.0), px(0.0)),
         blur_radius: px(0.0),
         spread_radius: px(1.0),
-        inset: false,
+        inset: true,
     }])
 }
 

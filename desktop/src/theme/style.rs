@@ -439,8 +439,10 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
     }
 }
 
-/// The keyboard focus as Figma draws it: a 4px `focus/default/focus-glow`
-/// and, over it, the 1px `focus/default/ring`, both outside the control.
+/// The keyboard focus as Figma draws it: the 1px `focus/default/ring` and,
+/// over it, the 4px `focus/default/focus-glow`, both outside the control
+/// (Figma stacks the glow over the ring, so the ring reads a touch paler
+/// than its token, and 3px of glow show past it).
 pub fn focus_shadow(theme: &Theme) -> Vec<BoxShadow> {
     let around = |color: Hsla, spread: f32| BoxShadow {
         color,
@@ -449,7 +451,7 @@ pub fn focus_shadow(theme: &Theme) -> Vec<BoxShadow> {
         spread_radius: px(spread),
         inset: false,
     };
-    vec![around(theme.focus_glow, 5.0), around(theme.focus_ring, 1.0)]
+    vec![around(theme.focus_ring, 1.0), around(theme.focus_glow, 4.0)]
 }
 
 /// An icon button's square.
@@ -524,10 +526,10 @@ pub fn tinted_icon_button(
     )
 }
 
-/// Figma's Icon slot: `icon` in a box `width` wide, flush right, so a 20px
+/// Figma's Icon slot: `icon` in a box `width` wide, flush right, so the
 /// icon hangs past the slot's left edge and the label after it sits where
-/// Figma puts it (the slot is 14px in an X-Small button, 12px in a Small
-/// one).
+/// Figma puts it (an 18px icon in a 14px slot in an X-Small button, 20px in
+/// 12px in a Small one).
 pub fn icon_slot(icon: Icon, width: f32, color: Hsla) -> Div {
     div()
         .flex()
@@ -546,17 +548,18 @@ pub fn toolbar_button(
     label: impl Into<SharedString>,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let fg = button_colors(ButtonKind::Secondary, theme).text;
     button_base(id, ButtonKind::Secondary, false, theme)
         .h(px(28.0))
         .gap(px(4.0))
-        .child(icon_slot(icon, 12.0, fg))
+        .child(icon_slot(icon, 12.0, theme.button_icon))
         .child(label.into())
 }
 
-/// A control that opens a menu (the board's and the feed's filters): the
-/// Figma Button at X-Small with a left icon (24px tall, 8px across, the
-/// overlay fill, X-Small/Medium loud); pressed while `open`.
+/// A control that opens a menu (the board's filters): the Figma Button at
+/// X-Small with a left icon (8px across, the overlay fill, X-Small/Medium
+/// loud, an 18px icon, `icons::FUNNEL_BUTTON`, in its 14px slot, which makes
+/// it 26px tall); pressed while `open` (the Active state, whose icon keeps
+/// its color).
 pub fn dropdown(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -578,14 +581,14 @@ pub fn dropdown(
         .flex_none()
         .items_center()
         .gap(px(4.0))
-        .h(px(24.0))
+        .h(px(26.0))
         .px(px(8.0))
         .rounded(px(6.0))
         .type_style(Type::XSmallMedium)
         .text_color(theme.text_loud)
         .cursor_pointer();
     fill_layer(d, id, px(6.0), [rest, theme.background_hover, theme.background_active])
-        .child(icon_slot(icon, 14.0, if open { theme.text_loud } else { theme.icon }))
+        .child(icon_slot(icon, 14.0, theme.button_icon))
         .child(div().whitespace_nowrap().child(label.into()))
 }
 

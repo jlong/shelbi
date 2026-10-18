@@ -14,9 +14,11 @@
 //! `activity-picker.png` and `activity-workspace-picker.png` (each picker
 //! open), `machines.png` once the unreachable remote's probe has landed,
 //! and the issues board: `board.png`
-//! (a card selected), `board-dropdown.png` (the workflow filter open) and
-//! `board-detail.png` (a card's detail); then `settings.png`, Settings with its
-//! font picker open (`settings-font-picker.png`), the other choices
+//! (a card selected), `board-dropdown.png` and `board-workspace-dropdown.png`
+//! (each filter open), `board-empty.png` (columns a filter emptied),
+//! `board-drag.png` (a card dragged over another column, the drop target
+//! lit) and `board-detail.png` (a card's detail); then `settings.png`, Settings
+//! with its font picker open (`settings-font-picker.png`), the other choices
 //! selected with the size stepper at each end (`settings-size-min.png`,
 //! `settings-size-max.png`, `settings-option-right.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
@@ -177,6 +179,37 @@ pub fn run(out: PathBuf) -> ! {
     save(&mut cx, window, &out, "board-dropdown.png");
     board.update(&mut cx, |v, cx| {
         v.state_mut().close_overlay();
+        v.state_mut().open_workspace_dropdown();
+        cx.notify();
+    });
+    wait(&mut cx, window, Duration::from_millis(300), |_| false);
+    save(&mut cx, window, &out, "board-workspace-dropdown.png");
+    // States the Figma frame doesn't draw: a column emptied by a filter, and
+    // a card dragged over another column (the drop target lit).
+    board.update(&mut cx, |v, cx| {
+        v.state_mut().close_overlay();
+        let _ = v
+            .state_mut()
+            .set_workspace_filter(Some(shelbi_app::board::WorkspaceFilter::Workspace("alpha".into())));
+        cx.notify();
+    });
+    save(&mut cx, window, &out, "board-empty.png");
+    board.update(&mut cx, |v, cx| {
+        let _ = v.state_mut().set_workspace_filter(None);
+        cx.notify();
+    });
+    draw(&mut cx, window);
+    let (none, left) = (gpui::Modifiers::default(), gpui::MouseButton::Left);
+    // The first backlog card, then over the In progress column.
+    cx.simulate_mouse_down(window, gpui::point(px(148.0), px(140.0)), left, none);
+    cx.simulate_mouse_move(window, gpui::point(px(160.0), px(150.0)), left, none);
+    cx.simulate_mouse_move(window, gpui::point(px(716.0), px(300.0)), left, none);
+    save(&mut cx, window, &out, "board-drag.png");
+    // Let go over the toolbar, no drop target, so nothing moves.
+    cx.simulate_mouse_move(window, gpui::point(px(500.0), px(20.0)), left, none);
+    cx.simulate_mouse_up(window, gpui::point(px(500.0), px(20.0)), left, none);
+    draw(&mut cx, window);
+    board.update(&mut cx, |v, cx| {
         v.state_mut().open_detail("t1");
         cx.notify();
     });
