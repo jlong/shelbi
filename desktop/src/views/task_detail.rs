@@ -15,7 +15,7 @@
 //! editor. Keys are the TUI popover's (`keys.yaml` `popover:`) plus the
 //! desktop's `s` / `a` / `e` / `E`.
 
-use gpui::{div, prelude::*, px, relative, BoxShadow, ClickEvent, Context, Div, ElementId, SharedString};
+use gpui::{div, prelude::*, px, relative, BoxShadow, ClickEvent, Context, Div, ElementId, Hsla, SharedString};
 use gpui_kit::component::input::Textarea;
 use shelbi_app::TaskDetailModel;
 use shelbi_state::keymap::PopoverAction;
@@ -64,11 +64,19 @@ pub fn render(
                 .child(d.title.clone()),
         )
         .child(
-            // Centered on the title's first line, the icon where the frame
-            // draws its 16pt x-mark (20pt in, 8pt across).
-            style::icon_button("detail-close", icons::X_MARK, IconButtonSize::Small, false, theme)
-                .mt(px(2.0))
-                .mr(px(-4.0))
+            // Centered on the title's first line, the 16pt x-mark in muted
+            // where the frame draws it (18pt in from the panel's inner
+            // edge: Figma lays the title row 2pt past its 20pt inset).
+            style::tinted_icon_button(
+                "detail-close",
+                icons::X_MARK_CLOSE,
+                IconButtonSize::Small,
+                false,
+                theme.muted,
+                theme,
+            )
+            .mt(px(2.0))
+            .mr(px(-6.0))
                 .tooltip(style::tooltip(format!("Close ({close_hint})")))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if this.editor.is_some() {
@@ -141,7 +149,7 @@ pub fn render(
         .px(px(INSET))
         .pb(px(12.0))
         .child(
-            action(theme, "detail-left", Some(icons::ARROW_LEFT), "Move", &left_hint, None, ButtonKind::Secondary)
+            action(theme, "detail-left", Some((icons::ARROW_LEFT_BUTTON, theme.button_icon)), "Move", &left_hint, None, ButtonKind::Secondary)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let intents = this.state.detail_move(false);
                     this.apply_intents(intents, window, cx);
@@ -149,7 +157,7 @@ pub fn render(
                 })),
         )
         .child(
-            action(theme, "detail-right", None, "Move", &right_hint, Some(icons::ARROW_RIGHT), ButtonKind::Secondary)
+            action(theme, "detail-right", None, "Move", &right_hint, Some((icons::ARROW_RIGHT_BUTTON, theme.button_icon)), ButtonKind::Secondary)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let intents = this.state.detail_move(true);
                     this.apply_intents(intents, window, cx);
@@ -157,7 +165,7 @@ pub fn render(
                 })),
         )
         .child(
-            action(theme, "detail-start", Some(icons::PLAY_SOLID), "Start", "s", None, ButtonKind::Secondary).on_click(
+            action(theme, "detail-start", Some((icons::PLAY_SOLID_BUTTON, theme.icon)), "Start", "s", None, ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     if let Some(id) = this.state.detail_id().map(str::to_string) {
                         let intents = this.state.start(&id);
@@ -168,7 +176,7 @@ pub fn render(
             ),
         )
         .child(
-            action(theme, "detail-assign", Some(icons::USER), "Assign", "a", None, ButtonKind::Secondary).on_click(
+            action(theme, "detail-assign", Some((icons::USER_BUTTON, theme.icon)), "Assign", "a", None, ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     if let Some(id) = this.state.detail_id().map(str::to_string) {
                         let intents = this.state.begin_assign(&id);
@@ -180,7 +188,7 @@ pub fn render(
         )
         .when(!editing, |row| {
             row.child(
-                action(theme, "detail-edit", Some(icons::PENCIL_SQUARE), "Edit", "e", None, ButtonKind::Secondary)
+                action(theme, "detail-edit", Some((icons::PENCIL_SQUARE_BUTTON, theme.icon)), "Edit", "e", None, ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         if let Some(id) = this.state.detail_id().map(str::to_string) {
                             let intents = this.state.begin_edit(&id);
@@ -194,7 +202,7 @@ pub fn render(
             action(
                 theme,
                 "detail-editor",
-                Some(icons::ARROW_UP_RIGHT),
+                Some((icons::ARROW_UP_RIGHT_BUTTON, theme.icon)),
                 "Editor",
                 "E",
                 None,
@@ -267,7 +275,7 @@ pub fn render(
             .type_style(Type::Base)
             .child(div().text_color(theme.muted).child("This issue has no description yet."))
             .child(
-                action(theme, "detail-add-description", Some(icons::PENCIL_SQUARE), "Write one", "e", None, ButtonKind::Secondary)
+                action(theme, "detail-add-description", Some((icons::PENCIL_SQUARE_BUTTON, theme.icon)), "Write one", "e", None, ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         if let Some(id) = this.state.detail_id().map(str::to_string) {
                             let intents = this.state.begin_edit(&id);
@@ -376,14 +384,15 @@ fn keycap_label(chord: &str) -> String {
 /// A compact action, the Figma Button at X-Small: the style's fill, 6pt
 /// corners, 26pt tall and 8pt across, an icon slot before (or after) the
 /// X-Small medium label, and the key that does the same thing as one small
-/// keycap.
+/// keycap. Each icon is 18pt, in its color: the frame draws the arrows in
+/// `button_icon` and the rest in `icon`.
 fn action(
     theme: &Theme,
     id: &'static str,
-    icon: Option<Icon>,
+    icon: Option<(Icon, Hsla)>,
     text: &str,
     key: &str,
-    trailing: Option<Icon>,
+    trailing: Option<(Icon, Hsla)>,
     kind: ButtonKind,
 ) -> gpui::Stateful<gpui::Div> {
     style::button_base(id, kind, false, theme)
@@ -392,13 +401,13 @@ fn action(
         .px(px(8.0))
         .gap_1()
         .type_style(Type::XSmallMedium)
-        .when_some(icon, |b, icon| b.child(style::icon_slot(icon, 14.0, theme.icon)))
+        .when_some(icon, |b, (icon, color)| b.child(style::icon_slot(icon, 14.0, color)))
         .child(text.to_string())
         .when(!key.is_empty(), |b| b.child(keycap(key, theme)))
-        .when_some(trailing, |b, icon| {
+        .when_some(trailing, |b, (icon, color)| {
             // The trailing slot is flush left: the icon hangs past its right
             // edge, as the leading one hangs past its left.
-            b.child(div().flex().flex_none().items_center().w(px(14.0)).child(heroicon(icon).text_color(theme.icon)))
+            b.child(div().flex().flex_none().items_center().w(px(14.0)).child(heroicon(icon).text_color(color)))
         })
 }
 

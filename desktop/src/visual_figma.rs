@@ -20,9 +20,10 @@
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
 //! machines, settings and command-palette, plus the palette states the
-//! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye)
-//! and the sidebar states no frame draws (`state-sidebar-*`: sections
-//! collapsed, Zen off, the sidebar hidden).
+//! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
+//! the sidebar states no frame draws (`state-sidebar-*`: sections
+//! collapsed, Zen off, the sidebar hidden) and the issue detail's
+//! ([`DETAIL_ACTIONS`] hovered, a long body scrolled).
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -86,6 +87,10 @@ pub const PALETTE_STATES: [(&str, &str); 4] = [
     ("tab", "command-palette-projects"),
     ("tab down", "command-palette-project-selected"),
 ];
+
+/// The issue detail's actions, left to right, by the name of the render
+/// with each one hovered (`issue-detail-hover-<name>`).
+pub const DETAIL_ACTIONS: [&str; 6] = ["move-left", "move-right", "start", "assign", "edit", "editor"];
 
 // ---- sessions -------------------------------------------------------------
 
@@ -754,6 +759,15 @@ impl Run {
 
     /// Save the window as `<screen>-<theme>.png` and close it.
     fn save(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
+        self.capture(handle, screen);
+        self.cx
+            .update_window(handle.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        self.cx.run_until_parked();
+    }
+
+    /// Save the window as `<screen>-<theme>.png`, keeping it open.
+    fn capture(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
         self.settle(handle);
         let window: AnyWindowHandle = handle.into();
         let image = self.cx.capture_screenshot(window).expect("render to image");
@@ -765,10 +779,6 @@ impl Run {
         let path = self.out.join(format!("{screen}-{}.png", self.theme));
         image.save(&path).expect("save the frame");
         println!("saved {} ({}x{})", path.display(), image.width(), image.height());
-        self.cx
-            .update_window(window, |_, window, _| window.remove_window())
-            .unwrap();
-        self.cx.run_until_parked();
     }
 
     fn all(&mut self) {
@@ -808,6 +818,7 @@ impl Run {
             .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
             .unwrap();
         self.save(handle, "issue-detail");
+        self.detail_states();
 
         // The Activity feed, the review row selected.
         let handle = self.open();
@@ -1034,6 +1045,58 @@ impl Run {
         })
     }
 
+    /// The issue detail over the board, as the frame shows it.
+    fn open_detail(&mut self) -> WindowHandle<ShelbiWindow> {
+        let handle = self.open();
+        self.click(handle, View::Issues);
+        self.wait_for_board(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
+            .unwrap();
+        self.settle(handle);
+        handle
+    }
+
+    /// The detail's states the frame doesn't draw (no reference; checked by
+    /// eye): each action hovered ([`DETAIL_ACTIONS`]), then a body too long
+    /// for the modal, paged down.
+    fn detail_states(&mut self) {
+        let handle = self.open_detail();
+        let window: AnyWindowHandle = handle.into();
+        let image = self.cx.capture_screenshot(window).expect("render to image");
+        let scale = image.width() as f32 / WIDTH as f32;
+        // The action row's top: the modal (85% of the window down, centered)
+        // plus its 1pt edge, the 52pt title row and the 176pt field table.
+        let top = HEIGHT as f32 * 0.075 + 1.0 + 52.0 + 176.0;
+        let buttons = detail_buttons(&image, scale, top + 2.0);
+        self.expect(
+            &format!("detail states: the {} actions found on the row", DETAIL_ACTIONS.len()),
+            buttons.len() == DETAIL_ACTIONS.len(),
+        );
+        for (name, x) in DETAIL_ACTIONS.iter().zip(buttons) {
+            let at = gpui::point(px(x), px(top + 13.0));
+            self.cx.simulate_mouse_move(window, at, None, gpui::Modifiers::none());
+            self.capture(handle, &format!("issue-detail-hover-{name}"));
+        }
+        // Park the pointer off the actions: the next window opens under it.
+        self.cx
+            .simulate_mouse_move(window, gpui::point(px(0.0), px(0.0)), None, gpui::Modifiers::none());
+        self.cx
+            .update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+
+        // The umbrella's body four times over: more than the modal holds.
+        let long = format!(
+            "{DESKTOP_APP_BODY}{}",
+            DESKTOP_APP_BODY.replace("# Desktop application", "## Desktop application").repeat(3)
+        );
+        save_task("desktop-app", "Desktop application", &long, Column::review(), 1, Some("review"));
+        let handle = self.open_detail();
+        self.cx.simulate_keystrokes(handle.into(), "pagedown");
+        self.save(handle, "issue-detail-scrolled");
+        save_task("desktop-app", "Desktop application", DESKTOP_APP_BODY, Column::review(), 1, Some("review"));
+    }
+
     fn wait_for_board(&mut self, handle: WindowHandle<ShelbiWindow>) -> bool {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(10) {
@@ -1044,6 +1107,34 @@ impl Run {
         }
         false
     }
+}
+
+/// The horizontal centers (in points) of the buttons on the detail's action
+/// row: each run of non-canvas pixels on row `y` with canvas on both sides
+/// (the modal's edge and the scrim beyond it run on to the window's edge or
+/// are wider than any button).
+fn detail_buttons(image: &image::RgbaImage, scale: f32, y: f32) -> Vec<f32> {
+    let row = (y * scale) as u32;
+    // The modal's empty bottom is the canvas.
+    let canvas = *image.get_pixel(image.width() / 2, (HEIGHT as f32 * 0.92 * scale) as u32);
+    let mut out = Vec::new();
+    let mut start: Option<u32> = None;
+    let mut after_canvas = false;
+    for x in 0..image.width() {
+        let is_canvas = *image.get_pixel(x, row) == canvas;
+        if is_canvas {
+            if let Some(s) = start.take() {
+                let width = (x - s) as f32 / scale;
+                if (40.0..=150.0).contains(&width) {
+                    out.push((s + x) as f32 / 2.0 / scale);
+                }
+            }
+        } else if after_canvas {
+            start = Some(x);
+        }
+        after_canvas = is_canvas;
+    }
+    out
 }
 
 // ---- the fixture project --------------------------------------------------

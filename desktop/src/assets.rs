@@ -19,7 +19,7 @@
 //! Render one with [`heroicon`]`(icons::X_MARK)`; the SVG's `currentColor`
 //! stroke takes the element's `text_color`. An icon carries its size, so no
 //! view calls `svg()` or sizes an icon itself (a test guards it, and another
-//! that every icon draws at one of the Figma file's sizes, 20, 14 or 18). Lay a row out around the 20px icon; an
+//! that every icon draws at one of the Figma file's sizes, 20, 14, 18 or 16). Lay a row out around the 20px icon; an
 //! icon button that needs a bigger hit area pads the icon rather than
 //! growing it.
 //!
@@ -44,7 +44,15 @@
 //! drawing under `assets/icons/heroicons-18/` with its stroke widened so it
 //! is 1.25pt at 18pt, as Figma draws it (see that folder's README). Its
 //! constant ends in `_BUTTON` (`icons::FUNNEL_BUTTON`) and [`heroicon`]
-//! draws it at [`ICON_SIZE_BUTTON`].
+//! draws it at [`ICON_SIZE_BUTTON`]. The issue detail's actions draw their
+//! icons there too, the Start button's filled play among them (John's
+//! drawing, on Figma's 18pt grid, since Heroicons has none).
+//!
+//! Where the Figma file draws an icon at **16pt** (the issue detail's close
+//! mark), the `@close` list names it: the drawing under
+//! `assets/icons/heroicons-16/` with its stroke widened so it is 1.5pt at
+//! 16pt. Its constant ends in `_CLOSE` and [`heroicon`] draws it at
+//! [`ICON_SIZE_CLOSE`].
 //!
 //! The other exception is the **status glyphs** ([`status_glyph`]): the Figma
 //! file's own `status-*` drawings (a dashed circle for backlog, an open one
@@ -76,9 +84,12 @@ pub const ICON_SIZE_SMALL: Pixels = px(14.0);
 /// The X-Small Button's left icon size (the board's filters).
 pub const ICON_SIZE_BUTTON: Pixels = px(18.0);
 
+/// A modal's close mark (the issue detail's).
+pub const ICON_SIZE_CLOSE: Pixels = px(16.0);
+
 /// Every size an icon renders at: the sizes the Figma file uses.
 #[cfg(test)]
-pub const ICON_SIZES: [Pixels; 3] = [ICON_SIZE, ICON_SIZE_SMALL, ICON_SIZE_BUTTON];
+pub const ICON_SIZES: [Pixels; 4] = [ICON_SIZE, ICON_SIZE_SMALL, ICON_SIZE_BUTTON, ICON_SIZE_CLOSE];
 
 /// One vendored Heroicon (its outline drawing) and the size it draws at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +113,8 @@ impl Icon {
 }
 
 /// `icon`, outline, at its size ([`ICON_SIZE`], [`ICON_SIZE_SMALL`] for a
-/// small one, [`ICON_SIZE_BUTTON`] for a button's): the only way Shelbi's
+/// small one, [`ICON_SIZE_BUTTON`] for a button's, [`ICON_SIZE_CLOSE`] for
+/// a close mark): the only way Shelbi's
 /// views draw an icon.
 pub fn heroicon(icon: Icon) -> Svg {
     svg().path(icon.path()).size(icon.size).flex_none()
@@ -198,10 +210,11 @@ macro_rules! heroicons {
         @figma { $($fconst:ident = $ffile:literal;)* }
         @small { $($sconst:ident = $sfile:literal;)* }
         @button { $($bconst:ident = $bfile:literal;)* }
+        @close { $($cconst:ident = $cfile:literal;)* }
     ) => {
         /// The vendored icons.
         pub mod icons {
-            use super::{Icon, ICON_SIZE, ICON_SIZE_BUTTON, ICON_SIZE_SMALL};
+            use super::{Icon, ICON_SIZE, ICON_SIZE_BUTTON, ICON_SIZE_CLOSE, ICON_SIZE_SMALL};
 
             $(
                 $(#[$meta])*
@@ -232,10 +245,17 @@ macro_rules! heroicons {
                     size: ICON_SIZE_BUTTON,
                 };
             )*
+            $(
+                pub const $cconst: Icon = Icon {
+                    name: $cfile,
+                    path: concat!("icons/heroicons-16/", $cfile, ".svg"),
+                    size: ICON_SIZE_CLOSE,
+                };
+            )*
 
             /// Every vendored icon.
             #[cfg(test)]
-            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)* $($sconst,)* $($bconst,)*];
+            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)* $($sconst,)* $($bconst,)* $($cconst,)*];
         }
 
         /// Every vendored drawing, by asset path.
@@ -276,6 +296,15 @@ macro_rules! heroicons {
                     ".svg"
                 )) as &[u8],
             ),)*
+            $((
+                concat!("icons/heroicons-16/", $cfile, ".svg"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/icons/heroicons-16/",
+                    $cfile,
+                    ".svg"
+                )) as &[u8],
+            ),)*
         ];
     };
 }
@@ -285,9 +314,13 @@ heroicons! {
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
     ARROW_LEFT = "arrow-left";
+    /// The drawing `ARROW_RIGHT_BUTTON` widens; no view draws it at 20pt.
+    #[allow(dead_code)]
     ARROW_RIGHT = "arrow-right";
     ARROW_PATH = "arrow-path";
     ARROW_TOP_RIGHT_ON_SQUARE = "arrow-top-right-on-square";
+    /// The drawing `ARROW_UP_RIGHT_BUTTON` widens; no view draws it at 20pt.
+    #[allow(dead_code)]
     ARROW_UP_RIGHT = "arrow-up-right";
     CLIPBOARD_DOCUMENT = "clipboard-document";
     EXCLAMATION_TRIANGLE = "exclamation-triangle";
@@ -299,6 +332,9 @@ heroicons! {
     PENCIL_SQUARE = "pencil-square";
     PLUS = "plus";
     MINUS = "minus";
+    /// The drawing `USER_SMALL` and `USER_BUTTON` widen; no view draws the
+    /// user at 20pt.
+    #[allow(dead_code)]
     USER = "user";
     MAGNIFYING_GLASS = "magnifying-glass";
     COG_6_TOOTH = "cog-6-tooth";
@@ -316,7 +352,6 @@ heroicons! {
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
     @figma {
-        PLAY_SOLID = "play-solid";
         TOGGLE_OFF = "toggle-off";
         TOGGLE_ON = "toggle-on";
         PAGE_CURL = "page-curl";
@@ -329,6 +364,15 @@ heroicons! {
     }
     @button {
         FUNNEL_BUTTON = "funnel";
+        ARROW_LEFT_BUTTON = "arrow-left";
+        ARROW_RIGHT_BUTTON = "arrow-right";
+        PLAY_SOLID_BUTTON = "play-solid";
+        USER_BUTTON = "user";
+        PENCIL_SQUARE_BUTTON = "pencil-square";
+        ARROW_UP_RIGHT_BUTTON = "arrow-up-right";
+    }
+    @close {
+        X_MARK_CLOSE = "x-mark";
     }
 }
 
@@ -593,6 +637,27 @@ mod tests {
                 );
                 continue;
             }
+            if path == "icons/heroicons-18/play-solid.svg" {
+                // John's own drawing (Heroicons has no filled play), as the
+                // Figma file draws it on its 18pt grid.
+                assert!(svg.contains(r#"viewBox="0 0 18 18""#), "{path} is on Figma's 18pt grid");
+                assert!(svg.contains(r#"fill="currentColor""#), "{path} paints in currentColor");
+                continue;
+            }
+            if path == format!("icons/heroicons-16/{}.svg", icon.name()) {
+                // The 20pt drawing with only its stroke widened, 1.5pt at 16.
+                let full = Assets
+                    .load(&format!("icons/heroicons/{}.svg", icon.name()))
+                    .unwrap()
+                    .expect("a close mark's 24/outline drawing is vendored too");
+                let full = std::str::from_utf8(&full).unwrap();
+                assert_eq!(
+                    svg,
+                    full.replace(r#"stroke-width="1.5""#, r#"stroke-width="2.25""#),
+                    "{path} is the outline drawing, stroke widened to 1.5pt at 16pt"
+                );
+                continue;
+            }
             if path == format!("icons/heroicons-18/{}.svg", icon.name()) {
                 // The 20pt drawing with only its stroke widened, 1.25pt at 18.
                 let full = Assets
@@ -665,7 +730,8 @@ mod tests {
         let listed = Assets.list("icons/heroicons/").unwrap().len()
             + Assets.list("icons/figma/").unwrap().len()
             + Assets.list("icons/heroicons-14/").unwrap().len()
-            + Assets.list("icons/heroicons-18/").unwrap().len();
+            + Assets.list("icons/heroicons-18/").unwrap().len()
+            + Assets.list("icons/heroicons-16/").unwrap().len();
         assert_eq!(listed, HEROICONS.len());
         assert_eq!(HEROICONS.len(), icons::ALL.len());
     }
@@ -674,7 +740,7 @@ mod tests {
     fn every_icon_draws_at_a_figma_size() {
         assert_eq!(
             ICON_SIZES,
-            [px(20.0), px(14.0), px(18.0)],
+            [px(20.0), px(14.0), px(18.0), px(16.0)],
             "the sizes the Figma file draws icons at"
         );
         for icon in icons::ALL {
@@ -682,6 +748,8 @@ mod tests {
                 ICON_SIZE_SMALL
             } else if icon.path().starts_with("icons/heroicons-18/") {
                 ICON_SIZE_BUTTON
+            } else if icon.path().starts_with("icons/heroicons-16/") {
+                ICON_SIZE_CLOSE
             } else {
                 ICON_SIZE
             };
