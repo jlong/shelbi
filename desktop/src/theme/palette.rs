@@ -55,6 +55,9 @@ pub mod figma {
     pub const GRAY: Pair = pair(0xacb4cfe5, 0x7b85a7e5);
     /// `theme.muted`: quiet text (section headers, branches, hints).
     pub const MUTED: Pair = pair(0x777a86ff, 0x444c65a6);
+    /// `theme.gray` as the Activity frame sets it: `#7b85a7`, opaque, in
+    /// both modes (the log's titles and the `you` actor).
+    pub const GRAY_ACTIVITY: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
     /// `icon/select`: the selected nav icon, the accent.
     pub const ICON_SELECT: Pair = pair(0x62cdf6ff, 0xf21478ff);
     pub const ICON_CYAN: Pair = pair(0x62cdf6ff, 0x31ade9ff);
@@ -262,6 +265,9 @@ palette! {
     muted,
     /// Text on a saturated fill (a project badge's initials).
     text_on_color,
+    /// The Activity log's titles and its `you` actor (the Activity frame's
+    /// `theme.gray`).
+    log_text,
 
     // ---- Icons --------------------------------------------------------------
     /// Icons at rest (`theme.gray`).
@@ -438,6 +444,7 @@ impl Palette {
             gray: pick(GRAY),
             muted: pick(MUTED),
             text_on_color: Rgba::hex(0xffffff),
+            log_text: pick(GRAY_ACTIVITY),
 
             icon: pick(GRAY),
             accent: pick(ICON_SELECT),
@@ -548,6 +555,7 @@ pub fn badge_fill(name: &str) -> Rgba {
 pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "muted on"),
     ("dark", "dark_gray on"),
+    ("dark", "log_text on"),
     ("dark", "info on"),
     ("dark", "blue on"),
     ("dark", "gray on background"),
@@ -563,6 +571,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "input_border on"),
     ("light", "muted on"),
     ("light", "gray on"),
+    ("light", "log_text on"),
     ("light", "icon on"),
     ("light", "link on"),
     ("light", "green on green_tint"),
@@ -647,6 +656,14 @@ mod tests {
                 check(format!("{name} on {sname}"), fg, s, AA);
             }
         }
+        // The log's titles, on the canvas and on its selected row.
+        check("log_text on canvas".into(), p.log_text, p.canvas, AA);
+        check(
+            "log_text on row_selected over canvas".into(),
+            p.log_text,
+            flatten(p.row_selected, p.canvas),
+            AA,
+        );
         // A chip's text on its tint, over a card and the canvas.
         for (name, fg, tint) in [
             ("green on green_tint", p.green, p.green_tint),

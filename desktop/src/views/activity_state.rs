@@ -7,12 +7,16 @@
 //! any of them change. Keys come from the user's `activity:` key map, as in the
 //! TUI; a feed row is opened with Enter or a click.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use shelbi_app::activity::{
     build_feed, filter_choices, ActivityData, ActivityFilter, ActivityKind, Feed, FeedItem,
     FeedRow, RowTarget, ACTIVITY_PAGE,
 };
 use shelbi_state::keymap::{ActivityAction, Key, KeyChord, Keymaps};
+
+use super::activity_labels::{Labels, Line};
 
 /// Rows a page-up / page-down moves the selection.
 const PAGE_ROWS: usize = 10;
@@ -22,6 +26,34 @@ const PAGE_ROWS: usize = 10;
 pub enum Picker {
     Project,
     Workspace,
+}
+
+/// What the feed needs from the project's config, read beside the log: the
+/// header's name and the workspaces that review (their actor reads cyan).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectInfo {
+    /// The project's display name (`name:`), when it has one.
+    pub label: Option<String>,
+    /// The `review`-tagged workspaces.
+    pub reviewers: HashSet<String>,
+}
+
+impl ProjectInfo {
+    /// Read `project`'s config; the default when it won't load.
+    pub fn read(project: &str) -> Self {
+        let Ok(p) = shelbi_state::load_project(project) else {
+            return Self::default();
+        };
+        ProjectInfo {
+            label: p.display_name.clone().or_else(|| p.label.clone()),
+            reviewers: p
+                .workspaces
+                .iter()
+                .filter(|w| p.effective_tags(w).contains("review"))
+                .map(|w| w.name.clone())
+                .collect(),
+        }
+    }
 }
 
 /// What the view should do after a key or a click.
@@ -39,8 +71,12 @@ pub enum Intent {
 
 pub struct ActivityState {
     pub project: String,
+    /// The project's display name, once its config is read.
+    label: Option<String>,
     pub filter: ActivityFilter,
     data: ActivityData,
+    /// The desktop's wording of the feed's rows.
+    labels: Labels,
     /// Whether a read has landed yet.
     loaded: bool,
     feed: Feed,
@@ -59,8 +95,10 @@ impl ActivityState {
     pub fn new(project: impl Into<String>, keymaps: Keymaps) -> Self {
         ActivityState {
             project: project.into(),
+            label: None,
             filter: ActivityFilter::default(),
             data: ActivityData::default(),
+            labels: Labels::default(),
             loaded: false,
             feed: Feed::default(),
             projects: Vec::new(),
@@ -85,7 +123,24 @@ impl ActivityState {
     pub fn apply(&mut self, data: ActivityData, now: DateTime<Utc>) {
         self.data = data;
         self.loaded = true;
+        self.labels.set_events(&self.data.events);
         self.rebuild(now);
+    }
+
+    /// Fold in the project's config, read beside the log.
+    pub fn set_project_info(&mut self, info: ProjectInfo) {
+        self.label = info.label;
+        self.labels.set_reviewers(info.reviewers);
+    }
+
+    /// The header's name: the project's display name, else its slug.
+    pub fn title(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.project)
+    }
+
+    /// `row` as the desktop words it (`activity_labels`).
+    pub fn line(&self, row: &FeedRow) -> Line {
+        self.labels.line(row)
     }
 
     /// Rebuild the feed from the latest read: on a new read, a filter change,
@@ -350,6 +405,25 @@ mod tests {
 
     fn verbs(s: &ActivityState) -> Vec<String> {
         s.feed().rows().map(|r| r.verb.clone()).collect()
+    }
+
+    #[test]
+    fn the_header_names_the_project_by_its_display_name() {
+        let mut s = state();
+        assert_eq!(s.title(), "demo");
+        s.set_project_info(ProjectInfo {
+            label: Some("Demo Board".into()),
+            reviewers: HashSet::new(),
+        });
+        assert_eq!(s.title(), "Demo Board");
+    }
+
+    #[test]
+    fn rows_carry_the_desktop_labels() {
+        let s = state();
+        // t1 is in review now, so its earlier "is building" row says so.
+        let building = s.feed().rows().find(|r| r.verb == "is building").unwrap();
+        assert_eq!(s.line(building).tag.map(|t| t.0).as_deref(), Some("review"));
     }
 
     #[test]

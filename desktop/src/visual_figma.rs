@@ -753,9 +753,14 @@ impl Run {
             activity.read_with(cx, |v, _| v.state().feed().rows().count() >= 8)
         });
         self.expect("activity: the eight mockup events load", loaded);
-        let verbs: Vec<String> =
-            activity.read_with(&self.cx, |v, _| v.state().feed().rows().map(|r| r.verb.clone()).collect());
+        let verbs: Vec<String> = activity.read_with(&self.cx, |v, _| {
+            v.state().feed().rows().map(|r| v.state().line(r).verb).collect()
+        });
         println!("      rows: {verbs:?}");
+        self.expect(
+            "activity: the mockup's verbs, available and started included",
+            verbs == ["merged", "promoted", "finished", "is building", "is building", "available", "finished", "started"],
+        );
         self.expect(
             "activity: newest first, from the zen merge",
             verbs.first().map(String::as_str) == Some("merged"),
@@ -942,8 +947,7 @@ fn write_fixtures(home: &Path, now: DateTime<Utc>) {
     std::fs::write(
         projects.join(format!("{PROJECT}.yaml")),
         format!(
-            "name: {PROJECT}
-display_name: My project
+            "name: Shelbi
 repo: ''
 default_branch: main
 orchestrator:
@@ -1030,15 +1034,15 @@ workspaces:
     )
     .unwrap();
 
-    // The Activity mockup's eight events, newest first there. The feed has
-    // no "available" or "started" verbs: charlie's row is its nearest
-    // workspace event, the daemon's start its generic daemon line.
+    // The Activity mockup's eight events, newest first there. charlie's
+    // "available" is its worktree released after a handoff, and the
+    // daemon's "started" its own line (the desktop labels both).
     let at = |mins: i64| (now - chrono::Duration::minutes(mins)).to_rfc3339();
     let p = format!("project={PROJECT}");
     let events = [
         format!("{} daemon started", at(24 * 60 + 50)),
         format!("{} {p} task=theme-tokens workflow=task in-progress -> review reason=workspace:ready-marker", at(24 * 60 + 20)),
-        format!("{} {p} workspace=charlie working -> awaiting_input", at(40)),
+        format!("{} worktree-detach task=sidebar-collapse workspace=charlie detached-from=jlong/fix-sidebar-collapse status=ok", at(40)),
         format!("{} {p} task=project-switcher workflow=task todo -> in-progress reason=orchestrator:auto-dispatch", at(25)),
         format!("{} {p} task=session-reconnect workflow=task todo -> in-progress reason=orchestrator:auto-dispatch", at(18)),
         format!("{} {p} task=desktop-app workflow=task in-progress -> review reason=workspace:ready-marker", at(12)),
