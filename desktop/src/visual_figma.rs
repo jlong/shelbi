@@ -19,7 +19,9 @@
 //! Each screen gets a fresh 1440x1024 window and is saved as
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
-//! machines, settings and command-palette. With `SHELBI_VISUAL_THEME` unset
+//! machines, settings and command-palette, plus the palette states the
+//! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye).
+//! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
 //! a Retina display instead and keeps the native 2x frame for close
@@ -72,6 +74,15 @@ pub const SCREENS: [&str; 10] = [
     "machines",
     "settings",
     "command-palette",
+];
+
+/// The palette states the frame doesn't draw: the keys typed into the open
+/// palette, and the render's name (beside the screens, with no reference).
+pub const PALETTE_STATES: [(&str, &str); 4] = [
+    ("e r r", "command-palette-search"),
+    ("x y z z y", "command-palette-no-match"),
+    ("tab", "command-palette-projects"),
+    ("tab down", "command-palette-project-selected"),
 ];
 
 // ---- sessions -------------------------------------------------------------
@@ -702,6 +713,37 @@ impl Run {
         }
     }
 
+    /// The palette open over `under`, with the frame's Projects column, after
+    /// `keys` (gpui keystroke syntax; none for the frame's state), saved as
+    /// `screen`.
+    fn palette(&mut self, under: &View, keys: &str, screen: &str) {
+        let handle = self.open();
+        self.click(handle, under.clone());
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                // The frame's Projects column: two open, one not.
+                use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
+                let project = |slug: &str, label: &str, indicator| ProjectEntry {
+                    slug: slug.into(),
+                    label: label.into(),
+                    indicator,
+                };
+                w.offscreen_palette_projects(vec![
+                    project("shelbi", "Shelbi", ProjectIndicator::LoadedIdle),
+                    project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle),
+                    project("32pixels", "32pixels", ProjectIndicator::Unloaded),
+                ]);
+                w.offscreen_open_overlay(None, window, cx)
+            })
+            .unwrap();
+        if !keys.is_empty() {
+            self.settle(handle);
+            self.cx.simulate_keystrokes(handle.into(), keys);
+        }
+        self.save(handle, screen);
+    }
+
     /// Save the window as `<screen>-<theme>.png` and close it.
     fn save(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
         self.settle(handle);
@@ -851,27 +893,13 @@ impl Run {
         self.save(handle, "settings");
 
         // The palette over the orchestrator.
-        let handle = self.open();
-        self.click(handle, orch);
-        self.settle(handle);
-        handle
-            .update(&mut self.cx, |w, window, cx| {
-                // The frame's Projects column: two open, one not.
-                use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
-                let project = |slug: &str, label: &str, indicator| ProjectEntry {
-                    slug: slug.into(),
-                    label: label.into(),
-                    indicator,
-                };
-                w.offscreen_palette_projects(vec![
-                    project("shelbi", "Shelbi", ProjectIndicator::LoadedIdle),
-                    project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle),
-                    project("32pixels", "32pixels", ProjectIndicator::Unloaded),
-                ]);
-                w.offscreen_open_overlay(None, window, cx)
-            })
-            .unwrap();
-        self.save(handle, "command-palette");
+        self.palette(&orch, "", "command-palette");
+        // The states the frame doesn't draw (no reference; checked by eye):
+        // a query with matches, one with none, Tab into the Projects column,
+        // and a project row selected there.
+        for (keys, screen) in PALETTE_STATES {
+            self.palette(&orch, keys, screen);
+        }
 
         let missing: Vec<&str> = SCREENS
             .iter()

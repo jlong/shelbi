@@ -159,12 +159,15 @@ pub fn close_chord(keymaps: &Keymaps) -> String {
         .unwrap_or_default()
 }
 
-/// The palette's drop: the frame's `0 10 15 -3` effect.
+/// The palette's drop: the frame's `0 10 15 -3` effect. Figma's blur, like
+/// CSS's, is twice the Gaussian's sigma; gpui's `blur_radius` is the sigma
+/// itself, so the frame's 15 is 7.5 here (at 15 the drop spread twice as
+/// far as the frame's).
 fn shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: theme.palette_shadow,
         offset: gpui::point(px(0.0), px(10.0)),
-        blur_radius: px(15.0),
+        blur_radius: px(15.0 / 2.0),
         spread_radius: px(-3.0),
         inset: false,
     }]
@@ -188,14 +191,19 @@ pub fn render<H: OverlayHost>(
     let projects_w = projects_width(width - 32.0, !palette.projects().is_empty());
 
     let commands = if results.is_empty() {
-        div()
-            .id("palette-results")
-            .h(px(ROW_H))
-            .px(px(ROW_RADIUS))
-            .flex()
-            .items_center()
-            .text_color(theme.muted)
-            .child("No matching commands")
+        // In the first row's slot: the column grows to the Projects
+        // column's height, and the message stays at its top.
+        div().id("palette-results").child(
+            div()
+                .debug_selector(|| "palette-no-match".into())
+                .h(px(ROW_H))
+                .px(px(ROW_RADIUS))
+                .flex()
+                .items_center()
+                .type_style(Type::Base)
+                .text_color(theme.muted)
+                .child("No matching commands"),
+        )
     } else {
         let rows: Vec<AnyElement> = results
             .iter()

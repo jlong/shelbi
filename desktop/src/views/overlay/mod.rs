@@ -820,6 +820,24 @@ mod render_tests {
     }
 
     #[gpui::test]
+    fn no_match_sits_in_the_first_rows_slot(cx: &mut TestAppContext) {
+        let mut palette = fixture_palette();
+        let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
+        for c in "xyzzy".chars() {
+            let chord = KeyChord::new(Key::Char(c), shelbi_state::keymap::Mods::NONE);
+            assert_eq!(palette.handle_key(chord, &keymaps), OverlayEvent::Stay);
+        }
+        let (_, mut cx) = open(cx, palette);
+        let query = cx.debug_bounds("palette-query").unwrap();
+        let message = cx.debug_bounds("palette-no-match").unwrap();
+        // Right under the query line, as the first row would be, though the
+        // Projects column makes the band taller.
+        assert_eq!(message.top(), query.bottom());
+        assert_eq!(message.size.height, px(crate::views::palette::ROW_H));
+        assert!(cx.debug_bounds("palette-project-Add project").unwrap().bottom() > message.bottom());
+    }
+
+    #[gpui::test]
     fn clicking_a_palette_row_runs_it(cx: &mut TestAppContext) {
         let (root, mut cx) = open(cx, fixture_palette());
         let zen = cx.debug_bounds("palette-row-action:toggle-zen").unwrap();
