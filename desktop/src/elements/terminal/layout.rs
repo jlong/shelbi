@@ -5,6 +5,8 @@
 //! background runs (adjacent cells sharing a non-default background) and glyph
 //! runs (adjacent single-width cells sharing a style, shaped as one line and
 //! pinned to the cell grid; a double-width character is its own run).
+//! Box-drawing characters leave the runs: they are drawn as lines
+//! ([`super::boxdraw`]).
 //! [`RowCache`] keeps the result per row and rebuilds only the rows the
 //! emulator reports as damaged, so an idle or slowly changing screen costs
 //! nothing to lay out.
@@ -24,6 +26,7 @@ use gpui::Hsla;
 use shelbi_term::emulator::TermEmulator;
 use shelbi_term::render::{xterm_256, CellAttrs, Damage, Underline};
 
+use super::boxdraw::{self, BoxGlyph};
 use crate::theme::{rgb_hsla, TerminalPalette};
 
 /// Alpha applied to a dim (SGR 2) foreground, so it reads as faint against
@@ -171,6 +174,17 @@ pub struct GlyphRun {
     pub wide: bool,
 }
 
+/// A box-drawing character the pane draws as lines ([`boxdraw`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxCell {
+    /// Its column.
+    pub col: u16,
+    /// What it draws.
+    pub glyph: BoxGlyph,
+    /// The line color (as a glyph's: reverse video and dim applied).
+    pub color: Hsla,
+}
+
 /// One viewport row, ready to paint.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RowLayout {
@@ -178,6 +192,8 @@ pub struct RowLayout {
     pub backgrounds: Vec<BgRun>,
     /// Glyph runs, left to right.
     pub glyphs: Vec<GlyphRun>,
+    /// Box-drawing characters, left to right (not in any glyph run).
+    pub boxes: Vec<BoxCell>,
 }
 
 /// Lay out viewport row `row` (0 = top of what is shown), its first `cols`
@@ -240,6 +256,12 @@ pub fn layout_row(emu: &TermEmulator, row: u16, cols: u16, palette: &Palette) ->
         };
         let ch = if blank { ' ' } else { cell.c };
         let marks = cell.zerowidth();
+
+        // Box drawing: lines, not glyphs (unless decorated or carrying marks).
+        if let Some(glyph) = boxdraw::builtin(ch).filter(|_| !a.wide && !decorated && marks.is_none_or(|m| m.is_empty())) {
+            out.boxes.push(BoxCell { col, glyph, color: fg });
+            continue;
+        }
 
         // Characters go straight into their run's text: no per-cell string.
         if !a.wide {
@@ -473,6 +495,26 @@ mod tests {
         assert_eq!(row.glyphs.len(), 1);
         assert_eq!(row.glyphs[0].text, "e\u{301}x");
         assert_eq!(row.glyphs[0].cells, 2);
+    }
+
+    #[test]
+    fn box_drawing_leaves_the_runs_as_lines() {
+        // A dim "│ a ─╮", then an underlined "─" (decorated: the font's).
+        let e = emu("\x1b[2m│ a ─╮\x1b[0;4m─".as_bytes());
+        let p = palette(&e);
+        let row = layout_row(&e, 0, 20, &p);
+        let boxes: Vec<_> = row.boxes.iter().map(|b| (b.col, b.glyph)).collect();
+        assert_eq!(
+            boxes,
+            [
+                (0, boxdraw::builtin('│').unwrap()),
+                (4, boxdraw::builtin('─').unwrap()),
+                (5, boxdraw::builtin('╮').unwrap()),
+            ]
+        );
+        assert!(row.boxes.iter().all(|b| b.color == p.dim_foreground()), "in the cell's color");
+        let glyphs: Vec<_> = row.glyphs.iter().map(|g| (g.col, g.text.as_str())).collect();
+        assert_eq!(glyphs, [(2, "a"), (6, "─")]);
     }
 
     #[test]

@@ -350,24 +350,24 @@ fn orchestrator_screen(cols: u16, rows: u16) -> String {
     let body = lines(&[
         paint(DIM, &format!("╭{}╮", "─".repeat(INNER))),
         boxed(">_ OpenAI Codex", BOLD),
-        boxed("", ""),
         boxed("model:     gpt-5.3-codex", ""),
         boxed("directory: ~/Workspaces/my-project", ""),
+        boxed("", ""),
         paint(DIM, &format!("╰{}╯", "─".repeat(INNER))),
         String::new(),
         paint(BOLD, "› Take the next ready issues and get them moving."),
         String::new(),
-        format!("{} I’ll check the board and available workspaces, then dispatch the ready work.", paint(DIM, "•")),
+        "• I’ll check the board and available workspaces, then dispatch the ready work.".into(),
         String::new(),
-        format!("{} Ran shelbi issue list --project shelbi", paint(DIM, "•")),
+        "• Ran shelbi issue list --project shelbi".into(),
         paint(DIM, "  └ 3 ready issues · 2 available developer workspaces"),
         String::new(),
-        format!("{} Ran shelbi workspace list", paint(DIM, "•")),
+        "• Ran shelbi workspace list".into(),
         paint(DIM, "  └ alpha    hub    idle"),
         paint(DIM, "    bravo    hub    idle"),
         paint(DIM, "    charlie  hub    idle"),
         String::new(),
-        format!("{} Dispatched two issues:", paint(DIM, "•")),
+        "• Dispatched two issues:".into(),
         paint(GREEN, "  • alpha: Desktop application"),
         paint(GREEN, "  • bravo: Session reconnect"),
         String::new(),
@@ -391,7 +391,7 @@ fn orchestrator_screen(cols: u16, rows: u16) -> String {
 /// The Workspace mockup: alpha's agent adding project switching, still
 /// working.
 fn workspace_screen(_cols: u16, rows: u16) -> String {
-    let bullet = |text: &str| format!("{} {text}", paint(DIM, "•"));
+    let bullet = |text: &str| format!("• {text}");
     let body = lines(&[
         paint(BOLD, "› Add project switching to the desktop app."),
         String::new(),
@@ -414,7 +414,7 @@ fn workspace_screen(_cols: u16, rows: u16) -> String {
         paint(DIM, "  └ test projects::tests::switch_project ... ok"),
         paint(DIM, "    test app::tests::restores_sidebar_selection ... ok"),
     ]);
-    body + &at_row(rows.saturating_sub(4), &paint(DIM, "• Working…  (esc to interrupt)"))
+    body + &at_row(rows.saturating_sub(3), &paint(DIM, "• Working…  (esc to interrupt)"))
 }
 
 /// The Review mockup: Claude Code's verification of the umbrella.
@@ -437,7 +437,7 @@ fn reviewer_screen(cols: u16, rows: u16) -> String {
         String::new(),
         paint(CYAN, "  Ready for your review."),
     ]);
-    let width = cols.min(104);
+    let width = cols.min(102);
     let footer = [
         at_row(rows - 3, &rule(width)),
         at_row(rows - 2, "❯ "),
@@ -771,6 +771,7 @@ impl Run {
         self.click(handle, orch.clone());
         self.settle(handle);
         self.save(handle, "orchestrator");
+        self.terminal_states(&orch);
 
         // The board, a card selected.
         let handle = self.open();
@@ -907,6 +908,71 @@ impl Run {
             .filter(|s| !self.out.join(format!("{s}-{}.png", self.theme)).exists())
             .collect();
         self.expect(&format!("all {} screens saved", SCREENS.len()), missing.is_empty());
+    }
+
+    /// The terminal states the frames don't draw, over the orchestrator
+    /// chat: a selection, the find bar, "Jump to bottom", and the font a
+    /// step bigger and smaller (`state-<name>-<theme>.png`; no reference to
+    /// diff against, they are checked by eye).
+    fn terminal_states(&mut self, orch: &View) {
+        use crate::elements::terminal::{FontZoom, TerminalPane, TerminalSettings};
+        use shelbi_term::selection::Point as GridPoint;
+
+        let open = |run: &mut Self| -> (WindowHandle<ShelbiWindow>, Option<gpui::Entity<TerminalPane>>) {
+            let handle = run.open();
+            run.click(handle, orch.clone());
+            run.settle(handle);
+            let pane = handle.update(&mut run.cx, |w, _, cx| w.offscreen_chat_pane(cx)).unwrap();
+            (handle, pane)
+        };
+
+        // "Both agents are running…" selected into the next line.
+        let (handle, pane) = open(self);
+        self.expect("states: the orchestrator's terminal attaches", pane.is_some());
+        let Some(pane) = pane else { return };
+        pane.update(&mut self.cx, |p, cx| {
+            let view = p.terminal_view_mut();
+            view.begin_selection(GridPoint::new(23, 2));
+            view.update_selection(GridPoint::new(24, 30));
+            cx.notify();
+        });
+        self.save(handle, "state-orchestrator-selection");
+
+        // The find bar, its matches highlighted.
+        let (handle, pane) = open(self);
+        if let Some(pane) = pane {
+            pane.update(&mut self.cx, |p, cx| p.offscreen_find("issues", cx));
+        }
+        self.save(handle, "state-orchestrator-find");
+
+        // Scrolled back past new output: "Jump to bottom".
+        let (handle, pane) = open(self);
+        if let Some(pane) = pane {
+            pane.update(&mut self.cx, |p, cx| {
+                p.feed("\r\n".repeat(40).as_bytes(), cx);
+                p.terminal_view_mut().scroll_up(40);
+                cx.notify();
+            });
+        }
+        self.save(handle, "state-orchestrator-jump");
+
+        // ⌘+ twice and ⌘− twice: the grid keeps its inset at each size.
+        for (name, step) in [("zoom-in", FontZoom::Bigger), ("zoom-out", FontZoom::Smaller)] {
+            let (handle, pane) = open(self);
+            self.cx.update(|cx| {
+                TerminalSettings::zoom(step, cx);
+                TerminalSettings::zoom(step, cx);
+            });
+            // The re-measured grid's size goes out after a debounce.
+            self.settle(handle);
+            if let Some(pane) = pane {
+                pane.update(&mut self.cx, |p, _| p.offscreen_flush_resize());
+            }
+            self.save(handle, &format!("state-orchestrator-{name}"));
+            self.cx.update(|cx| {
+                TerminalSettings::zoom(FontZoom::ActualSize, cx);
+            });
+        }
     }
 
     fn views(&mut self, handle: WindowHandle<ShelbiWindow>) -> NativeViews {
