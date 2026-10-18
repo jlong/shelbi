@@ -4193,6 +4193,16 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Collapse or expand a sidebar section, as a click on its header does.
+    pub(crate) fn offscreen_toggle_section(&mut self, section: sidebar::Section, cx: &mut Context<Self>) {
+        self.toggle_section(section, cx);
+    }
+
+    /// Hide or show the sidebar, as its Toggle sidebar button does.
+    pub(crate) fn offscreen_toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.toggle_sidebar(cx);
+    }
+
     /// Ask for review `task` before anything resolves it: its placeholder.
     pub(crate) fn offscreen_open_pending(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.open_review_pending(task, window, cx);
