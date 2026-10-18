@@ -318,7 +318,7 @@ impl Render for FontPicker {
                     .child("Not installed"),
             )
         })
-        .child(heroicon(icons::CHEVRON_DOWN).text_color(if self.open { theme.text_loud } else { theme.icon }))
+        .child(heroicon(icons::CHEVRON_DOWN).text_color(if self.open { theme.text_loud } else { theme.form_text }))
         .on_key_down(cx.listener(Self::field_key))
         .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)));
 

@@ -35,6 +35,11 @@
 //! done), 16×16 on a 16 grid, vendored under `assets/icons/status/` in
 //! `currentColor`. Heroicons has no status set. Views draw them through
 //! `theme::style::status_icon`, which tints each glyph.
+//!
+//! The last is the **checkbox mark** ([`check_mark`]): Settings' checked
+//! box draws the Figma file's `Icon / check` (node 2169:675), the Heroicons
+//! check at 12pt with a 1.5pt stroke, vendored as Figma exports it under
+//! `assets/icons/checkbox/` in `currentColor`.
 
 use std::borrow::Cow;
 
@@ -137,6 +142,21 @@ macro_rules! status_glyphs {
 }
 
 status_glyphs!("backlog", "todo", "in-progress", "review", "done", "canceled");
+
+/// The width and height the checkbox mark renders at.
+pub const CHECK_MARK_SIZE: Pixels = px(12.0);
+
+/// The checkbox mark's drawing, by asset path.
+const CHECK_MARK: (&str, &[u8]) = (
+    "icons/checkbox/check.svg",
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/checkbox/check.svg")),
+);
+
+/// A checked box's mark at [`CHECK_MARK_SIZE`], in the element's
+/// `text_color`.
+pub fn check_mark() -> Svg {
+    svg().path(CHECK_MARK.0).size(CHECK_MARK_SIZE).flex_none()
+}
 
 macro_rules! heroicons {
     (
@@ -380,7 +400,12 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some((_, bytes)) = HEROICONS.iter().chain(STATUS_GLYPHS).find(|(p, _)| *p == path) {
+        if let Some((_, bytes)) = HEROICONS
+            .iter()
+            .chain(STATUS_GLYPHS)
+            .chain([&CHECK_MARK])
+            .find(|(p, _)| *p == path)
+        {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         gpui_kit::assets::Assets.load(path)
@@ -390,6 +415,7 @@ impl AssetSource for Assets {
         let mut out: Vec<SharedString> = HEROICONS
             .iter()
             .chain(STATUS_GLYPHS)
+            .chain([&CHECK_MARK])
             .filter(|(p, _)| p.starts_with(path))
             .map(|(p, _)| SharedString::from(*p))
             .collect();
@@ -437,6 +463,18 @@ mod tests {
             let mut el = status_glyph(glyph);
             assert_eq!(el.style().size.width, Some(STATUS_GLYPH_SIZE.into()), "{path}");
         }
+    }
+
+    #[test]
+    fn the_check_mark_loads_on_a_12_grid_in_current_color() {
+        assert_eq!(Assets.list("icons/checkbox/").unwrap(), vec![SharedString::from(CHECK_MARK.0)]);
+        let bytes = Assets.load(CHECK_MARK.0).unwrap().expect(CHECK_MARK.0);
+        let svg = std::str::from_utf8(&bytes).unwrap();
+        assert!(svg.contains(r#"viewBox="0 0 12 12""#), "drawn on Figma's 12pt grid");
+        assert!(svg.contains(r#"stroke="currentColor""#), "takes the element's color");
+        let mut el = check_mark();
+        assert_eq!(el.style().size.width, Some(CHECK_MARK_SIZE.into()));
+        assert_eq!(el.style().size.height, Some(CHECK_MARK_SIZE.into()));
     }
 
     #[test]

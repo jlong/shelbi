@@ -441,9 +441,22 @@ pub fn icon_button(
     active: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
+    tinted_icon_button(id, icon, size, active, theme.icon, theme)
+}
+
+/// [`icon_button`] with the icon in `rest` at rest instead of the icon role
+/// (Settings' fields draw theirs in `form_text`, the frame's gray).
+pub fn tinted_icon_button(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    size: IconButtonSize,
+    active: bool,
+    rest_icon: Hsla,
+    theme: &Theme,
+) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
-    let color = if active { theme.text_loud } else { theme.icon };
+    let color = if active { theme.text_loud } else { rest_icon };
     let hover_icon = theme.text_loud;
     let radius = match size {
         IconButtonSize::Small => px(8.0),

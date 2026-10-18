@@ -1128,4 +1128,8 @@ workspaces:
         format!("{} {p} task=theme-tokens workflow=task review -> done reason=orchestrator:zen-merge_pr=594", at(2)),
     ];
     std::fs::write(home.join("events.log"), events.join("\n") + "\n").unwrap();
+
+    // Settings: the frame's Shelbi CLI path. Its font and size predate the
+    // Source Code Pro default, so those keep theirs.
+    std::fs::write(home.join("config.yaml"), "desktop:\n  cli_path: /opt/homebrew/bin/shelbi\n").unwrap();
 }

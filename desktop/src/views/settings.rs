@@ -36,7 +36,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 
 use super::font_picker::{FontPicker, FontPickerEvent};
-use crate::assets::icons;
+use crate::assets::{check_mark, icons};
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::TerminalSettings;
@@ -472,6 +472,26 @@ impl SettingsView {
         let picker = self.font_family.read(cx);
         picker.is_open() && picker.fonts_loaded()
     }
+
+    /// Whether `config.yaml` has been read into the form.
+    pub(crate) fn offscreen_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Show `theme`, `option` and `size` as chosen, without applying or
+    /// saving them (`--visual-views`' states the Figma frame doesn't draw).
+    pub(crate) fn offscreen_show(
+        &mut self,
+        theme: ThemePreference,
+        option: OptionAsMeta,
+        size: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme = theme;
+        self.option_as_meta = option;
+        self.show_size(size, window, cx);
+    }
 }
 
 /// `~/.shelbi/keys.yaml`, the shared key bindings.
@@ -587,7 +607,7 @@ impl Render for SettingsView {
         let size = self.font_size;
         let step = |id: &'static str, icon, delta: i32, cx: &mut Context<Self>| {
             let inert = step_size(size, delta).is_none();
-            style::icon_button(id, icon, IconButtonSize::Small, false, &theme)
+            style::tinted_icon_button(id, icon, IconButtonSize::Small, false, theme.form_text, &theme)
                 .when(inert, |d| d.opacity(0.4).cursor_default())
                 .on_click(cx.listener(move |this, _, window, cx| this.step(delta, window, cx)))
         };
@@ -637,7 +657,7 @@ impl Render for SettingsView {
                 .cursor_pointer()
                 .child(
                     // Figma's checkbox: 14px, 2px corners; checked, the
-                    // loud color with the mark in the canvas.
+                    // loud color with Figma's 12pt check in the canvas.
                     div()
                         .size(px(14.0))
                         .flex_none()
@@ -649,12 +669,7 @@ impl Render for SettingsView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(on, |d| {
-                            d.text_color(theme.canvas)
-                                .type_style(Type::XSmallSemibold)
-                                .line_height(px(14.0))
-                                .child("✓")
-                        }),
+                        .when(on, |d| d.child(check_mark().text_color(theme.canvas))),
                 )
                 .child(
                     div()
@@ -721,7 +736,7 @@ impl Render for SettingsView {
                     )
                     .child(helper(
                         "Characters: Option+E, E types é, as in other Mac apps. Meta: \
-                         Option+B sends Esc B, for shell word motion and Claude Code's \
+                         Option+B sends Esc B, for shell word motion and Claude Code’s \
                          Option shortcuts. Option with Enter, the arrows, Backspace, or \
                          Delete is Meta either way.",
                         &theme,
@@ -766,7 +781,7 @@ impl Render for SettingsView {
                         cx,
                     ))
                     .child(helper(
-                        "Not shown for what's already on screen in the front window. \
+                        "Not shown for what’s already on screen in the front window. \
                          macOS asks for permission the first time.",
                         &theme,
                     )),
