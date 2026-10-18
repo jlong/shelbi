@@ -303,7 +303,9 @@ pub struct TaskCacheEntry {
 /// How long a task-metadata cache entry with no local file (a remote backend)
 /// is trusted before it is re-fetched from the store. Long enough that a busy
 /// activity view doesn't spam the tracker API per render frame, short enough
-/// that a remote title / branch / assignment edit shows up promptly.
+/// that a remote title / branch / assignment edit shows up promptly. An open
+/// issue's refresh is served from the board index
+/// ([`serve_open_ids_from_index`]), so the TTL costs no API call for it.
 const REMOTE_META_TTL: Duration = Duration::from_secs(15);
 
 /// First retry delay after a title fetch *errors* (not a miss — a GraphQL blip, a
@@ -498,6 +500,60 @@ impl ActivityMetaCache {
     }
 }
 
+/// Resolve the `wanted` ids the daemon-published board index already carries,
+/// removing them from `wanted`. A remote board's open issues are all in the index
+/// (title, branch, and the assignment overlay folded on top), so an open id's
+/// [`REMOTE_META_TTL`] refresh is a local file read rather than a GraphQL call;
+/// only closed history (frozen once fetched) and ids the index doesn't know yet
+/// reach the network. Without this, every open id the feed referenced was
+/// re-fetched every 15s for as long as the TUI stayed open. A `file_system`
+/// board, or a missing / mismatched index, leaves `wanted` untouched.
+fn serve_open_ids_from_index(
+    project_name: &str,
+    wanted: &mut Vec<String>,
+    cache: &mut ActivityMetaCache,
+    now: Instant,
+) {
+    let Ok(project) = shelbi_state::load_project(project_name) else {
+        return;
+    };
+    let cfg = &project.issue_tracker;
+    if !cfg.backend.is_remote() {
+        return;
+    }
+    let Ok(state) = shelbi_state::read_board_with_cfg(project_name, cfg) else {
+        return;
+    };
+    let mut board = state.into_issues();
+    if board.is_empty() {
+        return;
+    }
+    shelbi_state::fold_assignment_overlay(project_name, cfg, &mut board);
+    let mut by_id: HashMap<String, shelbi_state::IssueFile> =
+        board.into_iter().map(|tf| (tf.task.id.clone(), tf)).collect();
+    wanted.retain(|id| {
+        let Some(tf) = by_id.remove(id) else {
+            return true;
+        };
+        let terminal = is_frozen_column(&tf.task.column);
+        cache.clear_backoff(id);
+        cache.entries.insert(
+            id.clone(),
+            TaskCacheEntry {
+                meta: Some(TaskMeta {
+                    title: tf.task.title,
+                    branch: tf.task.branch,
+                    assigned_to: tf.task.assigned_to,
+                }),
+                mtime: task_file_mtime(project_name, id),
+                fetched: now,
+                terminal,
+            },
+        );
+        false
+    });
+}
+
 /// Resolve task metadata for the ids referenced by `events`, folding the result
 /// into the persistent `cache` and returning a snapshot the feed renders from.
 /// `now` is the clock the TTL and fetch-error backoff read (injected so a test
@@ -532,6 +588,9 @@ pub fn resolve_task_meta_into(
         if entry_stale(cache.entries.get(id), mtime) && !cache.in_backoff(id, now) {
             wanted.push(id.to_string());
         }
+    }
+    if !wanted.is_empty() {
+        serve_open_ids_from_index(project_name, &mut wanted, cache, now);
     }
 
     if wanted.is_empty() {
@@ -3601,6 +3660,102 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             calls.load(std::sync::atomic::Ordering::SeqCst),
             after_warmup,
             "an idle board costs no GraphQL requests per tick (O(1), not O(N))"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An idle TUI left on the Activity view re-resolved every **open** id the
+    /// feed referenced each time its 15s TTL lapsed, one GraphQL fetch apiece,
+    /// for as long as the TUI stayed open. Open issues are all in the
+    /// daemon-published board index, so their titles must come from it: an hour
+    /// of TTL expiries costs no `gh` call at all.
+    #[test]
+    fn activity_view_serves_open_titles_from_the_board_index() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-idx");
+
+        let open = |id: &str, title: &str| {
+            let now = Utc::now();
+            shelbi_state::IssueFile {
+                task: shelbi_core::Issue {
+                    id: id.into(),
+                    title: title.into(),
+                    column: Column::in_progress(),
+                    priority: 0,
+                    assigned_to: None,
+                    workflow: None,
+                    branch: Some(format!("jlong/{id}")),
+                    depends_on: Vec::new(),
+                    prefers_machine: None,
+                    zen: None,
+                    launch: None,
+                    params: std::collections::BTreeMap::new(),
+                    created_at: now,
+                    updated_at: now,
+                },
+                body: String::new(),
+                tracker_assignees: Vec::new(),
+            }
+        };
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![
+            open("o1", "Open One"),
+            open("o2", "Open Two"),
+        ]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("actv-idx", &idx).unwrap();
+        shelbi_state::set_task_assignment("actv-idx", "o1", Some("alpha")).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |_args: &[&str]| {
+            rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(String::new())
+        });
+
+        let started = |id: &str| Event::Issue {
+            ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
+            project: None,
+            id: id.into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
+            from: Column::todo(),
+            to: Column::in_progress(),
+            reason: "user:cli".into(),
+            agent: None,
+            from_category: Column::todo().category(),
+            to_category: Column::in_progress().category(),
+            raw: String::new(),
+        };
+        let events = vec![started("o1"), started("o2")];
+        let mut cache = ActivityMetaCache::default();
+        let start = Instant::now();
+        // An hour of passes, each one past the open-entry TTL.
+        for minute in 0..60u64 {
+            let now = start + Duration::from_secs(minute * 60);
+            let snap = resolve_task_meta_into("actv-idx", &events, &mut cache, now);
+            let o1 = snap.get("o1").and_then(|e| e.meta.as_ref()).expect("o1 resolved");
+            assert_eq!(o1.title, "Open One");
+            assert_eq!(o1.branch.as_deref(), Some("jlong/o1"));
+            assert_eq!(o1.assigned_to.as_deref(), Some("alpha"), "overlay folded in");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "open titles come from the board index, never a gh call"
         );
 
         shelbi_state::clear_test_gh_runner();

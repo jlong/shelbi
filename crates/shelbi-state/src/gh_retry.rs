@@ -220,6 +220,15 @@ impl RetryPolicy {
                 Disposition::RateLimited(None) if self.hintless_rate_limit_is_terminal => {
                     return Err(err)
                 }
+                // Likewise a server hint longer than the read policy's longest
+                // wait: every `--include` 403 carries `x-ratelimit-reset`, which
+                // can be most of an hour out, and sleeping that long would wedge
+                // the board read. Fail fast and let the read-path park hold off.
+                Disposition::RateLimited(Some(wait))
+                    if self.hintless_rate_limit_is_terminal && wait > self.max_delay =>
+                {
+                    return Err(err)
+                }
                 Disposition::RateLimited(hint) => (RetryKind::RateLimited, hint),
                 // A create whose outcome is unknown (the request went out but no
                 // usable response came back — a connection drop or a post-send
@@ -544,6 +553,78 @@ pub fn rate_limit_reset_epoch(err: &Error, now: i64) -> Option<i64> {
         return Some(reset as i64);
     }
     parse_after_key(&lower, "retry-after").map(|secs| now + secs as i64)
+}
+
+/// Which GitHub limit a rate-limited response tripped. The read-path park
+/// treats them differently: the *primary* hourly quota parks until the window
+/// resets, while a *secondary* (abuse / concurrency) limit is short-lived and
+/// parks only for its `Retry-After` (or a short backoff when it names none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    /// The primary hourly quota (`API rate limit exceeded`).
+    Primary,
+    /// A secondary limit: the "secondary rate limit" / abuse-detection message,
+    /// or any 403/429 that names a `Retry-After`.
+    Secondary,
+}
+
+impl RateLimitKind {
+    /// The `limit=` token the `board rate-limited` events.log line carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateLimitKind::Primary => "primary",
+            RateLimitKind::Secondary => "secondary",
+        }
+    }
+}
+
+/// What one rate-limited response said about the limit it tripped, parsed from
+/// its captured status line, headers and message. Every field but `kind` is
+/// optional: a failure without `--include` (the GraphQL path) carries only the
+/// message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitHit {
+    /// Which limit tripped.
+    pub kind: RateLimitKind,
+    /// `x-ratelimit-remaining` on *this* response. Above zero means the primary
+    /// quota was not what refused the call.
+    pub remaining: Option<i64>,
+    /// `x-ratelimit-reset` on this response (epoch seconds).
+    pub reset_at: Option<i64>,
+    /// `Retry-After` on this response (seconds).
+    pub retry_after_secs: Option<i64>,
+}
+
+/// Describe the limit a rate-limited `gh` failure tripped, or `None` when the
+/// failure is not a rate limit at all ([`is_rate_limit_error`] is false).
+pub fn rate_limit_hit(err: &Error) -> Option<RateLimitHit> {
+    let Error::Command { stderr, status, .. } = err else {
+        return None;
+    };
+    if !is_rate_limit_error(err) {
+        return None;
+    }
+    let hay = format!("{status}\n{stderr}").to_ascii_lowercase();
+    // The *last* header block is the one that refused: a paginated read's
+    // earlier pages answered 200 with more quota left.
+    let last = |key: &str| {
+        let idx = hay.rfind(key)?;
+        parse_after_key(&hay[idx..], key).map(|v| v as i64)
+    };
+    let retry_after_secs = last("retry-after");
+    let secondary = hay.contains("secondary rate limit")
+        || hay.contains("abuse detection")
+        || retry_after_secs.is_some();
+    Some(RateLimitHit {
+        kind: if secondary {
+            RateLimitKind::Secondary
+        } else {
+            RateLimitKind::Primary
+        },
+        remaining: last("x-ratelimit-remaining"),
+        reset_at: last("x-ratelimit-reset"),
+        retry_after_secs,
+    })
 }
 
 #[cfg(test)]
@@ -991,5 +1072,63 @@ mod tests {
         assert!(hint.as_secs() >= 25 && hint.as_secs() <= 31, "≈30s, got {hint:?}");
         // Neither present → no hint.
         assert_eq!(parse_wait_hint("HTTP 403: forbidden"), None);
+    }
+    #[test]
+    fn reads_policy_fails_fast_on_a_server_hint_longer_than_its_longest_wait() {
+        // A primary-limit 403 with `--include` names its reset, often most of an
+        // hour out. The read policy must not sleep that out: one attempt, no wait.
+        let waits: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = waits.clone();
+        let sleep: SleepFn = Arc::new(move |d: Duration| rec.lock().unwrap().push(d.as_secs()));
+        let policy = RetryPolicy::for_test_reads(2, sleep, Arc::new(|_| {}));
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let out: Result<()> = policy.run(|| {
+            *c.lock().unwrap() += 1;
+            Err(command_err("exit status: 1", "HTTP 429: Too Many Requests\nRetry-After: 900"))
+        });
+        assert!(out.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(waits.lock().unwrap().is_empty(), "no 15-minute sleep on a read");
+    }
+
+    #[test]
+    fn rate_limit_hit_tells_primary_from_secondary() {
+        let primary = command_err(
+            "exit status: 1",
+            "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0\nx-ratelimit-reset: 1700000000\n\n{\"message\":\"API rate limit exceeded\"}",
+        );
+        assert_eq!(
+            rate_limit_hit(&primary),
+            Some(RateLimitHit {
+                kind: RateLimitKind::Primary,
+                remaining: Some(0),
+                reset_at: Some(1_700_000_000),
+                retry_after_secs: None,
+            })
+        );
+
+        let secondary = command_err(
+            "exit status: 1",
+            "HTTP/2.0 403 Forbidden\nretry-after: 60\nx-ratelimit-remaining: 4999\nx-ratelimit-reset: 1700003600\n\n{\"message\":\"You have exceeded a secondary rate limit.\"}",
+        );
+        let hit = rate_limit_hit(&secondary).expect("a secondary limit is a rate limit");
+        assert_eq!(hit.kind, RateLimitKind::Secondary);
+        assert_eq!(hit.retry_after_secs, Some(60));
+        assert_eq!(hit.remaining, Some(4999));
+
+        // A 429 that only names a Retry-After is secondary too.
+        let throttled = command_err("exit status: 1", "HTTP 429: Too Many Requests\nRetry-After: 5");
+        assert_eq!(rate_limit_hit(&throttled).unwrap().kind, RateLimitKind::Secondary);
+
+        // A paginated read: the refusing page's headers (the last block) win.
+        let paged = command_err(
+            "exit status: 1",
+            "HTTP/2.0 200 OK\nx-ratelimit-remaining: 3\n\n{}\nHTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0\nx-ratelimit-reset: 1700000000\n\n{}",
+        );
+        assert_eq!(rate_limit_hit(&paged).unwrap().remaining, Some(0));
+
+        // Not a rate limit at all.
+        assert_eq!(rate_limit_hit(&command_err("exit status: 1", "HTTP 404: Not Found")), None);
     }
 }

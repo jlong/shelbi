@@ -316,7 +316,13 @@ pub(super) fn run_foreground() -> Result<()> {
     // and the next open restarts us). A short minimum-lifetime debounce keeps a
     // just-started daemon alive long enough for the opener to record its open
     // flag and for a restart to verify, and avoids thrash on project switches.
-    spawn_idle_monitor(stop.clone(), sock.clone());
+    spawn_idle_monitor(
+        stop.clone(),
+        sock.clone(),
+        duration_from_env_ms(IDLE_GRACE_ENV, IDLE_GRACE),
+        duration_from_env_ms(IDLE_POLL_ENV, IDLE_POLL),
+        || daemon_is_idle(shelbi_state::list_open_projects()),
+    );
     // macOS only: detect a lost GUI login session (user logged out/in while the
     // daemon kept running) and recover by re-execing into the live session, or
     // warn. A hermetic no-op on non-macOS, when disabled, and under a non-default
@@ -423,13 +429,31 @@ fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
     }
 }
 
-/// Spawn the idle-exit monitor: after a minimum-lifetime grace, poll the
-/// open-project set and shut the daemon down once it is empty. Shutting down
-/// reuses the signal path — flip the shared stop flag, then self-connect to wake
-/// the blocking `accept()` so the main loop drains and exits.
-fn spawn_idle_monitor(stop: Arc<AtomicBool>, sock: PathBuf) {
-    let grace = duration_from_env_ms(IDLE_GRACE_ENV, IDLE_GRACE);
-    let poll = duration_from_env_ms(IDLE_POLL_ENV, IDLE_POLL);
+/// Whether the daemon has nothing left to serve: no project is open AND no
+/// quit is in flight. Quitting the last open project clears its open flag
+/// first and then waits on the orchestrator's handoff before ending its
+/// sessions; exiting in that window would leave the orchestrator session
+/// running with no daemon owning it. The open-project set is read (by the
+/// caller, as the argument) before the in-flight check, which is the order
+/// [`shelbi_orchestrator::quit::quit_in_flight`] is safe in. An unreadable
+/// open-project set is never idle.
+fn daemon_is_idle<E>(open_projects: std::result::Result<Vec<String>, E>) -> bool {
+    let none_open = open_projects.map(|v| v.is_empty()).unwrap_or(false);
+    none_open && !shelbi_orchestrator::quit::quit_in_flight()
+}
+
+/// Spawn the idle-exit monitor: after a minimum-lifetime `grace`, poll
+/// `is_idle` every `poll` and shut the daemon down once it reports idle.
+/// Shutting down reuses the signal path — flip the shared stop flag, then
+/// self-connect to wake the blocking `accept()` so the main loop drains and
+/// exits.
+fn spawn_idle_monitor(
+    stop: Arc<AtomicBool>,
+    sock: PathBuf,
+    grace: Duration,
+    poll: Duration,
+    is_idle: impl Fn() -> bool + Send + 'static,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         if !sleep_unless_stopped(&stop, grace, poll) {
             return;
@@ -438,10 +462,7 @@ fn spawn_idle_monitor(stop: Arc<AtomicBool>, sock: PathBuf) {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-            let empty = shelbi_state::list_open_projects()
-                .map(|v| v.is_empty())
-                .unwrap_or(false);
-            if empty {
+            if is_idle() {
                 eprintln!("shelbi daemon: no project open, shutting down");
                 stop.store(true, Ordering::SeqCst);
                 // Wake the accept loop so it notices the flag and drains.
@@ -452,7 +473,7 @@ fn spawn_idle_monitor(stop: Arc<AtomicBool>, sock: PathBuf) {
                 return;
             }
         }
-    });
+    })
 }
 
 /// Sleep for `total` in `slice`-sized steps, returning early (`false`) if the
@@ -1978,6 +1999,50 @@ mod tests {
             subscribe_project_filter("not json"),
             None,
             "a malformed frame is not a subscribe frame"
+        );
+    }
+
+    #[test]
+    fn daemon_is_idle_only_with_nothing_open_and_no_quit_in_flight() {
+        assert!(!daemon_is_idle::<()>(Ok(vec!["alpha".into()])));
+        assert!(!daemon_is_idle(Err(())), "an unreadable open set is never idle");
+        let quit = shelbi_orchestrator::quit::QuitInFlight::enter();
+        assert!(
+            !daemon_is_idle::<()>(Ok(vec![])),
+            "nothing open but a quit in flight is not idle"
+        );
+        drop(quit);
+    }
+
+    #[test]
+    fn idle_exit_is_deferred_while_a_quit_is_in_flight() {
+        // Quitting the last open project clears its open flag and then waits
+        // on the orchestrator's handoff. The monitor must not stop the daemon
+        // in that window; it stops once the quit has finished.
+        let stop = Arc::new(AtomicBool::new(false));
+        let sock = std::env::temp_dir().join(format!("shb-idle-{}.sock", std::process::id()));
+        let quit = shelbi_orchestrator::quit::QuitInFlight::enter();
+        let monitor = spawn_idle_monitor(
+            stop.clone(),
+            sock,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            || daemon_is_idle::<()>(Ok(vec![])),
+        );
+
+        // Many polls past the grace with nothing open: still running.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !stop.load(Ordering::SeqCst),
+            "idle exit fired while a quit was still in flight"
+        );
+
+        // The quit finishes (handoff done or timed out, sessions ended).
+        drop(quit);
+        monitor.join().unwrap();
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "idle exit fires once the quit is no longer in flight"
         );
     }
 }
