@@ -1670,6 +1670,25 @@ impl ShelbiWindow {
     /// A sidebar chord (⌘O ⌘I ⌘L, ⌘1 to ⌘9): open what it names, selecting
     /// its row as a click would.
     fn nav_chord(&mut self, chord: NavChord, window: &mut Window, cx: &mut Context<Self>) {
+        // While a task panel holds the column, ⌘1 to ⌘N are its views (the
+        // hints it draws), not the hidden sidebar's rows.
+        if let NavChord::Row(n) = chord {
+            match self.column.target() {
+                Occupant::Review => {
+                    if let Some(review) = self.review.clone() {
+                        review.update(cx, |r, cx| r.view_shortcut(n, window, cx));
+                    }
+                    return;
+                }
+                Occupant::Workspace => {
+                    if let Some(ws) = self.workspace.clone() {
+                        ws.update(cx, |w, cx| w.view_shortcut(n, window, cx));
+                    }
+                    return;
+                }
+                Occupant::Sidebar => {}
+            }
+        }
         let target = match chord {
             NavChord::View(view) => Some(SidebarTarget::View(view)),
             NavChord::Row(n) => sidebar::layout(&self.model, &BTreeSet::new())
@@ -3850,6 +3869,7 @@ impl ShelbiWindow {
             let width = sidebar::width_px(c.width_cols, window_width);
             let layer = |selector: &'static str, l: Layer| {
                 div()
+                    .id(selector)
                     .debug_selector(move || selector.into())
                     .absolute()
                     .top_0()
@@ -3886,14 +3906,27 @@ impl ShelbiWindow {
                     cx,
                 ))
             });
-            let review = c
-                .review
-                .zip(self.review.clone())
-                .map(|(l, review)| layer("column-review", l).child(review));
-            let workspace = c
-                .workspace
-                .zip(self.workspace.clone())
-                .map(|(l, ws)| layer("column-workspace", l).child(ws));
+            // A task panel keeps the sidebar's titlebar and footer around it.
+            let review = c.review.zip(self.review.clone()).map(|(l, review)| {
+                layer("column-review", l).child(sidebar::render_panel_column(
+                    review,
+                    &self.model,
+                    self.link,
+                    &self.palette_chord,
+                    &theme,
+                    cx,
+                ))
+            });
+            let workspace = c.workspace.zip(self.workspace.clone()).map(|(l, ws)| {
+                layer("column-workspace", l).child(sidebar::render_panel_column(
+                    ws,
+                    &self.model,
+                    self.link,
+                    &self.palette_chord,
+                    &theme,
+                    cx,
+                ))
+            });
             div()
                 .id("leading-column")
                 .debug_selector(|| "leading-column".into())

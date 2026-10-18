@@ -138,23 +138,26 @@ paths on every `cargo test`.
   (`shelbi_app::workspace_panel`: Back, More, the folder, the view switch;
   ↑/↓ or j/k, Enter, `m`, Esc for Back, `q` to close the diff and editor and
   go back, Tab to the agent). The desktop's (`views/workspace.rs`
-  `render_panel`) pushes in with the review's motion and differs in what it
-  shows:
-  - **An idle workspace gets a reduced panel** (name, live state, branch,
-    worktree, machine) beside the idle placeholder. The TUI keeps its
-    sidebar for an idle workspace and opens the panel only for one with a
-    task.
-  - **The status is the live state** (Working, Awaiting input, …, the
-    sidebar badge), with the workspace name and agent role under it. The TUI
-    shows the task's column (IN PROGRESS) and no name.
-  - **The task's id and branch, and the machine** show in the panel; the
-    TUI shows them only in the More popover (the machine not at all).
+  `render_panel`, the Navigation component's State=Workspace,
+  `dt-figma-task-panels`) pushes in with the review's motion, keeps the
+  sidebar's titlebar and footer around it, and differs in what it shows:
+  - **An idle workspace keeps the sidebar** and shows its page in the main
+    area (the state, the name, where it lives, a Shell button), as the TUI
+    keeps its sidebar for one.
+  - **The status is the task's column** (IN PROGRESS), as in the TUI; the
+    workspace name, its live state, the task's id and branch, and the
+    machine are not in the panel (the sidebar row carries the live state).
+  - **The description clamps to five lines** and More expands it in place
+    (then reads Less); the TUI's More opens a popover.
+  - **The worktree row has an Open button** that reveals it in Finder.
+  - **The views carry ⌘1 to ⌘N hints**, and those chords pick them while
+    the panel holds the column (the sidebar's rows otherwise).
   - **A Shell row** opens the user shell beside the agent (the TUI has no
     user shell), and the active Diff or Editor row has a × that ends those
     sessions without leaving.
   - **A remote workspace** keeps the agent and Shell rows and shows its
-    worktree path without a reveal; the TUI opens remote workspaces with
-    the same panel as local ones.
+    worktree path without Open, its machine in the path's tooltip; the TUI
+    opens remote workspaces with the same panel as local ones.
   - **Back returns to the view the workspace was opened over**, as the TUI's
     does; going from a workspace to a review (or back) pops one panel to the
     sidebar and pushes the other.
@@ -182,13 +185,17 @@ Found by this audit and not closed by it; each is a follow-up.
 - **The TUI board sends no expected state** with a move or reorder, so it has
   no protection against overwriting a change another client just made; the
   desktop sends `(status, revision)` on every mutation.
-- **The TUI's workspace panel shows less than the desktop's** (workspace
-  name, live state, machine, branch, task id, remote marker). Its status is
-  the task's column, so a workspace waiting for input still reads IN
-  PROGRESS. `WorkspaceHeader` is unused by the TUI.
+- **Neither workspace panel shows the live state** (both read IN PROGRESS
+  for a workspace waiting for input); the sidebar row shows it.
+  `WorkspaceHeader` is unused by the TUI.
 - **The TUI review panel** shows the live server state and location (added
   here) but not the health check or the sub-state detail, and always shows
-  Diff and Editor (it has no remote flag for a review slot).
+  Diff and Editor (it has no remote flag for a review slot). The desktop's
+  (State=Review, `dt-figma-task-panels`) has no server block: the Web
+  Browser row stays inert with "loading…" until the slot serves, the
+  sub-state, detail and health check in its tooltip, and the URL in its
+  tooltip once serving. It also offers a user shell in the slot's worktree
+  (Shell ⌘5), which the TUI does not.
 - **Board details shown in one client only**: the desktop shows a card's
   excerpt, workflow badge (even on a one-workflow board) and dependencies on
   the card, "Loading history…" in the done
@@ -253,20 +260,20 @@ equivalent datum.
 | `task_id` | not shown: routing key for opening the review (`shell/sidebar.rs` `build_rows`, `RowTarget::Review`); palette command id | not shown in the row: routing key (via `SidebarRow::target`) and debug selector (`views/sidebar.rs` `row_selector`); shown in the "reached review" notification body (`notify.rs`) |
 | `title` | row first line, truncated with `…` (`shell/sidebar.rs` `render_row`); palette entry and Approve/Reject titles | row first line (`views/sidebar.rs` `row_text`); palette; Go > Reviews menu; notification title (`notify.rs`) |
 | `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`) | muted second line after the number (`views/sidebar.rs` `row_text`, `render_row`) |
-| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | review view server section (`views/review.rs` `render_server`); not in the sidebar row, whose right side is its ⌘N hint (the Navigation component) |
+| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | not shown: State=Review dropped the server block and the sidebar row's right side is its ⌘N hint (the Navigation component); the review URL stands in (the Web Browser row's tooltip) |
 | `workspace` | not used | not used |
 | `number` | not shown | `#401` before the branch on the row's second line (`views/sidebar.rs` `row_text`); filled from the board index for a GitHub-backed project (`shelbi-orchestrator` `sidebar_model`) |
-| `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); review view server sub-state and detail (`views/review.rs` `render_server`) |
+| `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); the review panel's Web Browser row, inert with "loading…" until serving, the sub-state and detail in its tooltip (`views/review.rs` `render_waiting_browser`) |
 
 ### `WorkspaceDetailsInfo`
 The TUI never constructs this struct; its workspace panel reads the same facts from `workspace_session::workspace_open_info` into its own `WorkspacePanel` (`shell/mod.rs` `build_workspace_interface`). The TUI column describes that equivalent display.
 
 | Field | TUI | Desktop |
 |---|---|---|
-| `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, bold and wrapped, with the id under it (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); description popover heading (`views/workspace.rs` `render_description`) |
-| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | three-line preview and More in the panel, only when non-empty (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`); markdown description popover (`views/workspace.rs` `render_description`) |
-| `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | panel branch row (`views/workspace.rs` `render_panel` via `WorkspaceHeader`) |
-| `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel folder row, left-truncated, click reveals in Finder when local (`views/workspace.rs` `render_panel`, `reveal_folder`) |
+| `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, wrapped (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); the id only as the title's fallback |
+| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, More / Less expanding it in place, only when non-empty (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`) |
+| `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | the idle page's place line when there is no worktree (`views/workspace.rs` `render_toolbar` via `WorkspaceHeader::location_line`); not in the panel |
+| `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line |
 | `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
 
 ### `WorkspaceHeader`
@@ -274,14 +281,14 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 
 | Field | TUI | Desktop |
 |---|---|---|
-| `name` | not used; the workspace panel never shows the workspace name | bold name under the panel's status (`views/workspace.rs` `render_panel`) |
-| `task_id` | not used; id only in the More popover | panel id line under the title (`views/workspace.rs` `render_panel`) |
+| `name` | not used; the workspace panel never shows the workspace name | the idle page's toolbar (`views/workspace.rs` `render_toolbar`); not in the panel (State=Workspace draws none) |
+| `task_id` | not used; id only in the More popover | not shown: the panel title's fallback when the title is empty (`views/workspace.rs` `render_panel`); gates the status and summary |
 | `title` | not used; the panel shows the task title from its own `IssueFile` (`workspace_panel.rs` `render_task_info`) | panel title, wrapped (`views/workspace.rs` `render_panel`) |
-| `branch` | not used; branch only in the More popover | panel branch row (`views/workspace.rs` `render_panel`) |
-| `machine` | not used | panel machine row (`views/workspace.rs` `render_panel`) |
-| `is_remote` | not used | globe icon and `(remote)` on the panel machine row (`views/workspace.rs` `render_panel`) |
-| `agent` | not used; Agent switch label comes from the task's `agent:` frontmatter (`shell/mod.rs` `agent_display_name`) | `· Agent` role after the panel name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
-| `state` | not used; panel status is the task column (`IN PROGRESS`/`IDLE`, `shell/mod.rs` `status_for_column`, `ws_status_from_model`), not the live badge | glyph plus state words, colored, beside the panel's back button (`views/workspace.rs` `render_panel` via `state_decoration`) |
+| `branch` | not used; branch only in the More popover | the idle page's place line without a worktree (`views/workspace.rs` `render_toolbar` via `location_line`) |
+| `machine` | not used | the idle page's place line (`views/workspace.rs` `render_toolbar`); a remote panel's worktree tooltip (`render_panel`) |
+| `is_remote` | not used | `(remote)` on the idle page's place line (`views/workspace.rs` `render_toolbar`); the worktree tooltip names the machine (`render_panel`) |
+| `agent` | not used; Agent switch label comes from the task's `agent:` frontmatter (`shell/mod.rs` `agent_display_name`) | the agent view's label, `Developer` (`views/workspace.rs` `render_panel`) |
+| `state` | not used; panel status is the task column (`IN PROGRESS`/`IDLE`, `shell/mod.rs` `status_for_column`, `ws_status_from_model`), not the live badge | the idle page's state, glyph and lowercase words (`views/workspace.rs` `render_toolbar` via `state_decoration`); the panel shows the task's column (IN PROGRESS), as the TUI's |
 
 #
 
@@ -426,18 +433,18 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 
 | Field | TUI | Desktop |
 |---|---|---|
-| `task_id` | `id` row in the More popover header, from the `IssueFile` (`kanban.rs` `popover_header`, opened by `shell/overlays.rs` `task_description`); also keys approve/reject | title fallback when the title is empty (`views/review.rs` `render_panel`) and More popover header (`views/review.rs` `render_description`) |
-| `slot` | not shown: binds the content sessions (`shell/review.rs` `show_chat` / `show_role`) | "Server · <slot>" heading (`views/review.rs` `render_server`) |
-| `title` | bold task-info title (`review_panel.rs` `render_full` via `panel.rs` `render_task_info`); More popover title (`kanban.rs` `render_task_popover_into`) | bold title (`views/review.rs` `render_panel`); popover title (`render_description`) |
-| `body` | More popover markdown body (`kanban.rs` `render_task_popover_into`) | More popover markdown body (`views/review.rs` `render_description`); gates More via `has_body` |
-| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | 3-line clamped preview (`views/review.rs` `render_panel`) |
-| `worktree` | left-truncated folder row, always shown (`review_panel.rs` `render_full` via `panel.rs` `render_folder`) | folder row, hidden on a remote slot (`views/review.rs` `render_panel`) |
-| `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | cyan status beside back button (`views/review.rs` `render_panel`) |
+| `task_id` | `id` row in the More popover header, from the `IssueFile` (`kanban.rs` `popover_header`, opened by `shell/overlays.rs` `task_description`); also keys approve/reject | title fallback when the title is empty (`views/review.rs` `render_panel`); also keys approve/reject |
+| `slot` | not shown: binds the content sessions (`shell/review.rs` `show_chat` / `show_role`) | not shown: binds the content sessions and the user shell (`views/review.rs` `content_target`, `open_shell`) |
+| `title` | bold task-info title (`review_panel.rs` `render_full` via `panel.rs` `render_task_info`); More popover title (`kanban.rs` `render_task_popover_into`) | Base/Medium title (`views/review.rs` `render_panel` via `task_panel::summary`) |
+| `body` | More popover markdown body (`kanban.rs` `render_task_popover_into`) | not shown as markdown: gates More via `has_body` (`views/review.rs` `render_panel`) |
+| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More / Less expanding it in place (`views/review.rs` `render_panel` via `task_panel::summary`) |
+| `worktree` | left-truncated folder row, always shown (`review_panel.rs` `render_full` via `panel.rs` `render_folder`) | worktree row, its last four components, Open reveals it in Finder, no Open on a remote slot (`views/review.rs` `render_panel` via `task_panel::worktree_row`) |
+| `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | not shown: the panel shows the task's column (REVIEW, the purple glyph) beside the back button, as State=Review draws it (`views/review.rs` `render_panel`) |
 | `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) |
-| `review_url` | not shown: only a `has_review_url` bool gating the Open Browser switch (`review_panel.rs` `rows`); URL resolved at open time (`review_panel.rs` `review_url`) | clickable URL under the server block (`views/review.rs` `render_server`); also gates Open Browser |
-| `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` hides the folder row and drops Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
-| `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model (`views/review.rs` `render_panel`) |
-| `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | state glyph + label, location, sub-state detail, health check (`views/review.rs` `render_server`) |
+| `review_url` | not shown: only a `has_review_url` bool gating the Open Browser switch (`review_panel.rs` `rows`); URL resolved at open time (`review_panel.rs` `review_url`) | the Web Browser row's tooltip (`views/review.rs` `render_panel`, `render_waiting_browser`); gates the row |
+| `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
+| `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌘N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
+| `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌘4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |
 
 ### `ErrorLogModel`
 Neither client consumes `ErrorLogModel`. Both render `shelbi_state::read_errors_with_unread` rows (`(ErrorLogEntry, bool)`) through the shared `shelbi_app::overlay::error_log::Viewer`. Mapped to that datum:

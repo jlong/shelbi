@@ -302,6 +302,9 @@ pub enum PanelRow {
     /// The worktree folder: reveal it in the file manager.
     Folder,
     Switch(ReviewSwitch),
+    /// The user shell beside the content, on or off (the desktop's; the TUI
+    /// asks for no shell row).
+    Shell,
     Approve,
     Reject,
 }
@@ -326,11 +329,24 @@ pub enum PanelEffect {
     /// Tear the review down (the TUI's `q`): the daemon ends the editor,
     /// diff and server sessions and frees the slot's port.
     Close,
+    /// Open or close the user shell beside the content (the desktop's).
+    ToggleShell,
 }
 
 /// The panel's rows: Back, `More` (only with a body), the folder (when it can
 /// be revealed), the switch entries, then Approve and Reject.
 pub fn panel_rows(has_body: bool, show_folder: bool, switches: &[ReviewSwitch]) -> Vec<PanelRow> {
+    panel_rows_with_shell(has_body, show_folder, switches, false)
+}
+
+/// [`panel_rows`] with the user-shell row after the switch entries when
+/// `shell` (the desktop's).
+pub fn panel_rows_with_shell(
+    has_body: bool,
+    show_folder: bool,
+    switches: &[ReviewSwitch],
+    shell: bool,
+) -> Vec<PanelRow> {
     let mut rows = vec![PanelRow::Back];
     if has_body {
         rows.push(PanelRow::More);
@@ -339,6 +355,9 @@ pub fn panel_rows(has_body: bool, show_folder: bool, switches: &[ReviewSwitch]) 
         rows.push(PanelRow::Folder);
     }
     rows.extend(switches.iter().map(|s| PanelRow::Switch(*s)));
+    if shell {
+        rows.push(PanelRow::Shell);
+    }
     rows.push(PanelRow::Approve);
     rows.push(PanelRow::Reject);
     rows
@@ -375,6 +394,7 @@ pub fn activate_row(row: PanelRow, has_body: bool, merging: bool) -> (PanelEffec
             (PanelEffect::ShowEditor, Some(ActiveView::Editor))
         }
         PanelRow::Switch(ReviewSwitch::Browser) => (PanelEffect::OpenBrowser, None),
+        PanelRow::Shell => (PanelEffect::ToggleShell, None),
         PanelRow::Approve | PanelRow::Reject if merging => (PanelEffect::None, None),
         PanelRow::Approve => (PanelEffect::Approve, None),
         PanelRow::Reject => (PanelEffect::RejectPrompt, None),
@@ -402,13 +422,20 @@ pub struct ReviewPanelState {
     has_body: bool,
     merging: bool,
     status_line: Option<String>,
+    /// The user-shell row is offered (the desktop's).
+    shell: bool,
 }
 
 impl ReviewPanelState {
     /// The panel for `model`, with the Chat switch selected and active (the
     /// default content view).
     pub fn new(model: &ReviewPanelModel) -> Self {
-        let rows = Self::rows_for(model);
+        Self::with_shell(model, false)
+    }
+
+    /// [`Self::new`], with the user-shell row when `shell` (the desktop's).
+    pub fn with_shell(model: &ReviewPanelModel, shell: bool) -> Self {
+        let rows = Self::rows_for(model, shell);
         let selected = rows
             .iter()
             .position(|r| *r == PanelRow::Switch(ReviewSwitch::Chat))
@@ -420,18 +447,19 @@ impl ReviewPanelState {
             has_body: model.has_body(),
             merging: false,
             status_line: None,
+            shell,
         }
     }
 
-    fn rows_for(model: &ReviewPanelModel) -> Vec<PanelRow> {
-        panel_rows(model.has_body(), !model.is_remote(), &model.switch_items)
+    fn rows_for(model: &ReviewPanelModel, shell: bool) -> Vec<PanelRow> {
+        panel_rows_with_shell(model.has_body(), !model.is_remote(), &model.switch_items, shell)
     }
 
     /// Follow a rebuilt model (a refreshed row): the selection stays on the
     /// same row when it still exists.
     pub fn sync(&mut self, model: &ReviewPanelModel) {
         let current = self.selected_row();
-        self.rows = Self::rows_for(model);
+        self.rows = Self::rows_for(model, self.shell);
         self.has_body = model.has_body();
         self.selected = current
             .and_then(|row| self.rows.iter().position(|r| *r == row))
@@ -820,6 +848,22 @@ mod tests {
         assert_eq!(m.switch_items, [ReviewSwitch::Chat, ReviewSwitch::Browser]);
         let p = ReviewPanelState::new(&m);
         assert!(!p.rows().contains(&PanelRow::Folder));
+    }
+
+    #[test]
+    fn the_shell_row_follows_the_switch_only_when_asked_for() {
+        let m = ReviewPanelModel::build(&info(false, true), Some(&row(ReviewState::Serving)));
+        assert!(!ReviewPanelState::new(&m).rows().contains(&PanelRow::Shell), "the TUI's has none");
+        let mut p = ReviewPanelState::with_shell(&m, true);
+        let rows = p.rows().to_vec();
+        let shell = rows.iter().position(|r| *r == PanelRow::Shell).expect("a shell row");
+        assert_eq!(rows[shell - 1], PanelRow::Switch(ReviewSwitch::Browser));
+        assert_eq!(rows[shell + 1], PanelRow::Approve);
+        assert_eq!(p.click(PanelRow::Shell), PanelEffect::ToggleShell);
+        assert_eq!(p.active(), ActiveView::Chat, "the shell is not a content view");
+        // A rebuilt model keeps the row.
+        p.sync(&m);
+        assert!(p.rows().contains(&PanelRow::Shell));
     }
 
     #[test]

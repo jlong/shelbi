@@ -139,6 +139,10 @@ impl ReviewOps for Ops {
     fn reveal(&self, _path: &str) -> Result<(), String> {
         Ok(())
     }
+
+    fn shell_op(&self, _project: &str, _slot: &str, _op: shelbi_app::WorkspaceSessionOp) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl WorkspaceOps for Ops {

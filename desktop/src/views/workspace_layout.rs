@@ -1,9 +1,17 @@
-//! The Workspace view's agent | user-shell split, as plain pixel math so it is
-//! tested without a window.
+//! The agent | user-shell split the Workspace and Review views share: the
+//! pixel math ([`Split`], tested without a window) and the panes' row with its
+//! draggable divider ([`render_split`]).
 //!
 //! The split is kept as the agent's share of the room left after the divider,
 //! so it survives window resizes. Both panes keep a minimum width; a container
 //! too narrow for two minimums splits evenly instead.
+
+use gpui::{
+    canvas, div, prelude::*, px, relative, AnyElement, Bounds, Context, CursorStyle, MouseButton,
+    MouseMoveEvent, Pixels, SharedString, Stateful,
+};
+
+use crate::theme::Theme;
 
 /// The divider's width, its grab room included.
 pub const DIVIDER_W: f32 = 5.0;
@@ -67,6 +75,124 @@ impl Split {
         };
         self.ratio = agent / room;
     }
+}
+
+/// A view's split as it is on screen: the ratio, where the panes' row was
+/// laid out last frame (for the drag math), and whether the divider is being
+/// dragged.
+#[derive(Debug, Default)]
+pub struct ShellSplit {
+    pub split: Split,
+    pub bounds: Option<Bounds<Pixels>>,
+    pub dragging: bool,
+}
+
+/// The panes' row: `content`, then, when `shell` is given, the divider and
+/// the shell's pane. Ids and selectors are `{prefix}-panes`,
+/// `{prefix}-split-divider` and `{prefix}-shell-pane`; `state` reaches the
+/// view's [`ShellSplit`] for the drag.
+pub fn render_split<V: 'static>(
+    prefix: &'static str,
+    split: &ShellSplit,
+    state: fn(&mut V) -> &mut ShellSplit,
+    content: AnyElement,
+    shell: Option<AnyElement>,
+    theme: &Theme,
+    cx: &mut Context<V>,
+) -> Stateful<gpui::Div> {
+    let this = cx.entity().downgrade();
+    let open = shell.is_some();
+    let widths = split.bounds.map(|b| split.split.widths(b.size.width.as_f32()));
+    let content = div()
+        .flex()
+        .min_w_0()
+        .min_h_0()
+        .h_full()
+        .map(|d| match (open, widths) {
+            (false, _) => d.flex_1(),
+            (true, Some((agent, _))) => d.flex_none().w(px(agent)),
+            (true, None) => d.flex_none().w(relative(split.split.ratio())),
+        })
+        .child(content);
+    let divider_color = if split.dragging { theme.icon } else { theme.divider };
+    let name = |suffix: &str| SharedString::from(format!("{prefix}-{suffix}"));
+    let shell_side = shell.map(|shell| {
+        let divider_name = name("split-divider");
+        let divider = div()
+            .id(divider_name.clone())
+            .debug_selector(move || divider_name.to_string())
+            .w(px(DIVIDER_W))
+            .h_full()
+            .flex_none()
+            .flex()
+            .justify_center()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .child(div().w(px(1.0)).h_full().bg(divider_color))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    state(this).dragging = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        let pane_name = name("shell-pane");
+        let pane = div()
+            .debug_selector(move || pane_name.to_string())
+            .flex()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .flex_1()
+            .child(shell);
+        [divider.into_any_element(), pane.into_any_element()]
+    });
+    let stop_drag = move |this: &mut V, _: &gpui::MouseUpEvent, _: &mut gpui::Window, cx: &mut Context<V>| {
+        if state(this).dragging {
+            state(this).dragging = false;
+            cx.notify();
+        }
+    };
+    let panes_name = name("panes");
+    div()
+        .id(panes_name.clone())
+        .debug_selector(move || panes_name.to_string())
+        .relative()
+        .flex()
+        .flex_row()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+            let s = state(this);
+            if let (true, Some(bounds)) = (s.dragging, s.bounds) {
+                let x = (event.position.x - bounds.origin.x).as_f32();
+                s.split.drag_to(x, bounds.size.width.as_f32());
+                cx.notify();
+            }
+        }))
+        .on_mouse_up(MouseButton::Left, cx.listener(stop_drag))
+        .on_mouse_up_out(MouseButton::Left, cx.listener(stop_drag))
+        .child(content)
+        .children(shell_side.into_iter().flatten())
+        // Measures the panes' row for the divider math; repaints once when
+        // the width first becomes known or changes.
+        .child(
+            canvas(
+                move |bounds, _, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        let s = state(this);
+                        if s.bounds != Some(bounds) {
+                            s.bounds = Some(bounds);
+                            cx.notify();
+                        }
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
 }
 
 #[cfg(test)]
