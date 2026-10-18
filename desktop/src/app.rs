@@ -104,7 +104,8 @@ use shelbi_state::keymap::{
 use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::feeds::{FeedHub, FeedSubscription};
-use crate::keys::{chord_from_keystroke, is_new_window, overlay_chord, paste_chords};
+use crate::elements::terminal::TerminalSettings;
+use crate::keys::{chord_from_keystroke, font_zoom, is_new_window, overlay_chord, paste_chords};
 use crate::menus;
 use crate::notify;
 use crate::projects::{self, Catalog, ProjectEntry};
@@ -3348,6 +3349,13 @@ impl ShelbiWindow {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let chord = chord_from_keystroke(&event.keystroke);
         tracing::trace!(keystroke = ?event.keystroke, ?chord, focus = ?self.client.focus(), "key down");
+        // The terminal font zoom (⌘+ ⌘− ⌘0) is app-wide and no overlay or
+        // view binds the chords, so it applies wherever focus is.
+        if let Some(step) = chord.as_ref().and_then(font_zoom) {
+            TerminalSettings::zoom(step, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.overlay.is_some() {
             self.overlay_key(event, window, cx);
             return;
@@ -3549,7 +3557,7 @@ fn row_key(target: &SidebarTarget) -> String {
 /// Whether the window takes `chord` away from a focused terminal: the focus
 /// moves (Ctrl+H / Ctrl+L by default), the Zen toggle (Option+Z), every
 /// palette chord (the configured one plus the reserved Ctrl+Space and Cmd+K),
-/// and New Window (⌘⇧N).
+/// New Window (⌘⇧N), and the terminal font zoom (⌘+ ⌘− ⌘0).
 /// Everything else is the session's.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
     matches!(
@@ -3557,6 +3565,7 @@ fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord)
         Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain | GlobalAction::ZenToggle)
     ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
         || is_new_window(&chord)
+        || font_zoom(&chord).is_some()
 }
 
 /// The palette-open chord as the search box shows it (`⌃P`).

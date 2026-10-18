@@ -326,6 +326,12 @@ mod tests {
         assert_eq!(classify(&ks("cmd-q"), true), KeyAction::Ignore);
         assert_eq!(classify(&ks("cmd-shift-c"), true), KeyAction::Ignore);
         assert_eq!(classify(&ks("cmd-enter"), true), KeyAction::Ignore);
+        // The font zoom chords are the window's (View ▸ Bigger / Smaller /
+        // Actual Size): nothing reaches the program.
+        for spec in ["cmd-+", "cmd-=", "cmd-shift-=", "cmd--", "cmd-0"] {
+            assert_eq!(classify(&ks(spec), true), KeyAction::Ignore, "{spec}");
+            assert_eq!(classify(&ks(spec), false), KeyAction::Ignore, "{spec}");
+        }
     }
 
     #[test]

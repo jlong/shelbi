@@ -392,6 +392,11 @@ impl Check {
                 "editing keys",
             ),
             ("cmd-w", b"", "Cmd chords are the app's"),
+            (
+                "cmd-+ cmd-= cmd-- cmd-0",
+                b"",
+                "the font zoom chords (⌘+ ⌘= ⌘− ⌘0) are the app's, never the program's",
+            ),
         ];
         for (keys, want, what) in cases {
             let got = self.keys_sent(keys);

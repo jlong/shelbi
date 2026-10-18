@@ -286,3 +286,68 @@ fn a_menu_pick_with_the_palette_up_closes_it_first(cx: &mut TestAppContext) {
     assert!(!h.overlay_open());
     assert_eq!(h.take_calls(), [HostCall::ShowView(View::Issues)]);
 }
+
+#[gpui::test]
+fn the_font_zoom_chords_and_menu_items_step_the_terminal_font(cx: &mut TestAppContext) {
+    use std::sync::{Arc, Mutex};
+
+    use crate::elements::terminal::settings::SizeWriter;
+    use crate::menus::tree::AppCommand;
+
+    let mut h = Harness::open(cx);
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let log = writes.clone();
+    h.cx.update(|_, cx| {
+        cx.set_global(TerminalSettings::default());
+        SizeWriter::install(
+            move |size| {
+                log.lock().unwrap().push(size);
+                Ok(())
+            },
+            cx,
+        );
+    });
+    let size = |h: &mut Harness| {
+        h.cx.update(|_, cx| {
+            let s = TerminalSettings::current(cx);
+            (s.font_size, s.font_size_setting)
+        })
+    };
+    h.focus_window();
+
+    // ⌘= and ⌘+ (as a US layout reports it) grow, ⌘− shrinks, ⌘0 resets.
+    h.key("cmd-=");
+    assert_eq!(size(&mut h), (15.0, Some(15)));
+    h.key("cmd-+");
+    assert_eq!(size(&mut h), (16.0, Some(16)));
+    h.key("cmd--");
+    assert_eq!(size(&mut h), (15.0, Some(15)));
+    h.key("cmd-0");
+    assert_eq!(size(&mut h), (14.0, None));
+    assert_eq!(writes.lock().unwrap().last(), Some(&None));
+
+    // An overlay doesn't take the chords.
+    h.key("ctrl-space");
+    assert!(h.overlay_open());
+    h.key("cmd-=");
+    assert_eq!(size(&mut h), (15.0, Some(15)));
+    assert!(h.overlay_open());
+    h.key("escape");
+
+    // The View menu items do the same.
+    for (command, want) in [
+        (AppCommand::FontBigger, (16.0, Some(16))),
+        (AppCommand::FontSmaller, (15.0, Some(15))),
+        (AppCommand::FontActualSize, (14.0, None)),
+    ] {
+        h.cx.dispatch_action(menus::MenuInvoke {
+            target: MenuAction::App(command),
+            generation: 0,
+        });
+        h.cx.run_until_parked();
+        assert_eq!(size(&mut h), want, "{command:?}");
+    }
+    assert_eq!(writes.lock().unwrap().last(), Some(&None));
+    // No registry command ran.
+    assert_eq!(h.take_calls(), []);
+}

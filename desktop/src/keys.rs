@@ -12,6 +12,8 @@
 use gpui::Keystroke;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
+use crate::elements::terminal::FontZoom;
+
 /// File ▸ New Window, the macOS standard (⌘⇧N), as a `keys.yaml` chord. The
 /// window takes it before a focused terminal can (`crate::app`), and the
 /// menu shows it on the item.
@@ -20,6 +22,29 @@ pub const NEW_WINDOW: &str = "shift-super-n";
 /// Whether `chord` is [`NEW_WINDOW`].
 pub fn is_new_window(chord: &KeyChord) -> bool {
     KeyChord::parse(NEW_WINDOW).is_ok_and(|c| c.canonical() == chord.canonical())
+}
+
+/// The terminal font zoom chords (View ▸ Bigger / Smaller / Actual Size), as
+/// `keys.yaml` chords. The window takes them before a focused terminal can
+/// (`crate::app`), and the menu shows them on the items.
+pub const FONT_BIGGER: &str = "super-+";
+pub const FONT_SMALLER: &str = "super--";
+pub const FONT_ACTUAL_SIZE: &str = "super-0";
+
+/// The font zoom step `chord` asks for. ⌘+ is Shift+= on a US layout, which
+/// macOS reports as `+` (gpui drops the Shift), so ⌘= (no Shift) and a
+/// Shift that a layout keeps both count as Bigger, as in Terminal and iTerm.
+pub fn font_zoom(chord: &KeyChord) -> Option<FontZoom> {
+    let shift = chord.mods == Mods::SUPER | Mods::SHIFT;
+    if chord.mods != Mods::SUPER && !shift {
+        return None;
+    }
+    match chord.code {
+        Key::Char('+' | '=') => Some(FontZoom::Bigger),
+        Key::Char('-') if !shift => Some(FontZoom::Smaller),
+        Key::Char('0') if !shift => Some(FontZoom::ActualSize),
+        _ => None,
+    }
 }
 
 /// Translate a gpui [`Keystroke`] into a [`KeyChord`], or `None` for a key
@@ -163,6 +188,41 @@ mod tests {
         assert!(is_new_window(&chord("cmd-shift-n")));
         assert!(!is_new_window(&chord("cmd-n")));
         assert!(!is_new_window(&chord("ctrl-shift-n")));
+    }
+
+    #[test]
+    fn cmd_plus_equals_minus_and_zero_are_the_font_zoom() {
+        let zoom = |spec: &str, key_char: &str| {
+            font_zoom(&chord_from_keystroke(&ks(spec, Some(key_char))).unwrap())
+        };
+        // ⌘+ as macOS reports it on a US layout (Shift dropped), and as a
+        // layout that keeps the Shift would.
+        assert_eq!(zoom("cmd-+", "+"), Some(FontZoom::Bigger));
+        assert_eq!(zoom("cmd-shift-=", "+"), Some(FontZoom::Bigger));
+        assert_eq!(zoom("cmd-=", "="), Some(FontZoom::Bigger));
+        assert_eq!(zoom("cmd--", "-"), Some(FontZoom::Smaller));
+        assert_eq!(zoom("cmd-0", "0"), Some(FontZoom::ActualSize));
+        // Other modifiers, or none, are someone else's.
+        for (spec, key_char) in [
+            ("=", "="),
+            ("-", "-"),
+            ("0", "0"),
+            ("ctrl-0", "0"),
+            ("alt-cmd-0", "0"),
+            ("ctrl-cmd--", "-"),
+            ("cmd-shift-0", ")"),
+            ("cmd-9", "9"),
+        ] {
+            assert_eq!(zoom(spec, key_char), None, "{spec}");
+        }
+        // The menu chords are the zoom chords.
+        for (spec, step) in [
+            (FONT_BIGGER, FontZoom::Bigger),
+            (FONT_SMALLER, FontZoom::Smaller),
+            (FONT_ACTUAL_SIZE, FontZoom::ActualSize),
+        ] {
+            assert_eq!(font_zoom(&KeyChord::parse(spec).unwrap()), Some(step), "{spec}");
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod tree;
 use gpui::{actions, App, Global, KeyBinding, Menu, MenuItem, SystemMenuType};
 
 use crate::app::{CloseWindow, OpenSettings, ToggleSidebar};
+use crate::elements::terminal::{FontZoom, TerminalSettings};
 use tree::{AppCommand, MenuAction, MenuEntry, MenuTree, FIXED_SHORTCUTS};
 
 actions!(
@@ -146,6 +147,16 @@ pub fn run_app_command(command: AppCommand, cx: &mut App) -> bool {
         AppCommand::QuitClient => cx.quit(),
         AppCommand::Documentation => cx.open_url(tree::DOCS_URL),
         AppCommand::ReportIssue => cx.open_url(tree::ISSUES_URL),
+        // The terminal font is app-wide: every window's terminals follow.
+        AppCommand::FontBigger => {
+            TerminalSettings::zoom(FontZoom::Bigger, cx);
+        }
+        AppCommand::FontSmaller => {
+            TerminalSettings::zoom(FontZoom::Smaller, cx);
+        }
+        AppCommand::FontActualSize => {
+            TerminalSettings::zoom(FontZoom::ActualSize, cx);
+        }
         AppCommand::About
         | AppCommand::Settings
         | AppCommand::CloseWindow
@@ -261,7 +272,8 @@ mod tests {
         specs.extend([
             "ctrl-p", "alt-z", "ctrl-h", "ctrl-l", "super-k", "f6", "ctrl-shift-up",
             "alt-page-down", "ctrl-esc", "ctrl-space", "ctrl-alt-shift-super-x", "super-.",
-            "ctrl-/", "ctrl-enter", "alt-tab",
+            "ctrl-/", "ctrl-enter", "alt-tab", "super-+", "super--", "super-0", "-",
+            "ctrl--",
         ]);
         for spec in specs {
             let chord = KeyChord::parse(spec).unwrap();
@@ -282,6 +294,7 @@ mod tests {
         assert!(uses_invoke(&MenuAction::Command("action:toggle-zen".into())));
         assert!(uses_invoke(&MenuAction::App(AppCommand::CommandPalette)));
         assert!(uses_invoke(&MenuAction::App(AppCommand::Documentation)));
+        assert!(uses_invoke(&MenuAction::App(AppCommand::FontBigger)));
         assert!(!uses_invoke(&MenuAction::App(AppCommand::Settings)));
         assert!(!uses_invoke(&MenuAction::App(AppCommand::Copy)));
     }

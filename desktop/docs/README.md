@@ -95,6 +95,7 @@ is left, and how it was verified.
 | `dt-figma-activity` | The Activity view restyled to the Figma frame in both themes: header with the display name, the frame's filter controls, day groups, rows colored by actor kind and status, current-status tags, the "available" and "started" desktop labels | [`status/dt-figma-activity.md`](status/dt-figma-activity.md) |
 | `dt-figma-palette` | The command palette restyled to the Figma Command palette frame in both themes: geometry, scrim, query line, rows, description column, Projects column, footer; the frame's default list and copy; Tab crosses into the Projects column | [`status/dt-figma-palette.md`](status/dt-figma-palette.md) |
 | `dt-figma-issues-board` | The Issues board restyled to the Figma Issues frame: filter toolbar, status-glyph column headers, cards with excerpts and workflow badges, the key-hint footer; the shared status glyphs | [`status/dt-figma-issues-board.md`](status/dt-figma-issues-board.md) |
+| `dt-terminal-font-zoom` | ⌘+ / ⌘− / ⌘0 (View ▸ Bigger, Smaller, Actual Size) step every terminal's font size and save it to the setting Settings edits | [`status/dt-terminal-font-zoom.md`](status/dt-terminal-font-zoom.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one
