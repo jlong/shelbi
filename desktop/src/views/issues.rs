@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, px, relative, App, ClickEvent, Context, Entity, EventEmitter,
-    FocusHandle, FontWeight, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
+    FocusHandle, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
     Window,
 };
 use shelbi_app::board::DropTarget;
@@ -45,8 +45,8 @@ use super::external_edit::{self, EditorEvent};
 use super::task_detail;
 use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
-use crate::theme::style::{self, ButtonKind};
-use crate::theme::{Hue, Theme};
+use crate::theme::style;
+use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 
 /// The fallback refresh cadence (the TUI's).
@@ -55,8 +55,22 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// An expanded column's width.
 const COLUMN_WIDTH: f32 = 272.0;
+/// How far a card's title runs past its content box into the right padding.
+const TITLE_OVERHANG: f32 = 6.0;
+/// How many lines a card's excerpt keeps (the Figma card's description).
+const SUMMARY_LINES: usize = 4;
 /// A collapsed column's width.
 const COLLAPSED_WIDTH: f32 = 36.0;
+/// The toolbar's height, its rule included (Figma: a 56px Board toolbar over
+/// a 1px divider).
+const TOOLBAR_H: f32 = 57.0;
+/// The key-hint footer's height, its rule included (Figma: a 1px divider
+/// over a 28px row).
+const FOOTER_H: f32 = 29.0;
+/// How far a column's scroll clip reaches past the column on every side, so
+/// the selected card's focus glow (5px outside it) isn't cut off while the
+/// cards keep the column's full width.
+const GLOW_ROOM: f32 = 6.0;
 
 /// What the view asks of the window.
 #[derive(Debug, Clone)]
@@ -87,13 +101,13 @@ impl Render for CardGhost {
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(theme.raised)
+            .bg(theme.card)
             .shadow(style::popover_shadow(&theme))
             .opacity(0.95)
             .type_style(Type::Base)
             .child(
                 div()
-                    .font_weight(FontWeight::MEDIUM)
+                    .type_style(Type::BaseMedium)
                     .text_color(theme.text_loud)
                     .line_clamp(2)
                     .text_ellipsis()
@@ -549,29 +563,21 @@ impl IssuesView {
 
     // ---- rendering --------------------------------------------------------
 
+    /// The toolbar: the two filters and, at the right, New issue, over the
+    /// board's rule (the Figma Issues frame has no board title).
     fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.state.model();
-        let title = if model.title.is_empty() {
-            self.state.project.clone()
-        } else {
-            model.title.clone()
-        };
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .px_4()
-            .h(px(56.0))
+            .pl_3()
+            .pr_4()
+            .h(px(TOOLBAR_H))
             .flex_none()
             .border_b_1()
-            .border_color(theme.divider)
-            .child(
-                div()
-                    .type_style(Type::BaseSemibold)
-                    .text_color(theme.text_loud)
-                    .child(title),
-            )
+            .border_color(theme.divider_strong)
             .child(
                 style::dropdown(
                     "workflow-chip",
@@ -589,7 +595,7 @@ impl IssuesView {
             .child(
                 style::dropdown(
                     "workspace-chip",
-                    icons::USER,
+                    icons::FUNNEL,
                     model.workspace_filter_label.clone(),
                     matches!(self.state.mode, Mode::WorkspaceDropdown { .. }),
                     theme,
@@ -610,7 +616,7 @@ impl IssuesView {
                 )
             })
             .child(
-                style::icon_label_button("new-issue", icons::PLUS, "New issue", ButtonKind::Primary, theme)
+                style::toolbar_button("new-issue", icons::PLUS, "New issue", theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         let intents = this.state.begin_add();
                         this.apply_intents(intents, window, cx);
@@ -624,7 +630,6 @@ impl IssuesView {
         while self.column_scrolls.len() < columns.len() {
             self.column_scrolls.push(ScrollHandle::new());
         }
-        let show_wf = self.state.model().show_workflow_badges;
         let children: Vec<_> = columns
             .iter()
             .enumerate()
@@ -632,7 +637,7 @@ impl IssuesView {
                 if col.collapsed {
                     self.render_collapsed(ci, col, theme, cx).into_any_element()
                 } else {
-                    self.render_column(ci, col, show_wf, theme, cx).into_any_element()
+                    self.render_column(ci, col, theme, cx).into_any_element()
                 }
             })
             .collect();
@@ -645,7 +650,10 @@ impl IssuesView {
                 .min_h_0()
                 .min_w_0()
                 .gap_3()
-                .p_3(),
+                // No bottom padding: a long column runs under the footer's
+                // rule, as Figma draws it.
+                .pt_3()
+                .px_3(),
             &self.board_scroll,
         )
         .children(children);
@@ -668,6 +676,10 @@ impl IssuesView {
             .filter(|c| !c.is_whitespace())
             .map(|c| div().child(c.to_string()))
             .collect();
+        let theme = *theme;
+        // Figma draws no collapsed column: the strip keeps the column header's
+        // pieces (the glyph, the count, the caps label run down the strip) on
+        // the canvas, with a hover fill.
         div()
             .id(("collapsed", ci))
             .flex()
@@ -677,15 +689,19 @@ impl IssuesView {
             .flex_none()
             .w(px(COLLAPSED_WIDTH))
             .h_full()
-            .py_2()
+            .py(px(4.0))
             .rounded_lg()
-            .bg(theme.canvas)
-            .border_1()
-            .border_color(if focused { theme.divider_strong } else { theme.divider })
-            .type_style(Type::XSmallMedium)
+            .type_style(Type::XSmallSemibold)
             .text_color(if focused { theme.text_loud } else { theme.muted })
             .cursor_pointer()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(col.cards.len().to_string()))
+            .hover(move |s| s.bg(theme.background))
+            .child(div().flex().items_center().h(px(16.0)).child(style::status_icon(col.category, &theme)))
+            .child(
+                div()
+                    .type_style(Type::XSmall)
+                    .text_color(theme.muted)
+                    .child(col.cards.len().to_string()),
+            )
             .children(letters)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let intents = this.state.toggle_column(ci);
@@ -694,10 +710,7 @@ impl IssuesView {
             }))
             .when(refused, |d| d.opacity(0.35))
             .when(drop.is_some() && !refused, |d| {
-                let theme = *theme;
-                d.drag_over::<CardDrag>(move |s, _, _, _| {
-                    s.bg(theme.background).border_color(theme.focus_ring)
-                })
+                d.drag_over::<CardDrag>(move |s, _, _, _| drop_highlight(s, &theme))
             })
             // A refused target still takes the drop, so the state can say why
             // (it sends nothing).
@@ -713,7 +726,6 @@ impl IssuesView {
         &self,
         ci: usize,
         col: &IssueColumn,
-        show_wf: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -736,7 +748,7 @@ impl IssuesView {
             .enumerate()
             .map(|(ri, card)| {
                 let selected = focused && ri == self.state.selected_row;
-                let card_el = self.render_card(card, ci, ri, selected, show_wf, theme, cx);
+                let card_el = self.render_card(card, ci, ri, selected, theme, cx);
                 match reorder_from {
                     Some(from) => reorder_target(card_el, card, ci, ri, from, theme, cx)
                         .into_any_element(),
@@ -754,6 +766,8 @@ impl IssuesView {
             _ => None,
         };
         let empty = col.cards.is_empty();
+        // The Figma column heading: the status glyph, the label in caps
+        // (loud on the keyboard's column) and the count.
         let header = div()
             .id(("header", ci))
             .flex()
@@ -761,17 +775,17 @@ impl IssuesView {
             .items_center()
             .gap_2()
             .px_1()
-            .h(px(32.0))
+            .h(px(24.0))
             .flex_none()
             .cursor_pointer()
+            .child(style::status_heading(col.category, col.label.clone(), focused, theme))
             .child(
                 div()
-                    .type_style(Type::BaseSemibold)
-                    .text_color(if focused { theme.text_loud } else { theme.foreground })
-                    .when(focused, |d| d.underline())
-                    .child(col.label.clone()),
+                    .flex_none()
+                    .type_style(Type::XSmall)
+                    .text_color(theme.muted)
+                    .child(col.cards.len().to_string()),
             )
-            .child(style::chip(format!("{}", col.cards.len()), Hue::Neutral, theme))
             // While a card is dragged, what a drop here does (in the header
             // row, so the cards don't shift when the drag starts).
             .children(
@@ -802,9 +816,15 @@ impl IssuesView {
                 .gap_2()
                 .flex_1()
                 .min_h_0()
-                // Room for the cards' rings and focus ring inside the
-                // scroll clip.
-                .p(px(2.0)),
+                // The clip reaches GLOW_ROOM past the column on the sides and
+                // top, so the focus glow shows while the cards keep the
+                // column's width; the bottom padding is the room under the
+                // last card once scrolled to the end.
+                .mx(px(-GLOW_ROOM))
+                .mt(px(-GLOW_ROOM))
+                .px(px(GLOW_ROOM))
+                .pt(px(GLOW_ROOM))
+                .pb_3(),
             &self.column_scrolls[ci],
         )
         .children(cards)
@@ -857,25 +877,22 @@ impl IssuesView {
             )
         });
         let theme = *theme;
+        // No well: the cards sit on the canvas under the heading. A legal
+        // drop target lights up under the pointer.
         div()
             .id(("column-drop", ci))
             .flex()
             .flex_col()
+            .gap_2()
             .flex_none()
             .w(px(COLUMN_WIDTH))
             .h_full()
-            .px_2()
-            .pt_1()
-            .pb_2()
             .rounded_lg()
-            .bg(theme.canvas)
-            .border_1()
-            .border_color(theme.divider)
             .child(header)
             .child(body)
             .when(refused.is_some(), |d| d.opacity(0.35))
             .when(drop.is_some() && refused.is_none(), |d| {
-                d.drag_over::<CardDrag>(move |s, _, _, _| s.bg(theme.background).border_color(theme.focus_ring))
+                d.drag_over::<CardDrag>(move |s, _, _, _| drop_highlight(s, &theme))
             })
             // A refused target still takes the drop, so the state can say why
             // (it sends nothing).
@@ -894,7 +911,6 @@ impl IssuesView {
         ci: usize,
         ri: usize,
         selected: bool,
-        show_wf: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -917,12 +933,12 @@ impl IssuesView {
             .flex()
             .flex_col()
             .flex_none()
-            .gap_1p5()
+            .gap(px(6.0))
             .p_3()
             .overflow_hidden()
             .rounded_lg()
             .bg(theme.card)
-            // The keyboard's card wears the focus ring.
+            // The keyboard's card wears the focus ring and glow.
             .shadow(if selected {
                 style::focus_shadow(theme)
             } else {
@@ -961,6 +977,10 @@ impl IssuesView {
                     .flex_row()
                     .gap_1()
                     .items_start()
+                    // Figma's title box is 254px, 6px wider than the card's
+                    // content: it runs into the right padding, so a title
+                    // wraps where Figma wraps it.
+                    .mr(px(-TITLE_OVERHANG))
                     .when(card.blocked, |d| {
                         d.child(
                             heroicon(icons::LOCK_CLOSED)
@@ -973,14 +993,27 @@ impl IssuesView {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .font_weight(FontWeight::MEDIUM)
+                            .type_style(Type::BaseMedium)
                             .text_color(title_color)
                             .line_clamp(2)
                             .text_ellipsis()
                             .child(card.title.clone()),
                     ),
             )
-            .child(card_meta(card, show_wf, theme))
+            // The body's first paragraph, X-Small on Figma's 18pt leading.
+            .when(!card.summary.is_empty(), |d| {
+                d.child(
+                    div()
+                        .overflow_hidden()
+                        .type_style(Type::XSmall)
+                        .line_height(px(18.0))
+                        .text_color(theme.foreground)
+                        .line_clamp(SUMMARY_LINES)
+                        .text_ellipsis()
+                        .child(card.summary.clone()),
+                )
+            })
+            .child(card_meta(card, theme))
             .when_some(pending, |d, p| {
                 d.child(
                     div()
@@ -1027,11 +1060,13 @@ impl IssuesView {
             })
     }
 
+    /// The key-hint footer along the bottom of the board, the Figma Board
+    /// keyboard shortcuts row, with the status line at its right.
     fn render_footer(&self, theme: &Theme) -> impl IntoElement {
         let km = self.keymaps();
         let h = |a| self.hint(km.kanban.first_chord_for(a));
         let hints = format!(
-            "{}/{} column   {}/{} card   {} open   {}/{} move   {}/{} reorder   drag to move or reorder   s start   a assign   e edit   E editor   n new   {} workflow   f workspace   {} refresh",
+            "{}/{} column   {}/{} card   {} open   {}/{} move   {}/{} reorder   drag to move or reorder   s start   a assign   e edit   E editor   n new",
             h(KanbanAction::NavLeft),
             h(KanbanAction::NavRight),
             h(KanbanAction::NavUp),
@@ -1041,8 +1076,6 @@ impl IssuesView {
             h(KanbanAction::MoveCardRight),
             h(KanbanAction::ReorderUp),
             h(KanbanAction::ReorderDown),
-            h(KanbanAction::CycleWorkflowFilter),
-            h(KanbanAction::Refresh),
         );
         let status = self
             .state
@@ -1052,15 +1085,19 @@ impl IssuesView {
         div()
             .flex()
             .flex_row()
+            .flex_none()
+            .items_center()
             .gap_4()
+            .h(px(FOOTER_H))
             .px_4()
-            .py_1p5()
             .border_t_1()
             .border_color(theme.divider)
             .type_style(Type::XSmall)
             .text_color(theme.muted)
-            .child(div().flex_1().truncate().child(hints))
-            .when_some(status, |d, s| d.child(div().text_color(theme.foreground).child(s)))
+            .child(div().flex_1().min_w_0().whitespace_nowrap().overflow_hidden().child(hints))
+            .when_some(status, |d, s| {
+                d.child(div().flex_none().max_w(relative(0.5)).truncate().text_color(theme.foreground).child(s))
+            })
     }
 
     fn render_dropdown(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1275,8 +1312,12 @@ fn reorder_target(
     }))
 }
 
-/// A card's meta lines: workflow badge + branch, then assignee and deps.
-fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement {
+/// A card's meta lines: the workflow badge and the branch, then its
+/// dependencies when it has any. The badge is on every card, as Figma draws
+/// it, even on a one-workflow board (where the TUI leaves it off, see
+/// `IssuesModel::show_workflow_badges`). The assignee isn't on the card, as
+/// in Figma: the detail and the workspace filter carry it.
+fn card_meta(card: &IssueCard, theme: &Theme) -> impl IntoElement {
     let deps = (!card.depends_on.is_empty()).then(|| {
         let list = card
             .depends_on
@@ -1293,32 +1334,41 @@ fn card_meta(card: &IssueCard, show_wf: bool, theme: &Theme) -> impl IntoElement
         .gap_1()
         .type_style(Type::XSmall)
         .text_color(theme.muted)
-        .when(show_wf || card.branch.is_some(), |d| {
-            d.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .items_center()
-                    .overflow_hidden()
-                    .when(show_wf, |d| {
-                        d.child(style::chip(card.workflow_name.clone(), Hue::Blue, theme))
-                    })
-                    .when_some(card.branch.clone(), |d, b| {
-                        d.child(div().truncate().child(format!("⎇ {b}")))
-                    }),
-            )
-        })
-        .when(card.assignee.is_some() || deps.is_some(), |d| {
-            d.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .when_some(card.assignee.clone(), |d, ws| d.child(format!("@{ws}")))
-                    .when_some(deps, |d, deps| d.child(div().truncate().child(deps))),
-            )
-        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .items_center()
+                .overflow_hidden()
+                .child(workflow_badge(card.workflow_name.clone(), theme))
+                .when_some(card.branch.clone(), |d, b| d.child(div().min_w_0().truncate().child(b))),
+        )
+        .when_some(deps, |d, deps| d.child(div().truncate().child(deps)))
+}
+
+/// Figma's Workflow badge: the workflow's name, X-Small, on
+/// `theme.workflow_badge_bg` with 2px corners.
+fn workflow_badge(name: String, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded(px(2.0))
+        .bg(theme.workflow_badge)
+        .text_color(theme.workflow_badge_text)
+        .child(name)
+}
+
+/// A legal drop target under a dragged card: the overlay fill and the focus
+/// ring's color drawn as a 1px ring outside it (no border, so nothing moves).
+fn drop_highlight(s: gpui::StyleRefinement, theme: &Theme) -> gpui::StyleRefinement {
+    s.bg(theme.background).shadow(vec![gpui::BoxShadow {
+        color: theme.focus_ring,
+        offset: gpui::point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(1.0),
+        inset: false,
+    }])
 }
 
 fn muted_row(theme: &Theme, text: &'static str) -> gpui::Div {

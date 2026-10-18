@@ -129,13 +129,25 @@ mod tests {
                 div()
                     .flex()
                     .flex_col()
+                    .gap_2()
                     .flex_none()
                     .w(px(COL_W))
                     .min_h_0()
                     .child(div().flex_none().h(px(24.0)))
                     .child(
                         column_body(
-                            div().id(("column", ci)).flex().flex_col().flex_1().min_h_0(),
+                            div()
+                                .id(("column", ci))
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h_0()
+                                // The focus glow's room past the column.
+                                .mx(px(-6.0))
+                                .mt(px(-6.0))
+                                .px(px(6.0))
+                                .pt(px(6.0))
+                                .pb_3(),
                             &self.columns[ci],
                         )
                         .children(cards),
@@ -150,7 +162,8 @@ mod tests {
                     .min_h_0()
                     .min_w_0()
                     .gap_3()
-                    .p_3(),
+                    .pt_3()
+                    .px_3(),
                 &self.board,
             )
             .children(columns);

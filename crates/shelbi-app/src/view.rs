@@ -746,6 +746,9 @@ pub struct IssueColumn {
 pub struct IssueCard {
     pub id: String,
     pub title: String,
+    /// The body's first prose paragraph as plain text, the card's excerpt
+    /// ([`crate::board::card_summary`]); empty when the body has none.
+    pub summary: String,
     /// True when a dependency is not yet done (renders the lock badge).
     pub blocked: bool,
     /// The meta-line branch: the task's own branch, or a resolved
@@ -971,6 +974,7 @@ fn card_for(
     IssueCard {
         id: task.id.clone(),
         title: task.title.clone(),
+        summary: board::card_summary(&tf.body),
         blocked: task.is_blocked(by_id),
         branch: board::card_branch(task, rules.workflows, &workflow_name),
         workflow: task.workflow.clone(),

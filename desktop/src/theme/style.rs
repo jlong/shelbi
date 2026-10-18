@@ -17,6 +17,10 @@
 //!   (green tint, `text/green`) and Danger (pink tint) styles, quiet only a
 //!   hover fill;
 //! - quiet icon buttons ([`icon_button`]) 24/32/40px on a hover fill;
+//! - toolbar actions ([`toolbar_button`]) and the icon slot Figma lays a
+//!   button's icon in ([`icon_slot`]);
+//! - a workflow status's glyph ([`status_icon`]) and heading
+//!   ([`status_heading`]: the board's column headers, the task panels);
 //! - controls that open something ([`dropdown`]), segmented controls
 //!   ([`segment_track`], [`segment`]) and the sidebar's search box
 //!   ([`search_box`], with the Hotkey [`keycaps`]);
@@ -34,12 +38,13 @@
 
 use gpui::{
     div, point, prelude::*, px, AnyView, App, BoxShadow, Div, FontWeight, Hsla,
-    SharedString, Stateful, Window,
+    SharedString, Stateful, Svg, Window,
 };
+use shelbi_core::StatusCategory;
 
 use super::motion::fill_layer;
 use super::{hsla, palette, Hue, Theme};
-use crate::assets::{heroicon, icons, Icon};
+use crate::assets::{heroicon, icons, status_glyph, Icon, StatusGlyph};
 
 /// The UI typeface every [`Type`] is set in.
 pub const UI_FAMILY: &str = "Geist";
@@ -468,8 +473,39 @@ pub fn icon_button(
     )
 }
 
-/// A control that opens a menu (the board's filters): the overlay fill, an
-/// icon, the label and a chevron; pressed while `open`.
+/// Figma's Icon slot: `icon` in a box `width` wide, flush right, so a 20px
+/// icon hangs past the slot's left edge and the label after it sits where
+/// Figma puts it (the slot is 14px in an X-Small button, 12px in a Small
+/// one).
+pub fn icon_slot(icon: Icon, width: f32, color: Hsla) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_end()
+        .w(px(width))
+        .child(heroicon(icon).text_color(color))
+}
+
+/// A toolbar action (the board's New issue): the Figma Button at Small,
+/// Default style, 28px tall, with a left icon.
+pub fn toolbar_button(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let fg = button_colors(ButtonKind::Secondary, theme).text;
+    button_base(id, ButtonKind::Secondary, false, theme)
+        .h(px(28.0))
+        .gap(px(4.0))
+        .child(icon_slot(icon, 12.0, fg))
+        .child(label.into())
+}
+
+/// A control that opens a menu (the board's and the feed's filters): the
+/// Figma Button at X-Small with a left icon (24px tall, 8px across, the
+/// overlay fill, X-Small/Medium loud); pressed while `open`.
 pub fn dropdown(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -490,18 +526,56 @@ pub fn dropdown(
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(6.0))
-        .h(px(BUTTON_H))
-        .pl(px(8.0))
-        .pr(px(6.0))
+        .gap(px(4.0))
+        .h(px(24.0))
+        .px(px(8.0))
         .rounded(px(6.0))
         .type_style(Type::XSmallMedium)
         .text_color(theme.text_loud)
         .cursor_pointer();
     fill_layer(d, id, px(6.0), [rest, theme.background_hover, theme.background_active])
-        .child(heroicon(icon).text_color(theme.icon))
+        .child(icon_slot(icon, 14.0, if open { theme.text_loud } else { theme.icon }))
         .child(div().whitespace_nowrap().child(label.into()))
-        .child(heroicon(icons::CHEVRON_DOWN).text_color(if open { theme.text_loud } else { theme.icon }))
+}
+
+/// A workflow status's glyph ([`StatusGlyph`]) in its Figma color: backlog
+/// and to do in the icon gray, in progress in the accent (`icon/select`),
+/// review purple, done green, canceled muted.
+pub fn status_icon(category: StatusCategory, theme: &Theme) -> Svg {
+    let (glyph, color) = match category {
+        StatusCategory::Backlog => (StatusGlyph::Backlog, theme.icon),
+        StatusCategory::Ready => (StatusGlyph::Todo, theme.icon),
+        StatusCategory::Active => (StatusGlyph::InProgress, theme.accent),
+        StatusCategory::Handoff => (StatusGlyph::Review, theme.icon_purple),
+        StatusCategory::Done => (StatusGlyph::Done, theme.icon_green),
+        StatusCategory::Archived => (StatusGlyph::Canceled, theme.muted),
+    };
+    status_glyph(glyph).text_color(color)
+}
+
+/// A status heading, as the board's column headers and the task panels draw
+/// it: the status glyph, then the label in caps at X-Small/Semibold, loud
+/// when `current` (the keyboard's column) and muted otherwise.
+pub fn status_heading(
+    category: StatusCategory,
+    label: impl Into<SharedString>,
+    current: bool,
+    theme: &Theme,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(8.0))
+        .child(status_icon(category, theme))
+        .child(
+            div()
+                .whitespace_nowrap()
+                .type_style(Type::XSmallSemibold)
+                .text_color(if current { theme.text_loud } else { theme.muted })
+                .child(label.into().to_uppercase()),
+        )
 }
 
 /// A segmented control's track: the overlay fill, 2px inside. Its segments
