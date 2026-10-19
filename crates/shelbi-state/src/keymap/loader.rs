@@ -73,6 +73,21 @@ impl<A: Copy + Eq + Hash> Default for ModeKeymap<A> {
 }
 
 impl Keymaps {
+    /// Every chord bound to `action`, in install order, whatever its mode.
+    pub fn chords(&self, action: Action) -> Vec<KeyChord> {
+        fn of<A: Copy + Eq + Hash>(map: &ModeKeymap<A>, a: A) -> Vec<KeyChord> {
+            map.by_action.get(&a).cloned().unwrap_or_default()
+        }
+        match action {
+            Action::Global(a) => of(&self.global, a),
+            Action::Sidebar(a) => of(&self.sidebar, a),
+            Action::Kanban(a) => of(&self.kanban, a),
+            Action::Popover(a) => of(&self.popover, a),
+            Action::Activity(a) => of(&self.activity, a),
+            Action::Palette(a) => of(&self.palette, a),
+        }
+    }
+
     /// Resolve the Zen Mode toggle chord into the legacy four-value
     /// [`ZenToggleChord`] enum used by the sidebar glyph and palette
     /// hint. Prefers the keys.yaml-resolved binding (so once the legacy

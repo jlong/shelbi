@@ -472,3 +472,147 @@ fn the_preview_draws_the_frame_s_session_with_no_session_behind_it(cx: &mut Test
     s.key("x");
     assert_eq!(s.read(|_, cx| preview.read(cx).terminal_text()), text);
 }
+
+// --- the Keybindings page (`dt-settings-keybindings-editor`) ----------------
+
+impl Settings {
+    /// Settings open on its Keybindings page.
+    fn open_keybindings(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("cmd-2");
+        s
+    }
+
+    /// Read the Keybindings page.
+    fn page_read<R>(&self, f: impl FnOnce(&crate::views::keybindings::KeybindingsPage) -> R) -> R {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => f(view.read(cx).keybindings().read(cx)),
+            _ => panic!("Settings is shown"),
+        })
+    }
+
+    /// The window's binding for `chord` in global.
+    fn global(&self, chord: &str) -> Option<GlobalAction> {
+        let chord = shelbi_state::keymap::KeyChord::parse(chord).unwrap();
+        self.read(|w, _| w.keymaps.global.dispatch(chord))
+    }
+}
+
+#[gpui::test]
+fn the_keybindings_page_lists_every_context(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    for selector in [
+        "settings-open-keys",
+        "keybindings-search",
+        "keybindings-context",
+        "keybindings-reset-all",
+        "keybindings-group-global",
+        "keybindings-group-sidebar",
+        "keybindings-group-kanban",
+        "keybindings-group-popover",
+        "keybindings-group-activity",
+        "keybindings-group-palette",
+        "keybinding-global-open_palette-key-0",
+        "keybinding-sidebar-nav_up-key-1",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    // The ↑ keycap leads (the frame's order), K follows.
+    let up = s.bounds("keybinding-sidebar-nav_up-key-1").unwrap();
+    let k = s.bounds("keybinding-sidebar-nav_up-key-0").unwrap();
+    assert!(up.origin.x < k.origin.x);
+    // The hover buttons are out of the resting layout.
+    let row = s.bounds("keybinding-sidebar-nav_up").unwrap();
+    assert!(k.right() <= row.right());
+}
+
+#[gpui::test]
+fn a_rebind_takes_effect_in_the_window_at_once(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    assert_eq!(s.global("ctrl-p"), Some(GlobalAction::OpenPalette));
+    s.click("keybinding-global-open_palette-key-0");
+    assert!(s.page_read(|p| p.state().capture().is_some()));
+    assert!(s.drawn("keybinding-global-open_palette-key-0"), "the keycap waits");
+
+    // ⌘K is the window's palette chord now, ⌃P no longer.
+    s.key("cmd-k");
+    assert!(s.page_read(|p| p.state().capture().is_none()));
+    assert_eq!(s.global("super-k"), Some(GlobalAction::OpenPalette));
+    assert_eq!(s.global("ctrl-p"), None);
+    assert!(s.page_read(|p| p.state().any_customized()), "Reset all is on");
+
+    // Reset all puts ⌃P back.
+    s.click("keybindings-reset-all");
+    assert_eq!(s.global("ctrl-p"), Some(GlobalAction::OpenPalette));
+    assert_eq!(s.global("super-k"), None);
+}
+
+#[gpui::test]
+fn a_capture_takes_the_windows_own_chords_and_esc_only_cancels(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    // Esc ends the capture without leaving Settings.
+    s.click("keybinding-sidebar-nav_up-key-0");
+    s.key("escape");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings));
+    assert!(s.page_read(|p| p.state().capture().is_none()));
+
+    // ⌘1, the General page's chord, is the capture's while it is open.
+    s.click("keybinding-sidebar-nav_up-key-0");
+    s.key("cmd-1");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings));
+    let nav_up = shelbi_state::keymap::Action::Sidebar(SidebarAction::NavUp);
+    let chords: Vec<String> = s.page_read(|p| p.state().chords(nav_up).iter().map(|c| c.canonical()).collect());
+    assert_eq!(chords, ["super-1", "up"]);
+    // Closed again, ⌘1 is the page chord once more.
+    s.key("cmd-1");
+    assert_eq!(s.page(), Some(SettingsPage::General));
+
+    // A capture left open by a click on another page's row ends with it.
+    s.key("cmd-2");
+    s.click("keybinding-sidebar-nav_up-key-0");
+    s.click("settings-nav-terminal");
+    assert!(s.page_read(|p| p.state().capture().is_none()));
+    s.key("cmd-2");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "⌘2 reaches the window");
+}
+
+#[gpui::test]
+fn a_conflict_shows_on_its_row_until_confirmed(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    s.click("keybinding-sidebar-nav_up-key-0");
+    s.key("r");
+    assert!(s.drawn("keybindings-conflict"));
+    s.key("r");
+    assert!(!s.drawn("keybindings-conflict"));
+    let refresh = shelbi_state::keymap::Action::Sidebar(SidebarAction::Refresh);
+    assert!(s.page_read(|p| p.state().chords(refresh).is_empty()), "moved off Refresh");
+    // The window's sidebar has it too.
+    let r = shelbi_state::keymap::KeyChord::parse("r").unwrap();
+    assert_eq!(s.read(|w, _| w.keymaps.sidebar.dispatch(r)), Some(SidebarAction::NavUp));
+}
+
+#[gpui::test]
+fn the_search_and_the_context_picker_narrow_the_list(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    s.click("keybindings-search");
+    for key in ["c", "o", "l", "u", "m", "n"] {
+        s.key(key);
+    }
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "typing stays in the field");
+    assert!(s.drawn("keybinding-kanban-nav_left"));
+    assert!(!s.drawn("keybinding-sidebar-nav_up") && !s.drawn("keybindings-group-global"));
+    // Esc clears the search, then hands the keys back to the sidebar.
+    s.key("escape");
+    assert!(s.drawn("keybinding-sidebar-nav_up"));
+    s.key("escape");
+    assert!(s.window_focused());
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings));
+
+    s.click("keybindings-context");
+    assert!(s.page_read(|p| p.picker_open()));
+    s.click("keybindings-context-activity");
+    assert!(!s.page_read(|p| p.picker_open()));
+    assert!(s.drawn("keybindings-group-activity"));
+    assert!(!s.drawn("keybindings-group-global") && !s.drawn("keybindings-group-sidebar"));
+}

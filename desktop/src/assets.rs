@@ -318,6 +318,7 @@ heroicons! {
     #[allow(dead_code)]
     ARROW_RIGHT = "arrow-right";
     ARROW_PATH = "arrow-path";
+    ARROW_UTURN_LEFT = "arrow-uturn-left";
     ARROW_TOP_RIGHT_ON_SQUARE = "arrow-top-right-on-square";
     /// The drawing `ARROW_UP_RIGHT_BUTTON` widens; no view draws it at 20pt.
     #[allow(dead_code)]

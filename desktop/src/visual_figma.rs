@@ -31,7 +31,8 @@
 //! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
 //! the remote down, its row selected; `machines-idle-selected`,
 //! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
-//! a focused textbox), the board toolbar's (`state-issues-unfiltered`: no
+//! a focused textbox; `state-keybindings-*`: the bindings editor's capture,
+//! conflict, search, picker and customized states), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs).
@@ -971,7 +972,64 @@ impl Run {
             })
             .unwrap();
         self.save(handle, "state-settings-cli-focused");
+        self.keybindings_states();
         self.components();
+    }
+
+    /// The Keybindings page's states no frame draws (`state-keybindings-*`,
+    /// checked by eye): a keycap capturing, a capture adding a chord, a
+    /// conflict held, the search and the context picker, and customized
+    /// bindings (Reset all enabled).
+    fn keybindings_states(&mut self) {
+        use crate::views::keybindings::KeybindingsPage;
+        use crate::views::keybindings_state::Slot;
+        use crate::views::settings_nav::SettingsPage;
+        use gpui::{Context, Entity, Window};
+        use shelbi_state::keymap::{Action, GlobalAction, SidebarAction};
+        type Act = Box<dyn Fn(&mut KeybindingsPage, &mut Window, &mut Context<KeybindingsPage>)>;
+        let nav_up = Action::Sidebar(SidebarAction::NavUp);
+        let states: Vec<(&str, Act)> = vec![
+            ("capture", Box::new(move |p, _, cx| p.offscreen_capture(nav_up, Slot::Chord(0), cx))),
+            (
+                "add",
+                Box::new(|p, _, cx| p.offscreen_capture(Action::Global(GlobalAction::OpenPalette), Slot::New, cx)),
+            ),
+            (
+                "conflict",
+                Box::new(move |p, _, cx| {
+                    p.offscreen_capture(nav_up, Slot::Chord(0), cx);
+                    p.offscreen_key("r", cx);
+                }),
+            ),
+            ("search", Box::new(|p, window, cx| p.offscreen_search("column", window, cx))),
+            ("picker", Box::new(|p, _, cx| p.offscreen_open_picker(cx))),
+            (
+                "customized",
+                Box::new(|p, _, cx| {
+                    p.offscreen_show("defaults:\n  sidebar:\n    nav_up: [w, up]\n    refresh: []\n", cx)
+                }),
+            ),
+        ];
+        for (name, act) in states {
+            let handle = self.open();
+            handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.offscreen_open_settings(SettingsPage::Keybindings, window, cx)
+                })
+                .unwrap();
+            // After the page has read `keys.yaml`, which would replace a
+            // state set before it.
+            self.settle(handle);
+            handle
+                .update(&mut self.cx, |w, window, cx| {
+                    let page: Option<Entity<KeybindingsPage>> = w.offscreen_settings().map(|s| s.read(cx).keybindings());
+                    if let Some(page) = page {
+                        page.update(cx, |p, cx| act(p, window, cx));
+                    }
+                })
+                .unwrap();
+            self.save(handle, &format!("state-keybindings-{name}"));
+        }
     }
 
     /// The form components as the Figma components page draws them, each

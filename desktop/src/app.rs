@@ -1177,21 +1177,25 @@ impl ShelbiWindow {
         cx.spawn(async move |this, cx| {
             let keymaps = read.await;
             this.update(cx, |this, cx| {
-                if !this.shows(&reading) {
-                    return;
+                if this.shows(&reading) {
+                    this.adopt_keymaps(keymaps, cx);
                 }
-                this.palette_chord = palette_chord(&keymaps);
-                this.keymaps = keymaps;
-                if let Some(ws) = this.workspace.clone() {
-                    let chord = this.palette_chord.clone();
-                    ws.update(cx, |ws, cx| ws.set_palette_chord(&chord, cx));
-                }
-                this.sync_menus(cx);
-                cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Take `keymaps` for the window's keys, its hints and the menu bar.
+    fn adopt_keymaps(&mut self, keymaps: Keymaps, cx: &mut Context<Self>) {
+        self.palette_chord = palette_chord(&keymaps);
+        self.keymaps = keymaps;
+        if let Some(ws) = self.workspace.clone() {
+            let chord = self.palette_chord.clone();
+            ws.update(cx, |ws, cx| ws.set_palette_chord(&chord, cx));
+        }
+        self.sync_menus(cx);
+        cx.notify();
     }
 
     /// Run bootstrap (again) and feed its events into this view.
@@ -2921,9 +2925,15 @@ impl ShelbiWindow {
                     view.show_page(page, cx);
                     view
                 });
-                // A saved switch applies to this window's next notice at once.
-                let sub = cx.subscribe(&view, |this, _, event: &SettingsEvent, cx| match event {
+                // A saved switch applies to this window's next notice at once,
+                // and a rebind to its keys and menus.
+                let sub = cx.subscribe_in(&view, window, |this, _, event: &SettingsEvent, window, cx| match event {
                     SettingsEvent::Saved => this.load_notify_prefs(cx),
+                    SettingsEvent::KeysSaved(keymaps) => this.adopt_keymaps((**keymaps).clone(), cx),
+                    SettingsEvent::Leave => {
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }
                 });
                 self._view_subscriptions.push(sub);
                 self.set_route(Route::Settings(view));
