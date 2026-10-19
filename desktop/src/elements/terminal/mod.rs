@@ -78,6 +78,7 @@ pub mod search_bar;
 pub mod session;
 pub mod settings;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -87,9 +88,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    div, prelude::*, px, Bounds, ClipboardItem, Context, EntityInputHandler, ExternalPaths,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton as GpuiMouseButton, Pixels, Point, Role,
-    ScrollDelta, SharedString, Subscription, Task, UTF16Selection, Window,
+    div, prelude::*, px, App, Bounds, ClipboardItem, Context, EntityInputHandler, ExternalPaths,
+    FocusHandle, Focusable, Global, KeyDownEvent, MouseButton as GpuiMouseButton, Pixels, Point,
+    Role, ScrollDelta, SharedString, Subscription, Task, UTF16Selection, Window, WindowId,
 };
 use shelbi_client::SessionEvent;
 use shelbi_term::gesture::{MouseGesture, MouseOutcome};
@@ -117,6 +118,39 @@ use crate::theme::Theme;
 /// so dragging the window edge sends one resize, not one per frame. The
 /// session debounces on its side too.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(60);
+
+/// The windows whose layout is in motion (the sidebar sliding in or out,
+/// `dt-sidebar-toggle-animation`): their terminals are drawn at each frame's
+/// size but hold their PTY resizes, and report the size they land at once,
+/// when the motion settles, instead of one per frame.
+#[derive(Debug, Default)]
+pub struct ResizeHold(HashSet<WindowId>);
+
+impl Global for ResizeHold {}
+
+impl ResizeHold {
+    /// Hold (or release) `window`'s resizes. Cheap when nothing changes.
+    pub fn set(window: WindowId, held: bool, cx: &mut App) {
+        if Self::holds_id(window, cx) == held {
+            return;
+        }
+        let hold = cx.default_global::<Self>();
+        if held {
+            hold.0.insert(window);
+        } else {
+            hold.0.remove(&window);
+        }
+    }
+
+    /// `window`'s layout is in motion.
+    pub fn holds(window: &Window, cx: &App) -> bool {
+        Self::holds_id(window.window_handle().window_id(), cx)
+    }
+
+    fn holds_id(window: WindowId, cx: &App) -> bool {
+        cx.try_global::<Self>().is_some_and(|h| h.0.contains(&window))
+    }
+}
 
 /// Most output bytes fed to the emulator per UI turn before yielding, so a
 /// flood (`yes`) still lets frames paint and input through.
@@ -801,12 +835,14 @@ impl TerminalPane {
         }
     }
 
-    /// Bring the frame's state up to date and report a new viewport size.
-    /// Called from the element's prepaint.
+    /// Bring the frame's state up to date and report a new viewport size
+    /// (kept until the motion ends while the window's layout is `held`,
+    /// [`ResizeHold`]). Called from the element's prepaint.
     pub(crate) fn begin_frame(
         &mut self,
         bounds: Bounds<Pixels>,
         viewer: Size,
+        held: bool,
         cx: &mut Context<Self>,
     ) {
         let placement = self.view.placement(self.session_size, viewer);
@@ -822,7 +858,7 @@ impl TerminalPane {
         if let Damage::Full = self.view.take_damage() {
             self.damage = Damage::Full;
         }
-        self.note_viewer_size(viewer, cx);
+        self.note_viewer_size(viewer, held, cx);
     }
 
     /// The shown rows, rebuilt where damaged, and how many were rebuilt.
@@ -894,13 +930,13 @@ impl TerminalPane {
         self.search.is_some()
     }
 
-    fn note_viewer_size(&mut self, viewer: Size, cx: &mut Context<Self>) {
+    fn note_viewer_size(&mut self, viewer: Size, held: bool, cx: &mut Context<Self>) {
         if self.reported_size == Some(viewer) {
             self.pending_size = None;
             self.resize_task = None;
             return;
         }
-        if self.pending_size == Some(viewer) {
+        if self.pending_size == Some(viewer) && (held || self.resize_task.is_some()) {
             return;
         }
         let Some(io) = self.io.as_ref() else {
@@ -908,6 +944,20 @@ impl TerminalPane {
         };
         if self.reported_size.is_none() {
             io.resize(viewer);
+            self.reported_size = Some(viewer);
+            return;
+        }
+        if held {
+            // The window's layout is in motion: keep the latest size, and
+            // report the one it settles at.
+            self.pending_size = Some(viewer);
+            self.resize_task = None;
+            return;
+        }
+        if self.pending_size.is_some() && self.resize_task.is_none() {
+            // A hold just lifted: the motion is over, report its size now.
+            io.resize(viewer);
+            self.pending_size = None;
             self.reported_size = Some(viewer);
             return;
         }

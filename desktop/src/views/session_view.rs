@@ -1569,6 +1569,41 @@ mod tests {
         }
     }
 
+    /// dt-sidebar-toggle-animation: while the window's layout is in motion
+    /// (the sidebar sliding), the pane is drawn at each frame's size but the
+    /// PTY hears nothing; once the motion settles it is told the size the
+    /// pane landed at, once.
+    #[gpui::test]
+    fn a_held_layout_resizes_the_pty_once_when_it_settles(cx: &mut TestAppContext) {
+        use crate::elements::terminal::ResizeHold;
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, 24))]);
+        h.update(|c, cx| c.show(cx));
+        draw(&mut h);
+        h.advance(Duration::from_millis(500));
+        let pane = pane_of(&mut h);
+        let before = h.session.wire.lock().unwrap().resizes.len();
+        assert!(before > 0, "the first size is reported");
+
+        let id = h.cx.update(|window, _| window.window_handle().window_id());
+        h.cx.update(|_, cx| ResizeHold::set(id, true, cx));
+        for w in [1000.0, 900.0, 820.0, 760.0, 740.0] {
+            h.cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(600.0)));
+            draw(&mut h);
+            h.advance(Duration::from_millis(100));
+        }
+        assert_eq!(h.session.wire.lock().unwrap().resizes.len(), before, "nothing while it moves");
+
+        h.cx.update(|_, cx| ResizeHold::set(id, false, cx));
+        draw(&mut h);
+        let (_, viewer, _, _) = pane.read_with(&h.cx, |p, _| p.last_frame()).expect("drawn");
+        let resizes = h.session.wire.lock().unwrap().resizes.clone();
+        assert_eq!(resizes.len(), before + 1, "one resize as it settles, with no debounce");
+        assert_eq!(resizes.last(), Some(&viewer), "the size it landed at");
+        h.advance(Duration::from_millis(500));
+        draw(&mut h);
+        assert_eq!(h.session.wire.lock().unwrap().resizes.len(), before + 1, "and no more");
+    }
+
     /// Taking focus claims the session's size (the PTY then follows this pane
     /// even if another client typed last); typing does too, on the session's
     /// side.

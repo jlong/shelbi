@@ -152,6 +152,7 @@ impl Element for TerminalElement {
         let theme = cx.global::<Theme>().terminal;
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
+        let held = super::ResizeHold::holds(window, cx);
         // Geometry and damage: the only mutation of the pane in a frame.
         let (metrics, rows, rows_rebuilt, palette) = self.pane.update(cx, |pane, cx| {
             let (family, size) = (pane.settings.font_family.clone(), pane.settings.font_size);
@@ -160,7 +161,7 @@ impl Element for TerminalElement {
                 .get_or_insert_with(|| CellMetrics::cached(window, &family, size))
                 .clone();
             let viewer = metrics.grid_size(bounds.size);
-            pane.begin_frame(bounds, viewer, cx);
+            pane.begin_frame(bounds, viewer, held, cx);
             let placement = pane
                 .geometry
                 .as_ref()

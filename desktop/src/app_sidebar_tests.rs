@@ -148,6 +148,8 @@ fn the_titlebar_buttons_search_and_toggle_the_sidebar(cx: &mut TestAppContext) {
         cx.notify();
     });
 
+    // Instant here: the slide itself is `app_column_tests`'s.
+    h.window.update(&mut h.cx, |w, _| w.reduce_motion = std::rc::Rc::new(|| true));
     h.click_selector("sidebar-collapse");
     h.draw();
     assert!(h.window.read_with(&h.cx, |w, _| w.collapsed));

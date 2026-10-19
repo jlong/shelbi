@@ -109,7 +109,7 @@ use shelbi_state::keymap::{
 use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::feeds::{FeedHub, FeedSubscription};
-use crate::elements::terminal::TerminalSettings;
+use crate::elements::terminal::{ResizeHold, TerminalSettings};
 use crate::keys::{
     chord_from_keystroke, font_zoom, is_new_window, nav_chord, overlay_chord, paste_chords, NavChord,
 };
@@ -122,6 +122,7 @@ use crate::theme::style::{self, IconButtonSize};
 use crate::theme::{self, Hue, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::column_swap::{self, ColumnSwap, Layer, Motion, Occupant};
+use crate::views::sidebar_reveal::{self, SidebarReveal};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
@@ -602,6 +603,10 @@ pub struct ShelbiWindow {
     model: SidebarModel,
     link: Option<DaemonLink>,
     collapsed: bool,
+    /// The sidebar's hide and show, following `collapsed` on a toggle
+    /// (`dt-sidebar-toggle-animation`); any other change to `collapsed`
+    /// lands at once.
+    reveal: SidebarReveal,
     dragging: bool,
     /// The project switcher's menu.
     switcher: sidebar::Switcher,
@@ -844,6 +849,7 @@ impl ShelbiWindow {
             model,
             link: None,
             collapsed: window_state.sidebar_collapsed,
+            reveal: SidebarReveal::new(!window_state.sidebar_collapsed),
             dragging: false,
             switcher: sidebar::Switcher::default(),
             overlay_opened: None,
@@ -2982,6 +2988,7 @@ impl ShelbiWindow {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.collapsed = !self.collapsed;
+        self.reveal.set(!self.collapsed, (self.clock)(), (self.reduce_motion)());
         if self.collapsed {
             self.client.focus_main();
         }
@@ -3759,10 +3766,10 @@ impl ShelbiWindow {
 
     // --- rendering ---------------------------------------------------------
 
-    /// The main area. `column_shown`: the leading column is up (the sidebar,
-    /// or the review panel in its place); without it the main area offers
-    /// the button that expands the sidebar.
-    fn render_main(&self, theme: &Theme, column_shown: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The main area. `titlebar`: how far its titlebar row is open (the
+    /// sidebar hidden or going, no panel holding the column), with the
+    /// button that shows the sidebar.
+    fn render_main(&self, theme: &Theme, titlebar: MainTitlebar, cx: &mut Context<Self>) -> impl IntoElement {
         let detail_over = self
             .detail_over
             .as_ref()
@@ -3823,20 +3830,10 @@ impl ShelbiWindow {
             .overflow_hidden()
             .h_full()
             .bg(theme.canvas)
-            .when(!column_shown, |main| {
-                main.child(
-                    // Beside the traffic lights, centered on them.
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .h(px(sidebar::TITLEBAR_H))
-                        .pl(px(sidebar::TRAFFIC_LIGHTS_RIGHT + 8.0))
-                        .child(
-                            style::icon_button("expand-sidebar", icons::SIDEBAR, IconButtonSize::Default, false, theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                        ),
-                )
+            // The collapsed sidebar's titlebar row, room for the traffic
+            // lights (opening as the sidebar slides out).
+            .when(titlebar.open > 0.0, |main| {
+                main.child(div().flex_none().h(px(sidebar::TITLEBAR_H * titlebar.open)))
             })
             .when_some(self.model.session_lost.clone(), |main, lost| {
                 main.child(notice(lost.into(), Hue::Red))
@@ -3868,10 +3865,36 @@ impl ShelbiWindow {
                 )
             })
             .child(body)
+            // Show the sidebar: beside the traffic lights and centered on
+            // them, put in the window rather than the row, so it stays put
+            // while the main area's edge slides past it, and fading in.
+            .when(titlebar.open > 0.0, |main| {
+                let size = IconButtonSize::Default.px();
+                main.child(
+                    div()
+                        .absolute()
+                        .top(px((sidebar::TITLEBAR_H - size) / 2.0))
+                        .left(px(sidebar::TRAFFIC_LIGHTS_RIGHT + 8.0 - titlebar.left))
+                        .opacity(titlebar.open)
+                        .child(
+                            style::icon_button("expand-sidebar", icons::SIDEBAR, IconButtonSize::Default, false, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        ),
+                )
+            })
             // The task detail over the Review or Workspace screen: the board
             // draws it, sized to the main area as it is over the board.
             .when_some(detail_over, |main, issues| main.relative().child(issues))
     }
+}
+
+/// The main area's titlebar row while the sidebar is hidden (or going).
+#[derive(Debug, Clone, Copy)]
+struct MainTitlebar {
+    /// How much of the row is open, 0 to 1.
+    open: f32,
+    /// The main area's left edge in the window.
+    left: f32,
 }
 
 /// Whether `view` is the orchestrator chat.
@@ -4107,15 +4130,30 @@ impl ShelbiWindow {
         } else if self.column.target() == Occupant::Sidebar {
             self.collapsed_panel_cols = None;
         }
-        let column = column_swap::column(
-            &frame,
-            self.collapsed,
-            self.client.sidebar_width(),
-            self.collapsed_panel_cols,
-        );
-        let column_shown = column.is_some();
-        let column = column.map(|c| {
-            let width = sidebar::width_px(c.width_cols, window_width);
+        // The sidebar's hide or show: the column at its width for this frame,
+        // whatever it holds laid out at its full width and slid left (clipped,
+        // never reflowed), the main area following its edge. The window's
+        // terminals hold their resizes until it settles.
+        if self.reveal.shown() == self.collapsed {
+            // `collapsed` changed other than by a toggle: no motion.
+            self.reveal = SidebarReveal::new(!self.collapsed);
+        }
+        self.reveal.pace(now);
+        let reveal = self.reveal.frame(now);
+        if reveal.animating {
+            window.request_animation_frame();
+        }
+        ResizeHold::set(window.window_handle().window_id(), reveal.animating, cx);
+        let column_px = |collapsed: bool| {
+            column_swap::column(&frame, collapsed, self.client.sidebar_width(), self.collapsed_panel_cols)
+                .map(|c| sidebar::width_px(c.width_cols, window_width))
+        };
+        let placement = column_px(false).and_then(|shown_px| {
+            sidebar_reveal::place(shown_px, column_px(true), reveal.position, self.reveal.shown())
+        });
+        let column_shown = placement.is_some();
+        let column = placement.map(|place| {
+            let width = place.content;
             let layer = |selector: &'static str, l: Layer| {
                 div()
                     .id(selector)
@@ -4127,7 +4165,7 @@ impl ShelbiWindow {
                     .w(px(width))
                     .opacity(l.opacity)
             };
-            let sidebar = c.sidebar.map(|l| {
+            let sidebar = frame.sidebar.filter(|_| reveal.position > 0.0).map(|l| {
                 layer("column-sidebar", l).child(sidebar::render(
                     SidebarProps {
                         model: &self.model,
@@ -4155,7 +4193,7 @@ impl ShelbiWindow {
                 ))
             });
             // A task panel keeps the sidebar's titlebar and footer around it.
-            let review = c.review.zip(self.review.clone()).map(|(l, review)| {
+            let review = frame.review.zip(self.review.clone()).map(|(l, review)| {
                 layer("column-review", l).child(sidebar::render_panel_column(
                     review,
                     &self.model,
@@ -4165,7 +4203,7 @@ impl ShelbiWindow {
                     cx,
                 ))
             });
-            let workspace = c.workspace.zip(self.workspace.clone()).map(|(l, ws)| {
+            let workspace = frame.workspace.zip(self.workspace.clone()).map(|(l, ws)| {
                 layer("column-workspace", l).child(sidebar::render_panel_column(
                     ws,
                     &self.model,
@@ -4175,7 +4213,8 @@ impl ShelbiWindow {
                     cx,
                 ))
             });
-            let settings = c.settings.map(|l| {
+            // The settings sidebar is a sidebar: it hides with the app's.
+            let settings = frame.settings.filter(|_| reveal.position > 0.0).map(|l| {
                 layer("column-settings", l).child(settings_nav::render(
                     self.settings_nav,
                     settings_chip.flatten(),
@@ -4190,14 +4229,22 @@ impl ShelbiWindow {
                 .debug_selector(|| "leading-column".into())
                 .relative()
                 .flex_none()
-                .w(px(width))
+                .w(px(place.visible))
                 .h_full()
                 .overflow_hidden()
                 .bg(theme.sidebar)
-                .children(sidebar)
-                .children(review)
-                .children(workspace)
-                .children(settings)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(place.offset))
+                        .w(px(width))
+                        .children(sidebar)
+                        .children(review)
+                        .children(workspace)
+                        .children(settings),
+                )
         });
         let divider_color = if self.dragging {
             theme.icon
@@ -4208,6 +4255,12 @@ impl ShelbiWindow {
         // starts at x 281); every other frame puts the main area right
         // after the column at x 280, the fill change the only edge.
         let rule = self.column.target() == Occupant::Review;
+        // The collapsed main area's titlebar row opens as the sidebar leaves,
+        // its Show button fixed beside the traffic lights.
+        let titlebar = MainTitlebar {
+            open: placement.map_or(1.0, |p| p.titlebar),
+            left: placement.map_or(0.0, |p| p.visible + if rule { 1.0 } else { 0.0 }),
+        };
         let handle = column_shown.then(|| {
             // The column's right edge: the rule (in the layout, when shown)
             // or nothing, with the grab room laid over the column's edge.
@@ -4280,7 +4333,7 @@ impl ShelbiWindow {
             let chooser = self.render_chooser(&theme, cx);
             shell.child(chooser)
         } else {
-            let main = self.render_main(&theme, column_shown, cx);
+            let main = self.render_main(&theme, titlebar, cx);
             shell.children(column).children(handle).child(main)
         };
 
@@ -4489,6 +4542,11 @@ impl ShelbiWindow {
     /// What the leading column draws now.
     pub(crate) fn offscreen_column(&mut self) -> column_swap::Frame {
         self.column.frame((self.clock)())
+    }
+
+    /// Where the sidebar's hide or show stands now.
+    pub(crate) fn offscreen_reveal(&mut self) -> sidebar_reveal::RevealFrame {
+        self.reveal.frame((self.clock)())
     }
 
     /// `--bench-push`'s window: [`Self::offscreen`]'s, on the real clock,

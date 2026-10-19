@@ -400,6 +400,41 @@ impl Run {
         self.expect("Back gives the column back to the sidebar", column == (true, false));
         self.save("review-back.png");
 
+        // Toggle sidebar: it slides out at its full width, clipped, the main
+        // area following its edge, then back in.
+        use crate::views::sidebar_reveal::REVEAL;
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_toggle_sidebar(cx)).unwrap();
+        self.settle();
+        self.advance(Duration::from_millis(30));
+        let at = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_reveal()).unwrap();
+        self.expect("hiding, the sidebar is part way out", at.animating && at.position > 0.0 && at.position < 1.0);
+        self.save("sidebar-hide-mid.png");
+        self.advance(REVEAL);
+        let at = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_reveal()).unwrap();
+        self.expect("hidden, the sidebar has settled", !at.animating && at.position == 0.0);
+        self.save("sidebar-hidden.png");
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_toggle_sidebar(cx)).unwrap();
+        self.settle();
+        self.advance(Duration::from_millis(30));
+        self.save("sidebar-show-mid.png");
+        // Turned around mid-way: it heads back out from where it stands.
+        let before = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_reveal()).unwrap();
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_toggle_sidebar(cx)).unwrap();
+        self.advance(Duration::from_millis(10));
+        let after = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_reveal()).unwrap();
+        self.expect(
+            "a second toggle mid-way turns it around",
+            after.animating && after.position < before.position && after.position > 0.0,
+        );
+        self.save("sidebar-reverse-mid.png");
+        self.advance(REVEAL);
+        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_toggle_sidebar(cx)).unwrap();
+        self.settle();
+        self.advance(REVEAL);
+        let at = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_reveal()).unwrap();
+        self.expect("shown again, the sidebar has settled", !at.animating && at.position == 1.0);
+        self.save("sidebar-shown.png");
+
         // The overlays over the shell.
         use crate::views::overlay::ActiveOverlay;
         use shelbi_app::overlay::error_log::Viewer;
