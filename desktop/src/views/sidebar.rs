@@ -1303,12 +1303,8 @@ fn render_footer<H: SidebarHost>(
         .clone()
         .filter(|_| model.daemon_version_mismatch)
         .map(|line| div().text_color(theme.error).child(line));
-    let banner = model.board_banner.clone().map(|banner| {
-        let stale = banner.contains("stale") || banner.contains("no daemon");
-        div()
-            .text_color(if stale { theme.warning } else { theme.muted })
-            .child(banner)
-    });
+    let banner = board_warning(model.board_banner.clone())
+        .map(|banner| div().text_color(theme.warning).child(banner));
     let polling = (link == Some(DaemonLink::Polling)).then(|| {
         div()
             .debug_selector(|| "sidebar-polling".into())
@@ -1448,6 +1444,16 @@ fn render_zen_pill<H: SidebarHost>(
 /// ([`SidebarModel::footer_status`]): the orchestrator supervisor's failure in
 /// red while there is one, else the status line in yellow. `None` hides the
 /// row.
+/// The shared board banner, kept only when the board needs a look: a stale
+/// index (`board 4m stale · quota resets 16:03`) or a cache read with no
+/// daemon (`board 4m cached · no daemon`). A warm board's banner is just its
+/// age (`board 12s`), a refresh timer the desktop doesn't show; the TUI's
+/// footer still does. The feed applies this too (`refresh::sidebar_reader`),
+/// so the ticking age never changes the model and repaints an idle window.
+pub fn board_warning(banner: Option<String>) -> Option<String> {
+    banner.filter(|b| b.contains("stale") || b.contains("no daemon"))
+}
+
 fn footer_status(model: &SidebarModel, theme: &Theme) -> Option<(String, Hsla)> {
     let line = model.footer_status();
     if line.is_empty() {
@@ -1982,6 +1988,43 @@ mod render_tests {
         model.daemon_version_mismatch = true;
         let (_, mut cx) = open(cx, model, 0, None);
         assert!(cx.debug_bounds("sidebar-version").is_some());
+    }
+
+    #[test]
+    fn board_warning_drops_the_warm_age_and_keeps_the_warnings() {
+        use shelbi_state::{BoardFreshness, BoardSource, ReadPath};
+        let freshness = |source, stale| BoardFreshness {
+            source,
+            stale,
+            age_secs: Some(240),
+            remaining: None,
+            reset: None,
+            read_path: ReadPath::Unknown,
+        };
+        let warning = |f: BoardFreshness| board_warning(f.banner());
+        assert_eq!(warning(freshness(BoardSource::Index, false)), None, "warm: a timer");
+        assert_eq!(warning(freshness(BoardSource::Local, false)), None);
+        assert_eq!(
+            warning(freshness(BoardSource::Index, true)).as_deref(),
+            Some("board 4m stale")
+        );
+        assert_eq!(
+            warning(freshness(BoardSource::CacheFallback, false)).as_deref(),
+            Some("board 4m cached · no daemon")
+        );
+    }
+
+    #[gpui::test]
+    fn the_footer_shows_a_stale_board_but_not_a_warm_one(app: &mut TestAppContext) {
+        let mut warm = fixture_model();
+        warm.board_banner = Some("board 12s".into());
+        let (_, mut cx) = open(app, warm, 0, None);
+        assert!(cx.debug_bounds("sidebar-version").is_none(), "no refresh timer");
+
+        let mut stale = fixture_model();
+        stale.board_banner = Some("board 4m stale · quota resets 16:03".into());
+        let (_, mut cx) = open(app, stale, 0, None);
+        assert!(cx.debug_bounds("sidebar-version").is_some(), "the stale board shows");
     }
 
     #[gpui::test]
