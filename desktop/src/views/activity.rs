@@ -1,0 +1,752 @@
+//! The Activity feed, rendered from the shared feed model
+//! (`shelbi_app::activity`): the same rows and order as the TUI's Activity
+//! view (`crates/shelbi-tui/src/activity.rs`), laid out natively after the
+//! Figma Activity frame and worded by the desktop's labels
+//! (`activity_labels.rs`: actor colors, current-status tags, "available"
+//! and the daemon's "started").
+//!
+//! The view is a thin gpui shell over [`ActivityState`] (`activity_state.rs`).
+//! Its data comes from the shared activity reader on its own background
+//! refresher (`shelbi_app::spawn_worker` over
+//! `shelbi_app::activity::read_activity_window`), re-read on the TUI's 750ms
+//! cadence so new events appear live. The read is windowed: it parses only the
+//! newest lines of `events.log`, and "Load older" re-reads with a window one
+//! page larger. Task titles resolve incrementally into a cache the refresher
+//! keeps across reads, never on the UI thread.
+//!
+//! Clicking (or Enter on) a row opens what it is about: a task row asks the
+//! window to open the task's detail ([`ActivityEvent::OpenTask`]); a workspace
+//! row runs `CommandKind::FocusWorkspace` through the window's dispatch.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use gpui::{
+    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle,
+    HighlightStyle, Hsla, KeyDownEvent, Pixels, ScrollHandle, SharedString, StyledText, Task,
+    Window,
+};
+use shelbi_app::activity::{
+    read_activity_window, ActivityData, ActivityKind, ActivityMetaCache, FeedItem, RowTarget,
+};
+use shelbi_app::theme::Tone;
+use shelbi_app::CommandKind;
+use shelbi_state::keymap::{ActivityAction, DisplayStyle};
+
+use super::activity_labels::{Actor, Line};
+use super::activity_state::{ActivityState, Intent, Picker, ProjectInfo};
+use crate::assets::{heroicon, icons, ICON_SIZE};
+use crate::keys::chord_from_keystroke;
+use crate::theme::motion::{self, SharedTrack, SlideTrack};
+use crate::theme::style::{self, ButtonKind};
+use crate::theme::Theme;
+use crate::theme::style::{Type, Typography};
+
+/// The TUI's activity refresh cadence.
+const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+/// How often the view drains its refresher.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The clock the feed's relative times and day groups read: the wall clock,
+/// or the time `--visual-figma` pinned so its frames read as the mockups do.
+fn now() -> DateTime<Utc> {
+    #[cfg(feature = "visual-check")]
+    if let Some(at) = PINNED_NOW.get() {
+        return *at;
+    }
+    Utc::now()
+}
+
+#[cfg(feature = "visual-check")]
+static PINNED_NOW: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+
+/// Pin [`now`] for the rest of the process (`--visual-figma`).
+#[cfg(feature = "visual-check")]
+pub fn pin_clock(at: DateTime<Utc>) {
+    let _ = PINNED_NOW.set(at);
+}
+/// The actor column's width, so messages line up across rows (the TUI's
+/// 9-cell chip column). A wider actor pushes only its own row over.
+const ACTOR_WIDTH: f32 = 84.0;
+
+/// What the feed asks of the window.
+#[derive(Debug, Clone)]
+pub enum ActivityEvent {
+    /// Show the task's detail (on the Issues board).
+    OpenTask(String),
+    /// Run this registry command through `commands::dispatch_command`.
+    Command(CommandKind),
+}
+
+pub struct ActivityView {
+    /// The pickers' controls, measured so their menus open under them.
+    project_anchor: style::Anchor,
+    workspace_anchor: style::Anchor,
+    /// The kind filter's segments, measured for the selected one's slide.
+    kind_track: SharedTrack,
+    state: ActivityState,
+    focus: FocusHandle,
+    needs_focus: bool,
+    /// Each read is the log's window and the project's config beside it.
+    refresher: shelbi_app::Refresher<(ActivityData, ProjectInfo)>,
+    /// The line window the refresher reads with; "load older" grows it.
+    window: Arc<AtomicUsize>,
+    last_refresh: Instant,
+    scroll: ScrollHandle,
+    display_style: DisplayStyle,
+    _poll: Task<()>,
+}
+
+impl EventEmitter<ActivityEvent> for ActivityView {}
+
+impl ActivityView {
+    pub fn new(project: String, cx: &mut Context<Self>) -> Self {
+        let (keymaps, diagnostics) = shelbi_state::keymap::load_keymaps(Some(&project));
+        for d in diagnostics {
+            tracing::warn!("keys.yaml: {d:?}");
+        }
+        let state = ActivityState::new(project.clone(), keymaps);
+        let window = Arc::new(AtomicUsize::new(state.window()));
+        // The title cache lives as long as the view, so each read only
+        // resolves ids it hasn't seen (the TUI shell's incremental rule).
+        let cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
+        let (p, w) = (project.clone(), window.clone());
+        let refresher = shelbi_app::spawn_worker(move |_| {
+            let data = read_activity_window(&p, &cache, w.load(Ordering::Acquire));
+            (data, ProjectInfo::read(&p))
+        });
+        refresher.request();
+        let poll = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(POLL_INTERVAL).await;
+            if this.update(cx, |view, cx| view.tick(cx)).is_err() {
+                break;
+            }
+        });
+        ActivityView {
+            state,
+            focus: cx.focus_handle(),
+            needs_focus: true,
+            refresher,
+            window,
+            kind_track: SlideTrack::shared(),
+            project_anchor: Default::default(),
+            workspace_anchor: Default::default(),
+            last_refresh: Instant::now(),
+            scroll: ScrollHandle::new(),
+            display_style: DisplayStyle::detect(),
+            _poll: poll,
+        }
+    }
+
+    /// The window is dropping this view (a project switch): stop its
+    /// background reads without waiting on one in flight, so the UI thread
+    /// never joins a slow read.
+    pub fn stop_workers(&mut self) {
+        self.refresher.stop_without_waiting();
+    }
+
+    /// Take keyboard focus on the next frame (the window calls this when the
+    /// view is shown).
+    pub fn request_focus(&mut self) {
+        self.needs_focus = true;
+    }
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        if let Some((data, info)) = self.refresher.latest() {
+            self.state.set_project_info(info);
+            self.state.apply(data, now());
+            cx.notify();
+        }
+        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+            self.refresh();
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.refresher.request();
+        self.last_refresh = Instant::now();
+    }
+
+    fn apply_intents(&mut self, intents: Vec<Intent>, cx: &mut Context<Self>) {
+        for intent in intents {
+            match intent {
+                Intent::Open(RowTarget::Task(id)) => cx.emit(ActivityEvent::OpenTask(id)),
+                Intent::Open(RowTarget::Workspace(workspace)) => {
+                    cx.emit(ActivityEvent::Command(CommandKind::FocusWorkspace { workspace }))
+                }
+                Intent::Refresh => self.refresh(),
+                Intent::LoadWindow(lines) => {
+                    self.window.store(lines, Ordering::Release);
+                    self.refresh();
+                }
+                Intent::Reveal(ix) => self.scroll.scroll_to_item(ix),
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chord) = chord_from_keystroke(&ev.keystroke) else {
+            return;
+        };
+        let Some(intents) = self.state.handle_key(chord, now()) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.apply_intents(intents, cx);
+    }
+
+    fn load_older(&mut self, cx: &mut Context<Self>) {
+        if let Some(intent) = self.state.load_older() {
+            self.apply_intents(vec![intent], cx);
+        }
+    }
+
+    /// Drain the background sources now (the offscreen check's dispatcher
+    /// doesn't run the poll timer).
+    #[cfg(feature = "visual-check")]
+    pub fn poll(&mut self, cx: &mut Context<Self>) {
+        self.tick(cx);
+    }
+
+    /// The view's state, for the offscreen views check.
+    #[cfg(feature = "visual-check")]
+    pub fn state(&self) -> &ActivityState {
+        &self.state
+    }
+
+    #[cfg(feature = "visual-check")]
+    pub fn state_mut(&mut self) -> &mut ActivityState {
+        &mut self.state
+    }
+
+    // ---- rendering --------------------------------------------------------
+
+    fn render_header(
+        &self,
+        chip: Option<Bounds<Pixels>>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let filter = &self.state.filter;
+        // The kind filter: "All" or any set of kinds. While one segment is
+        // selected alone, its chip slides to the next one picked.
+        let track = &self.kind_track;
+        let segment = |id: &'static str, label: &'static str, active: bool| {
+            style::filter_segment(id, label, active, chip.is_none(), theme)
+                .child(motion::probe(track, id))
+        };
+        let mut kinds = style::filter_track()
+            .debug_selector(|| "activity-kinds".into())
+            .child(motion::origin_probe(track))
+            .children(chip.map(|b| motion::floating_chip(b, |d| style::segment_chip(d, theme))))
+            .child(segment("kind-all", "All", filter.is_all()).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.state.clear_kinds(now());
+                    cx.notify();
+                },
+            )));
+        for kind in ActivityKind::ALL {
+            let id = kind_id(kind);
+            kinds = kinds.child(segment(id, kind.label(), filter.has_kind(kind)).on_click(
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.state.toggle_kind(kind, now());
+                    cx.notify();
+                }),
+            ));
+        }
+        let project_label = filter
+            .project
+            .clone()
+            .unwrap_or_else(|| "All projects".to_string());
+        let workspace_label = filter
+            .workspace
+            .clone()
+            .unwrap_or_else(|| "All workspaces".to_string());
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.divider)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .type_style(Type::BaseMedium)
+                            .text_color(theme.text_loud)
+                            .child("Activity"),
+                    )
+                    .child(
+                        div()
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
+                            .child(self.state.title().to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(kinds)
+                    // The frame's filter gap: 16pt from the kinds to the
+                    // pickers, 4pt between them.
+                    .child(div().w(px(8.0)).flex_none())
+                    .child(
+                        style::filter_dropdown(
+                            "project-picker",
+                            icons::FUNNEL_SMALL,
+                            project_label,
+                            self.state.picker == Some(Picker::Project),
+                            theme,
+                        )
+                        .child(style::anchor_probe(&self.project_anchor))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.state.toggle_picker(Picker::Project);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        style::filter_dropdown(
+                            "workspace-picker",
+                            icons::USER_SMALL,
+                            workspace_label,
+                            self.state.picker == Some(Picker::Workspace),
+                            theme,
+                        )
+                        .child(style::anchor_probe(&self.workspace_anchor))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.state.toggle_picker(Picker::Workspace);
+                            cx.notify();
+                        })),
+                    ),
+            )
+    }
+
+    fn render_feed(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let feed = self.state.feed();
+        let placeholder = |text: SharedString| {
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted)
+                .child(text)
+                .into_any_element()
+        };
+        if !self.state.is_loaded() {
+            return placeholder("Loading…".into());
+        }
+        if let Some(empty) = feed.empty {
+            // A filter can hide every loaded row while older ones may match.
+            if !(self.state.has_older() && !self.state.filter.is_unfiltered()) {
+                // Filtered to nothing: the way back is clearing the filters.
+                let clear = (!self.state.filter.is_unfiltered()).then(|| {
+                    style::button("activity-clear-filters", "Clear filters", ButtonKind::Secondary, false, theme)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            let now = now();
+                            this.state.clear_kinds(now);
+                            this.state.set_project(None, now);
+                            this.state.set_workspace(None, now);
+                            cx.notify();
+                        }))
+                });
+                return style::empty_state("activity-empty", empty, clear, theme).into_any_element();
+            }
+        }
+        let mut list = div()
+            .id("activity-feed")
+            .debug_selector(|| "activity-feed".into())
+            .track_scroll(&self.scroll)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_4();
+        for (ix, item) in feed.items.iter().enumerate() {
+            list = list.child(match item {
+                FeedItem::Day(label) => day_header(theme, label).into_any_element(),
+                FeedItem::Row(row) => {
+                    let selected = self.state.selected == Some(ix);
+                    feed_row(theme, &self.state.line(row), selected)
+                        .id(("activity-row", ix))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            let intents = this.state.click(ix);
+                            this.apply_intents(intents, cx);
+                        }))
+                        .into_any_element()
+                }
+            });
+        }
+        if let Some(empty) = feed.empty {
+            list = list.child(
+                div()
+                    .py_4()
+                    .text_color(theme.muted)
+                    .child(empty),
+            );
+        }
+        list.child(self.render_paging(theme, cx)).into_any_element()
+    }
+
+    fn render_paging(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let loaded = format!("{} events loaded", self.state.loaded_events());
+        // "Start of the log   8 events loaded": the frame's three spaces.
+        let row = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(10.0))
+            .py_4()
+            .type_style(Type::XSmall)
+            .text_color(theme.muted);
+        if self.state.is_loading_older() {
+            row.child("Loading older events…").child(loaded)
+        } else if self.state.has_older() {
+            row.child(
+                style::icon_label_button("load-older", icons::ARROW_PATH, "Load older", ButtonKind::Secondary, theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.load_older(cx))),
+            )
+            .child(loaded)
+        } else {
+            row.child("Start of the log").child(loaded)
+        }
+    }
+
+    fn render_footer(&self, theme: &Theme) -> impl IntoElement {
+        let km = self.state.keymaps();
+        let h = |a| {
+            km.activity
+                .first_chord_for(a)
+                .map_or_else(|| "–".to_string(), |c| crate::keys::chord_text(c, self.display_style))
+        };
+        let hints = format!(
+            "{}/{} select   enter open   {}/{} page   {} top   {} bottom   {} refresh   {}/{}/{} filter",
+            h(ActivityAction::ScrollDown),
+            h(ActivityAction::ScrollUp),
+            h(ActivityAction::PageUp),
+            h(ActivityAction::PageDown),
+            h(ActivityAction::ScrollHome),
+            h(ActivityAction::ScrollEnd),
+            h(ActivityAction::Refresh),
+            h(ActivityAction::ResetFilter),
+            h(ActivityAction::ToggleZenFilter),
+            h(ActivityAction::ToggleWorkspacesFilter),
+        );
+        div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            // The frame's 1px divider sits above the 26pt shortcuts bar,
+            // not inside it.
+            .h(px(27.0))
+            .px_4()
+            .border_t_1()
+            .border_color(theme.divider)
+            .type_style(Type::XSmall)
+            .text_color(theme.muted)
+            .child(div().flex_1().truncate().child(hints))
+            .when_some(self.state.status().map(str::to_string), |d, s| {
+                d.child(div().text_color(theme.red).child(s))
+            })
+    }
+
+    fn render_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let picker = self.state.picker?;
+        let (title, all_label, current, options, anchor) = match picker {
+            Picker::Project => (
+                "Project",
+                "All projects",
+                self.state.filter.project.clone(),
+                self.state.projects().to_vec(),
+                &self.project_anchor,
+            ),
+            Picker::Workspace => (
+                "Workspace",
+                "All workspaces",
+                self.state.filter.workspace.clone(),
+                self.state.workspaces().to_vec(),
+                &self.workspace_anchor,
+            ),
+        };
+        let choice = move |this: &mut Self, value: Option<String>| match picker {
+            Picker::Project => this.state.set_project(value, now()),
+            Picker::Workspace => this.state.set_workspace(value, now()),
+        };
+        let mut rows = vec![(all_label.to_string(), None)];
+        rows.extend(options.into_iter().map(|o| (o.clone(), Some(o))));
+        let items: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (label, value))| {
+                let selected = value == current;
+                picker_row(theme, selected, label)
+                    .id(("picker-option", ix))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        choice(this, value.clone());
+                        cx.notify();
+                    }))
+            })
+            .collect();
+        // A menu dims nothing.
+        let dim: Hsla = gpui::transparent_black();
+        Some(
+            div()
+                .id("picker-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(dim)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.state.picker = None;
+                    cx.notify();
+                }))
+                .child(style::below(
+                    anchor,
+                    gpui::point(px(16.0), px(84.0)),
+                    style::menu_entrance(
+                        "picker-menu",
+                        super::issues::panel(theme)
+                        .id("picker-panel")
+                        .debug_selector(|| "picker-panel".into())
+                        .w(px(260.0))
+                        .max_h(px(360.0))
+                        .overflow_y_scroll()
+                        .on_click(|_, _, cx: &mut App| cx.stop_propagation())
+                        .child(super::issues::panel_title(theme, title))
+                        .children(items),
+                    ),
+                )),
+        )
+    }
+}
+
+impl Render for ActivityView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.needs_focus {
+            self.needs_focus = false;
+            window.focus(&self.focus, cx);
+        }
+        let theme = *cx.global::<Theme>();
+        // The selected kind segment, when exactly one is.
+        let chip = {
+            let key = selected_kind_id(&self.state.filter);
+            let mut track = self.kind_track.borrow_mut();
+            track.select(key.map(SharedString::from), Instant::now(), || cx.reduce_motion());
+            let chip = track.frame(Instant::now());
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        };
+        div()
+            .id("activity")
+            .track_focus(&self.focus)
+            .key_context("Activity")
+            .on_key_down(cx.listener(Self::on_key))
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_w_0()
+            .overflow_hidden()
+            .bg(theme.canvas)
+            .type_style(Type::Base)
+            .text_color(theme.foreground)
+            .child(self.render_header(chip, &theme, cx))
+            .child(self.render_feed(&theme, cx))
+            .child(self.render_footer(&theme))
+            .children(self.render_picker(&theme, cx))
+    }
+}
+
+// ---- pieces -----------------------------------------------------------------
+
+/// A kind's segment id.
+fn kind_id(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::Tasks => "kind-tasks",
+        ActivityKind::Zen => "kind-zen",
+        ActivityKind::Workspaces => "kind-workspaces",
+        ActivityKind::System => "kind-system",
+    }
+}
+
+/// The one selected segment's id ("All", or a kind picked alone); `None`
+/// when several kinds are (each draws its own chip).
+fn selected_kind_id(filter: &shelbi_app::activity::ActivityFilter) -> Option<&'static str> {
+    if filter.is_all() {
+        return Some("kind-all");
+    }
+    let mut picked = ActivityKind::ALL.into_iter().filter(|k| filter.has_kind(*k));
+    match (picked.next(), picked.next()) {
+        (Some(one), None) => Some(kind_id(one)),
+        _ => None,
+    }
+}
+
+/// `── Today ─────`: the day label on its rule, 40pt tall.
+fn day_header(theme: &Theme, label: &str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .h(px(40.0))
+        .type_style(Type::XSmall)
+        .text_color(theme.dark_gray)
+        .child(div().w(px(12.0)).h(px(1.0)).bg(theme.divider))
+        .child(label.to_string())
+        .child(div().flex_1().h(px(1.0)).bg(theme.divider))
+}
+
+/// A shared tone as the log paints it: the neutral tones in the log's gray
+/// and its dark gray, every hue as the theme has it.
+fn log_tone(theme: &Theme, tone: Tone) -> Hsla {
+    match tone {
+        Tone::White | Tone::Gray | Tone::WorkflowBadge => theme.log_text,
+        Tone::DarkGray => theme.dark_gray,
+        hue => theme.tone(hue),
+    }
+}
+
+/// The actor column's color for each kind of actor, as the frame draws it.
+fn actor_color(theme: &Theme, actor: Actor) -> Hsla {
+    match actor {
+        Actor::Zen => theme.green,
+        Actor::You => theme.log_text,
+        Actor::Machine => theme.muted,
+        Actor::Review => theme.theme_cyan,
+        Actor::Workspace(tone) => log_tone(theme, tone),
+    }
+}
+
+/// One feed row, laid out like the TUI's: the actor pinned left, the muted
+/// verb, the title (wrapping, never truncated) with its trail and the
+/// X-Small second line under it, and the status tag + time pinned right.
+/// Selected, it sits on the background fill.
+fn feed_row(theme: &Theme, line: &Line, selected: bool) -> gpui::Div {
+    let actor = div()
+        .flex_none()
+        .min_w(px(ACTOR_WIDTH))
+        .pr_2()
+        .when_some(line.actor.as_ref(), |d, (label, actor)| {
+            d.text_color(actor_color(theme, *actor)).child(label.clone())
+        });
+    // A verb in the shared dim tone reads muted; a system row's status tint
+    // (`unreachable` in red) stays.
+    let verb_color = match line.verb_tone {
+        Tone::Gray | Tone::DarkGray | Tone::White => theme.muted,
+        hue => theme.tone(hue),
+    };
+    let verb = div()
+        .flex_none()
+        .when(!line.verb.is_empty(), |d| d.pr_2().text_color(verb_color).child(line.verb.clone()));
+    // The title and its trail are one paragraph, so a long title wraps at
+    // the message column's edge (Figma's full-width text box) and the trail
+    // flows on after its last word.
+    let mut title = line.title.clone();
+    let trail = line.trail.as_ref().map(|(text, tone)| {
+        let start = title.len();
+        title.push_str(text);
+        let style = HighlightStyle {
+            color: Some(log_tone(theme, *tone)),
+            ..Default::default()
+        };
+        (start..title.len(), style)
+    });
+    let message = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(px(2.0))
+        .child(
+            div()
+                .w_full()
+                .text_color(log_tone(theme, line.title_tone))
+                .child(StyledText::new(title).with_highlights(trail)),
+        )
+        .when_some(line.secondary.as_ref(), |d, sec| {
+            let (icon, text) = sec.parts();
+            d.child(
+                div()
+                    .type_style(Type::XSmall)
+                    .text_color(theme.dark_gray)
+                    .truncate()
+                    .child(format!("{icon}{text}")),
+            )
+        });
+    let right = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .pl_2()
+        .when_some(line.tag.as_ref(), |d, (text, tone)| {
+            d.child(
+                div()
+                    .type_style(Type::BaseMedium)
+                    .text_color(log_tone(theme, *tone))
+                    .child(format!("[{text}]")),
+            )
+        })
+        .when(!line.time.is_empty(), |d| {
+            d.child(div().text_color(theme.dark_gray).child(line.time.clone()))
+        });
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_start()
+        .px_2()
+        .py_1()
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .when(selected, |d| d.bg(theme.row_selected))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.background)))
+        .child(actor)
+        .child(verb)
+        .child(message)
+        .child(right)
+}
+
+fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .mx_1()
+        .px_2()
+        .py_1()
+        .rounded_lg()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.background))
+        .child(
+            div().w(ICON_SIZE).flex_none().when(selected, |d| {
+                d.child(heroicon(icons::CHECK).text_color(theme.accent))
+            }),
+        )
+        .child(label)
+}

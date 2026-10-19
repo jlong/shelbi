@@ -134,6 +134,14 @@ impl Selection {
         self.region.end = Anchor::new(point, side);
     }
 
+    // SHELBI FORK: read-only accessor. The anchor (where the selection began,
+    // as rotated by scrolling) lets shelbi-term re-anchor a drag that crosses
+    // back over its starting cell without losing the rotation.
+    /// The point the selection was started at, kept current as output scrolls.
+    pub fn anchor(&self) -> Point {
+        self.region.start.point
+    }
+
     pub fn rotate<D: Dimensions>(
         mut self,
         dimensions: &D,

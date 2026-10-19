@@ -214,3 +214,165 @@ fn remote_dispatch_to_handoff_reconnect_and_unreachable() {
     // Restore the working seam so the Guard can clean up the real session.
     remote_session::set_test_seam(Some(Arc::new(LocalRelaySeam)));
 }
+
+/// Like [`LocalRelaySeam`], but it keeps the hub end of every relay socket so
+/// the test can kill the "SSH connection" under a live relay
+/// ([`DroppableRelaySeam::drop_ssh`]): the relay channel then reads EOF, as it
+/// does when `ssh` dies, and every stream on it ends.
+#[derive(Default)]
+struct DroppableRelaySeam {
+    hub_ends: Mutex<Vec<UnixStream>>,
+}
+
+impl DroppableRelaySeam {
+    fn drop_ssh(&self) {
+        for end in self.hub_ends.lock().unwrap().drain(..) {
+            let _ = end.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl RemoteSsh for DroppableRelaySeam {
+    fn launch(&self, host: &Host, bin: &str, spec: &SpawnSpec) -> Result<()> {
+        LocalRelaySeam.launch(host, bin, spec)
+    }
+
+    fn open_relay(&self, _host: &Host, _bin: &str) -> Result<RelayHandle> {
+        let root = shelbi_state::sessions_dir().map_err(|e| Error::Other(e.to_string()))?;
+        let (hub, relay) = UnixStream::pair().map_err(Error::Io)?;
+        let relay_read = relay.try_clone().map_err(Error::Io)?;
+        let handle = std::thread::spawn(move || {
+            let _ = serve_relay(Box::new(relay_read), Box::new(relay), &root);
+        });
+        self.hub_ends
+            .lock()
+            .unwrap()
+            .push(hub.try_clone().map_err(Error::Io)?);
+        let hub_read = hub.try_clone().map_err(Error::Io)?;
+        let channel = RelayChannel::new(Box::new(hub_read), Box::new(hub))
+            .map_err(|e| Error::Other(format!("relay channel: {e}")))?;
+        Ok(RelayHandle::new(channel, Box::new(handle)))
+    }
+}
+
+/// Collect a session's output until it contains `want` (or the stream ends /
+/// the deadline passes). Returns whether it was seen.
+fn read_until(rx: &std::sync::mpsc::Receiver<shelbi_client::SessionEvent>, want: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(shelbi_client::SessionEvent::Output { data, .. })
+            | Ok(shelbi_client::SessionEvent::Resync { replay: data, .. }) => {
+                seen.extend_from_slice(&data);
+                if String::from_utf8_lossy(&seen).contains(want) {
+                    return true;
+                }
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    false
+}
+
+/// The client side of a remote workspace (`dt-workspace-view`): a terminal
+/// view attaches to the remote agent through the machine's relay with the
+/// shared `session_connect::connect` (the desktop's connector), streams its
+/// output and sends input; when the SSH connection under the relay dies the
+/// stream ends while the agent keeps running; an unreachable machine reads as
+/// `Unreachable` (reconnect, not a death); and once the machine answers again a
+/// fresh attach replays the screen, the earlier exchange included.
+#[test]
+fn a_client_attach_through_the_relay_recovers_after_an_ssh_drop() {
+    use shelbi_app::session::{ConnectFailure, SessionRef};
+    use shelbi_orchestrator::session_connect;
+
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("projects/demo/tasks")).unwrap();
+    std::fs::write(
+        home.path().join("projects/demo.yaml"),
+        "name: demo\nrepo: /tmp/demo\ndefault_branch: main\n\
+         orchestrator:\n  runner: claude\n\
+         agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+         machines:\n  - name: box\n    kind: ssh\n    host: box\n    work_dir: /tmp/demo\n\
+         workspaces:\n  - { name: alice, machine: box, runner: claude }\n",
+    )
+    .unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    let seam = Arc::new(DroppableRelaySeam::default());
+    remote_session::set_test_seam(Some(seam.clone()));
+
+    let host = Host::Ssh {
+        host: "box".into(),
+    };
+    let target = SessionTarget::slot("shelbi-demo", "alice");
+    struct Guard<'a> {
+        host: &'a Host,
+        target: &'a SessionTarget,
+    }
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            let _ = backend().kill(self.host, self.target);
+            remote_session::set_test_seam(None);
+            std::env::remove_var("SHELBI_HOME");
+        }
+    }
+    let _guard = Guard {
+        host: &host,
+        target: &target,
+    };
+
+    let agent = SessionRef::Workspace("alice".into());
+    // Before anything runs there: the machine answers, no session → idle.
+    assert!(matches!(
+        session_connect::connect("demo", &agent),
+        Err(ConnectFailure::Idle(info)) if info.machine == "box"
+    ));
+
+    backend()
+        .spawn(&host, &target, Some("printf 'hello from box\\n'; exec cat"))
+        .expect("remote spawn");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            matches!(backend().probe(&host, &target, None), Liveness::Alive).then_some(())
+        })
+        .is_some(),
+        "the remote session never came up"
+    );
+
+    // Attach through the relay, as the desktop's Workspace view does.
+    let c = wait_for(Duration::from_secs(10), || session_connect::connect("demo", &agent).ok())
+        .expect("attach through the relay");
+    let rx = c.events.into_inner();
+    assert!(read_until(&rx, "hello from box"), "the attach replays the remote screen");
+    c.conn.input(b"ping\r").unwrap();
+    assert!(read_until(&rx, "ping"), "input reaches the remote session");
+
+    // The SSH connection dies: the stream ends (no exit, nothing left to read).
+    seam.drop_ssh();
+    let ended = wait_for(Duration::from_secs(10), || match rx.recv_timeout(Duration::from_millis(100)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(()),
+        _ => None,
+    });
+    assert!(ended.is_some(), "the client's stream ends when the relay's SSH dies");
+    drop(c.conn);
+
+    // While the machine can't be reached the client is told Unreachable (it
+    // keeps reconnecting), never that the session is gone.
+    remote_session::set_test_seam(Some(Arc::new(UnreachableSeam)));
+    assert!(matches!(
+        session_connect::connect("demo", &agent),
+        Err(ConnectFailure::Unreachable(_))
+    ));
+
+    // The machine is back: a fresh relay, and the agent kept running all along.
+    remote_session::set_test_seam(Some(seam.clone()));
+    let again = session_connect::connect("demo", &agent).expect("reattach after the drop");
+    let rx = again.events.into_inner();
+    assert!(read_until(&rx, "ping"), "the replay carries the exchange from before the drop");
+    again.conn.input(b"pong\r").unwrap();
+    assert!(read_until(&rx, "pong"), "the reattached session takes input");
+}

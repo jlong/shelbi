@@ -26,8 +26,6 @@ pub enum Effect {
     FocusWorkspace { project: String, workspace: String },
     /// Load a task into a review slot and show it.
     LoadReview { project: String, task_id: String },
-    /// Focus an already-running session (e.g. a legacy spawned agent).
-    FocusSession { session: String },
     /// Open an editable config/instructions target in the user's editor.
     OpenEditor { target: EditTarget },
     /// Open the per-project error log.
@@ -37,6 +35,9 @@ pub enum Effect {
     /// Begin the add-project flow (the host collects the form, then calls
     /// [`Mutation::AddProject`]).
     AddProject,
+    /// Open another window on `project` (a multi-window client only; the
+    /// registry never offers it to the TUI).
+    NewWindow { project: String },
     /// Detach this client: stop rendering and drop its connections, leaving
     /// every session and agent running (the palette's "Detach"; the same
     /// client-local stop `q` performs).
@@ -75,7 +76,7 @@ pub enum EditTarget {
 /// steps. `rt-mutations-daemon` owns the daemon-side routing; here they are
 /// just typed requests.
 ///
-/// The issue mutations (`MoveIssue` … `AddIssue`) are the generic set the
+/// The issue mutations (`MoveIssue` … `PrioritizeIssue`) are the generic set the
 /// plan names. They are not surfaced in the tmux palette today — the
 /// registry carries them so the single-process TUI and the desktop app can
 /// bind them without a second definition — while [`Mutation::ToggleZen`]
@@ -119,13 +120,22 @@ pub enum Mutation {
         title: String,
         workflow: Option<String>,
     },
+    /// Reorder an issue within its status column: land it at absolute slot
+    /// `position` (0 is the top) of the column's priority order.
+    PrioritizeIssue {
+        project: String,
+        id: String,
+        position: u32,
+    },
     /// Toggle Zen Mode for a project.
     ToggleZen { project: String },
     /// Scaffold and open a new project (payload collected by the host's
-    /// add-project form).
+    /// add-project form): the raw name, the repo path as typed (resolved
+    /// against the host's working directory), and where its config lives.
     AddProject {
         name: String,
         root: String,
+        mode: shelbi_core::ConfigMode,
     },
 }
 

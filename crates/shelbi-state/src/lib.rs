@@ -82,7 +82,8 @@ pub use issue_migrate::{
 pub use board_index::{
     board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
     fold_assignment_overlay, github_board_repo, indexed_issue, mark_board_index_stale,
-    patch_board_index_issue, read_board, read_board_index, read_board_index_viewer_login,
+    patch_board_index_issue, read_board, read_board_index, read_board_index_numbers,
+    read_board_index_viewer_login,
     read_board_refresh_error, read_board_report, read_board_report_with_cfg,
     read_board_with_cfg, read_valid_board_index, record_board_index_number,
     record_board_refresh_error, remove_board_index_issue, update_board_index, write_board_index,
@@ -139,7 +140,8 @@ pub use hub_config::{
     HubConfig, ProjectMeta, ProjectSummary,
 };
 pub use daemon_lifecycle::{
-    daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon, StopOutcome,
+    daemon_lock_held, ensure_daemon_running, ensure_daemon_running_with, hub_lock_path,
+    set_daemon_launcher, stop_daemon, DaemonLauncher, DaemonStartError, StopOutcome,
 };
 pub use change_bus::{
     publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,
@@ -167,7 +169,8 @@ pub use ssh_control::{
 };
 pub use user_config::{
     editor_display_name, load_user_config, resolve_editor, save_user_config,
-    scaffold_user_config_if_missing, user_config_path, Keymap, UserConfig, ZenToggleChord,
+    scaffold_user_config_if_missing, update_user_config, user_config_path, DesktopConfig,
+    DesktopNotifications, Keymap, OptionAsMeta, ThemePreference, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };
 pub use workflows::{

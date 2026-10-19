@@ -20,16 +20,10 @@ use ratatui::Frame;
 
 use std::path::Path;
 
-use shelbi_app::command::{
-    CommandModel, EditItem, ProjectItem, ReviewItem, ViewItem, WorkspaceItem,
-};
-use shelbi_app::exec::EditTarget;
-use shelbi_app::nav::View;
-use shelbi_app::view::SidebarModel;
 use std::collections::HashMap;
 
 use shelbi_core::{Column, ConfigMode};
-use shelbi_palette::{Decoration, DecorationColor, Entry};
+use shelbi_palette::Entry;
 use shelbi_state::keymap::{DisplayStyle, Keymaps, PopoverAction};
 use shelbi_state::IssueFile;
 
@@ -232,7 +226,7 @@ impl ActiveOverlay {
                 },
                 overlay::review_reject::Step::Cancel => OverlayEvent::ReviewCancelled,
             },
-            ActiveOverlay::ErrorLog { project, viewer } => match viewer.handle_key(ev) {
+            ActiveOverlay::ErrorLog { project, viewer } => match overlay::error_log::handle_key(viewer, ev) {
                 overlay::error_log::ErrorLogOutcome::Continue => OverlayEvent::Stay,
                 overlay::error_log::ErrorLogOutcome::Close => OverlayEvent::Close,
                 overlay::error_log::ErrorLogOutcome::Clear => {
@@ -469,219 +463,32 @@ fn confirm_event(task_id: &str, outcome: overlay::review_confirm::Outcome) -> Ov
     }
 }
 
-/// Build the palette's [`CommandModel`] from the shell's live sidebar model plus
-/// a few light on-disk reads (the other projects and the edit targets). The
-/// registry enumerates the palette's commands from this, so populating it is
-/// what makes every command reachable.
-pub fn build_command_model(
-    project: &str,
-    sidebar: &SidebarModel,
-    other_clients_attached: bool,
-) -> CommandModel {
-    let mut views: Vec<ViewItem> = sidebar
-        .nav
-        .iter()
-        .map(|n| ViewItem {
-            id: format!("view:{}", n.view.as_view_id()),
-            title: n.label.clone(),
-            view: n.view.clone(),
-            decoration: nav_decoration(&n.label),
-        })
-        .collect();
-
-    // Machines is palette-only: it's no longer a sidebar nav row, so add its
-    // command here (guarded against duplication should a future nav reintroduce
-    // it). The id/title match the historical `view:machines` entry.
-    if !views.iter().any(|v| v.view == View::Machines) {
-        views.push(ViewItem {
-            id: format!("view:{}", View::Machines.as_view_id()),
-            title: "Machines".to_string(),
-            view: View::Machines,
-            decoration: nav_decoration("Machines"),
-        });
-    }
-
-    let workspaces = sidebar
-        .workspaces
-        .iter()
-        .map(|w| WorkspaceItem {
-            name: w.name.clone(),
-            subtitle: w.current_task.clone(),
-            decoration: None,
-        })
-        .collect();
-
-    let reviews = sidebar
-        .reviews
-        .iter()
-        .map(|r| ReviewItem {
-            task_id: r.task_id.clone(),
-            title: r.title.clone(),
-            subtitle: None,
-            decoration: None,
-        })
-        .collect();
-
-    let other_projects = shelbi_state::list_projects()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.name != project)
-        .map(|p| ProjectItem {
-            slug: p.name.clone(),
-            label: p.display_label().to_string(),
-        })
-        .collect();
-
-    CommandModel {
-        project: Some(project.to_string()),
-        zen_on: !matches!(sidebar.zen_mode, shelbi_state::ZenModeState::Off),
-        zen_shortcut: None,
-        views,
-        workspaces,
-        reviews,
-        legacy_agents: Vec::new(),
-        other_projects,
-        edit_targets: edit_targets(project),
-        other_clients_attached,
-    }
-}
-
-/// The palette icon decoration for a nav view, from its label: the Figma's
-/// twemoji nav glyph (💬 / 📋 / ⚡ / 🖥), rendered in its natural color. A label
-/// with no mapped glyph gets `None`, so it falls back to the entry-kind icon.
-fn nav_decoration(label: &str) -> Option<Decoration> {
-    let glyph = super::sidebar::nav_glyph(label);
-    if glyph == "•" {
-        return None;
-    }
-    Some(Decoration {
-        glyph: glyph.to_string(),
-        color: DecorationColor::Default,
-    })
-}
-
-/// Build the palette's Projects column from the registered projects on disk.
-/// The current project leads (filled `●`), other open projects get the green
-/// ring (`○`), and closed ones the gray ring. Enter on a row activates its
-/// `action:switch-project:<slug>` entry; the renderer appends the trailing
-/// "+ Add project" row itself.
+/// Build the palette's Projects column from the registered projects on disk
+/// ([`shelbi_app::command_model::build_projects_column`]): the current project
+/// leads (filled `●`), other open projects get the green ring (`○`), and
+/// closed ones the gray ring.
 pub fn build_projects_column(current: &str) -> Vec<ProjectEntry> {
-    let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    let mut rows: Vec<ProjectEntry> = shelbi_state::list_projects()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| {
-            let is_current = p.name == current;
-            let loaded = is_current || open.contains(&p.name);
-            // The current project is the single "active" one (the filled,
-            // pulsing disc), matching the Figma.
-            ProjectEntry {
-                indicator: overlay::palette::project_indicator(loaded, is_current),
-                label: p.display_label().to_string(),
-                slug: p.name,
-            }
-        })
-        .collect();
-    // Lead with the current project, keeping the rest in list order
-    // (most-recently-launched first).
-    rows.sort_by_key(|p| p.slug != current);
-    rows
-}
-
-/// The on-disk edit targets that exist for `project`, titled to match the tmux
-/// palette's edit openers. Missing targets are skipped so the palette never
-/// offers a dead entry.
-fn edit_targets(project: &str) -> Vec<EditItem> {
-    let mut out = Vec::new();
-    let mut push = |target: EditTarget, title: &str, path: Option<std::path::PathBuf>| {
-        if path.map(|p| p.exists()).unwrap_or(false) {
-            out.push(EditItem {
-                target,
-                title: title.to_string(),
-            });
-        }
-    };
-
-    push(
-        EditTarget::Project,
-        "Edit Project Settings",
-        project_settings_path(project),
-    );
-    // Per-agent openers, enumerated from `agents/` and sorted for stability.
-    if let Ok(dir) = shelbi_state::agents_dir(project) {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut agents: Vec<String> = rd
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect();
-            agents.sort();
-            for agent in agents {
-                let path = dir.join(&agent).join("instructions.md");
-                push(
-                    EditTarget::Agent(agent.clone()),
-                    &format!("Edit {agent} Settings"),
-                    Some(path),
-                );
-            }
-        }
-    }
-    push(
-        EditTarget::ZenMode,
-        "Edit Zen Mode",
-        shelbi_state::zenmode_path(project).ok(),
-    );
-    push(
-        EditTarget::Workflows,
-        "Edit Workflows",
-        shelbi_state::workflows_dir(project).ok(),
-    );
-    out
-}
-
-/// Resolve the project settings file, preferring an in-repo `project.yaml` over
-/// the global `projects/<name>.yaml` (mirrors the tmux palette).
-fn project_settings_path(project: &str) -> Option<std::path::PathBuf> {
-    if let Ok(dir) = shelbi_state::config_project_dir(project) {
-        let in_repo = dir.join("project.yaml");
-        if in_repo.exists() {
-            return Some(in_repo);
-        }
-    }
-    Some(
-        shelbi_state::projects_dir()
-            .ok()?
-            .join(format!("{project}.yaml")),
-    )
+    shelbi_app::command_model::build_projects_column(current)
 }
 
 /// Whether the first-run Zen intro should show before toggling Zen on for
-/// `project`: only on an off→on transition, and only while the global
-/// `zen_intro_seen` flag is unset. Mirrors the tmux palette's gate.
+/// `project` ([`shelbi_app::zen::should_show_intro`]).
 pub fn should_show_zen_intro(project: &str) -> bool {
-    let project_off = shelbi_state::read_state(project)
-        .map(|s| s.zen_mode == shelbi_state::ZenModeState::Off)
-        .unwrap_or(true);
-    if !project_off {
-        return false;
-    }
-    !shelbi_state::read_global_state()
-        .map(|s| s.zen_intro_seen)
-        .unwrap_or(false)
+    shelbi_app::zen::should_show_intro(project)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::palette;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::style::{Modifier, Style};
     use ratatui::Terminal;
     use shelbi_app::nav::View;
-    use shelbi_app::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, WorkspaceRow};
+    use shelbi_app::view::{
+        NavItem, ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -864,7 +671,7 @@ mod tests {
         let mut found_row = false;
         for y in rect.top()..rect.bottom() {
             let selected_cells: Vec<u16> = (rect.left()..rect.right())
-                .filter(|&x| buf[(x, y)].bg == crate::theme::SELECTION_BG)
+                .filter(|&x| buf[(x, y)].bg == palette().selection)
                 .collect();
             if selected_cells.is_empty() {
                 continue;
@@ -891,7 +698,7 @@ mod tests {
                 "the selection bar must reach the content's right edge, got {selected_cells:?}"
             );
             for x in first..=last {
-                if buf[(x, y)].bg != crate::theme::SELECTION_BG {
+                if buf[(x, y)].bg != palette().selection {
                     assert_eq!(
                         buf[(x, y)].symbol().trim(),
                         "",
@@ -1080,6 +887,7 @@ mod tests {
                 location: None,
                 workspace: None,
                 state: ReviewState::Pending,
+                number: None,
             }],
             config_error: None,
             board_loading: false,
@@ -1093,14 +901,14 @@ mod tests {
             session_lost: None,
             orchestrator_status: None,
         };
-        let m = build_command_model("alpha", &sidebar, false);
+        let m = shelbi_app::command_model::command_model_from("alpha", &sidebar, false, Vec::new(), Vec::new());
         assert_eq!(m.project.as_deref(), Some("alpha"));
         assert!(m.zen_on);
         let view_ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
         assert!(view_ids.contains(&"view:orch"));
         assert!(view_ids.contains(&"view:tasks"));
         // Machines is palette-only now: it isn't in the sidebar nav, but
-        // `build_command_model` adds its command so Ctrl+P → Machines works.
+        // `command_model_from` adds its command so Ctrl+P → Machines works.
         assert!(
             view_ids.contains(&"view:machines"),
             "Machines reachable from the palette, got: {view_ids:?}"
@@ -1146,7 +954,7 @@ mod tests {
             session_lost: None,
             orchestrator_status: None,
         };
-        let m = build_command_model("alpha", &sidebar, false);
+        let m = shelbi_app::command_model::command_model_from("alpha", &sidebar, false, Vec::new(), Vec::new());
         let machines = m.views.iter().filter(|v| v.id == "view:machines").count();
         assert_eq!(machines, 1, "exactly one Machines command");
     }
@@ -1179,7 +987,7 @@ mod tests {
         };
 
         let ids = |others: bool| -> Vec<String> {
-            let m = build_command_model("alpha", &sidebar, others);
+            let m = shelbi_app::command_model::command_model_from("alpha", &sidebar, others, Vec::new(), Vec::new());
             CommandRegistry::new()
                 .entries(&m)
                 .into_iter()

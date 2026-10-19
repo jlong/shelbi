@@ -1,7 +1,7 @@
 //! The shared Shelbi application model.
 //!
 //! This crate is the toolkit-independent core that both the single-process
-//! TUI and the later desktop app render. It owns four things:
+//! TUI and the later desktop app render. It owns:
 //!
 //! - [`nav`] — the model of what a client is looking at: the current
 //!   project, the sidebar selection, the current main view, focus, and
@@ -11,13 +11,29 @@
 //!   palette's string-prefix dispatch. Each command has an id, a title,
 //!   typed arguments, an availability check against the current model, and
 //!   an [`Effect`](exec::Effect) it produces.
+//! - [`board`] — the issues board's shared semantics (columns, status
+//!   resolution, legal moves, card order, filters) and its background reads.
 //! - [`view`] — plain-data view models for the sidebar, issues board,
 //!   activity feed, machines list, review panel, and error log, built from
 //!   the existing `shelbi-state` readers.
+//! - [`review`] — the review interface: the panel's model and navigation,
+//!   and the load / queue flow that opens a review.
+//! - [`overlay`] — the overlays' state machines (palette, error log,
+//!   review load, reject reason, Zen intro, add project), keyed on
+//!   toolkit-free chords so both clients drive the same decision tables;
+//!   [`command_model`] builds the palette's inputs from live state.
+//! - [`theme`] — the named color tokens (dark and light) both clients
+//!   paint with, and the `theme:` preference resolution.
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
 //!   state off the caller's thread and publishes immutable snapshots over a
 //!   channel. Threads and channels only, so a gpui client can consume it
-//!   without tokio.
+//!   without tokio. [`changes`] is its wake source: a hub-socket subscriber
+//!   for the daemon's board/workspace change notifications; [`layout_sub`]
+//!   is the same for its layout events (a review slot opening or closing).
+//! - [`session`] — showing a session in a main area: naming
+//!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
+//!   classification, and the per-pane restart controller over
+//!   [`supervision`], the crash-loop core the daemon poller shares.
 //!
 //! # No UI toolkit
 //!
@@ -28,19 +44,35 @@
 //! (`shelbi-tui`, `shelbi-cli`). The `tests/no_ui_deps.rs` integration test
 //! asserts the invariant against the resolved dependency tree.
 
+pub mod activity;
+pub mod board;
+pub mod changes;
 pub mod command;
+pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
+pub mod layout_sub;
 pub mod nav;
+pub mod overlay;
+pub mod reachability;
 pub mod refresh;
+pub mod review;
+pub mod session;
+pub mod supervision;
+pub mod theme;
 pub mod view;
+pub mod workspace_panel;
+pub mod zen;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};
-pub use exec_daemon::{execute_mutation, review_session, workspace_session};
-pub use shelbi_proto::control::{ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
+pub use exec_daemon::{
+    execute_mutation, execute_mutation_expecting, review_session, workspace_session,
+};
+pub use shelbi_proto::control::{ExpectedState, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};
-pub use refresh::{spawn_refresher, RefreshHandle, Snapshot};
+pub use refresh::{spawn_refresher, spawn_worker, RefreshHandle, Refresher, Snapshot};
 pub use view::{
-    ActivityModel, ErrorLogModel, IssuesModel, MachinesModel, ReviewPanelModel, SidebarModel,
+    BoardFilters, ErrorLogModel, IssueCard, IssueColumn, IssuesModel,
+    MachinesModel, ReviewPanelModel, SidebarModel, TaskDetailModel,
 };

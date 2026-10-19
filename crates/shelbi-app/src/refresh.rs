@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
-use crate::view::{ActivityModel, ErrorLogModel, IssuesModel, MachinesModel, SidebarModel};
+use crate::activity::Feed;
+use crate::view::{ErrorLogModel, IssuesModel, MachinesModel, SidebarModel};
 
 /// One immutable published view of the world. A refresh produces exactly
 /// one of these. Fields are `Option` so a reader that can't currently
@@ -33,7 +34,7 @@ pub struct Snapshot {
     pub taken_at: Option<SystemTime>,
     pub sidebar: Option<SidebarModel>,
     pub issues: Option<IssuesModel>,
-    pub activity: Option<ActivityModel>,
+    pub activity: Option<Feed>,
     pub machines: Option<MachinesModel>,
     pub errors: Option<ErrorLogModel>,
 }
@@ -126,6 +127,19 @@ impl RefreshHandle {
         self.snapshot_rx.recv_timeout(timeout).ok()
     }
 
+    /// Stop the worker without waiting for it: a read in flight finishes on
+    /// the worker's own thread and its result is dropped. For a host tearing
+    /// a view down on its UI thread (the desktop's project switch), where a
+    /// join could wait on a slow read. Idempotent; a later [`Self::stop`] (or
+    /// the drop) has nothing left to join.
+    pub fn stop_without_waiting(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(tx) = self.request_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(self.join.take());
+    }
+
     /// Stop the worker and join its thread. Idempotent; also runs on drop.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -143,6 +157,116 @@ impl RefreshHandle {
 }
 
 impl Drop for RefreshHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A refresh worker generic over the payload `T` it publishes: the same
+/// request / coalesce / publish loop as [`spawn_refresher`], for a host whose
+/// reads don't fit [`Snapshot`] (the TUI shell's board / activity / closed-page
+/// refreshers, the desktop board's open and closed reads). Dropping it stops
+/// the worker and joins its thread.
+pub struct Refresher<T> {
+    request_tx: Option<Sender<()>>,
+    snapshot_rx: Receiver<T>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+/// Spawn a [`Refresher`] driven by `reader`. The worker blocks until
+/// [`Refresher::request`] asks for a refresh, then calls `reader(gen)` off the
+/// caller's thread and publishes the result. Requests that pile up while a
+/// read is in flight coalesce into one read.
+pub fn spawn_worker<T, F>(reader: F) -> Refresher<T>
+where
+    T: Send + 'static,
+    F: Fn(u64) -> T + Send + 'static,
+{
+    let (request_tx, request_rx) = mpsc::channel::<()>();
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<T>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+
+    let join = std::thread::Builder::new()
+        .name("shelbi-app-refresh".to_string())
+        .spawn(move || {
+            let mut generation: u64 = 0;
+            while request_rx.recv().is_ok() {
+                if worker_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                while request_rx.try_recv().is_ok() {}
+                let snapshot = reader(generation);
+                generation = generation.wrapping_add(1);
+                if snapshot_tx.send(snapshot).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn refresh worker thread");
+
+    Refresher {
+        request_tx: Some(request_tx),
+        snapshot_rx,
+        stop,
+        join: Some(join),
+    }
+}
+
+impl<T> Refresher<T> {
+    /// Ask for a refresh. Returns immediately; the read happens on the worker.
+    /// Returns `false` if the worker has stopped.
+    pub fn request(&self) -> bool {
+        match &self.request_tx {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// The most recent result available without blocking, draining older
+    /// queued ones. `None` when nothing new has arrived since the last call.
+    pub fn latest(&self) -> Option<T> {
+        let mut newest = None;
+        while let Ok(s) = self.snapshot_rx.try_recv() {
+            newest = Some(s);
+        }
+        newest
+    }
+
+    /// Block up to `timeout` for the next result.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<T> {
+        self.snapshot_rx.recv_timeout(timeout).ok()
+    }
+
+    /// Stop the worker without waiting for it: a read in flight finishes on
+    /// the worker's own thread and its result is dropped. For a host tearing
+    /// a view down on its UI thread (the desktop's project switch), where a
+    /// join could wait on a slow read. Idempotent; a later [`Self::stop`] (or
+    /// the drop) has nothing left to join.
+    pub fn stop_without_waiting(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(tx) = self.request_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(self.join.take());
+    }
+
+    /// Stop the worker and join its thread. Idempotent; also runs on drop.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let tx = self.request_tx.take();
+        if let Some(tx) = &tx {
+            let _ = tx.send(());
+        }
+        drop(tx);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl<T> Drop for Refresher<T> {
     fn drop(&mut self) {
         self.stop();
     }
@@ -233,6 +357,21 @@ mod tests {
     }
 
     #[test]
+    fn a_generic_worker_publishes_coalesces_and_stops() {
+        let mut worker = spawn_worker(|gen| gen * 10);
+        assert!(worker.request());
+        assert_eq!(worker.recv_timeout(Duration::from_secs(2)), Some(0));
+        for _ in 0..5 {
+            worker.request();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(worker.latest().is_some());
+        assert!(worker.latest().is_none(), "drained");
+        worker.stop();
+        assert!(!worker.request());
+    }
+
+    #[test]
     fn stop_winds_down_the_worker() {
         static READS: AtomicUsize = AtomicUsize::new(0);
         let mut handle = spawn_refresher(|gen| {
@@ -246,5 +385,25 @@ mod tests {
         assert!(!handle.request());
         // A second stop is a no-op.
         handle.stop();
+    }
+
+    #[test]
+    fn stopping_without_waiting_returns_before_a_slow_read_finishes() {
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
+        let mut worker = spawn_worker(move |_| {
+            flag.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        assert!(worker.request());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the read never started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let t0 = Instant::now();
+        worker.stop_without_waiting();
+        drop(worker);
+        assert!(t0.elapsed() < Duration::from_millis(100), "took {:?}", t0.elapsed());
     }
 }

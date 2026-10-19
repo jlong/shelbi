@@ -17,8 +17,8 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
-    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, MutationRequest,
-    ReviewSessionRequest, ServerMsg, Stream as OutStream, WorkspaceSessionRequest,
+    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
+    MutationRequest, ReviewSessionRequest, ServerMsg, Stream as OutStream, WorkspaceSessionRequest,
     CONTROL_PROTOCOL_VERSION,
 };
 
@@ -89,14 +89,15 @@ impl ControlClient {
 
     /// Run one mutation. `on_line` is called for each streamed output line (the
     /// daemon reproduces the in-process stdout/stderr). Blocks until the daemon
-    /// reports [`ServerMsg::Done`] (returns `Ok`) or [`ServerMsg::Failed`]
+    /// reports [`ServerMsg::Done`] (returns `Ok` with the issue's post-change
+    /// `(status, revision)`, when the daemon sent one) or [`ServerMsg::Failed`]
     /// (returns [`ClientError::Mutation`]). Change notifications that arrive on
     /// this connection are ignored.
     pub fn mutate(
         &mut self,
         req: &MutationRequest,
         on_line: &mut dyn FnMut(OutStream, &str),
-    ) -> Result<(), ClientError> {
+    ) -> Result<Option<ExpectedState>, ClientError> {
         self.write
             .write_all(&control::encode(&ClientMsg::Mutate(req.clone()))?)?;
         self.write.flush()?;
@@ -109,7 +110,9 @@ impl ControlClient {
                     stream,
                     text,
                 } if request_id == req.request_id => on_line(stream, &text),
-                ServerMsg::Done { request_id } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Done { request_id, state } if request_id == req.request_id => {
+                    return Ok(state)
+                }
                 ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
                     return Err(ClientError::Mutation(error))
                 }
@@ -158,7 +161,9 @@ impl ControlClient {
         self.write.flush()?;
         loop {
             match self.read.read_frame::<ServerMsg>() {
-                Ok(Some(ServerMsg::Done { request_id: id })) if id == request_id => return Ok(()),
+                Ok(Some(ServerMsg::Done { request_id: id, .. })) if id == request_id => {
+                    return Ok(())
+                }
                 Ok(Some(ServerMsg::Failed { request_id: id, error })) if id == request_id => {
                     return Err(ClientError::Mutation(error))
                 }
@@ -195,7 +200,7 @@ impl ControlClient {
                     stream,
                     text,
                 } if request_id == req.request_id => on_line(stream, &text),
-                ServerMsg::Done { request_id } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
                 ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
                     return Err(ClientError::Mutation(error))
                 }
@@ -226,7 +231,7 @@ impl ControlClient {
                     stream,
                     text,
                 } if request_id == req.request_id => on_line(stream, &text),
-                ServerMsg::Done { request_id } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
                 ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
                     return Err(ClientError::Mutation(error))
                 }

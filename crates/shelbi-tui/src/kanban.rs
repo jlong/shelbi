@@ -29,6 +29,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use shelbi_app::board::{
+    self as board_rules, card_branch, column_label, columns_from as kanban_columns_from,
+    BoardRules,
+};
+#[cfg(test)]
+use shelbi_app::board::resolve_task_status;
 use shelbi_core::{
     default_project_statuses, default_workflow, Column, ProjectStatuses, StatusCategory, Issue,
     Workflow, DEFAULT_WORKFLOW_NAME,
@@ -39,6 +45,7 @@ use shelbi_orchestrator::transition::{
 };
 use shelbi_state::{KanbanColumnOverride, IssueFile};
 
+use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
 
 /// State for the Kanban TUI. Selection is `(column, row)` — `row` is the
@@ -232,6 +239,15 @@ pub(crate) trait MovePersister: Send + Sync {
     /// Persist a move of `id` to `target`, returning the settled move or a
     /// ready-to-display error. Called on the background persistence thread.
     fn persist(&self, project: &str, id: &str, target: &Column) -> PersistResult;
+
+    /// Reorder `id` to absolute `slot` in its column (`Shift+k`/`Shift+j`). The
+    /// default writes the store directly (the standalone board); the shell's
+    /// persister sends the registry's `PrioritizeIssue` through the daemon.
+    fn persist_priority(&self, project: &str, id: &str, slot: u32) -> Result<(), String> {
+        shelbi_state::issue_store_for(project)
+            .and_then(|s| s.set_priority(id, shelbi_state::PrioMove::Set(slot)))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// The default persister: the shared in-process library move
@@ -269,6 +285,18 @@ impl MovePersister for ExecutorMovePersister {
         shelbi_app::execute_mutation(&mutation, &mut sink)
             .map(|()| PersistedMove::default())
             .map_err(|e| format!("move failed: {e}"))
+    }
+
+    fn persist_priority(&self, project: &str, id: &str, slot: u32) -> Result<(), String> {
+        let kind = shelbi_app::CommandKind::PrioritizeIssue {
+            id: id.to_string(),
+            position: slot,
+        };
+        let shelbi_app::Effect::Mutate(mutation) = kind.effect_with_project(project) else {
+            return Err("reorder is not a daemon mutation".to_string());
+        };
+        shelbi_app::execute_mutation(&mutation, &mut |_stream, _line: &str| {})
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -324,98 +352,20 @@ pub struct HeaderHit {
     pub col_idx: usize,
 }
 
-/// Resolved collapse state for one column on a given frame. Combines
-/// the three logical states a column can be in:
-///
-/// - **Auto** — no user override; non-empty columns expand, empty
-///   columns collapse.
-/// - **Explicit collapsed** — user clicked to collapse; respected
-///   regardless of count.
-/// - **Explicit expanded** — user clicked to expand; respected
-///   regardless of count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColumnExpansion {
-    Auto,
-    Collapsed,
-    Expanded,
-}
+/// Resolved collapse state for one column on a given frame (Auto / explicit
+/// collapsed / explicit expanded). Shared with the desktop board; see
+/// [`shelbi_app::board::ColumnExpansion`].
+pub use shelbi_app::board::ColumnExpansion;
 
-impl ColumnExpansion {
-    /// True when the column should render in the rotated single-char
-    /// strip instead of the full horizontal layout.
-    pub fn is_collapsed(self, task_count: usize) -> bool {
-        match self {
-            ColumnExpansion::Collapsed => true,
-            ColumnExpansion::Expanded => false,
-            ColumnExpansion::Auto => task_count == 0,
-        }
-    }
-}
+/// Workspace filter applied to the visible cards, mirrored to
+/// `state.json::workspace_filter`. Shared with the desktop board; see
+/// [`shelbi_app::board::WorkspaceFilter`].
+pub use shelbi_app::board::WorkspaceFilter;
 
-/// Workspace filter applied to the visible cards. Separate from the
-/// dropdown's cursor (which can hover the same options without
-/// committing) so the active filter and the in-flight selection can't
-/// silently desync.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceFilter {
-    /// Show only tasks assigned to this workspace name.
-    Workspace(String),
-    /// Show only tasks with no `assigned_to`. Distinct from "All" so the
-    /// user can isolate the orchestrator-untouched backlog.
-    Unassigned,
-}
-
-impl WorkspaceFilter {
-    /// Wire format stored in `state.json::workspace_filter`. `Unassigned`
-    /// gets a sentinel string rather than its own enum variant on disk
-    /// so the schema stays a plain `Option<String>` — no migration
-    /// needed when older code reads the field.
-    pub const UNASSIGNED_SENTINEL: &'static str = "__unassigned__";
-
-    fn from_disk(s: &str) -> WorkspaceFilter {
-        if s == Self::UNASSIGNED_SENTINEL {
-            WorkspaceFilter::Unassigned
-        } else {
-            WorkspaceFilter::Workspace(s.to_string())
-        }
-    }
-
-    fn to_disk(&self) -> String {
-        match self {
-            WorkspaceFilter::Workspace(w) => w.clone(),
-            WorkspaceFilter::Unassigned => Self::UNASSIGNED_SENTINEL.to_string(),
-        }
-    }
-
-    /// Predicate against a task's `assigned_to` field.
-    pub fn matches(&self, assigned_to: Option<&str>) -> bool {
-        match self {
-            WorkspaceFilter::Workspace(w) => assigned_to == Some(w.as_str()),
-            WorkspaceFilter::Unassigned => assigned_to.is_none(),
-        }
-    }
-
-    /// Short label used in the chip and the dropdown row.
-    pub fn label(&self) -> String {
-        match self {
-            WorkspaceFilter::Workspace(w) => w.clone(),
-            WorkspaceFilter::Unassigned => "Unassigned".to_string(),
-        }
-    }
-}
-
-/// One entry rendered in the open dropdown — `None` is the "All
-/// workspaces" reset row, `Some(filter)` is a concrete filter the user can
-/// commit to. Order matches the rendered options list, so the dropdown
-/// cursor and this slice can share an index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DropdownOption {
-    pub filter: Option<WorkspaceFilter>,
-    /// How many tasks currently match this option — shown in the
-    /// dropdown row as a hint. Computed at render time from the
-    /// in-memory tasks slice.
-    pub count: usize,
-}
+/// One entry rendered in the open workspace dropdown (`filter: None` is the
+/// "All workspaces" row) with its card count. Order matches the rendered
+/// options list, so the dropdown cursor and this slice share an index.
+pub type DropdownOption = shelbi_app::board::WorkspaceOption;
 
 /// State carried while the workspace filter dropdown is open. Lives only
 /// for the lifetime of the popover — selecting an option closes it and
@@ -440,17 +390,9 @@ pub struct WorkflowDropdown {
     pub cursor: usize,
 }
 
-/// One entry rendered in the workflow filter dropdown. `None` is the
-/// "All workflows" reset row; `Some(name)` filters the board to that
-/// workflow's columns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowDropdownOption {
-    pub filter: Option<String>,
-    /// How many tasks currently sit in this workflow (or the whole
-    /// board, for the `All` row). Computed at render time against the
-    /// unfiltered tasks slice so an empty workflow can still be picked.
-    pub count: usize,
-}
+/// One entry rendered in the workflow filter dropdown (`filter: None` is the
+/// "All workflows" row) with its card count.
+pub type WorkflowDropdownOption = shelbi_app::board::WorkflowOption;
 
 /// One option row's hit-test rect. Captured each frame by the dropdown
 /// renderer so a click can map a screen coordinate back to an option
@@ -481,21 +423,7 @@ pub struct CardHit {
 /// [`status_id`](KanbanColumn::status_id) — the destination status id is
 /// the move target verbatim, so any column (including `canceled`) can hold
 /// a card.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KanbanColumn {
-    /// Stable status id ([`shelbi_core::ProjectStatus::id`]) used for
-    /// bucketing tasks into this column. Decoupled from the display
-    /// label so a project that renames `Review → QA` keeps every task
-    /// reference pointing at the same id.
-    pub status_id: String,
-    /// Status display label rendered above the column. Mirrors
-    /// [`shelbi_core::ProjectStatus::name`] — free to change without
-    /// breaking the matching path, which keys off [`status_id`].
-    pub status_name: String,
-    /// Semantic category the status reports — controls header colour
-    /// and the legacy-column mapping used when moving cards.
-    pub category: StatusCategory,
-}
+pub type KanbanColumn = shelbi_app::view::ColumnDef;
 
 /// State for the open task detail popover. We key by task id (not column/row
 /// indices) so a background refresh that reorders cards doesn't swap the
@@ -506,60 +434,17 @@ pub struct TaskPopover {
 }
 
 /// Everything one board refresh reads off disk / the daemon index. Produced by
-/// [`KanbanApp::read_board_data`] — pure IO, safe to run on a background worker —
-/// and folded into the app by [`KanbanApp::apply_board_data`] on the UI thread.
-///
-/// Splitting the read from the fold is what lets the single-process TUI shell
-/// keep the board fresh without ever blocking its event loop on a disk or `gh`
-/// read: the shell does the read on its refresh worker and applies the result in
-/// a cheap in-memory fold. [`KanbanApp::refresh`] still does both back to back,
-/// so the standalone `__tasks` process is byte-for-byte unchanged.
-pub(crate) struct BoardData {
-    /// `None` when the project YAML couldn't be read (degrade to empty lists).
-    project: Option<BoardProject>,
-    /// The project state snapshot (`read_state(...).ok()`), for the workspace and
-    /// kanban-column-override view state.
-    state_snapshot: Option<shelbi_state::State>,
-    /// Loaded workflows, or the load error message for the status line.
-    workflows: Result<Vec<Workflow>, String>,
-    /// `statuses.yaml`, or the load error message for the status line.
-    project_statuses: Result<ProjectStatuses, String>,
-    /// The board read outcome.
-    board: BoardOutcome,
-}
+/// [`KanbanApp::read_board_data`] (pure IO, safe on a background worker) and
+/// folded into the app by [`KanbanApp::apply_board_data`] on the UI thread. The
+/// read itself is shared with the desktop board
+/// ([`shelbi_app::board::read_open_board`]).
+pub(crate) type BoardData = shelbi_app::board::BoardRead;
 
-/// The project-level fields a refresh reads.
-struct BoardProject {
-    default_workflow_name: String,
-    display_name: Option<String>,
-    workspaces: Vec<String>,
-}
+/// The on-demand terminal `done`/`canceled` page a refresh read, from
+/// [`KanbanApp::read_closed_page`] on its own refresher.
+pub(crate) type ClosedPageRead = shelbi_app::board::ClosedPage;
 
-/// The outcome of reading the board (and its on-demand closed history).
-enum BoardOutcome {
-    /// `issue_store_for` or `read_board_report` failed — carries the message the
-    /// UI thread passes to `fail_refresh`.
-    Failed(String),
-    /// A cold board: no index published yet. The chrome paints with a loading
-    /// overlay until the daemon fills the index.
-    Cold { banner: Option<String> },
-    /// A warm/stale board read. `base_tasks` is the **open** board only; the
-    /// terminal `done`/`canceled` history is read on its own refresher and folded
-    /// in by [`KanbanApp::apply_closed_page`], so a slow (stale-cache)
-    /// done-history fetch never delays this fast, locally-cached read.
-    Warm {
-        banner: Option<String>,
-        base_tasks: Vec<IssueFile>,
-    },
-}
-
-/// The on-demand terminal `done`/`canceled` page a refresh read. Produced by
-/// [`KanbanApp::read_closed_page`] on its own refresher and applied via
-/// [`KanbanApp::apply_closed_page`].
-pub(crate) struct ClosedPageRead {
-    issues: Vec<IssueFile>,
-    next_cursor: Option<String>,
-}
+use shelbi_app::board::BoardOutcome;
 
 impl KanbanApp {
     pub fn new(project_name: impl Into<String>) -> Self {
@@ -849,14 +734,9 @@ impl KanbanApp {
             .filter(|tf| self.task_matches_filter(tf))
             .filter(|tf| self.task_belongs_to(&tf.task, ac))
             .collect();
-        // Done shows most-recently-completed first: `updated_at` is rewritten
-        // on the move-into-done write, so it's a stable proxy for completion
-        // time. Other columns keep their priority order (the natural order of
-        // `self.tasks`). Stable sort → equal timestamps preserve that order,
-        // so identical-state polls don't reshuffle / flicker.
-        if ac.category == StatusCategory::Done {
-            tasks.sort_by_key(|tf| std::cmp::Reverse(tf.task.updated_at));
-        }
+        // Done shows most-recently-completed first; other columns keep their
+        // priority order (the natural order of `self.tasks`). Shared rule.
+        board_rules::sort_column_cards(ac.category, &mut tasks);
         tasks
     }
 
@@ -888,22 +768,19 @@ impl KanbanApp {
             .unwrap_or(&self.default_workflow_name)
     }
 
+    /// The shared workflow-aware lookups over this board's workflows.
+    fn rules(&self) -> BoardRules<'_> {
+        BoardRules {
+            workflows: &self.workflows,
+            default_workflow_name: &self.default_workflow_name,
+        }
+    }
+
     /// Resolve a task to its status id. Prefers the task's own workflow,
     /// then the default workflow, then the legacy column-derived id as
-    /// a last-resort fallback.
+    /// a last-resort fallback ([`BoardRules::resolved_status_id`]).
     fn resolved_status_id(&self, task: &Issue) -> String {
-        let wf_name = self.task_workflow_name(task);
-        if let Some(wf) = self.workflows.iter().find(|w| w.name == wf_name) {
-            return resolve_task_status(task, wf);
-        }
-        if let Some(wf) = self
-            .workflows
-            .iter()
-            .find(|w| w.name == DEFAULT_WORKFLOW_NAME)
-        {
-            return resolve_task_status(task, wf);
-        }
-        task.column.as_str().to_string()
+        self.rules().resolved_status_id(task)
     }
 
     /// True when `tf` passes the active workspace filter. With no filter
@@ -948,65 +825,7 @@ impl KanbanApp {
     /// list of its own. On a cold process with no index published yet the read
     /// returns `Cold` without blocking.
     pub(crate) fn read_board_data(project_name: &str) -> BoardData {
-        // Project YAML may be missing on a fresh project — surface empty lists
-        // rather than failing; the dropdown degrades to "All"/"Unassigned".
-        let project = shelbi_state::load_project(project_name)
-            .ok()
-            .map(|p| BoardProject {
-                default_workflow_name: p.default_workflow_name().to_string(),
-                display_name: p.display_name.clone().or_else(|| p.label.clone()),
-                workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
-            });
-
-        // Workspace filter / column overrides are persisted view state; a missing
-        // or unreadable state.json falls back to defaults silently.
-        let state_snapshot = shelbi_state::read_state(project_name).ok();
-
-        // Workflows are still loaded — per-task overlays and move semantics need
-        // them — but no longer drive the column layout. A broken file degrades to
-        // the canonical default so the board still paints.
-        let workflows = shelbi_state::list_workflows(project_name)
-            .map_err(|e| format!("workflow load failed: {e}"));
-
-        // `statuses.yaml` is the source of truth for the column layout. A broken /
-        // missing file degrades to the canonical six.
-        let project_statuses = shelbi_state::load_project_statuses(project_name)
-            .map_err(|e| format!("statuses.yaml load failed: {e}"));
-
-        // The **open** board only. `issue_store_for` is the config-validity gate;
-        // the open board is served from the published index / per-process snapshot
-        // cache (`read_board_report`), never a live backend read here. The terminal
-        // `done`/`canceled` history — the one network-capable read — is fetched on
-        // its own refresher (`read_closed_page`), so it never delays this paint.
-        let board = match shelbi_state::issue_store_for(project_name) {
-            Err(e) => BoardOutcome::Failed(format!("refresh failed: {e}")),
-            Ok(_store) => {
-                // `read_board_report` serves this process's snapshot cache when no
-                // index exists and no daemon answers, so a bare `__tasks` pane on a
-                // hubless machine paints its last-known board rather than empty.
-                match shelbi_state::read_board_report(project_name) {
-                    Err(e) => BoardOutcome::Failed(format!("refresh failed: {e}")),
-                    Ok(report) => {
-                        let banner = report.freshness.banner();
-                        match report.state {
-                            shelbi_state::BoardState::Cold => BoardOutcome::Cold { banner },
-                            state => BoardOutcome::Warm {
-                                banner,
-                                base_tasks: state.into_issues(),
-                            },
-                        }
-                    }
-                }
-            }
-        };
-
-        BoardData {
-            project,
-            state_snapshot,
-            workflows,
-            project_statuses,
-            board,
-        }
+        shelbi_app::board::read_open_board(project_name)
     }
 
     /// Read the first page of terminal `done`/`canceled` history for `project` —
@@ -1020,20 +839,7 @@ impl KanbanApp {
     /// volume beyond what that cache already does. `None` when the store can't be
     /// built or the read fails — the UI thread then keeps the last-known lanes.
     pub(crate) fn read_closed_page(project: &str) -> Option<ClosedPageRead> {
-        let store = shelbi_state::issue_store_for(project).ok()?;
-        // Gate exactly as the old monolithic read did: the terminal history is
-        // read only for a non-cold board. A cold-open project (no index yet) adds
-        // no closed fetch — unchanged from before this split — and for a warm one
-        // the ten-minute done-history cache bounds it to one live fetch per TTL,
-        // so request volume per switch is unchanged.
-        match shelbi_state::read_board_report(project) {
-            Ok(report) if report.state.is_cold() => None,
-            Ok(_) => store.closed_page(None).ok().map(|page| ClosedPageRead {
-                issues: page.issues,
-                next_cursor: page.next_cursor,
-            }),
-            Err(_) => None,
-        }
+        shelbi_app::board::read_closed_page(project)
     }
 
     /// Fold a freshly-read [`BoardData`] into the app — the in-memory half of a
@@ -1151,18 +957,11 @@ impl KanbanApp {
     /// Deduped by id (open wins) so the local `file_system` backend, whose open
     /// board already returns the full board, is unaffected.
     fn rebuild_tasks(&mut self) {
-        let mut tasks = self.open_tasks.clone();
-        let mut seen: HashSet<String> = tasks.iter().map(|tf| tf.task.id.clone()).collect();
-        for tf in self
-            .closed_first_page
-            .iter()
-            .chain(self.closed_more.iter())
-        {
-            if seen.insert(tf.task.id.clone()) {
-                tasks.push(tf.clone());
-            }
-        }
-        self.tasks = tasks;
+        self.tasks = board_rules::merge_board(
+            &self.open_tasks,
+            &self.closed_first_page,
+            &self.closed_more,
+        );
     }
 
     /// Whether a "load more" of the terminal history is available — the on-demand
@@ -1224,34 +1023,7 @@ impl KanbanApp {
     /// (otherwise the user couldn't pick it to clear a previously-set
     /// filter on another workspace).
     pub fn dropdown_options(&self) -> Vec<DropdownOption> {
-        let mut opts: Vec<DropdownOption> = Vec::with_capacity(self.workspaces.len() + 2);
-        opts.push(DropdownOption {
-            filter: None,
-            count: self.tasks.len(),
-        });
-        for w in &self.workspaces {
-            let count = self
-                .tasks
-                .iter()
-                .filter(|tf| tf.task.assigned_to.as_deref() == Some(w.as_str()))
-                .count();
-            opts.push(DropdownOption {
-                filter: Some(WorkspaceFilter::Workspace(w.clone())),
-                count,
-            });
-        }
-        let unassigned_count = self
-            .tasks
-            .iter()
-            .filter(|tf| tf.task.assigned_to.is_none())
-            .count();
-        if unassigned_count > 0 {
-            opts.push(DropdownOption {
-                filter: Some(WorkspaceFilter::Unassigned),
-                count: unassigned_count,
-            });
-        }
-        opts
+        board_rules::workspace_options(&self.tasks, &self.workspaces)
     }
 
     /// Index of the option that matches the active filter, used to seed
@@ -1373,23 +1145,7 @@ impl KanbanApp {
     /// scaffolding behaviour the workspace dropdown uses for the same
     /// reason).
     pub fn workflow_dropdown_options(&self) -> Vec<WorkflowDropdownOption> {
-        let mut opts: Vec<WorkflowDropdownOption> = Vec::with_capacity(self.workflows.len() + 1);
-        opts.push(WorkflowDropdownOption {
-            filter: None,
-            count: self.tasks.len(),
-        });
-        for w in &self.workflows {
-            let count = self
-                .tasks
-                .iter()
-                .filter(|tf| self.task_workflow_name(&tf.task) == w.name)
-                .count();
-            opts.push(WorkflowDropdownOption {
-                filter: Some(w.name.clone()),
-                count,
-            });
-        }
-        opts
+        board_rules::workflow_options(&self.tasks, self.rules())
     }
 
     fn current_workflow_filter_idx(&self, opts: &[WorkflowDropdownOption]) -> usize {
@@ -1468,22 +1224,8 @@ impl KanbanApp {
         if self.workflows.is_empty() {
             return;
         }
-        let next = match &self.workflow_filter {
-            None => Some(self.workflows[0].name.clone()),
-            Some(current) => {
-                let pos = self.workflows.iter().position(|w| &w.name == current);
-                match pos {
-                    Some(i) if i + 1 < self.workflows.len() => {
-                        Some(self.workflows[i + 1].name.clone())
-                    }
-                    // Cycled past the last workflow, or the active
-                    // filter targets a workflow that no longer exists —
-                    // wrap back to "All" so the user always reaches the
-                    // unfiltered view.
-                    _ => None,
-                }
-            }
-        };
+        let next =
+            board_rules::next_workflow_filter(&self.workflows, self.workflow_filter.as_deref());
         self.apply_workflow_filter(next);
     }
 
@@ -1775,35 +1517,7 @@ impl KanbanApp {
         forward: bool,
         wrap: bool,
     ) -> Option<usize> {
-        let eligible: Vec<usize> = self
-            .all_columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| workflow.status(&c.status_id).is_some())
-            .map(|(i, _)| i)
-            .collect();
-        if eligible.len() <= 1 {
-            return None;
-        }
-        let current_col_idx = self
-            .all_columns
-            .iter()
-            .position(|c| c.status_id == current_status_id)?;
-        let pos = eligible.iter().position(|&i| i == current_col_idx)?;
-        let next = if forward {
-            match pos + 1 {
-                n if n < eligible.len() => n,
-                _ if wrap => 0,
-                _ => return None,
-            }
-        } else if pos > 0 {
-            pos - 1
-        } else if wrap {
-            eligible.len() - 1
-        } else {
-            return None;
-        };
-        Some(eligible[next])
+        board_rules::adjacent_column(&self.all_columns, current_status_id, workflow, forward, wrap)
     }
 
     /// Move card `id` to column `new_col_idx` **optimistically**: the card
@@ -2129,8 +1843,18 @@ impl KanbanApp {
             self.fail_status(format!("reorder blocked: {e}"));
             return;
         }
-        if let Err(e) = shelbi_state::issue_store_for(&self.project_name)
-            .and_then(|s| s.set_priority(&id, shelbi_state::PrioMove::Set(new_pos as u32)))
+        // Trade places with the visible neighbour. The slot indexes the whole
+        // stored column (shared with the desktop's drag), since a filter can
+        // hide cards between the two.
+        let target = self
+            .column_tasks(self.selected_column)
+            .get(new_pos)
+            .map(|tf| tf.task.id.clone());
+        let slot = board_rules::reorder_slot(&self.tasks, &id, target.as_deref())
+            .unwrap_or(new_pos as u32);
+        if let Err(e) = self
+            .move_persister()
+            .persist_priority(&self.project_name, &id, slot)
         {
             self.fail_status(format!("reorder failed: {e}"));
             return;
@@ -2208,7 +1932,7 @@ fn render_loading_overlay(f: &mut Frame, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(
         "Loading board…",
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(palette().ansi_dark_gray)
             .add_modifier(Modifier::ITALIC),
     )))
     .alignment(Alignment::Center);
@@ -2257,16 +1981,16 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     };
 
     let mut left_spans = vec![
-        Span::styled("Issues · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Issues · ", Style::default().fg(palette().ansi_dark_gray)),
         Span::styled(
             app.display_label().to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("   {total} total"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ];
     // Board freshness banner (Phase 3 §6): a warm board reads plainly dim; a
@@ -2275,7 +1999,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // unchanging board.
     if let Some(banner) = &app.board_banner {
         let stale = banner.contains("stale") || banner.contains("no daemon");
-        let color = if stale { Color::Yellow } else { Color::DarkGray };
+        let color = if stale { palette().ansi_yellow } else { palette().ansi_dark_gray };
         left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
     }
     f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
@@ -2283,10 +2007,10 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     if let Some(area) = workflow_area {
         let style = if app.workflow_filter.is_some() {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(workflow_text, style))),
@@ -2300,10 +2024,10 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     if let Some(area) = workspace_area {
         let style = if app.workspace_filter.is_some() {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(workspace_text, style))),
@@ -2381,7 +2105,10 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     // Per-card workflow label: only meaningful when the board can
     // actually mix workflows in a single column — i.e. multiple
     // workflows are loaded AND no filter narrows the view to one.
-    let show_card_workflow_label = app.workflows.len() > 1 && app.workflow_filter.is_none();
+    let show_card_workflow_label = board_rules::show_card_workflow_label(
+        app.workflows.len(),
+        app.workflow_filter.is_some(),
+    );
     let mut header_hits: Vec<HeaderHit> = Vec::with_capacity(widths.len());
     let mut x = area.x;
     for (i, w) in widths.iter().copied() {
@@ -2419,7 +2146,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
         let glyph = Span::styled(
             "◂",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         );
         let pos = Rect {
@@ -2434,7 +2161,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
         let glyph = Span::styled(
             "▸",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         );
         let pos = Rect {
@@ -2639,7 +2366,7 @@ fn render_collapsed_column(
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 count_text,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             ))),
             count_rect,
         );
@@ -2674,7 +2401,7 @@ fn render_column(
         Span::styled(header_text, header_style),
         Span::styled(
             format!(" ({})", tasks.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ),
     ]);
 
@@ -2717,7 +2444,7 @@ fn render_column(
             wrap_title_two_lines(&format!("{badge_prefix}{}", tf.task.title), max_text);
         let title_style = if blocked {
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette().ansi_dark_gray)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -2743,8 +2470,8 @@ fn render_column(
         if focused && row == app.selected_row {
             item = item.style(
                 Style::default()
-                    .bg(crate::theme::SELECTION_BG)
-                    .fg(Color::White)
+                    .bg(palette().selection)
+                    .fg(palette().ansi_white)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -2757,7 +2484,7 @@ fn render_column(
     if items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "(empty)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))));
     }
     // The done column is history loaded on demand (§4): when the closed page
@@ -2768,7 +2495,7 @@ fn render_column(
         items.push(ListItem::new(Line::from(Span::styled(
             "↓ load more (m)",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette().ansi_dark_gray)
                 .add_modifier(Modifier::ITALIC),
         ))));
     }
@@ -2852,13 +2579,13 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
             fc(km.kanban.first_chord_for(KanbanAction::OpenWorkspace)),
         ));
     }
-    let keys = Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
+    let keys = Line::from(Span::styled(text, Style::default().fg(palette().ansi_dark_gray)));
     let status = if app.status_line.is_empty() {
         Line::raw("")
     } else {
         Line::from(Span::styled(
             format!("  {}", app.status_line),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette().ansi_yellow),
         ))
     };
     f.render_widget(Paragraph::new(vec![keys, status]), area);
@@ -2925,11 +2652,11 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     f.render_widget(Clear, popover_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(vec![Span::styled(
             " Filter by workspace ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
@@ -2955,13 +2682,13 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let line = Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(prefix, Style::default().fg(palette().ansi_cyan)),
             Span::styled(label, label_style),
         ]);
         items.push(ListItem::new(line));
@@ -2986,15 +2713,15 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     state.select(Some(cursor.min(opts.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(crate::theme::SELECTION_BG)
-            .fg(Color::White)
+            .bg(palette().selection)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, list_area, &mut state);
 
     let hint = Line::from(Span::styled(
         " ↑↓ nav · ↵ select · c clear · esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), hint_area);
 
@@ -3059,11 +2786,11 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     f.render_widget(Clear, popover_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(vec![Span::styled(
             " Filter by workflow ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
@@ -3084,13 +2811,13 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let line = Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(prefix, Style::default().fg(palette().ansi_cyan)),
             Span::styled(label, label_style),
         ]);
         items.push(ListItem::new(line));
@@ -3112,15 +2839,15 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     state.select(Some(cursor.min(opts.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(crate::theme::SELECTION_BG)
-            .fg(Color::White)
+            .bg(palette().selection)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, list_area, &mut state);
 
     let hint = Line::from(Span::styled(
         " ↑↓ nav · ↵ select · c clear · esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), hint_area);
 
@@ -3143,35 +2870,21 @@ fn workflow_dropdown_row_text(opt: &WorkflowDropdownOption) -> String {
 /// status names fall through to a generic uppercase rendering so a
 /// `Design` status renders as `DESIGN` without the renderer needing a
 /// per-workflow lookup table.
-fn column_label(status_name: &str) -> String {
-    match status_name {
-        "Backlog" => "BACKLOG".to_string(),
-        "Todo" => "TO DO".to_string(),
-        // Accept both the post-split "In Progress" (matches the spec
-        // wireframe) and the pre-split "InProgress" written into legacy
-        // workflow YAMLs that haven't been migrated yet.
-        "In Progress" | "InProgress" => "IN PROGRESS".to_string(),
-        "Review" => "REVIEW".to_string(),
-        "Done" => "DONE".to_string(),
-        other => other.to_uppercase(),
-    }
-}
-
 /// Header colour for a column. Driven by [`StatusCategory`] so a
 /// renamed Review-step column (e.g. a workflow's `QA` status with
 /// `category: handoff`) still gets the same magenta the canonical
 /// Review column has — generic code keys off category, not name.
 fn category_color(category: StatusCategory) -> Color {
     match category {
-        StatusCategory::Backlog => Color::Gray,
-        StatusCategory::Ready => Color::Blue,
-        StatusCategory::Active => Color::Yellow,
-        StatusCategory::Handoff => Color::Magenta,
-        StatusCategory::Done => Color::Green,
+        StatusCategory::Backlog => palette().ansi_gray,
+        StatusCategory::Ready => palette().ansi_blue,
+        StatusCategory::Active => palette().ansi_yellow,
+        StatusCategory::Handoff => palette().ansi_magenta,
+        StatusCategory::Done => palette().ansi_green,
         // Closed-without-shipping (Cancelled / Won't Fix / Duplicate).
         // Darker than Backlog so the eye reads it as terminal-inactive,
         // not waiting-for-triage.
-        StatusCategory::Archived => Color::DarkGray,
+        StatusCategory::Archived => palette().ansi_dark_gray,
     }
 }
 
@@ -3223,31 +2936,6 @@ fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
     (line1, Some(truncate(&remainder, max)))
 }
 
-/// Resolve the branch to surface on a card's meta line. Prefers the
-/// task's own `branch` (the working branch, once the orchestrator has cut
-/// it) and otherwise falls back to the workflow's `git.base_branch`
-/// template when it carries a `{{var}}` placeholder that resolves cleanly
-/// from this task's params. A fixed `base_branch: main` (no placeholder)
-/// or a half-substituted template resolves to `None` — neither adds
-/// trustworthy per-task info at the card-glance scale.
-fn card_branch(task: &Issue, workflows: &[Workflow], workflow_name: &str) -> Option<String> {
-    if let Some(branch) = task.branch.as_deref().filter(|b| !b.is_empty()) {
-        return Some(branch.to_string());
-    }
-    workflows
-        .iter()
-        .find(|w| w.name == workflow_name)
-        .and_then(|w| w.git.as_ref())
-        .and_then(|g| g.base_branch.as_deref())
-        .filter(|tmpl| tmpl.contains("{{"))
-        .and_then(|tmpl| {
-            let mut missing = Vec::new();
-            let resolved =
-                shelbi_core::substitute_placeholders(tmpl, &task.string_params(), &mut missing);
-            missing.is_empty().then_some(resolved)
-        })
-}
-
 /// Build the card's meta line: the task's workflow name rendered as a
 /// small background-filled badge, followed on the same line by the branch
 /// prefixed with `⎇ ` (dim, truncated to the remaining width).
@@ -3277,8 +2965,8 @@ fn card_meta_line(
         spans.push(Span::styled(
             badge,
             Style::default()
-                .bg(crate::theme::WORKFLOW_BADGE_BG)
-                .fg(crate::theme::WORKFLOW_BADGE_FG),
+                .bg(palette().workflow_badge_bg)
+                .fg(palette().workflow_badge_fg),
         ));
     }
 
@@ -3293,7 +2981,7 @@ fn card_meta_line(
             }
             spans.push(Span::styled(
                 truncate(&format!("⎇ {branch}"), remaining),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().ansi_dark_gray),
             ));
         }
     }
@@ -3305,62 +2993,7 @@ fn card_meta_line(
 }
 
 // ---------------------------------------------------------------------------
-// Column builder
-
-/// Build the column list from `statuses.yaml`. When `workflow` is `None`
-/// every status declared in the file is emitted (in declared order).
-/// When `Some`, the list narrows to the statuses that workflow declares
-/// — still in `statuses.yaml` order, since the loader rejects workflow
-/// files that try to reorder relative to the project-wide catalogue.
-fn kanban_columns_from(
-    statuses: &ProjectStatuses,
-    workflow: Option<&Workflow>,
-) -> Vec<KanbanColumn> {
-    let allowed: Option<HashSet<&str>> =
-        workflow.map(|wf| wf.statuses.iter().map(|s| s.id.as_str()).collect());
-    statuses
-        .statuses
-        .iter()
-        .filter(|st| {
-            allowed
-                .as_ref()
-                .is_none_or(|set| set.contains(st.id.as_str()))
-        })
-        .map(|st| KanbanColumn {
-            status_id: st.id.clone(),
-            status_name: st.name.clone(),
-            category: st.category,
-        })
-        .collect()
-}
-
-/// Resolve the workflow status *id* `task` lives in. A task's position is
-/// itself a status id ([`Column::as_str`]), so this is mostly an identity
-/// — the fallbacks only matter when the task's stored id isn't one the
-/// workflow declares (a workflow that renamed a status).
-///
-/// Resolution order, mirroring the events log writer's behaviour:
-///
-/// 1. **Id match** — if the workflow declares a status whose id equals the
-///    task's stored position id, use it. Covers the common case.
-/// 2. **Category match** — fall back to the first status in the workflow
-///    whose category equals the task's position category. Handles a custom
-///    workflow that renamed `in-progress` to `design` (both report
-///    `StatusCategory::Active`).
-/// 3. **Canonical** — if the workflow declares no status that matches by
-///    id or category, return the stored id unchanged. The task won't
-///    bucket cleanly, but the renderer never crashes.
-fn resolve_task_status(task: &Issue, workflow: &Workflow) -> String {
-    let stored = task.column.as_str();
-    if workflow.status(stored).is_some() {
-        return stored.to_string();
-    }
-    let cat = task.column.category();
-    if let Some(st) = workflow.statuses.iter().find(|s| s.category == cat) {
-        return st.id.clone();
-    }
-    stored.to_string()
-}
+// Move persistence
 
 /// Spawn one card-move persistence step on a background thread and hand back the
 /// receiver its result will arrive on. The UI thread never blocks on the daemon
@@ -3517,13 +3150,13 @@ pub(crate) fn render_task_popover_into(
     let title_text = truncate(&title, popover_area.width.saturating_sub(4) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(
                 title_text,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette().ansi_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -3550,7 +3183,7 @@ pub(crate) fn render_task_popover_into(
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(chunks[1].width as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         ))),
         chunks[1],
     );
@@ -3595,7 +3228,7 @@ pub(crate) fn render_task_popover_into(
     }
     let hint = Line::from(Span::styled(
         hint_text,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), chunks[3]);
 }
@@ -3616,7 +3249,7 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
         col_line.push(meta_label("workspace"));
         col_line.push(Span::styled(
             format!("@{w}"),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(palette().ansi_magenta),
         ));
     }
     lines.push(Line::from(col_line));
@@ -3640,7 +3273,7 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
             };
             let color = match dep_col {
                 Some(c) => column_color(c),
-                None => Color::Red,
+                None => palette().ansi_red,
             };
             spans.push(Span::styled(label_text, Style::default().fg(color)));
         }
@@ -3664,7 +3297,7 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
 }
 
 fn meta_label(label: &str) -> Span<'static> {
-    Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray))
+    Span::styled(format!("{label}: "), Style::default().fg(palette().ansi_dark_gray))
 }
 
 fn meta_row(label: &str, value: &str) -> Line<'static> {
@@ -4290,6 +3923,45 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             "error: {}",
             errors[0].message
         );
+    }
+
+    /// Records reorders instead of persisting them; moves are not expected.
+    #[derive(Default)]
+    struct RecordingPrioPersister(std::sync::Mutex<Vec<(String, u32)>>);
+
+    impl MovePersister for RecordingPrioPersister {
+        fn persist(&self, _project: &str, _id: &str, _target: &Column) -> PersistResult {
+            Err("unexpected move".into())
+        }
+
+        fn persist_priority(&self, _project: &str, id: &str, slot: u32) -> Result<(), String> {
+            self.0.lock().unwrap().push((id.to_string(), slot));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reorder_goes_through_the_persister_with_the_whole_column_slot() {
+        // With a workspace filter hiding `b`, `a`'s visible neighbour `d` sits at
+        // slot 2 of the stored column, not row 1: Shift+j must land `a` past
+        // `d`, which the visible row index alone would not.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("prio-slot");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+        for (id, prio, ws) in [("a", 0, "alpha"), ("b", 1, "bravo"), ("d", 2, "alpha")] {
+            let tf = task_file_for(id, Column::todo(), prio, "2026-06-20T10:00:00Z", Some(ws));
+            shelbi_state::save_task("demo", &tf.task, &tf.body).unwrap();
+        }
+        let recorder = Arc::new(RecordingPrioPersister::default());
+        let mut app = KanbanApp::new("demo");
+        app.move_persister = Some(recorder.clone());
+        app.refresh();
+        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
+        app.selected_column = 1;
+        app.selected_row = 0;
+
+        app.reorder_down();
+        assert_eq!(*recorder.0.lock().unwrap(), [("a".to_string(), 2)]);
     }
 
     #[test]
@@ -6115,6 +5787,47 @@ transitions:
             rendered.contains("design-review") || rendered.contains("design-revi"),
             "design-review card label missing:\n{rendered}"
         );
+    }
+
+    /// The board (headers, cards, a selected card with its workflow badge,
+    /// the filter chips), the open workflow dropdown, and the task popover
+    /// are readable on a light terminal.
+    #[test]
+    fn renders_readable_in_light() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::theme::Appearance;
+        let mut app = KanbanApp::new("demo");
+        app.workspaces = vec!["alpha".into(), "bravo".into()];
+        app.workflows = vec![
+            default_workflow(),
+            workflow_using("design-review", &["backlog", "in-progress", "done"]),
+        ];
+        app.project_statuses = default_project_statuses();
+        app.all_columns = app.compute_all_columns();
+        app.tasks = vec![
+            task_in_workflow("d-backlog", Column::backlog(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-todo", Column::todo(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-wip", Column::in_progress(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-review", Column::review(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-done", Column::done(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("dr-wip", Column::in_progress(), Some("design-review"), "2026-06-20T10:00:00Z"),
+        ];
+        app.selected_column = 2;
+        app.selected_row = 0;
+        app.status_line = "moved d-wip to In Progress".into();
+        crate::theme::with_appearance(Appearance::Light, || {
+            let draw = |app: &mut KanbanApp, name: &str| {
+                let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
+                term.draw(|f| render_full(f, app, f.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            };
+            draw(&mut app, "kanban-board");
+            app.open_workflow_dropdown();
+            draw(&mut app, "kanban-workflow-dropdown");
+            app.workflow_dropdown = None;
+            app.open_popover();
+            draw(&mut app, "kanban-popover");
+        });
     }
 
     /// A full blank row separates consecutive cards in a column: the

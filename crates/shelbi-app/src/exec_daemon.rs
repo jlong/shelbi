@@ -8,7 +8,7 @@
 //! app composes this with its own client-local navigation handling to form a
 //! full [`Executor`](crate::exec::Executor).
 //!
-//! Only the issue mutations (`MoveIssue` … `AddIssue`) are daemon-routed here;
+//! Only the issue mutations (`MoveIssue` … `PrioritizeIssue`) are daemon-routed here;
 //! the lifecycle mutations ([`Mutation::ToggleZen`], [`Mutation::AddProject`])
 //! are not part of the issue control protocol and are left to the host.
 
@@ -29,7 +29,39 @@ pub fn execute_mutation(
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
     let (project, id, kind) = map_to_kind(mutation)?;
-    route(&project, &id, kind, on_line)
+    // The `(status, revision)` the app last saw, so the daemon can reject a
+    // command whose issue moved on. `add` has no prior state. Read through the
+    // store (shelbi-state), not the orchestrator, to keep this crate light.
+    let expected = match &kind {
+        MutationKind::Add(_) => None,
+        _ => read_expected(&project, &id),
+    };
+    route(&project, &id, expected, kind, on_line).map(|_| ())
+}
+
+/// [`execute_mutation`] with the expected state supplied by the caller: the
+/// `(status, revision)` the client was **looking at** when the user acted,
+/// rather than one re-read at send time. A board that renders a snapshot passes
+/// the card's read state, so if another client moved the issue after that
+/// snapshot the daemon refuses the mutation ([`ExecError::Conflict`]) instead
+/// of applying it to state the user never saw. `None` sends no expectation
+/// (the daemon applies unconditionally); `add` ignores it.
+///
+/// On success it returns the issue's `(status, revision)` right after the
+/// change, when the daemon reports one: the state this client's next mutation
+/// of the same issue should expect, since its read still shows the state
+/// before its own change until the board re-reads.
+pub fn execute_mutation_expecting(
+    mutation: &Mutation,
+    expected: Option<ExpectedState>,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<ExpectedState>, ExecError> {
+    let (project, id, kind) = map_to_kind(mutation)?;
+    let expected = match &kind {
+        MutationKind::Add(_) => None,
+        _ => expected,
+    };
+    route(&project, &id, expected, kind, on_line)
 }
 
 /// Ask the daemon to start or stop a review slot's editor/diff/server sessions
@@ -165,6 +197,17 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
                 branch: None,
             })),
         ),
+        Mutation::PrioritizeIssue {
+            project,
+            id,
+            position,
+        } => (
+            project.clone(),
+            id.clone(),
+            MutationKind::Prioritize {
+                position: *position,
+            },
+        ),
         Mutation::ToggleZen { .. } | Mutation::AddProject { .. } => {
             return Err(ExecError::Backend(
                 "lifecycle mutation not handled by the daemon mutation executor".to_string(),
@@ -174,21 +217,14 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
 }
 
 /// Ensure the daemon, connect, send the mutation, and map the result to an
-/// [`ExecError`].
+/// [`ExecError`]. `Ok` carries the issue's post-change state, when reported.
 fn route(
     project: &str,
     id: &str,
+    expected: Option<ExpectedState>,
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
-) -> ExecOutcome {
-    // The `(status, revision)` the app last saw, so the daemon can reject a
-    // command whose issue moved on. `add` has no prior state. Read through the
-    // store (shelbi-state), not the orchestrator, to keep this crate light.
-    let expected = match &kind {
-        MutationKind::Add(_) => None,
-        _ => read_expected(project, id),
-    };
-
+) -> Result<Option<ExpectedState>, ExecError> {
     shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
     let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
     let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)

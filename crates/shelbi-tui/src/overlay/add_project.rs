@@ -22,55 +22,31 @@
 //! keystroke: the caller runs [`shelbi_orchestrator::project_create::validate_add_project`]
 //! on submit and, on failure, stashes the message back via [`Form::set_error`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
 use shelbi_core::ConfigMode;
-use shelbi_orchestrator::project_create::{absolutize, validate_root, RootValidation};
+use crate::theme::palette;
 
-/// The three focusable controls, in Tab order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Name,
-    Root,
-    Config,
-}
+// The form's state machine is shared with the desktop app
+// (`shelbi_app::overlay::add_project`).
+pub use shelbi_app::overlay::add_project::{Detected, Field, Step};
+use shelbi_app::overlay::add_project as shared;
 
-/// What feeding one key into the form resolved to. The caller keeps the overlay
-/// open on [`Step::Continue`], validates + creates on [`Step::Submit`] (reading
-/// [`Form::name`] / [`Form::root`] / [`Form::mode`]), and discards on
-/// [`Step::Cancel`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
-    Continue,
-    Submit,
-    Cancel,
-}
-
-/// Everything the dialog collects, plus transient UI state (focus, the last
-/// inline validation error, and the cached git-repo detection).
+/// The add-project form: the shared state machine, with the "Detected:" check
+/// run inline after each key (it is cached per root text, so it only runs git
+/// when the repo path changes).
 #[derive(Debug, Clone)]
 pub struct Form {
-    name: String,
-    root: String,
-    mode: ConfigMode,
-    focus: Field,
-    error: Option<String>,
-    /// The launch directory, used to absolutize a relative repo path for the
-    /// detection line (and later for validation by the caller).
-    cwd: PathBuf,
-    /// Cached git-repo detection for the current `root`, recomputed only when
-    /// the root text changes so we don't spawn `git rev-parse` per keystroke.
-    detected: Detected,
-    detect_root: String,
+    inner: shared::Form,
 }
 
 impl Form {
@@ -78,79 +54,50 @@ impl Form {
     /// "Project root?" prompt offers); config location defaults to `global`,
     /// the low-ceremony solo choice the user can flip to in-repo with one key.
     pub fn new(cwd: &Path) -> Self {
-        let root = cwd.display().to_string();
-        let detected = Detected::for_root(cwd, &root);
-        Self {
-            name: String::new(),
-            root: root.clone(),
-            mode: ConfigMode::Global,
-            focus: Field::Name,
-            error: None,
-            cwd: cwd.to_path_buf(),
-            detected,
-            detect_root: root,
-        }
+        let mut form = Self {
+            inner: shared::Form::new(cwd),
+        };
+        form.detect();
+        form
     }
 
     /// The entered (raw, human-readable) project name.
     pub fn name(&self) -> &str {
-        &self.name
+        self.inner.name()
     }
 
     /// The entered repo-path text (not yet absolutized).
     pub fn root(&self) -> &str {
-        &self.root
+        self.inner.root()
     }
 
     /// The chosen config location.
     pub fn mode(&self) -> ConfigMode {
-        self.mode
+        self.inner.mode()
+    }
+
+    /// The focused control.
+    pub fn focus(&self) -> Field {
+        self.inner.focus()
     }
 
     /// Stash an inline validation error (shown in red) after a failed submit,
     /// keeping the form open so the user can fix the input. Cleared the moment
     /// they edit anything.
     pub fn set_error(&mut self, msg: impl Into<String>) {
-        self.error = Some(msg.into());
+        self.inner.set_error(msg);
     }
 
-    /// Feed one key event. Bindings (identical to the pre-move CLI dialog):
-    /// - `Esc` cancels regardless of focus.
-    /// - `Enter` requests submission regardless of focus.
-    /// - `Tab` / `BackTab` cycle focus Name → Root → Config → Name.
-    /// - On a text field: printable chars append, `Backspace` deletes.
-    /// - On `Config`: `Space` / arrows toggle in-repo vs global.
-    ///
-    /// Any edit clears a stale inline error. Editing the root recomputes the
-    /// cached git-repo detection.
+    /// Feed one key event ([`shared::Form::handle_key`]): Esc cancels and
+    /// Enter submits from any field, Tab / BackTab cycle focus, a text field
+    /// takes typed characters and Backspace, and the config row flips on Space
+    /// or an arrow. Editing the root re-runs the cached git-repo detection.
     pub fn handle_key(&mut self, key: KeyEvent) -> Step {
-        let step = match key.code {
-            KeyCode::Esc => return Step::Cancel,
-            KeyCode::Enter => return Step::Submit,
-            KeyCode::Tab => {
-                self.focus = next_field(self.focus);
-                self.error = None;
-                Step::Continue
-            }
-            KeyCode::BackTab => {
-                self.focus = prev_field(self.focus);
-                self.error = None;
-                Step::Continue
-            }
-            _ => {
-                match self.focus {
-                    Field::Name => edit_text(&mut self.name, &mut self.error, key),
-                    Field::Root => edit_text(&mut self.root, &mut self.error, key),
-                    Field::Config => toggle_config(&mut self.mode, &mut self.error, key),
-                }
-                Step::Continue
-            }
+        let step = match crate::keymap::chord_from_event(key) {
+            Some(chord) => self.inner.handle_key(chord),
+            None => Step::Continue,
         };
-        // Recompute detection only when the root text actually changed.
-        if self.root != self.detect_root {
-            self.detected = Detected::for_root(&self.cwd, &self.root);
-            self.detect_root = self.root.clone();
-        }
+        self.detect();
         step
     }
 
@@ -158,111 +105,30 @@ impl Form {
     pub fn render(&self, f: &mut Frame, area: Rect) {
         render(f, area, self);
     }
-}
 
-fn next_field(f: Field) -> Field {
-    match f {
-        Field::Name => Field::Root,
-        Field::Root => Field::Config,
-        Field::Config => Field::Name,
-    }
-}
-
-fn prev_field(f: Field) -> Field {
-    match f {
-        Field::Name => Field::Config,
-        Field::Root => Field::Name,
-        Field::Config => Field::Root,
-    }
-}
-
-fn edit_text(buf: &mut String, error: &mut Option<String>, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char(c)
-            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-        {
-            buf.push(c);
-            *error = None;
+    /// Run the git-repo check when the root text changed since the last one.
+    fn detect(&mut self) {
+        if let Some(root) = self.inner.detection_due() {
+            let detected =
+                shelbi_orchestrator::project_create::detect_root(self.inner.cwd(), &root);
+            self.inner.set_detected(&root, detected);
         }
-        KeyCode::Backspace => {
-            buf.pop();
-            *error = None;
-        }
-        _ => {}
     }
 }
 
-fn toggle_config(mode: &mut ConfigMode, error: &mut Option<String>, key: KeyEvent) {
-    match key.code {
-        KeyCode::Left
-        | KeyCode::Right
-        | KeyCode::Up
-        | KeyCode::Down
-        | KeyCode::Char(' ') => {
-            *mode = match *mode {
-                ConfigMode::InRepo => ConfigMode::Global,
-                ConfigMode::Global => ConfigMode::InRepo,
+/// The "Detected:" line for the latest detection.
+fn detected_line(detected: Option<Detected>) -> Span<'static> {
+    match detected {
+        Some(d) => {
+            let color = if d.is_ok() {
+                palette().ansi_green
+            } else {
+                palette().ansi_yellow
             };
-            *error = None;
+            Span::styled(d.message(), Style::default().fg(color))
         }
-        _ => {}
+        None => Span::raw(""),
     }
-}
-
-/// Cheap, cached detection shown on the "Detected:" line — limited to the
-/// git-repo check [`validate_root`] performs; the heavier default-branch /
-/// runner / machine detection is deferred to the scaffold step so the dialog
-/// stays responsive per keystroke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Detected {
-    exists: bool,
-    is_git: bool,
-}
-
-impl Detected {
-    fn for_root(cwd: &Path, root: &str) -> Self {
-        let trimmed = root.trim();
-        if trimmed.is_empty() {
-            return Self {
-                exists: false,
-                is_git: false,
-            };
-        }
-        let path = absolutize(cwd, Path::new(trimmed));
-        match validate_root(&path) {
-            RootValidation::Ok => Self {
-                exists: true,
-                is_git: true,
-            },
-            RootValidation::NotGitRepo => Self {
-                exists: true,
-                is_git: false,
-            },
-            RootValidation::NotExists | RootValidation::NotDirectory => Self {
-                exists: false,
-                is_git: false,
-            },
-        }
-    }
-
-    fn line(&self) -> Span<'static> {
-        if !self.exists {
-            return Span::styled("Detected: path not found", Style::default().fg(Color::Yellow));
-        }
-        if self.is_git {
-            return Span::styled("Detected: git repo ✓", Style::default().fg(Color::Green));
-        }
-        Span::styled(
-            "Detected: not a git repo (shelbi expects git, but will continue)",
-            Style::default().fg(Color::Yellow),
-        )
-    }
-}
-
-/// Slugify the entered name the same way the scaffolder will, for the live
-/// preview. `None` when the input has no `[a-z0-9]` to build an id from.
-fn derived_slug(name: &str) -> Option<String> {
-    shelbi_core::normalize_project_name(name.trim()).ok()
 }
 
 /// Paint the dialog. The card **fills** `area` (rather than a small centered
@@ -272,36 +138,36 @@ fn render(f: &mut Frame, area: Rect, form: &Form) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().ansi_cyan))
         .title(Line::from(Span::styled(
-            " Add a project ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            format!(" {} ", shared::TITLE),
+            Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
-    lines.push(field_line("Name", &form.name, form.focus == Field::Name));
-    lines.push(field_line("Repo path", &form.root, form.focus == Field::Root));
-    lines.push(config_line(form.mode, form.focus == Field::Config));
+    lines.push(field_line("Name", form.name(), form.focus() == Field::Name));
+    lines.push(field_line("Repo path", form.root(), form.focus() == Field::Root));
+    lines.push(config_line(form.mode(), form.focus() == Field::Config));
     lines.push(Line::raw(""));
-    lines.push(Line::from(form.detected.line()));
-    lines.push(preview_line(&form.name, form.mode));
+    lines.push(Line::from(detected_line(form.inner.detected())));
+    lines.push(preview_line(&form.inner));
     lines.push(Line::raw(""));
     // Error row is reserved unconditionally so the hints don't reflow when a
     // validation message appears.
-    lines.push(match &form.error {
+    lines.push(match form.inner.error() {
         Some(msg) => Line::from(Span::styled(
             format!("✗ {msg}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().ansi_red).add_modifier(Modifier::BOLD),
         )),
         None => Line::raw(""),
     });
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![Span::styled(
-        "[ Enter ] Create    [ Esc ] Cancel    [ Tab ] Next field",
-        Style::default().fg(Color::DarkGray),
+        shared::HINT,
+        Style::default().fg(palette().ansi_dark_gray),
     )]));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -309,26 +175,20 @@ fn render(f: &mut Frame, area: Rect, form: &Form) {
 
 /// The live "where this lands" preview: the derived slug and the path its
 /// config will be written to.
-fn preview_line(name: &str, mode: ConfigMode) -> Line<'static> {
-    let label_style = Style::default().fg(Color::Gray);
-    match derived_slug(name) {
-        Some(slug) => {
-            let path = match mode {
-                ConfigMode::Global => format!("~/.shelbi/projects/{slug}.yaml"),
-                ConfigMode::InRepo => "<repo>/.shelbi/project.yaml".to_string(),
-            };
-            Line::from(vec![
-                Span::styled("Folder / id: ", label_style),
-                Span::styled(
-                    slug,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("   ({path})"), Style::default().fg(Color::DarkGray)),
-            ])
-        }
+fn preview_line(form: &shared::Form) -> Line<'static> {
+    let label_style = Style::default().fg(palette().ansi_gray);
+    match form.preview() {
+        Some((slug, path)) => Line::from(vec![
+            Span::styled("Folder / id: ", label_style),
+            Span::styled(
+                slug,
+                Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("   ({path})"), Style::default().fg(palette().ansi_dark_gray)),
+        ]),
         None => Line::from(Span::styled(
             "Folder / id: (type a name to see the derived id)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().ansi_dark_gray),
         )),
     }
 }
@@ -338,17 +198,17 @@ fn preview_line(name: &str, mode: ConfigMode) -> Line<'static> {
 fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
     let label_style = if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().ansi_gray)
     };
     let mut spans = vec![
         Span::styled(format!("{label:<11}"), label_style),
         Span::raw(value.to_string()),
     ];
     if focused {
-        spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled("▏", Style::default().fg(palette().ansi_cyan)));
     }
     Line::from(spans)
 }
@@ -357,10 +217,10 @@ fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
 fn config_line(mode: ConfigMode, focused: bool) -> Line<'static> {
     let label_style = if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().ansi_gray)
     };
     let in_repo = if mode == ConfigMode::InRepo {
         "(•) In repo"
@@ -374,9 +234,9 @@ fn config_line(mode: ConfigMode, focused: bool) -> Line<'static> {
     };
     let opt_style = |selected: bool| {
         if selected {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette().ansi_white)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(palette().ansi_dark_gray)
         }
     };
     Line::from(vec![
@@ -390,6 +250,7 @@ fn config_line(mode: ConfigMode, focused: bool) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -403,24 +264,24 @@ mod tests {
     #[test]
     fn new_prefills_root_and_defaults_to_global() {
         let f = Form::new(Path::new("/tmp/here"));
-        assert_eq!(f.name, "");
-        assert_eq!(f.root, "/tmp/here");
-        assert_eq!(f.mode, ConfigMode::Global);
-        assert_eq!(f.focus, Field::Name);
-        assert!(f.error.is_none());
+        assert_eq!(f.name(), "");
+        assert_eq!(f.root(), "/tmp/here");
+        assert_eq!(f.mode(), ConfigMode::Global);
+        assert_eq!(f.focus(), Field::Name);
+        assert!(f.inner.error().is_none());
     }
 
     #[test]
     fn tab_and_back_tab_cycle_focus() {
         let mut f = form();
         assert_eq!(f.handle_key(key(KeyCode::Tab)), Step::Continue);
-        assert_eq!(f.focus, Field::Root);
+        assert_eq!(f.focus(), Field::Root);
         f.handle_key(key(KeyCode::Tab));
-        assert_eq!(f.focus, Field::Config);
+        assert_eq!(f.focus(), Field::Config);
         f.handle_key(key(KeyCode::Tab));
-        assert_eq!(f.focus, Field::Name);
+        assert_eq!(f.focus(), Field::Name);
         f.handle_key(key(KeyCode::BackTab));
-        assert_eq!(f.focus, Field::Config);
+        assert_eq!(f.focus(), Field::Config);
     }
 
     #[test]
@@ -441,7 +302,7 @@ mod tests {
     #[test]
     fn config_toggles_between_in_repo_and_global() {
         let mut f = form();
-        f.focus = Field::Config;
+        f.inner.set_focus(Field::Config);
         assert_eq!(f.mode(), ConfigMode::Global);
         f.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(f.mode(), ConfigMode::InRepo);
@@ -454,7 +315,7 @@ mod tests {
     #[test]
     fn typing_on_config_field_does_not_leak_into_a_text_buffer() {
         let mut f = form();
-        f.focus = Field::Config;
+        f.inner.set_focus(Field::Config);
         f.handle_key(key(KeyCode::Char('x')));
         assert_eq!(f.mode(), ConfigMode::Global);
         assert_eq!(f.name(), "");
@@ -472,9 +333,9 @@ mod tests {
     fn editing_clears_a_stale_error() {
         let mut f = form();
         f.set_error("boom");
-        assert!(f.error.is_some());
+        assert!(f.inner.error().is_some());
         f.handle_key(key(KeyCode::Char('a')));
-        assert!(f.error.is_none());
+        assert!(f.inner.error().is_none());
     }
 
     fn render_to_string(f: &Form, w: u16, h: u16) -> String {
@@ -489,6 +350,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The form (title, labels, the focused field and cursor, the radio,
+    /// the detection line, an inline error, the key hints) is readable on a
+    /// light terminal with each control focused.
+    #[test]
+    fn renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            for (name, focus) in [
+                ("add-project-name", Field::Name),
+                ("add-project-root", Field::Root),
+                ("add-project-config", Field::Config),
+            ] {
+                let mut f = form();
+                for c in "acme".chars() {
+                    f.handle_key(key(KeyCode::Char(c)));
+                }
+                f.set_error("a project already lives at `acme`".to_string());
+                f.inner.set_focus(focus);
+                let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                term.draw(|frame| f.render(frame, frame.area())).unwrap();
+                crate::theme::assert_light_readable(name, term.backend().buffer());
+            }
+        });
     }
 
     #[test]

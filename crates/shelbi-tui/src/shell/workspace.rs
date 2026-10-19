@@ -92,7 +92,7 @@ impl WorkspaceInterface {
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
-            super::relaunch::WorkspaceContentRelauncher {
+            shelbi_app::session::WorkspaceContentRelauncher {
                 project: project.to_string(),
             },
         ));
@@ -345,7 +345,7 @@ impl WorkspaceInterface {
             MainState::Restarting(attempt, max) => super::render_placeholder(
                 buf,
                 content_rect,
-                &format!("Session exited — restarting ({attempt}/{max})…"),
+                &shelbi_app::session::restarting_notice(attempt, max),
             ),
             MainState::GaveUp(last_line) => super::render_placeholder(
                 buf,
@@ -385,6 +385,10 @@ fn map_effect(effect: WsEffect) -> WorkspaceAction {
         WsEffect::ShowDiff => WorkspaceAction::ShowContent(Some(ReviewRole::Diff)),
         WsEffect::ShowEditor => WorkspaceAction::ShowContent(Some(ReviewRole::Editor)),
         WsEffect::ShowDescription => WorkspaceAction::ShowDescription,
+        WsEffect::Close => WorkspaceAction::Close,
+        // The TUI's panel has no user-shell row (the desktop's), so this
+        // never comes out of it.
+        WsEffect::ToggleShell => WorkspaceAction::None,
     }
 }
 
@@ -396,7 +400,7 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::*;
     use crate::shell::session::{ConnectFailure, Connected};
-    use crate::theme::STATUS_YELLOW;
+    use crate::theme::palette;
     use crossterm::event::KeyModifiers;
 
     /// A connector that never resolves — the content view stays Connecting, so
@@ -435,7 +439,7 @@ mod tests {
     fn status() -> WsStatus {
         WsStatus {
             text: "IN PROGRESS".into(),
-            color: STATUS_YELLOW,
+            color: palette().yellow,
         }
     }
 

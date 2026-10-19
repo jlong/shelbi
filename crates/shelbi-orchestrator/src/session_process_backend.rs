@@ -477,12 +477,20 @@ impl SessionProcessBackend {
     /// [`enumerate_slots`](SessionBackend::enumerate_slots) handed back.
     /// Best-effort: an already-gone session is fine.
     pub(crate) fn kill_by_name(&self, host: &Host, name: &str) -> Result<()> {
+        self.signal_by_name(host, name, None)
+    }
+
+    /// [`kill_by_name`](Self::kill_by_name) with an explicit signal for the
+    /// child's process group (`None` is the session's default, SIGTERM). An
+    /// interactive shell ignores SIGTERM, so ending one takes SIGHUP, what a
+    /// terminal sends when it closes.
+    pub(crate) fn signal_by_name(&self, host: &Host, name: &str, signal: Option<i32>) -> Result<()> {
         if host.is_ssh() {
-            return remote_session::kill(host, name);
+            return remote_session::signal(host, name, signal);
         }
         if let Some(session) = self.find_live(name) {
             let conn = self.connect(&session)?;
-            conn.kill(None)
+            conn.kill(signal)
                 .map_err(|e| Error::Other(format!("killing session `{name}`: {e}")))?;
         }
         Ok(())

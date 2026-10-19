@@ -24,10 +24,13 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape as VtCursorShape, NamedColor, Processor};
 
+use crate::input::{KeyEncoding, MouseModes};
+use crate::render::{Cursor, CursorShape, Damage, Rgb, RowDamage};
 use crate::Size;
 
 /// Lines of scrollback the client-side emulator retains, matching the session
@@ -72,7 +75,7 @@ impl From<Size> for Dims {
 /// are simply ignored here; the view layer learns about those from the
 /// session's pushed events, not from this local emulator.
 #[derive(Clone, Default)]
-struct DiscardProxy {
+pub(crate) struct DiscardProxy {
     discarded_replies: Arc<AtomicUsize>,
 }
 
@@ -107,7 +110,13 @@ impl TermEmulator {
     pub fn new(size: Size) -> Self {
         let discarded_replies = Arc::new(AtomicUsize::new(0));
         let proxy = DiscardProxy { discarded_replies: Arc::clone(&discarded_replies) };
-        let config = Config { scrolling_history: SCROLLBACK_LINES, kitty_keyboard: true, ..Config::default() };
+        let config = Config {
+            scrolling_history: SCROLLBACK_LINES,
+            kitty_keyboard: true,
+            // Double-click word boundaries (the emulator's semantic search).
+            semantic_escape_chars: crate::selection::WORD_SEPARATORS.to_owned(),
+            ..Config::default()
+        };
         let term = Term::new(config, &Dims::from(size), proxy);
         Self { term, parser: Processor::new(), discarded_replies, size }
     }
@@ -142,6 +151,17 @@ impl TermEmulator {
         self.term.grid()
     }
 
+    /// The emulator itself, for the view's selection (which lives in the
+    /// `Term` so it rotates with scrolling).
+    pub(crate) fn term(&self) -> &Term<DiscardProxy> {
+        &self.term
+    }
+
+    /// The emulator itself, mutably (see [`TermEmulator::term`]).
+    pub(crate) fn term_mut(&mut self) -> &mut Term<DiscardProxy> {
+        &mut self.term
+    }
+
     /// The current terminal mode flags.
     pub fn mode(&self) -> TermMode {
         *self.term.mode()
@@ -152,6 +172,13 @@ impl TermEmulator {
     /// are disabled here (plan, "Shared client crates").
     pub fn on_alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether a wheel should reach the program as arrow keys: it is on the
+    /// alternate screen (a pager or editor with no scrollback of ours) and
+    /// alternate-scroll mode (`ESC[?1007h`, on by default) is set.
+    pub fn alternate_scroll(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
     }
 
     /// Whether the program enabled bracketed paste.
@@ -181,6 +208,112 @@ impl TermEmulator {
         self.term.scroll_display(scroll);
     }
 
+    /// The cursor as a viewer paints it, or `None` when it is not shown: the
+    /// program hid it (DECTCEM off or a hidden DECSCUSR shape), or the view is
+    /// scrolled back far enough that the cursor's row is below the viewport.
+    pub fn cursor(&self) -> Option<Cursor> {
+        if !self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            return None;
+        }
+        let style = self.term.cursor_style();
+        let shape = match style.shape {
+            VtCursorShape::Block => CursorShape::Block,
+            VtCursorShape::Underline => CursorShape::Underline,
+            VtCursorShape::Beam => CursorShape::Beam,
+            VtCursorShape::HollowBlock => CursorShape::HollowBlock,
+            VtCursorShape::Hidden => return None,
+        };
+        let grid = self.term.grid();
+        let point = grid.cursor.point;
+        let row = point.line.0 + grid.display_offset() as i32;
+        if row < 0 || row >= grid.screen_lines() as i32 {
+            return None;
+        }
+        Some(Cursor { row: row as u16, col: point.column.0 as u16, shape, blinking: style.blinking })
+    }
+
+    /// The lowest row of the live screen (0 = its top, whatever the scroll
+    /// position) that holds anything: a printed character, a non-default
+    /// background, reverse video, or the cursor. What a viewer with fewer rows
+    /// than the session keeps in view ([`crate::viewport::fit_showing`]).
+    pub fn content_bottom(&self) -> u16 {
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point.line.0.max(0) as u16;
+        let cols = grid.columns();
+        let filled = (0..grid.screen_lines()).rev().find(|&row| {
+            let line = &grid[Line(row as i32)];
+            (0..cols).any(|col| {
+                let cell = &line[Column(col)];
+                !matches!(cell.c, ' ' | '\0')
+                    || cell.bg != Color::Named(NamedColor::Background)
+                    || cell.flags.contains(Flags::INVERSE)
+            })
+        });
+        filled.map_or(cursor, |row| (row as u16).max(cursor))
+    }
+
+    /// The cursor's row on the live screen (0 = its top, whatever the scroll
+    /// position) when the cursor is shown.
+    pub fn cursor_screen_row(&self) -> Option<u16> {
+        let visible = self.term.mode().contains(TermMode::SHOW_CURSOR)
+            && self.term.cursor_style().shape != VtCursorShape::Hidden;
+        let line = self.term.grid().cursor.point.line.0;
+        (visible && line >= 0).then_some(line as u16)
+    }
+
+    /// The viewport rows that changed since the last call, then forget them.
+    ///
+    /// A viewer calls this after feeding output and repaints only when it is
+    /// not empty, which is what keeps an idle session at zero repaints. A
+    /// resize or a scrollback move reports [`Damage::Full`].
+    pub fn take_damage(&mut self) -> Damage {
+        let damage = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(lines) => Damage::Rows(
+                lines
+                    .filter(|d| d.is_damaged())
+                    .map(|d| RowDamage { row: d.line as u16, left: d.left as u16, right: d.right as u16 })
+                    .collect(),
+            ),
+        };
+        self.term.reset_damage();
+        damage
+    }
+
+    /// A color the program redefined at runtime (OSC 4 for a palette index,
+    /// OSC 10/11/12 for the default foreground, background, and cursor), or
+    /// `None` when it kept the viewer's color. `index` is a palette index
+    /// `0..=255`, or a `NamedColor` cast to `usize` for the named slots.
+    pub fn color_override(&self, index: usize) -> Option<Rgb> {
+        if index >= alacritty_terminal::term::color::COUNT {
+            return None;
+        }
+        self.term.colors()[index].map(Rgb::from)
+    }
+
+    /// The key-encoding modes the program enabled (kitty keyboard protocol,
+    /// application cursor keys, newline mode), for [`crate::input::encode_key`].
+    pub fn key_encoding(&self) -> KeyEncoding {
+        let mode = self.term.mode();
+        KeyEncoding {
+            kitty: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
+            newline_mode: mode.contains(TermMode::LINE_FEED_NEW_LINE),
+        }
+    }
+
+    /// The mouse-reporting modes the program enabled, for
+    /// [`crate::input::encode_mouse`] and the ownership policy.
+    pub fn mouse_modes(&self) -> MouseModes {
+        let mode = self.term.mode();
+        MouseModes {
+            reporting: mode.intersects(TermMode::MOUSE_MODE),
+            drag: mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+        }
+    }
+
     /// The number of query replies this emulator generated and discarded (see
     /// the module docs). Non-zero after the program sends e.g. a cursor-position
     /// request; the bytes are never forwarded to the session.
@@ -204,6 +337,40 @@ mod tests {
         let grid = e.grid();
         let row: String = (0..5).map(|c| grid[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(c)].c).collect();
         assert_eq!(row, "hello");
+    }
+
+    #[test]
+    fn content_bottom_is_the_lowest_filled_row_or_the_cursor() {
+        let mut e = emu();
+        assert_eq!(e.content_bottom(), 0, "a blank screen: the cursor's row");
+        // Text on row 3, cursor parked back up on row 1.
+        e.feed(b"\x1b[4;1Hstatus\x1b[2;1H");
+        assert_eq!(e.content_bottom(), 3);
+        // A row that is only a colored background counts (a status bar).
+        e.feed(b"\x1b[10;1H\x1b[44m\x1b[K\x1b[0m\x1b[2;1H");
+        assert_eq!(e.content_bottom(), 9);
+        // The cursor below everything counts too (a fresh prompt line).
+        e.feed(b"\x1b[20;1H");
+        assert_eq!(e.content_bottom(), 19);
+        assert_eq!(e.cursor_screen_row(), Some(19));
+        // Hiding the cursor hides it from the placement's cursor rule.
+        e.feed(b"\x1b[?25l");
+        assert_eq!(e.cursor_screen_row(), None);
+    }
+
+    #[test]
+    fn content_bottom_ignores_the_scroll_position() {
+        let mut e = emu();
+        for i in 0..60 {
+            e.feed(format!("line {i}\r\n").as_bytes());
+        }
+        e.feed(b"$ ");
+        let bottom = e.content_bottom();
+        assert_eq!(bottom, 23);
+        e.scroll(Scroll::Delta(10));
+        assert!(e.display_offset() > 0);
+        assert_eq!(e.content_bottom(), bottom, "the live screen, not the scrolled view");
+        assert_eq!(e.cursor_screen_row(), Some(23));
     }
 
     #[test]
@@ -241,6 +408,109 @@ mod tests {
         e.feed(b"\x1b[?1004h");
         assert!(e.bracketed_paste());
         assert!(e.focus_reporting());
+    }
+
+    #[test]
+    fn cursor_reports_position_shape_and_blink() {
+        let mut e = emu();
+        e.feed(b"abc");
+        let c = e.cursor().expect("visible by default");
+        assert_eq!((c.row, c.col), (0, 3));
+        assert_eq!(c.shape, CursorShape::Block);
+        // DECSCUSR 5: blinking bar.
+        e.feed(b"\x1b[5 q");
+        let c = e.cursor().unwrap();
+        assert_eq!(c.shape, CursorShape::Beam);
+        assert!(c.blinking);
+        // DECSCUSR 4: steady underline.
+        e.feed(b"\x1b[4 q");
+        let c = e.cursor().unwrap();
+        assert_eq!(c.shape, CursorShape::Underline);
+        assert!(!c.blinking);
+    }
+
+    #[test]
+    fn hidden_cursor_is_none() {
+        let mut e = emu();
+        e.feed(b"\x1b[?25l");
+        assert_eq!(e.cursor(), None);
+        e.feed(b"\x1b[?25h");
+        assert!(e.cursor().is_some());
+    }
+
+    #[test]
+    fn cursor_follows_the_scrollback_offset() {
+        let mut e = TermEmulator::new(Size::new(10, 3));
+        for i in 0..10 {
+            e.feed(format!("{i}\r\n").as_bytes());
+        }
+        let before = e.cursor().unwrap();
+        assert_eq!(before.row, 2);
+        e.scroll(Scroll::Delta(1));
+        // Scrolled back one line: the cursor's row is now below the viewport.
+        assert_eq!(e.cursor(), None);
+    }
+
+    #[test]
+    fn damage_reports_changed_rows_then_resets() {
+        let mut e = emu();
+        // The first read after construction is a full repaint.
+        assert_eq!(e.take_damage(), Damage::Full);
+        e.feed(b"\r\n\r\nhi");
+        let d = e.take_damage();
+        assert!(d.contains_row(2), "the written row is damaged: {d:?}");
+        assert!(!d.contains_row(10), "untouched rows are not: {d:?}");
+        // Nothing fed since: only the cursor's own row is reported.
+        let d = e.take_damage();
+        match d {
+            Damage::Rows(rows) => assert!(rows.iter().all(|r| r.row == 2), "{rows:?}"),
+            Damage::Full => panic!("no change should not be full damage"),
+        }
+    }
+
+    #[test]
+    fn resize_and_scroll_are_full_damage() {
+        let mut e = emu();
+        let _ = e.take_damage();
+        e.resize(Size::new(100, 30));
+        assert_eq!(e.take_damage(), Damage::Full);
+        for i in 0..50 {
+            e.feed(format!("{i}\r\n").as_bytes());
+        }
+        let _ = e.take_damage();
+        e.scroll(Scroll::Delta(3));
+        assert_eq!(e.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn color_overrides_come_from_osc() {
+        let mut e = emu();
+        assert_eq!(e.color_override(1), None);
+        // OSC 4: palette index 1 -> #102030.
+        e.feed(b"\x1b]4;1;rgb:10/20/30\x07");
+        assert_eq!(e.color_override(1), Some(Rgb::new(0x10, 0x20, 0x30)));
+        // OSC 11: default background.
+        let bg = alacritty_terminal::vte::ansi::NamedColor::Background as usize;
+        e.feed(b"\x1b]11;rgb:01/02/03\x07");
+        assert_eq!(e.color_override(bg), Some(Rgb::new(1, 2, 3)));
+        assert_eq!(e.color_override(100_000), None);
+    }
+
+    #[test]
+    fn key_and_mouse_modes_follow_the_program() {
+        let mut e = emu();
+        assert_eq!(e.key_encoding(), KeyEncoding::default());
+        assert_eq!(e.mouse_modes(), MouseModes::default());
+        e.feed(b"\x1b[?1h"); // DECCKM
+        e.feed(b"\x1b[>1u"); // kitty: disambiguate
+        e.feed(b"\x1b[?1000h\x1b[?1006h"); // click reporting, SGR
+        let k = e.key_encoding();
+        assert!(k.kitty && k.application_cursor_keys && !k.newline_mode);
+        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, drag: false, motion: false, sgr: true });
+        e.feed(b"\x1b[?1002h"); // button-event tracking: drags too
+        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, drag: true, motion: false, sgr: true });
+        e.feed(b"\x1b[?1003h"); // any-event tracking: all motion
+        assert_eq!(e.mouse_modes(), MouseModes { reporting: true, drag: true, motion: true, sgr: true });
     }
 
     #[test]

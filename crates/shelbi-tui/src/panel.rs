@@ -28,7 +28,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::theme::{ACCENT_CYAN, FG_SECONDARY, PALETTE_FG, SELECTION_BG};
+use crate::theme::palette;
 
 /// Outer left padding (in columns) for the header block, task info, worktree,
 /// and actions — 2 cols per the Figma. The nav switches keep the sidebar's
@@ -169,7 +169,7 @@ pub(crate) fn render_status_line(f: &mut Frame, status: &str, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             status.to_string(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(palette().ansi_red),
         )))
         .wrap(ratatui::widgets::Wrap { trim: true }),
         area.inner(STATUS_INDENT),
@@ -228,7 +228,7 @@ pub(crate) fn render_back_button(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let bg = SELECTION_BG;
+    let bg = palette().selection;
     let avail = area.width.saturating_sub(PAD) as usize;
     let btn_w = BACK_BTN_WIDTH.min(avail.max(1)).max(1);
     let left = (btn_w - 1) / 2;
@@ -236,11 +236,11 @@ pub(crate) fn render_back_button(
     let btn_text = format!("{}\u{2190}{}", " ".repeat(left), " ".repeat(right));
     let arrow_style = if selected {
         Style::default()
-            .fg(Color::White)
+            .fg(palette().ansi_white)
             .bg(bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray).bg(bg)
+        Style::default().fg(palette().ansi_gray).bg(bg)
     };
     let bleed_style = Style::default().fg(bg);
     let pad = " ".repeat(PAD as usize);
@@ -297,7 +297,7 @@ pub(crate) fn render_task_info(
     if !title.is_empty() && used < area.height {
         lines.push(Line::from(Span::styled(
             truncate_right(title, width),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD),
         )));
         used += 1;
     }
@@ -315,7 +315,7 @@ pub(crate) fn render_task_info(
         }
         lines.push(Line::from(Span::styled(
             dl.clone(),
-            Style::default().fg(PALETTE_FG),
+            Style::default().fg(palette().foreground),
         )));
         used += 1;
     }
@@ -326,11 +326,11 @@ pub(crate) fn render_task_info(
     if !desc_lines.is_empty() && used < area.height {
         let more_style = if more_selected {
             Style::default()
-                .fg(Color::White)
-                .bg(SELECTION_BG)
+                .fg(palette().ansi_white)
+                .bg(palette().selection)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(ACCENT_CYAN)
+            Style::default().fg(palette().cyan)
         };
         lines.push(Line::from(Span::styled("More", more_style)));
         more_hit = Some(Rect {
@@ -364,9 +364,9 @@ pub(crate) fn render_folder(f: &mut Frame, area: Rect, worktree: &str, selected:
     // tail ends two columns before the border (never clipped at it).
     let width = area.width.saturating_sub(PAD + PAD_RIGHT) as usize;
     let style = if selected {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(FG_SECONDARY)
+        Style::default().fg(palette().gray)
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -416,7 +416,7 @@ pub(crate) fn render_nav_block(
         return rects;
     }
     let width = inner.width as usize;
-    let bleed = SELECTION_BG;
+    let bleed = palette().selection;
 
     // The item line for entry `p` sits at nav-area offset `2p + 1`.
     let content: Vec<Line> = entries
@@ -455,17 +455,17 @@ fn nav_block_line(entry: &NavEntry, selected: bool, width: usize, bg: Color) -> 
         Line::from(Span::styled(
             format!("{text}{}", " ".repeat(pad)),
             Style::default()
-                .fg(Color::White)
+                .fg(palette().ansi_white)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
         ))
     } else if entry.active {
         Line::from(Span::styled(
             text,
-            Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD),
+            Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
         ))
     } else {
-        Line::from(Span::styled(text, Style::default().fg(FG_SECONDARY)))
+        Line::from(Span::styled(text, Style::default().fg(palette().gray)))
     }
 }
 
@@ -481,12 +481,10 @@ pub(crate) fn description_preview(body: &str, width: usize, max_lines: usize) ->
     if width == 0 || max_lines == 0 {
         return Vec::new();
     }
-    let mut words: Vec<String> = Vec::new();
-    for raw in body.lines() {
-        for w in strip_block_markers(raw).split_whitespace() {
-            words.push(w.to_string());
-        }
-    }
+    // The markdown stripping is the shared model's, so the desktop's preview
+    // reads the same prose.
+    let text = shelbi_app::review::description_text(body);
+    let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return Vec::new();
     }
@@ -529,46 +527,6 @@ pub(crate) fn description_preview(body: &str, width: usize, max_lines: usize) ->
         }
     }
     lines
-}
-
-/// Strip the leading block-level markdown markers from one source line and drop
-/// inline-code backticks. Blockquote `>` markers are removed; list bullets
-/// (`-`/`*`/`+`/`N.`/`N)`) are removed but their text is kept; an ATX heading
-/// line (`## Summary`) is dropped *whole* — its text is a section label, not
-/// prose, so the preview flows the body beneath it. Emphasis markers (`*`, `_`)
-/// are left alone so identifiers like `snake_case` survive.
-fn strip_block_markers(line: &str) -> String {
-    let mut t = line.trim();
-    while let Some(rest) = t.strip_prefix('>') {
-        t = rest.trim_start();
-    }
-    if t.starts_with('#') {
-        return String::new();
-    }
-    t = strip_list_marker(t);
-    t.replace('`', "")
-}
-
-/// Strip a single leading list marker (`- `, `* `, `+ `, or an ordered
-/// `N.`/`N)` followed by a space) from `s`.
-fn strip_list_marker(s: &str) -> &str {
-    let t = s.trim_start();
-    for m in ["- ", "* ", "+ "] {
-        if let Some(rest) = t.strip_prefix(m) {
-            return rest.trim_start();
-        }
-    }
-    let bytes = t.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 && i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b')') {
-        if let Some(rest) = t[i + 1..].strip_prefix(' ') {
-            return rest.trim_start();
-        }
-    }
-    t
 }
 
 /// Truncate `s` to at most `width` columns (no ellipsis) — used when a single

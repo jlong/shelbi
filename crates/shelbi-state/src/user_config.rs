@@ -2,9 +2,10 @@
 //! `~/.shelbi/shelbi.yaml` (the hub config's project index) so a future
 //! `shelbi config reset` can wipe UI tweaks without nuking onboarding.
 //!
-//! Currently holds the Zen Mode toggle chord chosen by the first-run probe.
-//! Missing file → defaults (`zen_toggle = AltZ`); a missing `keymap:` block
-//! likewise falls back so older partial files keep loading.
+//! Holds the Zen Mode toggle chord chosen by the first-run probe, the review
+//! editor, the color theme, and the desktop app's own settings (`desktop:`).
+//! Missing file → defaults (`zen_toggle = AltZ`, `theme = auto`); a missing
+//! `keymap:` block likewise falls back so older partial files keep loading.
 
 use std::fs;
 use std::path::PathBuf;
@@ -36,6 +37,184 @@ pub struct UserConfig {
     /// program name (see [`editor_display_name`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+
+    /// Color theme for the TUI and the desktop app (`theme: auto | dark |
+    /// light`). A missing key is [`ThemePreference::Auto`], and `auto` is
+    /// omitted on save (lean on-disk form, like `editor`). The token values
+    /// live in `shelbi_app::theme`.
+    #[serde(default, skip_serializing_if = "ThemePreference::is_auto")]
+    pub theme: ThemePreference,
+
+    /// Desktop app settings (`desktop:` block). Ignored by the CLI and TUI.
+    #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
+    pub desktop: DesktopConfig,
+}
+
+/// The `theme:` setting. `Auto` follows the system appearance where a client
+/// can read it (the desktop app) and is dark where it can't (the TUI:
+/// terminals don't report their appearance).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemePreference {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemePreference {
+    /// True for [`ThemePreference::Auto`], the default.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ThemePreference::Auto)
+    }
+}
+
+/// The desktop app's settings in `config.yaml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopConfig {
+    /// The `shelbi` CLI the desktop app runs, overriding its discovery (the
+    /// login-shell `PATH`, then the Homebrew prefixes and `~/.cargo/bin`).
+    /// A leading `~/` is expanded by the app. Unset means discover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<PathBuf>,
+
+    /// Font family for the desktop app's terminals. Unset means the app's
+    /// default (Geist Mono).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_family: Option<String>,
+
+    /// Font size, in points, for the desktop app's terminals. Unset means the
+    /// app's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_size: Option<u16>,
+
+    /// Whether Option acts as Meta in the desktop app's terminals (Option+B
+    /// sends `ESC b`, for shell word motion and Claude Code's Option chords)
+    /// instead of typing the keyboard layout's Option characters and dead
+    /// keys (Option+E, E types `é`): `false` (the macOS default), `true`,
+    /// `left`, or `right` (only that Option key is Meta), as in Ghostty.
+    /// Unset means `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_as_meta: Option<OptionAsMeta>,
+
+    /// Which system notifications the desktop app posts (`notifications:`).
+    /// Every kind is on unless switched off.
+    #[serde(default, skip_serializing_if = "DesktopNotifications::is_empty")]
+    pub notifications: DesktopNotifications,
+}
+
+/// Which Option keys act as Meta in the desktop app's terminals
+/// (`desktop.option_as_meta`). Written as a YAML bool or `left` / `right`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptionAsMeta {
+    /// Neither: Option types characters and dead keys (`false`).
+    #[default]
+    Off,
+    /// Both Option keys are Meta (`true`).
+    Both,
+    /// Only the left Option key is Meta; the right one types characters.
+    Left,
+    /// Only the right Option key is Meta; the left one types characters.
+    Right,
+}
+
+impl Serialize for OptionAsMeta {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            OptionAsMeta::Off => s.serialize_bool(false),
+            OptionAsMeta::Both => s.serialize_bool(true),
+            OptionAsMeta::Left => s.serialize_str("left"),
+            OptionAsMeta::Right => s.serialize_str("right"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OptionAsMeta {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = OptionAsMeta;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("true, false, left, or right")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<OptionAsMeta, E> {
+                Ok(if v { OptionAsMeta::Both } else { OptionAsMeta::Off })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<OptionAsMeta, E> {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "both" => Ok(OptionAsMeta::Both),
+                    "false" => Ok(OptionAsMeta::Off),
+                    "left" => Ok(OptionAsMeta::Left),
+                    "right" => Ok(OptionAsMeta::Right),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+impl DesktopConfig {
+    /// Whether no desktop setting is present (so the block isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.cli_path.is_none()
+            && self.terminal_font_family.is_none()
+            && self.terminal_font_size.is_none()
+            && self.option_as_meta.is_none()
+            && self.notifications.is_empty()
+    }
+}
+
+/// The desktop app's notification switches (`desktop.notifications:`). A
+/// missing key means on, and only a switched-off kind is written, so the
+/// block stays absent until the user turns something off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopNotifications {
+    /// A workspace's agent stops for the user: it finished a turn and waits
+    /// for input, or a permission dialog is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_blocked: Option<bool>,
+
+    /// A task reaches the review column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_ready: Option<bool>,
+
+    /// The orchestrator finishes a turn and waits for an answer, or a
+    /// permission dialog is up in its session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_waiting: Option<bool>,
+}
+
+impl DesktopNotifications {
+    pub fn workspace_blocked(&self) -> bool {
+        self.workspace_blocked.unwrap_or(true)
+    }
+
+    pub fn review_ready(&self) -> bool {
+        self.review_ready.unwrap_or(true)
+    }
+
+    pub fn orchestrator_waiting(&self) -> bool {
+        self.orchestrator_waiting.unwrap_or(true)
+    }
+
+    /// Set each switch, writing only the ones that are off.
+    pub fn set(&mut self, workspace_blocked: bool, review_ready: bool, orchestrator_waiting: bool) {
+        let off = |on: bool| (!on).then_some(false);
+        self.workspace_blocked = off(workspace_blocked);
+        self.review_ready = off(review_ready);
+        self.orchestrator_waiting = off(orchestrator_waiting);
+    }
+
+    /// Whether every switch is at its default (so the block isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.workspace_blocked.is_none()
+            && self.review_ready.is_none()
+            && self.orchestrator_waiting.is_none()
+    }
 }
 
 /// Keymap overrides. Today just the Zen Mode toggle chord — extended as new
@@ -187,6 +366,41 @@ pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
     atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
 }
 
+/// Load the user config, apply `edit`, and write it back, keeping every
+/// top-level key this build doesn't model (a newer client's settings) instead
+/// of dropping it the way a plain [`save_user_config`] round-trip would. Keys
+/// the edited config omits on save (a cleared `editor`, an `auto` theme, an
+/// empty `desktop:` block) are removed. YAML comments are not preserved.
+/// Returns the config as written.
+pub fn update_user_config(edit: impl FnOnce(&mut UserConfig)) -> Result<UserConfig> {
+    use serde_yaml::{Mapping, Value};
+
+    let path = user_config_path()?;
+    let mut raw: Mapping = if path.exists() {
+        match serde_yaml::from_str::<Value>(&fs::read_to_string(&path)?)? {
+            Value::Mapping(m) => m,
+            _ => Mapping::new(),
+        }
+    } else {
+        Mapping::new()
+    };
+    let mut cfg: UserConfig = serde_yaml::from_value(Value::Mapping(raw.clone()))?;
+    edit(&mut cfg);
+
+    let Value::Mapping(known) = serde_yaml::to_value(&cfg)? else {
+        unreachable!("UserConfig serializes to a mapping");
+    };
+    for key in ["keymap", "editor", "theme", "desktop"] {
+        raw.remove(key);
+    }
+    for (key, value) in known {
+        raw.insert(key, value);
+    }
+    ensure_dir(&shelbi_home()?)?;
+    atomic_write(&path, serde_yaml::to_string(&Value::Mapping(raw))?.as_bytes())?;
+    Ok(cfg)
+}
+
 /// Write a self-documenting `~/.shelbi/config.yaml` when one doesn't already
 /// exist — the scaffold `shelbi init` drops so the hub-wide UI preferences are
 /// discoverable inline (see [`shelbi_core::scaffold::CONFIG_YAML`]). Idempotent:
@@ -218,6 +432,93 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn desktop_settings_and_theme_round_trip() {
+        let cfg: UserConfig = serde_yaml::from_str(
+            "theme: light\ndesktop:\n  cli_path: /opt/shelbi/bin/shelbi\n  \
+             terminal_font_family: Geist Mono\n  terminal_font_size: 14\n  \
+             option_as_meta: left\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.theme, ThemePreference::Light);
+        assert_eq!(
+            cfg.desktop.cli_path.as_deref(),
+            Some(std::path::Path::new("/opt/shelbi/bin/shelbi"))
+        );
+        assert_eq!(cfg.desktop.terminal_font_family.as_deref(), Some("Geist Mono"));
+        assert_eq!(cfg.desktop.terminal_font_size, Some(14));
+        assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
+        let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        // Defaults write neither key, so the CLI's own saves don't add them.
+        let text = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        assert!(!text.contains("desktop") && !text.contains("theme"), "{text}");
+    }
+
+    #[test]
+    fn desktop_notification_switches_default_on_and_write_only_when_off() {
+        let cfg: UserConfig =
+            serde_yaml::from_str("desktop:\n  notifications:\n    review_ready: false\n").unwrap();
+        let n = &cfg.desktop.notifications;
+        assert!(n.workspace_blocked() && n.orchestrator_waiting());
+        assert!(!n.review_ready());
+
+        let mut n = DesktopNotifications::default();
+        n.set(true, true, true);
+        assert!(n.is_empty(), "all on writes nothing");
+        n.set(false, true, true);
+        let cfg = UserConfig {
+            desktop: DesktopConfig {
+                notifications: n,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = serde_yaml::to_string(&cfg).unwrap();
+        assert!(text.contains("workspace_blocked: false"), "{text}");
+        assert!(!text.contains("review_ready"), "{text}");
+        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn update_user_config_keeps_unknown_and_shared_keys() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(
+            home.join("config.yaml"),
+            "keymap:\n  zen_toggle: ctrl-g\neditor: hx\nfuture_key:\n  nested: 1\n",
+        )
+        .unwrap();
+
+        let written = update_user_config(|c| {
+            c.theme = ThemePreference::Dark;
+            c.desktop.terminal_font_size = Some(13);
+        })
+        .unwrap();
+        assert_eq!(written.theme, ThemePreference::Dark);
+
+        // What another client (the TUI) reads on its next start.
+        let back = load_user_config().unwrap();
+        assert_eq!(back.keymap.zen_toggle, ZenToggleChord::CtrlG);
+        assert_eq!(back.editor.as_deref(), Some("hx"));
+        assert_eq!(back.theme, ThemePreference::Dark);
+        assert_eq!(back.desktop.terminal_font_size, Some(13));
+        let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(text.contains("future_key"), "an unknown key survives: {text}");
+
+        // Clearing a setting removes its key instead of leaving a stale one.
+        update_user_config(|c| {
+            c.theme = ThemePreference::Auto;
+            c.desktop = DesktopConfig::default();
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!text.contains("theme") && !text.contains("desktop"), "{text}");
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
@@ -336,6 +637,51 @@ mod tests {
     }
 
     #[test]
+    fn theme_round_trips_and_defaults_to_auto() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A missing key (and a missing file) is `auto`.
+        assert_eq!(load_user_config().unwrap().theme, ThemePreference::Auto);
+        std::fs::write(home.join("config.yaml"), "editor: hx\n").unwrap();
+        assert_eq!(load_user_config().unwrap().theme, ThemePreference::Auto);
+
+        // Each value reads back from its lowercase spelling.
+        for (text, want) in [
+            ("auto", ThemePreference::Auto),
+            ("dark", ThemePreference::Dark),
+            ("light", ThemePreference::Light),
+        ] {
+            std::fs::write(home.join("config.yaml"), format!("theme: {text}\n")).unwrap();
+            assert_eq!(load_user_config().unwrap().theme, want, "theme: {text}");
+        }
+
+        // dark / light survive a save; auto is omitted (it is the default).
+        for pref in [ThemePreference::Dark, ThemePreference::Light] {
+            let cfg = UserConfig {
+                theme: pref,
+                ..UserConfig::default()
+            };
+            save_user_config(&cfg).unwrap();
+            assert_eq!(load_user_config().unwrap(), cfg);
+        }
+        let yaml = serde_yaml::to_string(&UserConfig {
+            theme: ThemePreference::Light,
+            ..UserConfig::default()
+        })
+        .unwrap();
+        assert!(yaml.contains("theme: light"), "got: {yaml}");
+        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        assert!(!yaml.contains("theme"), "auto omitted: {yaml}");
+
+        // An unknown value is a parse error, not a silent fallback, so
+        // `shelbi config lint` reports it.
+        assert!(serde_yaml::from_str::<UserConfig>("theme: purple\n").is_err());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn editor_round_trips_through_yaml_and_is_omitted_when_unset() {
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
@@ -352,5 +698,23 @@ mod tests {
         let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
         assert!(!yaml.contains("editor"), "unset editor omitted: {yaml}");
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn option_as_meta_reads_bools_and_sides() {
+        let read = |v: &str| -> OptionAsMeta {
+            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  option_as_meta: {v}\n")).unwrap();
+            cfg.desktop.option_as_meta.unwrap()
+        };
+        assert_eq!(read("false"), OptionAsMeta::Off);
+        assert_eq!(read("true"), OptionAsMeta::Both);
+        assert_eq!(read("left"), OptionAsMeta::Left);
+        assert_eq!(read("Right"), OptionAsMeta::Right);
+        assert!(serde_yaml::from_str::<UserConfig>("desktop:\n  option_as_meta: sideways\n").is_err());
+        for v in [OptionAsMeta::Off, OptionAsMeta::Both, OptionAsMeta::Left, OptionAsMeta::Right] {
+            let text = serde_yaml::to_string(&v).unwrap();
+            assert_eq!(serde_yaml::from_str::<OptionAsMeta>(&text).unwrap(), v, "{text}");
+        }
+        assert_eq!(serde_yaml::to_string(&OptionAsMeta::Both).unwrap().trim(), "true");
     }
 }

@@ -74,8 +74,8 @@ impl Connector for DirectConnector {
         let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
             .map_err(|e| ConnectFailure::Message(e.to_string()))?;
         let size = match conn.info() {
-            Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
-            Err(_) => Size::new(80, 24),
+            Ok(info) => shelbi_app::session::GridSize::new(info.cols.max(1), info.rows.max(1)),
+            Err(_) => shelbi_app::session::GridSize::new(80, 24),
         };
         conn.attach(None)
             .map_err(|e| ConnectFailure::Message(e.to_string()))?;

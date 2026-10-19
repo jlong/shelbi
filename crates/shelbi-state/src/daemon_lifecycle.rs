@@ -8,9 +8,11 @@
 //!
 //! See `docs/removing-tmux/phase3-daemon.md` (Lifecycle).
 
+use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use crate::{hub_socket_path, probe_daemon_hello, DaemonProbe};
@@ -80,11 +82,72 @@ fn socket_answers() -> bool {
     !matches!(probe_daemon_hello(), DaemonProbe::NotRunning)
 }
 
+/// How a client launches `shelbi daemon` when none is running.
+///
+/// The default (no launcher installed, see [`set_daemon_launcher`]) re-runs the
+/// current executable, which is right for the `shelbi` binary itself and the
+/// TUI it hosts. A client that is **not** the `shelbi` binary (the desktop app)
+/// installs a launcher naming the CLI it discovered, so every on-demand start in
+/// that process, including the ones buried in shared code like
+/// `shelbi_app::execute_mutation`, runs `<cli> daemon` instead of re-running
+/// the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLauncher {
+    /// The `shelbi` executable to run as `<exe> daemon`.
+    pub exe: PathBuf,
+    /// The daemon's complete environment (applied after `env_clear`), or
+    /// `None` to inherit the caller's.
+    pub env: Option<BTreeMap<String, String>>,
+    /// Where the daemon's stderr goes (truncated on each start), so a daemon
+    /// that dies during startup leaves its reason behind. `None` discards it.
+    pub stderr_log: Option<PathBuf>,
+}
+
+/// The process-wide launcher [`ensure_daemon_running`] uses; `None` = re-run
+/// the current executable.
+static LAUNCHER: RwLock<Option<DaemonLauncher>> = RwLock::new(None);
+
+/// Install the launcher every later [`ensure_daemon_running`] in this process
+/// uses (replacing any earlier one).
+pub fn set_daemon_launcher(launcher: DaemonLauncher) {
+    *LAUNCHER.write().unwrap_or_else(|p| p.into_inner()) = Some(launcher);
+}
+
+/// Why [`ensure_daemon_running_with`] could not bring a daemon up.
+#[derive(Debug)]
+pub enum DaemonStartError {
+    /// The daemon executable could not be spawned at all.
+    Spawn(std::io::Error),
+    /// The daemon we spawned exited before any daemon answered the socket.
+    /// `status` is its exit status as text (`exit status: 1`).
+    Exited { status: String },
+    /// Nothing answered the socket within the deadline.
+    Timeout { after: Duration },
+}
+
+impl std::fmt::Display for DaemonStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonStartError::Spawn(e) => write!(f, "could not run `shelbi daemon`: {e}"),
+            DaemonStartError::Exited { status } => {
+                write!(f, "`shelbi daemon` exited during startup ({status})")
+            }
+            DaemonStartError::Timeout { after } => write!(
+                f,
+                "hub daemon did not start within {}s (check `shelbi daemon status`)",
+                after.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonStartError {}
+
 /// Ensure a hub daemon is running, starting one on demand if not.
 ///
 /// 1. Return immediately if the socket already answers.
 /// 2. Otherwise, if the single-instance lock is free, spawn `shelbi daemon`
-///    detached.
+///    detached (through the installed [`DaemonLauncher`], if any).
 /// 3. Wait for the socket to answer, up to [`START_DEADLINE`].
 ///
 /// Safe when several clients race: the daemon takes the single-instance lock
@@ -92,6 +155,31 @@ fn socket_answers() -> bool {
 /// exactly one wins the bind and the losers exit without touching the live
 /// socket. Every caller then observes the one surviving daemon.
 pub fn ensure_daemon_running() -> Result<()> {
+    let installed = LAUNCHER.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let launcher = match installed {
+        Some(l) => l,
+        None => DaemonLauncher {
+            exe: std::env::current_exe().map_err(Error::Io)?,
+            env: None,
+            stderr_log: None,
+        },
+    };
+    ensure_daemon_running_with(&launcher, START_DEADLINE).map_err(|e| Error::Other(e.to_string()))
+}
+
+/// [`ensure_daemon_running`] with an explicit launcher and deadline, returning
+/// a typed error so a client can render each failure (the desktop app's
+/// "daemon failed to start" screen reads `launcher.stderr_log` on
+/// [`DaemonStartError::Exited`] / [`DaemonStartError::Timeout`]).
+///
+/// A spawned daemon that exits while no daemon holds the lock or answers the
+/// socket fails fast with [`DaemonStartError::Exited`] instead of waiting out
+/// the deadline. (A daemon that loses a start race also exits, but then the
+/// winner holds the lock, so the wait continues.)
+pub fn ensure_daemon_running_with(
+    launcher: &DaemonLauncher,
+    deadline: Duration,
+) -> std::result::Result<(), DaemonStartError> {
     if socket_answers() {
         return Ok(());
     }
@@ -99,22 +187,34 @@ pub fn ensure_daemon_running() -> Result<()> {
     // spawn one. If it's held, a daemon is mid-startup; just wait for it. A
     // redundant spawn is harmless (the daemon's bind lock dedups), so the lock
     // check is an optimization, not a correctness gate.
-    if !daemon_lock_held() {
-        spawn_daemon_detached()?;
-    }
-    wait_for_socket(START_DEADLINE)
+    let child = if daemon_lock_held() {
+        None
+    } else {
+        Some(spawn_daemon_detached(launcher).map_err(DaemonStartError::Spawn)?)
+    };
+    wait_for_socket(child, deadline)
 }
 
-/// Launch `shelbi daemon` as a detached background process in its own session,
+/// Launch `<exe> daemon` as a detached background process in its own session,
 /// so it outlives the launching client and a launching `ssh`/terminal does not
 /// hang on its stdio.
-fn spawn_daemon_detached() -> Result<()> {
-    let exe = std::env::current_exe().map_err(Error::Io)?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+fn spawn_daemon_detached(launcher: &DaemonLauncher) -> std::io::Result<Child> {
+    let mut cmd = Command::new(&launcher.exe);
+    cmd.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null());
+    match &launcher.stderr_log {
+        Some(path) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            cmd.stderr(std::fs::File::create(path)?);
+        }
+        None => {
+            cmd.stderr(Stdio::null());
+        }
+    }
+    if let Some(env) = &launcher.env {
+        cmd.env_clear().envs(env);
+    }
     // Detach into a new session so a quitting client's process-group kill (and
     // the controlling terminal going away) never reaches the daemon.
     // SAFETY: `setsid` is async-signal-safe and touches no shared state; the
@@ -130,25 +230,45 @@ fn spawn_daemon_detached() -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().map_err(Error::Io)?;
-    Ok(())
+    cmd.spawn()
 }
 
-/// Block until the hub socket answers or `deadline` elapses.
-fn wait_for_socket(deadline: Duration) -> Result<()> {
+/// Block until the hub socket answers or `deadline` elapses. `child` is the
+/// daemon this call spawned, if any: its early exit ends the wait (see
+/// [`ensure_daemon_running_with`]), and it is reaped either way so a
+/// long-lived client never collects zombies.
+fn wait_for_socket(
+    mut child: Option<Child>,
+    deadline: Duration,
+) -> std::result::Result<(), DaemonStartError> {
     let start = Instant::now();
-    loop {
+    let result = loop {
         if socket_answers() {
-            return Ok(());
+            break Ok(());
+        }
+        if let Some(c) = child.as_mut() {
+            if let Ok(Some(status)) = c.try_wait() {
+                child = None;
+                if !daemon_lock_held() && !socket_answers() {
+                    break Err(DaemonStartError::Exited {
+                        status: status.to_string(),
+                    });
+                }
+            }
         }
         if start.elapsed() >= deadline {
-            return Err(Error::Other(format!(
-                "hub daemon did not start within {}s (check `shelbi daemon status`)",
-                deadline.as_secs()
-            )));
+            break Err(DaemonStartError::Timeout { after: deadline });
         }
         std::thread::sleep(POLL_SLICE);
+    };
+    if let Some(mut c) = child {
+        // The daemon runs for as long as projects are open; reap it off-thread
+        // whenever it eventually exits.
+        std::thread::spawn(move || {
+            let _ = c.wait();
+        });
     }
+    result
 }
 
 /// What [`stop_daemon`] did.
@@ -419,6 +539,84 @@ mod tests {
         assert!(matches!(d, StopDecision::Refuse(ref r) if r.contains("recycled")), "{d:?}");
         let d = decide_stop(true, None, Some(4242), &pid_file());
         assert!(matches!(d, StopDecision::Refuse(ref r) if r.contains("no pid")), "{d:?}");
+    }
+
+    /// A launcher running `sh -c <script> daemon` stand-in: `exe` is a script
+    /// written to a temp dir.
+    fn script_launcher(tag: &str, body: &str) -> (DaemonLauncher, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("shb-dl-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("shelbi");
+        std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = dir.join("daemon.stderr");
+        (
+            DaemonLauncher {
+                exe,
+                env: None,
+                stderr_log: Some(log.clone()),
+            },
+            log,
+        )
+    }
+
+    #[test]
+    fn a_daemon_that_dies_at_startup_fails_fast_with_its_stderr_kept() {
+        let _l = LOCK.lock().unwrap();
+        let _g = SockGuard::new("dies");
+        let (launcher, log) = script_launcher("dies", "echo \"boom: bad config\" >&2; exit 3");
+        let started = Instant::now();
+        let err = ensure_daemon_running_with(&launcher, Duration::from_secs(20)).unwrap_err();
+        assert!(
+            matches!(&err, DaemonStartError::Exited { status } if status.contains('3')),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not wait out the deadline"
+        );
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("boom: bad config"));
+    }
+
+    #[test]
+    fn the_installed_launcher_runs_its_exe_with_the_daemon_arg() {
+        let _l = LOCK.lock().unwrap();
+        let _g = SockGuard::new("launch");
+        let sock = hub_socket_path().unwrap();
+        // The stand-in "daemon" records its argv, then binds the socket by way
+        // of the test (it can't bind a Unix socket from sh); the test waits for
+        // the record and binds on its behalf, while the script stays alive.
+        let dir = std::env::temp_dir().join(format!("shb-dl-launch-{}", std::process::id()));
+        let argv = dir.join("argv");
+        let stop = dir.join("stop");
+        let _ = std::fs::remove_file(&argv);
+        let _ = std::fs::remove_file(&stop);
+        let (launcher, _log) = script_launcher(
+            "launch",
+            &format!(
+                "echo \"$@\" > {}; while [ ! -f {} ]; do sleep 0.05; done",
+                argv.display(),
+                stop.display()
+            ),
+        );
+        set_daemon_launcher(launcher);
+        let binder = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !argv.exists() && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let recorded = std::fs::read_to_string(&argv).unwrap_or_default();
+            (UnixListener::bind(&sock).unwrap(), recorded)
+        });
+        let result = ensure_daemon_running();
+        let (_listener, recorded) = binder.join().unwrap();
+        *LAUNCHER.write().unwrap() = None;
+        std::fs::write(&stop, "").unwrap();
+        result.unwrap();
+        assert_eq!(recorded.trim(), "daemon");
     }
 
     #[test]

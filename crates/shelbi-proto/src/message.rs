@@ -89,7 +89,9 @@ pub struct Output {
 
 /// Raw bytes to write to the PTY. Input frames from different clients are
 /// written whole and in arrival order, never interleaved mid-frame. Encoded as
-/// raw bytes, **not** JSON.
+/// raw bytes, **not** JSON. Any input makes its sender the active (sizing)
+/// client; an empty one writes nothing and does only that (a client claiming
+/// the size when it takes focus).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     /// Raw bytes to deliver to the PTY.

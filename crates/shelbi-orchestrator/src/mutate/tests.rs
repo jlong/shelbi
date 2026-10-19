@@ -150,6 +150,101 @@ fn apply_move_aborts_before_writing_when_the_recheck_reports_stale() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+fn column_ids(column: Column) -> Vec<String> {
+    issue_store("p")
+        .unwrap()
+        .list_in_status(&column)
+        .unwrap()
+        .into_iter()
+        .map(|tf| tf.task.id)
+        .collect()
+}
+
+#[test]
+fn apply_prioritize_lands_the_issue_at_the_slot_and_shifts_the_rest() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+        let mut t = task(Column::todo(), id);
+        t.priority = i as u32;
+        shelbi_state::save_task("p", &t, "").unwrap();
+    }
+
+    let mut sink = RecordingSink::default();
+    let mut recheck = no_recheck();
+    let note = apply(
+        "p",
+        "d",
+        &MutationKind::Prioritize { position: 1 },
+        &mut sink,
+        &mut recheck,
+    )
+    .unwrap();
+
+    assert_eq!(column_ids(Column::todo()), ["a", "d", "b", "c"]);
+    assert_eq!(note.verb, "prioritize");
+    assert_eq!(note.status, "todo");
+    assert!(
+        sink.lines
+            .iter()
+            .any(|(s, t)| *s == Stream::Stdout && t == "✓ d now at slot 1 in todo"),
+        "stdout lines: {:?}",
+        sink.lines
+    );
+
+    // A slot past the end clamps to the bottom, like `issue prio --set`.
+    apply(
+        "p",
+        "a",
+        &MutationKind::Prioritize { position: 99 },
+        &mut sink,
+        &mut recheck,
+    )
+    .unwrap();
+    assert_eq!(column_ids(Column::todo()), ["d", "b", "c", "a"]);
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn apply_prioritize_aborts_without_reordering_when_the_recheck_reports_stale() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    for (i, id) in ["a", "b"].iter().enumerate() {
+        let mut t = task(Column::todo(), id);
+        t.priority = i as u32;
+        shelbi_state::save_task("p", &t, "").unwrap();
+    }
+
+    let mut sink = RecordingSink::default();
+    let stale = ExpectedState {
+        status: "todo".into(),
+        updated_at: "x".into(),
+    };
+    let mut recheck = || {
+        Err(MutateError::Stale {
+            expected: stale.clone(),
+            actual: stale.clone(),
+        })
+    };
+    let err = apply(
+        "p",
+        "b",
+        &MutationKind::Prioritize { position: 0 },
+        &mut sink,
+        &mut recheck,
+    )
+    .unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }));
+    assert_eq!(column_ids(Column::todo()), ["a", "b"]);
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Write a second project `g` into the current `SHELBI_HOME` whose board is the
 /// GitHub (remote) backend, so a test can exercise the remote-vs-local branch of
 /// [`is_stale_change`]. The YAML otherwise mirrors `fresh_home`'s project `p`.

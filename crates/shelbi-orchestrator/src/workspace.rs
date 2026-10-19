@@ -154,7 +154,7 @@ pub fn resolve_idle_workspace(project: &str, workspace: &str) -> Option<IdleWork
 /// The worktree's current branch via `git rev-parse --abbrev-ref HEAD`, or
 /// `None` when the worktree is missing, isn't a git repo, or is on a detached
 /// HEAD (no branch to name). Best-effort: any failure reads as "unknown".
-fn worktree_current_branch(host: &Host, worktree: &Path) -> Option<String> {
+pub(crate) fn worktree_current_branch(host: &Host, worktree: &Path) -> Option<String> {
     let dir = worktree.to_string_lossy();
     let out = crate::git::run_in_dir(host, &dir, &["git", "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
     if !out.status.success() {

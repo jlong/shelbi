@@ -1628,6 +1628,23 @@ pub enum MachineKind {
     Ssh,
 }
 
+/// Live reachability of a remote machine, surfaced in the machines view next to
+/// its `ssh <host>` label. Produced by the background prober
+/// (`shelbi_orchestrator::machine::probe_reachability`); a local machine is always reachable and never
+/// probed, so this only ever describes a remote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Reachability {
+    /// Not probed yet (startup), or a probe is in flight — the initial state the
+    /// view shows as "checking".
+    #[default]
+    Unknown,
+    /// The last probe connected and the host answered.
+    Reachable,
+    /// The last probe failed; carries a short human reason (SSH timeout, auth
+    /// failure, connection refused, …) so the view can show *why*.
+    Unreachable { error: String },
+}
+
 /// How the hub exposes its daemon socket to a remote machine via SSH.
 ///
 /// The hub carries a `-R` reverse forward on every outbound `ssh` so a

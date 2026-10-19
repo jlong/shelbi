@@ -1607,6 +1607,19 @@ mod tests {
     }
 
     #[test]
+    fn theme_is_a_known_user_config_field_with_checked_values() {
+        let entry = fake_entry("global.preferences", SurfaceFormat::Yaml);
+        for value in ["auto", "dark", "light"] {
+            let mut diagnostics = Vec::new();
+            lint_typed_yaml::<UserConfig>(&entry, &format!("theme: {value}\n"), &mut diagnostics);
+            assert!(diagnostics.is_empty(), "theme: {value}: {diagnostics:?}");
+        }
+        let mut diagnostics = Vec::new();
+        lint_typed_yaml::<UserConfig>(&entry, "theme: purple\n", &mut diagnostics);
+        assert!(diagnostics.iter().any(|d| d.code == "CONFIG_YAML_SYNTAX"));
+    }
+
+    #[test]
     fn keybinding_collision_is_an_error() {
         let entry = fake_entry("global.keybindings", SurfaceFormat::Yaml);
         let mut diagnostics = Vec::new();

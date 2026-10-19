@@ -5,7 +5,8 @@
 //! project and one issue, spawns a real `shelbi daemon` against it (short socket
 //! paths — macOS caps Unix-socket paths at ~104 bytes), and drives mutations
 //! over the typed control protocol via [`shelbi_client::ControlClient`]. Only
-//! `move` mutations are used: they are deterministic (no git, no agent spawn),
+//! `move` and `prioritize` mutations are used: they are deterministic (no git,
+//! no agent spawn),
 //! and the daemon's concurrency guarantees — one mutation per issue at a time,
 //! the expected-state gate, finish-if-the-client-leaves, and change
 //! notifications — are identical for every mutation kind. The merge/dispatch
@@ -67,14 +68,29 @@ impl Home {
 
     /// Write issue `id` in `column` with the fixed `updated_at` [`T0`].
     fn write_issue(&self, id: &str, column: &str) {
+        self.write_issue_at(id, column, 0);
+    }
+
+    /// [`Self::write_issue`] at `priority`.
+    fn write_issue_at(&self, id: &str, column: &str, priority: u32) {
         std::fs::write(
             self.path.join(format!("projects/p/tasks/{id}.md")),
             format!(
-                "---\nid: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
+                "---\nid: {id}\ntitle: {id}\ncolumn: {column}\npriority: {priority}\n\
                  created_at: {T0}\nupdated_at: {T0}\n---\nbody\n"
             ),
         )
         .unwrap();
+    }
+
+    /// The current `priority:` value of issue `id` on disk.
+    fn priority_of(&self, id: &str) -> u32 {
+        let text =
+            std::fs::read_to_string(self.path.join(format!("projects/p/tasks/{id}.md"))).unwrap();
+        text.lines()
+            .find_map(|l| l.strip_prefix("priority:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
     }
 
     /// The current `column:` value of issue `id` on disk.
@@ -88,7 +104,13 @@ impl Home {
     }
 
     fn start_daemon(&mut self) {
+        self.start_daemon_with(&[]);
+    }
+
+    /// Start the daemon with extra environment (`(name, value)` pairs).
+    fn start_daemon_with(&mut self, env: &[(&str, &str)]) {
         let child = Command::new(BIN)
+            .envs(env.iter().copied())
             .arg("daemon")
             .env("SHELBI_HOME", &self.path)
             .env("SHELBI_HUB_SOCK", &self.hub)
@@ -240,6 +262,174 @@ fn two_clients_moving_the_same_issue_one_wins_one_is_stale() {
     assert_eq!(home.column_of("t1"), "todo");
 }
 
+/// The board's refusal path end to end (`dt-issues-board`): a client renders a
+/// card, the CLI moves that issue before the client acts, and the client's
+/// move, sent with the state its card was read at (`IssueCard::expected`, what
+/// `execute_mutation_expecting` sends), is refused as stale and changes
+/// nothing; re-reading the board shows where the CLI put it.
+#[test]
+fn a_board_move_from_a_stale_card_is_refused_after_a_cli_move() {
+    let mut home = Home::new("board");
+    home.write_issue("t1", "backlog");
+    home.start_daemon();
+
+    // The client's read: the board model built from the issue as it is now.
+    let read_card = |home: &Home| {
+        let text =
+            std::fs::read_to_string(home.path.join("projects/p/tasks/t1.md")).unwrap();
+        let input = shelbi_app::board::BoardInput {
+            open: vec![shelbi_state::parse_task_file(&text).unwrap()],
+            loading: false,
+            closed_loaded: true,
+            ..Default::default()
+        };
+        let model =
+            shelbi_app::IssuesModel::build(&input, &shelbi_app::BoardFilters::default());
+        model.card("t1").cloned().unwrap()
+    };
+    let card = read_card(&home);
+    assert_eq!(card.status_id, "backlog");
+
+    // Between the read and the move, the CLI moves the issue.
+    let status = Command::new(BIN)
+        .args(["issue", "move", "t1", "--to", "todo", "-p", "p"])
+        .env("SHELBI_HOME", &home.path)
+        .env("SHELBI_HUB_SOCK", &home.hub)
+        .env("SHELBI_CONTROL_SOCK", &home.control)
+        .env_remove("SHELBI_ROOT")
+        .env("SHELBI_YES", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the CLI move ran");
+    assert_eq!(home.column_of("t1"), "todo");
+
+    // The client now moves its (stale) card, sending the state the card was
+    // read at, exactly what the desktop board puts on its mutation.
+    let mut client = connect(&home.control).unwrap();
+    let err = client
+        .mutate(&move_req(1, "t1", "in-progress", Some(card.expected())), &mut discard())
+        .unwrap_err();
+    match err {
+        shelbi_client::ClientError::Mutation(shelbi_proto::control::MutationError::Stale {
+            actual,
+            ..
+        }) => assert_eq!(actual.status, "todo", "the refusal names the real state"),
+        other => panic!("expected the daemon to refuse the stale card, got {other:?}"),
+    }
+    // Nothing changed; the board's re-read shows the CLI's move.
+    assert_eq!(home.column_of("t1"), "todo");
+    assert_eq!(read_card(&home).status_id, "todo");
+}
+
+/// `dt-board-stale-after-own-mutation`: the daemon's `Done` carries the
+/// issue's post-change `(status, revision)`, so the client that made a change
+/// sends its next mutation of the same issue against it, back to back, while
+/// its read still shows the state from before (which is refused). A change
+/// made by another client in between is still refused.
+#[test]
+fn a_mutation_reports_its_landed_state_for_the_next_one() {
+    let mut home = Home::new("landed");
+    home.write_issue("t1", "backlog");
+    home.start_daemon();
+    let on_disk = |home: &Home| {
+        let text =
+            std::fs::read_to_string(home.path.join("projects/p/tasks/t1.md")).unwrap();
+        let tf = shelbi_state::parse_task_file(&text).unwrap();
+        ExpectedState {
+            status: tf.task.column.as_str().to_string(),
+            updated_at: tf.task.updated_at.to_rfc3339(),
+        }
+    };
+
+    let mut client = connect(&home.control).unwrap();
+    let landed = client
+        .mutate(&move_req(1, "t1", "todo", Some(expected_backlog())), &mut discard())
+        .unwrap()
+        .expect("a mutation's Done carries the landed state");
+    assert_eq!(landed, on_disk(&home), "the landed state is the issue's real one");
+    assert_eq!(landed.status, "todo");
+
+    // The read the client made before its change is now stale...
+    let err = client
+        .mutate(&move_req(2, "t1", "backlog", Some(expected_backlog())), &mut discard())
+        .unwrap_err();
+    use shelbi_proto::control::MutationError;
+    assert!(
+        matches!(err, shelbi_client::ClientError::Mutation(MutationError::Stale { .. })),
+        "{err:?}"
+    );
+    // ...but the landed state is current, so the follow-up goes through.
+    // (Moves between backlog and todo only: they run no transition actions.)
+    let next = client
+        .mutate(&move_req(3, "t1", "backlog", Some(landed)), &mut discard())
+        .unwrap()
+        .unwrap();
+    assert_eq!(next, on_disk(&home));
+    assert_eq!(next.status, "backlog");
+
+    // Another client changes it; the landed state no longer holds.
+    let mut other = connect(&home.control).unwrap();
+    other
+        .mutate(&move_req(1, "t1", "todo", None), &mut discard())
+        .unwrap();
+    let err = client
+        .mutate(&move_req(4, "t1", "backlog", Some(next)), &mut discard())
+        .unwrap_err();
+    match err {
+        shelbi_client::ClientError::Mutation(shelbi_proto::control::MutationError::Stale {
+            actual,
+            ..
+        }) => assert_eq!(actual.status, "todo"),
+        other => panic!("expected the other client's change to refuse it, got {other:?}"),
+    }
+    assert_eq!(home.column_of("t1"), "todo");
+}
+
+#[test]
+fn a_prioritize_reorders_the_column_and_a_stale_sibling_reorder_is_refused() {
+    let mut home = Home::new("prio");
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        home.write_issue_at(id, "todo", i as u32);
+    }
+    home.start_daemon();
+    let at_t0 = ExpectedState {
+        status: "todo".into(),
+        updated_at: T0.into(),
+    };
+    let prio_req = |request_id, id: &str, position| MutationRequest {
+        request_id,
+        project: "p".into(),
+        id: id.into(),
+        expected: Some(at_t0.clone()),
+        kind: MutationKind::Prioritize { position },
+    };
+
+    // `c` to the top: the board's drag sends the registry's PrioritizeIssue as
+    // this request, carrying the card's read state.
+    let mut client = connect(&home.control).unwrap();
+    client.mutate(&prio_req(1, "c", 0), &mut discard()).unwrap();
+    assert_eq!(
+        ["c", "a", "b"].map(|id| home.priority_of(id)),
+        [0, 1, 2],
+        "c landed on top and the rest shifted down"
+    );
+
+    // The renumber rewrote `b`'s revision, so a reorder sent from the old
+    // snapshot is refused rather than applied to a column the user didn't see.
+    let err = client.mutate(&prio_req(2, "b", 0), &mut discard()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            shelbi_client::ClientError::Mutation(shelbi_proto::control::MutationError::Stale { .. })
+        ),
+        "expected a stale refusal, got {err:?}"
+    );
+    assert_eq!(home.priority_of("b"), 2, "nothing changed");
+}
+
 #[test]
 fn a_mutation_finishes_after_the_client_disconnects() {
     let mut home = Home::new("leave");
@@ -315,3 +505,121 @@ fn other_connected_clients_are_notified_of_a_change() {
     assert_eq!(note.verb, "move");
     assert_eq!(note.status, "todo");
 }
+
+/// Kill every live session under `home`'s sessions directory (the daemon spawns
+/// them detached, so they outlive it).
+fn kill_sessions(home: &Path) {
+    let Ok(sessions) = shelbi_client::list(&home.join("sessions")) else {
+        return;
+    };
+    for s in sessions.iter().filter(|s| s.alive) {
+        if let Ok((conn, _)) = shelbi_client::Connection::open(&s.sock, None, &[]) {
+            let _ = conn.kill(None);
+        }
+    }
+}
+
+/// `dt-workspace-view`: the daemon starts a workspace's user shell on request
+/// (`<project>/ws/<workspace>/shell`, a login shell in the worktree), reuses it
+/// when asked again, and ends it on `CloseShell`, leaving the agent's slot
+/// alone.
+#[test]
+fn the_daemon_starts_and_ends_a_workspaces_user_shell() {
+    use shelbi_proto::control::{WorkspaceSessionOp, WorkspaceSessionRequest};
+
+    let mut home = Home::new("shell");
+    let work_dir = home.path.join("w");
+    let worktree = work_dir.join(".shelbi/wt/dev");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        home.path.join("projects/p.yaml"),
+        format!(
+            "name: p\nrepo: /tmp/p\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: local\n    kind: local\n    work_dir: {}\n\
+             workspaces:\n  - {{ name: dev, machine: local, runner: claude }}\n",
+            work_dir.display()
+        ),
+    )
+    .unwrap();
+    // A plain `sh` as the login shell, so the test doesn't run the developer's.
+    home.start_daemon_with(&[("SHELL", "/bin/sh")]);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            kill_sessions(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(home.path.clone());
+
+    let req = |request_id, op| WorkspaceSessionRequest {
+        request_id,
+        project: "p".into(),
+        workspace: "dev".into(),
+        op,
+    };
+    let live_shells = |home: &Path| {
+        shelbi_client::list(&home.join("sessions"))
+            .map(|l| {
+                l.into_iter()
+                    .filter(|s| s.alive && s.meta.name == "p/ws/dev/shell")
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut client = connect(&home.control).unwrap();
+    client
+        .workspace_session(&req(1, WorkspaceSessionOp::EnsureShell), &mut discard())
+        .expect("ensure the shell");
+    assert!(
+        wait_until(Duration::from_secs(10), || live_shells(&home.path).len() == 1),
+        "the shell session never came up"
+    );
+    // Asking again reuses it.
+    client
+        .workspace_session(&req(2, WorkspaceSessionOp::EnsureShell), &mut discard())
+        .unwrap();
+    assert_eq!(live_shells(&home.path).len(), 1, "an ensure is idempotent");
+
+    // It is a shell in the worktree.
+    let shell = live_shells(&home.path).remove(0);
+    // Its socket binds a beat after the session is listed.
+    let mut opened = None;
+    assert!(wait_until(Duration::from_secs(10), || {
+        opened = shelbi_client::Connection::open(&shell.sock, None, shelbi_proto::capability::ALL).ok();
+        opened.is_some()
+    }));
+    let (conn, events) = opened.unwrap();
+    conn.attach(None).unwrap();
+    conn.input(b"pwd\r").unwrap();
+    let want = worktree.canonicalize().unwrap().display().to_string();
+    let rx = events.into_inner();
+    let mut seen = Vec::new();
+    let found = wait_until(Duration::from_secs(10), || {
+        while let Ok(ev) = rx.try_recv() {
+            if let shelbi_client::SessionEvent::Output { data, .. }
+            | shelbi_client::SessionEvent::Resync { replay: data, .. } = ev
+            {
+                seen.extend_from_slice(&data);
+            }
+        }
+        String::from_utf8_lossy(&seen).contains(&want)
+    });
+    assert!(found, "pwd in the shell names the worktree: {:?}", String::from_utf8_lossy(&seen));
+    drop(conn);
+
+    client
+        .workspace_session(&req(3, WorkspaceSessionOp::CloseShell), &mut discard())
+        .expect("close the shell");
+    assert!(
+        wait_until(Duration::from_secs(10), || live_shells(&home.path).is_empty()),
+        "the shell session ended"
+    );
+    // Closing an already-closed shell is fine.
+    client
+        .workspace_session(&req(4, WorkspaceSessionOp::CloseShell), &mut discard())
+        .unwrap();
+}
+
