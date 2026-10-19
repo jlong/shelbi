@@ -620,6 +620,9 @@ pub struct ShelbiWindow {
     /// The sidebar sections the user has collapsed (saved per project with
     /// the rest of where it was left).
     collapsed_sections: BTreeSet<sidebar::Section>,
+    /// The sections and machine groups folding open or closed after a
+    /// click on their header.
+    folds: sidebar::SidebarFolds,
     route: Route,
     /// The settings sidebar's page and keyboard row (the page outlives a
     /// visit: Settings reopens on it), and its rows measured for the
@@ -856,6 +859,7 @@ impl ShelbiWindow {
             nav_track: SlideTrack::shared(),
             cursor: None,
             collapsed_sections: BTreeSet::new(),
+            folds: Default::default(),
             route: Route::View,
             settings_nav: SettingsNav::default(),
             settings_track: SlideTrack::shared(),
@@ -1439,6 +1443,7 @@ impl ShelbiWindow {
         self.collapsed_panel_cols = None;
         self.sidebar_scroll = ScrollHandle::new();
         self.nav_track = SlideTrack::shared();
+        self.folds.clear();
         self.cursor = None;
         self.switch_hold = None;
         self.pending_rows = None;
@@ -1519,6 +1524,8 @@ impl ShelbiWindow {
             .iter()
             .filter_map(|key| sidebar::Section::from_key(key))
             .collect();
+        // Restored, not toggled: drawn as left, with no fold.
+        self.folds.clear();
         self.pending_rows = Some(PendingRows {
             selected: saved.selected,
             scroll_y: saved.scroll_y,
@@ -1737,13 +1744,21 @@ impl ShelbiWindow {
             .nth(ordinal)
     }
 
-    /// Collapse or expand a sidebar section, and remember it for the
-    /// project. The selection stays on its row while that row is drawn
-    /// (selection follows rows, not ordinals).
+    /// Collapse or expand a sidebar section, folding it closed or open, and
+    /// remember it for the project. The selection stays on its row while
+    /// that row is drawn (selection follows rows, not ordinals); the keys
+    /// skip a section's rows from the moment it starts closing.
     fn toggle_section(&mut self, section: sidebar::Section, cx: &mut Context<Self>) {
-        if !self.collapsed_sections.remove(&section) {
+        let collapsed = !self.collapsed_sections.remove(&section);
+        if collapsed {
             self.collapsed_sections.insert(section);
         }
+        self.folds.toggle(
+            sidebar::Body::Section(section),
+            collapsed,
+            (self.clock)(),
+            (self.reduce_motion)(),
+        );
         self.remember_view_state(cx);
         cx.notify();
     }
@@ -1820,8 +1835,19 @@ impl ShelbiWindow {
     /// Collapse or expand a machine group: at once in the model, persisted
     /// off the UI thread (to `state.json`, shared with the TUI).
     fn toggle_machine(&mut self, name: String, cx: &mut Context<Self>) {
-        if !self.model.collapsed_machines.remove(&name) {
+        let collapsed = !self.model.collapsed_machines.remove(&name);
+        if collapsed {
             self.model.collapsed_machines.insert(name.clone());
+        }
+        self.folds.toggle(
+            sidebar::Body::Machine(name.clone()),
+            collapsed,
+            (self.clock)(),
+            (self.reduce_motion)(),
+        );
+        if self.offline() {
+            cx.notify();
+            return;
         }
         let write = cx.background_executor().spawn(async move {
             shelbi_state::toggle_sidebar_machine_collapsed(&name).map_err(|e| e.to_string())
@@ -4074,6 +4100,11 @@ impl ShelbiWindow {
             window.request_animation_frame();
         }
         let catalog_projects = switcher_phase.map(|_| self.switcher_projects(cx));
+        // The sidebar's sections and machine groups folding open or closed.
+        self.folds.settle(now);
+        if self.folds.animating(now) {
+            window.request_animation_frame();
+        }
         // The leading column: the sidebar, or a review's or workspace's panel
         // in its place, both while the push between them runs (clipped to
         // the column).
@@ -4170,6 +4201,8 @@ impl ShelbiWindow {
                     SidebarProps {
                         model: &self.model,
                         collapsed: &self.collapsed_sections,
+                        folds: &self.folds,
+                        now,
                         selection,
                         link: self.link,
                         palette_chord: self.palette_chord.clone(),
@@ -4670,6 +4703,10 @@ mod sidebar_tests;
 #[cfg(test)]
 #[path = "app_settings_tests.rs"]
 mod settings_tests;
+
+#[cfg(test)]
+#[path = "app_fold_tests.rs"]
+mod fold_tests;
 
 #[cfg(test)]
 mod tests {

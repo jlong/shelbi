@@ -14,6 +14,7 @@
 //! the system switches between light and dark while the app runs; `dark` and
 //! `light` pin the theme and the window chrome with it.
 
+pub mod fold;
 pub mod motion;
 pub mod palette;
 pub mod style;
