@@ -5,7 +5,6 @@
 //!
 //! - `workspace-working.png`: a working workspace, its panel and agent;
 //! - `workspace-shell.png`: the user shell open beside the agent;
-//! - `workspace-description.png`: the task description (More);
 //! - `workspace-idle.png`: an idle workspace's reduced panel and placeholder;
 //! - `workspace-remote-reconnecting.png`: a remote workspace whose SSH
 //!   connection dropped, reconnecting.
@@ -331,13 +330,6 @@ impl Run {
         let shell = self.view().read_with(&self.cx, |v, _| v.shell_open());
         self.expect("the shell opens beside the agent", shell);
         self.save("workspace-shell.png");
-
-        // The description.
-        self.update(|v, _, cx| v.toggle_description_for_check(cx));
-        let description = self.view().read_with(&self.cx, |v, _| v.description_open());
-        self.expect("More opens the task description", description);
-        self.save("workspace-description.png");
-        self.update(|v, _, cx| v.toggle_description_for_check(cx));
 
         // An idle workspace.
         self.update(|v, _, cx| v.show("bravo", Some(row("bravo", "hub", false, None, WorkspaceBadge::Idle)), cx));

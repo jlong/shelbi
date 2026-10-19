@@ -24,7 +24,8 @@
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
 //! collapsed, Zen off, the sidebar hidden), the issue detail's
 //! ([`DETAIL_ACTIONS`] hovered, a long body scrolled) and the task panels'
-//! (`state-review-*`, `state-workspace-*`: More, each view's ⌘N, Approve
+//! (`state-review-*`, `state-workspace-*`: More opening the task detail
+//! over the screen, each view's ⌘N, Approve
 //! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
 //! the remote down, its row selected; `machines-idle-selected`,
 //! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
@@ -1150,8 +1151,8 @@ impl Run {
 
     /// The task panels' states the frames don't draw
     /// (`state-{review,workspace}-<name>-<theme>.png`; no reference, checked
-    /// by eye): the description expanded by More, each view picked with its
-    /// ⌘N, and Approve and Reject hovered and pressed.
+    /// by eye): the task detail More opens over the screen, each view picked
+    /// with its ⌘N, and Approve and Reject hovered and pressed.
     fn panel_states(&mut self, orch: &View) {
         use gpui::{point, Modifiers, MouseButton};
 
@@ -1165,6 +1166,19 @@ impl Run {
             run.cx.simulate_click(handle.into(), at, Modifiers::none());
             run.settle(handle);
         };
+        // More, then the detail over the screen once the board has its issue.
+        let more_detail = |screen: &'static str| {
+            move |run: &mut Self, handle: WindowHandle<ShelbiWindow>| {
+                click(run, handle, more);
+                let over = handle.read_with(&run.cx, |w, cx| w.offscreen_detail_over(cx)).unwrap_or(false);
+                run.expect(&format!("{screen}: More opens the task detail over the screen"), over);
+                let board = run.views(handle).0;
+                let loaded = run.wait(handle, Duration::from_secs(10), |cx| {
+                    board.as_ref().is_some_and(|b| b.read_with(cx, |v, _| v.detail_loaded()))
+                });
+                run.expect(&format!("{screen}: the detail loads its issue"), loaded);
+            }
+        };
         let keys = |keys: &'static str| {
             move |run: &mut Self, handle: WindowHandle<ShelbiWindow>| {
                 run.cx.simulate_keystrokes(handle.into(), keys);
@@ -1172,7 +1186,7 @@ impl Run {
             }
         };
 
-        self.review(orch, "state-review-more", |run, handle| click(run, handle, more));
+        self.review(orch, "state-review-more", more_detail("state-review-more"));
         for n in 2..=5 {
             let chord: &'static str = ["", "", "cmd-2", "cmd-3", "cmd-4", "cmd-5"][n];
             self.review(orch, &format!("state-review-view-{n}"), keys(chord));
@@ -1190,7 +1204,7 @@ impl Run {
         }
 
         // The workspace panel's worktree row is 8pt taller, so More is too.
-        self.workspace(orch, "state-workspace-more", |run, handle| click(run, handle, more));
+        self.workspace(orch, "state-workspace-more", more_detail("state-workspace-more"));
         for n in 2..=4 {
             let chord: &'static str = ["", "", "cmd-2", "cmd-3", "cmd-4"][n];
             self.workspace(orch, &format!("state-workspace-view-{n}"), keys(chord));

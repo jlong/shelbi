@@ -15,8 +15,9 @@
 //!   Navigation component's State=Review (`dt-figma-task-panels`, the pieces
 //!   in [`super::task_panel`]; the window keeps the sidebar's titlebar and
 //!   footer around it): the back button and the task's column (REVIEW), the
-//!   title and the description clamped to five lines with `More` expanding
-//!   it in place, the worktree with Open (reveal it in Finder), the views
+//!   title and the description clamped to five lines with `More` opening
+//!   the task detail over the screen (the window draws it,
+//!   `dt-more-opens-detail`), the worktree with Open (reveal it in Finder), the views
 //!   numbered ⌘1 to ⌘N (Reviewer / View Diff / Edit in <editor> / Web
 //!   Browser when a URL exists / Shell), then Actions: Approve and Reject.
 //!   The review slot's **server** has no block of its own: until it serves,
@@ -212,6 +213,8 @@ pub enum ReviewEvent {
     Command(CommandKind),
     /// Leave the review loaded and go back to the previous view.
     Back,
+    /// More: open this task's detail over the screen.
+    OpenTask(String),
     /// The review was torn down (the daemon was asked to end its sessions):
     /// go back to the previous view.
     Closed,
@@ -250,8 +253,6 @@ pub struct ReviewView {
     review: Option<Shown>,
     shown: bool,
     focus: ReviewFocus,
-    /// The description shows in full (More), not clamped.
-    description_open: bool,
     /// The user shell beside the content (Shell), in the slot's worktree.
     shell: Entity<SessionView>,
     shell_open: bool,
@@ -312,7 +313,6 @@ impl ReviewView {
             switch_track: SlideTrack::shared(),
             shown: false,
             focus: ReviewFocus::Panel,
-            description_open: false,
             generation: 0,
             hold: false,
             held: None,
@@ -386,7 +386,6 @@ impl ReviewView {
             old.content.update(cx, |c, cx| c.hide(cx));
         }
         self.generation += 1;
-        self.description_open = false;
         self.focus = ReviewFocus::Panel;
         self.held = None;
         let info = ReviewInfo {
@@ -433,7 +432,6 @@ impl ReviewView {
                 old.content.update(cx, |c, cx| c.hide(cx));
             }
             self.generation += 1;
-            self.description_open = false;
             self.focus = ReviewFocus::Panel;
             self.held = None;
             self.review = Some(self.build(info, row, cx));
@@ -491,13 +489,29 @@ impl ReviewView {
             return;
         }
         self.shown = false;
-        self.description_open = false;
         self.held = None;
         self.split.dragging = false;
         self.close_shell(cx);
         if let Some(r) = &self.review {
             r.content.update(cx, |c, cx| c.hide(cx));
         }
+        cx.notify();
+    }
+
+    /// The task's title and description as the board reads them now (the
+    /// detail opened over the screen edited them): the panel shows them
+    /// when they're its review's.
+    pub fn refresh_task_text(&mut self, task: &str, title: &str, body: &str, cx: &mut Context<Self>) {
+        let Some(r) = self.review.as_mut().filter(|r| r.resolved && r.info.task_id == task) else {
+            return;
+        };
+        if r.info.title == title && r.info.body == body {
+            return;
+        }
+        r.info.title = title.to_string();
+        r.info.body = body.to_string();
+        r.model = ReviewPanelModel::build(&r.info, r.row.as_ref());
+        r.panel.sync(&r.model);
         cx.notify();
     }
 
@@ -747,12 +761,8 @@ impl ReviewView {
                 };
                 self.run_opener("reveal the folder", move |ops| ops.reveal(&path), cx);
             }
-            // More expands the description in place; Less (the same row)
-            // clamps it again.
-            PanelEffect::ShowDescription => {
-                self.description_open = !self.description_open;
-                cx.notify();
-            }
+            // More opens the task's detail over the screen.
+            PanelEffect::ShowDescription => cx.emit(ReviewEvent::OpenTask(task)),
             PanelEffect::ToggleShell => self.toggle_shell(cx),
             PanelEffect::Approve => cx.emit(ReviewEvent::Command(CommandKind::ApproveReview { id: task })),
             PanelEffect::RejectPrompt => cx.emit(ReviewEvent::Command(CommandKind::RejectReview {
@@ -958,7 +968,7 @@ impl ReviewView {
             model.title.clone()
         };
         let more = (shown.resolved && model.has_body()).then(|| {
-            task_panel::more_link("review-more", self.description_open, selected(PanelRow::More), theme)
+            task_panel::more_link("review-more", selected(PanelRow::More), theme)
                 .on_click(listen(PanelRow::More))
         });
         let summary = task_panel::summary(
@@ -966,7 +976,6 @@ impl ReviewView {
             title,
             model.description.clone(),
             more,
-            self.description_open,
             theme,
         );
 
@@ -1845,14 +1854,41 @@ pub(crate) mod tests {
         h.key("j");
         h.key("enter");
         assert_eq!(h.ops(), vec![ReviewSessionOp::Ensure { role: ReviewRole::Diff }]);
-        // `m` expands the description in place, and again clamps it.
+        // `m` opens the task's detail.
         h.key("m");
-        assert!(h.view.read_with(&h.cx, |v, _| v.description_open));
-        h.key("m");
-        assert!(!h.view.read_with(&h.cx, |v, _| v.description_open));
-        assert!(h.events().is_empty());
+        assert_eq!(h.events(), vec![ReviewEvent::OpenTask("t-1".into())]);
+        // So does Enter on the More row (up from View Diff; the rows wrap).
+        let selected = |h: &Harness| h.view.read_with(&h.cx, |v, _| v.panel().and_then(|p| p.selected_row()));
+        for _ in 0..12 {
+            if selected(&h) == Some(PanelRow::More) {
+                break;
+            }
+            h.key("k");
+        }
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel().and_then(|p| p.selected_row())), Some(PanelRow::More));
+        h.key("enter");
+        assert_eq!(h.events().len(), 2);
+        assert_eq!(h.events()[1], ReviewEvent::OpenTask("t-1".into()));
         h.key("escape");
-        assert_eq!(h.events(), vec![ReviewEvent::Back]);
+        assert_eq!(h.events().last(), Some(&ReviewEvent::Back));
+    }
+
+    #[gpui::test]
+    fn more_opens_the_detail_and_the_board_s_text_refreshes_the_summary(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), None, cx));
+        h.click("review-more");
+        assert_eq!(h.events(), vec![ReviewEvent::OpenTask("t-1".into())]);
+        h.click("review-more");
+        assert_eq!(h.events().len(), 2, "More opens it every time, it doesn't toggle");
+
+        h.update(|v, cx| v.refresh_task_text("t-1", "Edited title", "Edited body.", cx));
+        let model = h.view.read_with(&h.cx, |v, _| v.model().cloned()).unwrap();
+        assert_eq!(model.title, "Edited title");
+        assert_eq!(model.description, "Edited body.");
+        h.update(|v, cx| v.refresh_task_text("t-9", "Other", "Other", cx));
+        let model = h.view.read_with(&h.cx, |v, _| v.model().cloned()).unwrap();
+        assert_eq!(model.title, "Edited title");
     }
 
     #[gpui::test]

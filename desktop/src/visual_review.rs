@@ -19,7 +19,6 @@
 //! - `review-loading.png`: a slot still loading (waiting for its health
 //!   check), no URL location yet;
 //! - `review-merging.png`: an approve in flight, the panel inert;
-//! - `review-description.png`: the task description (More);
 //! - `review-back-mid.png` and `review-back.png`: Back, half-way and done
 //!   (the sidebar as it was);
 //! - the overlays over the shell: `palette-entering.png` (the palette
@@ -391,11 +390,6 @@ impl Run {
         self.expect("an approve makes the panel inert", merging);
         self.save("review-merging.png");
         self.update(|v, cx| v.set_merging(false, cx));
-
-        // The description.
-        self.update(|v, cx| v.apply(PanelEffect::ShowDescription, cx));
-        self.save("review-description.png");
-        self.update(|v, cx| v.apply(PanelEffect::None, cx));
 
         // Back: the reverse push, then the sidebar as it was.
         self.update(|v, cx| v.apply(PanelEffect::Back, cx));

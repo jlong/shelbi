@@ -27,6 +27,13 @@
 //! nothing and puts the reason in the status line. A legal drop becomes the
 //! same registry command the keys send, so it goes through the window's
 //! dispatch and the daemon like any other move.
+//!
+//! The task detail can also open over another screen
+//! ([`IssuesView::open_task_over`], the Review and Workspace panels' More,
+//! `dt-more-opens-detail`): the view then draws only the detail and what it
+//! opens, as a layer the window puts over its main area, and keeps its own
+//! keys, editor and commands. The board itself isn't drawn until the window
+//! shows it.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -173,6 +180,8 @@ pub struct IssuesView {
     pub(super) editor: Option<(String, Entity<TextareaState>)>,
     add_input: Option<Entity<InputState>>,
     display_style: DisplayStyle,
+    /// Drawn over another screen: the detail alone, no board.
+    floating: bool,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -230,6 +239,7 @@ impl IssuesView {
             editor: None,
             add_input: None,
             display_style: DisplayStyle::detect(),
+            floating: false,
             _subscriptions: Vec::new(),
             _poll: poll,
         }
@@ -268,6 +278,13 @@ impl IssuesView {
     #[cfg(feature = "visual-check")]
     pub fn state_mut(&mut self) -> &mut BoardState {
         &mut self.state
+    }
+
+    /// Whether the open detail has its issue to show (the board has loaded),
+    /// for the offscreen renders.
+    #[cfg(feature = "visual-check")]
+    pub fn detail_loaded(&self) -> bool {
+        self.state.detail_id().is_some() && !self.state.model().loading
     }
 
     /// Drain the board's reads now, for the offscreen renders.
@@ -332,6 +349,43 @@ impl IssuesView {
         self.state.open_detail(id);
         self.needs_focus = true;
         cx.notify();
+    }
+
+    /// Open task `id`'s detail over another screen (the Review or Workspace
+    /// panel's More): the view draws the detail, and the assign picker it
+    /// opens, without the board, for the window to lay over its main area
+    /// until [`Self::overlay_open`] goes false.
+    pub fn open_task_over(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.floating = true;
+        self.open_task(id, cx);
+    }
+
+    /// Whether the view draws over another screen.
+    pub fn is_floating(&self) -> bool {
+        self.floating
+    }
+
+    /// Whether the detail, or a picker over the board, is up.
+    pub fn overlay_open(&self) -> bool {
+        self.state.mode != Mode::Board
+    }
+
+    /// Stop drawing over another screen. `close` closes the detail too (the
+    /// screen it opened over went away); without it the detail stays open,
+    /// for the board.
+    pub fn land(&mut self, close: bool, cx: &mut Context<Self>) {
+        self.floating = false;
+        if close {
+            self.editor = None;
+            self.add_input = None;
+            self.state.close_overlay();
+        }
+        cx.notify();
+    }
+
+    /// The open detail's task, title and body, as the board last read them.
+    pub fn detail_text(&mut self) -> Option<(String, String, String)> {
+        self.detail_model().map(|d| (d.id, d.title, d.body))
     }
 
     /// Drain the refreshers and background results; re-read on the cadence.
@@ -1387,8 +1441,26 @@ impl Render for IssuesView {
             self.state.end_drag();
         }
         let theme = *cx.global::<Theme>();
-        let detail = self.detail_model();
-        let detail_missing = self.state.detail_id().is_some() && detail.is_none();
+        let detail = self.render_detail(&theme, cx);
+        if self.floating {
+            // Over another screen: the detail and its assign picker, filling
+            // the main area the window lays this over.
+            return div()
+                .id("issues-over")
+                .debug_selector(|| "issues-over".into())
+                .track_focus(&self.focus)
+                .key_context("IssuesBoard")
+                .on_key_down(cx.listener(Self::on_key))
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .type_style(Type::Base)
+                .text_color(theme.foreground)
+                .children(detail)
+                .children(self.render_assign(&theme, cx))
+                .into_any_element();
+        }
         let board = self.render_board(&theme, cx);
         div()
             .id("issues")
@@ -1407,21 +1479,37 @@ impl Render for IssuesView {
             .child(self.render_header(&theme, cx))
             .child(board)
             .child(self.render_footer(&theme))
-            .when_some(detail, |root, d| {
-                root.child(task_detail::render(self, &d, &theme, cx))
-            })
-            .when(detail_missing, |root| {
-                root.child(centered(
-                    backdrop(&theme, cx),
-                    panel(&theme)
-                        .w(px(360.0))
-                        .child(panel_title(&theme, "This issue is no longer on the board"))
-                        .child(muted_row(&theme, "Press Esc to close.")),
-                ))
-            })
+            .children(detail)
             .children(self.render_dropdown(&theme, cx))
             .children(self.render_assign(&theme, cx))
             .children(self.render_add(&theme, cx))
+            .into_any_element()
+    }
+}
+
+impl IssuesView {
+    /// The open detail: the modal, or (an issue the board doesn't have) a
+    /// note saying so, once the board has loaded.
+    fn render_detail(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.state.detail_id()?;
+        if let Some(d) = self.detail_model() {
+            return Some(task_detail::render(self, &d, theme, cx).into_any_element());
+        }
+        let (title, note) = if self.state.model().loading {
+            ("Loading the issue…", "Press Esc to close.")
+        } else {
+            ("This issue is no longer on the board", "Press Esc to close.")
+        };
+        Some(
+            centered(
+                backdrop(theme, cx),
+                panel(theme)
+                    .w(px(360.0))
+                    .child(panel_title(theme, title))
+                    .child(muted_row(theme, note)),
+            )
+            .into_any_element(),
+        )
     }
 }
 
