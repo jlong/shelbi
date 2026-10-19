@@ -5,7 +5,8 @@
 //!
 //! Top to bottom: the back button beside the task's status (its glyph and
 //! the status in caps), the issue summary (the title, the description
-//! clamped to five lines, More / Less), the worktree with its Open button,
+//! clamped to five lines, More opening the task detail over the screen),
+//! the worktree with its Open button,
 //! the views (the sidebar's nav item with the sliding chip, numbered ⌘1 to
 //! ⌘N), and, in the Review panel, its Actions. The window draws the
 //! sidebar's titlebar and footer around a panel
@@ -25,7 +26,8 @@ use crate::theme::Theme;
 /// The back button's square.
 pub const BACK_BUTTON: f32 = 28.0;
 
-/// How many lines the description shows until More expands it.
+/// How many lines of the description the panel shows (More opens the rest in
+/// the task detail).
 pub const DESCRIPTION_LINES: usize = 5;
 
 /// The back button: a 28pt square on the overlay fill (deepening on hover
@@ -80,14 +82,13 @@ pub fn status_row(back: Stateful<Div>, status: Option<(StatusCategory, &str)>, t
 
 /// The issue summary: the title (Base/Medium, loud), the description
 /// (X-Small on an 18pt line, clamped to [`DESCRIPTION_LINES`] with an
-/// ellipsis until `expanded`), and the More / Less link the caller makes
-/// ([`more_link`]); 18pt in, 8pt apart.
+/// ellipsis), and the More link the caller makes ([`more_link`]); 18pt in,
+/// 8pt apart.
 pub fn summary(
     selectors: (&'static str, &'static str),
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     more: Option<Stateful<Div>>,
-    expanded: bool,
     theme: &Theme,
 ) -> Div {
     let (title_selector, description_selector) = selectors;
@@ -113,22 +114,16 @@ pub fn summary(
                     .type_style(Type::XSmall)
                     .line_height(px(18.0))
                     .text_color(theme.foreground)
-                    .map(|d| {
-                        if expanded {
-                            d.child(description)
-                        } else {
-                            d.child(clamped_text(description, DESCRIPTION_LINES))
-                        }
-                    }),
+                    .child(clamped_text(description, DESCRIPTION_LINES)),
             )
         })
         .children(more)
 }
 
-/// The More link under the description (Less once it expanded): X-Small /
-/// Medium in `text/link`, the hover color on hover. `keyboard` marks it the
-/// keyboard's row with the selection fill.
-pub fn more_link(id: &'static str, expanded: bool, keyboard: bool, theme: &Theme) -> Stateful<Div> {
+/// The More link under the description, which opens the task detail:
+/// X-Small / Medium in `text/link`, the hover color on hover. `keyboard`
+/// marks it the keyboard's row with the selection fill.
+pub fn more_link(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<Div> {
     let hover = theme.link_hover;
     div()
         .id(id)
@@ -155,7 +150,7 @@ pub fn more_link(id: &'static str, expanded: bool, keyboard: bool, theme: &Theme
                     .bg(theme.background),
             )
         })
-        .child(if expanded { "Less" } else { "More" })
+        .child("More")
 }
 
 /// A worktree path as the panel shows it: its last four components after

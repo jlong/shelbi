@@ -618,6 +618,10 @@ pub struct ShelbiWindow {
     /// The Issues board for this window's project, created the first time it
     /// is shown.
     issues: Option<Entity<IssuesView>>,
+    /// The task detail is open over the main area, which shows this (the
+    /// Review or Workspace panel's More, `dt-more-opens-detail`): the board
+    /// draws it as a layer there until it closes or the main area moves on.
+    detail_over: Option<Shown>,
     /// The workflow filter the project was left with, for its board.
     pending_workflow_filter: Option<String>,
     /// The orchestrator chat, created the first time it is shown.
@@ -839,6 +843,7 @@ impl ShelbiWindow {
             collapsed_sections: BTreeSet::new(),
             route: Route::View,
             issues: None,
+            detail_over: None,
             pending_workflow_filter: None,
             chat: None,
             activity: None,
@@ -1401,6 +1406,7 @@ impl ShelbiWindow {
         if let Some(issues) = self.issues.take() {
             issues.update(cx, |v, _| v.stop_workers());
         }
+        self.detail_over = None;
         if let Some(activity) = self.activity.take() {
             activity.update(cx, |v, _| v.stop_workers());
         }
@@ -1976,6 +1982,8 @@ impl ShelbiWindow {
             this.run(kind.clone(), window, cx);
         });
         self._view_subscriptions.push(sub);
+        let sub = cx.observe_in(&issues, window, |this, _, window, cx| this.sync_detail_over(window, cx));
+        self._view_subscriptions.push(sub);
         if let Some(filter) = self.pending_workflow_filter.take() {
             issues.update(cx, |v, cx| v.restore_workflow_filter(Some(filter), cx));
         }
@@ -2048,6 +2056,7 @@ impl ShelbiWindow {
                 cx.notify();
             }
             WorkspaceEvent::Back => this.leave_workspace(window, cx),
+            WorkspaceEvent::OpenTask(id) => this.open_task_over(id, window, cx),
         });
         self._view_subscriptions.push(sub);
         self.workspace = Some(ws.clone());
@@ -2078,6 +2087,7 @@ impl ShelbiWindow {
             // commands, through the same gates as the palette's.
             ReviewEvent::Command(kind) => this.run(kind.clone(), window, cx),
             ReviewEvent::Back | ReviewEvent::Closed => this.leave_review(window, cx),
+            ReviewEvent::OpenTask(id) => this.open_task_over(id, window, cx),
         });
         self._view_subscriptions.push(sub);
         self.review = Some(review.clone());
@@ -2469,6 +2479,67 @@ impl ShelbiWindow {
         self.run(CommandKind::ShowView(View::Issues), window, cx);
         let issues = self.ensure_issues(window, cx);
         issues.update(cx, |v, cx| v.open_task(id, cx));
+    }
+
+    /// Show task `id`'s detail over the main area, which stays as it is
+    /// under it (the Review and Workspace panels' More). Closing it hands
+    /// the keys back to the main area ([`Self::sync_detail_over`]).
+    fn open_task_over(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.shown(cx);
+        if matches!(shown, Shown::Settings | Shown::View(View::Issues)) {
+            return self.open_task(id, window, cx);
+        }
+        let issues = self.ensure_issues(window, cx);
+        issues.update(cx, |v, cx| v.open_task_over(id, cx));
+        self.detail_over = Some(shown);
+        cx.notify();
+    }
+
+    /// The board changed while its detail is up over the main area: the
+    /// panel under it shows the task's title and description as the board
+    /// reads them (an edit made in the detail), and once the detail closes
+    /// the keys go back to what the main area shows.
+    fn sync_detail_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.detail_over.is_none() {
+            return;
+        }
+        let Some(issues) = self.issues.clone() else {
+            self.detail_over = None;
+            return;
+        };
+        let text = issues.update(cx, |v, _| v.detail_text());
+        if let Some((task, title, body)) = text {
+            if let Some(review) = self.review.clone().filter(|_| matches!(self.route, Route::Review)) {
+                review.update(cx, |r, cx| r.refresh_task_text(&task, &title, &body, cx));
+            } else if let Some(ws) = self.workspace.clone() {
+                ws.update(cx, |w, cx| w.refresh_task_text(&task, &title, &body, cx));
+            }
+        }
+        if issues.read(cx).overlay_open() {
+            return;
+        }
+        self.detail_over = None;
+        issues.update(cx, |v, cx| v.land(false, cx));
+        self.focus_main_view(window, cx);
+        cx.notify();
+    }
+
+    /// The main area moved on from what the detail opened over (a sidebar
+    /// row, a command): the detail goes with it, or onto the board when the
+    /// board is what shows now.
+    fn settle_detail_over(&mut self, cx: &mut Context<Self>) {
+        let Some(over) = self.detail_over.clone() else {
+            return;
+        };
+        let shown = self.shown(cx);
+        if shown == over {
+            return;
+        }
+        self.detail_over = None;
+        if let Some(issues) = self.issues.clone() {
+            let onto_board = shown == Shown::View(View::Issues);
+            issues.update(cx, |v, cx| v.land(!onto_board, cx));
+        }
     }
 
     /// Hand keyboard focus to what the main area shows: a native view, the
@@ -3590,6 +3661,11 @@ impl ShelbiWindow {
     /// or the review panel in its place); without it the main area offers
     /// the button that expands the sidebar.
     fn render_main(&self, theme: &Theme, column_shown: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let detail_over = self
+            .detail_over
+            .as_ref()
+            .and_then(|_| self.issues.clone())
+            .filter(|issues| issues.read(cx).is_floating());
         let body = match &self.route {
             Route::Settings(view) => div().size_full().child(view.clone()).into_any_element(),
             Route::Review => div()
@@ -3690,6 +3766,9 @@ impl ShelbiWindow {
                 )
             })
             .child(body)
+            // The task detail over the Review or Workspace screen: the board
+            // draws it, sized to the main area as it is over the board.
+            .when_some(detail_over, |main, issues| main.relative().child(issues))
     }
 }
 
@@ -3848,6 +3927,7 @@ impl ShelbiWindow {
         // (bootstrap has no window to hand it); later changes go through
         // `perform`. Idempotent.
         self.sync_chat(window, cx);
+        self.settle_detail_over(cx);
         // A switch (or a new window): this frame paints the project's
         // sidebar; the next builds its main view and attaches its sessions.
         if let Some(hold) = self.switch_hold.as_mut() {
@@ -4331,6 +4411,11 @@ impl ShelbiWindow {
         if let Some(ordinal) = entries.iter().filter_map(|e| e.row.target()).position(|t| t == *target) {
             self.offscreen_select(ordinal, cx);
         }
+    }
+
+    /// Whether the task detail is up over the main area (the panels' More).
+    pub(crate) fn offscreen_detail_over(&self, cx: &App) -> bool {
+        self.detail_over.is_some() && self.issues.as_ref().is_some_and(|v| v.read(cx).is_floating())
     }
 
     pub(crate) fn offscreen_open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {

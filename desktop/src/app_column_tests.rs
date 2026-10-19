@@ -18,6 +18,7 @@ use gpui::{point, Bounds, Focusable, Modifiers, Pixels, TestAppContext};
 use shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH;
 use shelbi_app::review::PanelEffect;
 use shelbi_app::view::{ReviewState, WorkspaceBadge, WorkspaceRow};
+use shelbi_app::workspace_panel::WsRow;
 
 use super::smoke::Harness;
 use super::*;
@@ -951,4 +952,102 @@ fn a_view_without_a_row_selects_none(cx: &mut TestAppContext) {
     });
     c.h.key("down");
     assert_eq!(c.selected(), orchestrator());
+}
+
+/// The task detail drawn over the main area (the panels' More,
+/// `dt-more-opens-detail`), and the board entity floating.
+fn detail_over(c: &Column) -> bool {
+    c.read(|w, cx| w.detail_over.is_some() && w.issues.as_ref().is_some_and(|v| v.read(cx).is_floating()))
+}
+
+#[gpui::test]
+fn more_opens_the_task_detail_over_the_workspace_and_esc_comes_back(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_workspace();
+    c.advance(SLIDE);
+    c.h.take_calls();
+    let ws = c.workspace();
+    let shown = c.read(|w, cx| w.shown(cx));
+    let attached = c.ws_sessions.attached();
+
+    c.h.click_selector("ws-more");
+    c.h.draw();
+    assert!(detail_over(&c), "More opens the detail over the screen");
+    assert!(c.drawn("issues-over"));
+    let main = c.bounds("workspace-view").unwrap();
+    let over = c.bounds("issues-over").unwrap();
+    assert_eq!(over.origin.x, main.origin.x, "the detail covers the main area, not the panel");
+    assert!(c.drawn("workspace-panel") && c.drawn("workspace-view"), "the workspace stays under it");
+    assert_eq!(c.read(|w, cx| w.shown(cx)), shown, "no switch to Issues");
+    assert!(
+        !c.h.take_calls().contains(&HostCall::ShowView(View::Issues)),
+        "the board isn't routed to"
+    );
+    let selected = c.read(|_, cx| ws.read(cx).panel_selected_row());
+    assert_eq!(selected, Some(WsRow::More));
+
+    // Esc closes it: the same screen, the panel's keys and row, the agent
+    // still attached.
+    c.h.key("escape");
+    c.h.draw();
+    assert!(!detail_over(&c) && !c.drawn("issues-over"));
+    assert_eq!(c.read(|w, cx| w.shown(cx)), shown);
+    assert!(c.workspace_panel_focused(), "the keys are back on the panel");
+    assert_eq!(c.read(|_, cx| ws.read(cx).panel_selected_row()), selected);
+    assert_eq!(c.ws_sessions.attached(), attached, "the agent pane is untouched");
+    assert!(c.read(|w, _| w.workspace_return.clone()).is_some(), "Back still returns where it did");
+
+    // Enter on the More row opens it again.
+    c.h.key("enter");
+    c.h.draw();
+    assert!(detail_over(&c), "Enter on More opens it too");
+}
+
+#[gpui::test]
+fn more_opens_the_task_detail_over_the_review_and_the_backdrop_closes_it(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_review();
+    c.advance(SLIDE);
+    let review = c.review();
+
+    c.h.click_selector("review-more");
+    c.h.draw();
+    assert!(detail_over(&c));
+    assert!(c.drawn("review-panel"), "the review stays under it");
+    assert!(c.read(|w, _| matches!(w.route, Route::Review)));
+
+    // A click on the scrim, beside the modal.
+    let over = c.bounds("issues-over").unwrap();
+    let at = over.origin + point(gpui::px(8.0), gpui::px(8.0));
+    c.h.cx.simulate_click(at, Modifiers::none());
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    assert!(!detail_over(&c) && !c.drawn("issues-over"));
+    assert!(c.read(|w, _| matches!(w.route, Route::Review)));
+    let panel_focused = c.h.cx.update(|window, cx| review.read(cx).contains_focus(window, cx));
+    assert!(panel_focused, "the keys are back in the review");
+}
+
+#[gpui::test]
+fn the_detail_over_a_screen_goes_when_the_main_area_moves_on(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.open_workspace();
+    c.advance(SLIDE);
+    c.h.click_selector("ws-more");
+    assert!(detail_over(&c));
+    c.update(|w, window, cx| w.perform(HostCall::ShowView(View::Machines), window, cx));
+    c.h.draw();
+    assert!(!detail_over(&c) && !c.drawn("issues-over"));
+    let open = c.read(|w, cx| w.issues.as_ref().is_some_and(|v| v.read(cx).overlay_open()));
+    assert!(!open, "the detail closed with the screen it opened over");
+}
+
+#[gpui::test]
+fn activity_still_opens_the_detail_on_the_board(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.update(|w, window, cx| w.open_task("t-1", window, cx));
+    assert!(!detail_over(&c), "not floating: the board shows it");
+    let open = c.read(|w, cx| w.issues.as_ref().is_some_and(|v| v.read(cx).overlay_open()));
+    assert!(open);
+    assert!(c.h.take_calls().contains(&HostCall::ShowView(View::Issues)), "routed to the board");
 }

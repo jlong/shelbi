@@ -14,7 +14,8 @@
 //!   Navigation component's State=Workspace (`dt-figma-task-panels`, the
 //!   pieces in [`super::task_panel`]): the back button and the task's
 //!   column (IN PROGRESS); the title and the description clamped to five
-//!   lines, More expanding it in place; the worktree with Open (reveal it in
+//!   lines, More opening the task detail over the screen (the window
+//!   draws it, `dt-more-opens-detail`); the worktree with Open (reveal it in
 //!   Finder); then the views, numbered ⌘1 to ⌘N: the agent, View Diff, Edit
 //!   in <editor>, and the Shell toggle. Its rows, selection and keys are the
 //!   shared [`WorkspacePanelState`] (the TUI's panel navigates by the same
@@ -175,6 +176,8 @@ pub enum WorkspaceEvent {
     /// Back (the back button, Esc, or `q` after closing the content): return
     /// to the view the workspace was opened over.
     Back,
+    /// More: open this task's detail over the screen.
+    OpenTask(String),
 }
 
 /// The Workspace view for one project window. It shows one workspace at a
@@ -206,7 +209,6 @@ pub struct WorkspaceView {
     /// A failure or note at the foot of the panel (the TUI panel's status
     /// line).
     status_line: Option<String>,
-    description_open: bool,
     /// Bumped whenever the shown workspace changes; a background result for
     /// an older one is dropped.
     generation: u64,
@@ -282,7 +284,6 @@ impl WorkspaceView {
             shell_starting: false,
             split: ShellSplit::default(),
             status_line: None,
-            description_open: false,
             generation: 0,
             hold: false,
             held: None,
@@ -310,7 +311,6 @@ impl WorkspaceView {
             self.details = None;
             self.details_pending = false;
             self.status_line = None;
-            self.description_open = false;
             self.row = None;
             self.panel = WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true, true));
             self.focus = WsFocus::Panel;
@@ -363,7 +363,6 @@ impl WorkspaceView {
             return;
         }
         self.shown = false;
-        self.description_open = false;
         self.split.dragging = false;
         self.held = None;
         self.close_panes(cx);
@@ -593,9 +592,12 @@ impl WorkspaceView {
             WsEffect::ShowAgent => self.select_view(ContentView::Agent, cx),
             WsEffect::ShowDiff => self.select_view(ContentView::Diff, cx),
             WsEffect::ShowEditor => self.select_view(ContentView::Editor, cx),
-            // More expands the description in place; Less (the same row)
-            // clamps it again.
-            WsEffect::ShowDescription => self.toggle_description(cx),
+            // More opens the task's detail over the screen.
+            WsEffect::ShowDescription => {
+                if let Some(task) = self.row.as_ref().and_then(|r| r.current_task.clone()) {
+                    cx.emit(WorkspaceEvent::OpenTask(task));
+                }
+            }
             WsEffect::ToggleShell => self.toggle_shell(window, cx),
         }
     }
@@ -713,15 +715,15 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// The panel row the keys are on (the window's tests).
+    #[cfg(test)]
+    pub fn panel_selected_row(&self) -> Option<WsRow> {
+        self.panel.selected_row()
+    }
+
     #[cfg(any(test, feature = "visual-check"))]
     pub fn shell_open(&self) -> bool {
         self.shell_open
-    }
-
-    /// Whether the description is open (the offscreen visual check).
-    #[cfg(feature = "visual-check")]
-    pub fn description_open(&self) -> bool {
-        self.description_open
     }
 
     /// What the agent pane says instead of a terminal (the offscreen check).
@@ -778,15 +780,23 @@ impl WorkspaceView {
 
     // --- the panel's other affordances ---------------------------------------
 
-    fn toggle_description(&mut self, cx: &mut Context<Self>) {
-        self.description_open = !self.description_open;
+    /// The task's title and description as the board reads them now (the
+    /// detail opened over the screen edited them): the panel shows them
+    /// when they're its task's.
+    pub fn refresh_task_text(&mut self, task: &str, title: &str, body: &str, cx: &mut Context<Self>) {
+        let Some(details) = self.details.as_mut() else {
+            return;
+        };
+        let Some((id, shown_title)) = details.task.as_mut() else {
+            return;
+        };
+        if id != task || (shown_title == title && details.body == body) {
+            return;
+        }
+        *shown_title = title.to_string();
+        details.body = body.to_string();
+        self.sync_panel();
         cx.notify();
-    }
-
-    /// Open or close the description (the offscreen visual check).
-    #[cfg(feature = "visual-check")]
-    pub fn toggle_description_for_check(&mut self, cx: &mut Context<Self>) {
-        self.toggle_description(cx);
     }
 
     fn reveal_folder(&mut self, cx: &mut Context<Self>) {
@@ -854,7 +864,7 @@ impl WorkspaceView {
                 .map(|d| shelbi_app::review::description_text(&d.body))
                 .unwrap_or_default();
             let more = panel.rows().contains(&WsRow::More).then(|| {
-                task_panel::more_link("ws-more", self.description_open, selected(WsRow::More), theme)
+                task_panel::more_link("ws-more", selected(WsRow::More), theme)
                     .on_click(listen(WsRow::More))
             });
             let title = header.title.clone().filter(|t| !t.is_empty()).unwrap_or(id);
@@ -863,7 +873,6 @@ impl WorkspaceView {
                 title,
                 preview,
                 more,
-                self.description_open,
                 theme,
             )
         });
@@ -1582,7 +1591,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn the_description_clamps_to_five_lines_until_more(cx: &mut TestAppContext) {
+    fn the_description_clamps_to_five_lines_and_more_opens_the_detail(cx: &mut TestAppContext) {
         let mut h = open(cx);
         *h.ops.details.lock().unwrap() = Some(WorkspaceDetailsInfo {
             body: "Build a native desktop client for Shelbi. ".repeat(20),
@@ -1592,13 +1601,31 @@ pub(crate) mod tests {
         h.draw();
         let clamped = h.cx.debug_bounds("workspace-description").unwrap();
         assert_eq!(clamped.size.height, px(18.0 * 5.0), "five 18pt lines");
+        // More asks the window for the task's detail; the preview stays
+        // clamped and the link stays More.
         h.click("ws-more");
+        assert_eq!(h.events(), vec![WorkspaceEvent::OpenTask("t-1".into())]);
         h.draw();
-        let full = h.cx.debug_bounds("workspace-description").unwrap();
-        assert!(full.size.height > clamped.size.height, "More shows it all: {full:?}");
+        assert_eq!(h.cx.debug_bounds("workspace-description").unwrap().size.height, px(90.0));
         h.click("ws-more");
-        h.draw();
-        assert_eq!(h.cx.debug_bounds("workspace-description").unwrap().size.height, px(90.0), "Less");
+        assert_eq!(h.events().len(), 2, "More opens it every time, it doesn't toggle");
+    }
+
+    #[gpui::test]
+    fn the_board_s_text_refreshes_the_summary(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.update(|v, cx| v.refresh_task_text("t-1", "Warm-start cache", "Edited in the detail.", cx));
+        let header = h.view.read_with(&h.cx, |v, _| v.header()).unwrap();
+        assert_eq!(header.title.as_deref(), Some("Warm-start cache"));
+        assert_eq!(
+            h.view.read_with(&h.cx, |v, _| v.details.as_ref().map(|d| d.body.clone())),
+            Some("Edited in the detail.".into())
+        );
+        // Another task's text leaves it alone.
+        h.update(|v, cx| v.refresh_task_text("t-2", "Other", "Other body", cx));
+        let header = h.view.read_with(&h.cx, |v, _| v.header()).unwrap();
+        assert_eq!(header.title.as_deref(), Some("Warm-start cache"));
     }
 
     #[gpui::test]
@@ -1934,16 +1961,26 @@ pub(crate) mod tests {
         assert!(h.view.read_with(&h.cx, |v, _| v.shell_open()));
         assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::EnsureShell));
 
-        // `m` expands the description in place, and again clamps it.
+        // `m` opens the task's detail.
         h.key("m");
-        assert!(h.view.read_with(&h.cx, |v, _| v.description_open));
-        h.key("m");
-        assert!(!h.view.read_with(&h.cx, |v, _| v.description_open));
-        assert!(h.events().is_empty());
+        assert_eq!(h.events(), vec![WorkspaceEvent::OpenTask("t-1".into())]);
+
+        // So does Enter on the More row, up past the worktree.
+        h.key("k");
+        h.key("k");
+        h.key("k");
+        h.key("k");
+        h.key("k");
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel.selected_row()), Some(WsRow::More));
+        h.key("enter");
+        assert_eq!(
+            h.events(),
+            vec![WorkspaceEvent::OpenTask("t-1".into()), WorkspaceEvent::OpenTask("t-1".into())]
+        );
 
         // Esc goes back.
         h.key("escape");
-        assert_eq!(h.events(), vec![WorkspaceEvent::Back]);
+        assert_eq!(h.events().last(), Some(&WorkspaceEvent::Back));
     }
 
     #[gpui::test]
@@ -1983,11 +2020,9 @@ pub(crate) mod tests {
         h.click("ws-folder");
         assert_eq!(*h.ops.revealed.lock().unwrap(), vec!["/w/alpha".to_string()]);
 
-        // More expands the description in place; Less clamps it again.
+        // More opens the task's detail (the window draws it).
         h.click("ws-more");
-        assert!(h.view.read_with(&h.cx, |v, _| v.description_open));
-        h.click("ws-more");
-        assert!(!h.view.read_with(&h.cx, |v, _| v.description_open));
+        assert_eq!(h.events(), vec![WorkspaceEvent::OpenTask("t-1".into())]);
 
         // The editor switch, then the agent.
         h.click("ws-switch-editor");
@@ -2008,7 +2043,7 @@ pub(crate) mod tests {
 
         // Back.
         h.click("ws-back");
-        assert_eq!(h.events(), vec![WorkspaceEvent::Back]);
+        assert_eq!(h.events(), vec![WorkspaceEvent::OpenTask("t-1".into()), WorkspaceEvent::Back]);
     }
 
     #[gpui::test]

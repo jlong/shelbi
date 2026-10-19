@@ -147,8 +147,10 @@ paths on every `cargo test`.
   - **The status is the task's column** (IN PROGRESS), as in the TUI; the
     workspace name, its live state, the task's id and branch, and the
     machine are not in the panel (the sidebar row carries the live state).
-  - **The description clamps to five lines** and More expands it in place
-    (then reads Less); the TUI's More opens a popover.
+  - **The description clamps to five lines** and More opens the task
+    detail (the board's modal) over the screen, which stays as it is under
+    it (`dt-more-opens-detail`); the TUI's More opens a description
+    popover.
   - **The worktree row has an Open button** that reveals it in Finder.
   - **The views carry ⌘1 to ⌘N hints**, and those chords pick them while
     the panel holds the column (the sidebar's rows otherwise).
@@ -271,7 +273,7 @@ The TUI never constructs this struct; its workspace panel reads the same facts f
 | Field | TUI | Desktop |
 |---|---|---|
 | `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, wrapped (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); the id only as the title's fallback |
-| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, More / Less expanding it in place, only when non-empty (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`) |
+| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, only when non-empty, More opening the task detail over the screen (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`; the window draws the board's detail, `app.rs` `open_task_over`) |
 | `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | the idle page's place line when there is no worktree (`views/workspace.rs` `render_toolbar` via `WorkspaceHeader::location_line`); not in the panel |
 | `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line |
 | `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
@@ -437,7 +439,7 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `slot` | not shown: binds the content sessions (`shell/review.rs` `show_chat` / `show_role`) | not shown: binds the content sessions and the user shell (`views/review.rs` `content_target`, `open_shell`) |
 | `title` | bold task-info title (`review_panel.rs` `render_full` via `panel.rs` `render_task_info`); More popover title (`kanban.rs` `render_task_popover_into`) | Base/Medium title (`views/review.rs` `render_panel` via `task_panel::summary`) |
 | `body` | More popover markdown body (`kanban.rs` `render_task_popover_into`) | not shown as markdown: gates More via `has_body` (`views/review.rs` `render_panel`) |
-| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More / Less expanding it in place (`views/review.rs` `render_panel` via `task_panel::summary`) |
+| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More opening the task detail over the screen (`views/review.rs` `render_panel` via `task_panel::summary`; the window draws the board's detail, `app.rs` `open_task_over`) |
 | `worktree` | left-truncated folder row, always shown (`review_panel.rs` `render_full` via `panel.rs` `render_folder`) | worktree row, its last four components, Open reveals it in Finder, no Open on a remote slot (`views/review.rs` `render_panel` via `task_panel::worktree_row`) |
 | `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | not shown: the panel shows the task's column (REVIEW, the purple glyph) beside the back button, as State=Review draws it (`views/review.rs` `render_panel`) |
 | `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) |
