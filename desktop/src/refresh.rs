@@ -48,12 +48,17 @@ use shelbi_client::{ControlClient, Notice, SessionEvent};
 /// SSH probe for a remote review slot); always called on the refresh worker.
 pub type Reader = Arc<dyn Fn(&str, u64) -> Snapshot + Send + Sync>;
 
-/// The production reader: the sidebar model both clients share.
+/// The production reader: the sidebar model both clients share, less the
+/// warm board's age (`crate::views::sidebar::board_warning`), which would
+/// otherwise differ on every read and repaint the window for nothing.
 pub fn sidebar_reader() -> Reader {
     Arc::new(|project, generation| Snapshot {
         generation,
         taken_at: Some(std::time::SystemTime::now()),
-        sidebar: shelbi_orchestrator::sidebar_model::read_sidebar_model(project),
+        sidebar: shelbi_orchestrator::sidebar_model::read_sidebar_model(project).map(|mut m| {
+            m.board_banner = crate::views::sidebar::board_warning(m.board_banner.take());
+            m
+        }),
         ..Default::default()
     })
 }
