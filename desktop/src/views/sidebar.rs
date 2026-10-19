@@ -24,7 +24,7 @@
 //! clamped by `shelbi_app::nav::clamp_sidebar_width`.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -41,6 +41,7 @@ use crate::assets::{glyph, glyphs, heroicon, icons, Icon, ICON_SIZE};
 use crate::keys::{nav_view_hotkey, row_hotkey};
 use crate::projects::ProjectEntry;
 use crate::refresh::DaemonLink;
+use crate::theme::fold::{self, Folds};
 use crate::theme::motion::{self, fill_layer, SharedTrack};
 use crate::theme::style::{self, Type, Typography, LIST_ROW_H, NAV_RADIUS};
 use crate::theme::Theme;
@@ -159,6 +160,17 @@ impl Section {
     }
 }
 
+/// A body that folds open and closed in the sidebar: a section's rows, or
+/// a machine group's workspaces.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Body {
+    Section(Section),
+    Machine(String),
+}
+
+/// The sections' and machine groups' folds, owned by the window.
+pub type SidebarFolds = Folds<Body>;
+
 /// A section header's decorations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SectionHead {
@@ -176,6 +188,11 @@ pub struct Entry {
     pub head: Option<SectionHead>,
     /// The row's ⌘1 to ⌘9 chord.
     pub shortcut: Option<u8>,
+    /// The section whose body the row is in (not its header, nor the blank
+    /// before it).
+    pub section: Option<Section>,
+    /// The machine group whose body the row is in (an indented workspace).
+    pub machine: Option<String>,
 }
 
 impl Entry {
@@ -184,7 +201,20 @@ impl Entry {
             row,
             head: None,
             shortcut: None,
+            section: None,
+            machine: None,
         }
+    }
+
+    /// The row is in a body folding closed (`collapsed` sections, the
+    /// model's collapsed machine groups): drawn while it closes, but no
+    /// longer selectable or clickable.
+    fn closing(&self, collapsed: &BTreeSet<Section>, model: &SidebarModel) -> bool {
+        self.section.is_some_and(|s| collapsed.contains(&s))
+            || self
+                .machine
+                .as_ref()
+                .is_some_and(|m| model.collapsed_machines.contains(m))
     }
 }
 
@@ -231,6 +261,7 @@ pub fn layout(model: &SidebarModel, collapsed: &BTreeSet<Section>) -> Vec<Entry>
         let section = section_of(&group);
         let count = group.iter().filter(|r| matches!(r, SidebarRow::Review { .. })).count();
         let folded = section.is_some_and(|s| collapsed.contains(&s));
+        let mut machine: Option<String> = None;
         for row in group {
             let shortcut = match &row {
                 SidebarRow::Review { .. } => number(),
@@ -245,13 +276,74 @@ pub fn layout(model: &SidebarModel, collapsed: &BTreeSet<Section>) -> Vec<Entry>
                 }),
                 _ => None,
             };
-            let hidden = folded && !matches!(row, SidebarRow::Blank | SidebarRow::Section(_));
-            if !hidden {
-                out.push(Entry { row, head, shortcut });
+            let in_body = !matches!(row, SidebarRow::Blank | SidebarRow::Section(_));
+            match &row {
+                SidebarRow::MachineGroup { name, .. } => machine = Some(name.clone()),
+                SidebarRow::Workspace { indent: true, .. } => {}
+                _ => machine = None,
+            }
+            let in_machine = match &row {
+                SidebarRow::Workspace { indent: true, .. } => machine.clone(),
+                _ => None,
+            };
+            if !(folded && in_body) {
+                out.push(Entry {
+                    row,
+                    head,
+                    shortcut,
+                    section: section.filter(|_| in_body),
+                    machine: in_machine,
+                });
             }
         }
     }
     out
+}
+
+/// The rows a frame draws at `now`: [`layout`]'s, plus the rows of each
+/// section and machine group still folding closed, so they can close
+/// rather than vanish. Chords are [`layout`]'s (a row folding away shows
+/// none), and the headers say what is collapsed, not what is still drawn.
+pub fn drawn(
+    model: &SidebarModel,
+    collapsed: &BTreeSet<Section>,
+    folds: &SidebarFolds,
+    now: Instant,
+) -> Vec<Entry> {
+    let hidden: BTreeSet<Section> = collapsed
+        .iter()
+        .copied()
+        .filter(|s| !folds.is_folding(&Body::Section(*s), true, now))
+        .collect();
+    let closing: Vec<&String> = model
+        .collapsed_machines
+        .iter()
+        .filter(|m| folds.is_folding(&Body::Machine((*m).clone()), true, now))
+        .collect();
+    let mut entries = if closing.is_empty() {
+        layout(model, &hidden)
+    } else {
+        let mut open = model.clone();
+        for m in closing {
+            open.collapsed_machines.remove(m);
+        }
+        let chords: HashMap<String, u8> = layout(model, &BTreeSet::new())
+            .iter()
+            .filter_map(|e| e.shortcut.map(|n| (row_selector(&e.row), n)))
+            .collect();
+        let mut entries = layout(&open, &hidden);
+        for e in &mut entries {
+            if let SidebarRow::MachineGroup { name, collapsed, .. } = &mut e.row {
+                *collapsed = model.collapsed_machines.contains(name);
+            }
+            e.shortcut = chords.get(&row_selector(&e.row)).copied();
+        }
+        entries
+    };
+    for head in entries.iter_mut().filter_map(|e| e.head.as_mut()) {
+        head.collapsed = collapsed.contains(&head.section);
+    }
+    entries
 }
 
 /// Whether workspace `name` is working a task (its row names the agent and
@@ -328,6 +420,10 @@ pub struct SidebarProps<'a> {
     pub model: &'a SidebarModel,
     /// The sections the user has collapsed.
     pub collapsed: &'a BTreeSet<Section>,
+    /// The sections and machine groups folding open or closed.
+    pub folds: &'a SidebarFolds,
+    /// The frame's time, for the folds.
+    pub now: Instant,
     /// The selected row's selectable-row ordinal over [`layout`]'s rows, or
     /// `None` when what the main area shows has no row.
     pub selection: Option<usize>,
@@ -642,17 +738,18 @@ pub fn render<H: SidebarHost>(
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
-    let entries = layout(props.model, props.collapsed);
+    let entries = drawn(props.model, props.collapsed, props.folds, props.now);
     let nav_n = entries
         .iter()
         .take_while(|e| matches!(e.row, SidebarRow::Nav { .. }))
         .count();
-    // Selectable ordinal for each entry.
+    // Selectable ordinal for each entry, over [`layout`]'s rows: a row
+    // folding away is drawn but has none.
     let mut ordinal = 0usize;
     let ordinals: Vec<Option<usize>> = entries
         .iter()
         .map(|e| {
-            e.row.is_selectable().then(|| {
+            (e.row.is_selectable() && !e.closing(props.collapsed, props.model)).then(|| {
                 ordinal += 1;
                 ordinal - 1
             })
@@ -670,12 +767,7 @@ pub fn render<H: SidebarHost>(
             style::nav_chip(d.rounded(px(NAV_RADIUS)), theme)
         })
     });
-    let rest = entries[nav_n..]
-        .iter()
-        .zip(&ordinals[nav_n..])
-        .enumerate()
-        .map(|(i, (entry, ord))| render_row(i, entry, *ord, &props, theme, cx))
-        .collect::<Vec<_>>();
+    let rest = render_bodies(&entries[nav_n..], &ordinals[nav_n..], &props, theme, cx);
 
     div()
         .id("sidebar")
@@ -1038,11 +1130,13 @@ fn selection_marker() -> impl IntoElement {
 }
 
 /// A section header: the label (Small/Medium, muted), the count badge, and
-/// the chevron, which turns to point right while the section is collapsed.
-/// A click anywhere on it collapses or expands the section.
+/// the chevron, which turns to point right as the section folds closed
+/// (`openness`, 1 open). A click anywhere on it collapses or expands the
+/// section.
 fn render_section_head<H: SidebarHost>(
     base: gpui::Stateful<gpui::Div>,
     head: &SectionHead,
+    openness: f32,
     label: String,
     theme: &Theme,
     cx: &mut Context<H>,
@@ -1050,11 +1144,7 @@ fn render_section_head<H: SidebarHost>(
     let section = head.section;
     let chevron = glyph(glyphs::CHEVRON_DOWN)
         .text_color(quiet_glyph(theme))
-        .when(head.collapsed, |g| {
-            g.with_transformation(gpui::Transformation::rotate(gpui::radians(
-                -std::f32::consts::FRAC_PI_2,
-            )))
-        });
+        .with_transformation(fold::chevron(openness));
     base.flex()
         .flex_row()
         .items_center()
@@ -1091,6 +1181,68 @@ fn render_section_head<H: SidebarHost>(
         .into_any_element()
 }
 
+/// The rows under the nav, each section's body (and each machine group's,
+/// inside it) in its own fold.
+fn render_bodies<H: SidebarHost>(
+    entries: &[Entry],
+    ordinals: &[Option<usize>],
+    props: &SidebarProps<'_>,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> Vec<AnyElement> {
+    // A run of consecutive rows sharing `key`'s body (`None`: no body).
+    type Run<T> = (Option<T>, std::ops::Range<usize>);
+    fn runs<T: PartialEq>(range: std::ops::Range<usize>, key: impl Fn(usize) -> Option<T>) -> Vec<Run<T>> {
+        let mut out: Vec<Run<T>> = Vec::new();
+        for i in range {
+            let k = key(i);
+            match out.last_mut() {
+                Some((last, r)) if k.is_some() && *last == k => r.end = i + 1,
+                _ => out.push((k, i..i + 1)),
+            }
+        }
+        out
+    }
+    let mut out = Vec::new();
+    for (section, range) in runs(0..entries.len(), |i| entries[i].section) {
+        let mut rows = Vec::new();
+        for (machine, range) in runs(range, |i| entries[i].machine.clone()) {
+            let mut machine_rows: Vec<AnyElement> = range
+                .map(|i| render_row(i, &entries[i], ordinals[i], props, theme, cx))
+                .collect();
+            match machine {
+                Some(name) => {
+                    let collapsed = props.model.collapsed_machines.contains(&name);
+                    rows.push(fold_body(props, Body::Machine(name), collapsed, machine_rows));
+                }
+                None => rows.append(&mut machine_rows),
+            }
+        }
+        match section {
+            Some(section) => {
+                let collapsed = props.collapsed.contains(&section);
+                out.push(fold_body(props, Body::Section(section), collapsed, rows));
+            }
+            None => out.append(&mut rows),
+        }
+    }
+    out
+}
+
+/// `rows` as body `key`'s fold, as open as it is this frame.
+fn fold_body(props: &SidebarProps<'_>, key: Body, collapsed: bool, rows: Vec<AnyElement>) -> AnyElement {
+    let openness = props.folds.openness(&key, collapsed, props.now);
+    let selector = match &key {
+        Body::Section(s) => format!("sidebar-body-{}", s.key()),
+        Body::Machine(name) => format!("sidebar-body-machine-{name}"),
+    };
+    props
+        .folds
+        .body(key, openness, div().flex().flex_col().children(rows))
+        .debug_selector(move || selector)
+        .into_any_element()
+}
+
 fn render_row<H: SidebarHost>(
     index: usize,
     entry: &Entry,
@@ -1122,9 +1274,11 @@ fn render_row<H: SidebarHost>(
             .cursor_pointer()
             .text_color(theme.foreground)
             .map(|d| selected_row(d, &selector, selected, props, theme))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.sidebar_event(SidebarEvent::Activate(ord), window, cx)
-            }))
+            .when(ordinal.is_some(), |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| {
+                    this.sidebar_event(SidebarEvent::Activate(ord), window, cx)
+                }))
+            })
     };
     let shortcut = entry.shortcut.map(|n| style::hotkey(&row_hotkey(n), theme));
     match row {
@@ -1134,7 +1288,10 @@ fn render_row<H: SidebarHost>(
         SidebarRow::Blank if index == 0 => base.h(px(BLOCK_Y)).into_any_element(),
         SidebarRow::Blank => base.h(px(2.0 * BLOCK_Y)).into_any_element(),
         SidebarRow::Section(_) => match &entry.head {
-            Some(head) => render_section_head(base, head, text.label, theme, cx),
+            Some(head) => {
+                let openness = props.folds.openness(&Body::Section(head.section), head.collapsed, props.now);
+                render_section_head(base, head, openness, text.label, theme, cx)
+            }
             None => base
                 .px_2()
                 .pt_2()
@@ -1162,14 +1319,11 @@ fn render_row<H: SidebarHost>(
             .child(text.label)
             .into_any_element(),
         SidebarRow::Nav { .. } => base.into_any_element(),
-        SidebarRow::MachineGroup { collapsed, .. } => {
+        SidebarRow::MachineGroup { name, collapsed, .. } => {
+            let openness = props.folds.openness(&Body::Machine(name.clone()), *collapsed, props.now);
             let chevron = glyph(glyphs::CHEVRON_DOWN)
                 .text_color(quiet_glyph(theme))
-                .when(*collapsed, |g| {
-                    g.with_transformation(gpui::Transformation::rotate(gpui::radians(
-                        -std::f32::consts::FRAC_PI_2,
-                    )))
-                });
+                .with_transformation(fold::chevron(openness));
             item(base)
                 .flex_row()
                 .items_center()
@@ -1531,6 +1685,62 @@ mod tests {
     }
 
     #[test]
+    fn rows_know_the_body_they_fold_with() {
+        let mut m = model();
+        m.workspaces.push(ws("echo", "box", Some("T-3"), WorkspaceBadge::Working));
+        let entries = layout(&m, &BTreeSet::new());
+        let body = |sel: &str| {
+            let e = entries.iter().find(|e| row_selector(&e.row) == sel).unwrap();
+            (e.section, e.machine.clone())
+        };
+        assert_eq!(body("sidebar-section-Queued for Review"), (None, None), "a header isn't in its body");
+        assert_eq!(body("sidebar-review-Q-1"), (Some(Section::Queued), None));
+        assert_eq!(body("sidebar-machine-box"), (Some(Section::Workspaces), None));
+        assert_eq!(body("sidebar-ws-echo"), (Some(Section::Workspaces), Some("box".into())));
+        assert_eq!(body("sidebar-ws-alpha"), (Some(Section::Workspaces), Some("hub".into())));
+    }
+
+    #[test]
+    fn a_closing_body_stays_drawn_until_its_fold_ends() {
+        let mut m = model();
+        m.workspaces.push(ws("echo", "box", Some("T-3"), WorkspaceBadge::Working));
+        let t0 = Instant::now();
+        let mut folds = SidebarFolds::default();
+        let collapsed = BTreeSet::from([Section::Queued]);
+        folds.toggle(Body::Section(Section::Queued), true, t0, false);
+        m.collapsed_machines.insert("hub".into());
+        folds.toggle(Body::Machine("hub".into()), true, t0, false);
+
+        let mid = drawn(&m, &collapsed, &folds, t0 + std::time::Duration::from_millis(50));
+        let sel = selectors(&mid);
+        assert!(sel.contains(&"sidebar-review-Q-1".to_string()), "closing, still drawn");
+        assert!(sel.contains(&"sidebar-ws-alpha".to_string()), "the machine's rows too");
+        let head = mid.iter().find_map(|e| e.head.clone().filter(|h| h.section == Section::Queued)).unwrap();
+        assert!(head.collapsed, "the header says collapsed");
+        let group = mid.iter().find(|e| row_selector(&e.row) == "sidebar-machine-hub").unwrap();
+        assert!(matches!(group.row, SidebarRow::MachineGroup { collapsed: true, .. }));
+        // The chords are the collapsed layout's: none on the closing
+        // machine's rows, so the next machine's row takes ⌘4 (not ⌘6).
+        let chord = |sel: &str| mid.iter().find(|e| row_selector(&e.row) == sel).and_then(|e| e.shortcut);
+        assert_eq!(chord("sidebar-ws-alpha"), None);
+        assert_eq!(chord("sidebar-review-Q-1"), Some(2), "a section's rows keep theirs");
+        assert_eq!(chord("sidebar-ws-echo"), Some(4));
+        // Only what is collapsed counts as closing.
+        let closing: Vec<String> = mid
+            .iter()
+            .filter(|e| e.closing(&collapsed, &m))
+            .map(|e| row_selector(&e.row))
+            .collect();
+        assert_eq!(
+            closing,
+            ["sidebar-review-Q-1", "sidebar-review-Q-2", "sidebar-ws-alpha", "sidebar-ws-bravo", "sidebar-ws-charlie", "sidebar-ws-delta"]
+        );
+
+        let settled = drawn(&m, &collapsed, &folds, t0 + fold::FOLD);
+        assert_eq!(selectors(&settled), selectors(&layout(&m, &collapsed)), "then exactly the layout");
+    }
+
+    #[test]
     fn width_follows_the_shared_clamp() {
         // The default 28 columns is the component's 280pt.
         assert_eq!(width_px(28, 1200.0), 280.0);
@@ -1789,6 +1999,8 @@ mod render_tests {
                 SidebarProps {
                     model: &self.model,
                     collapsed: &collapsed,
+                    folds: &SidebarFolds::default(),
+                    now: Instant::now(),
                     selection: Some(self.selection),
                     link: self.link,
                     palette_chord: "⌃P".into(),

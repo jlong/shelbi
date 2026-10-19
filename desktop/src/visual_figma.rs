@@ -914,10 +914,24 @@ impl Run {
         self.cx.run_until_parked();
     }
 
+    /// Save the window as `<screen>-<theme>.png` as it draws at the run's
+    /// clock now (no settle: a transition stays where it is).
+    fn capture_frame(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
+        let window: AnyWindowHandle = handle.into();
+        self.cx
+            .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        self.write_capture(window, screen);
+    }
+
     /// Save the window as `<screen>-<theme>.png`, keeping it open.
     fn capture(&mut self, handle: WindowHandle<ShelbiWindow>, screen: &str) {
         self.settle(handle);
         let window: AnyWindowHandle = handle.into();
+        self.write_capture(window, screen);
+    }
+
+    fn write_capture(&mut self, window: AnyWindowHandle, screen: &str) {
         let image = self.cx.capture_screenshot(window).expect("render to image");
         let image = if self.native || image.width() == WIDTH {
             image
@@ -1291,6 +1305,28 @@ impl Run {
                 })
                 .unwrap();
             self.save(handle, &format!("state-sidebar-{name}"));
+        }
+
+        // The Queued for review section folding closed, and back open, a
+        // few frames in (`state-sidebar-fold-<closing|opening>-<ms>`).
+        for (name, start_collapsed) in [("closing", false), ("opening", true)] {
+            let handle = self.open();
+            self.click(handle, orch.clone());
+            if start_collapsed {
+                handle
+                    .update(&mut self.cx, |w, _, cx| w.offscreen_toggle_section(Section::Queued, cx))
+                    .unwrap();
+                self.settle(handle);
+            }
+            handle
+                .update(&mut self.cx, |w, _, cx| w.offscreen_toggle_section(Section::Queued, cx))
+                .unwrap();
+            let start = self.now.get();
+            for ms in [0, 40, 90, 220] {
+                self.now.set(start + Duration::from_millis(ms));
+                self.capture_frame(handle, &format!("state-sidebar-fold-{name}-{ms}"));
+            }
+            self.save(handle, &format!("state-sidebar-fold-{name}-settled"));
         }
 
         self.sidebar.zen_mode = shelbi_state::ZenModeState::Off;

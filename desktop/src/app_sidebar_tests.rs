@@ -8,6 +8,8 @@
 //! (`T-9`, queued) and one working workspace (`alpha-1`), so `T-9` is ⌘1 and
 //! `alpha-1` is ⌘2.
 
+use std::rc::Rc;
+
 use gpui::TestAppContext;
 
 use super::smoke::Harness;
@@ -21,6 +23,9 @@ fn calls_of(kind: CommandKind) -> Vec<HostCall> {
 
 fn open(cx: &mut TestAppContext) -> Harness {
     let mut h = Harness::open(cx);
+    // Sections fold closed and open in an instant here (the fold itself is
+    // `app_fold_tests`').
+    h.window.update(&mut h.cx, |w, _| w.reduce_motion = Rc::new(|| true));
     h.focus_window();
     h.take_calls();
     h
