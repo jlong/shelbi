@@ -12,12 +12,13 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui::{Bounds, Pixels, TestAppContext};
+use gpui::{px, Bounds, Pixels, TestAppContext};
 use shelbi_app::view::ReviewState;
 
 use super::smoke::Harness;
 use super::*;
 use crate::views::column_swap::SLIDE;
+use crate::views::sidebar_reveal::REVEAL;
 use crate::views::review::tests::{fake_deps, info, row};
 
 struct Settings {
@@ -67,11 +68,12 @@ impl Settings {
         self.settle();
     }
 
-    /// Move the push's clock past its end and draw.
+    /// Move the clock past the push's end (and a sidebar hide or show's)
+    /// and draw.
     fn settle(&mut self) {
         self.h.draw();
         self.now
-            .set(self.now.get() + SLIDE + Duration::from_millis(1));
+            .set(self.now.get() + SLIDE.max(REVEAL) + Duration::from_millis(1));
         self.h.draw();
     }
 
@@ -331,7 +333,17 @@ fn settings_over_a_review_returns_to_the_review(cx: &mut TestAppContext) {
 fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.click("sidebar-collapse");
+    let full = s.bounds("settings-sidebar").expect("drawn").size.width;
+    // It slides out like the app's sidebar: clipped at its full width.
+    s.h.click_selector("sidebar-collapse");
+    s.now.set(s.now.get() + Duration::from_millis(30));
+    s.h.draw();
+    let column = s.bounds("leading-column").expect("still going").size.width;
+    let slid = s.bounds("settings-sidebar").expect("still drawn");
+    assert!(column > px(0.0) && column < full, "{column:?}");
+    assert_eq!(slid.size.width, full, "never laid out narrower");
+    assert!(slid.origin.x < px(0.0), "slid left");
+    s.settle();
     assert!(!s.drawn("settings-sidebar") && !s.drawn("leading-column"));
     assert!(s.drawn("settings-page-general"), "the page stays");
     assert!(s.drawn("expand-sidebar"));

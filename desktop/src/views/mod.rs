@@ -66,4 +66,5 @@ pub mod task_panel;
 pub mod settings;
 pub mod settings_nav;
 pub mod sidebar;
+pub mod sidebar_reveal;
 pub mod update;

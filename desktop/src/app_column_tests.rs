@@ -4,7 +4,8 @@
 //! ways (and turns around mid-way), going from one panel to the other passes
 //! through the sidebar, and leaving gives the sidebar back as it was (scroll,
 //! collapsed state and keys) with its selection on the main area's row
-//! (`dt-back-syncs-sidebar`).
+//! (`dt-back-syncs-sidebar`). Toggle sidebar slides the column out and back
+//! in (`dt-sidebar-toggle-animation`).
 //!
 //! The window is the smoke test's headless one ([`Harness`]) with fake review
 //! and workspace sessions and daemon ops, an injected clock for the
@@ -1050,4 +1051,155 @@ fn activity_still_opens_the_detail_on_the_board(cx: &mut TestAppContext) {
     let open = c.read(|w, cx| w.issues.as_ref().is_some_and(|v| v.read(cx).overlay_open()));
     assert!(open);
     assert!(c.h.take_calls().contains(&HostCall::ShowView(View::Issues)), "routed to the board");
+}
+
+// ---------------------------------------------------------------------------
+// The sidebar's hide and show (`dt-sidebar-toggle-animation`).
+// ---------------------------------------------------------------------------
+
+fn held(c: &mut Column) -> bool {
+    c.h.cx.update(|window, cx| crate::elements::terminal::ResizeHold::holds(window, cx))
+}
+
+fn close_px(a: f32, b: f32) -> bool {
+    (a - b).abs() < 0.5
+}
+
+/// Where the Show sidebar button sits at rest: beside the traffic lights,
+/// centered on the titlebar row.
+fn expand_origin() -> (f32, f32) {
+    (
+        sidebar::TRAFFIC_LIGHTS_RIGHT + 8.0,
+        (sidebar::TITLEBAR_H - style::IconButtonSize::Default.px()) / 2.0,
+    )
+}
+
+#[gpui::test]
+fn the_toggle_slides_the_sidebar_out_at_its_full_width_and_back(cx: &mut TestAppContext) {
+    use crate::views::sidebar_reveal::REVEAL;
+    let mut c = Column::open(cx);
+    let full = c.width("leading-column");
+    let content = c.width("sidebar");
+    assert!(!c.drawn("expand-sidebar") && !held(&mut c));
+
+    // Hide: the first frame is already a step out.
+    c.h.click_selector("sidebar-collapse");
+    c.advance(Duration::ZERO);
+    let first = c.width("leading-column");
+    assert!(first < full && first > 0.0, "a step in: {first}");
+    assert!(c.read(|w, _| w.collapsed && w.window_state.sidebar_collapsed), "the state saves at once");
+    assert_ne!(c.read(|w, _| w.client.focus()), Focus::Sidebar, "the keys go to the main area");
+
+    // Part way: the column narrower, the sidebar still at its full width,
+    // slid left so its right edge rides the column's; the main area follows.
+    c.advance(Duration::from_millis(30));
+    let col = c.width("leading-column");
+    assert!(col < first && col > 0.0, "{col}");
+    assert_eq!(c.width("sidebar"), content, "clipped, never laid out narrower");
+    assert!(close_px(c.left("sidebar") + content, col), "its right edge on the column's");
+    assert!(held(&mut c), "the terminals hold their resizes");
+    // The Show button is already in place beside the traffic lights.
+    let at = c.bounds("expand-sidebar").expect("drawn while the sidebar leaves").origin;
+    assert_eq!((at.x.as_f32(), at.y.as_f32()), expand_origin());
+
+    // Settled: no column, the button where it rests, the hold released.
+    c.advance(REVEAL);
+    assert!(!c.drawn("leading-column") && !c.drawn("sidebar"));
+    let at = c.bounds("expand-sidebar").expect("the toggle stays reachable").origin;
+    assert_eq!((at.x.as_f32(), at.y.as_f32()), expand_origin());
+    assert!(!held(&mut c));
+
+    // Show: it slides back in from the left.
+    c.h.click_selector("expand-sidebar");
+    c.advance(Duration::from_millis(30));
+    let col = c.width("leading-column");
+    assert!(col > 0.0 && col < full, "{col}");
+    assert_eq!(c.width("sidebar"), content);
+    assert!(c.left("sidebar") < 0.0);
+    assert!(!c.read(|w, _| w.collapsed || w.window_state.sidebar_collapsed));
+    assert!(held(&mut c));
+    c.advance(REVEAL);
+    assert_eq!(c.width("leading-column"), full);
+    assert_eq!(c.left("sidebar"), 0.0);
+    assert!(!c.drawn("expand-sidebar") && !held(&mut c));
+}
+
+#[gpui::test]
+fn a_second_toggle_mid_way_turns_the_sidebar_around(cx: &mut TestAppContext) {
+    use crate::views::sidebar_reveal::REVEAL;
+    let mut c = Column::open(cx);
+    let full = c.width("leading-column");
+    c.update(|w, _, cx| w.toggle_sidebar(cx));
+    c.advance(Duration::ZERO);
+    c.advance(Duration::from_millis(25));
+    let at = c.width("leading-column");
+    assert!(at > 0.0 && at < full);
+
+    // Back before it finished: the same frame draws it where it stood.
+    c.update(|w, _, cx| w.toggle_sidebar(cx));
+    c.advance(Duration::ZERO);
+    assert!(close_px(c.width("leading-column"), at), "no jump from {at}");
+    c.advance(Duration::from_millis(16));
+    assert!(c.width("leading-column") > at, "heading back in");
+    c.advance(REVEAL);
+    assert_eq!(c.width("leading-column"), full);
+    assert!(!c.read(|w, _| w.collapsed));
+    assert!(!held(&mut c));
+}
+
+#[gpui::test]
+fn reduce_motion_toggles_the_sidebar_at_once(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.reduce_motion.set(true);
+    c.h.click_selector("sidebar-collapse");
+    c.advance(Duration::ZERO);
+    assert!(!c.drawn("leading-column") && c.drawn("expand-sidebar"));
+    assert!(!held(&mut c), "nothing moves, nothing is held");
+    c.h.click_selector("expand-sidebar");
+    c.advance(Duration::ZERO);
+    assert_eq!(c.width("sidebar"), c.width("leading-column"));
+    assert_eq!(c.left("sidebar"), 0.0);
+    assert!(!c.drawn("expand-sidebar"));
+}
+
+#[gpui::test]
+fn a_window_that_opens_collapsed_does_not_animate(cx: &mut TestAppContext) {
+    let mut c = Column::open_with(cx, |w| w.collapsed = true);
+    assert!(!c.drawn("leading-column") && c.drawn("expand-sidebar"));
+    let at = c.bounds("expand-sidebar").unwrap().origin;
+    assert_eq!((at.x.as_f32(), at.y.as_f32()), expand_origin());
+    assert!(!held(&mut c));
+    assert!(!c.read(|w, _| w.reveal.clone()).is_animating());
+}
+
+#[gpui::test]
+fn showing_the_sidebar_over_a_collapsed_panel_column_widens_it(cx: &mut TestAppContext) {
+    use crate::views::sidebar_reveal::REVEAL;
+    let mut c = Column::open_with(cx, |w| {
+        w.collapsed = true;
+        w.client.set_sidebar_width(40);
+    });
+    c.open_review();
+    c.advance(SLIDE);
+    assert_eq!(c.width("leading-column"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
+
+    // Shown: the panel keeps the column, which widens to the user's width;
+    // no titlebar row opens in the main area.
+    c.update(|w, _, cx| w.toggle_sidebar(cx));
+    c.advance(Duration::ZERO);
+    c.advance(Duration::from_millis(30));
+    let mid = c.width("leading-column");
+    assert!(mid > sidebar_px(DEFAULT_SIDEBAR_WIDTH) && mid < sidebar_px(40), "{mid}");
+    assert!(c.drawn("column-review") && !c.drawn("column-sidebar"));
+    assert!(!c.drawn("expand-sidebar"));
+    c.advance(REVEAL);
+    assert_eq!(c.width("leading-column"), sidebar_px(40));
+    assert_eq!(c.width("review-panel"), sidebar_px(40));
+
+    // And hidden again: back to the panel's width, the column kept.
+    c.update(|w, _, cx| w.toggle_sidebar(cx));
+    c.advance(Duration::ZERO);
+    c.advance(REVEAL);
+    assert_eq!(c.width("leading-column"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
+    assert!(c.read(|w, _| w.collapsed));
 }
