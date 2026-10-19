@@ -47,6 +47,8 @@ desktop:
     red:
       regular: "#E04F52"             # ANSI 1
       bold: "#E69589"                # ANSI 9, the bright red
+  window_opacity: 100                # percent, 30 to 100; below 100 the desktop shows through
+  window_blur: 0                     # blur radius in points, 0 to 50, for what shows through
   notifications:                     # every kind is on unless switched off
     workspace_blocked: true          # an agent waits for input or a permission
     review_ready: true               # a task reaches the review column
@@ -62,6 +64,8 @@ desktop:
 | `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72; Settings' stepper and ⌘+ / ⌘− step it by 1 within 8 to 32), on 18pt rows at the default. ⌘+ / ⌘− / ⌘0 write it too. |
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
 | `desktop.terminal_colors.<color>.regular` / `.bold` | the theme's | Terminal ANSI colors as `#rrggbb`, for `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan` and `white` (regular is ANSI 0 to 7, bold the bright 8 to 15). Settings writes only the colors that differ from the theme's (dark: the Sensible palette; light: its own set), applies them to open terminals at once, and Reset removes them all. A value that isn't a color is ignored. |
+| `desktop.window_opacity` | 100 | How opaque the windows' backgrounds are, in percent (30 to 100; lower values clamp to 30, and a fraction like `0.85` reads as 85). Only the surfaces (the main area, the sidebar, terminal backgrounds) go see-through: text, icons, borders, controls, cell colors and overlays stay opaque. Settings ▸ General's Window transparency slider writes it and applies it to every window as it moves. Reduce Transparency (System Settings ▸ Accessibility ▸ Display) keeps the windows opaque. |
+| `desktop.window_blur` | 0 | How much a translucent window blurs what shows through it: the window server's background blur radius in points (0 to 50), as Ghostty's `background-blur`. No effect at 100% opacity. Settings ▸ General's Background blur slider. |
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
 | `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. Settings ▸ Keybindings edits it. |
 

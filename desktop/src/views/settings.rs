@@ -19,6 +19,10 @@
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
 //!   reads, typed or chosen with Browse.
 //!
+//! - `desktop.window_opacity` / `desktop.window_blur`: the windows'
+//!   translucency, two sliders under Theme. A slider applies to every open
+//!   window as it moves ([`crate::theme::window`]) and is saved when it is
+//!   let go; Reduce Transparency forces the windows opaque and disables them.
 //! - `desktop.notifications`: which system notifications the app posts.
 //! - `desktop.terminal_colors`: the ANSI colors the user changed, regular
 //!   and bold for each of the eight, typed as hex. A valid color applies to
@@ -54,13 +58,14 @@ use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use crate::assets::icons;
-use crate::elements::controls;
+use crate::elements::controls::{self, Slider, SliderEvent};
 use crate::elements::terminal::colors::{self, AnsiOverrides};
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::{TerminalPane, TerminalSettings};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::window::{self as translucency, Translucency, WindowLook, BLUR_RANGE, OPACITY_RANGE};
 use crate::theme::{rgb_hsla, Theme};
 
 /// The ANSI colors' Reset: the Button component at Small.
@@ -98,6 +103,8 @@ pub struct SettingsValues {
     pub notifications: Switches,
     /// The ANSI colors the user changed (`None` keeps the theme's).
     pub ansi: AnsiOverrides,
+    /// The windows' opacity and blur.
+    pub translucency: Translucency,
 }
 
 /// The notification switches, as the form shows them.
@@ -161,6 +168,7 @@ impl Default for SettingsValues {
             option_as_meta: OptionAsMeta::default(),
             notifications: Switches::default(),
             ansi: [None; 16],
+            translucency: Translucency::default(),
         }
     }
 }
@@ -198,6 +206,7 @@ impl SettingsValues {
             option_as_meta: cfg.desktop.option_as_meta.unwrap_or_default(),
             notifications: Switches::from(&cfg.desktop.notifications),
             ansi: terminal.ansi,
+            translucency: Translucency::from_config(&cfg.desktop),
         }
     }
 
@@ -223,7 +232,10 @@ impl SettingsValues {
             option_as_meta: (self.option_as_meta != OptionAsMeta::Off).then_some(self.option_as_meta),
             notifications,
             terminal_colors: colors::to_config(&self.ansi),
+            window_opacity: None,
+            window_blur: None,
         };
+        self.translucency.apply(&mut cfg.desktop);
         cfg.theme = self.theme;
     }
 }
@@ -262,6 +274,10 @@ pub struct SettingsView {
     font_size_input: Entity<InputState>,
     cli_path: Entity<InputState>,
     theme: ThemePreference,
+    /// The windows' translucency, and its two sliders.
+    translucency: Translucency,
+    opacity_slider: Entity<Slider>,
+    blur_slider: Entity<Slider>,
     option_as_meta: OptionAsMeta,
     notifications: Switches,
     /// The ANSI colors the user changed, the sixteen fields they are typed
@@ -297,7 +313,23 @@ impl SettingsView {
             TerminalPane::canned("Preview".into(), terminal_preview::stream, window, cx)
         });
         let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
+        let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
+        let initial = Translucency::default();
+        let opacity_slider = cx.new(|cx| {
+            Slider::new("settings-window-opacity", initial.opacity.into(), range(&OPACITY_RANGE), (1, 10), "%", cx)
+        });
+        let blur_slider =
+            cx.new(|cx| Slider::new("settings-window-blur", initial.blur.into(), range(&BLUR_RANGE), (1, 5), "", cx));
         let mut subscriptions = vec![
+            cx.subscribe(&opacity_slider, |this, _, event: &SliderEvent, cx| {
+                this.slide(|t, v| t.opacity = v, *event, cx)
+            }),
+            cx.subscribe(&blur_slider, |this, _, event: &SliderEvent, cx| {
+                this.slide(|t, v| t.blur = v, *event, cx)
+            }),
+            // Reduce Transparency changed, or another window's sliders
+            // moved: show it.
+            cx.observe_global::<WindowLook>(|this, cx| this.follow_window_look(cx)),
             cx.subscribe(&keybindings, |_, _, event: &KeybindingsEvent, cx| match event {
                 KeybindingsEvent::Saved(keymaps) => cx.emit(SettingsEvent::KeysSaved(keymaps.clone())),
                 KeybindingsEvent::Leave => cx.emit(SettingsEvent::Leave),
@@ -340,6 +372,9 @@ impl SettingsView {
             font_size_input,
             cli_path,
             theme: ThemePreference::Auto,
+            translucency: initial,
+            opacity_slider,
+            blur_slider,
             option_as_meta: OptionAsMeta::Off,
             notifications: Switches::default(),
             ansi: [None; 16],
@@ -355,6 +390,7 @@ impl SettingsView {
             state: SaveState::Idle,
             _subscriptions: subscriptions,
         };
+        view.follow_window_look(cx);
         // A test's window never reads the real `~/.shelbi`.
         if !cfg!(test) {
             view.load(window, cx);
@@ -462,6 +498,9 @@ impl SettingsView {
         self.cli_path
             .update(cx, |s, cx| s.set_value(values.cli_path, window, cx));
         self.theme = values.theme;
+        self.show_translucency(values.translucency, cx);
+        // What config.yaml says is what the windows show.
+        translucency::set(values.translucency, cx);
         self.option_as_meta = values.option_as_meta;
         self.notifications = values.notifications;
         self.ansi = values.ansi;
@@ -479,7 +518,58 @@ impl SettingsView {
             option_as_meta: self.option_as_meta,
             notifications: self.notifications,
             ansi: self.ansi,
+            translucency: self.translucency,
         }
+    }
+
+    /// A slider moved (`set` writes its value into the setting): every
+    /// window follows at once, and letting go saves it.
+    fn slide(&mut self, set: fn(&mut Translucency, u8), event: SliderEvent, cx: &mut Context<Self>) {
+        let (SliderEvent::Changed(v) | SliderEvent::Committed(v)) = event;
+        let mut next = self.translucency;
+        set(&mut next, v.clamp(0, u8::MAX as i32) as u8);
+        let next = Translucency::clamped(next.opacity.into(), next.blur.into());
+        if next != self.translucency {
+            self.translucency = next;
+            translucency::set(next, cx);
+            cx.notify();
+        }
+        if matches!(event, SliderEvent::Committed(_)) {
+            self.save(cx);
+        }
+    }
+
+    /// Show `t` on the sliders.
+    fn show_translucency(&mut self, t: Translucency, cx: &mut Context<Self>) {
+        self.translucency = t;
+        self.opacity_slider.update(cx, |s, cx| s.set_value(t.opacity.into(), cx));
+        self.blur_slider.update(cx, |s, cx| s.set_value(t.blur.into(), cx));
+        cx.notify();
+    }
+
+    /// The installed look changed: show its setting (once the config is
+    /// read), and disable the sliders under Reduce Transparency.
+    fn follow_window_look(&mut self, cx: &mut Context<Self>) {
+        let look = WindowLook::current(cx);
+        if self.loaded && look.setting != self.translucency {
+            self.show_translucency(look.setting, cx);
+        }
+        for slider in [&self.opacity_slider, &self.blur_slider] {
+            slider.update(cx, |s, cx| s.set_disabled(look.reduce_transparency, cx));
+        }
+        cx.notify();
+    }
+
+    /// The opacity slider.
+    #[cfg(test)]
+    pub fn opacity_slider(&self) -> Entity<Slider> {
+        self.opacity_slider.clone()
+    }
+
+    /// The blur slider.
+    #[cfg(test)]
+    pub fn blur_slider(&self) -> Entity<Slider> {
+        self.blur_slider.clone()
     }
 
     /// Show `size` in the size field (unless it is being typed into).
@@ -907,7 +997,7 @@ impl Render for SettingsView {
             .gap_6()
             .size_full()
             .p_8()
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .overflow_y_scroll()
             .type_style(Type::Base)
             .text_color(theme.foreground)
@@ -926,6 +1016,7 @@ impl Render for SettingsView {
                     Some("Shared with the TUI, which picks it up on its next start.".into()),
                     &theme,
                 ))
+                .child(self.render_translucency(&theme, cx))
                 .child(controls::labeled_control(
                     "Shelbi CLI",
                     cli,
@@ -1025,6 +1116,42 @@ impl Render for SettingsView {
 }
 
 impl SettingsView {
+    /// Window transparency and Background blur: a slider each, with a note
+    /// in place of their helpers while Reduce Transparency holds the
+    /// windows opaque.
+    fn render_translucency(&self, theme: &Theme, cx: &App) -> impl IntoElement {
+        let reduced = WindowLook::current(cx).reduce_transparency;
+        let help = |text: &'static str| (!reduced).then(|| SharedString::from(text));
+        div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(controls::labeled_control(
+                "Window transparency",
+                self.opacity_slider.clone(),
+                help("How much of the desktop shows through the window. 100% is opaque."),
+                theme,
+            ))
+            .child(controls::labeled_control(
+                "Background blur",
+                self.blur_slider.clone(),
+                help("Blurs what shows through. 0 is a clear see-through."),
+                theme,
+            ))
+            .when(reduced, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "settings-reduce-transparency".into())
+                        .mt(px(-18.0))
+                        .child(controls::helper(
+                            "Reduce Transparency is on (System Settings ▸ Accessibility ▸ Display), \
+                             so windows are opaque.",
+                            theme,
+                        )),
+                )
+            })
+    }
+
     /// The ANSI colors editor (`2263:4808`): the title with Reset, the
     /// helper, then a row per color with its regular and bold fields.
     fn render_ansi(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1172,7 +1299,9 @@ impl SettingsView {
                     .rounded(px(6.0))
                     .border_1()
                     .border_color(theme.divider_strong)
-                    .bg(rgb_hsla(theme.terminal.background))
+                    // The terminal's background, as a terminal pane on the
+                    // page shows it (the page's own glass while translucent).
+                    .bg(theme.nested(rgb_hsla(theme.terminal.background)))
                     .overflow_hidden()
                     .child(self.preview.clone()),
             )
@@ -1211,6 +1340,7 @@ mod tests {
                 ansi[9] = Some(TermRgb::hex(0xe69589));
                 ansi
             },
+            translucency: Translucency { opacity: 85, blur: 20 },
         };
         let mut cfg = UserConfig {
             editor: Some("hx".into()),
@@ -1228,6 +1358,7 @@ mod tests {
         let ansi = &cfg.desktop.terminal_colors;
         assert_eq!((ansi.black.regular.as_deref(), ansi.red.bold.as_deref()), (Some("#000000"), Some("#E69589")));
         assert_eq!((ansi.black.bold.as_ref(), ansi.green.regular.as_ref()), (None, None), "only what was changed");
+        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(20)));
         assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
         assert_eq!(back, values);
@@ -1241,6 +1372,7 @@ mod tests {
         cfg.desktop.terminal_font_size = Some(12);
         cfg.desktop.terminal_font_family = Some("Menlo".into());
         cfg.desktop.terminal_colors.set(3, Some("#dbc300".into()));
+        (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(60), Some(10));
         SettingsValues::default().apply(&mut cfg);
         assert!(cfg.desktop.is_empty(), "{:?}", cfg.desktop);
 

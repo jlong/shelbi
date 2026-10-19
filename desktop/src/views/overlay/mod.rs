@@ -347,6 +347,8 @@ pub fn render_layer<H: OverlayHost>(
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
+    // Overlays are opaque over a translucent window, so they stay readable.
+    let theme = &theme.opaque();
     let (panel, top_aligned) = match overlay {
         ActiveOverlay::Palette { palette, scroll } => (
             crate::views::palette::render(palette, scroll, size, keymaps, theme, cx),

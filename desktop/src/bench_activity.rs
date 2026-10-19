@@ -37,7 +37,7 @@
 //!   and the rows on it.
 //!
 //! ```sh
-//! cargo run --release --features visual-check -- --bench-activity [--events 6000] [--tasks 500] [--days 6] [--steps 120]
+//! cargo run --release --features visual-check -- --bench-activity [--events 6000] [--tasks 500] [--days 6] [--steps 120] [--opacity 85 --blur 20]
 //! ```
 
 use std::io::Write as _;
@@ -69,6 +69,9 @@ struct Options {
     tasks: usize,
     days: i64,
     steps: usize,
+    /// The window's translucency (`--opacity <percent>`, `--blur <points>`),
+    /// opaque by default.
+    look: crate::theme::window::Translucency,
 }
 
 fn parse(args: &[String]) -> Options {
@@ -77,6 +80,7 @@ fn parse(args: &[String]) -> Options {
         tasks: 500,
         days: 6,
         steps: 120,
+        look: Default::default(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -87,6 +91,8 @@ fn parse(args: &[String]) -> Options {
         };
         match a.as_str() {
             "--events" => o.events = num("--events"),
+            "--opacity" => o.look = crate::theme::window::Translucency::clamped(num("--opacity") as i32, o.look.blur.into()),
+            "--blur" => o.look = crate::theme::window::Translucency::clamped(o.look.opacity.into(), num("--blur") as i32),
             "--tasks" => o.tasks = num("--tasks"),
             "--days" => o.days = num("--days") as i64,
             "--steps" => o.steps = num("--steps"),
@@ -395,6 +401,7 @@ pub fn run(args: &[String]) -> ! {
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
     cx.update(|cx| {
         crate::visual_check::install_theme(cx);
+        crate::theme::window::set(opts.look, cx);
         crate::assets::load_fonts(cx);
         crate::elements::terminal::TerminalSettings::init(cx);
     });

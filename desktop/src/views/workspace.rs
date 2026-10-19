@@ -1160,7 +1160,7 @@ impl WorkspaceView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .children(toolbar)
             .child(div().flex_none().h(px(1.0)).bg(theme.divider))
             // Waiting for the push to settle: an empty canvas, not the

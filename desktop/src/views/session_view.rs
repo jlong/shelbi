@@ -874,7 +874,7 @@ impl Render for SessionView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.canvas);
+            .bg(theme.nested(theme.canvas));
         if let Slot::Live(pane) = &self.slot {
             // The grid sits where the Figma frames draw it: clear of the
             // column divider and the window's corner by the inset across,

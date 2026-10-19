@@ -296,7 +296,7 @@ impl Render for MachinesView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .type_style(Type::Base)
             .text_color(theme.foreground)
             // The toolbar: the view's name, loud, then the project's, muted.

@@ -1891,7 +1891,7 @@ impl Render for TerminalPane {
             .on_action(cx.listener(|this, _: &crate::menus::SelectAll, _, cx| this.select_all(cx)))
             .relative()
             .size_full()
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .child(TerminalElement::new(cx.entity()))
             .children(search_bar)
             .children(jump)
@@ -1904,7 +1904,9 @@ impl Render for TerminalPane {
                         .right_0()
                         .px_3()
                         .py_1p5()
-                        .bg(theme.sidebar)
+                        // Over the grid: opaque, so the text under it can't
+                        // show through.
+                        .bg(theme.opaque().sidebar)
                         .border_t_1()
                         .border_color(theme.divider)
                         .text_color(theme.muted)

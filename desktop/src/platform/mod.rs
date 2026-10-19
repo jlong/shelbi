@@ -16,6 +16,7 @@
 //! notifications (`dt-menus-notifications`) are platform concerns too, but
 //! live where that subtask puts them; the app bundle is `scripts/bundle.sh`.
 
+pub mod blur;
 pub mod bootstrap;
 pub mod control;
 pub mod daemon;

@@ -33,6 +33,8 @@ pub fn render(
     theme: &Theme,
     cx: &mut Context<IssuesView>,
 ) -> impl IntoElement {
+    // A modal over the board: opaque over a translucent window.
+    let theme = &theme.opaque();
     let editing = view
         .editor
         .as_ref()

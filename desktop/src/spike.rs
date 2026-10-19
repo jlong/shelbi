@@ -39,6 +39,9 @@ pub fn open(selector: String, cx: &mut App) {
             // Refresh the window title when the session's title changes.
             cx.new(|cx| {
                 cx.observe(&pane, |_, _, cx| cx.notify()).detach();
+                // `desktop.window_opacity` / `window_blur`, as a project
+                // window draws them.
+                crate::theme::window::apply_to(window, cx);
                 pane.read(cx).focus_handle(cx).focus(window, cx);
                 SpikeWindow {
                     pane,

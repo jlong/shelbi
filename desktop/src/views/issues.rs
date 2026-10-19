@@ -1608,7 +1608,7 @@ impl Render for IssuesView {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .type_style(Type::Base)
             .text_color(theme.foreground)
             .child(self.render_header(&theme, window, cx))

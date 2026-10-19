@@ -1465,11 +1465,17 @@ pub fn install_theme(cx: &mut gpui::App) {
 }
 
 /// The theme a visual run paints with: `SHELBI_VISUAL_THEME` (dark unless
-/// `light`).
+/// `light`), its surfaces at `SHELBI_VISUAL_OPACITY` percent (opaque
+/// unless set: a translucent window's frames, for QA).
 pub fn theme() -> Theme {
-    if theme_name() == Some("light") {
+    let theme = if theme_name() == Some("light") {
         Theme::resolve(ThemePreference::Light, gpui::WindowAppearance::Light)
     } else {
         Theme::resolve(ThemePreference::Dark, gpui::WindowAppearance::Dark)
-    }
+    };
+    let opacity = std::env::var("SHELBI_VISUAL_OPACITY")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|v| crate::theme::window::Translucency::clamped(v, 0).alpha());
+    theme.with_opacity(opacity.unwrap_or(1.0))
 }

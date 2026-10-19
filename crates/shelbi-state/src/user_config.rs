@@ -108,6 +108,28 @@ pub struct DesktopConfig {
     /// is written and the defaults can move.
     #[serde(default, skip_serializing_if = "TerminalColors::is_empty")]
     pub terminal_colors: TerminalColors,
+
+    /// How opaque the desktop app's windows are, in percent: 100 is opaque
+    /// and the app clamps lower values to its floor (30), so text stays
+    /// readable. Below 100 the window's background surfaces (not its text)
+    /// let the desktop show through. A fraction (`0.85`, Ghostty's
+    /// `background-opacity` shape) reads as that percentage. Unset means
+    /// 100.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_percent"
+    )]
+    pub window_opacity: Option<u8>,
+
+    /// How much a translucent window blurs what shows through it: a blur
+    /// radius in points, 0 (clear) to 50. Unset means 0.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_amount"
+    )]
+    pub window_blur: Option<u8>,
 }
 
 /// Which Option keys act as Meta in the desktop app's terminals
@@ -164,6 +186,24 @@ impl<'de> Deserialize<'de> for OptionAsMeta {
     }
 }
 
+/// `window_opacity`: a whole percentage, or a fraction up to 1 read as one
+/// (`0.85` is 85). Out of range saturates; anything that isn't a number is
+/// ignored rather than failing the whole file.
+fn lenient_percent<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u8>, D::Error> {
+    let value = serde_yaml::Value::deserialize(d)?;
+    Ok(value.as_f64().map(|v| {
+        let v = if v > 0.0 && v <= 1.0 && value.is_f64() { v * 100.0 } else { v };
+        v.round().clamp(0.0, u8::MAX as f64) as u8
+    }))
+}
+
+/// `window_blur`: a number of points; out of range saturates, and anything
+/// that isn't a number is ignored.
+fn lenient_amount<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u8>, D::Error> {
+    let value = serde_yaml::Value::deserialize(d)?;
+    Ok(value.as_f64().map(|v| v.round().clamp(0.0, u8::MAX as f64) as u8))
+}
+
 impl DesktopConfig {
     /// Whether no desktop setting is present (so the block isn't written).
     pub fn is_empty(&self) -> bool {
@@ -173,6 +213,8 @@ impl DesktopConfig {
             && self.option_as_meta.is_none()
             && self.notifications.is_empty()
             && self.terminal_colors.is_empty()
+            && self.window_opacity.is_none()
+            && self.window_blur.is_none()
     }
 }
 
@@ -849,6 +891,34 @@ mod tests {
         colors.set(15, None);
         assert!(colors.is_empty());
         assert!(DesktopConfig { terminal_colors: colors, ..DesktopConfig::default() }.is_empty());
+    }
+
+    #[test]
+    fn window_opacity_and_blur_round_trip_and_read_leniently() {
+        let cfg = UserConfig {
+            desktop: DesktopConfig {
+                window_opacity: Some(85),
+                window_blur: Some(20),
+                ..DesktopConfig::default()
+            },
+            ..UserConfig::default()
+        };
+        let text = serde_yaml::to_string(&cfg).unwrap();
+        assert!(text.contains("window_opacity: 85") && text.contains("window_blur: 20"), "{text}");
+        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+        assert!(!DesktopConfig { window_blur: Some(0), ..DesktopConfig::default() }.is_empty());
+
+        let read = |yaml: &str| {
+            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n{yaml}\n")).unwrap();
+            (cfg.desktop.window_opacity, cfg.desktop.window_blur)
+        };
+        assert_eq!(read("  window_opacity: 0.85"), (Some(85), None), "Ghostty's fraction");
+        assert_eq!(read("  window_opacity: 1.0"), (Some(100), None));
+        assert_eq!(read("  window_opacity: 1"), (Some(1), None), "a whole number is a percentage");
+        assert_eq!(read("  window_opacity: 300\n  window_blur: -4"), (Some(255), Some(0)));
+        assert_eq!(read("  window_opacity: lots\n  window_blur: 12.4"), (None, Some(12)));
+        assert_eq!(read("  window_opacity: ~"), (None, None));
     }
 
     #[test]
