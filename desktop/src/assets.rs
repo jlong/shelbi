@@ -40,13 +40,13 @@
 //! [`ICON_SIZE_SMALL`].
 //!
 //! Where the Figma file draws an icon at **18pt** (the X-Small Button's left
-//! icon: the board's filters), the `@button` list names it the same way: the
-//! drawing under `assets/icons/heroicons-18/` with its stroke widened so it
-//! is 1.25pt at 18pt, as Figma draws it (see that folder's README). Its
-//! constant ends in `_BUTTON` (`icons::FUNNEL_BUTTON`) and [`heroicon`]
-//! draws it at [`ICON_SIZE_BUTTON`]. The issue detail's actions draw their
-//! icons there too, the Start button's filled play among them (John's
-//! drawing, on Figma's 18pt grid, since Heroicons has none).
+//! icon: the issue detail's actions), the `@button` list names it the same
+//! way: the drawing under `assets/icons/heroicons-18/` with its stroke
+//! widened so it is 1.25pt at 18pt, as Figma draws it (see that folder's
+//! README). Its constant ends in `_BUTTON` (`icons::USER_BUTTON`) and
+//! [`heroicon`] draws it at [`ICON_SIZE_BUTTON`]. The Start button's filled
+//! play is among them (John's drawing, on Figma's 18pt grid, since Heroicons
+//! has none).
 //!
 //! Where the Figma file draws an icon at **16pt** (the issue detail's close
 //! mark), the `@close` list names it: the drawing under
@@ -81,7 +81,7 @@ pub const ICON_SIZE: Pixels = px(20.0);
 /// The size the Figma file draws its small icons at (the Activity pickers).
 pub const ICON_SIZE_SMALL: Pixels = px(14.0);
 
-/// The X-Small Button's left icon size (the board's filters).
+/// The X-Small Button's left icon size (the issue detail's actions).
 pub const ICON_SIZE_BUTTON: Pixels = px(18.0);
 
 /// A modal's close mark (the issue detail's).
@@ -324,8 +324,7 @@ heroicons! {
     ARROW_UP_RIGHT = "arrow-up-right";
     CLIPBOARD_DOCUMENT = "clipboard-document";
     EXCLAMATION_TRIANGLE = "exclamation-triangle";
-    /// The drawing `FUNNEL_SMALL` and `FUNNEL_BUTTON` widen; no view draws
-    /// the funnel at 20pt.
+    /// The drawing `FUNNEL_SMALL` widens; no view draws the funnel at 20pt.
     #[allow(dead_code)]
     FUNNEL = "funnel";
     LOCK_CLOSED = "lock-closed";
@@ -364,7 +363,6 @@ heroicons! {
         COMMAND_LINE_SMALL = "command-line";
     }
     @button {
-        FUNNEL_BUTTON = "funnel";
         ARROW_LEFT_BUTTON = "arrow-left";
         ARROW_RIGHT_BUTTON = "arrow-right";
         PLAY_SOLID_BUTTON = "play-solid";

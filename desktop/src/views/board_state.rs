@@ -85,6 +85,10 @@ pub enum Intent {
     OpenInEditor(String),
     /// Show the new-issue title prompt.
     BeginAdd,
+    /// Put the keyboard in the toolbar's search field (`/`).
+    FocusSearch,
+    /// The search was cleared from the board (Esc): empty the field to match.
+    ClearSearchField,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,6 +606,27 @@ impl BoardState {
         vec![Intent::PersistWorkspaceFilter(filter)]
     }
 
+    /// The board's text search, as typed.
+    pub fn search(&self) -> &str {
+        &self.filters.search
+    }
+
+    /// Narrow the cards to those matching `query` (the toolbar's search
+    /// field, as the user types). Quiet: no status note per keystroke.
+    /// When the selected card drops out, the keyboard moves to the first
+    /// card left, so `j`/`k` walk the matches.
+    pub fn set_search(&mut self, query: &str) {
+        if self.filters.search != query {
+            self.filters.search = query.to_string();
+            self.rebuild();
+            if self.selected_card().is_none() {
+                if let Some(ci) = self.model.columns.iter().position(|c| !c.cards.is_empty()) {
+                    self.select(ci, 0);
+                }
+            }
+        }
+    }
+
     pub fn set_workflow_filter(&mut self, filter: Option<String>) {
         self.status = Some(match &filter {
             None => "workflow: all".to_string(),
@@ -671,6 +696,12 @@ impl BoardState {
     }
 
     fn board_key(&mut self, chord: KeyChord) -> Option<Vec<Intent>> {
+        // Esc on the board clears an active search (the field's own Esc does
+        // the same while it has the keyboard).
+        if chord.code == Key::Esc && chord.mods.is_empty() && !self.filters.search.is_empty() {
+            self.set_search("");
+            return Some(vec![Intent::ClearSearchField]);
+        }
         if let Some(action) = self.keymaps.kanban.dispatch(chord) {
             let selected = self.selected_card().map(|c| (c.id.clone(), c.assignee.clone()));
             return Some(match action {
@@ -733,6 +764,7 @@ impl BoardState {
                 self.open_workflow_dropdown();
                 Vec::new()
             }
+            DesktopKey::Plain('/') | DesktopKey::Shifted('/') => vec![Intent::FocusSearch],
             DesktopKey::Plain('m') => self.load_more(),
             DesktopKey::Plain('s') => selected.map_or_else(Vec::new, |id| self.start(&id)),
             DesktopKey::Plain('a') => selected.map_or_else(Vec::new, |id| self.begin_assign(&id)),
@@ -1471,6 +1503,47 @@ mod tests {
         assert!(b.model().card("B").is_some() && b.model().card("D").is_some());
         b.apply_reads(None, None);
         assert_eq!(b.generation(), before + 1, "nothing read, nothing rebuilt");
+    }
+
+    #[test]
+    fn search_narrows_the_cards_and_combines_with_the_filters() {
+        let mut tasks = vec![issue("A", "todo"), issue("B", "todo"), issue("C", "in-progress")];
+        tasks[0].task.title = "Restyle the command palette".into();
+        tasks[1].task.assigned_to = Some("alpha".into());
+        tasks[1].task.branch = Some("jlong/palette-keys".into());
+        tasks[2].task.title = "Palette search".into();
+        tasks[2].task.assigned_to = Some("alpha".into());
+        let mut b = board(tasks);
+        let visible = |b: &BoardState| -> Vec<String> {
+            b.model().columns.iter().flat_map(|c| c.cards.iter().map(|k| k.id.clone())).collect()
+        };
+        b.set_search("palette");
+        assert_eq!(visible(&b), ["A", "B", "C"], "title or branch, any case");
+        assert!(b.status.is_none(), "typing leaves no status note");
+        b.set_search("command");
+        assert_eq!(visible(&b), ["A"]);
+        // The selection follows the board: a card outside the search can't
+        // stay selected, so it lands on the first match.
+        assert_eq!(b.selected_card().map(|c| c.id.as_str()), Some("A"));
+        b.set_search("palette");
+        let _ = b.set_workspace_filter(Some(WorkspaceFilter::Workspace("alpha".into())));
+        assert_eq!(visible(&b), ["B", "C"], "search and workspace filter combine");
+        let _ = b.set_workspace_filter(None);
+        b.set_workflow_filter(Some("default".into()));
+        assert_eq!(visible(&b), ["A", "B", "C"], "and the workflow filter");
+    }
+
+    #[test]
+    fn slash_focuses_the_search_and_esc_clears_it() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        assert_eq!(press(&mut b, "/"), [Intent::FocusSearch]);
+        // Esc with no search leaves the key to the window.
+        assert_eq!(b.handle_key(key("esc")), None);
+        b.set_search("issue a");
+        assert_eq!(b.model().columns.iter().map(|c| c.cards.len()).sum::<usize>(), 1);
+        assert_eq!(press(&mut b, "esc"), [Intent::ClearSearchField]);
+        assert_eq!(b.search(), "");
+        assert_eq!(b.model().columns.iter().map(|c| c.cards.len()).sum::<usize>(), 2);
     }
 
     #[test]

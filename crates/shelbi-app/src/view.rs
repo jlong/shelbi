@@ -789,11 +789,15 @@ pub struct DepBadge {
 
 /// The view-only filters a client applies over the board. The workflow
 /// filter is per-session; the workspace filter is persisted in `state.json`
-/// (the client reads it back through [`BoardInput::workspace_filter`]).
+/// (the client reads it back through [`BoardInput::workspace_filter`]). The
+/// text search is per-session too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BoardFilters {
     pub workflow: Option<String>,
     pub workspace: Option<WorkspaceFilter>,
+    /// The board's text search ([`board::card_matches_search`]): blank
+    /// shows every card.
+    pub search: String,
 }
 
 impl IssueCard {
@@ -844,6 +848,9 @@ impl IssuesModel {
                 let cards: Vec<IssueCard> = members
                     .into_iter()
                     .map(|tf| card_for(tf, &by_id, &rules, &def.status_id))
+                    .filter(|c| {
+                        board::card_matches_search(&c.title, &c.id, c.branch.as_deref(), &filters.search)
+                    })
                     .collect();
                 let collapsed = input
                     .expansion(workflow_filter, &def.status_id)
@@ -1706,6 +1713,39 @@ mod tests {
         assert_eq!(expected.status, "todo");
         assert_eq!(expected.updated_at, input.open[0].task.updated_at.to_rfc3339());
         assert_eq!(model.position("T-1"), Some((1, 0)));
+    }
+
+    #[test]
+    fn issues_board_search_narrows_cards_on_top_of_the_other_filters() {
+        let mut board = vec![
+            issue_full("T-1", "todo", &[], Some("alpha")),
+            issue_full("T-2", "todo", &[], Some("beta")),
+            issue_full("T-3", "todo", &[], Some("alpha")),
+        ];
+        board[0].task.title = "Restyle the command palette".into();
+        board[1].task.title = "Palette keyboard shortcuts".into();
+        board[2].task.branch = Some("jlong/palette-search".into());
+        let input = board_input(board);
+        let ids = |filters: &BoardFilters| -> Vec<String> {
+            let model = IssuesModel::build(&input, filters);
+            model.columns[1].cards.iter().map(|c| c.id.clone()).collect()
+        };
+        let mut filters = BoardFilters {
+            search: "palette".into(),
+            ..BoardFilters::default()
+        };
+        // Title (either case) and branch both match.
+        assert_eq!(ids(&filters), ["T-1", "T-2", "T-3"]);
+        filters.search = "t-2".into();
+        assert_eq!(ids(&filters), ["T-2"]);
+        // Combined with the workspace filter: only alpha's palette cards.
+        filters.search = "PALETTE".into();
+        filters.workspace = Some(WorkspaceFilter::Workspace("alpha".into()));
+        assert_eq!(ids(&filters), ["T-1", "T-3"]);
+        filters.search = "keyboard".into();
+        assert!(ids(&filters).is_empty());
+        filters.search.clear();
+        assert_eq!(ids(&filters), ["T-1", "T-3"]);
     }
 
     #[test]

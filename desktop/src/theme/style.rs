@@ -44,7 +44,7 @@ use shelbi_core::StatusCategory;
 
 use super::motion::fill_layer;
 use super::{hsla, palette, Theme};
-use crate::assets::{heroicon, status_glyph, Icon, StatusGlyph};
+use crate::assets::{heroicon, icons, status_glyph, Icon, StatusGlyph};
 use crate::elements::exact_text::exact_text;
 
 /// The UI typeface every [`Type`] is set in.
@@ -335,6 +335,8 @@ pub enum ButtonKind {
     Danger,
     /// A low-key action beside others: no fill until hovered.
     Quiet,
+    /// A set filter: the Select style (a cyan tint, `button/select/text`).
+    Select,
 }
 
 /// A Figma button (Small): 13 / 18 medium, 6px corners, 12px across, the
@@ -423,6 +425,12 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.danger_fill_hover,
             pressed: theme.danger_fill_active,
             text: theme.error,
+        },
+        ButtonKind::Select => ButtonColors {
+            fill: theme.select_fill,
+            hover: theme.select_fill_hover,
+            pressed: theme.select_fill_active,
+            text: theme.select_label,
         },
         ButtonKind::Quiet => ButtonColors {
             fill: theme.background.opacity(0.0),
@@ -577,41 +585,86 @@ pub fn xsmall_button(id: impl Into<SharedString>, label: impl Into<SharedString>
         .child(label.into())
 }
 
-/// A control that opens a menu (the board's filters): the Figma Button at
-/// X-Small with a left icon (8px across, the overlay fill, X-Small/Medium
-/// loud, an 18px icon, `icons::FUNNEL_BUTTON`, in its 14px slot, which makes
-/// it 26px tall); pressed while `open` (the Active state, whose icon keeps
-/// its color).
-pub fn dropdown(
+/// A board filter (the Issues Header's chips): the Figma Button at Small,
+/// label only, 28px tall, in the Select style while its filter is set
+/// (`selected`: the cyan tint and label) and the Default style while it
+/// isn't; pressed while `open` (its menu is up).
+pub fn filter_chip(
     id: impl Into<SharedString>,
-    icon: Icon,
     label: impl Into<SharedString>,
+    selected: bool,
     open: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
-    let rest = if open {
-        theme.background_active
+    let kind = if selected {
+        ButtonKind::Select
     } else {
-        theme.background
+        ButtonKind::Secondary
     };
+    let c = button_colors(kind, theme);
+    let rest = if open { c.pressed } else { c.fill };
     let d = div()
         .id(id.clone())
         .debug_selector(move || selector.to_string())
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(4.0))
-        .h(px(26.0))
-        .px(px(8.0))
+        .justify_center()
+        .h(px(28.0))
+        .px(px(12.0))
         .rounded(px(6.0))
-        .type_style(Type::XSmallMedium)
-        .text_color(theme.text_loud)
+        .type_style(Type::SmallMedium)
+        .text_color(c.text)
         .cursor_pointer();
-    fill_layer(d, id, px(6.0), [rest, theme.background_hover, theme.background_active])
-        .child(icon_slot(icon, 14.0, theme.button_icon))
+    fill_layer(d, id, px(6.0), [rest, c.hover, c.pressed])
         .child(div().whitespace_nowrap().child(label.into()))
+}
+
+/// The Searchbox component at Small (the Issues Header's search): 28px tall,
+/// 6px corners, the overlay fill (the hover fill under the pointer), the
+/// 20px magnifying glass in `icon` 6px in, then `content` 6px after it.
+/// `focused` draws the focus ring and glow around it ([`focus_bands`]). The
+/// caller sets its width (Figma: 180px).
+pub fn search_box(id: impl Into<SharedString>, content: impl IntoElement, focused: bool, theme: &Theme) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(6.0))
+        .h(px(28.0))
+        .px(px(6.0))
+        .rounded(px(6.0))
+        .cursor_text();
+    fill_layer(d, id, px(6.0), [theme.background, theme.background_hover, theme.background_hover])
+        .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon))
+        .child(div().relative().flex().flex_1().min_w_0().h_full().items_center().child(content))
+        .when(focused, |d| d.children(focus_bands(6.0, theme)))
+}
+
+/// [`focus_shadow`] drawn as bands around a control whose corners are
+/// `radius`, for a translucent control: gpui paints a drop shadow as a
+/// filled box under the element, which would show through its fill. The
+/// 1px ring, then the 4px glow over it, both outside the control.
+fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
+    let band = |width: f32, color: Hsla| {
+        div()
+            .absolute()
+            .top(px(-width))
+            .left(px(-width))
+            .right(px(-width))
+            .bottom(px(-width))
+            .rounded(px(radius + width))
+            .border(px(width))
+            .border_color(color)
+    };
+    [band(1.0, theme.focus_ring), band(4.0, theme.focus_glow)]
 }
 
 /// A workflow status's glyph ([`StatusGlyph`]) in its Figma color: backlog

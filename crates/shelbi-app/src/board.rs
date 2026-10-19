@@ -273,6 +273,16 @@ pub fn show_card_workflow_label(workflow_count: usize, workflow_filtered: bool) 
     workflow_count > 1 && !workflow_filtered
 }
 
+/// Whether a card matches the board's text search: every whitespace-separated
+/// word of `query` appears, ignoring case, in the card's title, id or branch
+/// (words may match different fields). A blank query matches every card.
+pub fn card_matches_search(title: &str, id: &str, branch: Option<&str>, query: &str) -> bool {
+    let haystack = format!("{title}\n{id}\n{}", branch.unwrap_or_default()).to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| haystack.contains(&word.to_lowercase()))
+}
+
 /// The branch a card's meta line shows: the task's own `branch` once the
 /// orchestrator has cut it, otherwise the workflow's `git.base_branch` template
 /// when it carries a `{{var}}` placeholder that resolves cleanly from the
@@ -996,6 +1006,20 @@ mod tests {
             narrowed.iter().map(|c| c.status_id.as_str()).collect::<Vec<_>>(),
             ["backlog", "in-progress", "done"]
         );
+    }
+
+    #[test]
+    fn search_matches_every_word_in_title_id_or_branch_ignoring_case() {
+        let m = |q| card_matches_search("Restyle the command palette", "t-42", Some("jlong/desktop-palette"), q);
+        assert!(m(""));
+        assert!(m("   "));
+        assert!(m("PALETTE"));
+        assert!(m("t-42"));
+        assert!(m("jlong/desktop"));
+        // Words may match different fields, but every word must match.
+        assert!(m("command t-42"));
+        assert!(!m("command scrollback"));
+        assert!(!card_matches_search("Retry failed starts", "t-7", None, "jlong"));
     }
 
     #[test]

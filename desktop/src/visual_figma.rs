@@ -29,11 +29,13 @@
 //! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
 //! the remote down, its row selected; `machines-idle-selected`,
 //! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
-//! a focused textbox), and the form components' sheets
+//! a focused textbox), the board toolbar's (`state-issues-unfiltered`: no
+//! filter set; `state-issues-search`: `/` and a query typed, the cards
+//! narrowed), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs).
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
-//! components.
+//! components; `=issues` just the board, its states and the issue detail.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -72,7 +74,8 @@ use crate::views::workspace::{WorkspaceDeps, WorkspaceOps};
 
 const PROJECT: &str = "my-project";
 /// `SHELBI_VISUAL_ONLY=panels` renders only the Review and Workspace
-/// screens and their panels' states; `=settings` only Settings.
+/// screens and their panels' states; `=settings` only Settings; `=issues`
+/// only the board and the issue detail.
 const ONLY_VAR: &str = "SHELBI_VISUAL_ONLY";
 /// The reference PNGs' size, in points.
 const WIDTH: u32 = 1440;
@@ -996,6 +999,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "issues") {
+            self.issues();
+            return;
+        }
+
         // The orchestrator chat.
         let handle = self.open();
         self.click(handle, orch.clone());
@@ -1003,34 +1011,7 @@ impl Run {
         self.save(handle, "orchestrator");
         self.terminal_states(&orch);
 
-        // The board, a card selected.
-        let handle = self.open();
-        self.click(handle, View::Issues);
-        let loaded = self.wait_for_board(handle);
-        self.expect("issues: the board loads the mockup's 19 open cards", loaded);
-        let counts = self.column_counts(handle);
-        println!("      columns: {counts:?}");
-        self.expect(
-            "issues: the column counts read 10 / 6 / 2 / 1",
-            counts.iter().take(4).copied().eq([10, 6, 2, 1]),
-        );
-        if let (Some(board), _, _) = self.views(handle) {
-            board.update(&mut self.cx, |v, cx| {
-                v.state_mut().select(1, 0);
-                cx.notify();
-            });
-        }
-        self.save(handle, "issues");
-
-        // A card's detail over the board.
-        let handle = self.open();
-        self.click(handle, View::Issues);
-        self.wait_for_board(handle);
-        handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
-            .unwrap();
-        self.save(handle, "issue-detail");
-        self.detail_states();
+        self.issues();
 
         // The Activity feed, the review row selected.
         let handle = self.open();
@@ -1326,11 +1307,73 @@ impl Run {
         })
     }
 
+    /// The board, a card selected, as the Issues frame shows it; the
+    /// toolbar's undrawn states; then a card's detail over the board.
+    fn issues(&mut self) {
+        let handle = self.open();
+        self.click(handle, View::Issues);
+        let loaded = self.wait_for_board(handle);
+        self.expect("issues: the board loads the mockup's 19 open cards", loaded);
+        let counts = self.column_counts(handle);
+        println!("      columns: {counts:?}");
+        self.expect(
+            "issues: the column counts read 10 / 6 / 2 / 1",
+            counts.iter().take(4).copied().eq([10, 6, 2, 1]),
+        );
+        self.capture(handle, "state-issues-unfiltered");
+        self.frame_filter(handle);
+        let filtered = self.column_counts(handle);
+        self.expect(
+            "issues: the task filter keeps every card",
+            filtered.iter().take(4).copied().eq([10, 6, 2, 1]),
+        );
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().select(1, 0);
+                cx.notify();
+            });
+        }
+        self.capture(handle, "issues");
+
+        // `/`, then a query: the search narrows the cards as it is typed.
+        self.cx.simulate_keystrokes(handle.into(), "/ t e r m i n a l");
+        self.settle(handle);
+        let counts = self.column_counts(handle);
+        println!("      searched: {counts:?}");
+        self.expect(
+            "issues: `terminal` narrows the board to its two cards",
+            counts.iter().sum::<usize>() == 2,
+        );
+        self.save(handle, "state-issues-search");
+
+        // A card's detail over the board.
+        let handle = self.open();
+        self.click(handle, View::Issues);
+        self.wait_for_board(handle);
+        self.frame_filter(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
+            .unwrap();
+        self.save(handle, "issue-detail");
+        self.detail_states();
+
+    }
+
+    /// Set the board's workflow filter to `task`, as the Issues frames'
+    /// Header shows it (quietly: no status note in the footer).
+    fn frame_filter(&mut self, handle: WindowHandle<ShelbiWindow>) {
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| v.restore_workflow_filter(Some("task".into()), cx));
+        }
+        self.settle(handle);
+    }
+
     /// The issue detail over the board, as the frame shows it.
     fn open_detail(&mut self) -> WindowHandle<ShelbiWindow> {
         let handle = self.open();
         self.click(handle, View::Issues);
         self.wait_for_board(handle);
+        self.frame_filter(handle);
         handle
             .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
             .unwrap();

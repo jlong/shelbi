@@ -136,7 +136,8 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
 | Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `success_label` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
 | Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, the task panels' back button on the keyboard's row, text fields) |
-| Dropdown | A button that opens a menu (the board's filters): the Figma Button at X-Small with a left icon, 8px across, the overlay fill, an X-Small medium loud label, no chevron; the 18px icon (`icons::FUNNEL_BUTTON`, in `button_icon`) sits in Figma's 14px Icon slot (`icon_slot`), which makes the button 26px tall; pressed while its menu is open (the icon keeps its color), and the menu opens 6px under it |
+| Filter chip | The board toolbar's workflow and workspace filters (`filter_chip`): the Figma Button at Small, label only, 28px, 12px across, 6px corners, Small medium; in the Select style (`select_fill`, `select_label`) while its filter is set, else the Default style (`background`, loud); pressed while its menu is open, and the menu opens 6px under it. Unfiltered the chips read `Workflows` and `Workspaces` |
+| Search box | The Searchbox component at Small (`search_box`): 28px, 6px corners, the overlay fill (hover fill under the pointer), the 20px magnifying glass in `icon` 6px in, then the input 6px on, Small, a `Search` placeholder in `form_hint`; focused, the 1px `focus_ring` and the 4px `focus_glow` over it, drawn as bands outside the box (`focus_bands`). The board's is 180px wide |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
 | Status glyph | Figma's `status-*` drawings, 16px (`status_icon`): backlog a dashed circle and to do an open one in `icon`, in progress half filled in `accent`, review three quarters in `icon_purple`, done filled in `icon_green`, canceled (not in Figma) struck through in `muted`. A status heading (`status_heading`: the board's column headers, the task panels) is the glyph, 8px, then the label in caps at X-Small semibold, loud on the current column and muted otherwise |
 | Segmented control | The Segmented Control component (`elements::controls::segmented_track` / `segment`): a `search` track, 4px in, 10px corners; items 24px, 12px across, Base in `form_text`, a fill fading in on hover; the selected one Base medium and loud on the canvas with `shadow/raised card`'s drops (`selected_segment`), which slides between items. Activity's kind filter is its own (below) |
@@ -215,6 +216,7 @@ until a new role has its row here, with the values the palette really has.
 | `card` | `#020303` | `#ffffff` | Measured (Issues): a board card |
 | `raised` | `#2c3140` | `#f9f9fc` | Measured (Command palette): the palette, menus, popovers, tooltips |
 | `well` | `#1e2330` | `#ffffff` | `theme.canvas`: the bootstrap screen's command box |
+| `toolbar` | `#acb4cf1a` | `#acb4cf14` | `surface/depth-10` (the Issues Header): the board toolbar's band over the canvas |
 | `textbox` | `#020303` | `#ffffff` | The Textbox component's well (the dark Settings frame draws `#020303`; white in Light), and an unchecked box's fill |
 
 ### Overlay fills
@@ -223,7 +225,11 @@ until a new role has its row here, with the values the palette really has.
 |---|---|---|---|
 | `background` | `#acb4cf2e` | `#acb4cf1f` | `theme.background`: buttons, dropdowns, chips, count badges, the Zen pill off, a hovered row |
 | `background_hover` | `#acb4cf47` | `#acb4cf38` | `button/default/background-hover` (dark derived): a control's hover |
-| `background_active` | `#acb4cf61` | `#acb4cf52` | `button/default/background-active` (dark derived): pressed, or open |
+| `background_active` | `#acb4cf66` | `#acb4cf52` | `button/default/background-active`: pressed, or open |
+| `select_fill` | `#62cdf62e` | `#62cdf61f` | `button/select/background` (`Cyan/400` at the overlay's alphas): a set filter's chip on the board toolbar |
+| `select_fill_hover` | `#62cdf647` | `#62cdf638` | `button/select/background-hover`: that chip hovered |
+| `select_fill_active` | `#62cdf666` | `#62cdf652` | `button/select/background-active`: that chip pressed, or its menu open |
+| `select_label` | `#b0e6fb` | `#1989c4` | `button/select/text` (`Cyan/300` / `Cyan/600`): the set filter chip's label |
 | `selection` | `#acb4cf8c` | `#acb4cf66` | `theme.selection`: the selected segment |
 | `search` | `#acb4cf40` | `#acb4cf29` | `theme.search`: Activity's filter chips |
 | `keycap` | `#1e2330` | `#ffffff` | The Hotkey's fill (`theme.canvas`) |
@@ -237,7 +243,7 @@ until a new role has its row here, with the values the palette really has.
 | `foreground` | `#f2f3f7b2` | `#020303b2` | `theme.foreground`: body text and labels |
 | `gray` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: hotkeys, secondary text |
 | `form_text` | `#f2f3f7d9` | `#020303b2` | `theme.foreground` as the Settings frame and the form components set it: a textbox's value, an unselected segment or checkbox |
-| `form_hint` | `#f2f3f78c` | `#444c6580` | `theme.muted` as the Settings frame and the form components set it: a labeled control's helper, a textbox's placeholder |
+| `form_hint` | `#f2f3f78c` | `#444c6580` | `theme.muted` as the Settings frame and the form components set it (`text/muted` in the Issues Header): a labeled control's helper, a textbox's placeholder, the board toolbar's `Filter:` and search placeholder |
 | `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
 | `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
 | `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
@@ -248,7 +254,7 @@ until a new role has its row here, with the values the palette really has.
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
 | `icon` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: icons at rest |
-| `button_icon` | `#acb4cf99` | `#7b85a7e5` | The Button component's icon stroke (the board's filters and New issue): `#acb4cf` at 60% in Dark, `theme.gray` in Light |
+| `button_icon` | `#acb4cf99` | `#7b85a7e5` | The Button component's icon stroke (New issue, the issue detail's actions): `#acb4cf` at 60% in Dark, `theme.gray` in Light |
 | `accent` | `#62cdf6` | `#f21478` | `icon/select`: the selected nav icon, the current project's check |
 | `icon_cyan` | `#62cdf6` | `#31ade9` | `icon/cyan`: ready for review |
 | `icon_green` | `#31d924` | `#5ac351` | `icon/green`: a working workspace |
@@ -406,11 +412,13 @@ with its worst ratio. **Flagged for John.**
 | dark | button_icon on | 2.58 | The Button component's icon (`#acb4cf` at 60%) on a button's fill over the sidebar; decorative beside the button's label |
 | dark | input_border on | 1.76 | `theme.divider` (`#acb4cf` at 30%) as a textbox's edge (Settings); the textbox also differs by its near-black well and its label |
 | dark | text_on_color on check_fill | 2.53 | The check mark (white) on the dark checked box (`#31ade9`), as the Settings frame draws it; the box itself is 6.19 on the canvas |
+| dark | form_hint on search box | 3.69 | `text/muted` (`#f2f3f7` at 55%) as the board search's `Search` placeholder, on the Searchbox fill over the toolbar band; AA on the band itself |
+| dark | select_label on | 3.98 | `button/select/text` (`Cyan/300`) on a set filter chip pressed (its menu open); AA at rest and hovered |
 | dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
 | light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
-| light | icon on | 2.97 | Icons in `theme.gray` on the sidebar (3.12 on white) |
+| light | icon on | 2.80 | Icons in `theme.gray` on the sidebar (3.12 on white); 2.80 for the board search's magnifying glass on the Searchbox fill over the toolbar band |
 | light | link on | 3.69 | `text/link` `#1989c4`: 3.88 on white |
 | light | green on green_tint | 4.30 | `[done]` on its (derived) chip tint |
 | light | success_label on pressed button | 4.36 | `text/green` on the Success button pressed |
@@ -419,9 +427,10 @@ with its worst ratio. **Flagged for John.**
 | light | dark_gray on selection | 4.08 | The selected Machines row: the branch in `theme.ansi_dark_gray` |
 | light | theme_green on selection | 4.02 | The same row: `working` in `theme.green` (5.0 on white) |
 | light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
-| light | button_icon on | 2.81 | `theme.gray` as the Button component's icon, on a button's fill; decorative beside the label |
+| light | button_icon on | 2.80 | `theme.gray` as the Button component's icon, on a button's fill (2.80 for New issue's plus over the toolbar band); decorative beside the label |
 | light | input_border on | 1.38 | `theme.divider` (`#acb4cf` at 50%) as a textbox's edge |
-| light | form_hint on | 2.46 | The form components' `theme.muted` (`#444c65` at 50%): a helper line, a placeholder |
+| light | form_hint on | 2.37 | The form components' `theme.muted` (`#444c65` at 50%): a helper line, a placeholder; the board toolbar's `Filter:` and its search's placeholder (2.37 on the Searchbox fill over the band) |
+| light | select_label on | 3.08 | `button/select/text` (`Cyan/600` `#1989c4`) on a set filter chip over the toolbar band: 3.45 at rest, 3.25 hovered, 3.08 pressed, as the Header draws it |
 | light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 
 ## Renders

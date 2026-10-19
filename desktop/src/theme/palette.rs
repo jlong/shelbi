@@ -32,13 +32,25 @@ pub mod figma {
     pub const CANVAS: Pair = pair(0x1e2330ff, 0xffffffff);
     /// `theme.background`: the overlay fill (controls, chips, badges).
     pub const BACKGROUND: Pair = pair(0xacb4cf2e, 0xacb4cf1f);
-    /// `button/default/background-hover`. Figma defines it in the Light
-    /// mode only (`#acb4cf38`, `theme.background` + 10 points); Dark takes
-    /// the same step over its own rest (18% → 28%).
+    /// `button/default/background-hover`: `#acb4cf` at 28% in Dark, 22% in
+    /// Light.
     pub const BACKGROUND_HOVER: Pair = pair(0xacb4cf47, 0xacb4cf38);
-    /// `button/default/background-active`: another 10 points (Dark derived
-    /// the same way).
-    pub const BACKGROUND_ACTIVE: Pair = pair(0xacb4cf61, 0xacb4cf52);
+    /// `button/default/background-active`: `#acb4cf` at 40% in Dark, 32% in
+    /// Light.
+    pub const BACKGROUND_ACTIVE: Pair = pair(0xacb4cf66, 0xacb4cf52);
+    /// `button/select/background`: the Button's Select style (a filter
+    /// that is set), `Cyan/400` at the overlay fill's alphas (18% Dark, 12%
+    /// Light).
+    pub const SELECT_FILL: Pair = pair(0x62cdf62e, 0x62cdf61f);
+    /// `button/select/background-hover`: 28% / 22%.
+    pub const SELECT_FILL_HOVER: Pair = pair(0x62cdf647, 0x62cdf638);
+    /// `button/select/background-active`: 40% / 32%.
+    pub const SELECT_FILL_ACTIVE: Pair = pair(0x62cdf666, 0x62cdf652);
+    /// `button/select/text`: `Cyan/300` in Dark, `Cyan/600` in Light.
+    pub const SELECT_TEXT: Pair = pair(0xb0e6fbff, 0x1989c4ff);
+    /// `surface/depth-10`: the Issues Header's band, `#acb4cf` at 10% in
+    /// Dark, 8% in Light, over the canvas.
+    pub const DEPTH_10: Pair = pair(0xacb4cf1a, 0xacb4cf14);
     /// `theme.selection`: the selected segment, the terminal's selection.
     pub const SELECTION: Pair = pair(0xacb4cf8c, 0xacb4cf66);
     /// `theme.search`: a search match, the Activity filter chips.
@@ -274,6 +286,9 @@ palette! {
     /// A command box's well (the bootstrap screen: the canvas, inside a
     /// divider).
     well,
+    /// The board's toolbar band over the canvas (the Issues Header's
+    /// `surface/depth-10`).
+    toolbar,
     /// The Textbox component's well, and an unchecked box's fill.
     textbox,
 
@@ -286,6 +301,16 @@ palette! {
     /// The overlay fill pressed, or a control while its menu is open
     /// (`button/default/background-active`).
     background_active,
+    /// A set filter's chip: the Button's Select style at rest
+    /// (`button/select/background`).
+    select_fill,
+    /// The Select style hovered (`button/select/background-hover`).
+    select_fill_hover,
+    /// The Select style pressed, or while its menu is open
+    /// (`button/select/background-active`).
+    select_fill_active,
+    /// The Select style's label (`button/select/text`).
+    select_label,
     /// The selected segment of a segmented control (`theme.selection`).
     selection,
     /// The Activity filter chips' fill (`theme.search`).
@@ -308,7 +333,9 @@ palette! {
     /// checkbox (`theme.foreground` as the form components set it).
     form_text,
     /// A form's quiet text: a labeled control's helper, a textbox's
-    /// placeholder (`theme.muted` as the form components set it).
+    /// placeholder, the board toolbar's `Filter:` and its search's
+    /// placeholder (`text/muted`, `theme.muted` as the form components set
+    /// it).
     form_hint,
     /// Quiet text: section headers, branches, timestamps, hints, idle
     /// states, placeholders (`theme.muted`).
@@ -495,11 +522,16 @@ impl Palette {
             card: pick(CARD),
             raised: pick(RAISED),
             well: canvas,
+            toolbar: pick(DEPTH_10),
             textbox: pick(TEXTBOX),
 
             background,
             background_hover: pick(BACKGROUND_HOVER),
             background_active: pick(BACKGROUND_ACTIVE),
+            select_fill: pick(SELECT_FILL),
+            select_fill_hover: pick(SELECT_FILL_HOVER),
+            select_fill_active: pick(SELECT_FILL_ACTIVE),
+            select_label: pick(SELECT_TEXT),
             selection: pick(SELECTION),
             search: pick(SEARCH),
             keycap: canvas,
@@ -649,6 +681,8 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "text_on_color on check_fill"),
     ("dark", "button_icon on"),
     ("dark", "table_text on"),
+    ("dark", "form_hint on search box"),
+    ("dark", "select_label on"),
     ("light", "muted on"),
     ("light", "gray on"),
     ("light", "log_text on"),
@@ -665,6 +699,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "form_hint on"),
     ("light", "button_icon on"),
     ("light", "table_text on"),
+    ("light", "select_label on"),
 ];
 
 #[cfg(test)]
@@ -821,6 +856,25 @@ mod tests {
             check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
             check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
         }
+        // The board toolbar: `Filter:` and the search's placeholder on its
+        // band, a chip's label and icon on each fill over it.
+        let band = flatten(p.toolbar, p.canvas);
+        check("form_hint on toolbar".into(), p.form_hint, band, AA);
+        check("form_hint on search box over toolbar".into(), p.form_hint, flatten(p.background, band), AA);
+        check("icon on search box over toolbar".into(), p.icon, flatten(p.background, band), NON_TEXT);
+        check("button_icon on rest button over toolbar".into(), p.button_icon, flatten(p.background, band), NON_TEXT);
+        for (state, fill) in ["rest", "hover", "pressed"]
+            .into_iter()
+            .zip([p.background, p.background_hover, p.background_active])
+        {
+            check(format!("text_loud on {state} button over toolbar"), p.text_loud, flatten(fill, band), AA);
+        }
+        for (state, fill) in ["rest", "hover", "pressed"]
+            .into_iter()
+            .zip([p.select_fill, p.select_fill_hover, p.select_fill_active])
+        {
+            check(format!("select_label on {state} select over toolbar"), p.select_label, flatten(fill, band), AA);
+        }
         // The form components, on the canvas they sit on: a textbox's value
         // in its well, an unselected segment on the track, a checkbox's
         // label, a helper and a placeholder.
@@ -965,6 +1019,11 @@ mod tests {
         // The form components (the dark Settings frame, the components page).
         both(d.form_text, l.form_text, (0xf2f3f7d9, 0x020303b2));
         both(d.form_hint, l.form_hint, (0xf2f3f78c, 0x444c6580));
+        // The Button's Select style and the Issues Header's band.
+        both(d.select_fill, l.select_fill, (0x62cdf62e, 0x62cdf61f));
+        both(d.select_label, l.select_label, (0xb0e6fbff, 0x1989c4ff));
+        both(d.background_active, l.background_active, (0xacb4cf66, 0xacb4cf52));
+        both(d.toolbar, l.toolbar, (0xacb4cf1a, 0xacb4cf14));
         both(d.input_border, l.input_border, (0xacb4cf4d, 0xacb4cf80));
         both(d.textbox, l.textbox, (0x020303ff, 0xffffffff));
         both(d.check_fill, l.check_fill, (0x31ade9ff, 0xf21478ff));
