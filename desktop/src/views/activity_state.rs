@@ -6,8 +6,16 @@
 //! rebuilds the shared [`Feed`] (`shelbi_app::activity::build_feed`) whenever
 //! any of them change. Keys come from the user's `activity:` key map, as in the
 //! TUI; a feed row is opened with Enter or a click.
+//!
+//! The feed is built by [`build`], a pure function of the read, the labels and
+//! the filter, so the background reader (`activity_reader.rs`) can build each
+//! refresh's feed off the UI thread; the state adopts a built feed when it was
+//! made under the filter shown, and rebuilds here only when the filter has
+//! moved on since (`dt-activity-perf`).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
 use shelbi_app::activity::{
@@ -56,6 +64,94 @@ impl ProjectInfo {
     }
 }
 
+/// One feed item's identity for the view's virtualized list: `ident` is the
+/// item without its relative time (the same row, a minute older), `content`
+/// everything it draws. The list keeps the measured heights of items whose
+/// keys didn't change, re-measures those whose content did, and splices in
+/// the span where idents differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ItemKey {
+    pub ident: u64,
+    pub content: u64,
+}
+
+impl ItemKey {
+    /// A key for an item that is only its text (a day header, the paging
+    /// row).
+    pub fn of(kind: &str, text: impl Hash) -> Self {
+        let mut h = DefaultHasher::new();
+        (kind, text).hash(&mut h);
+        let ident = h.finish();
+        ItemKey { ident, content: ident }
+    }
+}
+
+/// The feed one read builds under one filter: what the view draws.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Built {
+    pub feed: Feed,
+    /// One per feed item.
+    pub keys: Vec<ItemKey>,
+    pub projects: Vec<String>,
+    pub workspaces: Vec<String>,
+}
+
+/// Build the feed of `data` under `filter`, worded by `labels`, at `now`.
+pub fn build(data: &ActivityData, labels: &Labels, filter: &ActivityFilter, now: DateTime<Utc>) -> Built {
+    let feed = build_feed(&data.events, &data.task_cache, filter, now);
+    let keys = feed
+        .items
+        .iter()
+        .map(|item| match item {
+            FeedItem::Day(label) => ItemKey::of("day", label),
+            FeedItem::Row(r) => {
+                let mut h = DefaultHasher::new();
+                (&r.chip, &r.verb, r.verb_tone, &r.title, r.title_tone, &r.trail, &r.pill, &r.secondary, &r.target)
+                    .hash(&mut h);
+                let ident = h.finish();
+                r.time.hash(&mut h);
+                labels.hash_context(r, &mut h);
+                ItemKey { ident, content: h.finish() }
+            }
+        })
+        .collect();
+    let (projects, workspaces) = filter_choices(&data.events, &data.task_cache);
+    Built {
+        feed,
+        keys,
+        projects,
+        workspaces,
+    }
+}
+
+/// A read from the background reader, its feed built off the UI thread.
+pub struct Read {
+    pub data: ActivityData,
+    pub info: ProjectInfo,
+    /// The labels over `data` and `info`.
+    pub labels: Labels,
+    /// The filter `built` was built under.
+    pub filter: ActivityFilter,
+    pub built: Built,
+}
+
+impl Read {
+    /// Word and build `data` (on the reader's thread).
+    pub fn new(data: ActivityData, info: ProjectInfo, filter: ActivityFilter, now: DateTime<Utc>) -> Self {
+        let mut labels = Labels::default();
+        labels.set_events(&data.events);
+        labels.set_reviewers(info.reviewers.clone());
+        let built = build(&data, &labels, &filter, now);
+        Read {
+            data,
+            info,
+            labels,
+            filter,
+            built,
+        }
+    }
+}
+
 /// What the view should do after a key or a click.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
@@ -79,9 +175,9 @@ pub struct ActivityState {
     labels: Labels,
     /// Whether a read has landed yet.
     loaded: bool,
-    feed: Feed,
-    projects: Vec<String>,
-    workspaces: Vec<String>,
+    built: Built,
+    /// Bumped each time the feed changes, for the view's list to follow.
+    generation: u64,
     /// The line window asked of the refresher; a read with a smaller window
     /// means "load older" is still in flight.
     window: usize,
@@ -100,9 +196,8 @@ impl ActivityState {
             data: ActivityData::default(),
             labels: Labels::default(),
             loaded: false,
-            feed: Feed::default(),
-            projects: Vec::new(),
-            workspaces: Vec::new(),
+            built: Built::default(),
+            generation: 0,
             window: ACTIVITY_PAGE,
             selected: None,
             picker: None,
@@ -120,6 +215,7 @@ impl ActivityState {
     }
 
     /// Fold in a fresh read and rebuild the feed.
+    #[cfg(test)]
     pub fn apply(&mut self, data: ActivityData, now: DateTime<Utc>) {
         self.data = data;
         self.loaded = true;
@@ -127,7 +223,52 @@ impl ActivityState {
         self.rebuild(now);
     }
 
+    /// Fold in a read from the background reader, its feed built there.
+    /// Returns whether anything shown changed (most refreshes read the log
+    /// as it was: nothing to redraw). A feed built under a filter since
+    /// changed is rebuilt here.
+    pub fn adopt(&mut self, read: Read, now: DateTime<Utc>) -> bool {
+        let same = self.loaded
+            && self.label == read.info.label
+            && self.data.status == read.data.status
+            && self.data.has_older == read.data.has_older
+            && self.data.window == read.data.window
+            && self.data.events.len() == read.data.events.len();
+        self.loaded = true;
+        self.label = read.info.label;
+        self.labels = read.labels;
+        self.data = read.data;
+        if read.filter != self.filter {
+            self.rebuild(now);
+            return true;
+        }
+        // The keys hash every row's words, so comparing them stands for
+        // comparing the rows.
+        let built = &read.built;
+        if same
+            && built.keys == self.built.keys
+            && built.feed.empty == self.built.feed.empty
+            && built.projects == self.built.projects
+            && built.workspaces == self.built.workspaces
+        {
+            return false;
+        }
+        self.install(read.built);
+        true
+    }
+
+    /// The feed's generation: bumped each time the feed changes.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// One key per feed item (see [`ItemKey`]).
+    pub fn keys(&self) -> &[ItemKey] {
+        &self.built.keys
+    }
+
     /// Fold in the project's config, read beside the log.
+    #[cfg(test)]
     pub fn set_project_info(&mut self, info: ProjectInfo) {
         self.label = info.label;
         self.labels.set_reviewers(info.reviewers);
@@ -146,15 +287,18 @@ impl ActivityState {
     /// Rebuild the feed from the latest read: on a new read, a filter change,
     /// and on the clock (the relative times).
     pub fn rebuild(&mut self, now: DateTime<Utc>) {
+        let built = build(&self.data, &self.labels, &self.filter, now);
+        self.install(built);
+    }
+
+    fn install(&mut self, built: Built) {
         let selected_row = self.selected_row().cloned();
-        self.feed = build_feed(&self.data.events, &self.data.task_cache, &self.filter, now);
-        let (projects, workspaces) = filter_choices(&self.data.events, &self.data.task_cache);
-        self.projects = projects;
-        self.workspaces = workspaces;
+        self.built = built;
+        self.generation += 1;
         // Keep the selection on the same row as the feed grows above it; drop
         // it when that row is gone.
         self.selected = selected_row.and_then(|old| {
-            self.feed.items.iter().position(|item| match item {
+            self.built.feed.items.iter().position(|item| match item {
                 FeedItem::Row(r) => {
                     r.title == old.title
                         && r.verb == old.verb
@@ -167,7 +311,7 @@ impl ActivityState {
     }
 
     pub fn feed(&self) -> &Feed {
-        &self.feed
+        &self.built.feed
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -205,11 +349,11 @@ impl ActivityState {
     }
 
     pub fn projects(&self) -> &[String] {
-        &self.projects
+        &self.built.projects
     }
 
     pub fn workspaces(&self) -> &[String] {
-        &self.workspaces
+        &self.built.workspaces
     }
 
     // ---- filters ----------------------------------------------------------
@@ -254,7 +398,8 @@ impl ActivityState {
     // ---- selection --------------------------------------------------------
 
     fn row_indices(&self) -> Vec<usize> {
-        self.feed
+        self.built
+            .feed
             .items
             .iter()
             .enumerate()
@@ -263,7 +408,7 @@ impl ActivityState {
     }
 
     pub fn selected_row(&self) -> Option<&FeedRow> {
-        match self.feed.items.get(self.selected?)? {
+        match self.built.feed.items.get(self.selected?)? {
             FeedItem::Row(r) => Some(r),
             FeedItem::Day(_) => None,
         }
@@ -302,14 +447,14 @@ impl ActivityState {
     /// Select feed item `ix` without opening it (`--visual-figma`).
     #[cfg(feature = "visual-check")]
     pub fn select_item(&mut self, ix: usize) {
-        if matches!(self.feed.items.get(ix), Some(FeedItem::Row(_))) {
+        if matches!(self.built.feed.items.get(ix), Some(FeedItem::Row(_))) {
             self.selected = Some(ix);
         }
     }
 
     /// Select feed item `ix` (a click) and open it.
     pub fn click(&mut self, ix: usize) -> Vec<Intent> {
-        if !matches!(self.feed.items.get(ix), Some(FeedItem::Row(_))) {
+        if !matches!(self.built.feed.items.get(ix), Some(FeedItem::Row(_))) {
             return Vec::new();
         }
         self.selected = Some(ix);
@@ -540,5 +685,47 @@ mod tests {
             Some("awaiting input")
         );
         assert_eq!(s.selected, Some(4));
+    }
+
+    fn read(events: Vec<Event>, filter: &ActivityFilter, at: DateTime<Utc>) -> Read {
+        Read::new(data(events, true, ACTIVITY_PAGE), ProjectInfo::default(), filter.clone(), at)
+    }
+
+    #[test]
+    fn a_read_that_changes_nothing_shown_is_not_adopted_as_a_change() {
+        let keymaps = validate_keymaps_yaml("{}", None).0;
+        let mut s = ActivityState::new("demo", keymaps);
+        assert!(s.adopt(read(events(), &s.filter.clone(), now()), now()), "the first read");
+        let generation = s.generation();
+        assert!(!s.adopt(read(events(), &s.filter.clone(), now()), now()), "the same log again");
+        assert_eq!(s.generation(), generation, "the feed wasn't rebuilt");
+        // A new event is a change, and the rows under it keep their keys.
+        let before = s.keys().to_vec();
+        let mut grown = events();
+        grown.push(parse_event_line(
+            "2026-07-22T14:04:00+00:00 project=demo workspace=charlie working -> blocked",
+        ));
+        assert!(s.adopt(read(grown, &s.filter.clone(), now()), now()));
+        assert_eq!(s.keys().len(), before.len() + 1);
+        assert_eq!(s.keys()[2..], before[1..], "the older rows' keys are unchanged");
+    }
+
+    #[test]
+    fn a_read_built_under_an_older_filter_is_rebuilt_under_the_shown_one() {
+        let mut s = state();
+        let unfiltered = s.filter.clone();
+        s.toggle_kind(ActivityKind::Zen, now());
+        assert!(s.adopt(read(events(), &unfiltered, now()), now()));
+        assert_eq!(verbs(&s), ["merged"]);
+    }
+
+    #[test]
+    fn a_row_a_minute_older_keeps_its_ident_but_not_its_content() {
+        let s = state();
+        let later = build(&s.data, &s.labels, &s.filter, now() + chrono::Duration::minutes(5));
+        let (a, b) = (s.keys(), &later.keys);
+        assert_eq!(a.len(), b.len());
+        assert!(a.iter().zip(b).all(|(x, y)| x.ident == y.ident), "the same items");
+        assert!(a.iter().zip(b).any(|(x, y)| x.content != y.content), "their times moved on");
     }
 }

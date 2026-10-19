@@ -121,6 +121,7 @@ use crate::theme::motion::{SharedTrack, SlideTrack};
 use crate::theme::style::{self, IconButtonSize};
 use crate::theme::{self, Hue, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
+use crate::views::activity_reader::ActivityReader;
 use crate::views::column_swap::{self, ColumnSwap, Layer, Motion, Occupant};
 use crate::views::sidebar_reveal::{self, SidebarReveal};
 use crate::views::issues::{IssuesEvent, IssuesView};
@@ -645,6 +646,12 @@ pub struct ShelbiWindow {
     chat: Option<Entity<ChatView>>,
     /// The Activity feed and the Machines view, likewise created on first show.
     activity: Option<Entity<ActivityView>>,
+    /// The Activity feed's reader, started when the project opens so its
+    /// first read is waiting when the feed is first shown; the view takes
+    /// it then (`dt-activity-perf`). Only a live window (`Self::new`)
+    /// starts one.
+    activity_reader: Option<ActivityReader>,
+    prefetch_activity: bool,
     machines: Option<Entity<MachinesView>>,
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
     overlay: Option<ActiveOverlay>,
@@ -755,6 +762,8 @@ impl ShelbiWindow {
         // shell has data the moment bootstrap is done.
         this.start_feed(window, cx);
         this.load_keymaps(cx);
+        this.prefetch_activity = true;
+        this.prefetch_activity();
         match shared_ready {
             Some(ready) => this.on_ready(ready, cx),
             None => this.start_bootstrap(cx),
@@ -869,6 +878,8 @@ impl ShelbiWindow {
             pending_workflow_filter: None,
             chat: None,
             activity: None,
+            activity_reader: None,
+            prefetch_activity: false,
             machines: None,
             overlay: None,
             palette_inputs: PaletteInputs::default(),
@@ -1363,6 +1374,7 @@ impl ShelbiWindow {
             .unwrap_or_default();
         self.adopt_view_state(saved);
         self.start_feed(window, cx);
+        self.prefetch_activity();
         if !self.offline() {
             self.load_keymaps(cx);
             self.open_project(cx);
@@ -1436,6 +1448,8 @@ impl ShelbiWindow {
         if let Some(activity) = self.activity.take() {
             activity.update(cx, |v, _| v.stop_workers());
         }
+        // Dropping it stops it, without waiting on a read in flight.
+        self.activity_reader = None;
         if let Some(machines) = self.machines.take() {
             machines.update(cx, |v, _| v.stop_workers());
         }
@@ -2488,6 +2502,22 @@ impl ShelbiWindow {
                 .is_some_and(|r| r.read(cx).is_shown() && r.read(cx).contains_focus(window, cx))
     }
 
+    /// Start the Activity feed's reader for the window's project, so its
+    /// first read is done before the feed is first shown.
+    fn prefetch_activity(&mut self) {
+        if self.prefetch_activity && !self.chooser && self.activity.is_none() {
+            self.activity_reader = Some(ActivityReader::spawn(self.project.clone()));
+        }
+    }
+
+    /// Start the Activity reader as a live window does on open
+    /// (`--bench-activity`).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_prefetch_activity(&mut self) {
+        self.prefetch_activity = true;
+        self.prefetch_activity();
+    }
+
     /// The Activity feed for the window's project, created on first use.
     /// A task row opens the task's detail on the board; a workspace row's
     /// `FocusWorkspace` goes through [`Self::run`] like the sidebar's.
@@ -2500,7 +2530,10 @@ impl ShelbiWindow {
             return activity.clone();
         }
         let project = self.project.clone();
-        let activity = cx.new(|cx| ActivityView::new(project, cx));
+        let activity = match self.activity_reader.take() {
+            Some(reader) => cx.new(|cx| ActivityView::with_reader(project, reader, cx)),
+            None => cx.new(|cx| ActivityView::new(project, cx)),
+        };
         let sub = cx.subscribe_in(&activity, window, |this, _, ev: &ActivityEvent, window, cx| {
             match ev {
                 ActivityEvent::OpenTask(id) => this.open_task(id, window, cx),

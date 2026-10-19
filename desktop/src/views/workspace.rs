@@ -799,6 +799,22 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Put the keyboard's selection on `row`, the panel focused, and return
+    /// the row it was on (the offscreen visual check: Back's focus ring).
+    #[cfg(feature = "visual-check")]
+    pub fn select_row_for_check(&mut self, row: WsRow, cx: &mut Context<Self>) -> Option<WsRow> {
+        let was = self.panel.selected_row();
+        self.focus = WsFocus::Panel;
+        for _ in 0..self.panel.rows().len() {
+            if self.panel.selected_row() == Some(row) {
+                break;
+            }
+            self.panel.nav(-1);
+        }
+        cx.notify();
+        was
+    }
+
     fn reveal_folder(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.details.as_ref().map(|d| d.worktree.clone()).filter(|p| !p.is_empty())
         else {

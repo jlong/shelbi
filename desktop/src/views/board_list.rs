@@ -99,23 +99,27 @@ impl ColumnList {
     /// it is scrolled to the top, and the list fills the view upward from it
     /// when it is near the end.
     pub fn reveal(&self, ix: usize) {
-        let top = self.state.logical_scroll_top().item_ix;
-        let view = self.state.viewport_bounds();
-        let to_top = || {
-            self.state.scroll_to(ListOffset {
-                item_ix: ix,
-                offset_in_item: px(0.0),
-            })
-        };
-        match self.state.bounds_for_item(ix) {
-            _ if ix < top => to_top(),
-            Some(b) if b.top() < view.top() => to_top(),
-            Some(b) if b.bottom() > view.bottom() => {
-                self.state.scroll_by((b.bottom() - view.bottom()).min(b.top() - view.top()))
-            }
-            Some(_) => {}
-            None => to_top(),
-        }
+        reveal(&self.state, ix);
+    }
+}
+
+/// Scroll item `ix` of `state` into view by the least scroll (see
+/// [`ColumnList::reveal`]; the Activity feed's selection too).
+pub(super) fn reveal(state: &ListState, ix: usize) {
+    let top = state.logical_scroll_top().item_ix;
+    let view = state.viewport_bounds();
+    let to_top = || {
+        state.scroll_to(ListOffset {
+            item_ix: ix,
+            offset_in_item: px(0.0),
+        })
+    };
+    match state.bounds_for_item(ix) {
+        _ if ix < top => to_top(),
+        Some(b) if b.top() < view.top() => to_top(),
+        Some(b) if b.bottom() > view.bottom() => state.scroll_by((b.bottom() - view.bottom()).min(b.top() - view.top())),
+        Some(_) => {}
+        None => to_top(),
     }
 }
 
@@ -130,7 +134,7 @@ fn same(old: &[Item], col: &IssueColumn, rows: &[Item]) -> bool {
 
 /// The old items' range that `new` replaces and how many items replace it:
 /// everything between the longest common prefix and suffix.
-pub(super) fn changed(old: &[Item], new: &[Item]) -> (Range<usize>, usize) {
+pub(super) fn changed<T: PartialEq>(old: &[T], new: &[T]) -> (Range<usize>, usize) {
     let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let max_suffix = old.len().min(new.len()) - prefix;
     let suffix = old
