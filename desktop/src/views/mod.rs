@@ -65,6 +65,7 @@ pub mod task_detail;
 pub mod task_panel;
 pub mod settings;
 pub mod settings_nav;
+pub mod terminal_preview;
 pub mod sidebar;
 pub mod sidebar_reveal;
 pub mod update;

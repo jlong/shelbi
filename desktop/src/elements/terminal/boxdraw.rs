@@ -9,6 +9,11 @@
 //! cell's color. Light lines are 1pt at the default 14pt size (scaled with
 //! the font), heavy lines twice that. Anything not listed here (double,
 //! dashed, mixed-weight) still comes from the font.
+//!
+//! The block elements (`▀ ▄ █ ▌ ▐`, the eighths, the quadrants `▖ ▛ ▜ ...`)
+//! are drawn too, as filled parts of the cell snapped to device pixels, so a
+//! run of them is solid: from a fallback font they leave seams and stripes
+//! (Claude Code's mascot, `▐▛███▜▌`). The shades (`░ ▒ ▓`) stay the font's.
 
 use gpui::{point, px, size, Bounds, Pixels, Point};
 
@@ -38,12 +43,23 @@ pub enum Corner {
     RightUp,
 }
 
+/// A part of a cell a block element fills, in eighths of the cell from its
+/// top-left corner: `(left, top, right, bottom)`.
+pub type Eighths = (u8, u8, u8, u8);
+
 /// A character the pane draws itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoxGlyph {
     Lines(Arms),
     Arc(Corner),
+    /// A block element: the parts it fills (which never overlap).
+    Block(&'static [Eighths]),
 }
+
+const UPPER_LEFT: Eighths = (0, 0, 4, 4);
+const UPPER_RIGHT: Eighths = (4, 0, 8, 4);
+const LOWER_LEFT: Eighths = (0, 4, 4, 8);
+const LOWER_RIGHT: Eighths = (4, 4, 8, 8);
 
 /// The drawing for `c`, or `None` when the font draws it.
 pub fn builtin(c: char) -> Option<BoxGlyph> {
@@ -84,8 +100,46 @@ pub fn builtin(c: char) -> Option<BoxGlyph> {
         '╮' => Some(BoxGlyph::Arc(Corner::LeftDown)),
         '╯' => Some(BoxGlyph::Arc(Corner::LeftUp)),
         '╰' => Some(BoxGlyph::Arc(Corner::RightUp)),
+        '▀'..='▟' => block(c).map(BoxGlyph::Block),
         _ => None,
     }
+}
+
+/// The parts block element `c` fills (U+2580 to U+259F), or `None` for the
+/// shades, which the font draws.
+fn block(c: char) -> Option<&'static [Eighths]> {
+    Some(match c {
+        '▀' => &[(0, 0, 8, 4)],
+        '▁' => &[(0, 7, 8, 8)],
+        '▂' => &[(0, 6, 8, 8)],
+        '▃' => &[(0, 5, 8, 8)],
+        '▄' => &[(0, 4, 8, 8)],
+        '▅' => &[(0, 3, 8, 8)],
+        '▆' => &[(0, 2, 8, 8)],
+        '▇' => &[(0, 1, 8, 8)],
+        '█' => &[(0, 0, 8, 8)],
+        '▉' => &[(0, 0, 7, 8)],
+        '▊' => &[(0, 0, 6, 8)],
+        '▋' => &[(0, 0, 5, 8)],
+        '▌' => &[(0, 0, 4, 8)],
+        '▍' => &[(0, 0, 3, 8)],
+        '▎' => &[(0, 0, 2, 8)],
+        '▏' => &[(0, 0, 1, 8)],
+        '▐' => &[(4, 0, 8, 8)],
+        '▔' => &[(0, 0, 8, 1)],
+        '▕' => &[(7, 0, 8, 8)],
+        '▖' => &[LOWER_LEFT],
+        '▗' => &[LOWER_RIGHT],
+        '▘' => &[UPPER_LEFT],
+        '▙' => &[UPPER_LEFT, LOWER_LEFT, LOWER_RIGHT],
+        '▚' => &[UPPER_LEFT, LOWER_RIGHT],
+        '▛' => &[UPPER_LEFT, UPPER_RIGHT, LOWER_LEFT],
+        '▜' => &[UPPER_LEFT, UPPER_RIGHT, LOWER_RIGHT],
+        '▝' => &[UPPER_RIGHT],
+        '▞' => &[UPPER_RIGHT, LOWER_LEFT],
+        '▟' => &[UPPER_RIGHT, LOWER_LEFT, LOWER_RIGHT],
+        _ => return None,
+    })
 }
 
 /// The light line's thickness at `font_size`: 1pt at the default 14pt.
@@ -204,6 +258,19 @@ pub fn draw(glyph: BoxGlyph, cell: Bounds<Pixels>, light: Pixels, scale: f32) ->
                 width: px(hy1 - hy0),
             })
         }
+        BoxGlyph::Block(parts) => {
+            // Each eighth's edge snapped on its own, so a cell's edge is the
+            // same pixel as its neighbor's and the parts tile the cell.
+            let (w, h) = (cell.size.width.as_f32(), cell.size.height.as_f32());
+            let x = |e: u8| snap(cell.left().as_f32() + w * e as f32 / 8.0, scale);
+            let y = |e: u8| snap(cell.top().as_f32() + h * e as f32 / 8.0, scale);
+            Drawing::Quads(
+                parts
+                    .iter()
+                    .map(|&(x0, y0, x1, y1)| rect(x(x0), y(y0), x(x1), y(y1)))
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -300,6 +367,43 @@ mod tests {
         assert_eq!(arc.to.x.as_f32(), (rule.left().as_f32() + rule.right().as_f32()) / 2.0);
         assert_eq!(arc.to.y, cell().bottom());
         assert_eq!(arc.width, px(1.0));
+    }
+
+    #[test]
+    fn block_elements_fill_their_parts_and_neighbors_join() {
+        let c = cell();
+        let full = quads('█', 1.0);
+        assert_eq!(full.len(), 1);
+        assert!(on_device_pixels(&full[0], 1.0));
+        assert!((full[0].size.height.as_f32() - 18.0).abs() < 1e-3);
+        // ▐ is the right half, ▄ the bottom half.
+        let right = quads('▐', 1.0)[0];
+        assert_eq!(right.right(), full[0].right());
+        assert!((right.left().as_f32() - (c.left().as_f32() + 4.2)).abs() <= 0.5);
+        let lower = quads('▄', 1.0)[0];
+        assert_eq!((lower.top(), lower.bottom()), (px(c.top().as_f32() + 9.0), full[0].bottom()));
+        // A quadrant set: ▛ is three quarters that tile without overlapping
+        // and leave the lower right empty.
+        let q = quads('▛', 2.0);
+        assert_eq!(q.len(), 3);
+        for (i, a) in q.iter().enumerate() {
+            assert!(on_device_pixels(a, 2.0));
+            for b in &q[i + 1..] {
+                assert!(!a.intersects(b), "{a:?} overlaps {b:?}");
+            }
+        }
+        let lr = point(c.right() - px(1.0), c.bottom() - px(1.0));
+        assert!(!q.iter().any(|b| b.contains(&lr)));
+        // Side by side, two full blocks share an edge: no seam.
+        let next = Bounds { origin: point(c.right(), c.top()), ..c };
+        let Drawing::Quads(b) = draw(builtin('█').unwrap(), next, px(1.0), 1.0) else {
+            unreachable!()
+        };
+        assert_eq!(full[0].right(), b[0].left());
+        // The shades stay the font's.
+        for shade in ['░', '▒', '▓'] {
+            assert_eq!(builtin(shade), None);
+        }
     }
 
     #[test]

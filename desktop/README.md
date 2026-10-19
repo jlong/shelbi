@@ -28,8 +28,9 @@ The app reads `~/.shelbi/config.yaml` (shared with the CLI and the TUI). The
 settings view (⌘,) edits the `desktop:` block, and terminal settings apply to
 open terminals at once. Its own sidebar stands in the app sidebar's place
 while it is open, with three pages: General (theme, the CLI, notifications,
-⌘1), Keybindings (`keys.yaml`, ⌘2) and Terminal (font, size, the Option key,
-⌘3). Back or Esc returns to the view it was opened over.
+⌘1), Keybindings (`keys.yaml`, ⌘2) and Terminal (font, size, ANSI
+colors with a live preview, the Option key, ⌘3). Back or Esc returns to
+the view it was opened over.
 
 ```yaml
 theme: auto                          # auto (follows the system), dark, light; shared with the TUI
@@ -39,6 +40,10 @@ desktop:
   terminal_font_family: Source Code Pro   # the default; bundled with the app
   terminal_font_size: 14             # points, 6 to 72 (Settings and ⌘+ / ⌘− step within 8 to 32)
   option_as_meta: false              # true, left, or right (Ghostty's shape)
+  terminal_colors:                   # only the ANSI colors you changed; the rest follow the theme
+    red:
+      regular: "#E04F52"             # ANSI 1
+      bold: "#E69589"                # ANSI 9, the bright red
   notifications:                     # every kind is on unless switched off
     workspace_blocked: true          # an agent waits for input or a permission
     review_ready: true               # a task reaches the review column
@@ -53,6 +58,7 @@ desktop:
 | `desktop.terminal_font_family` | Source Code Pro | Terminal font. Settings picks it from the bundled faces and the installed monospaced families; one that isn't installed falls back to Source Code Pro. |
 | `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72; Settings' stepper and ⌘+ / ⌘− step it by 1 within 8 to 32), on 18pt rows at the default. ⌘+ / ⌘− / ⌘0 write it too. |
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
+| `desktop.terminal_colors.<color>.regular` / `.bold` | the theme's | Terminal ANSI colors as `#rrggbb`, for `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan` and `white` (regular is ANSI 0 to 7, bold the bright 8 to 15). Settings writes only the colors that differ from the theme's (dark: the Sensible palette; light: its own set), applies them to open terminals at once, and Reset removes them all. A value that isn't a color is ignored. |
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
 | `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. |
 

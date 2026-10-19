@@ -101,6 +101,13 @@ pub struct DesktopConfig {
     /// Every kind is on unless switched off.
     #[serde(default, skip_serializing_if = "DesktopNotifications::is_empty")]
     pub notifications: DesktopNotifications,
+
+    /// The desktop app's terminal ANSI colors (`terminal_colors:`): a
+    /// `#rrggbb` per color the user changed, regular and bold. Unset colors
+    /// take the app's palette for the appearance, so only what was changed
+    /// is written and the defaults can move.
+    #[serde(default, skip_serializing_if = "TerminalColors::is_empty")]
+    pub terminal_colors: TerminalColors,
 }
 
 /// Which Option keys act as Meta in the desktop app's terminals
@@ -165,6 +172,122 @@ impl DesktopConfig {
             && self.terminal_font_size.is_none()
             && self.option_as_meta.is_none()
             && self.notifications.is_empty()
+            && self.terminal_colors.is_empty()
+    }
+}
+
+/// The ANSI colors the user changed in the desktop app's terminals
+/// (`desktop.terminal_colors:`), keyed by color name, each with its
+/// `regular` (ANSI 0 to 7) and `bold` (the bright eight, 8 to 15) value:
+///
+/// ```yaml
+/// terminal_colors:
+///   red:
+///     regular: "#e04f52"
+///     bold: "#e69589"
+/// ```
+///
+/// The values are kept as written; the app parses them and ignores one that
+/// isn't a `#rrggbb` color.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalColors {
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub black: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub red: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub green: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub yellow: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub blue: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub magenta: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub cyan: AnsiPair,
+    #[serde(default, skip_serializing_if = "AnsiPair::is_empty")]
+    pub white: AnsiPair,
+}
+
+/// One color's two values in [`TerminalColors`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsiPair {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regular: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<String>,
+}
+
+impl AnsiPair {
+    /// Whether neither value is set (so the color isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.regular.is_none() && self.bold.is_none()
+    }
+}
+
+impl TerminalColors {
+    /// The colors' names, in ANSI order (black is 0, white 7).
+    pub const NAMES: [&'static str; 8] = [
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    ];
+
+    fn pairs(&self) -> [&AnsiPair; 8] {
+        [
+            &self.black,
+            &self.red,
+            &self.green,
+            &self.yellow,
+            &self.blue,
+            &self.magenta,
+            &self.cyan,
+            &self.white,
+        ]
+    }
+
+    fn pair_mut(&mut self, color: usize) -> &mut AnsiPair {
+        match color {
+            0 => &mut self.black,
+            1 => &mut self.red,
+            2 => &mut self.green,
+            3 => &mut self.yellow,
+            4 => &mut self.blue,
+            5 => &mut self.magenta,
+            6 => &mut self.cyan,
+            _ => &mut self.white,
+        }
+    }
+
+    /// The value written for ANSI color `slot` (0 to 15: 0 to 7 a color's
+    /// regular value, 8 to 15 its bold one), if any.
+    pub fn get(&self, slot: usize) -> Option<&str> {
+        if slot >= 16 {
+            return None;
+        }
+        let pair = self.pairs()[slot % 8];
+        if slot < 8 {
+            pair.regular.as_deref()
+        } else {
+            pair.bold.as_deref()
+        }
+    }
+
+    /// Set (or, with `None`, clear) ANSI color `slot`'s value. A slot past
+    /// 15 is ignored.
+    pub fn set(&mut self, slot: usize, value: Option<String>) {
+        if slot >= 16 {
+            return;
+        }
+        let pair = self.pair_mut(slot % 8);
+        if slot < 8 {
+            pair.regular = value;
+        } else {
+            pair.bold = value;
+        }
+    }
+
+    /// Whether no color is set (so the block isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.pairs().iter().all(|p| p.is_empty())
     }
 }
 
@@ -698,6 +821,34 @@ mod tests {
         let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
         assert!(!yaml.contains("editor"), "unset editor omitted: {yaml}");
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn terminal_colors_write_only_what_is_set() {
+        let mut colors = TerminalColors::default();
+        assert!(colors.is_empty());
+        colors.set(1, Some("#e04f52".into()));
+        colors.set(15, Some("#ffffff".into()));
+        colors.set(16, Some("#000000".into()));
+        assert_eq!((colors.get(1), colors.get(9), colors.get(15)), (Some("#e04f52"), None, Some("#ffffff")));
+        assert_eq!(colors.get(16), None, "past the sixteen");
+        let cfg = UserConfig {
+            desktop: DesktopConfig {
+                terminal_colors: colors.clone(),
+                ..DesktopConfig::default()
+            },
+            ..UserConfig::default()
+        };
+        let text = serde_yaml::to_string(&cfg).unwrap();
+        assert!(text.contains("red:\n      regular: '#e04f52'"), "{text}");
+        assert!(!text.contains("black") && !text.contains("bold: null"), "{text}");
+        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(back.desktop.terminal_colors, colors);
+
+        colors.set(1, None);
+        colors.set(15, None);
+        assert!(colors.is_empty());
+        assert!(DesktopConfig { terminal_colors: colors, ..DesktopConfig::default() }.is_empty());
     }
 
     #[test]

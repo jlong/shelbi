@@ -1,6 +1,8 @@
-//! The terminal's settings: font family and size, and which Option keys are
-//! Meta. Read from `~/.shelbi/config.yaml` (`desktop.terminal_font_family`,
-//! `desktop.terminal_font_size`, `desktop.option_as_meta`) and held
+//! The terminal's settings: font family and size, which Option keys are
+//! Meta, and the ANSI colors the user changed. Read from
+//! `~/.shelbi/config.yaml` (`desktop.terminal_font_family`,
+//! `desktop.terminal_font_size`, `desktop.option_as_meta`,
+//! `desktop.terminal_colors`) and held
 //! as a gpui [`Global`]; the settings view sets the global after a save, and
 //! every pane observes it, so a change applies to open terminals at once.
 //!
@@ -14,6 +16,7 @@ use std::sync::Arc;
 use gpui::{App, Global};
 use shelbi_state::{DesktopConfig, OptionAsMeta};
 
+use super::colors::{self, AnsiOverrides};
 use super::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 
 /// The smallest and largest font size the terminal accepts (points), for a
@@ -75,6 +78,9 @@ pub struct TerminalSettings {
     /// with a named key (Enter, arrows, Backspace, Delete) is Meta whatever
     /// this says.
     pub option_as_meta: OptionAsMeta,
+    /// The ANSI colors the user changed, over the theme's
+    /// ([`super::colors`]).
+    pub ansi: AnsiOverrides,
 }
 
 impl Default for TerminalSettings {
@@ -84,6 +90,7 @@ impl Default for TerminalSettings {
             font_size: DEFAULT_FONT_SIZE,
             font_size_setting: None,
             option_as_meta: OptionAsMeta::Off,
+            ansi: [None; 16],
         }
     }
 }
@@ -107,6 +114,7 @@ impl TerminalSettings {
             }),
             font_size_setting: cfg.terminal_font_size,
             option_as_meta: cfg.option_as_meta.unwrap_or(defaults.option_as_meta),
+            ansi: colors::from_config(&cfg.terminal_colors),
         }
     }
 
