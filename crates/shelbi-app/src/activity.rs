@@ -508,25 +508,27 @@ impl ActivityMetaCache {
 /// reach the network. Without this, every open id the feed referenced was
 /// re-fetched every 15s for as long as the TUI stayed open. A `file_system`
 /// board, or a missing / mismatched index, leaves `wanted` untouched.
+/// Returns whether the board is remote (what's left of `wanted` then waits
+/// on the network).
 fn serve_open_ids_from_index(
     project_name: &str,
     wanted: &mut Vec<String>,
     cache: &mut ActivityMetaCache,
     now: Instant,
-) {
+) -> bool {
     let Ok(project) = shelbi_state::load_project(project_name) else {
-        return;
+        return false;
     };
     let cfg = &project.issue_tracker;
     if !cfg.backend.is_remote() {
-        return;
+        return false;
     }
     let Ok(state) = shelbi_state::read_board_with_cfg(project_name, cfg) else {
-        return;
+        return true;
     };
     let mut board = state.into_issues();
     if board.is_empty() {
-        return;
+        return true;
     }
     shelbi_state::fold_assignment_overlay(project_name, cfg, &mut board);
     let mut by_id: HashMap<String, shelbi_state::IssueFile> =
@@ -552,6 +554,26 @@ fn serve_open_ids_from_index(
         );
         false
     });
+    true
+}
+
+/// How far one resolve pass may reach for titles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The cache, the local board index and a filesystem board's task files:
+    /// never the network.
+    Local,
+    /// Everything, the tracker included.
+    All,
+}
+
+/// One resolve pass: the snapshot, and what it left for later.
+struct Resolved {
+    cache: TaskCache,
+    /// A [`Reach::Local`] pass left ids that only the tracker can resolve.
+    needs_network: bool,
+    /// More ids wanted resolving than one batch takes; a later pass continues.
+    more: bool,
 }
 
 /// Resolve task metadata for the ids referenced by `events`, folding the result
@@ -573,6 +595,21 @@ pub fn resolve_task_meta_into(
     cache: &mut ActivityMetaCache,
     now: Instant,
 ) -> TaskCache {
+    resolve_task_meta(project_name, events, cache, now, Reach::All).cache
+}
+
+fn resolve_task_meta(
+    project_name: &str,
+    events: &[Event],
+    cache: &mut ActivityMetaCache,
+    now: Instant,
+    reach: Reach,
+) -> Resolved {
+    let done = |cache: &ActivityMetaCache, needs_network: bool, more: bool| Resolved {
+        cache: cache.entries.clone(),
+        needs_network,
+        more,
+    };
     // Candidate ids: unique, referenced, unknown-or-stale, and not currently
     // backing off from a recent fetch error.
     let mut wanted: Vec<String> = Vec::new();
@@ -589,8 +626,10 @@ pub fn resolve_task_meta_into(
             wanted.push(id.to_string());
         }
     }
-    if !wanted.is_empty() {
-        serve_open_ids_from_index(project_name, &mut wanted, cache, now);
+    let remote = !wanted.is_empty() && serve_open_ids_from_index(project_name, &mut wanted, cache, now);
+    if reach == Reach::Local && remote && !wanted.is_empty() {
+        // The rest are the tracker's to answer: a later full pass.
+        return done(cache, true, false);
     }
 
     if wanted.is_empty() {
@@ -607,10 +646,11 @@ pub fn resolve_task_meta_into(
                 "activity title hydration complete; feed is quiet"
             );
         }
-        return cache.entries.clone();
+        return done(cache, false, false);
     }
 
     let total_wanted = wanted.len();
+    let more = total_wanted > MAX_META_RESOLVE_PER_PASS;
     // Resolve at most one batch this pass; the next pass continues.
     wanted.truncate(MAX_META_RESOLVE_PER_PASS);
 
@@ -635,7 +675,7 @@ pub fn resolve_task_meta_into(
 
     let store = match shelbi_state::issue_store_for(project_name) {
         Ok(s) => s,
-        Err(_) => return cache.entries.clone(),
+        Err(_) => return done(cache, false, false),
     };
     let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
     // `fetch_many_partial` isolates per-id failures: it returns the ids that
@@ -655,7 +695,7 @@ pub fn resolve_task_meta_into(
             for id in &wanted {
                 cache.note_fetch_failure(id, now);
             }
-            return cache.entries.clone();
+            return done(cache, false, more);
         }
     };
     let mut resolved: HashSet<String> = HashSet::new();
@@ -707,7 +747,7 @@ pub fn resolve_task_meta_into(
             },
         );
     }
-    cache.entries.clone()
+    done(cache, false, more)
 }
 
 impl Event {
@@ -787,16 +827,10 @@ pub fn read_activity_window(
     cache: &Mutex<ActivityMetaCache>,
     window: usize,
 ) -> ActivityData {
-    let path = match events_log_path() {
-        Ok(p) => p,
-        Err(e) => return ActivityData::failed(format!("events.log path failed: {e}")),
-    };
-    let (text, has_older) = match read_last_lines(&path, window) {
+    let (events, has_older) = match read_window_events(window) {
         Ok(read) => read,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
-        Err(e) => return ActivityData::failed(format!("read events.log: {e}")),
+        Err(failed) => return failed,
     };
-    let events = parse_lines(&text);
     let task_cache = resolve_locked(project_name, &events, cache);
     ActivityData {
         events,
@@ -805,6 +839,70 @@ pub fn read_activity_window(
         has_older,
         window: Some(window),
     }
+}
+
+/// A [`read_activity_window_staged`] read.
+#[derive(Debug, Clone, Default)]
+pub struct WindowRead {
+    pub data: ActivityData,
+    /// More titles wait than one pass resolves: reading again soon fills
+    /// them in (a batch a pass).
+    pub more_titles: bool,
+}
+
+/// [`read_activity_window`] for a feed that shows what it has first: when
+/// some of the window's titles wait on a remote tracker, `early` is handed
+/// the read with the titles already at hand (the cache, the board index)
+/// before the tracker is asked, and the call returns the read with them
+/// resolved. `early` isn't called when nothing waits on the network.
+pub fn read_activity_window_staged(
+    project_name: &str,
+    cache: &Mutex<ActivityMetaCache>,
+    window: usize,
+    early: impl FnOnce(ActivityData),
+) -> WindowRead {
+    let (events, has_older) = match read_window_events(window) {
+        Ok(read) => read,
+        Err(data) => return WindowRead { data, more_titles: false },
+    };
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    let local = resolve_task_meta(project_name, &events, &mut guard, now, Reach::Local);
+    let resolved = if local.needs_network {
+        early(ActivityData {
+            events: events.clone(),
+            task_cache: local.cache,
+            status: None,
+            has_older,
+            window: Some(window),
+        });
+        resolve_task_meta(project_name, &events, &mut guard, now, Reach::All)
+    } else {
+        local
+    };
+    WindowRead {
+        data: ActivityData {
+            events,
+            task_cache: resolved.cache,
+            status: None,
+            has_older,
+            window: Some(window),
+        },
+        more_titles: resolved.more,
+    }
+}
+
+/// The newest `window` lines of `events.log`, parsed, and whether older ones
+/// exist; the failed read for the status line when the log won't read.
+fn read_window_events(window: usize) -> Result<(Vec<Event>, bool), ActivityData> {
+    let path = events_log_path()
+        .map_err(|e| ActivityData::failed(format!("events.log path failed: {e}")))?;
+    let (text, has_older) = match read_last_lines(&path, window) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+        Err(e) => return Err(ActivityData::failed(format!("read events.log: {e}"))),
+    };
+    Ok((parse_lines(&text), has_older))
 }
 
 fn parse_lines(text: &str) -> Vec<Event> {
@@ -1739,7 +1837,7 @@ pub type TaskCache = HashMap<String, TaskCacheEntry>;
 ///                    real, alive, and animated on hover
 ///                    ⎇ shelbi/home-feature-grid
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FeedRow {
     /// The bracketed identity chip (`[alpha]`, `[you]`, `[zen]`).
     pub chip: Option<Chip>,
@@ -1770,7 +1868,7 @@ pub struct FeedRow {
 /// A bracketed identity chip. Agent chips carry the workspace tint, bold;
 /// `you` and machine sources are dimmed so human and agent activity stand out
 /// from machine noise.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chip {
     pub label: String,
     pub tone: Tone,
@@ -1785,7 +1883,7 @@ impl Chip {
 }
 
 /// The colored outcome pill pinned to the right of a task row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pill {
     pub text: String,
     pub tone: Tone,
@@ -1800,7 +1898,7 @@ impl Pill {
 
 /// The dim second line: a git branch (shown with [`BRANCH_ICON`]) or any other
 /// muted context fragment (`backlog → todo`, a zen bail reason, ...).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Secondary {
     Branch(String),
     Detail(String),
@@ -1818,7 +1916,7 @@ impl Secondary {
 
 /// What a row is about, for click-through: its task (opens the task detail)
 /// or its workspace (focuses the workspace).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RowTarget {
     Task(String),
     Workspace(String),
@@ -1828,7 +1926,7 @@ pub enum RowTarget {
 // Rows are the common case and a feed is built once per refresh, so a boxed
 // row would only add an allocation per row.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FeedItem {
     /// A day header: `Today`, `Yesterday`, `Monday, July 20`.
     Day(String),
@@ -4624,5 +4722,81 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
 
         std::env::remove_var("SHELBI_HOME");
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The desktop's first paint (`dt-activity-perf`): a staged read hands
+    /// over the titles at hand (the board index's open ones) before the
+    /// tracker is asked for the closed ones, and a filesystem board, with
+    /// nothing waiting on the network, reads once.
+    #[test]
+    fn a_staged_read_shows_the_local_titles_before_asking_the_tracker() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_dir("staged");
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-staged");
+        let now = Utc::now();
+        let open = shelbi_state::IssueFile {
+            task: shelbi_core::Issue {
+                id: "o1".into(),
+                title: "Open One".into(),
+                column: Column::in_progress(),
+                priority: 0,
+                assigned_to: None,
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                params: std::collections::BTreeMap::new(),
+                created_at: now,
+                updated_at: now,
+            },
+            body: String::new(),
+            tracker_assignees: Vec::new(),
+        };
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![open]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("actv-staged", &idx).unwrap();
+        fs::write(
+            home.join("events.log"),
+            "2026-07-22T14:00:00+00:00 project=actv-staged task=o1 workflow=app todo -> in_progress reason=user:cli\n\
+             2026-07-22T14:01:00+00:00 project=actv-staged task=d1 workflow=app review -> done reason=user:cli\n",
+        )
+        .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |_args: &[&str]| {
+            rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(String::new())
+        });
+        let cache = Mutex::new(ActivityMetaCache::default());
+        let mut early = None;
+        let read = read_activity_window_staged("actv-staged", &cache, ACTIVITY_PAGE, |data| {
+            early = Some((data, calls.load(std::sync::atomic::Ordering::SeqCst)));
+        });
+        let (data, calls_before) = early.expect("d1 waits on the tracker, so the local titles come first");
+        assert_eq!(calls_before, 0, "before any gh call");
+        assert_eq!(data.events.len(), 2);
+        assert_eq!(task_meta(&data.task_cache, "o1").map(|m| m.title.as_str()), Some("Open One"));
+        assert!(task_meta(&data.task_cache, "d1").is_none());
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0, "then the tracker is asked");
+        assert_eq!(read.data.events.len(), 2);
+        assert!(!read.more_titles);
+        shelbi_state::clear_test_gh_runner();
+
+        // A filesystem board resolves locally: one read, no early one.
+        let fs_home = temp_dir("staged-fs");
+        std::env::set_var("SHELBI_HOME", &fs_home);
+        fs::write(fs_home.join("events.log"), log_lines(3)).unwrap();
+        let cache = Mutex::new(ActivityMetaCache::default());
+        let read = read_activity_window_staged("demo", &cache, ACTIVITY_PAGE, |_| panic!("no early read"));
+        assert_eq!(read.data.events.len(), 3);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&fs_home);
     }
 }

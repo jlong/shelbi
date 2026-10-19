@@ -42,6 +42,8 @@
 
 pub mod activity;
 pub mod activity_labels;
+mod activity_list;
+pub mod activity_reader;
 pub mod activity_state;
 pub mod board_list;
 pub mod board_scroll;

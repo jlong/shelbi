@@ -4,6 +4,8 @@
 //! state, plus a check that each state shows what it should:
 //!
 //! - `workspace-working.png`: a working workspace, its panel and agent;
+//! - `workspace-back-focused.png`: the same, the keyboard on Back (its
+//!   focus ring);
 //! - `workspace-shell.png`: the user shell open beside the agent;
 //! - `workspace-idle.png`: an idle workspace's reduced panel and placeholder;
 //! - `workspace-remote-reconnecting.png`: a remote workspace whose SSH
@@ -323,6 +325,15 @@ impl Run {
         );
 
         self.save("workspace-working.png");
+
+        // The keyboard on Back: the focus ring around it, the button's own
+        // fill inside (a shadow under its translucent fill showed through
+        // as a blue square).
+        let was = self.update(|v, _, cx| v.select_row_for_check(WsRow::Back, cx));
+        self.save("workspace-back-focused.png");
+        if let Some(was) = was {
+            self.update(|v, _, cx| v.select_row_for_check(was, cx));
+        }
 
         // The user shell beside it.
         self.update(|v, window, cx| v.toggle_shell(window, cx));

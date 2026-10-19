@@ -18,6 +18,7 @@
 //!   `system <action> Shelbi daemon`, the reason on the second line.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use shelbi_app::activity::{category_tone, Event, FeedRow, Pill, RowTarget, Secondary};
 use shelbi_app::theme::Tone;
@@ -117,6 +118,20 @@ impl Labels {
             line.secondary = None;
         }
         line
+    }
+
+    /// Hash what [`Self::line`] reads beyond `row` itself (its task's status
+    /// now, whether its workspace reviews), so a row whose words change with
+    /// them reads as changed (`dt-activity-perf`'s list keys).
+    pub fn hash_context<H: Hasher>(&self, row: &FeedRow, h: &mut H) {
+        if row.pill.is_some() {
+            if let Some(RowTarget::Task(id)) = &row.target {
+                self.statuses.get(id).hash(h);
+            }
+        }
+        if let Some(chip) = row.chip.as_ref().filter(|c| c.bold) {
+            self.reviewers.contains(&chip.label).hash(h);
+        }
     }
 
     fn tag(&self, pill: &Pill, target: Option<&RowTarget>) -> (String, Tone) {

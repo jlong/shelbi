@@ -59,14 +59,28 @@ pub(super) fn column_list(list: List, state: &ListState, board: &BoardScroll) ->
         .flex_1()
         .min_h_0()
         .child(list.with_sizing_behavior(ListSizingBehavior::Auto).flex_1().min_h_0())
-        .child(column_wheel(state.clone(), board.handle.clone()))
+        .child(column_wheel(state.clone(), Some(board.handle.clone())))
+}
+
+/// A list over `state` filling a flex column on its own (the Activity feed):
+/// [`column_list`] with no board beside it, a wheel mouse's lines stepped at
+/// the window's line height as a scroll container steps them.
+pub(super) fn wheel_list(list: List, state: &ListState) -> Div {
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(list.with_sizing_behavior(ListSizingBehavior::Auto).flex_1().min_h_0())
+        .child(column_wheel(state.clone(), None))
 }
 
 /// An invisible layer over a column's list that takes a wheel mouse's
 /// vertical lines (in the capture phase, before the list's own handler) and
 /// scrolls the list by them at the window's line height, the step the
 /// board's scroll containers take. Trackpad deltas and shift+wheel pass by.
-fn column_wheel(list: ListState, board: ScrollHandle) -> AnyElement {
+fn column_wheel(list: ListState, board: Option<ScrollHandle>) -> AnyElement {
     canvas(
         |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
@@ -87,7 +101,7 @@ fn column_wheel(list: ListState, board: ScrollHandle) -> AnyElement {
                 cx.stop_propagation();
                 list.scroll_by(-delta.y);
                 // The board took a wheel's x beside a column's y.
-                if delta.x != Pixels::ZERO {
+                if let Some(board) = board.as_ref().filter(|_| delta.x != Pixels::ZERO) {
                     let offset = board.offset();
                     board.set_offset(point(clamp_x(offset.x + delta.x, board.max_offset().x), offset.y));
                 }

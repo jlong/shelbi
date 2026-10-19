@@ -7,36 +7,42 @@
 //!
 //! The view is a thin gpui shell over [`ActivityState`] (`activity_state.rs`).
 //! Its data comes from the shared activity reader on its own background
-//! refresher (`shelbi_app::spawn_worker` over
-//! `shelbi_app::activity::read_activity_window`), re-read on the TUI's 750ms
-//! cadence so new events appear live. The read is windowed: it parses only the
-//! newest lines of `events.log`, and "Load older" re-reads with a window one
-//! page larger. Task titles resolve incrementally into a cache the refresher
-//! keeps across reads, never on the UI thread.
+//! thread ([`ActivityReader`], over
+//! `shelbi_app::activity::read_activity_window_staged`), re-read on the TUI's
+//! 750ms cadence so new events appear live. The read is windowed: it parses
+//! only the newest lines of `events.log`, and "Load older" re-reads with a
+//! window one page larger. Task titles resolve incrementally into a cache the
+//! reader keeps across reads, never on the UI thread, and each read's feed is
+//! built there too.
+//!
+//! Fast to show and to scroll (`dt-activity-perf`): a read is folded the
+//! moment it lands (the view awaits the reader, it doesn't poll it), the
+//! window starts its reader when it opens so the first read is waiting when
+//! Activity is first shown, a read that changes nothing redraws nothing, and
+//! the feed is a virtualized list (`activity_list.rs`) that builds only the
+//! rows in view.
 //!
 //! Clicking (or Enter on) a row opens what it is about: a task row asks the
 //! window to open the task's detail ([`ActivityEvent::OpenTask`]); a workspace
 //! row runs `CommandKind::FocusWorkspace` through the window's dispatch.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    div, prelude::*, px, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle,
-    HighlightStyle, Hsla, KeyDownEvent, Pixels, ScrollHandle, SharedString, StyledText, Task,
-    Window,
+    div, prelude::*, px, AnyElement, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle,
+    HighlightStyle, Hsla, KeyDownEvent, Pixels, SharedString, StyledText, Task, Window,
 };
-use shelbi_app::activity::{
-    read_activity_window, ActivityData, ActivityKind, ActivityMetaCache, FeedItem, RowTarget,
-};
+use shelbi_app::activity::{ActivityKind, FeedItem, RowTarget};
 use shelbi_app::theme::Tone;
 use shelbi_app::CommandKind;
 use shelbi_state::keymap::{ActivityAction, DisplayStyle};
 
 use super::activity_labels::{Actor, Line};
-use super::activity_state::{ActivityState, Intent, Picker, ProjectInfo};
+use super::activity_list::FeedList;
+use super::activity_reader::ActivityReader;
+use super::activity_state::{ActivityState, Intent, ItemKey, Picker, Read};
+use super::{board_list, board_scroll};
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
@@ -46,12 +52,10 @@ use crate::theme::style::{Type, Typography};
 
 /// The TUI's activity refresh cadence.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
-/// How often the view drains its refresher.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The clock the feed's relative times and day groups read: the wall clock,
 /// or the time `--visual-figma` pinned so its frames read as the mockups do.
-fn now() -> DateTime<Utc> {
+pub(super) fn now() -> DateTime<Utc> {
     #[cfg(feature = "visual-check")]
     if let Some(at) = PINNED_NOW.get() {
         return *at;
@@ -89,38 +93,60 @@ pub struct ActivityView {
     state: ActivityState,
     focus: FocusHandle,
     needs_focus: bool,
-    /// Each read is the log's window and the project's config beside it.
-    refresher: shelbi_app::Refresher<(ActivityData, ProjectInfo)>,
-    /// The line window the refresher reads with; "load older" grows it.
-    window: Arc<AtomicUsize>,
-    last_refresh: Instant,
-    scroll: ScrollHandle,
+    reader: ActivityReader,
+    /// The feed's items in view, built as they scroll in.
+    list: FeedList,
+    /// The feed generation and the rows under it the list last synced to.
+    synced: Option<(u64, Vec<ItemKey>)>,
     display_style: DisplayStyle,
-    _poll: Task<()>,
+    /// Folds each read as it lands.
+    _reads: Task<()>,
+    /// Asks for a read on the refresh cadence.
+    _cadence: Task<()>,
+}
+
+/// A row under the feed's items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trailing {
+    /// Every loaded row filtered away while older events may match.
+    EmptyNote(&'static str),
+    /// "Load older" (or where the log starts) and the loaded count.
+    Paging,
 }
 
 impl EventEmitter<ActivityEvent> for ActivityView {}
 
 impl ActivityView {
     pub fn new(project: String, cx: &mut Context<Self>) -> Self {
+        let reader = ActivityReader::spawn(project.clone());
+        Self::with_reader(project, reader, cx)
+    }
+
+    /// The view over `reader`, which the window may have started when it
+    /// opened: a read that has already landed is shown on the first frame.
+    pub fn with_reader(project: String, reader: ActivityReader, cx: &mut Context<Self>) -> Self {
         let (keymaps, diagnostics) = shelbi_state::keymap::load_keymaps(Some(&project));
         for d in diagnostics {
             tracing::warn!("keys.yaml: {d:?}");
         }
-        let state = ActivityState::new(project.clone(), keymaps);
-        let window = Arc::new(AtomicUsize::new(state.window()));
-        // The title cache lives as long as the view, so each read only
-        // resolves ids it hasn't seen (the TUI shell's incremental rule).
-        let cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
-        let (p, w) = (project.clone(), window.clone());
-        let refresher = shelbi_app::spawn_worker(move |_| {
-            let data = read_activity_window(&p, &cache, w.load(Ordering::Acquire));
-            (data, ProjectInfo::read(&p))
+        let mut state = ActivityState::new(project.clone(), keymaps);
+        reader.set_window(state.window());
+        if let Some(read) = reader.latest() {
+            state.adopt(read, now());
+        }
+        // A fresh read now (a prefetched one may be old), then on the cadence.
+        reader.request();
+        let reads = reader.reads();
+        let fold = cx.spawn(async move |this, cx| {
+            while let Ok(read) = reads.recv().await {
+                if this.update(cx, |view, cx| view.fold(read, cx)).is_err() {
+                    break;
+                }
+            }
         });
-        refresher.request();
-        let poll = cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(POLL_INTERVAL).await;
-            if this.update(cx, |view, cx| view.tick(cx)).is_err() {
+        let cadence = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(REFRESH_INTERVAL).await;
+            if this.update(cx, |view, _| view.reader.request()).is_err() {
                 break;
             }
         });
@@ -128,15 +154,15 @@ impl ActivityView {
             state,
             focus: cx.focus_handle(),
             needs_focus: true,
-            refresher,
-            window,
+            reader,
+            list: FeedList::new(),
+            synced: None,
             kind_track: SlideTrack::shared(),
             project_anchor: Default::default(),
             workspace_anchor: Default::default(),
-            last_refresh: Instant::now(),
-            scroll: ScrollHandle::new(),
             display_style: DisplayStyle::detect(),
-            _poll: poll,
+            _reads: fold,
+            _cadence: cadence,
         }
     }
 
@@ -144,7 +170,7 @@ impl ActivityView {
     /// background reads without waiting on one in flight, so the UI thread
     /// never joins a slow read.
     pub fn stop_workers(&mut self) {
-        self.refresher.stop_without_waiting();
+        self.reader.stop_without_waiting();
     }
 
     /// Take keyboard focus on the next frame (the window calls this when the
@@ -153,20 +179,17 @@ impl ActivityView {
         self.needs_focus = true;
     }
 
-    fn tick(&mut self, cx: &mut Context<Self>) {
-        if let Some((data, info)) = self.refresher.latest() {
-            self.state.set_project_info(info);
-            self.state.apply(data, now());
+    /// Fold in a read (and any newer one already waiting behind it). One
+    /// that changes nothing shown doesn't redraw.
+    fn fold(&mut self, read: Read, cx: &mut Context<Self>) {
+        let read = self.reader.latest().unwrap_or(read);
+        if self.state.adopt(read, now()) {
             cx.notify();
-        }
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
-            self.refresh();
         }
     }
 
     fn refresh(&mut self) {
-        self.refresher.request();
-        self.last_refresh = Instant::now();
+        self.reader.request();
     }
 
     fn apply_intents(&mut self, intents: Vec<Intent>, cx: &mut Context<Self>) {
@@ -178,10 +201,10 @@ impl ActivityView {
                 }
                 Intent::Refresh => self.refresh(),
                 Intent::LoadWindow(lines) => {
-                    self.window.store(lines, Ordering::Release);
+                    self.reader.set_window(lines);
                     self.refresh();
                 }
-                Intent::Reveal(ix) => self.scroll.scroll_to_item(ix),
+                Intent::Reveal(ix) => board_list::reveal(&self.list.state, ix),
             }
         }
         cx.notify();
@@ -204,11 +227,43 @@ impl ActivityView {
         }
     }
 
-    /// Drain the background sources now (the offscreen check's dispatcher
-    /// doesn't run the poll timer).
+    /// Fold in the newest read now (the offscreen checks drive the view by
+    /// hand).
     #[cfg(feature = "visual-check")]
     pub fn poll(&mut self, cx: &mut Context<Self>) {
-        self.tick(cx);
+        if let Some(read) = self.reader.latest() {
+            self.fold(read, cx);
+        }
+    }
+
+    /// Read with a window of `lines` (`--bench-activity`: the whole fixture
+    /// log, as "Load older" a few times would).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_window(&mut self, lines: usize, cx: &mut Context<Self>) {
+        self.apply_intents(vec![Intent::LoadWindow(lines)], cx);
+    }
+
+    /// One refresh, the way the poll runs it: the read (off this thread, not
+    /// timed), then its fold, timed (`--bench-activity`).
+    #[cfg(feature = "visual-check")]
+    pub fn bench_refresh(&mut self, cx: &mut Context<Self>) -> Duration {
+        // Polled, not `recv_blocking`: the wake loop's listener (its task
+        // never runs while the bench holds the main thread) can take the
+        // channel's one wakeup, and a blocked receive then never wakes.
+        let reads = self.reader.reads();
+        while reads.try_recv().is_ok() {}
+        self.refresh();
+        let asked = Instant::now();
+        let read = loop {
+            if let Ok(read) = reads.try_recv() {
+                break read;
+            }
+            assert!(asked.elapsed() < Duration::from_secs(60), "the refresh read never landed");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let start = Instant::now();
+        self.fold(read, cx);
+        start.elapsed()
     }
 
     /// The view's state, for the offscreen views check.
@@ -335,7 +390,7 @@ impl ActivityView {
             )
     }
 
-    fn render_feed(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_feed(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let feed = self.state.feed();
         let placeholder = |text: SharedString| {
             div()
@@ -367,40 +422,84 @@ impl ActivityView {
                 return style::empty_state("activity-empty", empty, clear, theme).into_any_element();
             }
         }
-        let mut list = div()
-            .id("activity-feed")
+        self.sync_list();
+        // Only the items in view are built; the list asks for each as it
+        // scrolls in.
+        let list = gpui::list(
+            self.list.state.clone(),
+            cx.processor(|this, ix: usize, _window, cx| this.render_item(ix, cx)),
+        );
+        board_scroll::wheel_list(list, &self.list.state)
             .debug_selector(|| "activity-feed".into())
-            .track_scroll(&self.scroll)
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px_4();
-        for (ix, item) in feed.items.iter().enumerate() {
-            list = list.child(match item {
-                FeedItem::Day(label) => day_header(theme, label).into_any_element(),
-                FeedItem::Row(row) => {
-                    let selected = self.state.selected == Some(ix);
-                    feed_row(theme, &self.state.line(row), selected)
-                        .id(("activity-row", ix))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            let intents = this.state.click(ix);
-                            this.apply_intents(intents, cx);
-                        }))
-                        .into_any_element()
+            .into_any_element()
+    }
+
+    /// The rows under the feed's items.
+    fn trailing(&self) -> Vec<Trailing> {
+        let mut rows = Vec::new();
+        if let Some(empty) = self.state.feed().empty {
+            rows.push(Trailing::EmptyNote(empty));
+        }
+        rows.push(Trailing::Paging);
+        rows
+    }
+
+    /// Tell the list what changed since it last drew: the feed's items (by
+    /// their keys) and the rows under them.
+    fn sync_list(&mut self) {
+        let trailing: Vec<ItemKey> = self
+            .trailing()
+            .into_iter()
+            .map(|row| match row {
+                Trailing::EmptyNote(text) => ItemKey::of("empty", text),
+                Trailing::Paging => {
+                    let content = ItemKey::of(
+                        "paging",
+                        (self.state.is_loading_older(), self.state.has_older(), self.state.loaded_events()),
+                    );
+                    ItemKey {
+                        ident: ItemKey::of("paging", ()).ident,
+                        content: content.content,
+                    }
                 }
-            });
+            })
+            .collect();
+        let generation = self.state.generation();
+        if self.synced.as_ref().is_some_and(|(g, t)| *g == generation && *t == trailing) {
+            return;
         }
-        if let Some(empty) = feed.empty {
-            list = list.child(
-                div()
-                    .py_4()
-                    .text_color(theme.muted)
-                    .child(empty),
-            );
-        }
-        list.child(self.render_paging(theme, cx)).into_any_element()
+        let mut keys = self.state.keys().to_vec();
+        keys.extend(trailing.iter().copied());
+        self.list.sync(&keys);
+        self.synced = Some((generation, trailing));
+    }
+
+    /// Feed item `ix`: a day header, a row, or a row under them, padded as
+    /// the feed's scroll container padded its children.
+    fn render_item(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.global::<Theme>();
+        let items = &self.state.feed().items;
+        let el = match items.get(ix) {
+            Some(FeedItem::Day(label)) => day_header(&theme, label).into_any_element(),
+            Some(FeedItem::Row(row)) => {
+                let selected = self.state.selected == Some(ix);
+                feed_row(&theme, &self.state.line(row), selected)
+                    .id(("activity-row", ix))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let intents = this.state.click(ix);
+                        this.apply_intents(intents, cx);
+                    }))
+                    .into_any_element()
+            }
+            None => match self.trailing().get(ix - items.len()) {
+                Some(Trailing::EmptyNote(empty)) => {
+                    div().py_4().text_color(theme.muted).child(*empty).into_any_element()
+                }
+                Some(Trailing::Paging) => self.render_paging(&theme, cx).into_any_element(),
+                None => div().into_any_element(),
+            },
+        };
+        div().px_4().child(el).into_any_element()
     }
 
     fn render_paging(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -557,6 +656,10 @@ impl Render for ActivityView {
             }
             chip
         };
+        // The reader builds the next reads' feeds under the filter shown.
+        self.reader.set_filter(&self.state.filter);
+        let header = self.render_header(chip, &theme, cx);
+        let feed = self.render_feed(&theme, cx);
         div()
             .id("activity")
             .track_focus(&self.focus)
@@ -571,8 +674,8 @@ impl Render for ActivityView {
             .bg(theme.canvas)
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(self.render_header(chip, &theme, cx))
-            .child(self.render_feed(&theme, cx))
+            .child(header)
+            .child(feed)
             .child(self.render_footer(&theme))
             .children(self.render_picker(&theme, cx))
     }
