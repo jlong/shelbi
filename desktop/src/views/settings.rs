@@ -1,4 +1,8 @@
-//! The settings view: the desktop's own preferences plus the shared theme.
+//! The settings view: the desktop's own preferences plus the shared theme,
+//! one page at a time (`dt-settings-sections`): General (the theme, the CLI,
+//! notifications), Keybindings (`keys.yaml`) and Terminal (the font, its
+//! size, the Option key). The settings sidebar picks the page
+//! ([`super::settings_nav`]); the view draws it.
 //!
 //! Stored in `~/.shelbi/config.yaml` through `shelbi_state::user_config`:
 //!
@@ -38,6 +42,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 
 use super::font_picker::{FontPicker, FontPickerEvent};
+use super::settings_nav::SettingsPage;
 use crate::assets::icons;
 use crate::elements::controls;
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
@@ -45,11 +50,14 @@ use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::TerminalSettings;
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{Type, Typography};
+use crate::theme::style::{self, ButtonKind, Type, Typography};
 use crate::theme::Theme;
 
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
+
+/// The Keybindings page's Open keys.yaml: the Button component at Small.
+const KEYS_BUTTON_H: f32 = 28.0;
 
 /// The size field's width (the frame's, room for `32pt`).
 const SIZE_FIELD_W: f32 = 76.0;
@@ -209,6 +217,8 @@ pub enum SettingsEvent {
 
 /// The settings view.
 pub struct SettingsView {
+    /// The page shown.
+    page: SettingsPage,
     /// The two segmented controls, measured for their selection's slide.
     theme_track: SharedTrack,
     option_track: SharedTrack,
@@ -255,6 +265,7 @@ impl SettingsView {
             }),
         ];
         let mut view = SettingsView {
+            page: SettingsPage::default(),
             font_family,
             font_size: DEFAULT_SIZE,
             font_size_input,
@@ -269,9 +280,26 @@ impl SettingsView {
             state: SaveState::Idle,
             _subscriptions: subscriptions,
         };
-        view.load(window, cx);
-        view.load_conflicts(project, cx);
+        // A test's window never reads the real `~/.shelbi`.
+        if !cfg!(test) {
+            view.load(window, cx);
+            view.load_conflicts(project, cx);
+        }
         view
+    }
+
+    /// The page shown.
+    #[cfg(test)]
+    pub fn page(&self) -> SettingsPage {
+        self.page
+    }
+
+    /// Show `page`.
+    pub fn show_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if self.page != page {
+            self.page = page;
+            cx.notify();
+        }
     }
 
     /// Read the project's merged keymaps off the UI thread and note the
@@ -709,7 +737,8 @@ impl Render for SettingsView {
         };
         let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
 
-        div()
+        let shown = self.page;
+        let page = div()
             .id("settings")
             .debug_selector(|| "settings".into())
             .flex()
@@ -721,92 +750,150 @@ impl Render for SettingsView {
             .overflow_y_scroll()
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(
-                div()
-                    .type_style(Type::Heading)
-                    .text_color(theme.text_loud)
-                    .child("Settings"),
-            )
-            .child(controls::labeled_control(
-                "Theme",
-                controls::segmented_track(&theme)
-                    .w(px(controls::CONTROL_W))
-                    .child(motion::origin_probe(&self.theme_track))
-                    .children(theme_chip.map(floating))
-                    .child(chip("Auto", ThemePreference::Auto, current, cx))
-                    .child(chip("Dark", ThemePreference::Dark, current, cx))
-                    .child(chip("Light", ThemePreference::Light, current, cx)),
-                Some("Shared with the TUI, which picks it up on its next start.".into()),
-                &theme,
-            ))
-            .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
-            .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
-            .child(controls::labeled_control(
-                "Option key in terminals",
-                controls::segmented_track(&theme)
-                    .child(motion::origin_probe(&self.option_track))
-                    .children(option_chip_slide.map(floating))
-                    .child(option_chip("Types characters", OptionAsMeta::Off, cx))
-                    .child(option_chip("Meta", OptionAsMeta::Both, cx))
-                    .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
-                    .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
-                Some(
-                    "Characters: Option+E, E types é, as in other Mac apps. Meta: \
-                     Option+B sends Esc B, for shell word motion and Claude Code’s \
-                     Option shortcuts. Option with Enter, the arrows, Backspace, or \
-                     Delete is Meta either way."
-                        .into(),
-                ),
-                &theme,
-            ))
-            .child(controls::labeled_control(
-                "Shelbi CLI",
-                cli,
-                Some(
-                    "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
-                     in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch."
-                        .into(),
-                ),
-                &theme,
-            ))
-            .child(
-                controls::labeled_control(
-                    "Key bindings",
-                    controls::form_button("settings-open-keys", "Open keys.yaml", &theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
-                    Some("Shared by the TUI and the desktop app.".into()),
+            .child(div().absolute().size_0().debug_selector(move || page_selector(shown).into()));
+        let page = match shown {
+            SettingsPage::General => page
+                .child(controls::labeled_control(
+                    "Theme",
+                    // The frame's track hugs its items (2238:25533).
+                    controls::segmented_track(&theme)
+                        .child(motion::origin_probe(&self.theme_track))
+                        .children(theme_chip.map(floating))
+                        .child(chip("Auto", ThemePreference::Auto, current, cx))
+                        .child(chip("Dark", ThemePreference::Dark, current, cx))
+                        .child(chip("Light", ThemePreference::Light, current, cx)),
+                    Some("Shared with the TUI, which picks it up on its next start.".into()),
                     &theme,
-                )
-                .children(conflicts.into_iter().map(|line| {
-                    div()
-                        .debug_selector(|| "settings-shortcut-conflict".into())
-                        .type_style(Type::XSmall)
-                        .text_color(theme.error)
-                        .child(line)
-                })),
-            )
-            .child(controls::labeled_control(
-                "Notifications",
-                controls::checkbox_list()
-                    .child(toggle(
-                        "A workspace is waiting for input or permission",
-                        Switch::WorkspaceBlocked,
-                        cx,
-                    ))
-                    .child(toggle("A task is ready for review", Switch::ReviewReady, cx))
-                    .child(toggle(
-                        "The orchestrator is waiting for an answer",
-                        Switch::OrchestratorWaiting,
-                        cx,
-                    )),
-                Some(
-                    "Not shown for what’s already on screen in the front window. \
-                     macOS asks for permission the first time."
-                        .into(),
-                ),
-                &theme,
-            ))
-            .children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
+                ))
+                .child(controls::labeled_control(
+                    "Shelbi CLI",
+                    cli,
+                    Some(
+                        "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
+                         in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch."
+                            .into(),
+                    ),
+                    &theme,
+                ))
+                .child(controls::labeled_control(
+                    "Notifications",
+                    controls::checkbox_list()
+                        .child(toggle(
+                            "A workspace is waiting for input or permission",
+                            Switch::WorkspaceBlocked,
+                            cx,
+                        ))
+                        .child(toggle("A task is ready for review", Switch::ReviewReady, cx))
+                        .child(toggle(
+                            "The orchestrator is waiting for an answer",
+                            Switch::OrchestratorWaiting,
+                            cx,
+                        )),
+                    Some(
+                        "Not shown for what’s already on screen in the front window. \
+                         macOS asks for permission the first time."
+                            .into(),
+                    ),
+                    &theme,
+                )),
+            // The Keybindings frame's header (2260:4318): the title with the
+            // Small Open keys.yaml button at its end, then the helper. The
+            // frame's bindings list is a later task.
+            SettingsPage::Keybindings => page.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .w_full()
+                    .max_w(px(controls::LABELED_MAX_W))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(controls::CONTROL_GAP))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .type_style(Type::BaseMedium)
+                                    .text_color(theme.text_loud)
+                                    .child("Keybindings"),
+                            )
+                            .child(
+                                style::button("settings-open-keys", "Open keys.yaml", ButtonKind::Secondary, false, &theme)
+                                    .h(px(KEYS_BUTTON_H))
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .type_style(Type::XSmall)
+                            .text_color(theme.muted)
+                            .child("Shared by the TUI and the desktop app."),
+                    )
+                    .children(conflicts.into_iter().map(|line| {
+                        div()
+                            .debug_selector(|| "settings-shortcut-conflict".into())
+                            .type_style(Type::XSmall)
+                            .text_color(theme.error)
+                            .child(line)
+                    })),
+            ),
+            // The Terminal frame (2252:28494) sets its controls in a column
+            // the picker's width, the Option helper a line per sentence.
+            SettingsPage::Terminal => page.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_6()
+                    .w(px(controls::CONTROL_W))
+                    .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
+                    .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
+                    .child(
+                        controls::labeled_control(
+                            "Option key in terminals",
+                            controls::segmented_track(&theme)
+                                .child(motion::origin_probe(&self.option_track))
+                                .children(option_chip_slide.map(floating))
+                                .child(option_chip("Types characters", OptionAsMeta::Off, cx))
+                                .child(option_chip("Meta", OptionAsMeta::Both, cx))
+                                .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
+                                .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
+                            None,
+                            &theme,
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(controls::helper("Characters: Option+E, E types é, as in other Mac apps.", &theme))
+                                .child(
+                                    controls::helper(
+                                        "Meta: Option+B sends Esc B, for shell word motion and Claude Code’s \
+                                         Option shortcuts.",
+                                        &theme,
+                                    )
+                                    .mb(px(4.0)),
+                                )
+                                .child(controls::helper(
+                                    "Option with Enter, the arrows, Backspace, or Delete is Meta either way.",
+                                    &theme,
+                                )),
+                        ),
+                    ),
+            ),
+        };
+        page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
+    }
+}
+
+/// The selector of a page's marker (tests find the page shown by it).
+pub fn page_selector(page: SettingsPage) -> &'static str {
+    match page {
+        SettingsPage::General => "settings-page-general",
+        SettingsPage::Keybindings => "settings-page-keybindings",
+        SettingsPage::Terminal => "settings-page-terminal",
     }
 }
 

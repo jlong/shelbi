@@ -128,6 +128,7 @@ use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::{SettingsEvent, SettingsView};
+use crate::views::settings_nav::{self, SettingsNav, SettingsPage};
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{self, Frame, LaunchWindow, ProjectViewState, WindowSession, WindowState};
 use crate::theme::style::{Type, Typography};
@@ -615,6 +616,14 @@ pub struct ShelbiWindow {
     /// the rest of where it was left).
     collapsed_sections: BTreeSet<sidebar::Section>,
     route: Route,
+    /// The settings sidebar's page and keyboard row (the page outlives a
+    /// visit: Settings reopens on it), and its rows measured for the
+    /// selection chip's slide.
+    settings_nav: SettingsNav,
+    settings_track: SharedTrack,
+    /// Settings was opened over the Review view: leaving it reopens the
+    /// review.
+    settings_over_review: bool,
     /// The Issues board for this window's project, created the first time it
     /// is shown.
     issues: Option<Entity<IssuesView>>,
@@ -842,6 +851,9 @@ impl ShelbiWindow {
             cursor: None,
             collapsed_sections: BTreeSet::new(),
             route: Route::View,
+            settings_nav: SettingsNav::default(),
+            settings_track: SlideTrack::shared(),
+            settings_over_review: false,
             issues: None,
             detail_over: None,
             pending_workflow_filter: None,
@@ -1749,6 +1761,13 @@ impl ShelbiWindow {
                     }
                     return;
                 }
+                // Likewise the settings sidebar's pages.
+                Occupant::Settings => {
+                    if let Some(page) = SettingsPage::for_shortcut(n) {
+                        self.show_settings_page(page, cx);
+                    }
+                    return;
+                }
                 Occupant::Sidebar => {}
             }
         }
@@ -2190,6 +2209,7 @@ impl ShelbiWindow {
                     ws.update(cx, |w, cx| w.release_content(cx));
                 }
             }
+            Occupant::Settings => {}
             Occupant::Sidebar => {
                 // A chat that waited for the pop: one more frame attaches it.
                 let chat_waits = self.chat_wanted() && self.chat.as_ref().is_none_or(|c| !c.read(cx).is_shown());
@@ -2273,7 +2293,9 @@ impl ShelbiWindow {
         let workspace_shown = matches!(self.route, Route::View)
             && workspace_name(self.client.view()).is_some()
             && self.workspace.as_ref().is_some_and(|w| w.read(cx).has_panel());
-        let want = if matches!(self.route, Route::Review) && self.review.is_some() {
+        let want = if matches!(self.route, Route::Settings(_)) {
+            Occupant::Settings
+        } else if matches!(self.route, Route::Review) && self.review.is_some() {
             Occupant::Review
         } else if workspace_shown {
             Occupant::Workspace
@@ -2852,21 +2874,92 @@ impl ShelbiWindow {
         .detach();
     }
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.route, Route::Settings(_)) {
-            let project = self.project.clone();
-            let view = cx.new(|cx| SettingsView::new(&project, window, cx));
-            // A saved switch applies to this window's next notice at once.
-            let sub = cx.subscribe(&view, |this, _, event: &SettingsEvent, cx| match event {
-                SettingsEvent::Saved => this.load_notify_prefs(cx),
-            });
-            self._view_subscriptions.push(sub);
-            self.set_route(Route::Settings(view));
+    /// Open Settings on `page`, or on the page last used. Its sidebar takes
+    /// the column (the push the task panels use) and the keys.
+    fn open_settings(&mut self, page: Option<SettingsPage>, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_nav.open(page);
+        let page = self.settings_nav.page();
+        match &self.route {
+            Route::Settings(view) => view.update(cx, |v, cx| v.show_page(page, cx)),
+            route => {
+                self.settings_over_review = matches!(route, Route::Review) && self.review.is_some();
+                let project = self.project.clone();
+                let view = cx.new(|cx| {
+                    let mut view = SettingsView::new(&project, window, cx);
+                    view.show_page(page, cx);
+                    view
+                });
+                // A saved switch applies to this window's next notice at once.
+                let sub = cx.subscribe(&view, |this, _, event: &SettingsEvent, cx| match event {
+                    SettingsEvent::Saved => this.load_notify_prefs(cx),
+                });
+                self._view_subscriptions.push(sub);
+                self.set_route(Route::Settings(view));
+            }
         }
         self.sync_chat(window, cx);
         self.banner = None;
         self.client.focus_main();
         self.focus_main_view(window, cx);
+        cx.notify();
+    }
+
+    /// Show a Settings page (its row, ⌘N, Enter on its row).
+    fn show_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.settings_nav.show(page);
+        if let Route::Settings(view) = &self.route {
+            view.update(cx, |v, cx| v.show_page(page, cx));
+        }
+        cx.notify();
+    }
+
+    /// A key for the settings sidebar (the window holds focus, no field
+    /// does): Esc leaves Settings, ↑ / ↓ (and the sidebar's other
+    /// bindings) move the selection, Enter opens it. Returns whether it was
+    /// one.
+    fn settings_key(&mut self, chord: shelbi_state::keymap::KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if chord.code == Key::Esc && chord.mods.is_empty() {
+            self.leave_settings(window, cx);
+            return true;
+        }
+        if self.collapsed {
+            return false;
+        }
+        match (self.keymaps.sidebar.dispatch(chord), chord.code) {
+            (Some(SidebarAction::NavUp), _) | (_, Key::BackTab) => self.settings_nav.step(false),
+            (Some(SidebarAction::NavDown), _) | (_, Key::Tab) => self.settings_nav.step(true),
+            (Some(SidebarAction::Activate), _) => {
+                if self.settings_nav.activate() {
+                    let page = self.settings_nav.page();
+                    self.show_settings_page(page, cx);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Leave Settings for what it was opened over (the back button, Esc):
+    /// the app sidebar comes back into its column (the push's reverse),
+    /// selecting that view's row, and takes the keys again, as leaving a
+    /// review does. Opened over a review, the review reopens.
+    fn leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Settings(_)) {
+            return;
+        }
+        let over_review = std::mem::take(&mut self.settings_over_review);
+        if let Some(info) = self.review.as_ref().and_then(|r| r.read(cx).info()).filter(|_| over_review) {
+            self.open_review(info, window, cx);
+            return;
+        }
+        let view = self.client.view().clone();
+        if !self.tapped_return(&view, window, cx) {
+            self.perform(HostCall::ShowView(view), window, cx);
+        }
+        if !self.collapsed {
+            self.client.focus_sidebar();
+            self.focus_handle.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -3506,7 +3599,7 @@ impl ShelbiWindow {
             }
             MenuAction::App(command) => match command {
                 AppCommand::About => self.show_about(window, cx),
-                AppCommand::Settings => self.open_settings(window, cx),
+                AppCommand::Settings => self.open_settings(None, window, cx),
                 AppCommand::CloseWindow => self.close_window(window, cx),
                 AppCommand::Minimize => window.minimize_window(),
                 AppCommand::Zoom => window.zoom_window(),
@@ -3633,6 +3726,15 @@ impl ShelbiWindow {
             }
             // Ctrl+C quits the TUI; here it's the terminal's (⌘Q quits).
             Some(GlobalAction::Quit | GlobalAction::OpenPalette) | None => {}
+        }
+        if matches!(self.route, Route::Settings(_)) {
+            // The settings sidebar's keys, while no field on the page has
+            // focus (a typed `j` is the field's).
+            if self.focus_handle.is_focused(window) && self.settings_key(chord, window, cx) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
         }
         if self.client.focus() != Focus::Sidebar || self.collapsed || self.panel_in_column() {
             // The main area's views take their own keys once they land; the
@@ -3886,8 +3988,10 @@ impl SidebarHost for ShelbiWindow {
             SidebarEvent::ToggleSection(section) => self.toggle_section(section, cx),
             SidebarEvent::ToggleZen => self.run(CommandKind::ToggleZen, window, cx),
             SidebarEvent::OpenErrors => self.run(CommandKind::OpenErrorLog, window, cx),
-            SidebarEvent::OpenSettings => self.open_settings(window, cx),
+            SidebarEvent::OpenSettings => self.open_settings(None, window, cx),
             SidebarEvent::Collapse => self.toggle_sidebar(cx),
+            SidebarEvent::LeaveSettings => self.leave_settings(window, cx),
+            SidebarEvent::ShowSettingsPage(page) => self.show_settings_page(page, cx),
         }
         cx.notify();
     }
@@ -3972,6 +4076,20 @@ impl ShelbiWindow {
             }
             chip
         };
+        // The settings sidebar's chip, likewise: placed while its column
+        // moves, sliding between its rows at rest.
+        let settings_chip = matches!(self.route, Route::Settings(_)).then(|| {
+            let mut track = self.settings_track.borrow_mut();
+            let key = SharedString::from(self.settings_nav.selected().selector());
+            let reduce = self.reduce_motion.clone();
+            let place = frame.animating;
+            track.select(Some(key), now, move || place || reduce());
+            let chip = track.frame(now);
+            if chip.is_some() {
+                window.request_animation_frame();
+            }
+            chip
+        });
         if !frame.animating {
             self.release_settled(cx);
         }
@@ -4057,6 +4175,16 @@ impl ShelbiWindow {
                     cx,
                 ))
             });
+            let settings = c.settings.map(|l| {
+                layer("column-settings", l).child(settings_nav::render(
+                    self.settings_nav,
+                    settings_chip.flatten(),
+                    &self.settings_track,
+                    &self.palette_chord,
+                    &theme,
+                    cx,
+                ))
+            });
             div()
                 .id("leading-column")
                 .debug_selector(|| "leading-column".into())
@@ -4069,6 +4197,7 @@ impl ShelbiWindow {
                 .children(sidebar)
                 .children(review)
                 .children(workspace)
+                .children(settings)
         });
         let divider_color = if self.dragging {
             theme.icon
@@ -4121,7 +4250,7 @@ impl ShelbiWindow {
             .capture_key_down(cx.listener(Self::on_capture_key_down))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.dragging {
@@ -4418,8 +4547,8 @@ impl ShelbiWindow {
         self.detail_over.is_some() && self.issues.as_ref().is_some_and(|v| v.read(cx).is_floating())
     }
 
-    pub(crate) fn offscreen_open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_settings(window, cx);
+    pub(crate) fn offscreen_open_settings(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(Some(page), window, cx);
     }
 
     /// The settings view, while it is shown.
@@ -4479,6 +4608,10 @@ mod window_tests;
 #[cfg(test)]
 #[path = "app_sidebar_tests.rs"]
 mod sidebar_tests;
+
+#[cfg(test)]
+#[path = "app_settings_tests.rs"]
+mod settings_tests;
 
 #[cfg(test)]
 mod tests {

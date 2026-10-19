@@ -26,7 +26,10 @@ The app is a client of the `shelbi` CLI and needs it installed
 
 The app reads `~/.shelbi/config.yaml` (shared with the CLI and the TUI). The
 settings view (⌘,) edits the `desktop:` block, and terminal settings apply to
-open terminals at once.
+open terminals at once. Its own sidebar stands in the app sidebar's place
+while it is open, with three pages: General (theme, the CLI, notifications,
+⌘1), Keybindings (`keys.yaml`, ⌘2) and Terminal (font, size, the Option key,
+⌘3). Back or Esc returns to the view it was opened over.
 
 ```yaml
 theme: auto                          # auto (follows the system), dark, light; shared with the TUI
@@ -281,7 +284,8 @@ local, so relative times and day groups read as drawn), the Machines rows
 transcripts with their SGR colors (redrawn at the pane's size, so footers sit
 on the last rows). Frames are named as the references are,
 `<screen>-<theme>.png` for orchestrator, issues, issue-detail, activity,
-review, workspace, workspace-idle, machines, settings and command-palette;
+review, workspace, workspace-idle, machines, settings-general,
+settings-keybindings, settings-terminal and command-palette;
 `SHELBI_VISUAL_THEME=dark|light` renders one theme. The hidden window draws
 at the main display's backing scale; a 2x frame is downsampled, so the saved
 frames are always 1x and line up with the references pixel for pixel. For

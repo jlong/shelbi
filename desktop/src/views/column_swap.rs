@@ -3,13 +3,14 @@
 //!
 //! The column shows the navigation sidebar, or, while a review or a workspace
 //! is open, that one's panel in its place, as the TUI's review and workspace
-//! panels replace its sidebar. Going in and coming back out are a push
+//! panels replace its sidebar; while Settings is open, the settings sidebar
+//! stands there the same way (`dt-settings-sections`). Going in and coming back out are a push
 //! between two levels of a navigation stack: the sidebar slides out to the
 //! left and fades while the panel slides in from the right and fades in, and
 //! the reverse on the way back. With Reduce Motion on, the two crossfade in
-//! place instead. The two panels are siblings on the upper level, so going
-//! from one to the other goes back through the sidebar: the first panel pops,
-//! then the second is pushed.
+//! place instead. The panels are siblings on the upper level, so going from
+//! one to another goes back through the sidebar: the first panel pops, then
+//! the second is pushed.
 //!
 //! Toolkit-free and clock-injected, so the state machine (entering, leaving,
 //! a second toggle mid-transition reversing from where it stands, a panel
@@ -32,6 +33,7 @@ pub enum Occupant {
     Sidebar,
     Review,
     Workspace,
+    Settings,
 }
 
 impl Occupant {
@@ -40,7 +42,7 @@ impl Occupant {
     fn position(self) -> f32 {
         match self {
             Occupant::Sidebar => 0.0,
-            Occupant::Review | Occupant::Workspace => 1.0,
+            Occupant::Review | Occupant::Workspace | Occupant::Settings => 1.0,
         }
     }
 }
@@ -102,6 +104,7 @@ pub struct Frame {
     pub sidebar: Option<Layer>,
     pub review: Option<Layer>,
     pub workspace: Option<Layer>,
+    pub settings: Option<Layer>,
     /// A swap is still running: request another frame.
     pub animating: bool,
 }
@@ -112,6 +115,7 @@ impl Frame {
             sidebar,
             review: layer.filter(|_| panel == Occupant::Review),
             workspace: layer.filter(|_| panel == Occupant::Workspace),
+            settings: layer.filter(|_| panel == Occupant::Settings),
             animating,
         }
     }
@@ -321,16 +325,20 @@ pub struct Column {
     pub sidebar: Option<Layer>,
     pub review: Option<Layer>,
     pub workspace: Option<Layer>,
+    pub settings: Option<Layer>,
 }
 
 /// The leading column for `frame`, or `None` when there is none (the sidebar
-/// collapsed, no panel in its place). The column is the user's sidebar width
+/// collapsed, no panel in its place; a collapsed settings sidebar is never
+/// drawn either). The column is the user's sidebar width
 /// (`user_cols`). A collapsed sidebar is never drawn, but a panel still takes
 /// the column, at the default sidebar width until the user drags it
 /// (`dragged_cols`), and the column goes again once the panel has left.
 pub fn column(frame: &Frame, collapsed: bool, user_cols: u16, dragged_cols: Option<u16>) -> Option<Column> {
     let sidebar = frame.sidebar.filter(|_| !collapsed);
-    if sidebar.is_none() && frame.review.is_none() && frame.workspace.is_none() {
+    // The settings sidebar is a sidebar: it collapses with the app's.
+    let settings = frame.settings.filter(|_| !collapsed);
+    if sidebar.is_none() && frame.review.is_none() && frame.workspace.is_none() && settings.is_none() {
         return None;
     }
     let width_cols = if collapsed {
@@ -343,6 +351,7 @@ pub fn column(frame: &Frame, collapsed: bool, user_cols: u16, dragged_cols: Opti
         sidebar,
         review: frame.review,
         workspace: frame.workspace,
+        settings,
     })
 }
 

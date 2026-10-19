@@ -19,7 +19,9 @@
 //! Each screen gets a fresh 1440x1024 window and is saved as
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
-//! machines, settings and command-palette, plus the palette states the
+//! machines, the three Settings pages (settings-general,
+//! settings-keybindings, settings-terminal) and command-palette, plus the
+//! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
 //! collapsed, Zen off, the sidebar hidden), the issue detail's
@@ -82,7 +84,7 @@ const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 1024;
 
 /// Every screen, named as its reference PNG.
-pub const SCREENS: [&str; 10] = [
+pub const SCREENS: [&str; 12] = [
     "orchestrator",
     "issues",
     "issue-detail",
@@ -91,7 +93,9 @@ pub const SCREENS: [&str; 10] = [
     "workspace",
     "workspace-idle",
     "machines",
-    "settings",
+    "settings-general",
+    "settings-keybindings",
+    "settings-terminal",
     "command-palette",
 ];
 
@@ -926,18 +930,27 @@ impl Run {
     }
 
     fn settings(&mut self) {
-        let handle = self.open();
-        handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(window, cx))
-            .unwrap();
-        self.save(handle, "settings");
+        use crate::views::settings_nav::SettingsPage;
+        // Each page with the settings sidebar in the column (General is the
+        // Settings frame, 2165:545).
+        for (page, screen) in [
+            (SettingsPage::General, "settings-general"),
+            (SettingsPage::Keybindings, "settings-keybindings"),
+            (SettingsPage::Terminal, "settings-terminal"),
+        ] {
+            let handle = self.open();
+            handle
+                .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(page, window, cx))
+                .unwrap();
+            self.save(handle, screen);
+        }
 
         // The Shelbi CLI field focused: the textbox's ring and glow, the
         // caret in the ring's color.
         let handle = self.open();
         handle
             .update(&mut self.cx, |w, window, cx| {
-                w.offscreen_open_settings(window, cx);
+                w.offscreen_open_settings(SettingsPage::General, window, cx);
                 if let Some(settings) = w.offscreen_settings() {
                     settings.update(cx, |v, cx| v.offscreen_focus_cli(window, cx));
                 }

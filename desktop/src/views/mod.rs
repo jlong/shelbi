@@ -30,6 +30,8 @@
 //! - the Workspace and Review panels drawn to the Navigation component's
 //!   task states, with the pieces they share: **`dt-figma-task-panels`**
 //!   (`task_panel`)
+//! - Settings split into pages, with its own sidebar in the column:
+//!   **`dt-settings-sections`** (`settings_nav`)
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
@@ -62,5 +64,6 @@ pub mod review;
 pub mod task_detail;
 pub mod task_panel;
 pub mod settings;
+pub mod settings_nav;
 pub mod sidebar;
 pub mod update;
