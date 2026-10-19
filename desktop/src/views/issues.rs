@@ -41,11 +41,11 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, px, relative, AnyElement, App, ClickEvent, Context, Entity, EventEmitter,
-    FocusHandle, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
+    FocusHandle, Focusable, Hsla, KeyDownEvent, ScrollHandle, SharedString, Subscription, Task,
     Window,
 };
 use shelbi_app::board::DropTarget;
-use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState, TextareaState};
 use shelbi_app::board::{self, BoardRead, ClosedPage};
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
@@ -81,9 +81,11 @@ const SUMMARY_WIDTH: f32 = 244.0;
 const CARD_RADIUS: f32 = 12.0;
 /// A collapsed column's width.
 const COLLAPSED_WIDTH: f32 = 36.0;
-/// The toolbar's height, its rule included (Figma: a 56px Board toolbar over
-/// a 1px divider).
-const TOOLBAR_H: f32 = 57.0;
+/// The toolbar's height (Figma: the 52px Header, no rule under it; its band
+/// sets it off from the board).
+const TOOLBAR_H: f32 = 52.0;
+/// The toolbar's search field's width (Figma's Searchbox in the Header).
+const SEARCH_W: f32 = 180.0;
 /// The key-hint footer's height, its rule included (Figma: a 1px divider
 /// over a 28px row).
 const FOOTER_H: f32 = 29.0;
@@ -179,6 +181,9 @@ pub struct IssuesView {
     /// The in-place body editor: the issue id and its text state.
     pub(super) editor: Option<(String, Entity<TextareaState>)>,
     add_input: Option<Entity<InputState>>,
+    /// The toolbar's search field, made on first draw (an input needs the
+    /// window).
+    search_input: Option<Entity<InputState>>,
     display_style: DisplayStyle,
     /// Drawn over another screen: the detail alone, no board.
     floating: bool,
@@ -238,6 +243,7 @@ impl IssuesView {
             detail_scroll: ScrollHandle::new(),
             editor: None,
             add_input: None,
+            search_input: None,
             display_style: DisplayStyle::detect(),
             floating: false,
             _subscriptions: Vec::new(),
@@ -568,6 +574,15 @@ impl IssuesView {
                 Intent::BeginEdit(id) => self.begin_edit(&id, window, cx),
                 Intent::OpenInEditor(id) => self.open_in_editor(&id),
                 Intent::BeginAdd => self.begin_add(window, cx),
+                Intent::FocusSearch => {
+                    let input = self.search_field(window, cx);
+                    input.update(cx, |s, cx| s.focus(window, cx));
+                }
+                Intent::ClearSearchField => {
+                    if let Some(input) = &self.search_input {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                    }
+                }
             }
         }
     }
@@ -684,7 +699,50 @@ impl IssuesView {
         self.add_input = Some(input);
     }
 
+    /// The toolbar's search field: typing narrows the board as it goes.
+    fn search_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(input) = &self.search_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, _, cx| {
+            if let InputEvent::Change = ev {
+                let query = input.read(cx).value().to_string();
+                this.state.set_search(&query);
+                this.scroll_selection_into_view();
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
+        self.search_input = Some(input.clone());
+        input
+    }
+
+    fn search_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search_input
+            .as_ref()
+            .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// Leave the search field for the board: `clear` empties the search too
+    /// (Esc), else it stays (Enter, to walk the cards it left).
+    fn leave_search(&mut self, clear: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if clear {
+            self.state.set_search("");
+            if let Some(input) = &self.search_input {
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+        }
+        self.needs_focus = true;
+        cx.notify();
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The search field owns its keys (its Esc and Enter come in as
+        // actions, caught in `render_search`).
+        if self.search_focused(window, cx) {
+            return;
+        }
         let Some(chord) = chord_from_keystroke(&ev.keystroke) else {
             return;
         };
@@ -756,10 +814,25 @@ impl IssuesView {
 
     // ---- rendering --------------------------------------------------------
 
-    /// The toolbar: the two filters and, at the right, New issue, over the
-    /// board's rule (the Figma Issues frame has no board title).
-    fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The toolbar, the Figma Issues Header: `Filter:` and the workflow and
+    /// workspace chips, then at the right the search field and New issue, on
+    /// the Header's band (the Issues frame has no board title).
+    fn render_header(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.state.model();
+        let filters = self.state.filters();
+        // Unfiltered, a chip reads as the Header draws it (`Workspaces`, in
+        // the Default style); set, it names the filter in the Select style.
+        let workflow_label = match filters.workflow {
+            Some(_) => model.workflow_filter_label.clone(),
+            None => "Workflows".to_string(),
+        };
+        let workspace_label = match filters.workspace {
+            Some(_) => model.workspace_filter_label.clone(),
+            None => "Workspaces".to_string(),
+        };
+        let (workflow_set, workspace_set) = (filters.workflow.is_some(), filters.workspace.is_some());
+        let banner = model.banner.clone();
+        let search = self.render_search(theme, window, cx);
         div()
             .flex()
             .flex_row()
@@ -769,37 +842,46 @@ impl IssuesView {
             .pr_4()
             .h(px(TOOLBAR_H))
             .flex_none()
-            .border_b_1()
-            .border_color(theme.divider_strong)
+            .bg(theme.toolbar)
+            // Figma's Header: a 1px canvas edge on its left.
+            .border_l_1()
+            .border_color(theme.canvas)
             .child(
-                style::dropdown(
+                div()
+                    .flex_none()
+                    .type_style(Type::SmallMedium)
+                    .text_color(theme.form_hint)
+                    .child("Filter:"),
+            )
+            .child(
+                style::filter_chip(
                     "workflow-chip",
-                    icons::FUNNEL_BUTTON,
-                    model.workflow_filter_label.clone(),
+                    workflow_label,
+                    workflow_set,
                     matches!(self.state.mode, Mode::WorkflowDropdown { .. }),
                     theme,
                 )
-                    .child(style::anchor_probe(&self.workflow_anchor))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.state.open_workflow_dropdown();
-                        cx.notify();
-                    })),
+                .child(style::anchor_probe(&self.workflow_anchor))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.state.open_workflow_dropdown();
+                    cx.notify();
+                })),
             )
             .child(
-                style::dropdown(
+                style::filter_chip(
                     "workspace-chip",
-                    icons::FUNNEL_BUTTON,
-                    model.workspace_filter_label.clone(),
+                    workspace_label,
+                    workspace_set,
                     matches!(self.state.mode, Mode::WorkspaceDropdown { .. }),
                     theme,
                 )
-                    .child(style::anchor_probe(&self.workspace_anchor))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.state.open_workspace_dropdown();
-                        cx.notify();
-                    })),
+                .child(style::anchor_probe(&self.workspace_anchor))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.state.open_workspace_dropdown();
+                    cx.notify();
+                })),
             )
-            .when_some(model.banner.clone(), |row, banner| {
+            .when_some(banner, |row, banner| {
                 row.child(div().type_style(Type::XSmall).text_color(theme.muted).child(banner))
             })
             .child(div().flex_1())
@@ -808,6 +890,7 @@ impl IssuesView {
                     heroicon(icons::ARROW_PATH).text_color(theme.icon),
                 )
             })
+            .child(search)
             .child(
                 style::toolbar_button("new-issue", icons::PLUS, "New issue", theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -816,6 +899,58 @@ impl IssuesView {
                         cx.notify();
                     })),
             )
+    }
+
+    /// The toolbar's search field (Figma's Searchbox): the input with its
+    /// own look off inside [`style::search_box`], and `Search` in
+    /// `form_hint` while it is empty. Esc clears it and Enter keeps it, both
+    /// handing the keyboard back to the board.
+    fn render_search(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input = self.search_field(window, cx);
+        let focused = input.read(cx).focus_handle(cx).is_focused(window);
+        let empty = self.state.search().is_empty();
+        let field = div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .type_style(Type::Small)
+            .text_color(theme.foreground)
+            .child(
+                Input::new(&input)
+                    .appearance(false)
+                    .px(px(0.0))
+                    .py(px(0.0))
+                    .h_full()
+                    .type_style(Type::Small),
+            )
+            .when(empty, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .text_color(theme.form_hint)
+                        .child("Search"),
+                )
+            });
+        let focus = input.read(cx).focus_handle(cx);
+        style::search_box("board-search", field, focused, theme)
+            .w(px(SEARCH_W))
+            .on_click(move |_, window, cx| window.focus(&focus, cx))
+            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                this.leave_search(true, window, cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &Enter, window, cx| {
+                this.leave_search(false, window, cx);
+                cx.stop_propagation();
+            }))
     }
 
     fn render_board(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1476,7 +1611,7 @@ impl Render for IssuesView {
             .bg(theme.canvas)
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(self.render_header(&theme, cx))
+            .child(self.render_header(&theme, window, cx))
             .child(board)
             .child(self.render_footer(&theme))
             .children(detail)
