@@ -36,6 +36,7 @@ use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::ZenModeState;
 
+use super::settings_nav::SettingsPage;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon, ICON_SIZE};
 use crate::keys::{nav_view_hotkey, row_hotkey};
 use crate::projects::ProjectEntry;
@@ -310,6 +311,10 @@ pub enum SidebarEvent {
     OpenSettings,
     /// The titlebar's Toggle sidebar button.
     Collapse,
+    /// The settings sidebar's back button.
+    LeaveSettings,
+    /// A settings sidebar row.
+    ShowSettingsPage(SettingsPage),
 }
 
 /// The window the sidebar is drawn into.
@@ -742,7 +747,7 @@ pub fn render_panel_column<H: SidebarHost>(
 
 /// The titlebar row: room for the traffic lights, then Search (the palette)
 /// and Toggle sidebar, right-aligned.
-fn render_titlebar<H: SidebarHost>(
+pub(crate) fn render_titlebar<H: SidebarHost>(
     palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,

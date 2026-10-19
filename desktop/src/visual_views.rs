@@ -17,8 +17,10 @@
 //! (a card selected), `board-dropdown.png` and `board-workspace-dropdown.png`
 //! (each filter open), `board-empty.png` (columns a filter emptied),
 //! `board-drag.png` (a card dragged over another column, the drop target
-//! lit) and `board-detail.png` (a card's detail); then `settings.png`, Settings
-//! with its font picker open (`settings-font-picker.png`), the other choices
+//! lit) and `board-detail.png` (a card's detail); then `settings.png`, Settings'
+//! General page, its Keybindings and Terminal pages
+//! (`settings-keybindings.png`, `settings-terminal.png`), Terminal with its
+//! font picker open (`settings-font-picker.png`), the other choices
 //! selected with the size stepper at each end (`settings-size-min.png`,
 //! `settings-size-max.png`, `settings-option-right.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
@@ -220,11 +222,16 @@ pub fn run(out: PathBuf) -> ! {
         cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
     });
     save(&mut cx, window, &out, "settings.png");
-    // The font picker open, once the installed families are read.
     let settings = window
         .update(&mut cx, |root, _, _| root.downcast::<crate::views::settings::SettingsView>())
         .expect("the settings window")
         .expect("the settings view");
+    use crate::views::settings_nav::SettingsPage;
+    settings.update(&mut cx, |v, cx| v.show_page(SettingsPage::Keybindings, cx));
+    save(&mut cx, window, &out, "settings-keybindings.png");
+    settings.update(&mut cx, |v, cx| v.show_page(SettingsPage::Terminal, cx));
+    save(&mut cx, window, &out, "settings-terminal.png");
+    // The font picker open, once the installed families are read.
     window
         .update(&mut cx, |_, window, cx| {
             settings.update(cx, |v, cx| v.offscreen_open_font_picker(window, cx))
@@ -258,7 +265,10 @@ pub fn run(out: PathBuf) -> ! {
             });
             window
                 .update(&mut cx, |_, window, cx| {
-                    settings.update(cx, |v, cx| v.offscreen_show(theme, option, size, window, cx))
+                    settings.update(cx, |v, cx| {
+                        v.show_page(SettingsPage::Terminal, cx);
+                        v.offscreen_show(theme, option, size, window, cx)
+                    })
                 })
                 .expect("show the state");
             // The selection chips slide to their choices.

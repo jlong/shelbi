@@ -406,6 +406,12 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// The open review's inputs, once it has resolved (a placeholder's are
+    /// the sidebar row's guess).
+    pub fn info(&self) -> Option<ReviewInfo> {
+        self.review.as_ref().filter(|r| r.resolved).map(|r| r.info.clone())
+    }
+
     /// The panel as shown now.
     pub fn model(&self) -> Option<&ReviewPanelModel> {
         self.review.as_ref().map(|r| &r.model)

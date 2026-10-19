@@ -12,3 +12,5 @@ palette frame (2171:752) and drawn on its 20pt grid with the outline set's
 - `flag-finish.svg`: Quit Shelbi (a filled drawing).
 - `sidebar.svg`: the Toggle sidebar button (the Navigation component's
   titlebar, 2164:4; the collapsed sidebar's toggle in the main area).
+- `keyboard-key.svg`: the Settings sidebar's Keybindings row (the
+  Navigation component's State=Settings, 2252:27934).

@@ -350,12 +350,14 @@ heroicons! {
     ARROWS_RIGHT_LEFT = "arrows-right-left";
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
+    WRENCH_SCREWDRIVER = "wrench-screwdriver";
     @figma {
         TOGGLE_OFF = "toggle-off";
         TOGGLE_ON = "toggle-on";
         PAGE_CURL = "page-curl";
         FLAG_FINISH = "flag-finish";
         SIDEBAR = "sidebar";
+        KEYBOARD_KEY = "keyboard-key";
     }
     @small {
         FUNNEL_SMALL = "funnel";
