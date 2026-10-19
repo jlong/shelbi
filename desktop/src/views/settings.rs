@@ -29,9 +29,8 @@
 //!   Claude Code session ([`super::terminal_preview`]) with the font, size
 //!   and colors as they are now.
 //!
-//! A button opens `keys.yaml` (the key bindings both clients share) in the
-//! user's default text editor; below it, any binding macOS already owns (⌘W,
-//! ⌘Space, ...) is reported, since it can't reach Shelbi.
+//! The Keybindings page is its own view ([`KeybindingsPage`]): the editor
+//! for `keys.yaml`, the key bindings both clients share.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -51,6 +50,7 @@ use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePrefe
 use shelbi_term::render::Rgb as TermRgb;
 
 use super::font_picker::{FontPicker, FontPickerEvent};
+use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use crate::assets::icons;
@@ -59,16 +59,15 @@ use crate::elements::terminal::colors::{self, AnsiOverrides};
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::{TerminalPane, TerminalSettings};
-use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, Type, Typography};
 use crate::theme::{rgb_hsla, Theme};
 
+/// The ANSI colors' Reset: the Button component at Small.
+const SMALL_BUTTON_H: f32 = 28.0;
+
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
-
-/// The Keybindings page's Open keys.yaml: the Button component at Small.
-const KEYS_BUTTON_H: f32 = 28.0;
 
 /// The size field's width (the frame's, room for `32pt`).
 const SIZE_FIELD_W: f32 = 76.0;
@@ -238,10 +237,16 @@ enum SaveState {
 }
 
 /// What the settings view tells its window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SettingsEvent {
     /// `config.yaml` was written.
     Saved,
+    /// `keys.yaml` was written (the Keybindings page), giving these merged
+    /// keymaps.
+    KeysSaved(Box<shelbi_state::keymap::Keymaps>),
+    /// The page hands the keys back to the settings sidebar (Esc in an empty
+    /// search).
+    Leave,
 }
 
 /// The settings view.
@@ -270,8 +275,8 @@ pub struct SettingsView {
     /// A test's view saves here, never to `~/.shelbi`.
     #[cfg(test)]
     saved: UserConfig,
-    /// `keys.yaml` bindings macOS already owns, once the keymaps are read.
-    conflicts: Vec<ShortcutConflict>,
+    /// The Keybindings page.
+    keybindings: Entity<KeybindingsPage>,
     /// False until the config has been read, so an early blur can't save
     /// blank values over it.
     loaded: bool,
@@ -291,7 +296,12 @@ impl SettingsView {
         let preview = cx.new(|cx| {
             TerminalPane::canned("Preview".into(), terminal_preview::stream, window, cx)
         });
+        let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
         let mut subscriptions = vec![
+            cx.subscribe(&keybindings, |_, _, event: &KeybindingsEvent, cx| match event {
+                KeybindingsEvent::Saved(keymaps) => cx.emit(SettingsEvent::KeysSaved(keymaps.clone())),
+                KeybindingsEvent::Leave => cx.emit(SettingsEvent::Leave),
+            }),
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                     this.save(cx);
@@ -338,7 +348,7 @@ impl SettingsView {
             preview,
             #[cfg(test)]
             saved: UserConfig::default(),
-            conflicts: Vec::new(),
+            keybindings,
             loaded: false,
             theme_track: SlideTrack::shared(),
             option_track: SlideTrack::shared(),
@@ -348,7 +358,6 @@ impl SettingsView {
         // A test's window never reads the real `~/.shelbi`.
         if !cfg!(test) {
             view.load(window, cx);
-            view.load_conflicts(project, cx);
         }
         view
     }
@@ -400,30 +409,20 @@ impl SettingsView {
         self.ansi_inputs[slot].read(cx).value().to_string()
     }
 
+    /// The Keybindings page's view.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub(crate) fn keybindings(&self) -> Entity<KeybindingsPage> {
+        self.keybindings.clone()
+    }
+
     /// Show `page`.
     pub fn show_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         if self.page != page {
+            // A capture on a page out of sight would take its keys.
+            self.keybindings.update(cx, |p, cx| p.cancel_capture(cx));
             self.page = page;
             cx.notify();
         }
-    }
-
-    /// Read the project's merged keymaps off the UI thread and note the
-    /// bindings macOS owns.
-    fn load_conflicts(&mut self, project: &str, cx: &mut Context<Self>) {
-        let project = project.to_string();
-        let read = cx.background_executor().spawn(async move {
-            reserved_conflicts(&shelbi_state::keymap::load_keymaps(Some(&project)).0)
-        });
-        cx.spawn(async move |this, cx| {
-            let conflicts = read.await;
-            this.update(cx, |this, cx| {
-                this.conflicts = conflicts;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Flip a notification switch and save.
@@ -717,21 +716,6 @@ impl SettingsView {
         .detach();
     }
 
-    /// Open `keys.yaml` in the default text editor, creating a commented stub
-    /// first when there is none (an editor won't open a missing file).
-    fn open_keys(&mut self, cx: &mut Context<Self>) {
-        let opened = cx.background_executor().spawn(async { open_keys_yaml() });
-        cx.spawn(async move |this, cx| {
-            if let Err(e) = opened.await {
-                this.update(cx, |this, cx| {
-                    this.state = SaveState::Failed(e);
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
 }
 
 #[cfg(feature = "visual-check")]
@@ -772,39 +756,6 @@ impl SettingsView {
         self.theme = theme;
         self.option_as_meta = option;
         self.show_size(size, window, cx);
-    }
-}
-
-/// `~/.shelbi/keys.yaml`, the shared key bindings.
-pub fn keys_yaml_path() -> Option<PathBuf> {
-    shelbi_state::shelbi_home()
-        .ok()
-        .map(|home| home.join(shelbi_state::keymap::KEYS_FILENAME))
-}
-
-/// The stub a missing `keys.yaml` starts as: comments only, so it changes no
-/// binding.
-const KEYS_STUB: &str = "# Shelbi key bindings, shared by the TUI and the desktop app.\n\
-# Override a built-in chord per mode; unlisted actions keep their defaults.\n\
-# `shelbi config lint` checks this file.\n";
-
-fn open_keys_yaml() -> Result<(), String> {
-    let path = keys_yaml_path().ok_or("No Shelbi home directory.")?;
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&path, KEYS_STUB).map_err(|e| format!("Couldn't create keys.yaml: {e}"))?;
-    }
-    let status = std::process::Command::new("open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .map_err(|e| format!("Couldn't open keys.yaml: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("Couldn't open keys.yaml in a text editor.".into())
     }
 }
 
@@ -946,7 +897,6 @@ impl Render for SettingsView {
             controls::checkbox(format!("settings-notify-{label}"), label, switches.get(switch), false, &theme)
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
         };
-        let conflicts: Vec<String> = self.conflicts.iter().map(ShortcutConflict::message).collect();
 
         let shown = self.page;
         let page = div()
@@ -1007,50 +957,9 @@ impl Render for SettingsView {
                     ),
                     &theme,
                 )),
-            // The Keybindings frame's header (2260:4318): the title with the
-            // Small Open keys.yaml button at its end, then the helper. The
-            // frame's bindings list is a later task.
-            SettingsPage::Keybindings => page.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .w_full()
-                    .max_w(px(controls::LABELED_MAX_W))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(controls::CONTROL_GAP))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .type_style(Type::BaseMedium)
-                                    .text_color(theme.text_loud)
-                                    .child("Keybindings"),
-                            )
-                            .child(
-                                style::button("settings-open-keys", "Open keys.yaml", ButtonKind::Secondary, false, &theme)
-                                    .h(px(KEYS_BUTTON_H))
-                                    .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .type_style(Type::XSmall)
-                            .text_color(theme.muted)
-                            .child("Shared by the TUI and the desktop app."),
-                    )
-                    .children(conflicts.into_iter().map(|line| {
-                        div()
-                            .debug_selector(|| "settings-shortcut-conflict".into())
-                            .type_style(Type::XSmall)
-                            .text_color(theme.error)
-                            .child(line)
-                    })),
-            ),
+            // The Keybindings frame (2252:28172): its own view, the list
+            // scrolling under its header rather than the whole page.
+            SettingsPage::Keybindings => page.overflow_hidden().child(self.keybindings.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -1110,6 +1019,7 @@ impl Render for SettingsView {
                     .child(self.render_preview(&theme)),
             ),
         };
+        let status = status.filter(|_| shown != SettingsPage::Keybindings);
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
     }
 }
@@ -1137,7 +1047,7 @@ impl SettingsView {
                     .text_color(theme.text_loud)
                     .child("ANSI colors"),
             )
-            .child(reset.h(px(KEYS_BUTTON_H)));
+            .child(reset.h(px(SMALL_BUTTON_H)));
         let column = |label: &'static str| div().flex_1().min_w_0().child(label);
         let labels = div()
             .flex()

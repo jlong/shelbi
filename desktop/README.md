@@ -30,7 +30,10 @@ open terminals at once. Its own sidebar stands in the app sidebar's place
 while it is open, with three pages: General (theme, the CLI, notifications,
 ⌘1), Keybindings (`keys.yaml`, ⌘2) and Terminal (font, size, ANSI
 colors with a live preview, the Option key, ⌘3). Back or Esc returns to
-the view it was opened over.
+the view it was opened over. Keybindings lists every binding by context:
+click a chord to rebind it (Esc cancels, Backspace removes it), and the
+change is written to `keys.yaml` with its comments kept and applies to the
+window at once.
 
 ```yaml
 theme: auto                          # auto (follows the system), dark, light; shared with the TUI
@@ -60,7 +63,7 @@ desktop:
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
 | `desktop.terminal_colors.<color>.regular` / `.bold` | the theme's | Terminal ANSI colors as `#rrggbb`, for `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan` and `white` (regular is ANSI 0 to 7, bold the bright 8 to 15). Settings writes only the colors that differ from the theme's (dark: the Sensible palette; light: its own set), applies them to open terminals at once, and Reset removes them all. A value that isn't a color is ignored. |
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
-| `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. |
+| `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. Settings ▸ Keybindings edits it. |
 
 Window state (frame, sidebar width, sidebar collapsed) is saved per window
 slot in `~/.shelbi/desktop-windows.json`, with the project each window last

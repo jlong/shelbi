@@ -197,7 +197,7 @@ impl ShortcutConflict {
 pub fn reserved_conflicts(keymaps: &Keymaps) -> Vec<ShortcutConflict> {
     let mut out = Vec::new();
     for action in Action::all() {
-        for chord in chords_of(keymaps, action) {
+        for chord in keymaps.chords(action) {
             if let Some(what) = reserved_by(&chord) {
                 out.push(ShortcutConflict {
                     mode: action.mode(),
@@ -209,19 +209,6 @@ pub fn reserved_conflicts(keymaps: &Keymaps) -> Vec<ShortcutConflict> {
         }
     }
     out
-}
-
-/// Every chord bound to `action`, in install order.
-fn chords_of(keymaps: &Keymaps, action: Action) -> Vec<KeyChord> {
-    let chords = match action {
-        Action::Global(a) => keymaps.global.chords_for(a),
-        Action::Sidebar(a) => keymaps.sidebar.chords_for(a),
-        Action::Kanban(a) => keymaps.kanban.chords_for(a),
-        Action::Popover(a) => keymaps.popover.chords_for(a),
-        Action::Activity(a) => keymaps.activity.chords_for(a),
-        Action::Palette(a) => keymaps.palette.chords_for(a),
-    };
-    chords.into_iter().copied().collect()
 }
 
 /// `chord` as a menu key equivalent, or `None` when a menu can't carry it

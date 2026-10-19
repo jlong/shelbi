@@ -82,6 +82,56 @@ pub fn chord_text(chord: &KeyChord, style: DisplayStyle) -> String {
     format_chord(chord, style).replace('⏎', "↵")
 }
 
+/// A chord's keycap as the Keybindings frame (2252:28172) spells it: each
+/// modifier glyph, then the key, letters as capitals and named keys as their
+/// macOS key names (`⌃`, `P`; `⇧`, `↑`; `Return`; `Page Up`). Shift+Tab
+/// (`back-tab`) is `⇧`, `Tab`.
+pub fn keycap_keys(chord: &KeyChord) -> Vec<String> {
+    let m = chord.mods;
+    let mut keys = Vec::new();
+    for (bit, glyph) in [(Mods::CONTROL, "⌃"), (Mods::ALT, "⌥"), (Mods::SHIFT, "⇧"), (Mods::SUPER, "⌘")] {
+        let back_tab = bit == Mods::SHIFT && chord.code == Key::BackTab;
+        if m.contains(bit) || back_tab {
+            keys.push(glyph.to_string());
+        }
+    }
+    let key = match chord.code {
+        Key::Char(' ') => "Space".to_string(),
+        Key::Char(c) => c.to_uppercase().to_string(),
+        Key::Up => "↑".into(),
+        Key::Down => "↓".into(),
+        Key::Left => "←".into(),
+        Key::Right => "→".into(),
+        Key::Enter => "Return".into(),
+        Key::Esc => "Esc".into(),
+        Key::Tab | Key::BackTab => "Tab".into(),
+        Key::Backspace => "⌫".into(),
+        Key::Delete => "⌦".into(),
+        Key::Insert => "Insert".into(),
+        Key::Home => "Home".into(),
+        Key::End => "End".into(),
+        Key::PageUp => "Page Up".into(),
+        Key::PageDown => "Page Down".into(),
+        Key::F(n) => format!("F{n}"),
+    };
+    keys.push(key);
+    keys
+}
+
+/// Every spelling a search for `chord` should find it by: its keycap
+/// (`⌃P`), the shared Mac and spelled-out forms (`Ctrl+P`) and `keys.yaml`'s
+/// (`ctrl-p`), lowercased.
+pub fn chord_search_text(chord: &KeyChord) -> String {
+    [
+        keycap_keys(chord).concat(),
+        format_chord(chord, DisplayStyle::Mac),
+        format_chord(chord, DisplayStyle::Linux),
+        chord.canonical(),
+    ]
+    .join(" ")
+    .to_lowercase()
+}
+
 /// [`nav_view_chord`] as the sidebar and the Go menu show it (`⌘O`).
 pub fn nav_view_hotkey(view: &View) -> Option<String> {
     nav_view_chord(view).map(|c| chord_text(&c, DisplayStyle::Mac))
@@ -242,6 +292,38 @@ mod tests {
         assert_eq!(chord_text(&enter, DisplayStyle::Mac), "↵");
         let save = KeyChord::parse("super-s").unwrap();
         assert_eq!(chord_text(&save, DisplayStyle::Mac), format_chord(&save, DisplayStyle::Mac));
+    }
+
+    #[test]
+    fn keycaps_spell_chords_as_the_keybindings_frame_does() {
+        let caps = |spec: &str| keycap_keys(&KeyChord::parse(spec).unwrap()).concat();
+        for (spec, want) in [
+            ("ctrl-p", "⌃P"),
+            ("alt-z", "⌥Z"),
+            ("k", "K"),
+            ("K", "⇧K"),
+            ("shift-up", "⇧↑"),
+            ("enter", "Return"),
+            ("space", "Space"),
+            ("esc", "Esc"),
+            ("page-up", "Page Up"),
+            ("page-down", "Page Down"),
+            ("home", "Home"),
+            ("G", "⇧G"),
+            ("backspace", "⌫"),
+            ("tab", "Tab"),
+            ("back-tab", "⇧Tab"),
+            ("super-shift-n", "⇧⌘N"),
+            ("?", "?"),
+            ("f5", "F5"),
+        ] {
+            assert_eq!(caps(spec), want, "{spec}");
+        }
+        assert_eq!(keycap_keys(&KeyChord::parse("ctrl-shift-p").unwrap()), ["⌃", "⇧", "P"]);
+        let text = chord_search_text(&KeyChord::parse("ctrl-p").unwrap());
+        for needle in ["⌃p", "ctrl+p", "ctrl-p"] {
+            assert!(text.contains(needle), "{needle} in {text}");
+        }
     }
 
     fn chord(spec: &str, key_char: Option<&str>) -> String {

@@ -264,25 +264,52 @@ pub const NAV_RADIUS: f32 = 6.0;
 /// font's, as in the frames (CoreText's own fallback for Geist draws a
 /// wider, heavier ⌘).
 pub fn hotkey(chord: &str, theme: &Theme) -> Div {
+    hotkey_keys(split_chord(chord), theme).px(px(4.0))
+}
+
+/// [`hotkey`] for keys already split (each modifier glyph, then the key),
+/// without its 4px either side.
+fn hotkey_keys(keys: Vec<String>, theme: &Theme) -> Div {
+    hotkey_row(theme).children(keys.into_iter().map(|key| {
+        let modifier = key.chars().all(|c| MODIFIERS.contains(&c));
+        let text = exact_text(key);
+        if modifier {
+            text.family(SYSTEM_FAMILY)
+        } else {
+            text
+        }
+    }))
+}
+
+/// A Keybindings keycap's label (frame 2252:28172): [`hotkey_keys`] with
+/// each modifier glyph in the face Figma's fallback draws it in there. `⌃`
+/// and `⌥` are Apple Symbols' (SF's are wider, and set a keycap 4pt wider
+/// than the frame's), `⇧` Geist's own fallback, `⌘` the system font's, as
+/// the sidebar's.
+pub fn keycap_label(keys: Vec<String>, theme: &Theme) -> Div {
+    hotkey_row(theme).children(keys.into_iter().map(|key| {
+        let text = exact_text(key.clone());
+        match key.as_str() {
+            "⌃" | "⌥" => text.family(SYMBOLS_FAMILY),
+            "⌘" => text.family(SYSTEM_FAMILY),
+            _ => text,
+        }
+    }))
+}
+
+fn hotkey_row(theme: &Theme) -> Div {
     div()
         .flex()
         .flex_row()
         .flex_none()
         .items_center()
         .gap(px(2.0))
-        .px(px(4.0))
         .type_style(Type::XSmall)
         .text_color(theme.gray)
-        .children(split_chord(chord).into_iter().map(|key| {
-            let modifier = key.chars().all(|c| MODIFIERS.contains(&c));
-            let text = exact_text(key);
-            if modifier {
-                text.family(SYSTEM_FAMILY)
-            } else {
-                text
-            }
-        }))
 }
+
+/// macOS's symbol font, whose `⌃` and `⌥` match the Figma keycaps'.
+const SYMBOLS_FAMILY: &str = "Apple Symbols";
 
 /// gpui's name for the system UI font (SF on macOS).
 const SYSTEM_FAMILY: &str = ".SystemUIFont";
@@ -656,6 +683,23 @@ pub fn filter_chip(
 /// `focused` draws the focus ring and glow around it ([`focus_bands`]). The
 /// caller sets its width (Figma: 180px).
 pub fn search_box(id: impl Into<SharedString>, content: impl IntoElement, focused: bool, theme: &Theme) -> Stateful<Div> {
+    search_box_sized(id, content, focused, 28.0, 6.0, theme)
+}
+
+/// The Searchbox at Base (the Keybindings page's): [`search_box`] 32px tall
+/// with 8px corners.
+pub fn search_box_base(id: impl Into<SharedString>, content: impl IntoElement, focused: bool, theme: &Theme) -> Stateful<Div> {
+    search_box_sized(id, content, focused, 32.0, 8.0, theme)
+}
+
+fn search_box_sized(
+    id: impl Into<SharedString>,
+    content: impl IntoElement,
+    focused: bool,
+    height: f32,
+    radius: f32,
+    theme: &Theme,
+) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
     let d = div()
@@ -666,21 +710,21 @@ pub fn search_box(id: impl Into<SharedString>, content: impl IntoElement, focuse
         .flex_none()
         .items_center()
         .gap(px(6.0))
-        .h(px(28.0))
+        .h(px(height))
         .px(px(6.0))
-        .rounded(px(6.0))
+        .rounded(px(radius))
         .cursor_text();
-    fill_layer(d, id, px(6.0), [theme.background, theme.background_hover, theme.background_hover])
+    fill_layer(d, id, px(radius), [theme.background, theme.background_hover, theme.background_hover])
         .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon))
         .child(div().relative().flex().flex_1().min_w_0().h_full().items_center().child(content))
-        .when(focused, |d| d.children(focus_bands(6.0, theme)))
+        .when(focused, |d| d.children(focus_bands(radius, theme)))
 }
 
 /// [`focus_shadow`] drawn as bands around a control whose corners are
 /// `radius`, for a translucent control: gpui paints a drop shadow as a
 /// filled box under the element, which would show through its fill. The
 /// 1px ring, then the 4px glow over it, both outside the control.
-fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
+pub fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
     let band = |width: f32, color: Hsla| {
         div()
             .absolute()

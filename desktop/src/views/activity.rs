@@ -731,7 +731,7 @@ fn feed_row(theme: &Theme, line: &Line, selected: bool) -> gpui::Div {
         .child(right)
 }
 
-fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
+pub(super) fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::Div {
     div()
         .flex()
         .flex_row()

@@ -175,6 +175,75 @@ impl Action {
         }
     }
 
+    /// Short label, without the mode prefix [`Self::description`] carries:
+    /// what a list grouped by mode (the desktop's Settings ▸ Keybindings)
+    /// shows beside the action's chords. The group's title
+    /// ([`KeymapContext::title`]) supplies the mode.
+    ///
+    /// [`KeymapContext::title`]: crate::keymap::KeymapContext
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Action::Global(a) => match a {
+                GlobalAction::Quit => "Quit Shelbi",
+                GlobalAction::ZenToggle => "Toggle Zen mode",
+                GlobalAction::OpenPalette => "Open command palette",
+                GlobalAction::FocusSidebar => "Focus sidebar",
+                GlobalAction::FocusMain => "Focus main pane",
+            },
+            Action::Sidebar(a) => match a {
+                SidebarAction::Quit => "Quit",
+                SidebarAction::NavUp => "Move selection up",
+                SidebarAction::NavDown => "Move selection down",
+                SidebarAction::Activate => "Open selection",
+                SidebarAction::Refresh => "Refresh",
+            },
+            Action::Kanban(a) => match a {
+                KanbanAction::NavLeft => "Focus previous column",
+                KanbanAction::NavRight => "Focus next column",
+                KanbanAction::NavUp => "Move selection up",
+                KanbanAction::NavDown => "Move selection down",
+                KanbanAction::MoveCardLeft => "Move card to previous column",
+                KanbanAction::MoveCardRight => "Move card to next column",
+                KanbanAction::ReorderUp => "Move card up",
+                KanbanAction::ReorderDown => "Move card down",
+                KanbanAction::OpenPopover => "Open issue details",
+                KanbanAction::Refresh => "Refresh",
+                KanbanAction::CycleWorkflowFilter => "Cycle workflow filter",
+                KanbanAction::OpenWorkspace => "Open assigned workspace",
+            },
+            Action::Popover(a) => match a {
+                PopoverAction::Close => "Close issue details",
+                PopoverAction::ScrollUp => "Scroll up",
+                PopoverAction::ScrollDown => "Scroll down",
+                PopoverAction::PageUp => "Page up",
+                PopoverAction::PageDown => "Page down",
+                PopoverAction::ScrollHome => "Scroll to top",
+                PopoverAction::MoveLeft => "Move task to previous column",
+                PopoverAction::MoveRight => "Move task to next column",
+                PopoverAction::OpenWorkspace => "Open assigned workspace",
+            },
+            Action::Activity(a) => match a {
+                ActivityAction::ScrollUp => "Scroll up",
+                ActivityAction::ScrollDown => "Scroll down",
+                ActivityAction::PageUp => "Page up",
+                ActivityAction::PageDown => "Page down",
+                ActivityAction::ScrollHome => "Scroll to top",
+                ActivityAction::ScrollEnd => "Scroll to bottom",
+                ActivityAction::Refresh => "Refresh",
+                ActivityAction::ResetFilter => "Reset filters",
+                ActivityAction::ToggleZenFilter => "Toggle Zen filter",
+                ActivityAction::ToggleWorkspacesFilter => "Toggle workspaces filter",
+            },
+            Action::Palette(a) => match a {
+                PaletteAction::Close => "Close command palette",
+                PaletteAction::Activate => "Run selected command",
+                PaletteAction::NavUp => "Previous command",
+                PaletteAction::NavDown => "Next command",
+                PaletteAction::Backspace => "Delete previous character",
+            },
+        }
+    }
+
     /// Default chord list — what `load_keymaps` installs when the user
     /// has no `keys.yaml`. Each string must parse with [`KeyChord::parse`].
     ///
