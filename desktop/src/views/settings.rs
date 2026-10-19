@@ -20,6 +20,14 @@
 //!   reads, typed or chosen with Browse.
 //!
 //! - `desktop.notifications`: which system notifications the app posts.
+//! - `desktop.terminal_colors`: the ANSI colors the user changed, regular
+//!   and bold for each of the eight, typed as hex. A valid color applies to
+//!   every terminal at once (through the same `TerminalSettings` global) and
+//!   is saved; a color equal to the theme's isn't written, and Reset clears
+//!   them all. Text that isn't a color marks its field and isn't saved.
+//!   Beside the controls, a read-only terminal draws the Terminal frame's
+//!   Claude Code session ([`super::terminal_preview`]) with the font, size
+//!   and colors as they are now.
 //!
 //! A button opens `keys.yaml` (the key bindings both clients share) in the
 //! user's default text editor; below it, any binding macOS already owns (⌘W,
@@ -35,23 +43,26 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, EventEmitter, Focusable, PathPromptOptions, SharedString,
-    Subscription, Window,
+    div, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, PathPromptOptions,
+    SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
+use shelbi_term::render::Rgb as TermRgb;
 
 use super::font_picker::{FontPicker, FontPickerEvent};
 use super::settings_nav::SettingsPage;
+use super::terminal_preview;
 use crate::assets::icons;
 use crate::elements::controls;
+use crate::elements::terminal::colors::{self, AnsiOverrides};
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
-use crate::elements::terminal::TerminalSettings;
+use crate::elements::terminal::{TerminalPane, TerminalSettings};
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, Type, Typography};
-use crate::theme::Theme;
+use crate::theme::{rgb_hsla, Theme};
 
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
@@ -61,6 +72,18 @@ const KEYS_BUTTON_H: f32 = 28.0;
 
 /// The size field's width (the frame's, room for `32pt`).
 const SIZE_FIELD_W: f32 = 76.0;
+
+/// The ANSI colors table's color-name column (`2263:4841`).
+const ANSI_NAME_W: f32 = 80.0;
+
+/// The gap between the Terminal page's controls and its preview, and the
+/// preview's inset inside its border (`2264:7447`).
+const PREVIEW_GAP: f32 = 32.0;
+const PREVIEW_INSET: f32 = 24.0;
+
+/// The Terminal frame's controls column, top to bottom (`2269:4844`): the
+/// preview is never shorter.
+const TERMINAL_COLUMN_H: f32 = 694.0;
 
 /// The values the view edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +97,8 @@ pub struct SettingsValues {
     pub theme: ThemePreference,
     pub option_as_meta: OptionAsMeta,
     pub notifications: Switches,
+    /// The ANSI colors the user changed (`None` keeps the theme's).
+    pub ansi: AnsiOverrides,
 }
 
 /// The notification switches, as the form shows them.
@@ -136,6 +161,7 @@ impl Default for SettingsValues {
             theme: ThemePreference::default(),
             option_as_meta: OptionAsMeta::default(),
             notifications: Switches::default(),
+            ansi: [None; 16],
         }
     }
 }
@@ -172,12 +198,14 @@ impl SettingsValues {
             theme: cfg.theme,
             option_as_meta: cfg.desktop.option_as_meta.unwrap_or_default(),
             notifications: Switches::from(&cfg.desktop.notifications),
+            ansi: terminal.ansi,
         }
     }
 
     /// Write these values into `cfg`. A blank CLI path clears its key; the
     /// default font family and size aren't written (as Option's default
-    /// isn't), so `config.yaml` keeps only what was changed.
+    /// isn't), nor are colors left to the theme, so `config.yaml` keeps only
+    /// what was changed.
     pub fn apply(&self, cfg: &mut UserConfig) {
         let blank = |s: &str| {
             let s = s.trim();
@@ -195,6 +223,7 @@ impl SettingsValues {
             // Off is the default, so it isn't written.
             option_as_meta: (self.option_as_meta != OptionAsMeta::Off).then_some(self.option_as_meta),
             notifications,
+            terminal_colors: colors::to_config(&self.ansi),
         };
         cfg.theme = self.theme;
     }
@@ -230,6 +259,17 @@ pub struct SettingsView {
     theme: ThemePreference,
     option_as_meta: OptionAsMeta,
     notifications: Switches,
+    /// The ANSI colors the user changed, the sixteen fields they are typed
+    /// in (regular 0 to 7, then bold 8 to 15), and which of those hold text
+    /// that isn't a color.
+    ansi: AnsiOverrides,
+    ansi_inputs: Vec<Entity<InputState>>,
+    ansi_invalid: [bool; 16],
+    /// The Terminal page's preview: a read-only terminal.
+    preview: Entity<TerminalPane>,
+    /// A test's view saves here, never to `~/.shelbi`.
+    #[cfg(test)]
+    saved: UserConfig,
     /// `keys.yaml` bindings macOS already owns, once the keymaps are read.
     conflicts: Vec<ShortcutConflict>,
     /// False until the config has been read, so an early blur can't save
@@ -244,7 +284,14 @@ impl SettingsView {
         let font_family = cx.new(|cx| FontPicker::new(PRIMARY_FAMILY.to_string(), window, cx));
         let font_size_input = cx.new(|cx| InputState::new(window, cx).default_value(size_text(DEFAULT_SIZE)));
         let cli_path = cx.new(|cx| InputState::new(window, cx).placeholder("Found automatically"));
-        let subscriptions = vec![
+        let defaults = cx.global::<Theme>().terminal.ansi;
+        let ansi_inputs: Vec<_> = (0..16)
+            .map(|slot| cx.new(|cx| InputState::new(window, cx).default_value(colors::hex(defaults[slot]))))
+            .collect();
+        let preview = cx.new(|cx| {
+            TerminalPane::canned("Preview".into(), terminal_preview::stream, window, cx)
+        });
+        let mut subscriptions = vec![
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                     this.save(cx);
@@ -263,7 +310,19 @@ impl SettingsView {
             cx.observe_global_in::<TerminalSettings>(window, |this, window, cx| {
                 this.follow_terminal_settings(window, cx)
             }),
+            // The appearance changed: the colors left to the theme are its
+            // new ones.
+            cx.observe_global_in::<Theme>(window, |this, window, cx| this.show_colors(window, cx)),
         ];
+        for (slot, input) in ansi_inputs.iter().enumerate() {
+            subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => this.color_edited(slot, cx),
+                    InputEvent::Blur | InputEvent::PressEnter { .. } => this.color_committed(slot, window, cx),
+                    _ => {}
+                }
+            }));
+        }
         let mut view = SettingsView {
             page: SettingsPage::default(),
             font_family,
@@ -273,6 +332,12 @@ impl SettingsView {
             theme: ThemePreference::Auto,
             option_as_meta: OptionAsMeta::Off,
             notifications: Switches::default(),
+            ansi: [None; 16],
+            ansi_inputs,
+            ansi_invalid: [false; 16],
+            preview,
+            #[cfg(test)]
+            saved: UserConfig::default(),
             conflicts: Vec::new(),
             loaded: false,
             theme_track: SlideTrack::shared(),
@@ -292,6 +357,47 @@ impl SettingsView {
     #[cfg(test)]
     pub fn page(&self) -> SettingsPage {
         self.page
+    }
+
+    /// Fill the form from `cfg` as reading `config.yaml` does (a test's
+    /// view reads no disk), which lets it save.
+    #[cfg(test)]
+    pub fn load_config(&mut self, cfg: UserConfig, window: &mut Window, cx: &mut Context<Self>) {
+        self.fill(&cfg, window, cx);
+        self.saved = cfg;
+    }
+
+    /// The config as a test's view last saved it.
+    #[cfg(test)]
+    pub fn saved(&self) -> &UserConfig {
+        &self.saved
+    }
+
+    /// Type `text` into color field `slot` (0 to 7 regular, 8 to 15 bold)
+    /// as the user would, then leave it.
+    #[cfg(test)]
+    pub fn type_color(&mut self, slot: usize, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.ansi_inputs[slot].update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+        self.color_edited(slot, cx);
+        self.color_committed(slot, window, cx);
+    }
+
+    /// The Terminal page's preview pane.
+    #[cfg(test)]
+    pub fn preview(&self) -> Entity<TerminalPane> {
+        self.preview.clone()
+    }
+
+    /// Whether Reset has anything to undo.
+    #[cfg(test)]
+    pub fn can_reset(&self) -> bool {
+        self.colors_customized()
+    }
+
+    /// A color field's text.
+    #[cfg(test)]
+    pub fn color_text(&self, slot: usize, cx: &App) -> String {
+        self.ansi_inputs[slot].read(cx).value().to_string()
     }
 
     /// Show `page`.
@@ -336,18 +442,7 @@ impl SettingsView {
             let cfg = read.await;
             this.update_in(cx, |this, window, cx| {
                 match cfg {
-                    Ok(cfg) => {
-                        let values = SettingsValues::from_config(&cfg);
-                        this.font_family
-                            .update(cx, |p, cx| p.set_family(values.font_family, cx));
-                        this.show_size(values.font_size, window, cx);
-                        this.cli_path
-                            .update(cx, |s, cx| s.set_value(values.cli_path, window, cx));
-                        this.theme = values.theme;
-                        this.option_as_meta = values.option_as_meta;
-                        this.notifications = values.notifications;
-                        this.loaded = true;
-                    }
+                    Ok(cfg) => this.fill(&cfg, window, cx),
                     Err(e) => {
                         this.state = SaveState::Failed(format!("Couldn't read config.yaml: {e}"));
                     }
@@ -359,6 +454,23 @@ impl SettingsView {
         .detach();
     }
 
+    /// Fill the form from `cfg`, and let it save from now on.
+    fn fill(&mut self, cfg: &UserConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let values = SettingsValues::from_config(cfg);
+        self.font_family
+            .update(cx, |p, cx| p.set_family(values.font_family, cx));
+        self.show_size(values.font_size, window, cx);
+        self.cli_path
+            .update(cx, |s, cx| s.set_value(values.cli_path, window, cx));
+        self.theme = values.theme;
+        self.option_as_meta = values.option_as_meta;
+        self.notifications = values.notifications;
+        self.ansi = values.ansi;
+        self.ansi_invalid = [false; 16];
+        self.show_colors(window, cx);
+        self.loaded = true;
+    }
+
     fn values(&self, cx: &Context<Self>) -> SettingsValues {
         SettingsValues {
             font_family: self.font_family.read(cx).family().to_string(),
@@ -367,6 +479,7 @@ impl SettingsView {
             theme: self.theme,
             option_as_meta: self.option_as_meta,
             notifications: self.notifications,
+            ansi: self.ansi,
         }
     }
 
@@ -425,6 +538,85 @@ impl SettingsView {
         }
         self.font_family
             .update(cx, |p, cx| p.set_family(settings.font_family, cx));
+        if settings.ansi != self.ansi {
+            self.ansi = settings.ansi;
+            self.show_colors(window, cx);
+        }
+    }
+
+    /// The theme's ANSI colors for the appearance now.
+    fn default_colors(cx: &App) -> [TermRgb; 16] {
+        cx.global::<Theme>().terminal.ansi
+    }
+
+    /// The color `slot` shows: the user's, else the theme's.
+    fn color(&self, slot: usize, cx: &App) -> TermRgb {
+        self.ansi[slot].unwrap_or(Self::default_colors(cx)[slot])
+    }
+
+    /// Whether any color differs from the theme's (what Reset undoes), or
+    /// a field holds text that isn't a color.
+    fn colors_customized(&self) -> bool {
+        self.ansi.iter().any(Option::is_some) || self.ansi_invalid.contains(&true)
+    }
+
+    /// Show each color in its field, except one being typed in or holding
+    /// text that isn't a color.
+    fn show_colors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for slot in 0..16 {
+            let input = self.ansi_inputs[slot].clone();
+            let typing = input.read(cx).focus_handle(cx).is_focused(window);
+            if typing || self.ansi_invalid[slot] {
+                continue;
+            }
+            let text = colors::hex(self.color(slot, cx));
+            if input.read(cx).value() != text.as_str() {
+                input.update(cx, |s, cx| s.set_value(text, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// A color field's text changed: a color applies at once and is saved
+    /// (unless it is the one already shown); anything else marks the field.
+    fn color_edited(&mut self, slot: usize, cx: &mut Context<Self>) {
+        let text = self.ansi_inputs[slot].read(cx).value().to_string();
+        match colors::parse_hex(&text) {
+            None => self.ansi_invalid[slot] = true,
+            Some(color) => {
+                self.ansi_invalid[slot] = false;
+                // The theme's own color isn't the user's: it isn't written.
+                let value = (color != Self::default_colors(cx)[slot]).then_some(color);
+                if value != self.ansi[slot] {
+                    self.ansi[slot] = value;
+                    self.save(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Enter in, or focus out of, a color field: a color is written back
+    /// the way the table shows them (`#E04F52`); text that isn't one stays,
+    /// marked, for the user to fix.
+    fn color_committed(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ansi_invalid[slot] {
+            return;
+        }
+        let text = colors::hex(self.color(slot, cx));
+        self.ansi_inputs[slot].update(cx, |s, cx| s.set_value(text, window, cx));
+    }
+
+    /// Put every color back to the theme's and save.
+    fn reset_colors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ansi = [None; 16];
+        self.ansi_invalid = [false; 16];
+        let defaults = Self::default_colors(cx);
+        for (input, color) in self.ansi_inputs.clone().iter().zip(defaults) {
+            input.update(cx, |s, cx| s.set_value(colors::hex(color), window, cx));
+        }
+        self.save(cx);
+        cx.notify();
     }
 
     /// Apply the form to open terminals at once, then write it off the UI
@@ -439,8 +631,27 @@ impl SettingsView {
             values.apply(&mut cfg);
             TerminalSettings::from_config(&cfg.desktop)
         };
-        // Open terminals pick up the font, its size and the Option key now.
+        // Open terminals pick up the font, its size, the Option key and the
+        // colors now.
         TerminalSettings::set(applied, cx);
+        #[cfg(test)]
+        self.save_in_memory(values, cx);
+        #[cfg(not(test))]
+        self.write(values, cx);
+    }
+
+    /// Keep `values` as a test's saved config.
+    #[cfg(test)]
+    fn save_in_memory(&mut self, values: SettingsValues, cx: &mut Context<Self>) {
+        values.apply(&mut self.saved);
+        self.state = SaveState::Saved;
+        cx.emit(SettingsEvent::Saved);
+        cx.notify();
+    }
+
+    /// Write `values` to `config.yaml` off the UI thread.
+    #[cfg(not(test))]
+    fn write(&mut self, values: SettingsValues, cx: &mut Context<Self>) {
         let write = cx.background_executor().spawn(async move {
             shelbi_state::update_user_config(|cfg| values.apply(cfg))
                 .map(|_| ())
@@ -840,51 +1051,221 @@ impl Render for SettingsView {
                             .child(line)
                     })),
             ),
-            // The Terminal frame (2252:28494) sets its controls in a column
-            // the picker's width, the Option helper a line per sentence.
+            // The Terminal frame (2252:28494): the controls in a column the
+            // picker's width, the Option helper a line per sentence; the
+            // preview fills the rest of the page beside them.
             SettingsPage::Terminal => page.child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_6()
-                    .w(px(controls::CONTROL_W))
-                    .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
-                    .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
+                    .flex_row()
+                    .flex_1()
+                    .gap(px(PREVIEW_GAP))
+                    .min_h(px(TERMINAL_COLUMN_H))
                     .child(
-                        controls::labeled_control(
-                            "Option key in terminals",
-                            controls::segmented_track(&theme)
-                                .child(motion::origin_probe(&self.option_track))
-                                .children(option_chip_slide.map(floating))
-                                .child(option_chip("Types characters", OptionAsMeta::Off, cx))
-                                .child(option_chip("Meta", OptionAsMeta::Both, cx))
-                                .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
-                                .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
-                            None,
-                            &theme,
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(controls::helper("Characters: Option+E, E types é, as in other Mac apps.", &theme))
-                                .child(
-                                    controls::helper(
-                                        "Meta: Option+B sends Esc B, for shell word motion and Claude Code’s \
-                                         Option shortcuts.",
-                                        &theme,
-                                    )
-                                    .mb(px(4.0)),
-                                )
-                                .child(controls::helper(
-                                    "Option with Enter, the arrows, Backspace, or Delete is Meta either way.",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .gap_6()
+                            .w(px(controls::CONTROL_W))
+                            .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
+                            .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
+                            .child(self.render_ansi(&theme, window, cx))
+                            .child(
+                                controls::labeled_control(
+                                    "Option key in terminals",
+                                    controls::segmented_track(&theme)
+                                        .child(motion::origin_probe(&self.option_track))
+                                        .children(option_chip_slide.map(floating))
+                                        .child(option_chip("Types characters", OptionAsMeta::Off, cx))
+                                        .child(option_chip("Meta", OptionAsMeta::Both, cx))
+                                        .child(option_chip("Left is Meta", OptionAsMeta::Left, cx))
+                                        .child(option_chip("Right is Meta", OptionAsMeta::Right, cx)),
+                                    None,
                                     &theme,
-                                )),
-                        ),
-                    ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(controls::helper(
+                                            "Characters: Option+E, E types é, as in other Mac apps.",
+                                            &theme,
+                                        ))
+                                        .child(
+                                            controls::helper(
+                                                "Meta: Option+B sends Esc B, for shell word motion and Claude Code’s \
+                                                 Option shortcuts.",
+                                                &theme,
+                                            )
+                                            .mb(px(4.0)),
+                                        )
+                                        .child(controls::helper(
+                                            "Option with Enter, the arrows, Backspace, or Delete is Meta either way.",
+                                            &theme,
+                                        )),
+                                ),
+                            ),
+                    )
+                    .child(self.render_preview(&theme)),
             ),
         };
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
+    }
+}
+
+impl SettingsView {
+    /// The ANSI colors editor (`2263:4808`): the title with Reset, the
+    /// helper, then a row per color with its regular and bold fields.
+    fn render_ansi(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let reset = if self.colors_customized() {
+            style::button("settings-ansi-reset", "Reset", ButtonKind::Secondary, false, theme)
+                .on_click(cx.listener(|this, _, window, cx| this.reset_colors(window, cx)))
+        } else {
+            style::disabled_button("settings-ansi-reset", "Reset", ButtonKind::Secondary, theme)
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(controls::CONTROL_GAP))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .type_style(Type::BaseMedium)
+                    .text_color(theme.text_loud)
+                    .child("ANSI colors"),
+            )
+            .child(reset.h(px(KEYS_BUTTON_H)));
+        let column = |label: &'static str| div().flex_1().min_w_0().child(label);
+        let labels = div()
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .type_style(Type::XSmallMedium)
+            .text_color(theme.muted)
+            .child(div().w(px(ANSI_NAME_W)).flex_none().child("Color"))
+            .child(column("Regular"))
+            .child(column("Bold"));
+        let rows = colors::NAMES.iter().enumerate().map(|(color, name)| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .w(px(ANSI_NAME_W))
+                        .flex_none()
+                        .type_style(Type::Base)
+                        .text_color(theme.foreground)
+                        .child(*name),
+                )
+                .child(self.color_field(color, theme, window, cx))
+                .child(self.color_field(color + 8, theme, window, cx))
+        });
+        let invalid = self.ansi_invalid.contains(&true);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .w_full()
+            .child(header)
+            .child(
+                div()
+                    .type_style(Type::XSmall)
+                    .text_color(theme.muted)
+                    .child("Regular and bold colors used by terminal applications."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(labels)
+                    .child(div().flex().flex_col().gap(px(4.0)).children(rows)),
+            )
+            .when(invalid, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "settings-ansi-invalid".into())
+                        .type_style(Type::XSmall)
+                        .text_color(theme.error)
+                        .child("A color is six hex digits, like #E04F52."),
+                )
+            })
+    }
+
+    /// Color field `slot`: the Textbox with the color's swatch before its
+    /// hex (`2264:4775`), in the error edge while its text isn't a color.
+    fn color_field(&self, slot: usize, theme: &Theme, window: &Window, cx: &App) -> impl IntoElement {
+        let input = &self.ansi_inputs[slot];
+        let focused = input.read(cx).focus_handle(cx).is_focused(window);
+        let swatch = div()
+            .flex_none()
+            .size(px(16.0))
+            .rounded(px(2.0))
+            .border_1()
+            .border_color(theme.divider_strong)
+            .bg(rgb_hsla(self.color(slot, cx)));
+        let content = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(8.0))
+            .child(swatch)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(input)
+                        .appearance(false)
+                        .h_full()
+                        .px_0()
+                        .type_style(Type::Base)
+                        .text_color(theme.foreground),
+                ),
+            );
+        let field = if self.ansi_invalid[slot] {
+            controls::invalid_textbox(content, focused, theme)
+        } else {
+            controls::textbox(content, focused, theme)
+        };
+        let (name, weight) = (colors::NAMES[slot % 8], if slot < 8 { "regular" } else { "bold" });
+        let selector = format!("settings-ansi-{}-{weight}", name.to_lowercase());
+        field.debug_selector(move || selector.clone()).flex_1().min_w_0()
+    }
+
+    /// The preview (`2264:7445`): its label over the read-only terminal, in
+    /// a 1px border 24px around the grid.
+    fn render_preview(&self, theme: &Theme) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .type_style(Type::BaseMedium)
+                    .text_color(theme.text_loud)
+                    .child("Preview"),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "settings-terminal-preview".into())
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(PREVIEW_INSET))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.divider_strong)
+                    .bg(rgb_hsla(theme.terminal.background))
+                    .overflow_hidden()
+                    .child(self.preview.clone()),
+            )
     }
 }
 
@@ -914,6 +1295,12 @@ mod tests {
                 review_ready: false,
                 orchestrator_waiting: true,
             },
+            ansi: {
+                let mut ansi = [None; 16];
+                ansi[0] = Some(TermRgb::hex(0x000000));
+                ansi[9] = Some(TermRgb::hex(0xe69589));
+                ansi
+            },
         };
         let mut cfg = UserConfig {
             editor: Some("hx".into()),
@@ -928,6 +1315,9 @@ mod tests {
         );
         assert_eq!(cfg.theme, ThemePreference::Light);
         assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
+        let ansi = &cfg.desktop.terminal_colors;
+        assert_eq!((ansi.black.regular.as_deref(), ansi.red.bold.as_deref()), (Some("#000000"), Some("#E69589")));
+        assert_eq!((ansi.black.bold.as_ref(), ansi.green.regular.as_ref()), (None, None), "only what was changed");
         assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
         assert_eq!(back, values);
@@ -940,6 +1330,7 @@ mod tests {
         let mut cfg = UserConfig::default();
         cfg.desktop.terminal_font_size = Some(12);
         cfg.desktop.terminal_font_family = Some("Menlo".into());
+        cfg.desktop.terminal_colors.set(3, Some("#dbc300".into()));
         SettingsValues::default().apply(&mut cfg);
         assert!(cfg.desktop.is_empty(), "{:?}", cfg.desktop);
 

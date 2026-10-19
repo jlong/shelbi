@@ -142,13 +142,15 @@ pub fn hsla(color: Rgba) -> Hsla {
 /// in the default color `text_loud` and dim text `muted`, as the terminal
 /// frames draw them; the selection is `text_selection`; the matches
 /// `search_match` / `search_current`), so they follow the theme. The ANSI
-/// sixteen take the Figma terminal colors where Figma has them (red, green
-/// and cyan output from the terminal frames' `theme.red` / `theme.green` /
-/// `theme.cyan`; yellow, blue, magenta and bright black from
-/// `theme.ansi_*`), and keep a
-/// terminal palette for the rest: Ghostty's defaults (Tomorrow Night) in the
-/// dark theme, a GitHub-light style set in the light theme, with "white"
-/// darkened so it shows on white. Indexed colors 16..=255 are the fixed xterm cube and ramp
+/// sixteen in the dark theme are the Settings ▸ Terminal frame's
+/// `ansi/regular/*` and `ansi/bold/*` variables (the Sensible palette,
+/// [`SENSIBLE`]); in the light theme a GitHub-light style set, with "white"
+/// darkened so it shows on white, takes the Figma terminal colors where
+/// Figma has them (red, green and cyan from the terminal frames'
+/// `theme.red` / `theme.green` / `theme.cyan`; yellow, blue, magenta and
+/// bright black from `theme.ansi_*`). The user's own colors
+/// (`desktop.terminal_colors`) go over either
+/// ([`TerminalPalette::with_ansi`]). Indexed colors 16..=255 are the fixed xterm cube and ramp
 /// ([`shelbi_term::render::xterm_256`]) and true color passes through. A
 /// program's own OSC 4/10/11/12 redefinitions win over these at render time.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -188,31 +190,28 @@ impl TerminalPalette {
             let rgb = role.over(under);
             TermRgb::new(rgb.r, rgb.g, rgb.b)
         };
-        let mut ansi = if palette.appearance == Appearance::Dark {
-            [
-                0x1d1f21, 0xcc6666, 0xb5bd68, 0xf0c674, 0x81a2be, 0xb294bb, 0x8abeb7, 0xc5c8c6,
-                0x666666, 0xd54e53, 0xb9ca4a, 0xe7c547, 0x7aa6da, 0xc397d8, 0x70c0b1, 0xeaeaea,
-            ]
-            .map(TermRgb::hex)
+        let ansi = if palette.appearance == Appearance::Dark {
+            SENSIBLE.map(TermRgb::hex)
         } else {
-            [
+            let mut ansi = [
                 0x24292f, 0xcf222e, 0x116329, 0x7d4e00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
                 0x57606a, 0xa40e26, 0x1a7f37, 0x9a6700, 0x218bff, 0xa475f9, 0x3192aa, 0x8c959f,
             ]
-            .map(TermRgb::hex)
+            .map(TermRgb::hex);
+            // The Figma terminal colors, in their ANSI slots.
+            for (slot, role) in [
+                (1, palette.theme_red),
+                (2, palette.theme_green),
+                (3, palette.yellow),
+                (4, palette.blue),
+                (5, palette.magenta),
+                (6, palette.theme_cyan),
+                (8, palette.dark_gray),
+            ] {
+                ansi[slot] = c(role);
+            }
+            ansi
         };
-        // The Figma terminal colors, in their ANSI slots.
-        for (slot, role) in [
-            (1, palette.theme_red),
-            (2, palette.theme_green),
-            (3, palette.yellow),
-            (4, palette.blue),
-            (5, palette.magenta),
-            (6, palette.theme_cyan),
-            (8, palette.dark_gray),
-        ] {
-            ansi[slot] = c(role);
-        }
         Self {
             foreground: c(palette.foreground),
             bold_foreground: c(palette.text_loud),
@@ -227,6 +226,15 @@ impl TerminalPalette {
         }
     }
 }
+
+/// The dark theme's ANSI sixteen: the Settings ▸ Terminal frame's
+/// (`2252:28494`) `ansi/regular/*` (0 to 7) and `ansi/bold/*` (8 to 15),
+/// the palette its Reset restores ("Reset to Sensible"). Red, green and cyan
+/// are the terminal frames' `theme.red`, `theme.green` and `theme.cyan`.
+pub const SENSIBLE: [u32; 16] = [
+    0x000000, 0xe04f52, 0x5acd25, 0xdbc300, 0x5893d6, 0xd259d7, 0x00a6b2, 0xbababa,
+    0x666666, 0xe69589, 0x9bdaa6, 0xe6d77b, 0x5abdff, 0xdc8de6, 0x82e6e5, 0xffffff,
+];
 
 /// A terminal [`TermRgb`] as a gpui color.
 pub fn rgb_hsla(c: TermRgb) -> Hsla {
@@ -393,14 +401,15 @@ mod tests {
         // frame's body text (#b2b5bb in the PNG, a unit off in green).
         assert_eq!(dark.foreground, TermRgb::hex(0xb2b4bb));
         assert_eq!(dark.ansi[1], TermRgb::hex(0xe04f52), "theme.red");
-        assert_eq!(dark.ansi[9], TermRgb::hex(0xd54e53), "Ghostty's bright red");
+        assert_eq!(dark.ansi, SENSIBLE.map(TermRgb::hex), "the Terminal frame's ansi/*");
+        assert_eq!(dark.ansi[9], TermRgb::hex(0xe69589), "ansi/bold/red");
         // Bold and dim default text: the frames' bold prompts (theme.white)
         // and dim tool output (theme.muted).
         assert_eq!(dark.bold_foreground, TermRgb::hex(0xf8f8fa));
         assert_eq!(dark.dim_foreground, TermRgb::hex(0x777a86));
         assert_eq!(dark.ansi[2], TermRgb::hex(0x5acd25), "theme.green");
         assert_eq!(dark.ansi[6], TermRgb::hex(0x00a6b2), "theme.cyan");
-        assert_eq!(dark.ansi[4], TermRgb::hex(0x4a8fd7), "theme.ansi_blue");
+        assert_eq!(dark.ansi[4], TermRgb::hex(0x5893d6), "ansi/regular/blue");
         let light = Theme::resolve(ThemePreference::Light, WindowAppearance::Light).terminal;
         assert_eq!(light.ansi[1], TermRgb::hex(0xc23b3e), "theme.red");
         assert_eq!(light.ansi[2], TermRgb::hex(0x367b16), "theme.green");

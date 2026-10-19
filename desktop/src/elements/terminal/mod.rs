@@ -47,10 +47,13 @@
 //!   reports them, in whichever mode it asked for (`shelbi_term::gesture`).
 //! - **Fonts**: family and size from the settings, applied live; Source Code
 //!   Pro (bundled) by default, Geist Mono (bundled) as the first fallback.
+//! - **Colors**: the theme's terminal palette with the user's ANSI colors
+//!   over it ([`colors`]), applied live.
 //! - **Box drawing**: the common line and rounded-corner characters (`─ │ ╭
 //!   ┼`, light and heavy) are drawn as lines snapped to device pixels
 //!   ([`boxdraw`]), not taken from the font, so a box's border is one crisp
-//!   pixel and its cells join without seams.
+//!   pixel and its cells join without seams; the block elements (`█ ▐ ▛`)
+//!   are filled the same way, so a run of them is solid.
 //! - **Accessibility**: the pane is an AccessKit `Terminal` node whose
 //!   children are the visible rows as text, with the cursor as the text
 //!   selection, so VoiceOver can read the screen.
@@ -66,6 +69,7 @@
 
 pub mod a11y;
 pub mod boxdraw;
+pub mod colors;
 mod element;
 pub mod fonts;
 pub mod highlights;
@@ -424,6 +428,24 @@ impl TerminalPane {
         pane
     }
 
+    /// A read-only pane with no session behind it, showing `render`'s
+    /// output for its size, drawn again whenever its size changes (Settings'
+    /// preview). Keys and pastes go nowhere.
+    pub fn canned(
+        name: String,
+        render: fn(Size) -> Vec<u8>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (events, rx) = futures::channel::mpsc::unbounded();
+        let mut pane = Self::new(name.clone(), window, cx);
+        pane.attached(name, Size::new(80, 24), Box::new(session::Canned { events, render }), cx);
+        pane._pump = Some(cx.spawn_in(window, async move |this, cx| {
+            Self::pump(this, rx, cx).await;
+        }));
+        pane
+    }
+
     /// The visible screen as text, one line per row (tests).
     #[cfg(test)]
     pub fn terminal_text(&self) -> String {
@@ -722,8 +744,10 @@ impl TerminalPane {
         io.claim();
     }
 
-    /// The font or the Option key setting changed: re-measure the cell on
-    /// the next frame (which reports the new grid size).
+    /// The font, the Option key or the ANSI colors changed: re-measure the
+    /// cell on the next frame (which reports the new grid size). New colors
+    /// lay the rows out again by themselves (the row cache keys on the
+    /// palette).
     fn settings_changed(&mut self, cx: &mut Context<Self>) {
         let settings = TerminalSettings::current(cx);
         if settings == self.settings {

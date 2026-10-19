@@ -352,6 +352,34 @@ pub fn button(
     button_base(id, kind, focused, theme).child(label.into())
 }
 
+/// The Button component with Disabled on: its fill and label at
+/// `button/disabled/opacity` (40%), no hover or press, no pointer.
+pub fn disabled_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let c = button_colors(kind, theme);
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(BUTTON_H))
+        .px(px(12.0))
+        .rounded(px(6.0))
+        .bg(c.fill)
+        .text_color(c.text)
+        .type_style(Type::SmallMedium)
+        .opacity(0.4)
+        .child(label.into())
+}
+
 /// A button with an icon before its label, the icon in the label's color.
 pub fn icon_label_button(
     id: impl Into<SharedString>,

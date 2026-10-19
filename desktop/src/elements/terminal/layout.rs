@@ -437,8 +437,9 @@ mod tests {
             vec![BgRun {
                 col: 3,
                 len: 1,
-                color: hsla(0x4a8fd7)
-            }]
+                color: hsla(0x5893d6)
+            }],
+            "ANSI blue from the theme (ansi/regular/blue)"
         );
     }
 

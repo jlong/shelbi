@@ -22,7 +22,7 @@ use std::io::ErrorKind;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use futures::channel::mpsc::{unbounded, UnboundedReceiver};
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use shelbi_client::{ClientError, Connection, DiscoveredSession, SessionEvent, SessionEvents};
 use shelbi_proto::capability;
 use shelbi_term::Size;
@@ -72,6 +72,33 @@ impl SessionIo for SessionLink {
 
     fn claim(&self) {
         let _ = self.tx.send(Request::Claim);
+    }
+}
+
+/// A [`SessionIo`] with no session behind it: input goes nowhere, and each
+/// size the pane reports is answered with `render`'s output for that size,
+/// drawn from a reset screen (Settings' preview,
+/// [`super::TerminalPane::canned`]).
+pub struct Canned {
+    pub events: UnboundedSender<SessionEvent>,
+    pub render: fn(Size) -> Vec<u8>,
+}
+
+impl SessionIo for Canned {
+    fn input(&self, _: Vec<u8>) {}
+
+    fn paste(&self, _: String, _: bool) {}
+
+    fn resize(&self, size: Size) {
+        // RIS: a full reset, so the new size draws on a clear screen.
+        let mut data = b"\x1bc".to_vec();
+        data.extend((self.render)(size));
+        let _ = self.events.unbounded_send(SessionEvent::Resized {
+            seq: 0,
+            cols: size.cols,
+            rows: size.rows,
+        });
+        let _ = self.events.unbounded_send(SessionEvent::Output { seq: 0, data });
     }
 }
 

@@ -105,13 +105,15 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
   lines), dim (SGR 2) text in it `muted` (`theme.muted`, their tool output
   and footers; dim colored text keeps its hue at 60%), the cursor
   `text_loud`, the selection `text_selection` (`theme.selection`), matches
-  `search_match` (`theme.search`). ANSI red, green and cyan are `theme.red`,
-  `theme.green` and `theme.cyan` (the terminal frames' agent output: the
-  Workspace frame's removed line, its added lines and the Review frame's
-  checks, the Orchestrator's notices), yellow, blue, magenta and bright black
-  `theme.ansi_*`; the other slots keep Tomorrow Night (dark) and a
-  GitHub-light set (light). A program's OSC 10 foreground also colors its
-  bold and dim text.
+  `search_match` (`theme.search`). In dark the ANSI sixteen are the
+  Settings ▸ Terminal frame's `ansi/regular/*` and `ansi/bold/*` variables,
+  the Sensible palette (`theme::SENSIBLE`; its red, green and cyan are the
+  terminal frames' `theme.red`, `theme.green` and `theme.cyan`). In light,
+  red, green and cyan are `theme.red`, `theme.green` and `theme.cyan`,
+  yellow, blue, magenta and bright black `theme.ansi_*`, and the other slots
+  keep a GitHub-light set. The user's own colors (Settings ▸ Terminal,
+  `desktop.terminal_colors`) go over either. A program's OSC 10 foreground
+  also colors its bold and dim text.
 - **Inset**: the grid sits 16px in from the main area's leading and
   trailing edges and 12px from its top and bottom (the Orchestrator and
   Workspace frames); the Review frame's reviewer terminal 12px across
@@ -301,8 +303,23 @@ until a new role has its row here, with the values the palette really has.
 | `blue` | `#4a8fd7` | `#2563c9` | `theme.ansi_blue`: `[ready]`, queued |
 | `magenta` | `#c586c0` | `#a21caf` | `theme.ansi_magenta`: `[review]`, handoff |
 | `cyan` | `#4ec9b0` | `#0f766e` | `theme.ansi_cyan`: a working actor in the log |
-| `dark_gray` | `#7c7c7c` | `#6b6b6b` | `theme.ansi_dark_gray`: timestamps, ANSI bright black |
+| `dark_gray` | `#7c7c7c` | `#6b6b6b` | `theme.ansi_dark_gray`: timestamps, ANSI bright black in light |
 | `red` | `#ff66ab` | `#b40041` | The Danger label: failures and errors as text |
+
+The dark terminal's ANSI sixteen (`theme::SENSIBLE`, the Terminal frame's
+`ansi/*` variables; Settings ▸ Terminal labels the bright eight Bold, and
+its Reset restores these):
+
+| Color | Regular (0 to 7) | Bold (8 to 15) |
+|---|---|---|
+| Black | `#000000` | `#666666` |
+| Red | `#e04f52` | `#e69589` |
+| Green | `#5acd25` | `#9bdaa6` |
+| Yellow | `#dbc300` | `#e6d77b` |
+| Blue | `#5893d6` | `#5abdff` |
+| Magenta | `#d259d7` | `#dc8de6` |
+| Cyan | `#00a6b2` | `#82e6e5` |
+| White | `#bababa` | `#ffffff` |
 
 ### Chip tints and badges
 

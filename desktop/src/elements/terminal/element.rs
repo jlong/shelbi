@@ -149,7 +149,8 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> Frame {
         let started = Instant::now();
-        let theme = cx.global::<Theme>().terminal;
+        // The theme's terminal colors, with the ANSI colors the user changed.
+        let theme = cx.global::<Theme>().terminal.with_ansi(&self.pane.read(cx).settings.ansi);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
         let held = super::ResizeHold::holds(window, cx);

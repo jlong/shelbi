@@ -364,3 +364,111 @@ fn a_typed_letter_in_a_field_stays_the_fields(cx: &mut TestAppContext) {
         "j didn't move the settings selection"
     );
 }
+
+/// The Terminal page's view, with `config.yaml` "read" as `cfg`.
+fn terminal_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
+    s.key("cmd-3");
+    let view = s.read(|w, _| match &w.route {
+        Route::Settings(view) => view.clone(),
+        _ => panic!("settings is open"),
+    });
+    s.update(|_, window, cx| view.update(cx, |v, cx| v.load_config(cfg, window, cx)));
+    s.settle();
+    view
+}
+
+fn live_ansi(s: &mut Settings) -> crate::elements::terminal::colors::AnsiOverrides {
+    s.h.cx.update(|_, cx| TerminalSettings::current(cx).ansi)
+}
+
+#[gpui::test]
+fn the_terminal_page_edits_colors_live_saves_them_and_resets(cx: &mut TestAppContext) {
+    use shelbi_term::render::Rgb;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let view = terminal_page(&mut s, shelbi_state::UserConfig::default());
+    for selector in [
+        "settings-ansi-black-regular",
+        "settings-ansi-white-bold",
+        "settings-ansi-reset",
+        "settings-terminal-preview",
+        "settings-option-Meta",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    let default_red = s.read(|_, cx| cx.global::<crate::theme::Theme>().terminal.ansi[1]);
+    let text = |s: &mut Settings, slot| s.read(|_, cx| view.read(cx).color_text(slot, cx));
+    assert_eq!(text(&mut s, 1), crate::elements::terminal::colors::hex(default_red));
+    assert!(!s.read(|_, cx| view.read(cx).can_reset()), "nothing to reset");
+
+    // A color applies to every terminal at once and is saved, as the table
+    // writes it.
+    s.update(|_, window, cx| view.update(cx, |v, cx| v.type_color(1, "123abc", window, cx)));
+    assert_eq!(live_ansi(&mut s)[1], Some(Rgb::hex(0x123abc)));
+    assert_eq!(text(&mut s, 1), "#123ABC");
+    let saved = s.read(|_, cx| view.read(cx).saved().desktop.terminal_colors.clone());
+    assert_eq!(saved.red.regular.as_deref(), Some("#123ABC"));
+    assert!(s.read(|_, cx| view.read(cx).can_reset()));
+    // The preview pane draws with it.
+    let preview = s.read(|_, cx| view.read(cx).preview());
+    assert_eq!(s.read(|_, cx| preview.read(cx).settings.ansi[1]), Some(Rgb::hex(0x123abc)));
+
+    // Text that isn't a color marks the field and changes nothing.
+    s.update(|_, window, cx| view.update(cx, |v, cx| v.type_color(9, "#12345", window, cx)));
+    s.settle();
+    assert!(s.drawn("settings-ansi-invalid"));
+    assert_eq!(text(&mut s, 9), "#12345", "the text stays for the user to fix");
+    assert_eq!(live_ansi(&mut s)[9], None);
+    let saved_after = s.read(|_, cx| view.read(cx).saved().desktop.terminal_colors.clone());
+    assert_eq!(saved_after, saved, "not saved");
+
+    // The theme's own color isn't the user's: nothing is written for it.
+    let default_green = s.read(|_, cx| cx.global::<crate::theme::Theme>().terminal.ansi[2]);
+    let hex = crate::elements::terminal::colors::hex(default_green).to_lowercase();
+    s.update(|_, window, cx| view.update(cx, |v, cx| v.type_color(2, &hex, window, cx)));
+    assert_eq!(live_ansi(&mut s)[2], None);
+    let saved = s.read(|_, cx| view.read(cx).saved().desktop.terminal_colors.clone());
+    assert!(saved.green.is_empty());
+
+    // Reset puts every color back and clears the mark.
+    s.click("settings-ansi-reset");
+    assert_eq!(live_ansi(&mut s), [None; 16]);
+    assert!(s.read(|_, cx| view.read(cx).saved().desktop.terminal_colors.is_empty()));
+    assert_eq!(text(&mut s, 1), crate::elements::terminal::colors::hex(default_red));
+    assert!(!s.drawn("settings-ansi-invalid"));
+    assert!(!s.read(|_, cx| view.read(cx).can_reset()));
+}
+
+#[gpui::test]
+fn the_terminal_page_shows_saved_colors(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    cfg.desktop.terminal_colors.set(4, Some("#5893d6".into()));
+    cfg.desktop.terminal_colors.set(12, Some("blue".into()));
+    let view = terminal_page(&mut s, cfg);
+    let text = |s: &mut Settings, slot| s.read(|_, cx| view.read(cx).color_text(slot, cx));
+    assert_eq!(text(&mut s, 4), "#5893D6");
+    let default = s.read(|_, cx| cx.global::<crate::theme::Theme>().terminal.ansi[12]);
+    assert_eq!(text(&mut s, 12), crate::elements::terminal::colors::hex(default), "a bad value is ignored");
+    assert!(s.read(|_, cx| view.read(cx).can_reset()));
+}
+
+#[gpui::test]
+fn the_preview_draws_the_frame_s_session_with_no_session_behind_it(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let view = terminal_page(&mut s, shelbi_state::UserConfig::default());
+    s.settle();
+    let preview = s.read(|_, cx| view.read(cx).preview());
+    let text = s.read(|_, cx| preview.read(cx).terminal_text());
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(rows[0].ends_with("Claude Code"), "{text}");
+    assert!(text.contains("● Update(crates/shelbi-state/src/keymap/actions.rs)"), "{text}");
+    assert_eq!(rows.last().copied(), Some("? for shortcuts"), "the prompt at the foot: {text}");
+    // Keys go nowhere: the screen doesn't change.
+    let focus = s.read(|_, cx| gpui::Focusable::focus_handle(preview.read(cx), cx));
+    s.update(|_, window, cx| window.focus(&focus, cx));
+    s.key("x");
+    assert_eq!(s.read(|_, cx| preview.read(cx).terminal_text()), text);
+}

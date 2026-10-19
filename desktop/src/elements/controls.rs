@@ -162,6 +162,17 @@ pub fn textbox(content: impl IntoElement, focused: bool, theme: &Theme) -> Div {
     } else {
         theme.input_border
     };
+    edged_textbox(content, edge, focused.then_some(theme.focus_glow), theme)
+}
+
+/// A [`textbox`] holding text it won't take (a color that isn't one): the
+/// edge in `error`, and its glow while focused. The Components page draws
+/// no error state for the Textbox, so this is the form's own.
+pub fn invalid_textbox(content: impl IntoElement, focused: bool, theme: &Theme) -> Div {
+    edged_textbox(content, theme.error, focused.then(|| theme.error.opacity(0.3)), theme)
+}
+
+fn edged_textbox(content: impl IntoElement, edge: Hsla, glow_color: Option<Hsla>, theme: &Theme) -> Div {
     // The edge is the box's fill, showing 1px around the well, so the well's
     // 5px corners sit inside the box's 6px as Figma nests them.
     div()
@@ -189,7 +200,7 @@ pub fn textbox(content: impl IntoElement, focused: bool, theme: &Theme) -> Div {
                 .text_color(theme.form_text)
                 .child(content),
         )
-        .when(focused, |d| d.child(glow(6.0, theme.focus_glow)))
+        .children(glow_color.map(|color| glow(6.0, color)))
 }
 
 /// A picker: `textbox` (it grows) and `button` after it, [`CONTROL_W`]
