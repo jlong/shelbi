@@ -183,6 +183,31 @@ this foundation sets the palette, the type styles and the shared shapes.
   window comes forward, so gpui's own animations end where they would; the
   chip and the menus read it when they start.
 
+## Window translucency (`src/theme/window.rs`)
+
+`desktop.window_opacity` / `desktop.window_blur` (Settings ▸ General) make
+the windows see-through. The opacity is applied when the theme resolves
+(`Theme::with_opacity`), never as an opacity layer over a view:
+
+- **Surfaces take it as their alpha**: `canvas` (the main area, the
+  bootstrap screen, the chooser) and `sidebar` (the leading column). The
+  terminals' default background follows them (a program's own OSC 11
+  background takes the opacity too); cells with a color of their own stay
+  opaque, as in Ghostty.
+- **Each region is coated once.** The window shell, the column and the main
+  area paint the surfaces; a view or panel that sits on the same surface
+  (Activity, the board, Settings, a terminal pane, the sidebar's panels)
+  paints `theme.nested(role)`, the role while opaque (where it still hides
+  what slides under it) and nothing while translucent. `well` is the glass
+  inside its divider.
+- **Everything else keeps its color**: text, icons, borders, fills,
+  `card`, `raised`, `keycap`, `nav_selected`. Overlays (the dialogs, the
+  task detail, the palette, menus) paint from `theme.opaque()`, as do the
+  fills a drop shadow sits under (the selected segment, the focused back
+  button) and the terminal's notice band.
+- **Reduce Transparency** keeps every window opaque, read at launch and each
+  time a window comes forward.
+
 ## Shared meanings
 
 The shared view models name colors by meaning (the activity feed's `Tone`, a

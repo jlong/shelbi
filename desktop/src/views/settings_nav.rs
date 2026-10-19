@@ -278,7 +278,7 @@ pub fn render<H: SidebarHost>(
         .flex()
         .flex_col()
         .size_full()
-        .bg(theme.sidebar)
+        .bg(theme.nested(theme.sidebar))
         .text_color(theme.foreground)
         .type_style(Type::Base)
         .child(render_titlebar(palette_chord, theme, cx))

@@ -1225,7 +1225,7 @@ impl ReviewView {
             .min_h_0()
             .min_w_0()
             .size_full()
-            .bg(theme.canvas);
+            .bg(theme.nested(theme.canvas));
         let Some(shown) = &self.review else {
             return root.into_any_element();
         };
@@ -1316,7 +1316,7 @@ impl Render for ReviewView {
             None => div()
                 .debug_selector(|| "review-panel-empty".into())
                 .size_full()
-                .bg(theme.sidebar)
+                .bg(theme.nested(theme.sidebar))
                 .into_any_element(),
         }
     }

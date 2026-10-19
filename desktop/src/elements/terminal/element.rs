@@ -150,7 +150,8 @@ impl Element for TerminalElement {
     ) -> Frame {
         let started = Instant::now();
         // The theme's terminal colors, with the ANSI colors the user changed.
-        let theme = cx.global::<Theme>().terminal.with_ansi(&self.pane.read(cx).settings.ansi);
+        let surfaces = *cx.global::<Theme>();
+        let theme = surfaces.terminal.with_ansi(&self.pane.read(cx).settings.ansi);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
         let held = super::ResizeHold::holds(window, cx);
@@ -425,7 +426,7 @@ impl Element for TerminalElement {
             hitbox,
             started,
             rows_rebuilt,
-            background: palette.background(),
+            background: default_background(&surfaces, palette.background()),
             quads,
             lines,
             box_quads,
@@ -505,6 +506,22 @@ impl Element for TerminalElement {
         let rebuilt = frame.rows_rebuilt;
         self.pane
             .update(cx, |pane, _| pane.stats.record_frame(took, rebuilt));
+    }
+}
+
+/// What the grid's default background paints in a window drawn with
+/// `theme`: the color itself while the window is opaque; while it is
+/// translucent, nothing when it is the theme's own (the canvas the pane sits
+/// on is the terminal's background, already at the window's opacity), and a
+/// program's own (OSC 11) at the window's opacity. Cells with a color of
+/// their own stay opaque, as in Ghostty.
+pub(crate) fn default_background(theme: &Theme, background: Hsla) -> Hsla {
+    if !theme.translucent() {
+        background
+    } else if background == rgb_hsla(theme.terminal.background) {
+        background.opacity(0.0)
+    } else {
+        background.opacity(theme.opacity())
     }
 }
 

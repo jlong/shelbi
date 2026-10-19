@@ -358,6 +358,7 @@ fn open_window(
 /// its slot isn't reopened at the next launch; the last window closing quits
 /// the app with its slot still open, so the next launch brings it back.
 pub fn window_closed(id: WindowId, cx: &mut App) {
+    theme::window::forget(id);
     if !cx.has_global::<Shell>() {
         return;
     }
@@ -843,6 +844,8 @@ impl ShelbiWindow {
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+        // The window's translucency, before its first frame.
+        theme::window::apply_to(window, cx);
 
         ShelbiWindow {
             project: project.to_string(),
@@ -853,8 +856,11 @@ impl ShelbiWindow {
             boot: Boot::InFlight(BootstrapState::ResolvingEnv),
             _bootstrap: None,
             _appearance: theme::follow_system(window, cx),
+            // The accessibility settings are read when a window comes to
+            // the front (System Settings is in front while they change).
             _motion: cx.observe_window_activation(window, |_, _, cx| {
-                theme::motion::sync_reduce_motion(cx)
+                theme::motion::sync_reduce_motion(cx);
+                theme::window::sync_reduce_transparency(cx);
             }),
             palette_chord: palette_chord(&keymaps),
             client,
@@ -4347,7 +4353,12 @@ impl ShelbiWindow {
                 .w(px(if rule { 1.0 } else { 0.0 }))
                 .h_full()
                 .flex_none()
-                .when(rule, |d| d.bg(divider_color))
+                // The rule over the canvas (which the window no longer
+                // paints under it while translucent).
+                .when(rule, |d| {
+                    d.bg(theme.canvas)
+                        .child(div().absolute().top_0().bottom_0().left_0().w(px(1.0)).bg(divider_color))
+                })
                 .when(!rule && self.dragging, |d| {
                     d.child(div().absolute().top_0().bottom_0().left(px(-1.0)).w(px(1.0)).bg(divider_color))
                 })
@@ -4404,7 +4415,9 @@ impl ShelbiWindow {
             .w_full()
             .font_family("Geist")
             .type_style(Type::Base)
-            .bg(theme.canvas);
+            // Under the column and the main area, which paint the window's
+            // two surfaces: translucent, it paints nothing.
+            .bg(theme.nested(theme.canvas));
         let shell = if self.chooser {
             let chooser = self.render_chooser(&theme, cx);
             shell.child(chooser)

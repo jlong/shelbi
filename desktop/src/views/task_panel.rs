@@ -52,7 +52,8 @@ pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<
         // translucent: on its own the ring's blue would fill the square. The
         // panel's own opaque color under the fill hides it, and the fill
         // reads as it does anywhere else in the panel.
-        .when(keyboard, |d| d.bg(theme.sidebar).shadow(style::focus_shadow(theme)))
+        // (Opaque whatever the window's translucency, for the same reason.)
+        .when(keyboard, |d| d.bg(theme.opaque().sidebar).shadow(style::focus_shadow(theme)))
 }
 
 /// The panel's first row (Figma's "Project and search"): the back button,

@@ -17,6 +17,7 @@ use shelbi_app::view::ReviewState;
 
 use super::smoke::Harness;
 use super::*;
+use crate::elements::controls::Slider;
 use crate::views::column_swap::SLIDE;
 use crate::views::sidebar_reveal::REVEAL;
 use crate::views::review::tests::{fake_deps, info, row};
@@ -615,4 +616,121 @@ fn the_search_and_the_context_picker_narrow_the_list(cx: &mut TestAppContext) {
     assert!(!s.page_read(|p| p.picker_open()));
     assert!(s.drawn("keybindings-group-activity"));
     assert!(!s.drawn("keybindings-group-global") && !s.drawn("keybindings-group-sidebar"));
+}
+
+/// The General page's view, with `config.yaml` "read" as `cfg`.
+fn general_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
+    s.key("cmd-1");
+    let view = s.read(|w, _| match &w.route {
+        Route::Settings(view) => view.clone(),
+        _ => panic!("settings is open"),
+    });
+    s.update(|_, window, cx| view.update(cx, |v, cx| v.load_config(cfg, window, cx)));
+    s.settle();
+    view
+}
+
+fn look(s: &mut Settings) -> crate::theme::window::Translucency {
+    s.h.cx.update(|_, cx| crate::theme::window::WindowLook::current(cx).effective())
+}
+
+fn theme_opacity(s: &mut Settings) -> f32 {
+    s.h.cx.update(|_, cx| cx.global::<Theme>().opacity())
+}
+
+fn window_applied(s: &mut Settings) -> crate::theme::window::Translucency {
+    s.h.cx.update(|window, _| crate::theme::window::applied(window.window_handle().window_id()))
+}
+
+#[gpui::test]
+fn the_sliders_apply_to_the_window_as_they_move_and_save(cx: &mut TestAppContext) {
+    use crate::theme::window::Translucency;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    // Nothing set: opaque and clear, the app as it was.
+    assert_eq!(look(&mut s), Translucency::default());
+    assert_eq!(theme_opacity(&mut s), 1.0);
+    let mut cfg = shelbi_state::UserConfig::default();
+    (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(85), Some(20));
+    let view = general_page(&mut s, cfg);
+    for selector in ["settings-window-opacity", "settings-window-blur"] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    assert!(!s.drawn("settings-reduce-transparency"));
+    let (opacity, blur) = s.read(|_, cx| (view.read(cx).opacity_slider(), view.read(cx).blur_slider()));
+    let value = |s: &mut Settings, e: &Entity<Slider>| s.read(|_, cx| e.read(cx).value());
+    assert_eq!((value(&mut s, &opacity), value(&mut s, &blur)), (85, 20), "the saved values");
+    assert_eq!(look(&mut s), Translucency { opacity: 85, blur: 20 });
+    assert_eq!(theme_opacity(&mut s), 0.85, "the surfaces carry it");
+    assert_eq!(window_applied(&mut s), Translucency { opacity: 85, blur: 20 }, "the open window has it");
+
+    // The keys: a click focuses it (and lands it under the pointer, the
+    // track's middle), → steps it, ⇧→ steps further, Home / End go to the
+    // ends; each applies at once and is saved.
+    s.click("settings-window-opacity");
+    assert_eq!(value(&mut s, &opacity), 65);
+    let saved = |s: &mut Settings| s.read(|_, cx| view.read(cx).saved().desktop.clone());
+    assert_eq!(saved(&mut s).window_opacity, Some(65), "letting go saves it");
+    s.key("right");
+    assert_eq!((value(&mut s, &opacity), theme_opacity(&mut s)), (66, 0.66));
+    s.key("shift-right");
+    assert_eq!(value(&mut s, &opacity), 76);
+    s.key("left");
+    assert_eq!(value(&mut s, &opacity), 75);
+    assert_eq!(saved(&mut s).window_opacity, Some(75));
+    assert_eq!(window_applied(&mut s).opacity, 75);
+    s.key("home");
+    assert_eq!(value(&mut s, &opacity), 30, "the floor");
+    s.key("left");
+    assert_eq!(value(&mut s, &opacity), 30, "stays at the floor");
+    s.key("end");
+    assert_eq!((value(&mut s, &opacity), theme_opacity(&mut s)), (100, 1.0));
+    let desktop = saved(&mut s);
+    assert_eq!((desktop.window_opacity, desktop.window_blur), (None, Some(20)), "100% isn't written");
+    assert_eq!(window_applied(&mut s), Translucency { opacity: 100, blur: 20 });
+
+    s.click("settings-window-blur");
+    s.key("shift-left");
+    assert_eq!(value(&mut s, &blur), 20, "the middle of 0 to 50, then 5 down");
+    s.key("home");
+    assert_eq!(saved(&mut s).window_blur, None, "0 isn't written");
+    assert!(saved(&mut s).is_empty(), "back to the defaults");
+
+    // A theme switch keeps the window's opacity.
+    s.click("settings-window-opacity");
+    s.key("home");
+    s.click("settings-theme-Light");
+    assert_eq!(theme_opacity(&mut s), 0.3);
+    assert!(!s.read(|_, cx| cx.global::<Theme>().is_dark()));
+}
+
+#[gpui::test]
+fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut TestAppContext) {
+    use crate::theme::window::{self as translucency, Translucency};
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(70), Some(10));
+    let view = general_page(&mut s, cfg);
+    assert_eq!(theme_opacity(&mut s), 0.7);
+
+    s.update(|_, _, cx| translucency::set_reduce_transparency(true, cx));
+    s.settle();
+    assert_eq!(look(&mut s), Translucency::default());
+    assert_eq!(theme_opacity(&mut s), 1.0);
+    assert_eq!(window_applied(&mut s), Translucency { opacity: 100, blur: 0 });
+    assert!(s.drawn("settings-reduce-transparency"), "the note says why");
+    let opacity = s.read(|_, cx| view.read(cx).opacity_slider());
+    assert!(s.read(|_, cx| opacity.read(cx).is_disabled()));
+    s.click("settings-window-opacity");
+    s.key("right");
+    assert_eq!(s.read(|_, cx| opacity.read(cx).value()), 70, "a disabled slider doesn't move");
+    assert_eq!(s.read(|_, cx| view.read(cx).saved().desktop.window_opacity), Some(70), "the setting is kept");
+
+    s.update(|_, _, cx| translucency::set_reduce_transparency(false, cx));
+    s.settle();
+    assert_eq!(look(&mut s), Translucency { opacity: 70, blur: 10 });
+    assert_eq!(theme_opacity(&mut s), 0.7);
+    assert!(!s.drawn("settings-reduce-transparency"));
+    assert!(!s.read(|_, cx| opacity.read(cx).is_disabled()));
 }

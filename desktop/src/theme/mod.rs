@@ -13,11 +13,16 @@
 //! follows the window's appearance, and [`follow_system`] re-resolves it when
 //! the system switches between light and dark while the app runs; `dark` and
 //! `light` pin the theme and the window chrome with it.
+//!
+//! The window's translucency ([`window`]) is a resolve-time change too: the
+//! surface roles take the window opacity as their alpha
+//! ([`Theme::with_opacity`]), and nothing else does.
 
 pub mod fold;
 pub mod motion;
 pub mod palette;
 pub mod style;
+pub mod window;
 
 use std::ops::Deref;
 
@@ -38,6 +43,8 @@ pub struct Theme {
     colors: Palette<Hsla>,
     /// The terminal element's colors for this appearance.
     pub terminal: TerminalPalette,
+    /// The window opacity the surface roles carry, 0 to 1 (1 is opaque).
+    opacity: f32,
 }
 
 impl Deref for Theme {
@@ -68,6 +75,52 @@ impl Theme {
             preference,
             terminal: TerminalPalette::for_palette(&palette),
             colors: palette.map(hsla),
+            opacity: 1.0,
+        }
+    }
+
+    /// This theme in a window `opacity` (0 to 1) opaque: the window's
+    /// surfaces, the main area (`canvas`) and the leading column
+    /// (`sidebar`), take it as their alpha, and the terminals' default
+    /// background follows them (`TerminalElement`). Every other role keeps
+    /// its color, so text, icons, borders and controls stay as they are.
+    /// The command well, the canvas inside a divider, is the glass itself
+    /// while translucent (a second coat would thicken it).
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        let opacity = opacity.clamp(0.0, 1.0);
+        self.opacity = opacity;
+        self.colors.canvas.a = opacity;
+        self.colors.sidebar.a = opacity;
+        self.colors.well = self.nested(self.colors.canvas);
+        self
+    }
+
+    /// The window opacity the surfaces carry (1 is opaque).
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    /// Whether the window's surfaces are see-through.
+    pub fn translucent(&self) -> bool {
+        self.opacity < 1.0
+    }
+
+    /// This theme with opaque surfaces: an overlay (the task detail, a
+    /// dialog) paints from it, so it stays readable over a translucent
+    /// window, as does a fill whose drop shadow would show through it.
+    pub fn opaque(&self) -> Self {
+        self.with_opacity(1.0)
+    }
+
+    /// `surface` for a layer that sits on that same surface (a view in the
+    /// main area, a panel in the leading column): the role while the window
+    /// is opaque, where it still hides what slides beneath it, and nothing
+    /// while it is translucent, where a second coat would thicken the glass.
+    pub fn nested(&self, surface: Hsla) -> Hsla {
+        if self.translucent() {
+            surface.opacity(0.0)
+        } else {
+            surface
         }
     }
 
@@ -251,15 +304,16 @@ fn chrome_appearance(preference: ThemePreference) -> Option<WindowAppearance> {
     }
 }
 
-/// Read the `theme:` setting and install the resolved theme. Call once at
-/// startup, before the first window opens. A missing or unreadable config is
-/// `auto`.
+/// Read the `theme:` setting and the window translucency and install the
+/// resolved theme. Call once at startup, before the first window opens. A
+/// missing or unreadable config is `auto`, opaque.
 pub fn init(cx: &mut App) {
-    let preference = shelbi_state::load_user_config()
-        .map(|c| c.theme)
-        .unwrap_or_default();
+    let cfg = shelbi_state::load_user_config().unwrap_or_default();
+    let preference = cfg.theme;
     cx.set_window_appearance(chrome_appearance(preference));
-    install(Theme::resolve(preference, cx.window_appearance()), cx);
+    window::init(window::Translucency::from_config(&cfg.desktop), cx);
+    let opacity = window::WindowLook::current(cx).effective().alpha();
+    install(Theme::resolve(preference, cx.window_appearance()).with_opacity(opacity), cx);
 }
 
 /// Switch to `preference` now (the settings view's theme choice): re-resolve
@@ -267,7 +321,8 @@ pub fn init(cx: &mut App) {
 /// repaint.
 pub fn apply_preference(preference: ThemePreference, window: &Window, cx: &mut App) {
     cx.set_window_appearance(chrome_appearance(preference));
-    install(Theme::resolve(preference, window.appearance()), cx);
+    let opacity = cx.global::<Theme>().opacity;
+    install(Theme::resolve(preference, window.appearance()).with_opacity(opacity), cx);
 }
 
 /// Make `theme` current: our global, and gpui-kit's light/dark mode with its
@@ -292,7 +347,8 @@ pub(crate) fn install(theme: Theme, cx: &mut App) {
 
 /// gpui-kit's widget colors from our roles.
 fn kit_colors(c: &mut gpui_kit::component::ThemeColor, t: &Theme) {
-    c.background = t.canvas;
+    // A widget's own background sits on our surfaces.
+    c.background = t.nested(t.canvas);
     c.foreground = t.foreground;
     c.border = t.divider_strong;
     c.input = t.input_border;
@@ -341,7 +397,7 @@ pub fn follow_system<V: 'static>(window: &mut Window, cx: &mut Context<V>) -> Su
 
 fn sync(window: &Window, cx: &mut App) {
     let current = *cx.global::<Theme>();
-    let next = Theme::resolve(current.preference, window.appearance());
+    let next = Theme::resolve(current.preference, window.appearance()).with_opacity(current.opacity);
     if next != current {
         install(next, cx);
     }
@@ -372,6 +428,46 @@ mod tests {
                     "{name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_window_opacity_reaches_the_surfaces_only() {
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            let opaque = Theme::resolve(ThemePreference::Auto, system);
+            assert!(!opaque.translucent());
+            assert_eq!((opaque.canvas.a, opaque.sidebar.a, opaque.well.a), (1.0, 1.0, 1.0), "surfaces are opaque");
+            assert_eq!(opaque.nested(opaque.canvas), opaque.canvas, "an opaque layer still hides what is under it");
+            let glass = opaque.with_opacity(0.85);
+            assert!(glass.translucent());
+            for (name, role) in [("canvas", glass.canvas), ("sidebar", glass.sidebar)] {
+                assert_eq!(role.a, 0.85, "{name}");
+            }
+            assert_eq!(glass.well.a, 0.0, "the well is the glass inside its divider");
+            assert_eq!(glass.nested(glass.canvas).a, 0.0, "no second coat");
+            for ((name, want), (_, got)) in opaque.roles().into_iter().zip(glass.roles()) {
+                if !["canvas", "sidebar", "well"].contains(&name) {
+                    assert_eq!(got, want, "{name} keeps its color");
+                }
+            }
+            // Same hue: only the alpha moved.
+            assert_eq!(rgba8(Hsla { a: 1.0, ..glass.canvas }), rgba8(opaque.canvas));
+            assert_eq!(glass.terminal, opaque.terminal, "the terminal palette stays opaque");
+            assert_eq!(glass.opaque(), opaque, "an overlay paints the opaque theme");
+            assert_eq!(opaque.with_opacity(3.0), opaque, "clamped");
+        }
+    }
+
+    #[test]
+    fn body_text_holds_3_to_1_at_the_opacity_floor_over_mid_gray() {
+        use shelbi_app::theme::Rgb;
+        let floor = *window::OPACITY_RANGE.start() as f32 / 100.0;
+        let gray = Rgb::new(128, 128, 128);
+        for palette in [Palette::dark(), Palette::light()] {
+            let surface = gray.lerp(palette.canvas.rgb, floor);
+            let text = palette.foreground.over(surface);
+            let ratio = text.contrast_ratio(surface);
+            assert!(ratio >= 3.0, "{:?}: {ratio:.2}", palette.appearance);
         }
     }
 
