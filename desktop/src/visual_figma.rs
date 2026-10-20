@@ -21,7 +21,9 @@
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
 //! machines, the four Settings pages (settings-general,
 //! settings-keybindings, settings-terminal, settings-workflows against
-//! `workflows/1-index.png`, and settings-workflow-form against
+//! `workflows/1-index.png`, settings-workflow-builder{,-status,-drawing,
+//! -new,-added} against `workflows/2-builder.png`, `3-…`, `5-…`, `6-…` and
+//! `7-…`, and settings-workflow-form against
 //! `workflows/4-workflow-form.png` in the frame's 1440x1283 window) and
 //! command-palette, plus the
 //! palette states the
@@ -36,7 +38,9 @@
 //! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
 //! a focused textbox; `state-keybindings-*`: the bindings editor's capture,
 //! conflict, search, picker and customized states; `state-workflow-form-*`:
-//! the workflow editor edited, its leave prompt, and its form's foot), the board toolbar's (`state-issues-unfiltered`: no
+//! the workflow editor edited, its leave prompt, and its form's foot;
+//! `state-workflow-builder-*`: the Builder fitted, zoomed out with the
+//! keyboard's focus ring, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs).
@@ -89,6 +93,13 @@ const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 1024;
 /// The Workflow Form frame's height (2252:29281): its window is taller.
 const FORM_HEIGHT: u32 = 1283;
+
+/// An edit to the open workflow editor.
+type EditFn = dyn Fn(
+    &mut crate::views::workflow_editor::WorkflowEditor,
+    &mut gpui::Window,
+    &mut gpui::Context<crate::views::workflow_editor::WorkflowEditor>,
+);
 
 /// Every screen, named as its reference PNG.
 pub const SCREENS: [&str; 12] = [
@@ -1008,6 +1019,7 @@ impl Run {
             .unwrap();
         self.settle(handle);
         self.save(handle, "settings-workflows");
+        self.workflow_builder();
         self.workflow_form();
         let _ = std::fs::remove_dir_all(&workflows);
         if !had_agents {
@@ -1022,30 +1034,14 @@ impl Run {
     /// transition's Details open with a refused timeout, the leave prompt,
     /// and the form's foot with Review running the branch.
     fn workflow_form(&mut self) {
-        use crate::views::settings_nav::SettingsPage;
         use crate::views::workflow_editor_state::{Change, DetailsForm};
         self.height = FORM_HEIGHT;
         let open = |run: &mut Run| {
-            let handle = run.open();
-            handle
-                .update(&mut run.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Workflows, window, cx))
-                .unwrap();
-            run.settle(handle);
-            handle
-                .update(&mut run.cx, |w, window, cx| w.offscreen_edit_workflow("task", window, cx))
-                .unwrap();
-            run.settle(handle);
+            let handle = run.open_workflow_editor("task");
+            run.edit_workflow(handle, &|e, window, cx| e.show_mode(crate::views::workflow_editor_state::Mode::Form, window, cx));
             handle
         };
-        let edit = |run: &mut Run, handle: WindowHandle<ShelbiWindow>, f: &dyn Fn(&mut crate::views::workflow_editor::WorkflowEditor, &mut gpui::Window, &mut gpui::Context<crate::views::workflow_editor::WorkflowEditor>)| {
-            handle
-                .update(&mut run.cx, |w, window, cx| {
-                    let editor = w.offscreen_settings().and_then(|s| s.read(cx).editor()).expect("the editor shows");
-                    editor.update(cx, |e, cx| f(e, window, cx));
-                })
-                .unwrap();
-            run.settle(handle);
-        };
+        let edit = |run: &mut Run, handle: WindowHandle<ShelbiWindow>, f: &EditFn| run.edit_workflow(handle, f);
 
         let handle = open(self);
         let shown = handle
@@ -1085,6 +1081,125 @@ impl Run {
         });
         self.save(handle, "state-workflow-form-bottom");
         self.height = HEIGHT;
+    }
+
+    /// A fresh window with Settings ▸ Workflows' workflow `name` open in the
+    /// editor (on the Builder, where it opens).
+    fn open_workflow_editor(&mut self, name: &str) -> WindowHandle<ShelbiWindow> {
+        use crate::views::settings_nav::SettingsPage;
+        let handle = self.open();
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Workflows, window, cx))
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_edit_workflow(name, window, cx))
+            .unwrap();
+        self.settle(handle);
+        handle
+    }
+
+    /// Run `f` on the open workflow editor, then settle.
+    fn edit_workflow(&mut self, handle: WindowHandle<ShelbiWindow>, f: &EditFn) {
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                let editor = w.offscreen_settings().and_then(|s| s.read(cx).editor()).expect("the editor shows");
+                editor.update(cx, |e, cx| f(e, window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+    }
+
+    /// The workflow editor's Builder over the fixture's Task, in each
+    /// Workflow Builder frame's state (references `workflows/2-builder.png`,
+    /// `3-builder-status-selected.png`, `5-drawing-transition.png`,
+    /// `6-new-transition.png`, `7-transition-added.png`), and the states no
+    /// frame draws (`state-workflow-builder-*`, checked by eye): fitted,
+    /// zoomed out with the keyboard's focus ring, and a 20-status,
+    /// 40-transition workflow.
+    fn workflow_builder(&mut self) {
+        use crate::views::workflow_builder_state::{NewTransition, Selection};
+        use crate::views::workflow_graph::{Graph, Side};
+        use shelbi_core::TransitionAction::{Merge, PushBranch};
+
+        let handle = self.open_workflow_editor("task");
+        let shown = handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_settings().is_some_and(|s| s.read(cx).editing()))
+            .unwrap();
+        self.expect("settings-workflow-builder: the editor opens on the Builder", shown);
+        self.save(handle, "settings-workflow-builder");
+
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            e.builder_mut().select_status("review");
+            cx.notify();
+        });
+        self.save(handle, "settings-workflow-builder-status");
+
+        // Dragging from In Progress's bottom handle, over Done's left side.
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            let g = Graph::of(e.state().expect("loaded").workflow());
+            let from = g.rect("in-progress").unwrap().side(Side::Bottom);
+            let to = g.rect("done").unwrap().side(Side::Left);
+            let b = e.builder_mut();
+            b.select_status("in-progress");
+            b.begin_draw("in-progress", Some(Side::Bottom), Some(from));
+            b.draw_to(to, &g);
+            cx.notify();
+        });
+        self.save(handle, "settings-workflow-builder-drawing");
+
+        fn new() -> NewTransition {
+            NewTransition {
+                from: "in-progress".into(),
+                to: "done".into(),
+                actions: vec![PushBranch, Merge],
+            }
+        }
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            e.builder_mut().selection = Some(Selection::New(new()));
+            cx.notify();
+        });
+        self.save(handle, "settings-workflow-builder-new");
+
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, window, cx| {
+            e.builder_mut().selection = Some(Selection::New(new()));
+            e.add_drawn_transition(window, cx);
+        });
+        let added = handle
+            .update(&mut self.cx, |w, _, cx| {
+                let editor = w.offscreen_settings().and_then(|s| s.read(cx).editor()).expect("the editor shows");
+                let e = editor.read(cx);
+                e.state().is_some_and(|s| s.transitions().len() == 5)
+            })
+            .unwrap();
+        self.expect("settings-workflow-builder-added: the transition is in the draft", added);
+        self.save(handle, "settings-workflow-builder-added");
+
+        // Fit, and 50% with the keyboard on Review.
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| e.fit_canvas(cx));
+        self.save(handle, "state-workflow-builder-fit");
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, window, cx| {
+            e.zoom_canvas(0.5, cx);
+            e.focus_canvas(window, cx);
+            e.builder_mut().focus = Some("review".into());
+        });
+        self.save(handle, "state-workflow-builder-zoomed");
+
+        // Twenty statuses and forty transitions, fitted.
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        std::fs::write(workflows.join("statuses.yaml"), crate::views::workflow_graph::big_fixture::statuses()).unwrap();
+        std::fs::write(workflows.join("big.yaml"), crate::views::workflow_graph::big_fixture::workflow()).unwrap();
+        let handle = self.open_workflow_editor("big");
+        self.edit_workflow(handle, &|e, _, cx| e.fit_canvas(cx));
+        self.save(handle, "state-workflow-builder-big");
+        let _ = std::fs::remove_file(workflows.join("big.yaml"));
+        std::fs::write(workflows.join("statuses.yaml"), crate::views::workflows_state::fixture::STATUSES).unwrap();
     }
 
     /// The Keybindings page's states no frame draws (`state-keybindings-*`,

@@ -1,6 +1,8 @@
 //! The workflow editor's state, toolkit-free (`dt-wf-editor-form`): one
 //! workflow's draft over `shelbi_state::workflow_config`, the changes the
-//! Form view makes to it, and Save, Discard and the leave prompt.
+//! Form and the Builder (`dt-wf-editor-builder`) make to it, and Save,
+//! Discard and the leave prompt. Both views edit this one draft, so an edit
+//! in either shows in the other.
 //!
 //! The editor holds two models: the one loaded (the files as on disk) and
 //! the draft. Every edit is a [`Change`] applied to the draft through the
@@ -286,6 +288,8 @@ pub enum Change {
     Tags { id: String, text: String },
     /// Add a transition between the first two statuses that have none.
     AddTransition,
+    /// Add this transition (the Builder's New transition).
+    InsertTransition(Transition),
     RemoveTransition(usize),
     From { index: usize, status: String },
     To { index: usize, status: String },
@@ -318,7 +322,7 @@ impl Change {
             | Change::Owner { id, .. }
             | Change::Agent { id, .. }
             | Change::Tags { id, .. } => Field::Status(id.clone()),
-            Change::AddTransition => Field::Transitions,
+            Change::AddTransition | Change::InsertTransition(_) => Field::Transitions,
             Change::RemoveTransition(index)
             | Change::From { index, .. }
             | Change::To { index, .. }
@@ -431,7 +435,7 @@ impl EditorState {
             base: config.clone(),
             draft: config,
             draft_dirty: false,
-            mode: Mode::Form,
+            mode: Mode::Builder,
             review_mode: if review.is_some() { ReviewMode::Serve } else { ReviewMode::DiffOnly },
             review_form: ReviewForm::of(review.as_ref()),
             project_git: ProjectGit::default(),
@@ -495,6 +499,12 @@ impl EditorState {
 
     fn clear_error(&mut self, field: &Field) {
         self.errors.retain(|(f, _)| f != field);
+    }
+
+    /// Drop the error showing at `field` (the Builder's New transition,
+    /// cancelled).
+    pub fn clear_error_at(&mut self, field: &Field) {
+        self.clear_error(field);
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -671,6 +681,7 @@ impl EditorState {
                 let t = self.next_transition().ok_or("Every pair of statuses already has a transition.")?;
                 c.add_transition(w, t)
             }
+            Change::InsertTransition(t) => c.add_transition(w, t.clone()),
             Change::RemoveTransition(index) => c.delete_transition(w, *index),
             Change::From { index, status } => return self.edit_transition(*index, |t| t.from = status.clone()),
             Change::To { index, status } => return self.edit_transition(*index, |t| t.to = status.clone()),
@@ -1064,6 +1075,30 @@ mod tests {
         assert_eq!(ts[0].actions, [TransitionAction::PushBranch]);
         assert_eq!((ts[3].from.as_str(), ts[3].to.as_str()), ("backlog", "in-progress"));
         assert_eq!(ts[3].actions, [TransitionAction::OpenPr, TransitionAction::Restack]);
+    }
+
+    #[test]
+    fn the_builders_new_transition_goes_in_whole_and_a_duplicate_is_refused() {
+        let _home = Home::new("ed-insert");
+        let mut state = editor("task");
+        let t = Transition {
+            from: "in-progress".into(),
+            to: "done".into(),
+            actions: vec![TransitionAction::PushBranch, TransitionAction::Merge],
+            target: None,
+            run: Vec::new(),
+            ready: None,
+            ready_timeout: None,
+            url: None,
+        };
+        assert!(state.change(Change::InsertTransition(t.clone())));
+        assert_eq!(state.transitions().last(), Some(&t));
+        assert!(!state.change(Change::InsertTransition(t)));
+        assert!(state.error_at(&Field::Transitions).unwrap().contains("duplicate transition"));
+        state.clear_error_at(&Field::Transitions);
+        assert!(!state.has_errors());
+        save(&mut state, vec![]);
+        assert_eq!(on_disk("task").transitions.unwrap().len(), 5);
     }
 
     #[test]

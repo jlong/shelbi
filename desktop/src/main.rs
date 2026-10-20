@@ -15,6 +15,8 @@ mod bench_activity;
 #[cfg(feature = "visual-check")]
 mod bench_board;
 #[cfg(feature = "visual-check")]
+mod bench_builder;
+#[cfg(feature = "visual-check")]
 mod bench_push;
 mod commands;
 mod drops;
@@ -97,6 +99,11 @@ enum Mode {
     /// fixture board, offscreen (feature `visual-check`).
     #[cfg(feature = "visual-check")]
     BenchBoard(Vec<String>),
+    /// `--bench-builder [options]`: time the workflow editor's Builder
+    /// frames on a 20-status, 40-transition workflow, offscreen (feature
+    /// `visual-check`).
+    #[cfg(feature = "visual-check")]
+    BenchBuilder(Vec<String>),
     /// `--bench-activity [options]`: time the Activity feed's first paint
     /// and frames on a large fixture events log, offscreen (feature
     /// `visual-check`).
@@ -140,6 +147,8 @@ fn parse_args() -> Mode {
         Some("--bench-push") => Mode::BenchPush(args.collect()),
         #[cfg(feature = "visual-check")]
         Some("--bench-board") => Mode::BenchBoard(args.collect()),
+        #[cfg(feature = "visual-check")]
+        Some("--bench-builder") => Mode::BenchBuilder(args.collect()),
         #[cfg(feature = "visual-check")]
         Some("--bench-activity") => Mode::BenchActivity(args.collect()),
         #[cfg(feature = "bench")]
@@ -198,6 +207,10 @@ fn main() {
     #[cfg(feature = "visual-check")]
     if let Mode::BenchBoard(args) = &mode {
         bench_board::run(args);
+    }
+    #[cfg(feature = "visual-check")]
+    if let Mode::BenchBuilder(args) = &mode {
+        bench_builder::run(args);
     }
     #[cfg(feature = "visual-check")]
     if let Mode::BenchActivity(args) = &mode {

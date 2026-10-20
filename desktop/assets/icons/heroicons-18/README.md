@@ -18,3 +18,6 @@ from `../heroicons/` with only `stroke-width` changed, from 1.5 to 1.6667
   row buttons (delete a status; a workflow's edit and its menu).
 - `plus.svg`: the workflow editor's Add action button (a transition row's
   `+`, Workflow Transition Row 2277:1519).
+- `x-mark.svg`, `chevron-up-down.svg`: the Workflow Builder inspector's
+  24pt buttons (close the inspector, remove an action, an action's
+  stepper; Workflow Builder frames 2303:5936 and 2307:11276).
