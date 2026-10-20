@@ -728,12 +728,20 @@ impl IssuesView {
     /// (Esc), else it stays (Enter, to walk the cards it left).
     fn leave_search(&mut self, clear: bool, window: &mut Window, cx: &mut Context<Self>) {
         if clear {
-            self.state.set_search("");
-            if let Some(input) = &self.search_input {
-                input.update(cx, |s, cx| s.set_value("", window, cx));
-            }
+            self.clear_search(window, cx);
         }
         self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Empty the search (the board shows every card under the other
+    /// filters again), leaving the keyboard where it is.
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.set_search("");
+        if let Some(input) = &self.search_input {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        self.scroll_selection_into_view();
         cx.notify();
     }
 
@@ -910,6 +918,7 @@ impl IssuesView {
         let focused = input.read(cx).focus_handle(cx).is_focused(window);
         let empty = self.state.search().is_empty();
         let field = div()
+            .debug_selector(|| "board-search-field".into())
             .relative()
             .flex()
             .flex_1()
@@ -940,9 +949,21 @@ impl IssuesView {
                 )
             });
         let focus = input.read(cx).focus_handle(cx);
+        let refocus = focus.clone();
         style::search_box("board-search", field, focused, theme)
             .w(px(SEARCH_W))
             .on_click(move |_, window, cx| window.focus(&focus, cx))
+            // The clear button keeps the keyboard in the field, for the
+            // next search.
+            .when(!empty, |d| {
+                d.child(style::search_clear("board-search-clear", theme).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.clear_search(window, cx);
+                        window.focus(&refocus, cx);
+                        cx.stop_propagation();
+                    },
+                )))
+            })
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                 this.leave_search(true, window, cx);
                 cx.stop_propagation();
@@ -1865,6 +1886,88 @@ mod tests {
         // A persisted filter clears it: the next read is folded either way.
         let mut cleared = None;
         assert_eq!(to_fold(Some(("b", 2)), &mut cleared, false), Some("b"));
+    }
+
+    /// The board in a window of its own, with `tasks` loaded (its disk
+    /// reads stopped, so nothing folds over them) and the toolbar drawn.
+    fn open_board(cx: &mut gpui::TestAppContext, tasks: Vec<shelbi_state::IssueFile>) -> (Entity<IssuesView>, gpui::VisualTestContext) {
+        use crate::views::board_state::tests::read;
+        cx.update(|cx| {
+            cx.set_global(Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark));
+            gpui_kit::init(cx);
+        });
+        let handle = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| IssuesView::new("dt-search-clear-test".into(), cx))
+            })
+            .unwrap()
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        let view = handle.root(&mut vcx).unwrap();
+        view.update(&mut vcx, |v, cx| {
+            v.stop_workers();
+            v.state.apply_reads(Some(read(tasks)), Some(None));
+            cx.notify();
+        });
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        vcx.run_until_parked();
+        (view, vcx)
+    }
+
+    fn drawn(cx: &mut gpui::VisualTestContext, selector: &'static str) -> bool {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        cx.debug_bounds(selector).is_some()
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        assert!(drawn(cx, selector), "{selector} is drawn");
+        let at = cx.debug_bounds(selector).unwrap().center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn cards(view: &Entity<IssuesView>, cx: &mut gpui::VisualTestContext) -> usize {
+        view.read_with(cx, |v, _| v.state.model().columns.iter().map(|c| c.cards.len()).sum())
+    }
+
+    fn search_focused(view: &Entity<IssuesView>, cx: &mut gpui::VisualTestContext) -> bool {
+        let view = view.clone();
+        cx.update(|window, cx| view.read(cx).search_focused(window, cx))
+    }
+
+    #[gpui::test]
+    fn the_clear_button_shows_with_a_query_and_clears_it(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let mut tasks = vec![issue("A", "todo"), issue("B", "todo"), issue("C", "in-progress")];
+        tasks[0].task.title = "Sidebar collapse".into();
+        let (view, mut cx) = open_board(cx, tasks);
+        assert!(!drawn(&mut cx, "board-search-clear"), "hidden while the box is empty");
+        click(&mut cx, "board-search");
+        assert!(search_focused(&view, &mut cx));
+        assert!(!drawn(&mut cx, "board-search-clear"), "focus alone doesn't show it");
+
+        cx.simulate_keystrokes("s i d e");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.search().to_string()), "side");
+        assert_eq!(cards(&view, &mut cx), 1);
+        assert!(drawn(&mut cx, "board-search-clear"), "shown with a query");
+        // The text area ends before the button, inside the box.
+        let field = cx.debug_bounds("board-search-field").unwrap();
+        let clear = cx.debug_bounds("board-search-clear").unwrap();
+        let bx = cx.debug_bounds("board-search").unwrap();
+        assert!(field.right() <= clear.left(), "{field:?} runs under {clear:?}");
+        assert!(clear.right() <= bx.right() && clear.top() >= bx.top() && clear.bottom() <= bx.bottom());
+
+        click(&mut cx, "board-search-clear");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.search().to_string()), "");
+        let value = view.read_with(&cx, |v, cx| v.search_input.as_ref().unwrap().read(cx).value().to_string());
+        assert_eq!(value, "", "the field is emptied too");
+        assert_eq!(cards(&view, &mut cx), 3, "every card is back");
+        assert!(!drawn(&mut cx, "board-search-clear"), "hidden again");
+        assert!(search_focused(&view, &mut cx), "the keyboard stays in the field");
+        cx.simulate_keystrokes("b");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(&cx, |v, _| v.state.search().to_string()), "b", "ready for the next search");
     }
 
     #[test]

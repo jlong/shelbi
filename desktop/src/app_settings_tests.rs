@@ -628,6 +628,42 @@ fn the_search_and_the_context_picker_narrow_the_list(cx: &mut TestAppContext) {
     assert!(!s.drawn("keybindings-group-global") && !s.drawn("keybindings-group-sidebar"));
 }
 
+#[gpui::test]
+fn the_search_clear_button_shows_with_a_query_and_clears_it(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    let search_focused = |s: &mut Settings| {
+        let window = s.h.window.clone();
+        s.h.cx.update(|win, cx| match &window.read(cx).route {
+            Route::Settings(view) => view.read(cx).keybindings().read(cx).search_focused(win, cx),
+            _ => panic!("Settings is shown"),
+        })
+    };
+    assert!(!s.drawn("keybindings-search-clear"), "hidden while the box is empty");
+    s.click("keybindings-search");
+    assert!(search_focused(&mut s));
+    assert!(!s.drawn("keybindings-search-clear"), "focus alone doesn't show it");
+    for key in ["c", "o", "l"] {
+        s.key(key);
+    }
+    assert!(s.drawn("keybindings-search-clear"), "shown with a query");
+    assert!(!s.drawn("keybinding-sidebar-nav_up"));
+    // The text area ends before the button, inside the box.
+    let field = s.bounds("keybindings-search-field").unwrap();
+    let clear = s.bounds("keybindings-search-clear").unwrap();
+    let bx = s.bounds("keybindings-search").unwrap();
+    assert!(field.right() <= clear.left(), "{field:?} runs under {clear:?}");
+    assert!(clear.right() <= bx.right() && clear.top() >= bx.top() && clear.bottom() <= bx.bottom());
+
+    s.click("keybindings-search-clear");
+    assert!(s.page_read(|p| p.state().query.is_empty()));
+    assert!(s.drawn("keybinding-sidebar-nav_up"), "every row is back");
+    assert!(!s.drawn("keybindings-search-clear"), "hidden again");
+    assert!(search_focused(&mut s), "the keyboard stays in the field");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings));
+    s.key("k");
+    assert_eq!(s.page_read(|p| p.state().query.clone()), "k", "ready for the next search");
+}
+
 /// The General page's view, with `config.yaml` "read" as `cfg`.
 fn general_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
     s.key("cmd-1");

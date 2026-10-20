@@ -1417,13 +1417,13 @@ fn reordered_column(tasks: &[shelbi_state::IssueFile], id: &str, slot: u32) -> V
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use shelbi_app::board::{BoardOutcome, BoardProject};
     use shelbi_core::{Column, Issue};
     use shelbi_state::IssueFile;
 
-    fn issue(id: &str, status: &str) -> IssueFile {
+    pub(crate) fn issue(id: &str, status: &str) -> IssueFile {
         let at = chrono::DateTime::parse_from_rfc3339("2026-10-01T10:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -1449,7 +1449,7 @@ mod tests {
         }
     }
 
-    fn read(tasks: Vec<IssueFile>) -> BoardRead {
+    pub(crate) fn read(tasks: Vec<IssueFile>) -> BoardRead {
         BoardRead {
             project: Some(BoardProject {
                 default_workflow_name: "default".into(),

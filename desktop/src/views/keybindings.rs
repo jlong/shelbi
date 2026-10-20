@@ -214,9 +214,16 @@ impl KeybindingsPage {
         if self.state.query.is_empty() {
             cx.emit(KeybindingsEvent::Leave);
         } else {
-            self.state.query.clear();
-            self.search.update(cx, |s, cx| s.set_value("", window, cx));
+            self.clear_search(window, cx);
         }
+        cx.notify();
+    }
+
+    /// Empty the search (every row shows again), leaving the keyboard where
+    /// it is.
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.query.clear();
+        self.search.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
     }
 
@@ -288,6 +295,7 @@ impl KeybindingsPage {
         let focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         let empty = self.state.query.is_empty();
         let field = div()
+            .debug_selector(|| "keybindings-search-field".into())
             .relative()
             .flex()
             .flex_1()
@@ -318,10 +326,22 @@ impl KeybindingsPage {
                 )
             });
         let focus = self.search.read(cx).focus_handle(cx);
+        let refocus = focus.clone();
         let search = style::search_box_base("keybindings-search", field, focused, theme)
             .flex_1()
             .min_w_0()
             .on_click(move |_, window, cx| window.focus(&focus, cx))
+            // The clear button keeps the keyboard in the field, for the
+            // next search.
+            .when(!empty, |d| {
+                d.child(style::search_clear("keybindings-search-clear", theme).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.clear_search(window, cx);
+                        window.focus(&refocus, cx);
+                        cx.stop_propagation();
+                    },
+                )))
+            })
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                 this.escape_search(window, cx);
                 cx.stop_propagation();
@@ -740,5 +760,10 @@ impl KeybindingsPage {
 
     pub(crate) fn picker_open(&self) -> bool {
         self.picker_open
+    }
+
+    /// Whether the search field has the keyboard.
+    pub(crate) fn search_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search.read(cx).focus_handle(cx).is_focused(window)
     }
 }
