@@ -16,3 +16,5 @@ from `../heroicons/` with only `stroke-width` changed, from 1.5 to 1.6667
   in `currentColor` on the 18pt grid), not a widened Heroicon.
 - `trash.svg`, `pencil.svg`, `ellipsis-vertical.svg`: Settings ▸ Workflows'
   row buttons (delete a status; a workflow's edit and its menu).
+- `plus.svg`: the workflow editor's Add action button (a transition row's
+  `+`, Workflow Transition Row 2277:1519).

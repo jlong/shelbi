@@ -856,10 +856,13 @@ fn the_workflows_page_lists_the_projects_workflows_and_statuses(cx: &mut TestApp
     let name = s.read(|_, cx| page.read(cx).name_field("todo").unwrap().read(cx).value().to_string());
     assert_eq!(name, "To Do");
 
-    // The edit button and a row click both ask for the editor.
+    // The edit button and a row click both open the editor.
     s.click("workflow-edit-task");
+    assert!(s.drawn("workflow-editor"));
+    s.click("workflow-editor-back");
     s.click("workflow-row-subtask");
     assert_eq!(s.edited(), ["task", "subtask"]);
+    assert_eq!(s.title(), "subtask");
 }
 
 #[gpui::test]
@@ -951,6 +954,9 @@ fn workflow_actions_create_duplicate_default_and_guard_delete(cx: &mut TestAppCo
     s.enter_text(draft, "hotfix");
     assert!(home.workflows().join("hotfix.yaml").exists());
     assert_eq!(s.edited(), ["hotfix"]);
+    assert!(s.drawn("workflow-editor"));
+    s.click("workflow-editor-back");
+    s.saved();
 
     // Delete one nothing uses.
     s.click("workflow-more-hotfix");
@@ -958,3 +964,318 @@ fn workflow_actions_create_duplicate_default_and_guard_delete(cx: &mut TestAppCo
     s.saved();
     assert!(!home.workflows().join("hotfix.yaml").exists());
 }
+
+// ---- The workflow editor (`dt-wf-editor-form`) ------------------------------
+
+use crate::views::workflow_editor::WorkflowEditor;
+use crate::views::workflow_editor_state::{Change, Field, ReviewMode};
+
+impl Settings {
+    /// Settings ▸ Workflows with workflow `name` open in the editor (by
+    /// its row's edit button).
+    fn open_editor(cx: &mut TestAppContext, name: &'static str) -> Settings {
+        let mut s = Settings::open_workflows(cx);
+        let selector: &'static str = Box::leak(format!("workflow-edit-{name}").into_boxed_str());
+        s.click(selector);
+        assert!(s.drawn("workflow-editor"), "the editor opened");
+        s
+    }
+
+    fn editor(&self) -> Option<Entity<WorkflowEditor>> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).editor(),
+            _ => None,
+        })
+    }
+
+    fn edit(&mut self, f: impl FnOnce(&mut WorkflowEditor, &mut Window, &mut Context<WorkflowEditor>)) {
+        let editor = self.editor().expect("the editor is open");
+        self.update(|_, window, cx| editor.update(cx, |e, cx| f(e, window, cx)));
+        self.settle();
+    }
+
+    fn dirty(&self) -> bool {
+        let editor = self.editor().expect("the editor is open");
+        self.read(|_, cx| editor.read(cx).state().is_some_and(|s| s.is_dirty()))
+    }
+
+    fn error_at(&self, field: Field) -> Option<String> {
+        let editor = self.editor().expect("the editor is open");
+        self.read(|_, cx| editor.read(cx).state().and_then(|s| s.error_at(&field)).map(str::to_string))
+    }
+
+    fn title(&mut self) -> String {
+        let editor = self.editor().expect("the editor is open");
+        self.read(|_, cx| editor.read(cx).state().map(|s| s.name().to_string()).unwrap_or_default())
+    }
+
+    /// Type `text` into `input` as the user would: the field focused and
+    /// emptied, then the text typed (a typed edit, not a set value).
+    fn type_into(&mut self, input: Entity<gpui_kit::component::input::InputState>, text: &str) {
+        self.update(|_, window, cx| {
+            let focus = gpui::Focusable::focus_handle(input.read(cx), cx);
+            window.focus(&focus, cx);
+            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        });
+        self.h.cx.simulate_input(text);
+        self.settle();
+    }
+}
+
+fn on_disk(name: &str) -> shelbi_core::Workflow {
+    config().workflow(name).unwrap().clone()
+}
+
+#[gpui::test]
+fn the_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-shell", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+    assert!(!s.drawn("column-settings") && !s.drawn("leading-column"), "no sidebar");
+    let titlebar = s.bounds("workflow-editor-titlebar").unwrap();
+    assert_eq!((titlebar.top(), titlebar.size.height), (px(0.0), px(52.0)), "the window's top row");
+    let back = s.bounds("workflow-editor-back").unwrap();
+    assert_eq!(back.left(), px(80.0), "after the traffic lights' room");
+    assert!(s.drawn("workflow-editor-default-badge"), "Task is the default");
+    assert!(s.drawn("workflow-editor-save") && !s.drawn("workflow-editor-discard"), "nothing to discard yet");
+    assert!(s.drawn("workflow-form") && s.drawn("workflow-statuses-table"));
+    for id in ["backlog", "todo", "in-progress", "review", "done", "canceled"] {
+        let selector: &'static str = Box::leak(format!("workflow-status-row-{id}").into_boxed_str());
+        assert!(s.drawn(selector), "{id}");
+    }
+    assert!(s.drawn("workflow-transition-row-0"));
+
+    // Builder shows its placeholder over the same draft; Form comes back.
+    s.click("workflow-editor-mode-builder");
+    assert!(s.drawn("workflow-builder-placeholder") && !s.drawn("workflow-form"));
+    s.click("workflow-editor-mode-form");
+    assert!(s.drawn("workflow-form"));
+
+    // ⌘N doesn't switch pages under it; Back returns to the page, the
+    // sidebar with it.
+    s.key("cmd-1");
+    assert!(s.drawn("workflow-editor"));
+    s.click("workflow-editor-back");
+    assert!(!s.drawn("workflow-editor") && s.drawn("settings-workflows") && s.drawn("column-settings"));
+    assert_eq!(s.page(), Some(SettingsPage::Workflows));
+}
+
+#[gpui::test]
+fn edits_wait_for_save_and_discard_reverts_them(cx: &mut TestAppContext) {
+    let home = Home::with_project("ed-save", "alpha");
+    let before = home.read("task.yaml");
+    let mut s = Settings::open_editor(cx, "task");
+
+    // An owner from its picker: dirty, nothing written.
+    s.click("workflow-owner-backlog");
+    assert!(s.drawn("workflow-owner-menu"));
+    s.click("workflow-owner-backlog-agent");
+    assert!(s.dirty() && s.drawn("workflow-editor-discard"));
+    assert_eq!(home.read("task.yaml"), before);
+
+    // Discard reverts it.
+    s.click("workflow-editor-discard");
+    assert!(!s.dirty() && !s.drawn("workflow-editor-discard"));
+
+    // A description typed, then saved: written with the file's comments.
+    let field = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).description_field(),
+        _ => unreachable!(),
+    });
+    s.type_into(field, "Branch work, reviewed.");
+    assert!(s.dirty());
+    s.click("workflow-editor-save");
+    s.saved();
+    assert!(!s.dirty());
+    assert_eq!(on_disk("task").description.as_deref(), Some("Branch work, reviewed."));
+    let text = home.read("task.yaml");
+    assert!(text.contains("## Statuses run left to right."), "{text}");
+}
+
+#[gpui::test]
+fn leaving_with_unsaved_edits_asks_to_save_or_discard(cx: &mut TestAppContext) {
+    let home = Home::with_project("ed-leave", "alpha");
+    let before = home.read("subtask.yaml");
+    let mut s = Settings::open_editor(cx, "subtask");
+    s.edit(|e, window, cx| e.make(Change::InitialStatus("todo".into()), window, cx));
+
+    // Esc asks; Cancel stays with the edits.
+    s.h.focus_window();
+    s.key("escape");
+    assert!(s.drawn("workflow-leave-prompt"));
+    s.click("workflow-leave-cancel");
+    assert!(!s.drawn("workflow-leave-prompt") && s.drawn("workflow-editor") && s.dirty());
+
+    // Back asks; Discard leaves without writing.
+    s.click("workflow-editor-back");
+    assert!(s.drawn("workflow-leave-prompt"));
+    s.click("workflow-leave-discard");
+    assert!(!s.drawn("workflow-editor"));
+    assert_eq!(home.read("subtask.yaml"), before);
+
+    // Save writes, then leaves.
+    s.click("workflow-edit-subtask");
+    s.edit(|e, window, cx| e.make(Change::InitialStatus("todo".into()), window, cx));
+    s.click("workflow-editor-back");
+    s.click("workflow-leave-save");
+    s.saved();
+    assert!(!s.drawn("workflow-editor"));
+    assert_eq!(on_disk("subtask").initial_status.as_deref(), Some("todo"));
+
+    // Nothing unsaved: Esc just goes.
+    s.click("workflow-edit-subtask");
+    s.h.focus_window();
+    s.key("escape");
+    assert!(!s.drawn("workflow-editor") && !s.drawn("workflow-leave-prompt"));
+}
+
+#[gpui::test]
+fn statuses_and_transitions_edit_from_their_controls(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-rows", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+
+    // A refused owner shows under its row; the draft is as it was.
+    s.click("workflow-owner-done");
+    s.click("workflow-owner-done-agent");
+    assert!(s.drawn("workflow-status-error-done"));
+    assert!(!s.dirty());
+    // Its agent first, then the owner.
+    s.click("workflow-agent-done");
+    s.click("workflow-agent-done-review");
+    s.click("workflow-owner-done");
+    s.click("workflow-owner-done-agent");
+    assert!(!s.drawn("workflow-status-error-done"));
+
+    // Tags typed into a row's field.
+    let tags = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).tags_field("done").unwrap(),
+        _ => unreachable!(),
+    });
+    s.type_into(tags, "mac, gpu");
+
+    // Reorder by a drop, remove a status.
+    s.edit(|e, window, cx| e.drop_on("canceled", "backlog", window, cx));
+    s.click("workflow-status-delete-todo");
+
+    // An action added from a row's +, another moved earlier and removed.
+    s.click("workflow-add-action-0");
+    assert!(s.drawn("workflow-add-action-menu"));
+    s.click("workflow-add-action-0-merge");
+    s.click("workflow-action-0-2");
+    s.click("workflow-action-0-2-earlier");
+    s.click("workflow-action-0-0");
+    s.click("workflow-action-0-0-remove");
+    // A transition's endpoint from its picker.
+    s.click("workflow-transition-to-2");
+    s.click("workflow-transition-to-2-done");
+
+    s.click("workflow-editor-save");
+    s.saved();
+    let w = on_disk("task");
+    let ids: Vec<_> = w.statuses.iter().map(|st| st.id.as_str()).collect();
+    assert_eq!(ids, ["canceled", "backlog", "in-progress", "review", "done"]);
+    let done = w.status("done").unwrap();
+    assert_eq!((done.owner, done.agent.as_deref()), (shelbi_core::Owner::Agent, Some("review")));
+    assert_eq!(done.tags, ["mac", "gpu"]);
+    let ts = w.transitions.unwrap();
+    use shelbi_core::TransitionAction::*;
+    assert_eq!(ts[0].actions, [Merge, OpenPr]);
+    assert_eq!((ts[2].from.as_str(), ts[2].to.as_str()), ("in-progress", "done"));
+}
+
+#[gpui::test]
+fn details_and_lower_sections_show_their_errors_inline(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-details", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+
+    // Details open under the row; a bad timeout shows there.
+    s.click("workflow-transition-details-0");
+    assert!(s.drawn("workflow-details"));
+    let timeout = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).details_timeout_field().unwrap(),
+        _ => unreachable!(),
+    });
+    s.type_into(timeout.clone(), "soon");
+    assert!(s.error_at(Field::Transition(0)).is_some_and(|e| e.contains("whole number")));
+    assert!(s.drawn("workflow-transition-error-0"));
+    s.type_into(timeout, "120");
+    assert_eq!(s.error_at(Field::Transition(0)), None);
+    s.click("workflow-transition-details-0");
+    assert!(!s.drawn("workflow-details"), "the button closes them");
+
+    // Git: a templated base branch needs a required field.
+    let base = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).base_branch_field(),
+        _ => unreachable!(),
+    });
+    s.type_into(base, "feature/{{feature}}");
+    assert!(s.error_at(Field::Git).is_some_and(|e| e.contains("required task field")));
+
+    // Review: Run the branch without a serve command is held at Save.
+    s.edit(|e, window, cx| e.make(Change::ReviewMode(ReviewMode::Serve), window, cx));
+    s.edit(|e, window, cx| e.save(window, cx));
+    s.saved();
+    assert!(s.error_at(Field::Review).is_some_and(|e| e.contains("starts the server")));
+    assert!(on_disk("task").review.is_none(), "nothing written");
+    assert!(on_disk("task").transitions.unwrap()[0].ready_timeout.is_none());
+}
+
+#[gpui::test]
+fn the_more_menu_sets_default_duplicates_and_deletes(cx: &mut TestAppContext) {
+    let home = Home::with_project("ed-more", "alpha");
+    let mut s = Settings::open_editor(cx, "subtask");
+    assert!(!s.drawn("workflow-editor-default-badge"));
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-set-default");
+    assert!(s.drawn("workflow-editor-default-badge") && s.dirty());
+    s.click("workflow-editor-save");
+    s.saved();
+    assert_eq!(config().default_workflow(), "subtask");
+
+    // Duplicate: the copy opens in the editor.
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-duplicate");
+    s.saved();
+    assert_eq!(s.title(), "subtask-copy");
+    assert!(home.workflows().join("subtask-copy.yaml").exists());
+
+    // Delete the copy: back to the page, its file gone.
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-delete");
+    s.saved();
+    assert!(!s.drawn("workflow-editor"));
+    assert!(!home.workflows().join("subtask-copy.yaml").exists());
+}
+
+#[gpui::test]
+fn manage_project_statuses_returns_to_the_page(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-manage", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+    s.click("workflow-manage-statuses");
+    s.saved();
+    assert!(!s.drawn("workflow-editor") && s.drawn("statuses-table") && s.drawn("column-settings"));
+    assert_eq!(s.page(), Some(SettingsPage::Workflows));
+}
+
+#[gpui::test]
+fn a_rename_waits_for_save_and_a_taken_name_shows_at_the_field(cx: &mut TestAppContext) {
+    let home = Home::with_project("ed-rename", "alpha");
+    let mut s = Settings::open_editor(cx, "subtask");
+    let name = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).name_field(),
+        _ => unreachable!(),
+    });
+    s.type_into(name.clone(), "task");
+    assert!(s.dirty());
+    s.click("workflow-editor-save");
+    s.saved();
+    assert!(s.drawn("workflow-name-error"));
+    assert!(home.workflows().join("subtask.yaml").exists());
+
+    s.type_into(name, "child");
+    assert!(!s.drawn("workflow-name-error"), "typing clears it");
+    s.click("workflow-editor-save");
+    s.saved();
+    assert_eq!(s.title(), "child");
+    assert!(home.workflows().join("child.yaml").exists() && !home.workflows().join("subtask.yaml").exists());
+}
+
