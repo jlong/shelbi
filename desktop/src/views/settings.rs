@@ -36,7 +36,10 @@
 //! The Keybindings page is its own view ([`KeybindingsPage`]): the editor
 //! for `keys.yaml`, the key bindings both clients share. So is the project's
 //! Workflows page ([`WorkflowsPage`]): its workflows and status catalog,
-//! saved through `shelbi_state::workflow_config`.
+//! saved through `shelbi_state::workflow_config`. A workflow opened from it
+//! shows in its editor ([`WorkflowEditor`]), which takes the whole view (the
+//! window hides the settings sidebar while it shows) until it closes back
+//! onto the page.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -48,8 +51,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, PathPromptOptions,
-    SharedString, Subscription, Window,
+    div, point, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, PathPromptOptions,
+    ScrollHandle, SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
@@ -59,6 +62,7 @@ use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
+use super::workflow_editor::{EditorEvent, WorkflowEditor};
 use super::workflows::{WorkflowsEvent, WorkflowsPage};
 use crate::assets::icons;
 use crate::elements::controls::{self, Slider, SliderEvent};
@@ -265,6 +269,8 @@ pub enum SettingsEvent {
     /// Open workflow `name`'s editor (Settings ▸ Workflows' edit button, a
     /// row's click, a workflow just created).
     EditWorkflow(String),
+    /// The workflow editor closed: the settings sidebar comes back.
+    EditorClosed,
 }
 
 /// The settings view.
@@ -301,6 +307,13 @@ pub struct SettingsView {
     keybindings: Entity<KeybindingsPage>,
     /// The project's Workflows page.
     workflows: Entity<WorkflowsPage>,
+    /// The workflow editor, while a workflow is open in it.
+    editor: Option<(Entity<WorkflowEditor>, Subscription)>,
+    /// The page's scroll, and whether to bring the Workflows page's
+    /// Statuses into view once it has drawn (the editor's Manage project
+    /// statuses).
+    scroll: ScrollHandle,
+    scroll_to_statuses: bool,
     /// False until the config has been read, so an early blur can't save
     /// blank values over it.
     loaded: bool,
@@ -397,6 +410,9 @@ impl SettingsView {
             saved: UserConfig::default(),
             keybindings,
             workflows,
+            editor: None,
+            scroll: ScrollHandle::new(),
+            scroll_to_statuses: false,
             loaded: false,
             theme_track: SlideTrack::shared(),
             option_track: SlideTrack::shared(),
@@ -468,6 +484,74 @@ impl SettingsView {
     #[cfg(test)]
     pub(crate) fn workflows(&self) -> Entity<WorkflowsPage> {
         self.workflows.clone()
+    }
+
+    /// Open workflow `name` in the editor, over the Workflows page's model
+    /// as last loaded (a save checks the files haven't changed since).
+    pub fn open_editor(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let config = self.workflows.read(cx).state().config().cloned();
+        let project = self.workflows.read(cx).state().project().to_string();
+        let editor = cx.new(|cx| WorkflowEditor::new(&project, name, config, window, cx));
+        let sub = cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, window, cx| {
+            this.close_editor(*event == EditorEvent::ManageStatuses, window, cx)
+        });
+        self.page = SettingsPage::Workflows;
+        self.editor = Some((editor, sub));
+        cx.notify();
+    }
+
+    /// Whether the workflow editor shows.
+    pub fn editing(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// The workflow editor, while it shows.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn editor(&self) -> Option<Entity<WorkflowEditor>> {
+        self.editor.as_ref().map(|(e, _)| e.clone())
+    }
+
+    /// Esc while the window holds the keys: the editor's Back.
+    pub fn editor_back(&mut self, cx: &mut Context<Self>) {
+        if let Some((editor, _)) = &self.editor {
+            editor.update(cx, |e, cx| e.back(cx));
+        }
+    }
+
+    /// Back onto the Workflows page (its files re-read), at its Statuses
+    /// for Manage project statuses.
+    fn close_editor(&mut self, to_statuses: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor = None;
+        self.page = SettingsPage::Workflows;
+        self.workflows.update(cx, |p, cx| {
+            // A test's page reads its throwaway home again only if it read
+            // it before (never the real `~/.shelbi`).
+            if !cfg!(test) {
+                p.reload_when_drawn();
+            } else if p.state().config().is_some() {
+                p.load(window, cx);
+            }
+            p.forget_statuses_bounds();
+        });
+        self.scroll_to_statuses = to_statuses;
+        cx.emit(SettingsEvent::EditorClosed);
+        cx.notify();
+    }
+
+    /// Scroll the Workflows page's Statuses to the top once it has drawn.
+    fn bring_statuses_into_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(section) = self.workflows.read(cx).statuses_bounds() else {
+            // Not drawn yet: try again on the next frame.
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
+            return;
+        };
+        self.scroll_to_statuses = false;
+        let top = self.scroll.bounds().top() + px(32.0);
+        let offset = self.scroll.offset();
+        let max = self.scroll.max_offset().y;
+        let y = (offset.y - (section.top() - top)).min(px(0.0)).max(-max);
+        self.scroll.set_offset(point(offset.x, y));
+        cx.notify();
     }
 
     /// Show `page`.
@@ -910,6 +994,12 @@ fn parse_size(text: &str) -> Option<i32> {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        if let Some((editor, _)) = &self.editor {
+            return div().size_full().child(editor.clone()).into_any_element();
+        }
+        if self.scroll_to_statuses && self.page == SettingsPage::Workflows {
+            self.bring_statuses_into_view(window, cx);
+        }
         // The segmented controls' selections slide to a new choice.
         let now = Instant::now();
         let slide = |track: &SharedTrack, key: String| {
@@ -1022,6 +1112,7 @@ impl Render for SettingsView {
             .p_8()
             .bg(theme.nested(theme.canvas))
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .type_style(Type::Base)
             .text_color(theme.foreground)
             .child(div().absolute().size_0().debug_selector(move || page_selector(shown).into()));
@@ -1138,6 +1229,7 @@ impl Render for SettingsView {
         // `config.yaml`'s save line belongs to the pages that write it.
         let status = status.filter(|_| !matches!(shown, SettingsPage::Keybindings | SettingsPage::Workflows));
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
+            .into_any_element()
     }
 }
 

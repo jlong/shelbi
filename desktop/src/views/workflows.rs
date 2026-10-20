@@ -123,6 +123,9 @@ pub struct WorkflowsPage {
     menu_anchor: style::Anchor,
     /// Re-read the files on the next draw (the page was shown again).
     reload: bool,
+    /// Where the Statuses section last painted (the editor's Manage project
+    /// statuses scrolls it into view).
+    statuses_anchor: style::Anchor,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,6 +147,7 @@ impl WorkflowsPage {
             menu: None,
             menu_anchor: Default::default(),
             reload: false,
+            statuses_anchor: Default::default(),
             _subscriptions: subscriptions,
         };
         // A test's page never reads the real `~/.shelbi`.
@@ -183,9 +187,19 @@ impl WorkflowsPage {
     }
 
     /// The page's state.
-    #[cfg(test)]
     pub fn state(&self) -> &WorkflowsState {
         &self.state
+    }
+
+    /// Where the Statuses section painted, since
+    /// [`forget_statuses_bounds`](Self::forget_statuses_bounds).
+    pub fn statuses_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.statuses_anchor.get()
+    }
+
+    /// Wait for the Statuses section's next paint.
+    pub fn forget_statuses_bounds(&mut self) {
+        self.statuses_anchor.set(None);
     }
 
     /// Status `id`'s name field.
@@ -834,10 +848,12 @@ impl WorkflowsPage {
             }))
         };
         div()
+            .relative()
             .flex()
             .flex_col()
             .w_full()
             .gap(px(24.0))
+            .child(style::anchor_probe(&self.statuses_anchor))
             .child(section_header(
                 "Statuses",
                 "Work transitions through statuses in workflows. Configure the statuses, agents, and \

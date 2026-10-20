@@ -335,9 +335,10 @@ impl WorkflowsState {
     }
 }
 
-/// The Workflows frame's content (`--visual-figma`, and the tests): the
+/// The Workflows frames' content (`--visual-figma`, and the tests): the
 /// shipped catalog (To Do as the frame names it), Task (six statuses, four
-/// transitions) and Subtask (five, two), and the agents they name.
+/// transitions, owners, agents, tags and git as the Workflow Form frame
+/// draws them) and Subtask (five, two), and the agents they name.
 #[cfg(any(test, feature = "visual-check"))]
 pub(crate) mod fixture {
     use std::path::Path;
@@ -346,7 +347,7 @@ pub(crate) mod fixture {
     pub fn write(project_dir: &Path) {
         let workflows = project_dir.join("workflows");
         std::fs::create_dir_all(&workflows).unwrap();
-        for agent in ["developer", "review"] {
+        for agent in ["developer", "orchestrator", "review"] {
             let dir = project_dir.join("agents").join(agent);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("instructions.md"), "# agent\n").unwrap();
@@ -382,32 +383,42 @@ statuses:
     pub const TASK: &str = "\
 name: task
 description: Branch work with a review gate.
+## Statuses run left to right.
 statuses:
 - id: backlog
   owner: user
+  agent: orchestrator
 - id: todo
-  owner: user
+  owner: agent
+  agent: orchestrator
 - id: in-progress
   owner: agent
   agent: developer
 - id: review
-  owner: agent
+  owner: user
   agent: review
+  tags: [review]
 - id: done
   owner: user
 - id: canceled
   owner: user
 transitions:
-- from: todo
-  to: in-progress
 - from: in-progress
   to: review
   actions: [push_branch, open_pr]
 - from: review
   to: done
-  actions: [merge]
+  actions: [push_branch, merge]
+- from: in-progress
+  to: canceled
+  actions: [close_pr, delete_branch]
 - from: review
-  to: in-progress
+  to: canceled
+  actions: [close_pr, delete_branch]
+git:
+  base_branch: main
+  branch: '{{github_user}}/{{id}}'
+  merge_strategy: squash
 ";
 
     pub const SUBTASK: &str = "\

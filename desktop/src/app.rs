@@ -2041,18 +2041,20 @@ impl ShelbiWindow {
     }
 
     /// Open workflow `name`'s editor (Settings ▸ Workflows' edit button, a
-    /// row's click, a workflow just created). Until the workflow editor
-    /// lands (`dt-wf-editor-form`), its file opens in the user's editor, as
-    /// `edit:workflows` opens the directory.
-    fn edit_workflow(&mut self, name: String, cx: &mut Context<Self>) {
-        // A test's window records it and launches nothing.
-        if cfg!(test) {
-            #[cfg(test)]
-            self.edited_workflows.push(name);
-            return;
+    /// row's click, a workflow just created): it takes the whole window,
+    /// the settings sidebar hidden, until it closes back onto the page.
+    fn edit_workflow(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.edited_workflows.push(name.clone());
+        if let Route::Settings(view) = &self.route {
+            view.update(cx, |v, cx| v.open_editor(&name, window, cx));
         }
-        let project = self.project.clone();
-        self.open_in_editor(move || shelbi_state::workflow_path(&project, &name).ok(), cx);
+        cx.notify();
+    }
+
+    /// Whether the workflow editor holds the window.
+    fn editing_workflow(&self, cx: &App) -> bool {
+        matches!(&self.route, Route::Settings(view) if view.read(cx).editing())
     }
 
     /// Open the file `find` locates in the user's editor and say so. The
@@ -3015,7 +3017,11 @@ impl ShelbiWindow {
                         this.focus_handle.focus(window, cx);
                         cx.notify();
                     }
-                    SettingsEvent::EditWorkflow(name) => this.edit_workflow(name.clone(), cx),
+                    SettingsEvent::EditWorkflow(name) => this.edit_workflow(name.clone(), window, cx),
+                    SettingsEvent::EditorClosed => {
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }
                 });
                 self._view_subscriptions.push(sub);
                 self.set_route(Route::Settings(view));
@@ -3028,8 +3034,12 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Show a Settings page (its row, ⌘N, Enter on its row).
+    /// Show a Settings page (its row, ⌘N, Enter on its row). Not while the
+    /// workflow editor holds the window: it has no sidebar to pick from.
     fn show_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if self.editing_workflow(cx) {
+            return;
+        }
         self.settings_nav.show(page);
         if let Route::Settings(view) = &self.route {
             view.update(cx, |v, cx| v.show_page(page, cx));
@@ -3042,6 +3052,16 @@ impl ShelbiWindow {
     /// bindings) move the selection, Enter opens it. Returns whether it was
     /// one.
     fn settings_key(&mut self, chord: shelbi_state::keymap::KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // The workflow editor: Esc is its Back; it has no sidebar keys.
+        if let Route::Settings(view) = &self.route {
+            if view.read(cx).editing() {
+                if chord.code == Key::Esc && chord.mods.is_empty() {
+                    view.update(cx, |v, cx| v.editor_back(cx));
+                    return true;
+                }
+                return false;
+            }
+        }
         if chord.code == Key::Esc && chord.mods.is_empty() {
             self.leave_settings(window, cx);
             return true;
@@ -4440,6 +4460,14 @@ impl ShelbiWindow {
             )
         });
 
+        // The workflow editor takes the whole window: no column, and its own
+        // titlebar row in place of the main area's.
+        let (column, handle, titlebar) = if self.editing_workflow(cx) {
+            (None, None, MainTitlebar { open: 0.0, left: 0.0 })
+        } else {
+            (column, handle, titlebar)
+        };
+
         let shell = div()
             .id("shelbi-window")
             .key_context("ShelbiWindow")
@@ -4753,6 +4781,11 @@ impl ShelbiWindow {
 
     pub(crate) fn offscreen_open_settings(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(Some(page), window, cx);
+    }
+
+    /// Open workflow `name` in the editor (Settings ▸ Workflows open).
+    pub(crate) fn offscreen_edit_workflow(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_workflow(name.to_string(), window, cx);
     }
 
     /// The settings view, while it is shown.

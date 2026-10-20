@@ -397,6 +397,7 @@ heroicons! {
         TRASH_BUTTON = "trash";
         ELLIPSIS_VERTICAL_BUTTON = "ellipsis-vertical";
         PENCIL_BUTTON = "pencil";
+        PLUS_BUTTON = "plus";
     }
     @close {
         X_MARK_CLOSE = "x-mark";
@@ -433,7 +434,8 @@ pub fn glyph(glyph: Glyph) -> Svg {
     svg().path(glyph.path()).size(glyph.size()).flex_none()
 }
 
-/// The sidebar's 12pt Figma glyphs (see the module docs).
+/// The sidebar's 12pt Figma glyphs (see the module docs), and the workflow
+/// editor's 10pt Discard mark.
 pub mod glyphs {
     use super::Glyph;
 
@@ -448,9 +450,12 @@ pub mod glyphs {
     pub const QUESTION: Glyph = Glyph { name: "question", size: 12 };
     /// A section header's collapse chevron.
     pub const CHEVRON_DOWN: Glyph = Glyph { name: "chevron-down", size: 12 };
+    /// The workflow editor's Discard changes link (the Header's `Discard
+    /// Link`, 2342:39062): John's 10pt drawing, a 1pt stroke.
+    pub const DISCARD: Glyph = Glyph { name: "discard", size: 10 };
 
     #[cfg(test)]
-    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN];
+    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN, DISCARD];
 }
 
 /// Every glyph drawing, by asset path.
@@ -460,6 +465,7 @@ const GLYPHS: &[(&str, &[u8])] = &[
     ("icons/glyphs/dot.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/dot.svg"))),
     ("icons/glyphs/question.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/question.svg"))),
     ("icons/glyphs/chevron-down.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chevron-down.svg"))),
+    ("icons/glyphs/discard.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/discard.svg"))),
 ];
 
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its

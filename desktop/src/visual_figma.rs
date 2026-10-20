@@ -20,8 +20,10 @@
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
 //! machines, the four Settings pages (settings-general,
-//! settings-keybindings, settings-terminal, and settings-workflows against
-//! `workflows/1-index.png`) and command-palette, plus the
+//! settings-keybindings, settings-terminal, settings-workflows against
+//! `workflows/1-index.png`, and settings-workflow-form against
+//! `workflows/4-workflow-form.png` in the frame's 1440x1283 window) and
+//! command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
@@ -33,7 +35,8 @@
 //! the remote down, its row selected; `machines-idle-selected`,
 //! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
 //! a focused textbox; `state-keybindings-*`: the bindings editor's capture,
-//! conflict, search, picker and customized states), the board toolbar's (`state-issues-unfiltered`: no
+//! conflict, search, picker and customized states; `state-workflow-form-*`:
+//! the workflow editor edited, its leave prompt, and its form's foot), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs).
@@ -84,6 +87,8 @@ const ONLY_VAR: &str = "SHELBI_VISUAL_ONLY";
 /// The reference PNGs' size, in points.
 const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 1024;
+/// The Workflow Form frame's height (2252:29281): its window is taller.
+const FORM_HEIGHT: u32 = 1283;
 
 /// Every screen, named as its reference PNG.
 pub const SCREENS: [&str; 12] = [
@@ -588,6 +593,8 @@ struct Run {
     failures: usize,
     /// The sidebar model the next window opens with.
     sidebar: SidebarModel,
+    /// The next window's height ([`HEIGHT`] but for the Workflow Form).
+    height: u32,
 }
 
 /// Run it for `theme`, saving `<screen>-<theme>.png` under `out`; exits
@@ -640,6 +647,7 @@ pub fn run(out: PathBuf, theme: &'static str, native: bool) -> ! {
         warned: false,
         failures: 0,
         sidebar: sidebar_model(),
+        height: HEIGHT,
     };
     run.all();
     let _ = std::fs::remove_dir_all(&home);
@@ -696,7 +704,7 @@ impl Run {
             None => {
                 let root = self.root();
                 self.cx
-                    .open_offscreen_window(size(px(WIDTH as f32), px(HEIGHT as f32)), root)
+                    .open_offscreen_window(size(px(WIDTH as f32), px(self.height as f32)), root)
                     .expect("open the offscreen window")
             }
         };
@@ -712,7 +720,7 @@ impl Run {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: display.bounds().origin,
-                    size: size(px(WIDTH as f32), px(HEIGHT as f32)),
+                    size: size(px(WIDTH as f32), px(self.height as f32)),
                 })),
                 display_id: Some(display.id()),
                 kind: WindowKind::PopUp,
@@ -935,10 +943,13 @@ impl Run {
 
     fn write_capture(&mut self, window: AnyWindowHandle, screen: &str) {
         let image = self.cx.capture_screenshot(window).expect("render to image");
+        // Down to 1x, keeping the aspect: a window taller than the display
+        // (the Workflow Form's 1283pt on a laptop) comes back clamped to it.
         let image = if self.native || image.width() == WIDTH {
             image
         } else {
-            image::imageops::resize(&image, WIDTH, HEIGHT, image::imageops::FilterType::Triangle)
+            let height = image.height() * WIDTH / image.width();
+            image::imageops::resize(&image, WIDTH, height, image::imageops::FilterType::Triangle)
         };
         let path = self.out.join(format!("{screen}-{}.png", self.theme));
         image.save(&path).expect("save the frame");
@@ -997,10 +1008,83 @@ impl Run {
             .unwrap();
         self.settle(handle);
         self.save(handle, "settings-workflows");
+        self.workflow_form();
         let _ = std::fs::remove_dir_all(&workflows);
         if !had_agents {
             let _ = std::fs::remove_dir_all(&agents);
         }
+    }
+
+    /// The workflow editor's Form (the Workflow Form frame, 2252:29281,
+    /// reference `workflows/4-workflow-form.png`, 1283pt tall) over the
+    /// fixture's Task, and its states no frame draws (`state-workflow-*`,
+    /// checked by eye): an edit made (Discard shows, Save enabled), a
+    /// transition's Details open with a refused timeout, the leave prompt,
+    /// and the form's foot with Review running the branch.
+    fn workflow_form(&mut self) {
+        use crate::views::settings_nav::SettingsPage;
+        use crate::views::workflow_editor_state::{Change, DetailsForm};
+        self.height = FORM_HEIGHT;
+        let open = |run: &mut Run| {
+            let handle = run.open();
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Workflows, window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_edit_workflow("task", window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle
+        };
+        let edit = |run: &mut Run, handle: WindowHandle<ShelbiWindow>, f: &dyn Fn(&mut crate::views::workflow_editor::WorkflowEditor, &mut gpui::Window, &mut gpui::Context<crate::views::workflow_editor::WorkflowEditor>)| {
+            handle
+                .update(&mut run.cx, |w, window, cx| {
+                    let editor = w.offscreen_settings().and_then(|s| s.read(cx).editor()).expect("the editor shows");
+                    editor.update(cx, |e, cx| f(e, window, cx));
+                })
+                .unwrap();
+            run.settle(handle);
+        };
+
+        let handle = open(self);
+        let shown = handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_settings().is_some_and(|s| s.read(cx).editing()))
+            .unwrap();
+        self.expect("settings-workflow-form: the editor holds the window", shown);
+        self.save(handle, "settings-workflow-form");
+
+        let handle = open(self);
+        edit(self, handle, &|e, window, cx| {
+            e.make(Change::Owner { id: "backlog".into(), owner: shelbi_core::Owner::Agent }, window, cx);
+            e.make(
+                Change::Details {
+                    index: 0,
+                    form: DetailsForm { ready_timeout: "soon".into(), ..DetailsForm::default() },
+                },
+                window,
+                cx,
+            );
+            e.offscreen_open_details(1, window, cx);
+        });
+        self.save(handle, "state-workflow-form-edited");
+
+        let handle = open(self);
+        edit(self, handle, &|e, window, cx| {
+            e.make(Change::Description("Branch work, reviewed.".into()), window, cx);
+            e.back(cx);
+        });
+        self.save(handle, "state-workflow-form-leave-prompt");
+
+        // The form's foot: Git, Review running the branch, Automation and
+        // Delete workflow.
+        let handle = open(self);
+        edit(self, handle, &|e, window, cx| {
+            e.make(Change::ReviewMode(crate::views::workflow_editor_state::ReviewMode::Serve), window, cx);
+            e.offscreen_scroll_to_bottom();
+        });
+        self.save(handle, "state-workflow-form-bottom");
+        self.height = HEIGHT;
     }
 
     /// The Keybindings page's states no frame draws (`state-keybindings-*`,
@@ -1081,6 +1165,7 @@ impl Run {
                     .unwrap();
             }
             let image = self.cx.capture_screenshot(window).expect("render to image");
+        eprintln!("DEBUG capture {}x{}", image.width(), image.height());
             let image = if self.native || image.width() == w as u32 {
                 image
             } else {
@@ -1522,6 +1607,7 @@ impl Run {
         let handle = self.open_detail();
         let window: AnyWindowHandle = handle.into();
         let image = self.cx.capture_screenshot(window).expect("render to image");
+        eprintln!("DEBUG capture {}x{}", image.width(), image.height());
         let scale = image.width() as f32 / WIDTH as f32;
         // The action row's top: the modal (85% of the window down, centered)
         // plus its 1pt edge, the 52pt title row and the 176pt field table.
