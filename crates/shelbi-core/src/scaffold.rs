@@ -402,6 +402,14 @@ pub fn subtask_workflow_yaml() -> Result<String> {
     ))
 }
 
+/// A workflow file for `wf`, created outside `shelbi init` (the desktop's
+/// New workflow): the docs header over the serialized workflow. No commented
+/// sections, since which of them would collide depends on what `wf` sets.
+pub fn new_workflow_yaml(wf: &crate::Workflow) -> Result<String> {
+    let active = serde_yaml::to_string(wf)?;
+    Ok(format!("{WORKFLOW_HEADER}{active}"))
+}
+
 // ---------------------------------------------------------------------------
 // statuses.yaml
 
