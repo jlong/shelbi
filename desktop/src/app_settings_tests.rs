@@ -1008,8 +1008,16 @@ use crate::views::workflow_editor_state::{Change, Field, ReviewMode};
 
 impl Settings {
     /// Settings ▸ Workflows with workflow `name` open in the editor (by
-    /// its row's edit button).
+    /// its row's edit button), on its Form.
     fn open_editor(cx: &mut TestAppContext, name: &'static str) -> Settings {
+        let mut s = Settings::open_builder(cx, name);
+        s.click("workflow-editor-mode-form");
+        assert!(s.drawn("workflow-form"), "the Form shows");
+        s
+    }
+
+    /// [`Settings::open_editor`], left on the Builder it opens on.
+    fn open_builder(cx: &mut TestAppContext, name: &'static str) -> Settings {
         let mut s = Settings::open_workflows(cx);
         let selector: &'static str = Box::leak(format!("workflow-edit-{name}").into_boxed_str());
         s.click(selector);
@@ -1080,9 +1088,9 @@ fn the_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext) {
     }
     assert!(s.drawn("workflow-transition-row-0"));
 
-    // Builder shows its placeholder over the same draft; Form comes back.
+    // Builder draws the same draft; Form comes back.
     s.click("workflow-editor-mode-builder");
-    assert!(s.drawn("workflow-builder-placeholder") && !s.drawn("workflow-form"));
+    assert!(s.drawn("workflow-builder") && !s.drawn("workflow-form"));
     s.click("workflow-editor-mode-form");
     assert!(s.drawn("workflow-form"));
 
@@ -1315,3 +1323,352 @@ fn a_rename_waits_for_save_and_a_taken_name_shows_at_the_field(cx: &mut TestAppC
     assert!(home.workflows().join("child.yaml").exists() && !home.workflows().join("subtask.yaml").exists());
 }
 
+
+// ---- The workflow editor's Builder (`dt-wf-editor-builder`) -----------------
+
+use crate::views::workflow_builder_state::Selection;
+use crate::views::workflow_editor_state::Mode;
+use gpui::{Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+impl Settings {
+    fn center(&mut self, selector: &'static str) -> Point<Pixels> {
+        self.bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn")).center()
+    }
+
+    fn mouse_move(&mut self, at: Point<Pixels>, held: bool) {
+        self.h.cx.simulate_mouse_move(at, held.then_some(MouseButton::Left), Modifiers::none());
+        self.settle();
+    }
+
+    fn mouse_down(&mut self, at: Point<Pixels>) {
+        self.h.cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        self.settle();
+    }
+
+    fn mouse_up(&mut self, at: Point<Pixels>) {
+        self.h.cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        self.settle();
+    }
+
+    fn scroll(&mut self, at: Point<Pixels>, dx: f32, dy: f32, modifiers: Modifiers) {
+        self.h.cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(gpui::point(px(dx), px(dy))),
+            modifiers,
+            touch_phase: TouchPhase::Moved,
+        });
+        self.settle();
+    }
+
+    fn selection(&self) -> Option<Selection> {
+        let editor = self.editor().expect("the editor is open");
+        self.read(|_, cx| editor.read(cx).builder_selection())
+    }
+
+    fn draft(&self) -> shelbi_core::Workflow {
+        let editor = self.editor().expect("the editor is open");
+        self.read(|_, cx| editor.read(cx).state().unwrap().workflow().clone())
+    }
+}
+
+#[gpui::test]
+fn the_builder_draws_the_workflows_statuses_and_transitions(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-draw", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    assert!(s.drawn("workflow-builder") && s.drawn("builder-toolbar") && !s.drawn("workflow-form"), "opens on the Builder");
+    for id in ["backlog", "todo", "in-progress", "review", "done", "canceled"] {
+        let selector: &'static str = Box::leak(format!("builder-node-{id}").into_boxed_str());
+        let b = s.bounds(selector).unwrap_or_else(|| panic!("{id}'s node"));
+        assert_eq!((b.size.width, b.size.height), (px(216.0), px(88.0)), "{id} at 100%");
+    }
+    // The frame's arrangement: Review beside In Progress, Done under it,
+    // Canceled at the top right.
+    let (ip, review, done, canceled) = (
+        s.bounds("builder-node-in-progress").unwrap(),
+        s.bounds("builder-node-review").unwrap(),
+        s.bounds("builder-node-done").unwrap(),
+        s.bounds("builder-node-canceled").unwrap(),
+    );
+    assert_eq!(review.top(), ip.top());
+    assert_eq!(review.left() - ip.right(), px(168.0));
+    assert_eq!(done.left(), review.left());
+    assert_eq!(done.top() - review.bottom(), px(120.0), "the labeled gap");
+    assert_eq!(canceled.top(), s.bounds("builder-node-backlog").unwrap().top());
+    // Every transition's label, the Initial badge on Backlog, the legend
+    // and the hint; nothing selected, no inspector.
+    for i in 0..4 {
+        let selector: &'static str = Box::leak(format!("builder-edge-label-{i}").into_boxed_str());
+        assert!(s.drawn(selector), "transition {i}'s label");
+    }
+    let badge = s.bounds("builder-initial-badge").unwrap();
+    assert!(s.bounds("builder-node-backlog").unwrap().contains(&badge.center()));
+    assert!(s.drawn("builder-legend") && s.drawn("builder-canvas-hint"));
+    assert!(!s.drawn("builder-inspector"));
+}
+
+#[gpui::test]
+fn selecting_a_status_edits_it_in_the_inspector_and_the_form_sees_it(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-status", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    s.click("builder-node-review");
+    assert_eq!(s.selection(), Some(Selection::Status("review".into())));
+    assert!(s.drawn("builder-inspector") && s.drawn("builder-status-category"));
+    assert!(!s.drawn("builder-canvas-hint"), "the frame drops the hint once something is selected");
+    // Its outgoing transitions: Done and Canceled.
+    assert!(s.drawn("builder-outgoing-1") && s.drawn("builder-outgoing-3") && !s.drawn("builder-outgoing-0"));
+
+    // Owner and agent from their pickers, Set as initial.
+    s.click("builder-owner-review");
+    s.click("builder-owner-review-agent");
+    s.click("builder-set-initial");
+    let w = s.draft();
+    assert_eq!(w.status("review").unwrap().owner, shelbi_core::Owner::Agent);
+    assert_eq!(w.initial_status.as_deref(), Some("review"));
+    assert!(s.dirty());
+
+    // Its tags field is the Form's: typed here, it's there.
+    let tags = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).tags_field("review").unwrap(),
+        _ => unreachable!(),
+    });
+    s.type_into(tags.clone(), "review, gpu");
+    assert_eq!(s.draft().status("review").unwrap().tags, ["review", "gpu"]);
+    s.click("workflow-editor-mode-form");
+    assert!(s.drawn("workflow-tags-review"));
+    assert_eq!(s.read(|_, cx| tags.read(cx).value().to_string()), "review, gpu");
+
+    // An edit in the Form shows in the Builder.
+    s.click("workflow-agent-done");
+    s.click("workflow-agent-done-review");
+    s.click("workflow-editor-mode-builder");
+    s.click("builder-node-done");
+    assert_eq!(s.draft().status("done").unwrap().agent.as_deref(), Some("review"));
+
+    // The Status picker moves the selection; Remove from workflow removes.
+    s.click("builder-status");
+    s.click("builder-status-canceled");
+    assert_eq!(s.selection(), Some(Selection::Status("canceled".into())));
+    s.click("builder-remove-status");
+    assert!(s.draft().status("canceled").is_none());
+    assert_eq!(s.selection(), None);
+    assert!(!s.drawn("builder-node-canceled"));
+
+    // Add status puts it back (from the catalog) and selects it.
+    s.click("builder-add-status");
+    s.click("builder-add-status-canceled");
+    assert!(s.draft().status("canceled").is_some());
+    assert_eq!(s.selection(), Some(Selection::Status("canceled".into())));
+
+    // Close deselects.
+    s.click("builder-inspector-close");
+    assert!(!s.drawn("builder-inspector"));
+
+    s.click("workflow-editor-save");
+    s.saved();
+    let w = on_disk("task");
+    assert_eq!(w.initial_status.as_deref(), Some("review"));
+    assert_eq!(w.status("review").unwrap().tags, ["review", "gpu"]);
+    assert_eq!(w.statuses.last().unwrap().id, "canceled");
+}
+
+#[gpui::test]
+fn dragging_a_handle_onto_a_status_draws_a_transition(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-drag", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    // Hover In Progress: its handles show.
+    let ip = s.center("builder-node-in-progress");
+    s.mouse_move(ip, false);
+    assert!(s.drawn("builder-handle-in-progress-bottom"));
+    assert!(!s.drawn("builder-handle-review-top"), "only the hovered node's");
+
+    // Press its bottom handle and drag over Done.
+    let handle = s.center("builder-handle-in-progress-bottom");
+    s.mouse_down(handle);
+    assert!(matches!(s.selection(), Some(Selection::Draw(_))));
+    assert!(s.drawn("builder-inspector") && s.drawn("builder-destination-none"));
+    let done = s.center("builder-node-done");
+    s.mouse_move(done, true);
+    assert!(s.drawn("builder-destination") && s.drawn("builder-drawing-label"));
+    assert!(s.drawn("builder-handle-done-left"), "the destination's handles show");
+    s.mouse_up(done);
+
+    // New transition: both ends, no actions yet.
+    let Some(Selection::New(n)) = s.selection() else { panic!("a new transition") };
+    assert_eq!((n.from.as_str(), n.to.as_str()), ("in-progress", "done"));
+    s.click("builder-new-add-action");
+    s.click("builder-new-add-action-push_branch");
+    s.click("builder-new-add-action");
+    s.click("builder-new-add-action-merge");
+    assert_eq!(s.draft().transitions.as_ref().unwrap().len(), 4, "not in the draft until Add transition");
+    s.click("builder-new-add");
+
+    // In the draft, selected, with the note.
+    let ts = s.draft().transitions.unwrap();
+    assert_eq!(ts.len(), 5);
+    use shelbi_core::TransitionAction::*;
+    assert_eq!((ts[4].from.as_str(), ts[4].to.as_str(), ts[4].actions.as_slice()), ("in-progress", "done", &[PushBranch, Merge][..]));
+    assert_eq!(s.selection(), Some(Selection::Transition { index: 4, added: true }));
+    assert!(s.drawn("builder-transition-added") && s.drawn("builder-edge-label-4"));
+
+    s.click("workflow-editor-save");
+    s.saved();
+    assert_eq!(on_disk("task").transitions.unwrap().len(), 5);
+}
+
+#[gpui::test]
+fn add_transition_then_a_click_picks_the_destination(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-add", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    s.click("builder-node-todo");
+    s.click("builder-status-add-transition");
+    assert!(matches!(s.selection(), Some(Selection::Draw(ref d)) if d.from == "todo"));
+    assert!(s.drawn("builder-canvas-hint"), "the drawing's hint");
+    // A click on the source itself isn't a destination.
+    s.click("builder-node-todo");
+    assert!(matches!(s.selection(), Some(Selection::Draw(_))));
+    s.click("builder-node-in-progress");
+    assert!(matches!(s.selection(), Some(Selection::New(_))));
+    // Its To picker; then Cancel goes back to the status.
+    s.click("builder-new-to");
+    s.click("builder-new-to-review");
+    assert!(matches!(s.selection(), Some(Selection::New(ref n)) if n.to == "review"));
+    s.click("builder-new-cancel");
+    assert_eq!(s.selection(), Some(Selection::Status("todo".into())));
+
+    // A transition that already exists is refused in the panel.
+    s.click("builder-node-in-progress");
+    s.click("builder-add-transition");
+    s.click("builder-node-review");
+    s.click("builder-new-add");
+    assert!(s.drawn("builder-new-error"));
+    assert!(matches!(s.selection(), Some(Selection::New(_))), "still open to fix");
+    assert_eq!(s.draft().transitions.unwrap().len(), 4);
+    // Esc steps back: the new transition, then the status, then nothing.
+    s.key("escape");
+    assert_eq!(s.selection(), Some(Selection::Status("in-progress".into())));
+    assert!(!s.drawn("builder-new-error"));
+    s.key("escape");
+    assert_eq!(s.selection(), None);
+    assert!(s.drawn("workflow-editor"), "still in the editor");
+}
+
+#[gpui::test]
+fn a_selected_transitions_actions_reorder_change_and_delete(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-transition", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    s.click("builder-edge-label-1");
+    assert_eq!(s.selection(), Some(Selection::Transition { index: 1, added: false }));
+    assert!(!s.drawn("builder-transition-added"));
+    use shelbi_core::TransitionAction::*;
+    // Push branch runs later; Merge becomes Close PR; Delete branch added.
+    s.click("builder-action-1-0-later");
+    assert_eq!(s.draft().transitions.unwrap()[1].actions, [Merge, PushBranch]);
+    s.click("builder-action-1-0");
+    s.click("builder-action-1-0-close_pr");
+    s.click("builder-add-action");
+    s.click("builder-add-action-delete_branch");
+    s.click("builder-action-1-1-remove");
+    assert_eq!(s.draft().transitions.unwrap()[1].actions, [ClosePr, DeleteBranch]);
+    // To from its picker.
+    s.click("builder-transition-to");
+    s.click("builder-transition-to-canceled");
+    assert!(s.drawn("builder-transition-error"), "review → canceled exists already");
+    assert_eq!(s.draft().transitions.unwrap()[1].to, "done");
+
+    s.click("builder-delete-transition");
+    assert_eq!(s.draft().transitions.unwrap().len(), 3);
+    assert_eq!(s.selection(), None);
+}
+
+#[gpui::test]
+fn the_keyboard_moves_the_focus_ring_selects_and_deletes(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-keys", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    // A click on the background focuses the canvas (and selects nothing).
+    let canvas = s.bounds("builder-canvas").unwrap();
+    let empty = gpui::point(canvas.left() + px(12.0), canvas.bottom() - px(12.0));
+    s.mouse_down(empty);
+    s.mouse_up(empty);
+    assert_eq!(s.selection(), None);
+    s.key("tab");
+    s.key("tab");
+    let editor = s.editor().unwrap();
+    let focus = |s: &Settings| s.read(|_, cx| editor.read(cx).builder_focus());
+    assert_eq!(focus(&s).as_deref(), Some("todo"));
+    s.key("down");
+    assert_eq!(focus(&s).as_deref(), Some("in-progress"));
+    s.key("right");
+    assert_eq!(focus(&s).as_deref(), Some("review"));
+    s.key("enter");
+    assert_eq!(s.selection(), Some(Selection::Status("review".into())));
+    s.key("backspace");
+    assert!(s.draft().status("review").is_none(), "Delete removes the selected status");
+    assert!(s.draft().transitions.unwrap().iter().all(|t| t.from != "review" && t.to != "review"));
+    // A selected transition (the one left: In Progress → Canceled),
+    // deleted by key.
+    s.click("builder-edge-label-0");
+    assert_eq!(s.selection(), Some(Selection::Transition { index: 0, added: false }));
+    s.key("delete");
+    assert_eq!(s.draft().transitions, None);
+    // Esc with nothing selected leaves (asking first: there are edits).
+    s.key("escape");
+    assert!(s.drawn("workflow-leave-prompt"));
+}
+
+#[gpui::test]
+fn the_canvas_pans_zooms_and_fits(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-view", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    let before = s.bounds("builder-node-backlog").unwrap();
+    let mid = s.center("builder-canvas");
+    // A scroll pans.
+    s.scroll(mid, -30.0, -40.0, Modifiers::none());
+    let after = s.bounds("builder-node-backlog").unwrap();
+    assert_eq!((after.left() - before.left(), after.top() - before.top()), (px(-30.0), px(-40.0)));
+    // A drag on the background pans too.
+    let canvas = s.bounds("builder-canvas").unwrap();
+    let empty = gpui::point(canvas.left() + px(12.0), canvas.bottom() - px(12.0));
+    s.mouse_down(empty);
+    s.mouse_move(gpui::point(empty.x + px(20.0), empty.y), true);
+    s.mouse_up(gpui::point(empty.x + px(20.0), empty.y));
+    assert_eq!(s.bounds("builder-node-backlog").unwrap().left() - after.left(), px(20.0));
+
+    // ⌘-scroll zooms about the pointer: the node under it stays put.
+    let review = s.center("builder-node-review");
+    s.scroll(review, 0.0, 50.0, Modifiers::command());
+    let zoomed = s.bounds("builder-node-review").unwrap();
+    assert!(zoomed.size.width > px(216.0));
+    assert!(zoomed.contains(&review));
+
+    // The zoom picker's 50%, then Fit.
+    s.click("builder-zoom");
+    s.click("builder-zoom-50");
+    assert_eq!(s.bounds("builder-node-review").unwrap().size.width, px(108.0));
+    s.click("builder-fit");
+    let graph = s.bounds("builder-graph").unwrap();
+    let canvas = s.bounds("builder-canvas").unwrap();
+    assert!(graph.left() >= canvas.left() && graph.right() <= canvas.right() + px(1.0));
+    assert!(graph.top() >= canvas.top() && graph.bottom() <= canvas.bottom() + px(1.0), "{graph:?} in {canvas:?}");
+}
+
+#[gpui::test]
+fn twenty_statuses_and_forty_transitions_draw_in_a_frame(cx: &mut TestAppContext) {
+    use crate::views::workflow_graph::big_fixture;
+    let home = Home::with_project("bu-big", "alpha");
+    std::fs::write(home.workflows().join("statuses.yaml"), big_fixture::statuses()).unwrap();
+    std::fs::write(home.workflows().join("big.yaml"), big_fixture::workflow()).unwrap();
+    let mut s = Settings::open_builder(cx, "big");
+    assert_eq!(s.draft().statuses.len(), 20);
+    assert!(s.drawn("builder-node-stage-19") && s.drawn("builder-edge-label-39"));
+    // Debug-build frames on a shared machine: a loose bound that still
+    // catches a layout gone quadratic.
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        s.h.draw();
+    }
+    let each = start.elapsed() / 10;
+    assert!(each < std::time::Duration::from_millis(250), "{each:?} a frame");
+    // Switching views keeps the draft as it is.
+    s.edit(|e, window, cx| e.show_mode(Mode::Form, window, cx));
+    assert!(s.drawn("workflow-form"));
+}

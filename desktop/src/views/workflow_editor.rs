@@ -18,8 +18,8 @@
 //! transition; Git (Base branch, Branch name, Merge strategy); Review (the
 //! review mode, and its recipe's fields when it runs the branch);
 //! Automation (Zen settings, Required task fields); and Delete workflow.
-//! Builder shows a placeholder until `dt-wf-editor-builder` lands; the
-//! editor opens on Form.
+//! **The Builder** (`workflow_builder`, `dt-wf-editor-builder`) draws the
+//! same draft as a graph; the editor opens on it.
 //!
 //! Every field edits a draft ([`EditorState`]) through
 //! `shelbi_state::workflow_config`; nothing is written until Save. Pickers
@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, Focusable,
+    deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     MouseDownEvent, ScrollHandle, SharedString, Stateful, Subscription, Window,
 };
 use gpui_kit::base::input::{Textarea, TextareaState};
@@ -48,6 +48,8 @@ use super::workflow_editor_state::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, Change, DetailsForm, EditorState,
     Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ACTIONS, STRATEGIES,
 };
+use super::workflow_builder_state::BuilderState;
+use super::workflow_graph::Pt;
 use super::workflows_state::category_label;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::elements::controls;
@@ -102,7 +104,7 @@ pub enum EditorEvent {
 
 /// The menu that's open.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Menu {
+pub(super) enum Menu {
     More,
     InitialStatus,
     AddStatus,
@@ -116,6 +118,19 @@ enum Menu {
     MergeStrategy,
     ReviewMode,
     Zen,
+    // The Builder's (`workflow_builder`).
+    BuilderAddStatus,
+    Zoom,
+    /// The status inspector's Status picker.
+    InspectStatus,
+    DrawFrom,
+    NewFrom,
+    NewTo,
+    /// New transition's action at this slot.
+    NewAction(usize),
+    NewAddAction,
+    /// The transition inspector's action at `.1` of transition `.0`.
+    BuilderAction(usize, usize),
 }
 
 /// A status row being dragged by its handle.
@@ -174,7 +189,7 @@ struct ReviewInputs {
 pub struct WorkflowEditor {
     project: String,
     /// `None` until the workflow config has loaded.
-    state: Option<EditorState>,
+    pub(super) state: Option<EditorState>,
     load_error: Option<String>,
     name: Entity<InputState>,
     description: Entity<InputState>,
@@ -182,13 +197,23 @@ pub struct WorkflowEditor {
     branch: Entity<InputState>,
     params: Entity<InputState>,
     review: ReviewInputs,
-    /// Each status's Workspace tags field, by id.
-    tags: HashMap<String, (Entity<InputState>, Subscription)>,
+    /// Each status's Workspace tags field, by id (the Form's row and the
+    /// Builder's inspector share it).
+    pub(super) tags: HashMap<String, (Entity<InputState>, Subscription)>,
     details: Option<Details>,
-    menu: Option<Menu>,
+    pub(super) menu: Option<Menu>,
     /// Where the open menu's button last painted (its own click toggles it).
     menu_anchor: style::Anchor,
     scroll: ScrollHandle,
+    /// The Builder's selection, drawing, focus and viewport.
+    pub(super) builder: BuilderState,
+    /// Where the Builder's canvas and its graph frame last painted.
+    pub(super) canvas_anchor: style::Anchor,
+    pub(super) frame_anchor: style::Anchor,
+    pub(super) canvas_focus: FocusHandle,
+    /// Where a press on the canvas's background went down (a click there
+    /// deselects).
+    pub(super) pressed_at: Option<Pt>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -247,6 +272,11 @@ impl WorkflowEditor {
             menu: None,
             menu_anchor: Default::default(),
             scroll: ScrollHandle::new(),
+            builder: BuilderState::default(),
+            canvas_anchor: Default::default(),
+            frame_anchor: Default::default(),
+            canvas_focus: cx.focus_handle(),
+            pressed_at: None,
             _subscriptions: subscriptions,
         };
         match config {
@@ -304,12 +334,8 @@ impl WorkflowEditor {
         self.details = None;
         self.menu = None;
         self.tags.clear();
+        self.builder = BuilderState::default();
         self.sync(true, window, cx);
-    }
-
-    #[cfg(test)]
-    pub fn state(&self) -> Option<&EditorState> {
-        self.state.as_ref()
     }
 
     /// Put the draft's values in the fields: all of them (`force`), or
@@ -444,9 +470,11 @@ impl WorkflowEditor {
     }
 
     /// Make `change` (a picker's, a button's).
-    fn change(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn change(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        if matches!(change, Change::RemoveTransition(_)) {
+        // Removing a transition (or a status, with its transitions)
+        // renumbers the rest: the open Details would be another's.
+        if matches!(change, Change::RemoveTransition(_) | Change::RemoveStatus(_)) {
             self.details = None;
         }
         let structural = matches!(change, Change::AddStatus(_) | Change::RemoveStatus(_));
@@ -464,11 +492,14 @@ impl WorkflowEditor {
         cx.notify();
     }
 
-    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+    /// Builder or Form: both show the one draft, so the Form's fields take
+    /// whatever the Builder changed.
+    fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.state.as_mut() {
             state.mode = mode;
         }
         self.menu = None;
+        self.sync(false, window, cx);
         cx.notify();
     }
 
@@ -544,7 +575,8 @@ impl WorkflowEditor {
     }
 
     /// Back (or Esc): close, asking first about unsaved edits. Esc with the
-    /// prompt up or a menu open closes that instead.
+    /// prompt up or a menu open closes that instead, and in the Builder
+    /// steps back out of a drawing or a selection first.
     pub fn back(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
@@ -555,6 +587,15 @@ impl WorkflowEditor {
                 state.cancel_prompt();
                 cx.notify();
                 return;
+            }
+            if state.mode == Mode::Builder {
+                if self.builder.drawing().is_some() || self.builder.new_transition().is_some() {
+                    state.clear_error_at(&Field::Transitions);
+                }
+                if self.builder.escape() {
+                    cx.notify();
+                    return;
+                }
             }
         }
         self.leave(Leave::Back, None, cx);
@@ -724,6 +765,53 @@ impl WorkflowEditor {
     pub fn offscreen_scroll_to_bottom(&mut self) {
         self.scroll.scroll_to_bottom();
     }
+
+    /// Show Builder or Form, as the segmented control does.
+    pub fn show_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(mode, window, cx);
+    }
+
+    /// The Builder's state, to put it in a frame's state.
+    #[cfg(feature = "visual-check")]
+    pub fn builder_mut(&mut self) -> &mut BuilderState {
+        &mut self.builder
+    }
+
+    /// New transition's Add transition.
+    #[cfg(feature = "visual-check")]
+    pub fn add_drawn_transition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_new_transition(window, cx);
+    }
+
+    /// Fit, as its button does.
+    #[cfg(feature = "visual-check")]
+    pub fn fit_canvas(&mut self, cx: &mut Context<Self>) {
+        self.fit(cx);
+    }
+
+    /// A zoom picker level.
+    #[cfg(feature = "visual-check")]
+    pub fn zoom_canvas(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.zoom_to(zoom, cx);
+    }
+
+    /// Give the Builder's canvas keyboard focus.
+    #[cfg(feature = "visual-check")]
+    pub fn focus_canvas(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.canvas_focus, cx);
+        cx.notify();
+    }
+
+    pub fn state(&self) -> Option<&EditorState> {
+        self.state.as_ref()
+    }
+
+    /// Where the Builder's graph frame last painted, and the zoom.
+    #[cfg(feature = "visual-check")]
+    pub fn bench_frame(&self) -> (gpui::Point<gpui::Pixels>, f32) {
+        let origin = self.frame_anchor.get().map(|b| b.origin).unwrap_or_default();
+        (origin, self.builder.viewport.zoom)
+    }
 }
 
 #[cfg(test)]
@@ -753,6 +841,14 @@ impl WorkflowEditor {
 
     pub fn drop_on(&mut self, dragged: &str, onto: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.drop_status(dragged, onto, window, cx);
+    }
+
+    pub fn builder_selection(&self) -> Option<super::workflow_builder_state::Selection> {
+        self.builder.selection.clone()
+    }
+
+    pub fn builder_focus(&self) -> Option<String> {
+        self.builder.focus.clone()
     }
 
 }
@@ -927,7 +1023,7 @@ fn menu_rule(theme: &Theme) -> Div {
 
 impl WorkflowEditor {
     /// `button` with `menu`'s items floating under it while it's open.
-    fn dropdown(
+    pub(super) fn dropdown(
         &self,
         menu: Menu,
         id: &'static str,
@@ -952,7 +1048,7 @@ impl WorkflowEditor {
             let top = anchor.get().map_or(px(style::BUTTON_H), |b| b.size.height) + px(MENU_GAP);
             // Menus whose buttons sit at the window's right hang left.
             let at = div().absolute().top(top);
-            let at = if matches!(menu, Menu::More | Menu::AddStatus) { at.right_0() } else { at.left_0() };
+            let at = if matches!(menu, Menu::More | Menu::AddStatus | Menu::Zoom) { at.right_0() } else { at.left_0() };
             deferred(
                 at.child(
                     popup(id, width, &theme)
@@ -974,7 +1070,7 @@ impl WorkflowEditor {
 
     /// A single-line field: `input` in the Textbox, `placeholder` (Base,
     /// `form_hint`) while it's empty, the edge in `error` when `invalid`.
-    fn text_field(
+    pub(super) fn text_field(
         &self,
         input: &Entity<InputState>,
         selector: impl Into<SharedString>,
@@ -1038,13 +1134,7 @@ impl Render for WorkflowEditor {
                 .text_color(theme.form_hint)
                 .child(self.load_error.clone().unwrap_or_else(|| "Loading…".into()))
                 .into_any_element(),
-            Some(state) if state.mode == Mode::Builder => style::empty_state(
-                "workflow-builder-placeholder",
-                "The builder is on its way. Use Form to edit this workflow for now.",
-                None,
-                &theme,
-            )
-            .into_any_element(),
+            Some(state) if state.mode == Mode::Builder => self.render_builder(&theme, window, cx).into_any_element(),
             Some(_) => self.render_form(&theme, window, cx).into_any_element(),
         };
         let prompt = self.state.as_ref().and_then(EditorState::prompt).map(|_| self.render_prompt(&theme, cx));
@@ -1094,7 +1184,7 @@ impl WorkflowEditor {
         let mode = state.map_or(Mode::Form, |s| s.mode);
         let segment = |label: &'static str, value: Mode, cx: &mut Context<Self>| {
             controls::segment(format!("workflow-editor-mode-{}", label.to_lowercase()), label, mode == value, true, theme)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_mode(value, cx)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_mode(value, window, cx)))
         };
         let discard = dirty.then(|| {
             let hover = theme.text_loud;

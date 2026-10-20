@@ -32,6 +32,10 @@
 //!   (`task_panel`)
 //! - Settings split into pages, with its own sidebar in the column:
 //!   **`dt-settings-sections`** (`settings_nav`)
+//! - Settings ▸ Workflows and the workflow editor: **`dt-wf-settings-index`**
+//!   (`workflows`), **`dt-wf-editor-form`** (`workflow_editor`, its Form),
+//!   **`dt-wf-editor-builder`** (`workflow_builder`, the Builder canvas over
+//!   `workflow_graph`'s layout and `workflow_builder_state`)
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
@@ -77,3 +81,6 @@ pub mod workflows;
 pub mod workflows_state;
 pub mod workflow_editor;
 pub mod workflow_editor_state;
+mod workflow_builder;
+pub mod workflow_builder_state;
+pub mod workflow_graph;
