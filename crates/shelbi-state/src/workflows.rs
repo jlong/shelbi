@@ -95,7 +95,7 @@ pub fn statuses_path(project: &str) -> Result<PathBuf> {
 /// matters for a reader that runs before that migration. Returns the
 /// canonical `.yaml` path when neither file exists so "missing" is
 /// reported against the extension shelbi actually writes.
-fn statuses_read_path(project: &str) -> Result<PathBuf> {
+pub(crate) fn statuses_read_path(project: &str) -> Result<PathBuf> {
     let canonical = statuses_path(project)?;
     if canonical.exists() {
         return Ok(canonical);
@@ -233,7 +233,7 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
 /// When neither file exists the name is returned unchanged, preserving the
 /// existing built-in-default fallback the callers apply on the resulting
 /// `NotFound`.
-fn resolve_workflow_alias(project: &str, name: &str) -> Result<String> {
+pub(crate) fn resolve_workflow_alias(project: &str, name: &str) -> Result<String> {
     if name != shelbi_core::DEFAULT_WORKFLOW_NAME {
         return Ok(name.to_string());
     }

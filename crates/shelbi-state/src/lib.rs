@@ -49,6 +49,8 @@ pub mod issue_auth;
 pub mod issue_migrate;
 pub mod issue_store;
 pub mod keymap;
+pub mod workflow_config;
+pub mod yaml_edit;
 mod migrate;
 mod pr_template;
 mod project_paths;
