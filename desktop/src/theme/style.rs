@@ -743,15 +743,26 @@ pub fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
 /// and to do in the icon gray, in progress in the accent (`icon/select`),
 /// review purple, done green, canceled muted.
 pub fn status_icon(category: StatusCategory, theme: &Theme) -> Svg {
-    let (glyph, color) = match category {
+    let (glyph, color) = status_glyph_for(category, theme);
+    status_glyph(glyph).text_color(color)
+}
+
+/// [`status_icon`] at 20pt, as Settings ▸ Workflows' status rows draw it.
+pub fn status_icon_large(category: StatusCategory, theme: &Theme) -> Svg {
+    let (glyph, color) = status_glyph_for(category, theme);
+    crate::assets::status_glyph_large(glyph).text_color(color)
+}
+
+/// A category's glyph and its color.
+fn status_glyph_for(category: StatusCategory, theme: &Theme) -> (StatusGlyph, Hsla) {
+    match category {
         StatusCategory::Backlog => (StatusGlyph::Backlog, theme.icon),
         StatusCategory::Ready => (StatusGlyph::Todo, theme.icon),
         StatusCategory::Active => (StatusGlyph::InProgress, theme.accent),
         StatusCategory::Handoff => (StatusGlyph::Review, theme.icon_purple),
         StatusCategory::Done => (StatusGlyph::Done, theme.icon_green),
         StatusCategory::Archived => (StatusGlyph::Canceled, theme.muted),
-    };
-    status_glyph(glyph).text_color(color)
+    }
 }
 
 /// A status heading, as the board's column headers and the task panels draw

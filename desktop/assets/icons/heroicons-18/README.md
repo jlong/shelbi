@@ -14,3 +14,5 @@ from `../heroicons/` with only `stroke-width` changed, from 1.5 to 1.6667
 - `play-solid.svg`: its Start button. Heroicons has no filled play, so this
   one is John's drawing, exported from the frame as Figma draws it (a fill
   in `currentColor` on the 18pt grid), not a widened Heroicon.
+- `trash.svg`, `pencil.svg`, `ellipsis-vertical.svg`: Settings ▸ Workflows'
+  row buttons (delete a status; a workflow's edit and its menu).

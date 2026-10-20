@@ -27,6 +27,8 @@ mod platform;
 mod projects;
 mod refresh;
 mod spike;
+#[cfg(test)]
+mod test_env;
 mod theme;
 mod views;
 #[cfg(feature = "visual-check")]

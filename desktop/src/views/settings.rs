@@ -34,7 +34,9 @@
 //!   and colors as they are now.
 //!
 //! The Keybindings page is its own view ([`KeybindingsPage`]): the editor
-//! for `keys.yaml`, the key bindings both clients share.
+//! for `keys.yaml`, the key bindings both clients share. So is the project's
+//! Workflows page ([`WorkflowsPage`]): its workflows and status catalog,
+//! saved through `shelbi_state::workflow_config`.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -57,6 +59,7 @@ use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
+use super::workflows::{WorkflowsEvent, WorkflowsPage};
 use crate::assets::icons;
 use crate::elements::controls::{self, Slider, SliderEvent};
 use crate::elements::terminal::colors::{self, AnsiOverrides};
@@ -259,6 +262,9 @@ pub enum SettingsEvent {
     /// The page hands the keys back to the settings sidebar (Esc in an empty
     /// search).
     Leave,
+    /// Open workflow `name`'s editor (Settings ▸ Workflows' edit button, a
+    /// row's click, a workflow just created).
+    EditWorkflow(String),
 }
 
 /// The settings view.
@@ -293,6 +299,8 @@ pub struct SettingsView {
     saved: UserConfig,
     /// The Keybindings page.
     keybindings: Entity<KeybindingsPage>,
+    /// The project's Workflows page.
+    workflows: Entity<WorkflowsPage>,
     /// False until the config has been read, so an early blur can't save
     /// blank values over it.
     loaded: bool,
@@ -313,6 +321,7 @@ impl SettingsView {
             TerminalPane::canned("Preview".into(), terminal_preview::stream, window, cx)
         });
         let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
+        let workflows = cx.new(|cx| WorkflowsPage::new(project, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -333,6 +342,9 @@ impl SettingsView {
             cx.subscribe(&keybindings, |_, _, event: &KeybindingsEvent, cx| match event {
                 KeybindingsEvent::Saved(keymaps) => cx.emit(SettingsEvent::KeysSaved(keymaps.clone())),
                 KeybindingsEvent::Leave => cx.emit(SettingsEvent::Leave),
+            }),
+            cx.subscribe(&workflows, |_, _, event: &WorkflowsEvent, cx| match event {
+                WorkflowsEvent::Edit(name) => cx.emit(SettingsEvent::EditWorkflow(name.clone())),
             }),
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -384,6 +396,7 @@ impl SettingsView {
             #[cfg(test)]
             saved: UserConfig::default(),
             keybindings,
+            workflows,
             loaded: false,
             theme_track: SlideTrack::shared(),
             option_track: SlideTrack::shared(),
@@ -451,11 +464,21 @@ impl SettingsView {
         self.keybindings.clone()
     }
 
+    /// The Workflows page's view.
+    #[cfg(test)]
+    pub(crate) fn workflows(&self) -> Entity<WorkflowsPage> {
+        self.workflows.clone()
+    }
+
     /// Show `page`.
     pub fn show_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         if self.page != page {
             // A capture on a page out of sight would take its keys.
             self.keybindings.update(cx, |p, cx| p.cancel_capture(cx));
+            // The files may have been edited by hand (Edit YAML) since.
+            if page == SettingsPage::Workflows {
+                self.workflows.update(cx, |p, _| p.reload_when_drawn());
+            }
             self.page = page;
             cx.notify();
         }
@@ -1051,6 +1074,8 @@ impl Render for SettingsView {
             // The Keybindings frame (2252:28172): its own view, the list
             // scrolling under its header rather than the whole page.
             SettingsPage::Keybindings => page.overflow_hidden().child(self.keybindings.clone()),
+            // The Workflows frame (2301:5824): the page scrolls.
+            SettingsPage::Workflows => page.child(self.workflows.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -1110,7 +1135,8 @@ impl Render for SettingsView {
                     .child(self.render_preview(&theme)),
             ),
         };
-        let status = status.filter(|_| shown != SettingsPage::Keybindings);
+        // `config.yaml`'s save line belongs to the pages that write it.
+        let status = status.filter(|_| !matches!(shown, SettingsPage::Keybindings | SettingsPage::Workflows));
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
     }
 }
@@ -1314,6 +1340,7 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::General => "settings-page-general",
         SettingsPage::Keybindings => "settings-page-keybindings",
         SettingsPage::Terminal => "settings-page-terminal",
+        SettingsPage::Workflows => "settings-page-workflows",
     }
 }
 

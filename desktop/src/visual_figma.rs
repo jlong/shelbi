@@ -19,8 +19,9 @@
 //! Each screen gets a fresh 1440x1024 window and is saved as
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
 //! issues, issue-detail, activity, review, workspace, workspace-idle,
-//! machines, the three Settings pages (settings-general,
-//! settings-keybindings, settings-terminal) and command-palette, plus the
+//! machines, the four Settings pages (settings-general,
+//! settings-keybindings, settings-terminal, and settings-workflows against
+//! `workflows/1-index.png`) and command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
@@ -972,8 +973,34 @@ impl Run {
             })
             .unwrap();
         self.save(handle, "state-settings-cli-focused");
+        self.settings_workflows();
         self.keybindings_states();
         self.components();
+    }
+
+    /// Settings ▸ Workflows (the Index frame, 2301:5824, reference
+    /// `workflows/1-index.png`) over the frame's workflows and statuses,
+    /// written for this screen only: the other screens keep the built-in
+    /// workflow.
+    fn settings_workflows(&mut self) {
+        use crate::views::settings_nav::SettingsPage;
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        let project_dir = workflows.parent().expect("the project directory").to_path_buf();
+        let agents = project_dir.join("agents");
+        let had_agents = agents.exists();
+        crate::views::workflows_state::fixture::write(&project_dir);
+        let handle = self.open();
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                w.offscreen_open_settings(SettingsPage::Workflows, window, cx)
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "settings-workflows");
+        let _ = std::fs::remove_dir_all(&workflows);
+        if !had_agents {
+            let _ = std::fs::remove_dir_all(&agents);
+        }
     }
 
     /// The Keybindings page's states no frame draws (`state-keybindings-*`,

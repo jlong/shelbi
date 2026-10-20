@@ -4,18 +4,27 @@
 //!
 //! Top to bottom: the sidebar's titlebar (the traffic lights, Search and
 //! Toggle sidebar), the back button beside the Settings title, then each
-//! section: its header and its pages' nav rows, numbered ⌘1 to ⌘N. Only the
-//! Global section exists (General, Keybindings, Terminal); the frame's
-//! project section (the project switcher, Workflows, Agents, Integrations)
-//! joins [`SECTIONS`] once those pages exist, after a divider. No footer:
-//! the frame draws no Zen pill and no settings gear.
+//! section: its header and its pages' nav rows, each with its ⌘N. The Global
+//! section (General, Keybindings, Terminal), then, after a divider, the
+//! project section (`dt-wf-settings-index`, frame 2301:5824): the project
+//! switcher, the same trigger and menu as the app sidebar's (switching
+//! reopens Settings on the new project), over the project's pages. Only
+//! Workflows exists; the frame's Workspaces, Agents and Integrations join
+//! [`SECTIONS`] with their pages. No footer: the frame draws no Zen pill and
+//! no settings gear.
 //!
 //! [`SettingsNav`] is the toolkit-free part: the page shown and the row the
 //! keys moved to.
 
-use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Pixels};
+use std::cell::Cell;
+use std::rc::Rc;
 
-use super::sidebar::{nav_item, render_titlebar, SidebarEvent, SidebarHost};
+use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Pixels, SharedString};
+
+use super::sidebar::{
+    nav_item, render_titlebar, switcher_menu, switcher_trigger, SidebarEvent, SidebarHost, SwitcherProps,
+    MENU_GAP, SWITCHER_H,
+};
 use super::task_panel;
 use crate::assets::{icons, Icon};
 use crate::keys::row_hotkey;
@@ -36,6 +45,8 @@ pub enum SettingsPage {
     Keybindings,
     /// The terminals' font, size, and Option key.
     Terminal,
+    /// The project's workflows and status catalog.
+    Workflows,
 }
 
 impl SettingsPage {
@@ -44,6 +55,7 @@ impl SettingsPage {
             SettingsPage::General => "General",
             SettingsPage::Keybindings => "Keybindings",
             SettingsPage::Terminal => "Terminal",
+            SettingsPage::Workflows => "Workflows",
         }
     }
 
@@ -52,16 +64,18 @@ impl SettingsPage {
             SettingsPage::General => icons::WRENCH_SCREWDRIVER,
             SettingsPage::Keybindings => icons::KEYBOARD_KEY,
             SettingsPage::Terminal => icons::COMMAND_LINE,
+            SettingsPage::Workflows => icons::VIEW_COLUMNS,
         }
     }
 
     /// Its ⌘N while Settings is open. Fixed per page rather than counted:
-    /// the frame numbers the project pages 4, 5 and 7.
+    /// the frame numbers Workflows 4 (and gives Workspaces Terminal's 3).
     pub fn shortcut(self) -> u8 {
         match self {
             SettingsPage::General => 1,
             SettingsPage::Keybindings => 2,
             SettingsPage::Terminal => 3,
+            SettingsPage::Workflows => 4,
         }
     }
 
@@ -76,26 +90,58 @@ impl SettingsPage {
             SettingsPage::General => "settings-nav-general",
             SettingsPage::Keybindings => "settings-nav-keybindings",
             SettingsPage::Terminal => "settings-nav-terminal",
+            SettingsPage::Workflows => "settings-nav-workflows",
         }
     }
+}
+
+/// What heads a section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Header {
+    /// A title.
+    Title(&'static str),
+    /// The project switcher, after a divider: the section's pages edit the
+    /// shown project.
+    Project,
 }
 
 /// A group of pages under a header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Section {
-    pub header: &'static str,
+    pub header: Header,
     pub pages: &'static [SettingsPage],
 }
 
 /// The sidebar's sections, in order.
-pub const SECTIONS: &[Section] = &[Section {
-    header: "Global",
-    pages: &[
-        SettingsPage::General,
-        SettingsPage::Keybindings,
-        SettingsPage::Terminal,
-    ],
-}];
+pub const SECTIONS: &[Section] = &[
+    Section {
+        header: Header::Title("Global"),
+        pages: &[
+            SettingsPage::General,
+            SettingsPage::Keybindings,
+            SettingsPage::Terminal,
+        ],
+    },
+    Section {
+        header: Header::Project,
+        pages: &[SettingsPage::Workflows],
+    },
+];
+
+/// The project section's switcher, as one frame draws it.
+pub struct ProjectSwitcher<'a> {
+    /// The shown project's name.
+    pub label: SharedString,
+    /// The menu while it shows (opening, open or closing).
+    pub menu: Option<SwitcherProps<'a>>,
+    /// Where the trigger lands, for the menu's outside click (the app
+    /// sidebar's: one switcher per window).
+    pub button: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The menu is open (the trigger holds its pressed fill).
+    pub open: bool,
+    /// The column's width, which the menu spans.
+    pub width: f32,
+}
 
 /// Every page, in the order the sidebar draws (and the keys walk) them.
 pub fn pages() -> impl Iterator<Item = SettingsPage> {
@@ -175,12 +221,52 @@ fn section_header(label: &'static str, theme: &Theme) -> impl IntoElement {
         )
 }
 
+/// The project section's head (frame 2301:5825): the 1pt divider 12pt in
+/// with 8pt above and below, then the switcher's trigger 12pt in, 8pt
+/// above and 4pt below, its menu opening under it.
+fn project_header<H: SidebarHost>(project: &ProjectSwitcher<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
+    let trigger = switcher_trigger(project.label.clone(), project.open, &project.button, theme, cx);
+    let menu = project.menu.as_ref().map(|menu| {
+        let top = SWITCHER_TOP + SWITCHER_H + MENU_GAP;
+        switcher_menu(menu, &project.button, top, project.width, theme, cx)
+    });
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .child(
+            div()
+                .flex_none()
+                .px(px(12.0))
+                .py(px(8.0))
+                .child(div().h(px(1.0)).bg(theme.divider)),
+        )
+        .child(
+            div()
+                .debug_selector(|| "settings-project".into())
+                .relative()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .px(px(12.0))
+                .pt(px(SWITCHER_TOP))
+                .pb(px(4.0))
+                .child(trigger)
+                .children(menu),
+        )
+}
+
+/// The switcher trigger's inset from its row's top.
+const SWITCHER_TOP: f32 = 8.0;
+
 /// The settings sidebar. `chip` is the sliding selection while it moves
-/// (measured on `track`).
+/// (measured on `track`); `project` is the project section's switcher.
 pub fn render<H: SidebarHost>(
     nav: SettingsNav,
     chip: Option<Bounds<Pixels>>,
     track: &SharedTrack,
+    project: ProjectSwitcher<'_>,
     palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,
@@ -248,30 +334,39 @@ pub fn render<H: SidebarHost>(
                     )
                 })
                 .collect();
+            let header = match section.header {
+                Header::Title(title) => section_header(title, theme).into_any_element(),
+                Header::Project => project_header(&project, theme, cx).into_any_element(),
+            };
             div()
                 .flex()
                 .flex_col()
                 .flex_none()
-                .child(section_header(section.header, theme))
+                .child(header)
                 .child(
                     div()
-                        .relative()
                         .flex()
                         .flex_col()
                         .flex_none()
                         .gap(px(4.0))
                         .px(px(12.0))
                         .py(px(8.0))
-                        .child(motion::origin_probe(track))
-                        .children(chip.map(|b| {
-                            motion::floating_chip(b, |d| {
-                                style::nav_chip(d.rounded(px(NAV_RADIUS)), theme)
-                            })
-                        }))
                         .children(rows),
                 )
         })
         .collect::<Vec<_>>();
+    // One layer under every section's rows, so the chip slides between
+    // sections as within one.
+    let sections = div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .child(motion::origin_probe(track))
+        .children(chip.map(|b| {
+            motion::floating_chip(b, |d| style::nav_chip(d.rounded(px(NAV_RADIUS)), theme))
+        }))
+        .children(sections);
     div()
         .id("settings-sidebar")
         .debug_selector(|| "settings-sidebar".into())
@@ -294,7 +389,7 @@ pub fn render<H: SidebarHost>(
                 .child(back)
                 .child(title),
         )
-        .children(sections)
+        .child(sections)
         .into_any_element()
 }
 
@@ -310,15 +405,21 @@ mod tests {
             [
                 SettingsPage::General,
                 SettingsPage::Keybindings,
-                SettingsPage::Terminal
+                SettingsPage::Terminal,
+                SettingsPage::Workflows
             ]
         );
         assert_eq!(
             all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(),
-            [1, 2, 3]
+            [1, 2, 3, 4]
         );
         assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
-        assert_eq!(SettingsPage::for_shortcut(4), None);
+        assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
+        assert_eq!(SettingsPage::for_shortcut(5), None);
+        assert_eq!(
+            SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
+            [(Header::Title("Global"), 3), (Header::Project, 1)]
+        );
     }
 
     #[test]
@@ -330,19 +431,19 @@ mod tests {
         );
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        nav.step(true);
-        nav.step(true);
-        nav.step(true);
+        for _ in 0..4 {
+            nav.step(true);
+        }
         assert_eq!(
             nav.selected(),
-            SettingsPage::Terminal,
-            "stops at the bottom"
+            SettingsPage::Workflows,
+            "crosses into the project section and stops at the bottom"
         );
         assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
         assert!(nav.activate());
         assert_eq!(
             (nav.page(), nav.selected()),
-            (SettingsPage::Terminal, SettingsPage::Terminal)
+            (SettingsPage::Workflows, SettingsPage::Workflows)
         );
         assert!(!nav.activate(), "already shown");
     }
