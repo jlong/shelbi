@@ -27,10 +27,6 @@ use super::discovery::CliSource;
 use super::env::{self, Env};
 use super::version::{ProtocolCheck, APP_VERSION};
 
-/// The tests set process-wide env vars (`SHELBI_HOME`), so they run one at a
-/// time.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
 const LOCATION_VARS: [&str; 3] = ["SHELBI_HOME", "SHELBI_HUB_SOCK", "SHELBI_CONTROL_SOCK"];
 
 /// A throwaway `SHELBI_HOME` (short, under `/tmp`: macOS caps socket paths at
@@ -45,7 +41,9 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(tag: &str) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The tests set process-wide env vars (`SHELBI_HOME`), so they run
+        // one at a time (with every other test that does).
+        let lock = crate::test_env::lock();
         let home = PathBuf::from(format!("/tmp/shb-dt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let bin = home.join("bin");

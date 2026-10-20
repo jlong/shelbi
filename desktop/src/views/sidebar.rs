@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Hsla, Pixels,
-    ScrollHandle, SharedString, Svg, Window,
+    Div, ScrollHandle, SharedString, Stateful, Svg, Window,
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
@@ -87,7 +87,7 @@ pub const SWITCHER_H: f32 = 28.0;
 /// The project block's minimum height.
 const PROJECT_BLOCK_H: f32 = 48.0;
 /// The menu's gap below the trigger.
-const MENU_GAP: f32 = 6.0;
+pub const MENU_GAP: f32 = 6.0;
 
 /// The footer toolbar's and the titlebar's square buttons.
 const TOOLBAR_BUTTON: f32 = 32.0;
@@ -881,16 +881,51 @@ fn render_project<H: SidebarHost>(
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
-    let open = props.switcher_open;
+    let button = switcher_trigger(
+        props.model.project_label.clone(),
+        props.switcher_open,
+        &props.switcher_button,
+        theme,
+        cx,
+    );
+    let menu = props.switcher.as_ref().map(|switcher| {
+        let top = (PROJECT_BLOCK_H + SWITCHER_H) / 2.0 + MENU_GAP;
+        switcher_menu(switcher, &props.switcher_button, top, props.width, theme, cx)
+    });
+
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .justify_center()
+        .items_start()
+        .min_h(px(PROJECT_BLOCK_H))
+        .px(px(BLOCK_X))
+        .py(px(BLOCK_Y))
+        .child(button)
+        .children(menu)
+}
+
+/// The project switcher's trigger: the project's `label` and an up-down
+/// chevron, holding its pressed fill while the menu is `open`; it records
+/// where it lands into `cell` (for the menu's outside click). The settings
+/// sidebar's project section draws it too.
+pub fn switcher_trigger<H: SidebarHost>(
+    label: impl Into<SharedString>,
+    open: bool,
+    cell: &Rc<Cell<Option<Bounds<Pixels>>>>,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> Stateful<Div> {
     let button_probe = {
-        let cell = props.switcher_button.clone();
+        let cell = cell.clone();
         gpui::canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
             .absolute()
             .top_0()
             .left_0()
             .size_full()
     };
-    let label = props.model.project_label.clone();
     let rest = if open {
         theme.background_active
     } else {
@@ -909,7 +944,7 @@ fn render_project<H: SidebarHost>(
         .max_w_full()
         .rounded(radius)
         .cursor_pointer();
-    let button = fill_layer(
+    fill_layer(
         button,
         "sidebar-project-title",
         radius,
@@ -922,42 +957,35 @@ fn render_project<H: SidebarHost>(
             .truncate()
             .type_style(Type::BaseMedium)
             .text_color(theme.foreground)
-            .child(label),
+            .child(label.into()),
     )
     .child(heroicon(icons::CHEVRON_UP_DOWN).text_color(if open { theme.text_loud } else { theme.muted }))
     .on_click(cx.listener(|this, _, window, cx| {
         this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
-    }));
+    }))
+}
 
-    // The menu floats over the sidebar, 6px under the trigger and as wide as
-    // the block: drawn after everything (`deferred`), so nothing below it
-    // moves and nothing paints over it.
-    let menu = props.switcher.as_ref().map(|switcher| {
-        let top = (PROJECT_BLOCK_H + SWITCHER_H) / 2.0 + MENU_GAP;
-        deferred(
-            div()
-                .absolute()
-                .top(px(top + (1.0 - switcher.phase) * motion::SLIDE_PX))
-                .left(px(8.0))
-                .min_w(px((props.width - 16.0).max(0.0)))
-                .opacity(switcher.phase)
-                .child(render_switcher(switcher, props.switcher_button.clone(), theme, cx)),
-        )
-        .with_priority(1)
-    });
-
-    div()
-        .relative()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .justify_center()
-        .items_start()
-        .min_h(px(PROJECT_BLOCK_H))
-        .px(px(BLOCK_X))
-        .py(px(BLOCK_Y))
-        .child(button)
-        .children(menu)
+/// The switcher's menu floating `top` below its block's top, 8px in and
+/// as wide as a column `width` wide allows: drawn after everything
+/// (`deferred`), so nothing below it moves and nothing paints over it.
+pub fn switcher_menu<H: SidebarHost>(
+    switcher: &SwitcherProps<'_>,
+    button: &Rc<Cell<Option<Bounds<Pixels>>>>,
+    top: f32,
+    width: f32,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> impl IntoElement {
+    deferred(
+        div()
+            .absolute()
+            .top(px(top + (1.0 - switcher.phase) * motion::SLIDE_PX))
+            .left(px(8.0))
+            .min_w(px((width - 16.0).max(0.0)))
+            .opacity(switcher.phase)
+            .child(render_switcher(switcher, button.clone(), theme, cx)),
+    )
+    .with_priority(1)
 }
 
 /// The switcher's menu: a row per project (its badge, its name, a check on

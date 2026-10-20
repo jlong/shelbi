@@ -170,6 +170,15 @@ pub fn status_glyph(glyph: StatusGlyph) -> Svg {
     svg().path(glyph.path()).size(STATUS_GLYPH_SIZE).flex_none()
 }
 
+/// The size Settings ▸ Workflows draws a status's glyph at (its `Status
+/// icon`, 2292:1159, the drawing scaled to its 20pt frame).
+pub const STATUS_GLYPH_LARGE_SIZE: Pixels = px(20.0);
+
+/// `glyph` at [`STATUS_GLYPH_LARGE_SIZE`].
+pub fn status_glyph_large(glyph: StatusGlyph) -> Svg {
+    svg().path(glyph.path()).size(STATUS_GLYPH_LARGE_SIZE).flex_none()
+}
+
 macro_rules! status_glyphs {
     ($($file:literal),*) => {
         /// The status glyphs, by asset path.
@@ -352,6 +361,19 @@ heroicons! {
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
+    VIEW_COLUMNS = "view-columns";
+    BARS_2 = "bars-2";
+    DOCUMENT_TEXT = "document-text";
+    /// The drawing `TRASH_BUTTON` widens; no view draws it at 20pt.
+    #[allow(dead_code)]
+    TRASH = "trash";
+    /// The drawing `ELLIPSIS_VERTICAL_BUTTON` widens; no view draws it at
+    /// 20pt.
+    #[allow(dead_code)]
+    ELLIPSIS_VERTICAL = "ellipsis-vertical";
+    /// The drawing `PENCIL_BUTTON` widens; no view draws it at 20pt.
+    #[allow(dead_code)]
+    PENCIL = "pencil";
     @figma {
         TOGGLE_OFF = "toggle-off";
         TOGGLE_ON = "toggle-on";
@@ -372,6 +394,9 @@ heroicons! {
         USER_BUTTON = "user";
         PENCIL_SQUARE_BUTTON = "pencil-square";
         ARROW_UP_RIGHT_BUTTON = "arrow-up-right";
+        TRASH_BUTTON = "trash";
+        ELLIPSIS_VERTICAL_BUTTON = "ellipsis-vertical";
+        PENCIL_BUTTON = "pencil";
     }
     @close {
         X_MARK_CLOSE = "x-mark";

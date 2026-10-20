@@ -78,6 +78,14 @@ impl FeedHub {
 
     /// The app's hub, installing the live one the first time.
     pub fn global(cx: &mut App) -> FeedHub {
+        // A live feed's reader thread wakes the test scheduler off its
+        // thread, which gpui fails the test for only when the wake lands in
+        // time (a flake under load): a test installs a canned hub.
+        #[cfg(test)]
+        assert!(
+            cx.has_global::<FeedHub>(),
+            "a test that starts a feed installs a FeedHub (tests::canned_hub)"
+        );
         if !cx.has_global::<FeedHub>() {
             let control = cx
                 .try_global::<crate::app::Shell>()

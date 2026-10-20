@@ -73,3 +73,5 @@ pub mod terminal_preview;
 pub mod sidebar;
 pub mod sidebar_reveal;
 pub mod update;
+pub mod workflows;
+pub mod workflows_state;

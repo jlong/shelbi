@@ -717,6 +717,9 @@ pub struct ShelbiWindow {
     _subscriptions: Vec<Subscription>,
     /// The project-bound views' subscriptions, dropped with them on a switch.
     _view_subscriptions: Vec<Subscription>,
+    /// The workflows a test's window was asked to open the editor of.
+    #[cfg(test)]
+    edited_workflows: Vec<String>,
     /// The shell has been drawn at least once (gpui has a frame to answer
     /// action-availability questions from).
     drawn_once: bool,
@@ -918,6 +921,8 @@ impl ShelbiWindow {
             _feed_task: None,
             _subscriptions: Vec::new(),
             _view_subscriptions: Vec::new(),
+            #[cfg(test)]
+            edited_workflows: Vec::new(),
             drawn_once: false,
             #[cfg(any(test, feature = "visual-check"))]
             tap: None,
@@ -1362,6 +1367,9 @@ impl ShelbiWindow {
         if self.shows(project) {
             return;
         }
+        // Switched from Settings (its project section's switcher): it
+        // reopens on the same page, for the new project.
+        let settings = matches!(self.route, Route::Settings(_)).then(|| self.settings_nav.page());
         self.remember_view_state(cx);
         self.teardown_project(window, cx);
         self.chooser = false;
@@ -1388,6 +1396,9 @@ impl ShelbiWindow {
         }
         self.record_slot(cx);
         self.sync_menus(cx);
+        if let Some(page) = settings {
+            self.open_settings(Some(page), window, cx);
+        }
         cx.notify();
     }
 
@@ -1601,7 +1612,16 @@ impl ShelbiWindow {
             self.column.show(Occupant::Workspace, Motion::Fade, (self.clock)());
             self.column.finish();
         }
+        // Settings, reopened by a switch from its project section, stays in
+        // front: the view is built behind it, for Back.
+        let settings = matches!(self.route, Route::Settings(_)).then(|| std::mem::replace(&mut self.route, Route::View));
         self.perform(HostCall::ShowView(view), window, cx);
+        if let Some(route) = settings {
+            self.set_route(route);
+            self.focus_main_view(window, cx);
+            cx.notify();
+            return;
+        }
         if let Some(task) = hold.review {
             self.quiet_review = Some(task.clone());
             self.load_review(task, window, cx);
@@ -2017,8 +2037,30 @@ impl ShelbiWindow {
     /// a terminal editor opens in Terminal.app, a GUI editor directly.
     fn open_editor(&mut self, target: EditTarget, cx: &mut Context<Self>) {
         let project = self.project.clone();
+        self.open_in_editor(move || shelbi_app::command_model::edit_target_path(&project, &target), cx);
+    }
+
+    /// Open workflow `name`'s editor (Settings ▸ Workflows' edit button, a
+    /// row's click, a workflow just created). Until the workflow editor
+    /// lands (`dt-wf-editor-form`), its file opens in the user's editor, as
+    /// `edit:workflows` opens the directory.
+    fn edit_workflow(&mut self, name: String, cx: &mut Context<Self>) {
+        // A test's window records it and launches nothing.
+        if cfg!(test) {
+            #[cfg(test)]
+            self.edited_workflows.push(name);
+            return;
+        }
+        let project = self.project.clone();
+        self.open_in_editor(move || shelbi_state::workflow_path(&project, &name).ok(), cx);
+    }
+
+    /// Open the file `find` locates in the user's editor and say so. The
+    /// lookup and the launch run off the UI thread; a terminal editor opens
+    /// in Terminal.app, a GUI editor directly.
+    fn open_in_editor(&mut self, find: impl FnOnce() -> Option<std::path::PathBuf> + Send + 'static, cx: &mut Context<Self>) {
         let launch = cx.background_executor().spawn(async move {
-            let path = shelbi_app::command_model::edit_target_path(&project, &target)
+            let path = find()
                 .filter(|p| p.exists())
                 .ok_or_else(|| "Couldn't find that file to edit.".to_string())?;
             let editor = shelbi_state::resolve_editor();
@@ -2973,6 +3015,7 @@ impl ShelbiWindow {
                         this.focus_handle.focus(window, cx);
                         cx.notify();
                     }
+                    SettingsEvent::EditWorkflow(name) => this.edit_workflow(name.clone(), cx),
                 });
                 self._view_subscriptions.push(sub);
                 self.set_route(Route::Settings(view));
@@ -4301,6 +4344,20 @@ impl ShelbiWindow {
                     self.settings_nav,
                     settings_chip.flatten(),
                     &self.settings_track,
+                    settings_nav::ProjectSwitcher {
+                        label: self.model.project_label.clone().into(),
+                        menu: catalog_projects.as_deref().zip(switcher_phase).map(|(projects, phase)| {
+                            sidebar::SwitcherProps {
+                                projects,
+                                current: self.project.as_str(),
+                                highlight: self.switcher.highlight,
+                                phase,
+                            }
+                        }),
+                        button: self.switcher.button.clone(),
+                        open: self.switcher.is_open(),
+                        width,
+                    },
                     &self.palette_chord,
                     &theme,
                     cx,

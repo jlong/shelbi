@@ -1,12 +1,13 @@
 //! Settings in its own sidebar (`dt-settings-sections`): opening it pushes
 //! the settings sidebar into the leading column on the General page (or the
-//! last page used), ⌘1 to ⌘3 and ↑ / ↓ plus Enter switch its pages while it
+//! last page used), ⌘1 to ⌘4 and ↑ / ↓ plus Enter switch its pages while it
 //! is open (and ⌘N keeps its sidebar meaning outside), and Back or Esc
 //! return to the view it was opened over with the app sidebar back and its
 //! selection on that view's row (`dt-back-syncs-sidebar`).
 //!
 //! The window is the smoke test's headless one ([`Harness`]) with an
-//! injected clock for the push. The settings view reads no disk under test.
+//! injected clock for the push. The settings view reads no disk under test,
+//! except the Workflows tests, which read a throwaway `SHELBI_HOME`.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -168,6 +169,12 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
             && s.drawn("settings-option-Meta")
     );
     assert!(!s.drawn("settings-open-keys") && !s.drawn("settings-theme-Auto"));
+
+    s.key("cmd-4");
+    assert!(s.drawn("settings-page-workflows") && s.drawn("settings-workflows"));
+    assert!(s.drawn("workflows-new") && s.drawn("statuses-new") && s.drawn("statuses-edit-yaml"));
+    assert!(s.drawn("status-categories"));
+    assert!(!s.drawn("settings-font-size"));
 }
 
 #[gpui::test]
@@ -219,19 +226,22 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Terminal),
+        Some(SettingsPage::Workflows),
+        "it crosses into the project section"
+    );
+    s.key("down");
+    assert_eq!(
+        s.selected_row(),
+        Some(SettingsPage::Workflows),
         "it stops at the last row"
     );
     s.key("enter");
-    assert_eq!(s.page(), Some(SettingsPage::Terminal));
+    assert_eq!(s.page(), Some(SettingsPage::Workflows));
     s.key("up");
     s.key("enter");
     assert_eq!(
         (s.page(), s.selected_row()),
-        (
-            Some(SettingsPage::Keybindings),
-            Some(SettingsPage::Keybindings)
-        )
+        (Some(SettingsPage::Terminal), Some(SettingsPage::Terminal))
     );
     assert!(
         s.h.take_calls().is_empty(),
@@ -733,4 +743,218 @@ fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut
     assert_eq!(theme_opacity(&mut s), 0.7);
     assert!(!s.drawn("settings-reduce-transparency"));
     assert!(!s.read(|_, cx| opacity.read(cx).is_disabled()));
+}
+
+// ---- Settings ▸ Workflows (`dt-wf-settings-index`) -------------------------
+
+use crate::views::workflows::WorkflowsPage;
+use crate::views::workflows_state::tests::Home;
+use shelbi_state::workflow_config::WorkflowConfig;
+
+impl Settings {
+    /// Settings on Workflows (⌘4), its page loaded from `home`'s files.
+    fn open_workflows(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("cmd-4");
+        let page = s.workflows();
+        s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+        s.settle();
+        s
+    }
+
+    fn workflows(&self) -> Entity<WorkflowsPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).workflows(),
+            _ => panic!("Settings is open"),
+        })
+    }
+
+    /// Run the page's saves out and draw.
+    fn saved(&mut self) {
+        self.h.cx.run_until_parked();
+        self.settle();
+    }
+
+    /// Type `text` into `input` as the user would, then press Enter.
+    fn enter_text(&mut self, input: Entity<gpui_kit::component::input::InputState>, text: &str) {
+        self.update(|_, window, cx| {
+            let focus = gpui::Focusable::focus_handle(input.read(cx), cx);
+            window.focus(&focus, cx);
+            input.update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+        });
+        self.h.key("enter");
+        self.saved();
+    }
+
+    fn edited(&self) -> Vec<String> {
+        self.read(|w, _| w.edited_workflows.clone())
+    }
+}
+
+fn config() -> WorkflowConfig {
+    WorkflowConfig::load("alpha").unwrap()
+}
+
+#[gpui::test]
+fn the_settings_sidebar_has_the_project_section(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    assert!(s.drawn("settings-project") && s.drawn("sidebar-project-title"));
+    let global = s.bounds("settings-nav-terminal").unwrap();
+    let switcher = s.bounds("sidebar-project-title").unwrap();
+    let workflows = s.bounds("settings-nav-workflows").unwrap();
+    assert!(global.bottom() < switcher.top() && switcher.bottom() < workflows.top(), "in the frame's order");
+    s.click("settings-nav-workflows");
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
+
+    // The switcher opens the app sidebar's project menu.
+    s.h.take_calls();
+    s.click("sidebar-project-title");
+    assert_eq!(s.h.take_calls(), [HostCall::OpenSwitcher]);
+    s.update(|w, _, cx| w.open_switcher(cx));
+    s.settle();
+    assert!(s.drawn("sidebar-switcher"), "its menu shows over the settings sidebar");
+}
+
+#[gpui::test]
+fn switching_projects_reopens_the_project_pages_for_the_new_project(cx: &mut TestAppContext) {
+    // The switch subscribes the window to beta's feed: a canned one, as a
+    // live feed's reader thread would wake the test scheduler off its thread.
+    // Both projects' files live in the test's own home.
+    let home = Home::with_project("page-switch", "alpha");
+    crate::views::workflows_state::tests::write_project(&home.root, "beta");
+    let (hub, _feeds) = crate::feeds::tests::canned_hub();
+    cx.update(|cx| cx.set_global(hub));
+    let mut s = Settings::open_workflows(cx);
+    let before = s.workflows();
+    s.update(|w, window, cx| w.switch_to("beta", window, cx));
+    s.saved();
+    assert_eq!(s.page(), Some(SettingsPage::Workflows), "still on Workflows");
+    let after = s.workflows();
+    assert_ne!(before.entity_id(), after.entity_id(), "a fresh page");
+    assert_eq!(s.read(|_, cx| after.read(cx).state().project().to_string()), "beta");
+    assert!(s.drawn("settings-project"));
+    assert!(!s.drawn("status-row-todo"), "alpha's rows went with its page");
+    s.update(|_, window, cx| after.update(cx, |p, cx| p.load(window, cx)));
+    s.saved();
+    assert!(s.drawn("status-row-todo"), "beta's statuses");
+}
+
+#[gpui::test]
+fn the_workflows_page_lists_the_projects_workflows_and_statuses(cx: &mut TestAppContext) {
+    let _home = Home::with_project("page-rows", "alpha");
+    let mut s = Settings::open_workflows(cx);
+    assert!(s.drawn("workflow-row-task") && s.drawn("workflow-row-subtask"));
+    let badge = s.bounds("workflow-default-badge").unwrap();
+    assert!(s.bounds("workflow-row-task").unwrap().contains(&badge.center()), "Task is the default");
+    for id in ["backlog", "todo", "in-progress", "review", "done", "canceled"] {
+        let selector: &'static str = Box::leak(format!("status-row-{id}").into_boxed_str());
+        assert!(s.drawn(selector), "{id}");
+    }
+    let page = s.workflows();
+    let name = s.read(|_, cx| page.read(cx).name_field("todo").unwrap().read(cx).value().to_string());
+    assert_eq!(name, "To Do");
+
+    // The edit button and a row click both ask for the editor.
+    s.click("workflow-edit-task");
+    s.click("workflow-row-subtask");
+    assert_eq!(s.edited(), ["task", "subtask"]);
+}
+
+#[gpui::test]
+fn status_edits_save_as_they_are_made(cx: &mut TestAppContext) {
+    let home = Home::with_project("page-statuses", "alpha");
+    let mut s = Settings::open_workflows(cx);
+    let page = s.workflows();
+
+    // Rename on Enter: the id stays.
+    let field = s.read(|_, cx| page.read(cx).name_field("todo").unwrap());
+    s.enter_text(field, "Up next");
+    assert_eq!(config().status("todo").unwrap().name, "Up next");
+    assert!(home.read("statuses.yaml").starts_with("## The project's statuses."), "comments kept");
+
+    // Category from the picker.
+    s.click("status-category-review");
+    assert!(s.drawn("status-category-menu"));
+    s.click("status-category-review-active");
+    s.saved();
+    assert_eq!(config().status("review").unwrap().category, shelbi_core::StatusCategory::Active);
+    assert!(!s.drawn("status-category-menu"));
+
+    // Reorder by dropping a row on another's.
+    s.update(|_, window, cx| page.update(cx, |p, cx| p.drop_on("canceled", "backlog", window, cx)));
+    s.saved();
+    assert_eq!(config().statuses()[0].id, "canceled");
+
+    // A status in use can't be deleted.
+    s.click("status-delete-review");
+    s.saved();
+    assert!(config().status("review").is_some());
+
+    // New status: typed into the new row, then deleted.
+    s.click("statuses-new");
+    assert!(s.drawn("status-new-name"));
+    let draft = s.read(|_, cx| page.read(cx).draft_input());
+    s.enter_text(draft, "QA");
+    assert_eq!(config().status("qa").map(|st| st.name.clone()).as_deref(), Some("QA"));
+    assert!(!s.drawn("status-new-name"), "the new row closes");
+    s.click("status-delete-qa");
+    s.saved();
+    assert!(config().status("qa").is_none());
+}
+
+#[gpui::test]
+fn a_refused_rename_shows_under_its_row_and_puts_the_name_back(cx: &mut TestAppContext) {
+    let _home = Home::with_project("page-refused", "alpha");
+    let mut s = Settings::open_workflows(cx);
+    let page = s.workflows();
+    let field = s.read(|_, cx| page.read(cx).name_field("todo").unwrap());
+    s.enter_text(field.clone(), "   ");
+    assert!(s.drawn("status-error-todo"));
+    assert_eq!(s.read(|_, cx| field.read(cx).value().to_string()), "To Do");
+    assert_eq!(config().status("todo").unwrap().name, "To Do");
+}
+
+#[gpui::test]
+fn workflow_actions_create_duplicate_default_and_guard_delete(cx: &mut TestAppContext) {
+    let home = Home::with_project("page-workflows", "alpha");
+    let mut s = Settings::open_workflows(cx);
+    let page = s.workflows();
+
+    // The default can't be deleted.
+    s.click("workflow-more-task");
+    assert!(s.drawn("workflow-menu"));
+    s.click("workflow-delete-task");
+    s.saved();
+    assert!(home.workflows().join("task.yaml").exists());
+    assert!(s.drawn("workflow-menu"), "a disabled item leaves the menu open");
+    s.click("workflow-more-task");
+    assert!(!s.drawn("workflow-menu"), "its button closes it");
+
+    // Set as default.
+    s.click("workflow-more-subtask");
+    s.click("workflow-set-default-subtask");
+    s.saved();
+    assert_eq!(config().default_workflow(), "subtask");
+
+    // Duplicate offers a name; Enter makes it.
+    s.click("workflow-more-task");
+    s.click("workflow-duplicate-task");
+    let draft = s.read(|_, cx| page.read(cx).draft_input());
+    assert_eq!(s.read(|_, cx| draft.read(cx).value().to_string()), "task-copy");
+    s.enter_text(draft.clone(), "task-copy");
+    assert!(config().workflow("task-copy").is_some());
+
+    // New workflow: created, then opened in the editor.
+    s.click("workflows-new");
+    s.enter_text(draft, "hotfix");
+    assert!(home.workflows().join("hotfix.yaml").exists());
+    assert_eq!(s.edited(), ["hotfix"]);
+
+    // Delete one nothing uses.
+    s.click("workflow-more-hotfix");
+    s.click("workflow-delete-hotfix");
+    s.saved();
+    assert!(!home.workflows().join("hotfix.yaml").exists());
 }
