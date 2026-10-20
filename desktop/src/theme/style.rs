@@ -681,7 +681,8 @@ pub fn filter_chip(
 /// 6px corners, the overlay fill (the hover fill under the pointer), the
 /// 20px magnifying glass in `icon` 6px in, then `content` 6px after it.
 /// `focused` draws the focus ring and glow around it ([`focus_bands`]). The
-/// caller sets its width (Figma: 180px).
+/// caller sets its width (Figma: 180px), and adds a [`search_clear`] after
+/// it while the query is non-empty (the field shrinks to make room).
 pub fn search_box(id: impl Into<SharedString>, content: impl IntoElement, focused: bool, theme: &Theme) -> Stateful<Div> {
     search_box_sized(id, content, focused, 28.0, 6.0, theme)
 }
@@ -718,6 +719,19 @@ fn search_box_sized(
         .child(heroicon(icons::MAGNIFYING_GLASS).text_color(theme.icon))
         .child(div().relative().flex().flex_1().min_w_0().h_full().items_center().child(content))
         .when(focused, |d| d.children(focus_bands(radius, theme)))
+}
+
+/// A search box's clear button (`dt-search-clear-button`): the 20px x-mark
+/// as a 24px [`icon_button`] at the box's right end, the icon 6px in from
+/// the edge as the magnifying glass is from the left (the button hangs 2px
+/// into the box's padding). The caller adds it after the field while the
+/// query is non-empty, as a macOS search field shows its cancel button, and
+/// gives it the click that clears the query. The Figma Searchbox draws no
+/// clear button, so this follows the app's icon buttons.
+pub fn search_clear(id: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    icon_button(id, icons::X_MARK, IconButtonSize::Small, false, theme)
+        .mr(px(-2.0))
+        .tooltip(tooltip("Clear search"))
 }
 
 /// [`focus_shadow`] drawn as bands around a control whose corners are
