@@ -1916,8 +1916,9 @@ fn a_selected_transitions_actions_reorder_change_and_delete(cx: &mut TestAppCont
     assert_eq!(s.selection(), Some(Selection::Transition { index: 1, added: false }));
     assert!(!s.drawn("builder-transition-added"));
     use shelbi_core::TransitionAction::*;
-    // Push branch runs later; Merge becomes Close PR; Delete branch added.
-    s.click("builder-action-1-0-later");
+    // Push branch dragged after Merge; Merge becomes Close PR; Delete
+    // branch added.
+    s.drag_action("builder-action-1", 0, 1);
     assert_eq!(s.draft().transitions.unwrap()[1].actions, [Merge, PushBranch]);
     s.click("builder-action-1-0");
     s.click("builder-action-1-0-close_pr");
@@ -1934,6 +1935,134 @@ fn a_selected_transitions_actions_reorder_change_and_delete(cx: &mut TestAppCont
     s.click("builder-delete-transition");
     assert_eq!(s.draft().transitions.unwrap().len(), 3);
     assert_eq!(s.selection(), None);
+}
+
+impl Settings {
+    /// Drag action row `from` of the list whose ids start `prefix` by its
+    /// handle, and let go over row `onto`.
+    fn drag_action(&mut self, prefix: &str, from: usize, onto: usize) {
+        let selector = |part: String| -> &'static str { Box::leak(format!("{prefix}-{part}").into_boxed_str()) };
+        let handle = self.center(selector(format!("{from}-handle")));
+        self.mouse_down(handle);
+        // Past gpui's drag threshold, so the drag starts.
+        self.mouse_move(gpui::point(handle.x, handle.y + px(6.0)), true);
+        let target = self.center(selector(format!("{onto}-row")));
+        self.mouse_move(target, true);
+        self.mouse_up(target);
+    }
+
+    /// Transition `index`'s label on the canvas, a line per action.
+    fn canvas_label(&self, index: usize) -> Vec<String> {
+        let editor = self.editor().expect("the editor is open");
+        let t = self.draft().transitions.unwrap()[index].clone();
+        self.read(|_, cx| {
+            let g = editor.read(cx).builder_graph().expect("a graph");
+            let edge = g.edges.iter().find(|e| e.from == t.from && e.to == t.to).expect("its edge");
+            edge.label.as_ref().map(|l| l.lines.clone()).unwrap_or_default()
+        })
+    }
+}
+
+#[gpui::test]
+fn dragging_an_action_handle_reorders_the_transitions_actions(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-action-drag", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    use shelbi_core::TransitionAction::*;
+    // Review → Done: Push branch, Merge; Delete branch added third.
+    s.click("builder-edge-label-1");
+    s.click("builder-add-action");
+    s.click("builder-add-action-delete_branch");
+    let actions = |s: &Settings| s.draft().transitions.unwrap()[1].actions.clone();
+    assert_eq!(actions(&s), [PushBranch, Merge, DeleteBranch]);
+    assert!(s.drawn("builder-action-1-0-handle") && s.drawn("builder-action-1-0-remove"));
+    assert!(!s.drawn("builder-action-1-0-stepper"), "the stepper is gone");
+
+    // First to last, last to first, and a drop on its own row.
+    s.drag_action("builder-action-1", 0, 2);
+    assert_eq!(actions(&s), [Merge, DeleteBranch, PushBranch]);
+    s.drag_action("builder-action-1", 2, 0);
+    assert_eq!(actions(&s), [PushBranch, Merge, DeleteBranch]);
+    s.drag_action("builder-action-1", 1, 1);
+    assert_eq!(actions(&s), [PushBranch, Merge, DeleteBranch], "dropped in place");
+
+    // The canvas label and the Form follow the draft.
+    s.drag_action("builder-action-1", 2, 0);
+    assert_eq!(actions(&s), [DeleteBranch, PushBranch, Merge]);
+    assert_eq!(s.canvas_label(1), ["Delete branch", "Push branch", "Merge"]);
+    assert!(s.dirty());
+    s.click("workflow-editor-mode-form");
+    let width = |s: &mut Settings, slot: usize| {
+        let selector: &'static str = Box::leak(format!("workflow-action-1-{slot}").into_boxed_str());
+        s.bounds(selector).unwrap_or_else(|| panic!("the Form's chip {slot}")).size.width
+    };
+    // "Merge" is the shortest chip, now last.
+    assert!(width(&mut s, 2) < width(&mut s, 0) && width(&mut s, 2) < width(&mut s, 1));
+
+    s.click("workflow-editor-save");
+    s.saved();
+    assert_eq!(on_disk("task").transitions.unwrap()[1].actions, [DeleteBranch, PushBranch, Merge]);
+}
+
+#[gpui::test]
+fn option_arrows_on_a_focused_handle_step_its_action(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-action-keys", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    use shelbi_core::TransitionAction::*;
+    s.click("builder-edge-label-1");
+    s.click("builder-add-action");
+    s.click("builder-add-action-delete_branch");
+    let actions = |s: &Settings| s.draft().transitions.unwrap()[1].actions.clone();
+    // A click focuses the handle; ⌥↓ steps it later and the focus follows.
+    s.click("builder-action-1-0-handle");
+    s.key("alt-down");
+    assert_eq!(actions(&s), [Merge, PushBranch, DeleteBranch]);
+    s.key("alt-down");
+    assert_eq!(actions(&s), [Merge, DeleteBranch, PushBranch]);
+    s.key("alt-down");
+    assert_eq!(actions(&s), [Merge, DeleteBranch, PushBranch], "already last");
+    s.key("alt-up");
+    assert_eq!(actions(&s), [Merge, PushBranch, DeleteBranch]);
+    // A plain arrow is not a reorder.
+    s.key("up");
+    assert_eq!(actions(&s), [Merge, PushBranch, DeleteBranch]);
+    assert_eq!(s.selection(), Some(Selection::Transition { index: 1, added: false }));
+}
+
+#[gpui::test]
+fn the_new_transition_panel_reorders_its_actions_the_same_way(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-new-action-drag", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    use shelbi_core::TransitionAction::*;
+    s.click("builder-node-in-progress");
+    s.click("builder-status-add-transition");
+    s.click("builder-node-done");
+    for a in ["push_branch", "merge", "delete_branch"] {
+        s.click("builder-new-add-action");
+        let selector: &'static str = Box::leak(format!("builder-new-add-action-{a}").into_boxed_str());
+        s.click(selector);
+    }
+    let actions = |s: &Settings| match s.selection() {
+        Some(Selection::New(n)) => n.actions,
+        other => panic!("a new transition, not {other:?}"),
+    };
+    // The same row as the Transition panel's: handle, picker, remove.
+    let (row, picker) = (s.bounds("builder-new-action-0-row").unwrap(), s.bounds("builder-new-action-0").unwrap());
+    assert_eq!(row.size.height, px(28.0));
+    assert_eq!(picker.size.height, px(28.0));
+    assert_eq!(s.bounds("builder-new-action-0-handle").unwrap().size.width, px(20.0));
+    assert_eq!(s.bounds("builder-new-action-0-remove").unwrap().size.width, px(28.0));
+
+    s.drag_action("builder-new-action", 0, 2);
+    assert_eq!(actions(&s), [Merge, DeleteBranch, PushBranch]);
+    s.drag_action("builder-new-action", 2, 0);
+    assert_eq!(actions(&s), [PushBranch, Merge, DeleteBranch]);
+    s.drag_action("builder-new-action", 0, 0);
+    assert_eq!(actions(&s), [PushBranch, Merge, DeleteBranch], "dropped in place");
+    s.click("builder-new-action-1-handle");
+    s.key("alt-up");
+    assert_eq!(actions(&s), [Merge, PushBranch, DeleteBranch]);
+    s.click("builder-new-add");
+    assert_eq!(s.draft().transitions.unwrap()[4].actions, [Merge, PushBranch, DeleteBranch]);
 }
 
 #[gpui::test]

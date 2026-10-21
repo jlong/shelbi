@@ -27,7 +27,11 @@
 //! transitions, Remove from workflow), the transition being drawn (From,
 //! the destination under the pointer, Cancel connection), a new transition
 //! (From, To, its actions, Cancel and Add transition) and a transition
-//! (From, To, its ordered actions, Delete transition).
+//! (From, To, its ordered actions, Delete transition). Both transition
+//! panels list actions in one row (`dt-builder-action-drag`, frame 6): the
+//! drag handle, the action's picker, Remove. Dragging a handle onto another
+//! row moves the action to that row's place, as the Statuses tables do;
+//! with a handle focused (a click focuses it), ⌥↑ and ⌥↓ step its action.
 //!
 //! Every edit goes into the editor's draft through the same
 //! [`Change`]s as the Form, so each view shows the other's edits. Nothing
@@ -42,7 +46,7 @@ use gpui::{
 use shelbi_core::{Owner, StatusCategory, TransitionAction, WorkflowStatus};
 
 use super::task_panel;
-use super::workflow_builder_state::{Removal, Selection};
+use super::workflow_builder_state::{action_drop, action_step, move_action, ActionList, Removal, Selection};
 use super::workflow_editor::{Menu, WorkflowEditor};
 use super::workflow_editor_state::{action_label, owner_label, Change, EditorState, Field, ACTIONS};
 use super::workflow_graph::{
@@ -66,10 +70,10 @@ const SMALL_H: f32 = 28.0;
 /// 1pt edge).
 const INSPECTOR_W: f32 = 320.0;
 const CONTROL_W: f32 = 286.0;
-/// The inspector's heading and row buttons (close, an action's stepper and
-/// remove).
+/// The inspector heading's close button.
 const ICON_BUTTON: f32 = 24.0;
-/// New transition's action rows: the delete button.
+/// An action row's drag handle and its delete button.
+const ACTION_HANDLE: f32 = 20.0;
 const TRASH_BUTTON: f32 = 28.0;
 /// Corner radius of a bend, and an arrowhead's length and half width.
 const BEND: f32 = 12.0;
@@ -84,18 +88,20 @@ const SCROLL_ZOOM: f32 = 0.01;
 const HINT: &str = "Hover over a status, then drag a handle to add a transition.";
 const DRAW_HINT: &str = "Choose a destination for the new transition.";
 
-/// An action row in New transition being dragged by its handle.
+/// An action row being dragged by its handle.
 #[derive(Debug, Clone)]
-pub struct NewActionDrag {
+pub struct ActionDrag {
+    list: ActionList,
     slot: usize,
     label: SharedString,
 }
 
-struct NewActionGhost {
+/// The row that follows the pointer during a drag.
+struct ActionGhost {
     label: SharedString,
 }
 
-impl Render for NewActionGhost {
+impl Render for ActionGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         style::popover(
@@ -451,6 +457,65 @@ impl WorkflowEditor {
         cx.notify();
     }
 
+    /// Set action `slot` of `list` to `action`.
+    fn set_action(&mut self, list: ActionList, slot: usize, action: TransitionAction, window: &mut Window, cx: &mut Context<Self>) {
+        match list {
+            ActionList::New => self.edit_new(cx, |actions| actions[slot] = action),
+            ActionList::Transition(index) => self.change(Change::SetAction { index, slot, action }, window, cx),
+        }
+    }
+
+    /// Remove action `slot` of `list`.
+    fn remove_action(&mut self, list: ActionList, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match list {
+            ActionList::New => self.edit_new(cx, |actions| {
+                actions.remove(slot);
+            }),
+            ActionList::Transition(index) => self.change(Change::RemoveAction { index, slot }, window, cx),
+        }
+    }
+
+    /// Move action `from` of `list` to `to`; a focused handle follows it.
+    pub(super) fn move_action(&mut self, list: ActionList, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let followed = self.action_focus.get(from).is_some_and(|f| f.is_focused(window));
+        match list {
+            ActionList::New => self.edit_new(cx, |actions| move_action(actions, from, to)),
+            ActionList::Transition(index) => self.change(Change::MoveAction { index, slot: from, to }, window, cx),
+        }
+        if followed {
+            if let Some(f) = self.action_focus.get(to) {
+                window.focus(f, cx);
+            }
+        }
+    }
+
+    /// `list`'s actions in the draft (or the new transition).
+    pub(super) fn actions_of(&self, list: ActionList) -> Vec<TransitionAction> {
+        match list {
+            ActionList::New => self.builder.new_transition().map(|n| n.actions.clone()),
+            ActionList::Transition(index) => self.state.as_ref().and_then(|s| s.transitions().get(index)).map(|t| t.actions.clone()),
+        }
+        .unwrap_or_default()
+    }
+
+    /// A key on a focused action handle: ⌥↑ runs its action earlier, ⌥↓
+    /// later.
+    fn action_key(&mut self, list: ActionList, slot: usize, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let k = &event.keystroke;
+        if !k.modifiers.alt || k.modifiers.platform || k.modifiers.control || k.modifiers.shift {
+            return;
+        }
+        let earlier = match k.key.as_str() {
+            "up" => true,
+            "down" => false,
+            _ => return,
+        };
+        cx.stop_propagation();
+        if let Some(to) = action_step(slot, self.actions_of(list).len(), earlier) {
+            self.move_action(list, slot, to, window, cx);
+        }
+    }
+
     /// Drop selection and hover on what the draft no longer has.
     pub(super) fn reconcile_builder(&mut self) {
         if let Some(state) = self.state.as_ref() {
@@ -486,7 +551,7 @@ fn small_button(id: impl Into<SharedString>, icon: Option<Icon>, label: impl Int
 }
 
 /// A square icon button on the overlay fill (the inspector's close, an
-/// action's remove and stepper): `size` across, `icon` centered.
+/// action's remove): `size` across, `icon` centered.
 fn square_button(id: impl Into<SharedString>, icon: Icon, size: f32, theme: &Theme) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
@@ -1093,9 +1158,9 @@ impl WorkflowEditor {
         let centered = matches!(self.builder.selection, Some(Selection::Status(_)));
         let (title, body): (&'static str, Vec<AnyElement>) = match self.builder.selection.clone() {
             Some(Selection::Status(id)) => ("Status", self.status_panel(&id, theme, window, cx)),
-            Some(Selection::Transition { index, added }) => ("Transition", self.transition_panel(index, added, theme, cx)),
+            Some(Selection::Transition { index, added }) => ("Transition", self.transition_panel(index, added, theme, window, cx)),
             Some(Selection::Draw(_)) => ("Draw transition", self.draw_panel(theme, cx)),
-            Some(Selection::New(_)) => ("New transition", self.new_panel(theme, cx)),
+            Some(Selection::New(_)) => ("New transition", self.new_panel(theme, window, cx)),
             None => ("", Vec::new()),
         };
         let close = square_button("builder-inspector-close", icons::X_MARK_BUTTON, ICON_BUTTON, theme)
@@ -1413,7 +1478,7 @@ impl WorkflowEditor {
     }
 
     /// A new transition: From, To, its actions, Cancel and Add transition.
-    fn new_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn new_panel(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let state = self.state.as_ref().expect("loaded");
         let Some(n) = self.builder.new_transition().cloned() else {
             return Vec::new();
@@ -1431,83 +1496,7 @@ impl WorkflowEditor {
             theme,
             cx,
         );
-        let rows: Vec<AnyElement> = n
-            .actions
-            .iter()
-            .enumerate()
-            .map(|(slot, &action)| {
-                let others: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| *a == action || !n.actions.contains(a)).collect();
-                let handle = div()
-                    .id(SharedString::from(format!("builder-new-action-handle-{slot}")))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(20.0))
-                    .cursor_grab()
-                    .child(heroicon(icons::BARS_2).text_color(theme.icon))
-                    .on_drag(
-                        NewActionDrag { slot, label: action_label(action).into() },
-                        |drag: &NewActionDrag, _, _, cx: &mut App| {
-                            let label = drag.label.clone();
-                            cx.new(|_| NewActionGhost { label })
-                        },
-                    );
-                let pick = self.dropdown(
-                    Menu::NewAction(slot),
-                    "builder-new-action-menu",
-                    picker(format!("builder-new-action-{slot}"), action_label(action), None, true, theme),
-                    move |cx| {
-                        let theme = *cx.global::<Theme>();
-                        others
-                            .iter()
-                            .map(|&a| {
-                                style::menu_row(format!("builder-new-action-{slot}-{a}"), a == action, &theme)
-                                    .child(action_label(a))
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.edit_new(cx, |actions| actions[slot] = a)
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect()
-                    },
-                    CONTROL_W,
-                    cx,
-                )
-                .flex_1()
-                .min_w_0();
-                let trash = square_button(format!("builder-new-action-remove-{slot}"), icons::TRASH, TRASH_BUTTON, theme)
-                    .tooltip(style::tooltip("Remove action"))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.edit_new(cx, |actions| {
-                            actions.remove(slot);
-                        })
-                    }));
-                let hover = *theme;
-                div()
-                    .id(SharedString::from(format!("builder-new-action-row-{slot}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .w_full()
-                    .rounded(px(6.0))
-                    .drag_over::<NewActionDrag>(move |st, _, _, _| st.bg(hover.background))
-                    .on_drop(cx.listener(move |this, drag: &NewActionDrag, _, cx| {
-                        let from = drag.slot;
-                        this.edit_new(cx, |actions| {
-                            if from < actions.len() && slot < actions.len() && from != slot {
-                                let a = actions.remove(from);
-                                actions.insert(slot, a);
-                            }
-                        })
-                    }))
-                    .child(handle)
-                    .child(pick)
-                    .child(trash)
-                    .into_any_element()
-            })
-            .collect();
+        let rows = self.action_rows(ActionList::New, &n.actions, theme, window, cx);
         let missing: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| !n.actions.contains(a)).collect();
         let add_action = self.add_action_menu(Menu::NewAddAction, "builder-new-add-action", missing, |this, a, _, cx| this.edit_new(cx, |actions| actions.push(a)), theme, cx);
         let cancel = base_button("builder-new-cancel", None, "Cancel", ButtonKind::Secondary, theme)
@@ -1525,6 +1514,100 @@ impl WorkflowEditor {
         out.extend(error);
         out.push(div().flex().flex_row().items_center().w_full().child(cancel).child(div().flex_1()).child(add).into_any_element());
         out
+    }
+
+    /// `list`'s action rows (frame 6's): the drag handle, the action's
+    /// picker (the actions not yet on the list, and its own), Remove.
+    fn action_rows(&self, list: ActionList, actions: &[TransitionAction], theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (prefix, menu_id): (SharedString, &'static str) = match list {
+            ActionList::New => ("builder-new-action".into(), "builder-new-action-menu"),
+            ActionList::Transition(index) => (format!("builder-action-{index}").into(), "builder-action-menu"),
+        };
+        actions
+            .iter()
+            .enumerate()
+            .map(|(slot, &action)| {
+                let id = |part: &str| -> SharedString {
+                    if part.is_empty() {
+                        format!("{prefix}-{slot}").into()
+                    } else {
+                        format!("{prefix}-{slot}-{part}").into()
+                    }
+                };
+                let others: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| *a == action || !actions.contains(a)).collect();
+                let focus = &self.action_focus[slot];
+                // The ring stays off while a row is dragged (pressing the
+                // handle focuses it).
+                let focused = focus.is_focused(window) && !cx.has_active_drag();
+                let handle_id = id("handle");
+                let handle = div()
+                    .id(handle_id.clone())
+                    .debug_selector(move || handle_id.to_string())
+                    .track_focus(focus)
+                    .relative()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(ACTION_HANDLE))
+                    .cursor_grab()
+                    .child(heroicon(icons::BARS_2).text_color(theme.icon))
+                    .when(focused, |d| d.children(focus_ring(ACTION_HANDLE, 4.0, theme)))
+                    .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| this.action_key(list, slot, e, window, cx)))
+                    .on_drag(ActionDrag { list, slot, label: action_label(action).into() }, |drag: &ActionDrag, _, _, cx: &mut App| {
+                        let label = drag.label.clone();
+                        cx.new(|_| ActionGhost { label })
+                    });
+                let item_prefix = prefix.clone();
+                let pick = self
+                    .dropdown(
+                        list_menu(list, slot),
+                        menu_id,
+                        picker(id(""), action_label(action), None, true, theme),
+                        move |cx| {
+                            let theme = *cx.global::<Theme>();
+                            others
+                                .iter()
+                                .map(|&a| {
+                                    style::menu_row(format!("{item_prefix}-{slot}-{a}"), a == action, &theme)
+                                        .child(action_label(a))
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_action(list, slot, a, window, cx)))
+                                        .into_any_element()
+                                })
+                                .collect()
+                        },
+                        CONTROL_W,
+                        cx,
+                    )
+                    .flex_1()
+                    .min_w_0();
+                let trash = square_button(id("remove"), icons::TRASH, TRASH_BUTTON, theme)
+                    .tooltip(style::tooltip("Remove action"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.remove_action(list, slot, window, cx)));
+                let row_id = id("row");
+                let hover = *theme;
+                div()
+                    .id(row_id.clone())
+                    .debug_selector(move || row_id.to_string())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .w_full()
+                    .rounded(px(6.0))
+                    .drag_over::<ActionDrag>(move |st, _, _, _| st.bg(hover.background))
+                    .on_drop(cx.listener(move |this, drag: &ActionDrag, window, cx| {
+                        let len = this.actions_of(list).len();
+                        if let Some((from, to)) = action_drop(drag.list, drag.slot, list, slot, len) {
+                            this.move_action(list, from, to, window, cx);
+                        }
+                    }))
+                    .child(handle)
+                    .child(pick)
+                    .child(trash)
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// The Actions block: its title, the help naming both ends, the rows,
@@ -1589,7 +1672,7 @@ impl WorkflowEditor {
 
     /// A transition: From, To, its ordered actions, Add action, the note
     /// when it was just added, Delete transition.
-    fn transition_panel(&self, index: usize, added: bool, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn transition_panel(&self, index: usize, added: bool, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let state = self.state.as_ref().expect("loaded");
         let Some(t) = state.transitions().get(index).cloned() else {
             return Vec::new();
@@ -1610,74 +1693,7 @@ impl WorkflowEditor {
             theme,
             cx,
         );
-        let last = t.actions.len().saturating_sub(1);
-        let rows: Vec<AnyElement> = t
-            .actions
-            .iter()
-            .enumerate()
-            .map(|(slot, &action)| {
-                let others: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| *a == action || !t.actions.contains(a)).collect();
-                // The stepper: its top half runs the action earlier, its
-                // bottom half later.
-                let half = |up: bool, cx: &mut Context<Self>| {
-                    let to = if up { slot.checked_sub(1) } else { (slot < last).then_some(slot + 1) };
-                    div()
-                        .id(SharedString::from(format!("builder-action-{index}-{slot}-{}", if up { "earlier" } else { "later" })))
-                        .debug_selector(move || format!("builder-action-{index}-{slot}-{}", if up { "earlier" } else { "later" }))
-                        .absolute()
-                        .left_0()
-                        .w_full()
-                        .h(px(ICON_BUTTON / 2.0))
-                        .when(up, |d| d.top_0())
-                        .when(!up, |d| d.bottom_0())
-                        .when_some(to, |d, to| {
-                            d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.change(Change::MoveAction { index, slot, to }, window, cx)
-                            }))
-                        })
-                };
-                let stepper = square_button(format!("builder-action-{index}-{slot}-stepper"), icons::CHEVRON_UP_DOWN_BUTTON, ICON_BUTTON, theme)
-                    .tooltip(style::tooltip("Run earlier or later"))
-                    .child(half(true, cx))
-                    .child(half(false, cx));
-                let pick = self.dropdown(
-                    Menu::BuilderAction(index, slot),
-                    "builder-action-menu",
-                    picker(format!("builder-action-{index}-{slot}"), action_label(action), None, false, theme),
-                    move |cx| {
-                        let theme = *cx.global::<Theme>();
-                        others
-                            .iter()
-                            .map(|&a| {
-                                style::menu_row(format!("builder-action-{index}-{slot}-{a}"), a == action, &theme)
-                                    .child(action_label(a))
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                        this.change(Change::SetAction { index, slot, action: a }, window, cx)
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect()
-                    },
-                    CONTROL_W,
-                    cx,
-                )
-                .flex_1()
-                .min_w_0();
-                let remove = square_button(format!("builder-action-{index}-{slot}-remove"), icons::X_MARK_BUTTON, ICON_BUTTON, theme)
-                    .tooltip(style::tooltip("Remove action"))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.change(Change::RemoveAction { index, slot }, window, cx)));
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .w_full()
-                    .child(stepper)
-                    .child(pick)
-                    .child(remove)
-                    .into_any_element()
-            })
-            .collect();
+        let rows = self.action_rows(ActionList::Transition(index), &t.actions, theme, window, cx);
         let missing: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| !t.actions.contains(a)).collect();
         let add_action = self.add_action_menu(
             Menu::AddAction(index),
@@ -1712,4 +1728,30 @@ impl WorkflowEditor {
         out.push(div().flex().flex_row().child(delete).into_any_element());
         out
     }
+}
+
+/// The menu of action `slot`'s picker in `list`.
+fn list_menu(list: ActionList, slot: usize) -> Menu {
+    match list {
+        ActionList::New => Menu::NewAction(slot),
+        ActionList::Transition(index) => Menu::BuilderAction(index, slot),
+    }
+}
+
+/// The keyboard focus around a `size` square with `radius` corners, as
+/// [`style::focus_shadow`] draws it (the 1px ring under a 4px glow) but in
+/// borders: a shadow shows through the inspector's translucent fill as a
+/// solid block.
+fn focus_ring(size: f32, radius: f32, theme: &Theme) -> [Div; 2] {
+    let around = |out: f32, width: f32, color: Hsla| {
+        div()
+            .absolute()
+            .top(px(-out))
+            .left(px(-out))
+            .size(px(size + 2.0 * out))
+            .rounded(px(radius + out))
+            .border(px(width))
+            .border_color(color)
+    };
+    [around(1.0, 1.0, theme.focus_ring), around(4.0, 3.0, theme.focus_glow)]
 }

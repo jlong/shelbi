@@ -220,6 +220,9 @@ pub struct WorkflowEditor {
     pub(super) canvas_anchor: style::Anchor,
     pub(super) frame_anchor: style::Anchor,
     pub(super) canvas_focus: FocusHandle,
+    /// The Builder's action rows' drag handles, by slot (a list holds each
+    /// action at most once).
+    pub(super) action_focus: Vec<FocusHandle>,
     /// Where a press on the canvas's background went down (a click there
     /// deselects).
     pub(super) pressed_at: Option<Pt>,
@@ -295,6 +298,7 @@ impl WorkflowEditor {
             canvas_anchor: Default::default(),
             frame_anchor: Default::default(),
             canvas_focus: cx.focus_handle(),
+            action_focus: (0..ACTIONS.len()).map(|_| cx.focus_handle()).collect(),
             pressed_at: None,
             reload_on_return: false,
             _subscriptions: subscriptions,
@@ -895,6 +899,12 @@ impl WorkflowEditor {
 
     pub fn drop_on(&mut self, dragged: &str, onto: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.drop_status(dragged, onto, window, cx);
+    }
+
+    /// The Builder's graph of the draft, as the canvas draws it.
+    #[cfg(test)]
+    pub fn builder_graph(&self) -> Option<super::workflow_graph::Graph> {
+        self.graph()
     }
 
     pub fn builder_selection(&self) -> Option<super::workflow_builder_state::Selection> {
