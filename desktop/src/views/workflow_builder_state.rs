@@ -20,6 +20,11 @@
 //! node's handle with no Status panel open goes back to the node it was
 //! drawn from. A transition selected on the canvas (its edge or label) has
 //! nothing to go back to: no ←, and Esc deselects, as it does anywhere else.
+//!
+//! **Hover** (`dt-builder-handle-hit`): a node's handles show while it is
+//! hovered, and it stays hovered while the pointer is over its handles,
+//! whose dots sit half outside it ([`Graph::hover_at`]); the handle under
+//! the pointer is [`BuilderState::hot`].
 
 use shelbi_core::{Transition, TransitionAction, Workflow};
 
@@ -81,8 +86,10 @@ pub enum Removal {
 pub struct BuilderState {
     pub selection: Option<Selection>,
     pub viewport: Viewport,
-    /// The node under the pointer: its handles show.
+    /// The node under the pointer (or over its handles): its handles show.
     pub hover: Option<String>,
+    /// The hovered node's handle under the pointer: it grows.
+    pub hot: Option<Side>,
     /// The keyboard's node (Tab, the arrow keys), ringed while the canvas
     /// has focus.
     pub focus: Option<String>,
@@ -170,6 +177,32 @@ impl BuilderState {
             ids.extend(self.focus.clone());
         }
         ids
+    }
+
+    /// The pointer moved to `p` (graph coordinates) on `graph`, at `zoom`,
+    /// no button held: the node it hovers and the handle under it. Returns
+    /// whether either changed.
+    pub fn hover_to(&mut self, p: Pt, graph: &Graph, zoom: f32) -> bool {
+        let hover = graph.hover_at(p, self.hover.as_deref(), zoom).map(|n| n.id.clone());
+        let hot = hover.as_deref().and_then(|id| graph.handle_at(id, p, zoom));
+        let changed = hover != self.hover || hot != self.hot;
+        (self.hover, self.hot) = (hover, hot);
+        changed
+    }
+
+    /// The pointer left the canvas. Returns whether anything hovered.
+    pub fn unhover(&mut self) -> bool {
+        self.hot = None;
+        self.hover.take().is_some()
+    }
+
+    /// The handle drawn hot: the one held while drawing from it, else the
+    /// hovered one under the pointer.
+    pub fn hot_handle(&self) -> Option<(&str, Side)> {
+        match self.drawing() {
+            Some(Draw { from, handle: Some(side), pointer: Some(_), .. }) => Some((from, *side)),
+            _ => Some((self.hover.as_deref()?, self.hot?)),
+        }
     }
 
     /// The nodes whose handles show: the hovered one, and a drawing's ends.
@@ -296,7 +329,7 @@ impl BuilderState {
             self.back = None;
         }
         if self.hover.as_deref().is_some_and(|id| !has(id)) {
-            self.hover = None;
+            self.unhover();
         }
         if self.focus.as_deref().is_some_and(|id| !has(id)) {
             self.focus = None;
@@ -368,6 +401,27 @@ mod tests {
         let _home = Home::new("builder-state");
         let config = shelbi_state::workflow_config::WorkflowConfig::load(PROJECT).unwrap();
         config.workflow("task").unwrap().clone()
+    }
+
+    #[test]
+    fn hovering_keeps_the_node_over_its_handles_and_heats_the_one_under_the_pointer() {
+        let g = task();
+        let mut b = BuilderState::default();
+        // In Progress, then out onto its right handle's outer half.
+        assert!(b.hover_to(Pt::new(156.0, 460.0), &g, 1.0));
+        assert_eq!((b.hover.as_deref(), b.hot), (Some("in-progress"), None));
+        assert!(b.hover_to(Pt::new(268.0, 460.0), &g, 1.0));
+        assert_eq!((b.hover.as_deref(), b.hot), (Some("in-progress"), Some(Side::Right)));
+        assert_eq!(b.hot_handle(), Some(("in-progress", Side::Right)));
+        assert!(!b.hover_to(Pt::new(269.0, 461.0), &g, 1.0), "nothing shown changed");
+        // Held while drawing, it stays hot wherever the pointer goes.
+        b.begin_draw("in-progress", Some(Side::Right), Some(Pt::new(268.0, 460.0)));
+        b.draw_to(Pt::new(300.0, 600.0), &g);
+        assert_eq!(b.hot_handle(), Some(("in-progress", Side::Right)));
+        b.release();
+        // Leaving the canvas drops both.
+        assert!(b.unhover());
+        assert_eq!((b.hover.as_deref(), b.hot, b.hot_handle()), (None, None, None));
     }
 
     #[test]

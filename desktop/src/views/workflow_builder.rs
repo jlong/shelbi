@@ -13,8 +13,11 @@
 //! [`super::workflow_graph::layout`]; status order dashed, transitions
 //! solid with their actions; the legend under them. Scroll or drag the
 //! background to pan, pinch or ⌘-scroll to zoom about the pointer. Hovering
-//! a node shows its four handles; dragging one draws a transition, dropped
-//! on the destination ([`super::workflow_builder_state`]). Clicking a node
+//! a node shows its four handles (a 24pt target each at any zoom, which
+//! keeps the node hovered, grows its dot and shows the crosshair); dragging
+//! one draws a transition, dropped on the destination
+//! ([`super::workflow_builder_state`]). A press on a hovered node's handle
+//! wins over the edges leaving from under it, and over panning. Clicking a node
 //! or an edge selects it. With the canvas focused, Tab and the arrow keys
 //! move the focus ring between nodes, Enter selects, Delete removes the
 //! selected status or transition, and Esc steps back.
@@ -43,7 +46,7 @@ use super::workflow_builder_state::{Removal, Selection};
 use super::workflow_editor::{Menu, WorkflowEditor};
 use super::workflow_editor_state::{action_label, owner_label, Change, EditorState, Field, ACTIONS};
 use super::workflow_graph::{
-    route_to_pointer, Edge, EdgeKind, Graph, Label, LabelAt, Pt, Rect, Side, HANDLE_D, LABEL_LINE_H, LABEL_PAD,
+    route_to_pointer, Edge, EdgeKind, Graph, Label, LabelAt, Pt, Rect, Side, HANDLE_D, HANDLE_HIT, HANDLE_HOT_D, LABEL_LINE_H, LABEL_PAD,
     ZOOMS,
 };
 use super::workflows_state::category_label;
@@ -171,6 +174,9 @@ impl WorkflowEditor {
     pub(super) fn press(&mut self, p: Pt, at: Pt, g: &Graph) {
         let z = self.builder.viewport.zoom;
         let drawing = self.builder.drawing().is_some();
+        // The hover as of this point (a scroll may have moved the graph
+        // under a still pointer).
+        self.builder.hover_to(p, g, z);
         if let Some(hovered) = self.builder.hover.clone() {
             if let Some(side) = g.handle_at(&hovered, p, z) {
                 self.keep_status_scroll();
@@ -228,12 +234,7 @@ impl WorkflowEditor {
             }
             return true;
         }
-        let hover = g.node_at(p).map(|n| n.id.clone());
-        if hover != self.builder.hover {
-            self.builder.hover = hover;
-            return true;
-        }
-        false
+        self.builder.hover_to(p, g, self.builder.viewport.zoom)
     }
 
     fn canvas_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -761,7 +762,7 @@ impl WorkflowEditor {
                 }),
             )
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if !hovered && this.builder.hover.take().is_some() {
+                if !hovered && this.builder.unhover() {
                     cx.notify();
                 }
             }))
@@ -834,6 +835,7 @@ impl WorkflowEditor {
         let focused = self.canvas_focus.is_focused(window);
         let ringed = self.builder.ringed(workflow, focused);
         let with_handles = self.builder.with_handles();
+        let hot = self.builder.hot_handle();
         let nodes = graph.nodes.iter().filter_map(|n| {
             let status = workflow.status(&n.id)?;
             Some(self.node_element(n.rect, status, initial.as_deref() == Some(&n.id), ringed.contains(&n.id), theme))
@@ -842,7 +844,7 @@ impl WorkflowEditor {
             .nodes
             .iter()
             .filter(|n| with_handles.contains(&n.id))
-            .flat_map(|n| Side::ALL.map(|side| handle_element(&n.id, n.rect, side, z, theme)))
+            .flat_map(|n| Side::ALL.map(|side| handle_element(&n.id, n.rect, side, hot == Some((n.id.as_str(), side)), z, theme)))
             .collect();
         let hint = if self.builder.drawing().is_some() {
             Some(DRAW_HINT)
@@ -1034,23 +1036,38 @@ fn graph_line(theme: &Theme) -> Hsla {
     theme.icon.opacity(0.6 / 0.9)
 }
 
-/// A node's connection handle on `side`: a 10pt circle on its edge.
-fn handle_element(id: &str, r: Rect, side: Side, zoom: f32, theme: &Theme) -> AnyElement {
+/// A node's connection handle on `side`: a 10pt circle on its edge, in its
+/// 24pt target (the hit area, [`HANDLE_HIT`] around it), which shows the
+/// crosshair. `hot` (under the pointer, or held): 14pt, in the accent.
+fn handle_element(id: &str, r: Rect, side: Side, hot: bool, zoom: f32, theme: &Theme) -> AnyElement {
     let c = r.side(side);
-    let d = HANDLE_D;
-    let selector = format!("builder-handle-{id}-{}", side.name());
-    // The line's color edges the same gray at 35%.
-    let fill = theme.icon.opacity(0.35 / 0.9);
+    let target = 2.0 * HANDLE_HIT;
+    let name = side.name();
+    let selector = format!("builder-handle-{id}-{name}");
+    // The line's color edges the same gray at 35%; hot, the drawing's
+    // accent.
+    let (d, border, fill) = if hot {
+        (HANDLE_HOT_D, theme.focus_ring, theme.focus_ring.opacity(0.35))
+    } else {
+        (HANDLE_D, graph_line(theme), theme.icon.opacity(0.35 / 0.9))
+    };
+    let mut dot = div().size(px(d)).rounded_full().border_1().border_color(border).bg(fill);
+    if hot {
+        let selector = format!("builder-handle-hot-{id}-{name}");
+        dot = dot.debug_selector(move || selector.clone());
+    }
     div()
         .debug_selector(move || selector.clone())
         .absolute()
-        .left(px(c.x * zoom - d / 2.0))
-        .top(px(c.y * zoom - d / 2.0))
-        .size(px(d))
+        .left(px(c.x * zoom - target / 2.0))
+        .top(px(c.y * zoom - target / 2.0))
+        .size(px(target))
+        .flex()
+        .items_center()
+        .justify_center()
         .rounded_full()
-        .border_1()
-        .border_color(graph_line(theme))
-        .bg(fill)
+        .cursor_crosshair()
+        .child(dot)
         .into_any_element()
 }
 

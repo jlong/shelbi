@@ -40,7 +40,7 @@
 //! conflict, search, picker and customized states; `state-workflow-form-*`:
 //! the workflow editor edited, its leave prompt, and its form's foot;
 //! `state-workflow-builder-*`: the Builder fitted, zoomed out with the
-//! keyboard's focus ring, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
+//! keyboard's focus ring, a hot handle, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs).
@@ -1115,12 +1115,13 @@ impl Run {
     /// `3-builder-status-selected.png`, `5-drawing-transition.png`,
     /// `6-new-transition.png`, `7-transition-added.png`), and the states no
     /// frame draws (`state-workflow-builder-*`, checked by eye): a
-    /// transition opened from its status (its back button), fitted, zoomed
+    /// transition opened from its status (its back button), a hovered handle
+    /// past its node's edge, fitted, zoomed
     /// out with the keyboard's focus ring, and a 20-status, 40-transition
     /// workflow.
     fn workflow_builder(&mut self) {
         use crate::views::workflow_builder_state::{NewTransition, Selection};
-        use crate::views::workflow_graph::{Graph, Side};
+        use crate::views::workflow_graph::{Graph, Pt, Side};
         use shelbi_core::TransitionAction::{Merge, PushBranch};
 
         let handle = self.open_workflow_editor("task");
@@ -1189,6 +1190,19 @@ impl Run {
             cx.notify();
         });
         self.save(handle, "state-workflow-builder-back");
+
+        // The pointer on In Progress's right handle, past the node's edge:
+        // the handles still show, that one hot.
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            let g = Graph::of(e.state().expect("loaded").workflow());
+            let side = g.rect("in-progress").unwrap().side(Side::Right);
+            let b = e.builder_mut();
+            b.hover = Some("in-progress".into());
+            b.hover_to(Pt::new(side.x + 4.0, side.y), &g, 1.0);
+            cx.notify();
+        });
+        self.save(handle, "state-workflow-builder-handle-hot");
 
         // Fit, and 50% with the keyboard on Review.
         let handle = self.open_workflow_editor("task");

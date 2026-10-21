@@ -1515,6 +1515,103 @@ fn dragging_a_handle_onto_a_status_draws_a_transition(cx: &mut TestAppContext) {
     assert_eq!(on_disk("task").transitions.unwrap().len(), 5);
 }
 
+impl Settings {
+    /// `out` points (on screen) beyond the middle of In Progress's `side`:
+    /// its handle's outer half, past the node's edge.
+    fn past_handle(&mut self, side: &'static str, out: f32) -> Point<Pixels> {
+        let selector: &'static str = Box::leak(format!("builder-handle-in-progress-{side}").into_boxed_str());
+        let c = self.center(selector);
+        let out = px(out);
+        match side {
+            "top" => gpui::point(c.x, c.y - out),
+            "right" => gpui::point(c.x + out, c.y),
+            "bottom" => gpui::point(c.x, c.y + out),
+            _ => gpui::point(c.x - out, c.y),
+        }
+    }
+
+    /// Hover In Progress, then move out onto `side`'s handle `out` points
+    /// past the node's edge.
+    fn onto_handle(&mut self, side: &'static str, out: f32) -> Point<Pixels> {
+        let ip = self.center("builder-node-in-progress");
+        self.mouse_move(ip, false);
+        let at = self.past_handle(side, out);
+        self.mouse_move(at, false);
+        at
+    }
+
+    fn drawing_from(&self) -> Option<(String, Option<crate::views::workflow_graph::Side>)> {
+        match self.selection() {
+            Some(Selection::Draw(d)) => Some((d.from, d.handle)),
+            _ => None,
+        }
+    }
+}
+
+#[gpui::test]
+fn a_handle_stays_hovered_past_the_nodes_edge_and_beats_the_edge_there(cx: &mut TestAppContext) {
+    use crate::views::workflow_graph::Side;
+    let _home = Home::with_project("bu-handle", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    // In Progress → Review leaves from In Progress's right side, where its
+    // right handle sits. On the handle's outer half, past the node's edge:
+    // the handles still show (they used to vanish, the hover being the
+    // node's rect alone)...
+    let at = s.onto_handle("right", 4.0);
+    assert!(s.drawn("builder-handle-in-progress-right"), "still hovered past the node's edge");
+    assert!(s.drawn("builder-handle-hot-in-progress-right"), "the hovered handle shows it");
+    // ...and a press there draws, rather than selecting the transition
+    // whose line starts under it.
+    s.mouse_down(at);
+    assert_eq!(s.drawing_from(), Some(("in-progress".into(), Some(Side::Right))));
+    s.mouse_up(at);
+    s.key("escape");
+    s.key("escape");
+    assert_eq!(s.selection(), None);
+
+    // Every side, from inside the node out to the hit area's edge, without
+    // the handles flickering off.
+    for side in ["top", "right", "bottom", "left"] {
+        let ip = s.center("builder-node-in-progress");
+        s.mouse_move(ip, false);
+        for out in [-4.0, 0.0, 4.0, 8.0, 11.0] {
+            let at = s.past_handle(side, out);
+            s.mouse_move(at, false);
+            assert!(s.drawn("builder-handle-in-progress-bottom"), "{side} {out}: still hovered");
+        }
+    }
+    // Well away, the hover goes.
+    let at = s.past_handle("bottom", 40.0);
+    s.mouse_move(at, false);
+    assert!(!s.drawn("builder-handle-in-progress-bottom"));
+}
+
+#[gpui::test]
+fn a_handles_hit_area_is_large_at_every_zoom(cx: &mut TestAppContext) {
+    use crate::views::workflow_graph::Side;
+    let _home = Home::with_project("bu-handle-zoom", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    for zoom in ["50", "100", "200"] {
+        s.click("builder-zoom");
+        let level: &'static str = Box::leak(format!("builder-zoom-{zoom}").into_boxed_str());
+        s.click(level);
+        // In Progress to the canvas's middle (a scroll pans by its delta).
+        let (canvas, ip) = (s.center("builder-canvas"), s.center("builder-node-in-progress"));
+        s.scroll(canvas, f32::from(canvas.x - ip.x), f32::from(canvas.y - ip.y), Modifiers::none());
+        // 11pt out from the dot's middle, on screen, at any zoom: well past
+        // the 5pt dot, inside the 24pt target.
+        for (side, want) in [("bottom", Side::Bottom), ("right", Side::Right), ("top", Side::Top)] {
+            let at = s.onto_handle(side, 11.0);
+            s.mouse_down(at);
+            assert_eq!(s.drawing_from(), Some(("in-progress".into(), Some(want))), "{side} at {zoom}%");
+            s.mouse_up(at);
+            s.key("escape");
+            s.key("escape");
+            assert_eq!(s.selection(), None);
+        }
+    }
+}
+
 #[gpui::test]
 fn add_transition_then_a_click_picks_the_destination(cx: &mut TestAppContext) {
     let _home = Home::with_project("bu-add", "alpha");
