@@ -4012,7 +4012,7 @@ impl ShelbiWindow {
                     div()
                         .absolute()
                         .top(px((sidebar::TITLEBAR_H - size) / 2.0))
-                        .left(px(sidebar::TRAFFIC_LIGHTS_RIGHT + 8.0 - titlebar.left))
+                        .left(px(sidebar::BESIDE_TRAFFIC_LIGHTS - titlebar.left))
                         .opacity(titlebar.open)
                         .child(
                             style::icon_button("expand-sidebar", icons::SIDEBAR, IconButtonSize::Default, false, theme)

@@ -65,6 +65,14 @@ const TRAFFIC_LIGHT_CENTER: f32 = 26.0;
 /// collapsed sidebar's toggle beside them.
 pub const TRAFFIC_LIGHTS_RIGHT: f32 =
     TRAFFIC_LIGHT_CENTER - TRAFFIC_LIGHT_BUTTON / 2.0 + 3.0 * TRAFFIC_LIGHT_BUTTON + 2.0 * 9.0;
+/// The gap from the traffic lights' right edge to whatever sits beside them
+/// when no sidebar is showing: Figma's Header puts the Back button's frame
+/// 12pt past the zoom button.
+const TRAFFIC_LIGHTS_GAP: f32 = 12.0;
+/// Where a titlebar's content starts beside the traffic lights (the workflow
+/// editor's Back, the collapsed sidebar's Show button, the relaunch bar):
+/// every no-sidebar titlebar takes its left edge from here.
+pub const BESIDE_TRAFFIC_LIGHTS: f32 = TRAFFIC_LIGHTS_RIGHT + TRAFFIC_LIGHTS_GAP;
 
 /// The close button's origin for gpui's `traffic_light_position` (the
 /// button's frame, inside a titlebar as tall as the button plus twice the
@@ -1789,6 +1797,7 @@ mod tests {
         assert_eq!(traffic_light_position(), gpui::point(px(19.0), px(19.0)));
         assert_eq!(TITLEBAR_H / 2.0, 26.0);
         assert_eq!(TRAFFIC_LIGHTS_RIGHT, 79.0);
+        assert_eq!(BESIDE_TRAFFIC_LIGHTS, 91.0, "Figma's 12pt gap past the zoom button");
     }
 
     #[test]

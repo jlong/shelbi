@@ -1069,7 +1069,7 @@ fn close_px(a: f32, b: f32) -> bool {
 /// centered on the titlebar row.
 fn expand_origin() -> (f32, f32) {
     (
-        sidebar::TRAFFIC_LIGHTS_RIGHT + 8.0,
+        sidebar::BESIDE_TRAFFIC_LIGHTS,
         (sidebar::TITLEBAR_H - style::IconButtonSize::Default.px()) / 2.0,
     )
 }
