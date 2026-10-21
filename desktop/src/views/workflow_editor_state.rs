@@ -13,8 +13,8 @@
 //! holds it back, its error showing), then the typed name (a rename reads
 //! the board, so it waits for Save and runs with the write, off the UI
 //! thread), then writes the draft; Discard puts the loaded model back. Back
-//! (or Esc), Manage project statuses and Duplicate ask to save or discard
-//! unsaved edits first ([`Leave`]).
+//! (or Esc), Manage project statuses, Duplicate and Edit YAML ask to save
+//! or discard unsaved edits first ([`Leave`]).
 //!
 //! The config the form maps onto (the frame's fields where they differ):
 //!
@@ -36,6 +36,7 @@
 //!   **Details** are its `target`, `run`, `ready`, `ready_timeout` and
 //!   `url`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use shelbi_core::{
@@ -348,6 +349,8 @@ pub enum Leave {
     ManageStatuses,
     /// Duplicate the workflow (as saved) and edit the copy.
     Duplicate,
+    /// Open the workflow's file in the user's editor.
+    EditYaml,
 }
 
 /// A save to run off the UI thread ([`run_save`]).
@@ -450,6 +453,11 @@ impl EditorState {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The workflow's file, as saved.
+    pub fn file(&self) -> PathBuf {
+        self.base.workflow_path(&self.name)
     }
 
     /// The draft of the workflow.
@@ -939,6 +947,11 @@ impl EditorState {
     /// A duplicate or a delete failed.
     pub fn job_failed(&mut self, e: String) {
         self.busy = false;
+        self.set_error(Field::Save, e);
+    }
+
+    /// Edit YAML couldn't open the file.
+    pub fn open_failed(&mut self, e: String) {
         self.set_error(Field::Save, e);
     }
 }

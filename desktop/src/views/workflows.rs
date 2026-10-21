@@ -4,7 +4,8 @@
 //! Top to bottom: the Workflows header (New workflow) over a table of the
 //! project's workflows (the name with a Default badge and the description,
 //! the status and transition counts, an edit button and a ⋮ menu with
-//! Duplicate, Set as default and Delete); a rule; the Statuses header (Edit
+//! Edit YAML, Duplicate, Set as default and Delete; a file that can't be
+//! read shows its error, and a ⋮ menu with Edit YAML only); a rule; the Statuses header (Edit
 //! YAML, New status) over the catalog (a drag handle, the status's board
 //! icon, its name in a textbox, its id, a Category picker, the workflows it
 //! is used in, and delete); the footnote; then the six categories' legend.
@@ -22,8 +23,13 @@
 //! will get. A new workflow opens in its editor once created. The edit
 //! button and a row click ask the window to open a workflow's editor
 //! ([`WorkflowsEvent::Edit`]).
+//!
+//! Both Edit YAML items open their file in the user's editor; when the
+//! window comes back to the front after one, the files are read again to
+//! show the hand edit.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, Focusable, FontWeight,
@@ -123,6 +129,9 @@ pub struct WorkflowsPage {
     menu_anchor: style::Anchor,
     /// Re-read the files on the next draw (the page was shown again).
     reload: bool,
+    /// Re-read the files when the window is next active (an Edit YAML
+    /// sent the user to their editor).
+    reload_on_return: bool,
     /// Where the Statuses section last painted (the editor's Manage project
     /// statuses scrolls it into view).
     statuses_anchor: style::Anchor,
@@ -132,14 +141,21 @@ pub struct WorkflowsPage {
 impl WorkflowsPage {
     pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let draft_input = cx.new(|cx| InputState::new(window, cx));
-        let subscriptions = vec![cx.subscribe_in(&draft_input, window, |this, _, event: &InputEvent, window, cx| {
-            match event {
-                InputEvent::PressEnter { .. } => this.submit_draft(window, cx),
-                // The new status row shows the id its name would get.
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            }
-        })];
+        let subscriptions = vec![
+            cx.subscribe_in(&draft_input, window, |this, _, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::PressEnter { .. } => this.submit_draft(window, cx),
+                    // The new status row shows the id its name would get.
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                }
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() && std::mem::take(&mut this.reload_on_return) {
+                    this.load(window, cx);
+                }
+            }),
+        ];
         let mut page = WorkflowsPage {
             state: WorkflowsState::new(project),
             names: HashMap::new(),
@@ -147,6 +163,7 @@ impl WorkflowsPage {
             menu: None,
             menu_anchor: Default::default(),
             reload: false,
+            reload_on_return: false,
             statuses_anchor: Default::default(),
             _subscriptions: subscriptions,
         };
@@ -369,20 +386,57 @@ impl WorkflowsPage {
             return;
         };
         let project = self.state.project().to_string();
-        let open = cx.background_executor().spawn(async move {
+        let prepare = move |path: &Path| {
             if !path.exists() {
                 shelbi_state::scaffold_project_statuses(&project)
                     .map_err(|e| format!("Couldn't write statuses.yaml: {e}"))?;
             }
-            let editor = shelbi_state::resolve_editor();
-            super::external_edit::spawn(&super::external_edit::launch_for(&editor, &path))
-                .map_err(|e| format!("Couldn't open statuses.yaml: {e}"))
+            Ok(())
+        };
+        self.open_yaml(path, Target::Page, prepare, window, cx);
+    }
+
+    /// Open workflow `name`'s file in the user's editor (its ⋮ menu's Edit
+    /// YAML), one that can't be read too: that's how it gets fixed.
+    fn edit_workflow_yaml(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let Some(path) = self.state.config().map(|c| c.workflow_path(name)) else {
+            return;
+        };
+        let file = format!("{name}.yaml");
+        let prepare = move |path: &Path| {
+            if path.exists() {
+                Ok(())
+            } else {
+                Err(format!("Couldn't find {file}."))
+            }
+        };
+        self.open_yaml(path, Target::Workflow(name.to_string()), prepare, window, cx);
+        cx.notify();
+    }
+
+    /// Open `path` in the user's editor off the UI thread, once `prepare`
+    /// has it ready; an error shows at `target`. The files are read again
+    /// when the window comes back to the front.
+    fn open_yaml(
+        &mut self,
+        path: PathBuf,
+        target: Target,
+        prepare: impl FnOnce(&Path) -> Result<(), String> + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reload_on_return = true;
+        let open = cx.background_executor().spawn(async move {
+            prepare(&path)?;
+            let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            super::external_edit::open_file(&path).map_err(|e| format!("Couldn't open {file}: {e}"))
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = open.await;
             this.update(cx, |this, cx| {
                 if let Err(e) = result {
-                    this.state.set_error(Target::Page, e);
+                    this.state.set_error(target, e);
                     cx.notify();
                 }
             })
@@ -527,26 +581,7 @@ impl WorkflowsPage {
             .map(|w| self.render_workflow_row(w, theme, cx))
             .collect();
         if let Some(config) = self.state.config() {
-            rows.extend(config.unreadable().iter().map(|u| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .p(px(12.0))
-                    .child(
-                        div()
-                            .type_style(Type::BaseSemibold)
-                            .text_color(theme.text_loud)
-                            .child(u.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .type_style(Type::Small)
-                            .text_color(theme.error)
-                            .child(format!("Can’t be edited here: {}", u.error)),
-                    )
-                    .into_any_element()
-            }));
+            rows.extend(config.unreadable().iter().map(|u| self.render_unreadable_row(&u.name, &u.error, theme, cx)));
         }
         if let Some(Draft::Workflow { from }) = &self.state.draft {
             rows.push(self.render_workflow_draft(from.clone(), theme, window, cx));
@@ -577,16 +612,8 @@ impl WorkflowsPage {
                     cx.emit(WorkflowsEvent::Edit(name.clone()));
                 }))
         };
-        let more = {
-            let name = name.clone();
-            row_button(format!("workflow-more-{name}"), icons::ELLIPSIS_VERTICAL_BUTTON, false, theme)
-                .when(menu_open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_menu(Menu::Workflow(name.clone()), cx);
-                }))
-        };
-        let menu = menu_open.then(|| self.render_workflow_menu(&w, theme, cx));
+        let more = self.more_button(&name, theme, cx);
+        let menu = menu_open.then(|| self.render_workflow_menu(&name, Some(&w), theme, cx));
         let badge = w.is_default.then(|| {
             div()
                 .debug_selector(|| "workflow-default-badge".into())
@@ -659,10 +686,82 @@ impl WorkflowsPage {
         div().flex().flex_col().child(row).children(error).into_any_element()
     }
 
-    /// A workflow's ⋮ menu: Duplicate, Set as default, Delete (disabled,
-    /// with the reason, for the default and the only workflow).
-    fn render_workflow_menu(&self, w: &WorkflowSummary, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let name = w.name.clone();
+    /// A workflow file that can't be read: its name and error, and a ⋮
+    /// menu with Edit YAML to fix it.
+    fn render_unreadable_row(&self, name: &str, error: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let menu_open = self.menu == Some(Menu::Workflow(name.to_string()));
+        let menu = menu_open.then(|| self.render_workflow_menu(name, None, theme, cx));
+        let row_id = SharedString::from(format!("workflow-row-{name}"));
+        let selector = row_id.clone();
+        let row = div()
+            .id(row_id)
+            .debug_selector(move || selector.to_string())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(24.0))
+            .p(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .type_style(Type::BaseSemibold)
+                            .text_color(theme.text_loud)
+                            .child(name.to_string()),
+                    )
+                    .child(
+                        div()
+                            .type_style(Type::Small)
+                            .text_color(theme.error)
+                            .child(format!("Can’t be edited here: {error}")),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .justify_end()
+                    .w(px(ACTIONS_W))
+                    .child(self.more_button(name, theme, cx))
+                    .children(menu),
+            );
+        let error = self
+            .state
+            .error_at(&Target::Workflow(name.to_string()))
+            .map(|e| row_error(format!("workflow-error-{name}"), e, theme));
+        div().flex().flex_col().child(row).children(error).into_any_element()
+    }
+
+    /// Workflow `name`'s ⋮ button, which opens (and closes) its menu.
+    fn more_button(&self, name: &str, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let menu = Menu::Workflow(name.to_string());
+        let open = self.menu.as_ref() == Some(&menu);
+        row_button(format!("workflow-more-{name}"), icons::ELLIPSIS_VERTICAL_BUTTON, false, theme)
+            .when(open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_menu(menu.clone(), cx);
+            }))
+    }
+
+    /// A workflow's ⋮ menu: Edit YAML, Duplicate, Set as default, Delete
+    /// (disabled, with the reason, for the default and the only workflow).
+    /// A file that can't be read (`w` is `None`) has Edit YAML only.
+    fn render_workflow_menu(
+        &self,
+        name: &str,
+        w: Option<&WorkflowSummary>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let name = name.to_string();
         let item = |id: String, label: &'static str, inert: Option<String>, danger: bool| {
             let row = style::menu_row(SharedString::from(id), false, theme).child(label);
             let row = if danger { row.text_color(theme.error) } else { row };
@@ -670,6 +769,29 @@ impl WorkflowsPage {
                 Some(why) => row.opacity(0.4).cursor_default().tooltip(style::tooltip(why)),
                 None => row,
             }
+        };
+        let edit_yaml = {
+            let name = name.clone();
+            item(format!("workflow-edit-yaml-{name}"), "Edit YAML", None, false).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.edit_workflow_yaml(&name, window, cx);
+                },
+            ))
+        };
+        let anchor = self.menu_anchor.clone();
+        let popup = popup("workflow-menu", theme)
+            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                // A press on its button toggles it closed through its click.
+                if anchor.get().is_some_and(|b| b.contains(&event.position)) {
+                    return;
+                }
+                this.menu = None;
+                cx.notify();
+            }))
+            .child(edit_yaml);
+        let Some(w) = w else {
+            return deferred(div().absolute().top(px(ROW_BUTTON + MENU_GAP)).right_0().child(popup)).with_priority(1);
         };
         let duplicate = {
             let name = name.clone();
@@ -707,18 +829,9 @@ impl WorkflowsPage {
                 }))
             }
         };
-        let anchor = self.menu_anchor.clone();
         deferred(
             div().absolute().top(px(ROW_BUTTON + MENU_GAP)).right_0().child(
-                popup("workflow-menu", theme)
-                    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        // A press on its button toggles it closed through its click.
-                        if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                            return;
-                        }
-                        this.menu = None;
-                        cx.notify();
-                    }))
+                popup
                     .child(duplicate)
                     .child(default)
                     .child(div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))

@@ -8,7 +8,7 @@
 //! Back, the workflow's name with its Default badge, the Builder | Form
 //! segmented control in the middle, then Discard changes (only with unsaved
 //! edits), Save changes (disabled while there are none) and a ⋮ menu with
-//! Duplicate, Set as default and Delete.
+//! Edit YAML, Duplicate, Set as default and Delete.
 //!
 //! **The Form** (`4-workflow-form.png`, scrolling): Name, Description and
 //! Initial status; the Statuses table (a drag handle, the status, its Owner
@@ -26,7 +26,13 @@
 //! apply when picked, text fields as typed (Name at Save, since a rename
 //! reads the board). A change the model refuses shows its message under the
 //! field or row it concerns. Discard reverts; Back, Esc, Manage project
-//! statuses and Duplicate ask to save or discard unsaved edits first.
+//! statuses, Duplicate and Edit YAML ask to save or discard unsaved edits
+//! first.
+//!
+//! **Edit YAML** opens the workflow's file in the user's editor. When the
+//! window comes back to the front, the file is read again into a clean
+//! draft; a draft edited meanwhile is kept, and its save is refused should
+//! it overwrite the hand edit (the model's check for files changed on disk).
 //!
 //! A transition's **Details** open under its row on every row, empty or
 //! not: the keys the row can't show (`target`, `run`, `ready`,
@@ -217,6 +223,9 @@ pub struct WorkflowEditor {
     /// Where a press on the canvas's background went down (a click there
     /// deselects).
     pub(super) pressed_at: Option<Pt>,
+    /// Read the file again when the window is next active (Edit YAML sent
+    /// the user to their editor).
+    reload_on_return: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -252,6 +261,11 @@ impl WorkflowEditor {
                 cx.notify();
             }
         })];
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && std::mem::take(&mut this.reload_on_return) {
+                this.read_again(window, cx);
+            }
+        }));
         let texts = [&description, &base_branch, &branch, &params, &review.serve, &review.setup, &review.ready, &review.url, &review.workdir];
         for input in texts {
             subscriptions.push(cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
@@ -282,6 +296,7 @@ impl WorkflowEditor {
             frame_anchor: Default::default(),
             canvas_focus: cx.focus_handle(),
             pressed_at: None,
+            reload_on_return: false,
             _subscriptions: subscriptions,
         };
         match config {
@@ -552,31 +567,69 @@ impl WorkflowEditor {
         let reload = self.state.as_mut().is_some_and(EditorState::discard);
         self.sync(true, window, cx);
         if reload && !cfg!(test) {
-            let project = self.project.clone();
-            let read = cx.background_executor().spawn(async move { WorkflowConfig::load(&project) });
-            cx.spawn_in(window, async move |this, cx| {
-                let config = read.await;
-                this.update_in(cx, |this, window, cx| {
-                    let Some(state) = this.state.as_mut() else {
-                        return;
-                    };
-                    match config {
-                        Ok(config) => {
-                            if state.reloaded(config) {
-                                this.sync(true, window, cx);
-                            } else {
-                                cx.emit(EditorEvent::Close);
-                            }
-                        }
-                        Err(e) => this.load_error = Some(format!("Couldn’t read the workflows: {e}")),
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+            self.read_again(window, cx);
         }
         cx.notify();
+    }
+
+    /// Read the files again into the draft, unless it holds edits (or a
+    /// save is running) by the time they're read. Closes when the workflow
+    /// is gone from them.
+    fn read_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        let read = cx.background_executor().spawn(async move { WorkflowConfig::load(&project) });
+        cx.spawn_in(window, async move |this, cx| {
+            let config = read.await;
+            this.update_in(cx, |this, window, cx| {
+                let Some(state) = this.state.as_mut() else {
+                    return;
+                };
+                if state.is_dirty() || state.busy() {
+                    return;
+                }
+                match config {
+                    Ok(config) => {
+                        if state.reloaded(config) {
+                            this.sync(true, window, cx);
+                        } else {
+                            cx.emit(EditorEvent::Close);
+                        }
+                    }
+                    Err(e) => this.load_error = Some(format!("Couldn’t read the workflows: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open the workflow's file (as saved) in the user's editor; the draft
+    /// is read again when the window comes back to the front.
+    fn edit_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let path = state.file();
+        self.reload_on_return = true;
+        let open = cx.background_executor().spawn(async move {
+            let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            if !path.exists() {
+                return Err(format!("Couldn’t find {file}."));
+            }
+            super::external_edit::open_file(&path).map_err(|e| format!("Couldn’t open {file}: {e}"))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = open.await;
+            this.update(cx, |this, cx| {
+                if let (Err(e), Some(state)) = (result, this.state.as_mut()) {
+                    state.open_failed(e);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Back (or Esc): close, asking first about unsaved edits. Esc with the
@@ -612,7 +665,7 @@ impl WorkflowEditor {
             (Some(then), Some(window)) => self.go(then, window, cx),
             (Some(Leave::Back), None) => cx.emit(EditorEvent::Close),
             (Some(Leave::ManageStatuses), None) => cx.emit(EditorEvent::ManageStatuses),
-            (Some(Leave::Duplicate), None) | (None, _) => {}
+            (Some(Leave::Duplicate | Leave::EditYaml), None) | (None, _) => {}
         }
         cx.notify();
     }
@@ -622,6 +675,7 @@ impl WorkflowEditor {
             Leave::Back => cx.emit(EditorEvent::Close),
             Leave::ManageStatuses => cx.emit(EditorEvent::ManageStatuses),
             Leave::Duplicate => self.duplicate(window, cx),
+            Leave::EditYaml => self.edit_yaml(window, cx),
         }
     }
 
@@ -1289,8 +1343,8 @@ impl WorkflowEditor {
             )
     }
 
-    /// The ⋮ menu: Duplicate, Set as default, Delete (disabled, with the
-    /// reason, for the default and the only workflow).
+    /// The ⋮ menu: Edit YAML, Duplicate, Set as default, Delete (disabled,
+    /// with the reason, for the default and the only workflow).
     fn more_items(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = *cx.global::<Theme>();
         let Some(state) = self.state.as_ref() else {
@@ -1304,6 +1358,12 @@ impl WorkflowEditor {
                 .on_click(|_, _, cx: &mut App| cx.stop_propagation()),
             None => row,
         };
+        let edit_yaml = menu_item("workflow-editor-edit-yaml", "Edit YAML", false, &theme).on_click(cx.listener(
+            |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.leave(Leave::EditYaml, Some(window), cx)
+            },
+        ));
         let duplicate = menu_item("workflow-editor-duplicate", "Duplicate", false, &theme).on_click(cx.listener(
             |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
@@ -1334,6 +1394,7 @@ impl WorkflowEditor {
             }))
         };
         vec![
+            edit_yaml.into_any_element(),
             duplicate.into_any_element(),
             default.into_any_element(),
             menu_rule(&theme).into_any_element(),

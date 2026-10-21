@@ -2065,12 +2065,10 @@ impl ShelbiWindow {
             let path = find()
                 .filter(|p| p.exists())
                 .ok_or_else(|| "Couldn't find that file to edit.".to_string())?;
-            let editor = shelbi_state::resolve_editor();
-            crate::views::external_edit::spawn(&crate::views::external_edit::launch_for(&editor, &path))?;
+            let editor = crate::views::external_edit::open_file(&path)?;
             Ok::<_, String>(format!(
-                "Opened {} in {}.",
+                "Opened {} in {editor}.",
                 path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                shelbi_state::editor_display_name(&editor)
             ))
         });
         cx.spawn(async move |this, cx| {
