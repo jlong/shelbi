@@ -59,10 +59,15 @@ const LABEL_BESIDE: f32 = 12.0;
 /// X-Small's average advance, for a label's extent (hit-testing, the
 /// frame's size); the view lays the text out itself.
 const LABEL_CHAR_W: f32 = 6.2;
-/// A connection handle: a 10pt circle centered on a node side's middle,
-/// hit within 9pt (on screen) of its center.
+/// A connection handle: a 10pt circle centered on a node side's middle
+/// (14pt under the pointer), hit within 12pt (on screen, at any zoom) of
+/// its center: a 24pt target, Apple's minimum for a pointer.
 pub const HANDLE_D: f32 = 10.0;
-const HANDLE_HIT: f32 = 9.0;
+pub const HANDLE_HOT_D: f32 = 14.0;
+pub const HANDLE_HIT: f32 = 12.0;
+/// A hovered node stays hovered this far (on screen) past its edges and its
+/// handles' hit areas, so moving out onto a handle never drops it.
+const HOVER_SLACK: f32 = 6.0;
 /// An edge is hit within 5pt (on screen) of its line.
 const EDGE_HIT: f32 = 5.0;
 
@@ -116,6 +121,11 @@ impl Rect {
 
     pub fn contains(&self, p: Pt) -> bool {
         p.x >= self.x && p.x <= self.right() && p.y >= self.y && p.y <= self.bottom()
+    }
+
+    /// This rect, `by` bigger on every side.
+    fn grown(&self, by: f32) -> Rect {
+        Rect::new(self.x - by, self.y - by, self.w + 2.0 * by, self.h + 2.0 * by)
     }
 
     /// The middle of `side`: where its handle sits and its edges meet it.
@@ -338,12 +348,33 @@ impl Graph {
         self.nodes.iter().find(|n| n.rect.contains(p))
     }
 
+    /// The node to hover with the pointer at `p`, `hovered` being hovered
+    /// now, at `zoom`: the node under `p`, else `hovered` while `p` is near
+    /// it or its handles' hit areas. A handle's dot is half outside its
+    /// node, so the node's rect alone would drop the handles as the pointer
+    /// moved onto one.
+    pub fn hover_at(&self, p: Pt, hovered: Option<&str>, zoom: f32) -> Option<&Node> {
+        if let Some(n) = self.node_at(p) {
+            return Some(n);
+        }
+        let n = self.node(hovered?)?;
+        let reach = (HANDLE_HIT + HOVER_SLACK) / zoom;
+        let near = n.rect.grown(HOVER_SLACK / zoom).contains(p) || Side::ALL.iter().any(|&s| n.rect.side(s).dist(p) <= reach);
+        near.then_some(n)
+    }
+
     /// Node `id`'s handle under `p` (handles show only on the hovered
-    /// node, so only its are hit), at `zoom`.
+    /// node, so only its are hit), the nearest if the hit areas overlap
+    /// (a small node at a low zoom), at `zoom`.
     pub fn handle_at(&self, id: &str, p: Pt, zoom: f32) -> Option<Side> {
         let rect = self.rect(id)?;
         let reach = HANDLE_HIT / zoom;
-        Side::ALL.into_iter().find(|&s| rect.side(s).dist(p) <= reach)
+        Side::ALL
+            .into_iter()
+            .map(|s| (s, rect.side(s).dist(p)))
+            .filter(|(_, d)| *d <= reach)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(s, _)| s)
     }
 
     /// The transition whose line or label is under `p`, at `zoom`.
@@ -984,9 +1015,9 @@ pub(crate) mod tests {
         let g = task();
         assert_eq!(g.node_at(Pt::new(100.0, 100.0)).map(|n| n.id.as_str()), Some("backlog"));
         assert_eq!(g.node_at(Pt::new(300.0, 300.0)), None);
-        // In Progress's bottom handle, within reach at 100% and not at 400%.
+        // In Progress's bottom handle, within reach at 100% and not at 200%.
         assert_eq!(g.handle_at("in-progress", Pt::new(160.0, 508.0), 1.0), Some(Side::Bottom));
-        assert_eq!(g.handle_at("in-progress", Pt::new(160.0, 508.0), 2.0), None, "reach is on screen");
+        assert_eq!(g.handle_at("in-progress", Pt::new(160.0, 514.0), 2.0), None, "reach is on screen");
         assert_eq!(g.handle_at("in-progress", Pt::new(160.0, 460.0), 1.0), None);
         // A line, and a label.
         assert_eq!(g.transition_at(Pt::new(348.0, 300.0), 1.0), Some(2));
@@ -996,6 +1027,62 @@ pub(crate) mod tests {
         assert_eq!(g.neighbor("in-progress", Side::Right).map(|n| n.id.as_str()), Some("review"));
         assert_eq!(g.neighbor("in-progress", Side::Top).map(|n| n.id.as_str()), Some("todo"));
         assert_eq!(g.neighbor("backlog", Side::Top), None);
+    }
+
+    #[test]
+    fn a_handle_is_a_24pt_target_at_every_zoom() {
+        let g = task();
+        // In Progress's bottom handle sits at (156, 504).
+        for zoom in [0.25, 0.5, 1.0, 2.0] {
+            // 11pt on screen out: inside; 13pt: outside. Graph units scale
+            // by the zoom, the target on screen doesn't.
+            let at = |pts: f32| Pt::new(156.0, 504.0 + pts / zoom);
+            assert_eq!(g.handle_at("in-progress", at(11.0), zoom), Some(Side::Bottom), "{zoom}");
+            assert_eq!(g.handle_at("in-progress", at(-8.0), zoom), Some(Side::Bottom), "{zoom}: its inner half");
+            assert_eq!(g.handle_at("in-progress", at(13.0), zoom), None, "{zoom}");
+        }
+        // A small node at a low zoom: the nearest side's handle, not the
+        // first one listed.
+        let small = Graph {
+            nodes: vec![Node {
+                id: "a".into(),
+                rect: Rect::new(0.0, 0.0, 40.0, 40.0),
+            }],
+            edges: vec![],
+            w: 40.0,
+            h: 40.0,
+        };
+        assert_eq!(small.handle_at("a", Pt::new(34.0, 14.0), 0.5), Some(Side::Right), "not Top");
+        assert_eq!(small.handle_at("a", Pt::new(2.0, 26.0), 0.5), Some(Side::Left), "not Bottom");
+    }
+
+    #[test]
+    fn a_hovered_node_stays_hovered_over_its_handles() {
+        let g = task();
+        let hover = |p: Pt, hovered: Option<&str>, zoom: f32| g.hover_at(p, hovered, zoom).map(|n| n.id.clone());
+        // In Progress's right side's middle is (264, 460). The handle's
+        // outer half lies past the node's edge: the node's rect alone loses
+        // the hover there.
+        let outer = Pt::new(268.0, 460.0);
+        assert_eq!(g.node_at(outer), None, "outside the rect");
+        for zoom in [0.5, 1.0, 2.0] {
+            let past = |pts: f32| Pt::new(264.0 + pts / zoom, 460.0);
+            let ip = Some("in-progress");
+            for pts in [1.0, 5.0, 12.0, 17.0] {
+                assert_eq!(hover(past(pts), ip, zoom).as_deref(), ip, "{pts}pt out at {zoom}");
+            }
+            assert_eq!(hover(past(30.0), ip, zoom), None, "well away at {zoom}");
+            // Only a hovered node keeps it: arriving from outside doesn't.
+            assert_eq!(hover(past(5.0), None, zoom), None);
+        }
+        // A little slack all round the node too, and the node under the
+        // pointer always wins.
+        assert_eq!(hover(Pt::new(100.0, 507.0), Some("in-progress"), 1.0).as_deref(), Some("in-progress"));
+        assert_eq!(hover(Pt::new(100.0, 100.0), Some("in-progress"), 1.0).as_deref(), Some("backlog"));
+        // There, the handle wins over the transition whose line starts
+        // under it (In Progress → Review); the view presses handles first.
+        assert_eq!(g.transition_at(outer, 1.0), Some(0));
+        assert_eq!(g.handle_at("in-progress", outer, 1.0), Some(Side::Right));
     }
 
     #[test]
