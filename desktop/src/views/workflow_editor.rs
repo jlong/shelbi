@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseDownEvent, ScrollHandle, SharedString, Stateful, Subscription, Window,
+    MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Stateful, Subscription, Window,
 };
 use gpui_kit::base::input::{Textarea, TextareaState};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
@@ -207,6 +207,10 @@ pub struct WorkflowEditor {
     scroll: ScrollHandle,
     /// The Builder's selection, drawing, focus and viewport.
     pub(super) builder: BuilderState,
+    /// The Builder's inspector, and the Status panel's offset kept while a
+    /// transition panel that goes back to it shows.
+    pub(super) inspector_scroll: ScrollHandle,
+    pub(super) back_scroll: Option<Point<Pixels>>,
     /// Where the Builder's canvas and its graph frame last painted.
     pub(super) canvas_anchor: style::Anchor,
     pub(super) frame_anchor: style::Anchor,
@@ -273,6 +277,8 @@ impl WorkflowEditor {
             menu_anchor: Default::default(),
             scroll: ScrollHandle::new(),
             builder: BuilderState::default(),
+            inspector_scroll: ScrollHandle::new(),
+            back_scroll: None,
             canvas_anchor: Default::default(),
             frame_anchor: Default::default(),
             canvas_focus: cx.focus_handle(),
@@ -588,15 +594,10 @@ impl WorkflowEditor {
                 cx.notify();
                 return;
             }
-            if state.mode == Mode::Builder {
-                if self.builder.drawing().is_some() || self.builder.new_transition().is_some() {
-                    state.clear_error_at(&Field::Transitions);
-                }
-                if self.builder.escape() {
-                    cx.notify();
-                    return;
-                }
-            }
+        }
+        if self.state.as_ref().is_some_and(|s| s.mode == Mode::Builder) && self.step_back() {
+            cx.notify();
+            return;
         }
         self.leave(Leave::Back, None, cx);
     }
@@ -849,6 +850,11 @@ impl WorkflowEditor {
 
     pub fn builder_focus(&self) -> Option<String> {
         self.builder.focus.clone()
+    }
+
+    /// The Builder inspector's scroll offset.
+    pub fn inspector_offset(&self) -> gpui::Point<Pixels> {
+        self.inspector_scroll.offset()
     }
 
 }

@@ -1553,6 +1553,61 @@ fn add_transition_then_a_click_picks_the_destination(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_transition_panel_goes_back_to_the_status_it_came_from(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-back", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    let editor = s.editor().unwrap();
+    let offset = |s: &Settings| s.read(|_, cx| editor.read(cx).inspector_offset());
+    s.click("builder-node-review");
+    assert!(!s.drawn("builder-inspector-back"), "a Status panel has nothing to go back to");
+    // Scrolled down a little, then into an outgoing transition.
+    let inspector = s.center("builder-inspector");
+    s.scroll(inspector, 0.0, -40.0, Modifiers::none());
+    let kept = offset(&s);
+    assert!(kept.y < px(0.0), "the Status panel scrolled");
+    s.click("builder-outgoing-1");
+    assert_eq!(s.selection(), Some(Selection::Transition { index: 1, added: false }));
+    assert_eq!(offset(&s).y, px(0.0), "the transition panel starts at the top");
+    // ← leads the heading, left of the title.
+    let back = s.bounds("builder-inspector-back").expect("the back button");
+    let title = s.bounds("builder-inspector-title").unwrap();
+    assert!(back.right() <= title.left() && back.left() < title.left());
+    assert_eq!(back.size.width, px(28.0), "the app's back button");
+    s.click("builder-inspector-back");
+    assert_eq!(s.selection(), Some(Selection::Status("review".into())));
+    assert_eq!(offset(&s), kept, "where the Status panel was");
+    assert!(!s.drawn("builder-inspector-back"));
+
+    // Esc takes the same path: the status, then nothing.
+    s.click("builder-outgoing-3");
+    s.key("escape");
+    assert_eq!(s.selection(), Some(Selection::Status("review".into())));
+    s.key("escape");
+    assert_eq!(s.selection(), None);
+
+    // Add transition: ← drops the drawing, then the new transition.
+    s.click("builder-node-todo");
+    s.click("builder-status-add-transition");
+    assert!(matches!(s.selection(), Some(Selection::Draw(_))) && s.drawn("builder-inspector-back"));
+    s.click("builder-inspector-back");
+    assert_eq!(s.selection(), Some(Selection::Status("todo".into())));
+    s.click("builder-status-add-transition");
+    s.click("builder-node-in-progress");
+    assert!(matches!(s.selection(), Some(Selection::New(_))) && s.drawn("builder-inspector-back"));
+    s.click("builder-inspector-back");
+    assert_eq!(s.selection(), Some(Selection::Status("todo".into())));
+    assert_eq!(s.draft().transitions.unwrap().len(), 4, "nothing added");
+    assert!(!s.dirty());
+
+    // A transition picked on the canvas: no ←, and Esc deselects.
+    s.click("builder-edge-label-1");
+    assert_eq!(s.selection(), Some(Selection::Transition { index: 1, added: false }));
+    assert!(!s.drawn("builder-inspector-back"));
+    s.key("escape");
+    assert_eq!(s.selection(), None);
+}
+
+#[gpui::test]
 fn a_selected_transitions_actions_reorder_change_and_delete(cx: &mut TestAppContext) {
     let _home = Home::with_project("bu-transition", "alpha");
     let mut s = Settings::open_builder(cx, "task");

@@ -11,8 +11,15 @@
 //! actions; letting go anywhere else keeps the drawing, waiting for a click
 //! on the destination (as Add transition starts it). The New transition
 //! panel's Add transition puts it in the draft and selects it, noting it
-//! was just added; Cancel drops it. Esc steps back: a drawing or a new
-//! transition goes back to its status, anything else deselects.
+//! was just added; Cancel drops it.
+//!
+//! **Back** (`dt-builder-panel-back`): a transition panel opened from a
+//! Status panel (an Outgoing transitions row, Add transition) remembers that
+//! status in [`BuilderState::back`], and its ← and Esc return to it (a
+//! pending drawing or new transition dropped). A drawing begun from a
+//! node's handle with no Status panel open goes back to the node it was
+//! drawn from. A transition selected on the canvas (its edge or label) has
+//! nothing to go back to: no ←, and Esc deselects, as it does anywhere else.
 
 use shelbi_core::{Transition, TransitionAction, Workflow};
 
@@ -81,6 +88,9 @@ pub struct BuilderState {
     pub focus: Option<String>,
     /// The canvas point a background drag last panned from.
     pub panning: Option<Pt>,
+    /// The status a transition panel goes back to (its ← and Esc); set
+    /// only while one shows.
+    pub back: Option<String>,
 }
 
 impl BuilderState {
@@ -122,14 +132,26 @@ impl BuilderState {
     pub fn select_status(&mut self, id: &str) {
         self.selection = Some(Selection::Status(id.to_string()));
         self.focus = Some(id.to_string());
+        self.back = None;
     }
 
+    /// Select transition `index` from the canvas: nothing to go back to.
     pub fn select_transition(&mut self, index: usize) {
         self.selection = Some(Selection::Transition { index, added: false });
+        self.back = None;
+    }
+
+    /// Open transition `index` from the selected status's Outgoing
+    /// transitions: Back returns to the status.
+    pub fn open_transition(&mut self, index: usize) {
+        let back = self.selected_status().map(str::to_string);
+        self.select_transition(index);
+        self.back = back;
     }
 
     pub fn deselect(&mut self) {
         self.selection = None;
+        self.back = None;
     }
 
     /// The nodes with the focus ring: the selected status, a drawing's ends,
@@ -164,8 +186,10 @@ impl BuilderState {
     // Drawing
 
     /// Start drawing from `from` (Add transition, or a handle pressed with
-    /// the pointer at `pointer`).
+    /// the pointer at `pointer`). Back returns to the selected status, else
+    /// to `from`.
     pub fn begin_draw(&mut self, from: &str, handle: Option<Side>, pointer: Option<Pt>) {
+        self.back = Some(self.selected_status().unwrap_or(from).to_string());
         self.selection = Some(Selection::Draw(Draw {
             from: from.to_string(),
             handle,
@@ -234,23 +258,23 @@ impl BuilderState {
         }
     }
 
-    /// The new transition was added to the draft at `index`.
+    /// The new transition was added to the draft at `index` (its Back still
+    /// returns to the status the drawing went back to).
     pub fn added(&mut self, index: usize) {
         self.selection = Some(Selection::Transition { index, added: true });
     }
 
-    /// Esc: a drawing or a new transition goes back to its status,
-    /// anything else deselects. `false` when nothing was selected.
+    /// Esc (or a transition panel's ←): back to the status the panel goes
+    /// back to (dropping a drawing or a new transition), else deselect.
+    /// `false` when nothing was selected.
     pub fn escape(&mut self) -> bool {
         self.panning = None;
-        match self.selection.take() {
-            None => false,
-            Some(Selection::Draw(Draw { from, .. }) | Selection::New(NewTransition { from, .. })) => {
-                self.selection = Some(Selection::Status(from));
-                true
-            }
-            Some(_) => true,
+        let back = self.back.take();
+        if self.selection.take().is_none() {
+            return false;
         }
+        self.selection = back.map(Selection::Status);
+        true
     }
 
     /// Drop what no longer exists in `workflow` (after a removal, a
@@ -267,6 +291,9 @@ impl BuilderState {
         };
         if !keep {
             self.selection = None;
+        }
+        if self.selection.is_none() || self.back.as_deref().is_some_and(|id| !has(id)) {
+            self.back = None;
         }
         if self.hover.as_deref().is_some_and(|id| !has(id)) {
             self.hover = None;
@@ -402,6 +429,83 @@ mod tests {
         assert_eq!(b.ringed(&workflow(), false), Vec::<String>::new(), "index 4 isn't in the fixture");
         b.select_transition(0);
         assert_eq!(b.ringed(&workflow(), false), ["in-progress"]);
+    }
+
+    #[test]
+    fn a_transition_opened_from_a_status_goes_back_to_it() {
+        let mut b = BuilderState::default();
+        b.select_status("review");
+        assert_eq!(b.back, None, "a Status panel has nothing to go back to");
+        b.open_transition(1);
+        assert_eq!(b.selection, Some(Selection::Transition { index: 1, added: false }));
+        assert_eq!(b.back.as_deref(), Some("review"));
+        assert!(b.escape());
+        assert_eq!(b.selected_status(), Some("review"), "back to the status");
+        assert_eq!(b.back, None);
+        assert!(b.escape());
+        assert_eq!(b.selection, None, "then nothing");
+        assert!(!b.escape());
+    }
+
+    #[test]
+    fn add_transition_goes_back_to_its_status_dropping_the_drawing() {
+        let mut b = BuilderState::default();
+        b.select_status("todo");
+        b.begin_draw("todo", None, None);
+        assert_eq!(b.back.as_deref(), Some("todo"));
+        assert!(b.escape());
+        assert_eq!(b.selected_status(), Some("todo"), "the drawing dropped");
+
+        // Through a new transition whose source moved: still back to the
+        // status it was started from.
+        b.begin_draw("todo", None, None);
+        b.set_from("in-progress");
+        assert!(b.pick("done"));
+        assert_eq!(b.back.as_deref(), Some("todo"));
+        assert!(b.escape());
+        assert_eq!(b.selected_status(), Some("todo"), "the new transition dropped");
+
+        // Once added, the transition still goes back to it.
+        b.begin_draw("todo", None, None);
+        assert!(b.pick("done"));
+        b.added(4);
+        assert_eq!(b.back.as_deref(), Some("todo"));
+        assert!(b.escape());
+        assert_eq!(b.selected_status(), Some("todo"));
+    }
+
+    #[test]
+    fn a_transition_selected_on_the_canvas_has_nothing_to_go_back_to() {
+        let mut b = BuilderState::default();
+        b.select_status("review");
+        b.select_transition(1);
+        assert_eq!(b.back, None, "an edge clicked with a status selected");
+        assert!(b.escape());
+        assert_eq!(b.selection, None, "Esc deselects");
+        // From a transition reached by its status, a click on another edge
+        // forgets the status.
+        b.select_status("review");
+        b.open_transition(1);
+        b.select_transition(3);
+        assert_eq!(b.back, None);
+        // A handle dragged with nothing open goes back to its node.
+        b.deselect();
+        b.begin_draw("done", Some(Side::Left), Some(Pt::new(0.0, 0.0)));
+        assert_eq!(b.back.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn reconcile_forgets_a_back_status_the_draft_lost() {
+        let mut w = workflow();
+        let mut b = BuilderState::default();
+        b.select_status("canceled");
+        b.open_transition(0);
+        w.statuses.retain(|s| s.id != "canceled");
+        b.reconcile(&w);
+        assert_eq!(b.selected_transition(), Some(0), "the transition stays");
+        assert_eq!(b.back, None);
+        assert!(b.escape());
+        assert_eq!(b.selection, None);
     }
 
     #[test]
