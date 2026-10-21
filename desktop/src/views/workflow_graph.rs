@@ -9,24 +9,34 @@
 //!
 //! **Layout** follows the Workflow Builder frame (2305:10965): the statuses
 //! still in flight (backlog, ready and active categories) run down the left
-//! column in workflow order; the rest go right. Archived statuses stack from
+//! column; the rest go right. Archived statuses stack from
 //! the top of the right column, handoff and done statuses from the row of
 //! the last left status (Review beside In Progress, Done under it). A row
 //! whose node has a transition straight down to the next row's gets the
 //! taller gap (Review to Done, room for its label). Positions are always
 //! worked out; nothing stores them.
 //!
+//! **Order down a column** (`dt-builder-catalog-order`): by category first
+//! (Backlog, Ready, Active on the left; Archived, Handoff, Done on the
+//! right), then by the project's catalog (`statuses.yaml`) within a
+//! category. The workflow's own `statuses:` list doesn't count, so every
+//! workflow draws its statuses the same way up (Review above Done even where
+//! a workflow lists `done` first) and reordering the catalog in Settings
+//! re-lays every workflow. [`layout`] ranks the categories, keeping the
+//! order it is given within one; [`Graph::of`] gives it the catalog's.
+//!
 //! **Edges** are orthogonal polylines between node sides. A straight run
 //! when the nodes share a row or column and nothing is in the way, else the
 //! first of an L (vertical first, then horizontal first) or a Z (through the
 //! gap between the columns, then between the rows) that crosses no other
-//! node, else a bracket around the side. Status order edges join
-//! consecutive statuses where neither is terminal and no transition already
-//! does. A transition's label sits over its longest segment: above a
+//! node, else a bracket around the side. Status order edges join the
+//! statuses that aren't terminal, each to the next in the columns' order
+//! (the left column's, then the right's handoffs), where no transition
+//! already does. A transition's label sits over its longest segment: above a
 //! horizontal one on a line of its own (`Push branch · Open PR`), beside a
 //! vertical one an action per line.
 
-use shelbi_core::{StatusCategory, Transition, Workflow};
+use shelbi_core::{ProjectStatus, StatusCategory, Transition, Workflow};
 
 use super::workflow_editor_state::action_label;
 
@@ -315,9 +325,11 @@ pub struct Graph {
 }
 
 impl Graph {
-    /// `workflow`'s graph.
-    pub fn of(workflow: &Workflow) -> Graph {
-        let nodes: Vec<NodeSpec> = workflow
+    /// `workflow`'s graph, each category's statuses in `catalog`'s order
+    /// (the project's `statuses.yaml`). A status the catalog has lost goes
+    /// after the rest of its category, in workflow order.
+    pub fn of(workflow: &Workflow, catalog: &[ProjectStatus]) -> Graph {
+        let mut nodes: Vec<NodeSpec> = workflow
             .statuses
             .iter()
             .map(|s| NodeSpec {
@@ -325,6 +337,7 @@ impl Graph {
                 category: s.category,
             })
             .collect();
+        nodes.sort_by_key(|n| catalog.iter().position(|s| s.id == n.id).unwrap_or(usize::MAX));
         let edges: Vec<EdgeSpec> = workflow.transitions.as_deref().unwrap_or(&[]).iter().map(EdgeSpec::of).collect();
         layout(&nodes, &edges)
     }
@@ -431,18 +444,35 @@ impl Graph {
     }
 }
 
-/// Lay `nodes` and `edges` out (see the module docs).
+/// A category's place down its column: in flight on the left, then the
+/// right's archived, handoff and done statuses.
+fn rank(category: StatusCategory) -> usize {
+    match category {
+        StatusCategory::Backlog => 0,
+        StatusCategory::Ready => 1,
+        StatusCategory::Active => 2,
+        StatusCategory::Archived => 3,
+        StatusCategory::Handoff => 4,
+        StatusCategory::Done => 5,
+    }
+}
+
+/// Lay `nodes` and `edges` out (see the module docs): by category, then in
+/// `nodes`' order within one.
 pub fn layout(nodes: &[NodeSpec], edges: &[EdgeSpec]) -> Graph {
+    let mut nodes: Vec<&NodeSpec> = nodes.iter().collect();
+    nodes.sort_by_key(|n| rank(n.category));
     let in_flight = |c: StatusCategory| matches!(c, StatusCategory::Backlog | StatusCategory::Ready | StatusCategory::Active);
-    let left: Vec<&NodeSpec> = nodes.iter().filter(|n| in_flight(n.category)).collect();
-    let archived: Vec<&NodeSpec> = nodes.iter().filter(|n| n.category == StatusCategory::Archived).collect();
+    let left: Vec<&NodeSpec> = nodes.iter().copied().filter(|n| in_flight(n.category)).collect();
+    let archived: Vec<&NodeSpec> = nodes.iter().copied().filter(|n| n.category == StatusCategory::Archived).collect();
     let after: Vec<&NodeSpec> = nodes
         .iter()
+        .copied()
         .filter(|n| matches!(n.category, StatusCategory::Handoff | StatusCategory::Done))
         .collect();
     let first_after = left.len().saturating_sub(1).max(archived.len());
 
-    // (column, row) per node, in workflow order.
+    // (column, row) per node, in the order given.
     let mut cells: Vec<(&NodeSpec, usize, usize)> = Vec::new();
     cells.extend(left.iter().enumerate().map(|(r, n)| (*n, 0, r)));
     cells.extend(archived.iter().enumerate().map(|(r, n)| (*n, 1, r)));
@@ -483,12 +513,14 @@ pub fn layout(nodes: &[NodeSpec], edges: &[EdgeSpec]) -> Graph {
         positioned.iter().filter(|n| n.id != a && n.id != b).map(|n| n.rect).collect()
     };
     let mut out = Vec::new();
-    // Status order: consecutive statuses, neither terminal, no transition
-    // between them already.
+    // Status order: each status that isn't terminal to the next, no
+    // transition between them already. (The archived ones sort between the
+    // left column and the handoffs; skipping them joins the two.)
     let terminal = |c: StatusCategory| matches!(c, StatusCategory::Done | StatusCategory::Archived);
-    for pair in nodes.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        if terminal(a.category) || terminal(b.category) || linked(&a.id, &b.id) {
+    let flow: Vec<&NodeSpec> = nodes.iter().copied().filter(|n| !terminal(n.category)).collect();
+    for pair in flow.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if linked(&a.id, &b.id) {
             continue;
         }
         let (Some(s), Some(t)) = (rect(&a.id), rect(&b.id)) else {
@@ -922,6 +954,91 @@ pub(crate) mod tests {
         assert_eq!(order, [("backlog", "todo"), ("todo", "in-progress")]);
         let e = &g.edges[0];
         assert_eq!(e.points, [Pt::new(156.0, 152.0), Pt::new(156.0, 240.0)], "the frame's 152..240 run");
+    }
+
+    /// The fixture's Task as loaded, and its project's catalog.
+    fn loaded(tag: &str) -> (Workflow, Vec<ProjectStatus>) {
+        use crate::views::workflows_state::tests::{Home, PROJECT};
+        let _home = Home::new(tag);
+        let config = shelbi_state::workflow_config::WorkflowConfig::load(PROJECT).unwrap();
+        (config.workflow("task").unwrap().clone(), config.statuses().to_vec())
+    }
+
+    fn order_dashes(g: &Graph) -> Vec<(&str, &str)> {
+        g.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Order)
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect()
+    }
+
+    /// `catalog` rearranged into `ids`' order.
+    fn reordered(catalog: &[ProjectStatus], ids: &[&str]) -> Vec<ProjectStatus> {
+        ids.iter().map(|id| catalog.iter().find(|s| s.id == *id).unwrap().clone()).collect()
+    }
+
+    /// Task with a second handoff status, QA, listed last, and the catalog
+    /// with it after Review.
+    fn with_qa(tag: &str) -> (Workflow, Vec<ProjectStatus>) {
+        let (mut workflow, mut catalog) = loaded(tag);
+        let mut qa = workflow.status("review").unwrap().clone();
+        qa.id = "qa".into();
+        workflow.statuses.push(qa);
+        let mut qa = catalog.iter().find(|s| s.id == "review").unwrap().clone();
+        qa.id = "qa".into();
+        catalog.insert(4, qa);
+        (workflow, catalog)
+    }
+
+    #[test]
+    fn the_workflows_own_list_order_moves_nothing() {
+        let (workflow, catalog) = loaded("graph-list-order");
+        assert_eq!(Graph::of(&workflow, &catalog), task());
+
+        // Listed backwards, Done before Review: Review still above Done.
+        let mut listed = workflow.clone();
+        listed.statuses.reverse();
+        let g = Graph::of(&listed, &catalog);
+        assert_eq!(g, task());
+        assert_eq!(at(&g, "review"), (432.0, 416.0));
+        assert_eq!(at(&g, "done"), (432.0, 624.0));
+        assert_eq!(order_dashes(&g), [("backlog", "todo"), ("todo", "in-progress")]);
+    }
+
+    #[test]
+    fn categories_rank_before_the_catalogs_order() {
+        // The catalog backwards: each column still runs Backlog, Ready,
+        // Active, and Archived, Handoff, Done.
+        let (workflow, catalog) = loaded("graph-category-rank");
+        let backwards = reordered(&catalog, &["canceled", "done", "review", "in-progress", "todo", "backlog"]);
+        assert_eq!(Graph::of(&workflow, &backwards), task());
+    }
+
+    #[test]
+    fn the_catalog_orders_statuses_within_a_category() {
+        let (workflow, catalog) = with_qa("graph-catalog-order");
+        let g = Graph::of(&workflow, &catalog);
+        assert_eq!(at(&g, "review"), (432.0, 416.0), "beside the last status in flight");
+        assert_eq!(at(&g, "qa"), (432.0, 592.0), "the catalog's next, the plain gap");
+        assert_eq!(at(&g, "done"), (432.0, 768.0), "done after every handoff");
+        assert_eq!(at(&g, "canceled"), (432.0, 64.0), "archived at the top");
+        // The dashes run the same way, past Canceled to the handoffs (In
+        // Progress to Review is a transition).
+        assert_eq!(order_dashes(&g), [("backlog", "todo"), ("todo", "in-progress"), ("review", "qa")]);
+
+        // QA moved above Review in the catalog.
+        let moved = reordered(&catalog, &["backlog", "todo", "in-progress", "qa", "review", "done", "canceled"]);
+        let g = Graph::of(&workflow, &moved);
+        assert_eq!(at(&g, "qa"), (432.0, 416.0));
+        assert_eq!(at(&g, "review"), (432.0, 592.0));
+        assert_eq!(at(&g, "done"), (432.0, 800.0), "under Review, the labeled gap");
+        assert_eq!(order_dashes(&g), [("backlog", "todo"), ("todo", "in-progress"), ("in-progress", "qa"), ("qa", "review")]);
+
+        // A status the catalog has lost goes after the rest of its category.
+        let lost: Vec<ProjectStatus> = moved.into_iter().filter(|s| s.id != "qa").collect();
+        let g = Graph::of(&workflow, &lost);
+        assert_eq!(at(&g, "review"), (432.0, 416.0));
+        assert_eq!(at(&g, "qa"), (432.0, 592.0));
     }
 
     #[test]

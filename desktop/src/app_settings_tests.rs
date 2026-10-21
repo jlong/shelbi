@@ -1574,6 +1574,43 @@ fn the_builder_draws_the_workflows_statuses_and_transitions(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn the_builder_lays_statuses_out_in_the_catalogs_order(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-catalog", "alpha");
+    let mut s = Settings::open_workflows(cx);
+    let page = s.workflows();
+    let nodes = |s: &mut Settings| {
+        ["backlog", "todo", "in-progress", "review", "done", "canceled"].map(|id| {
+            let selector: &'static str = Box::leak(format!("builder-node-{id}").into_boxed_str());
+            s.bounds(selector).unwrap()
+        })
+    };
+    // Review made a Done status: within the category, the catalog's order,
+    // Review beside In Progress and Done under it.
+    s.click("status-category-review");
+    s.click("status-category-review-done");
+    s.saved();
+    s.click("workflow-edit-task");
+    let [_, _, ip, review, done, _] = nodes(&mut s);
+    assert_eq!((review.top(), done.left()), (ip.top(), review.left()));
+    assert_eq!(done.top() - review.bottom(), px(120.0), "Done under Review");
+
+    // Done moved above Review in the catalog: the Builder re-lays.
+    s.click("workflow-editor-back");
+    s.update(|_, window, cx| page.update(cx, |p, cx| p.drop_on("done", "review", window, cx)));
+    s.saved();
+    s.click("workflow-edit-task");
+    let [_, _, ip, review, done, _] = nodes(&mut s);
+    assert_eq!((done.top(), review.left()), (ip.top(), done.left()));
+    assert_eq!(review.top() - done.bottom(), px(120.0), "Review under Done");
+
+    // The workflow's own list order moves nothing.
+    let before = nodes(&mut s);
+    s.edit(|e, window, cx| e.make(Change::MoveStatus { id: "backlog".into(), index: 5 }, window, cx));
+    assert_eq!(s.draft().statuses.last().map(|st| st.id.as_str()), Some("backlog"));
+    assert_eq!(nodes(&mut s), before);
+}
+
+#[gpui::test]
 fn selecting_a_status_edits_it_in_the_inspector_and_the_form_sees_it(cx: &mut TestAppContext) {
     let _home = Home::with_project("bu-status", "alpha");
     let mut s = Settings::open_builder(cx, "task");

@@ -465,6 +465,11 @@ impl EditorState {
         self.draft.workflow(&self.name).expect("the edited workflow is in its model")
     }
 
+    /// The draft's status catalog (`statuses.yaml`), in its order.
+    pub fn catalog(&self) -> &[ProjectStatus] {
+        self.draft.statuses()
+    }
+
     pub fn set_project_git(&mut self, git: ProjectGit) {
         self.project_git = git;
     }

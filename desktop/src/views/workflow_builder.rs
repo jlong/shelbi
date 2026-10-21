@@ -134,7 +134,7 @@ impl WorkflowEditor {
 
     /// The draft's graph.
     pub(super) fn graph(&self) -> Option<Graph> {
-        self.state.as_ref().map(|s| Graph::of(s.workflow()))
+        self.state.as_ref().map(|s| Graph::of(s.workflow(), s.catalog()))
     }
 
     /// Window point `p` in graph coordinates.
