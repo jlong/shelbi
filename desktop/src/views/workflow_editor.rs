@@ -48,6 +48,7 @@ use super::workflow_editor_state::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, Change, DetailsForm, EditorState,
     Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ACTIONS, STRATEGIES,
 };
+use super::sidebar;
 use super::workflow_builder_state::BuilderState;
 use super::workflow_graph::Pt;
 use super::workflows_state::category_label;
@@ -57,11 +58,9 @@ use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, ButtonKind, Type, Typography};
 use crate::theme::Theme;
 
-/// The titlebar row (the Header component): 52pt, the traffic lights' room
-/// at its left.
+/// The titlebar row (the Header component): 52pt, its content starting
+/// beside the traffic lights ([`sidebar::BESIDE_TRAFFIC_LIGHTS`]).
 const TITLEBAR_H: f32 = 52.0;
-const TRAFFIC_LIGHTS_W: f32 = 60.0;
-const TRAFFIC_LIGHTS_H: f32 = 38.0;
 /// The Header's toolbar buttons (Back, ⋮).
 const TOOLBAR_BUTTON: f32 = 32.0;
 /// The form's inset in the window and the gap between its sections.
@@ -1245,10 +1244,10 @@ impl WorkflowEditor {
             .flex_none()
             .items_center()
             .gap(px(8.0))
-            .px(px(12.0))
+            .pl(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
+            .pr(px(12.0))
             .h(px(TITLEBAR_H))
             .bg(theme.toolbar)
-            .child(div().flex_none().w(px(TRAFFIC_LIGHTS_W)).h(px(TRAFFIC_LIGHTS_H)))
             .child(
                 div()
                     .flex()

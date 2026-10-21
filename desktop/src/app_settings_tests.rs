@@ -1078,7 +1078,14 @@ fn the_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext) {
     let titlebar = s.bounds("workflow-editor-titlebar").unwrap();
     assert_eq!((titlebar.top(), titlebar.size.height), (px(0.0), px(52.0)), "the window's top row");
     let back = s.bounds("workflow-editor-back").unwrap();
-    assert_eq!(back.left(), px(80.0), "after the traffic lights' room");
+    assert_eq!(back.left(), px(sidebar::BESIDE_TRAFFIC_LIGHTS), "beside the traffic lights");
+    assert!(
+        f32::from(back.left()) - sidebar::TRAFFIC_LIGHTS_RIGHT >= 12.0,
+        "a clear gap from the zoom button: {:?}",
+        back.left()
+    );
+    let middle = back.top() + back.size.height / 2.0;
+    assert_eq!(middle, px(sidebar::TITLEBAR_H / 2.0), "centered on the traffic lights");
     assert!(s.drawn("workflow-editor-default-badge"), "Task is the default");
     assert!(s.drawn("workflow-editor-save") && !s.drawn("workflow-editor-discard"), "nothing to discard yet");
     assert!(s.drawn("workflow-form") && s.drawn("workflow-statuses-table"));

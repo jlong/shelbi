@@ -11,6 +11,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, ClipboardItem, IntoElement, SharedString,
 };
 
+use super::sidebar;
 use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
 use crate::platform::version::{ProtocolCheck, VersionCheck};
@@ -473,7 +474,11 @@ pub fn render_relaunch_bar(
         .items_center()
         .justify_between()
         .gap_4()
-        .px_4()
+        // The window's top row, under the traffic lights: its content starts
+        // beside them and centers on them.
+        .min_h(px(sidebar::TITLEBAR_H))
+        .pl(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
+        .pr_4()
         .py_2()
         .bg(theme.notice)
         .border_b_1()
