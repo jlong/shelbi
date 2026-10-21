@@ -399,7 +399,6 @@ heroicons! {
         PENCIL_BUTTON = "pencil";
         PLUS_BUTTON = "plus";
         X_MARK_BUTTON = "x-mark";
-        CHEVRON_UP_DOWN_BUTTON = "chevron-up-down";
     }
     @close {
         X_MARK_CLOSE = "x-mark";

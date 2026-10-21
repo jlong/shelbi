@@ -25,6 +25,12 @@
 //! hovered, and it stays hovered while the pointer is over its handles,
 //! whose dots sit half outside it ([`Graph::hover_at`]); the handle under
 //! the pointer is [`BuilderState::hot`].
+//!
+//! **Action rows** (`dt-builder-action-drag`): the Transition and New
+//! transition panels list their actions in the same row, reordered the way
+//! the Statuses tables reorder statuses: drag a row's handle onto another
+//! row and it takes that row's place ([`action_drop`]). With the handle
+//! focused (a click focuses it), ⌥↑ and ⌥↓ step it ([`action_step`]).
 
 use shelbi_core::{Transition, TransitionAction, Workflow};
 
@@ -80,6 +86,45 @@ pub enum Selection {
 pub enum Removal {
     Status(String),
     Transition(usize),
+}
+
+/// The inspector list an action row belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionList {
+    /// The New transition panel's (not yet in the draft).
+    New,
+    /// Transition `.0`'s, in the draft.
+    Transition(usize),
+}
+
+/// Action `from` of `list` dropped on row `onto` of `onto_list`, among
+/// `len`: the move, `(from, to)`. The dragged action takes the row's place,
+/// as a status dropped on a Statuses table row does. A drop on its own row,
+/// from another list or past the end moves nothing.
+pub fn action_drop(list: ActionList, from: usize, onto_list: ActionList, onto: usize, len: usize) -> Option<(usize, usize)> {
+    (list == onto_list && from != onto && from < len && onto < len).then_some((from, onto))
+}
+
+/// ⌥↑ (`earlier`) or ⌥↓ on action `slot` of `len`: where it goes, `None`
+/// at that end.
+pub fn action_step(slot: usize, len: usize, earlier: bool) -> Option<usize> {
+    if slot >= len {
+        return None;
+    }
+    if earlier {
+        slot.checked_sub(1)
+    } else {
+        (slot + 1 < len).then_some(slot + 1)
+    }
+}
+
+/// Move action `from` to `to` (both in range), the others closing up
+/// behind it.
+pub fn move_action(actions: &mut Vec<TransitionAction>, from: usize, to: usize) {
+    if from < actions.len() && to < actions.len() {
+        let a = actions.remove(from);
+        actions.insert(to, a);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -401,6 +446,37 @@ mod tests {
         let _home = Home::new("builder-state");
         let config = shelbi_state::workflow_config::WorkflowConfig::load(PROJECT).unwrap();
         config.workflow("task").unwrap().clone()
+    }
+
+    #[test]
+    fn an_action_dropped_on_a_row_takes_its_place() {
+        use TransitionAction::*;
+        let list = ActionList::Transition(1);
+        let moved = |from, onto| {
+            let mut actions = vec![PushBranch, OpenPr, Merge];
+            if let Some((from, to)) = action_drop(list, from, list, onto, actions.len()) {
+                move_action(&mut actions, from, to);
+            }
+            actions
+        };
+        assert_eq!(moved(0, 2), [OpenPr, Merge, PushBranch], "first to last");
+        assert_eq!(moved(2, 0), [Merge, PushBranch, OpenPr], "last to first");
+        assert_eq!(moved(1, 2), [PushBranch, Merge, OpenPr], "one later");
+        assert_eq!(action_drop(list, 1, list, 1, 3), None, "a drop in place");
+        assert_eq!(moved(1, 1), [PushBranch, OpenPr, Merge]);
+        assert_eq!(action_drop(list, 0, ActionList::New, 1, 3), None, "another list");
+        assert_eq!(action_drop(list, 0, ActionList::Transition(2), 1, 3), None, "another transition");
+        assert_eq!(action_drop(list, 3, list, 0, 3), None, "a stale row");
+    }
+
+    #[test]
+    fn option_arrows_step_an_action_to_either_end() {
+        assert_eq!(action_step(1, 3, true), Some(0));
+        assert_eq!(action_step(1, 3, false), Some(2));
+        assert_eq!(action_step(0, 3, true), None, "already first");
+        assert_eq!(action_step(2, 3, false), None, "already last");
+        assert_eq!(action_step(0, 1, false), None, "the only one");
+        assert_eq!(action_step(3, 3, true), None, "a stale row");
     }
 
     #[test]

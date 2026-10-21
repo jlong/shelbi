@@ -40,7 +40,8 @@
 //! conflict, search, picker and customized states; `state-workflow-form-*`:
 //! the workflow editor edited, its leave prompt, and its form's foot;
 //! `state-workflow-builder-*`: the Builder fitted, zoomed out with the
-//! keyboard's focus ring, a hot handle, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
+//! keyboard's focus ring, a hot handle, an action row dragged and its
+//! handle focused, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs).
@@ -1116,12 +1117,14 @@ impl Run {
     /// `6-new-transition.png`, `7-transition-added.png`), and the states no
     /// frame draws (`state-workflow-builder-*`, checked by eye): a
     /// transition opened from its status (its back button), a hovered handle
-    /// past its node's edge, fitted, zoomed
+    /// past its node's edge, an action row dragged and its handle focused,
+    /// fitted, zoomed
     /// out with the keyboard's focus ring, and a 20-status, 40-transition
     /// workflow.
     fn workflow_builder(&mut self) {
         use crate::views::workflow_builder_state::{NewTransition, Selection};
         use crate::views::workflow_graph::{Graph, Pt, Side};
+        use gpui::{point, Modifiers, MouseButton};
         use shelbi_core::TransitionAction::{Merge, PushBranch};
 
         let handle = self.open_workflow_editor("task");
@@ -1181,6 +1184,36 @@ impl Run {
             .unwrap();
         self.expect("settings-workflow-builder-added: the transition is in the draft", added);
         self.save(handle, "settings-workflow-builder-added");
+
+        // New transition's first action row (its handle at frame 6's
+        // 1123,426) dragged over the second (y 462): the ghost at the
+        // pointer, the row under it highlighted; and its handle clicked, the
+        // focus ring on it (⌥↑ / ⌥↓ step it).
+        let first = point(px(1123.0), px(426.0));
+        let second = point(px(1123.0), px(462.0));
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            e.builder_mut().selection = Some(Selection::New(new()));
+            cx.notify();
+        });
+        self.cx.simulate_mouse_move(handle.into(), first, None, Modifiers::none());
+        self.cx.simulate_mouse_down(handle.into(), first, MouseButton::Left, Modifiers::none());
+        self.cx.simulate_mouse_move(handle.into(), point(first.x, first.y + px(6.0)), Some(MouseButton::Left), Modifiers::none());
+        self.cx.simulate_mouse_move(handle.into(), second, Some(MouseButton::Left), Modifiers::none());
+        self.settle(handle);
+        self.save(handle, "state-workflow-builder-action-drag");
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            e.builder_mut().selection = Some(Selection::New(new()));
+            cx.notify();
+        });
+        self.cx.simulate_mouse_move(handle.into(), first, None, Modifiers::none());
+        self.cx.simulate_mouse_down(handle.into(), first, MouseButton::Left, Modifiers::none());
+        self.cx.simulate_mouse_up(handle.into(), first, MouseButton::Left, Modifiers::none());
+        // Off the row, so the focus ring shows without the hover.
+        self.cx.simulate_mouse_move(handle.into(), point(px(700.0), px(950.0)), None, Modifiers::none());
+        self.settle(handle);
+        self.save(handle, "state-workflow-builder-action-focused");
 
         // Review's Done transition, opened from its status: the back button.
         let handle = self.open_workflow_editor("task");
