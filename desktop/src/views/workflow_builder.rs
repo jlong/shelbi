@@ -38,6 +38,7 @@ use gpui::{
 };
 use shelbi_core::{Owner, StatusCategory, TransitionAction, WorkflowStatus};
 
+use super::task_panel;
 use super::workflow_builder_state::{Removal, Selection};
 use super::workflow_editor::{Menu, WorkflowEditor};
 use super::workflow_editor_state::{action_label, owner_label, Change, EditorState, Field, ACTIONS};
@@ -172,6 +173,7 @@ impl WorkflowEditor {
         let drawing = self.builder.drawing().is_some();
         if let Some(hovered) = self.builder.hover.clone() {
             if let Some(side) = g.handle_at(&hovered, p, z) {
+                self.keep_status_scroll();
                 self.builder.begin_draw(&hovered, Some(side), Some(p));
                 return;
             }
@@ -375,9 +377,49 @@ impl WorkflowEditor {
             .or_else(|| self.builder.focus.clone())
             .or_else(|| self.state.as_ref().and_then(|s| s.workflow().statuses.first().map(|s| s.id.clone())));
         if let Some(from) = from {
+            self.keep_status_scroll();
             self.builder.begin_draw(&from, None, None);
         }
         cx.notify();
+    }
+
+    /// An Outgoing transitions row: open its transition, Back returning to
+    /// the status.
+    pub(super) fn open_transition(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.keep_status_scroll();
+        self.builder.open_transition(index);
+        cx.notify();
+    }
+
+    /// Leaving the inspector's panel for a transition panel: a Status
+    /// panel's scroll offset is kept for Back, and the new panel starts at
+    /// the top.
+    fn keep_status_scroll(&mut self) {
+        self.back_scroll = self.builder.selected_status().map(|_| self.inspector_scroll.offset());
+        if self.back_scroll.is_some() {
+            self.inspector_scroll.set_offset(Point::default());
+        }
+    }
+
+    /// Esc, or a transition panel's ←: back to the status it came from
+    /// (dropping a pending drawing or new transition, and restoring the
+    /// Status panel's scroll), else deselect. `false` when nothing was
+    /// selected.
+    pub(super) fn step_back(&mut self) -> bool {
+        if self.builder.drawing().is_some() || self.builder.new_transition().is_some() {
+            if let Some(state) = self.state.as_mut() {
+                state.clear_error_at(&Field::Transitions);
+            }
+        }
+        let back = self.builder.back.is_some();
+        if !self.builder.escape() {
+            return false;
+        }
+        if let Some(offset) = self.back_scroll.take().filter(|_| back) {
+            self.inspector_scroll.set_offset(offset);
+        }
+        true
     }
 
     /// New transition's Add transition: into the draft, then selected.
@@ -396,10 +438,7 @@ impl WorkflowEditor {
 
     fn cancel_new(&mut self, cx: &mut Context<Self>) {
         self.menu = None;
-        if let Some(state) = self.state.as_mut() {
-            state.clear_error_at(&Field::Transitions);
-        }
-        self.builder.escape();
+        self.step_back();
         cx.notify();
     }
 
@@ -1032,7 +1071,8 @@ fn status_icon(category: StatusCategory, theme: &Theme) -> Div {
 impl WorkflowEditor {
     fn render_inspector(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         // The status inspector centers its heading on the close button;
-        // the transition inspectors set it at the top.
+        // the transition inspectors set it at the top, unless a back button
+        // (taller than the close) leads it.
         let centered = matches!(self.builder.selection, Some(Selection::Status(_)));
         let (title, body): (&'static str, Vec<AnyElement>) = match self.builder.selection.clone() {
             Some(Selection::Status(id)) => ("Status", self.status_panel(&id, theme, window, cx)),
@@ -1051,6 +1091,17 @@ impl WorkflowEditor {
                 this.builder.deselect();
                 cx.notify();
             }));
+        // A transition panel opened from a status goes back to it.
+        let back = self.builder.back.as_deref().zip(self.state.as_ref()).map(|(id, state)| {
+            task_panel::back_button("builder-inspector-back", false, theme)
+                .tooltip(style::tooltip(format!("Back to {}", status_name(state, id))))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.menu = None;
+                    this.step_back();
+                    cx.notify();
+                }))
+        });
+        let centered = centered || back.is_some();
         div()
             .id("builder-inspector")
             .debug_selector(|| "builder-inspector".into())
@@ -1066,6 +1117,7 @@ impl WorkflowEditor {
             .border_color(theme.divider)
             .bg(theme.search)
             .overflow_y_scroll()
+            .track_scroll(&self.inspector_scroll)
             .child(
                 div()
                     .flex()
@@ -1075,6 +1127,7 @@ impl WorkflowEditor {
                     .when(!centered, |d| d.items_start())
                     .gap(px(8.0))
                     .w_full()
+                    .children(back)
                     .child(
                         div()
                             .debug_selector(|| "builder-inspector-title".into())
@@ -1250,10 +1303,7 @@ impl WorkflowEditor {
                 };
                 small_button(format!("builder-outgoing-{i}"), None, label, ButtonKind::Secondary, theme)
                     .w_full()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.builder.select_transition(i);
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_transition(i, cx)))
                     .into_any_element()
             })
             .collect();

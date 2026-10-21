@@ -1114,9 +1114,10 @@ impl Run {
     /// Workflow Builder frame's state (references `workflows/2-builder.png`,
     /// `3-builder-status-selected.png`, `5-drawing-transition.png`,
     /// `6-new-transition.png`, `7-transition-added.png`), and the states no
-    /// frame draws (`state-workflow-builder-*`, checked by eye): fitted,
-    /// zoomed out with the keyboard's focus ring, and a 20-status,
-    /// 40-transition workflow.
+    /// frame draws (`state-workflow-builder-*`, checked by eye): a
+    /// transition opened from its status (its back button), fitted, zoomed
+    /// out with the keyboard's focus ring, and a 20-status, 40-transition
+    /// workflow.
     fn workflow_builder(&mut self) {
         use crate::views::workflow_builder_state::{NewTransition, Selection};
         use crate::views::workflow_graph::{Graph, Side};
@@ -1178,6 +1179,16 @@ impl Run {
             .unwrap();
         self.expect("settings-workflow-builder-added: the transition is in the draft", added);
         self.save(handle, "settings-workflow-builder-added");
+
+        // Review's Done transition, opened from its status: the back button.
+        let handle = self.open_workflow_editor("task");
+        self.edit_workflow(handle, &|e, _, cx| {
+            let b = e.builder_mut();
+            b.select_status("review");
+            b.open_transition(1);
+            cx.notify();
+        });
+        self.save(handle, "state-workflow-builder-back");
 
         // Fit, and 50% with the keyboard on Review.
         let handle = self.open_workflow_editor("task");

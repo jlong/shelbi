@@ -48,7 +48,9 @@ focuses it): Tab and shift-Tab step through the statuses in order, the arrow
 keys go to the nearest node that way, Enter selects (or picks the
 destination while drawing), Delete or Backspace removes the selected status
 (not the last one) or transition, and Esc steps back: a drawing or a new
-transition to its status, a selection to nothing, then the editor's Back.
+transition to its status, a selection to nothing, then the editor's Back
+(a transition panel opened from a status goes back to it, with a ← for it:
+`dt-builder-panel-back`).
 
 **Inspector** (320pt, from the frames):
 - *Status*: the Status picker, Category, Owner, Agent, Workspace tags (the
