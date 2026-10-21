@@ -141,6 +141,23 @@ pub fn spawn(launch: &Launch) -> Result<Option<std::process::Child>, String> {
     }
 }
 
+/// Open `path` in the user's editor ([`shelbi_state::resolve_editor`]),
+/// the launch every Edit YAML and `edit:*` share. Hands back the editor's
+/// name. A test opens nothing: it records the path ([`tests::opened`]).
+pub fn open_file(path: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    {
+        tests::OPENED.lock().unwrap().push(path.to_path_buf());
+        Ok("the test editor".into())
+    }
+    #[cfg(not(test))]
+    {
+        let editor = shelbi_state::resolve_editor();
+        spawn(&launch_for(&editor, path))?;
+        Ok(shelbi_state::editor_display_name(&editor))
+    }
+}
+
 /// The AppleScript string literal for `s`.
 fn applescript_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -226,8 +243,17 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The files [`open_file`] was asked to open, every test's (each
+    /// checks for its own home's paths).
+    pub(crate) static OPENED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// How many times [`open_file`] has opened `path`.
+    pub(crate) fn opened(path: &Path) -> usize {
+        OPENED.lock().unwrap().iter().filter(|p| *p == path).count()
+    }
 
     #[test]
     fn gui_editors_spawn_directly_and_terminal_editors_get_a_terminal() {

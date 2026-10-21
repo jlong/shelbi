@@ -1001,6 +1001,75 @@ fn workflow_actions_create_duplicate_default_and_guard_delete(cx: &mut TestAppCo
     assert!(!home.workflows().join("hotfix.yaml").exists());
 }
 
+// ---- Edit YAML in the ⋮ menus (`dt-workflow-edit-yaml`) ---------------------
+
+use crate::views::external_edit::tests::opened;
+
+impl Settings {
+    /// Another app takes the front (the user's editor), then this window
+    /// comes back.
+    fn come_back(&mut self) {
+        self.h.cx.deactivate_window();
+        self.h.cx.update(|window, _| window.activate_window());
+        self.saved();
+    }
+
+    /// Whether `first`'s item sits above `second`'s in the open menu.
+    fn above(&mut self, first: &'static str, second: &'static str) -> bool {
+        self.bounds(first).unwrap().bottom() <= self.bounds(second).unwrap().top()
+    }
+
+    fn page_description(&self, name: &str) -> Option<String> {
+        let page = self.workflows();
+        self.read(|_, cx| {
+            let w = page.read(cx).state().workflows().into_iter().find(|w| w.name == name);
+            w.and_then(|w| w.description)
+        })
+    }
+}
+
+#[gpui::test]
+fn edit_yaml_on_a_workflow_row_opens_its_file_and_the_page_rereads_it(cx: &mut TestAppContext) {
+    let home = Home::with_project("page-edit-yaml", "alpha");
+    let file = home.workflows().join("task.yaml");
+    let mut s = Settings::open_workflows(cx);
+    s.click("workflow-more-task");
+    assert!(s.above("workflow-edit-yaml-task", "workflow-duplicate-task"), "Edit YAML comes first");
+    s.click("workflow-edit-yaml-task");
+    s.saved();
+    assert_eq!(opened(&file), 1, "the workflow's file, in the editor");
+    assert!(!s.drawn("workflow-menu"), "the menu closes");
+    assert!(s.edited().is_empty(), "the workflow editor stays shut");
+
+    // The hand edit shows once the window is back in front.
+    let edited = home.read("task.yaml").replace("Branch work with a review gate.", "Edited by hand.");
+    std::fs::write(&file, edited).unwrap();
+    assert_eq!(s.page_description("task").as_deref(), Some("Branch work with a review gate."));
+    s.come_back();
+    assert_eq!(s.page_description("task").as_deref(), Some("Edited by hand."));
+}
+
+#[gpui::test]
+fn a_broken_workflow_file_still_offers_edit_yaml(cx: &mut TestAppContext) {
+    let home = Home::with_project("page-broken-yaml", "alpha");
+    let file = home.workflows().join("broken.yaml");
+    std::fs::write(&file, "name: broken\nstatuses: [\n").unwrap();
+    let mut s = Settings::open_workflows(cx);
+    assert!(s.drawn("workflow-row-broken") && s.drawn("workflow-more-broken"));
+    s.click("workflow-more-broken");
+    assert!(s.drawn("workflow-edit-yaml-broken"));
+    assert!(!s.drawn("workflow-duplicate-broken") && !s.drawn("workflow-delete-broken"), "Edit YAML only");
+    s.click("workflow-edit-yaml-broken");
+    s.saved();
+    assert_eq!(opened(&file), 1);
+
+    // Fixed by hand: back in front, it's a workflow like the others.
+    std::fs::write(&file, crate::views::workflows_state::fixture::SUBTASK.replace("name: subtask", "name: broken")).unwrap();
+    s.come_back();
+    assert!(s.page_description("broken").is_some(), "the fixed file reads as a workflow");
+    assert!(s.drawn("workflow-edit-broken"), "and can be edited here");
+}
+
 // ---- The workflow editor (`dt-wf-editor-form`) ------------------------------
 
 use crate::views::workflow_editor::WorkflowEditor;
@@ -1051,6 +1120,12 @@ impl Settings {
     fn title(&mut self) -> String {
         let editor = self.editor().expect("the editor is open");
         self.read(|_, cx| editor.read(cx).state().map(|s| s.name().to_string()).unwrap_or_default())
+    }
+
+    /// The draft's description.
+    fn draft_description(&self) -> Option<String> {
+        let editor = self.editor().expect("the editor is open");
+        self.read(|_, cx| editor.read(cx).state().and_then(|s| s.workflow().description.clone()))
     }
 
     /// Type `text` into `input` as the user would: the field focused and
@@ -1305,6 +1380,91 @@ fn manage_project_statuses_returns_to_the_page(cx: &mut TestAppContext) {
     s.saved();
     assert!(!s.drawn("workflow-editor") && s.drawn("statuses-table") && s.drawn("column-settings"));
     assert_eq!(s.page(), Some(SettingsPage::Workflows));
+}
+
+#[gpui::test]
+fn edit_yaml_in_the_editor_asks_about_unsaved_edits_first(cx: &mut TestAppContext) {
+    let home = Home::with_project("ed-edit-yaml", "alpha");
+    let file = home.workflows().join("subtask.yaml");
+    let before = home.read("subtask.yaml");
+    let mut s = Settings::open_editor(cx, "subtask");
+    s.click("workflow-editor-more");
+    assert!(s.above("workflow-editor-edit-yaml", "workflow-editor-duplicate"), "Edit YAML comes first");
+
+    // Nothing unsaved: it opens at once.
+    s.click("workflow-editor-edit-yaml");
+    s.saved();
+    assert_eq!(opened(&file), 1);
+    assert!(!s.drawn("workflow-leave-prompt") && !s.drawn("workflow-editor-menu"));
+
+    // Unsaved edits: it asks. Cancel opens nothing and keeps them.
+    s.edit(|e, window, cx| e.make(Change::InitialStatus("todo".into()), window, cx));
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-edit-yaml");
+    assert!(s.drawn("workflow-leave-prompt"));
+    s.click("workflow-leave-cancel");
+    s.saved();
+    assert_eq!(opened(&file), 1);
+    assert!(s.dirty() && s.drawn("workflow-editor"));
+
+    // Discard reverts, then opens.
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-edit-yaml");
+    s.click("workflow-leave-discard");
+    s.saved();
+    assert_eq!(opened(&file), 2);
+    assert!(!s.dirty() && s.drawn("workflow-editor"), "still editing, the draft clean");
+    assert_eq!(home.read("subtask.yaml"), before);
+
+    // Save writes, then opens.
+    s.edit(|e, window, cx| e.make(Change::InitialStatus("todo".into()), window, cx));
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-edit-yaml");
+    s.click("workflow-leave-save");
+    s.saved();
+    assert_eq!(opened(&file), 3);
+    assert_eq!(on_disk("subtask").initial_status.as_deref(), Some("todo"));
+    assert!(!s.dirty() && s.drawn("workflow-editor"));
+}
+
+#[gpui::test]
+fn the_editor_rereads_a_clean_draft_on_return_and_keeps_a_dirty_one(cx: &mut TestAppContext) {
+    let home = Home::with_project("ed-yaml-return", "alpha");
+    let file = home.workflows().join("subtask.yaml");
+    let original = "Focused work that merges back into a parent task.";
+    let hand_edit = |text: &str| {
+        let edited = home.read("subtask.yaml").replace(original, text);
+        std::fs::write(&file, edited).unwrap();
+    };
+    let mut s = Settings::open_editor(cx, "subtask");
+    let description = |s: &Settings| s.draft_description();
+
+    // A clean draft takes the hand edit once the window is back in front.
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-edit-yaml");
+    s.saved();
+    hand_edit("Edited by hand.");
+    assert_eq!(description(&s).as_deref(), Some(original), "not before");
+    s.come_back();
+    assert_eq!(description(&s).as_deref(), Some("Edited by hand."));
+    assert!(!s.dirty());
+    assert_eq!(opened(&file), 1);
+
+    // A draft edited meanwhile is kept, and its save won't overwrite a
+    // second hand edit.
+    s.click("workflow-editor-more");
+    s.click("workflow-editor-edit-yaml");
+    s.saved();
+    s.edit(|e, window, cx| e.make(Change::InitialStatus("todo".into()), window, cx));
+    let edited = home.read("subtask.yaml").replace("Edited by hand.", "Edited twice.");
+    std::fs::write(&file, &edited).unwrap();
+    s.come_back();
+    assert!(s.dirty(), "the draft is kept");
+    assert_eq!(description(&s).as_deref(), Some("Edited by hand."));
+    s.click("workflow-editor-save");
+    s.saved();
+    assert!(s.error_at(Field::Save).unwrap().starts_with("Changed on disk"));
+    assert_eq!(home.read("subtask.yaml"), edited, "the hand edit stands");
 }
 
 #[gpui::test]
