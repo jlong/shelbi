@@ -200,7 +200,8 @@ pub fn run(args: &[String]) -> ! {
         .handle
         .update(&mut b.cx, |w, _, cx| {
             let editor = w.offscreen_settings().and_then(|s| s.read(cx).editor()).expect("the editor shows");
-            Graph::of(editor.read(cx).state().expect("loaded").workflow())
+            let s = editor.read(cx).state().expect("loaded");
+            Graph::of(s.workflow(), s.catalog())
         })
         .unwrap();
     let mut sweeps: Vec<(&str, Vec<Duration>)> = Vec::new();

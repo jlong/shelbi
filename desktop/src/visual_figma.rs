@@ -1141,7 +1141,8 @@ impl Run {
         // Dragging from In Progress's bottom handle, over Done's left side.
         let handle = self.open_workflow_editor("task");
         self.edit_workflow(handle, &|e, _, cx| {
-            let g = Graph::of(e.state().expect("loaded").workflow());
+            let s = e.state().expect("loaded");
+            let g = Graph::of(s.workflow(), s.catalog());
             let from = g.rect("in-progress").unwrap().side(Side::Bottom);
             let to = g.rect("done").unwrap().side(Side::Left);
             let b = e.builder_mut();
@@ -1195,7 +1196,8 @@ impl Run {
         // the handles still show, that one hot.
         let handle = self.open_workflow_editor("task");
         self.edit_workflow(handle, &|e, _, cx| {
-            let g = Graph::of(e.state().expect("loaded").workflow());
+            let s = e.state().expect("loaded");
+            let g = Graph::of(s.workflow(), s.catalog());
             let side = g.rect("in-progress").unwrap().side(Side::Right);
             let b = e.builder_mut();
             b.hover = Some("in-progress".into());
