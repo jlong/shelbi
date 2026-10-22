@@ -8,9 +8,9 @@
 //! section (General, Keybindings, Terminal), then, after a divider, the
 //! project section (`dt-wf-settings-index`, frame 2301:5824): the project
 //! switcher, the same trigger and menu as the app sidebar's (switching
-//! reopens Settings on the new project), over the project's pages. Only
-//! Workflows exists; the frame's Workspaces, Agents and Integrations join
-//! [`SECTIONS`] with their pages. No footer: the frame draws no Zen pill and
+//! reopens Settings on the new project), over the project's pages: Workflows
+//! and Agents (`dt-agents-settings-page`, frame 2377:41040). The frames'
+//! Workspaces and Integrations join [`SECTIONS`] with their pages. No footer: the frame draws no Zen pill and
 //! no settings gear.
 //!
 //! [`SettingsNav`] is the toolkit-free part: the page shown and the row the
@@ -47,6 +47,8 @@ pub enum SettingsPage {
     Terminal,
     /// The project's workflows and status catalog.
     Workflows,
+    /// The project's agents and their shared instructions.
+    Agents,
 }
 
 impl SettingsPage {
@@ -56,6 +58,7 @@ impl SettingsPage {
             SettingsPage::Keybindings => "Keybindings",
             SettingsPage::Terminal => "Terminal",
             SettingsPage::Workflows => "Workflows",
+            SettingsPage::Agents => "Agents",
         }
     }
 
@@ -65,17 +68,20 @@ impl SettingsPage {
             SettingsPage::Keybindings => icons::KEYBOARD_KEY,
             SettingsPage::Terminal => icons::COMMAND_LINE,
             SettingsPage::Workflows => icons::VIEW_COLUMNS,
+            SettingsPage::Agents => icons::RECTANGLE_STACK,
         }
     }
 
     /// Its ⌘N while Settings is open. Fixed per page rather than counted:
-    /// the frame numbers Workflows 4 (and gives Workspaces Terminal's 3).
+    /// the frames number Workflows 4 and Agents 6 (and give Workspaces
+    /// Terminal's 3; 5 is left to whichever page takes it).
     pub fn shortcut(self) -> u8 {
         match self {
             SettingsPage::General => 1,
             SettingsPage::Keybindings => 2,
             SettingsPage::Terminal => 3,
             SettingsPage::Workflows => 4,
+            SettingsPage::Agents => 6,
         }
     }
 
@@ -91,6 +97,7 @@ impl SettingsPage {
             SettingsPage::Keybindings => "settings-nav-keybindings",
             SettingsPage::Terminal => "settings-nav-terminal",
             SettingsPage::Workflows => "settings-nav-workflows",
+            SettingsPage::Agents => "settings-nav-agents",
         }
     }
 }
@@ -124,7 +131,7 @@ pub const SECTIONS: &[Section] = &[
     },
     Section {
         header: Header::Project,
-        pages: &[SettingsPage::Workflows],
+        pages: &[SettingsPage::Workflows, SettingsPage::Agents],
     },
 ];
 
@@ -406,19 +413,21 @@ mod tests {
                 SettingsPage::General,
                 SettingsPage::Keybindings,
                 SettingsPage::Terminal,
-                SettingsPage::Workflows
+                SettingsPage::Workflows,
+                SettingsPage::Agents
             ]
         );
         assert_eq!(
             all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(),
-            [1, 2, 3, 4]
+            [1, 2, 3, 4, 6]
         );
         assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
         assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
         assert_eq!(SettingsPage::for_shortcut(5), None);
+        assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
         assert_eq!(
             SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 1)]
+            [(Header::Title("Global"), 3), (Header::Project, 2)]
         );
     }
 
@@ -431,19 +440,19 @@ mod tests {
         );
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        for _ in 0..4 {
+        for _ in 0..5 {
             nav.step(true);
         }
         assert_eq!(
             nav.selected(),
-            SettingsPage::Workflows,
+            SettingsPage::Agents,
             "crosses into the project section and stops at the bottom"
         );
         assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
         assert!(nav.activate());
         assert_eq!(
             (nav.page(), nav.selected()),
-            (SettingsPage::Workflows, SettingsPage::Workflows)
+            (SettingsPage::Agents, SettingsPage::Agents)
         );
         assert!(!nav.activate(), "already shown");
     }

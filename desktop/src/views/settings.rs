@@ -39,7 +39,9 @@
 //! saved through `shelbi_state::workflow_config`. A workflow opened from it
 //! shows in its editor ([`WorkflowEditor`]), which takes the whole view (the
 //! window hides the settings sidebar while it shows) until it closes back
-//! onto the page.
+//! onto the page. The Agents page ([`AgentsPage`]) lists the project's
+//! agents and edits their shared instructions, through
+//! `shelbi_state::agents_config`.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -58,6 +60,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 use shelbi_term::render::Rgb as TermRgb;
 
+use super::agents::{AgentsEvent, AgentsPage};
 use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::settings_nav::SettingsPage;
@@ -271,6 +274,12 @@ pub enum SettingsEvent {
     EditWorkflow(String),
     /// The workflow editor closed: the settings sidebar comes back.
     EditorClosed,
+    /// Open agent `name`'s details (Settings ▸ Agents' edit button, a row's
+    /// click, an agent just created).
+    EditAgent(String),
+    /// Show `page`, as its row in the settings sidebar does (a link on
+    /// another page).
+    ShowPage(SettingsPage),
 }
 
 /// The settings view.
@@ -309,6 +318,8 @@ pub struct SettingsView {
     workflows: Entity<WorkflowsPage>,
     /// The workflow editor, while a workflow is open in it.
     editor: Option<(Entity<WorkflowEditor>, Subscription)>,
+    /// The project's Agents page.
+    agents: Entity<AgentsPage>,
     /// The page's scroll, and whether to bring the Workflows page's
     /// Statuses into view once it has drawn (the editor's Manage project
     /// statuses).
@@ -335,6 +346,7 @@ impl SettingsView {
         });
         let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
         let workflows = cx.new(|cx| WorkflowsPage::new(project, window, cx));
+        let agents = cx.new(|cx| AgentsPage::new(project, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -358,6 +370,10 @@ impl SettingsView {
             }),
             cx.subscribe(&workflows, |_, _, event: &WorkflowsEvent, cx| match event {
                 WorkflowsEvent::Edit(name) => cx.emit(SettingsEvent::EditWorkflow(name.clone())),
+            }),
+            cx.subscribe(&agents, |_, _, event: &AgentsEvent, cx| match event {
+                AgentsEvent::Edit(name) => cx.emit(SettingsEvent::EditAgent(name.clone())),
+                AgentsEvent::ShowWorkflows => cx.emit(SettingsEvent::ShowPage(SettingsPage::Workflows)),
             }),
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -411,6 +427,7 @@ impl SettingsView {
             keybindings,
             workflows,
             editor: None,
+            agents,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
             loaded: false,
@@ -484,6 +501,12 @@ impl SettingsView {
     #[cfg(test)]
     pub(crate) fn workflows(&self) -> Entity<WorkflowsPage> {
         self.workflows.clone()
+    }
+
+    /// The Agents page's view.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub(crate) fn agents(&self) -> Entity<AgentsPage> {
+        self.agents.clone()
     }
 
     /// Open workflow `name` in the editor, over the Workflows page's model
@@ -560,8 +583,10 @@ impl SettingsView {
             // A capture on a page out of sight would take its keys.
             self.keybindings.update(cx, |p, cx| p.cancel_capture(cx));
             // The files may have been edited by hand (Edit YAML) since.
-            if page == SettingsPage::Workflows {
-                self.workflows.update(cx, |p, _| p.reload_when_drawn());
+            match page {
+                SettingsPage::Workflows => self.workflows.update(cx, |p, _| p.reload_when_drawn()),
+                SettingsPage::Agents => self.agents.update(cx, |p, _| p.reload_when_drawn()),
+                _ => {}
             }
             self.page = page;
             cx.notify();
@@ -1167,6 +1192,8 @@ impl Render for SettingsView {
             SettingsPage::Keybindings => page.overflow_hidden().child(self.keybindings.clone()),
             // The Workflows frame (2301:5824): the page scrolls.
             SettingsPage::Workflows => page.child(self.workflows.clone()),
+            // The Agents frame (2377:41040): the page scrolls.
+            SettingsPage::Agents => page.child(self.agents.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -1227,7 +1254,7 @@ impl Render for SettingsView {
             ),
         };
         // `config.yaml`'s save line belongs to the pages that write it.
-        let status = status.filter(|_| !matches!(shown, SettingsPage::Keybindings | SettingsPage::Workflows));
+        let status = status.filter(|_| !matches!(shown, SettingsPage::Keybindings | SettingsPage::Workflows | SettingsPage::Agents));
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
             .into_any_element()
     }
@@ -1433,6 +1460,7 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Keybindings => "settings-page-keybindings",
         SettingsPage::Terminal => "settings-page-terminal",
         SettingsPage::Workflows => "settings-page-workflows",
+        SettingsPage::Agents => "settings-page-agents",
     }
 }
 

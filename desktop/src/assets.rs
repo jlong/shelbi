@@ -371,8 +371,8 @@ heroicons! {
     /// 20pt.
     #[allow(dead_code)]
     ELLIPSIS_VERTICAL = "ellipsis-vertical";
-    /// The drawing `PENCIL_BUTTON` widens; no view draws it at 20pt.
-    #[allow(dead_code)]
+    /// Settings ▸ Agents' Edit instructions (`PENCIL_BUTTON` is its
+    /// widened drawing for the 24pt row buttons).
     PENCIL = "pencil";
     @figma {
         TOGGLE_OFF = "toggle-off";

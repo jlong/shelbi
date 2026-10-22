@@ -1,13 +1,14 @@
 //! Settings in its own sidebar (`dt-settings-sections`): opening it pushes
 //! the settings sidebar into the leading column on the General page (or the
-//! last page used), ⌘1 to ⌘4 and ↑ / ↓ plus Enter switch its pages while it
+//! last page used), ⌘1 to ⌘4 and ⌘6 and ↑ / ↓ plus Enter switch its pages while it
 //! is open (and ⌘N keeps its sidebar meaning outside), and Back or Esc
 //! return to the view it was opened over with the app sidebar back and its
 //! selection on that view's row (`dt-back-syncs-sidebar`).
 //!
 //! The window is the smoke test's headless one ([`Harness`]) with an
 //! injected clock for the push. The settings view reads no disk under test,
-//! except the Workflows tests, which read a throwaway `SHELBI_HOME`.
+//! except the Workflows and Agents tests, which read a throwaway
+//! `SHELBI_HOME`.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -230,13 +231,15 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
         "it crosses into the project section"
     );
     s.key("down");
+    s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Workflows),
+        Some(SettingsPage::Agents),
         "it stops at the last row"
     );
     s.key("enter");
-    assert_eq!(s.page(), Some(SettingsPage::Workflows));
+    assert_eq!(s.page(), Some(SettingsPage::Agents));
+    s.key("up");
     s.key("up");
     s.key("enter");
     assert_eq!(
@@ -2156,4 +2159,208 @@ fn twenty_statuses_and_forty_transitions_draw_in_a_frame(cx: &mut TestAppContext
     // Switching views keeps the draft as it is.
     s.edit(|e, window, cx| e.show_mode(Mode::Form, window, cx));
     assert!(s.drawn("workflow-form"));
+}
+
+// ---- Settings ▸ Agents (`dt-agents-settings-page`) ---------------------------
+
+use crate::views::agents::AgentsPage;
+use shelbi_state::agents_config::AgentsConfig;
+
+impl Settings {
+    /// Settings on Agents (⌘6), its page loaded from the test's home.
+    fn open_agents(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("cmd-6");
+        let page = s.agents();
+        s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+        s.settle();
+        s
+    }
+
+    fn agents(&self) -> Entity<AgentsPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).agents(),
+            _ => panic!("Settings is open"),
+        })
+    }
+
+    fn edited_agents(&self) -> Vec<String> {
+        self.read(|w, _| w.edited_agents.clone())
+    }
+
+    /// The page's agents, by name.
+    fn agent_names(&self) -> Vec<String> {
+        let page = self.agents();
+        self.read(|_, cx| page.read(cx).state().agents().into_iter().map(|a| a.name).collect())
+    }
+}
+
+fn agents_dir(home: &Home) -> std::path::PathBuf {
+    home.root.join("projects").join("alpha").join("agents")
+}
+
+#[gpui::test]
+fn the_agents_page_lists_the_projects_agents(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("page-rows", "alpha");
+    let mut s = Settings::open_agents(cx);
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Agents), Some(SettingsPage::Agents)));
+    let workflows = s.bounds("settings-nav-workflows").unwrap();
+    assert!(workflows.bottom() <= s.bounds("settings-nav-agents").unwrap().top(), "after Workflows");
+
+    assert_eq!(s.agent_names(), ["orchestrator", "developer", "review", "qa", "security", "adversarial"]);
+    for selector in [
+        "agent-row-orchestrator",
+        "agent-row-developer",
+        "agent-row-adversarial",
+        "agent-customized-orchestrator",
+        "agent-customized-review",
+        "agent-recommended-developer",
+        "agent-status-orchestrator-backlog",
+        "agent-status-orchestrator-todo",
+        "agent-status-developer-in-progress",
+        "agent-status-review-review",
+        "agents-shared-preview",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    assert!(!s.drawn("agent-customized-developer"), "still the shipped default");
+    let badge = s.bounds("agent-customized-orchestrator").unwrap();
+    assert!(s.bounds("agent-row-orchestrator").unwrap().contains(&badge.center()));
+
+    // The footnote's link goes to Workflows, sidebar and all.
+    s.click("agents-workflows-link");
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
+}
+
+#[gpui::test]
+fn the_edit_button_and_a_row_click_open_the_agent(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("page-edit", "alpha");
+    let mut s = Settings::open_agents(cx);
+    s.click("agent-edit-developer");
+    s.click("agent-row-qa");
+    s.saved();
+    assert_eq!(s.edited_agents(), ["developer", "qa"]);
+    // Until the details page lands, its `agent.yaml` opens in the editor.
+    assert_eq!(opened(&agents_dir(&home).join("qa").join("agent.yaml")), 1);
+}
+
+#[gpui::test]
+fn a_new_agent_is_created_and_opened(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("page-new", "alpha");
+    let mut s = Settings::open_agents(cx);
+    s.click("agents-new");
+    assert!(s.drawn("agent-new-name"));
+    let draft = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).agents().read(cx).draft_input(),
+        _ => unreachable!(),
+    });
+    s.enter_text(draft.clone(), "developer");
+    assert!(s.drawn("agent-new-error"), "a taken name stays on the new row");
+    s.enter_text(draft, "docs");
+    assert!(agents_dir(&home).join("docs").join("agent.yaml").exists());
+    assert!(!s.drawn("agent-new-name"), "the new row closes");
+    assert!(s.drawn("agent-row-docs"));
+    assert_eq!(s.edited_agents(), ["docs"], "it opens once created");
+}
+
+#[gpui::test]
+fn the_menu_duplicates_resets_and_deletes_with_their_guards(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("page-menu", "alpha");
+    let dir = agents_dir(&home);
+    let mut s = Settings::open_agents(cx);
+
+    // A shipped agent can't be deleted, and one still the default can't be
+    // reset: both items are inert.
+    s.click("agent-more-developer");
+    assert!(s.above("agent-edit-yaml-developer", "agent-duplicate-developer"), "Edit YAML comes first");
+    s.click("agent-reset-developer");
+    s.click("agent-delete-developer");
+    assert!(!s.drawn("agent-confirm"), "nothing to confirm");
+    // Duplicate types the copy's name into the new row.
+    s.click("agent-duplicate-developer");
+    let draft = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).agents().read(cx).draft_input(),
+        _ => unreachable!(),
+    });
+    assert_eq!(s.read(|_, cx| draft.read(cx).value().to_string()), "developer-copy");
+    s.h.key("enter");
+    s.saved();
+    assert!(dir.join("developer-copy").join("instructions.md").exists());
+    assert!(s.drawn("agent-row-developer-copy"));
+
+    // A customized shipped agent resets, once confirmed.
+    s.click("agent-more-orchestrator");
+    s.click("agent-reset-orchestrator");
+    assert!(s.drawn("agent-confirm"));
+    s.click("agent-confirm-cancel");
+    assert!(!s.drawn("agent-confirm"));
+    assert!(s.drawn("agent-customized-orchestrator"));
+    s.click("agent-more-orchestrator");
+    s.click("agent-reset-orchestrator");
+    s.click("agent-confirm-reset");
+    s.saved();
+    assert!(!std::fs::read_to_string(dir.join("orchestrator/instructions.md")).unwrap().contains("release notes"));
+    assert!(!s.drawn("agent-customized-orchestrator"), "the badge goes");
+
+    // The user's own agent deletes, once confirmed.
+    s.click("agent-more-developer-copy");
+    s.click("agent-delete-developer-copy");
+    s.click("agent-confirm-delete");
+    s.saved();
+    assert!(!dir.join("developer-copy").exists());
+    assert!(!s.drawn("agent-row-developer-copy"));
+}
+
+#[gpui::test]
+fn edit_yaml_on_an_agent_opens_its_manifest_and_the_page_rereads_it(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("page-edit-yaml", "alpha");
+    let file = agents_dir(&home).join("security").join("agent.yaml");
+    let mut s = Settings::open_agents(cx);
+    s.click("agent-more-security");
+    s.click("agent-edit-yaml-security");
+    s.saved();
+    assert_eq!(opened(&file), 1);
+    assert!(!s.drawn("agent-menu"), "the menu closes");
+    assert!(s.edited_agents().is_empty());
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, text.replace("Reviews a diff for defensive security issues", "Edited by hand")).unwrap();
+    s.come_back();
+    let page = s.agents();
+    let description = s.read(|_, cx| {
+        page.read(cx).state().agents().into_iter().find(|a| a.name == "security").and_then(|a| a.description)
+    });
+    assert_eq!(description.as_deref(), Some("Edited by hand"));
+    assert!(s.drawn("agent-customized-security"), "a hand edit customizes it");
+}
+
+#[gpui::test]
+fn edit_instructions_edits_and_saves_the_shared_instructions(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("page-shared", "alpha");
+    let path = agents_dir(&home).join("_shared").join("preamble.md");
+    let mut s = Settings::open_agents(cx);
+    s.click("agents-edit-instructions");
+    assert!(s.drawn("agents-shared-editor") && !s.drawn("agents-shared-preview"));
+    assert!(!s.drawn("agents-edit-instructions"), "Cancel and Save stand in its place");
+    let header = s.bounds("agents-shared-save").unwrap();
+    assert!(header.bottom() <= s.bounds("agents-shared-editor").unwrap().top(), "above the text area");
+    let page = s.agents();
+    let input = s.read(|_, cx| page.read(cx).shared_input().unwrap());
+    assert_eq!(s.read(|_, cx| input.read(cx).value().to_string()), crate::views::agents_state::fixture::PREAMBLE);
+
+    // Cancel keeps the file.
+    s.update(|_, window, cx| input.update(cx, |t, cx| t.set_value("Thrown away.", window, cx)));
+    s.click("agents-shared-cancel");
+    assert!(s.drawn("agents-shared-preview"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), crate::views::agents_state::fixture::PREAMBLE);
+
+    s.click("agents-edit-instructions");
+    let input = s.read(|_, cx| page.read(cx).shared_input().unwrap());
+    s.update(|_, window, cx| input.update(cx, |t, cx| t.set_value("## Ground rules\n\nBe kind.\n", window, cx)));
+    s.click("agents-shared-save");
+    s.saved();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "## Ground rules\n\nBe kind.\n");
+    assert!(s.drawn("agents-shared-preview"), "back to the preview");
+    assert_eq!(AgentsConfig::load("alpha").unwrap().shared_instructions(), "## Ground rules\n\nBe kind.\n");
 }
