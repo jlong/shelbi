@@ -24,7 +24,8 @@
 //! `workflows/1-index.png`, settings-workflow-builder{,-status,-drawing,
 //! -new,-added} against `workflows/2-builder.png`, `3-…`, `5-…`, `6-…` and
 //! `7-…`, and settings-workflow-form against
-//! `workflows/4-workflow-form.png` in the frame's 1440x1283 window) and
+//! `workflows/4-workflow-form.png` in the frame's 1440x1283 window,
+//! settings-agents against `agents/1-agents-index.png`) and
 //! command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
@@ -39,6 +40,8 @@
 //! a focused textbox; `state-keybindings-*`: the bindings editor's capture,
 //! conflict, search, picker and customized states; `state-workflow-form-*`:
 //! the workflow editor edited, its leave prompt, and its form's foot;
+//! `state-agents-*`: an agent's ⋮ menu, a reset waiting to be confirmed,
+//! and the shared instructions' editor;
 //! `state-workflow-builder-*`: the Builder fitted, zoomed out with the
 //! keyboard's focus ring, a hot handle, an action row dragged and its
 //! handle focused, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
@@ -1018,6 +1021,7 @@ impl Run {
             .unwrap();
         self.save(handle, "state-settings-cli-focused");
         self.settings_workflows();
+        self.settings_agents();
         self.keybindings_states();
         self.components();
     }
@@ -1043,6 +1047,68 @@ impl Run {
         self.save(handle, "settings-workflows");
         self.workflow_builder();
         self.workflow_form();
+        let _ = std::fs::remove_dir_all(&workflows);
+        if !had_agents {
+            let _ = std::fs::remove_dir_all(&agents);
+        }
+    }
+
+    /// Settings ▸ Agents (the Agents frame, 2377:41040, reference
+    /// `agents/1-agents-index.png`) over the frame's agents
+    /// (`agents_state::fixture`: the shipped six, the orchestrator and the
+    /// review agent customized, the Workflows fixture assigning them), and
+    /// its states no frame draws (`state-agents-*`, checked by eye): the
+    /// orchestrator's ⋮ menu (Delete disabled, Reset offered), a delete
+    /// waiting to be confirmed, and the shared instructions' editor. Written
+    /// for these screens only.
+    fn settings_agents(&mut self) {
+        use crate::views::agents_state::Confirm;
+        use crate::views::settings_nav::SettingsPage;
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        let project_dir = workflows.parent().expect("the project directory").to_path_buf();
+        let agents = project_dir.join("agents");
+        let had_agents = agents.exists();
+        crate::views::agents_state::fixture::write(&project_dir, PROJECT);
+        let open = |run: &mut Self| {
+            let handle = run.open();
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Agents, window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle
+        };
+        let page = |run: &mut Self, handle: WindowHandle<ShelbiWindow>| {
+            handle
+                .update(&mut run.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).agents()))
+                .unwrap()
+                .expect("Settings is open")
+        };
+        let handle = open(self);
+        let loaded = page(self, handle).read_with(&self.cx, |p, _| p.state().agents().len());
+        self.expect("settings-agents: the six shipped agents", loaded == 6);
+        self.save(handle, "settings-agents");
+
+        let handle = open(self);
+        let agents_page = page(self, handle);
+        agents_page.update(&mut self.cx, |p, cx| p.offscreen_open_menu("orchestrator", cx));
+        self.save(handle, "state-agents-menu");
+
+        let handle = open(self);
+        let agents_page = page(self, handle);
+        agents_page.update(&mut self.cx, |p, cx| {
+            p.offscreen_ask(Confirm::Reset("orchestrator".into()), cx)
+        });
+        self.save(handle, "state-agents-confirm");
+
+        let handle = open(self);
+        let agents_page = page(self, handle);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                agents_page.update(cx, |p, cx| p.offscreen_edit_shared(window, cx))
+            })
+            .unwrap();
+        self.save(handle, "state-agents-shared-editor");
+
         let _ = std::fs::remove_dir_all(&workflows);
         if !had_agents {
             let _ = std::fs::remove_dir_all(&agents);

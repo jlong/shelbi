@@ -61,13 +61,13 @@ const IDENTITY_W: f32 = 280.0;
 const ID_W: f32 = 200.0;
 const CATEGORY_W: f32 = 200.0;
 /// A row's 24pt icon buttons (edit, ⋮, delete).
-const ROW_BUTTON: f32 = 24.0;
+pub(super) const ROW_BUTTON: f32 = 24.0;
 /// The status icon's frame.
 const STATUS_ICON_BOX: f32 = 20.0;
 /// The ⋮ menu's and the category picker's widths.
 const MENU_W: f32 = 200.0;
 /// A menu's gap under its button.
-const MENU_GAP: f32 = 6.0;
+pub(super) const MENU_GAP: f32 = 6.0;
 
 /// What the page tells the settings view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,7 +450,7 @@ impl EventEmitter<WorkflowsEvent> for WorkflowsPage {}
 
 /// A section's header (`Header`, 2301:5824): the title and its buttons, the
 /// helper under them.
-fn section_header(title: &'static str, help: &'static str, buttons: Vec<AnyElement>, theme: &Theme) -> Div {
+pub(super) fn section_header(title: &'static str, help: &'static str, buttons: Vec<AnyElement>, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_col()
@@ -480,7 +480,7 @@ fn section_header(title: &'static str, help: &'static str, buttons: Vec<AnyEleme
 /// A bordered table (`Workflow index`, `Table`): its column headings, a
 /// rule, then its rows. The Settings frames' edge is the form controls'
 /// (`input_border`); the rule under the headings is the stronger divider.
-fn table(headings: Div, rows: Vec<AnyElement>, theme: &Theme) -> Div {
+pub(super) fn table(headings: Div, rows: Vec<AnyElement>, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_col()
@@ -495,7 +495,7 @@ fn table(headings: Div, rows: Vec<AnyElement>, theme: &Theme) -> Div {
 
 /// A header's button (the Button component at Small with a left icon, as
 /// `style::small_icon_button` draws it), its icon in the frame's gray.
-fn header_button(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) -> Stateful<Div> {
+pub(super) fn header_button(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) -> Stateful<Div> {
     style::button_base(id, ButtonKind::Secondary, false, theme)
         .h(px(28.0))
         .gap(px(4.0))
@@ -505,7 +505,7 @@ fn header_button(id: &'static str, icon: Icon, label: &'static str, theme: &Them
 
 /// A row's 24pt icon button (`Delete status`): `icon` (18pt) on the
 /// overlay fill, 6pt corners; `inert` dims it and drops the pointer.
-fn row_button(id: impl Into<SharedString>, icon: Icon, inert: bool, theme: &Theme) -> Stateful<Div> {
+pub(super) fn row_button(id: impl Into<SharedString>, icon: Icon, inert: bool, theme: &Theme) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
     let d = div()
@@ -533,7 +533,7 @@ fn row_button(id: impl Into<SharedString>, icon: Icon, inert: bool, theme: &Them
 }
 
 /// An error line under the row it's about.
-fn row_error(selector: String, text: &str, theme: &Theme) -> Div {
+pub(super) fn row_error(selector: String, text: &str, theme: &Theme) -> Div {
     div()
         .debug_selector(move || selector.clone())
         .px(px(12.0))
@@ -544,7 +544,7 @@ fn row_error(selector: String, text: &str, theme: &Theme) -> Div {
 }
 
 /// A popup menu's panel (the caller floats it under its button).
-fn popup(id: &'static str, theme: &Theme) -> Stateful<Div> {
+pub(super) fn popup(id: &'static str, theme: &Theme) -> Stateful<Div> {
     style::popover(
         div()
             .id(id)

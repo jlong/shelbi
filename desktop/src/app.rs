@@ -720,6 +720,9 @@ pub struct ShelbiWindow {
     /// The workflows a test's window was asked to open the editor of.
     #[cfg(test)]
     edited_workflows: Vec<String>,
+    /// The agents a test's window was asked to open the details of.
+    #[cfg(test)]
+    edited_agents: Vec<String>,
     /// The shell has been drawn at least once (gpui has a frame to answer
     /// action-availability questions from).
     drawn_once: bool,
@@ -923,6 +926,8 @@ impl ShelbiWindow {
             _view_subscriptions: Vec::new(),
             #[cfg(test)]
             edited_workflows: Vec::new(),
+            #[cfg(test)]
+            edited_agents: Vec::new(),
             drawn_once: false,
             #[cfg(any(test, feature = "visual-check"))]
             tap: None,
@@ -2052,6 +2057,16 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Open agent `name`'s details (Settings ▸ Agents' edit button, a row's
+    /// click, an agent just created). Until the details page lands
+    /// (`dt-agent-details`), its `agent.yaml` opens in the user's editor.
+    fn edit_agent(&mut self, name: String, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.edited_agents.push(name.clone());
+        let project = self.project.clone();
+        self.open_in_editor(move || shelbi_state::agent_manifest_path(&project, &name).ok(), cx);
+    }
+
     /// Whether the workflow editor holds the window.
     fn editing_workflow(&self, cx: &App) -> bool {
         matches!(&self.route, Route::Settings(view) if view.read(cx).editing())
@@ -3016,6 +3031,8 @@ impl ShelbiWindow {
                         cx.notify();
                     }
                     SettingsEvent::EditWorkflow(name) => this.edit_workflow(name.clone(), window, cx),
+                    SettingsEvent::EditAgent(name) => this.edit_agent(name.clone(), cx),
+                    SettingsEvent::ShowPage(page) => this.show_settings_page(*page, cx),
                     SettingsEvent::EditorClosed => {
                         this.focus_handle.focus(window, cx);
                         cx.notify();
