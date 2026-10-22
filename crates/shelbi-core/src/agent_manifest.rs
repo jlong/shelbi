@@ -195,7 +195,12 @@ impl AgentManifest {
 /// Claude actually enforces. As a launch posture `read-only` therefore behaves
 /// like `default`, so it ranks there.
 fn permission_rank(mode: &str) -> u8 {
-    match mode.trim() {
+    known_permission_rank(mode).unwrap_or(1)
+}
+
+/// [`permission_rank`] for a mode Shelbi recognizes, `None` otherwise.
+fn known_permission_rank(mode: &str) -> Option<u8> {
+    Some(match mode.trim() {
         "plan" => 0,
         // `read-only`/`readonly` launch as `default` (their no-edit intent is
         // enforced by a deny block, not by disabling all tool use), so they
@@ -203,7 +208,51 @@ fn permission_rank(mode: &str) -> u8 {
         "read-only" | "readonly" | "default" => 1,
         "auto" | "auto-edit" | "acceptEdits" | "acceptedits" => 2,
         "full-access" | "full" | "bypassPermissions" | "bypass" => 3,
-        _ => 1,
+        _ => return None,
+    })
+}
+
+/// Whether `mode` is a `permissions_mode` value Shelbi understands: one of
+/// [`PERMISSION_MODES`] or an alias of one (`read-only`, `full-access`, …).
+/// Anything else would silently launch as `default`.
+pub fn is_known_permission_mode(mode: &str) -> bool {
+    known_permission_rank(mode).is_some()
+}
+
+/// The `permissions_mode` values a settings picker offers, tightest first:
+/// the launch modes Shelbi passes to the runner as-is. Aliases
+/// ([`is_known_permission_mode`]) stay valid in a hand-edited file.
+pub const PERMISSION_MODES: &[&str] = &[
+    "plan",
+    "default",
+    "auto",
+    "acceptEdits",
+    "bypassPermissions",
+];
+
+/// The [`ReasoningEffort`] levels `kind` can take, lowest first. Claude and
+/// Codex take the whole scale (the adapter maps `max` to Codex's `xhigh`); a
+/// generic runner has no effort knob Shelbi can drive.
+pub fn reasoning_efforts(kind: RunnerKind) -> &'static [ReasoningEffort] {
+    match kind {
+        RunnerKind::Claude | RunnerKind::Codex => &[
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ],
+        RunnerKind::Generic => &[],
+    }
+}
+
+/// Suggested `runners.<kind>.model` values for a settings picker. A model is
+/// free text passed to the runner's `--model`, so these are suggestions, not
+/// a whitelist; a generic runner takes no model Shelbi can drive.
+pub fn model_suggestions(kind: RunnerKind) -> &'static [&'static str] {
+    match kind {
+        RunnerKind::Claude => &["opus", "sonnet", "haiku"],
+        RunnerKind::Codex => &["gpt-5", "gpt-5-codex"],
+        RunnerKind::Generic => &[],
     }
 }
 
@@ -561,6 +610,23 @@ workspaces: []
             clamp_permission_mode(Some("acceptEdits"), Some("bypassPermissions")).as_deref(),
             Some("acceptEdits")
         );
+    }
+
+    #[test]
+    fn picker_options_are_known_and_per_runner() {
+        for mode in PERMISSION_MODES {
+            assert!(is_known_permission_mode(mode), "{mode}");
+        }
+        for alias in ["read-only", "auto-edit", "full-access", " plan "] {
+            assert!(is_known_permission_mode(alias), "{alias}");
+        }
+        assert!(!is_known_permission_mode("yolo"));
+        assert!(!is_known_permission_mode(""));
+        assert_eq!(model_suggestions(RunnerKind::Claude), &["opus", "sonnet", "haiku"]);
+        assert!(!model_suggestions(RunnerKind::Codex).is_empty());
+        assert!(model_suggestions(RunnerKind::Generic).is_empty());
+        assert_eq!(reasoning_efforts(RunnerKind::Codex).len(), 4);
+        assert!(reasoning_efforts(RunnerKind::Generic).is_empty());
     }
 
     #[test]

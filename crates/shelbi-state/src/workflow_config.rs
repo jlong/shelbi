@@ -1255,7 +1255,7 @@ fn raw_status_ids(text: &str) -> Vec<String> {
 }
 
 /// `(stem, path)` of each workflow file in `dir`, sorted by stem.
-fn workflow_files(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+pub(crate) fn workflow_files(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1286,7 +1286,7 @@ fn workflow_files(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// The project YAML that holds `default_workflow:`: the global
 /// `projects/<name>.yaml`, or an in-repo project's shared
 /// `<repo>/.shelbi/project.yaml`. Same precedence as the project loader.
-fn project_config_file(project: &str) -> Result<PathBuf> {
+pub(crate) fn project_config_file(project: &str) -> Result<PathBuf> {
     let projects = crate::projects_dir().map_err(other)?;
     let local = projects.join(project).join("local.yaml");
     if local.is_file() {

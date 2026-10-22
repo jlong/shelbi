@@ -189,7 +189,10 @@ fn new(project: &str, name: &str) -> Result<()> {
         shelbi_state::agent_instructions_path(project, name).map_err(|e| anyhow!(e))?;
     shelbi_state::ensure_dir(&workspace).map_err(|e| anyhow!(e))?;
     shelbi_state::ensure_dir(&skills_dir).map_err(|e| anyhow!(e))?;
-    fs::write(&instructions_path, placeholder_instructions(name))?;
+    fs::write(
+        &instructions_path,
+        shelbi_state::agents_config::placeholder_instructions(name),
+    )?;
     println!("✓ agent '{name}' scaffolded at agents/{name}/.");
     println!();
     println!("next: edit agents/{name}/instructions.md, then bind it to a workflow status:");
@@ -295,21 +298,6 @@ fn validate_agent_name(name: &str) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Placeholder `instructions.md` body for `shelbi agent new`. The
-/// header reminds the author what to write and points them at the
-/// shared preamble dir for project-wide context.
-fn placeholder_instructions(name: &str) -> String {
-    format!(
-        "# {name} agent\n\
-         \n\
-         <!-- Replace this file with the agent's system prompt. It will be loaded as\n\
-         --system-prompt when shelbi dispatches a task to a workspace running this\n\
-         agent. Project-wide context (the \"you're in this monorepo, here's the\n\
-         layout\" intro) belongs in agents/_shared/preamble.md instead — that gets\n\
-         prepended automatically. -->\n"
-    )
 }
 
 #[cfg(test)]
