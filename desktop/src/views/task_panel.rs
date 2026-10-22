@@ -48,12 +48,10 @@ pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<
         .cursor_pointer();
     fill_layer(d, id, radius, [theme.background, theme.background_hover, theme.background_active])
         .child(heroicon(icons::ARROW_LEFT).text_color(theme.button_icon))
-        // A gpui shadow is a filled box under the element, and the fill is
-        // translucent: on its own the ring's blue would fill the square. The
-        // panel's own opaque color under the fill hides it, and the fill
-        // reads as it does anywhere else in the panel.
-        // (Opaque whatever the window's translucency, for the same reason.)
-        .when(keyboard, |d| d.bg(theme.opaque().sidebar).shadow(style::focus_shadow(theme)))
+        // Bands, not a shadow: a gpui shadow is a filled box under the
+        // element and the fill is translucent, so the ring's blue would fill
+        // the square. Focus adds the ring and nothing else.
+        .when(keyboard, |d| d.children(style::focus_bands(NAV_RADIUS, theme)))
 }
 
 /// The panel's first row (Figma's "Project and search"): the back button,

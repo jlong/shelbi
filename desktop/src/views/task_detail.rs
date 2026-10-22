@@ -220,7 +220,7 @@ pub fn render(
         )
         .when(editing, |row| {
             row.child(
-                action(theme, "detail-save", None, "Save", "⌘S", None, ButtonKind::Primary)
+                action(theme, "detail-save", None, "Save", "⌘S", None, ButtonKind::Success)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_editor(cx))),
             )
             .child(

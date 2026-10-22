@@ -75,13 +75,16 @@ pub fn render<H: OverlayHost>(
                     .flex_1()
                     .min_w_0()
                     .items_center()
+                    .relative()
                     .h(px(32.0))
                     .px_2()
                     .rounded_lg()
                     .bg(theme.canvas)
                     .border_1()
                     .border_color(theme.input_border)
-                    .when(focused, |d| d.shadow(style::focus_shadow(theme)))
+                    // Bands, not a shadow: the canvas is translucent while
+                    // the window is, and a shadow would fill the field.
+                    .when(focused, |d| d.children(style::focus_bands_past(8.0, 1.0, theme)))
                     .child(
                         div()
                             .min_w_0()

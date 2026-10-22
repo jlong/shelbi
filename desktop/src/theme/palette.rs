@@ -126,6 +126,18 @@ pub mod figma {
     pub const WORKFLOW_BADGE_FG: Pair = pair(0xdcdfe8ff, 0x2a3142ff);
     pub const FOCUS_RING: Pair = pair(0x62cdf6ff, 0x31ade9ff);
     pub const FOCUS_GLOW: Pair = pair(0x12adff33, 0x12adff33);
+    /// `button/primary/background`: the Button's Primary style (a dialog's
+    /// confirming action), `Cyan/400` at the overlay fill's alphas (18%
+    /// Dark, 12% Light), the Select style's values under their own names.
+    pub const PRIMARY_FILL: Pair = pair(0x62cdf62e, 0x62cdf61f);
+    /// `button/primary/background-hover`: 28% / 22%.
+    pub const PRIMARY_FILL_HOVER: Pair = pair(0x62cdf647, 0x62cdf638);
+    /// `button/primary/background-active`: 40% / 32%. (The component's
+    /// Active variant binds the rest fill; the variable is the press.)
+    pub const PRIMARY_FILL_ACTIVE: Pair = pair(0x62cdf666, 0x62cdf652);
+    /// `button/primary/text` and `button/primary/icon`: `Cyan/300` in Dark,
+    /// `Cyan/600` in Light.
+    pub const PRIMARY_TEXT: Pair = pair(0xb0e6fbff, 0x1989c4ff);
     /// The Button component's Success style: `#5ac351` at the
     /// `theme.background` / hover / active alphas (Light defined, Dark at
     /// Dark's alphas).
@@ -439,7 +451,16 @@ palette! {
     /// The workflow badge's label (`theme.workflow_badge_fg`).
     workflow_badge_text,
 
-    // ---- Buttons (the Button component's Success and Danger styles) --------
+    // ---- Buttons (the Button component's Primary, Success, Danger styles) --
+    /// The Primary button: a dialog's confirming action
+    /// (`button/primary/background`).
+    primary_fill,
+    /// The Primary button hovered (`button/primary/background-hover`).
+    primary_fill_hover,
+    /// The Primary button pressed (`button/primary/background-active`).
+    primary_fill_active,
+    /// The Primary button's label and icon (`button/primary/text`).
+    primary_label,
     /// The Success button, and the Zen pill.
     success_fill,
     /// The Success button hovered.
@@ -591,6 +612,10 @@ impl Palette {
             workflow_badge: pick(WORKFLOW_BADGE_BG),
             workflow_badge_text: pick(WORKFLOW_BADGE_FG),
 
+            primary_fill: pick(PRIMARY_FILL),
+            primary_fill_hover: pick(PRIMARY_FILL_HOVER),
+            primary_fill_active: pick(PRIMARY_FILL_ACTIVE),
+            primary_label: pick(PRIMARY_TEXT),
             success_fill: pick(SUCCESS_FILL),
             success_fill_hover: pick(SUCCESS_FILL_HOVER),
             success_fill_active: pick(SUCCESS_FILL_ACTIVE),
@@ -683,6 +708,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "table_text on"),
     ("dark", "form_hint on search box"),
     ("dark", "select_label on"),
+    ("dark", "primary_label on"),
     ("light", "muted on"),
     ("light", "gray on"),
     ("light", "log_text on"),
@@ -700,6 +726,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "button_icon on"),
     ("light", "table_text on"),
     ("light", "select_label on"),
+    ("light", "primary_label on"),
 ];
 
 #[cfg(test)]
@@ -826,6 +853,11 @@ mod tests {
                     "text_loud",
                     p.text_loud,
                     [p.background, p.background_hover, p.background_active],
+                ),
+                (
+                    "primary_label",
+                    p.primary_label,
+                    [p.primary_fill, p.primary_fill_hover, p.primary_fill_active],
                 ),
                 (
                     "success_label",
@@ -1022,6 +1054,11 @@ mod tests {
         // The Button's Select style and the Issues Header's band.
         both(d.select_fill, l.select_fill, (0x62cdf62e, 0x62cdf61f));
         both(d.select_label, l.select_label, (0xb0e6fbff, 0x1989c4ff));
+        // The Button's Primary style (a dialog's confirming action).
+        both(d.primary_fill, l.primary_fill, (0x62cdf62e, 0x62cdf61f));
+        both(d.primary_fill_hover, l.primary_fill_hover, (0x62cdf647, 0x62cdf638));
+        both(d.primary_fill_active, l.primary_fill_active, (0x62cdf666, 0x62cdf652));
+        both(d.primary_label, l.primary_label, (0xb0e6fbff, 0x1989c4ff));
         both(d.background_active, l.background_active, (0xacb4cf66, 0xacb4cf52));
         both(d.toolbar, l.toolbar, (0xacb4cf1a, 0xacb4cf14));
         both(d.input_border, l.input_border, (0xacb4cf4d, 0xacb4cf80));
