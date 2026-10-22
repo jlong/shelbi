@@ -91,11 +91,17 @@ sed "s/@VERSION@/$version/g" "$here/macos/Shelbi.app.plist" >"$app/Contents/Info
 plutil -lint -s "$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 
-# The icon: the committed 1024px master (scripts/render-icon.sh renders it
-# from assets/icon/shelbi.svg) cut into an iconset, then compiled.
+# The icon: the committed 1024px master (assets/icon/shelbi-1024.png, the
+# finished raster artwork and the icon's only source; see assets/icon/README.md)
+# cut into an iconset, then compiled.
+master="$here/assets/icon/shelbi-1024.png"
+master_info="$(sips -g pixelWidth -g pixelHeight -g hasAlpha "$master")"
+grep -q 'pixelWidth: 1024$' <<<"$master_info" &&
+  grep -q 'pixelHeight: 1024$' <<<"$master_info" &&
+  grep -q 'hasAlpha: yes$' <<<"$master_info" ||
+  fail "$master must be a 1024x1024 PNG with alpha"
 iconset="$(mktemp -d)/Shelbi.iconset"
 mkdir -p "$iconset"
-master="$here/assets/icon/shelbi-1024.png"
 for size in 16 32 128 256 512; do
   sips -s format png -z "$size" "$size" "$master" --out "$iconset/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))

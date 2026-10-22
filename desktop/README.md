@@ -162,8 +162,7 @@ desktop/
   macos/Info.plist     the unbundled binary's name (no CFBundleIdentifier: see the file)
   macos/Shelbi.app.plist  the .app bundle's Info.plist (bundle.sh fills in the version)
   scripts/bundle.sh    build, bundle, sign, notarize, staple, zip, sha256 (see Packaging)
-  scripts/render-icon.sh  assets/icon/shelbi.svg -> shelbi-1024.png
-  assets/icon/         the app icon: SVG source + the 1024px PNG master bundle.sh cuts into .icns
+  assets/icon/         the app icon: the 1024px PNG master bundle.sh cuts into .icns (its only source; see its README)
   assets/icons/        vendored Heroicons + their LICENSE
   assets/fonts/        Geist (UI), Source Code Pro (terminal) and Geist Mono (terminal fallback), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
@@ -416,10 +415,14 @@ NOTARIZED`, or `UNSIGNED`):
   Credentials that are set but wrong fail the script rather than quietly
   producing an un-notarized build.
 
-`assets/icon/shelbi.svg` is the icon's source (the brand's pixel "S" on the
-macOS icon grid). After editing it, run `scripts/render-icon.sh` (needs
-ImageMagick) and commit the regenerated `shelbi-1024.png` too; `bundle.sh` only
-needs macOS's `sips` and `iconutil`.
+`assets/icon/shelbi-1024.png` is the icon and its only source: the finished
+"Command Grille" artwork (raster, finished in Figma with its macOS mask,
+padding and shadow over transparent corners), committed as a 1024 x 1024 RGBA
+PNG. `bundle.sh` cuts it into the 16 to 512pt iconset at 1x and 2x with `sips`
+and compiles `Shelbi.icns` with `iconutil`, both part of macOS, and refuses a
+master that isn't 1024 x 1024 with alpha. Nothing renders or regenerates it.
+To change the icon, replace the PNG with a new 1024px transparent export of
+the Figma component; `assets/icon/README.md` has the source links and steps.
 
 The release workflow (`.github/workflows/release.yml`, job `desktop-release`)
 runs the same script on every tag, with the certificate imported from
