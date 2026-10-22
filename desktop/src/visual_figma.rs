@@ -25,7 +25,8 @@
 //! -new,-added} against `workflows/2-builder.png`, `3-…`, `5-…`, `6-…` and
 //! `7-…`, and settings-workflow-form against
 //! `workflows/4-workflow-form.png` in the frame's 1440x1283 window,
-//! settings-agents against `agents/1-agents-index.png`) and
+//! settings-agents against `agents/1-agents-index.png`,
+//! settings-agent-details against `agents/2-agent-details.png`) and
 //! command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
@@ -41,7 +42,10 @@
 //! conflict, search, picker and customized states; `state-workflow-form-*`:
 //! the workflow editor edited, its leave prompt, and its form's foot;
 //! `state-agents-*`: an agent's ⋮ menu, a reset waiting to be confirmed,
-//! and the shared instructions' editor;
+//! and the shared instructions' editor; `state-agent-details-*`: the agent
+//! editor edited with its ⋮ menu open, its Model picker, the Add skill
+//! form, its leave prompt, a user agent with skills, and its Delete
+//! confirm;
 //! `state-workflow-builder-*`: the Builder fitted, zoomed out with the
 //! keyboard's focus ring, a hot handle, an action row dragged and its
 //! handle focused, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
@@ -1109,10 +1113,97 @@ impl Run {
             .unwrap();
         self.save(handle, "state-agents-shared-editor");
 
+        self.agent_details();
+
         let _ = std::fs::remove_dir_all(&workflows);
         if !had_agents {
             let _ = std::fs::remove_dir_all(&agents);
         }
+    }
+
+    /// The agent details editor (the Agent Details frame, 2405:6965,
+    /// reference `agents/2-agent-details.png`) over the fixture's developer,
+    /// and its states no frame draws (`state-agent-details-*`, checked by
+    /// eye): an edit made with the ⋮ menu open, a picker open, the Add skill
+    /// form, the leave prompt, and a user agent with skills and no
+    /// assignments.
+    fn agent_details(&mut self) {
+        use crate::views::agent_editor::Menu;
+        use crate::views::agent_editor_state::Change;
+        type AgentFn = dyn Fn(
+            &mut crate::views::agent_editor::AgentEditor,
+            &mut gpui::Window,
+            &mut gpui::Context<crate::views::agent_editor::AgentEditor>,
+        );
+        let open = |run: &mut Self, name: &str| {
+            use crate::views::settings_nav::SettingsPage;
+            let handle = run.open();
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Agents, window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_edit_agent(name, window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle
+        };
+        let edit = |run: &mut Self, handle: WindowHandle<ShelbiWindow>, f: &AgentFn| {
+            handle
+                .update(&mut run.cx, |w, window, cx| {
+                    let editor = w.offscreen_settings().and_then(|s| s.read(cx).agent_editor()).expect("the editor shows");
+                    editor.update(cx, |e, cx| f(e, window, cx));
+                })
+                .unwrap();
+            run.settle(handle);
+        };
+
+        let handle = open(self, "developer");
+        let shown = handle
+            .update(&mut self.cx, |w, _, cx| {
+                w.offscreen_settings().and_then(|s| s.read(cx).agent_editor()).is_some_and(|e| e.read(cx).state().is_some())
+            })
+            .unwrap();
+        self.expect("settings-agent-details: the developer opens", shown);
+        self.save(handle, "settings-agent-details");
+
+        let handle = open(self, "developer");
+        edit(self, handle, &|e, window, cx| {
+            e.make(Change::Permissions(Some("acceptEdits".into())), window, cx);
+            e.offscreen_open_menu(Menu::More, cx);
+        });
+        self.save(handle, "state-agent-details-menu");
+
+        let handle = open(self, "developer");
+        edit(self, handle, &|e, _, cx| e.offscreen_open_menu(Menu::Model, cx));
+        self.save(handle, "state-agent-details-model");
+
+        let handle = open(self, "developer");
+        edit(self, handle, &|e, window, cx| e.offscreen_add_skill("release-notes", "Write the release notes.", window, cx));
+        self.save(handle, "state-agent-details-add-skill");
+
+        let handle = open(self, "orchestrator");
+        edit(self, handle, &|e, window, cx| {
+            e.make(Change::Reset, window, cx);
+            e.back(cx);
+        });
+        self.save(handle, "state-agent-details-leave");
+
+        // A user agent: no badge, skills listed, no assignments, Delete
+        // offered (and confirmed here).
+        let config = shelbi_state::agents_config::AgentsConfig::load(PROJECT)
+            .and_then(|c| c.create_agent("docs", Some("Keeps the docs current.")))
+            .and_then(|c| {
+                c.add_skill("docs", "changelog", "Update CHANGELOG.md for a merged change.", "")
+                    .and_then(|c| c.add_skill("docs", "screenshots", "Retake the site's screenshots.", ""))
+            })
+            .and_then(|c| c.save());
+        self.expect("state-agent-details-user: the agent is written", config.is_ok());
+        let handle = open(self, "docs");
+        self.save(handle, "state-agent-details-user");
+        let handle = open(self, "docs");
+        edit(self, handle, &|e, _, cx| e.offscreen_ask_delete(cx));
+        self.save(handle, "state-agent-details-delete");
     }
 
     /// The workflow editor's Form (the Workflow Form frame, 2252:29281,

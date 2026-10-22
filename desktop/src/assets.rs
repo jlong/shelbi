@@ -357,6 +357,9 @@ heroicons! {
     ARROW_DOWN = "arrow-down";
     CHEVRON_UP = "chevron-up";
     CHEVRON_DOWN = "chevron-down";
+    /// The agent editor's Workflow assignments rows (they open the
+    /// workflow).
+    CHEVRON_RIGHT = "chevron-right";
     ARROWS_RIGHT_LEFT = "arrows-right-left";
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";

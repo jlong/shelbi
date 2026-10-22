@@ -2058,16 +2058,18 @@ impl ShelbiWindow {
     }
 
     /// Open agent `name`'s details (Settings ▸ Agents' edit button, a row's
-    /// click, an agent just created). Until the details page lands
-    /// (`dt-agent-details`), its `agent.yaml` opens in the user's editor.
-    fn edit_agent(&mut self, name: String, cx: &mut Context<Self>) {
+    /// click, an agent just created): like the workflow editor, it takes
+    /// the whole window until it closes back onto the page.
+    fn edit_agent(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(test)]
         self.edited_agents.push(name.clone());
-        let project = self.project.clone();
-        self.open_in_editor(move || shelbi_state::agent_manifest_path(&project, &name).ok(), cx);
+        if let Route::Settings(view) = &self.route {
+            view.update(cx, |v, cx| v.open_agent_editor(&name, window, cx));
+        }
+        cx.notify();
     }
 
-    /// Whether the workflow editor holds the window.
+    /// Whether the workflow editor (or the agent editor) holds the window.
     fn editing_workflow(&self, cx: &App) -> bool {
         matches!(&self.route, Route::Settings(view) if view.read(cx).editing())
     }
@@ -3031,9 +3033,16 @@ impl ShelbiWindow {
                         cx.notify();
                     }
                     SettingsEvent::EditWorkflow(name) => this.edit_workflow(name.clone(), window, cx),
-                    SettingsEvent::EditAgent(name) => this.edit_agent(name.clone(), cx),
+                    SettingsEvent::EditAgent(name) => this.edit_agent(name.clone(), window, cx),
                     SettingsEvent::ShowPage(page) => this.show_settings_page(*page, cx),
                     SettingsEvent::EditorClosed => {
+                        // The settings sidebar comes back on the page the
+                        // editor closed onto (the agent editor's links go
+                        // to Workflows).
+                        if let Route::Settings(view) = &this.route {
+                            let page = view.read(cx).page();
+                            this.settings_nav.show(page);
+                        }
                         this.focus_handle.focus(window, cx);
                         cx.notify();
                     }
@@ -4801,6 +4810,11 @@ impl ShelbiWindow {
     /// Open workflow `name` in the editor (Settings ▸ Workflows open).
     pub(crate) fn offscreen_edit_workflow(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.edit_workflow(name.to_string(), window, cx);
+    }
+
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_edit_agent(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_agent(name.to_string(), window, cx);
     }
 
     /// The settings view, while it is shown.

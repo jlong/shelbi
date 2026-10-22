@@ -41,7 +41,9 @@
 //! window hides the settings sidebar while it shows) until it closes back
 //! onto the page. The Agents page ([`AgentsPage`]) lists the project's
 //! agents and edits their shared instructions, through
-//! `shelbi_state::agents_config`.
+//! `shelbi_state::agents_config`; an agent opened from it shows in its
+//! details editor ([`AgentEditor`]), which takes the whole view the same
+//! way.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -60,6 +62,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
 use shelbi_term::render::Rgb as TermRgb;
 
+use super::agent_editor::{AgentEditor, AgentEditorEvent};
 use super::agents::{AgentsEvent, AgentsPage};
 use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
@@ -272,7 +275,8 @@ pub enum SettingsEvent {
     /// Open workflow `name`'s editor (Settings ▸ Workflows' edit button, a
     /// row's click, a workflow just created).
     EditWorkflow(String),
-    /// The workflow editor closed: the settings sidebar comes back.
+    /// The workflow or agent editor closed: the settings sidebar comes
+    /// back, on the page the view now shows.
     EditorClosed,
     /// Open agent `name`'s details (Settings ▸ Agents' edit button, a row's
     /// click, an agent just created).
@@ -320,6 +324,8 @@ pub struct SettingsView {
     editor: Option<(Entity<WorkflowEditor>, Subscription)>,
     /// The project's Agents page.
     agents: Entity<AgentsPage>,
+    /// The agent details editor, while an agent is open in it.
+    agent_editor: Option<(Entity<AgentEditor>, Subscription)>,
     /// The page's scroll, and whether to bring the Workflows page's
     /// Statuses into view once it has drawn (the editor's Manage project
     /// statuses).
@@ -428,6 +434,7 @@ impl SettingsView {
             workflows,
             editor: None,
             agents,
+            agent_editor: None,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
             loaded: false,
@@ -445,7 +452,6 @@ impl SettingsView {
     }
 
     /// The page shown.
-    #[cfg(test)]
     pub fn page(&self) -> SettingsPage {
         self.page
     }
@@ -523,9 +529,9 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Whether the workflow editor shows.
+    /// Whether the workflow editor or the agent editor shows.
     pub fn editing(&self) -> bool {
-        self.editor.is_some()
+        self.editor.is_some() || self.agent_editor.is_some()
     }
 
     /// The workflow editor, while it shows.
@@ -534,11 +540,68 @@ impl SettingsView {
         self.editor.as_ref().map(|(e, _)| e.clone())
     }
 
-    /// Esc while the window holds the keys: the editor's Back.
+    /// The agent editor, while it shows.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn agent_editor(&self) -> Option<Entity<AgentEditor>> {
+        self.agent_editor.as_ref().map(|(e, _)| e.clone())
+    }
+
+    /// Esc while the window holds the keys: the open editor's Back.
     pub fn editor_back(&mut self, cx: &mut Context<Self>) {
         if let Some((editor, _)) = &self.editor {
             editor.update(cx, |e, cx| e.back(cx));
+        } else if let Some((editor, _)) = &self.agent_editor {
+            editor.update(cx, |e, cx| e.back(cx));
         }
+    }
+
+    /// Open agent `name` in the details editor, over the Agents page's
+    /// model as last loaded (a save checks the files haven't changed since).
+    pub fn open_agent_editor(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let config = self.agents.read(cx).state().config().cloned();
+        let project = self.agents.read(cx).state().project().to_string();
+        let editor = cx.new(|cx| AgentEditor::new(&project, name, config, window, cx));
+        let sub = cx.subscribe_in(&editor, window, |this, _, event: &AgentEditorEvent, window, cx| match event {
+            AgentEditorEvent::Close => this.close_agent_editor(SettingsPage::Agents, window, cx),
+            AgentEditorEvent::ShowWorkflows => this.close_agent_editor(SettingsPage::Workflows, window, cx),
+            AgentEditorEvent::OpenWorkflow(workflow) => {
+                // Straight into the workflow's editor; closing it returns to
+                // the Workflows page.
+                this.agent_editor = None;
+                this.agents.update(cx, |p, _| p.reload_when_drawn());
+                this.open_editor(workflow, window, cx);
+            }
+        });
+        self.page = SettingsPage::Agents;
+        self.agent_editor = Some((editor, sub));
+        cx.notify();
+    }
+
+    /// Back onto `page` (Agents, or Workflows for the editor's Manage
+    /// assignments link), its files re-read.
+    fn close_agent_editor(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_editor = None;
+        self.page = page;
+        // A test's page reads its throwaway home again only if it read it
+        // before (never the real `~/.shelbi`).
+        match page {
+            SettingsPage::Workflows => self.workflows.update(cx, |p, cx| {
+                if !cfg!(test) {
+                    p.reload_when_drawn();
+                } else if p.state().config().is_some() {
+                    p.load(window, cx);
+                }
+            }),
+            _ => self.agents.update(cx, |p, cx| {
+                if !cfg!(test) {
+                    p.reload_when_drawn();
+                } else if p.state().config().is_some() {
+                    p.load(window, cx);
+                }
+            }),
+        }
+        cx.emit(SettingsEvent::EditorClosed);
+        cx.notify();
     }
 
     /// Back onto the Workflows page (its files re-read), at its Statuses
@@ -1020,6 +1083,9 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         if let Some((editor, _)) = &self.editor {
+            return div().size_full().child(editor.clone()).into_any_element();
+        }
+        if let Some((editor, _)) = &self.agent_editor {
             return div().size_full().child(editor.clone()).into_any_element();
         }
         if self.scroll_to_statuses && self.page == SettingsPage::Workflows {

@@ -51,6 +51,8 @@ pub mod activity_reader;
 pub mod activity_state;
 pub mod agents;
 pub mod agents_state;
+pub mod agent_editor;
+pub mod agent_editor_state;
 pub mod board_list;
 pub mod board_scroll;
 pub mod bootstrap;

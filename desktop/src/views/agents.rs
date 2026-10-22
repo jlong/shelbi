@@ -151,7 +151,6 @@ impl AgentsPage {
     }
 
     /// The page's state.
-    #[cfg(any(test, feature = "visual-check"))]
     pub fn state(&self) -> &AgentsState {
         &self.state
     }
