@@ -66,7 +66,7 @@ use crate::theme::Theme;
 
 /// The titlebar row (the Header component): 52pt, its content starting
 /// beside the traffic lights ([`sidebar::BESIDE_TRAFFIC_LIGHTS`]).
-const TITLEBAR_H: f32 = 52.0;
+pub(super) const TITLEBAR_H: f32 = 52.0;
 /// The Header's toolbar buttons (Back, ⋮).
 const TOOLBAR_BUTTON: f32 = 32.0;
 /// The form's inset in the window and the gap between its sections.
@@ -91,12 +91,12 @@ const DETAILS_W: f32 = 67.0;
 /// A table row's buttons (delete, add an action).
 const ROW_BUTTON: f32 = 24.0;
 /// A row's pickers, the Button at Small.
-const SMALL_H: f32 = 28.0;
+pub(super) const SMALL_H: f32 = 28.0;
 /// A menu's width, and its gap under its button.
-const MENU_W: f32 = 200.0;
-const MENU_GAP: f32 = 6.0;
+pub(super) const MENU_W: f32 = 200.0;
+pub(super) const MENU_GAP: f32 = 6.0;
 /// The leave prompt's width.
-const PROMPT_W: f32 = 400.0;
+pub(super) const PROMPT_W: f32 = 400.0;
 
 /// What the editor tells the settings view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -926,7 +926,7 @@ impl WorkflowEditor {
 // Rendering helpers
 
 /// A section's title: Base semibold, loud.
-fn section_title(text: &'static str, theme: &Theme) -> Div {
+pub(super) fn section_title(text: &'static str, theme: &Theme) -> Div {
     div()
         .flex_none()
         .type_style(Type::BaseSemibold)
@@ -968,12 +968,12 @@ fn labeled(label: &'static str, control: impl IntoElement, help: Option<SharedSt
 }
 
 /// A small helper or footnote line: Small in `form_hint`.
-fn footnote(text: impl Into<SharedString>, theme: &Theme) -> Div {
+pub(super) fn footnote(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div().type_style(Type::Small).text_color(theme.form_hint).child(text.into())
 }
 
 /// An error under the field or row it's about.
-fn error_line(selector: String, text: &str, theme: &Theme) -> Div {
+pub(super) fn error_line(selector: String, text: &str, theme: &Theme) -> Div {
     div()
         .debug_selector(move || selector.clone())
         .type_style(Type::XSmall)
@@ -983,7 +983,7 @@ fn error_line(selector: String, text: &str, theme: &Theme) -> Div {
 
 /// A header's button: the Button at Small, an optional 20pt icon hanging
 /// in a 12pt slot before its label.
-fn header_button(id: impl Into<SharedString>, icon: Option<Icon>, label: &'static str, theme: &Theme) -> Stateful<Div> {
+pub(super) fn header_button(id: impl Into<SharedString>, icon: Option<Icon>, label: &'static str, theme: &Theme) -> Stateful<Div> {
     style::button_base(id, ButtonKind::Secondary, false, theme)
         .h(px(SMALL_H))
         .gap(px(4.0))
@@ -993,7 +993,7 @@ fn header_button(id: impl Into<SharedString>, icon: Option<Icon>, label: &'stati
 
 /// A row's 24pt icon button (delete, add an action): `icon` (18pt) on the
 /// overlay fill.
-fn row_button(id: impl Into<SharedString>, icon: Icon, inert: bool, theme: &Theme) -> Stateful<Div> {
+pub(super) fn row_button(id: impl Into<SharedString>, icon: Icon, inert: bool, theme: &Theme) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
     let d = div()
@@ -1015,7 +1015,7 @@ fn row_button(id: impl Into<SharedString>, icon: Icon, inert: bool, theme: &Them
 
 /// A toolbar button (Back, ⋮): 32pt, 8pt corners, the icon brightening
 /// on hover.
-fn toolbar_button(id: &'static str, icon: Icon, theme: &Theme) -> Stateful<Div> {
+pub(super) fn toolbar_button(id: &'static str, icon: Icon, theme: &Theme) -> Stateful<Div> {
     let radius = px(8.0);
     let loud = theme.text_loud;
     let d = div()
@@ -1035,7 +1035,7 @@ fn toolbar_button(id: &'static str, icon: Icon, theme: &Theme) -> Stateful<Div> 
 
 /// A picker's button: the Button (Small in a row, Base in the form), an
 /// optional status icon, the choice, and a chevron.
-fn picker_button(
+pub(super) fn picker_button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     icon: Option<StatusCategory>,
@@ -1066,7 +1066,7 @@ fn picker_button(
 }
 
 /// A popup menu's panel.
-fn popup(id: &'static str, width: f32, theme: &Theme) -> Stateful<Div> {
+pub(super) fn popup(id: &'static str, width: f32, theme: &Theme) -> Stateful<Div> {
     style::popover(
         div()
             .id(id)
@@ -1081,13 +1081,190 @@ fn popup(id: &'static str, width: f32, theme: &Theme) -> Stateful<Div> {
 }
 
 /// A menu's item.
-fn menu_item(id: impl Into<SharedString>, label: impl Into<SharedString>, selected: bool, theme: &Theme) -> Stateful<Div> {
+pub(super) fn menu_item(id: impl Into<SharedString>, label: impl Into<SharedString>, selected: bool, theme: &Theme) -> Stateful<Div> {
     style::menu_row(id, selected, theme).child(label.into())
 }
 
 /// A menu's rule between groups.
-fn menu_rule(theme: &Theme) -> Div {
+pub(super) fn menu_rule(theme: &Theme) -> Div {
     div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider)
+}
+
+/// `button` with a menu's `items` floating under it while `open`: the menu
+/// hangs left from the button's right edge when `right` (a button at the
+/// window's right). `toggle` runs on the button's click, `close` on a press
+/// outside the menu (one on its button toggles it closed instead).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dropdown<V: 'static>(
+    open: bool,
+    anchor: &style::Anchor,
+    id: &'static str,
+    button: Stateful<Div>,
+    items: impl FnOnce(&mut Context<V>) -> Vec<AnyElement>,
+    width: f32,
+    right: bool,
+    toggle: impl Fn(&mut V, &mut Context<V>) + 'static,
+    close: impl Fn(&mut V, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> Div {
+    let button = button
+        .when(open, |d| d.child(style::anchor_probe(anchor)))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            toggle(this, cx)
+        }));
+    let theme = *cx.global::<Theme>();
+    let panel = open.then(|| {
+        let anchor = anchor.clone();
+        let items = items(cx);
+        let top = anchor.get().map_or(px(style::BUTTON_H), |b| b.size.height) + px(MENU_GAP);
+        let at = div().absolute().top(top);
+        let at = if right { at.right_0() } else { at.left_0() };
+        deferred(
+            at.child(
+                popup(id, width, &theme)
+                    .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        // A press on its button toggles it closed through its click.
+                        if anchor.get().is_some_and(|b| b.contains(&event.position)) {
+                            return;
+                        }
+                        close(this, cx);
+                        cx.notify();
+                    }))
+                    .children(items),
+            ),
+        )
+        .with_priority(1)
+    });
+    div().relative().flex().flex_none().child(button).children(panel)
+}
+
+/// A single-line field: `input` in the Textbox, `placeholder` (Base,
+/// `form_hint`) while it's empty, the edge in `error` when `invalid`.
+pub(super) fn text_field(
+    input: &Entity<InputState>,
+    selector: impl Into<SharedString>,
+    placeholder: Option<SharedString>,
+    invalid: bool,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    field(input, selector, placeholder, invalid, false, window, cx)
+}
+
+/// [`text_field`] whose text can be selected and copied but not changed.
+pub(super) fn readonly_field(input: &Entity<InputState>, selector: impl Into<SharedString>, window: &Window, cx: &App) -> Div {
+    field(input, selector, None, false, true, window, cx)
+}
+
+fn field(
+    input: &Entity<InputState>,
+    selector: impl Into<SharedString>,
+    placeholder: Option<SharedString>,
+    invalid: bool,
+    readonly: bool,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    let theme = cx.global::<Theme>();
+    let focused = input.read(cx).focus_handle(cx).is_focused(window);
+    let empty = input.read(cx).value().is_empty();
+    let content = div()
+        .relative()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .items_center()
+        .child(
+            Input::new(input)
+                .appearance(false)
+                .readonly(readonly)
+                .h_full()
+                .px_0()
+                .type_style(Type::Base)
+                .text_color(theme.form_text),
+        )
+        .when_some(placeholder.filter(|_| empty), |d, text| {
+            d.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .type_style(Type::Base)
+                    .text_color(theme.form_hint)
+                    .child(text),
+            )
+        });
+    let selector: SharedString = selector.into();
+    let field = if invalid {
+        controls::invalid_textbox(content, focused, theme)
+    } else {
+        controls::textbox(content, focused, theme)
+    };
+    field.debug_selector(move || selector.to_string()).w_full().min_w_0()
+}
+
+/// The titlebar's Discard changes: a quiet link with the discard glyph,
+/// brightening on hover.
+pub(super) fn discard_link(id: &'static str, theme: &Theme) -> Stateful<Div> {
+    let hover = theme.text_loud;
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .group(id)
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(4.0))
+        .h(px(18.0))
+        .cursor_pointer()
+        .type_style(Type::Small)
+        .text_color(theme.form_hint)
+        .hover(move |s| s.text_color(hover))
+        .child(glyph(glyphs::DISCARD).text_color(theme.form_hint).group_hover(id, move |s| s.text_color(hover)))
+        .child("Discard changes")
+}
+
+/// A dialog over the editor (the leave prompt, a confirm): `title`, `body`
+/// and its `buttons` at the right, on the scrim.
+pub(super) fn dialog_overlay(
+    id: &'static str,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    buttons: Vec<AnyElement>,
+    theme: &Theme,
+) -> Div {
+    let panel = style::dialog(
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .w(px(PROMPT_W))
+            .p(px(16.0))
+            .occlude(),
+        theme,
+    )
+    .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(title.into()))
+    .child(footnote(body, theme))
+    .child(div().flex().flex_row().justify_end().gap(px(8.0)).pt(px(8.0)).children(buttons));
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.scrim)
+        .child(panel)
 }
 
 impl WorkflowEditor {
@@ -1102,43 +1279,23 @@ impl WorkflowEditor {
         cx: &mut Context<Self>,
     ) -> Div {
         let open = self.menu.as_ref() == Some(&menu);
-        let toggle = menu.clone();
-        let menu = &menu;
-        let button = button
-            .when(open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                cx.stop_propagation();
-                this.toggle_menu(toggle.clone(), cx)
-            }));
-        let theme = *cx.global::<Theme>();
-        let panel = open.then(|| {
-            let anchor = self.menu_anchor.clone();
-            let items = items(cx);
-            let top = anchor.get().map_or(px(style::BUTTON_H), |b| b.size.height) + px(MENU_GAP);
-            // Menus whose buttons sit at the window's right hang left.
-            let at = div().absolute().top(top);
-            let at = if matches!(menu, Menu::More | Menu::AddStatus | Menu::Zoom) { at.right_0() } else { at.left_0() };
-            deferred(
-                at.child(
-                    popup(id, width, &theme)
-                        .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            // A press on its button toggles it closed through its click.
-                            if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                                return;
-                            }
-                            this.menu = None;
-                            cx.notify();
-                        }))
-                        .children(items),
-                ),
-            )
-            .with_priority(1)
-        });
-        div().relative().flex().flex_none().child(button).children(panel)
+        // Menus whose buttons sit at the window's right hang left.
+        let right = matches!(menu, Menu::More | Menu::AddStatus | Menu::Zoom);
+        dropdown(
+            open,
+            &self.menu_anchor,
+            id,
+            button,
+            items,
+            width,
+            right,
+            move |this: &mut Self, cx| this.toggle_menu(menu.clone(), cx),
+            |this: &mut Self, _| this.menu = None,
+            cx,
+        )
     }
 
-    /// A single-line field: `input` in the Textbox, `placeholder` (Base,
-    /// `form_hint`) while it's empty, the edge in `error` when `invalid`.
+    /// [`text_field`].
     pub(super) fn text_field(
         &self,
         input: &Entity<InputState>,
@@ -1148,45 +1305,7 @@ impl WorkflowEditor {
         window: &Window,
         cx: &App,
     ) -> Div {
-        let theme = cx.global::<Theme>();
-        let focused = input.read(cx).focus_handle(cx).is_focused(window);
-        let empty = input.read(cx).value().is_empty();
-        let content = div()
-            .relative()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .items_center()
-            .child(
-                Input::new(input)
-                    .appearance(false)
-                    .h_full()
-                    .px_0()
-                    .type_style(Type::Base)
-                    .text_color(theme.form_text),
-            )
-            .when_some(placeholder.filter(|_| empty), |d, text| {
-                d.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .type_style(Type::Base)
-                        .text_color(theme.form_hint)
-                        .child(text),
-                )
-            });
-        let selector: SharedString = selector.into();
-        let field = if invalid {
-            controls::invalid_textbox(content, focused, theme)
-        } else {
-            controls::textbox(content, focused, theme)
-        };
-        field.debug_selector(move || selector.to_string()).w_full().min_w_0()
+        text_field(input, selector, placeholder, invalid, window, cx)
     }
 }
 
@@ -1256,28 +1375,7 @@ impl WorkflowEditor {
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.set_mode(value, window, cx)))
         };
         let discard = dirty.then(|| {
-            let hover = theme.text_loud;
-            div()
-                .id("workflow-editor-discard")
-                .debug_selector(|| "workflow-editor-discard".into())
-                .group("workflow-editor-discard")
-                .flex()
-                .flex_row()
-                .flex_none()
-                .items_center()
-                .gap(px(4.0))
-                .px(px(4.0))
-                .h(px(18.0))
-                .cursor_pointer()
-                .type_style(Type::Small)
-                .text_color(theme.form_hint)
-                .hover(move |s| s.text_color(hover))
-                .child(
-                    glyph(glyphs::DISCARD)
-                        .text_color(theme.form_hint)
-                        .group_hover("workflow-editor-discard", move |s| s.text_color(hover)),
-                )
-                .child("Discard changes")
+            discard_link("workflow-editor-discard", theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.discard(window, cx)))
         });
         let save = if dirty && !busy {
@@ -2322,76 +2420,45 @@ impl WorkflowEditor {
     /// The leave prompt: save or discard the unsaved edits, or stay.
     fn render_prompt(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
-        let panel = style::dialog(
-            div()
-                .id("workflow-leave-prompt")
-                .debug_selector(|| "workflow-leave-prompt".into())
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .w(px(PROMPT_W))
-                .p(px(16.0))
-                .occlude(),
+        let buttons = vec![
+            style::button("workflow-leave-cancel", "Cancel", ButtonKind::Quiet, false, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(state) = this.state.as_mut() {
+                        state.cancel_prompt();
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+            style::button("workflow-leave-discard", "Discard", ButtonKind::Secondary, false, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    let then = this.state.as_mut().and_then(EditorState::discard_and_leave);
+                    this.sync(true, window, cx);
+                    if let Some(then) = then {
+                        this.go(then, window, cx);
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+            style::button("workflow-leave-save", "Save", ButtonKind::Primary, false, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    let texts = this.texts(cx);
+                    let job = this.state.as_mut().and_then(|s| s.save_and_leave(texts));
+                    this.run_save(job, window, cx);
+                }))
+                .into_any_element(),
+        ];
+        dialog_overlay(
+            "workflow-leave-prompt",
+            format!("Save changes to {name}?"),
+            "Your edits to this workflow haven’t been saved.",
+            buttons,
             theme,
         )
-        .child(
-            div()
-                .type_style(Type::BaseSemibold)
-                .text_color(theme.text_loud)
-                .child(format!("Save changes to {name}?")),
-        )
-        .child(footnote("Your edits to this workflow haven’t been saved.", theme))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .gap(px(8.0))
-                .pt(px(8.0))
-                .child(
-                    style::button("workflow-leave-cancel", "Cancel", ButtonKind::Quiet, false, theme)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Some(state) = this.state.as_mut() {
-                                state.cancel_prompt();
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    style::button("workflow-leave-discard", "Discard", ButtonKind::Secondary, false, theme)
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            let then = this.state.as_mut().and_then(EditorState::discard_and_leave);
-                            this.sync(true, window, cx);
-                            if let Some(then) = then {
-                                this.go(then, window, cx);
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    style::button("workflow-leave-save", "Save", ButtonKind::Primary, false, theme)
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            let texts = this.texts(cx);
-                            let job = this.state.as_mut().and_then(|s| s.save_and_leave(texts));
-                            this.run_save(job, window, cx);
-                        })),
-                ),
-        );
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.scrim)
-            .child(panel)
     }
 }
 
 /// A status's board icon in the rows' 20pt frame.
-fn status_icon(category: StatusCategory, theme: &Theme) -> Div {
+pub(super) fn status_icon(category: StatusCategory, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_none()

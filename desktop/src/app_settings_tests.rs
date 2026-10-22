@@ -2238,11 +2238,13 @@ fn the_edit_button_and_a_row_click_open_the_agent(cx: &mut TestAppContext) {
     let home = crate::views::agents_state::tests::home_for("page-edit", "alpha");
     let mut s = Settings::open_agents(cx);
     s.click("agent-edit-developer");
+    assert!(s.drawn("agent-editor"), "the details editor opens");
+    s.click("agent-editor-back");
     s.click("agent-row-qa");
-    s.saved();
+    assert!(s.drawn("agent-editor"));
     assert_eq!(s.edited_agents(), ["developer", "qa"]);
-    // Until the details page lands, its `agent.yaml` opens in the editor.
-    assert_eq!(opened(&agents_dir(&home).join("qa").join("agent.yaml")), 1);
+    assert_eq!(s.agent_title(), "qa");
+    assert_eq!(opened(&agents_dir(&home).join("qa").join("agent.yaml")), 0, "no file opens");
 }
 
 #[gpui::test]
@@ -2259,9 +2261,11 @@ fn a_new_agent_is_created_and_opened(cx: &mut TestAppContext) {
     assert!(s.drawn("agent-new-error"), "a taken name stays on the new row");
     s.enter_text(draft, "docs");
     assert!(agents_dir(&home).join("docs").join("agent.yaml").exists());
+    assert_eq!(s.edited_agents(), ["docs"], "it opens once created");
+    assert_eq!(s.agent_title(), "docs");
+    s.click("agent-editor-back");
     assert!(!s.drawn("agent-new-name"), "the new row closes");
     assert!(s.drawn("agent-row-docs"));
-    assert_eq!(s.edited_agents(), ["docs"], "it opens once created");
 }
 
 #[gpui::test]
@@ -2287,6 +2291,9 @@ fn the_menu_duplicates_resets_and_deletes_with_their_guards(cx: &mut TestAppCont
     s.h.key("enter");
     s.saved();
     assert!(dir.join("developer-copy").join("instructions.md").exists());
+    // The copy opens in the details editor; Back shows its row.
+    assert_eq!(s.agent_title(), "developer-copy");
+    s.click("agent-editor-back");
     assert!(s.drawn("agent-row-developer-copy"));
 
     // A customized shipped agent resets, once confirmed.
@@ -2363,4 +2370,365 @@ fn edit_instructions_edits_and_saves_the_shared_instructions(cx: &mut TestAppCon
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "## Ground rules\n\nBe kind.\n");
     assert!(s.drawn("agents-shared-preview"), "back to the preview");
     assert_eq!(AgentsConfig::load("alpha").unwrap().shared_instructions(), "## Ground rules\n\nBe kind.\n");
+}
+
+use crate::views::agent_editor::AgentEditor;
+use crate::views::agent_editor_state::{Change as AgentChange, Field as AgentField};
+
+impl Settings {
+    /// Settings ▸ Agents with agent `name` open in the details editor (by
+    /// its row's edit button).
+    fn open_agent(cx: &mut TestAppContext, name: &'static str) -> Settings {
+        let mut s = Settings::open_agents(cx);
+        let selector: &'static str = Box::leak(format!("agent-edit-{name}").into_boxed_str());
+        s.click(selector);
+        assert!(s.drawn("agent-editor"), "the editor opened");
+        s
+    }
+
+    fn agent_editor(&self) -> Option<Entity<AgentEditor>> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).agent_editor(),
+            _ => None,
+        })
+    }
+
+    fn with_agent_editor<R>(&self, f: impl FnOnce(&AgentEditor, &App) -> R) -> R {
+        let editor = self.agent_editor().expect("the agent editor is open");
+        self.read(|_, cx| f(editor.read(cx), cx))
+    }
+
+    fn edit_agent(&mut self, f: impl FnOnce(&mut AgentEditor, &mut Window, &mut Context<AgentEditor>)) {
+        let editor = self.agent_editor().expect("the agent editor is open");
+        self.update(|_, window, cx| editor.update(cx, |e, cx| f(e, window, cx)));
+        self.settle();
+    }
+
+    fn agent_dirty(&self) -> bool {
+        self.with_agent_editor(|e, _| e.state().is_some_and(|s| s.is_dirty()))
+    }
+
+    fn agent_title(&self) -> String {
+        self.with_agent_editor(|e, _| e.state().map(|s| s.name().to_string()).unwrap_or_default())
+    }
+
+    fn agent_error(&self, field: AgentField) -> Option<String> {
+        self.with_agent_editor(|e, _| e.state().and_then(|s| s.error_at(&field)).map(str::to_string))
+    }
+
+    /// Type `text` into a text area as the user would: focused, emptied,
+    /// then typed.
+    fn type_into_area(&mut self, input: Entity<gpui_kit::component::input::TextareaState>, text: &str) {
+        self.update(|_, window, cx| {
+            let focus = gpui::Focusable::focus_handle(input.read(cx), cx);
+            window.focus(&focus, cx);
+            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        });
+        self.h.cx.simulate_input(text);
+        self.settle();
+    }
+}
+
+fn agent_on_disk(name: &str) -> shelbi_state::agents_config::Agent {
+    AgentsConfig::load("alpha").unwrap().agent(name).unwrap().clone()
+}
+
+#[gpui::test]
+fn the_agent_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-shell", "alpha");
+    let mut s = Settings::open_agent(cx, "developer");
+    assert!(!s.drawn("column-settings") && !s.drawn("leading-column"), "no sidebar");
+    let titlebar = s.bounds("agent-editor-titlebar").unwrap();
+    assert_eq!((titlebar.top(), titlebar.size.height), (px(0.0), px(52.0)), "the window's top row");
+    let back = s.bounds("agent-editor-back").unwrap();
+    assert_eq!(back.left(), px(sidebar::BESIDE_TRAFFIC_LIGHTS), "beside the traffic lights");
+    assert_eq!(s.agent_title(), "developer");
+    assert!(s.drawn("agent-editor-badge-default"), "a shipped agent as shipped");
+    assert!(s.drawn("agent-editor-save") && !s.drawn("agent-editor-discard"), "nothing to discard yet");
+    for selector in [
+        "agent-name",
+        "agent-description",
+        "agent-instructions",
+        "agent-runner",
+        "agent-model",
+        "agent-effort",
+        "agent-permissions",
+        "agent-assignment-task-in-progress",
+        "agent-workflows-link",
+        "agent-editor-footer",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    // The two columns: Instructions left of Runner preferences.
+    assert!(s.bounds("agent-instructions").unwrap().right() < s.bounds("agent-runner").unwrap().left());
+    let text = s.with_agent_editor(|e, cx| e.instructions_field().read(cx).value().to_string());
+    assert_eq!(text, agent_on_disk("developer").instructions());
+
+    // ⌘N doesn't switch pages under it; Back returns to the page, the
+    // sidebar with it.
+    s.key("cmd-1");
+    assert!(s.drawn("agent-editor"));
+    s.click("agent-editor-back");
+    assert!(!s.drawn("agent-editor") && s.drawn("settings-agents") && s.drawn("column-settings"));
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Agents), Some(SettingsPage::Agents)));
+
+    // A customized agent says so.
+    s.click("agent-edit-orchestrator");
+    assert!(s.drawn("agent-editor-badge-customized"));
+}
+
+#[gpui::test]
+fn agent_edits_wait_for_save_and_discard_reverts_them(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("ad-save", "alpha");
+    let yaml = agents_dir(&home).join("developer").join("agent.yaml");
+    let before = std::fs::read_to_string(&yaml).unwrap();
+    let mut s = Settings::open_agent(cx, "developer");
+
+    // A permission mode from its picker: dirty, nothing written.
+    s.click("agent-permissions");
+    assert!(s.drawn("agent-permissions-menu"));
+    s.click("agent-permissions-acceptEdits");
+    assert!(!s.drawn("agent-permissions-menu"));
+    assert!(s.agent_dirty() && s.drawn("agent-editor-discard"));
+    assert_eq!(std::fs::read_to_string(&yaml).unwrap(), before);
+
+    // Discard reverts it.
+    s.click("agent-editor-discard");
+    assert!(!s.agent_dirty() && !s.drawn("agent-editor-discard"));
+
+    // A description and instructions typed, then saved.
+    let description = s.with_agent_editor(|e, _| e.description_field());
+    s.type_into(description, "Ships one task at a time.");
+    let instructions = s.with_agent_editor(|e, _| e.instructions_field());
+    s.type_into_area(instructions, "# Developer\n\nShip it.\n");
+    assert!(s.agent_dirty());
+    s.click("agent-editor-save");
+    s.saved();
+    assert!(!s.agent_dirty());
+    let a = agent_on_disk("developer");
+    assert_eq!(a.description(), Some("Ships one task at a time."));
+    assert_eq!(a.instructions(), "# Developer\n\nShip it.\n");
+    assert!(std::fs::read_to_string(&yaml).unwrap().contains("##"), "the file's comments stay");
+    assert!(s.drawn("agent-editor-badge-customized"), "edited now");
+}
+
+#[gpui::test]
+fn runner_pickers_write_their_keys_and_the_defaults_remove_them(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-runner", "alpha");
+    let mut s = Settings::open_agent(cx, "developer");
+    s.click("agent-model");
+    s.click("agent-model-opus");
+    s.click("agent-effort");
+    s.click("agent-effort-high");
+    s.click("agent-editor-save");
+    s.saved();
+    let a = agent_on_disk("developer");
+    assert_eq!(a.model(shelbi_core::RunnerKind::Claude), Some("opus"));
+    assert_eq!(a.reasoning_effort(shelbi_core::RunnerKind::Claude), Some(shelbi_core::ReasoningEffort::High));
+
+    s.click("agent-model");
+    s.click("agent-model-default");
+    s.click("agent-effort");
+    s.click("agent-effort-default");
+    s.click("agent-runner");
+    s.click("agent-runner-default");
+    s.click("agent-editor-save");
+    s.saved();
+    let a = agent_on_disk("developer");
+    assert_eq!((a.model(shelbi_core::RunnerKind::Claude), a.reasoning_effort(shelbi_core::RunnerKind::Claude)), (None, None));
+    assert_eq!(a.preferred_runner(), None);
+
+    // A generic runner takes neither: both pickers are off.
+    s.click("agent-runner");
+    s.click("agent-runner-generic");
+    s.click("agent-model");
+    assert!(!s.drawn("agent-model-menu"), "no model for a generic runner");
+}
+
+#[gpui::test]
+fn leaving_the_agent_editor_with_edits_asks_first(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-leave", "alpha");
+    let mut s = Settings::open_agent(cx, "developer");
+    s.edit_agent(|e, window, cx| e.make(AgentChange::Permissions(Some("plan".into())), window, cx));
+
+    // Esc asks; Cancel stays with the edits.
+    s.h.focus_window();
+    s.key("escape");
+    assert!(s.drawn("agent-leave-prompt"));
+    s.click("agent-leave-cancel");
+    assert!(!s.drawn("agent-leave-prompt") && s.drawn("agent-editor") && s.agent_dirty());
+
+    // Back asks; Discard leaves without writing.
+    s.click("agent-editor-back");
+    s.click("agent-leave-discard");
+    assert!(!s.drawn("agent-editor"));
+    assert_eq!(agent_on_disk("developer").permissions_mode(), None);
+
+    // Save writes, then leaves.
+    s.click("agent-edit-developer");
+    s.edit_agent(|e, window, cx| e.make(AgentChange::Permissions(Some("plan".into())), window, cx));
+    s.click("agent-editor-back");
+    s.click("agent-leave-save");
+    s.saved();
+    assert!(!s.drawn("agent-editor"));
+    assert_eq!(agent_on_disk("developer").permissions_mode(), Some("plan"));
+
+    // The shared instructions' link goes back to the page too.
+    s.click("agent-edit-developer");
+    s.click("agent-shared-instructions-link");
+    assert!(!s.drawn("agent-editor") && s.drawn("agents-shared-preview"));
+}
+
+#[gpui::test]
+fn skills_add_and_remove_from_the_editor(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("ad-skills", "alpha");
+    let mut s = Settings::open_agent(cx, "security");
+    let count = |s: &Settings| s.with_agent_editor(|e, _| e.state().map_or(0, |st| st.skills().len()));
+    let before = count(&s);
+
+    s.click("agent-add-skill");
+    assert!(s.drawn("agent-skill-form"));
+    let (name, description, _) = s.with_agent_editor(|e, _| e.skill_fields().unwrap());
+    s.type_into(name, "triage");
+    // No description: refused in the form, which stays open.
+    let add = s.bounds("agent-skill-add").unwrap();
+    s.h.cx.simulate_click(add.center(), gpui::Modifiers::none());
+    s.settle();
+    assert!(s.agent_error(AgentField::NewSkill).is_some() && s.drawn("agent-skill-form"));
+    s.type_into(description, "Sort new issues.");
+    let add = s.bounds("agent-skill-add").unwrap();
+    s.h.cx.simulate_click(add.center(), gpui::Modifiers::none());
+    s.settle();
+    assert!(!s.drawn("agent-skill-form"), "the form closes once added");
+    assert_eq!(count(&s), before + 1);
+    assert!(s.drawn("agent-skill-triage"));
+    let file = agents_dir(&home).join("security").join("skills").join("triage").join("SKILL.md");
+    assert!(!file.exists(), "not before Save");
+    s.click("agent-editor-save");
+    s.saved();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("description: Sort new issues."));
+
+    // Remove, then Save.
+    s.click("agent-skill-remove-triage");
+    assert!(!s.drawn("agent-skill-triage") && s.agent_dirty());
+    s.click("agent-editor-save");
+    s.saved();
+    assert!(!file.exists());
+
+    // Cancel drops the form.
+    s.click("agent-add-skill");
+    s.click("agent-skill-cancel");
+    assert!(!s.drawn("agent-skill-form"));
+}
+
+#[gpui::test]
+fn assignment_rows_open_their_workflow_and_the_link_shows_workflows(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-assign", "alpha");
+    let mut s = Settings::open_agent(cx, "developer");
+    // The workflow editor opens over the Workflows page's model.
+    let page = s.workflows();
+    s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+    s.settle();
+
+    s.click("agent-assignment-task-in-progress");
+    assert!(!s.drawn("agent-editor") && s.drawn("workflow-editor"));
+    assert_eq!(s.title(), "task");
+    // Closing it lands on Workflows, its sidebar row selected.
+    s.click("workflow-editor-back");
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
+
+    // Manage assignments in Workflows.
+    s.key("cmd-6");
+    s.click("agent-edit-developer");
+    s.click("agent-workflows-link");
+    assert!(!s.drawn("agent-editor") && s.drawn("settings-workflows"));
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
+
+    // With unsaved edits, a row asks first.
+    s.key("cmd-6");
+    s.click("agent-edit-developer");
+    s.edit_agent(|e, window, cx| e.make(AgentChange::Permissions(Some("plan".into())), window, cx));
+    s.click("agent-assignment-task-in-progress");
+    assert!(s.drawn("agent-leave-prompt") && !s.drawn("workflow-editor"));
+    s.click("agent-leave-discard");
+    assert!(s.drawn("workflow-editor"));
+}
+
+#[gpui::test]
+fn the_agent_menu_guards_reset_and_delete_and_duplicates(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("ad-menu", "alpha");
+    let dir = agents_dir(&home);
+    let mut s = Settings::open_agent(cx, "developer");
+
+    // A shipped agent as shipped: Reset and Delete are inert.
+    s.click("agent-editor-more");
+    assert!(s.drawn("agent-editor-menu"));
+    s.click("agent-editor-reset");
+    s.click("agent-editor-delete");
+    assert!(!s.drawn("agent-delete-prompt") && !s.agent_dirty());
+    s.h.focus_window();
+    s.key("escape");
+    assert!(!s.drawn("agent-editor-menu") && s.drawn("agent-editor"), "Esc closes the menu first");
+
+    // Edit YAML opens the manifest.
+    s.click("agent-editor-more");
+    s.click("agent-editor-edit-yaml");
+    s.saved();
+    assert_eq!(opened(&dir.join("developer").join("agent.yaml")), 1);
+
+    // Duplicate saves a copy and edits it; a copy can be deleted, once
+    // confirmed.
+    s.click("agent-editor-more");
+    s.click("agent-editor-duplicate");
+    s.saved();
+    assert_eq!(s.agent_title(), "developer-copy");
+    assert!(dir.join("developer-copy").join("instructions.md").exists());
+    assert!(!s.drawn("agent-editor-badge-default") && !s.drawn("agent-editor-badge-customized"), "the user's own");
+    s.click("agent-editor-more");
+    s.click("agent-editor-delete");
+    assert!(s.drawn("agent-delete-prompt"));
+    s.click("agent-delete-cancel");
+    assert!(dir.join("developer-copy").exists());
+    s.click("agent-editor-more");
+    s.click("agent-editor-delete");
+    s.click("agent-delete-confirm");
+    s.saved();
+    assert!(!s.drawn("agent-editor") && !dir.join("developer-copy").exists());
+
+    // A customized agent resets into the draft.
+    s.click("agent-edit-orchestrator");
+    s.click("agent-editor-more");
+    s.click("agent-editor-reset");
+    assert!(s.agent_dirty());
+    s.click("agent-editor-save");
+    s.saved();
+    assert!(s.drawn("agent-editor-badge-default"));
+}
+
+#[gpui::test]
+fn a_rename_is_read_only_for_shipped_agents_and_waits_for_save(cx: &mut TestAppContext) {
+    let home = crate::views::agents_state::tests::home_for("ad-rename", "alpha");
+    AgentsConfig::load("alpha").unwrap().create_agent("docs", None).unwrap().save().unwrap();
+    let mut s = Settings::open_agent(cx, "docs");
+    let name = s.with_agent_editor(|e, _| e.name_field());
+    s.type_into(name, "writer");
+    assert!(s.agent_dirty());
+    assert!(agents_dir(&home).join("docs").exists(), "not before Save");
+    s.click("agent-editor-save");
+    s.saved();
+    assert_eq!(s.agent_title(), "writer");
+    assert!(agents_dir(&home).join("writer").join("agent.yaml").exists());
+
+    // A shipped agent's name can't change: typing does nothing.
+    s.click("agent-editor-back");
+    s.click("agent-edit-qa");
+    let name = s.with_agent_editor(|e, _| e.name_field());
+    s.update(|_, window, cx| {
+        let focus = gpui::Focusable::focus_handle(name.read(cx), cx);
+        window.focus(&focus, cx);
+    });
+    s.h.cx.simulate_input("tester");
+    s.settle();
+    assert!(!s.agent_dirty());
+    assert_eq!(s.with_agent_editor(|e, cx| e.name_field().read(cx).value().to_string()), "qa");
 }
