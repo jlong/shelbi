@@ -2665,6 +2665,51 @@ pub fn append_push_event(
     ))
 }
 
+/// The tip Shelbi most recently put on `origin/<branch>`, reconstructed from the
+/// [`append_push_event`] lines in `events.log` (the retained `.1` generation,
+/// then the live file). Returns the abbreviated sha those lines carry, or
+/// `None` when no handed-off push for `branch` is on record.
+///
+/// This is the handoff push's fallback provenance. The per-workspace
+/// `shelbi-pushed-tip` sidecar is the primary record, but it lives in one
+/// worktree, so a task bounced to a different workspace (or a sidecar written
+/// before it kept one line per branch) has no entry; the hub-global log still
+/// shows what Shelbi pushed. Only a successful push line counts
+/// (`pushed` / `force-pushed` / `up-to-date`); a `failed` or `blocked` line left
+/// origin unchanged.
+pub fn last_pushed_tip_from_events(branch: &str) -> Result<Option<String>> {
+    let path = events_log_path()?;
+    let mut last = None;
+    for p in [path.with_extension("log.1"), path] {
+        let text = match fs::read(&p) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(shelbi_core::Error::Io(crate::annotate_io_error(&p, e))),
+        };
+        if let Some(tip) = text.lines().rev().find_map(|l| pushed_tip_from_push_line(l, branch)) {
+            last = Some(tip);
+        }
+    }
+    Ok(last)
+}
+
+/// The abbreviated sha a handed-off `push` line for `branch` left on origin, or
+/// `None` for any other line. `pushed` / `force-pushed` details read
+/// `<ff|forced>_<from>..<sha>`; `up-to-date` reads `local=<sha>`.
+fn pushed_tip_from_push_line(line: &str, branch: &str) -> Option<String> {
+    let body = line.split_once(' ')?.1;
+    if !body.starts_with("push ") || event_field(body, "branch")? != sanitize_reason(branch) {
+        return None;
+    }
+    let detail = event_field(body, "detail")?;
+    let sha = match event_field(body, "status")? {
+        "pushed" | "force-pushed" => detail.rsplit_once("..")?.1,
+        "up-to-date" => detail.strip_prefix("local=")?,
+        _ => return None,
+    };
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
 /// Append `<rfc3339> merge task=<id> workspace=<name> base=<base> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff for
 /// a **handoff-less** workflow that auto-advances straight to a terminal status
@@ -3514,6 +3559,69 @@ mod tests {
         append_issue_comment_event("demo", "fix-login", "556", None).unwrap();
         let body = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         assert!(body.contains("comment id=556 author=-"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn last_pushed_tip_reads_the_latest_handed_off_push_for_the_branch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert_eq!(last_pushed_tip_from_events("jlong/feat").unwrap(), None);
+
+        append_push_event("feat", "charlie", "jlong/feat", "pushed", "ff_(new)..07e953f").unwrap();
+        // Another branch's push, and a failed/blocked push, never count.
+        append_push_event("other", "charlie", "jlong/other", "pushed", "ff_(new)..ec458bc").unwrap();
+        append_push_event(
+            "feat",
+            "charlie",
+            "jlong/feat",
+            "blocked",
+            "remote_has_unrebased_commits:origin_tip_07e953f_not_pushed_by_shelbi",
+        )
+        .unwrap();
+        append_push_event("feat", "charlie", "jlong/feat", "failed", "push_rejected:x..abcdef1").unwrap();
+        assert_eq!(
+            last_pushed_tip_from_events("jlong/feat").unwrap().as_deref(),
+            Some("07e953f")
+        );
+
+        append_push_event("feat", "delta", "jlong/feat", "force-pushed", "forced_07e953f..2e72c88").unwrap();
+        assert_eq!(
+            last_pushed_tip_from_events("jlong/feat").unwrap().as_deref(),
+            Some("2e72c88")
+        );
+        append_push_event("feat", "delta", "jlong/feat", "up-to-date", "local=3f00d1e").unwrap();
+        assert_eq!(
+            last_pushed_tip_from_events("jlong/feat").unwrap().as_deref(),
+            Some("3f00d1e")
+        );
+        assert_eq!(
+            last_pushed_tip_from_events("jlong/other").unwrap().as_deref(),
+            Some("ec458bc")
+        );
+
+        // The retained `.1` generation is older history: it answers for a branch
+        // the live file never mentions, and loses to the live file otherwise.
+        let rotated = events_log_path().unwrap().with_extension("log.1");
+        std::fs::write(
+            &rotated,
+            "2026-10-01T05:00:00Z push task=old workspace=alpha branch=jlong/old \
+             status=pushed detail=ff_(new)..1111111\n\
+             2026-10-01T05:00:01Z push task=feat workspace=alpha branch=jlong/feat \
+             status=pushed detail=ff_(new)..2222222\n",
+        )
+        .unwrap();
+        assert_eq!(
+            last_pushed_tip_from_events("jlong/old").unwrap().as_deref(),
+            Some("1111111")
+        );
+        assert_eq!(
+            last_pushed_tip_from_events("jlong/feat").unwrap().as_deref(),
+            Some("3f00d1e")
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

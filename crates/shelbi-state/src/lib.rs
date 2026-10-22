@@ -190,7 +190,7 @@ pub use event_log::{
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
     append_message_event, append_migration_event, append_project_event,
-    append_push_event,
+    append_push_event, last_pushed_tip_from_events,
     append_rebase_event, append_review_ready_event, append_review_slot_override_event,
     append_send_event, append_settings_selfheal_event, append_supervision_event,
     append_task_edit_event, append_task_event, append_task_event_actions_skipped,
