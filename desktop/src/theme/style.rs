@@ -352,9 +352,12 @@ pub fn heading(text: impl Into<SharedString>, theme: &Theme) -> Div {
 /// A button's look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonKind {
-    /// The one main action: the Button component's Success style (a green
-    /// tint, `text/green`). Figma draws no solid brand button.
+    /// A dialog's confirming action (Load, Save, Enable): the Button
+    /// component's Primary style (a cyan tint, `button/primary/text`).
     Primary,
+    /// A positive action beside a Danger one (the Review panel's Approve):
+    /// the Success style (a green tint, `text/green`).
+    Success,
     /// Every other action: the Default style (`theme.background`, loud
     /// text).
     Secondary,
@@ -368,7 +371,8 @@ pub enum ButtonKind {
 
 /// A Figma button (Small): 13 / 18 medium, 6px corners, 12px across, the
 /// style's fill and no boundary. `focused` draws the focus ring and glow
-/// (keyboard focus in a dialog).
+/// around it (keyboard focus in a dialog), and nothing else: the fill and
+/// label stay the style's.
 pub fn button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -445,9 +449,11 @@ pub fn button_base(
         .rounded(px(6.0))
         .text_color(c.text)
         .type_style(Type::SmallMedium)
-        .cursor_pointer()
-        .when(focused, |b| b.shadow(focus_shadow(theme)));
+        .cursor_pointer();
+    // Bands, not `focus_shadow`: a gpui shadow is a filled box under the
+    // button and its tinted fill is translucent, so the glow would fill it.
     fill_layer(d, id, px(6.0), [c.fill, c.hover, c.pressed])
+        .when(focused, |b| b.children(focus_bands(6.0, theme)))
 }
 
 /// A button kind's colors, in each state.
@@ -464,6 +470,12 @@ pub struct ButtonColors {
 pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
     match kind {
         ButtonKind::Primary => ButtonColors {
+            fill: theme.primary_fill,
+            hover: theme.primary_fill_hover,
+            pressed: theme.primary_fill_active,
+            text: theme.primary_label,
+        },
+        ButtonKind::Success => ButtonColors {
             fill: theme.success_fill,
             hover: theme.success_fill_hover,
             pressed: theme.success_fill_active,
@@ -739,13 +751,20 @@ pub fn search_clear(id: impl Into<SharedString>, theme: &Theme) -> Stateful<Div>
 /// filled box under the element, which would show through its fill. The
 /// 1px ring, then the 4px glow over it, both outside the control.
 pub fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
+    focus_bands_past(radius, 0.0, theme)
+}
+
+/// [`focus_bands`] for a control with a `border` of its own: an absolute
+/// child is placed from inside the border, so the bands step out past it.
+pub fn focus_bands_past(radius: f32, border: f32, theme: &Theme) -> [Div; 2] {
     let band = |width: f32, color: Hsla| {
+        let out = px(-(width + border));
         div()
             .absolute()
-            .top(px(-width))
-            .left(px(-width))
-            .right(px(-width))
-            .bottom(px(-width))
+            .top(out)
+            .left(out)
+            .right(out)
+            .bottom(out)
             .rounded(px(radius + width))
             .border(px(width))
             .border_color(color)
@@ -1091,6 +1110,68 @@ mod tests {
         assert_eq!(initials("my cool project"), "MC");
         assert_eq!(initials("x"), "X");
         assert_eq!(initials(""), "?");
+    }
+
+    fn themes() -> [Theme; 2] {
+        use gpui::WindowAppearance;
+        use shelbi_app::theme::ThemePreference;
+        [WindowAppearance::Dark, WindowAppearance::Light].map(|a| Theme::resolve(ThemePreference::Auto, a))
+    }
+
+    fn rgba8(c: Hsla) -> u32 {
+        let c = c.to_rgb();
+        let q = |v: f32| (v * 255.0).round() as u32;
+        q(c.r) << 24 | q(c.g) << 16 | q(c.b) << 8 | q(c.a)
+    }
+
+    /// The Primary style is the Figma Button's Primary: `button/primary/*`,
+    /// `Cyan/400` at 18 / 28 / 40% in Dark and 12 / 22 / 32% in Light under
+    /// `Cyan/300` / `Cyan/600`. Success keeps the green it had as Primary.
+    #[test]
+    fn the_primary_button_is_the_figma_primary_style() {
+        let [dark, light] = themes();
+        let colors = |theme: &Theme, kind| {
+            let c = button_colors(kind, theme);
+            [c.fill, c.hover, c.pressed, c.text].map(rgba8)
+        };
+        assert_eq!(colors(&dark, ButtonKind::Primary), [0x62cdf62e, 0x62cdf647, 0x62cdf666, 0xb0e6fbff]);
+        assert_eq!(colors(&light, ButtonKind::Primary), [0x62cdf61f, 0x62cdf638, 0x62cdf652, 0x1989c4ff]);
+        assert_eq!(colors(&dark, ButtonKind::Success), [0x5ac3512e, 0x5ac35147, 0x5ac35161, 0x86d580ff]);
+        assert_eq!(colors(&light, ButtonKind::Success), [0x5ac3511f, 0x5ac35138, 0x5ac35152, 0x00753dff]);
+    }
+
+    /// Focus is the ring and glow and nothing else: a focused button keeps
+    /// its label color, sets no fill of its own (the fill is the hover layer
+    /// under it, the same three colors either way), and draws no shadow,
+    /// which gpui paints as a filled box that shows through the translucent
+    /// fills and turned the focused Load button solid cyan.
+    #[test]
+    fn focus_never_changes_a_buttons_fill_or_label() {
+        const KINDS: [ButtonKind; 6] = [
+            ButtonKind::Primary,
+            ButtonKind::Success,
+            ButtonKind::Secondary,
+            ButtonKind::Danger,
+            ButtonKind::Quiet,
+            ButtonKind::Select,
+        ];
+        for theme in themes() {
+            for kind in KINDS {
+                let mut rest = button("b", "Load", kind, false, &theme);
+                let mut focused = button("b", "Load", kind, true, &theme);
+                let (rest, focused) = (rest.style(), focused.style());
+                assert_eq!(focused.text.color, rest.text.color, "{kind:?} label");
+                assert_eq!(focused.text.color, Some(button_colors(kind, &theme).text), "{kind:?} label");
+                assert!(rest.background.is_none() && focused.background.is_none(), "{kind:?} fill");
+                assert!(focused.box_shadow.is_none(), "{kind:?} draws its focus as a shadow");
+                for mut small in [
+                    small_icon_button("s", icons::CHECK, "Approve", kind, true, &theme),
+                    icon_label_button("i", icons::CHECK, "Refresh", kind, &theme),
+                ] {
+                    assert!(small.style().box_shadow.is_none(), "{kind:?} icon button");
+                }
+            }
+        }
     }
 
     #[test]

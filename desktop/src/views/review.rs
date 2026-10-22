@@ -1121,7 +1121,7 @@ impl ReviewView {
                         "review-approve",
                         icons::CHECK,
                         "Approve",
-                        ButtonKind::Primary,
+                        ButtonKind::Success,
                         selected(PanelRow::Approve),
                         theme,
                     )

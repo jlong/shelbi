@@ -136,8 +136,8 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Selection chip | One chip for the current row; when the selection moves (keys, clicks, route changes) it slides to the new row on a spring with a slight overshoot before the row takes it back. The sidebar, the review and workspace panels' view switches, and every segmented control |
 | List row (leading column) | The review and workspace panels: 32px, Small (13 / 18); the same chip when selected. The sidebar's rows follow the Navigation component (see `views/sidebar.rs`): 8px across, 4px above and below, a 12px state glyph |
 | Section heading | Base medium, loud; the sidebar's section headers are Small medium in `muted`, with a count badge (`background`, X-Small medium, 16px) and a 12px chevron |
-| Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Success style (`success_fill`, `success_label` label: Figma draws no solid brand button); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
-| Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, the task panels' back button on the keyboard's row, text fields) |
+| Button | The Figma Button (Small): 32px tall, 12px across, 6px corners, Small medium, no boundary. Secondary is the Default style (`background`, loud label); Primary the Primary style (`primary_fill`, `primary_label` label), a dialog's confirming action; Success the Success style (`success_fill`, `success_label` label); Danger the Danger style (`danger_fill`, the Danger label); Quiet no fill until hovered. Fills fade on hover and press. Compact actions are X-Small: the card detail's are 26px tall, 8px across, X-Small medium, the icon in a 14px slot and the key as one 16px keycap (`button_keycap_edge` drop); the error log's are 28px with their key as keycaps |
+| Focus | Figma's focus state: a 1px `focus_ring` and a 4px `focus_glow` outside the control, the glow painted over the ring (so the ring reads a touch paler and 3px of glow show past it) (the board's keyboard card, a dialog's keyboard button, the task panels' back button on the keyboard's row, text fields). Focus adds the ring and nothing else: a button keeps its fill and label. On a translucent control the ring is drawn as bands (`focus_bands`), never as a shadow, which gpui paints as a filled box under the control (Figma's own Focus variants swap the Primary label to `button/default/text`; the app doesn't) |
 | Filter chip | The board toolbar's workflow and workspace filters (`filter_chip`): the Figma Button at Small, label only, 28px, 12px across, 6px corners, Small medium; in the Select style (`select_fill`, `select_label`) while its filter is set, else the Default style (`background`, loud); pressed while its menu is open, and the menu opens 6px under it. Unfiltered the chips read `Workflows` and `Workspaces` |
 | Search box | The Searchbox component at Small (`search_box`): 28px, 6px corners, the overlay fill (hover fill under the pointer), the 20px magnifying glass in `icon` 6px in, then the input 6px on, Small, a `Search` placeholder in `form_hint`; focused, the 1px `focus_ring` and the 4px `focus_glow` over it, drawn as bands outside the box (`focus_bands`). The board's is 180px wide. While the query is non-empty, a clear button (`search_clear`) at its right end: the 20px x-mark as a 24px `icon_button` (the `icon` role, `text_loud` and the hover fill fading in under the pointer), hung 2px into the padding so the mark sits 6px in like the glass; the field shrinks to make room. Figma's Searchbox draws no clear button |
 | Toolbar button | The board's New issue: the Figma Button at Small, Default style, 28px tall, the icon in a 12px Icon slot (`toolbar_button`) |
@@ -366,7 +366,11 @@ component's Success and Danger styles follow.
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `success_fill` | `#5ac3512e` | `#5ac3511f` | Button Success: the primary button |
+| `primary_fill` | `#62cdf62e` | `#62cdf61f` | `button/primary/background` (`Cyan/400` at the overlay's alphas): Button Primary, a dialog's confirming action |
+| `primary_fill_hover` | `#62cdf647` | `#62cdf638` | `button/primary/background-hover` |
+| `primary_fill_active` | `#62cdf666` | `#62cdf652` | `button/primary/background-active` (the component's Active variant binds the rest fill; the variable is the press) |
+| `primary_label` | `#b0e6fb` | `#1989c4` | `button/primary/text` and `button/primary/icon` (`Cyan/300` / `Cyan/600`) |
+| `success_fill` | `#5ac3512e` | `#5ac3511f` | Button Success: Approve, the bootstrap and relaunch actions, the card detail's Save |
 | `success_fill_hover` | `#5ac35147` | `#5ac35138` | `button/success/background-hover` (dark derived) |
 | `success_fill_active` | `#5ac35161` | `#5ac35152` | `button/success/background-active` (dark derived) |
 | `success_label` | `#86d580` | `#00753d` | Button Success's label and icon: `text/green` in Light, `#86d580` in the dark Review frame |
@@ -456,6 +460,7 @@ with its worst ratio. **Flagged for John.**
 | dark | text_on_color on check_fill | 2.53 | The check mark (white) on the dark checked box (`#31ade9`), as the Settings frame draws it; the box itself is 6.19 on the canvas |
 | dark | form_hint on search box | 3.69 | `text/muted` (`#f2f3f7` at 55%) as the board search's `Search` placeholder, on the Searchbox fill over the toolbar band; AA on the band itself |
 | dark | select_label on | 3.98 | `button/select/text` (`Cyan/300`) on a set filter chip pressed (its menu open); AA at rest and hovered |
+| dark | primary_label on | 4.02 | `button/primary/text` (`Cyan/300`) on the Primary button pressed over the sidebar or a dialog; AA at rest and hovered |
 | dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
 | light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
 | light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
@@ -473,6 +478,7 @@ with its worst ratio. **Flagged for John.**
 | light | input_border on | 1.38 | `theme.divider` (`#acb4cf` at 50%) as a textbox's edge |
 | light | form_hint on | 2.37 | The form components' `theme.muted` (`#444c65` at 50%): a helper line, a placeholder; the board toolbar's `Filter:` and its search's placeholder (2.37 on the Searchbox fill over the band) |
 | light | select_label on | 3.08 | `button/select/text` (`Cyan/600` `#1989c4`) on a set filter chip over the toolbar band: 3.45 at rest, 3.25 hovered, 3.08 pressed, as the Header draws it |
+| light | primary_label on | 3.09 | `button/primary/text` (`Cyan/600` `#1989c4`) on the Primary button: 3.61 at rest on white, 3.46 at rest in a dialog, 3.09 pressed there, as the Button component draws it |
 | light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 
 ## Renders

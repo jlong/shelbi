@@ -453,7 +453,7 @@ pub fn render_failure(
                 "bootstrap-action",
                 action.icon(),
                 action.label(),
-                ButtonKind::Primary,
+                ButtonKind::Success,
                 theme,
             )
             .on_click(move |_, window, cx| on_action(action, window, cx)),
@@ -497,7 +497,7 @@ pub fn render_relaunch_bar(
                 .child(relaunch_message(notice)),
         )
         .child(
-            style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Primary, false, theme)
+            style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Success, false, theme)
                 .on_click(move |_, window, cx| on_relaunch(window, cx)),
         )
         .into_any_element()

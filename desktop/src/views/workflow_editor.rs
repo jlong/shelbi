@@ -1281,14 +1281,14 @@ impl WorkflowEditor {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.discard(window, cx)))
         });
         let save = if dirty && !busy {
-            style::button("workflow-editor-save", "Save changes", ButtonKind::Select, false, theme)
+            style::button("workflow-editor-save", "Save changes", ButtonKind::Primary, false, theme)
                 .h(px(SMALL_H))
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx)))
         } else {
             style::disabled_button(
                 "workflow-editor-save",
                 if busy { "Saving…" } else { "Save changes" },
-                ButtonKind::Select,
+                ButtonKind::Primary,
                 theme,
             )
             .h(px(SMALL_H))
@@ -2369,7 +2369,7 @@ impl WorkflowEditor {
                         })),
                 )
                 .child(
-                    style::button("workflow-leave-save", "Save", ButtonKind::Select, false, theme)
+                    style::button("workflow-leave-save", "Save", ButtonKind::Primary, false, theme)
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             let texts = this.texts(cx);
                             let job = this.state.as_mut().and_then(|s| s.save_and_leave(texts));

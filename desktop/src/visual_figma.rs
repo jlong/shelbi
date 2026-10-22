@@ -136,7 +136,8 @@ pub const DETAIL_ACTIONS: [&str; 6] = ["move-left", "move-right", "start", "assi
 /// The components page's sheets, named as its PNGs, with their sizes: every
 /// state of the Textbox and the Checkbox, a Segmented Control, a Labeled
 /// Control and a Picker; plus a Checkbox List (no PNG: checked by eye).
-const COMPONENT_SHEETS: [(&str, f32, f32); 6] = [
+const COMPONENT_SHEETS: [(&str, f32, f32); 7] = [
+    ("buttons", 234.0, 306.0),
     ("textbox", 234.0, 210.0),
     ("checkbox", 126.0, 154.0),
     ("segmented-control", 167.0, 32.0),
@@ -144,6 +145,19 @@ const COMPONENT_SHEETS: [(&str, f32, f32); 6] = [
     ("picker", 400.0, 32.0),
     ("checkbox-list", 200.0, 74.0),
 ];
+
+/// The `buttons` sheet's rows, top to bottom: each kind at rest at
+/// [`BUTTON_SHEET_X`]`.0` and keyboard-focused at `.1`.
+const BUTTON_SHEET_KINDS: [crate::theme::style::ButtonKind; 6] = {
+    use crate::theme::style::ButtonKind::*;
+    [Primary, Success, Secondary, Danger, Select, Quiet]
+};
+const BUTTON_SHEET_X: (f32, f32) = (17.0, 129.0);
+
+/// The `buttons` sheet's row `i` top.
+fn button_sheet_y(i: usize) -> f32 {
+    17.0 + 48.0 * i as f32
+}
 
 /// One component sheet, by name.
 struct Sheet(&'static str);
@@ -176,6 +190,13 @@ impl gpui::Render for Sheet {
         };
         let sheet = div().relative().size_full().bg(page);
         match self.0 {
+            "buttons" => sheet.children(BUTTON_SHEET_KINDS.iter().enumerate().flat_map(|(i, kind)| {
+                let (rest, focused) = BUTTON_SHEET_X;
+                [(rest, false), (focused, true)].map(|(x, focus)| {
+                    let id = format!("sheet-button-{kind:?}-{focus}");
+                    at(x, button_sheet_y(i), crate::theme::style::button(id, "Button", *kind, focus, &theme).into_any_element())
+                })
+            })),
             "textbox" => sheet
                 .child(at(17.0, 17.0, textbox(false, true)))
                 .child(at(17.0, 65.0, textbox(true, true)))
@@ -1346,6 +1367,9 @@ impl Run {
             } else {
                 image::imageops::resize(&image, w as u32, h as u32, image::imageops::FilterType::Triangle)
             };
+            if name == "buttons" {
+                self.expect_ring_only_focus(&image, image.width() as f32 / w);
+            }
             let path = dir.join(format!("{name}-{}.png", self.theme));
             image.save(&path).expect("save the sheet");
             println!("saved {} ({}x{})", path.display(), image.width(), image.height());
@@ -1353,6 +1377,57 @@ impl Run {
                 .update_window(window, |_, window, _| window.remove_window())
                 .unwrap();
             self.cx.run_until_parked();
+        }
+    }
+
+    /// On the `buttons` sheet, every kind's focused button wears the ring and
+    /// glow outside it and keeps its resting fill inside it: the pixel 3pt
+    /// in from its left edge (fill, not label) matches the resting
+    /// button's, and the pixel 3pt out (the glow) differs from the page.
+    fn expect_ring_only_focus(&mut self, image: &image::RgbaImage, scale: f32) {
+        let (rest, focused) = BUTTON_SHEET_X;
+        let pixel = |x: f32, y: f32| image.get_pixel((x * scale) as u32, (y * scale) as u32).0;
+        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2);
+        for (i, kind) in BUTTON_SHEET_KINDS.iter().enumerate() {
+            let y = button_sheet_y(i) + 16.0;
+            let (fill, focused_fill) = (pixel(rest + 3.0, y), pixel(focused + 3.0, y));
+            self.expect(
+                &format!("buttons: focused {kind:?} keeps its fill ({fill:?} vs {focused_fill:?})"),
+                close(fill, focused_fill),
+            );
+            self.expect(
+                &format!("buttons: focused {kind:?} wears the ring and glow"),
+                !close(pixel(rest - 3.0, y), pixel(focused - 3.0, y)),
+            );
+        }
+    }
+
+    /// The Load for review dialog (one free slot, the shape John's
+    /// screenshot shows) with the keyboard on Load, as it opens, then on
+    /// Cancel: the focused button keeps its own fill and label (Load the
+    /// Primary style) and only gains the ring and glow.
+    fn review_confirm_states(&mut self, under: &View) {
+        use crate::views::overlay::ActiveOverlay;
+        use shelbi_app::overlay::review_confirm::Slot;
+        let slot = Slot {
+            name: "review".into(),
+            occupant: None,
+        };
+        let title = "Adopt Command Grille as the Shelbi desktop app icon";
+        for (tabs, screen) in [(0, "state-review-confirm-load-focused"), (1, "state-review-confirm-cancel-focused")] {
+            let handle = self.open();
+            self.click(handle, under.clone());
+            self.settle(handle);
+            let mut overlay = ActiveOverlay::review_confirm("dt-command-grille-icon", title, vec![slot.clone()], 1);
+            if let ActiveOverlay::ReviewConfirm { dialog, .. } = &mut overlay {
+                for _ in 0..tabs {
+                    dialog.handle_key(shelbi_state::keymap::KeyChord::parse("tab").expect("a chord"));
+                }
+            }
+            handle
+                .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(Some(overlay), window, cx))
+                .unwrap();
+            self.save(handle, screen);
         }
     }
 
@@ -1373,6 +1448,12 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "issues") {
             self.issues();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
+            self.components();
+            self.review_confirm_states(&orch);
             return;
         }
 
@@ -1461,6 +1542,7 @@ impl Run {
             self.palette(&orch, keys, screen);
         }
         self.sidebar_states(&orch);
+        self.review_confirm_states(&orch);
 
         let missing: Vec<&str> = SCREENS
             .iter()

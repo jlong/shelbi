@@ -76,7 +76,6 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
         .bg(theme.canvas)
         .border_1()
         .border_color(theme.input_border)
-        .when(focused, |d| d.shadow(crate::theme::style::focus_shadow(theme)))
         .overflow_hidden()
         .cursor_text()
         .children(lines)
@@ -84,6 +83,15 @@ pub fn render<H: OverlayHost>(prompt: &RejectPrompt, theme: &Theme, cx: &mut Con
             p.click_text();
             None
         })));
+    // The focus ring and glow as bands around the area, not a shadow: the
+    // canvas is translucent while the window is, and a shadow would fill
+    // it. They sit on a holder because the area clips what overflows it.
+    let area = div()
+        .relative()
+        .flex()
+        .flex_col()
+        .child(area)
+        .when(focused, |d| d.children(crate::theme::style::focus_bands(8.0, theme)));
 
     panel("review-reject", theme)
         .w(px(WIDTH))
