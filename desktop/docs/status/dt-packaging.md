@@ -25,8 +25,8 @@
   - Credentials that are present but wrong fail the script, and
     `REQUIRE_NOTARIZATION=1` (set by CI once all secrets exist) fails anything
     short of notarized.
-- **The icon**: `assets/icon/shelbi.svg` (source) and `shelbi-1024.png` (the
-  committed master), rendered by `scripts/render-icon.sh` (ImageMagick).
+- **The icon**: `assets/icon/shelbi-1024.png`, the committed master and the
+  icon's only source (see `assets/icon/README.md`).
 - **`--print-version`** (`src/platform/print_version.rs`): prints
   `Shelbi <version>` and the CLI check (`shelbi CLI: <path> <version>
   (matches)`), then exits 0 on a match and 1 otherwise. No window, no daemon.
@@ -120,10 +120,11 @@
   quarantined first launch waits on macOS's "downloaded from the Internet"
   confirmation (seen here: it appeared on screen for the quarantined test
   copy), which nobody clicks on a runner.
-- **The icon** is the brand's pixel "S" (the shape of `site/app/icon.svg`)
-  redrawn on an exact 10x9 grid so it stays crisp at 16px: `#D5D5D5` on a
-  black rounded square, the site icon's two colors, on the 1024 macOS grid.
-  The PNG master is committed so bundling needs only `sips`/`iconutil`.
+- **The icon** was first the brand's pixel "S" (the shape of
+  `site/app/icon.svg`) drawn as an SVG and rendered to PNG. It is now the
+  "Command Grille" artwork, raster and finished in Figma, committed as the
+  1024px PNG master with no SVG or render step behind it. The PNG master is
+  committed so bundling needs only `sips`/`iconutil`.
 - **The update check shells out to `/usr/bin/curl`** rather than adding an
   HTTP client for one GET a day; `file://` fixtures come free with it. The
   bar sits in the main column rather than across the window top, where it
