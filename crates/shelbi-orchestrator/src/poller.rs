@@ -3852,14 +3852,24 @@ fn rebase_workspace_branch_before_handoff(
 
     let status = outcome.status_token();
     let detail = outcome.detail();
-    if let Err(e) = append_rebase_event(task_id, &workspace.name, &branch, &base_branch, status, &detail)
-    {
-        tracing::warn!(
-            workspace = %workspace.name,
-            task = %task_id,
-            error = %e,
-            "append_rebase_event failed",
-        );
+    // While the handoff push is blocked (and already surfaced) for the branch's
+    // current tip, every tick re-runs this rebase only to change nothing. Logging
+    // each of those is the silent `rebase status=up-to-date` loop the block's one
+    // event replaces; a rebase that moves the tip still logs (and gives the push
+    // a fresh tip to report on).
+    let tip_unchanged = !matches!(outcome, crate::workspace::RebaseOutcome::Rebased { .. });
+    let quiet = tip_unchanged && push_block_surfaced_for_current_tip(host, machine, workspace, &branch);
+    if !quiet {
+        if let Err(e) =
+            append_rebase_event(task_id, &workspace.name, &branch, &base_branch, status, &detail)
+        {
+            tracing::warn!(
+                workspace = %workspace.name,
+                task = %task_id,
+                error = %e,
+                "append_rebase_event failed",
+            );
+        }
     }
     match &outcome {
         crate::workspace::RebaseOutcome::Conflict { .. } => {
@@ -3892,6 +3902,27 @@ fn rebase_workspace_branch_before_handoff(
             );
         }
     }
+}
+
+/// True when the [`workspace_push_blocked_marker`] says the handoff push was
+/// already surfaced as blocked for `branch`'s current local tip.
+fn push_block_surfaced_for_current_tip(
+    host: &shelbi_core::Host,
+    machine: &shelbi_core::Machine,
+    workspace: &shelbi_core::WorkspaceSpec,
+    branch: &str,
+) -> bool {
+    let marker = crate::workspace::workspace_push_blocked_marker(machine, workspace);
+    let Some(ledger) = crate::workspace::read_deferred_marker(host, &marker)
+        .ok()
+        .flatten()
+        .and_then(|s| PushRetryLedger::parse(&s))
+    else {
+        return false;
+    };
+    let worktree = crate::workspace::workspace_worktree(machine, workspace);
+    let tip = crate::workspace::local_branch_tip(host, &worktree, branch).unwrap_or_default();
+    PushRetryLedger::already_surfaced(Some(&ledger), &tip)
 }
 
 /// Max transient handoff-push failures for one local tip before the push is
@@ -3946,17 +3977,49 @@ impl PushRetryLedger {
     }
 }
 
-/// Parse a [`workspace_pushed_tip_marker`] body (`<branch> <sha>`), returning
-/// the recorded sha **only** when its branch matches `branch`. A workspace
-/// reused for a later task on a different branch must not inherit a stale
-/// branch's pushed tip (which would let a force-push over a tip that is not
-/// this branch's own earlier push), so a branch mismatch — or any malformed
-/// body — yields `None` and the push falls back to blocking a non-ff remote.
+/// Parse a [`workspace_pushed_tip_marker`] body (one `<branch> <sha>` line per
+/// branch), returning the sha recorded for `branch`. A workspace reused for a
+/// later task on a different branch must not inherit another branch's pushed
+/// tip (which would let a force-push over a tip that is not this branch's own
+/// earlier push), so only a line naming `branch` counts; no such line — or a
+/// malformed one — yields `None` and the push falls back to blocking a non-ff
+/// remote (unless `events.log` vouches for it). A single-line body written
+/// before the marker kept one line per branch parses the same way.
 fn parse_pushed_tip(body: &str, branch: &str) -> Option<String> {
-    let mut it = body.split_whitespace();
-    let recorded_branch = it.next()?;
-    let sha = it.next()?;
-    (recorded_branch == branch && !sha.is_empty()).then(|| sha.to_string())
+    body.lines().rev().find_map(|line| {
+        let mut it = line.split_whitespace();
+        let recorded_branch = it.next()?;
+        let sha = it.next()?;
+        (recorded_branch == branch).then(|| sha.to_string())
+    })
+}
+
+/// Most branches a [`workspace_pushed_tip_marker`] remembers. A workspace works
+/// one task at a time, so this only bounds the file; dropping the oldest branch
+/// leaves its provenance to the `events.log` fallback.
+const MAX_PUSHED_TIP_BRANCHES: usize = 32;
+
+/// The [`workspace_pushed_tip_marker`] body after recording `sha` as Shelbi's
+/// push for `branch`: `branch`'s line is replaced (moved last), every other
+/// branch's line is kept, so a task bounced back to this workspace after it ran
+/// another one still finds its own earlier push.
+fn upsert_pushed_tip(prev: Option<&str>, branch: &str, sha: &str) -> String {
+    let mut lines: Vec<&str> = prev
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| {
+            let mut it = l.split_whitespace();
+            matches!((it.next(), it.next()), (Some(b), Some(_)) if b != branch)
+        })
+        .collect();
+    let keep_from = lines.len().saturating_sub(MAX_PUSHED_TIP_BRANCHES - 1);
+    lines.drain(..keep_from);
+    let mut body = lines.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.push_str(&format!("{branch} {sha}"));
+    body
 }
 
 /// What the poller should do with a failed handoff push. Pure decision over the
@@ -4036,6 +4099,47 @@ fn push_blocked_message(branch: &str, cap: bool, reason: &str) -> String {
              place; once the branch is a clean rebase of origin, the handoff \
              retries automatically."
         )
+    }
+}
+
+/// Ask the orchestrator (through the same question store and `question=` event
+/// a worker's `request-clarification` uses) to resolve a terminally blocked
+/// handoff push. Best-effort: a failure only loses the question, never the
+/// `push status=blocked` event already on `events.log`.
+fn raise_push_blocked_question(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+    branch: &str,
+    tip: &str,
+    reason: &str,
+) {
+    let short = tip.get(..7).unwrap_or(tip);
+    let text = format!(
+        "Shelbi can't hand off `{task_id}`: pushing `{branch}` (local tip {short}) to origin \
+         is blocked ({reason}). Shelbi has no record of pushing origin's current tip, so it \
+         won't force over it. Reconcile origin/{branch} with the workspace branch (force-push \
+         the local tip if origin's commit is safe to drop, or merge it into the branch); the \
+         ready marker is still in place and the handoff completes on the next poll once origin \
+         is the local tip or an ancestor of it."
+    );
+    let stored = shelbi_state::questions::record_question(shelbi_state::questions::NewQuestion {
+        project: Some(&project.name),
+        task: task_id,
+        id: "push-blocked",
+        workspace: Some(&workspace.name),
+        text: &text,
+        context: Some(reason),
+    });
+    let (id, file) = match &stored {
+        Ok(q) => (q.meta.id.as_str(), Some(q.path.as_path())),
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "could not store push-blocked question");
+            ("push-blocked", None)
+        }
+    };
+    if let Err(e) = shelbi_state::append_clarification_event(Some(&project.name), id, task_id, &text, file) {
+        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_clarification_event failed");
     }
 }
 
@@ -4119,12 +4223,26 @@ fn push_workspace_branch_before_handoff(
 
     // Provenance: the last commit Shelbi itself pushed for this branch (if any).
     // It is what makes a non-fast-forward force safe — we may overwrite a remote
-    // tip only when it is that recorded commit, now reworked by the worker. A
-    // body for a *different* branch (a reused workspace) is ignored.
-    let last_pushed_tip = crate::workspace::read_deferred_marker(host, &pushed_tip_marker)
+    // tip only when it is that recorded commit, now reworked by the worker. The
+    // workspace's own sidecar answers first; `events.log` (hub-wide, so it also
+    // knows a push made from a different workspace) answers when the sidecar
+    // has no matching line. The log is only read when a force is needed.
+    let pushed_tip_body = crate::workspace::read_deferred_marker(host, &pushed_tip_marker)
         .ok()
-        .flatten()
-        .and_then(|body| parse_pushed_tip(&body, &branch));
+        .flatten();
+    let recorded_tip = pushed_tip_body
+        .as_deref()
+        .and_then(|body| parse_pushed_tip(body, &branch));
+    let pushed_by_shelbi = |remote: &str| {
+        if recorded_tip.as_deref() == Some(remote) {
+            return true;
+        }
+        // The log carries abbreviated shas (at least 7 hex digits).
+        shelbi_state::last_pushed_tip_from_events(&branch)
+            .ok()
+            .flatten()
+            .is_some_and(|short| remote.starts_with(&short))
+    };
 
     // Whether this exact tip was already surfaced as blocked on a prior tick.
     // We still re-attempt the push below (so an out-of-band origin fix completes
@@ -4136,7 +4254,7 @@ fn push_workspace_branch_before_handoff(
         host,
         &worktree,
         &branch,
-        last_pushed_tip.as_deref(),
+        &pushed_by_shelbi,
     );
 
     let status = outcome.status_token();
@@ -4159,7 +4277,7 @@ fn push_workspace_branch_before_handoff(
             let _ = crate::workspace::write_deferred_marker(
                 host,
                 &pushed_tip_marker,
-                &format!("{branch} {sha}"),
+                &upsert_pushed_tip(pushed_tip_body.as_deref(), &branch, sha),
             );
         }
         if let Err(e) = append_push_event(task_id, &workspace.name, &branch, status, &detail) {
@@ -4232,6 +4350,10 @@ fn push_workspace_branch_before_handoff(
             }
             let body = push_blocked_message(&branch, cap, &reason);
             crate::workspace::push_worker_directive(host, &worktree, task_id, &body);
+            // The worker can't untangle origin itself, so put the block in
+            // front of the orchestrator as a question too. Same once-per-tip
+            // guarantee as the event above.
+            raise_push_blocked_question(project, workspace, task_id, &branch, &tip, &reason);
             tracing::warn!(
                 workspace = %workspace.name,
                 task = %task_id,
@@ -9565,8 +9687,212 @@ transitions:
             "sidecar must mark the current tip terminally blocked; got {recorded:?}",
         );
 
+        // The block is put to the orchestrator as a question it can act on.
+        let question = shelbi_state::questions::read_question(
+            &shelbi_state::questions::question_path(Some("demo"), "fix-login", "push-blocked")
+                .unwrap(),
+        )
+        .unwrap()
+        .expect("a push-blocked question must be stored for the orchestrator");
+        assert!(question.text.contains("shelbi/fix-login"), "{}", question.text);
+        assert!(
+            log.lines().any(|l| l.contains(" question=push-blocked task=fix-login project=demo ")),
+            "the question must ride the events stream; log: {log:?}",
+        );
+
+        // Later ticks on the unchanged tip stay quiet: no second blocked event,
+        // no second question, and no per-tick `rebase` line either.
+        let before = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        for _ in 0..2 {
+            maybe_apply_ready_handoff(
+                &project,
+                &project.workspaces[0],
+                &project.machines[0],
+                &Host::Local,
+                &SessionTarget::slot("s", "w"),
+            );
+        }
+        let after = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert_eq!(
+            after.lines().count(),
+            before.lines().count(),
+            "a surfaced block must not keep logging; new lines: {:?}",
+            &after[before.len()..],
+        );
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::in_progress(),
+        );
+
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A hub-like fixture for the handoff-push tests: a main clone at
+    /// `<home>/repo` whose `main` is on a bare `<home>/origin.git`, and the
+    /// project's one workspace worktree checked out on `branch` (cut from main)
+    /// with one task commit.
+    fn push_fixture(
+        home: &std::path::Path,
+        branch: &str,
+    ) -> (Project, std::path::PathBuf, std::path::PathBuf) {
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+        let bare = home.join("origin.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(git_in(&work_dir, &["remote", "add", "origin", &bare_str]).status.success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "main"]).status.success());
+
+        let project = local_project(&work_dir);
+        let wt = crate::workspace::workspace_worktree(&project.machines[0], &project.workspaces[0]);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap(), "main"],
+        )
+        .status
+        .success());
+        std::fs::write(wt.join("work.txt"), "v0\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "task work"]).status.success());
+        (project, wt, bare)
+    }
+
+    /// Mark `task_id` in-progress on the workspace (pinned to `branch`), drop
+    /// its ready marker, and run one handoff tick.
+    fn ready_handoff_tick(project: &Project, task_id: &str, branch: &str) {
+        let mut task = in_progress_task(task_id, "alpha");
+        task.branch = Some(branch.into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        write_marker(project, &format!("{task_id}\n"));
+        maybe_apply_ready_handoff(
+            project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &SessionTarget::slot("s", "w"),
+        );
+    }
+
+    fn rev(dir: &std::path::Path, rev: &str) -> String {
+        String::from_utf8_lossy(&git_in(dir, &["rev-parse", rev]).stdout).trim().to_string()
+    }
+
+    /// The `dt-figma-qa-activity` incident: a task is handed off (Shelbi pushes
+    /// its branch), its workspace then runs a *different* task (whose push
+    /// overwrote the old single-slot provenance), and the first task is bounced
+    /// back to the same workspace, where the worker rebases onto a moved base.
+    /// The rebased branch is a rework of Shelbi's own earlier push, so the
+    /// handoff must force-push it (with lease) and reach review, not block on
+    /// `not_pushed_by_shelbi`. With `forget_sidecar` the workspace's provenance
+    /// sidecar is gone entirely (a bounce to a different workspace, or a sidecar
+    /// written by an older build), and `events.log` alone must vouch for the tip.
+    fn redispatched_rebased_push_force_pushes(forget_sidecar: bool) {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-bounce-push-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let (project, wt, bare) = push_fixture(&home, "shelbi/fix-login");
+
+        // 1. First handoff: Shelbi pushes the branch and the task reaches review.
+        ready_handoff_tick(&project, "fix-login", "shelbi/fix-login");
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::review()
+        );
+        let first_push = rev(&bare, "shelbi/fix-login");
+        assert_eq!(first_push, rev(&wt, "shelbi/fix-login"));
+
+        // 2. The same workspace runs another task and hands it off too.
+        assert!(git_in(&wt, &["checkout", "-q", "-b", "shelbi/other", "main"]).status.success());
+        std::fs::write(wt.join("other.txt"), "other\n").unwrap();
+        assert!(git_in(&wt, &["add", "other.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "other work"]).status.success());
+        ready_handoff_tick(&project, "other", "shelbi/other");
+        assert_eq!(
+            shelbi_state::load_task("demo", "other").unwrap().task.column,
+            Column::review()
+        );
+        if forget_sidecar {
+            let sidecar = crate::workspace::workspace_pushed_tip_marker(
+                &project.machines[0],
+                &project.workspaces[0],
+            );
+            std::fs::remove_file(&sidecar).unwrap();
+        }
+
+        // 3. A sibling merge moves main on origin.
+        let main_clone = home.join("repo");
+        std::fs::write(main_clone.join("sibling.txt"), "sibling\n").unwrap();
+        assert!(git_in(&main_clone, &["add", "sibling.txt"]).status.success());
+        assert!(git_in(&main_clone, &["commit", "-q", "-m", "sibling merge"]).status.success());
+        assert!(git_in(&main_clone, &["push", "-q", "origin", "main"]).status.success());
+
+        // 4. The task bounces back to the workspace; the worker rebases its
+        //    branch onto the new base (rewriting Shelbi's pushed commit) and
+        //    writes the ready marker again.
+        assert!(git_in(&wt, &["checkout", "-q", "shelbi/fix-login"]).status.success());
+        assert!(git_in(&wt, &["fetch", "-q", "origin"]).status.success());
+        assert!(git_in(&wt, &["rebase", "-q", "origin/main"]).status.success());
+        let rebased = rev(&wt, "shelbi/fix-login");
+        assert_ne!(rebased, first_push);
+        ready_handoff_tick(&project, "fix-login", "shelbi/fix-login");
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::review(),
+            "the rebased rework of Shelbi's own push must hand off",
+        );
+        assert_eq!(
+            rev(&bare, "shelbi/fix-login"),
+            rebased,
+            "origin must carry the rebased tip",
+        );
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" push task=fix-login ")
+                && l.contains(" status=force-pushed ")),
+            "the rebased push must be a force-push; log: {log:?}",
+        );
+        assert!(
+            !log.lines().any(|l| l.contains(" status=blocked ")),
+            "nothing may block; log: {log:?}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn redispatch_after_handoff_then_rebased_push_force_pushes() {
+        redispatched_rebased_push_force_pushes(false);
+    }
+
+    #[test]
+    fn redispatch_rebased_push_trusts_events_log_without_a_sidecar() {
+        redispatched_rebased_push_force_pushes(true);
     }
 
     #[test]
@@ -12088,6 +12414,35 @@ transitions:
         assert_eq!(parse_pushed_tip("jlong/feat", "jlong/feat"), None);
         assert_eq!(parse_pushed_tip("", "jlong/feat"), None);
         assert_eq!(parse_pushed_tip("   ", "jlong/feat"), None);
+        // One line per branch: the matching line answers wherever it sits.
+        let body = "jlong/feat abc1234\njlong/other def5678";
+        assert_eq!(parse_pushed_tip(body, "jlong/feat").as_deref(), Some("abc1234"));
+        assert_eq!(parse_pushed_tip(body, "jlong/other").as_deref(), Some("def5678"));
+    }
+
+    #[test]
+    fn upsert_pushed_tip_keeps_other_branches_and_replaces_this_one() {
+        let one = upsert_pushed_tip(None, "jlong/a", "aaa1111");
+        assert_eq!(one, "jlong/a aaa1111");
+        // A workspace that hands off A, then runs B, still remembers A.
+        let two = upsert_pushed_tip(Some(&one), "jlong/b", "bbb2222");
+        assert_eq!(parse_pushed_tip(&two, "jlong/a").as_deref(), Some("aaa1111"));
+        assert_eq!(parse_pushed_tip(&two, "jlong/b").as_deref(), Some("bbb2222"));
+        // Re-pushing A replaces its line (moved last) rather than adding one.
+        let three = upsert_pushed_tip(Some(&two), "jlong/a", "aaa3333");
+        assert_eq!(three, "jlong/b bbb2222\njlong/a aaa3333");
+        // Malformed lines are dropped, and the file stays bounded.
+        let mut body = "garbage\n".to_string();
+        for i in 0..(MAX_PUSHED_TIP_BRANCHES + 5) {
+            body = upsert_pushed_tip(Some(&body), &format!("b{i}"), "0123456");
+        }
+        assert_eq!(body.lines().count(), MAX_PUSHED_TIP_BRANCHES);
+        assert!(!body.contains("garbage"));
+        assert_eq!(
+            parse_pushed_tip(&body, &format!("b{}", MAX_PUSHED_TIP_BRANCHES + 4)).as_deref(),
+            Some("0123456")
+        );
+        assert_eq!(parse_pushed_tip(&body, "b0"), None);
     }
 
     #[test]

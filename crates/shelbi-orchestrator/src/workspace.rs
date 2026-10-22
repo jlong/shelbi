@@ -383,7 +383,7 @@ pub fn workspace_push_blocked_marker(machine: &Machine, workspace: &WorkspaceSpe
 }
 
 /// The handoff-push **provenance** marker for a workspace:
-/// `<worktree>/.shelbi/shelbi-pushed-tip`, body `<branch> <sha>`.
+/// `<worktree>/.shelbi/shelbi-pushed-tip`, one `<branch> <sha>` line per branch.
 ///
 /// It records the last commit *Shelbi itself pushed* to `origin/<branch>` for
 /// this workspace. [`push_workspace_branch_to_origin`] uses it to decide whether
@@ -402,7 +402,11 @@ pub fn workspace_push_blocked_marker(machine: &Machine, workspace: &WorkspaceSpe
 ///
 /// The body is branch-qualified so a workspace reused for a later task on a
 /// different branch does not inherit a stale branch's pushed tip (the recorded
-/// branch must match before the sha is trusted). Lives under `.shelbi/` for the
+/// branch must match before the sha is trusted). It keeps a line *per branch*
+/// rather than only the latest push: a workspace commonly hands off task A,
+/// runs task B, and then gets A bounced back to it for a rebase. A single slot
+/// held only B's push by then, so A's rebased push found no provenance and
+/// blocked forever (the `dt-figma-qa-activity` incident). Lives under `.shelbi/` for the
 /// same gitignore reason as the ready marker, and uses the
 /// [`read_deferred_marker`] / [`write_deferred_marker`] / [`clear_deferred_marker`]
 /// trio.
@@ -1600,17 +1604,20 @@ fn origin_branch_tip(host: &Host, wt: &str, branch: &str) -> std::result::Result
 ///
 /// Behaviour:
 ///
-/// `last_pushed_tip` is the commit Shelbi recorded as its own last push for this
-/// branch (the [`workspace_pushed_tip_marker`] the caller reads and, on a
-/// successful push, rewrites). It is the **provenance** gate on a force: the
-/// only remote tip Shelbi may overwrite is one it put there itself, which the
-/// worker has since rewritten.
+/// `pushed_by_shelbi` answers whether a remote tip is a commit Shelbi recorded
+/// as its own last push for this branch (the caller checks the
+/// [`workspace_pushed_tip_marker`] it rewrites on a successful push, then the
+/// hub-wide push history in `events.log`). It is the **provenance** gate on a
+/// force: the only remote tip Shelbi may overwrite is one it put there itself,
+/// which the worker has since rewritten. It is only consulted when a force is
+/// actually needed, so an expensive fallback lookup costs nothing on the
+/// ordinary fast-forward path.
 ///
 /// - Local tip already on origin → [`PushOutcome::UpToDate`], no push.
 /// - Remote tip is an ancestor of the local tip (ordinary progress) or the
 ///   branch is new on origin → fast-forward `git push`.
 /// - Remote tip is *not* an ancestor (rebase/amend/squash rewrote the branch),
-///   **and** the live remote tip equals `last_pushed_tip` (it is Shelbi's own
+///   **and** `pushed_by_shelbi` vouches for the live remote tip (it is Shelbi's own
 ///   earlier push, now reworked) →
 ///   `git push --force-with-lease=<branch>:<freshly-read-remote-tip>` on the
 ///   **first** attempt. This covers the common bounce-and-rework case where a
@@ -1624,7 +1631,7 @@ fn origin_branch_tip(host: &Host, wt: &str, branch: &str) -> std::result::Result
 ///   the force safe against a foreign push; the lease only guards the tiny
 ///   read→push window (if origin changes in it, the lease aborts → `Failed`,
 ///   retried next tick).
-/// - Remote tip is *not* an ancestor and is *not* `last_pushed_tip` (foreign
+/// - Remote tip is *not* an ancestor and `pushed_by_shelbi` rejects it (foreign
 ///   work from another clone, or a tip Shelbi never recorded pushing) →
 ///   [`PushOutcome::Blocked`]; we refuse to force (forcing could clobber it) and
 ///   the caller surfaces it for a human once, then re-attempts quietly so an
@@ -1648,7 +1655,7 @@ pub fn push_workspace_branch_to_origin(
     host: &Host,
     worktree: &Path,
     branch: &str,
-    last_pushed_tip: Option<&str>,
+    pushed_by_shelbi: &dyn Fn(&str) -> bool,
 ) -> PushOutcome {
     let wt = worktree.to_string_lossy().into_owned();
 
@@ -1724,15 +1731,15 @@ pub fn push_workspace_branch_to_origin(
     let mut argv: Vec<String> = vec!["git".into(), "-C".into(), wt.clone(), "push".into()];
     if forced {
         // The remote tip was rewritten out from under us. Only overwrite it if
-        // it is *Shelbi's own earlier push* for this branch (recorded in
-        // `last_pushed_tip`) that the worker has since reworked — then forcing
+        // it is *Shelbi's own earlier push* for this branch (vouched for by
+        // `pushed_by_shelbi`) that the worker has since reworked — then forcing
         // over it loses nothing foreign, because the only commit there is ours.
         // Any other remote tip is foreign work from another clone (or a tip we
         // never recorded pushing): refuse to force and let the caller surface it
         // to a human. This provenance check — not the lease — is the real safety
         // guard against clobbering a concurrent push.
         let remote = remote_sha.as_deref().unwrap_or_default();
-        if last_pushed_tip != Some(remote) {
+        if !pushed_by_shelbi(remote) {
             return PushOutcome::Blocked {
                 reason: format!(
                     "remote_has_unrebased_commits:origin_tip_{}_not_pushed_by_shelbi",
@@ -11982,7 +11989,7 @@ mod push_git_tests {
         // the rebase rewrote, and it is still the live remote tip — so the force
         // is over our own earlier push and lands.
         let outcome =
-            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&stale_remote));
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|t: &str| t == stale_remote);
         match &outcome {
             PushOutcome::Pushed {
                 local_sha,
@@ -12024,7 +12031,7 @@ mod push_git_tests {
 
         // Ordinary fast-forward: the force path (and its provenance gate) is not
         // reached, so no recorded pushed tip is needed.
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|_: &str| false);
         assert!(
             matches!(&outcome, PushOutcome::Pushed { forced: false, .. }),
             "expected non-forced Pushed, got {outcome:?}"
@@ -12050,7 +12057,7 @@ mod push_git_tests {
             .success());
         let local = head_sha(&repo);
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|_: &str| false);
         match &outcome {
             PushOutcome::UpToDate { local_sha } => assert_eq!(local_sha, &local),
             other => panic!("expected UpToDate, got {other:?}"),
@@ -12075,7 +12082,7 @@ mod push_git_tests {
 
         // A new branch is a plain push: the force path (and its provenance gate)
         // is never reached, so no recorded pushed tip is needed.
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|_: &str| false);
         match &outcome {
             PushOutcome::Pushed {
                 remote_before,
@@ -12105,7 +12112,7 @@ mod push_git_tests {
         run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
         commit_file(&repo, "feature.txt", "v0\n", "feature v0");
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|_: &str| false);
         assert_eq!(outcome, PushOutcome::NoRemote);
         assert!(outcome.handed_off_local_tip(), "no-remote must not block");
 
@@ -12180,7 +12187,7 @@ mod push_git_tests {
             &Host::Local,
             &repo,
             "feature",
-            Some(&shelbi_pushed),
+            &|t: &str| t == shelbi_pushed,
         );
         assert!(
             matches!(&outcome, PushOutcome::Blocked { .. }),
@@ -12240,7 +12247,7 @@ mod push_git_tests {
         // Provenance: the live remote tip is exactly what Shelbi pushed, so the
         // force over it is safe regardless of how the content changed.
         let outcome =
-            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&pushed));
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|t: &str| t == pushed);
         match &outcome {
             PushOutcome::Pushed {
                 local_sha,
@@ -12302,7 +12309,7 @@ mod push_git_tests {
         // The live remote tip is still Shelbi's push (no one else touched it).
         assert_eq!(origin_tip(&bare, "feature"), pushed);
         let outcome =
-            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&pushed));
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|t: &str| t == pushed);
         match &outcome {
             PushOutcome::Pushed {
                 local_sha,
@@ -12374,7 +12381,7 @@ mod push_git_tests {
             &Host::Local,
             &repo,
             "feature",
-            Some(&shelbi_pushed),
+            &|t: &str| t == shelbi_pushed,
         );
         assert!(
             matches!(&blocked, PushOutcome::Blocked { .. }),
@@ -12398,7 +12405,7 @@ mod push_git_tests {
             &Host::Local,
             &repo,
             "feature",
-            Some(&shelbi_pushed),
+            &|t: &str| t == shelbi_pushed,
         );
         match &healed {
             PushOutcome::UpToDate { local_sha } => assert_eq!(local_sha, &local),
@@ -12451,7 +12458,7 @@ mod push_git_tests {
         // Provenance: the recorded pushed tip is the live remote tip, so the
         // force is over Shelbi's own earlier push and lands on the first attempt.
         let outcome =
-            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&remote_tip));
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", &|t: &str| t == remote_tip);
         match &outcome {
             PushOutcome::Pushed { forced, local_sha, remote_before } => {
                 assert!(*forced, "a rebased branch must force");
