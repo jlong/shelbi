@@ -524,8 +524,9 @@ mod tests {
         let p = palette(&e);
         let row = layout_row(&e, 0, 20, &p);
         assert_eq!(row.glyphs.len(), 2, "hidden text paints nothing");
-        // Dim default text is the theme's muted (the frames' tool output).
-        assert_eq!(row.glyphs[0].style.color, hsla(0x777a86), "theme.muted");
+        // Dim default text is the theme's muted (the frames' tool output):
+        // `text/muted`, #f2f3f7 at 55%, flattened over the canvas.
+        assert_eq!(row.glyphs[0].style.color, hsla(0x92959d), "text/muted");
         // Dim colored text keeps its hue, faded.
         let red = p.color(VtColor::Named(NamedColor::Red));
         assert_eq!(row.glyphs[1].style.color.h, red.h);
@@ -534,12 +535,12 @@ mod tests {
 
     #[test]
     fn bold_default_text_is_the_loud_color() {
-        // The frames' bold prompt lines are theme.white; bold colored text
+        // The frames' bold prompt lines are `text/bold`; bold colored text
         // keeps its color.
         let e = emu(b"\x1b[1mB\x1b[0;1;32mG\x1b[0mP");
         let p = palette(&e);
         let row = layout_row(&e, 0, 20, &p);
-        assert_eq!(row.glyphs[0].style.color, hsla(0xf8f8fa), "theme.white");
+        assert_eq!(row.glyphs[0].style.color, hsla(0xf2f3f7), "text/bold");
         assert_eq!(row.glyphs[1].style.color, hsla(0x5acd25), "theme.green");
         assert_eq!(row.glyphs[2].style.color, p.foreground());
         // A program's own foreground (OSC 10) wins for bold too.

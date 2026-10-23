@@ -130,7 +130,7 @@ impl Theme {
 
     /// The color a shared view model names by [`Tone`] (an activity row's
     /// tag, a machines badge): the Figma log color for the TUI hue's
-    /// meaning (Activity's `theme.ansi_*`).
+    /// meaning (Activity's `text/ansi_*`).
     pub fn tone(&self, tone: Tone) -> Hsla {
         match tone {
             Tone::White => self.text_loud,
@@ -194,14 +194,17 @@ pub fn hsla(color: Rgba) -> Hsla {
 /// window rather than a hole in it; the foreground `foreground`, bold text
 /// in the default color `text_loud` and dim text `muted`, as the terminal
 /// frames draw them; the selection is `text_selection`; the matches
-/// `search_match` / `search_current`), so they follow the theme. The ANSI
-/// sixteen in the dark theme are the Settings ▸ Terminal frame's
-/// `ansi/regular/*` and `ansi/bold/*` variables (the Sensible palette,
-/// [`SENSIBLE`]); in the light theme a GitHub-light style set, with "white"
-/// darkened so it shows on white, takes the Figma terminal colors where
-/// Figma has them (red, green and cyan from the terminal frames'
-/// `theme.red` / `theme.green` / `theme.cyan`; yellow, blue, magenta and
-/// bright black from `theme.ansi_*`). The user's own colors
+/// `search_match` / `search_current`), so they follow the theme. A cell
+/// has no alpha, so a translucent role (`text/foreground` at 85%,
+/// `text/muted` at 55% in Dark) is composited over the canvas here, once:
+/// a change to the shared text tokens reaches the terminal by itself. The
+/// ANSI sixteen in the dark theme are `04 Terminal`'s `ansi/regular/*` and
+/// `ansi/bold/*` variables (the Sensible palette, [`SENSIBLE`]), not the
+/// desktop's `text/ansi_*`; in the light theme a GitHub-light style set,
+/// with "white" darkened so it shows on white, takes the Figma terminal
+/// colors where Figma has them (red, green and cyan from `other/red` /
+/// `other/green` / `other/cyan`; yellow, blue, magenta and bright black
+/// from `text/ansi_*`). The user's own colors
 /// (`desktop.terminal_colors`) go over either
 /// ([`TerminalPalette::with_ansi`]). Indexed colors 16..=255 are the fixed xterm cube and ramp
 /// ([`shelbi_term::render::xterm_256`]) and true color passes through. A
@@ -211,7 +214,7 @@ pub struct TerminalPalette {
     /// The default foreground (`Foreground`): the `foreground` role.
     pub foreground: TermRgb,
     /// Bold text in the default foreground (`BrightForeground`): the
-    /// `text_loud` role (`theme.white`, the frames' bold prompt lines).
+    /// `text_loud` role (`text/bold`, the frames' bold prompt lines).
     pub bold_foreground: TermRgb,
     /// Dim (SGR 2) text in the default foreground (`DimForeground`): the
     /// `muted` role (the frames' tool output and footers).
@@ -280,10 +283,10 @@ impl TerminalPalette {
     }
 }
 
-/// The dark theme's ANSI sixteen: the Settings ▸ Terminal frame's
-/// (`2252:28494`) `ansi/regular/*` (0 to 7) and `ansi/bold/*` (8 to 15),
-/// the palette its Reset restores ("Reset to Sensible"). Red, green and cyan
-/// are the terminal frames' `theme.red`, `theme.green` and `theme.cyan`.
+/// The dark theme's ANSI sixteen: `04 Terminal`'s (the Settings ▸ Terminal
+/// frame's, `2252:28494`) `ansi/regular/*` (0 to 7) and `ansi/bold/*` (8 to
+/// 15), the palette its Reset restores ("Reset to Sensible"). Red, green and
+/// cyan match `other/red`, `other/green` and `other/cyan`.
 pub const SENSIBLE: [u32; 16] = [
     0x000000, 0xe04f52, 0x5acd25, 0xdbc300, 0x5893d6, 0xd259d7, 0x00a6b2, 0xbababa,
     0x666666, 0xe69589, 0x9bdaa6, 0xe6d77b, 0x5abdff, 0xdc8de6, 0x82e6e5, 0xffffff,
@@ -493,16 +496,16 @@ mod tests {
         }
         let dark = Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark).terminal;
         assert_eq!(dark.background, TermRgb::hex(0x1e2330), "theme.canvas");
-        // theme.foreground (#f2f3f7 at 70%) over the canvas: the Orchestrator
-        // frame's body text (#b2b5bb in the PNG, a unit off in green).
-        assert_eq!(dark.foreground, TermRgb::hex(0xb2b4bb));
+        // `text/foreground` (#f2f3f7 at 85%) composited over the canvas.
+        assert_eq!(dark.foreground, TermRgb::hex(0xd2d4d9));
         assert_eq!(dark.ansi[1], TermRgb::hex(0xe04f52), "theme.red");
         assert_eq!(dark.ansi, SENSIBLE.map(TermRgb::hex), "the Terminal frame's ansi/*");
         assert_eq!(dark.ansi[9], TermRgb::hex(0xe69589), "ansi/bold/red");
-        // Bold and dim default text: the frames' bold prompts (theme.white)
-        // and dim tool output (theme.muted).
-        assert_eq!(dark.bold_foreground, TermRgb::hex(0xf8f8fa));
-        assert_eq!(dark.dim_foreground, TermRgb::hex(0x777a86));
+        // Bold and dim default text: the frames' bold prompts (`text/bold`,
+        // opaque) and dim tool output (`text/muted`, #f2f3f7 at 55% over the
+        // canvas).
+        assert_eq!(dark.bold_foreground, TermRgb::hex(0xf2f3f7));
+        assert_eq!(dark.dim_foreground, TermRgb::hex(0x92959d));
         assert_eq!(dark.ansi[2], TermRgb::hex(0x5acd25), "theme.green");
         assert_eq!(dark.ansi[6], TermRgb::hex(0x00a6b2), "theme.cyan");
         assert_eq!(dark.ansi[4], TermRgb::hex(0x5893d6), "ansi/regular/blue");
@@ -510,9 +513,9 @@ mod tests {
         assert_eq!(light.ansi[1], TermRgb::hex(0xc23b3e), "theme.red");
         assert_eq!(light.ansi[2], TermRgb::hex(0x367b16), "theme.green");
         assert_eq!(light.ansi[6], TermRgb::hex(0x007a83), "theme.cyan");
-        assert_eq!(light.bold_foreground, TermRgb::hex(0x020303), "theme.white");
-        // theme.muted (#444c65 at 65%) over white.
-        assert_eq!(light.dim_foreground, TermRgb::hex(0x858a9b));
+        assert_eq!(light.bold_foreground, TermRgb::hex(0x020303), "text/bold");
+        // `text/muted` (#444c65 at 50%) over white.
+        assert_eq!(light.dim_foreground, TermRgb::hex(0xa1a5b2));
         assert_ne!(
             light.ansi[7], light.background,
             "ANSI white must show on the light surface"
@@ -531,10 +534,13 @@ mod tests {
             let bg = rgb(t.background);
             assert!(rgb(t.foreground).contrast_ratio(bg) >= 4.5, "{system:?} fg");
             assert!(rgb(t.bold_foreground).contrast_ratio(bg) >= 4.5, "{system:?} bold fg");
-            // Dim text is de-emphasis by design (theme.muted): held to the
-            // hues' 3:1.
+            // Dim text is de-emphasis by design (`text/muted`): held to the
+            // hues' 3:1, except Light's, where Figma's `#444c65` at 50% is
+            // 2.46 on white (`docs/theme.md`, "Exceptions"). The floor keeps
+            // it from sliding further unnoticed.
             let dim = rgb(t.dim_foreground).contrast_ratio(bg);
-            assert!(dim >= 3.0, "{system:?} dim fg: {dim:.2}");
+            let floor = if system == WindowAppearance::Light { 2.4 } else { 3.0 };
+            assert!(dim >= floor, "{system:?} dim fg: {dim:.2}");
             for (i, c) in t.ansi.iter().enumerate() {
                 // Skip black (0) and its bright (8) in dark, white (7, 15) in
                 // light: the slot that matches the background by design.

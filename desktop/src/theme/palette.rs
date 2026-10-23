@@ -3,10 +3,10 @@
 //!
 //! The TUI keeps the shared tokens ([`shelbi_app::theme`]); the desktop paints
 //! from these roles instead, after John's Figma file (`Shelbi`, fileKey
-//! `pu3hxHgWoCDPCzJ4u6zTQK`). Each role's two values are the Figma variable's
-//! Dark and Light modes ([`figma`]), or, where Figma draws a color without a
-//! variable (the sidebar tint, the board's cards, the scrim), the value
-//! measured from the frame. `desktop/docs/theme.md` lists every role with
+//! `pu3hxHgWoCDPCzJ4u6zTQK`). Each role's two values are a `03 Desktop`
+//! variable's Dark and Light modes ([`figma`]), or, where Figma draws a color
+//! without one (the sidebar tint, the raised surface), the value measured
+//! from the frame. `desktop/docs/theme.md` lists every role with
 //! both values and which token or frame it comes from; the tests check WCAG
 //! AA for every text role on every surface it is drawn on, and list where a
 //! Figma value falls short instead of shifting it.
@@ -16,9 +16,18 @@
 
 use shelbi_app::theme::{Appearance, Rgb};
 
-/// The Figma variables, by their Figma names, one `(dark, light)` pair each.
-/// Translucent tokens keep their alpha: `theme.background` is a slate overlay
-/// that tints whatever it sits on, as in Figma.
+/// The Figma variables, one `(dark, light)` pair each: the `03 Desktop`
+/// collection's Dark and Light modes, each constant documented with its
+/// semantic Figma name (`surface/*`, `text/*`, `icon/*`, `stroke/*`,
+/// `button/*`, `focus/*`, `checkbox/*`). Translucent tokens keep their
+/// straight alpha: `button/default/background` is a slate overlay that tints
+/// whatever it sits on, as in Figma.
+///
+/// Figma stores a variable's opacity as a 32-bit float; a byte here is that
+/// float times 255, rounded to the nearest (so 70% is `b2` and 90% `e5`,
+/// as Figma's own hex reads them, while 50% is `80`).
+/// `token_alphas_are_figmas_opacities` holds every percentage-defined token
+/// to that convention.
 pub mod figma {
     use super::Rgba;
 
@@ -28,107 +37,109 @@ pub mod figma {
         (Rgba::hexa(dark), Rgba::hexa(light))
     }
 
-    /// `theme.canvas`: the main surface and the terminal's background.
+    /// `surface/background` (`Slate/900` / white): the main surface and the
+    /// terminal's background.
     pub const CANVAS: Pair = pair(0x1e2330ff, 0xffffffff);
-    /// `theme.background`: the overlay fill (controls, chips, badges).
+    /// `surface/depth-0` (`Black/950` / white), and
+    /// `checkbox/default/background`, which aliases it: the Textbox well, an
+    /// unchecked box, a board card.
+    pub const DEPTH_0: Pair = pair(0x020303ff, 0xffffffff);
+    /// `button/default/background` (also `surface/hover` and
+    /// `surface/depth-20`): `Slate/400` at 18% in Dark, 12% in Light, the
+    /// overlay fill (controls, chips, badges).
     pub const BACKGROUND: Pair = pair(0xacb4cf2e, 0xacb4cf1f);
-    /// `button/default/background-hover`: `#acb4cf` at 28% in Dark, 22% in
-    /// Light.
+    /// `button/default/background-hover`: `Slate/400` at 28% / 22%.
     pub const BACKGROUND_HOVER: Pair = pair(0xacb4cf47, 0xacb4cf38);
-    /// `button/default/background-active`: `#acb4cf` at 40% in Dark, 32% in
-    /// Light.
+    /// `button/default/background-active`: `Slate/400` at 40% / 32%.
     pub const BACKGROUND_ACTIVE: Pair = pair(0xacb4cf66, 0xacb4cf52);
     /// `button/select/background`: the Button's Select style (a filter
-    /// that is set), `Cyan/400` at the overlay fill's alphas (18% Dark, 12%
-    /// Light).
+    /// that is set), `Cyan/400` at 18% / 12%.
     pub const SELECT_FILL: Pair = pair(0x62cdf62e, 0x62cdf61f);
     /// `button/select/background-hover`: 28% / 22%.
     pub const SELECT_FILL_HOVER: Pair = pair(0x62cdf647, 0x62cdf638);
     /// `button/select/background-active`: 40% / 32%.
     pub const SELECT_FILL_ACTIVE: Pair = pair(0x62cdf666, 0x62cdf652);
-    /// `button/select/text`: `Cyan/300` in Dark, `Cyan/600` in Light.
+    /// `button/select/text` (and `/icon`): `Cyan/300` in Dark, `Cyan/600`
+    /// in Light.
     pub const SELECT_TEXT: Pair = pair(0xb0e6fbff, 0x1989c4ff);
-    /// `surface/depth-10`: the Issues Header's band, `#acb4cf` at 10% in
-    /// Dark, 8% in Light, over the canvas.
+    /// `surface/depth-10`: the Issues Header's band, `Slate/400` at 10% /
+    /// 8% over the canvas.
     pub const DEPTH_10: Pair = pair(0xacb4cf1a, 0xacb4cf14);
-    /// `theme.selection`: the selected segment, the terminal's selection.
+    /// `surface/selection`: `Slate/400` at 55% / 40%, the selected segment,
+    /// the terminal's selection.
     pub const SELECTION: Pair = pair(0xacb4cf8c, 0xacb4cf66);
-    /// `theme.search`: a search match, the Activity filter chips.
+    /// `surface/depth-30`: `Slate/400` at 25% / 16%, a search match, the
+    /// Activity filter chips, the segmented track.
     pub const SEARCH: Pair = pair(0xacb4cf40, 0xacb4cf29);
-    /// `theme.divider` (Orchestrator, Activity, Settings, Issue detail).
+    /// `stroke/light`: `Slate/400` at 10%, dividers.
     pub const DIVIDER: Pair = pair(0xacb4cf1a, 0xacb4cf1a);
-    /// `theme.divider` as the Issues frame overrides it (the board's rules).
+    /// `stroke/medium`: `Slate/400` at 20%, the board's rules.
     pub const DIVIDER_STRONG: Pair = pair(0xacb4cf33, 0xacb4cf33);
-    /// `theme.search` as the Issue detail frame sets it: its buttons'
-    /// Hotkey drop (near black at 55% in Dark, `#acb4cf` at 60% in Light).
-    pub const SEARCH_DETAIL: Pair = pair(0x0203038c, 0xacb4cf99);
-    /// `theme.foreground`: body text.
-    pub const FOREGROUND: Pair = pair(0xf2f3f7b2, 0x020303b2);
-    /// `theme.white`: loud text (near black in Light, despite the name).
-    pub const WHITE: Pair = pair(0xf8f8faff, 0x020303ff);
-    /// `theme.gray`: secondary text, hotkeys, icons.
-    pub const GRAY: Pair = pair(0xacb4cfe5, 0x7b85a7e5);
-    /// `theme.foreground` as the Settings frame and the form components
-    /// set it: `#f2f3f7` at 85% in Dark, the usual `#020303b2` in Light (a
-    /// textbox's value, an unselected segment or checkbox).
-    pub const FOREGROUND_FORM: Pair = pair(0xf2f3f7d9, 0x020303b2);
-    /// `theme.muted` as the Settings frame and the form components set it
-    /// (a labeled control's helper, a textbox's placeholder).
-    pub const MUTED_FORM: Pair = pair(0xf2f3f78c, 0x444c6580);
-    /// `theme.divider` as the Settings frame and the form components set
-    /// it: a textbox's and an unchecked box's 1px edge.
+    /// `stroke/dark`: `Slate/400` at 30% / 50%, a textbox's 1px edge.
     pub const DIVIDER_FORM: Pair = pair(0xacb4cf4d, 0xacb4cf80);
-    /// `checkbox/select/background` (and `/border`): a checked box. The
-    /// Settings frame gives Dark's, the components page Light's.
+    /// `shadow/hard`: the buttons' Hotkey drop (`Black/950` at 55% in Dark,
+    /// `Slate/400` at 60% in Light).
+    pub const SEARCH_DETAIL: Pair = pair(0x0203038c, 0xacb4cf99);
+    /// `text/foreground`: body text, `Slate/100` at 85% in Dark, `Black/950`
+    /// at 70% in Light.
+    pub const FOREGROUND: Pair = pair(0xf2f3f7d9, 0x020303b2);
+    /// `text/bold` (and `button/default/text`, which aliases it): loud
+    /// text, `Slate/100` in Dark, `Black/950` in Light.
+    pub const WHITE: Pair = pair(0xf2f3f7ff, 0x020303ff);
+    /// `text/muted`: quiet text, `Slate/100` at 55% in Dark, `Slate/600`
+    /// at 50% in Light.
+    pub const MUTED: Pair = pair(0xf2f3f78c, 0x444c6580);
+    /// `icon/primary`: `Slate/400` at 90% in Dark, `Slate/500` at 90% in
+    /// Light; icons at rest, and the secondary text (hotkeys, keycaps) the
+    /// frames draw in the same color.
+    pub const GRAY: Pair = pair(0xacb4cfe5, 0x7b85a7e5);
+    /// `checkbox/select/background` (and `/border`, `/focus-ring`): a
+    /// checked box, `Cyan/500` in Dark, `Pink/500` in Light.
     pub const CHECKBOX_SELECT: Pair = pair(0x31ade9ff, 0xf21478ff);
-    /// `checkbox/select/focus-glow`: a focused checked box. Figma defines
-    /// it in Light only; Dark keeps `focus/default/focus-glow`, the cyan
-    /// its checked box already is.
+    /// `checkbox/select/focus-glow`: `#12adff` at 20% in Dark, `Pink/400`
+    /// at 20% in Light.
     pub const CHECKBOX_SELECT_GLOW: Pair = pair(0x12adff33, 0xff66ab33);
-    /// `theme.muted`: quiet text (section headers, branches, hints).
-    pub const MUTED: Pair = pair(0x777a86ff, 0x444c65a6);
-    /// `theme.gray` as the Activity frame sets it: `#7b85a7`, opaque, in
-    /// both modes (the log's titles and the `you` actor).
-    pub const GRAY_ACTIVITY: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
-    /// `theme.gray` as the Machines frame sets it: `#7b85a7`, opaque, in
-    /// both modes (a workspace row's runner and task).
-    pub const GRAY_MACHINES: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
+    /// `checkbox/default/border`: an unchecked box's edge, `Slate/400` at
+    /// 20% in Dark (`stroke/medium`), 50% in Light (`stroke/dark`). Lighter
+    /// than a textbox's edge in Dark.
+    pub const CHECKBOX_BORDER: Pair = pair(0xacb4cf33, 0xacb4cf80);
     /// `icon/select`: the selected nav icon, the accent.
     pub const ICON_SELECT: Pair = pair(0x62cdf6ff, 0xf21478ff);
+    /// `icon/cyan`, `icon/green`, `icon/yellow`, `icon/purple`.
     pub const ICON_CYAN: Pair = pair(0x62cdf6ff, 0x31ade9ff);
     pub const ICON_GREEN: Pair = pair(0x31d924ff, 0x5ac351ff);
     pub const ICON_YELLOW: Pair = pair(0xffdd64ff, 0xffca0dff);
     pub const ICON_PURPLE: Pair = pair(0xe374ffff, 0xb247e7ff);
-    /// The Button component's icon (its drawings' stroke): `#acb4cf` at 60%
-    /// in Dark, `theme.gray` in Light.
-    pub const BUTTON_ICON: Pair = pair(0xacb4cf99, 0x7b85a7e5);
+    /// `button/default/icon`: the Default button's icon, `Slate/400` in
+    /// Dark, `Slate/500` in Light, both opaque. Its own token, louder than
+    /// `icon/primary` (90%) and `icon/secondary` (60%).
+    pub const BUTTON_ICON: Pair = pair(0xacb4cfff, 0x7b85a7ff);
     /// `text/green`: success text, the Zen pill's label.
     pub const TEXT_GREEN: Pair = pair(0x31d924ff, 0x00753dff);
-    /// `text/link` (Dark from the Review frame, Light from its light frame;
-    /// `text/cyan` in the palette frames is the same pair).
+    /// `text/link` (`text/cyan` is the same pair).
     pub const TEXT_LINK: Pair = pair(0x30c6ffff, 0x1989c4ff);
-    /// `theme.green`: green output in the terminal.
+    /// `other/green`: green output in the terminal, the Machines states.
     pub const THEME_GREEN: Pair = pair(0x5acd25ff, 0x367b16ff);
-    /// `theme.cyan`: cyan output in the terminal.
+    /// `other/cyan`: cyan output in the terminal.
     pub const THEME_CYAN: Pair = pair(0x00a6b2ff, 0x007a83ff);
-    /// `theme.red`: red output in the terminal (the Workspace frame's
-    /// removed line).
+    /// `other/red` (and `text/ansi_red`): red output in the terminal.
     pub const THEME_RED: Pair = pair(0xe04f52ff, 0xc23b3eff);
-    /// `theme.ansi_*`: the Activity log's colors (status tags, actors,
-    /// timestamps) and the terminal's ANSI slots.
-    pub const ANSI_GREEN: Pair = pair(0x5fb56dff, 0x1a7f37ff);
-    pub const ANSI_YELLOW: Pair = pair(0xdcb767ff, 0x8a5f04ff);
-    pub const ANSI_BLUE: Pair = pair(0x4a8fd7ff, 0x2563c9ff);
-    pub const ANSI_MAGENTA: Pair = pair(0xc586c0ff, 0xa21cafff);
-    pub const ANSI_CYAN: Pair = pair(0x4ec9b0ff, 0x0f766eff);
-    pub const ANSI_DARK_GRAY: Pair = pair(0x7c7c7cff, 0x6b6b6bff);
-    pub const WORKFLOW_BADGE_BG: Pair = pair(0x3a4258ff, 0xd3d8e4ff);
-    pub const WORKFLOW_BADGE_FG: Pair = pair(0xdcdfe8ff, 0x2a3142ff);
+    /// `text/ansi_*`: the Activity log's colors (status tags, actors,
+    /// timestamps), and the light terminal's ANSI slots. (The dark
+    /// terminal's sixteen are `04 Terminal`'s, `theme::SENSIBLE`.)
+    pub const ANSI_GREEN: Pair = pair(0x5acd25ff, 0x1a7f37ff);
+    pub const ANSI_YELLOW: Pair = pair(0xdbc300ff, 0x8a5f04ff);
+    pub const ANSI_BLUE: Pair = pair(0x5893d6ff, 0x2563c9ff);
+    pub const ANSI_MAGENTA: Pair = pair(0xd259d7ff, 0xa21cafff);
+    pub const ANSI_CYAN: Pair = pair(0x00a6b2ff, 0x0f766eff);
+    pub const ANSI_DARK_GRAY: Pair = pair(0x666666ff, 0x6b6b6bff);
+    /// `focus/default/ring`: `Cyan/400` in Dark, `Cyan/500` in Light.
     pub const FOCUS_RING: Pair = pair(0x62cdf6ff, 0x31ade9ff);
+    /// `focus/default/glow`: `#12adff` at 20%.
     pub const FOCUS_GLOW: Pair = pair(0x12adff33, 0x12adff33);
     /// `button/primary/background`: the Button's Primary style (a dialog's
-    /// confirming action), `Cyan/400` at the overlay fill's alphas (18%
-    /// Dark, 12% Light), the Select style's values under their own names.
+    /// confirming action), `Cyan/400` at 18% / 12%, the Select style's
+    /// values under their own names.
     pub const PRIMARY_FILL: Pair = pair(0x62cdf62e, 0x62cdf61f);
     /// `button/primary/background-hover`: 28% / 22%.
     pub const PRIMARY_FILL_HOVER: Pair = pair(0x62cdf647, 0x62cdf638);
@@ -138,55 +149,60 @@ pub mod figma {
     /// `button/primary/text` and `button/primary/icon`: `Cyan/300` in Dark,
     /// `Cyan/600` in Light.
     pub const PRIMARY_TEXT: Pair = pair(0xb0e6fbff, 0x1989c4ff);
-    /// The Button component's Success style: `#5ac351` at the
-    /// `theme.background` / hover / active alphas (Light defined, Dark at
-    /// Dark's alphas).
+    /// `button/success/background` (and `surface/green`): `Green/500` at
+    /// 18% / 12%.
     pub const SUCCESS_FILL: Pair = pair(0x5ac3512e, 0x5ac3511f);
+    /// `button/success/background-hover`: 28% / 22%.
     pub const SUCCESS_FILL_HOVER: Pair = pair(0x5ac35147, 0x5ac35138);
-    pub const SUCCESS_FILL_ACTIVE: Pair = pair(0x5ac35161, 0x5ac35152);
-    /// The Success style's label and icon: `#86d580` in Dark (the dark
-    /// Review frame's Approve, an override of `text/green`), `text/green` in
-    /// Light.
+    /// `button/success/background-active`: 40% / 32%.
+    pub const SUCCESS_FILL_ACTIVE: Pair = pair(0x5ac35166, 0x5ac35152);
+    /// `button/success/text` (and `/icon`): `Green/400` in Dark, `Green/700`
+    /// in Light.
     pub const SUCCESS_LABEL: Pair = pair(0x86d580ff, 0x00753dff);
-    /// The Danger style: `#f21478` at the same alphas.
+    /// `button/danger/background`: `Pink/500` at 18% / 12%.
     pub const DANGER_FILL: Pair = pair(0xf214782e, 0xf214781f);
+    /// `button/danger/background-hover`: 28% / 22%.
     pub const DANGER_FILL_HOVER: Pair = pair(0xf2147847, 0xf2147838);
-    pub const DANGER_FILL_ACTIVE: Pair = pair(0xf2147861, 0xf2147852);
-    /// The Danger style's label: `#b40041` in Light; Figma has no Dark
-    /// value, so Dark takes `focus/danger/glow`'s pink (`#ff66ab`), which
-    /// reads on the dark surfaces.
+    /// `button/danger/background-active`: 40% / 32%.
+    pub const DANGER_FILL_ACTIVE: Pair = pair(0xf2147866, 0xf2147852);
+    /// `button/danger/text` (and `/icon`): `Pink/400` in Dark, `Pink/700`
+    /// in Light.
     pub const DANGER_TEXT: Pair = pair(0xff66abff, 0xb40041ff);
-    /// `shadow/raised card`'s colors: the three drops, and the 1px ring.
+    /// `surface/overlay`: the backdrop behind the palette and dialogs,
+    /// `Black/950` at 35% in Dark, `Slate/600` at 65% in Light.
+    pub const SCRIM: Pair = pair(0x02030359, 0x444c65a6);
+    /// `shadow/raised card`'s colors (an effect style): the three drops,
+    /// and the 1px ring.
     pub const SHADOW: Pair = pair(0x0a1e5105, 0x0a1e5105);
     pub const SHADOW_RING: Pair = pair(0x0a1e5108, 0x0a1e5108);
     /// The Command palette's drop (an effect, `0 10 15 -3`, not a
     /// variable): black at 25% in both modes.
     pub const PALETTE_SHADOW: Pair = pair(0x00000040, 0x00000040);
 
-    /// Colors Figma draws without a variable, measured from the 1x frames
-    /// (1 px = 1 pt) and named for where they appear.
+    /// Colors with no `03 Desktop` variable, measured from the 1x frames
+    /// (1 px = 1 pt) or kept from a frame's binding to a variable outside
+    /// the collection, and named for where they appear.
     pub mod measured {
         use super::{pair, Pair};
 
-        /// The Navigation component's fill: `#acb4cf` at 10% over the dark
-        /// canvas, at about 7% over white.
+        /// The Navigation component's fill: `Slate/400` at 10% over the
+        /// dark canvas, at about 7% over white.
         pub const SIDEBAR: Pair = pair(0x2c3140ff, 0xf9f9fcff);
-        /// The Issues board's cards: near black on the dark canvas, white
-        /// (with the raised-card shadow) in Light.
-        pub const CARD: Pair = pair(0x020303ff, 0xffffffff);
-        /// The Textbox component's well: near black in the dark Settings
-        /// frame (its `theme.canvas` binding draws `#020303` there), white
-        /// in Light.
-        pub const TEXTBOX: Pair = pair(0x020303ff, 0xffffffff);
         /// The command palette's surface: the sidebar's tint.
         pub const RAISED: Pair = pair(0x2c3140ff, 0xf9f9fcff);
-        /// The dark Issue detail's 1px edge (`#acb4cf` at ~5% would read as
-        /// nothing; it is `theme.divider`), the light one the raised-card
-        /// ring.
+        /// The dark Issue detail's 1px edge (`stroke/light`'s value), the
+        /// light one the raised-card ring.
         pub const RING: Pair = pair(0xacb4cf1a, 0x0a1e5108);
-        /// The palette's scrim: near black at 35% over the dark window,
-        /// `theme.muted`'s light value (`#444c65` at 65%) over the light one.
-        pub const SCRIM: Pair = pair(0x02030359, 0x444c65a6);
+        /// `#7b85a7` (`Slate/500`), opaque in both modes: the Activity and
+        /// Machines frames' titles, actor, runner and task. Those frames
+        /// bind a `text/gray` that isn't in `03 Desktop`, so the value is
+        /// the frames' own.
+        pub const LOG_GRAY: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
+        /// A card's workflow badge and its label. The frames bind
+        /// `other/workflow_badge_*`, which isn't in `03 Desktop`; the values
+        /// are the frames' own.
+        pub const WORKFLOW_BADGE_BG: Pair = pair(0x3a4258ff, 0xd3d8e4ff);
+        pub const WORKFLOW_BADGE_FG: Pair = pair(0xdcdfe8ff, 0x2a3142ff);
     }
 }
 
@@ -224,8 +240,8 @@ impl Rgba {
         }
     }
 
-    /// This color at another's alpha: a hue at `theme.background`'s
-    /// opacity is its chip tint.
+    /// This color at another's alpha: a hue at
+    /// `button/default/background`'s opacity is its chip tint.
     pub const fn with_alpha_of(self, other: Rgba) -> Self {
         Self {
             rgb: self.rgb,
@@ -285,28 +301,31 @@ macro_rules! palette {
 palette! {
     // ---- Surfaces ---------------------------------------------------------
     /// The main area: the window's content surface and the terminal's
-    /// background (`theme.canvas`).
+    /// background (`surface/background`).
     canvas,
     /// The leading column: the sidebar, the review and workspace panels
     /// (the Navigation component's tint).
     sidebar,
-    /// A board card: near black on the dark canvas, white in Light.
+    /// A board card: near black on the dark canvas, white in Light
+    /// (`surface/depth-0`).
     card,
     /// A surface lifted over the window: the command palette, menus,
     /// popovers, tooltips.
     raised,
-    /// A command box's well (the bootstrap screen: the canvas, inside a
-    /// divider).
+    /// A command box's well (the bootstrap screen: `surface/background`,
+    /// inside a divider).
     well,
     /// The board's toolbar band over the canvas (the Issues Header's
     /// `surface/depth-10`).
     toolbar,
-    /// The Textbox component's well, and an unchecked box's fill.
+    /// The Textbox component's well, and an unchecked box's fill
+    /// (`surface/depth-0`, `checkbox/default/background`).
     textbox,
 
-    // ---- Overlay fills (the `theme.background` family) ---------------------
+    // ---- Overlay fills (the `button/default/background` family) ------------
     /// The overlay fill at rest: buttons, dropdowns, chips, count badges,
-    /// the search box, a hovered row (`theme.background`).
+    /// the search box, a hovered row (`button/default/background`,
+    /// `surface/hover`).
     background,
     /// The overlay fill hovered (`button/default/background-hover`).
     background_hover,
@@ -323,48 +342,51 @@ palette! {
     select_fill_active,
     /// The Select style's label (`button/select/text`).
     select_label,
-    /// The selected segment of a segmented control (`theme.selection`).
+    /// The selected segment of a segmented control (`surface/selection`).
     selection,
-    /// The Activity filter chips' fill (`theme.search`).
+    /// The Activity filter chips' fill, the segmented track
+    /// (`surface/depth-30`).
     search,
-    /// A keycap in a shortcut hint (the Button component's Hotkey: the
-    /// canvas).
+    /// A keycap in a shortcut hint (the Button component's Hotkey:
+    /// `surface/background`).
     keycap,
     /// A keycap's 1px bottom edge inside a button (the Issue detail's
-    /// action buttons).
+    /// action buttons, `shadow/hard`).
     button_keycap_edge,
 
     // ---- Text ---------------------------------------------------------------
-    /// Headings, titles, the selected row's label (`theme.white`).
+    /// Headings, titles, the selected row's label (`text/bold`).
     text_loud,
-    /// Body text and labels (`theme.foreground`).
+    /// Body text and labels (`text/foreground`).
     foreground,
-    /// Secondary text: hotkeys, metadata (`theme.gray`).
+    /// Secondary text: hotkeys, metadata (`icon/primary`'s color, as the
+    /// frames draw it).
     gray,
     /// A form control's text: a textbox's value, an unselected segment or
-    /// checkbox (`theme.foreground` as the form components set it).
+    /// checkbox (`text/foreground`, kept a role of its own).
     form_text,
     /// A form's quiet text: a labeled control's helper, a textbox's
     /// placeholder, the board toolbar's `Filter:` and its search's
-    /// placeholder (`text/muted`, `theme.muted` as the form components set
-    /// it).
+    /// placeholder (`text/muted`, kept a role of its own).
     form_hint,
     /// Quiet text: section headers, branches, timestamps, hints, idle
-    /// states, placeholders (`theme.muted`).
+    /// states, placeholders (`text/muted`).
     muted,
-    /// Text on a saturated fill (a project badge's initials).
+    /// Text on a saturated fill (a project badge's initials,
+    /// `other/on_color`).
     text_on_color,
     /// The Activity log's titles and its `you` actor (the Activity frame's
-    /// `theme.gray`).
+    /// `#7b85a7`).
     log_text,
     /// A Machines workspace row's runner and task (the Machines frame's
-    /// `theme.gray`).
+    /// `#7b85a7`).
     table_text,
 
     // ---- Icons --------------------------------------------------------------
-    /// Icons at rest (`theme.gray`).
+    /// Icons at rest (`icon/primary`).
     icon,
-    /// A button's icon (the Button component's: dimmer than `icon` in Dark).
+    /// A button's icon (`button/default/icon`: opaque, a step louder than
+    /// `icon`).
     button_icon,
     /// The selected nav icon: cyan in Dark, pink in Light (`icon/select`).
     accent,
@@ -378,22 +400,24 @@ palette! {
     icon_purple,
 
     // ---- Rules --------------------------------------------------------------
-    /// Dividers and hairline borders (`theme.divider`).
+    /// Dividers and hairline borders (`stroke/light`).
     divider,
-    /// The board's stronger rules (the Issues frame's `theme.divider`).
+    /// The board's stronger rules (`stroke/medium`).
     divider_strong,
-    /// A textbox's and an unchecked box's 1px edge (`theme.divider` as the
-    /// form components set it).
+    /// A textbox's 1px edge, and the other form fields' (`stroke/dark`).
     input_border,
+    /// An unchecked box's 1px edge (`checkbox/default/border`): lighter
+    /// than a textbox's in Dark.
+    check_border,
 
     // ---- Links and focus ----------------------------------------------------
     /// A link, the "More" action (`text/link`).
     link,
-    /// A hovered link (`theme.white`).
+    /// A hovered link (`text/bold`).
     link_hover,
     /// The keyboard-focus ring (`focus/default/ring`).
     focus_ring,
-    /// The glow outside the ring (`focus/default/focus-glow`).
+    /// The glow outside the ring (`focus/default/glow`).
     focus_glow,
     /// A checked box (`checkbox/select/background`), and a focused one's
     /// ring.
@@ -404,36 +428,36 @@ palette! {
     // ---- Meaning ------------------------------------------------------------
     /// Success, done, approve (`text/green`).
     success,
-    /// Warnings, in progress (`theme.ansi_yellow`).
+    /// Warnings, in progress (`text/ansi_yellow`).
     warning,
-    /// Ready, informational (`theme.ansi_blue`).
+    /// Ready, informational (`text/ansi_blue`).
     info,
-    /// Errors, blocked, reject (the Danger button's label).
+    /// Errors, blocked, reject (`button/danger/text`).
     error,
 
     // ---- Log and terminal hues (Activity's tags, ANSI slots) ---------------
-    /// Green output in the terminal (`theme.green`).
+    /// Green output in the terminal (`other/green`).
     theme_green,
-    /// Cyan output in the terminal (`theme.cyan`).
+    /// Cyan output in the terminal (`other/cyan`).
     theme_cyan,
-    /// Red output in the terminal (`theme.red`).
+    /// Red output in the terminal (`other/red`).
     theme_red,
-    /// `[done]` (`theme.ansi_green`).
+    /// `[done]` (`text/ansi_green`).
     green,
-    /// `[in progress]` (`theme.ansi_yellow`).
+    /// `[in progress]` (`text/ansi_yellow`).
     yellow,
-    /// `[ready]`, queued work (`theme.ansi_blue`).
+    /// `[ready]`, queued work (`text/ansi_blue`).
     blue,
-    /// `[review]`, handoff (`theme.ansi_magenta`).
+    /// `[review]`, handoff (`text/ansi_magenta`).
     magenta,
-    /// A working actor in the log (`theme.ansi_cyan`).
+    /// A working actor in the log (`text/ansi_cyan`).
     cyan,
-    /// Timestamps in the log (`theme.ansi_dark_gray`).
+    /// Timestamps in the log (`text/ansi_dark_gray`).
     dark_gray,
-    /// Errors and failures as text (the Danger label).
+    /// Errors and failures as text (`button/danger/text`).
     red,
 
-    // ---- Chip tints: each hue at `theme.background`'s opacity --------------
+    // ---- Chip tints: each hue at `button/default/background`'s opacity ----
     /// A green chip's background.
     green_tint,
     /// A yellow chip's background.
@@ -446,9 +470,9 @@ palette! {
     magenta_tint,
     /// A red chip's background.
     red_tint,
-    /// A workflow name's badge on a card (`theme.workflow_badge_bg`).
+    /// A workflow name's badge on a card (the frames' own).
     workflow_badge,
-    /// The workflow badge's label (`theme.workflow_badge_fg`).
+    /// The workflow badge's label (the frames' own).
     workflow_badge_text,
 
     // ---- Buttons (the Button component's Primary, Success, Danger styles) --
@@ -461,37 +485,41 @@ palette! {
     primary_fill_active,
     /// The Primary button's label and icon (`button/primary/text`).
     primary_label,
-    /// The Success button, and the Zen pill.
+    /// The Success button, and the Zen pill (`button/success/background`).
     success_fill,
-    /// The Success button hovered.
+    /// The Success button hovered (`button/success/background-hover`).
     success_fill_hover,
-    /// The Success button pressed.
+    /// The Success button pressed (`button/success/background-active`).
     success_fill_active,
-    /// The Success button's label and icon.
+    /// The Success button's label and icon (`button/success/text`).
     success_label,
-    /// The Danger button, and the unread-errors button.
+    /// The Danger button, and the unread-errors button
+    /// (`button/danger/background`).
     danger_fill,
-    /// The Danger button hovered.
+    /// The Danger button hovered (`button/danger/background-hover`).
     danger_fill_hover,
-    /// The Danger button pressed.
+    /// The Danger button pressed (`button/danger/background-active`).
     danger_fill_active,
 
     // ---- Bands --------------------------------------------------------------
-    /// The `Zen mode on` pill (with [`Palette::success`] text).
+    /// The `Zen mode on` pill (with [`Palette::success`] text):
+    /// `surface/green`.
     zen,
     /// A soft warning band (a status or a notice over the main area):
-    /// `icon/yellow` at `theme.background`'s opacity.
+    /// `icon/yellow` at `button/default/background`'s opacity.
     notice,
 
     // ---- Selection ----------------------------------------------------------
-    /// The selected nav row: the canvas, lifted with the raised-card shadow.
+    /// The selected nav row: `surface/background`, lifted with the
+    /// raised-card shadow.
     nav_selected,
     /// A selected or keyboard-current row in a list (Activity, the palette):
-    /// `theme.background` in Dark, `theme.selection` in Light, as drawn.
+    /// `surface/hover` in Dark, `surface/selection` in Light, as drawn.
     row_selected,
-    /// Selected text (the terminal's selection highlight, `theme.selection`).
+    /// Selected text (the terminal's selection highlight,
+    /// `surface/selection`).
     text_selection,
-    /// A search match's highlight behind text (`theme.search`).
+    /// A search match's highlight behind text (`surface/depth-30`).
     search_match,
     /// The current search match's highlight: `icon/yellow` at 40%, where
     /// Figma draws no current match.
@@ -506,7 +534,7 @@ palette! {
     shadow_ring,
     /// The command palette's drop, over the scrim.
     palette_shadow,
-    /// The backdrop behind a modal overlay.
+    /// The backdrop behind a modal overlay (`surface/overlay`).
     scrim,
 }
 
@@ -540,11 +568,11 @@ impl Palette {
             appearance,
             canvas,
             sidebar: pick(SIDEBAR),
-            card: pick(CARD),
+            card: pick(DEPTH_0),
             raised: pick(RAISED),
             well: canvas,
             toolbar: pick(DEPTH_10),
-            textbox: pick(TEXTBOX),
+            textbox: pick(DEPTH_0),
 
             background,
             background_hover: pick(BACKGROUND_HOVER),
@@ -561,12 +589,12 @@ impl Palette {
             text_loud: pick(WHITE),
             foreground: pick(FOREGROUND),
             gray: pick(GRAY),
-            form_text: pick(FOREGROUND_FORM),
-            form_hint: pick(MUTED_FORM),
+            form_text: pick(FOREGROUND),
+            form_hint: pick(MUTED),
             muted: pick(MUTED),
             text_on_color: Rgba::hex(0xffffff),
-            log_text: pick(GRAY_ACTIVITY),
-            table_text: pick(GRAY_MACHINES),
+            log_text: pick(LOG_GRAY),
+            table_text: pick(LOG_GRAY),
 
             icon: pick(GRAY),
             button_icon: pick(BUTTON_ICON),
@@ -579,6 +607,7 @@ impl Palette {
             divider: pick(DIVIDER),
             divider_strong: pick(DIVIDER_STRONG),
             input_border: pick(DIVIDER_FORM),
+            check_border: pick(CHECKBOX_BORDER),
 
             link: pick(TEXT_LINK),
             link_hover: pick(WHITE),
@@ -692,7 +721,8 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "blue on"),
     ("dark", "gray on background"),
     ("dark", "gray on row_selected"),
-    ("dark", "magenta on magenta_tint"),
+    ("dark", "magenta on"),
+    ("dark", "cyan on"),
     ("dark", "red on red_tint"),
     ("dark", "text_loud on selection"),
     ("dark", "theme_green on selection"),
@@ -704,7 +734,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("dark", "error on pressed button"),
     ("dark", "input_border on"),
     ("dark", "text_on_color on check_fill"),
-    ("dark", "button_icon on"),
+    ("dark", "check_border on"),
     ("dark", "table_text on"),
     ("dark", "form_hint on search box"),
     ("dark", "select_label on"),
@@ -723,7 +753,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "theme_cyan on selection"),
     ("light", "input_border on"),
     ("light", "form_hint on"),
-    ("light", "button_icon on"),
+    ("light", "check_border on"),
     ("light", "table_text on"),
     ("light", "select_label on"),
     ("light", "primary_label on"),
@@ -919,6 +949,7 @@ mod tests {
         check("form_hint on textbox".into(), p.form_hint, p.textbox, AA);
         // Non-text: a textbox's and a box's edge, a checked box and its mark.
         check("input_border on textbox".into(), p.input_border, p.textbox, NON_TEXT);
+        check("check_border on textbox".into(), p.check_border, p.textbox, NON_TEXT);
         check("check_fill on canvas".into(), p.check_fill, p.canvas, NON_TEXT);
         check("text_on_color on check_fill".into(), p.text_on_color, p.check_fill, NON_TEXT);
         // The selected Machines row: every cell on the selection band.
@@ -1039,11 +1070,28 @@ mod tests {
         both(d.canvas, l.canvas, (0x1e2330ff, 0xffffffff));
         both(d.background, l.background, (0xacb4cf2e, 0xacb4cf1f));
         both(d.divider, l.divider, (0xacb4cf1a, 0xacb4cf1a));
-        both(d.foreground, l.foreground, (0xf2f3f7b2, 0x020303b2));
-        both(d.text_loud, l.text_loud, (0xf8f8faff, 0x020303ff));
+        // `text/foreground`, `text/bold`, `text/muted`: the shared tokens,
+        // no longer a frame's sampled override.
+        both(d.foreground, l.foreground, (0xf2f3f7d9, 0x020303b2));
+        both(d.text_loud, l.text_loud, (0xf2f3f7ff, 0x020303ff));
+        both(d.link_hover, l.link_hover, (0xf2f3f7ff, 0x020303ff));
         both(d.gray, l.gray, (0xacb4cfe5, 0x7b85a7e5));
-        both(d.muted, l.muted, (0x777a86ff, 0x444c65a6));
-        // The Machines frame's `theme.gray`, opaque in both modes.
+        both(d.icon, l.icon, (0xacb4cfe5, 0x7b85a7e5));
+        both(d.muted, l.muted, (0xf2f3f78c, 0x444c6580));
+        // `button/default/icon`: opaque in both modes, its own token, not
+        // `icon/primary` (90%) or `icon/secondary` (60%).
+        both(d.button_icon, l.button_icon, (0xacb4cfff, 0x7b85a7ff));
+        // The Activity log's `text/ansi_*` (Dark changed with the design
+        // system; Light as before).
+        both(d.green, l.green, (0x5acd25ff, 0x1a7f37ff));
+        both(d.yellow, l.yellow, (0xdbc300ff, 0x8a5f04ff));
+        both(d.blue, l.blue, (0x5893d6ff, 0x2563c9ff));
+        both(d.magenta, l.magenta, (0xd259d7ff, 0xa21cafff));
+        both(d.cyan, l.cyan, (0x00a6b2ff, 0x0f766eff));
+        both(d.dark_gray, l.dark_gray, (0x666666ff, 0x6b6b6bff));
+        both(d.warning, l.warning, (0xdbc300ff, 0x8a5f04ff));
+        both(d.info, l.info, (0x5893d6ff, 0x2563c9ff));
+        // The Machines frame's `text/gray`, opaque in both modes.
         both(d.table_text, l.table_text, (0x7b85a7ff, 0x7b85a7ff));
         both(d.accent, l.accent, (0x62cdf6ff, 0xf21478ff));
         both(d.focus_ring, l.focus_ring, (0x62cdf6ff, 0x31ade9ff));
@@ -1061,9 +1109,32 @@ mod tests {
         both(d.primary_label, l.primary_label, (0xb0e6fbff, 0x1989c4ff));
         both(d.background_active, l.background_active, (0xacb4cf66, 0xacb4cf52));
         both(d.toolbar, l.toolbar, (0xacb4cf1a, 0xacb4cf14));
+        // `stroke/dark` for a textbox, `checkbox/default/border` for an
+        // unchecked box: the same in Light, apart in Dark.
         both(d.input_border, l.input_border, (0xacb4cf4d, 0xacb4cf80));
+        both(d.check_border, l.check_border, (0xacb4cf33, 0xacb4cf80));
+        assert_ne!(d.check_border, d.input_border);
         both(d.textbox, l.textbox, (0x020303ff, 0xffffffff));
         both(d.check_fill, l.check_fill, (0x31ade9ff, 0xf21478ff));
+        both(d.check_glow, l.check_glow, (0x12adff33, 0xff66ab33));
+        // The Button's styles stay apart even where values coincide:
+        // Default (slate), Primary and Select (cyan), Success (green),
+        // Danger (pink), each at 18 / 28 / 40% in Dark, 12 / 22 / 32% in
+        // Light.
+        both(d.background_hover, l.background_hover, (0xacb4cf47, 0xacb4cf38));
+        both(d.select_fill_hover, l.select_fill_hover, (0x62cdf647, 0x62cdf638));
+        both(d.select_fill_active, l.select_fill_active, (0x62cdf666, 0x62cdf652));
+        both(d.success_fill, l.success_fill, (0x5ac3512e, 0x5ac3511f));
+        both(d.success_fill_hover, l.success_fill_hover, (0x5ac35147, 0x5ac35138));
+        both(d.success_fill_active, l.success_fill_active, (0x5ac35166, 0x5ac35152));
+        both(d.success_label, l.success_label, (0x86d580ff, 0x00753dff));
+        both(d.danger_fill, l.danger_fill, (0xf214782e, 0xf214781f));
+        both(d.danger_fill_hover, l.danger_fill_hover, (0xf2147847, 0xf2147838));
+        both(d.danger_fill_active, l.danger_fill_active, (0xf2147866, 0xf2147852));
+        both(d.error, l.error, (0xff66abff, 0xb40041ff));
+        both(d.zen, l.zen, (0x5ac3512e, 0x5ac3511f));
+        // `surface/overlay`.
+        both(d.scrim, l.scrim, (0x02030359, 0x444c65a6));
         both(d.workflow_badge, l.workflow_badge, (0x3a4258ff, 0xd3d8e4ff));
         both(d.success, l.success, (0x31d924ff, 0x00753dff));
         both(d.theme_green, l.theme_green, (0x5acd25ff, 0x367b16ff));
@@ -1097,6 +1168,59 @@ mod tests {
         assert_eq!(c.css(), "#acb4cf2e");
         assert_eq!(Rgba::hexa(0x1e2330ff).css(), "#1e2330");
         assert_eq!(Rgba::hex(0).alpha(10).a, 0x1a);
+    }
+
+    /// Every token Figma defines as a hue at a percentage carries Figma's
+    /// own byte for it: the percentage as Figma's 32-bit float, times 255,
+    /// rounded (70% is `b2`, 90% `e5`, 50% `80`).
+    #[test]
+    fn token_alphas_are_figmas_opacities() {
+        fn byte(percent: u8) -> u8 {
+            (f64::from(f32::from(percent) / 100.0) * 255.0).round() as u8
+        }
+        use figma::*;
+        let (slate100, black, slate400, slate500, slate600) = (0xf2f3f7, 0x020303, 0xacb4cf, 0x7b85a7, 0x444c65);
+        let (cyan400, green500, pink500, pink400, glow) = (0x62cdf6, 0x5ac351, 0xf21478, 0xff66ab, 0x12adff);
+        /// A hue and the percentage Figma sets it at.
+        type At = (u32, u8);
+        // (token, Dark, Light)
+        let tokens: &[(&str, (Rgba, Rgba), At, At)] = &[
+            ("text/foreground", FOREGROUND, (slate100, 85), (black, 70)),
+            ("text/bold", WHITE, (slate100, 100), (black, 100)),
+            ("text/muted", MUTED, (slate100, 55), (slate600, 50)),
+            ("icon/primary", GRAY, (slate400, 90), (slate500, 90)),
+            ("button/default/icon", BUTTON_ICON, (slate400, 100), (slate500, 100)),
+            ("button/default/background", BACKGROUND, (slate400, 18), (slate400, 12)),
+            ("button/default/background-hover", BACKGROUND_HOVER, (slate400, 28), (slate400, 22)),
+            ("button/default/background-active", BACKGROUND_ACTIVE, (slate400, 40), (slate400, 32)),
+            ("button/primary/background", PRIMARY_FILL, (cyan400, 18), (cyan400, 12)),
+            ("button/primary/background-hover", PRIMARY_FILL_HOVER, (cyan400, 28), (cyan400, 22)),
+            ("button/primary/background-active", PRIMARY_FILL_ACTIVE, (cyan400, 40), (cyan400, 32)),
+            ("button/select/background", SELECT_FILL, (cyan400, 18), (cyan400, 12)),
+            ("button/select/background-hover", SELECT_FILL_HOVER, (cyan400, 28), (cyan400, 22)),
+            ("button/select/background-active", SELECT_FILL_ACTIVE, (cyan400, 40), (cyan400, 32)),
+            ("button/success/background", SUCCESS_FILL, (green500, 18), (green500, 12)),
+            ("button/success/background-hover", SUCCESS_FILL_HOVER, (green500, 28), (green500, 22)),
+            ("button/success/background-active", SUCCESS_FILL_ACTIVE, (green500, 40), (green500, 32)),
+            ("button/danger/background", DANGER_FILL, (pink500, 18), (pink500, 12)),
+            ("button/danger/background-hover", DANGER_FILL_HOVER, (pink500, 28), (pink500, 22)),
+            ("button/danger/background-active", DANGER_FILL_ACTIVE, (pink500, 40), (pink500, 32)),
+            ("surface/depth-10", DEPTH_10, (slate400, 10), (slate400, 8)),
+            ("surface/depth-30", SEARCH, (slate400, 25), (slate400, 16)),
+            ("surface/selection", SELECTION, (slate400, 55), (slate400, 40)),
+            ("surface/overlay", SCRIM, (black, 35), (slate600, 65)),
+            ("stroke/light", DIVIDER, (slate400, 10), (slate400, 10)),
+            ("stroke/medium", DIVIDER_STRONG, (slate400, 20), (slate400, 20)),
+            ("stroke/dark", DIVIDER_FORM, (slate400, 30), (slate400, 50)),
+            ("shadow/hard", SEARCH_DETAIL, (black, 55), (slate400, 60)),
+            ("checkbox/default/border", CHECKBOX_BORDER, (slate400, 20), (slate400, 50)),
+            ("checkbox/select/focus-glow", CHECKBOX_SELECT_GLOW, (glow, 20), (pink400, 20)),
+            ("focus/default/glow", FOCUS_GLOW, (glow, 20), (glow, 20)),
+        ];
+        for (name, (dark, light), (dh, dp), (lh, lp)) in tokens {
+            assert_eq!((dark.rgb, dark.a), (Rgb::hex(*dh), byte(*dp)), "{name} Dark");
+            assert_eq!((light.rgb, light.a), (Rgb::hex(*lh), byte(*lp)), "{name} Light");
+        }
     }
 
     /// `docs/theme.md` lists every role with its dark and light value, so

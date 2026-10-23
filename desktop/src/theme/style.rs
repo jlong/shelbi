@@ -13,9 +13,9 @@
 //!   raised chip ([`nav_chip`]: the canvas with Figma's `shadow/raised
 //!   card`);
 //! - buttons medium weight on the overlay fill, no boundary ([`button`]):
-//!   the Figma Button component's Default (`theme.background`), Success
-//!   (green tint, `text/green`) and Danger (pink tint) styles, quiet only a
-//!   hover fill;
+//!   the Figma Button component's Default (`button/default/*`), Success
+//!   (`button/success/*`) and Danger (`button/danger/*`) styles, quiet only
+//!   a hover fill;
 //! - quiet icon buttons ([`icon_button`]) 24/32px on a hover fill;
 //! - toolbar actions ([`toolbar_button`], [`small_icon_button`]), the
 //!   X-Small button ([`xsmall_button`]) and the icon slot Figma lays a
@@ -356,10 +356,11 @@ pub enum ButtonKind {
     /// component's Primary style (a cyan tint, `button/primary/text`).
     Primary,
     /// A positive action beside a Danger one (the Review panel's Approve):
-    /// the Success style (a green tint, `text/green`).
+    /// the Success style (`button/success/*`: a green tint, `Green/400` /
+    /// `Green/700` text).
     Success,
-    /// Every other action: the Default style (`theme.background`, loud
-    /// text).
+    /// Every other action: the Default style (`button/default/background`,
+    /// `button/default/text`).
     Secondary,
     /// A destructive action: the Danger style (a pink tint).
     Danger,
@@ -899,10 +900,11 @@ pub fn filter_segment(
     d.child(label.into())
 }
 
-/// The Activity frame's pickers: `theme.search`'s fill, a 14px icon (pass
-/// a small one, `icons::FUNNEL_SMALL`) and an X-Small label, 24px tall and
-/// no chevron; pressed while `open`. Icon and label are `log_text`: the
-/// frame sets `theme.gray` to the log's opaque `#7b85a7` in both modes.
+/// The Activity frame's pickers: `surface/depth-30`'s fill, a 14px icon
+/// (pass a small one, `icons::FUNNEL_SMALL`) and an X-Small label, 24px
+/// tall and no chevron; pressed while `open`. Icon and label are
+/// `log_text`: the frame's `text/gray`, the log's opaque `#7b85a7` in both
+/// modes.
 pub fn filter_dropdown(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -1136,7 +1138,7 @@ mod tests {
         };
         assert_eq!(colors(&dark, ButtonKind::Primary), [0x62cdf62e, 0x62cdf647, 0x62cdf666, 0xb0e6fbff]);
         assert_eq!(colors(&light, ButtonKind::Primary), [0x62cdf61f, 0x62cdf638, 0x62cdf652, 0x1989c4ff]);
-        assert_eq!(colors(&dark, ButtonKind::Success), [0x5ac3512e, 0x5ac35147, 0x5ac35161, 0x86d580ff]);
+        assert_eq!(colors(&dark, ButtonKind::Success), [0x5ac3512e, 0x5ac35147, 0x5ac35166, 0x86d580ff]);
         assert_eq!(colors(&light, ButtonKind::Success), [0x5ac3511f, 0x5ac35138, 0x5ac35152, 0x00753dff]);
     }
 
