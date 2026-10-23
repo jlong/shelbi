@@ -112,6 +112,7 @@ is left, and how it was verified.
 | `dt-figma-qa-issue-detail` | Pixel QA of the issue detail: 18pt action icons, the modal's metrics and colors | [`status/dt-figma-qa-issue-detail.md`](status/dt-figma-qa-issue-detail.md) |
 | `dt-figma-qa-task-panels` | Pixel QA of the task panels: a shaped line clamp, the 1pt column divider (the main area at x 281), the dark Success label | [`status/dt-figma-qa-task-panels.md`](status/dt-figma-qa-task-panels.md) |
 | `dt-figma-qa-final` | Final pixel QA of all 20 frames at 1x and 2x, the real window in both themes with live theme switching, shared components across screens, the bundled fonts; the departures list for John | [`status/dt-figma-qa-final.md`](status/dt-figma-qa-final.md) |
+| `dt-figma-semantic-token-sync` | The palette synced to Figma's `03 Desktop` collection: semantic token names, the new text, button-icon and Activity ANSI values, the checkbox's own border | [`status/dt-figma-semantic-token-sync.md`](status/dt-figma-semantic-token-sync.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

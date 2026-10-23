@@ -19,9 +19,9 @@
 //!   square Icon Button;
 //! - [`check`] (`2238:25598`), [`checkbox`] (`2238:25621`) and
 //!   [`checkbox_list`] (`2238:25702`): a 14px check (a 12px box, 2px
-//!   corners, stroked 1px outside, as Figma strokes it) checked in
-//!   `check_fill` with Figma's 12pt mark, beside its label; the list
-//!   stacks them 4px apart;
+//!   corners, stroked 1px outside, as Figma strokes it) edged in
+//!   `check_border` and checked in `check_fill` with Figma's 12pt mark,
+//!   beside its label; the list stacks them 4px apart;
 //! - [`Slider`]: a value along a track, its readout after it. The
 //!   Components page draws no slider, so it is built from the tokens the
 //!   drawn controls use: the segmented track's `theme.search` for the rail,
@@ -272,16 +272,17 @@ pub fn form_icon_button(id: impl Into<SharedString>, icon: Icon, inert: bool, th
 
 /// The check by itself: Figma's 12px box with 2px corners and a 1px stroke
 /// outside it, so 14px edge to edge (3px corners). Unchecked, the
-/// `textbox` well in an `input_border` edge; checked, `check_fill` with
-/// the mark in white. `focused` turns the edge to the ring (`check_fill`
-/// when checked) with the glow around it.
+/// `textbox` well in a `check_border` edge (`checkbox/default/border`, its
+/// own token: lighter than a textbox's edge in Dark); checked,
+/// `check_fill` with the mark in white. `focused` turns the edge to the
+/// ring (`check_fill` when checked) with the glow around it.
 pub fn check(selected: bool, focused: bool, theme: &Theme) -> Div {
     let (fill, edge) = if selected {
         (theme.check_fill, theme.check_fill)
     } else if focused {
         (theme.textbox, theme.focus_ring)
     } else {
-        (theme.textbox, theme.input_border)
+        (theme.textbox, theme.check_border)
     };
     let glow_color = if selected {
         theme.check_glow

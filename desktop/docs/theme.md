@@ -28,48 +28,77 @@ follows the system appearance live.
 
 ## The look
 
-**Dark.** The main surface is a deep blue-slate, `theme.canvas` `#1e2330`.
-The sidebar is a lighter tint of it (`#acb4cf` at 10% over the canvas,
-`#2c3140`). Cards on the Issues board are near black (`#020303`), so they
-read as wells cut into the canvas. Body text is `theme.foreground` (a near
-white at 70%), titles `theme.white` (`#f8f8fa`), secondary text
-`theme.gray`, quiet text `theme.muted` (`#777a86`). The accent (the
-selected nav icon) is cyan `#62cdf6`, as is the focus
-ring.
+**Dark.** The main surface is a deep blue-slate, `surface/background`
+`#1e2330`. The sidebar is a lighter tint of it (`#acb4cf` at 10% over the
+canvas, `#2c3140`). Cards on the Issues board are near black
+(`surface/depth-0`, `#020303`), so they read as wells cut into the canvas.
+Body text is `text/foreground` (`#f2f3f7` at 85%), titles `text/bold`
+(`#f2f3f7`, opaque), secondary text and icons `icon/primary`, quiet text
+`text/muted` (`#f2f3f7` at 55%). The accent (the selected nav icon) is cyan
+`#62cdf6`, as is the focus ring.
 
 **Light.** The main surface is white, the sidebar a light gray-blue tint
 (`#f9f9fc`), cards white with Figma's `shadow/raised card`. Text is near
-black (`#020303`) at 70% for body, opaque for titles. The accent is pink
-`#f21478`; the focus ring is `#31ade9`.
+black (`#020303`) at 70% for body, opaque for titles, `#444c65` at 50% for
+quiet text. The accent is pink `#f21478`; the focus ring is `#31ade9`.
 
 **Both.** Controls (buttons, dropdowns, filter chips, count badges, the
-toolbar buttons) are fill only: `theme.background`, a translucent slate
-(`#acb4cf` at 18% dark, 12% light) that tints whatever it sits on, with a
-hover and a pressed step 10 points stronger each. There are no control
-borders. The selected nav row is the canvas, lifted with `shadow/raised card`
-in Light (the Navigation component draws the dark chip flat); the selected
-segment is `theme.selection`.
+toolbar buttons) are fill only: `button/default/background`, a translucent
+slate (`#acb4cf` at 18% dark, 12% light) that tints whatever it sits on,
+with a hover and a pressed step (28% / 40% dark, 22% / 32% light). There are
+no control borders. The selected nav row is the canvas, lifted with
+`shadow/raised card` in Light (the Navigation component draws the dark chip
+flat); the selected segment is `surface/selection`.
 
 ## Figma tokens and roles
 
-`palette.rs`'s `figma` module holds each variable as `get_variable_defs`
-returns it on the frames (Orchestrator `2160:1307` / `2220:20936`, Issues
-`2165:94` / `2220:20975`, Review `2165:275` / `2220:21066`, Activity,
-Issue detail, Command palette, Settings). Some frames override a variable:
-the Issues frame's `theme.divider` is `#acb4cf33` (the `divider_strong`
-role), the Review frame's `theme.background` reads stronger, and the Issue
-detail and Activity frames redefine `theme.search`. The roles take the value
-most frames use, and a separate role where an override is a distinct use.
+`palette.rs`'s `figma` module holds the `03 Desktop` variable collection
+(`VariableCollectionId:2162:2`; modes Light `2162:0` and Dark `2162:1`;
+the Shelbi Colors page `2196:7154`), one Dark and one Light value per
+constant, each documented with its semantic Figma name: `surface/background`,
+`surface/depth-*`, `surface/selection`, `surface/overlay`, `text/*`,
+`icon/*`, `stroke/*`, `button/*`, `focus/*` and `checkbox/*`. Read from the
+file with both modes resolved on 2026-10-22. The constants keep their older
+Rust names (`WHITE` is `text/bold`, `GRAY` is `icon/primary`, `DIVIDER_FORM`
+is `stroke/dark`, `SEARCH` is `surface/depth-30`, `SEARCH_DETAIL` is
+`shadow/hard`); the roles views read are unchanged.
 
-Figma defines the Button component's hover and active fills
-(`button/*/background-hover`, `-active`) in its Light mode only, 10 and 20
-points over `theme.background`. Dark takes the same steps over its own rest
-alpha (18% → 28% → 38%). The Danger label has no Dark value either; Dark
-uses `focus/danger/glow`'s pink, `#ff66ab`.
+Every value is the source RGB with straight alpha, never a color flattened
+onto a background. Figma stores an opacity as a 32-bit float, and a byte
+here is that float times 255, rounded: 70% is `b2` and 90% is `e5`, as
+Figma's hex reads them, while 50% is `80`.
+`token_alphas_are_figmas_opacities` holds every percentage-defined token
+to that.
 
-Colors Figma draws without a variable are measured from the 1x frames
-(1 px = 1 pt) in `figma::measured`: the sidebar tint, the board's card, the
-palette's surface, the Issue detail's edge, and the palette's scrim.
+Each Button style keeps its own roles even where the values coincide:
+Default (`#acb4cf`), Primary and Select (`Cyan/400`), Success (`Green/500`)
+and Danger (`Pink/500`) all step 18% → 28% → 40% in Dark and
+12% → 22% → 32% in Light. Every style defines its Dark hover, active and
+label (`button/danger/text` is `Pink/400` `#ff66ab`, `button/success/text`
+`Green/400` `#86d580`). `button/default/icon` is its own token, opaque in
+both modes, louder than `icon/primary` (90%, the `icon` role) and
+`icon/secondary` (60%); only button icons take it.
+
+`checkbox/default/border` (an unchecked box's edge, `check_border`) is
+`#acb4cf` at 20% in Dark and 50% in Light, and `stroke/dark` (a textbox's
+edge, `input_border`) 30% and 50%. They stay two roles. `checkbox/select/*`
+defines both modes, its Dark focus glow included.
+
+Colors with no `03 Desktop` variable live in `figma::measured`: the
+sidebar tint (the Navigation fill), the palette's raised surface and the
+Issue detail's edge, measured from the 1x frames (1 px = 1 pt). Two more are
+frame bindings to variables outside the collection, kept at the frames'
+values: the Activity and Machines frames' `text/gray` (`#7b85a7` opaque,
+the `log_text` and `table_text` roles) and the cards'
+`other/workflow_badge_*`. `text/foreground` and `text/muted` used to differ
+by frame (the Settings frame's 85% / 55% against an older 70% and an opaque
+`#777a86`); the collection now defines one value each, so `form_text` and
+`form_hint` read the shared tokens and stay roles of their own only so form
+controls can diverge again.
+
+The dark terminal's ANSI sixteen are `04 Terminal`'s (below), not the
+`text/ansi_*` tokens, which color the Activity log and the light terminal's
+borrowed slots.
 
 ## Type (`src/theme/style.rs`)
 
@@ -100,18 +129,23 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
   the family from a list of the bundled faces and the installed monospaced
   families (`elements/terminal/fonts.rs`), each row set in its own font.
 - **Colors**: the background is `canvas`, the default foreground
-  `foreground` (flattened over the canvas: `#b2b4bb` dark), bold text in the
-  default foreground `text_loud` (`theme.white`, the frames' bold prompt
-  lines), dim (SGR 2) text in it `muted` (`theme.muted`, their tool output
-  and footers; dim colored text keeps its hue at 60%), the cursor
-  `text_loud`, the selection `text_selection` (`theme.selection`), matches
-  `search_match` (`theme.search`). In dark the ANSI sixteen are the
-  Settings ▸ Terminal frame's `ansi/regular/*` and `ansi/bold/*` variables,
-  the Sensible palette (`theme::SENSIBLE`; its red, green and cyan are the
-  terminal frames' `theme.red`, `theme.green` and `theme.cyan`). In light,
-  red, green and cyan are `theme.red`, `theme.green` and `theme.cyan`,
-  yellow, blue, magenta and bright black `theme.ansi_*`, and the other slots
-  keep a GitHub-light set. The user's own colors (Settings ▸ Terminal,
+  `foreground` (`text/foreground`), bold text in the default foreground
+  `text_loud` (`text/bold`, the frames' bold prompt lines), dim (SGR 2) text
+  in it `muted` (`text/muted`, their tool output and footers; dim colored
+  text keeps its hue at 60%), the cursor `text_loud`, the selection
+  `text_selection` (`surface/selection`), matches `search_match`
+  (`surface/depth-30`). A terminal cell has no alpha, so
+  `TerminalPalette::for_palette` composites each translucent role over the
+  canvas once, when the theme resolves: the dark foreground is `#f2f3f7` at
+  85% over `#1e2330`, `#d2d4d9`; dim text `#f2f3f7` at 55%, `#92959d`; bold
+  `#f2f3f7` as is; in Light, dim text is `#444c65` at 50% over white,
+  `#a1a5b2`. A change to the shared text tokens reaches the terminal with no
+  terminal-side edit. In dark the ANSI sixteen are `04 Terminal`'s
+  `ansi/regular/*` and `ansi/bold/*` variables (the Settings ▸ Terminal
+  frame's), the Sensible palette (`theme::SENSIBLE`), unchanged by the
+  `text/ansi_*` tokens. In light, red, green and cyan are `other/red`,
+  `other/green` and `other/cyan`, yellow, blue, magenta and bright black
+  `text/ansi_*`, and the other slots keep a GitHub-light set. The user's own colors (Settings ▸ Terminal,
   `desktop.terminal_colors`) go over either. A program's OSC 10 foreground
   also colors its bold and dim text.
 - **Inset**: the grid sits 16px in from the main area's leading and
@@ -149,7 +183,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Textbox | The Textbox component (`textbox`): 32px, the `textbox` well (5px corners, 8px across) inside a 1px `input_border` (6px corners), Base in `form_text`, a placeholder in `form_hint`; focused, the edge is `focus_ring` with a 3px `focus_glow` band just outside it, and the caret is `focus_ring` |
 | Picker | The Picker component (`picker`): a growing textbox, 8px, a form button; 400px. The font picker ("Choose font") and the Shelbi CLI ("Browse") |
 | Form button | `form_button`: the Button component's Default style at the Base size: 32px, 12px across, 6px corners, Base medium, loud, on `background`. `form_icon_button`: its 32px square Icon Button, the 20px icon in `button_icon` (the size stepper's − and +) |
-| Checkbox | The Check, Checkbox and Checkbox List components (`check`, `checkbox`, `checkbox_list`): a 12px box with 2px corners stroked 1px outside (as Figma strokes it: 14px edge to edge, 3px corners), unchecked the `textbox` well in an `input_border` edge, checked `check_fill` with the 12pt mark in white; the label Base, loud when checked and `form_text` when not, 8px on, 2px in; focused, the edge turns `focus_ring` (`check_fill` checked) with a 3px glow around it (`focus_glow`, `check_glow` checked). The list stacks them 4px apart, 4px in |
+| Checkbox | The Check, Checkbox and Checkbox List components (`check`, `checkbox`, `checkbox_list`): a 12px box with 2px corners stroked 1px outside (as Figma strokes it: 14px edge to edge, 3px corners), unchecked the `textbox` well in a `check_border` edge (`checkbox/default/border`, lighter than a textbox's `input_border` in Dark), checked `check_fill` with the 12pt mark in white; the label Base, loud when checked and `form_text` when not, 8px on, 2px in; focused, the edge turns `focus_ring` (`check_fill` checked) with a 3px glow around it (`focus_glow`, `check_glow` checked). The list stacks them 4px apart, 4px in |
 | Menu, popover | `raised`, 8px corners, a 1px `ring` and a soft drop |
 | Palette | The Command palette frame: over the `scrim`, 200px down, 788px wide (a 580px commands column, a 160px Projects column, 16px between and either side); `raised`, 8px corners, no ring, `palette_shadow` (0 10 15 -3). A 44px query line (`❯`, a 2x18px `link` caret, the placeholder `muted`), 32px rows (6px across and between, 6px corners: a 20px `icon`, the name in a 220px column in Base medium `foreground`, the description in Base `muted`; the selected row on `background`, its name Base semibold `text_loud`, its description `foreground`), 26px project rows, an X-Small `muted` footer |
 | Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
@@ -213,7 +247,7 @@ the windows see-through. The opacity is applied when the theme resolves
 The shared view models name colors by meaning (the activity feed's `Tone`, a
 badge's `DecorationColor`). `Theme::tone` and
 `Theme::decoration` map each onto the Figma color for the same meaning:
-Activity's log colors (`theme.ansi_*`) for tones, the Navigation component's
+Activity's log colors (`text/ansi_*`) for tones, the Navigation component's
 status icons for sidebar badges.
 
 | Meaning (TUI color) | Tone role | Badge role |
@@ -238,50 +272,50 @@ until a new role has its row here, with the values the palette really has.
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `canvas` | `#1e2330` | `#ffffff` | `theme.canvas`: the main area, the terminal's background |
+| `canvas` | `#1e2330` | `#ffffff` | `surface/background`: the main area, the terminal's background |
 | `sidebar` | `#2c3140` | `#f9f9fc` | Measured (the Navigation fill): the sidebar, the review and workspace panels |
-| `card` | `#020303` | `#ffffff` | Measured (Issues): a board card |
+| `card` | `#020303` | `#ffffff` | `surface/depth-0`: a board card |
 | `raised` | `#2c3140` | `#f9f9fc` | Measured (Command palette): the palette, menus, popovers, tooltips |
-| `well` | `#1e2330` | `#ffffff` | `theme.canvas`: the bootstrap screen's command box |
+| `well` | `#1e2330` | `#ffffff` | `surface/background`: the bootstrap screen's command box |
 | `toolbar` | `#acb4cf1a` | `#acb4cf14` | `surface/depth-10` (the Issues Header): the board toolbar's band over the canvas |
-| `textbox` | `#020303` | `#ffffff` | The Textbox component's well (the dark Settings frame draws `#020303`; white in Light), and an unchecked box's fill |
+| `textbox` | `#020303` | `#ffffff` | `surface/depth-0` (`checkbox/default/background` aliases it): the Textbox component's well, and an unchecked box's fill |
 
 ### Overlay fills
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `background` | `#acb4cf2e` | `#acb4cf1f` | `theme.background`: buttons, dropdowns, chips, count badges, the Zen pill off, a hovered row |
-| `background_hover` | `#acb4cf47` | `#acb4cf38` | `button/default/background-hover` (dark derived): a control's hover |
+| `background` | `#acb4cf2e` | `#acb4cf1f` | `button/default/background` (`surface/hover`): buttons, dropdowns, chips, count badges, the Zen pill off, a hovered row |
+| `background_hover` | `#acb4cf47` | `#acb4cf38` | `button/default/background-hover`: a control's hover |
 | `background_active` | `#acb4cf66` | `#acb4cf52` | `button/default/background-active`: pressed, or open |
 | `select_fill` | `#62cdf62e` | `#62cdf61f` | `button/select/background` (`Cyan/400` at the overlay's alphas): a set filter's chip on the board toolbar |
 | `select_fill_hover` | `#62cdf647` | `#62cdf638` | `button/select/background-hover`: that chip hovered |
 | `select_fill_active` | `#62cdf666` | `#62cdf652` | `button/select/background-active`: that chip pressed, or its menu open |
 | `select_label` | `#b0e6fb` | `#1989c4` | `button/select/text` (`Cyan/300` / `Cyan/600`): the set filter chip's label |
-| `selection` | `#acb4cf8c` | `#acb4cf66` | `theme.selection`: the selected segment |
-| `search` | `#acb4cf40` | `#acb4cf29` | `theme.search`: Activity's filter chips |
-| `keycap` | `#1e2330` | `#ffffff` | The Hotkey's fill (`theme.canvas`) |
-| `button_keycap_edge` | `#0203038c` | `#acb4cf99` | The Hotkey's 1px drop inside a button (the Issue detail frame's `theme.search`) |
+| `selection` | `#acb4cf8c` | `#acb4cf66` | `surface/selection`: the selected segment |
+| `search` | `#acb4cf40` | `#acb4cf29` | `surface/depth-30`: Activity's filter chips, the segmented track |
+| `keycap` | `#1e2330` | `#ffffff` | The Hotkey's fill (`surface/background`) |
+| `button_keycap_edge` | `#0203038c` | `#acb4cf99` | `shadow/hard`: the Hotkey's 1px drop inside a button (the Issue detail's actions) |
 
 ### Text
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `text_loud` | `#f8f8fa` | `#020303` | `theme.white`: titles, the selected row, a workspace name |
-| `foreground` | `#f2f3f7b2` | `#020303b2` | `theme.foreground`: body text and labels |
-| `gray` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: hotkeys, secondary text |
-| `form_text` | `#f2f3f7d9` | `#020303b2` | `theme.foreground` as the Settings frame and the form components set it: a textbox's value, an unselected segment or checkbox |
-| `form_hint` | `#f2f3f78c` | `#444c6580` | `theme.muted` as the Settings frame and the form components set it (`text/muted` in the Issues Header): a labeled control's helper, a textbox's placeholder, the board toolbar's `Filter:` and search placeholder |
-| `muted` | `#777a86` | `#444c65a6` | `theme.muted`: section headers, branches, hints, idle, placeholders |
-| `text_on_color` | `#ffffff` | `#ffffff` | A project badge's initials |
-| `log_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Activity frame sets it (opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
-| `table_text` | `#7b85a7` | `#7b85a7` | `theme.gray` as the Machines frame sets it (opaque, both modes): a workspace row's runner and task |
+| `text_loud` | `#f2f3f7` | `#020303` | `text/bold` (`button/default/text` aliases it): titles, the selected row, a workspace name, a Default button's label |
+| `foreground` | `#f2f3f7d9` | `#020303b2` | `text/foreground`: body text and labels |
+| `gray` | `#acb4cfe5` | `#7b85a7e5` | `icon/primary`'s color, as the frames draw secondary text: hotkeys, keycaps |
+| `form_text` | `#f2f3f7d9` | `#020303b2` | `text/foreground`, a role of its own: a textbox's value, an unselected segment or checkbox |
+| `form_hint` | `#f2f3f78c` | `#444c6580` | `text/muted`, a role of its own: a labeled control's helper, a textbox's placeholder, the board toolbar's `Filter:` and search placeholder |
+| `muted` | `#f2f3f78c` | `#444c6580` | `text/muted`: section headers, branches, hints, idle, placeholders |
+| `text_on_color` | `#ffffff` | `#ffffff` | `other/on_color`: a project badge's initials, the check mark |
+| `log_text` | `#7b85a7` | `#7b85a7` | The Activity frame's `text/gray` (not in `03 Desktop`; opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
+| `table_text` | `#7b85a7` | `#7b85a7` | The Machines frame's `text/gray` (the same): a workspace row's runner and task |
 
 ### Icons
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `icon` | `#acb4cfe5` | `#7b85a7e5` | `theme.gray`: icons at rest |
-| `button_icon` | `#acb4cf99` | `#7b85a7e5` | The Button component's icon stroke (New issue, the issue detail's actions): `#acb4cf` at 60% in Dark, `theme.gray` in Light |
+| `icon` | `#acb4cfe5` | `#7b85a7e5` | `icon/primary` (90%): icons at rest |
+| `button_icon` | `#acb4cf` | `#7b85a7` | `button/default/icon` (opaque, not `icon/primary`'s 90% or `icon/secondary`'s 60%): a button's icon (New issue, the issue detail's actions, the size stepper) |
 | `accent` | `#62cdf6` | `#f21478` | `icon/select`: the selected nav icon, the current project's check |
 | `icon_cyan` | `#62cdf6` | `#31ade9` | `icon/cyan`: ready for review |
 | `icon_green` | `#31d924` | `#5ac351` | `icon/green`: a working workspace |
@@ -292,44 +326,45 @@ until a new role has its row here, with the values the palette really has.
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `divider` | `#acb4cf1a` | `#acb4cf1a` | `theme.divider`: dividers and hairlines |
-| `divider_strong` | `#acb4cf33` | `#acb4cf33` | The Issues frame's `theme.divider`: the board's rules |
-| `input_border` | `#acb4cf4d` | `#acb4cf80` | `theme.divider` as the Settings frame and the form components set it: a textbox's and an unchecked box's edge |
+| `divider` | `#acb4cf1a` | `#acb4cf1a` | `stroke/light`: dividers and hairlines |
+| `divider_strong` | `#acb4cf33` | `#acb4cf33` | `stroke/medium`: the board's rules |
+| `input_border` | `#acb4cf4d` | `#acb4cf80` | `stroke/dark`: a textbox's edge, the other form fields' |
+| `check_border` | `#acb4cf33` | `#acb4cf80` | `checkbox/default/border` (`#acb4cf` at 20% / 50%): an unchecked box's edge, apart from a textbox's in Dark |
 
 ### Links and focus
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
 | `link` | `#30c6ff` | `#1989c4` | `text/link`: links, More |
-| `link_hover` | `#f8f8fa` | `#020303` | `theme.white`: a hovered link |
+| `link_hover` | `#f2f3f7` | `#020303` | `text/bold`: a hovered link |
 | `focus_ring` | `#62cdf6` | `#31ade9` | `focus/default/ring`: the 1px focus ring, the find caret, drop targets |
-| `focus_glow` | `#12adff33` | `#12adff33` | `focus/default/focus-glow`: the 4px glow outside it |
-| `check_fill` | `#31ade9` | `#f21478` | `checkbox/select/background` and `/border`: a checked box (Dark from the Settings frame, Light from the components page), and a focused checked box's ring |
-| `check_glow` | `#12adff33` | `#ff66ab33` | `checkbox/select/focus-glow` (Light); Figma has no Dark value, so Dark keeps `focus/default/focus-glow` |
+| `focus_glow` | `#12adff33` | `#12adff33` | `focus/default/glow`: the 4px glow outside it |
+| `check_fill` | `#31ade9` | `#f21478` | `checkbox/select/background` and `/border` (`Cyan/500` / `Pink/500`): a checked box, and a focused checked box's ring |
+| `check_glow` | `#12adff33` | `#ff66ab33` | `checkbox/select/focus-glow`: a focused checked box's glow |
 
 ### Meaning
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
 | `success` | `#31d924` | `#00753d` | `text/green`: done, approve, the Zen pill's label |
-| `warning` | `#dcb767` | `#8a5f04` | `theme.ansi_yellow`: in progress, stale data |
-| `info` | `#4a8fd7` | `#2563c9` | `theme.ansi_blue`: ready, informational |
-| `error` | `#ff66ab` | `#b40041` | The Danger label: errors, blocked, a version mismatch |
+| `warning` | `#dbc300` | `#8a5f04` | `text/ansi_yellow`: in progress, stale data |
+| `info` | `#5893d6` | `#2563c9` | `text/ansi_blue`: ready, informational |
+| `error` | `#ff66ab` | `#b40041` | `button/danger/text` (`Pink/400` / `Pink/700`): errors, blocked, a version mismatch |
 
 ### Log and terminal hues
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `theme_green` | `#5acd25` | `#367b16` | `theme.green`: ANSI green in the terminal |
-| `theme_cyan` | `#00a6b2` | `#007a83` | `theme.cyan`: ANSI cyan in the terminal |
-| `theme_red` | `#e04f52` | `#c23b3e` | `theme.red`: ANSI red in the terminal |
-| `green` | `#5fb56d` | `#1a7f37` | `theme.ansi_green`: `[done]` |
-| `yellow` | `#dcb767` | `#8a5f04` | `theme.ansi_yellow`: `[in progress]` |
-| `blue` | `#4a8fd7` | `#2563c9` | `theme.ansi_blue`: `[ready]`, queued |
-| `magenta` | `#c586c0` | `#a21caf` | `theme.ansi_magenta`: `[review]`, handoff |
-| `cyan` | `#4ec9b0` | `#0f766e` | `theme.ansi_cyan`: a working actor in the log |
-| `dark_gray` | `#7c7c7c` | `#6b6b6b` | `theme.ansi_dark_gray`: timestamps, ANSI bright black in light |
-| `red` | `#ff66ab` | `#b40041` | The Danger label: failures and errors as text |
+| `theme_green` | `#5acd25` | `#367b16` | `other/green`: ANSI green in the light terminal, the Machines states |
+| `theme_cyan` | `#00a6b2` | `#007a83` | `other/cyan`: ANSI cyan in the light terminal, a review slot |
+| `theme_red` | `#e04f52` | `#c23b3e` | `other/red` (`text/ansi_red`): ANSI red in the light terminal |
+| `green` | `#5acd25` | `#1a7f37` | `text/ansi_green`: `[done]` |
+| `yellow` | `#dbc300` | `#8a5f04` | `text/ansi_yellow`: `[in progress]` |
+| `blue` | `#5893d6` | `#2563c9` | `text/ansi_blue`: `[ready]`, queued |
+| `magenta` | `#d259d7` | `#a21caf` | `text/ansi_magenta`: `[review]`, handoff |
+| `cyan` | `#00a6b2` | `#0f766e` | `text/ansi_cyan`: a working actor in the log |
+| `dark_gray` | `#666666` | `#6b6b6b` | `text/ansi_dark_gray`: timestamps, ANSI bright black in light |
+| `red` | `#ff66ab` | `#b40041` | `button/danger/text`: failures and errors as text |
 
 The dark terminal's ANSI sixteen (`theme::SENSIBLE`, the Terminal frame's
 `ansi/*` variables; Settings ▸ Terminal labels the bright eight Bold, and
@@ -348,19 +383,19 @@ its Reset restores these):
 
 ### Chip tints and badges
 
-Each tint is its hue at `theme.background`'s opacity, the rule the Button
-component's Success and Danger styles follow.
+Each tint is its hue at `button/default/background`'s opacity (18% / 12%),
+the rule the Button component's Success and Danger styles follow.
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `green_tint` | `#5fb56d2e` | `#1a7f371f` | A green chip's background |
-| `yellow_tint` | `#dcb7672e` | `#8a5f041f` | A yellow chip's background |
-| `cyan_tint` | `#4ec9b02e` | `#0f766e1f` | A cyan chip's background |
-| `blue_tint` | `#4a8fd72e` | `#2563c91f` | A blue chip's background |
-| `magenta_tint` | `#c586c02e` | `#a21caf1f` | A magenta chip's background |
+| `green_tint` | `#5acd252e` | `#1a7f371f` | A green chip's background |
+| `yellow_tint` | `#dbc3002e` | `#8a5f041f` | A yellow chip's background |
+| `cyan_tint` | `#00a6b22e` | `#0f766e1f` | A cyan chip's background |
+| `blue_tint` | `#5893d62e` | `#2563c91f` | A blue chip's background |
+| `magenta_tint` | `#d259d72e` | `#a21caf1f` | A magenta chip's background |
 | `red_tint` | `#ff66ab2e` | `#b400411f` | A red chip's background |
-| `workflow_badge` | `#3a4258` | `#d3d8e4` | `theme.workflow_badge_bg`: a card's workflow name, a neutral chip |
-| `workflow_badge_text` | `#dcdfe8` | `#2a3142` | `theme.workflow_badge_fg`: its label |
+| `workflow_badge` | `#3a4258` | `#d3d8e4` | The cards' `other/workflow_badge_bg` (not in `03 Desktop`): a card's workflow name, a neutral chip |
+| `workflow_badge_text` | `#dcdfe8` | `#2a3142` | The cards' `other/workflow_badge_fg` (the same): its label |
 
 ### Buttons
 
@@ -370,40 +405,40 @@ component's Success and Danger styles follow.
 | `primary_fill_hover` | `#62cdf647` | `#62cdf638` | `button/primary/background-hover` |
 | `primary_fill_active` | `#62cdf666` | `#62cdf652` | `button/primary/background-active` (the component's Active variant binds the rest fill; the variable is the press) |
 | `primary_label` | `#b0e6fb` | `#1989c4` | `button/primary/text` and `button/primary/icon` (`Cyan/300` / `Cyan/600`) |
-| `success_fill` | `#5ac3512e` | `#5ac3511f` | Button Success: Approve, the bootstrap and relaunch actions, the card detail's Save |
-| `success_fill_hover` | `#5ac35147` | `#5ac35138` | `button/success/background-hover` (dark derived) |
-| `success_fill_active` | `#5ac35161` | `#5ac35152` | `button/success/background-active` (dark derived) |
-| `success_label` | `#86d580` | `#00753d` | Button Success's label and icon: `text/green` in Light, `#86d580` in the dark Review frame |
-| `danger_fill` | `#f214782e` | `#f214781f` | Button Danger: the danger button, the unread-errors button |
-| `danger_fill_hover` | `#f2147847` | `#f2147838` | `button/danger/background-hover` (dark derived) |
-| `danger_fill_active` | `#f2147861` | `#f2147852` | `button/danger/background-active` (dark derived) |
+| `success_fill` | `#5ac3512e` | `#5ac3511f` | `button/success/background` (`Green/500` at 18% / 12%): Button Success, Approve, the bootstrap and relaunch actions, the card detail's Save |
+| `success_fill_hover` | `#5ac35147` | `#5ac35138` | `button/success/background-hover` |
+| `success_fill_active` | `#5ac35166` | `#5ac35152` | `button/success/background-active` (40% / 32%) |
+| `success_label` | `#86d580` | `#00753d` | `button/success/text` and `/icon` (`Green/400` / `Green/700`) |
+| `danger_fill` | `#f214782e` | `#f214781f` | `button/danger/background` (`Pink/500` at 18% / 12%): the danger button, the unread-errors button |
+| `danger_fill_hover` | `#f2147847` | `#f2147838` | `button/danger/background-hover` |
+| `danger_fill_active` | `#f2147866` | `#f2147852` | `button/danger/background-active` (40% / 32%) |
 
 ### Bands
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `zen` | `#5ac3512e` | `#5ac3511f` | The Zen pill (the Success fill; measured `#294036` / `#ebf7ea` over the canvas) |
-| `notice` | `#ffdd642e` | `#ffca0d1f` | `icon/yellow` at `theme.background`'s opacity: the relaunch band |
+| `zen` | `#5ac3512e` | `#5ac3511f` | `surface/green` (the Success fill's values): the Zen pill |
+| `notice` | `#ffdd642e` | `#ffca0d1f` | `icon/yellow` at `button/default/background`'s opacity: the relaunch band |
 
 ### Selection
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `nav_selected` | `#1e2330` | `#ffffff` | `theme.canvas`: the selected nav chip (it slides) |
-| `row_selected` | `#acb4cf2e` | `#acb4cf66` | Activity's selected row: `theme.background` dark, `theme.selection` light, as drawn |
-| `text_selection` | `#acb4cf8c` | `#acb4cf66` | `theme.selection`: the terminal's selection |
-| `search_match` | `#acb4cf40` | `#acb4cf29` | `theme.search`: a find match |
+| `nav_selected` | `#1e2330` | `#ffffff` | `surface/background`: the selected nav chip (it slides) |
+| `row_selected` | `#acb4cf2e` | `#acb4cf66` | Activity's selected row: `surface/hover` dark, `surface/selection` light, as drawn |
+| `text_selection` | `#acb4cf8c` | `#acb4cf66` | `surface/selection`: the terminal's selection |
+| `search_match` | `#acb4cf40` | `#acb4cf29` | `surface/depth-30`: a find match |
 | `search_current` | `#ffdd6466` | `#ffca0d66` | `icon/yellow` at 40% (Figma draws no current match) |
 
 ### Elevation
 
 | Role | Dark | Light | Source, used for |
 |---|---|---|---|
-| `ring` | `#acb4cf1a` | `#0a1e5108` | Measured (Issue detail's edge): the 1px ring around raised surfaces |
+| `ring` | `#acb4cf1a` | `#0a1e5108` | Measured (Issue detail's edge; `stroke/light`'s value in Dark): the 1px ring around raised surfaces |
 | `shadow` | `#0a1e5105` | `#0a1e5105` | `shadow/raised card`'s drops (menus, popovers and dialogs too) |
 | `shadow_ring` | `#0a1e5108` | `#0a1e5108` | `shadow/raised card`'s 1px ring |
 | `palette_shadow` | `#00000040` | `#00000040` | The Command palette's drop effect (`0 10 15 -3`): the palette over the scrim |
-| `scrim` | `#02030359` | `#444c65a6` | Measured (Command palette): the backdrop behind the palette and dialogs |
+| `scrim` | `#02030359` | `#444c65a6` | `surface/overlay`: the backdrop behind the palette and dialogs |
 
 ### Project badges
 
@@ -424,8 +459,9 @@ workflow badge; each button style's label on its rest, hover and pressed
 fill; the selected segment's label; a keycap's label; the Zen pill's label.
 Text is held to WCAG AA (4.5:1). Icons, the focus ring, a text field's edge
 and the selected nav icon are held to 3:1 (WCAG 1.4.11). `src/theme/mod.rs`
-checks the terminal's default foreground at AA and its ANSI hues at 3:1 on
-the canvas. `project_badges_carry_white_initials` checks every badge fill.
+checks the terminal's default foreground at AA and its ANSI hues and dim
+text at 3:1 on the canvas, except Light's dim text: `text/muted` (`#444c65`
+at 50%) over white is 2.46, held to a 2.4 floor. `project_badges_carry_white_initials` checks every badge fill.
 
 ### Exceptions
 
@@ -438,48 +474,52 @@ with its worst ratio. **Flagged for John.**
 
 | Theme | Pairing | Worst | Why |
 |---|---|---|---|
-| dark | muted on | 1.11 | `theme.muted` `#777a86`: 3.67 on the canvas, 3.03 on the sidebar, 2.10 on a hovered row there. Section headers, branches, idle labels. 1.11 is an idle state on the selected Machines row (`theme.selection`), a row the frame doesn't draw selected |
-| dark | dark_gray on | 1.13 | `theme.ansi_dark_gray`: Activity's timestamps, 3.76 on the canvas, 3.10 on the sidebar. 1.13 is the branch on the selected Machines row, as the frame draws it |
-| dark | log_text on | 2.53 | The Activity frame's `theme.gray` `#7b85a7`: the log's titles, 4.30 on the canvas, 2.96 on the selected row; the pickers' labels, 2.53 on their `search` fill |
-| dark | info on | 3.83 | `theme.ansi_blue` as the info color: AA on the canvas (4.7), short on the sidebar and raised surfaces |
-| dark | blue on | 3.61 | The same blue as `[ready]`, and on its chip tint |
-| dark | gray on background | 3.84 | `theme.gray` (hotkeys) on a hovered row over the sidebar |
-| dark | gray on row_selected | 3.84 | `theme.gray` on the selected row over the sidebar |
-| dark | magenta on magenta_tint | 4.19 | `[review]` on its (derived) chip tint |
+| dark | muted on | 2.42 | `text/muted` (`#f2f3f7` at 55%): AA on the canvas (5.24) and the sidebar (4.72), 3.69 on a hovered row over the sidebar, 4.19 over the canvas. Section headers, branches, idle labels. 2.42 is an idle state on the selected Machines row (`surface/selection`), a row the frame doesn't draw selected |
+| dark | dark_gray on | 1.21 | `text/ansi_dark_gray` `#666666`: Activity's timestamps, 2.73 on the canvas, 2.26 on the sidebar, 3.60 on a card. 1.21 is the branch on the selected Machines row, as the frame draws it |
+| dark | log_text on | 2.53 | The Activity frame's `text/gray` `#7b85a7`: the log's titles, 4.30 on the canvas, 2.96 on the selected row; the pickers' labels, 2.53 on their `search` fill |
+| dark | info on | 4.05 | `text/ansi_blue` `#5893d6` as the info color: AA on the canvas (4.90), 4.05 on the sidebar and raised surfaces |
+| dark | blue on | 3.76 | The same blue as `[ready]`: 4.05 on the sidebar, 3.76 on its chip tint |
+| dark | gray on background | 3.84 | `icon/primary`'s color (hotkeys) on a hovered row over the sidebar |
+| dark | gray on row_selected | 3.84 | The same on the selected row over the sidebar |
+| dark | magenta on | 3.64 | `text/ansi_magenta` `#d259d7` as `[review]`: AA on the canvas (4.60), 3.80 on the sidebar and raised surfaces, 3.64 on its (derived) chip tint |
+| dark | cyan on | 4.04 | `text/ansi_cyan` `#00a6b2` as a working actor: AA on the canvas (5.30), 4.38 on the sidebar and raised surfaces, 4.04 on its (derived) chip tint |
 | dark | red on red_tint | 4.39 | The Danger pink on its (derived) chip tint |
-| dark | text_loud on selection | 4.08 | `theme.white` on the selected segment (`theme.selection`) over the sidebar; 4.46 on the canvas |
-| dark | theme_green on selection | 2.30 | The same row: `working` and `● reachable` in `theme.green` |
-| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `theme.cyan`. The lowest pairing the desktop draws |
-| dark | success_label on hover button | 4.35 | the Success label (`#86d580`) on the Success button's (derived dark) hover |
-| dark | success_label on pressed button | 3.58 | the Success label on the Success button pressed |
-| dark | error on rest button | 4.30 | The Danger label on the Danger fill over the sidebar (AA over the canvas) |
+| dark | text_loud on selection | 3.91 | `text/bold` `#f2f3f7` on the selected segment (`surface/selection`) over the sidebar; 4.27 on the canvas |
+| dark | theme_green on selection | 2.30 | The selected Machines row: `working` and `● reachable` in `other/green` |
+| dark | theme_cyan on selection | 1.60 | The same row: a review slot's `review` in `other/cyan`. The lowest pairing the desktop draws |
+| dark | success_label on hover button | 4.35 | `button/success/text` (`#86d580`) on the Success button hovered, over the sidebar |
+| dark | success_label on pressed button | 3.48 | The same on the Success button pressed (`button/success/background-active`, 40%): 3.94 over the canvas, 3.48 over the sidebar |
+| dark | error on rest button | 4.30 | `button/danger/text` on the Danger fill over the sidebar (AA over the canvas) |
 | dark | error on hover button | 3.94 | The same, hovered |
-| dark | error on pressed button | 3.53 | The same, pressed |
-| dark | button_icon on | 2.58 | The Button component's icon (`#acb4cf` at 60%) on a button's fill over the sidebar; decorative beside the button's label |
-| dark | input_border on | 1.76 | `theme.divider` (`#acb4cf` at 30%) as a textbox's edge (Settings); the textbox also differs by its near-black well and its label |
+| dark | error on pressed button | 3.45 | The same, pressed (`button/danger/background-active`, 40%): 3.85 over the canvas |
+| dark | input_border on | 1.76 | `stroke/dark` (`#acb4cf` at 30%) as a textbox's edge (Settings); the textbox also differs by its near-black well and its label |
 | dark | text_on_color on check_fill | 2.53 | The check mark (white) on the dark checked box (`#31ade9`), as the Settings frame draws it; the box itself is 6.19 on the canvas |
+| dark | check_border on | 1.37 | `checkbox/default/border` (`#acb4cf` at 20%) around an unchecked box's near-black well; the box also differs by its well and its label |
+| dark | table_text on | 1.30 | The Machines frame's `text/gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`surface/selection` over the canvas), as the frame draws it |
 | dark | form_hint on search box | 3.69 | `text/muted` (`#f2f3f7` at 55%) as the board search's `Search` placeholder, on the Searchbox fill over the toolbar band; AA on the band itself |
 | dark | select_label on | 3.98 | `button/select/text` (`Cyan/300`) on a set filter chip pressed (its menu open); AA at rest and hovered |
 | dark | primary_label on | 4.02 | `button/primary/text` (`Cyan/300`) on the Primary button pressed over the sidebar or a dialog; AA at rest and hovered |
-| dark | table_text on | 1.30 | The Machines frame's `theme.gray` `#7b85a7`: a row's runner and task, 4.30 on the canvas, 1.30 on the selected row (`theme.selection` over the canvas), as the frame draws it |
-| light | muted on | 2.95 | `theme.muted` (`#444c65` at 65%): 3.44 on white, 2.95 on the selected row |
-| light | gray on | 2.39 | `theme.gray` (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
+| light | muted on | 2.23 | `text/muted` (`#444c65` at 50%): 2.46 on white, 2.42 on the sidebar, 2.23 on the selected row. Also the terminal's dim text (2.46) |
+| light | gray on | 2.39 | `icon/primary`'s color (`#7b85a7` at 90%): 3.12 on white; hotkeys, keycaps, secondary text |
 | light | log_text on | 2.80 | The same `#7b85a7` in Light: 3.65 on white, 2.80 on the selected row |
-| light | icon on | 2.80 | Icons in `theme.gray` on the sidebar (3.12 on white); 2.80 for the board search's magnifying glass on the Searchbox fill over the toolbar band |
+| light | icon on | 2.80 | Icons in `icon/primary` on the sidebar (3.12 on white); 2.80 for the board search's magnifying glass on the Searchbox fill over the toolbar band |
 | light | link on | 3.69 | `text/link` `#1989c4`: 3.88 on white |
 | light | green on green_tint | 4.30 | `[done]` on its (derived) chip tint |
-| light | success_label on pressed button | 4.36 | `text/green` on the Success button pressed |
-| light | error on pressed button | 3.98 | `#b40041` on the Danger button pressed |
+| light | success_label on pressed button | 4.36 | `button/success/text` on the Success button pressed |
+| light | error on pressed button | 3.98 | `button/danger/text` `#b40041` on the Danger button pressed |
 | light | focus_ring on | 2.41 | `focus/default/ring` `#31ade9`: 2.53 on white; the 4px glow widens it |
-| light | dark_gray on selection | 4.08 | The selected Machines row: the branch in `theme.ansi_dark_gray` |
-| light | theme_green on selection | 4.02 | The same row: `working` in `theme.green` (5.0 on white) |
-| light | theme_cyan on selection | 3.91 | The same row: `review` in `theme.cyan` |
-| light | button_icon on | 2.80 | `theme.gray` as the Button component's icon, on a button's fill (2.80 for New issue's plus over the toolbar band); decorative beside the label |
-| light | input_border on | 1.38 | `theme.divider` (`#acb4cf` at 50%) as a textbox's edge |
-| light | form_hint on | 2.37 | The form components' `theme.muted` (`#444c65` at 50%): a helper line, a placeholder; the board toolbar's `Filter:` and its search's placeholder (2.37 on the Searchbox fill over the band) |
+| light | dark_gray on selection | 4.08 | The selected Machines row: the branch in `text/ansi_dark_gray` |
+| light | theme_green on selection | 4.02 | The same row: `working` in `other/green` (5.0 on white) |
+| light | theme_cyan on selection | 3.91 | The same row: `review` in `other/cyan` |
+| light | input_border on | 1.38 | `stroke/dark` (`#acb4cf` at 50%) as a textbox's edge |
+| light | form_hint on | 2.37 | `text/muted` (`#444c65` at 50%) in the forms: a helper line, a placeholder; the board toolbar's `Filter:` and its search's placeholder (2.37 on the Searchbox fill over the band) |
+| light | check_border on | 1.41 | `checkbox/default/border` (`#acb4cf` at 50%) around an unchecked box |
+| light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
 | light | select_label on | 3.08 | `button/select/text` (`Cyan/600` `#1989c4`) on a set filter chip over the toolbar band: 3.45 at rest, 3.25 hovered, 3.08 pressed, as the Header draws it |
 | light | primary_label on | 3.09 | `button/primary/text` (`Cyan/600` `#1989c4`) on the Primary button: 3.61 at rest on white, 3.46 at rest in a dialog, 3.09 pressed there, as the Button component draws it |
-| light | table_text on | 2.80 | The same `#7b85a7`: 3.65 on white, 2.80 on the selected row |
+
+`button_icon` is no longer an exception: `button/default/icon` is opaque, so
+the Button's icon holds 3:1 on every fill (4.35 dark, 3.23 light at worst).
 
 ## Renders
 
