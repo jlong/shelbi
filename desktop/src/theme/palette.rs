@@ -135,8 +135,21 @@ pub mod figma {
     pub const ANSI_DARK_GRAY: Pair = pair(0x666666ff, 0x6b6b6bff);
     /// `focus/default/ring`: `Cyan/400` in Dark, `Cyan/500` in Light.
     pub const FOCUS_RING: Pair = pair(0x62cdf6ff, 0x31ade9ff);
-    /// `focus/default/glow`: `#12adff` at 20%.
+    /// `focus/default/glow`: `#12adff` at 20%. (The Button component's
+    /// Default and Primary focus variants still bind the older
+    /// `focus/default/focus-glow`, `VariableID:2220:20442`, which resolves
+    /// to the same value.)
     pub const FOCUS_GLOW: Pair = pair(0x12adff33, 0x12adff33);
+    /// `focus/success/ring`: `Green/500` in both modes, the Success
+    /// button's focus ring.
+    pub const SUCCESS_FOCUS_RING: Pair = pair(0x5ac351ff, 0x5ac351ff);
+    /// `focus/success/glow`: `Green/400` at 20% in Dark, 15% in Light.
+    pub const SUCCESS_FOCUS_GLOW: Pair = pair(0x86d58033, 0x86d58026);
+    /// `focus/danger/ring`: `Pink/500` in both modes, the Danger button's
+    /// focus ring.
+    pub const DANGER_FOCUS_RING: Pair = pair(0xf21478ff, 0xf21478ff);
+    /// `focus/danger/glow`: `Pink/400` at 25% in Dark, 10% in Light.
+    pub const DANGER_FOCUS_GLOW: Pair = pair(0xff66ab40, 0xff66ab1a);
     /// `button/primary/background`: the Button's Primary style (a dialog's
     /// confirming action), `Cyan/400` at 18% / 12%, the Select style's
     /// values under their own names.
@@ -419,6 +432,14 @@ palette! {
     focus_ring,
     /// The glow outside the ring (`focus/default/glow`).
     focus_glow,
+    /// A focused Success button's ring (`focus/success/ring`).
+    success_focus_ring,
+    /// A focused Success button's glow (`focus/success/glow`).
+    success_focus_glow,
+    /// A focused Danger button's ring (`focus/danger/ring`).
+    danger_focus_ring,
+    /// A focused Danger button's glow (`focus/danger/glow`).
+    danger_focus_glow,
     /// A checked box (`checkbox/select/background`), and a focused one's
     /// ring.
     check_fill,
@@ -613,6 +634,10 @@ impl Palette {
             link_hover: pick(WHITE),
             focus_ring: pick(FOCUS_RING),
             focus_glow: pick(FOCUS_GLOW),
+            success_focus_ring: pick(SUCCESS_FOCUS_RING),
+            success_focus_glow: pick(SUCCESS_FOCUS_GLOW),
+            danger_focus_ring: pick(DANGER_FOCUS_RING),
+            danger_focus_glow: pick(DANGER_FOCUS_GLOW),
             check_fill: pick(CHECKBOX_SELECT),
             check_glow: pick(CHECKBOX_SELECT_GLOW),
 
@@ -748,6 +773,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "success_label on pressed button"),
     ("light", "error on pressed button"),
     ("light", "focus_ring on"),
+    ("light", "success_focus_ring on"),
     ("light", "dark_gray on selection"),
     ("light", "theme_green on selection"),
     ("light", "theme_cyan on selection"),
@@ -916,6 +942,8 @@ mod tests {
                 NON_TEXT,
             );
             check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
+            check(format!("success_focus_ring on {sname}"), p.success_focus_ring, s, NON_TEXT);
+            check(format!("danger_focus_ring on {sname}"), p.danger_focus_ring, s, NON_TEXT);
             check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
         }
         // The board toolbar: `Filter:` and the search's placeholder on its
@@ -1096,6 +1124,12 @@ mod tests {
         both(d.accent, l.accent, (0x62cdf6ff, 0xf21478ff));
         both(d.focus_ring, l.focus_ring, (0x62cdf6ff, 0x31ade9ff));
         both(d.focus_glow, l.focus_glow, (0x12adff33, 0x12adff33));
+        // The Success and Danger buttons' own focus (`focus/success/*`,
+        // `focus/danger/*`).
+        both(d.success_focus_ring, l.success_focus_ring, (0x5ac351ff, 0x5ac351ff));
+        both(d.success_focus_glow, l.success_focus_glow, (0x86d58033, 0x86d58026));
+        both(d.danger_focus_ring, l.danger_focus_ring, (0xf21478ff, 0xf21478ff));
+        both(d.danger_focus_glow, l.danger_focus_glow, (0xff66ab40, 0xff66ab1a));
         // The form components (the dark Settings frame, the components page).
         both(d.form_text, l.form_text, (0xf2f3f7d9, 0x020303b2));
         both(d.form_hint, l.form_hint, (0xf2f3f78c, 0x444c6580));
@@ -1181,6 +1215,7 @@ mod tests {
         use figma::*;
         let (slate100, black, slate400, slate500, slate600) = (0xf2f3f7, 0x020303, 0xacb4cf, 0x7b85a7, 0x444c65);
         let (cyan400, green500, pink500, pink400, glow) = (0x62cdf6, 0x5ac351, 0xf21478, 0xff66ab, 0x12adff);
+        let green400 = 0x86d580;
         /// A hue and the percentage Figma sets it at.
         type At = (u32, u8);
         // (token, Dark, Light)
@@ -1216,6 +1251,10 @@ mod tests {
             ("checkbox/default/border", CHECKBOX_BORDER, (slate400, 20), (slate400, 50)),
             ("checkbox/select/focus-glow", CHECKBOX_SELECT_GLOW, (glow, 20), (pink400, 20)),
             ("focus/default/glow", FOCUS_GLOW, (glow, 20), (glow, 20)),
+            ("focus/success/ring", SUCCESS_FOCUS_RING, (green500, 100), (green500, 100)),
+            ("focus/success/glow", SUCCESS_FOCUS_GLOW, (green400, 20), (green400, 15)),
+            ("focus/danger/ring", DANGER_FOCUS_RING, (pink500, 100), (pink500, 100)),
+            ("focus/danger/glow", DANGER_FOCUS_GLOW, (pink400, 25), (pink400, 10)),
         ];
         for (name, (dark, light), (dh, dp), (lh, lp)) in tokens {
             assert_eq!((dark.rgb, dark.a), (Rgb::hex(*dh), byte(*dp)), "{name} Dark");

@@ -144,7 +144,7 @@ pub const DETAIL_ACTIONS: [&str; 6] = ["move-left", "move-right", "start", "assi
 /// state of the Textbox and the Checkbox, a Segmented Control, a Labeled
 /// Control and a Picker; plus a Checkbox List (no PNG: checked by eye).
 const COMPONENT_SHEETS: [(&str, f32, f32); 7] = [
-    ("buttons", 234.0, 306.0),
+    ("buttons", 580.0, 498.0),
     ("textbox", 234.0, 210.0),
     ("checkbox", 126.0, 154.0),
     ("segmented-control", 167.0, 32.0),
@@ -153,17 +153,128 @@ const COMPONENT_SHEETS: [(&str, f32, f32); 7] = [
     ("checkbox-list", 200.0, 74.0),
 ];
 
-/// The `buttons` sheet's rows, top to bottom: each kind at rest at
-/// [`BUTTON_SHEET_X`]`.0` and keyboard-focused at `.1`.
-const BUTTON_SHEET_KINDS: [crate::theme::style::ButtonKind; 6] = {
+/// The `buttons` sheet's rows, top to bottom: each kind as `style::button`,
+/// then the icon-bearing wrappers (the Review panel's Approve and Reject),
+/// the Base size (the workflow editor's Delete) and X-Small.
+const BUTTON_SHEET_ROWS: [SheetButton; 10] = {
     use crate::theme::style::ButtonKind::*;
-    [Primary, Success, Secondary, Danger, Select, Quiet]
+    [
+        SheetButton::Label(Primary),
+        SheetButton::Label(Success),
+        SheetButton::Label(Secondary),
+        SheetButton::Label(Danger),
+        SheetButton::Label(Select),
+        SheetButton::Label(Quiet),
+        SheetButton::Icon(Success, "Approve"),
+        SheetButton::Icon(Danger, "Reject"),
+        SheetButton::Base(Danger),
+        SheetButton::XSmall(Secondary),
+    ]
 };
-const BUTTON_SHEET_X: (f32, f32) = (17.0, 129.0);
+
+/// The `buttons` sheet's columns, left to right: at rest, focused, focused
+/// and hovered, focused and pressed, and disabled.
+const BUTTON_SHEET_COLUMNS: [SheetState; 5] = [
+    SheetState::Rest,
+    SheetState::Focused,
+    SheetState::FocusedHover,
+    SheetState::FocusedActive,
+    SheetState::Disabled,
+];
+
+/// A row of the `buttons` sheet.
+#[derive(Debug, Clone, Copy)]
+enum SheetButton {
+    /// `style::button` (32 tall, a label).
+    Label(crate::theme::style::ButtonKind),
+    /// `style::small_icon_button` (28 tall, an icon then a label).
+    Icon(crate::theme::style::ButtonKind, &'static str),
+    /// The Base size as the workflow editor's Delete draws it (32 tall,
+    /// Base medium).
+    Base(crate::theme::style::ButtonKind),
+    /// The X-Small size (24 tall, X-Small medium, 8 across).
+    XSmall(crate::theme::style::ButtonKind),
+}
+
+/// A column of the `buttons` sheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SheetState {
+    Rest,
+    Focused,
+    FocusedHover,
+    FocusedActive,
+    Disabled,
+}
+
+impl SheetButton {
+    fn kind(self) -> crate::theme::style::ButtonKind {
+        match self {
+            SheetButton::Label(k) | SheetButton::Icon(k, _) | SheetButton::Base(k) | SheetButton::XSmall(k) => k,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SheetButton::Label(_) => "Button",
+            SheetButton::Icon(_, label) => label,
+            SheetButton::Base(_) => "Delete",
+            SheetButton::XSmall(_) => "Open",
+        }
+    }
+
+    fn height(self) -> f32 {
+        match self {
+            SheetButton::Label(_) | SheetButton::Base(_) => crate::theme::style::BUTTON_H,
+            SheetButton::Icon(..) => 28.0,
+            SheetButton::XSmall(_) => 24.0,
+        }
+    }
+
+    fn render(self, id: String, state: SheetState, theme: &crate::theme::Theme) -> gpui::AnyElement {
+        use crate::theme::style::{self, Type, Typography};
+        use gpui::{IntoElement, ParentElement, Styled};
+        let focused = state != SheetState::Rest;
+        let kind = self.kind();
+        if state == SheetState::Disabled {
+            let d = style::disabled_button(id, self.label(), kind, theme);
+            return match self {
+                SheetButton::Base(_) => d.type_style(Type::BaseMedium),
+                SheetButton::XSmall(_) => d.h(px(24.0)).px(px(8.0)).type_style(Type::XSmallMedium),
+                SheetButton::Icon(..) => d.h(px(28.0)),
+                SheetButton::Label(_) => d,
+            }
+            .into_any_element();
+        }
+        match self {
+            SheetButton::Label(_) => style::button(id, self.label(), kind, focused, theme),
+            SheetButton::Icon(_, label) => {
+                let icon = if label == "Approve" { crate::assets::icons::CHECK } else { crate::assets::icons::X_MARK };
+                style::small_icon_button(id, icon, label, kind, focused, theme)
+            }
+            SheetButton::Base(_) => style::button_base(id, kind, focused, theme).type_style(Type::BaseMedium).child(self.label()),
+            SheetButton::XSmall(_) => style::button_base(id, kind, focused, theme)
+                .h(px(24.0))
+                .px(px(8.0))
+                .type_style(Type::XSmallMedium)
+                .child(self.label()),
+        }
+        .into_any_element()
+    }
+}
+
+/// The `buttons` sheet's column `j` left.
+fn button_sheet_x(j: usize) -> f32 {
+    17.0 + 112.0 * j as f32
+}
 
 /// The `buttons` sheet's row `i` top.
 fn button_sheet_y(i: usize) -> f32 {
     17.0 + 48.0 * i as f32
+}
+
+/// The `buttons` sheet's button at row `i`, column `j`.
+fn button_sheet_id(i: usize, j: usize) -> String {
+    format!("sheet-button-{i}-{j}")
 }
 
 /// One component sheet, by name.
@@ -197,11 +308,9 @@ impl gpui::Render for Sheet {
         };
         let sheet = div().relative().size_full().bg(page);
         match self.0 {
-            "buttons" => sheet.children(BUTTON_SHEET_KINDS.iter().enumerate().flat_map(|(i, kind)| {
-                let (rest, focused) = BUTTON_SHEET_X;
-                [(rest, false), (focused, true)].map(|(x, focus)| {
-                    let id = format!("sheet-button-{kind:?}-{focus}");
-                    at(x, button_sheet_y(i), crate::theme::style::button(id, "Button", *kind, focus, &theme).into_any_element())
+            "buttons" => sheet.children(BUTTON_SHEET_ROWS.iter().enumerate().flat_map(|(i, row)| {
+                BUTTON_SHEET_COLUMNS.iter().enumerate().map(move |(j, state)| {
+                    at(button_sheet_x(j), button_sheet_y(i), row.render(button_sheet_id(i, j), *state, &theme))
                 })
             })),
             "textbox" => sheet
@@ -1506,6 +1615,17 @@ impl Run {
         std::fs::create_dir_all(&dir).expect("create the components directory");
         for (name, w, h) in COMPONENT_SHEETS {
             crate::theme::motion::reset_pointers();
+            if name == "buttons" {
+                for i in 0..BUTTON_SHEET_ROWS.len() {
+                    for (j, state) in BUTTON_SHEET_COLUMNS.iter().enumerate() {
+                        match state {
+                            SheetState::FocusedHover => crate::theme::motion::hold_pointer(button_sheet_id(i, j), false),
+                            SheetState::FocusedActive => crate::theme::motion::hold_pointer(button_sheet_id(i, j), true),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             let handle = self
                 .cx
                 .open_offscreen_window(size(px(w), px(h)), |_, cx| cx.new(|_| Sheet(name)))
@@ -1518,15 +1638,16 @@ impl Run {
                     .unwrap();
             }
             let image = self.cx.capture_screenshot(window).expect("render to image");
-        eprintln!("DEBUG capture {}x{}", image.width(), image.height());
+            if name == "buttons" {
+                // At the backing scale, before any downsampling blurs the
+                // 1px ring into its neighbors.
+                self.expect_button_focus(&image, image.width() as f32 / w);
+            }
             let image = if self.native || image.width() == w as u32 {
                 image
             } else {
                 image::imageops::resize(&image, w as u32, h as u32, image::imageops::FilterType::Triangle)
             };
-            if name == "buttons" {
-                self.expect_ring_only_focus(&image, image.width() as f32 / w);
-            }
             let path = dir.join(format!("{name}-{}.png", self.theme));
             image.save(&path).expect("save the sheet");
             println!("saved {} ({}x{})", path.display(), image.width(), image.height());
@@ -1537,25 +1658,55 @@ impl Run {
         }
     }
 
-    /// On the `buttons` sheet, every kind's focused button wears the ring and
-    /// glow outside it and keeps its resting fill inside it: the pixel 3pt
-    /// in from its left edge (fill, not label) matches the resting
-    /// button's, and the pixel 3pt out (the glow) differs from the page.
-    fn expect_ring_only_focus(&mut self, image: &image::RgbaImage, scale: f32) {
-        let (rest, focused) = BUTTON_SHEET_X;
+    /// On the `buttons` sheet, every button's fill and focus against the
+    /// theme's own colors, at mid-height: 3pt in from its left edge (fill,
+    /// not label) its state's fill over the page, focused or not (hovered
+    /// and pressed included), so focus never tints the inside; 0.5pt out
+    /// the style's ring under its glow, and 3pt out the glow alone (Success
+    /// green, Danger pink, the rest the default cyan); at rest and disabled,
+    /// the page untouched outside it, and disabled the fill at 40%.
+    fn expect_button_focus(&mut self, image: &image::RgbaImage, scale: f32) {
+        use crate::theme::style::button_colors;
+        use gpui::Hsla;
+        let theme = self.cx.update(|cx| *cx.global::<crate::theme::Theme>());
         let pixel = |x: f32, y: f32| image.get_pixel((x * scale) as u32, (y * scale) as u32).0;
-        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2);
-        for (i, kind) in BUTTON_SHEET_KINDS.iter().enumerate() {
-            let y = button_sheet_y(i) + 16.0;
-            let (fill, focused_fill) = (pixel(rest + 3.0, y), pixel(focused + 3.0, y));
-            self.expect(
-                &format!("buttons: focused {kind:?} keeps its fill ({fill:?} vs {focused_fill:?})"),
-                close(fill, focused_fill),
-            );
-            self.expect(
-                &format!("buttons: focused {kind:?} wears the ring and glow"),
-                !close(pixel(rest - 3.0, y), pixel(focused - 3.0, y)),
-            );
+        let page = pixel(2.0, 2.0);
+        // Straight alpha over an opaque color, as the renderer blends.
+        let over = |c: Hsla, under: [u8; 4]| -> [u8; 4] {
+            let c = c.to_rgb();
+            let mix = |v: f32, u: u8| (v * 255.0 * c.a + f32::from(u) * (1.0 - c.a)).round() as u8;
+            [mix(c.r, under[0]), mix(c.g, under[1]), mix(c.b, under[2]), 255]
+        };
+        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 3);
+        let check = |run: &mut Self, what: String, got: [u8; 4], want: [u8; 4]| {
+            run.expect(&format!("buttons: {what} (got {got:?}, want {want:?})"), close(got, want));
+        };
+        for (i, row) in BUTTON_SHEET_ROWS.iter().enumerate() {
+            let c = button_colors(row.kind(), &theme);
+            let y = button_sheet_y(i) + row.height() / 2.0;
+            for (j, state) in BUTTON_SHEET_COLUMNS.iter().enumerate() {
+                let x = button_sheet_x(j);
+                let what = format!("{row:?} {state:?}");
+                let fill = match state {
+                    SheetState::Rest | SheetState::Focused => c.fill,
+                    SheetState::FocusedHover => c.hover,
+                    SheetState::FocusedActive => c.pressed,
+                    SheetState::Disabled => c.fill.opacity(0.4),
+                };
+                check(self, format!("{what} fill"), pixel(x + 3.0, y), over(fill, page));
+                match state {
+                    SheetState::Rest | SheetState::Disabled => {
+                        check(self, format!("{what} has no ring"), pixel(x - 0.5, y), page);
+                        check(self, format!("{what} has no glow"), pixel(x - 3.0, y), page);
+                    }
+                    _ => {
+                        let ring = over(c.focus.glow, over(c.focus.ring, page));
+                        check(self, format!("{what} ring"), pixel(x - 0.5, y), ring);
+                        check(self, format!("{what} glow"), pixel(x - 3.0, y), over(c.focus.glow, page));
+                        check(self, format!("{what} glow ends at 4pt"), pixel(x - 4.5, y), page);
+                    }
+                }
+            }
         }
     }
 

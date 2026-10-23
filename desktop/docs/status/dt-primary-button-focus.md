@@ -54,7 +54,7 @@ focused button, in every style.
 | Padding | | X-Small 8 / 4 (24 tall), Small 12 / 4 (28 tall), Base 12 / 4 (32 tall) | same |
 | Label type | | Geist Medium 12 / 13 / 14 (X-Small / Small / Base) | same |
 | Disabled | | the whole button at 40% opacity | same |
-| Focus | | `Focus Ring` + `Focus Glow` rectangles outside the button (`focus/default/ring`: `Cyan/400` dark, `Cyan/500` `#31ade9` light; `focus/default/glow`: `#12adff` at 20%) | same |
+| Focus | | `Focus Ring` + `Focus Glow` rectangles outside the button (`focus/default/ring`: `Cyan/400` dark, `Cyan/500` `#31ade9` light; `focus/default/glow`: `#12adff` at 20%). Success and Danger have their own (`focus/success/*`, `focus/danger/*`; see [`dt-figma-button-focus-colors`](dt-figma-button-focus-colors.md)) | same |
 
 These are the Select style's values exactly (`button/select/*` aliases the
 same `Cyan/400` at the same alphas, and the same text colors), so the
@@ -167,6 +167,11 @@ selection the sidebar uses, not a button's focus.
   four new rows in `docs/theme.md`).
 
 ## Renders (`--visual-figma`)
+
+> **Later:** [`dt-figma-button-focus-colors`](dt-figma-button-focus-colors.md)
+> gave Success and Danger their own focus colors and grew this sheet to ten
+> rows by five states (rest, focused, focused + hovered, focused + pressed,
+> disabled), checked against the theme's ring, glow and fill colors.
 
 - `components/buttons-<theme>.png`: a new sheet, every kind (Primary,
   Success, Default, Danger, Select, Quiet) at rest and keyboard-focused side

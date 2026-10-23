@@ -32,7 +32,9 @@
 //! - menus, popovers and the palette raised with a ring and a soft drop
 //!   ([`popover`]);
 //! - the keyboard focus as Figma draws it: a 1px `focus/default/ring` and a
-//!   4px `focus/default/focus-glow` ([`focus_shadow`]).
+//!   4px `focus/default/glow` ([`focus_bands`]); a Success or Danger
+//!   button's in its own `focus/success/*` or `focus/danger/*`
+//!   ([`ButtonColors::focus`]).
 //!
 //! Spacing follows Figma's scale (2, 4, 6, 8, 12, 16).
 
@@ -371,9 +373,9 @@ pub enum ButtonKind {
 }
 
 /// A Figma button (Small): 13 / 18 medium, 6px corners, 12px across, the
-/// style's fill and no boundary. `focused` draws the focus ring and glow
-/// around it (keyboard focus in a dialog), and nothing else: the fill and
-/// label stay the style's.
+/// style's fill and no boundary. `focused` draws the style's focus ring and
+/// glow around it (keyboard focus in a dialog), and nothing else: the fill
+/// and label stay the style's.
 pub fn button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -385,7 +387,7 @@ pub fn button(
 }
 
 /// The Button component with Disabled on: its fill and label at
-/// `button/disabled/opacity` (40%), no hover or press, no pointer.
+/// `button/disabled/opacity` (40%), no hover, press or focus, no pointer.
 pub fn disabled_button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -454,7 +456,7 @@ pub fn button_base(
     // Bands, not `focus_shadow`: a gpui shadow is a filled box under the
     // button and its tinted fill is translucent, so the glow would fill it.
     fill_layer(d, id, px(6.0), [c.fill, c.hover, c.pressed])
-        .when(focused, |b| b.children(focus_bands(6.0, theme)))
+        .when(focused, |b| b.children(focus_bands_in(6.0, 0.0, c.focus)))
 }
 
 /// A button kind's colors, in each state.
@@ -464,53 +466,89 @@ pub struct ButtonColors {
     pub hover: Hsla,
     pub pressed: Hsla,
     pub text: Hsla,
+    /// The ring and glow it wears while focused, over whichever fill.
+    pub focus: FocusColors,
+}
+
+/// A focus treatment: the 1px ring and the 4px glow over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusColors {
+    pub ring: Hsla,
+    pub glow: Hsla,
+}
+
+impl FocusColors {
+    /// `focus/default/*`: every control's focus but a Success or Danger
+    /// button's.
+    pub fn default(theme: &Theme) -> Self {
+        Self {
+            ring: theme.focus_ring,
+            glow: theme.focus_glow,
+        }
+    }
 }
 
 /// A button kind's fill and text at rest, hovered and pressed: the Button
-/// component's `background`, `background-hover` and `background-active`.
+/// component's `background`, `background-hover` and `background-active`;
+/// and its focus. The Success and Danger styles have their own
+/// (`focus/success/*`, `focus/danger/*`); the rest wear the default cyan
+/// (Select and Quiet have no Figma focus variant).
 pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
+    let default_focus = FocusColors::default(theme);
     match kind {
         ButtonKind::Primary => ButtonColors {
             fill: theme.primary_fill,
             hover: theme.primary_fill_hover,
             pressed: theme.primary_fill_active,
             text: theme.primary_label,
+            focus: default_focus,
         },
         ButtonKind::Success => ButtonColors {
             fill: theme.success_fill,
             hover: theme.success_fill_hover,
             pressed: theme.success_fill_active,
             text: theme.success_label,
+            focus: FocusColors {
+                ring: theme.success_focus_ring,
+                glow: theme.success_focus_glow,
+            },
         },
         ButtonKind::Secondary => ButtonColors {
             fill: theme.background,
             hover: theme.background_hover,
             pressed: theme.background_active,
             text: theme.text_loud,
+            focus: default_focus,
         },
         ButtonKind::Danger => ButtonColors {
             fill: theme.danger_fill,
             hover: theme.danger_fill_hover,
             pressed: theme.danger_fill_active,
             text: theme.error,
+            focus: FocusColors {
+                ring: theme.danger_focus_ring,
+                glow: theme.danger_focus_glow,
+            },
         },
         ButtonKind::Select => ButtonColors {
             fill: theme.select_fill,
             hover: theme.select_fill_hover,
             pressed: theme.select_fill_active,
             text: theme.select_label,
+            focus: default_focus,
         },
         ButtonKind::Quiet => ButtonColors {
             fill: theme.background.opacity(0.0),
             hover: theme.background_hover,
             pressed: theme.background_active,
             text: theme.foreground,
+            focus: default_focus,
         },
     }
 }
 
 /// The keyboard focus as Figma draws it: the 1px `focus/default/ring` and,
-/// over it, the 4px `focus/default/focus-glow`, both outside the control
+/// over it, the 4px `focus/default/glow`, both outside the control
 /// (Figma stacks the glow over the ring, so the ring reads a touch paler
 /// than its token, and 3px of glow show past it).
 pub fn focus_shadow(theme: &Theme) -> Vec<BoxShadow> {
@@ -750,7 +788,12 @@ pub fn search_clear(id: impl Into<SharedString>, theme: &Theme) -> Stateful<Div>
 /// [`focus_shadow`] drawn as bands around a control whose corners are
 /// `radius`, for a translucent control: gpui paints a drop shadow as a
 /// filled box under the element, which would show through its fill. The
-/// 1px ring, then the 4px glow over it, both outside the control.
+/// 1px ring, then the 4px glow over it, both outside the control, so
+/// neither moves its layout nor its hit area.
+///
+/// The widths are the Button component's focus variants' (a 1px and a 4px
+/// outside stroke), not `focus/ring-width`, which says 2 and which no
+/// variant binds.
 pub fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
     focus_bands_past(radius, 0.0, theme)
 }
@@ -758,6 +801,11 @@ pub fn focus_bands(radius: f32, theme: &Theme) -> [Div; 2] {
 /// [`focus_bands`] for a control with a `border` of its own: an absolute
 /// child is placed from inside the border, so the bands step out past it.
 pub fn focus_bands_past(radius: f32, border: f32, theme: &Theme) -> [Div; 2] {
+    focus_bands_in(radius, border, FocusColors::default(theme))
+}
+
+/// [`focus_bands_past`] in `colors` (a Success or Danger button's focus).
+pub fn focus_bands_in(radius: f32, border: f32, colors: FocusColors) -> [Div; 2] {
     let band = |width: f32, color: Hsla| {
         let out = px(-(width + border));
         div()
@@ -770,7 +818,7 @@ pub fn focus_bands_past(radius: f32, border: f32, theme: &Theme) -> [Div; 2] {
             .border(px(width))
             .border_color(color)
     };
-    [band(1.0, theme.focus_ring), band(4.0, theme.focus_glow)]
+    [band(1.0, colors.ring), band(4.0, colors.glow)]
 }
 
 /// A workflow status's glyph ([`StatusGlyph`]) in its Figma color: backlog
@@ -1140,6 +1188,28 @@ mod tests {
         assert_eq!(colors(&light, ButtonKind::Primary), [0x62cdf61f, 0x62cdf638, 0x62cdf652, 0x1989c4ff]);
         assert_eq!(colors(&dark, ButtonKind::Success), [0x5ac3512e, 0x5ac35147, 0x5ac35166, 0x86d580ff]);
         assert_eq!(colors(&light, ButtonKind::Success), [0x5ac3511f, 0x5ac35138, 0x5ac35152, 0x00753dff]);
+    }
+
+    /// Each style's focus, as the Button component's Focus variants draw it
+    /// (`2224:5758` Default, `2224:5770` Success, `2224:5782` Danger):
+    /// Success green and Danger pink in both themes, every other style the
+    /// default cyan the search boxes and fields wear too.
+    #[test]
+    fn success_and_danger_buttons_focus_in_their_own_colors() {
+        let [dark, light] = themes();
+        let focus = |theme: &Theme, kind| {
+            let f = button_colors(kind, theme).focus;
+            [rgba8(f.ring), rgba8(f.glow)]
+        };
+        for kind in [ButtonKind::Primary, ButtonKind::Secondary, ButtonKind::Select, ButtonKind::Quiet] {
+            assert_eq!(focus(&dark, kind), [0x62cdf6ff, 0x12adff33], "{kind:?} Dark");
+            assert_eq!(focus(&light, kind), [0x31ade9ff, 0x12adff33], "{kind:?} Light");
+            assert_eq!(button_colors(kind, &dark).focus, FocusColors::default(&dark));
+        }
+        assert_eq!(focus(&dark, ButtonKind::Success), [0x5ac351ff, 0x86d58033]);
+        assert_eq!(focus(&light, ButtonKind::Success), [0x5ac351ff, 0x86d58026]);
+        assert_eq!(focus(&dark, ButtonKind::Danger), [0xf21478ff, 0xff66ab40]);
+        assert_eq!(focus(&light, ButtonKind::Danger), [0xf21478ff, 0xff66ab1a]);
     }
 
     /// Focus is the ring and glow and nothing else: a focused button keeps
