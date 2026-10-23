@@ -45,7 +45,7 @@ use gpui::{
 
 use crate::assets::{check_mark, heroicon, Icon};
 use crate::theme::motion::fill_layer;
-use crate::theme::style::{button_base, focus_shadow, raised_drops, ButtonKind, Type, Typography, BUTTON_H};
+use crate::theme::style::{button, focus_shadow, raised_drops, ButtonKind, ButtonSize, Type, Typography, BUTTON_H};
 use crate::theme::Theme;
 
 /// A labeled control's widest: its helper wraps at this.
@@ -235,18 +235,14 @@ pub fn picker(textbox: impl IntoElement, button: impl IntoElement) -> Div {
         .child(button)
 }
 
-/// A form's button: the Button component's Default style at the Base size
-/// (Base medium, loud, on `theme.background`, 32px, 12px across, 6px
-/// corners). Hover and press fade to the stronger fills.
+/// A form's button (a picker's Browse): the Button component's Default
+/// style at the Base size. Hover and press fade to the stronger fills.
 pub fn form_button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     theme: &Theme,
 ) -> Stateful<Div> {
-    button_base(id, ButtonKind::Secondary, false, theme)
-        .type_style(Type::BaseMedium)
-        .whitespace_nowrap()
-        .child(label.into())
+    button(id, label, ButtonKind::Secondary, ButtonSize::Base, false, theme).whitespace_nowrap()
 }
 
 /// The Icon Button beside a textbox: 32px square, 6px corners, `icon` in

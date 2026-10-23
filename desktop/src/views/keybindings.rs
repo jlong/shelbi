@@ -32,15 +32,13 @@ use crate::assets::{heroicon, icons};
 use crate::elements::controls;
 use crate::keys::{chord_from_keystroke, keycap_keys};
 use crate::menus::tree::{reserved_conflicts, ShortcutConflict};
-use crate::theme::style::{self, ButtonKind, IconButtonSize, Type, Typography};
+use crate::theme::style::{self, ButtonKind, ButtonSize, IconButtonSize, Type, Typography};
 use crate::theme::Theme;
 
-/// The Open keys.yaml button: the Button component at Small.
-const KEYS_BUTTON_H: f32 = 28.0;
 /// A binding row's height, its 1px rule below inside the frame's 40.
 const ROW_H: f32 = 39.0;
-/// A keycap: the Button component at Small, label only, at least square-ish.
-const KEYCAP_H: f32 = 28.0;
+/// A keycap's least width: the Button component at Small, at least
+/// square-ish.
 const KEYCAP_MIN_W: f32 = 36.0;
 /// Room past the rows' right edge for a row's hover buttons (+, reset).
 const HOVER_W: f32 = 6.0 + 24.0 + 4.0 + 24.0;
@@ -264,8 +262,7 @@ impl KeybindingsPage {
                             .child("Keybindings"),
                     )
                     .child(
-                        style::button("settings-open-keys", "Open keys.yaml", ButtonKind::Secondary, false, theme)
-                            .h(px(KEYS_BUTTON_H))
+                        style::button("settings-open-keys", "Open keys.yaml", ButtonKind::Secondary, ButtonSize::Small, false, theme)
                             .on_click(cx.listener(|this, _, _, cx| this.open_keys(cx))),
                     ),
             )
@@ -657,18 +654,16 @@ impl Render for KeybindingsPage {
 /// The Button component at Base (14 / 18 medium, 32 tall), its content to
 /// come.
 fn base_button(id: &'static str, kind: ButtonKind, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    style::button_base(id, kind, false, theme).type_style(Type::BaseMedium)
+    style::button_base(id, kind, ButtonSize::Base, false, theme)
 }
 
 /// A chord's keycap: the Button component at Small with only its Hotkey,
 /// the keys in gray. Capturing, it takes the focus ring and reads "Press
 /// keys".
 fn keycap(id: String, keys: Vec<String>, capturing: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    let cap = style::button_base(id, ButtonKind::Secondary, false, theme)
+    let cap = style::button_base(id, ButtonKind::Secondary, ButtonSize::Small, false, theme)
         .relative()
-        .h(px(KEYCAP_H))
         .min_w(px(KEYCAP_MIN_W))
-        .gap(px(4.0))
         // Keep a click on a keycap from ending the capture it starts.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
     if capturing {

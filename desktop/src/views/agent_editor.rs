@@ -51,11 +51,11 @@ use super::agents_state::runner_label;
 use super::sidebar;
 use super::workflow_editor::{
     dialog_overlay, discard_link, dropdown, error_line, footnote, header_button, menu_item, menu_rule, readonly_field,
-    row_button, section_title, text_field, toolbar_button, MENU_W, SMALL_H, TITLEBAR_H,
+    row_button, section_title, text_field, toolbar_button, MENU_W, TITLEBAR_H,
 };
-use crate::assets::{heroicon, icons, Icon};
+use crate::assets::{icons, Icon};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
-use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The page's inset in the window, and the gap between its rows, its
@@ -643,9 +643,9 @@ fn labeled(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div
         .child(control)
 }
 
-/// A picker's button at the column's width (the Button at Base, its label
-/// Small medium): an optional status icon, the choice, and `trailing` (the
-/// chevron) hanging in a 12pt slot.
+/// A picker's button at the column's width (the Button at Small, 32pt tall
+/// as the frame stretches it): an optional status icon, the choice, and
+/// `trailing` (the chevron) in the right icon slot.
 fn select_button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -653,27 +653,14 @@ fn select_button(
     trailing: Icon,
     theme: &Theme,
 ) -> Stateful<Div> {
-    style::button_base(id, ButtonKind::Secondary, false, theme)
+    // The frame's instances are the Small size stretched to the form's
+    // 32pt rows.
+    style::button_base(id, ButtonKind::Secondary, ButtonSize::Small, false, theme)
+        .h(px(style::BUTTON_H))
         .w_full()
-        .gap(px(4.0))
-        .children(icon.map(|c| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_end()
-                .w(px(12.0))
-                .child(style::status_icon_large(c, theme))
-        }))
+        .children(icon.map(|c| style::left_slot(ButtonSize::Small, style::status_icon_large(c, theme))))
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .w(px(12.0))
-                .child(heroicon(trailing).text_color(theme.icon)),
-        )
+        .child(style::right_icon_slot(trailing, ButtonSize::Small, theme.button_icon))
 }
 
 /// A link in a footnote: the footnote's color, underlined on hover.
@@ -812,17 +799,16 @@ impl AgentEditor {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.discard(window, cx)))
         });
         let save = if dirty && !busy {
-            style::button("agent-editor-save", "Save changes", ButtonKind::Primary, false, theme)
-                .h(px(SMALL_H))
+            style::button("agent-editor-save", "Save changes", ButtonKind::Primary, ButtonSize::Small, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx)))
         } else {
             style::disabled_button(
                 "agent-editor-save",
                 if busy { "Saving…" } else { "Save changes" },
                 ButtonKind::Primary,
+                ButtonSize::Small,
                 theme,
             )
-            .h(px(SMALL_H))
         };
         let more = dropdown(
             self.menu == Some(Menu::More),
@@ -1175,15 +1161,12 @@ impl AgentEditor {
     /// Import (an existing skill), Cancel and Add skill.
     fn render_skill_form(&self, form: &SkillForm, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let state = self.state.as_ref().expect("loaded");
-        let import = style::button("agent-skill-import", "Import…", ButtonKind::Quiet, false, theme)
-            .h(px(SMALL_H))
+        let import = style::button("agent-skill-import", "Import…", ButtonKind::Quiet, ButtonSize::Small, false, theme)
             .tooltip(style::tooltip("Copy a skill folder (with its SKILL.md) or a .md file"))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.import_skill(window, cx)));
-        let cancel = style::button("agent-skill-cancel", "Cancel", ButtonKind::Quiet, false, theme)
-            .h(px(SMALL_H))
+        let cancel = style::button("agent-skill-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Small, false, theme)
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_skill_form(cx)));
-        let add = style::button("agent-skill-add", "Add skill", ButtonKind::Primary, false, theme)
-            .h(px(SMALL_H))
+        let add = style::button("agent-skill-add", "Add skill", ButtonKind::Primary, ButtonSize::Small, false, theme)
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_skill(window, cx)));
         div()
             .debug_selector(|| "agent-skill-form".into())
@@ -1443,7 +1426,7 @@ impl AgentEditor {
     fn render_prompt(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
         let buttons = vec![
-            style::button("agent-leave-cancel", "Cancel", ButtonKind::Quiet, false, theme)
+            style::button("agent-leave-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(state) = this.state.as_mut() {
                         state.cancel_prompt();
@@ -1451,7 +1434,7 @@ impl AgentEditor {
                     cx.notify();
                 }))
                 .into_any_element(),
-            style::button("agent-leave-discard", "Discard", ButtonKind::Secondary, false, theme)
+            style::button("agent-leave-discard", "Discard", ButtonKind::Secondary, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let then = this.state.as_mut().and_then(AgentEditorState::discard_and_leave);
                     this.skill_form = None;
@@ -1462,7 +1445,7 @@ impl AgentEditor {
                     cx.notify();
                 }))
                 .into_any_element(),
-            style::button("agent-leave-save", "Save", ButtonKind::Primary, false, theme)
+            style::button("agent-leave-save", "Save", ButtonKind::Primary, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let texts = this.texts(cx);
                     let job = this.state.as_mut().and_then(|s| s.save_and_leave(texts));
@@ -1484,7 +1467,7 @@ impl AgentEditor {
     fn render_confirm_delete(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
         let buttons = vec![
-            style::button("agent-delete-cancel", "Cancel", ButtonKind::Quiet, false, theme)
+            style::button("agent-delete-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(state) = this.state.as_mut() {
                         state.cancel_delete();
@@ -1492,7 +1475,7 @@ impl AgentEditor {
                     cx.notify();
                 }))
                 .into_any_element(),
-            style::button("agent-delete-confirm", "Delete", ButtonKind::Danger, false, theme)
+            style::button("agent-delete-confirm", "Delete", ButtonKind::Danger, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.delete(window, cx)))
                 .into_any_element(),
         ];

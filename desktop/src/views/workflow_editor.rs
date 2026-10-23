@@ -61,7 +61,7 @@ use super::workflows_state::category_label;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::elements::controls;
 use crate::theme::motion::fill_layer;
-use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The titlebar row (the Header component): 52pt, its content starting
@@ -90,8 +90,6 @@ const ARROW_W: f32 = 16.0;
 const DETAILS_W: f32 = 67.0;
 /// A table row's buttons (delete, add an action).
 const ROW_BUTTON: f32 = 24.0;
-/// A row's pickers, the Button at Small.
-pub(super) const SMALL_H: f32 = 28.0;
 /// A menu's width, and its gap under its button.
 pub(super) const MENU_W: f32 = 200.0;
 pub(super) const MENU_GAP: f32 = 6.0;
@@ -981,14 +979,9 @@ pub(super) fn error_line(selector: String, text: &str, theme: &Theme) -> Div {
         .child(text.to_string())
 }
 
-/// A header's button: the Button at Small, an optional 20pt icon hanging
-/// in a 12pt slot before its label.
+/// A header's button: the Button at Small, with an optional left icon.
 pub(super) fn header_button(id: impl Into<SharedString>, icon: Option<Icon>, label: &'static str, theme: &Theme) -> Stateful<Div> {
-    style::button_base(id, ButtonKind::Secondary, false, theme)
-        .h(px(SMALL_H))
-        .gap(px(4.0))
-        .children(icon.map(|i| style::icon_slot(i, 12.0, theme.icon)))
-        .child(label)
+    style::content_button(id, ButtonContent::label(label).left(icon), ButtonKind::Secondary, ButtonSize::Small, false, theme)
 }
 
 /// A row's 24pt icon button (delete, add an action): `icon` (18pt) on the
@@ -1042,27 +1035,12 @@ pub(super) fn picker_button(
     small: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let b = style::button_base(id, ButtonKind::Secondary, false, theme);
-    let b = if small { b.h(px(SMALL_H)).gap(px(4.0)) } else { b.type_style(Type::BaseMedium).gap(px(6.0)) };
-    let slot = if small { 12.0 } else { 14.0 };
-    b.children(icon.map(|c| {
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_end()
-            .w(px(12.0))
-            .child(style::status_icon_large(c, theme))
-    }))
-    .child(div().flex_1().min_w_0().truncate().child(label.into()))
-    .child(
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .w(px(slot))
-            .child(heroicon(icons::CHEVRON_DOWN).text_color(theme.icon)),
-    )
+    let size = if small { ButtonSize::Small } else { ButtonSize::Base };
+    let chevron = style::button_colors(ButtonKind::Secondary, theme).icon;
+    style::button_base(id, ButtonKind::Secondary, size, false, theme)
+        .children(icon.map(|c| style::left_slot(size, style::status_icon_large(c, theme))))
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .child(style::right_icon_slot(icons::CHEVRON_DOWN, size, chevron))
 }
 
 /// A popup menu's panel.
@@ -1379,17 +1357,16 @@ impl WorkflowEditor {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.discard(window, cx)))
         });
         let save = if dirty && !busy {
-            style::button("workflow-editor-save", "Save changes", ButtonKind::Primary, false, theme)
-                .h(px(SMALL_H))
+            style::button("workflow-editor-save", "Save changes", ButtonKind::Primary, ButtonSize::Small, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx)))
         } else {
             style::disabled_button(
                 "workflow-editor-save",
                 if busy { "Saving…" } else { "Save changes" },
                 ButtonKind::Primary,
+                ButtonSize::Small,
                 theme,
             )
-            .h(px(SMALL_H))
         };
         let more = self.dropdown(
             Menu::More,
@@ -1988,8 +1965,7 @@ impl WorkflowEditor {
         });
         let open = self.details.as_ref().is_some_and(|d| d.index == index);
         let kind = if open || state.has_details(index) { ButtonKind::Select } else { ButtonKind::Secondary };
-        let details = style::button(format!("workflow-transition-details-{index}"), "Details", kind, false, theme)
-            .h(px(SMALL_H))
+        let details = style::button(format!("workflow-transition-details-{index}"), "Details", kind, ButtonSize::Small, false, theme)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.toggle_details(index, window, cx)));
         let delete = row_button(format!("workflow-transition-delete-{index}"), icons::TRASH_BUTTON, false, theme)
             .tooltip(style::tooltip("Delete transition"))
@@ -2049,18 +2025,15 @@ impl WorkflowEditor {
     ) -> Div {
         let others: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| *a == action || !actions.contains(a)).collect();
         let last = actions.len() - 1;
-        let button = style::button_base(format!("workflow-action-{index}-{slot}"), ButtonKind::Secondary, false, theme)
-            .h(px(SMALL_H))
-            .gap(px(4.0))
-            .child(div().flex_none().whitespace_nowrap().child(action_label(action)))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .w(px(12.0))
-                    .child(heroicon(icons::CHEVRON_DOWN).text_color(theme.icon)),
-            );
+        let button = style::content_button(
+            format!("workflow-action-{index}-{slot}"),
+            ButtonContent::label(action_label(action)).right(icons::CHEVRON_DOWN),
+            ButtonKind::Secondary,
+            ButtonSize::Small,
+            false,
+            theme,
+        )
+        .whitespace_nowrap();
         self.dropdown(
             Menu::Action(index, slot),
             "workflow-action-menu",
@@ -2406,12 +2379,9 @@ impl WorkflowEditor {
         let state = self.state.as_ref().expect("loaded");
         let blocked = state.delete_blocked();
         let button = match blocked {
-            Some(why) => style::disabled_button("workflow-delete", "Delete workflow", ButtonKind::Danger, theme)
-                .type_style(Type::BaseMedium)
+            Some(why) => style::disabled_button("workflow-delete", "Delete workflow", ButtonKind::Danger, ButtonSize::Base, theme)
                 .tooltip(style::tooltip(why)),
-            None => style::button_base("workflow-delete", ButtonKind::Danger, false, theme)
-                .type_style(Type::BaseMedium)
-                .child("Delete workflow")
+            None => style::button("workflow-delete", "Delete workflow", ButtonKind::Danger, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.delete(window, cx))),
         };
         div().flex().flex_row().w_full().child(button)
@@ -2421,7 +2391,7 @@ impl WorkflowEditor {
     fn render_prompt(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
         let buttons = vec![
-            style::button("workflow-leave-cancel", "Cancel", ButtonKind::Quiet, false, theme)
+            style::button("workflow-leave-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(state) = this.state.as_mut() {
                         state.cancel_prompt();
@@ -2429,7 +2399,7 @@ impl WorkflowEditor {
                     cx.notify();
                 }))
                 .into_any_element(),
-            style::button("workflow-leave-discard", "Discard", ButtonKind::Secondary, false, theme)
+            style::button("workflow-leave-discard", "Discard", ButtonKind::Secondary, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let then = this.state.as_mut().and_then(EditorState::discard_and_leave);
                     this.sync(true, window, cx);
@@ -2439,7 +2409,7 @@ impl WorkflowEditor {
                     cx.notify();
                 }))
                 .into_any_element(),
-            style::button("workflow-leave-save", "Save", ButtonKind::Primary, false, theme)
+            style::button("workflow-leave-save", "Save", ButtonKind::Primary, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let texts = this.texts(cx);
                     let job = this.state.as_mut().and_then(|s| s.save_and_leave(texts));

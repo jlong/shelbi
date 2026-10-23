@@ -16,7 +16,7 @@ use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
 use crate::platform::version::{ProtocolCheck, VersionCheck};
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 
@@ -454,6 +454,7 @@ pub fn render_failure(
                 action.icon(),
                 action.label(),
                 ButtonKind::Success,
+                ButtonSize::Base,
                 theme,
             )
             .on_click(move |_, window, cx| on_action(action, window, cx)),
@@ -497,7 +498,7 @@ pub fn render_relaunch_bar(
                 .child(relaunch_message(notice)),
         )
         .child(
-            style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Success, false, theme)
+            style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Success, ButtonSize::Base, false, theme)
                 .on_click(move |_, window, cx| on_relaunch(window, cx)),
         )
         .into_any_element()

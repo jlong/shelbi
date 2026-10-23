@@ -31,7 +31,7 @@ use shelbi_core::ConfigMode;
 use shelbi_palette::Entry;
 use shelbi_state::keymap::{Key, KeyChord, Keymaps};
 
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 
@@ -434,7 +434,7 @@ pub fn button(
     kind: ButtonKind,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    style::button(id, button_label(label), kind, focused, theme)
+    style::button(id, button_label(label), kind, ButtonSize::Base, focused, theme)
 }
 
 /// A shared button label without the TUI's brackets.

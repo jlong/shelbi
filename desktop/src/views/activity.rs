@@ -46,7 +46,7 @@ use super::{board_list, board_scroll};
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::keys::chord_from_keystroke;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 
@@ -410,7 +410,7 @@ impl ActivityView {
             if !(self.state.has_older() && !self.state.filter.is_unfiltered()) {
                 // Filtered to nothing: the way back is clearing the filters.
                 let clear = (!self.state.filter.is_unfiltered()).then(|| {
-                    style::button("activity-clear-filters", "Clear filters", ButtonKind::Secondary, false, theme)
+                    style::button("activity-clear-filters", "Clear filters", ButtonKind::Secondary, ButtonSize::Base, false, theme)
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             let now = now();
                             this.state.clear_kinds(now);
@@ -518,7 +518,7 @@ impl ActivityView {
             row.child("Loading older events…").child(loaded)
         } else if self.state.has_older() {
             row.child(
-                style::icon_label_button("load-older", icons::ARROW_PATH, "Load older", ButtonKind::Secondary, theme)
+                style::icon_label_button("load-older", icons::ARROW_PATH, "Load older", ButtonKind::Secondary, ButtonSize::Base, theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.load_older(cx))),
             )
             .child(loaded)

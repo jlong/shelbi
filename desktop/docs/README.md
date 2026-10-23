@@ -114,6 +114,7 @@ is left, and how it was verified.
 | `dt-figma-qa-final` | Final pixel QA of all 20 frames at 1x and 2x, the real window in both themes with live theme switching, shared components across screens, the bundled fonts; the departures list for John | [`status/dt-figma-qa-final.md`](status/dt-figma-qa-final.md) |
 | `dt-figma-semantic-token-sync` | The palette synced to Figma's `03 Desktop` collection: semantic token names, the new text, button-icon and Activity ANSI values, the checkbox's own border | [`status/dt-figma-semantic-token-sync.md`](status/dt-figma-semantic-token-sync.md) |
 | `dt-figma-button-focus-colors` | Success and Danger buttons focus in their own green and pink (`focus/success/*`, `focus/danger/*`); the buttons sheet checks every style's ring and glow colors, focused over hover and press, and disabled | [`status/dt-figma-button-focus-colors.md`](status/dt-figma-button-focus-colors.md) |
+| `dt-figma-button-size-content` | Explicit Button sizes (X-Small 24, Small 28, Base 32 with 14px text) and shared content (left icon, label, Hotkey, right icon) in the component's slots; icons in the style's icon role; disabled keeps its size and dims once; a `button-sizes` sheet | [`status/dt-figma-button-size-content.md`](status/dt-figma-button-size-content.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

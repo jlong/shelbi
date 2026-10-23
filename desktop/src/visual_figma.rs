@@ -51,7 +51,10 @@
 //! handle focused, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed), and the form components' sheets
-//! (`components/<name>-<theme>.png`, against the components page's PNGs).
+//! (`components/<name>-<theme>.png`, against the components page's PNGs;
+//! `button-sizes` has none: each Button size with each content mix, pixel
+//! checked). `SHELBI_VISUAL_ONLY=buttons` renders just the components and
+//! the Load for review dialog's focus states.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the issue detail.
@@ -140,11 +143,14 @@ pub const DETAIL_ACTIONS: [&str; 6] = ["move-left", "move-right", "start", "assi
 
 // ---- the form components ---------------------------------------------------
 
-/// The components page's sheets, named as its PNGs, with their sizes: every
-/// state of the Textbox and the Checkbox, a Segmented Control, a Labeled
-/// Control and a Picker; plus a Checkbox List (no PNG: checked by eye).
-const COMPONENT_SHEETS: [(&str, f32, f32); 7] = [
+/// The components page's sheets, named as its PNGs, with their sizes: the
+/// Button's states, every state of the Textbox and the Checkbox, a
+/// Segmented Control, a Labeled Control and a Picker; plus the Button's
+/// sizes and content mixes (`button-sizes`, pixel-checked) and a Checkbox
+/// List (no PNG: checked by eye).
+const COMPONENT_SHEETS: [(&str, f32, f32); 8] = [
     ("buttons", 580.0, 498.0),
+    ("button-sizes", 1024.0, 744.0),
     ("textbox", 234.0, 210.0),
     ("checkbox", 126.0, 154.0),
     ("segmented-control", 167.0, 32.0),
@@ -153,22 +159,24 @@ const COMPONENT_SHEETS: [(&str, f32, f32); 7] = [
     ("checkbox-list", 200.0, 74.0),
 ];
 
-/// The `buttons` sheet's rows, top to bottom: each kind as `style::button`,
-/// then the icon-bearing wrappers (the Review panel's Approve and Reject),
-/// the Base size (the workflow editor's Delete) and X-Small.
+/// The `buttons` sheet's rows, top to bottom: each kind label only at Base,
+/// then the Review panel's Approve and Reject (Small, a left icon), the
+/// task panels' Open (X-Small) and an issue detail action (X-Small, a left
+/// icon and a Hotkey).
 const BUTTON_SHEET_ROWS: [SheetButton; 10] = {
     use crate::theme::style::ButtonKind::*;
+    use crate::theme::style::ButtonSize::*;
     [
-        SheetButton::Label(Primary),
-        SheetButton::Label(Success),
-        SheetButton::Label(Secondary),
-        SheetButton::Label(Danger),
-        SheetButton::Label(Select),
-        SheetButton::Label(Quiet),
-        SheetButton::Icon(Success, "Approve"),
-        SheetButton::Icon(Danger, "Reject"),
-        SheetButton::Base(Danger),
-        SheetButton::XSmall(Secondary),
+        SheetButton(Primary, Base, SheetContent::Label("Button")),
+        SheetButton(Success, Base, SheetContent::Label("Button")),
+        SheetButton(Secondary, Base, SheetContent::Label("Button")),
+        SheetButton(Danger, Base, SheetContent::Label("Button")),
+        SheetButton(Select, Base, SheetContent::Label("Button")),
+        SheetButton(Quiet, Base, SheetContent::Label("Button")),
+        SheetButton(Success, Small, SheetContent::Left("Approve")),
+        SheetButton(Danger, Small, SheetContent::Left("Reject")),
+        SheetButton(Secondary, XSmall, SheetContent::Label("Open")),
+        SheetButton(Secondary, XSmall, SheetContent::Hotkey("Move")),
     ]
 };
 
@@ -182,18 +190,53 @@ const BUTTON_SHEET_COLUMNS: [SheetState; 5] = [
     SheetState::Disabled,
 ];
 
-/// A row of the `buttons` sheet.
+/// A button on a sheet: its style, size and content.
 #[derive(Debug, Clone, Copy)]
-enum SheetButton {
-    /// `style::button` (32 tall, a label).
-    Label(crate::theme::style::ButtonKind),
-    /// `style::small_icon_button` (28 tall, an icon then a label).
-    Icon(crate::theme::style::ButtonKind, &'static str),
-    /// The Base size as the workflow editor's Delete draws it (32 tall,
-    /// Base medium).
-    Base(crate::theme::style::ButtonKind),
-    /// The X-Small size (24 tall, X-Small medium, 8 across).
-    XSmall(crate::theme::style::ButtonKind),
+struct SheetButton(crate::theme::style::ButtonKind, crate::theme::style::ButtonSize, SheetContent);
+
+/// A sheet button's content, with its label.
+#[derive(Debug, Clone, Copy)]
+enum SheetContent {
+    Label(&'static str),
+    Left(&'static str),
+    Right(&'static str),
+    Both(&'static str),
+    /// A left icon, the label and a Hotkey (the issue detail's actions).
+    Hotkey(&'static str),
+    /// Both icons around the label and a Hotkey.
+    All(&'static str),
+}
+
+impl SheetContent {
+    /// Every mix the `button-sizes` sheet shows.
+    const ALL: [SheetContent; 6] = [
+        SheetContent::Label("Button"),
+        SheetContent::Left("Button"),
+        SheetContent::Right("Button"),
+        SheetContent::Both("Button"),
+        SheetContent::Hotkey("Button"),
+        SheetContent::All("Button"),
+    ];
+
+    /// The component's content at `size`: X-Small takes the 18pt drawings.
+    fn at(self, size: crate::theme::style::ButtonSize) -> crate::theme::style::ButtonContent {
+        use crate::assets::icons;
+        use crate::theme::style::{ButtonContent, ButtonSize};
+        let (left, right) = match (size, self) {
+            (ButtonSize::XSmall, _) => (icons::ARROW_LEFT_BUTTON, icons::ARROW_RIGHT_BUTTON),
+            (_, SheetContent::Left("Approve")) => (icons::CHECK, icons::CHEVRON_DOWN),
+            (_, SheetContent::Left("Reject")) => (icons::X_MARK, icons::CHEVRON_DOWN),
+            _ => (icons::PLUS, icons::CHEVRON_DOWN),
+        };
+        match self {
+            SheetContent::Label(l) => ButtonContent::label(l),
+            SheetContent::Left(l) => ButtonContent::label(l).left(left),
+            SheetContent::Right(l) => ButtonContent::label(l).right(right),
+            SheetContent::Both(l) => ButtonContent::label(l).left(left).right(right),
+            SheetContent::Hotkey(l) => ButtonContent::label(l).left(left).hotkey("H"),
+            SheetContent::All(l) => ButtonContent::label(l).left(left).hotkey("⌘S").right(right),
+        }
+    }
 }
 
 /// A column of the `buttons` sheet.
@@ -208,58 +251,48 @@ enum SheetState {
 
 impl SheetButton {
     fn kind(self) -> crate::theme::style::ButtonKind {
-        match self {
-            SheetButton::Label(k) | SheetButton::Icon(k, _) | SheetButton::Base(k) | SheetButton::XSmall(k) => k,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            SheetButton::Label(_) => "Button",
-            SheetButton::Icon(_, label) => label,
-            SheetButton::Base(_) => "Delete",
-            SheetButton::XSmall(_) => "Open",
-        }
+        self.0
     }
 
     fn height(self) -> f32 {
-        match self {
-            SheetButton::Label(_) | SheetButton::Base(_) => crate::theme::style::BUTTON_H,
-            SheetButton::Icon(..) => 28.0,
-            SheetButton::XSmall(_) => 24.0,
-        }
+        self.1.height()
     }
 
     fn render(self, id: String, state: SheetState, theme: &crate::theme::Theme) -> gpui::AnyElement {
-        use crate::theme::style::{self, Type, Typography};
-        use gpui::{IntoElement, ParentElement, Styled};
-        let focused = state != SheetState::Rest;
-        let kind = self.kind();
+        use crate::theme::style;
+        use gpui::IntoElement;
+        let SheetButton(kind, size, content) = self;
         if state == SheetState::Disabled {
-            let d = style::disabled_button(id, self.label(), kind, theme);
-            return match self {
-                SheetButton::Base(_) => d.type_style(Type::BaseMedium),
-                SheetButton::XSmall(_) => d.h(px(24.0)).px(px(8.0)).type_style(Type::XSmallMedium),
-                SheetButton::Icon(..) => d.h(px(28.0)),
-                SheetButton::Label(_) => d,
-            }
-            .into_any_element();
+            style::disabled_content_button(id, content.at(size), kind, size, theme).into_any_element()
+        } else {
+            style::content_button(id, content.at(size), kind, size, state != SheetState::Rest, theme).into_any_element()
         }
-        match self {
-            SheetButton::Label(_) => style::button(id, self.label(), kind, focused, theme),
-            SheetButton::Icon(_, label) => {
-                let icon = if label == "Approve" { crate::assets::icons::CHECK } else { crate::assets::icons::X_MARK };
-                style::small_icon_button(id, icon, label, kind, focused, theme)
-            }
-            SheetButton::Base(_) => style::button_base(id, kind, focused, theme).type_style(Type::BaseMedium).child(self.label()),
-            SheetButton::XSmall(_) => style::button_base(id, kind, focused, theme)
-                .h(px(24.0))
-                .px(px(8.0))
-                .type_style(Type::XSmallMedium)
-                .child(self.label()),
-        }
-        .into_any_element()
     }
+}
+
+/// The `button-sizes` sheet's columns: the styles (Select is the Figma
+/// Select flag), then Default disabled.
+const SIZE_SHEET_COLUMNS: [(crate::theme::style::ButtonKind, bool); 6] = {
+    use crate::theme::style::ButtonKind::*;
+    [(Secondary, false), (Primary, false), (Success, false), (Danger, false), (Select, false), (Secondary, true)]
+};
+
+/// The `button-sizes` sheet's rows: each size (X-Small, Small, Base) with
+/// each [`SheetContent::ALL`].
+fn size_sheet_rows() -> Vec<SheetButton> {
+    use crate::theme::style::ButtonSize;
+    [ButtonSize::XSmall, ButtonSize::Small, ButtonSize::Base]
+        .into_iter()
+        .flat_map(|size| SheetContent::ALL.map(|c| SheetButton(crate::theme::style::ButtonKind::Secondary, size, c)))
+        .collect()
+}
+
+fn size_sheet_x(j: usize) -> f32 {
+    17.0 + 168.0 * j as f32
+}
+
+fn size_sheet_y(i: usize) -> f32 {
+    17.0 + 40.0 * i as f32
 }
 
 /// The `buttons` sheet's column `j` left.
@@ -311,6 +344,13 @@ impl gpui::Render for Sheet {
             "buttons" => sheet.children(BUTTON_SHEET_ROWS.iter().enumerate().flat_map(|(i, row)| {
                 BUTTON_SHEET_COLUMNS.iter().enumerate().map(move |(j, state)| {
                     at(button_sheet_x(j), button_sheet_y(i), row.render(button_sheet_id(i, j), *state, &theme))
+                })
+            })),
+            "button-sizes" => sheet.children(size_sheet_rows().into_iter().enumerate().flat_map(|(i, row)| {
+                SIZE_SHEET_COLUMNS.iter().enumerate().map(move |(j, &(kind, disabled))| {
+                    let state = if disabled { SheetState::Disabled } else { SheetState::Rest };
+                    let b = SheetButton(kind, row.1, row.2);
+                    at(size_sheet_x(j), size_sheet_y(i), b.render(format!("size-button-{i}-{j}"), state, &theme))
                 })
             })),
             "textbox" => sheet
@@ -1643,6 +1683,9 @@ impl Run {
                 // 1px ring into its neighbors.
                 self.expect_button_focus(&image, image.width() as f32 / w);
             }
+            if name == "button-sizes" {
+                self.expect_button_sizes(&image, image.width() as f32 / w);
+            }
             let image = if self.native || image.width() == w as u32 {
                 image
             } else {
@@ -1705,6 +1748,41 @@ impl Run {
                         check(self, format!("{what} glow"), pixel(x - 3.0, y), over(c.focus.glow, page));
                         check(self, format!("{what} glow ends at 4pt"), pixel(x - 4.5, y), page);
                     }
+                }
+            }
+        }
+    }
+
+    /// On the `button-sizes` sheet, each button's height in pixels: 8pt in
+    /// (past the corner, clear of the glyphs), its style's fill 1.5pt inside
+    /// its top and bottom edges (40% for the disabled column) and the page
+    /// 1.5pt outside them, so X-Small is 24 tall, Small 28 and Base 32
+    /// whatever it holds.
+    fn expect_button_sizes(&mut self, image: &image::RgbaImage, scale: f32) {
+        use crate::theme::style::button_colors;
+        let theme = self.cx.update(|cx| *cx.global::<crate::theme::Theme>());
+        let pixel = |x: f32, y: f32| image.get_pixel((x * scale) as u32, (y * scale) as u32).0;
+        let page = pixel(2.0, 2.0);
+        let over = |c: gpui::Hsla, under: [u8; 4]| -> [u8; 4] {
+            let c = c.to_rgb();
+            let mix = |v: f32, u: u8| (v * 255.0 * c.a + f32::from(u) * (1.0 - c.a)).round() as u8;
+            [mix(c.r, under[0]), mix(c.g, under[1]), mix(c.b, under[2]), 255]
+        };
+        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 3);
+        for (i, row) in size_sheet_rows().into_iter().enumerate() {
+            for (j, &(kind, disabled)) in SIZE_SHEET_COLUMNS.iter().enumerate() {
+                let fill = button_colors(kind, &theme).fill;
+                let fill = over(if disabled { fill.opacity(0.4) } else { fill }, page);
+                let (x, top, h) = (size_sheet_x(j) + 8.0, size_sheet_y(i), row.height());
+                let what = format!("button-sizes: {:?} {:?} {kind:?}{}", row.1, row.2, if disabled { " disabled" } else { "" });
+                for (edge, y, want) in [
+                    ("top inside", top + 1.5, fill),
+                    ("bottom inside", top + h - 1.5, fill),
+                    ("above", top - 1.5, page),
+                    ("below", top + h + 1.5, page),
+                ] {
+                    let got = pixel(x, y);
+                    self.expect(&format!("{what} {edge} (got {got:?}, want {want:?})"), close(got, want));
                 }
             }
         }
