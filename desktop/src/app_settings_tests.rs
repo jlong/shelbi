@@ -453,6 +453,48 @@ fn the_terminal_page_edits_colors_live_saves_them_and_resets(cx: &mut TestAppCon
     assert!(!s.read(|_, cx| view.read(cx).can_reset()));
 }
 
+/// dt-terminal-scrollbar-overlay: Show scrollbar shows the saved choice,
+/// and a pick applies to every terminal at once and is saved (Automatic,
+/// the default, isn't written). The preview's scrollbar overlays its inset.
+#[gpui::test]
+fn the_terminal_page_picks_when_the_scrollbar_shows(cx: &mut TestAppContext) {
+    use shelbi_state::TerminalScrollbar;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    cfg.desktop.terminal_scrollbar = Some(TerminalScrollbar::Always);
+    let view = terminal_page(&mut s, cfg);
+    for selector in ["settings-scrollbar-Automatic", "settings-scrollbar-When scrolling", "settings-scrollbar-Always"] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    assert_eq!(s.read(|_, cx| view.read(cx).scrollbar()), TerminalScrollbar::Always);
+    let live = |s: &mut Settings| s.h.cx.update(|_, cx| TerminalSettings::current(cx).scrollbar);
+    let saved = |s: &mut Settings| s.read(|_, cx| view.read(cx).saved().desktop.terminal_scrollbar);
+
+    s.click("settings-scrollbar-When scrolling");
+    assert_eq!(live(&mut s), TerminalScrollbar::Scrolling, "every terminal follows at once");
+    assert_eq!(saved(&mut s), Some(TerminalScrollbar::Scrolling));
+    let preview = s.read(|_, cx| view.read(cx).preview());
+    assert_eq!(s.read(|_, cx| preview.read(cx).settings.scrollbar), TerminalScrollbar::Scrolling);
+
+    s.click("settings-scrollbar-Automatic");
+    assert_eq!(live(&mut s), TerminalScrollbar::Auto);
+    assert_eq!(saved(&mut s), None, "the default isn't written");
+
+    // Changed elsewhere (another window's Settings): the control follows.
+    s.h.cx.update(|_, cx| {
+        TerminalSettings::set(TerminalSettings { scrollbar: TerminalScrollbar::Always, ..TerminalSettings::current(cx) }, cx)
+    });
+    s.settle();
+    assert_eq!(s.read(|_, cx| view.read(cx).scrollbar()), TerminalScrollbar::Always);
+
+    let inset = crate::views::settings::PREVIEW_INSET;
+    assert_eq!(
+        s.read(|_, cx| preview.read(cx).scrollbar_padding()),
+        crate::elements::terminal::scrollbar::Padding { top: inset, right: inset, bottom: inset }
+    );
+}
+
 #[gpui::test]
 fn the_terminal_page_shows_saved_colors(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);

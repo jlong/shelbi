@@ -13,7 +13,9 @@
 //!   hollow when unfocused) with the glyph under a block cursor repainted in
 //!   the cursor's text color, any IME composition (over the cells at the
 //!   cursor, underlined, its selected clause underlined thicker), and the
-//!   scrollbar. It also registers the pointer listeners and the input
+//!   scrollbar, which runs down the right edge of the pane's padded area
+//!   (outside the element, over its host's padding) and fades in and out
+//!   ([`super::scrollbar`]). It also registers the pointer listeners and the input
 //!   handler. (Modifier changes reach the pane's own div: gpui sends them
 //!   along the focus path, which ends at the focused pane, not this child.)
 //!
@@ -31,7 +33,7 @@ use gpui::{
     fill, outline, point, px, relative, size, App, BorderStyle, Bounds, ContentMask,
     CursorStyle as PointerStyle, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
     FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point,
+    IntoElement, LayoutId, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point,
     ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
     Window,
 };
@@ -87,6 +89,9 @@ pub struct CompositionPaint {
 /// Everything prepaint computed for paint.
 pub struct Frame {
     hitbox: Hitbox,
+    /// The scrollbar's edge strip, which reaches past the element into the
+    /// host's padding.
+    scrollbar_hitbox: Option<Hitbox>,
     started: Instant,
     rows_rebuilt: usize,
     background: Hsla,
@@ -99,7 +104,7 @@ pub struct Frame {
     over: Vec<(Bounds<Pixels>, Hsla)>,
     cursor: Option<CursorPaint>,
     composition: Option<CompositionPaint>,
-    /// The scrollbar thumb.
+    /// The scrollbar thumb, when it shows.
     scrollbar: Option<(Bounds<Pixels>, Hsla)>,
     background_fill: Hsla,
     line_height: Pixels,
@@ -156,7 +161,7 @@ impl Element for TerminalElement {
 
         let held = super::ResizeHold::holds(window, cx);
         // Geometry and damage: the only mutation of the pane in a frame.
-        let (metrics, rows, rows_rebuilt, palette) = self.pane.update(cx, |pane, cx| {
+        let (metrics, rows, rows_rebuilt, palette, scrollbar_opacity) = self.pane.update(cx, |pane, cx| {
             let (family, size) = (pane.settings.font_family.clone(), pane.settings.font_size);
             let metrics = pane
                 .metrics
@@ -171,10 +176,14 @@ impl Element for TerminalElement {
                 .expect("set by begin_frame");
             let palette = Palette::resolve(&theme, pane.view().emulator());
             let (rows, rebuilt) = pane.layout_rows(placement, &palette);
-            (metrics, rows, rebuilt, palette)
+            let scrollbar_opacity = pane.scrollbar_frame(pane.scrollbar_clock(), window, cx);
+            (metrics, rows, rebuilt, palette, scrollbar_opacity)
         });
 
         let pane = self.pane.read(cx);
+        let scrollbar_hitbox = pane
+            .scrollbar_track()
+            .map(|track| window.insert_hitbox(track, HitboxBehavior::Normal));
         let geometry = pane.geometry.clone().expect("set by begin_frame");
         let origin = grid_origin(&geometry, &metrics);
         let shown = Size::new(geometry.placement.cols.len, geometry.placement.rows.len);
@@ -395,24 +404,19 @@ impl Element for TerminalElement {
                 })
             });
 
-        // The scrollbar thumb, over the right edge.
-        let scrollbar = pane.scrollbar_thumb().map(|thumb| {
-            let color = if pane.scrollbar_active() || pane.scrollbar_hovered {
-                cx.global::<Theme>().icon
-            } else {
-                cx.global::<Theme>().muted.opacity(0.6)
-            };
-            (
-                Bounds {
-                    origin: point(
-                        bounds.right() - px(scrollbar::WIDTH + scrollbar::INSET),
-                        bounds.top() + px(thumb.top),
-                    ),
-                    size: size(px(scrollbar::WIDTH), px(thumb.height)),
-                },
-                color,
-            )
-        });
+        // The scrollbar thumb, against the padded area's right edge, at
+        // this frame's point in its fade.
+        let scrollbar = pane
+            .scrollbar_thumb_rect()
+            .filter(|_| scrollbar_opacity > 0.0)
+            .map(|thumb| {
+                let color = if pane.scrollbar_active() || pane.scrollbar_hovered {
+                    surfaces.icon
+                } else {
+                    surfaces.muted.opacity(0.6)
+                };
+                (thumb, color.opacity(color.a * scrollbar_opacity))
+            });
 
         let pointer = if pane.hovered_link.is_some() {
             PointerStyle::PointingHand
@@ -435,6 +439,7 @@ impl Element for TerminalElement {
             cursor,
             composition,
             scrollbar,
+            scrollbar_hitbox,
             background_fill: palette.background(),
             line_height: metrics.height,
             pointer,
@@ -488,13 +493,17 @@ impl Element for TerminalElement {
                     window.paint_quad(fill(clause, frame.cursor_color()));
                 }
             }
-            if let Some((b, color)) = &frame.scrollbar {
-                window.paint_quad(fill(*b, *color).corner_radii(px(scrollbar::WIDTH / 2.0)));
-            }
         });
+        // Outside the element's own mask: the thumb overlays the padding.
+        if let Some((b, color)) = &frame.scrollbar {
+            window.paint_quad(fill(*b, *color).corner_radii(px(scrollbar::WIDTH / 2.0)));
+        }
 
-        self.register_listeners(&frame.hitbox, window, cx);
+        self.register_listeners(&frame.hitbox, frame.scrollbar_hitbox.as_ref(), window, cx);
         window.set_cursor_style(frame.pointer, &frame.hitbox);
+        if let Some(edge) = &frame.scrollbar_hitbox {
+            window.set_cursor_style(PointerStyle::Arrow, edge);
+        }
         let focus = self.pane.read(cx).focus_handle_ref().clone();
         window.handle_input(
             &focus,
@@ -533,11 +542,16 @@ impl Frame {
 }
 
 impl TerminalElement {
-    fn register_listeners(&self, hitbox: &Hitbox, window: &mut Window, _cx: &mut App) {
+    fn register_listeners(&self, hitbox: &Hitbox, edge: Option<&Hitbox>, window: &mut Window, _cx: &mut App) {
+        let on_edge = {
+            let edge = edge.cloned();
+            move |window: &Window| edge.as_ref().is_some_and(|e| e.is_hovered(window))
+        };
         let pane = self.pane.clone();
         let hb = hitbox.clone();
+        let edge = on_edge.clone();
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
+            if phase == DispatchPhase::Bubble && (hb.is_hovered(window) || edge(window)) {
                 pane.update(cx, |p, cx| {
                     p.mouse_down(e.button, e.position, e.modifiers, e.click_count, window, cx)
                 });
@@ -546,12 +560,19 @@ impl TerminalElement {
         });
         let pane = self.pane.clone();
         let hb = hitbox.clone();
+        let edge = on_edge.clone();
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble {
-                let hovered = hb.is_hovered(window);
+                let (hovered, on_edge) = (hb.is_hovered(window), edge(window));
                 pane.update(cx, |p, cx| {
-                    p.mouse_move(e.position, e.pressed_button, e.modifiers, hovered, cx)
+                    p.mouse_move(e.position, e.pressed_button, e.modifiers, hovered, on_edge, cx)
                 });
+            }
+        });
+        let pane = self.pane.clone();
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                pane.update(cx, |p, cx| p.mouse_exited(cx));
             }
         });
         let pane = self.pane.clone();
@@ -567,7 +588,7 @@ impl TerminalElement {
         let pane = self.pane.clone();
         let hb = hitbox.clone();
         window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
+            if phase == DispatchPhase::Bubble && (hb.is_hovered(window) || on_edge(window)) {
                 pane.update(cx, |p, cx| {
                     p.scroll_wheel(e.delta, e.position, e.modifiers, cx)
                 });

@@ -59,7 +59,7 @@ use shelbi_app::session::{
 use shelbi_term::Size;
 
 use crate::elements::terminal::session::{self as pane_session, Connected};
-use crate::elements::terminal::{PaneEvent, TerminalPane};
+use crate::elements::terminal::{scrollbar, PaneEvent, TerminalPane};
 use crate::refresh::SessionSink;
 use crate::theme::style::{Type, Typography};
 use crate::theme::Theme;
@@ -878,7 +878,14 @@ impl Render for SessionView {
         if let Slot::Live(pane) = &self.slot {
             // The grid sits where the Figma frames draw it: clear of the
             // column divider and the window's corner by the inset across,
-            // 12px from the top and bottom.
+            // 12px from the top and bottom. The scrollbar overlays that
+            // padding, against the main area's right edge.
+            let padding = scrollbar::Padding {
+                top: TERMINAL_INSET_Y,
+                right: self.inset_x,
+                bottom: TERMINAL_INSET_Y,
+            };
+            pane.update(cx, |pane, _| pane.set_scrollbar_padding(padding));
             return root
                 .pl(gpui::px(self.inset_x))
                 .pr(gpui::px(self.inset_x))
@@ -924,7 +931,7 @@ mod tests {
     use std::sync::Mutex;
 
     use futures::channel::mpsc::{unbounded, UnboundedSender};
-    use gpui::{TestAppContext, VisualTestContext, WindowAppearance};
+    use gpui::{px, TestAppContext, VisualTestContext, WindowAppearance};
     use shelbi_app::supervision::{BASE_BACKOFF, MAX_RESTARTS_IN_WINDOW};
     use shelbi_client::SessionEvent;
     use shelbi_app::theme::ThemePreference;
@@ -1567,6 +1574,186 @@ mod tests {
             let reported = *h.session.wire.lock().unwrap().resizes.last().unwrap();
             assert_eq!(reported, viewer, "{ht}: the session is told the grid that fits");
         }
+    }
+
+    /// A live pane with a couple of hundred lines of history, drawn.
+    fn with_history(cx: &mut TestAppContext) -> (Harness, Entity<TerminalPane>) {
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, 24))]);
+        h.update(|c, cx| c.show(cx));
+        draw(&mut h);
+        let out: String = (0..200).map(|i| format!("line {i}\r\n")).collect();
+        h.session.push(SessionEvent::Output { seq: 1, data: out.into_bytes() });
+        h.settle();
+        draw(&mut h);
+        let pane = pane_of(&mut h);
+        (h, pane)
+    }
+
+    fn opacity(h: &mut Harness, pane: &Entity<TerminalPane>) -> f32 {
+        draw(h);
+        pane.read_with(&h.cx, |p, _| p.scrollbar_opacity())
+    }
+
+    fn skew(h: &mut Harness, pane: &Entity<TerminalPane>, by: Duration) {
+        pane.update(&mut h.cx, |p, _| p.clock_skew += by);
+    }
+
+    /// dt-terminal-scrollbar-overlay: the thumb runs down the main area's
+    /// right edge, 2pt in, over the session view's padding; the grid keeps
+    /// its insets, and the strip that reveals and grabs the scrollbar sits
+    /// in the padding, clear of the text.
+    #[gpui::test]
+    fn the_scrollbar_hugs_the_areas_right_edge_over_the_padding(cx: &mut TestAppContext) {
+        use crate::elements::terminal::scrollbar::{HIT_WIDTH, INSET, WIDTH};
+        let (mut h, pane) = with_history(cx);
+        let window = h.cx.update(|window, _| window.viewport_size());
+        let (bounds, ..) = pane.read_with(&h.cx, |p, _| p.last_frame()).expect("drawn");
+        // The text grid is where it always was.
+        assert_eq!(bounds.right(), window.width - px(TERMINAL_INSET_X));
+        assert_eq!(bounds.top(), px(TERMINAL_INSET_Y));
+        assert_eq!(
+            pane.read_with(&h.cx, |p, _| p.scrollbar_padding()),
+            scrollbar::Padding { top: TERMINAL_INSET_Y, right: TERMINAL_INSET_X, bottom: TERMINAL_INSET_Y }
+        );
+        // At the live bottom the thumb ends 2pt above the area's bottom edge,
+        // 2pt in from its right edge (the window's).
+        let thumb = pane.read_with(&h.cx, |p, _| p.scrollbar_thumb_bounds()).expect("history");
+        assert_eq!(thumb.right(), window.width - px(INSET));
+        assert_eq!(thumb.size.width, px(WIDTH));
+        assert!((f32::from(thumb.bottom()) - (f32::from(window.height) - INSET)).abs() < 0.01);
+        // Scrolled to the oldest line it starts 2pt below the area's top.
+        pane.update(&mut h.cx, |p, _| p.terminal_view_mut().scroll_up(10_000));
+        draw(&mut h);
+        let top = pane.read_with(&h.cx, |p, _| p.scrollbar_thumb_bounds()).unwrap();
+        assert_eq!(top.top(), px(INSET));
+        // The strip is in the padding, so a press on the last text column
+        // still selects text.
+        let track = pane.read_with(&h.cx, |p, _| p.scrollbar_track()).unwrap();
+        assert_eq!(track.right(), window.width);
+        assert_eq!(track.size.width, px(HIT_WIDTH));
+        assert!(track.left() >= bounds.right(), "{track:?} vs {bounds:?}");
+    }
+
+    /// At rest an overlay scrollbar is hidden; scrolling shows it, and a
+    /// second after the last scroll it goes (instantly here: Reduce Motion).
+    #[gpui::test]
+    fn an_overlay_scrollbar_shows_while_scrolling_then_hides(cx: &mut TestAppContext) {
+        let (mut h, pane) = with_history(cx);
+        h.cx.update(|_, cx| cx.set_reduce_motion(true));
+        assert_eq!(opacity(&mut h, &pane), 0.0, "hidden at rest, history and all");
+        // Output at the live bottom isn't a scroll.
+        h.session.push(SessionEvent::Output { seq: 2, data: b"more\r\n".to_vec() });
+        h.settle();
+        assert_eq!(opacity(&mut h, &pane), 0.0);
+
+        pane.update(&mut h.cx, |p, _| p.terminal_view_mut().scroll_up(5));
+        assert_eq!(opacity(&mut h, &pane), 1.0, "a scroll shows it");
+        skew(&mut h, &pane, Duration::from_millis(600));
+        assert_eq!(opacity(&mut h, &pane), 1.0, "it lingers");
+        // New output while scrolled back is a scroll too.
+        h.session.push(SessionEvent::Output { seq: 3, data: b"later\r\n".to_vec() });
+        h.settle();
+        assert_eq!(opacity(&mut h, &pane), 1.0);
+        skew(&mut h, &pane, Duration::from_millis(600));
+        assert_eq!(opacity(&mut h, &pane), 1.0, "the new output restarted the linger");
+        skew(&mut h, &pane, Duration::from_millis(500));
+        // The hide timer draws the frame that hides it.
+        h.advance(Duration::from_secs(2));
+        assert_eq!(pane.read_with(&h.cx, |p, _| p.scrollbar_opacity()), 0.0, "gone a second after");
+    }
+
+    /// Without Reduce Motion the scrollbar fades: a scroll starts a fade
+    /// in, which keeps frames coming until it lands.
+    #[gpui::test]
+    fn the_scrollbar_fades_in(cx: &mut TestAppContext) {
+        let (mut h, pane) = with_history(cx);
+        h.cx.update(|_, cx| cx.set_reduce_motion(false));
+        pane.update(&mut h.cx, |p, _| p.terminal_view_mut().scroll_up(5));
+        let first = opacity(&mut h, &pane);
+        assert!(first < 1.0, "not shown at once: {first}");
+        skew(&mut h, &pane, Duration::from_millis(100));
+        let mid = opacity(&mut h, &pane);
+        assert!(mid > first && mid < 1.0, "{first} -> {mid}");
+        skew(&mut h, &pane, Duration::from_millis(200));
+        assert_eq!(opacity(&mut h, &pane), 1.0);
+    }
+
+    /// The pointer at the right edge (in the padding, past the text)
+    /// reveals the scrollbar; a drag of the thumb from there scrolls and
+    /// keeps it shown; a click on the track jumps; letting go and leaving
+    /// lets it hide.
+    #[gpui::test]
+    fn the_edge_reveals_the_scrollbar_and_its_thumb_drags(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton};
+        let (mut h, pane) = with_history(cx);
+        h.cx.update(|_, cx| cx.set_reduce_motion(true));
+        let window = h.cx.update(|window, _| window.viewport_size());
+        assert_eq!(opacity(&mut h, &pane), 0.0);
+        let edge_x = window.width - px(4.0);
+        h.cx.simulate_mouse_move(gpui::point(edge_x, px(200.0)), None, Modifiers::none());
+        h.settle();
+        assert!(pane.read_with(&h.cx, |p, _| p.scrollbar_hovered));
+        assert_eq!(opacity(&mut h, &pane), 1.0, "the pointer at the edge shows it");
+        skew(&mut h, &pane, Duration::from_secs(5));
+        assert_eq!(opacity(&mut h, &pane), 1.0, "and keeps it");
+
+        // Drag the thumb (at the bottom) to the top: the oldest line.
+        let thumb = pane.read_with(&h.cx, |p, _| p.scrollbar_thumb_bounds()).unwrap();
+        let grab = gpui::point(edge_x, thumb.center().y);
+        h.cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        h.cx.simulate_mouse_move(gpui::point(edge_x, px(0.0)), MouseButton::Left, Modifiers::none());
+        h.settle();
+        let (offset, history) = pane.read_with(&h.cx, |p, _| {
+            let view = p.view();
+            (view.scroll_offset(), view.emulator().history_len())
+        });
+        assert_eq!(offset, history, "dragged to the oldest line");
+        // Away from the edge, still held: the drag keeps it.
+        h.cx.simulate_mouse_move(gpui::point(px(100.0), px(5.0)), MouseButton::Left, Modifiers::none());
+        h.settle();
+        skew(&mut h, &pane, Duration::from_secs(5));
+        assert_eq!(opacity(&mut h, &pane), 1.0, "a drag holds it");
+        h.cx.simulate_mouse_up(gpui::point(px(100.0), px(5.0)), MouseButton::Left, Modifiers::none());
+        h.settle();
+        skew(&mut h, &pane, Duration::from_secs(2));
+        assert_eq!(opacity(&mut h, &pane), 0.0, "let go and away: hidden");
+        assert!(!pane.read_with(&h.cx, |p, _| p.scrollbar_hovered));
+
+        // A click low on the track (hidden or not) jumps back toward the
+        // bottom.
+        h.cx.simulate_click(gpui::point(edge_x, window.height - px(6.0)), Modifiers::none());
+        h.settle();
+        let offset = pane.read_with(&h.cx, |p, _| p.view().scroll_offset());
+        assert_eq!(offset, 0, "the track click jumped to the live bottom");
+    }
+
+    /// "Always" (the setting, or Automatic with the system's Always) keeps
+    /// it shown with scrollback; "When scrolling" hides it at rest whatever
+    /// the system says.
+    #[gpui::test]
+    fn the_setting_and_the_system_decide_whether_it_rests_shown(cx: &mut TestAppContext) {
+        use crate::elements::terminal::scrollbar::SystemScrollbars;
+        use crate::elements::terminal::TerminalSettings;
+        use shelbi_state::TerminalScrollbar;
+        let (mut h, pane) = with_history(cx);
+        let set = |h: &mut Harness, scrollbar: TerminalScrollbar| {
+            h.cx.update(|_, cx| TerminalSettings::set(TerminalSettings { scrollbar, ..TerminalSettings::default() }, cx));
+            h.settle();
+        };
+        assert_eq!(opacity(&mut h, &pane), 0.0, "Automatic, the system's overlays");
+        set(&mut h, TerminalScrollbar::Always);
+        assert_eq!(opacity(&mut h, &pane), 1.0, "Always: shown at once, no scroll");
+        skew(&mut h, &pane, Duration::from_secs(60));
+        assert_eq!(opacity(&mut h, &pane), 1.0);
+
+        set(&mut h, TerminalScrollbar::Auto);
+        h.cx.update(|_, cx| cx.set_reduce_motion(true));
+        assert_eq!(opacity(&mut h, &pane), 0.0);
+        h.cx.update(|_, cx| SystemScrollbars::set(false, cx));
+        h.settle();
+        assert_eq!(opacity(&mut h, &pane), 1.0, "Automatic follows the system's Always");
+        set(&mut h, TerminalScrollbar::Scrolling);
+        assert_eq!(opacity(&mut h, &pane), 0.0, "When scrolling overrides it");
     }
 
     /// dt-sidebar-toggle-animation: while the window's layout is in motion

@@ -97,6 +97,18 @@ pub struct DesktopConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_as_meta: Option<OptionAsMeta>,
 
+    /// When the desktop app's terminals show their scrollbar: `auto`
+    /// (follow macOS's "Show scroll bars"), `scrolling` (only while
+    /// scrolling or with the pointer at the edge), or `always` (whenever
+    /// there is scrollback). Unset, or a value it doesn't know, means
+    /// `auto`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_scrollbar"
+    )]
+    pub terminal_scrollbar: Option<TerminalScrollbar>,
+
     /// Which system notifications the desktop app posts (`notifications:`).
     /// Every kind is on unless switched off.
     #[serde(default, skip_serializing_if = "DesktopNotifications::is_empty")]
@@ -186,6 +198,37 @@ impl<'de> Deserialize<'de> for OptionAsMeta {
     }
 }
 
+/// When the desktop app's terminals show their scrollbar
+/// (`desktop.terminal_scrollbar`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalScrollbar {
+    /// Follow System Settings ▸ Appearance ▸ "Show scroll bars".
+    #[default]
+    Auto,
+    /// Only while scrolling or with the pointer at the edge (macOS's
+    /// overlay scrollers).
+    Scrolling,
+    /// Whenever there is scrollback.
+    Always,
+}
+
+/// `terminal_scrollbar`: `auto`, `scrolling`, or `always` (any case, and
+/// macOS's own names `automatic` and `when-scrolling`); anything else is
+/// ignored rather than failing the whole file.
+fn lenient_scrollbar<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<TerminalScrollbar>, D::Error> {
+    let value = serde_yaml::Value::deserialize(d)?;
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    Ok(match text.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "auto" | "automatic" => Some(TerminalScrollbar::Auto),
+        "scrolling" | "when-scrolling" => Some(TerminalScrollbar::Scrolling),
+        "always" => Some(TerminalScrollbar::Always),
+        _ => None,
+    })
+}
+
 /// `window_opacity`: a whole percentage, or a fraction up to 1 read as one
 /// (`0.85` is 85). Out of range saturates; anything that isn't a number is
 /// ignored rather than failing the whole file.
@@ -211,6 +254,7 @@ impl DesktopConfig {
             && self.terminal_font_family.is_none()
             && self.terminal_font_size.is_none()
             && self.option_as_meta.is_none()
+            && self.terminal_scrollbar.is_none()
             && self.notifications.is_empty()
             && self.terminal_colors.is_empty()
             && self.window_opacity.is_none()
@@ -937,5 +981,41 @@ mod tests {
             assert_eq!(serde_yaml::from_str::<OptionAsMeta>(&text).unwrap(), v, "{text}");
         }
         assert_eq!(serde_yaml::to_string(&OptionAsMeta::Both).unwrap().trim(), "true");
+    }
+
+    #[test]
+    fn terminal_scrollbar_round_trips_and_reads_leniently() {
+        for v in [TerminalScrollbar::Auto, TerminalScrollbar::Scrolling, TerminalScrollbar::Always] {
+            let cfg = UserConfig {
+                desktop: DesktopConfig {
+                    terminal_scrollbar: Some(v),
+                    ..DesktopConfig::default()
+                },
+                ..UserConfig::default()
+            };
+            let text = serde_yaml::to_string(&cfg).unwrap();
+            let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+            assert_eq!(back, cfg, "{text}");
+        }
+        let text = serde_yaml::to_string(&DesktopConfig {
+            terminal_scrollbar: Some(TerminalScrollbar::Scrolling),
+            ..DesktopConfig::default()
+        })
+        .unwrap();
+        assert!(text.contains("terminal_scrollbar: scrolling"), "{text}");
+
+        let read = |v: &str| {
+            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  terminal_scrollbar: {v}\n")).unwrap();
+            cfg.desktop.terminal_scrollbar
+        };
+        assert_eq!(read("auto"), Some(TerminalScrollbar::Auto));
+        assert_eq!(read("Automatic"), Some(TerminalScrollbar::Auto));
+        assert_eq!(read("when_scrolling"), Some(TerminalScrollbar::Scrolling));
+        assert_eq!(read("ALWAYS"), Some(TerminalScrollbar::Always));
+        // Unknown values are ignored, not an error that loses the file.
+        assert_eq!(read("sometimes"), None);
+        assert_eq!(read("3"), None);
+        assert_eq!(read("~"), None);
+        assert!(DesktopConfig::default().terminal_scrollbar.is_none());
     }
 }

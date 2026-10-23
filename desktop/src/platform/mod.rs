@@ -26,6 +26,7 @@ pub mod font_smoothing;
 pub mod motion;
 pub mod print_version;
 pub mod relaunch;
+pub mod scrollers;
 pub mod update;
 pub mod version;
 

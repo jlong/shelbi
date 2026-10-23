@@ -1,8 +1,8 @@
 //! The terminal's settings: font family and size, which Option keys are
-//! Meta, and the ANSI colors the user changed. Read from
-//! `~/.shelbi/config.yaml` (`desktop.terminal_font_family`,
+//! Meta, the ANSI colors the user changed, and when the scrollbar shows.
+//! Read from `~/.shelbi/config.yaml` (`desktop.terminal_font_family`,
 //! `desktop.terminal_font_size`, `desktop.option_as_meta`,
-//! `desktop.terminal_colors`) and held
+//! `desktop.terminal_colors`, `desktop.terminal_scrollbar`) and held
 //! as a gpui [`Global`]; the settings view sets the global after a save, and
 //! every pane observes it, so a change applies to open terminals at once.
 //!
@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use gpui::{App, Global};
-use shelbi_state::{DesktopConfig, OptionAsMeta};
+use shelbi_state::{DesktopConfig, OptionAsMeta, TerminalScrollbar};
 
 use super::colors::{self, AnsiOverrides};
 use super::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
@@ -81,6 +81,10 @@ pub struct TerminalSettings {
     /// The ANSI colors the user changed, over the theme's
     /// ([`super::colors`]).
     pub ansi: AnsiOverrides,
+    /// When the scrollbar shows: following the system's "Show scroll
+    /// bars" (the default), only while scrolling, or always
+    /// ([`super::scrollbar`]).
+    pub scrollbar: TerminalScrollbar,
 }
 
 impl Default for TerminalSettings {
@@ -91,6 +95,7 @@ impl Default for TerminalSettings {
             font_size_setting: None,
             option_as_meta: OptionAsMeta::Off,
             ansi: [None; 16],
+            scrollbar: TerminalScrollbar::Auto,
         }
     }
 }
@@ -115,6 +120,7 @@ impl TerminalSettings {
             font_size_setting: cfg.terminal_font_size,
             option_as_meta: cfg.option_as_meta.unwrap_or(defaults.option_as_meta),
             ansi: colors::from_config(&cfg.terminal_colors),
+            scrollbar: cfg.terminal_scrollbar.unwrap_or_default(),
         }
     }
 
@@ -253,6 +259,7 @@ mod tests {
         assert_eq!(s.font_family, "Source Code Pro");
         assert_eq!(s.font_size, 14.0);
         assert_eq!(s.option_as_meta, OptionAsMeta::Off);
+        assert_eq!(s.scrollbar, TerminalScrollbar::Auto);
     }
 
     #[test]
@@ -261,12 +268,13 @@ mod tests {
             terminal_font_family: Some("  Berkeley Mono ".into()),
             terminal_font_size: Some(15),
             option_as_meta: Some(OptionAsMeta::Right),
+            terminal_scrollbar: Some(TerminalScrollbar::Always),
             ..DesktopConfig::default()
         };
         let s = TerminalSettings::from_config(&cfg);
         assert_eq!(
-            (s.font_family.as_str(), s.font_size, s.option_as_meta),
-            ("Berkeley Mono", 15.0, OptionAsMeta::Right)
+            (s.font_family.as_str(), s.font_size, s.option_as_meta, s.scrollbar),
+            ("Berkeley Mono", 15.0, OptionAsMeta::Right, TerminalScrollbar::Always)
         );
         let cfg = DesktopConfig {
             terminal_font_family: Some("   ".into()),

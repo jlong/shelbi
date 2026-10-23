@@ -29,7 +29,7 @@ settings view (⌘,) edits the `desktop:` block, and terminal settings apply to
 open terminals at once. Its own sidebar stands in the app sidebar's place
 while it is open, with three pages: General (theme, the CLI, notifications,
 ⌘1), Keybindings (`keys.yaml`, ⌘2) and Terminal (font, size, ANSI
-colors with a live preview, the Option key, ⌘3). Back or Esc returns to
+colors with a live preview, the Option key, when the scrollbar shows, ⌘3). Back or Esc returns to
 the view it was opened over. Keybindings lists every binding by context:
 click a chord to rebind it (Esc cancels, Backspace removes it), and the
 change is written to `keys.yaml` with its comments kept and applies to the
@@ -43,6 +43,7 @@ desktop:
   terminal_font_family: Source Code Pro   # the default; bundled with the app
   terminal_font_size: 14             # points, 6 to 72 (Settings and ⌘+ / ⌘− step within 8 to 32)
   option_as_meta: false              # true, left, or right (Ghostty's shape)
+  terminal_scrollbar: auto           # auto (System Settings' "Show scroll bars"), scrolling, or always
   terminal_colors:                   # only the ANSI colors you changed; the rest follow the theme
     red:
       regular: "#E04F52"             # ANSI 1
@@ -63,6 +64,7 @@ desktop:
 | `desktop.terminal_font_family` | Source Code Pro | Terminal font. Settings picks it from the bundled faces and the installed monospaced families; one that isn't installed falls back to Source Code Pro. |
 | `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72; Settings' stepper and ⌘+ / ⌘− step it by 1 within 8 to 32), on 18pt rows at the default. ⌘+ / ⌘− / ⌘0 write it too. |
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
+| `desktop.terminal_scrollbar` | `auto` | When the terminals' scrollbar shows. `auto` follows System Settings ▸ Appearance ▸ "Show scroll bars" (live, as it changes); `scrolling` shows it only while scrolling, for a second after, and with the pointer at the pane's right edge, fading in and out like macOS's overlay scroll bars; `always` shows it whenever there is scrollback. Settings ▸ Terminal's Show scrollbar (Automatic, When scrolling, Always) writes it and applies it to every terminal at once; `auto` isn't written. Any other value reads as `auto`. |
 | `desktop.terminal_colors.<color>.regular` / `.bold` | the theme's | Terminal ANSI colors as `#rrggbb`, for `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan` and `white` (regular is ANSI 0 to 7, bold the bright 8 to 15). Settings writes only the colors that differ from the theme's (dark: the Sensible palette; light: its own set), applies them to open terminals at once, and Reset removes them all. A value that isn't a color is ignored. |
 | `desktop.window_opacity` | 100 | How opaque the windows' backgrounds are, in percent (30 to 100; lower values clamp to 30, and a fraction like `0.85` reads as 85). Only the surfaces (the main area, the sidebar, terminal backgrounds) go see-through: text, icons, borders, controls, cell colors and overlays stay opaque. Settings ▸ General's Window transparency slider writes it and applies it to every window as it moves. Reduce Transparency (System Settings ▸ Accessibility ▸ Display) keeps the windows opaque. |
 | `desktop.window_blur` | 0 | How much a translucent window blurs what shows through it: the window server's background blur radius in points (0 to 50), as Ghostty's `background-blur`. No effect at 100% opacity. Settings ▸ General's Background blur slider. |
@@ -225,7 +227,7 @@ TUI's rules where the TUI has the feature (the shared code is
 
 | | |
 |---|---|
-| Scroll | The wheel, Shift+wheel (always Shelbi's), Shift+PageUp/PageDown/Home/End, and the scrollbar. New output doesn't move a scrolled-up view; "N lines below" jumps back. On the alternate screen (`less`, `man`) the wheel sends arrow keys. |
+| Scroll | The wheel, Shift+wheel (always Shelbi's), Shift+PageUp/PageDown/Home/End, and the scrollbar. New output doesn't move a scrolled-up view; "N lines below" jumps back. On the alternate screen (`less`, `man`) the wheel sends arrow keys. The scrollbar is an overlay against the pane's right edge (over the text's padding, never over the text): hidden at rest, it fades in while the terminal scrolls or the pointer is at the edge and out a second later, unless `terminal_scrollbar` (or the system's "Show scroll bars: Always") keeps it shown. Reduce Motion makes the fades instant. |
 | Select | Drag (cells), double-click (a word), triple-click (a line), Alt+drag (a block). Shift keeps a gesture Shelbi's while a program reports the mouse. Dragging past the top or bottom edge scrolls. A finished selection is copied; Cmd+C copies too. Works on both screens; it follows its text as output scrolls and goes away when that text changes. |
 | Paste | Cmd+V, bracketed when the program asked. |
 | Find | Cmd+F: search as you type (smart case), Enter / Shift+Enter (or Cmd+G / Cmd+Shift+G) for older / newer matches, Escape to close. |
