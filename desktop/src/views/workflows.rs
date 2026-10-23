@@ -46,7 +46,7 @@ use crate::assets::{heroicon, icons, Icon};
 use crate::elements::controls;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::motion::fill_layer;
-use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The page's titles: `Desktop/Heading`, 18 / 28 semibold.
@@ -493,14 +493,9 @@ pub(super) fn table(headings: Div, rows: Vec<AnyElement>, theme: &Theme) -> Div 
         .children(rows)
 }
 
-/// A header's button (the Button component at Small with a left icon, as
-/// `style::small_icon_button` draws it), its icon in the frame's gray.
+/// A header's button: the Button component at Small with a left icon.
 pub(super) fn header_button(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) -> Stateful<Div> {
-    style::button_base(id, ButtonKind::Secondary, false, theme)
-        .h(px(28.0))
-        .gap(px(4.0))
-        .child(style::icon_slot(icon, 12.0, theme.icon))
-        .child(label)
+    style::small_icon_button(id, icon, label, ButtonKind::Secondary, false, theme)
 }
 
 /// A row's 24pt icon button (`Delete status`): `icon` (18pt) on the
@@ -1194,20 +1189,10 @@ impl WorkflowsPage {
         let open = self.menu == Some(Menu::Category(target.clone()));
         let button = {
             let target = target.clone();
-            style::button_base(format!("status-category-{key}"), ButtonKind::Secondary, false, theme)
+            style::button_base(format!("status-category-{key}"), ButtonKind::Secondary, ButtonSize::Base, false, theme)
                 .w(px(CATEGORY_W))
-                .gap(px(6.0))
-                .type_style(Type::BaseMedium)
                 .child(div().flex_1().min_w_0().truncate().child(category_label(category)))
-                // Figma's 20pt chevron in a 14pt slot, hanging past its right.
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .w(px(14.0))
-                        .child(heroicon(icons::CHEVRON_DOWN).text_color(theme.icon)),
-                )
+                .child(style::right_icon_slot(icons::CHEVRON_DOWN, ButtonSize::Base, theme.button_icon))
                 .when(open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.toggle_menu(Menu::Category(target.clone()), cx)

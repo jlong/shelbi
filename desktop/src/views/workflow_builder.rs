@@ -56,16 +56,13 @@ use super::workflow_graph::{
 use super::workflows_state::category_label;
 use crate::assets::{heroicon, icons, Icon};
 use crate::theme::motion::fill_layer;
-use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The content's inset in the window, and the gap between the toolbar,
 /// the canvas and the inspector.
 const INSET: f32 = 24.0;
 const GAP: f32 = 16.0;
-/// The toolbar's Base buttons and its Small ones.
-const BASE_H: f32 = 32.0;
-const SMALL_H: f32 = 28.0;
 /// The inspector's width, and its controls' (its 16pt padding inside a
 /// 1pt edge).
 const INSPECTOR_W: f32 = 320.0;
@@ -111,7 +108,7 @@ impl Render for ActionGhost {
                 .items_center()
                 .gap(px(8.0))
                 .px(px(12.0))
-                .h(px(SMALL_H))
+                .h(px(ButtonSize::Small.height()))
                 .type_style(Type::SmallMedium)
                 .text_color(theme.text_loud),
             &theme,
@@ -527,27 +524,14 @@ impl WorkflowEditor {
 // ---------------------------------------------------------------------------
 // Rendering
 
-/// The Button at Base: 32pt, Base medium, an optional 20pt icon in a 14pt
-/// slot.
+/// The Button at Base with an optional left icon.
 fn base_button(id: impl Into<SharedString>, icon: Option<Icon>, label: impl Into<SharedString>, kind: ButtonKind, theme: &Theme) -> Stateful<Div> {
-    style::button_base(id, kind, false, theme)
-        .h(px(BASE_H))
-        .gap(px(6.0))
-        .type_style(Type::BaseMedium)
-        .whitespace_nowrap()
-        .children(icon.map(|i| style::icon_slot(i, 14.0, theme.icon)))
-        .child(label.into())
+    style::content_button(id, ButtonContent::label(label).left(icon), kind, ButtonSize::Base, false, theme).whitespace_nowrap()
 }
 
-/// The Button at Small: 28pt, Small medium, an optional icon in a 12pt
-/// slot.
+/// The Button at Small with an optional left icon.
 fn small_button(id: impl Into<SharedString>, icon: Option<Icon>, label: impl Into<SharedString>, kind: ButtonKind, theme: &Theme) -> Stateful<Div> {
-    style::button_base(id, kind, false, theme)
-        .h(px(SMALL_H))
-        .gap(px(4.0))
-        .whitespace_nowrap()
-        .children(icon.map(|i| style::icon_slot(i, 12.0, theme.icon)))
-        .child(label.into())
+    style::content_button(id, ButtonContent::label(label).left(icon), kind, ButtonSize::Small, false, theme).whitespace_nowrap()
 }
 
 /// A square icon button on the overlay fill (the inspector's close, an
@@ -572,30 +556,12 @@ fn square_button(id: impl Into<SharedString>, icon: Icon, size: f32, theme: &The
 /// A picker's button at Base or Small: an optional status icon, the
 /// choice, a chevron; it fills its row.
 fn picker(id: impl Into<SharedString>, label: impl Into<SharedString>, icon: Option<StatusCategory>, small: bool, theme: &Theme) -> Stateful<Div> {
-    let b = style::button_base(id, ButtonKind::Secondary, false, theme).w_full();
-    let (b, slot) = if small {
-        (b.h(px(SMALL_H)).gap(px(4.0)), 12.0)
-    } else {
-        (b.type_style(Type::BaseMedium).gap(px(6.0)), 14.0)
-    };
-    b.children(icon.map(|c| {
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_end()
-            .w(px(14.0))
-            .child(style::status_icon_large(c, theme))
-    }))
-    .child(div().flex_1().min_w_0().truncate().child(label.into()))
-    .child(
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .w(px(slot))
-            .child(heroicon(icons::CHEVRON_DOWN).text_color(theme.icon)),
-    )
+    let size = if small { ButtonSize::Small } else { ButtonSize::Base };
+    style::button_base(id, ButtonKind::Secondary, size, false, theme)
+        .w_full()
+        .children(icon.map(|c| style::left_slot(size, style::status_icon_large(c, theme))))
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .child(style::right_icon_slot(icons::CHEVRON_DOWN, size, theme.button_icon))
 }
 
 /// A labeled control in the inspector: Base label, 6pt, the control, the
@@ -747,11 +713,14 @@ impl WorkflowEditor {
         let zoom = self.dropdown(
             Menu::Zoom,
             "builder-zoom-menu",
-            style::button_base("builder-zoom", ButtonKind::Secondary, false, theme)
-                .h(px(SMALL_H))
-                .gap(px(4.0))
-                .child(self.builder.viewport.label())
-                .child(div().flex().flex_none().items_center().w(px(12.0)).child(heroicon(icons::CHEVRON_DOWN).text_color(theme.icon))),
+            style::content_button(
+                "builder-zoom",
+                ButtonContent::label(self.builder.viewport.label()).right(icons::CHEVRON_DOWN),
+                ButtonKind::Secondary,
+                ButtonSize::Small,
+                false,
+                theme,
+            ),
             move |cx| {
                 let theme = *cx.global::<Theme>();
                 ZOOMS
@@ -775,7 +744,7 @@ impl WorkflowEditor {
             .flex_none()
             .items_center()
             .gap(px(12.0))
-            .h(px(BASE_H))
+            .h(px(ButtonSize::Base.height()))
             .child(div().flex().flex_row().flex_none().gap(px(8.0)).child(add_status).child(add_transition))
             .child(div().flex_none().type_style(Type::Small).text_color(theme.form_hint).child(HINT))
             .child(div().flex_1())
@@ -1362,8 +1331,7 @@ impl WorkflowEditor {
         });
         let is_initial = state.initial_status().is_some_and(|i| i.id == s.id);
         let set_initial = if is_initial {
-            style::disabled_button("builder-set-initial", "Set as initial", ButtonKind::Secondary, theme)
-                .h(px(SMALL_H))
+            style::disabled_button("builder-set-initial", "Set as initial", ButtonKind::Secondary, ButtonSize::Small, theme)
                 .tooltip(style::tooltip("New tasks start here already"))
         } else {
             let sid = s.id.clone();
@@ -1393,8 +1361,7 @@ impl WorkflowEditor {
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_transition(cx)));
         let only = state.workflow().statuses.len() <= 1;
         let remove = if only {
-            style::disabled_button("builder-remove-status", "Remove from workflow", ButtonKind::Danger, theme)
-                .h(px(SMALL_H))
+            style::disabled_button("builder-remove-status", "Remove from workflow", ButtonKind::Danger, ButtonSize::Small, theme)
                 .tooltip(style::tooltip("A workflow needs at least one status"))
         } else {
             let sid = s.id.clone();
@@ -1448,10 +1415,8 @@ impl WorkflowEditor {
         };
         let from = self.status_picker(Menu::DrawFrom, "builder-draw-from", &d.from, |this, sid, _, _| this.builder.set_from(&sid), theme, cx);
         let destination = match d.over.as_deref().and_then(|id| state.status(id)) {
-            Some(s) => style::button_base("builder-destination", ButtonKind::Secondary, false, theme)
-                .type_style(Type::BaseMedium)
-                .gap(px(6.0))
-                .child(div().flex().flex_none().items_center().justify_end().w(px(14.0)).child(style::status_icon_large(s.category, theme)))
+            Some(s) => style::button_base("builder-destination", ButtonKind::Secondary, ButtonSize::Base, false, theme)
+                .child(style::left_slot(ButtonSize::Base, style::status_icon_large(s.category, theme)))
                 .child(s.name.clone())
                 .into_any_element(),
             None => div()

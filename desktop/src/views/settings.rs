@@ -79,12 +79,10 @@ use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
 use crate::elements::terminal::{scrollbar, TerminalPane, TerminalSettings};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::window::{self as translucency, Translucency, WindowLook, BLUR_RANGE, OPACITY_RANGE};
 use crate::theme::{rgb_hsla, Theme};
 
-/// The ANSI colors' Reset: the Button component at Small.
-const SMALL_BUTTON_H: f32 = 28.0;
 
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
@@ -1438,10 +1436,10 @@ impl SettingsView {
     /// helper, then a row per color with its regular and bold fields.
     fn render_ansi(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let reset = if self.colors_customized() {
-            style::button("settings-ansi-reset", "Reset", ButtonKind::Secondary, false, theme)
+            style::button("settings-ansi-reset", "Reset", ButtonKind::Secondary, ButtonSize::Small, false, theme)
                 .on_click(cx.listener(|this, _, window, cx| this.reset_colors(window, cx)))
         } else {
-            style::disabled_button("settings-ansi-reset", "Reset", ButtonKind::Secondary, theme)
+            style::disabled_button("settings-ansi-reset", "Reset", ButtonKind::Secondary, ButtonSize::Small, theme)
         };
         let header = div()
             .flex()
@@ -1456,7 +1454,7 @@ impl SettingsView {
                     .text_color(theme.text_loud)
                     .child("ANSI colors"),
             )
-            .child(reset.h(px(SMALL_BUTTON_H)));
+            .child(reset);
         let column = |label: &'static str| div().flex_1().min_w_0().child(label);
         let labels = div()
             .flex()

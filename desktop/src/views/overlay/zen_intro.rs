@@ -6,7 +6,7 @@
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight};
 use shelbi_app::overlay::zen_intro::{self as zen, IntroFocus, IntroState};
 
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::views::overlay::{panel, with_overlay, zen_event, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::theme::style::{Type, Typography};
@@ -51,7 +51,7 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
         .on_click(cx.listener(on_control(IntroFocus::Checkbox)));
 
     let button = |id: &'static str, label: &str, focused: bool, kind| {
-        style::button(id, label.to_string(), kind, focused, theme)
+        style::button(id, label.to_string(), kind, ButtonSize::Base, focused, theme)
     };
 
     panel("zen-intro", theme)

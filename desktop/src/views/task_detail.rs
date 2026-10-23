@@ -15,15 +15,15 @@
 //! editor. Keys are the TUI popover's (`keys.yaml` `popover:`) plus the
 //! desktop's `s` / `a` / `e` / `E`.
 
-use gpui::{div, prelude::*, px, relative, BoxShadow, ClickEvent, Context, Div, ElementId, Hsla, SharedString};
+use gpui::{div, prelude::*, px, relative, ClickEvent, Context, Div, ElementId, SharedString};
 use gpui_kit::component::input::Textarea;
 use shelbi_app::TaskDetailModel;
 use shelbi_state::keymap::PopoverAction;
 
 use super::issues::{backdrop, IssuesView};
 use super::markdown;
-use crate::assets::{heroicon, icons, Icon};
-use crate::theme::style::{self, ButtonKind, IconButtonSize};
+use crate::assets::{heroicon, icons};
+use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, IconButtonSize};
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 
@@ -151,7 +151,7 @@ pub fn render(
         .px(px(INSET))
         .pb(px(12.0))
         .child(
-            action(theme, "detail-left", Some((icons::ARROW_LEFT_BUTTON, theme.button_icon)), "Move", &left_hint, None, ButtonKind::Secondary)
+            action(theme, "detail-left", ButtonContent::label("Move").left(icons::ARROW_LEFT_BUTTON).hotkey(left_hint), ButtonKind::Secondary)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let intents = this.state.detail_move(false);
                     this.apply_intents(intents, window, cx);
@@ -159,7 +159,7 @@ pub fn render(
                 })),
         )
         .child(
-            action(theme, "detail-right", None, "Move", &right_hint, Some((icons::ARROW_RIGHT_BUTTON, theme.button_icon)), ButtonKind::Secondary)
+            action(theme, "detail-right", ButtonContent::label("Move").hotkey(right_hint).right(icons::ARROW_RIGHT_BUTTON), ButtonKind::Secondary)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     let intents = this.state.detail_move(true);
                     this.apply_intents(intents, window, cx);
@@ -167,7 +167,7 @@ pub fn render(
                 })),
         )
         .child(
-            action(theme, "detail-start", Some((icons::PLAY_SOLID_BUTTON, theme.icon)), "Start", "s", None, ButtonKind::Secondary).on_click(
+            action(theme, "detail-start", ButtonContent::label("Start").left(icons::PLAY_SOLID_BUTTON).hotkey("s"), ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     if let Some(id) = this.state.detail_id().map(str::to_string) {
                         let intents = this.state.start(&id);
@@ -178,7 +178,7 @@ pub fn render(
             ),
         )
         .child(
-            action(theme, "detail-assign", Some((icons::USER_BUTTON, theme.icon)), "Assign", "a", None, ButtonKind::Secondary).on_click(
+            action(theme, "detail-assign", ButtonContent::label("Assign").left(icons::USER_BUTTON).hotkey("a"), ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     if let Some(id) = this.state.detail_id().map(str::to_string) {
                         let intents = this.state.begin_assign(&id);
@@ -190,7 +190,7 @@ pub fn render(
         )
         .when(!editing, |row| {
             row.child(
-                action(theme, "detail-edit", Some((icons::PENCIL_SQUARE_BUTTON, theme.icon)), "Edit", "e", None, ButtonKind::Secondary)
+                action(theme, "detail-edit", ButtonContent::label("Edit").left(icons::PENCIL_SQUARE_BUTTON).hotkey("e"), ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         if let Some(id) = this.state.detail_id().map(str::to_string) {
                             let intents = this.state.begin_edit(&id);
@@ -204,10 +204,7 @@ pub fn render(
             action(
                 theme,
                 "detail-editor",
-                Some((icons::ARROW_UP_RIGHT_BUTTON, theme.icon)),
-                "Editor",
-                "E",
-                None,
+                ButtonContent::label("Editor").left(icons::ARROW_UP_RIGHT_BUTTON).hotkey("E"),
                 ButtonKind::Secondary,
             )
             .tooltip(style::tooltip("Open in your editor"))
@@ -220,11 +217,11 @@ pub fn render(
         )
         .when(editing, |row| {
             row.child(
-                action(theme, "detail-save", None, "Save", "⌘S", None, ButtonKind::Success)
+                action(theme, "detail-save", ButtonContent::label("Save").hotkey("⌘S"), ButtonKind::Success)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_editor(cx))),
             )
             .child(
-                action(theme, "detail-cancel", None, "Cancel", "Esc", None, ButtonKind::Quiet)
+                action(theme, "detail-cancel", ButtonContent::label("Cancel").hotkey("Esc"), ButtonKind::Quiet)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_editor(cx))),
             )
         });
@@ -277,7 +274,7 @@ pub fn render(
             .type_style(Type::Base)
             .child(div().text_color(theme.muted).child("This issue has no description yet."))
             .child(
-                action(theme, "detail-add-description", Some((icons::PENCIL_SQUARE_BUTTON, theme.icon)), "Write one", "e", None, ButtonKind::Secondary)
+                action(theme, "detail-add-description", ButtonContent::label("Write one").left(icons::PENCIL_SQUARE_BUTTON).hotkey("e"), ButtonKind::Secondary)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         if let Some(id) = this.state.detail_id().map(str::to_string) {
                             let intents = this.state.begin_edit(&id);
@@ -383,53 +380,17 @@ fn keycap_label(chord: &str) -> String {
     }
 }
 
-/// A compact action, the Figma Button at X-Small: the style's fill, 6pt
-/// corners, 26pt tall and 8pt across, an icon slot before (or after) the
-/// X-Small medium label, and the key that does the same thing as one small
-/// keycap. Each icon is 18pt, in its color: the frame draws the arrows in
-/// `button_icon` and the rest in `icon`.
-fn action(
-    theme: &Theme,
-    id: &'static str,
-    icon: Option<(Icon, Hsla)>,
-    text: &str,
-    key: &str,
-    trailing: Option<(Icon, Hsla)>,
-    kind: ButtonKind,
-) -> gpui::Stateful<gpui::Div> {
-    style::button_base(id, kind, false, theme)
-        .debug_selector(move || id.into())
-        .h(px(26.0))
-        .px(px(8.0))
-        .gap_1()
-        .type_style(Type::XSmallMedium)
-        .when_some(icon, |b, (icon, color)| b.child(style::icon_slot(icon, 14.0, color)))
-        .child(text.to_string())
-        .when(!key.is_empty(), |b| b.child(keycap(key, theme)))
-        .when_some(trailing, |b, (icon, color)| {
-            // The trailing slot is flush left: the icon hangs past its right
-            // edge, as the leading one hangs past its left.
-            b.child(div().flex().flex_none().items_center().w(px(14.0)).child(heroicon(icon).text_color(color)))
-        })
+/// A compact action, the Figma Button at X-Small: an optional left icon,
+/// the label, the key that does the same thing as its Hotkey, and an
+/// optional right icon (the right Move's arrow). The frame resizes its
+/// instances to 26pt tall (every action in Issue detail · Dark), so this
+/// keeps that one override.
+fn action(theme: &Theme, id: &'static str, content: ButtonContent, kind: ButtonKind) -> gpui::Stateful<gpui::Div> {
+    style::content_button(id, content, kind, ButtonSize::XSmall, false, theme).h(px(ACTION_H))
 }
 
-/// The Button component's Hotkey inside a button: the key as written (`s`,
-/// `E`, `⌘S`), X-Small in gray on the canvas, 16pt tall with 4pt corners and
-/// a 1px drop.
-fn keycap(key: &str, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(16.0))
-        .px(px(4.0))
-        .rounded(px(4.0))
-        .bg(theme.keycap)
-        .shadow(vec![BoxShadow::new(px(0.0), px(1.0), theme.button_keycap_edge)])
-        .type_style(Type::XSmall)
-        .text_color(theme.gray)
-        .child(key.to_string())
-}
+/// The frame's height for its X-Small actions.
+const ACTION_H: f32 = 26.0;
 
 /// One dependency as the detail lists it: `id [status]`, a `✓` once it's
 /// done (the TUI colors a done dependency green; the desktop is

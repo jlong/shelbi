@@ -46,7 +46,7 @@ use shelbi_core::StatusCategory;
 
 use super::motion::fill_layer;
 use super::{hsla, palette, Theme};
-use crate::assets::{heroicon, icons, status_glyph, Icon, StatusGlyph};
+use crate::assets::{heroicon, icons, status_glyph, Icon, StatusGlyph, ICON_SIZE, ICON_SIZE_BUTTON};
 use crate::elements::exact_text::exact_text;
 
 /// The UI typeface every [`Type`] is set in.
@@ -125,8 +125,6 @@ impl<E: Styled> Typography for E {}
 /// project rows): a 32px control height, so a long list stays
 /// scannable.
 pub const LIST_ROW_H: f32 = 32.0;
-/// A button's height at the medium size.
-pub const BUTTON_H: f32 = 32.0;
 
 /// A Figma (or CSS) blur as gpui's `blur_radius`: Figma's blur is twice the
 /// Gaussian's sigma, and gpui's `blur_radius` is the sigma itself, so a
@@ -372,31 +370,233 @@ pub enum ButtonKind {
     Select,
 }
 
-/// A Figma button (Small): 13 / 18 medium, 6px corners, 12px across, the
-/// style's fill and no boundary. `focused` draws the style's focus ring and
-/// glow around it (keyboard focus in a dialog), and nothing else: the fill
-/// and label stay the style's.
+/// The Button component's Size (`2220:17600`). Every size is Geist Medium
+/// with 6px corners and its content centered; the presets differ in height,
+/// type, padding, gap and icon slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonSize {
+    /// 24px, X-Small medium (12 / 16), 8px across, 4px between, an 18px
+    /// glyph in a 14px slot (the task panels' Open, the issue detail's
+    /// actions).
+    XSmall,
+    /// 28px, Small medium (13 / 18), 12px across, 4px between, a 20px glyph
+    /// in a 12px slot (toolbars, headers, rows).
+    Small,
+    /// 32px, Base medium (14 / 18), 12px across, 6px between, a 20px glyph
+    /// in a 14px slot (forms and dialogs).
+    Base,
+}
+
+impl ButtonSize {
+    pub const fn height(self) -> f32 {
+        match self {
+            ButtonSize::XSmall => 24.0,
+            ButtonSize::Small => 28.0,
+            ButtonSize::Base => 32.0,
+        }
+    }
+
+    /// The padding either side.
+    pub const fn padding(self) -> f32 {
+        match self {
+            ButtonSize::XSmall => 8.0,
+            ButtonSize::Small | ButtonSize::Base => 12.0,
+        }
+    }
+
+    /// The gap between its pieces of content.
+    pub const fn gap(self) -> f32 {
+        match self {
+            ButtonSize::XSmall | ButtonSize::Small => 4.0,
+            ButtonSize::Base => 6.0,
+        }
+    }
+
+    /// The label's text style.
+    pub const fn text(self) -> Type {
+        match self {
+            ButtonSize::XSmall => Type::XSmallMedium,
+            ButtonSize::Small => Type::SmallMedium,
+            ButtonSize::Base => Type::BaseMedium,
+        }
+    }
+
+    /// An icon slot's width: narrower than the glyph, which hangs past the
+    /// slot's outer edge.
+    pub const fn slot(self) -> f32 {
+        match self {
+            ButtonSize::XSmall | ButtonSize::Base => 14.0,
+            ButtonSize::Small => 12.0,
+        }
+    }
+
+    /// The size an icon draws at in this button: the `_BUTTON` drawings at
+    /// X-Small, the 20px ones otherwise.
+    pub const fn glyph(self) -> Pixels {
+        match self {
+            ButtonSize::XSmall => ICON_SIZE_BUTTON,
+            ButtonSize::Small | ButtonSize::Base => ICON_SIZE,
+        }
+    }
+}
+
+/// A button's height at the Base size: the height of a form's controls
+/// (textboxes, pickers) beside it.
+pub const BUTTON_H: f32 = ButtonSize::Base.height();
+
+/// What a Button holds, in the component's order: the left icon, the label,
+/// the Hotkey, the right icon. Anything left out takes no gap.
+#[derive(Debug, Clone, Default)]
+pub struct ButtonContent {
+    left: Option<Icon>,
+    label: Option<SharedString>,
+    hotkey: Option<SharedString>,
+    right: Option<Icon>,
+}
+
+impl ButtonContent {
+    /// Just `label`.
+    pub fn label(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: Some(label.into()),
+            ..Self::default()
+        }
+    }
+
+    /// `Show Left Icon` (`None` hides it).
+    pub fn left(mut self, icon: impl Into<Option<Icon>>) -> Self {
+        self.left = icon.into();
+        self
+    }
+
+    /// `Show Right Icon` (`None` hides it).
+    pub fn right(mut self, icon: impl Into<Option<Icon>>) -> Self {
+        self.right = icon.into();
+        self
+    }
+
+    /// `Show Hotkey`: `key` as written (`E`, `⌘S`, `Esc`). Empty shows
+    /// none.
+    pub fn hotkey(mut self, key: impl Into<SharedString>) -> Self {
+        let key = key.into();
+        self.hotkey = (!key.is_empty()).then_some(key);
+        self
+    }
+}
+
+/// The Button component, label only: `kind` at `size`. `focused` draws the
+/// style's focus ring and glow outside it (keyboard focus in a dialog) and
+/// nothing else: the fill and label stay the style's.
 pub fn button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     kind: ButtonKind,
+    size: ButtonSize,
     focused: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    button_base(id, kind, focused, theme).child(label.into())
+    content_button(id, ButtonContent::label(label), kind, size, focused, theme)
 }
 
-/// The Button component with Disabled on: its fill and label at
-/// `button/disabled/opacity` (40%), no hover, press or focus, no pointer.
+/// [`button`] with Disable on.
 pub fn disabled_button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     kind: ButtonKind,
+    size: ButtonSize,
+    theme: &Theme,
+) -> Stateful<Div> {
+    disabled_content_button(id, ButtonContent::label(label), kind, size, theme)
+}
+
+/// The Button component holding `content`.
+pub fn content_button(
+    id: impl Into<SharedString>,
+    content: ButtonContent,
+    kind: ButtonKind,
+    size: ButtonSize,
+    focused: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
-    let selector = id.clone();
+    with_content(button_base(id.clone(), kind, size, focused, theme), &id, content, kind, size, theme)
+}
+
+/// The Button component holding `content`, with Disable on: the whole
+/// control (fill, label, icons, hotkey) at `button/disabled/opacity`
+/// (40%) once, at the enabled button's size, with no hover, press, focus
+/// or pointer.
+pub fn disabled_content_button(
+    id: impl Into<SharedString>,
+    content: ButtonContent,
+    kind: ButtonKind,
+    size: ButtonSize,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
     let c = button_colors(kind, theme);
+    let d = button_shell(id.clone(), kind, size, theme).bg(c.fill).opacity(0.4);
+    with_content(d, &id, content, kind, size, theme)
+}
+
+/// A button with an icon before its label (Load older, Refresh).
+pub fn icon_label_button(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    size: ButtonSize,
+    theme: &Theme,
+) -> Stateful<Div> {
+    content_button(id, ButtonContent::label(label).left(icon), kind, size, false, theme)
+}
+
+/// `content` laid into button `id` of `size`, in the component's order,
+/// each icon in the style's icon color (not the label's). Each piece is
+/// `<id>-left`, `-label`, `-hotkey` or `-right` to a test.
+fn with_content(
+    b: Stateful<Div>,
+    id: &SharedString,
+    content: ButtonContent,
+    kind: ButtonKind,
+    size: ButtonSize,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let icon = button_colors(kind, theme).icon;
+    let part = |name: &'static str| {
+        let selector = format!("{id}-{name}");
+        move || selector.clone()
+    };
+    b.children(content.left.map(|i| left_icon_slot(i, size, icon).debug_selector(part("left"))))
+        .children(content.label.map(|l| div().debug_selector(part("label")).child(l)))
+        .children(content.hotkey.map(|k| button_hotkey(k, theme).debug_selector(part("hotkey"))))
+        .children(content.right.map(|i| right_icon_slot(i, size, icon).debug_selector(part("right"))))
+}
+
+/// A button's shape, type and colors at `size`, without its content: hover
+/// and press fade its fill, and `focused` adds the style's ring and glow
+/// outside it. Views that hold more than [`ButtonContent`] (a status glyph,
+/// a truncating choice) add their own children, sized from `size`.
+pub fn button_base(
+    id: impl Into<SharedString>,
+    kind: ButtonKind,
+    size: ButtonSize,
+    focused: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let c = button_colors(kind, theme);
+    let d = button_shell(id.clone(), kind, size, theme).cursor_pointer();
+    // Bands, not `focus_shadow`: a gpui shadow is a filled box under the
+    // button and its tinted fill is translucent, so the glow would fill it.
+    fill_layer(d, id, px(6.0), [c.fill, c.hover, c.pressed])
+        .when(focused, |b| b.children(focus_bands_in(6.0, 0.0, c.focus)))
+}
+
+/// The geometry and type every state of a size shares.
+fn button_shell(id: impl Into<SharedString>, kind: ButtonKind, size: ButtonSize, theme: &Theme) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
     div()
         .id(id)
         .debug_selector(move || selector.to_string())
@@ -404,59 +604,65 @@ pub fn disabled_button(
         .flex_none()
         .items_center()
         .justify_center()
-        .h(px(BUTTON_H))
-        .px(px(12.0))
+        .h(px(size.height()))
+        .px(px(size.padding()))
+        .gap(px(size.gap()))
         .rounded(px(6.0))
-        .bg(c.fill)
-        .text_color(c.text)
-        .type_style(Type::SmallMedium)
-        .opacity(0.4)
-        .child(label.into())
+        .text_color(button_colors(kind, theme).text)
+        .type_style(size.text())
 }
 
-/// A button with an icon before its label, the icon in the label's color.
-pub fn icon_label_button(
-    id: impl Into<SharedString>,
-    icon: Icon,
-    label: impl Into<SharedString>,
-    kind: ButtonKind,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let fg = button_colors(kind, theme).text;
-    button_base(id, kind, false, theme)
-        .gap_1()
-        .pl(px(10.0))
-        .child(heroicon(icon).text_color(fg))
-        .child(label.into())
+/// The Button's left Icon slot: `icon` in a box [`ButtonSize::slot`] wide,
+/// flush right, so the glyph hangs past the slot's left edge and the label
+/// sits where Figma puts it.
+pub fn left_icon_slot(icon: Icon, size: ButtonSize, color: Hsla) -> Div {
+    left_slot(size, button_glyph(icon, size, color))
 }
 
-/// A button's shape and colors, without its content.
-pub fn button_base(
-    id: impl Into<SharedString>,
-    kind: ButtonKind,
-    focused: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let id: SharedString = id.into();
-    let selector = id.clone();
-    let c = button_colors(kind, theme);
-    let d = div()
-        .id(id.clone())
-        .debug_selector(move || selector.to_string())
+/// The Button's Right Icon slot: [`left_icon_slot`] mirrored, flush left so
+/// the glyph hangs past its right edge.
+pub fn right_icon_slot(icon: Icon, size: ButtonSize, color: Hsla) -> Div {
+    right_slot(size, button_glyph(icon, size, color))
+}
+
+/// The left Icon slot holding something other than an icon (a picker's
+/// status glyph).
+pub fn left_slot(size: ButtonSize, content: impl IntoElement) -> Div {
+    slot(size).justify_end().child(content)
+}
+
+/// The Right Icon slot holding something other than an icon.
+pub fn right_slot(size: ButtonSize, content: impl IntoElement) -> Div {
+    slot(size).justify_start().child(content)
+}
+
+fn slot(size: ButtonSize) -> Div {
+    div().flex().flex_none().items_center().w(px(size.slot()))
+}
+
+/// `icon` as a `size` button draws it: an X-Small button's at 18px (a
+/// `_BUTTON` drawing), the others' at 20px.
+fn button_glyph(icon: Icon, size: ButtonSize, color: Hsla) -> Svg {
+    debug_assert_eq!(icon.size(), size.glyph(), "{} in a {size:?} button", icon.path());
+    heroicon(icon).text_color(color)
+}
+
+/// The Button component's Hotkey: the key as written (`s`, `E`, `⌘S`),
+/// X-Small in gray on the canvas, 16px tall with 4px across and corners,
+/// and a 1px drop.
+pub fn button_hotkey(key: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
         .flex()
         .flex_none()
         .items_center()
-        .justify_center()
-        .h(px(BUTTON_H))
-        .px(px(12.0))
-        .rounded(px(6.0))
-        .text_color(c.text)
-        .type_style(Type::SmallMedium)
-        .cursor_pointer();
-    // Bands, not `focus_shadow`: a gpui shadow is a filled box under the
-    // button and its tinted fill is translucent, so the glow would fill it.
-    fill_layer(d, id, px(6.0), [c.fill, c.hover, c.pressed])
-        .when(focused, |b| b.children(focus_bands_in(6.0, 0.0, c.focus)))
+        .h(px(16.0))
+        .px(px(4.0))
+        .rounded(px(4.0))
+        .bg(theme.keycap)
+        .shadow(vec![BoxShadow::new(px(0.0), px(1.0), theme.button_keycap_edge)])
+        .type_style(Type::XSmall)
+        .text_color(theme.gray)
+        .child(key.into())
 }
 
 /// A button kind's colors, in each state.
@@ -466,6 +672,9 @@ pub struct ButtonColors {
     pub hover: Hsla,
     pub pressed: Hsla,
     pub text: Hsla,
+    /// Its icons (`button/<style>/icon`): the Default style's own gray, the
+    /// tinted styles' their label's color.
+    pub icon: Hsla,
     /// The ring and glow it wears while focused, over whichever fill.
     pub focus: FocusColors,
 }
@@ -501,6 +710,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.primary_fill_hover,
             pressed: theme.primary_fill_active,
             text: theme.primary_label,
+            icon: theme.primary_label,
             focus: default_focus,
         },
         ButtonKind::Success => ButtonColors {
@@ -508,6 +718,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.success_fill_hover,
             pressed: theme.success_fill_active,
             text: theme.success_label,
+            icon: theme.success_label,
             focus: FocusColors {
                 ring: theme.success_focus_ring,
                 glow: theme.success_focus_glow,
@@ -518,6 +729,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.background_hover,
             pressed: theme.background_active,
             text: theme.text_loud,
+            icon: theme.button_icon,
             focus: default_focus,
         },
         ButtonKind::Danger => ButtonColors {
@@ -525,6 +737,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.danger_fill_hover,
             pressed: theme.danger_fill_active,
             text: theme.error,
+            icon: theme.error,
             focus: FocusColors {
                 ring: theme.danger_focus_ring,
                 glow: theme.danger_focus_glow,
@@ -535,6 +748,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.select_fill_hover,
             pressed: theme.select_fill_active,
             text: theme.select_label,
+            icon: theme.select_label,
             focus: default_focus,
         },
         ButtonKind::Quiet => ButtonColors {
@@ -542,6 +756,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.background_hover,
             pressed: theme.background_active,
             text: theme.foreground,
+            icon: theme.button_icon,
             focus: default_focus,
         },
     }
@@ -634,22 +849,8 @@ pub fn tinted_icon_button(
     )
 }
 
-/// Figma's Icon slot: `icon` in a box `width` wide, flush right, so the
-/// icon hangs past the slot's left edge and the label after it sits where
-/// Figma puts it (an 18px icon in a 14px slot in an X-Small button, 20px in
-/// 12px in a Small one).
-pub fn icon_slot(icon: Icon, width: f32, color: Hsla) -> Div {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_end()
-        .w(px(width))
-        .child(heroicon(icon).text_color(color))
-}
-
-/// A toolbar action (the board's New issue): the Figma Button at Small,
-/// Default style, 28px tall, with a left icon.
+/// A toolbar action (the board's New issue): the Button at Small, Default
+/// style, with a left icon.
 pub fn toolbar_button(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -659,9 +860,8 @@ pub fn toolbar_button(
     small_icon_button(id, icon, label, ButtonKind::Secondary, false, theme)
 }
 
-/// The Figma Button at Small in any style, 28px tall, with a left icon (the
-/// board's New issue, the Review panel's Approve and Reject): the Default
-/// style's icon is `button_icon`, a tinted style's the label's color.
+/// The Button at Small in any style with a left icon (the board's New
+/// issue, the Review panel's Approve and Reject).
 pub fn small_icon_button(
     id: impl Into<SharedString>,
     icon: Icon,
@@ -670,25 +870,13 @@ pub fn small_icon_button(
     focused: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let icon_color = match kind {
-        ButtonKind::Secondary => theme.button_icon,
-        _ => button_colors(kind, theme).text,
-    };
-    button_base(id, kind, focused, theme)
-        .h(px(28.0))
-        .gap(px(4.0))
-        .child(icon_slot(icon, 12.0, icon_color))
-        .child(label.into())
+    content_button(id, ButtonContent::label(label).left(icon), kind, ButtonSize::Small, focused, theme)
 }
 
-/// The Figma Button at X-Small, Default style, label only: 8px across, 4px
-/// down, X-Small/Medium loud on the overlay fill (the task panels' Open).
+/// The Button at X-Small, Default style, label only (the task panels'
+/// Open).
 pub fn xsmall_button(id: impl Into<SharedString>, label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
-    button_base(id, ButtonKind::Secondary, false, theme)
-        .h(px(24.0))
-        .px(px(8.0))
-        .type_style(Type::XSmallMedium)
-        .child(label.into())
+    button(id, label, ButtonKind::Secondary, ButtonSize::XSmall, false, theme)
 }
 
 /// A board filter (the Issues Header's chips): the Figma Button at Small,
@@ -703,7 +891,6 @@ pub fn filter_chip(
     theme: &Theme,
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
-    let selector = id.clone();
     let kind = if selected {
         ButtonKind::Select
     } else {
@@ -711,19 +898,7 @@ pub fn filter_chip(
     };
     let c = button_colors(kind, theme);
     let rest = if open { c.pressed } else { c.fill };
-    let d = div()
-        .id(id.clone())
-        .debug_selector(move || selector.to_string())
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .h(px(28.0))
-        .px(px(12.0))
-        .rounded(px(6.0))
-        .type_style(Type::SmallMedium)
-        .text_color(c.text)
-        .cursor_pointer();
+    let d = button_shell(id.clone(), kind, ButtonSize::Small, theme).cursor_pointer();
     fill_layer(d, id, px(6.0), [rest, c.hover, c.pressed])
         .child(div().whitespace_nowrap().child(label.into()))
 }
@@ -1229,8 +1404,8 @@ mod tests {
         ];
         for theme in themes() {
             for kind in KINDS {
-                let mut rest = button("b", "Load", kind, false, &theme);
-                let mut focused = button("b", "Load", kind, true, &theme);
+                let mut rest = button("b", "Load", kind, ButtonSize::Base, false, &theme);
+                let mut focused = button("b", "Load", kind, ButtonSize::Base, true, &theme);
                 let (rest, focused) = (rest.style(), focused.style());
                 assert_eq!(focused.text.color, rest.text.color, "{kind:?} label");
                 assert_eq!(focused.text.color, Some(button_colors(kind, &theme).text), "{kind:?} label");
@@ -1238,10 +1413,164 @@ mod tests {
                 assert!(focused.box_shadow.is_none(), "{kind:?} draws its focus as a shadow");
                 for mut small in [
                     small_icon_button("s", icons::CHECK, "Approve", kind, true, &theme),
-                    icon_label_button("i", icons::CHECK, "Refresh", kind, &theme),
+                    icon_label_button("i", icons::CHECK, "Refresh", kind, ButtonSize::Base, &theme),
                 ] {
                     assert!(small.style().box_shadow.is_none(), "{kind:?} icon button");
                 }
+            }
+        }
+    }
+
+    /// Every button of `size` holding each mix of content, enabled and
+    /// disabled, Default style.
+    struct SizeSheet(Theme);
+
+    const CONTENTS: [&str; 5] = ["label", "left", "right", "both", "hotkey"];
+
+    fn sheet_content(name: &str, size: ButtonSize) -> ButtonContent {
+        let (left, right) = match size {
+            ButtonSize::XSmall => (icons::ARROW_LEFT_BUTTON, icons::ARROW_RIGHT_BUTTON),
+            _ => (icons::PLUS, icons::CHEVRON_DOWN),
+        };
+        let c = ButtonContent::label("Button");
+        match name {
+            "left" => c.left(left),
+            "right" => c.right(right),
+            "both" => c.left(left).right(right),
+            "hotkey" => c.left(left).hotkey("E").right(right),
+            _ => c,
+        }
+    }
+
+    const SIZES: [ButtonSize; 3] = [ButtonSize::XSmall, ButtonSize::Small, ButtonSize::Base];
+
+    impl gpui::Render for SizeSheet {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            let theme = self.0;
+            div().flex().flex_col().gap_4().p_4().children(SIZES.iter().flat_map(move |&size| {
+                CONTENTS.iter().map(move |&name| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_4()
+                        .child(content_button(format!("{size:?}-{name}"), sheet_content(name, size), ButtonKind::Secondary, size, false, &theme))
+                        .child(disabled_content_button(
+                            format!("{size:?}-{name}-off"),
+                            sheet_content(name, size),
+                            ButtonKind::Secondary,
+                            size,
+                            &theme,
+                        ))
+                })
+            }))
+        }
+    }
+
+    /// The Figma size contract (`2220:17545` X-Small, `2220:17601` Small,
+    /// `2220:17603` Base): each size's height and padding, its slots' widths
+    /// on the outer sides, the gap between pieces (none for a hidden one),
+    /// and a disabled button laid out exactly as its enabled twin.
+    #[gpui::test]
+    fn buttons_lay_out_to_the_figma_size_contract(cx: &mut gpui::TestAppContext) {
+        let [dark, _] = themes();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| SizeSheet(dark))).unwrap()
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        let at = |vcx: &mut gpui::VisualTestContext, s: String| {
+            let s: &'static str = Box::leak(s.into_boxed_str());
+            vcx.debug_bounds(s)
+        };
+        let close = |a: Pixels, b: f32, what: &str| assert!((f32::from(a) - b).abs() < 0.01, "{what}: {a:?} vs {b}");
+        for size in SIZES {
+            let (h, pad, gap, slot) = (size.height(), size.padding(), size.gap(), size.slot());
+            assert_eq!((h, pad, gap, slot), match size {
+                ButtonSize::XSmall => (24.0, 8.0, 4.0, 14.0),
+                ButtonSize::Small => (28.0, 12.0, 4.0, 12.0),
+                ButtonSize::Base => (32.0, 12.0, 6.0, 14.0),
+            });
+            for name in CONTENTS {
+                let id = format!("{size:?}-{name}");
+                let what = |part: &str| format!("{id} {part}");
+                let b = at(&mut vcx, id.clone()).unwrap_or_else(|| panic!("{id} drawn"));
+                let off = at(&mut vcx, format!("{id}-off")).unwrap();
+                close(b.size.height, h, &what("height"));
+                assert_eq!(b.size, off.size, "{id}: disabled shares the enabled geometry");
+                let label = at(&mut vcx, format!("{id}-label")).unwrap();
+                let left = at(&mut vcx, format!("{id}-left"));
+                let hotkey = at(&mut vcx, format!("{id}-hotkey"));
+                let right = at(&mut vcx, format!("{id}-right"));
+                // Left to right, each piece `gap` after the one before.
+                let mut edge = b.left() + px(pad);
+                for (part, bounds) in [("left", left), ("label", Some(label)), ("hotkey", hotkey), ("right", right)] {
+                    let Some(bounds) = bounds else { continue };
+                    close(bounds.left() - edge, 0.0, &what(part));
+                    if part == "left" || part == "right" {
+                        close(bounds.size.width, slot, &what("slot width"));
+                    }
+                    edge = bounds.right() + px(gap);
+                }
+                close(b.right() - (edge - px(gap)), pad, &what("right padding"));
+                assert_eq!(left.is_some(), matches!(name, "left" | "both" | "hotkey"), "{id} left");
+                assert_eq!(right.is_some(), matches!(name, "right" | "both" | "hotkey"), "{id} right");
+                assert_eq!(hotkey.is_some(), name == "hotkey", "{id} hotkey");
+                if let Some(k) = hotkey {
+                    close(k.size.height, 16.0, &what("hotkey height"));
+                }
+            }
+        }
+    }
+
+    /// An icon in a button draws at its size's glyph: 18px (the `_BUTTON`
+    /// drawings) at X-Small, 20px at Small and Base, hanging past the
+    /// slot's outer edge.
+    #[test]
+    fn button_glyphs_draw_at_the_sizes_glyph() {
+        assert_eq!(ButtonSize::XSmall.glyph(), px(18.0));
+        assert_eq!(ButtonSize::Small.glyph(), px(20.0));
+        assert_eq!(ButtonSize::Base.glyph(), px(20.0));
+        for size in SIZES {
+            for name in CONTENTS {
+                let c = sheet_content(name, size);
+                for icon in c.left.into_iter().chain(c.right) {
+                    assert_eq!(icon.size(), size.glyph(), "{size:?} {name}");
+                    assert!(f32::from(icon.size()) > size.slot(), "{size:?}: the glyph hangs past its slot");
+                }
+            }
+        }
+    }
+
+    /// Icons take the style's icon role, not the label's: the Default
+    /// style's own `button/default/icon` (`#acb4cf` Dark, `#7b85a7` Light,
+    /// opaque), the tinted styles' their label's color.
+    #[test]
+    fn button_icons_take_the_styles_icon_role() {
+        let [dark, light] = themes();
+        assert_eq!(rgba8(button_colors(ButtonKind::Secondary, &dark).icon), 0xacb4cfff);
+        assert_eq!(rgba8(button_colors(ButtonKind::Secondary, &light).icon), 0x7b85a7ff);
+        for theme in [dark, light] {
+            assert_ne!(button_colors(ButtonKind::Secondary, &theme).icon, button_colors(ButtonKind::Secondary, &theme).text);
+            for kind in [ButtonKind::Primary, ButtonKind::Success, ButtonKind::Danger, ButtonKind::Select] {
+                let c = button_colors(kind, &theme);
+                assert_eq!(c.icon, c.text, "{kind:?}");
+            }
+        }
+    }
+
+    /// A disabled button dims once, as a whole: the control at 40% and
+    /// nothing inside it dimmed again; no hover layer, pointer or focus.
+    #[test]
+    fn disabled_buttons_dim_once_and_take_no_pointer() {
+        for theme in themes() {
+            for size in SIZES {
+                let mut b = disabled_content_button("d", sheet_content("hotkey", size), ButtonKind::Secondary, size, &theme);
+                let style = b.style();
+                assert_eq!(style.opacity, Some(0.4));
+                assert!(style.mouse_cursor.is_none(), "{size:?} takes no pointer");
+                assert_eq!(style.background, Some(button_colors(ButtonKind::Secondary, &theme).fill.into()));
+                let mut on = content_button("e", sheet_content("hotkey", size), ButtonKind::Secondary, size, true, &theme);
+                assert!(on.style().opacity.is_none(), "{size:?} enabled is opaque");
             }
         }
     }

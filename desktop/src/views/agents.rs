@@ -44,7 +44,7 @@ use super::agents_state::{
 use super::workflows::{header_button, popup, row_button, row_error, section_header, table, MENU_GAP, ROW_BUTTON};
 use crate::assets::icons;
 use crate::elements::controls;
-use crate::theme::style::{self, ButtonKind, Type, Typography};
+use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The table's columns (`Agent Row`, 2397:7514): the runner, the workflow
@@ -59,8 +59,6 @@ const DRAFT_W: f32 = 280.0;
 const TABLE_RADIUS: f32 = 12.0;
 /// The shared instructions' editor's height.
 const EDITOR_H: f32 = 360.0;
-/// A section header's buttons (the Button component at Small).
-const HEADER_BUTTON_H: f32 = 28.0;
 
 /// What the page tells the settings view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,14 +718,14 @@ impl AgentsPage {
             .pb(px(16.0))
             .child(div().flex_1().min_w_0().type_style(Type::Small).text_color(theme.form_text).child(text))
             .child(
-                style::button("agent-confirm-cancel", "Cancel", ButtonKind::Quiet, false, theme).on_click(cx.listener(
+                style::button("agent-confirm-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         this.state.confirm = None;
                         cx.notify();
                     },
                 )),
             )
-            .child(style::button(id, label, kind, false, theme).on_click(cx.listener(
+            .child(style::button(id, label, kind, ButtonSize::Base, false, theme).on_click(cx.listener(
                 move |this, _: &ClickEvent, window, cx| this.request(confirm.edit(), window, cx),
             )))
             .into_any_element()
@@ -800,17 +798,16 @@ impl AgentsPage {
         // in view however far the text area runs down the page.
         let buttons = if editing.is_some() {
             let save = if self.state.saving() {
-                style::disabled_button("agents-shared-save", "Save", ButtonKind::Primary, theme)
+                style::disabled_button("agents-shared-save", "Save", ButtonKind::Primary, ButtonSize::Small, theme)
             } else {
-                style::button("agents-shared-save", "Save", ButtonKind::Primary, false, theme)
+                style::button("agents-shared-save", "Save", ButtonKind::Primary, ButtonSize::Small, false, theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_shared(window, cx)))
             };
             vec![
-                style::button("agents-shared-cancel", "Cancel", ButtonKind::Quiet, false, theme)
-                    .h(px(HEADER_BUTTON_H))
+                style::button("agents-shared-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Small, false, theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_shared(cx)))
                     .into_any_element(),
-                save.h(px(HEADER_BUTTON_H)).into_any_element(),
+                save.into_any_element(),
             ]
         } else {
             vec![header_button("agents-edit-instructions", icons::PENCIL, "Edit instructions", theme)

@@ -39,7 +39,7 @@ use shelbi_app::CommandKind;
 use super::machines_state::{Intent, MachinesState};
 use crate::assets::{heroicon, icons};
 use crate::keys::chord_from_keystroke;
-use crate::theme::style::{self, ButtonKind};
+use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 
@@ -219,7 +219,7 @@ impl MachinesView {
                 "machines-empty",
                 "No machines are declared for this project yet. Add them under `machines:` in its config, then refresh.",
                 Some(
-                    style::icon_label_button("machines-refresh", icons::ARROW_PATH, "Refresh", ButtonKind::Secondary, theme)
+                    style::icon_label_button("machines-refresh", icons::ARROW_PATH, "Refresh", ButtonKind::Secondary, ButtonSize::Base, theme)
                         .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                             this.refresh();
                             cx.notify();

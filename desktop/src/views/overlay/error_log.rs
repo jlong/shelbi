@@ -15,7 +15,6 @@ use shelbi_app::overlay::error_log::{format_ts, Viewer, EMPTY, HINT};
 use crate::theme::style;
 use crate::theme::Theme;
 use crate::views::overlay::{hint, panel, title, with_overlay, ActiveOverlay, OverlayEvent, OverlayHost};
-use crate::theme::style::{Type, Typography};
 
 /// One scroll step (a key's line) in pixels.
 pub const LINE_H: f32 = 20.0;
@@ -95,12 +94,9 @@ pub fn render<H: OverlayHost>(
                     )
             })),
     };
-    // Compact secondary buttons (28px).
+    // Compact secondary buttons.
     let small_button = |id: &'static str, label: &'static str| {
-        style::button(id, label, style::ButtonKind::Secondary, false, theme)
-            .h(px(28.0))
-            .px(px(10.0))
-            .type_style(Type::XSmall)
+        style::button(id, label, style::ButtonKind::Secondary, style::ButtonSize::Small, false, theme)
     };
     let header = div()
         .flex()

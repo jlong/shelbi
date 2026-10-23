@@ -110,6 +110,11 @@ impl Icon {
     pub const fn path(self) -> &'static str {
         self.path
     }
+
+    /// The width and height it draws at.
+    pub const fn size(self) -> Pixels {
+        self.size
+    }
 }
 
 /// `icon`, outline, at its size ([`ICON_SIZE`], [`ICON_SIZE_SMALL`] for a
