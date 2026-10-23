@@ -6365,14 +6365,14 @@ dependencies = [
 
 [[package]]
 name = "shelbi-agent"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "shelbi-core",
 ]
 
 [[package]]
 name = "shelbi-app"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "serde",
@@ -6387,7 +6387,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-client"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "libc",
  "serde",
@@ -6399,7 +6399,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "libc",
@@ -6411,7 +6411,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-desktop"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -6446,7 +6446,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-orchestrator"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6474,7 +6474,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-palette"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "nucleo-matcher",
  "shelbi-core",
@@ -6482,7 +6482,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-proto"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6491,7 +6491,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-session"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -6509,7 +6509,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-ssh"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "libc",
  "shelbi-core",
@@ -6521,7 +6521,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-state"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -6536,7 +6536,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-term"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "alacritty_terminal",
  "shelbi-proto",

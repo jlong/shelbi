@@ -9,7 +9,121 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
-### October 4, 2026
+### October 23, 2026
+
+**v0.11.0. The native macOS desktop app, plus steadier handoffs and sessions.**
+
+**Shelbi has a native macOS app.** `Shelbi.app` is a second client beside the
+TUI, built with gpui and at feature parity with it: both render the same models,
+run the same command registry, and attach to the same daemon and sessions, so
+the TUI, `shelbi attach` and the app can watch one agent byte for byte. On launch
+the app finds the `shelbi` CLI, starts or adopts the daemon, and checks that the
+versions match, offering a relaunch or an upgrade when they don't. A window shows
+one project at a time and switches projects in place (`⌘⇧N` opens another), with
+the sidebar, the Orchestrator chat, the Issues board with task detail and drag
+and drop, Activity, Machines, the Workspace view (the agent with your own shell
+beside it, local or remote), and the Review view (the task panel beside the
+reviewer, with diff and editor sessions, approve and reject, and the review
+server's live state). The command palette and the overlays (error log, add
+project, load for review, reject reason, Zen intro) come along, as do native menus
+that carry your `keys.yaml` chords and system notifications for a blocked
+workspace, a task ready for review, or an orchestrator waiting on you. Terminals
+are the app's own, drawn over Shelbi's shared emulator with scrollback,
+selection, find, links and IME. Light and dark follow the system, and the TUI
+gains the same light theme through a new `theme:` key (`auto`, `dark` or `light`)
+in the global config ([#1683](https://github.com/jlong/shelbi/pull/1683)).
+
+**Every view tuned for the desktop.** The Issues toolbar gains a search field
+that narrows cards live by title, id and branch (`/` focuses it, Esc clears it)
+([#1812](https://github.com/jlong/shelbi/pull/1812), [#1829](https://github.com/jlong/shelbi/pull/1829)). **More** in the Review and Workspace task panels opens
+the full task detail over the screen you're on ([#1805](https://github.com/jlong/shelbi/pull/1805)). Activity paints at once
+and scrolls at frame rate on thousands of rows ([#1818](https://github.com/jlong/shelbi/pull/1818)), and the sidebar slides
+in and out instead of jumping ([#1814](https://github.com/jlong/shelbi/pull/1814)).
+
+**Settings you edit in the app.** Settings (`⌘,`) gets its own sidebar in place
+of the app's, with General, Keybindings and Terminal pages ([#1813](https://github.com/jlong/shelbi/pull/1813)). Keybindings
+is a real editor: click a chord to rebind it, and the change is written to
+`keys.yaml` with its comments kept and applies at once ([#1817](https://github.com/jlong/shelbi/pull/1817)). Terminal sets the
+font and size, edits the ANSI colors against a live preview ([#1816](https://github.com/jlong/shelbi/pull/1816)), and picks
+when the new macOS-style overlay scrollbar shows ([#1855](https://github.com/jlong/shelbi/pull/1855)). General adds window
+transparency and a background blur behind it, stored as `desktop.window_opacity`
+and `desktop.window_blur` ([#1820](https://github.com/jlong/shelbi/pull/1820)).
+
+**Workflows and agents, editable in Settings.** Settings ▸ Workflows lists a
+project's workflows and statuses ([#1826](https://github.com/jlong/shelbi/pull/1826)) and opens a workflow editor with two
+views: a **Form** that edits statuses and transitions as rows ([#1828](https://github.com/jlong/shelbi/pull/1828)), and a
+**Builder** that draws the workflow as a graph on a pannable, zoomable canvas,
+with an inspector for each status and transition, connection handles you can
+drag between statuses, and reorderable transition actions ([#1830](https://github.com/jlong/shelbi/pull/1830), [#1832](https://github.com/jlong/shelbi/pull/1832),
+[#1834](https://github.com/jlong/shelbi/pull/1834), [#1841](https://github.com/jlong/shelbi/pull/1841), [#1842](https://github.com/jlong/shelbi/pull/1842)). **Edit YAML** in either workflow menu opens the file itself
+for anything the editor can't express ([#1840](https://github.com/jlong/shelbi/pull/1840)). Settings ▸ Agents shows each
+agent's preferred runner, the statuses that use it, and whether its files still
+match what Shelbi ships, and an agent details page edits its name, description,
+`instructions.md` and skills ([#1852](https://github.com/jlong/shelbi/pull/1852), [#1853](https://github.com/jlong/shelbi/pull/1853)). Both editors save through new
+editing models in `shelbi-state` that patch the YAML in place, so the `##` help
+blocks, comments and notes in your hand-edited files survive a save, and a
+workflow that open issues still use can't be renamed or deleted out from under
+them ([#1825](https://github.com/jlong/shelbi/pull/1825), [#1851](https://github.com/jlong/shelbi/pull/1851)).
+
+**Installed with Homebrew, signed and notarized.** The release now builds,
+signs, notarizes and staples `Shelbi.app`, attaches
+`Shelbi-<version>-arm64.zip` to the GitHub release, and publishes it as the
+`shelbi-desktop` cask in the Shelbi tap. The app is a client of the CLI, so the
+cask depends on the `shelbi` formula; name both when you install
+(`brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop`), and the app
+tells you when a newer release is out. It needs an Apple silicon Mac on macOS 15
+or later. It ships with the new Command Grille app icon ([#1683](https://github.com/jlong/shelbi/pull/1683), [#1845](https://github.com/jlong/shelbi/pull/1845)).
+
+**The first release on Shelbi's own sessions.** This is the first tagged release
+without tmux (see October 12 below), and the session runtime got a round of
+hardening. A dead session is never read as live or classified from its final
+frame ([#1663](https://github.com/jlong/shelbi/pull/1663)), a client never reattaches to a session that has already exited
+([#1702](https://github.com/jlong/shelbi/pull/1702)), a resume prompt is delivered only into a live, ready session ([#1689](https://github.com/jlong/shelbi/pull/1689)),
+and the supervisor really relaunches a dead orchestrator and logs `restart` only
+once the new one is live ([#1690](https://github.com/jlong/shelbi/pull/1690)). `shelbi daemon stop` stops only its own root's
+daemon, and a session's `exit.json` now records which signal ended it and who
+sent it ([#1693](https://github.com/jlong/shelbi/pull/1693)). The daemon no longer idles out halfway through a quit ([#1742](https://github.com/jlong/shelbi/pull/1742)).
+In the TUI, Switch Project now really switches: it rebuilds the views for the
+target, starts its orchestrator, and paints the target at once instead of
+freezing on the old project ([#1635](https://github.com/jlong/shelbi/pull/1635), [#1659](https://github.com/jlong/shelbi/pull/1659), [#1661](https://github.com/jlong/shelbi/pull/1661), [#1665](https://github.com/jlong/shelbi/pull/1665)), and the workspace header
+reads the same status the sidebar shows ([#1660](https://github.com/jlong/shelbi/pull/1660)).
+
+**Handoffs survive bounces and rewrites.** A task bounced back to a reused
+workspace keeps its push provenance per branch, so the hub no longer refuses
+the push of a tip it pushed itself, and a real block is raised to the
+orchestrator once instead of looping quietly ([#1844](https://github.com/jlong/shelbi/pull/1844)). A worker that amends or
+squashes an already-pushed commit no longer wedges its handoff, and a blocked
+push heals itself once the branch is fixed ([#1643](https://github.com/jlong/shelbi/pull/1643)). A handoff force-push leases
+against the fresh remote tip and caps its retries ([#1583](https://github.com/jlong/shelbi/pull/1583)), every move into the
+handoff status detaches the worktree, not just the ready marker ([#1651](https://github.com/jlong/shelbi/pull/1651)), and a
+stale merged PR can no longer finalize a reused branch ([#1627](https://github.com/jlong/shelbi/pull/1627)). Review slots load
+the branch as a detached HEAD, so a branch checked out elsewhere never blocks a
+review ([#1743](https://github.com/jlong/shelbi/pull/1743)).
+
+**GitHub boards spend far less quota.** Idle TUI and daemon pollers read the
+daemon's board index instead of sweeping the whole issue history, which had
+emptied the REST quota about once an hour ([#1741](https://github.com/jlong/shelbi/pull/1741)). A rate-limit park only waits
+for a window reset it can believe, and the `board rate-limited` event says
+which limit tripped ([#1769](https://github.com/jlong/shelbi/pull/1769)). The Activity feed stops refetching done issues and
+bounds its retries on a failing title fetch ([#1631](https://github.com/jlong/shelbi/pull/1631), [#1647](https://github.com/jlong/shelbi/pull/1647)), and `shelbi issue
+start` right after a move no longer trips over its own write ([#1634](https://github.com/jlong/shelbi/pull/1634)).
+
+**Per-worktree markers move to `.shelbi/`.** The ready, review-loaded,
+push-blocked and transition markers now live in each worktree's `.shelbi/`
+directory instead of `.claude/`, which is the runner's own config and not
+Shelbi state. Update any script that watches the old paths ([#1609](https://github.com/jlong/shelbi/pull/1609), [#1611](https://github.com/jlong/shelbi/pull/1611)).
+
+**Smaller fixes.** A worker's clarification question is stored on the hub in
+full and attached to its event, instead of being cut at 120 characters ([#1703](https://github.com/jlong/shelbi/pull/1703)).
+`shelbi zen ci-watch` waits for the commit's GitHub Actions run to exist before
+calling it green ([#1655](https://github.com/jlong/shelbi/pull/1655)), and `shelbi zen probe` refuses a branch held by another
+worktree before any local check runs ([#1649](https://github.com/jlong/shelbi/pull/1649)). Tracing goes to stderr, so
+commands that print JSON keep their stdout clean ([#1653](https://github.com/jlong/shelbi/pull/1653)). The orchestrator's
+shipped Reporting instructions name the issue, not the workspace, as the subject
+of each update ([#1645](https://github.com/jlong/shelbi/pull/1645)), and the TUI palette hides workspaces until you type and
+gives every action row an icon ([#1632](https://github.com/jlong/shelbi/pull/1632), [#1640](https://github.com/jlong/shelbi/pull/1640)).
+
+### October 12, 2026
 
 **Shelbi runs its own sessions; tmux is no longer required.** Each agent now
 runs in its own Shelbi session, a small process that owns one PTY and outlives
