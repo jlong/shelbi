@@ -867,6 +867,7 @@ impl ShelbiWindow {
             _motion: cx.observe_window_activation(window, |_, _, cx| {
                 theme::motion::sync_reduce_motion(cx);
                 theme::window::sync_reduce_transparency(cx);
+                crate::elements::terminal::scrollbar::SystemScrollbars::sync(cx);
             }),
             palette_chord: palette_chord(&keymaps),
             client,

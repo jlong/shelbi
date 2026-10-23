@@ -173,7 +173,7 @@ pub use ssh_control::{
 pub use user_config::{
     editor_display_name, load_user_config, resolve_editor, save_user_config,
     scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, DesktopConfig,
-    DesktopNotifications, Keymap, OptionAsMeta, TerminalColors, ThemePreference, UserConfig, ZenToggleChord,
+    DesktopNotifications, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };
 pub use workflows::{

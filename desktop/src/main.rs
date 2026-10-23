@@ -257,6 +257,9 @@ fn main() {
             theme::motion::sync_reduce_motion(cx);
             assets::load_fonts(cx);
             elements::terminal::TerminalSettings::init(cx);
+            // System Settings' "Show scroll bars", which the terminals'
+            // scrollbar follows (read now and on every change).
+            elements::terminal::scrollbar::SystemScrollbars::follow(cx);
             // Image and file-promise drops onto a terminal pane (gpui's window
             // takes only Finder drops on its own).
             drops::install(cx);

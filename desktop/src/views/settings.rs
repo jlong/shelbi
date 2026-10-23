@@ -9,8 +9,10 @@
 //! - `desktop.terminal_font_family` / `desktop.terminal_font_size`: the
 //!   terminals' font, chosen from a picker of the bundled and installed
 //!   monospaced fonts ([`FontPicker`]) and a size stepper (8 to 32 points),
-//!   and `desktop.option_as_meta`: which Option keys are Meta in terminals.
-//!   The terminal element applies all three at once through its
+//!   `desktop.option_as_meta`: which Option keys are Meta in terminals, and
+//!   `desktop.terminal_scrollbar`: when their scrollbar shows (Automatic
+//!   follows macOS's "Show scroll bars"; When scrolling; Always).
+//!   The terminal element applies them at once through its
 //!   `TerminalSettings` global, which a change sets at once (before the
 //!   write), and which the view follows, so a size changed elsewhere shows
 //!   here too;
@@ -59,7 +61,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
-use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, ThemePreference, UserConfig};
+use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, TerminalScrollbar, ThemePreference, UserConfig};
 use shelbi_term::render::Rgb as TermRgb;
 
 use super::agent_editor::{AgentEditor, AgentEditorEvent};
@@ -75,7 +77,7 @@ use crate::elements::controls::{self, Slider, SliderEvent};
 use crate::elements::terminal::colors::{self, AnsiOverrides};
 use crate::elements::terminal::metrics::{DEFAULT_FONT_SIZE, PRIMARY_FAMILY};
 use crate::elements::terminal::settings::{FONT_SIZE_RANGE, ZOOM_RANGE};
-use crate::elements::terminal::{TerminalPane, TerminalSettings};
+use crate::elements::terminal::{scrollbar, TerminalPane, TerminalSettings};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, Type, Typography};
 use crate::theme::window::{self as translucency, Translucency, WindowLook, BLUR_RANGE, OPACITY_RANGE};
@@ -96,7 +98,7 @@ const ANSI_NAME_W: f32 = 80.0;
 /// The gap between the Terminal page's controls and its preview, and the
 /// preview's inset inside its border (`2264:7447`).
 const PREVIEW_GAP: f32 = 32.0;
-const PREVIEW_INSET: f32 = 24.0;
+pub(crate) const PREVIEW_INSET: f32 = 24.0;
 
 /// The Terminal frame's controls column, top to bottom (`2269:4844`): the
 /// preview is never shorter.
@@ -113,6 +115,8 @@ pub struct SettingsValues {
     pub cli_path: String,
     pub theme: ThemePreference,
     pub option_as_meta: OptionAsMeta,
+    /// When the terminals' scrollbar shows.
+    pub scrollbar: TerminalScrollbar,
     pub notifications: Switches,
     /// The ANSI colors the user changed (`None` keeps the theme's).
     pub ansi: AnsiOverrides,
@@ -179,6 +183,7 @@ impl Default for SettingsValues {
             cli_path: String::new(),
             theme: ThemePreference::default(),
             option_as_meta: OptionAsMeta::default(),
+            scrollbar: TerminalScrollbar::default(),
             notifications: Switches::default(),
             ansi: [None; 16],
             translucency: Translucency::default(),
@@ -217,6 +222,7 @@ impl SettingsValues {
                 .unwrap_or_default(),
             theme: cfg.theme,
             option_as_meta: cfg.desktop.option_as_meta.unwrap_or_default(),
+            scrollbar: terminal.scrollbar,
             notifications: Switches::from(&cfg.desktop.notifications),
             ansi: terminal.ansi,
             translucency: Translucency::from_config(&cfg.desktop),
@@ -243,6 +249,8 @@ impl SettingsValues {
             terminal_font_size: (size != DEFAULT_SIZE).then_some(size),
             // Off is the default, so it isn't written.
             option_as_meta: (self.option_as_meta != OptionAsMeta::Off).then_some(self.option_as_meta),
+            // Automatic is the default, so it isn't written either.
+            terminal_scrollbar: (self.scrollbar != TerminalScrollbar::Auto).then_some(self.scrollbar),
             notifications,
             terminal_colors: colors::to_config(&self.ansi),
             window_opacity: None,
@@ -290,9 +298,10 @@ pub enum SettingsEvent {
 pub struct SettingsView {
     /// The page shown.
     page: SettingsPage,
-    /// The two segmented controls, measured for their selection's slide.
+    /// The segmented controls, measured for their selection's slide.
     theme_track: SharedTrack,
     option_track: SharedTrack,
+    scrollbar_track: SharedTrack,
     font_family: Entity<FontPicker>,
     /// The terminal font size, and the field it is typed into.
     font_size: u16,
@@ -304,6 +313,7 @@ pub struct SettingsView {
     opacity_slider: Entity<Slider>,
     blur_slider: Entity<Slider>,
     option_as_meta: OptionAsMeta,
+    scrollbar: TerminalScrollbar,
     notifications: Switches,
     /// The ANSI colors the user changed, the sixteen fields they are typed
     /// in (regular 0 to 7, then bold 8 to 15), and which of those hold text
@@ -348,7 +358,14 @@ impl SettingsView {
             .map(|slot| cx.new(|cx| InputState::new(window, cx).default_value(colors::hex(defaults[slot]))))
             .collect();
         let preview = cx.new(|cx| {
-            TerminalPane::canned("Preview".into(), terminal_preview::stream, window, cx)
+            let mut pane = TerminalPane::canned("Preview".into(), terminal_preview::stream, window, cx);
+            // Its scrollbar runs down the bordered box's edge, over the inset.
+            pane.set_scrollbar_padding(scrollbar::Padding {
+                top: PREVIEW_INSET,
+                right: PREVIEW_INSET,
+                bottom: PREVIEW_INSET,
+            });
+            pane
         });
         let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
         let workflows = cx.new(|cx| WorkflowsPage::new(project, window, cx));
@@ -423,6 +440,7 @@ impl SettingsView {
             opacity_slider,
             blur_slider,
             option_as_meta: OptionAsMeta::Off,
+            scrollbar: TerminalScrollbar::Auto,
             notifications: Switches::default(),
             ansi: [None; 16],
             ansi_inputs,
@@ -440,6 +458,7 @@ impl SettingsView {
             loaded: false,
             theme_track: SlideTrack::shared(),
             option_track: SlideTrack::shared(),
+            scrollbar_track: SlideTrack::shared(),
             state: SaveState::Idle,
             _subscriptions: subscriptions,
         };
@@ -697,6 +716,7 @@ impl SettingsView {
         // What config.yaml says is what the windows show.
         translucency::set(values.translucency, cx);
         self.option_as_meta = values.option_as_meta;
+        self.scrollbar = values.scrollbar;
         self.notifications = values.notifications;
         self.ansi = values.ansi;
         self.ansi_invalid = [false; 16];
@@ -711,6 +731,7 @@ impl SettingsView {
             cli_path: self.cli_path.read(cx).value().to_string(),
             theme: self.theme,
             option_as_meta: self.option_as_meta,
+            scrollbar: self.scrollbar,
             notifications: self.notifications,
             ansi: self.ansi,
             translucency: self.translucency,
@@ -825,6 +846,10 @@ impl SettingsView {
         if settings.ansi != self.ansi {
             self.ansi = settings.ansi;
             self.show_colors(window, cx);
+        }
+        if settings.scrollbar != self.scrollbar {
+            self.scrollbar = settings.scrollbar;
+            cx.notify();
         }
     }
 
@@ -974,6 +999,19 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Pick when the terminals' scrollbar shows; saved and applied at once.
+    fn set_scrollbar(&mut self, value: TerminalScrollbar, cx: &mut Context<Self>) {
+        self.scrollbar = value;
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// The scrollbar choice shown (tests).
+    #[cfg(test)]
+    pub fn scrollbar(&self) -> TerminalScrollbar {
+        self.scrollbar
+    }
+
     /// Choose the `shelbi` binary in a file dialog; the choice fills the
     /// field and is saved.
     fn browse_cli(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1065,6 +1103,15 @@ fn option_label(value: OptionAsMeta) -> &'static str {
     }
 }
 
+/// A scrollbar choice's segment label.
+fn scrollbar_label(value: TerminalScrollbar) -> &'static str {
+    match value {
+        TerminalScrollbar::Auto => "Automatic",
+        TerminalScrollbar::Scrolling => "When scrolling",
+        TerminalScrollbar::Always => "Always",
+    }
+}
+
 /// The size field's text: the size and its unit, as the frame writes it
 /// (`14pt`).
 fn size_text(size: u16) -> String {
@@ -1105,6 +1152,7 @@ impl Render for SettingsView {
         let chips = (
             slide(&self.theme_track, format!("settings-theme-{}", theme_label(self.theme))),
             slide(&self.option_track, format!("settings-option-{}", option_label(self.option_as_meta))),
+            slide(&self.scrollbar_track, format!("settings-scrollbar-{}", scrollbar_label(self.scrollbar))),
         );
         let theme_chip = chips.0;
         let chip = |label: &'static str, value: ThemePreference, current: ThemePreference, cx: &mut Context<Self>| {
@@ -1126,6 +1174,15 @@ impl Render for SettingsView {
             controls::segment(id.clone(), label, value == option_as_meta, option_chip_slide.is_none(), &theme)
                 .child(motion::probe(&self.option_track, id))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_option_as_meta(value, cx)))
+        };
+        let scrollbar = self.scrollbar;
+        let scrollbar_chip_slide = chips.2;
+        let scrollbar_chip = |value: TerminalScrollbar, cx: &mut Context<Self>| {
+            let label = scrollbar_label(value);
+            let id = SharedString::from(format!("settings-scrollbar-{label}"));
+            controls::segment(id.clone(), label, value == scrollbar, scrollbar_chip_slide.is_none(), &theme)
+                .child(motion::probe(&self.scrollbar_track, id))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_scrollbar(value, cx)))
         };
         let floating = |bounds| motion::floating_chip(bounds, |d| controls::selected_segment(d, &theme));
         // The size stepper: the typed field, then − and +, each dimmed (and
@@ -1314,7 +1371,21 @@ impl Render for SettingsView {
                                             &theme,
                                         )),
                                 ),
-                            ),
+                            )
+                            .child(controls::labeled_control(
+                                "Show scrollbar",
+                                controls::segmented_track(&theme)
+                                    .child(motion::origin_probe(&self.scrollbar_track))
+                                    .children(scrollbar_chip_slide.map(floating))
+                                    .child(scrollbar_chip(TerminalScrollbar::Auto, cx))
+                                    .child(scrollbar_chip(TerminalScrollbar::Scrolling, cx))
+                                    .child(scrollbar_chip(TerminalScrollbar::Always, cx)),
+                                Some(
+                                    "Automatic follows Show scroll bars in System Settings ▸ Appearance."
+                                        .into(),
+                                ),
+                                &theme,
+                            )),
                     )
                     .child(self.render_preview(&theme)),
             ),
@@ -1542,6 +1613,7 @@ mod tests {
             cli_path: "~/bin/shelbi".into(),
             theme: ThemePreference::Light,
             option_as_meta: OptionAsMeta::Left,
+            scrollbar: TerminalScrollbar::Scrolling,
             notifications: Switches {
                 workspace_blocked: true,
                 review_ready: false,
@@ -1568,6 +1640,7 @@ mod tests {
         );
         assert_eq!(cfg.theme, ThemePreference::Light);
         assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
+        assert_eq!(cfg.desktop.terminal_scrollbar, Some(TerminalScrollbar::Scrolling));
         let ansi = &cfg.desktop.terminal_colors;
         assert_eq!((ansi.black.regular.as_deref(), ansi.red.bold.as_deref()), (Some("#000000"), Some("#E69589")));
         assert_eq!((ansi.black.bold.as_ref(), ansi.green.regular.as_ref()), (None, None), "only what was changed");
@@ -1586,6 +1659,7 @@ mod tests {
         cfg.desktop.terminal_font_family = Some("Menlo".into());
         cfg.desktop.terminal_colors.set(3, Some("#dbc300".into()));
         (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(60), Some(10));
+        cfg.desktop.terminal_scrollbar = Some(TerminalScrollbar::Always);
         SettingsValues::default().apply(&mut cfg);
         assert!(cfg.desktop.is_empty(), "{:?}", cfg.desktop);
 

@@ -24,7 +24,12 @@
 //! - **Scrollback**: the wheel (Shift+wheel always), Shift+PageUp/PageDown/
 //!   Home/End, and the scrollbar ([`scrollbar`]) scroll Shelbi's scrollback on
 //!   the normal screen. New output while scrolled up doesn't move the view; a
-//!   "Jump to bottom" button shows how far up it is. On the alternate screen
+//!   "Jump to bottom" button shows how far up it is. The scrollbar is a macOS
+//!   overlay against the right edge of the pane's padded area (its host sets
+//!   the padding, [`TerminalPane::set_scrollbar_padding`]): hidden at rest,
+//!   shown while scrolling or with the pointer at the edge, unless
+//!   `desktop.terminal_scrollbar` or the system's "Show scroll bars" says
+//!   always. On the alternate screen
 //!   the wheel reaches the program as arrow keys (`less`, `man`).
 //! - **Selection**: a drag selects cells, a double-click a word, a
 //!   triple-click a line, an Alt-drag a block (Shift keeps any of these
@@ -327,7 +332,23 @@ pub struct TerminalPane {
     /// Fractional wheel lines carried between events (trackpads send pixels).
     wheel_carry: f32,
     scrollbar_drag: Option<ScrollbarDrag>,
+    /// The pointer is over the scrollbar's edge strip.
     pub(crate) scrollbar_hovered: bool,
+    /// The host's padding around the grid, which the scrollbar overlays
+    /// (it runs down the area's right edge, not the grid's).
+    scrollbar_padding: scrollbar::Padding,
+    /// When the scrollbar shows, the history and offset the last frame
+    /// drew (a change is a scroll), and the timer that draws its fade out
+    /// once a scroll's linger runs out (with when it fires).
+    scrollbar_visibility: scrollbar::Visibility,
+    scrollbar_seen: Option<(usize, usize)>,
+    scrollbar_hide: Option<(Instant, Task<()>)>,
+    /// The scrollbar's opacity in the last frame (0 hidden, 1 shown).
+    scrollbar_opacity: f32,
+    /// Added to the clock the scrollbar's fades read (tests step it past a
+    /// linger without waiting).
+    #[cfg(test)]
+    pub(crate) clock_skew: Duration,
     /// Scrolling while a selection drag is held past the top (`true`) or
     /// bottom edge.
     autoscroll: Option<(bool, Task<()>)>,
@@ -576,15 +597,11 @@ impl TerminalPane {
         self.link_sink = Some(sink);
     }
 
-    /// The scrollbar thumb's bounds (window coordinates), when it shows.
-    #[cfg(feature = "visual-check")]
+    /// The scrollbar thumb's bounds (window coordinates), when there is
+    /// history to scroll (shown or not).
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn scrollbar_thumb_bounds(&self) -> Option<Bounds<Pixels>> {
-        let track = self.scrollbar_track()?;
-        let thumb = self.scrollbar_thumb()?;
-        Some(Bounds {
-            origin: gpui::point(track.right() - px(scrollbar::WIDTH + scrollbar::INSET), track.top() + px(thumb.top)),
-            size: gpui::size(px(scrollbar::WIDTH), px(thumb.height)),
-        })
+        self.scrollbar_thumb_rect()
     }
 
     /// Where the input method's candidate window would go for `range`.
@@ -647,6 +664,8 @@ impl TerminalPane {
             }),
             cx.observe_window_activation(window, |this, window, cx| this.focus_changed(window, cx)),
             cx.observe_global::<TerminalSettings>(|this, cx| this.settings_changed(cx)),
+            // "Show scroll bars" changed in System Settings.
+            cx.observe_global::<scrollbar::SystemScrollbars>(|_, cx| cx.notify()),
         ];
         let size = Size::new(80, 24);
         Self {
@@ -664,6 +683,13 @@ impl TerminalPane {
             wheel_carry: 0.0,
             scrollbar_drag: None,
             scrollbar_hovered: false,
+            scrollbar_padding: scrollbar::Padding::default(),
+            scrollbar_visibility: scrollbar::Visibility::default(),
+            scrollbar_seen: None,
+            scrollbar_hide: None,
+            scrollbar_opacity: 0.0,
+            #[cfg(test)]
+            clock_skew: Duration::ZERO,
             autoscroll: None,
             focus_handle,
             focused: false,
@@ -1289,30 +1315,132 @@ impl TerminalPane {
         }
     }
 
-    /// The scrollbar's track (the element's right edge) when the scrollbar
-    /// shows: on the normal screen, with history to scroll.
-    fn scrollbar_track(&self) -> Option<Bounds<Pixels>> {
+    /// Set the padding the pane's host puts around it (the session view's
+    /// insets, the Settings preview's), so the scrollbar runs down the
+    /// padded area's right edge, over the padding. The grid is unchanged.
+    /// Takes effect at the pane's next frame, so a host can set it as it
+    /// renders.
+    pub fn set_scrollbar_padding(&mut self, padding: scrollbar::Padding) {
+        self.scrollbar_padding = padding;
+    }
+
+    /// The host's padding the scrollbar overlays (tests).
+    #[cfg(test)]
+    pub(crate) fn scrollbar_padding(&self) -> scrollbar::Padding {
+        self.scrollbar_padding
+    }
+
+    /// The scrollbar's opacity in the last frame (tests).
+    #[cfg(test)]
+    pub(crate) fn scrollbar_opacity(&self) -> f32 {
+        self.scrollbar_opacity
+    }
+
+    /// The clock the scrollbar's fades read.
+    pub(crate) fn scrollbar_clock(&self) -> Instant {
+        #[cfg(test)]
+        return Instant::now() + self.clock_skew;
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    /// The scrollbar's rail, when there is a scrollbar: on the normal
+    /// screen, with history to scroll.
+    fn scrollbar_rail(&self) -> Option<scrollbar::Rail> {
         let g = self.geometry.as_ref()?;
         let emu = self.view.emulator();
         if !self.view.scrollback_enabled() || emu.history_len() == 0 {
             return None;
         }
-        Some(Bounds {
-            origin: gpui::point(g.bounds.right() - px(scrollbar::HIT_WIDTH), g.bounds.top()),
-            size: gpui::size(px(scrollbar::HIT_WIDTH), g.bounds.size.height),
-        })
+        Some(scrollbar::Rail::around(
+            f32::from(g.bounds.right()),
+            f32::from(g.bounds.top()),
+            f32::from(g.bounds.bottom()),
+            self.scrollbar_padding,
+        ))
     }
 
-    /// The thumb for the current scroll position, relative to the track top.
+    /// The strip along the area's right edge where the pointer reveals and
+    /// grabs the scrollbar (window coordinates).
+    pub(crate) fn scrollbar_track(&self) -> Option<Bounds<Pixels>> {
+        Some(bounds_of(self.scrollbar_rail()?.hit()))
+    }
+
+    /// The thumb for the current scroll position, along the rail.
     pub(crate) fn scrollbar_thumb(&self) -> Option<scrollbar::Thumb> {
-        let track = self.scrollbar_track()?;
+        let rail = self.scrollbar_rail()?;
         let emu = self.view.emulator();
         scrollbar::thumb(
             emu.history_len(),
             self.view.scroll_offset(),
             emu.size().rows as usize,
-            f32::from(track.size.height),
+            rail.length(),
         )
+    }
+
+    /// Where the thumb is drawn (window coordinates).
+    pub(crate) fn scrollbar_thumb_rect(&self) -> Option<Bounds<Pixels>> {
+        let rail = self.scrollbar_rail()?;
+        Some(bounds_of(rail.thumb_rect(self.scrollbar_thumb()?)))
+    }
+
+    /// What decides whether the scrollbar shows now.
+    fn scrollbar_inputs(&self, cx: &App) -> scrollbar::Inputs {
+        scrollbar::Inputs {
+            always: !scrollbar::overlay(self.settings.scrollbar, scrollbar::SystemScrollbars::overlay(cx)),
+            hovered: self.scrollbar_hovered,
+            dragging: self.scrollbar_drag.is_some(),
+            reduce_motion: cx.reduce_motion(),
+        }
+    }
+
+    /// The scrollbar's opacity this frame (0 with no scrollbar). A change in
+    /// the history or offset since the last frame is a scroll (the wheel,
+    /// the keys, the thumb, a search step, output while scrolled back;
+    /// output at the live bottom isn't one), which shows an overlay
+    /// scrollbar. Asks for frames while it fades, and sets a timer for the
+    /// fade out once a scroll's linger runs out.
+    pub(crate) fn scrollbar_frame(&mut self, now: Instant, window: &mut Window, cx: &mut Context<Self>) -> f32 {
+        let seen = self.scrollbar_rail().map(|_| (self.view.emulator().history_len(), self.view.scroll_offset()));
+        if let (Some((history, offset)), Some((was_history, was_offset))) = (seen, self.scrollbar_seen) {
+            if offset != was_offset || (offset > 0 && history != was_history) {
+                self.scrollbar_visibility.scrolled(now);
+            }
+        }
+        self.scrollbar_seen = seen;
+        if seen.is_none() {
+            self.scrollbar_opacity = 0.0;
+            return 0.0;
+        }
+        let inputs = self.scrollbar_inputs(cx);
+        let shown = self.scrollbar_visibility.frame(now, inputs);
+        if shown.animating {
+            window.request_animation_frame();
+        }
+        match self.scrollbar_visibility.hide_in(now, inputs) {
+            Some(after) if self.scrollbar_hide.as_ref().is_none_or(|(at, _)| *at != now + after) => {
+                let timer = cx.background_executor().timer(after);
+                let task = cx.spawn(async move |this, cx| {
+                    timer.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.scrollbar_hide = None;
+                        cx.notify();
+                    });
+                });
+                self.scrollbar_hide = Some((now + after, task));
+            }
+            Some(_) => {}
+            None => self.scrollbar_hide = None,
+        }
+        self.scrollbar_opacity = shown.opacity;
+        shown.opacity
+    }
+
+    /// The pointer left the window: it's off the scrollbar.
+    pub(crate) fn mouse_exited(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.scrollbar_hovered) {
+            cx.notify();
+        }
     }
 
     pub(crate) fn scrollbar_active(&self) -> bool {
@@ -1333,16 +1461,16 @@ impl TerminalPane {
     /// A press on the scrollbar: grab the thumb, or jump to the press on the
     /// track. Returns whether the scrollbar took it.
     fn scrollbar_press(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
-        let Some(track) = self.scrollbar_track() else {
+        let Some(rail) = self.scrollbar_rail() else {
             return false;
         };
-        if !track.contains(&position) {
+        if !rail.hit().contains(f32::from(position.x), f32::from(position.y)) {
             return false;
         }
         let Some(thumb) = self.scrollbar_thumb() else {
             return false;
         };
-        let y = f32::from(position.y - track.top());
+        let y = rail.along(f32::from(position.y));
         let grab = if y >= thumb.top && y <= thumb.top + thumb.height {
             y - thumb.top
         } else {
@@ -1351,7 +1479,7 @@ impl TerminalPane {
                 y,
                 emu.history_len(),
                 emu.size().rows as usize,
-                f32::from(track.size.height),
+                rail.length(),
             );
             self.scroll_to_offset(offset, cx);
             thumb.height / 2.0
@@ -1362,15 +1490,15 @@ impl TerminalPane {
     }
 
     fn scrollbar_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let (Some(drag), Some(track)) = (self.scrollbar_drag, self.scrollbar_track()) else {
+        let (Some(drag), Some(rail)) = (self.scrollbar_drag, self.scrollbar_rail()) else {
             return;
         };
         let emu = self.view.emulator();
         let offset = scrollbar::offset_for_thumb_top(
-            f32::from(position.y - track.top()) - drag.grab,
+            rail.along(f32::from(position.y)) - drag.grab,
             emu.history_len(),
             emu.size().rows as usize,
-            f32::from(track.size.height),
+            rail.length(),
         );
         self.scroll_to_offset(offset, cx);
     }
@@ -1417,12 +1545,16 @@ impl TerminalPane {
 
     /// The pointer moved: a drag of the held button, a scrollbar drag, or a
     /// plain move (link hover, and motion for a program that tracks it).
+    /// `hovered`: over the grid; `on_edge`: over the scrollbar's strip
+    /// (which reaches past the grid into the host's padding).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mouse_move(
         &mut self,
         position: Point<Pixels>,
         pressed: Option<GpuiMouseButton>,
         modifiers: gpui::Modifiers,
         hovered: bool,
+        on_edge: bool,
         cx: &mut Context<Self>,
     ) {
         self.last_pointer = Some(position);
@@ -1430,7 +1562,7 @@ impl TerminalPane {
             self.scrollbar_move(position, cx);
             return;
         }
-        let over_scrollbar = hovered && self.scrollbar_track().is_some_and(|t| t.contains(&position));
+        let over_scrollbar = (hovered || on_edge) && self.scrollbar_track().is_some_and(|t| t.contains(&position));
         if over_scrollbar != self.scrollbar_hovered {
             self.scrollbar_hovered = over_scrollbar;
             cx.notify();
@@ -1463,6 +1595,9 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         if button == GpuiMouseButton::Left && self.scrollbar_drag.take().is_some() {
+            // Let go wherever the drag took the pointer: off the edge, the
+            // scrollbar no longer holds.
+            self.scrollbar_hovered = self.scrollbar_track().is_some_and(|t| t.contains(&position));
             cx.notify();
             return;
         }
@@ -2071,6 +2206,14 @@ impl EntityInputHandler for TerminalPane {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+/// A scrollbar rectangle as gpui bounds.
+fn bounds_of(r: scrollbar::Rect) -> Bounds<Pixels> {
+    Bounds {
+        origin: gpui::point(px(r.x), px(r.y)),
+        size: gpui::size(px(r.w), px(r.h)),
     }
 }
 
