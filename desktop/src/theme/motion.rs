@@ -278,6 +278,17 @@ pub fn reset_pointers() {
     POINTERS.with(|p| p.borrow_mut().clear());
 }
 
+/// Hold `key` hovered, and pressed too if `pressed`, as if under the
+/// pointer: the components sheet's buttons in their hover and press fills
+/// (a fill layer mounted after this starts at that fill).
+#[cfg(feature = "visual-check")]
+pub fn hold_pointer(key: impl Into<SharedString>, pressed: bool) {
+    set_pointer(&key.into(), |p| {
+        p.hovered = true;
+        p.pressed = pressed;
+    });
+}
+
 fn pointer(key: &SharedString) -> Pointer {
     POINTERS.with(|p| p.borrow().get(key).copied().unwrap_or_default())
 }
