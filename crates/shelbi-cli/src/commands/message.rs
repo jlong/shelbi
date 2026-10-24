@@ -283,8 +283,9 @@ fn run_send(
     }
 
     // Undeliverable #2 — no live reader right now. The SessionStart hook
-    // writes its `tail -f` pid to `<msgs>/<id>.tail.d/pid` and clears the dir
-    // on exit; its absence means nothing is draining the log. The record is
+    // writes its `tail -f` pid to `<msgs>/<id>.tail.d/pid`, and its watchdog
+    // removes the dir once the session ends (a dispatch sweep clears any left
+    // over); its absence means nothing is draining the log. The record is
     // durable and *this* task's next session (a resume) would drain it, but as
     // of now it is not delivered — surface that with a non-zero exit so no
     // caller trusts an undelivered push.
@@ -353,8 +354,10 @@ fn wait_for_delivery(msg_id: &str, id: &str, kind: MessageKind, secs: u64) -> Re
 
 /// Check whether the SessionStart hook's `tail -f` pid file exists and
 /// names a live process on `host`. `.tail.d/pid` is the durable
-/// beacon the hook drops when it starts and clears when the pane exits
-/// (see `crates/shelbi-cli/src/commands/open/pane.rs::kill_task_tail`).
+/// beacon the hook drops when it starts; the hook's watchdog clears it
+/// within a few seconds of the session ending, and the dispatch sweep
+/// (`shelbi_orchestrator::workspace::sweep_message_tails`) clears any that
+/// predate the watchdog.
 /// Absence means no live worker tailing the log — the caller treats that
 /// as a delivery failure so the message doesn't silently vanish.
 fn tail_pid_alive(host: &Host, messages_dir: &std::path::Path, task_id: &str) -> Result<bool> {

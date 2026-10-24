@@ -2985,6 +2985,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
     }
     deploy_runner_hooks(a.host, a.worktree)?;
+    disclose_message_tail_sweep(&a, sweep_message_tails(a.host, a.worktree, Some(a.task_id)));
 
     // Decide + record the hub→workspace message channel for THIS launch. The
     // mode is derived from the runner's verified hook health (see
@@ -3584,6 +3585,34 @@ fn classify_limit_resume_screen(
         Some(current) if current == *expected_stall => LimitResumeScreen::ExpectedIncident,
         Some(_) => LimitResumeScreen::IncidentChanged,
     }
+}
+
+/// Best effort: a failed sweep never blocks the dispatch, since the leftover
+/// tails only cost a process each. Silent when there was nothing to sweep.
+fn disclose_message_tail_sweep(a: &SpawnArgs<'_>, swept: Result<Vec<SweptTail>>) {
+    let swept = match swept {
+        Ok(swept) => swept,
+        Err(e) => {
+            tracing::warn!(workspace = %a.workspace.name, error = %e, "sweeping message tails failed");
+            return;
+        }
+    };
+    if swept.is_empty() {
+        return;
+    }
+    let count = |want: fn(&SweptTail) -> bool| swept.iter().filter(|s| want(s)).count();
+    append_dispatch_status(
+        &a.project.name,
+        a.task_id,
+        &a.workspace.name,
+        "message-tails-swept",
+        &format!(
+            "stopped={} stale={} foreign={}",
+            count(|s| matches!(s, SweptTail::Stopped { .. })),
+            count(|s| matches!(s, SweptTail::Stale { .. })),
+            count(|s| matches!(s, SweptTail::Foreign { .. })),
+        ),
+    );
 }
 
 fn append_dispatch_status(project: &str, task_id: &str, workspace: &str, status: &str, detail: &str) {
@@ -4416,6 +4445,12 @@ const WORKTREE_OWNED_SKILLS_REL: &str = ".shelbi/mounted-claude-skills";
 /// `info/exclude`, so a human inspecting the file sees who put the lines there.
 const SHELBI_EXCLUDE_HEADER: &str = "# shelbi-mounted, never-committed agent context (skills/hooks)";
 
+// SessionStart hook: start the `tail -f` that streams the task's message log
+// into `<task>.unread.log` for the Stop hook to drain, plus a watchdog that
+// stops the tail once the agent session that started it is gone. Without the
+// watchdog every dispatch leaked a tail for the life of the machine (the log
+// never goes away, so `tail -f` never exits on its own); the dispatch-time
+// [`sweep_message_tails`] clears any that predate it.
 const MESSAGE_TAIL_START_SH: &str = r#"#!/bin/sh
 mkdir -p .shelbi/messages
 if [ -z "${TASK_ID:-}" ]; then
@@ -4424,14 +4459,53 @@ if [ -z "${TASK_ID:-}" ]; then
   exit 0
 fi
 LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
+LOG=.shelbi/messages/$TASK_ID.log
+# A pid file can outlive its tail and the OS may have reused the pid, so only
+# ever signal a pid whose command line is still exactly this task's tail.
+is_task_tail() {
+  case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  case "$(ps -ww -o command= -p "$1" 2>/dev/null)" in
+    "tail -f -n 0 $LOG"|*/"tail -f -n 0 $LOG") return 0 ;;
+  esac
+  return 1
+}
 if [ -f "$LOCKDIR/pid" ]; then
-  kill "$(cat "$LOCKDIR/pid")" 2>/dev/null || true
+  OLD_PID=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  if is_task_tail "$OLD_PID"; then kill "$OLD_PID" 2>/dev/null || true; fi
   rm -rf "$LOCKDIR"
 fi
 mkdir -p "$LOCKDIR"
-touch .shelbi/messages/$TASK_ID.log
-tail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &
-echo $! > "$LOCKDIR/pid"
+touch "$LOG"
+tail -f -n 0 "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
+TAIL_PID=$!
+echo "$TAIL_PID" > "$LOCKDIR/pid"
+# Watchdog: the tail must not outlive the agent session that started it.
+# The session is the first non-shell ancestor (the hook runner may wrap this
+# script in `sh -c`). Every 2s it checks that the session and the tail are alive
+# and the lock still names this tail (a newer session for the task, or
+# Shelbi's dispatch sweep, takes over by replacing or removing it). On exit it
+# stops the tail and removes the lock it still owns. Without `ps` neither the
+# ancestry nor the tail can be verified, so no watchdog runs.
+command -v ps >/dev/null 2>&1 || exit 0
+SESSION_PID=$PPID
+while :; do
+  case "$(ps -o comm= -p "$SESSION_PID" 2>/dev/null)" in
+    sh|bash|dash|zsh|ksh|*/sh|*/bash|*/dash|*/zsh|*/ksh|-*) ;;
+    *) break ;;
+  esac
+  UP=$(ps -o ppid= -p "$SESSION_PID" 2>/dev/null | tr -d ' ')
+  case "$UP" in ''|*[!0-9]*|0|1) break ;; esac
+  SESSION_PID=$UP
+done
+owns_lock() { read -r CUR 2>/dev/null < "$LOCKDIR/pid" && [ "$CUR" = "$TAIL_PID" ]; }
+(
+  trap '' HUP
+  while kill -0 "$SESSION_PID" 2>/dev/null && kill -0 "$TAIL_PID" 2>/dev/null && owns_lock; do
+    sleep 2
+  done
+  if is_task_tail "$TAIL_PID"; then kill "$TAIL_PID" 2>/dev/null; fi
+  if owns_lock; then rm -rf "$LOCKDIR"; fi
+) </dev/null >/dev/null 2>&1 &
 "#;
 
 // Stop hook: drain any messages the SessionStart `tail -f` streamed into
@@ -4604,6 +4678,104 @@ fn deploy_runner_hook_file(host: &Host, worktree: &Path, file: &RunnerHookFile) 
             Ok(())
         }
     }
+}
+
+/// Stops leftover message tails in one worktree. Arguments: `$1` the
+/// worktree, `$2` the task whose lock to leave alone (empty sweeps them all).
+/// One line per lock visited: `<verdict> <pid|-> <task-id>`. A pid is
+/// signalled only while its command line is exactly that task's `tail -f`, the
+/// same check the SessionStart hook makes, so a recycled pid is never hit.
+const MESSAGE_TAIL_SWEEP_SH: &str = r#"MSGS=$1/.shelbi/messages
+KEEP=$2
+for LOCK in "$MSGS"/*.tail.d; do
+  [ -d "$LOCK" ] || continue
+  ID=${LOCK##*/}
+  ID=${ID%.tail.d}
+  [ "$ID" = "$KEEP" ] && continue
+  PID=$(cat "$LOCK/pid" 2>/dev/null)
+  VERDICT=stale
+  case "$PID" in
+    ''|*[!0-9]*|0|1) PID=- ;;
+    *)
+      if kill -0 "$PID" 2>/dev/null; then
+        case "$(ps -ww -o command= -p "$PID" 2>/dev/null)" in
+          "tail -f -n 0 .shelbi/messages/$ID.log"|*/"tail -f -n 0 .shelbi/messages/$ID.log")
+            kill "$PID" 2>/dev/null && VERDICT=stopped ;;
+          *) VERDICT=foreign ;;
+        esac
+      fi ;;
+  esac
+  rm -rf "$LOCK"
+  printf '%s %s %s\n' "$VERDICT" "$PID" "$ID"
+done
+"#;
+
+/// What [`sweep_message_tails`] did with one `<task>.tail.d` lock. Every
+/// visited lock is removed; only `Stopped` signalled anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweptTail {
+    /// The pid was that task's live `tail -f`, and got SIGTERM.
+    Stopped { task_id: String, pid: u32 },
+    /// The pid file was missing, unparseable, or named a dead process.
+    Stale { task_id: String },
+    /// The pid is alive but is no longer that task's tail (the OS reused it),
+    /// so it was left alone.
+    Foreign { task_id: String, pid: u32 },
+}
+
+/// Stop every message `tail -f` the SessionStart hook left in `worktree`,
+/// except `keep`'s, and remove their `.tail.d` locks.
+///
+/// The hook's watchdog stops a tail once its session is gone, but tails
+/// started by an older hook have no watchdog and run until the machine
+/// reboots. Dispatch runs this before launching the next task, so those
+/// leaks clear the first time each worktree is used again, and so does any
+/// tail a watchdog missed (a host without `ps`).
+pub fn sweep_message_tails(
+    host: &Host,
+    worktree: &Path,
+    keep: Option<&str>,
+) -> Result<Vec<SweptTail>> {
+    let worktree = worktree.to_string_lossy();
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "sh",
+            "-c",
+            MESSAGE_TAIL_SWEEP_SH,
+            "sh",
+            &worktree,
+            keep.unwrap_or(""),
+        ],
+    )
+    .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("sweep message tails in {worktree}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let swept = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            let (verdict, pid, task_id) = (parts.next()?, parts.next()?, parts.next()?);
+            let task_id = task_id.to_string();
+            Some(match verdict {
+                "stopped" => SweptTail::Stopped {
+                    task_id,
+                    pid: pid.parse().ok()?,
+                },
+                "foreign" => SweptTail::Foreign {
+                    task_id,
+                    pid: pid.parse().ok()?,
+                },
+                _ => SweptTail::Stale { task_id },
+            })
+        })
+        .collect();
+    Ok(swept)
 }
 
 #[cfg(unix)]
@@ -6905,6 +7077,12 @@ pub fn remove_workspace_worktree(
 
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Stop its message tails first: deleting the directory wouldn't end a
+    // `tail -f`, and no later dispatch would ever sweep them.
+    if let Err(e) = sweep_message_tails(&host, &worktree, None) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "sweeping message tails failed");
+    }
 
     // Best-effort git deregistration — a `remove` that finds nothing
     // registered is a harmless non-zero exit — then force-delete the dir so no
@@ -9791,6 +9969,14 @@ statuses:
 
         let start_body = std::fs::read_to_string(&start).unwrap();
         assert!(start_body.contains(".shelbi/messages/$TASK_ID.tail.d"));
+        assert!(
+            start_body.contains("is_task_tail"),
+            "pid kills must be verified"
+        );
+        assert!(
+            start_body.contains("SESSION_PID"),
+            "tail must be tied to its session"
+        );
         assert!(start_body.contains(".no-task-id.log"));
 
         let stop_body = std::fs::read_to_string(&stop).unwrap();
@@ -9863,6 +10049,263 @@ statuses:
             .arg(pid.trim())
             .output();
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `kill(pid, 0)`: is the pid alive? A zombie still answers, so tests reap
+    /// their own children before asking.
+    fn process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Poll `done` every 50ms for up to `secs`, returning its last answer.
+    fn wait_until(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        done()
+    }
+
+    /// Spawn a long-lived child the test owns (and so can always reap).
+    fn spawn_quiet(worktree: &Path, argv: &[&str]) -> std::process::Child {
+        std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .current_dir(worktree)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Kill and reap a test-owned child, ignoring "already gone".
+    fn reap(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn write_tail_lock(worktree: &Path, task_id: &str, pid: &str) {
+        let lock = worktree.join(format!(".shelbi/messages/{task_id}.tail.d"));
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("pid"), pid).unwrap();
+    }
+
+    /// The leak this hook's watchdog exists for: a worker session ends (here a
+    /// stand-in `perl` process that runs the hook the way the agent CLI does,
+    /// then is killed like a torn-down pane) and its `tail -f` must stop and its
+    /// `.tail.d` lock disappear within a few seconds, instead of running forever.
+    #[test]
+    fn session_start_hook_tail_stops_when_its_session_exits() {
+        let tmp = agent_test_tmpdir("tail-watchdog");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+
+        let mut session = std::process::Command::new("perl")
+            .arg("-e")
+            .arg(r#"system("sh", "-c", ".shelbi/hooks/session-start.sh"); sleep 60"#)
+            .env("TASK_ID", "feat-x")
+            .current_dir(&worktree)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stand-in session");
+
+        let lock = worktree.join(".shelbi/messages/feat-x.tail.d");
+        let pid_path = lock.join("pid");
+        let read_pid =
+            || -> Option<u32> { std::fs::read_to_string(&pid_path).ok()?.trim().parse().ok() };
+        assert!(
+            wait_until(10, || read_pid().is_some()),
+            "hook never wrote the tail pid"
+        );
+        let tail_pid = read_pid().unwrap();
+        assert!(
+            process_alive(tail_pid),
+            "tail should run while its session is alive"
+        );
+
+        // The channel still works while the session lives.
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(worktree.join(".shelbi/messages/feat-x.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut log, b"{\"msg_id\":\"m-1\"}\n").unwrap();
+        let unread = worktree.join(".shelbi/messages/feat-x.unread.log");
+        assert!(
+            wait_until(5, || std::fs::read_to_string(&unread)
+                .unwrap_or_default()
+                .contains("m-1")),
+            "tail should stream new log lines into unread.log"
+        );
+        // Still running a beat later: the watchdog follows the session, not
+        // the hook process (which exited as soon as it started the tail).
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(
+            process_alive(tail_pid),
+            "watchdog must not stop a live session's tail"
+        );
+
+        reap(&mut session);
+        let stopped = wait_until(10, || !process_alive(tail_pid) && !lock.exists());
+        if !stopped && process_alive(tail_pid) {
+            unsafe { libc::kill(tail_pid as libc::pid_t, libc::SIGTERM) };
+        }
+        assert!(
+            stopped,
+            "tail {tail_pid} and its lock must go once the session exits"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A restarted session for the same task replaces the old lock, but only
+    /// signals the recorded pid while it is still that task's tail: here the
+    /// pid now belongs to an unrelated `sleep`, which must survive.
+    #[test]
+    fn session_start_hook_never_signals_a_recycled_pid() {
+        let tmp = agent_test_tmpdir("tail-hook-recycled");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+
+        let mut bystander = spawn_quiet(&worktree, &["sleep", "30"]);
+        write_tail_lock(&worktree, "feat-x", &bystander.id().to_string());
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(".shelbi/hooks/session-start.sh")
+            .env("TASK_ID", "feat-x")
+            .current_dir(&worktree)
+            .output()
+            .expect("run hook");
+        assert!(out.status.success());
+
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "recycled pid was signalled"
+        );
+        let pid =
+            std::fs::read_to_string(worktree.join(".shelbi/messages/feat-x.tail.d/pid")).unwrap();
+        let pid: u32 = pid.trim().parse().unwrap();
+        assert_ne!(pid, bystander.id(), "the lock should name the new tail");
+
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        reap(&mut bystander);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The dispatch sweep stops earlier tasks' tails and clears their locks,
+    /// keeps the task being started, and never signals a pid whose command
+    /// line isn't that task's tail: a recycled pid (a `sleep`) and another
+    /// task's tail recorded under the wrong lock both survive.
+    #[test]
+    fn sweep_message_tails_stops_only_verified_leftover_tails() {
+        let tmp = agent_test_tmpdir("tail-sweep");
+        let worktree = tmp.join("wt");
+        let msgs = worktree.join(".shelbi/messages");
+        std::fs::create_dir_all(&msgs).unwrap();
+        for id in ["old-a", "old-b", "keep-me", "other"] {
+            std::fs::write(msgs.join(format!("{id}.log")), "").unwrap();
+        }
+        let tail = |id: &str| format!(".shelbi/messages/{id}.log");
+
+        let mut old_a = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("old-a")]);
+        let mut old_b = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("old-b")]);
+        let mut keep = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("keep-me")]);
+        let mut recycled = spawn_quiet(&worktree, &["sleep", "30"]);
+        let mut other_tail = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("other")]);
+        let dead = {
+            let mut c = spawn_quiet(&worktree, &["sh", "-c", ":"]);
+            let pid = c.id();
+            let _ = c.wait();
+            pid
+        };
+
+        write_tail_lock(&worktree, "old-a", &old_a.id().to_string());
+        write_tail_lock(&worktree, "old-b", &format!("{}\n", old_b.id()));
+        write_tail_lock(&worktree, "keep-me", &keep.id().to_string());
+        write_tail_lock(&worktree, "recycled", &recycled.id().to_string());
+        write_tail_lock(&worktree, "misfiled", &other_tail.id().to_string());
+        write_tail_lock(&worktree, "dead", &dead.to_string());
+        std::fs::create_dir_all(msgs.join("no-pid.tail.d")).unwrap();
+
+        let mut swept = sweep_message_tails(&Host::Local, &worktree, Some("keep-me")).unwrap();
+        swept.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        let mut want = vec![
+            SweptTail::Stopped {
+                task_id: "old-a".into(),
+                pid: old_a.id(),
+            },
+            SweptTail::Stopped {
+                task_id: "old-b".into(),
+                pid: old_b.id(),
+            },
+            SweptTail::Foreign {
+                task_id: "recycled".into(),
+                pid: recycled.id(),
+            },
+            SweptTail::Foreign {
+                task_id: "misfiled".into(),
+                pid: other_tail.id(),
+            },
+            SweptTail::Stale {
+                task_id: "dead".into(),
+            },
+            SweptTail::Stale {
+                task_id: "no-pid".into(),
+            },
+        ];
+        want.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(swept, want);
+
+        let exited =
+            |c: &mut std::process::Child| wait_until(5, || c.try_wait().unwrap().is_some());
+        assert!(exited(&mut old_a), "old-a's tail should be stopped");
+        assert!(exited(&mut old_b), "old-b's tail should be stopped");
+        assert!(
+            keep.try_wait().unwrap().is_none(),
+            "the starting task's tail is kept"
+        );
+        assert!(
+            recycled.try_wait().unwrap().is_none(),
+            "a recycled pid must never be signalled"
+        );
+        assert!(
+            other_tail.try_wait().unwrap().is_none(),
+            "another task's tail must not be signalled"
+        );
+
+        let mut locks: Vec<String> = std::fs::read_dir(&msgs)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".tail.d"))
+            .collect();
+        locks.sort();
+        assert_eq!(locks, vec!["keep-me.tail.d".to_string()]);
+
+        // A worktree that never had a message channel has nothing to sweep.
+        let bare = tmp.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            sweep_message_tails(&Host::Local, &bare, None).unwrap(),
+            vec![]
+        );
+
+        for c in [
+            &mut old_a,
+            &mut old_b,
+            &mut keep,
+            &mut recycled,
+            &mut other_tail,
+        ] {
+            reap(c);
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
