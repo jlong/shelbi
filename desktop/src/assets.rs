@@ -477,6 +477,10 @@ const GLYPHS: &[(&str, &[u8])] = &[
     ("icons/glyphs/discard.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/discard.svg"))),
 ];
 
+/// The Heroicons license, for Bundled Software (`crate::licenses`): the
+/// vendored set's own `LICENSE`, kept here with the rest of its paths.
+pub const HEROICONS_LICENSE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/heroicons/LICENSE"));
+
 /// Geist, the UI typeface (SIL Open Font License 1.1, vendored with its
 /// license under `assets/fonts/geist/`, from the `geist` npm package 1.7.2).
 const GEIST: &[&[u8]] = &[

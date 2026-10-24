@@ -55,6 +55,9 @@
 //! `button-sizes` has none: each Button size with each content mix, pixel
 //! checked). `SHELBI_VISUAL_ONLY=buttons` renders just the components and
 //! the Load for review dialog's focus states.
+//! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
+//! and Bundled Software at their frames' sizes (with `state-bundled-*`);
+//! `SHELBI_VISUAL_ONLY=about` renders just those.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the issue detail.
@@ -1647,6 +1650,98 @@ impl Run {
 
     /// The form components as the Figma components page draws them, each
     /// at its variant sheet's size and positions:
+    /// About Shelbi and Bundled Software (`dt-about-bundled-software`), each
+    /// in a window of its frame's size: `about` and `bundled-software`
+    /// (Source Code Pro selected, as the frame draws it), plus the states
+    /// no frame draws: `state-bundled-first` (as it opens, the first entry
+    /// selected), `state-bundled-search` (`mit` typed), `state-bundled-crates`
+    /// (the long tail's entry) and `state-bundled-no-match`. The frames are
+    /// in `about/` as `about.png` and `bundled-software.png` (Dark only).
+    fn about_windows(&mut self) {
+        use crate::views::about::AboutView;
+        use crate::views::bundled_software::{BundledSoftwareView, SIZE};
+
+        let (w, h) = crate::views::about::SIZE;
+        let handle = self
+            .cx
+            .open_offscreen_window(size(px(w), px(h)), |window, cx| cx.new(|cx| AboutView::new(window, cx)))
+            .expect("open the offscreen window");
+        self.settle_sheet(handle.into());
+        self.write_sized(handle.into(), "about", w as u32);
+        let _ = self.cx.update_window(handle.into(), |_, window, _| window.remove_window());
+
+        let entries = crate::licenses::entries();
+        let index = |name: &str| entries.iter().position(|e| e.name == name).expect("an entry");
+        let states: [(&str, &str, Option<usize>); 5] = [
+            ("bundled-software", "", Some(index("Source Code Pro"))),
+            ("state-bundled-first", "", None),
+            ("state-bundled-search", "mit", None),
+            ("state-bundled-crates", "", Some(index("Rust crates"))),
+            ("state-bundled-no-match", "zzzz", None),
+        ];
+        for (screen, query, select) in states {
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| BundledSoftwareView::new(window, cx))
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        if !query.is_empty() {
+                            v.set_query(query, window, cx);
+                        }
+                        if let Some(ix) = select {
+                            v.select(ix, cx);
+                        }
+                    })
+                })
+                .unwrap();
+            // The license parses off the UI thread: draw until it has.
+            self.settle_sheet(window);
+            self.settle_sheet(window);
+            if screen == "bundled-software" {
+                let selected = view.read_with(&self.cx, |v, _| v.browser().selected());
+                self.expect("bundled-software: Source Code Pro selected", selected == select);
+            }
+            if screen == "state-bundled-first" {
+                let selected = view.read_with(&self.cx, |v, _| v.browser().selected());
+                self.expect("bundled-software: opens on the first entry", selected == Some(0));
+            }
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
+    /// Run and draw a window that isn't the shell a few times over.
+    fn settle_sheet(&mut self, window: AnyWindowHandle) {
+        for _ in 0..5 {
+            self.cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(20));
+            self.cx
+                .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+        self.cx.run_until_parked();
+    }
+
+    /// Save `window` as `<screen>-<theme>.png`, at 1x unless `--2x`.
+    fn write_sized(&mut self, window: AnyWindowHandle, screen: &str, width: u32) {
+        let image = self.cx.capture_screenshot(window).expect("render to image");
+        let image = if self.native || image.width() == width {
+            image
+        } else {
+            let height = image.height() * width / image.width();
+            image::imageops::resize(&image, width, height, image::imageops::FilterType::Triangle)
+        };
+        let path = self.out.join(format!("{screen}-{}.png", self.theme));
+        image.save(&path).expect("save the frame");
+        println!("saved {} ({}x{})", path.display(), image.width(), image.height());
+    }
+
     /// `components/<name>-<theme>.png`, beside the page's
     /// `components/<name>.png` (Light). Light sits on the page's `#f5f5f5`,
     /// Dark on the canvas.
@@ -1837,6 +1932,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "about") {
+            self.about_windows();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
             self.components();
             self.review_confirm_states(&orch);
@@ -1929,6 +2029,7 @@ impl Run {
         }
         self.sidebar_states(&orch);
         self.review_confirm_states(&orch);
+        self.about_windows();
 
         let missing: Vec<&str> = SCREENS
             .iter()

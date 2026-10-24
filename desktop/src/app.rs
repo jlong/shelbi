@@ -3768,7 +3768,6 @@ impl ShelbiWindow {
                 }
             }
             MenuAction::App(command) => match command {
-                AppCommand::About => self.show_about(window, cx),
                 AppCommand::Settings => self.open_settings(None, window, cx),
                 AppCommand::CloseWindow => self.close_window(window, cx),
                 AppCommand::Minimize => window.minimize_window(),
@@ -3787,18 +3786,6 @@ impl ShelbiWindow {
             },
         }
         cx.notify();
-    }
-
-    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let detail = match self.ready().and_then(|r| r.cli_version.clone()) {
-            Some(cli) => format!("Desktop {APP_VERSION}, CLI {cli}\n{}", menus::tree::DOCS_URL),
-            None => format!("Desktop {APP_VERSION}\n{}", menus::tree::DOCS_URL),
-        };
-        let answer = window.prompt(PromptLevel::Info, "Shelbi", Some(&detail), &["OK"], cx);
-        cx.spawn(async move |_, _| {
-            let _ = answer.await;
-        })
-        .detach();
     }
 
     /// Edit ▸ Paste with an overlay up: type the clipboard into its text.

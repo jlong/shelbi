@@ -12,6 +12,13 @@ top of it.
 renders or regenerates the PNG, so bundling always ships exactly the committed
 file.
 
+`shelbi-224.png` is the same icon at 224 x 224, for About Shelbi, which draws
+it at 112pt: twice the size, so it stays sharp on a Retina display (gpui
+samples a texture without mipmaps, so drawing the 1024px master that small
+would alias). It is cut from the master with
+`sips -z 224 224 shelbi-1024.png --out shelbi-224.png`; recut it whenever the
+master changes.
+
 ## Where it comes from
 
 The artwork is raster, not vector: it was generated, then finished in Figma
@@ -29,7 +36,8 @@ It replaced the earlier pixel "S" icon (an SVG rendered by
 
 1. Export the Figma component in isolation at 1024px, PNG, with transparency
    (no background fill, no extra mask).
-2. Replace `shelbi-1024.png` with it and commit it. Update the SHA-256 above.
+2. Replace `shelbi-1024.png` with it and commit it. Update the SHA-256 above,
+   and recut `shelbi-224.png` (above).
 3. Run `scripts/bundle.sh --no-build` (or a full bundle) and check the icon in
    Finder, the Dock and the app switcher, on light and dark backgrounds.
 
