@@ -9,14 +9,53 @@ if [ -z "${TASK_ID:-}" ]; then
   exit 0
 fi
 LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
+LOG=.shelbi/messages/$TASK_ID.log
+# A pid file can outlive its tail and the OS may have reused the pid, so only
+# ever signal a pid whose command line is still exactly this task's tail.
+is_task_tail() {
+  case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  case "$(ps -ww -o command= -p "$1" 2>/dev/null)" in
+    "tail -f -n 0 $LOG"|*/"tail -f -n 0 $LOG") return 0 ;;
+  esac
+  return 1
+}
 if [ -f "$LOCKDIR/pid" ]; then
-  kill "$(cat "$LOCKDIR/pid")" 2>/dev/null || true
+  OLD_PID=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  if is_task_tail "$OLD_PID"; then kill "$OLD_PID" 2>/dev/null || true; fi
   rm -rf "$LOCKDIR"
 fi
 mkdir -p "$LOCKDIR"
-touch .shelbi/messages/$TASK_ID.log
-tail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &
-echo $! > "$LOCKDIR/pid"
+touch "$LOG"
+tail -f -n 0 "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
+TAIL_PID=$!
+echo "$TAIL_PID" > "$LOCKDIR/pid"
+# Watchdog: the tail must not outlive the agent session that started it.
+# The session is the first non-shell ancestor (the hook runner may wrap this
+# script in `sh -c`). Every 2s it checks that the session and the tail are alive
+# and the lock still names this tail (a newer session for the task, or
+# Shelbi's dispatch sweep, takes over by replacing or removing it). On exit it
+# stops the tail and removes the lock it still owns. Without `ps` neither the
+# ancestry nor the tail can be verified, so no watchdog runs.
+command -v ps >/dev/null 2>&1 || exit 0
+SESSION_PID=$PPID
+while :; do
+  case "$(ps -o comm= -p "$SESSION_PID" 2>/dev/null)" in
+    sh|bash|dash|zsh|ksh|*/sh|*/bash|*/dash|*/zsh|*/ksh|-*) ;;
+    *) break ;;
+  esac
+  UP=$(ps -o ppid= -p "$SESSION_PID" 2>/dev/null | tr -d ' ')
+  case "$UP" in ''|*[!0-9]*|0|1) break ;; esac
+  SESSION_PID=$UP
+done
+owns_lock() { read -r CUR 2>/dev/null < "$LOCKDIR/pid" && [ "$CUR" = "$TAIL_PID" ]; }
+(
+  trap '' HUP
+  while kill -0 "$SESSION_PID" 2>/dev/null && kill -0 "$TAIL_PID" 2>/dev/null && owns_lock; do
+    sleep 2
+  done
+  if is_task_tail "$TAIL_PID"; then kill "$TAIL_PID" 2>/dev/null; fi
+  if owns_lock; then rm -rf "$LOCKDIR"; fi
+) </dev/null >/dev/null 2>&1 &
 
 ========
 .shelbi/hooks/stop.sh
