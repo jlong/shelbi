@@ -145,6 +145,7 @@ pub fn run_app_command(command: AppCommand, cx: &mut App) -> bool {
         AppCommand::HideOthers => cx.hide_other_apps(),
         AppCommand::ShowAll => cx.unhide_other_apps(),
         AppCommand::QuitClient => cx.quit(),
+        AppCommand::About => crate::views::about::show_about(cx),
         AppCommand::Documentation => cx.open_url(tree::DOCS_URL),
         AppCommand::ReportIssue => cx.open_url(tree::ISSUES_URL),
         // The terminal font is app-wide: every window's terminals follow.
@@ -157,8 +158,7 @@ pub fn run_app_command(command: AppCommand, cx: &mut App) -> bool {
         AppCommand::FontActualSize => {
             TerminalSettings::zoom(FontZoom::ActualSize, cx);
         }
-        AppCommand::About
-        | AppCommand::Settings
+        AppCommand::Settings
         | AppCommand::CloseWindow
         | AppCommand::Minimize
         | AppCommand::Zoom

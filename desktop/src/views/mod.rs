@@ -40,10 +40,14 @@
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
 //! - the new-release notice: **`dt-packaging`** (`update`)
+//! - About Shelbi and the Bundled Software window it opens:
+//!   **`dt-about-bundled-software`** (`about`, `bundled_software`, over
+//!   `crate::licenses`)
 //!
 //! Views read view models and invoke registry commands through
 //! `crate::commands`; they never hold domain logic of their own.
 
+pub mod about;
 pub mod activity;
 pub mod activity_labels;
 mod activity_list;
@@ -56,6 +60,7 @@ pub mod agent_editor_state;
 pub mod board_list;
 pub mod board_scroll;
 pub mod bootstrap;
+pub mod bundled_software;
 pub mod board_state;
 pub mod chat;
 pub mod column_swap;

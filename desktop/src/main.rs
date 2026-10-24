@@ -23,6 +23,7 @@ mod drops;
 mod elements;
 mod feeds;
 mod keys;
+mod licenses;
 mod menus;
 mod notify;
 mod platform;
