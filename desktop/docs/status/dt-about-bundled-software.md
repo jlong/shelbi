@@ -57,7 +57,8 @@ window listing what the app ships from others, each with its full license
   name or license (and by the long tail's crate names and licenses, so
   `serde` finds "Rust crates"); the rows (48pt: name in
   `Desktop/Small/Medium`, license under it in `Desktop/X-Small/Regular`
-  muted); the footer "Software, fonts, and icons". ↑ / ↓ move the
+  muted), filling the column to its bottom padding (the frame's footer
+  caption was dropped in `dt-bundled-drop-footer`). ↑ / ↓ move the
   selection through the shown rows (scrolling it into view), a click
   selects, ⌘F goes to the search, Esc in the search clears it or hands the
   keys back. It opens on the first entry.
@@ -217,9 +218,9 @@ paragraphs all land on the frame's pixels.
   font used in Shelbi's terminal."). Crate attributions carry the version.
 - **View source** goes to the homepage or repository: for the long tail,
   the lockfile on GitHub.
-- **The footer** is pinned to the column's bottom (the frame's sits under
-  its 12 rows, which fill the column); with 14 rows the list scrolls above
-  it.
+- **No footer**: the frame's "Software, fonts, and icons" caption under
+  the rows added nothing and was dropped (`dt-bundled-drop-footer`); the
+  list runs to the column's bottom padding and scrolls there.
 - **Symbols Nerd Font Mono** shows the font's MIT license and a paragraph
   naming the glyph sets' licenses (from its README); their full texts live
   in Nerd Fonts' `license-audit.md`, not vendored here.

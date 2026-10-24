@@ -6,7 +6,7 @@
 //! which closes the window as ⌘W does. On the left (280pt, the toolbar's
 //! tint) a search over the names and licenses, the list (name, license
 //! under it; the selected row in the row-selected fill, ↑ / ↓ move it, ⌘F
-//! searches) and its footer. On the right the selected entry: its name,
+//! searches), filling the pane. On the right the selected entry: its name,
 //! who made it and what it is, View source (its homepage or repository in
 //! the browser), what it does in Shelbi, a rule, then its license under the
 //! license's name, scrollable, selectable and copyable. The window opens on
@@ -288,13 +288,6 @@ impl BundledSoftwareView {
                     .overflow_y_scroll()
                     .track_scroll(&self.list_scroll)
                     .children(rows),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .type_style(Type::XSmall)
-                    .text_color(theme.muted)
-                    .child("Software, fonts, and icons"),
             )
     }
 
