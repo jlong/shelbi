@@ -1,5 +1,5 @@
 //! Three jobs: embed `macos/Info.plist` in the binary's `__TEXT,__info_plist`
-//! section, generate Bundled Software's crate list ([`licenses`]), and set
+//! section, generate Acknowledgements' crate list ([`licenses`]), and set
 //! `SHELBI_BUILD_YEAR`, the year About's copyright line shows
 //! (`SOURCE_DATE_EPOCH`'s year when set, for a reproducible build, else
 //! the clock's).

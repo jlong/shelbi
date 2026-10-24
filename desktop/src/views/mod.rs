@@ -40,7 +40,7 @@
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
 //! - the new-release notice: **`dt-packaging`** (`update`)
-//! - About Shelbi and the Bundled Software window it opens:
+//! - About Shelbi and the Acknowledgements window it opens:
 //!   **`dt-about-bundled-software`** (`about`, `bundled_software`, over
 //!   `crate::licenses`)
 //!

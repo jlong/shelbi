@@ -56,7 +56,7 @@
 //! checked). `SHELBI_VISUAL_ONLY=buttons` renders just the components and
 //! the Load for review dialog's focus states.
 //! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
-//! and Bundled Software at their frames' sizes (with `state-bundled-*`);
+//! and Acknowledgements at their frames' sizes (with `state-bundled-*`);
 //! `SHELBI_VISUAL_ONLY=about` renders just those.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
@@ -1650,7 +1650,7 @@ impl Run {
 
     /// The form components as the Figma components page draws them, each
     /// at its variant sheet's size and positions:
-    /// About Shelbi and Bundled Software (`dt-about-bundled-software`), each
+    /// About Shelbi and Acknowledgements (`dt-about-bundled-software`), each
     /// in a window of its frame's size: `about` and `bundled-software`
     /// (Source Code Pro selected, as the frame draws it), plus the states
     /// no frame draws: `state-bundled-first` (as it opens, the first entry

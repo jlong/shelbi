@@ -1,4 +1,4 @@
-//! What the app ships from others, for the Bundled Software window
+//! What the app ships from others, for the Acknowledgements window
 //! (`dt-about-bundled-software`): the fonts, the icon sets and the notable
 //! crates, each with its full license text, plus one entry for the long
 //! tail of Rust crates.
@@ -33,7 +33,7 @@ mod generated {
 
 pub use generated::{CRATES, SHIPPED};
 
-/// One row of Bundled Software and the detail it opens.
+/// One row of Acknowledgements and the detail it opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The row's and the detail's name.
@@ -248,7 +248,7 @@ fn build() -> Vec<Entry> {
     list
 }
 
-/// Bundled Software's list: the search and the selected entry, as indices
+/// Acknowledgements' list: the search and the selected entry, as indices
 /// into [`entries`]. The selection stays on a row the search shows: one it
 /// hides moves to the first that matches, and with nothing matching there is
 /// none until the search shows rows again.
