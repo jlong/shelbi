@@ -1,13 +1,13 @@
 //! The About Shelbi window (`dt-about-bundled-software`, Figma "About
 //! Shelbi · Dark", 2431:8310) and the two small windows' lifecycle: About
-//! and Bundled Software ([`super::bundled_software`]) each open once, and
+//! and Acknowledgements ([`super::bundled_software`]) each open once, and
 //! asking again brings the open one to the front.
 //!
 //! About is a fixed 400 × 520 window with only the traffic lights (not
 //! resizable, so no zoom, and no minimize): the app icon at 112pt, the name
-//! and this build's version, the tagline, the project's links, Bundled
-//! Software, and the copyright and license. Every link opens in the
-//! browser except Bundled Software, which opens its window. ⌘W closes it.
+//! and this build's version, the tagline, the project's links,
+//! Acknowledgements, and the copyright and license. Every link opens in the
+//! browser except Acknowledgements, which opens its window. ⌘W closes it.
 
 use std::sync::{Arc, LazyLock};
 
@@ -49,7 +49,7 @@ static ICON_IMAGE: LazyLock<Arc<Image>> = LazyLock::new(|| {
     ))
 });
 
-/// The open About and Bundled Software windows (a closed one's handle
+/// The open About and Acknowledgements windows (a closed one's handle
 /// fails to update, so it opens anew).
 #[derive(Default)]
 struct Windows {
@@ -103,7 +103,7 @@ pub fn show_about(cx: &mut App) {
     }
 }
 
-/// About's Bundled Software: its window, or the open one to the front.
+/// About's Acknowledgements: its window, or the open one to the front.
 pub fn show_bundled_software(cx: &mut App) {
     if !cx.has_global::<Windows>() {
         cx.set_global(Windows::default());
@@ -112,12 +112,12 @@ pub fn show_bundled_software(cx: &mut App) {
         return;
     }
     let size = super::bundled_software::SIZE;
-    let opened = cx.open_window(options("Bundled Software", size, true, cx), |window, cx| {
+    let opened = cx.open_window(options("Acknowledgements", size, true, cx), |window, cx| {
         cx.new(|cx| BundledSoftwareView::new(window, cx))
     });
     match opened {
         Ok(handle) => cx.global_mut::<Windows>().bundled = Some(handle),
-        Err(e) => tracing::error!(error = %e, "could not open Bundled Software"),
+        Err(e) => tracing::error!(error = %e, "could not open Acknowledgements"),
     }
 }
 
@@ -200,7 +200,7 @@ impl Render for AboutView {
             .child(url_link("about-website", "Website", WEBSITE_URL, theme.link, &theme))
             .child(url_link("about-docs", "Documentation", DOCS_URL, theme.link, &theme))
             .child(url_link("about-github", "GitHub", GITHUB_URL, theme.link, &theme));
-        let bundled = link("about-bundled", "Bundled Software", theme.link, &theme)
+        let bundled = link("about-bundled", "Acknowledgements", theme.link, &theme)
             .type_style(Type::SmallMedium)
             .on_click(|_: &ClickEvent, _, cx| show_bundled_software(cx));
         let credits = div()
@@ -324,7 +324,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| cx.windows().len()), before + 1, "About again raises the open one");
 
-        // Bundled Software from About's link, then again.
+        // Acknowledgements from About's link, then again.
         let about = cx.update(|cx| cx.global::<Windows>().about).unwrap();
         let vcx = &mut VisualTestContext::from_window(about.into(), cx);
         vcx.run_until_parked();

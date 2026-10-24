@@ -1,4 +1,4 @@
-//! Bundled Software's generated data (`dt-about-bundled-software`): every
+//! Acknowledgements' generated data (`dt-about-bundled-software`): every
 //! Rust crate compiled into the app, with its license texts, read at build
 //! time from `cargo metadata` and the crates' own files.
 //!
@@ -38,7 +38,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Crates Bundled Software lists on their own (with the license files it
+/// Crates Acknowledgements lists on their own (with the license files it
 /// shows for them), so the generated long tail leaves them out.
 const LONG_TAIL_SKIP: &[&str] = &[
     "alacritty_terminal",

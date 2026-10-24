@@ -1,4 +1,4 @@
-//! The Bundled Software window (`dt-about-bundled-software`, Figma "Bundled
+//! The Acknowledgements window (`dt-about-bundled-software`, Figma "Bundled
 //! Software · Dark", 2453:8397): the third-party software, fonts and icons
 //! the app ships ([`crate::licenses`]), each with its full license.
 //!
@@ -41,7 +41,7 @@ const ROW_H: f32 = 48.0;
 /// The license text's paragraph gap: one blank line of its 18pt.
 const PARAGRAPH_GAP: f32 = 18.0;
 
-/// The Bundled Software window.
+/// The Acknowledgements window.
 pub struct BundledSoftwareView {
     browser: Browser,
     search: Entity<InputState>,
@@ -173,7 +173,7 @@ impl BundledSoftwareView {
                     .min_w_0()
                     .type_style(Type::BaseSemibold)
                     .text_color(theme.text_loud)
-                    .child("Bundled Software"),
+                    .child("Acknowledgements"),
             )
             .child(done)
     }
@@ -210,7 +210,7 @@ impl BundledSoftwareView {
                         .flex()
                         .items_center()
                         .text_color(theme.form_hint)
-                        .child("Search bundled software"),
+                        .child("Search acknowledgements"),
                 )
             });
         let refocus = focus.clone();
@@ -445,10 +445,10 @@ impl Render for BundledSoftwareView {
 /// a new one every time.
 #[cfg(test)]
 pub fn open_for_test(cx: &mut gpui::App) -> gpui::WindowHandle<BundledSoftwareView> {
-    cx.open_window(super::about::options("Bundled Software", SIZE, true, cx), |window, cx| {
+    cx.open_window(super::about::options("Acknowledgements", SIZE, true, cx), |window, cx| {
         cx.new(|cx| BundledSoftwareView::new(window, cx))
     })
-    .expect("open Bundled Software")
+    .expect("open Acknowledgements")
 }
 
 #[cfg(test)]

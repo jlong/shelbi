@@ -8,6 +8,14 @@ Shelbi ▸ About Shelbi used to show a system alert ("Desktop 0.11.0, CLI
 window listing what the app ships from others, each with its full license
 (Figma "Bundled Software · Dark", 2453:8397).
 
+**Renamed (`dt-rename-acknowledgements`):** the second window is now
+titled **Acknowledgements**, the usual Mac name for it: About's link, the
+titlebar, the macOS window title and the search placeholder ("Search
+acknowledgements") all say so. Code identifiers (`BundledSoftwareView`,
+`bundled_software.rs`, the `about-bundled` / `bundled-*` selectors, the
+`state-bundled-*` visual states) and the Figma frame name keep the old
+name; the sections below describe the window as first built.
+
 ```
  ● ● ●                                   ● ● ●  Bundled Software                     [Done]
             [icon 112pt]                 ┌──────────────────────┬──────────────────────────────┐
