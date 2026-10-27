@@ -45,6 +45,8 @@ use shelbi_core::{
 };
 use shelbi_state::workflow_config::{ConfigError, Saved, WorkflowConfig};
 
+use shelbi_app::settings::LeaveGuard;
+
 use super::workflows_state::sentence;
 
 /// The transition actions, in the order the action picker lists them.
@@ -418,10 +420,9 @@ pub struct EditorState {
     errors: Vec<(Field, String)>,
     /// Comments the last save dropped.
     notice: Option<String>,
-    /// The leave prompt, while it asks.
-    prompt: Option<Leave>,
-    /// What to do once the save in flight lands.
-    after_save: Option<Leave>,
+    /// The leave prompt while it asks, and where to go once the save it
+    /// started lands (`shelbi_app::settings::LeaveGuard`, shared with the TUI).
+    guard: LeaveGuard<Leave>,
     /// A save, a duplicate or a delete is running.
     busy: bool,
     /// The files changed on disk under the last save: Discard reloads.
@@ -444,8 +445,7 @@ impl EditorState {
             project_git: ProjectGit::default(),
             errors: Vec::new(),
             notice: None,
-            prompt: None,
-            after_save: None,
+            guard: LeaveGuard::default(),
             busy: false,
             stale: false,
         }
@@ -820,7 +820,7 @@ impl EditorState {
         }
         let typed = self.typed_name.trim().to_string();
         if refused || !self.is_dirty() {
-            self.after_save = None;
+            self.guard.forget_save();
             return None;
         }
         self.busy = true;
@@ -860,7 +860,7 @@ impl EditorState {
                         lines.iter().map(move |l| format!("{file}: {}", l.trim()))
                     })
                     .collect();
-                let then = self.after_save.take();
+                let then = self.guard.saved(true);
                 self.reset(saved.config, &name);
                 if !dropped.is_empty() {
                     self.notice = Some(format!("The save dropped these comments: {}", dropped.join("; ")));
@@ -870,7 +870,7 @@ impl EditorState {
             Err((field, e)) => {
                 self.stale = e.starts_with("Changed on disk");
                 self.set_error(field, e);
-                self.after_save = None;
+                self.guard.forget_save();
                 None
             }
         }
@@ -909,32 +909,28 @@ impl EditorState {
     /// Ask to leave for `then`: `Some(then)` to go now, or `None` while the
     /// prompt asks to save or discard the unsaved edits first.
     pub fn leave(&mut self, then: Leave) -> Option<Leave> {
-        if self.is_dirty() {
-            self.prompt = Some(then);
-            None
-        } else {
-            Some(then)
-        }
+        let dirty = self.is_dirty();
+        self.guard.leave(then, dirty)
     }
 
     pub fn prompt(&self) -> Option<Leave> {
-        self.prompt
+        self.guard.prompt().copied()
     }
 
     pub fn cancel_prompt(&mut self) {
-        self.prompt = None;
+        self.guard.cancel();
     }
 
     /// The prompt's Discard: drop the edits and go.
     pub fn discard_and_leave(&mut self) -> Option<Leave> {
-        let then = self.prompt.take();
+        let then = self.guard.discard();
         self.discard();
         then
     }
 
     /// The prompt's Save: save, then go once it lands ([`EditorState::saved`]).
     pub fn save_and_leave(&mut self, texts: Vec<Change>) -> Option<SaveJob> {
-        self.after_save = self.prompt.take();
+        self.guard.save();
         self.begin_save(texts)
     }
 

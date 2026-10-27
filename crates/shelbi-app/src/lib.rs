@@ -22,6 +22,9 @@
 //!   review load, reject reason, Zen intro, add project), keyed on
 //!   toolkit-free chords so both clients drive the same decision tables;
 //!   [`command_model`] builds the palette's inputs from live state.
+//! - [`settings`] — Settings' pages and sections, the settings sidebar's
+//!   navigation over the pages a client offers, and the hooks a page uses
+//!   for background loads and saves and the unsaved-edits leave prompt.
 //! - [`theme`] — the named color tokens (dark and light) both clients
 //!   paint with, and the `theme:` preference resolution.
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
@@ -59,6 +62,7 @@ pub mod reachability;
 pub mod refresh;
 pub mod review;
 pub mod session;
+pub mod settings;
 pub mod supervision;
 pub mod theme;
 pub mod view;

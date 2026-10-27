@@ -30,6 +30,9 @@ pub enum Effect {
     OpenEditor { target: EditTarget },
     /// Open the per-project error log.
     OpenErrorLog { project: String },
+    /// Open Settings in place of the navigation column, on the page last
+    /// used (a client-local view change; nothing stops).
+    OpenSettings,
     /// Switch the client to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow (the host collects the form, then calls

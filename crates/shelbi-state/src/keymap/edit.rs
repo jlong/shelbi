@@ -207,8 +207,8 @@ fn chords_value(chords: &[KeyChord]) -> Value {
 }
 
 /// `s` as a YAML scalar: plain when it can only read as that string, else
-/// single-quoted (`'?'`, `'1'`, `'-'`).
-fn yaml_scalar(s: &str) -> String {
+/// single-quoted (`'?'`, `'1'`, `'-'`, `','`).
+pub fn yaml_scalar(s: &str) -> String {
     const WORDS: &[&str] = &["true", "false", "null", "yes", "no", "on", "off", "y", "n"];
     let plain = s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | '='))

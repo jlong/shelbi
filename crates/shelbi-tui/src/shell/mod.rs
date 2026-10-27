@@ -24,6 +24,7 @@ mod refresh;
 use shelbi_app::session::relaunch;
 mod review;
 mod session;
+mod settings;
 mod sidebar;
 mod workspace;
 mod terminal_view;
@@ -63,7 +64,9 @@ use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
 use shelbi_core::{ConfigMode, IssueTrackerConfig};
 use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
-use shelbi_state::keymap::{load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps};
+use shelbi_state::keymap::{
+    load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps, SidebarAction,
+};
 use shelbi_term::Size;
 
 use crate::theme::palette;
@@ -75,11 +78,32 @@ use overlays::{ActiveOverlay, OverlayEvent};
 use refresh::ShellSnapshot;
 use review::{ReviewAction, ReviewInterface};
 use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
+use settings::{SettingsAction, SettingsShell};
+use shelbi_app::settings::summary::GeneralSummary;
+use shelbi_app::settings::Ticket;
 use sidebar::{RowTarget, SidebarView};
 use workspace::{WorkspaceAction, WorkspaceInterface};
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+
+/// Where Back returns to when Settings closes: the focus and the sidebar
+/// selection it was opened over. (The view under it is `main_view`, which
+/// Settings never changes: a review that closes meanwhile lands under it.)
+#[derive(Debug, Clone, Copy)]
+struct SettingsReturn {
+    focus: Focus,
+    selection: usize,
+}
+
+/// What a Settings background job sends back.
+enum SettingsMsg {
+    Loaded(Ticket, Box<GeneralSummary>),
+    Saved(Ticket, Result<(), String>),
+}
+
+/// Reads the General summary for a project (blocking; run off the UI thread).
+type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
 
 /// Resolved inputs the shell needs to build a [`ReviewInterface`], read off the
 /// UI thread (board + project config lookups).
@@ -348,6 +372,10 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if let Some(path) = state.pending_editor.take() {
             state.status = Some(run_editor(&mut term, &path));
             state.reported_main = None;
+            // Opened from Settings: what it summarizes may have changed.
+            if state.settings_open() {
+                state.load_settings(true);
+            }
             state.dirty = true;
         }
 
@@ -447,6 +475,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_startup() {
+            state.dirty = true;
+        }
+        if state.poll_settings() {
             state.dirty = true;
         }
         if ring {
@@ -1073,6 +1104,17 @@ struct ShellState {
     /// palette also always opens on Ctrl+Space (the plan's reserved key), so the
     /// opener is the union of this chord and Ctrl+Space.
     palette_chord: Option<KeyChord>,
+    /// Settings (`tui-settings-shell`): its pages' state, kept across visits.
+    settings: SettingsShell,
+    /// `Some` while Settings shows, standing in the sidebar's column and the
+    /// main area over the view: what Back restores.
+    settings_return: Option<SettingsReturn>,
+    /// Settings' background loads and saves report here. One channel for all
+    /// of them, so a superseded load still lands and its ticket drops it.
+    settings_tx: Sender<SettingsMsg>,
+    settings_rx: Receiver<SettingsMsg>,
+    /// Reads Settings' General summary (disk in production; a fixture in tests).
+    settings_reader: SettingsReader,
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
@@ -1153,6 +1195,13 @@ impl ShellState {
             }
             c
         };
+        let (settings_tx, settings_rx) = std::sync::mpsc::channel();
+        // Tests never read the real `~/.shelbi` (and `load_project` may migrate).
+        #[cfg(not(test))]
+        let settings_reader: SettingsReader =
+            Arc::new(shelbi_app::settings::summary::read);
+        #[cfg(test)]
+        let settings_reader: SettingsReader = Arc::new(settings::fixture_summary);
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1201,6 +1250,11 @@ impl ShellState {
             notice,
             overlay: None,
             palette_chord,
+            settings: SettingsShell::default(),
+            settings_return: None,
+            settings_tx,
+            settings_rx,
+            settings_reader,
             status: None,
             job: None,
             pending_editor: None,
@@ -1634,6 +1688,15 @@ impl ShellState {
         // replaces any still-pending startup job, dropping its receiver.
         self.status = Some(STARTUP_STATUS.to_string());
         self.spawn_startup();
+        // Settings stays up on the same page, now for the new project: its
+        // project data reloads, and a load still in flight for the old one is
+        // dropped when it lands. Back lands on the new project's sidebar.
+        if let Some(ret) = self.settings_return.as_mut() {
+            ret.focus = Focus::Sidebar;
+            ret.selection = 0;
+            self.settings.project_changed();
+            self.load_settings(false);
+        }
         self.dirty = true;
     }
 
@@ -1783,6 +1846,11 @@ impl ShellState {
     /// can keep typing there afterward. Native board/activity/machines views
     /// have no terminal session, so a drop over one is a no-op.
     fn deliver_paste(&mut self, text: &str) {
+        // Settings has no text field yet; a paste (or a dropped file) never
+        // reaches the session hidden under it.
+        if self.settings_open() {
+            return;
+        }
         match self.main_view {
             MainView::Session => {
                 self.client.focus_main();
@@ -1833,6 +1901,13 @@ impl ShellState {
             self.dirty = true;
             return;
         }
+        // Settings holds every other key while it shows: none reaches the
+        // session (or the board) under it.
+        if self.settings_open() {
+            let action = self.settings.handle_key(k, &self.keymaps);
+            self.apply_settings_action(action);
+            return;
+        }
         if self.focus_is_main() {
             self.handle_main_key(k);
         } else {
@@ -1857,6 +1932,15 @@ impl ShellState {
     /// (left) and the main pane (right). Moving to the pane that already has
     /// focus is a harmless no-op.
     fn move_focus(&mut self, action: GlobalAction) {
+        // Over Settings the moves step between its sidebar and its page.
+        if self.settings_open() {
+            match action {
+                GlobalAction::FocusSidebar => self.settings.set_region(settings::Region::Sidebar),
+                GlobalAction::FocusMain => self.settings.set_region(settings::Region::Page),
+                _ => {}
+            }
+            return;
+        }
         if matches!(self.main_view, MainView::Review(_)) {
             // The review always owns the main area while open (opening it
             // focuses main); keep that invariant, then move within it.
@@ -1923,6 +2007,126 @@ impl ShellState {
         if let Some(ActiveOverlay::Palette(p)) = &mut self.overlay {
             p.focus_projects();
         }
+    }
+
+    // --- Settings (tui-settings-shell) -------------------------------------
+
+    /// Whether Settings shows over the view.
+    fn settings_open(&self) -> bool {
+        self.settings_return.is_some()
+    }
+
+    /// Open Settings over the current view, on the page last shown: it takes
+    /// the sidebar's column and the main area, and the keys. Nothing under it
+    /// stops: the sessions stay attached and keep streaming, a review or
+    /// workspace interface stays built, and Back returns to all of it.
+    fn open_settings(&mut self) {
+        if self.settings_open() {
+            return;
+        }
+        self.settings_return = Some(SettingsReturn {
+            focus: self.client.focus(),
+            selection: self.client.sidebar_selection(),
+        });
+        self.settings.open();
+        self.load_settings(false);
+        self.dirty = true;
+    }
+
+    /// Leave Settings (Back, Esc): the view under it shows again, with the
+    /// focus and sidebar selection it was opened over.
+    fn leave_settings(&mut self) {
+        let Some(ret) = self.settings_return.take() else {
+            return;
+        };
+        match ret.focus {
+            Focus::Main => self.client.focus_main(),
+            Focus::Sidebar => self.client.focus_sidebar(),
+        }
+        let count = self
+            .sidebar_view()
+            .map(|v| v.selectable_count())
+            .unwrap_or(0);
+        self.client.select(ret.selection, count);
+        self.dirty = true;
+    }
+
+    /// Load the shown Settings page's data off the UI thread (unless it is
+    /// loaded for this project already and `force` is off). The result comes
+    /// back through `settings_rx` under the load's ticket.
+    fn load_settings(&mut self, force: bool) {
+        let project = self.client.project().map(str::to_string);
+        let Some(ticket) = self.settings.begin_load(project.as_deref(), force) else {
+            return;
+        };
+        let reader = self.settings_reader.clone();
+        let tx = self.settings_tx.clone();
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings".into())
+            .spawn(move || {
+                let summary = reader(project.as_deref());
+                let _ = tx.send(SettingsMsg::Loaded(sent, Box::new(summary)));
+            });
+        if let Err(e) = spawned {
+            self.settings
+                .loaded(&ticket, Err(format!("couldn't start the read: {e}")));
+        }
+    }
+
+    /// Start the shown page's save (the unsaved-edits prompt's Save) off the
+    /// UI thread.
+    fn save_settings(&mut self) {
+        let project = self.client.project().map(str::to_string);
+        let Some((ticket, work)) = self.settings.begin_save(project.as_deref()) else {
+            return;
+        };
+        let tx = self.settings_tx.clone();
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-save".into())
+            .spawn(move || {
+                let _ = tx.send(SettingsMsg::Saved(sent, work()));
+            });
+        if let Err(e) = spawned {
+            let action = self
+                .settings
+                .saved(&ticket, Err(format!("couldn't start the save: {e}")));
+            self.apply_settings_action(action);
+        }
+    }
+
+    /// Drain Settings' finished loads and saves. Returns whether any landed.
+    fn poll_settings(&mut self) -> bool {
+        let mut landed = false;
+        while let Ok(msg) = self.settings_rx.try_recv() {
+            landed = true;
+            match msg {
+                SettingsMsg::Loaded(ticket, summary) => {
+                    self.settings.loaded(&ticket, Ok(*summary));
+                }
+                SettingsMsg::Saved(ticket, result) => {
+                    let action = self.settings.saved(&ticket, result);
+                    self.apply_settings_action(action);
+                }
+            }
+        }
+        landed
+    }
+
+    /// Carry out what a Settings key or click asked for.
+    fn apply_settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::Stay => {}
+            SettingsAction::Leave => self.leave_settings(),
+            SettingsAction::SwitchProject(project) => self.switch_project(&project),
+            SettingsAction::OpenSwitcher => self.open_project_switcher(),
+            SettingsAction::Run(effect) => self.dispatch_effect(effect),
+            SettingsAction::Load => self.load_settings(false),
+            SettingsAction::Reload => self.load_settings(true),
+            SettingsAction::Save => self.save_settings(),
+        }
+        self.dirty = true;
     }
 
     /// Act on what the active overlay yielded.
@@ -2152,6 +2356,16 @@ impl ShellState {
             tap.push(effect);
             return;
         }
+        // A view the user picked elsewhere (the palette over Settings) takes
+        // the main area: Settings closes for it.
+        if self.settings_open()
+            && matches!(
+                effect,
+                Effect::ShowView(_) | Effect::FocusWorkspace { .. } | Effect::LoadReview { .. }
+            )
+        {
+            self.settings_return = None;
+        }
         match effect {
             Effect::ShowView(v) => self.show_view_effect(v),
             Effect::FocusWorkspace { workspace, .. } => {
@@ -2162,9 +2376,16 @@ impl ShellState {
                 self.overlay = Some(ActiveOverlay::error_log(project));
             }
             Effect::OpenEditor { target } => self.open_editor(&target),
+            Effect::OpenSettings => self.open_settings(),
             // A bare switch (the palette's "Switch Project") picks the target in
             // the Projects column; a named one switches.
             Effect::SwitchProject { project } if project.is_empty() => self.open_project_switcher(),
+            // Over Settings, a switch asks the shown page first (it may hold
+            // unsaved edits); Settings then stays up for the new project.
+            Effect::SwitchProject { project } if self.settings_open() => {
+                let action = self.settings.request(settings::Leave::Project(project));
+                self.apply_settings_action(action);
+            }
             Effect::SwitchProject { project } => self.switch_project(&project),
             Effect::AddProject => {
                 // Open the in-process add-project form over the main area. On
@@ -3064,6 +3285,14 @@ impl ShellState {
     }
 
     fn handle_sidebar_key(&mut self, k: KeyEvent) {
+        // The sidebar keymap's open-Settings key (`,` by default).
+        let open_settings = crate::keymap::chord_from_event(k)
+            .and_then(|c| self.keymaps.sidebar.dispatch(c))
+            == Some(SidebarAction::OpenSettings);
+        if open_settings {
+            self.open_settings();
+            return;
+        }
         let count = self
             .sidebar_view()
             .map(|v| v.selectable_count())
@@ -3308,6 +3537,14 @@ impl ShellState {
             self.update_sidebar_drag(m.column);
             return;
         }
+        // Settings owns both columns while it shows.
+        if self.settings_open() {
+            let sidebar = self.sidebar_content_rect();
+            let main = self.main_rect;
+            let action = self.settings.handle_mouse(m, sidebar, main);
+            self.apply_settings_action(action);
+            return;
+        }
         // While a review is open the panel occupies the sidebar column and the
         // content view the main area, so the review interface owns clicks in
         // both rects — except the divider press-drag-release handled above
@@ -3443,6 +3680,11 @@ impl ShellState {
                     if view.search_box_hit(self.sidebar_content_rect(), m.column, m.row) {
                         self.open_palette();
                         self.dirty = true;
+                        return;
+                    }
+                    // The gear beside the project title opens Settings.
+                    if view.settings_hit(self.sidebar_content_rect(), m.column, m.row) {
+                        self.open_settings();
                         return;
                     }
                     if let Some(sel) = view.hit(self.sidebar_content_rect(), m.column, m.row) {
@@ -3734,6 +3976,18 @@ fn draw_frame<B: ratatui::backend::Backend>(
     // Either sidebar-column interface suppresses the nav sidebar and the shell's
     // bottom status band (each carries its own column + status line).
     let is_panel = is_review || is_workspace;
+    // Settings stands over all of it: its sidebar in the column, its page in
+    // the main area. What's under it isn't drawn (its sessions keep running).
+    let is_settings = state.settings_return.is_some();
+    let project_label = state
+        .sidebar_model
+        .as_ref()
+        .map(|m| m.project_label.clone())
+        .or_else(|| state.client.project().map(str::to_string))
+        .unwrap_or_else(|| "No project".to_string());
+    let settings = &mut state.settings;
+    let keymaps = &state.keymaps;
+    let display_style = state.display_style;
     let kanban = &mut state.kanban;
     let activity = &mut state.activity;
     let machines = &mut state.machines;
@@ -3744,6 +3998,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // Native views render through the `Frame` (their own `render_full`), so
         // they must run before the shared buffer is taken below.
         match &main_view {
+            _ if is_settings => {}
             MainView::Native(View::Issues) => crate::kanban::render_full(frame, kanban, main_rect),
             MainView::Native(View::Activity) => {
                 crate::activity::render_full(frame, activity, main_rect)
@@ -3769,7 +4024,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
             // interface is open: then that panel takes the sidebar's column
             // (rendered at the frame level below), so there are only two columns,
             // panel and content (`rt-review-screen-hangs-on-connecting`).
-            if !is_panel {
+            if !is_panel && !is_settings {
                 if let Some(view) = &sidebar_view {
                     view.render(buf, content_rect, selection, !focus_main, &sidebar_chrome);
                 }
@@ -3782,6 +4037,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
                 orchestrator_status.as_deref(),
             );
             match &main_view {
+                _ if is_settings => {}
                 MainView::Session if orch_down.is_some() => {
                     render_placeholder(buf, main_rect, orch_down.as_deref().unwrap_or_default())
                 }
@@ -3832,7 +4088,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
 
             // The review / workspace panel carries its own status line, so the
             // shell's bottom-row status/search band is only for the other views.
-            if !is_panel {
+            if !is_panel && !is_settings {
                 if let Some(q) = &searching {
                     render_search_prompt(buf, main_rect, q);
                 } else if let Some(s) = &status {
@@ -3849,7 +4105,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // The review interface renders with a mutable frame borrow: the panel
         // into the sidebar's column (`sidebar_rect`), the content terminal view
         // into the main area (`main_rect`) — two columns, panel and content.
-        if let Some(r) = review.as_mut() {
+        if let Some(r) = review.as_mut().filter(|_| !is_settings) {
             let cur = r.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
@@ -3858,11 +4114,21 @@ fn draw_frame<B: ratatui::backend::Backend>(
 
         // The workspace interface renders the same way — panel into the sidebar
         // column, content terminal view into the main area.
-        if let Some(w) = workspace.as_mut() {
+        if let Some(w) = workspace.as_mut().filter(|_| !is_settings) {
             let cur = w.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
             }
+        }
+
+        if is_settings {
+            let chrome = settings::Chrome {
+                project_label: &project_label,
+                status: status.as_deref(),
+                keymaps,
+                style: display_style,
+            };
+            settings.render(frame, content_rect, main_rect, &chrome);
         }
 
         // The drag-handle line down the sidebar's right edge, painted last so
@@ -7156,6 +7422,7 @@ mod tests {
             "action:approve-review:T-9",
             "action:reject-review:T-9",
             "action:error-log",
+            "action:settings",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -7209,6 +7476,373 @@ mod tests {
             render_divider(&mut buf, Rect::new(0, 4, 20, 1), false);
             render_divider(&mut buf, Rect::new(0, 5, 20, 1), true);
             crate::theme::assert_light_readable("shell-chrome", &buf);
+        });
+    }
+
+    // --- Settings (tui-settings-shell), through the real event path ---------
+
+    fn press(st: &mut ShellState, code: KeyCode) {
+        st.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    /// Drain Settings' background loads until its General page has loaded.
+    fn settle_settings(st: &mut ShellState) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.general().done().is_some()
+            }),
+            "the General summary loads"
+        );
+    }
+
+    /// Where `needle` first shows on the screen, as (col, row).
+    fn find_on_screen(term: &Terminal<ratatui::backend::TestBackend>, needle: &str) -> Option<(u16, u16)> {
+        let buf = term.backend().buffer();
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            let mut cols = Vec::new();
+            for x in 0..buf.area.width {
+                let sym = buf[(x, y)].symbol();
+                for _ in sym.chars() {
+                    cols.push(x);
+                }
+                row.push_str(sym);
+            }
+            if let Some(at) = row.find(needle) {
+                let char_at = row[..at].chars().count();
+                return cols.get(char_at).map(|x| (*x, y));
+            }
+        }
+        None
+    }
+
+    /// The test state with a sidebar model and the switcher's palette inputs
+    /// faked, on the orchestrator session (focus on main).
+    fn settings_state() -> ShellState {
+        let mut st = test_state();
+        st.palette_inputs = Arc::new(FixturePaletteInputs);
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        st
+    }
+
+    #[test]
+    fn settings_opens_from_the_palette_the_sidebar_key_and_the_gear() {
+        // The palette: Ctrl+Space, type, Enter.
+        let mut st = settings_state();
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        for c in "Settings".chars() {
+            type_key(&mut st, c);
+        }
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette is open");
+        };
+        assert_eq!(p.results()[p.selected()].0.id, "action:settings");
+        press(&mut st, KeyCode::Enter);
+        assert!(st.overlay.is_none());
+        assert!(st.settings_open(), "the palette's Settings opens it");
+
+        // The sidebar's `,`.
+        let mut st = settings_state();
+        st.client.focus_sidebar();
+        type_key(&mut st, ',');
+        assert!(st.settings_open(), "`,` in the sidebar opens Settings");
+
+        // The gear beside the project title.
+        let mut st = settings_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "⚙").expect("the gear shows in the sidebar");
+        assert!(contains(st.sidebar_rect, x, y), "it is in the sidebar column");
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert!(st.settings_open(), "clicking the gear opens Settings");
+    }
+
+    #[test]
+    fn back_and_esc_restore_the_view_selection_and_focus_without_touching_sessions() {
+        let mut st = settings_state();
+        let count = st.sidebar_view().unwrap().selectable_count();
+        st.client.select(2, count);
+        st.client.focus_main();
+        st.dispatch_effect(Effect::OpenSettings);
+        assert!(st.settings_open());
+        // Keys inside Settings move its own selection, never the sidebar's.
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Up);
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings_open());
+        assert!(matches!(st.main_view, MainView::Session));
+        assert_eq!(st.sessions.current_target(), Some(&SessionRef::Orchestrator), "the session stays bound");
+        assert_eq!(st.client.focus(), Focus::Main);
+        assert_eq!(st.selection(), 2);
+
+        // The Back row: from the sidebar, up to Back and Enter.
+        st.client.focus_sidebar();
+        st.client.select(1, count);
+        st.dispatch_effect(Effect::OpenSettings);
+        press(&mut st, KeyCode::Up);
+        assert_eq!(st.settings.stop(), settings::Stop::Back);
+        press(&mut st, KeyCode::Enter);
+        assert!(!st.settings_open());
+        assert_eq!(st.client.focus(), Focus::Sidebar);
+        assert_eq!(st.selection(), 1);
+    }
+
+    #[test]
+    fn settings_reopens_on_the_last_page_and_focus_moves_between_its_columns() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        press(&mut st, KeyCode::Tab);
+        assert_eq!(st.settings.region(), settings::Region::Page);
+        // The global focus chords step between Settings' sidebar and page.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)));
+        assert_eq!(st.settings.region(), settings::Region::Sidebar);
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)));
+        assert_eq!(st.settings.region(), settings::Region::Page);
+        type_key(&mut st, '1');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::General);
+        press(&mut st, KeyCode::Esc);
+        st.dispatch_effect(Effect::OpenSettings);
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::General);
+        assert_eq!(st.settings.region(), settings::Region::Sidebar, "it reopens on its sidebar");
+    }
+
+    #[test]
+    fn esc_closes_the_innermost_first_and_typing_in_the_switcher_stays_in_it() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        // Down to the project switcher; Enter opens the palette's Projects column.
+        press(&mut st, KeyCode::Down);
+        assert_eq!(st.settings.stop(), settings::Stop::Switcher);
+        press(&mut st, KeyCode::Enter);
+        assert!(
+            matches!(&st.overlay, Some(ActiveOverlay::Palette(p)) if p.projects_focused()),
+            "the switcher is the palette's Projects column"
+        );
+        press(&mut st, KeyCode::Esc);
+        assert!(st.overlay.is_none(), "Esc closes the switcher");
+        assert!(st.settings_open(), "and leaves Settings up");
+
+        // A text field over Settings takes every typed key: nothing moves in
+        // Settings, nothing quits, nothing reaches the session.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        for c in "jkq1,".chars() {
+            type_key(&mut st, c);
+        }
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette stays open while typing");
+        };
+        assert_eq!(p.query(), "jkq1,");
+        assert_eq!(st.settings.stop(), settings::Stop::Switcher);
+        assert!(!st.should_quit);
+        press(&mut st, KeyCode::Esc);
+        assert!(st.settings_open());
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings_open(), "the next Esc leaves Settings");
+    }
+
+    #[test]
+    fn switching_project_keeps_the_page_and_reloads_for_the_new_project() {
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        assert_eq!(st.settings.general().project(), Some("proj"));
+        // The palette's switch, over Settings.
+        st.dispatch_effect(Effect::SwitchProject {
+            project: "beta".into(),
+        });
+        assert_eq!(st.client.project(), Some("beta"));
+        assert!(st.settings_open(), "Settings stays up across the switch");
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::General);
+        settle_settings(&mut st);
+        let summary = st.settings.general().done().unwrap();
+        assert_eq!(
+            summary.project.as_ref().unwrap().as_ref().unwrap().project,
+            "beta",
+            "the page shows the new project's settings"
+        );
+        // Back lands on the new project's view, its sidebar focused.
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings_open());
+        assert_eq!(st.client.focus(), Focus::Sidebar);
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)), "beta's default view");
+    }
+
+    #[test]
+    fn a_load_for_the_project_left_is_dropped_when_it_lands_late() {
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        st.settings_reader = Arc::new(move |project: Option<&str>| {
+            if project == Some("proj") {
+                let _ = gate.lock().unwrap().recv();
+            }
+            settings::fixture_summary(project)
+        });
+        st.dispatch_effect(Effect::OpenSettings);
+        // proj's read is stuck; the user switches before it lands.
+        st.dispatch_effect(Effect::SwitchProject {
+            project: "beta".into(),
+        });
+        settle_settings(&mut st);
+        release.send(()).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.dropped() == 1
+            }),
+            "proj's late read lands and is dropped"
+        );
+        let summary = st.settings.general().done().unwrap();
+        assert_eq!(summary.project.as_ref().unwrap().as_ref().unwrap().project, "beta");
+    }
+
+    #[test]
+    fn settings_draws_at_80x24_and_wide_over_the_hidden_view() {
+        for (w, h) in [(80, 24), (160, 48)] {
+            let mut st = settings_state();
+            st.dispatch_effect(Effect::OpenSettings);
+            settle_settings(&mut st);
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            draw_frame(&mut term, &mut st).unwrap();
+            let screen = screen_text(&term);
+            for want in [
+                "Settings",
+                "Global",
+                "General",
+                "▾ proj",
+                "This computer",
+                "Settings folder",
+                "PROJ",
+                "Open in editor",
+                "Edit Project Settings",
+                "Esc back",
+            ] {
+                assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
+            }
+            assert!(!screen.contains("Orchestrator"), "{w}x{h}: the nav sidebar is replaced:\n{screen}");
+            // The settings sidebar sits in the sidebar's column, the page in main.
+            let (bx, _) = find_on_screen(&term, "Settings").unwrap();
+            assert!(contains(st.sidebar_rect, bx, 1), "{w}x{h}");
+            let (gx, gy) = find_on_screen(&term, "This computer").unwrap();
+            assert!(contains(st.main_rect, gx, gy), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn a_short_terminal_scrolls_the_page_to_every_action() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(64, 14)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("↓ more"), "what's below says so");
+        // Tab to the page and walk down to its last action: it scrolls into view.
+        press(&mut st, KeyCode::Tab);
+        for _ in 0..5 {
+            press(&mut st, KeyCode::Down);
+        }
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("› Edit Zen Mode"), "the last action is on screen and focused:\n{screen}");
+        // A resize mid-visit redraws without panicking, down to a sliver.
+        for (w, h) in [(30, 8), (12, 3), (200, 60)] {
+            term.backend_mut().resize(w, h);
+            draw_frame(&mut term, &mut st).unwrap();
+        }
+        st.handle_event(Event::Resize(200, 60));
+        assert!(st.settings_open());
+    }
+
+    #[test]
+    fn page_actions_run_the_open_in_editor_paths() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        st.effect_tap = Some(Vec::new());
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Char('j'));
+        press(&mut st, KeyCode::Enter);
+        assert_eq!(
+            st.effect_tap.as_ref().unwrap().last(),
+            Some(&Effect::OpenEditor {
+                target: shelbi_app::EditTarget::ZenMode
+            })
+        );
+        assert!(st.settings_open(), "the editor opens over Settings, which stays");
+    }
+
+    #[test]
+    fn mouse_clicks_rows_and_actions_and_the_wheel_moves_and_scrolls() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        st.effect_tap = Some(Vec::new());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "Edit Project Settings").unwrap();
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert_eq!(st.settings.region(), settings::Region::Page);
+        assert_eq!(
+            st.effect_tap.as_ref().unwrap().last(),
+            Some(&Effect::OpenEditor {
+                target: shelbi_app::EditTarget::Project
+            })
+        );
+        // The wheel over the sidebar moves its selection.
+        let side = st.sidebar_content_rect();
+        st.handle_event(Event::Mouse(wheel(false, side.x + 2, side.y + 6)));
+        assert_eq!(st.settings.stop(), settings::Stop::Switcher);
+        assert_eq!(st.settings.region(), settings::Region::Sidebar);
+        // A click on the back button leaves.
+        draw_frame(&mut term, &mut st).unwrap();
+        st.handle_event(Event::Mouse(left_click(side.x + 4, side.y + 1)));
+        assert!(!st.settings_open());
+    }
+
+    #[test]
+    fn unsaved_edits_ask_before_leaving_and_save_then_leave() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        st.settings.test_edits = Some(Ok(()));
+        press(&mut st, KeyCode::Esc);
+        assert!(st.settings_open() && st.settings.prompting());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Unsaved changes") && screen.contains("Discard"), "{screen}");
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings.prompting() && st.settings_open(), "Esc closes the prompt first");
+        // A switch over a dirty page asks too, and Cancel keeps the project.
+        st.dispatch_effect(Effect::SwitchProject {
+            project: "beta".into(),
+        });
+        assert!(st.settings.prompting());
+        type_key(&mut st, 'c');
+        assert_eq!(st.client.project(), Some("proj"));
+        // Leave again; Save runs off the UI thread, then Settings closes.
+        press(&mut st, KeyCode::Esc);
+        type_key(&mut st, 's');
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                !st.settings_open()
+            }),
+            "the save lands and Settings leaves"
+        );
+        assert!(st.settings.test_edits.is_none(), "the edits were saved");
+    }
+
+    #[test]
+    fn settings_renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            draw_frame(&mut term, &mut st).unwrap();
+            crate::theme::assert_light_readable("settings", term.backend().buffer());
         });
     }
 }
