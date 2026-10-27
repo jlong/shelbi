@@ -1970,6 +1970,31 @@ mod tests {
         assert_eq!(view.read_with(&cx, |v, _| v.state.search().to_string()), "b", "ready for the next search");
     }
 
+    #[gpui::test]
+    fn a_filter_chip_shows_a_chevron_and_anchors_its_menu(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let (view, mut cx) = open_board(cx, vec![issue("A", "todo")]);
+        for (chip, label, right) in [
+            ("workflow-chip", "workflow-chip-label", "workflow-chip-right"),
+            ("workspace-chip", "workspace-chip-label", "workspace-chip-right"),
+        ] {
+            assert!(drawn(&mut cx, right), "{chip} has a chevron");
+            let bx = cx.debug_bounds(chip).unwrap();
+            let label = cx.debug_bounds(label).unwrap();
+            let chevron = cx.debug_bounds(right).unwrap();
+            assert!(label.right() <= chevron.left(), "{label:?} runs under {chevron:?}");
+            assert!(chevron.left() < bx.right() && chevron.top() >= bx.top() && chevron.bottom() <= bx.bottom());
+        }
+
+        click(&mut cx, "workflow-chip");
+        assert!(view.read_with(&cx, |v, _| matches!(v.state.mode, Mode::WorkflowDropdown { .. })));
+        assert!(drawn(&mut cx, "dropdown-panel"));
+        let chip = cx.debug_bounds("workflow-chip").unwrap();
+        let panel = cx.debug_bounds("dropdown-panel").unwrap();
+        assert!(panel.top() >= chip.bottom(), "the menu opens under {chip:?}: {panel:?}");
+        assert_eq!(panel.left(), chip.left(), "the menu lines up with its chip");
+    }
+
     #[test]
     fn a_fingerprint_tells_reads_apart() {
         let read = |title: &str| vec![("id-1", title.to_string()), ("id-2", "Other".to_string())];

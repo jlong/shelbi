@@ -885,9 +885,11 @@ pub fn xsmall_button(id: impl Into<SharedString>, label: impl Into<SharedString>
 }
 
 /// A board filter (the Issues Header's chips): the Figma Button at Small,
-/// label only, 28px tall, in the Select style while its filter is set
-/// (`selected`: the cyan tint and label) and the Default style while it
-/// isn't; pressed while `open` (its menu is up).
+/// 28px tall, its label then a down chevron in the Right Icon slot, in the
+/// Select style (the cyan tint, label and chevron) while its filter is set
+/// (`selected`) or its menu is up (`open`), and the Default style
+/// otherwise ([`filter_chip_kind`]). Each piece is `<id>-label` or
+/// `-right` to a test.
 pub fn filter_chip(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -896,16 +898,26 @@ pub fn filter_chip(
     theme: &Theme,
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
-    let kind = if selected {
+    let kind = filter_chip_kind(selected, open);
+    let c = button_colors(kind, theme);
+    let part = |name: &'static str| {
+        let selector = format!("{id}-{name}");
+        move || selector.clone()
+    };
+    let d = button_shell(id.clone(), kind, ButtonSize::Small, theme).cursor_pointer();
+    fill_layer(d, id.clone(), px(6.0), [c.fill, c.hover, c.pressed])
+        .child(div().debug_selector(part("label")).whitespace_nowrap().child(label.into()))
+        .child(right_icon_slot(icons::CHEVRON_DOWN, ButtonSize::Small, c.icon).debug_selector(part("right")))
+}
+
+/// The style a board filter chip draws in: Select while its filter is set
+/// or its menu is open, Default (Secondary) otherwise.
+pub fn filter_chip_kind(selected: bool, open: bool) -> ButtonKind {
+    if selected || open {
         ButtonKind::Select
     } else {
         ButtonKind::Secondary
-    };
-    let c = button_colors(kind, theme);
-    let rest = if open { c.pressed } else { c.fill };
-    let d = button_shell(id.clone(), kind, ButtonSize::Small, theme).cursor_pointer();
-    fill_layer(d, id, px(6.0), [rest, c.hover, c.pressed])
-        .child(div().whitespace_nowrap().child(label.into()))
+    }
 }
 
 /// The Searchbox component at Small (the Issues Header's search): 28px tall,
@@ -1330,6 +1342,14 @@ impl gpui::Render for Tooltip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filter_chip_is_select_while_set_or_open() {
+        assert_eq!(filter_chip_kind(false, false), ButtonKind::Secondary);
+        assert_eq!(filter_chip_kind(true, false), ButtonKind::Select, "a set filter");
+        assert_eq!(filter_chip_kind(false, true), ButtonKind::Select, "its menu is open");
+        assert_eq!(filter_chip_kind(true, true), ButtonKind::Select);
+    }
 
     #[test]
     fn initials_take_two_words_or_two_letters() {
