@@ -107,6 +107,9 @@ pub mod figma {
     pub const ICON_SELECT: Pair = pair(0x62cdf6ff, 0xf21478ff);
     /// `icon/cyan`, `icon/green`, `icon/yellow`, `icon/purple`.
     pub const ICON_CYAN: Pair = pair(0x62cdf6ff, 0x31ade9ff);
+    /// `progress/default`: `icon/cyan` in Dark, `icon/red` (`Pink/500`) in
+    /// Light. (`progress/transparent` is the same at 0%.)
+    pub const PROGRESS: Pair = pair(0x62cdf6ff, 0xf21478ff);
     pub const ICON_GREEN: Pair = pair(0x31d924ff, 0x5ac351ff);
     pub const ICON_YELLOW: Pair = pair(0xffdd64ff, 0xffca0dff);
     pub const ICON_PURPLE: Pair = pair(0xe374ffff, 0xb247e7ff);
@@ -411,6 +414,9 @@ palette! {
     icon_yellow,
     /// A review status glyph (`icon/purple`).
     icon_purple,
+    /// A running step's spinner, fading out along its tail
+    /// (`progress/default`).
+    progress,
 
     // ---- Rules --------------------------------------------------------------
     /// Dividers and hairline borders (`stroke/light`).
@@ -624,6 +630,7 @@ impl Palette {
             icon_green: pick(ICON_GREEN),
             icon_yellow: pick(ICON_YELLOW),
             icon_purple: pick(ICON_PURPLE),
+            progress: pick(PROGRESS),
 
             divider: pick(DIVIDER),
             divider_strong: pick(DIVIDER_STRONG),
@@ -1122,6 +1129,7 @@ mod tests {
         // The Machines frame's `text/gray`, opaque in both modes.
         both(d.table_text, l.table_text, (0x7b85a7ff, 0x7b85a7ff));
         both(d.accent, l.accent, (0x62cdf6ff, 0xf21478ff));
+        both(d.progress, l.progress, (0x62cdf6ff, 0xf21478ff));
         both(d.focus_ring, l.focus_ring, (0x62cdf6ff, 0x31ade9ff));
         both(d.focus_glow, l.focus_glow, (0x12adff33, 0x12adff33));
         // The Success and Danger buttons' own focus (`focus/success/*`,

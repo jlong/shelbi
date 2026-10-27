@@ -20,6 +20,8 @@
 //! - the in-process TUI overlay: the same [`validate_add_project`] +
 //!   [`scaffold_project`] pair, with a [`NullReporter`] (the TUI shows a single
 //!   status line instead of a scrolling log).
+//! - the desktop Add Project wizard: [`add_project`], whose reporter turns the
+//!   [`ScaffoldStage`] callbacks into its checklist and keeps the warnings.
 //!
 //! Human-readable progress is emitted through the [`ScaffoldReporter`] seam
 //! rather than written straight to stdout/stderr, so a caller inside a ratatui
@@ -52,9 +54,63 @@ pub const IN_REPO_CONFIG_REL: &str = ".shelbi/project.yaml";
 /// one if it prints. The CLI's implementation prints `note`→stdout and
 /// `warn`→stderr verbatim, preserving the exact output `shelbi init` had before
 /// this engine moved out of `shelbi-cli`.
+///
+/// The stage callbacks are the structured half: [`scaffold_project`] says
+/// when each [`ScaffoldStage`] starts, finishes, or fails, so a caller that
+/// draws progress (the desktop wizard's checklist) never has to parse the
+/// lines. They default to nothing, so a line-only reporter (the CLI's) is
+/// unchanged.
 pub trait ScaffoldReporter {
     fn note(&mut self, line: &str);
     fn warn(&mut self, line: &str);
+    /// `stage`'s work begins. Exactly one stage runs at a time.
+    fn stage_started(&mut self, _stage: ScaffoldStage) {}
+    /// `stage`'s work all succeeded.
+    fn stage_finished(&mut self, _stage: ScaffoldStage) {}
+    /// `stage` failed with `error`; nothing after it ran.
+    fn stage_failed(&mut self, _stage: ScaffoldStage, _error: &str) {}
+}
+
+/// The parts of [`scaffold_project`], in the order they run. Every write the
+/// scaffold makes belongs to one, so the last one finishing means the project
+/// is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaffoldStage {
+    /// The registration (`projects/<id>.yaml`, or `<id>/local.yaml` plus the
+    /// committed `<repo>/.shelbi/project.yaml` in-repo), the onboarding seeds
+    /// published with it, and the workspace-settings template.
+    Config,
+    /// The default agents' workspaces (`agents/<name>/`).
+    Agents,
+    /// The Task and Subtask workflows and the status catalogue, then the rest
+    /// of the project's scaffold: the Zen policy, the PR template, the shared
+    /// agent preamble and the commit guard.
+    Workflows,
+}
+
+impl ScaffoldStage {
+    /// Every stage, in order.
+    pub const ALL: [ScaffoldStage; 3] =
+        [ScaffoldStage::Config, ScaffoldStage::Agents, ScaffoldStage::Workflows];
+}
+
+impl From<ScaffoldStage> for shelbi_app::add_project_wizard::Stage {
+    fn from(stage: ScaffoldStage) -> Self {
+        use shelbi_app::add_project_wizard::Stage;
+        match stage {
+            ScaffoldStage::Config => Stage::Config,
+            ScaffoldStage::Agents => Stage::Agents,
+            ScaffoldStage::Workflows => Stage::Workflows,
+        }
+    }
+}
+
+/// One stage callback, as [`CollectReporter`] records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageEvent {
+    Started(ScaffoldStage),
+    Finished(ScaffoldStage),
+    Failed(ScaffoldStage, String),
 }
 
 /// A reporter that drops every line — the TUI path, which surfaces a single
@@ -72,6 +128,8 @@ impl ScaffoldReporter for NullReporter {
 pub struct CollectReporter {
     pub notes: Vec<String>,
     pub warnings: Vec<String>,
+    /// The stage callbacks, in order.
+    pub stages: Vec<StageEvent>,
 }
 
 impl ScaffoldReporter for CollectReporter {
@@ -80,6 +138,15 @@ impl ScaffoldReporter for CollectReporter {
     }
     fn warn(&mut self, line: &str) {
         self.warnings.push(line.to_string());
+    }
+    fn stage_started(&mut self, stage: ScaffoldStage) {
+        self.stages.push(StageEvent::Started(stage));
+    }
+    fn stage_finished(&mut self, stage: ScaffoldStage) {
+        self.stages.push(StageEvent::Finished(stage));
+    }
+    fn stage_failed(&mut self, stage: ScaffoldStage, error: &str) {
+        self.stages.push(StageEvent::Failed(stage, error.to_string()));
     }
 }
 
@@ -290,24 +357,36 @@ pub enum AddProjectError {
     Failed(String),
 }
 
+/// Which [`add_project`] call this is for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// The first: an id that's already registered is a clash.
+    New,
+    /// Finishing the same request after a failed attempt: a registration this
+    /// request's earlier attempt published (same id, same folder, same config
+    /// mode) is picked up and the scaffold completed around it, keeping every
+    /// file already there. Any other registration under the id is still a
+    /// clash.
+    Retry,
+}
+
 /// Run a `Mutation::AddProject`: validate the form's values (resolving the
 /// repo path against `cwd`), then scaffold the project with a `file_system`
-/// board, the way the TUI's form does. Returns the new project's slug.
-/// Blocking (file IO and git); run it off the UI thread.
+/// board, the way the TUI's form does, reporting progress to `out`. Returns
+/// the new project's slug. Blocking (file IO and git); run it off the UI
+/// thread.
 pub fn add_project(
     name: &str,
     root: &str,
     mode: ConfigMode,
     cwd: &Path,
+    attempt: Attempt,
+    out: &mut dyn ScaffoldReporter,
 ) -> std::result::Result<String, AddProjectError> {
-    let resolved = validate_add_project(name, root, cwd).map_err(AddProjectError::Invalid)?;
-    scaffold_project(
-        &resolved,
-        mode,
-        &IssueTrackerConfig::default(),
-        &mut NullReporter,
-    )
-    .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e}")))?;
+    let retry = (attempt == Attempt::Retry).then_some(mode);
+    let resolved = validate_request(name, root, cwd, retry).map_err(AddProjectError::Invalid)?;
+    scaffold_project(&resolved, mode, &IssueTrackerConfig::default(), out)
+        .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e}")))?;
     Ok(resolved.name)
 }
 
@@ -324,6 +403,18 @@ pub fn validate_add_project(
     root: &str,
     cwd: &Path,
 ) -> std::result::Result<ResolvedProjectRoot, String> {
+    validate_request(name, root, cwd, None)
+}
+
+/// [`validate_add_project`], or with `retry` (the request's config mode) its
+/// [`Attempt::Retry`] form: an existing registration passes only when
+/// [`registration_is_for`] this folder and mode.
+fn validate_request(
+    name: &str,
+    root: &str,
+    cwd: &Path,
+    retry: Option<ConfigMode>,
+) -> std::result::Result<ResolvedProjectRoot, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Enter a project name.".to_string());
@@ -333,16 +424,13 @@ pub fn validate_add_project(
     let slug = shelbi_core::normalize_project_name(name).ok().ok_or_else(|| {
         format!("`{name}` has no letters or digits to build an id from — try a name like `my-app`.")
     })?;
+    let taken = || format!("a project already lives at `{slug}` — pick a different name.");
     // Collision is checked on the SLUG (the folder / settings-file id), not the
     // display name, so two different labels that slugify the same still clash.
-    match project_name_collides(&slug) {
-        Ok(true) => {
-            return Err(format!(
-                "a project already lives at `{slug}` — pick a different name."
-            ))
-        }
-        Ok(false) => {}
-        Err(e) => return Err(e.to_string()),
+    // A retry decides once the folder is known.
+    let collides = project_name_collides(&slug).map_err(|e| e.to_string())?;
+    if collides && retry.is_none() {
+        return Err(taken());
     }
 
     let root_raw = root.trim();
@@ -359,6 +447,11 @@ pub fn validate_add_project(
             return Err(format!("{} is not a directory.", path.display()))
         }
     }
+    if let (true, Some(mode)) = (collides, retry) {
+        if !registration_is_for(&slug, &path, mode) {
+            return Err(taken());
+        }
+    }
 
     // The display label is the raw human-readable name, kept only when
     // slugifying changed it (so a clean slug never grows a redundant label).
@@ -368,6 +461,46 @@ pub fn validate_add_project(
         name: slug,
         display_name,
     })
+}
+
+/// Whether `slug`'s registration is the one creating a project at `root` in
+/// `mode` publishes: the registration file for that mode (the flat
+/// `projects/<id>.yaml` for global, the split `projects/<id>/local.yaml`
+/// in-repo, never both), whose hub machine works in `root`. Reads the file
+/// itself rather than loading the project, so a registration whose scaffold
+/// stopped early (no committed in-repo half yet) still answers.
+fn registration_is_for(slug: &str, root: &Path, mode: ConfigMode) -> bool {
+    let Ok(projects) = shelbi_state::projects_dir() else {
+        return false;
+    };
+    let flat = projects.join(format!("{slug}.yaml"));
+    let split = projects.join(slug).join("local.yaml");
+    let file = match (mode, flat.is_file(), split.is_file()) {
+        (ConfigMode::Global, true, false) => flat,
+        (ConfigMode::InRepo, false, true) => split,
+        _ => return false,
+    };
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return false;
+    };
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return false;
+    };
+    let same = |dir: &str| {
+        let dir = Path::new(dir);
+        dir == root
+            || matches!(
+                (dir.canonicalize(), root.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    doc.get("machines")
+        .and_then(|m| m.as_sequence())
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("name").and_then(|n| n.as_str()) == Some("hub"))
+        .filter_map(|m| m.get("work_dir").and_then(|w| w.as_str()))
+        .any(same)
 }
 
 // ---------------------------------------------------------------------------
@@ -721,15 +854,61 @@ fn install_guard_at_scaffold(
 ///
 /// Human-readable progress is emitted through `out`; the CLI passes a reporter
 /// that prints to the terminal (byte-identical to the pre-move `println!`s),
-/// the TUI a [`NullReporter`].
+/// the TUI a [`NullReporter`]. The work runs as the [`ScaffoldStage`]s, in
+/// order, each reported started then finished (or failed, which stops the
+/// scaffold there).
 pub fn scaffold_project(
     resolved: &ResolvedProjectRoot,
     mode: ConfigMode,
     issue_tracker: &IssueTrackerConfig,
     out: &mut dyn ScaffoldReporter,
 ) -> Result<()> {
+    // Held from the collision check through the last write.
+    let _scaffold_lock = run_stage(out, ScaffoldStage::Config, |out| {
+        scaffold_config(resolved, mode, issue_tracker, out)
+    })?;
+    run_stage(out, ScaffoldStage::Agents, |out| {
+        let outcomes =
+            shelbi_state::self_heal_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
+        for outcome in outcomes {
+            out.note(&render_agent_materialize_outcome(&outcome));
+        }
+        Ok(())
+    })?;
+    run_stage(out, ScaffoldStage::Workflows, |out| scaffold_workflows(resolved, out))
+}
+
+/// Run `work` as `stage`: report it started, then finished or failed.
+fn run_stage<T>(
+    out: &mut dyn ScaffoldReporter,
+    stage: ScaffoldStage,
+    work: impl FnOnce(&mut dyn ScaffoldReporter) -> Result<T>,
+) -> Result<T> {
+    out.stage_started(stage);
+    match work(out) {
+        Ok(value) => {
+            out.stage_finished(stage);
+            Ok(value)
+        }
+        Err(error) => {
+            out.stage_failed(stage, &error.to_string());
+            Err(error)
+        }
+    }
+}
+
+/// [`ScaffoldStage::Config`]: take the scaffold lock (returned, for the
+/// caller to hold through the remaining stages), seed onboarding, publish the
+/// registration, and write the committed in-repo half and the
+/// workspace-settings template.
+fn scaffold_config(
+    resolved: &ResolvedProjectRoot,
+    mode: ConfigMode,
+    issue_tracker: &IssueTrackerConfig,
+    out: &mut dyn ScaffoldReporter,
+) -> Result<shelbi_state::ProjectScaffoldLock> {
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
-    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
+    let scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
     let registration_exists =
         shelbi_state::has_project_registration(&resolved.name).map_err(|e| anyhow!(e))?;
@@ -811,13 +990,13 @@ pub fn scaffold_project(
     }
 
     write_workspace_settings_template(&resolved.name, out)?;
+    Ok(scaffold_lock)
+}
 
-    let outcomes =
-        shelbi_state::self_heal_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
-    for outcome in outcomes {
-        out.note(&render_agent_materialize_outcome(&outcome));
-    }
-
+/// [`ScaffoldStage::Workflows`]: the workflows and statuses, then the rest of
+/// the project-wide scaffold (Zen policy, PR template, shared preamble, commit
+/// guard).
+fn scaffold_workflows(resolved: &ResolvedProjectRoot, out: &mut dyn ScaffoldReporter) -> Result<()> {
     for path in shelbi_state::scaffold_project_workflow(&resolved.name).map_err(|e| anyhow!(e))? {
         out.note(&format!("✓ wrote project workflow: {}", path.display()));
     }
@@ -994,20 +1173,20 @@ mod tests {
 
         // Bad input stays on the form; nothing is written.
         assert_eq!(
-            add_project("", "web", ConfigMode::Global, &home),
+            add_project("", "web", ConfigMode::Global, &home, Attempt::New, &mut NullReporter),
             Err(AddProjectError::Invalid("Enter a project name.".into()))
         );
         assert!(!home.join("projects/web.yaml").exists());
 
         // Good input scaffolds and names the new project.
         assert_eq!(
-            add_project("Web", "web", ConfigMode::Global, &home),
+            add_project("Web", "web", ConfigMode::Global, &home, Attempt::New, &mut NullReporter),
             Ok("web".to_string())
         );
         assert!(home.join("projects/web.yaml").exists());
         // The second time the name is taken.
         assert!(matches!(
-            add_project("web", "web", ConfigMode::Global, &home),
+            add_project("web", "web", ConfigMode::Global, &home, Attempt::New, &mut NullReporter),
             Err(AddProjectError::Invalid(msg)) if msg.contains("already")
         ));
 
@@ -1080,7 +1259,7 @@ mod tests {
 
         let c = check_folder(&home, &wt.display().to_string(), None);
         let (name, root) = (c.name.unwrap(), c.path.display().to_string());
-        assert_eq!(add_project(&name, &root, ConfigMode::InRepo, &home), Ok("alpha-wt".to_string()));
+        assert_eq!(add_project(&name, &root, ConfigMode::InRepo, &home, Attempt::New, &mut NullReporter), Ok("alpha-wt".to_string()));
         assert!(wt.join(IN_REPO_CONFIG_REL).is_file());
         assert!(shelbi_state::has_project_registration("alpha-wt").unwrap());
 
@@ -1191,6 +1370,231 @@ mod tests {
             "re-run should report an existing registration, got: {:?}",
             out.notes
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The stage events of a run that got all the way through.
+    fn all_stages() -> Vec<StageEvent> {
+        ScaffoldStage::ALL
+            .iter()
+            .flat_map(|s| [StageEvent::Started(*s), StageEvent::Finished(*s)])
+            .collect()
+    }
+
+    /// Where `slug`'s registration lives, asserting there is exactly one.
+    fn only_registration(home: &Path, slug: &str) -> PathBuf {
+        let flat = home.join(format!("projects/{slug}.yaml"));
+        let split = home.join(format!("projects/{slug}/local.yaml"));
+        match (flat.is_file(), split.is_file()) {
+            (true, false) => flat,
+            (false, true) => split,
+            other => panic!("expected exactly one registration for {slug}, got {other:?}"),
+        }
+    }
+
+    /// Checks, as each stage reports, that its writes are already on disk
+    /// (and the next stage's aren't yet).
+    struct DiskChecker {
+        slug: String,
+        events: Vec<StageEvent>,
+    }
+
+    impl ScaffoldReporter for DiskChecker {
+        fn note(&mut self, _line: &str) {}
+        fn warn(&mut self, _line: &str) {}
+        fn stage_started(&mut self, stage: ScaffoldStage) {
+            let agents = shelbi_state::agents_dir(&self.slug).unwrap();
+            let statuses = shelbi_state::statuses_path(&self.slug).unwrap();
+            match stage {
+                ScaffoldStage::Config => {
+                    assert!(!shelbi_state::has_project_registration(&self.slug).unwrap())
+                }
+                ScaffoldStage::Agents => assert!(!agents.exists(), "agents before their stage"),
+                ScaffoldStage::Workflows => assert!(!statuses.exists(), "statuses before their stage"),
+            }
+            self.events.push(StageEvent::Started(stage));
+        }
+        fn stage_finished(&mut self, stage: ScaffoldStage) {
+            let slug = self.slug.as_str();
+            match stage {
+                ScaffoldStage::Config => {
+                    assert!(shelbi_state::has_project_registration(slug).unwrap());
+                    let settings = shelbi_state::config_project_dir(slug)
+                        .unwrap()
+                        .join("workspace-settings.json.template");
+                    assert!(settings.is_file(), "workspace settings before Config is checked");
+                }
+                ScaffoldStage::Agents => {
+                    let agents = shelbi_state::agents_dir(slug).unwrap();
+                    assert!(agents.join("developer").is_dir(), "agents before Agents is checked");
+                }
+                ScaffoldStage::Workflows => {
+                    for wf in [shelbi_core::TASK_WORKFLOW_NAME, shelbi_core::SUBTASK_WORKFLOW_NAME] {
+                        assert!(shelbi_state::workflow_path(slug, wf).unwrap().is_file());
+                    }
+                    assert!(shelbi_state::statuses_path(slug).unwrap().is_file());
+                    assert!(shelbi_state::zenmode_path(slug).unwrap().is_file());
+                    assert!(shelbi_state::pr_template_path(slug).unwrap().is_file());
+                    assert!(shelbi_state::agent_shared_preamble_path(slug).unwrap().is_file());
+                }
+            }
+            self.events.push(StageEvent::Finished(stage));
+        }
+        fn stage_failed(&mut self, stage: ScaffoldStage, error: &str) {
+            self.events.push(StageEvent::Failed(stage, error.to_string()));
+        }
+    }
+
+    #[test]
+    fn each_stage_is_reported_in_order_once_its_writes_are_on_disk() {
+        let _g = lock_env();
+        for mode in [ConfigMode::Global, ConfigMode::InRepo] {
+            let home = fresh_home();
+            std::env::set_var("SHELBI_HOME", &home);
+            let repo = home.join("acme");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            let mut out = DiskChecker { slug: "acme".into(), events: Vec::new() };
+            let slug = add_project("acme", "acme", mode, &home, Attempt::New, &mut out).unwrap();
+            assert_eq!(slug, "acme");
+            assert_eq!(out.events, all_stages(), "{mode:?}");
+            only_registration(&home, "acme");
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// What blocks a stage: a plain file where it needs a directory.
+    fn obstruct(home: &Path, repo: &Path, mode: ConfigMode, stage: ScaffoldStage) -> PathBuf {
+        let config = match mode {
+            ConfigMode::Global => home.join("projects/acme"),
+            ConfigMode::InRepo => repo.join(".shelbi"),
+        };
+        let at = match stage {
+            // Global: the project's own folder (onboarding is seeded there
+            // before the registration). In-repo: the committed config's
+            // folder (written after the registration).
+            ScaffoldStage::Config => config,
+            ScaffoldStage::Agents => config.join("agents"),
+            ScaffoldStage::Workflows => config.join("workflows"),
+        };
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(&at, "in the way\n").unwrap();
+        at
+    }
+
+    #[test]
+    fn a_failure_at_each_stage_is_reported_and_a_retry_finishes_the_same_project() {
+        let _g = lock_env();
+        for mode in [ConfigMode::Global, ConfigMode::InRepo] {
+            for (i, stage) in ScaffoldStage::ALL.into_iter().enumerate() {
+                let home = fresh_home();
+                std::env::set_var("SHELBI_HOME", &home);
+                let repo = home.join("acme");
+                std::fs::create_dir_all(repo.join(".git")).unwrap();
+                let blocker = obstruct(&home, &repo, mode, stage);
+                let case = format!("{mode:?} {stage:?}");
+
+                let mut out = CollectReporter::default();
+                let failed = add_project("acme", "acme", mode, &home, Attempt::New, &mut out);
+                assert!(matches!(failed, Err(AddProjectError::Failed(_))), "{case}: {failed:?}");
+                let mut expected = all_stages()[..i * 2].to_vec();
+                expected.push(StageEvent::Started(stage));
+                assert_eq!(out.stages[..expected.len()], expected[..], "{case}");
+                assert_eq!(out.stages.len(), expected.len() + 1, "{case}: nothing after the failure");
+                assert!(
+                    matches!(out.stages.last(), Some(StageEvent::Failed(s, _)) if *s == stage),
+                    "{case}: {:?}",
+                    out.stages
+                );
+
+                // Customize a file the earlier stages wrote: the retry keeps it.
+                let custom = (i > 0).then(|| {
+                    let settings = shelbi_state::config_project_dir("acme")
+                        .unwrap()
+                        .join("workspace-settings.json.template");
+                    std::fs::write(&settings, "{\"custom\": true}\n").unwrap();
+                    settings
+                });
+                let instructions = (i > 1).then(|| {
+                    let path = shelbi_state::agents_dir("acme")
+                        .unwrap()
+                        .join("developer/instructions.md");
+                    let mine = format!("{}\n## My notes\n", std::fs::read_to_string(&path).unwrap());
+                    std::fs::write(&path, &mine).unwrap();
+                    (path, mine)
+                });
+
+                std::fs::remove_file(&blocker).unwrap();
+                let registered = shelbi_state::has_project_registration("acme").unwrap();
+                if registered {
+                    // A plain second request clashes with the partial project...
+                    assert!(
+                        matches!(
+                            add_project("acme", "acme", mode, &home, Attempt::New, &mut NullReporter),
+                            Err(AddProjectError::Invalid(m)) if m.contains("already")
+                        ),
+                        "{case}"
+                    );
+                }
+                // ...and a retry of this one finishes it.
+                let mut out = CollectReporter::default();
+                assert_eq!(
+                    add_project("acme", "acme", mode, &home, Attempt::Retry, &mut out),
+                    Ok("acme".to_string()),
+                    "{case}"
+                );
+                assert_eq!(out.stages, all_stages(), "{case}");
+                let registration = only_registration(&home, "acme");
+                assert_eq!(
+                    registration.ends_with("local.yaml"),
+                    mode == ConfigMode::InRepo,
+                    "{case}: the registration for its mode"
+                );
+                if let Some(settings) = custom {
+                    assert_eq!(std::fs::read_to_string(settings).unwrap(), "{\"custom\": true}\n", "{case}");
+                }
+                if let Some((path, mine)) = instructions {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), mine, "{case}");
+                }
+                assert!(shelbi_state::statuses_path("acme").unwrap().is_file(), "{case}");
+            }
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_retry_never_takes_an_unrelated_registration() {
+        let _g = lock_env();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        for dir in ["mine/acme", "theirs/acme"] {
+            std::fs::create_dir_all(home.join(dir).join(".git")).unwrap();
+        }
+        // Someone else's project already has the id.
+        add_project("acme", "theirs/acme", ConfigMode::Global, &home, Attempt::New, &mut NullReporter)
+            .unwrap();
+        let theirs = std::fs::read_to_string(home.join("projects/acme.yaml")).unwrap();
+
+        let mut out = CollectReporter::default();
+        let other_folder =
+            add_project("acme", "mine/acme", ConfigMode::Global, &home, Attempt::Retry, &mut out);
+        assert!(matches!(other_folder, Err(AddProjectError::Invalid(m)) if m.contains("already")));
+        assert!(out.stages.is_empty(), "nothing ran");
+        // The same folder in the other config mode isn't this request either.
+        assert!(matches!(
+            add_project("acme", "theirs/acme", ConfigMode::InRepo, &home, Attempt::Retry, &mut NullReporter),
+            Err(AddProjectError::Invalid(_))
+        ));
+        assert!(!home.join("theirs/acme/.shelbi/project.yaml").exists());
+        assert_eq!(std::fs::read_to_string(home.join("projects/acme.yaml")).unwrap(), theirs);
+        only_registration(&home, "acme");
+
+        // A retry of the request that made it is welcome, and changes nothing.
+        assert_eq!(
+            add_project("acme", "theirs/acme", ConfigMode::Global, &home, Attempt::Retry, &mut NullReporter),
+            Ok("acme".to_string())
+        );
+        assert_eq!(std::fs::read_to_string(home.join("projects/acme.yaml")).unwrap(), theirs);
 
         std::env::remove_var("SHELBI_HOME");
     }

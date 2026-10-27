@@ -152,16 +152,20 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
     }
 }
 
-/// Run a `Mutation::AddProject` the add-project form produced: validate it
-/// (its repo path resolved against `cwd`) and scaffold the project, the way
-/// the TUI's form does. Returns the new project's slug. Blocking.
+/// Run a `Mutation::AddProject` the add-project wizard produced: validate it
+/// (its repo path resolved against `cwd`) and scaffold the project, reporting
+/// each stage and warning to `out`. `attempt` says whether this finishes an
+/// earlier failed run of the same request. Returns the new project's slug.
+/// Blocking.
 pub fn run_add_project(
     mutation: &Mutation,
+    attempt: shelbi_orchestrator::project_create::Attempt,
     cwd: &Path,
+    out: &mut dyn shelbi_orchestrator::project_create::ScaffoldReporter,
 ) -> Result<String, shelbi_orchestrator::project_create::AddProjectError> {
     use shelbi_orchestrator::project_create::{add_project, AddProjectError};
     match mutation {
-        Mutation::AddProject { name, root, mode } => add_project(name, root, *mode, cwd),
+        Mutation::AddProject { name, root, mode } => add_project(name, root, *mode, cwd, attempt, out),
         other => Err(AddProjectError::Failed(format!("not an add-project mutation: {other:?}"))),
     }
 }

@@ -59,8 +59,10 @@
 //! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
 //! and Acknowledgements at their frames' sizes (with `state-bundled-*`);
 //! `SHELBI_VISUAL_ONLY=about` renders just those.
-//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01 and
-//! 02 at 800 × 580; `SHELBI_VISUAL_ONLY=add-project` renders just those.
+//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02
+//! and 03 (`add-project-writing-config`, `-creating-agents`,
+//! `-adding-workflows`) at 800 × 580; `SHELBI_VISUAL_ONLY=add-project`
+//! renders just those.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the issue detail.
@@ -1749,7 +1751,7 @@ impl Run {
                     }
                 }
             }),
-            create: Arc::new(|_, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
+            create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
         };
         let states: [(&str, Option<ConfigMode>, bool); 4] = [
             ("add-project-folder", None, false),
@@ -1792,6 +1794,77 @@ impl Run {
             self.write_sized(window, screen, SIZE.0 as u32);
             let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
         }
+
+        // Screen 03 (`dt-project-creation-checklist`): each stage running,
+        // the ones before it checked (2484:8673, 2514:45915, 2514:45972);
+        // `-failed` (no Figma frame) stopped in Creating agents, and
+        // `-created` the screen after it with a warning (its Figma frame is
+        // `dt-wizard-workflow-summary`'s). Reduce Motion holds the spinner at
+        // its drawn angle.
+        use crate::views::add_project::Report;
+        use shelbi_app::add_project_wizard::Stage;
+        use shelbi_orchestrator::project_create::AddProjectError;
+        // A frame's reports, and how the run ended (if it has).
+        type Run = (Vec<Report>, Option<Result<String, AddProjectError>>);
+        let up_to = |i: usize| {
+            let mut reports = Vec::new();
+            for stage in &Stage::ALL[..i] {
+                reports.push(Report::Started(*stage));
+                reports.push(Report::Finished(*stage));
+            }
+            reports
+        };
+        let running = |i: usize| -> Run {
+            let mut reports = up_to(i);
+            reports.push(Report::Started(Stage::ALL[i]));
+            (reports, None)
+        };
+        let mut failed = running(1).0;
+        failed.push(Report::Failed(
+            Stage::Agents,
+            "Permission denied (os error 13) writing ~/.shelbi/projects/my-project/agents".into(),
+        ));
+        let mut created = up_to(3);
+        created.insert(
+            0,
+            Report::Warning(shelbi_orchestrator::githook::hub_branch_guard_disclosure(&home.join("Projects/my-project"))),
+        );
+        let frames: [(&str, Run); 5] = [
+            ("add-project-writing-config", running(0)),
+            ("add-project-creating-agents", running(1)),
+            ("add-project-adding-workflows", running(2)),
+            ("add-project-failed", (failed, Some(Err(AddProjectError::Failed("failed".into()))))),
+            ("add-project-created", (created, Some(Ok("my-project".into())))),
+        ];
+        self.cx.update(|cx| cx.set_reduce_motion(true));
+        for (screen, (reports, result)) in frames {
+            let engine = engine.clone();
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| {}), window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| v.folder_picked(Some(&folder), window, cx))
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| v.preview_creating(reports, result, window, cx))
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+        self.cx.update(crate::theme::motion::sync_reduce_motion);
     }
 
     /// Run and draw a window that isn't the shell a few times over.
