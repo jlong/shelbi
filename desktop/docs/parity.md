@@ -132,6 +132,14 @@ paths on every `cargo test`.
   cell mapping. It has no controls, never writes `desktop:` and never sends
   palette escape sequences to the host. See
   [`status/tui-settings-general.md`](status/tui-settings-general.md).
+- **Settings ▸ Workflows** (`tui-settings-workflows`): both clients run one
+  state (`shelbi_app::settings::workflows`: the edits, the one-at-a-time save
+  queue, the guards, per-row errors). The TUI asks before a delete (the
+  desktop's guards disable it up front and it deletes at once), reorders with
+  Shift/Alt+arrows or its row menu (the desktop drags), keeps a new workflow
+  selected rather than opening its editor, and draws a status as `●` in the
+  board's category color. See
+  [`status/tui-settings-workflows.md`](status/tui-settings-workflows.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

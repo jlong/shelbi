@@ -20,6 +20,17 @@ is the canonical left-to-right column order in the TUI's all-view.
 [global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
 in-repo mode, the same directory as the workflow files.
 
+## Editing from Settings
+
+You don't have to edit the file by hand. Settings ▸ Workflows, in the desktop
+app and in the TUI (press `,` in the sidebar, then `4`), lists the catalog
+with the workflows that use each status. From there you can add a status,
+rename it (its id never changes, so workflows keep pointing at it), change
+its category, reorder it, and delete one no workflow uses. Each change is
+saved to this file as you make it, comments and unknown keys included, and
+Edit YAML opens the file itself. If the file changed on disk since the page
+read it, nothing is written: the page reloads and says so.
+
 ## Example
 
 ```yaml

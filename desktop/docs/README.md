@@ -125,6 +125,7 @@ is left, and how it was verified.
 | `tui-settings-shell` | Settings in the TUI over the desktop's navigation, moved to `shelbi_app::settings` (pages offered per client, the leave prompt, stale-load tickets); `action:settings` opens it in both clients | [`status/tui-settings-shell.md`](status/tui-settings-shell.md) |
 | `tui-settings-general` | The TUI's General (live theme, editor command) and Terminal (host-owned, swatches, preview) pages; narrow comment-preserving `update_user_config`; shared `settings::general` and `terminal_preview` | [`status/tui-settings-general.md`](status/tui-settings-general.md) |
 | `dt-workspace-settings-forms` | New workspace and Edit workspace dialogs over Settings ▸ Workspaces (name, machine picker, own tags, derived worktree location, optional slot) through the shared `pool_admin` service, and the removal confirmation that never forces; modal keys, errors beside their fields, focus back on the row | [`status/dt-workspace-settings-forms.md`](status/dt-workspace-settings-forms.md) |
+| `tui-settings-workflows` | Settings ▸ Workflows in the TUI over the desktop's index state, moved to `shelbi_app::settings::workflows` (per-row errors, a keyboard reorder step): the workflows and status catalog edited in place, saved off the input loop one at a time, deletes confirmed | [`status/tui-settings-workflows.md`](status/tui-settings-workflows.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one

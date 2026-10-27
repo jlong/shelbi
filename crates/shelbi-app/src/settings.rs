@@ -25,10 +25,13 @@
 //! - [`general`]: the General page's appearance and editor preferences, and
 //!   where a save of them stands.
 //! - [`terminal_preview`]: the Terminal page's canned preview session.
+//! - [`workflows`]: the Workflows page's state (the project's workflows and
+//!   status catalog, the edits it saves as they're made, and their guards).
 
 pub mod general;
 pub mod summary;
 pub mod terminal_preview;
+pub mod workflows;
 
 /// A page of Settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

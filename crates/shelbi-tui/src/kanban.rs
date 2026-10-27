@@ -2874,7 +2874,7 @@ fn workflow_dropdown_row_text(opt: &WorkflowDropdownOption) -> String {
 /// renamed Review-step column (e.g. a workflow's `QA` status with
 /// `category: handoff`) still gets the same magenta the canonical
 /// Review column has — generic code keys off category, not name.
-fn category_color(category: StatusCategory) -> Color {
+pub(crate) fn category_color(category: StatusCategory) -> Color {
     match category {
         StatusCategory::Backlog => palette().ansi_gray,
         StatusCategory::Ready => palette().ansi_blue,

@@ -80,7 +80,9 @@ use review::{ReviewAction, ReviewInterface};
 use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
 use settings::{SettingsAction, SettingsShell};
 use shelbi_app::settings::summary::GeneralSummary;
+use shelbi_app::settings::workflows::Committed;
 use shelbi_app::settings::Ticket;
+use shelbi_state::workflow_config::WorkflowConfig;
 use sidebar::{RowTarget, SidebarView};
 use workspace::{WorkspaceAction, WorkspaceInterface};
 
@@ -102,10 +104,18 @@ enum SettingsMsg {
     Saved(Ticket, Result<Option<shelbi_state::UserConfig>, String>),
     /// An immediate-save preference write landed (General's theme or editor).
     Written(Result<shelbi_state::UserConfig, String>),
+    /// The Workflows page's read of its project's workflow config.
+    WorkflowsLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
+    /// One Workflows edit, applied and saved.
+    WorkflowsCommitted(Ticket, Box<Committed>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
 type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
+
+/// Reads a project's workflow config for Settings ▸ Workflows (blocking; run
+/// off the UI thread).
+type WorkflowsReader = Arc<dyn Fn(&str) -> Result<WorkflowConfig, String> + Send + Sync>;
 
 /// Resolved inputs the shell needs to build a [`ReviewInterface`], read off the
 /// UI thread (board + project config lookups).
@@ -1124,6 +1134,9 @@ struct ShellState {
     /// `~/.shelbi/config.yaml`.
     #[cfg(test)]
     settings_store: Arc<std::sync::Mutex<settings::FixtureConfig>>,
+    /// Reads Settings ▸ Workflows' config (disk in production; in tests a
+    /// refusal unless a test points it at its own `SHELBI_HOME`).
+    workflows_reader: WorkflowsReader,
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
@@ -1215,6 +1228,10 @@ impl ShellState {
         let settings_store = Arc::new(std::sync::Mutex::new(settings::FixtureConfig::default()));
         #[cfg(test)]
         let (settings_reader, settings_writer) = settings::fixture_io(&settings_store);
+        #[cfg(not(test))]
+        let workflows_reader: WorkflowsReader = Arc::new(shelbi_app::settings::workflows::load);
+        #[cfg(test)]
+        let workflows_reader: WorkflowsReader = Arc::new(|_: &str| Err("tests read no ~/.shelbi".to_string()));
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1271,6 +1288,7 @@ impl ShellState {
             settings_writer,
             #[cfg(test)]
             settings_store,
+            workflows_reader,
             status: None,
             job: None,
             pending_editor: None,
@@ -2076,22 +2094,115 @@ impl ShellState {
     /// back through `settings_rx` under the load's ticket.
     fn load_settings(&mut self, force: bool) {
         let project = self.client.project().map(str::to_string);
-        let Some(ticket) = self.settings.begin_load(project.as_deref(), force) else {
+        let Some(load) = self.settings.begin_page_load(project.as_deref(), force) else {
             return;
         };
-        let reader = self.settings_reader.clone();
+        let tx = self.settings_tx.clone();
+        let spawned = match load.clone() {
+            settings::Load::General(sent) => {
+                let reader = self.settings_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings".into())
+                    .spawn(move || {
+                        let summary = reader(project.as_deref());
+                        let _ = tx.send(SettingsMsg::Loaded(sent, Box::new(summary)));
+                    })
+            }
+            settings::Load::Workflows(sent, project) => {
+                let reader = self.workflows_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings".into())
+                    .spawn(move || {
+                        let config = reader(&project);
+                        let _ = tx.send(SettingsMsg::WorkflowsLoaded(sent, Box::new(config)));
+                    })
+            }
+        };
+        if let Err(e) = spawned {
+            let why = format!("couldn't start the read: {e}");
+            match load {
+                settings::Load::General(ticket) => {
+                    self.settings.loaded(&ticket, Err(why));
+                }
+                settings::Load::Workflows(ticket, _) => {
+                    self.settings.workflows_loaded(&ticket, Err(why));
+                }
+            }
+        }
+    }
+
+    /// Start Settings ▸ Workflows' next save off the UI thread, if one is
+    /// waiting. Saves run one at a time: the next starts when this one
+    /// lands ([`Self::poll_settings`]).
+    fn start_workflows_commit(&mut self) {
+        let Some((ticket, project, config, edit)) = self.settings.begin_commit() else {
+            return;
+        };
         let tx = self.settings_tx.clone();
         let sent = ticket.clone();
+        let work = edit.clone();
         let spawned = std::thread::Builder::new()
-            .name("shelbi-shell-settings".into())
+            .name("shelbi-shell-settings-save".into())
             .spawn(move || {
-                let summary = reader(project.as_deref());
-                let _ = tx.send(SettingsMsg::Loaded(sent, Box::new(summary)));
+                let done = shelbi_app::settings::workflows::commit(&project, &config, work);
+                let _ = tx.send(SettingsMsg::WorkflowsCommitted(sent, Box::new(done)));
             });
         if let Err(e) = spawned {
-            self.settings
-                .loaded(&ticket, Err(format!("couldn't start the read: {e}")));
+            let done = Committed {
+                edit,
+                config: None,
+                error: Some(format!("Couldn't start the save: {e}")),
+                dropped_comments: Vec::new(),
+            };
+            self.workflows_committed(&ticket, done);
         }
+    }
+
+    /// A Workflows save landed: take it, refresh the board when it saved
+    /// (its columns are the catalog), and start the next queued save.
+    fn workflows_committed(&mut self, ticket: &Ticket, done: Committed) {
+        if self.settings.committed(ticket, done) {
+            self.request_refresh();
+        }
+        self.start_workflows_commit();
+    }
+
+    /// Open `file` in the user's editor for Settings ▸ Workflows. The run
+    /// loop hands the terminal to the editor on its next turn and the page
+    /// reads its files again when the editor exits. `statuses.yaml` is
+    /// written from the shipped catalog first when the project has none.
+    fn edit_settings_file(&mut self, file: settings::EditFile) {
+        let ready = match &file.statuses_of {
+            Some(project) => shelbi_app::settings::workflows::prepare_statuses_yaml(project, &file.path),
+            None => {
+                let stem = file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                shelbi_app::settings::workflows::prepare_workflow_yaml(&stem, &file.path)
+            }
+        };
+        match ready {
+            Ok(()) => self.pending_editor = Some(file.path),
+            Err(e) => self.settings.workflows_error(file.target, e),
+        }
+    }
+
+    /// Open workflow `name`'s editor. The workflow editor is its own task;
+    /// until it lands this opens the workflow's YAML in the user's editor,
+    /// as the desktop did before its editor existed.
+    fn edit_workflow(&mut self, name: &str) {
+        let Some(path) = self
+            .settings
+            .workflows()
+            .state()
+            .and_then(|s| s.config())
+            .map(|c| c.workflow_path(name))
+        else {
+            return;
+        };
+        self.edit_settings_file(settings::EditFile {
+            path,
+            target: shelbi_app::settings::workflows::Target::Workflow(name.to_string()),
+            statuses_of: None,
+        });
     }
 
     /// Start the shown page's save (the unsaved-edits prompt's Save) off the
@@ -2130,6 +2241,12 @@ impl ShellState {
                     self.apply_settings_action(action);
                 }
                 SettingsMsg::Written(result) => self.settings.config_written(result),
+                SettingsMsg::WorkflowsLoaded(ticket, config) => {
+                    self.settings.workflows_loaded(&ticket, *config);
+                }
+                SettingsMsg::WorkflowsCommitted(ticket, done) => {
+                    self.workflows_committed(&ticket, *done);
+                }
             }
         }
         // A theme config.yaml now holds (read on entering Settings or after
@@ -2171,6 +2288,9 @@ impl ShellState {
             SettingsAction::Save => self.save_settings(),
             SettingsAction::Write(change) => self.write_setting(change),
             SettingsAction::EditFile(path) => self.pending_editor = Some(path),
+            SettingsAction::Commit => self.start_workflows_commit(),
+            SettingsAction::EditWorkflow(name) => self.edit_workflow(&name),
+            SettingsAction::EditYaml(file) => self.edit_settings_file(file),
         }
         self.dirty = true;
     }
@@ -4031,6 +4151,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         .map(|m| m.project_label.clone())
         .or_else(|| state.client.project().map(str::to_string))
         .unwrap_or_else(|| "No project".to_string());
+    let has_project = state.client.project().is_some();
     let settings = &mut state.settings;
     let keymaps = &state.keymaps;
     let display_style = state.display_style;
@@ -4173,6 +4294,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
                 status: status.as_deref(),
                 keymaps,
                 style: display_style,
+                has_project,
             };
             settings.render(frame, content_rect, main_rect, &chrome);
         }
@@ -8037,6 +8159,182 @@ mod tests {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         assert!(screen_text(&term).contains("vim (the default)"), "{}", screen_text(&term));
+    }
+
+    // --- Settings ▸ Workflows (tui-settings-workflows), through the shell ---
+
+    /// A throwaway `SHELBI_HOME` holding the Workflows fixture as projects
+    /// `proj` and `beta`, held under `ENV_LOCK` for the test.
+    struct WorkflowsHome {
+        root: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl WorkflowsHome {
+        fn new(tag: &str) -> WorkflowsHome {
+            let lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = std::env::temp_dir().join(format!("shb-shell-wf-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::env::set_var("SHELBI_HOME", &root);
+            for project in ["proj", "beta"] {
+                shelbi_app::settings::workflows::fixture::write_project(&root.join("projects"), project);
+            }
+            WorkflowsHome { root, _lock: lock }
+        }
+
+        fn file(&self, project: &str, file: &str) -> std::path::PathBuf {
+            self.root.join("projects").join(project).join("workflows").join(file)
+        }
+    }
+
+    impl Drop for WorkflowsHome {
+        fn drop(&mut self) {
+            std::env::remove_var("SHELBI_HOME");
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Settings open on Workflows (its number, `4`) over the test state,
+    /// reading the real files under `_home`, loaded.
+    fn workflows_state(_home: &WorkflowsHome) -> ShellState {
+        let mut st = settings_state();
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(&mut st, '4');
+        settle_workflows(&mut st);
+        st
+    }
+
+    /// Drain Settings until the Workflows page has its config and no save
+    /// runs.
+    fn settle_workflows(st: &mut ShellState) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings
+                    .workflows()
+                    .state()
+                    .is_some_and(|s| s.config().is_some() && !s.saving())
+            }),
+            "the Workflows page loads and settles"
+        );
+    }
+
+    #[test]
+    fn workflows_opens_by_its_number_and_draws_at_80x24_and_wide() {
+        let home = WorkflowsHome::new("draw");
+        let mut st = workflows_state(&home);
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workflows);
+        for (w, h) in [(80, 24), (160, 48)] {
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            draw_frame(&mut term, &mut st).unwrap();
+            let screen = screen_text(&term);
+            for want in ["Settings", "▾ proj", "📑", "task default", "subtask", "+ New workflow"] {
+                assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
+            }
+            let (x, y) = find_on_screen(&term, "task default").unwrap();
+            assert!(contains(st.main_rect, x, y), "{w}x{h}: the page is in the main area");
+        }
+        // Down the page: it scrolls the statuses into view at 80x24.
+        press(&mut st, KeyCode::Tab);
+        for _ in 0..8 {
+            press(&mut st, KeyCode::Down);
+        }
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("› ● Canceled"), "{screen}");
+        assert!(screen.contains("⏎ rename · m actions"), "the hints name the row's keys:\n{screen}");
+    }
+
+    #[test]
+    fn a_workflow_created_from_the_keys_saves_off_the_ui_thread() {
+        let home = WorkflowsHome::new("create");
+        let mut st = workflows_state(&home);
+        press(&mut st, KeyCode::Tab);
+        type_key(&mut st, 'n');
+        // Inside the name field digits and Esc belong to the field.
+        for c in "hotfix4".chars() {
+            type_key(&mut st, c);
+        }
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workflows, "4 typed, no page switch");
+        press(&mut st, KeyCode::Backspace);
+        st.handle_event(Event::Paste("-2".into()));
+        press(&mut st, KeyCode::Enter);
+        settle_workflows(&mut st);
+        assert!(home.file("proj", "hotfix-2.yaml").exists());
+        assert!(st.settings_open());
+        // Esc in a field closes the field first, then Settings.
+        type_key(&mut st, 'n');
+        press(&mut st, KeyCode::Esc);
+        assert!(st.settings_open() && !st.settings.workflows().modal_open());
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings_open());
+    }
+
+    #[test]
+    fn edit_yaml_hands_the_editor_the_file_and_its_return_reloads_the_page() {
+        let home = WorkflowsHome::new("yaml");
+        let mut st = workflows_state(&home);
+        press(&mut st, KeyCode::Tab);
+        st.settings.workflows_mut().select(&settings::workflows_item_status("todo"));
+        type_key(&mut st, 'y');
+        let path = st.pending_editor.take().expect("the editor is queued");
+        assert_eq!(path, home.file("proj", "statuses.yaml"));
+        // The user's edit, then the run loop's return path.
+        let text = std::fs::read_to_string(&path).unwrap().replace("name: To Do", "name: Next up");
+        std::fs::write(&path, text).unwrap();
+        st.load_settings(true);
+        assert!(wait_until(Duration::from_secs(5), || {
+            st.poll_settings();
+            st.settings
+                .workflows()
+                .state()
+                .and_then(|s| s.config())
+                .is_some_and(|c| c.status("todo").is_some_and(|s| s.name == "Next up"))
+        }));
+        // A missing workflow file says so at its row rather than opening.
+        std::fs::remove_file(home.file("proj", "subtask.yaml")).unwrap();
+        st.settings.workflows_mut().select(&settings::workflows_item_workflow("subtask"));
+        press(&mut st, KeyCode::Enter);
+        assert!(st.pending_editor.is_none());
+        let state = st.settings.workflows().state().unwrap();
+        assert_eq!(
+            state.error_at(&shelbi_app::settings::workflows::Target::Workflow("subtask".into())),
+            Some("Couldn't find subtask.yaml.")
+        );
+    }
+
+    #[test]
+    fn a_project_switch_over_workflows_shows_the_new_projects_files() {
+        let home = WorkflowsHome::new("switch");
+        std::fs::write(
+            home.file("beta", "statuses.yaml"),
+            shelbi_app::settings::workflows::fixture::STATUSES.replace("name: Review", "name: QA"),
+        )
+        .unwrap();
+        let mut st = workflows_state(&home);
+        st.dispatch_effect(Effect::SwitchProject {
+            project: "beta".into(),
+        });
+        assert!(st.settings_open(), "Settings stays up");
+        settle_workflows(&mut st);
+        let state = st.settings.workflows().state().unwrap();
+        assert_eq!(state.project(), "beta");
+        assert_eq!(state.config().unwrap().status("review").unwrap().name, "QA");
+    }
+
+    #[test]
+    fn the_workflows_page_renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        let home = WorkflowsHome::new("light");
+        let mut st = workflows_state(&home);
+        press(&mut st, KeyCode::Tab);
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
+            draw_frame(&mut term, &mut st).unwrap();
+            crate::theme::assert_light_readable("settings-workflows-shell", term.backend().buffer());
+        });
     }
 
     #[test]
