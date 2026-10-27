@@ -330,6 +330,13 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   cuts the last line mid-word with no marker; add `text_ellipsis()` beside it.
   For a path, `text_ellipsis_start()` with `overflow_hidden().whitespace_nowrap()`
   keeps the end visible (the TUI's left-truncated worktree).
+- **`on_hover` remembers hover per element id, not per control**
+  (`dt-sidebar-hover-stuck`). The listener fires when its element's own
+  "was hovered" changes, and an element that stops painting never reports a
+  leave. Give rows that can move a stable id (not their index), and don't
+  keep hover state keyed elsewhere on `on_hover` alone: `motion::fill_layer`
+  settles it against a hitbox's `is_hovered` at paint, which reflects the
+  frame being painted. `Window::refresh` is ignored while drawing; defer it.
 
 ### Menus and system notifications (`dt-menus-notifications`, gpui-pre 0.3.9)
 
