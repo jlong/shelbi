@@ -8,10 +8,11 @@
 //! section (General, Keybindings, Terminal), then, after a divider, the
 //! project section (`dt-wf-settings-index`, frame 2301:5824): the project
 //! switcher, the same trigger and menu as the app sidebar's (switching
-//! reopens Settings on the new project), over the project's pages: Workflows
+//! reopens Settings on the new project), over the project's pages:
+//! Workspaces (`dt-workspace-settings-index`, frame 2523:8879), Workflows
 //! and Agents (`dt-agents-settings-page`, frame 2377:41040). The frames'
-//! Workspaces and Integrations join [`SECTIONS`] with their pages. No footer: the frame draws no Zen pill and
-//! no settings gear.
+//! Integrations joins [`SECTIONS`] with its page. No footer: the frame draws
+//! no Zen pill and no settings gear.
 //!
 //! [`SettingsNav`] is the toolkit-free part: the page shown and the row the
 //! keys moved to.
@@ -45,6 +46,8 @@ pub enum SettingsPage {
     Keybindings,
     /// The terminals' font, size, and Option key.
     Terminal,
+    /// The project's workspace pool and the machines that host it.
+    Workspaces,
     /// The project's workflows and status catalog.
     Workflows,
     /// The project's agents and their shared instructions.
@@ -57,6 +60,7 @@ impl SettingsPage {
             SettingsPage::General => "General",
             SettingsPage::Keybindings => "Keybindings",
             SettingsPage::Terminal => "Terminal",
+            SettingsPage::Workspaces => "Workspaces",
             SettingsPage::Workflows => "Workflows",
             SettingsPage::Agents => "Agents",
         }
@@ -67,19 +71,22 @@ impl SettingsPage {
             SettingsPage::General => icons::WRENCH_SCREWDRIVER,
             SettingsPage::Keybindings => icons::KEYBOARD_KEY,
             SettingsPage::Terminal => icons::COMMAND_LINE,
+            SettingsPage::Workspaces => icons::FOLDER,
             SettingsPage::Workflows => icons::VIEW_COLUMNS,
             SettingsPage::Agents => icons::RECTANGLE_STACK,
         }
     }
 
     /// Its ⌘N while Settings is open. Fixed per page rather than counted:
-    /// the frames number Workflows 4 and Agents 6 (and give Workspaces
-    /// Terminal's 3; 5 is left to whichever page takes it).
+    /// the frames number Workflows 4 and Agents 6. They give Workspaces
+    /// Terminal's 3 too; it takes the free 5 instead, so each chord opens one
+    /// page (the sidebar lists it before Workflows all the same).
     pub fn shortcut(self) -> u8 {
         match self {
             SettingsPage::General => 1,
             SettingsPage::Keybindings => 2,
             SettingsPage::Terminal => 3,
+            SettingsPage::Workspaces => 5,
             SettingsPage::Workflows => 4,
             SettingsPage::Agents => 6,
         }
@@ -96,6 +103,7 @@ impl SettingsPage {
             SettingsPage::General => "settings-nav-general",
             SettingsPage::Keybindings => "settings-nav-keybindings",
             SettingsPage::Terminal => "settings-nav-terminal",
+            SettingsPage::Workspaces => "settings-nav-workspaces",
             SettingsPage::Workflows => "settings-nav-workflows",
             SettingsPage::Agents => "settings-nav-agents",
         }
@@ -131,7 +139,7 @@ pub const SECTIONS: &[Section] = &[
     },
     Section {
         header: Header::Project,
-        pages: &[SettingsPage::Workflows, SettingsPage::Agents],
+        pages: &[SettingsPage::Workspaces, SettingsPage::Workflows, SettingsPage::Agents],
     },
 ];
 
@@ -413,22 +421,37 @@ mod tests {
                 SettingsPage::General,
                 SettingsPage::Keybindings,
                 SettingsPage::Terminal,
+                SettingsPage::Workspaces,
                 SettingsPage::Workflows,
                 SettingsPage::Agents
             ]
         );
         assert_eq!(
             all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(),
-            [1, 2, 3, 4, 6]
+            [1, 2, 3, 5, 4, 6]
         );
         assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
         assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
-        assert_eq!(SettingsPage::for_shortcut(5), None);
+        assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Workspaces));
         assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
+        assert_eq!(SettingsPage::for_shortcut(7), None);
         assert_eq!(
             SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 2)]
+            [(Header::Title("Global"), 3), (Header::Project, 3)]
         );
+    }
+
+    #[test]
+    fn every_page_has_its_own_chord_label_and_selector() {
+        let all: Vec<_> = pages().collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a chord");
+                assert_ne!(a.label(), b.label());
+                assert_ne!(a.selector(), b.selector());
+            }
+            assert_eq!(SettingsPage::for_shortcut(a.shortcut()), Some(*a), "its chord opens it");
+        }
     }
 
     #[test]
@@ -440,7 +463,7 @@ mod tests {
         );
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        for _ in 0..5 {
+        for _ in 0..6 {
             nav.step(true);
         }
         assert_eq!(

@@ -51,8 +51,9 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Probe `host` over SSH, or (`--visual-figma`, whose fixture hosts don't
-/// exist) answer the stubbed reachability without a probe.
-fn probe(host: &str) -> shelbi_core::Reachability {
+/// exist) answer the stubbed reachability without a probe. Settings ▸
+/// Workspaces' prober probes through it too.
+pub(super) fn probe(host: &str) -> shelbi_core::Reachability {
     #[cfg(feature = "visual-check")]
     if let Some(stub) = FIXTURE_HOSTS.lock().unwrap().clone() {
         return stub;

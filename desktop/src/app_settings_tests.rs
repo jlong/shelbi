@@ -1,6 +1,6 @@
 //! Settings in its own sidebar (`dt-settings-sections`): opening it pushes
 //! the settings sidebar into the leading column on the General page (or the
-//! last page used), ⌘1 to ⌘4 and ⌘6 and ↑ / ↓ plus Enter switch its pages while it
+//! last page used), ⌘1 to ⌘6 and ↑ / ↓ plus Enter switch its pages while it
 //! is open (and ⌘N keeps its sidebar meaning outside), and Back or Esc
 //! return to the view it was opened over with the app sidebar back and its
 //! selection on that view's row (`dt-back-syncs-sidebar`).
@@ -227,9 +227,10 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Workflows),
+        Some(SettingsPage::Workspaces),
         "it crosses into the project section"
     );
+    s.key("down");
     s.key("down");
     s.key("down");
     assert_eq!(
@@ -239,6 +240,7 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     );
     s.key("enter");
     assert_eq!(s.page(), Some(SettingsPage::Agents));
+    s.key("up");
     s.key("up");
     s.key("up");
     s.key("enter");
@@ -2773,4 +2775,281 @@ fn a_rename_is_read_only_for_shipped_agents_and_waits_for_save(cx: &mut TestAppC
     s.settle();
     assert!(!s.agent_dirty());
     assert_eq!(s.with_agent_editor(|e, cx| e.name_field().read(cx).value().to_string()), "qa");
+}
+
+// ---- Settings ▸ Workspaces (`dt-workspace-settings-index`) -------------------
+
+use crate::views::workspaces::WorkspacesPage;
+use crate::views::workspaces_state::tests::{write_pool, POOL};
+use crate::views::workspaces_state::{probe_key, Intent, Load};
+
+impl Settings {
+    /// Settings on Workspaces (⌘5), its page loaded from the test's home.
+    fn open_workspaces(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("cmd-5");
+        s.load_workspaces();
+        s
+    }
+
+    fn load_workspaces(&mut self) {
+        let page = self.workspaces();
+        self.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+        self.saved();
+    }
+
+    fn workspaces(&self) -> Entity<WorkspacesPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).workspaces(),
+            _ => panic!("Settings is open"),
+        })
+    }
+
+    fn pool_forms(&self) -> Vec<Intent> {
+        self.read(|w, _| w.pool_forms.clone())
+    }
+
+    fn workspace_tags(&self, name: &str) -> Vec<String> {
+        let page = self.workspaces();
+        self.read(|_, cx| match page.read(cx).state().load() {
+            Load::Loaded(index) => index
+                .workspaces
+                .iter()
+                .find(|w| w.name == name)
+                .map(|w| w.tags.iter().map(|t| t.name.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        })
+    }
+}
+
+/// A pool small enough that both sections fit the test window.
+const SMALL_POOL: &str = "\
+machines:
+  - name: This Mac
+    kind: local
+    work_dir: /tmp/my-project
+  - name: Build server
+    kind: ssh
+    host: build-server
+    work_dir: /home/me/my-project
+    tags: [linux]
+workspaces:
+  - name: alpha
+    machine: This Mac
+    tags: [frontend]
+  - name: charlie
+    machine: Build server
+";
+
+#[gpui::test]
+fn workspaces_sits_before_workflows_on_its_own_chord(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let switcher = s.bounds("sidebar-project-title").unwrap();
+    let workspaces = s.bounds("settings-nav-workspaces").unwrap();
+    let workflows = s.bounds("settings-nav-workflows").unwrap();
+    assert!(switcher.bottom() < workspaces.top() && workspaces.bottom() < workflows.top());
+    s.key("cmd-5");
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workspaces), Some(SettingsPage::Workspaces)));
+    assert!(s.drawn("settings-page-workspaces") && s.drawn("workspaces-heading"));
+    s.key("cmd-3");
+    assert_eq!(s.page(), Some(SettingsPage::Terminal), "⌘3 stays Terminal's");
+    s.click("settings-nav-workspaces");
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces));
+
+    // Back from it returns to the view, as from any page.
+    s.key("escape");
+    assert_eq!(s.page(), None);
+}
+
+#[gpui::test]
+fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-rows", "alpha");
+    write_pool(&home.root, "alpha", POOL);
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    s.key("cmd-5");
+    assert!(s.drawn("workspaces-loading"), "loading until the read lands");
+    s.load_workspaces();
+    assert!(!s.drawn("workspaces-loading"));
+    for name in ["alpha", "bravo", "review", "charlie", "delta"] {
+        let selector: &'static str = Box::leak(format!("workspace-row-{name}").into_boxed_str());
+        assert!(s.drawn(selector), "{name}");
+    }
+    let alpha = s.bounds("workspace-row-alpha").unwrap();
+    let delta = s.bounds("workspace-row-delta").unwrap();
+    assert!(alpha.top() < delta.top(), "in declaration order");
+    assert_eq!(s.workspace_tags("charlie"), ["linux"], "the machine's tag is charlie's");
+    assert!(s.drawn("workspace-tag-charlie-linux"));
+    assert!(s.drawn("workspace-tags-bravo"));
+    assert!(s.drawn("workspace-slot-review"));
+    let table = s.bounds("workspaces-table").unwrap();
+    let heading = s.bounds("machines-heading").unwrap();
+    assert!(table.bottom() < heading.top(), "Machines under the table");
+    assert!(!s.drawn("workspaces-empty") && !s.drawn("workspaces-failed"));
+}
+
+#[gpui::test]
+fn a_remote_that_cant_be_reached_keeps_its_configuration(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-down", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_workspaces(cx);
+    let page = s.workspaces();
+    let status = |s: &Settings| {
+        s.read(|_, cx| {
+            let state = page.read(cx).state();
+            let m = state.index().unwrap().machines[1].clone();
+            state.status(&m).label()
+        })
+    };
+    assert_eq!(status(&s), "Checking…");
+    assert!(s.drawn("machine-status-Build server") && s.drawn("machine-dir-Build server"));
+    s.update(|_, _, cx| {
+        page.update(cx, |p, cx| {
+            p.state_mut().set_reachability(std::collections::HashMap::from([(
+                probe_key("Build server", "build-server"),
+                shelbi_core::Reachability::Unreachable {
+                    error: "ssh: connect to host build-server port 22: Operation timed out".into(),
+                },
+            )]));
+            cx.notify();
+        })
+    });
+    s.settle();
+    assert_eq!(status(&s), "Unreachable");
+    assert!(s.drawn("machine-error-Build server"), "SSH's reason under the machine");
+    assert!(s.drawn("machine-dir-Build server") && s.drawn("machine-configure-Build server"));
+    assert!(s.drawn("workspace-row-charlie"), "its workspaces stay listed");
+    assert_eq!(status(&s), "Unreachable");
+    s.key("cmd-4");
+    assert_eq!(s.page(), Some(SettingsPage::Workflows), "the rest of Settings carries on");
+}
+
+#[gpui::test]
+fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-intents", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_workspaces(cx);
+    s.click("workspaces-new");
+    s.click("workspace-edit-alpha");
+    s.click("workspace-row-charlie");
+    s.click("workspace-more-alpha");
+    assert!(s.drawn("workspace-menu"));
+    s.click("workspace-menu-remove-alpha");
+    assert!(!s.drawn("workspace-menu"), "the menu closes");
+    s.click("machines-add");
+    s.click("machine-configure-Build server");
+    s.saved();
+    assert_eq!(
+        s.pool_forms(),
+        [
+            Intent::NewWorkspace,
+            Intent::EditWorkspace("alpha".into()),
+            Intent::EditWorkspace("charlie".into()),
+            Intent::RemoveWorkspace("alpha".into()),
+            Intent::AddMachine,
+            Intent::ConfigureMachine("Build server".into()),
+        ]
+    );
+    // Until the forms take them, each opens the file the pool lives in.
+    assert_eq!(opened(&file), 6);
+    assert!(s.drawn("workspaces-notice"));
+}
+
+#[gpui::test]
+fn an_edit_shows_on_return_and_refreshes_the_window(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-reread", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_workspaces(cx);
+    s.click("workspace-edit-alpha");
+    s.saved();
+    assert_eq!(s.read(|w, _| w.pool_refreshes), 0, "nothing changed yet");
+    let edited = std::fs::read_to_string(&file).unwrap().replace("tags: [frontend]", "tags: [frontend, web]");
+    std::fs::write(&file, edited).unwrap();
+    s.come_back();
+    assert_eq!(s.workspace_tags("alpha"), ["frontend", "web"]);
+    assert_eq!(s.read(|w, _| w.pool_refreshes), 1, "the window rereads its feed");
+
+    // A reread with nothing new doesn't.
+    s.click("workspace-edit-alpha");
+    s.come_back();
+    assert_eq!(s.read(|w, _| w.pool_refreshes), 1);
+}
+
+#[gpui::test]
+fn an_empty_pool_and_a_broken_config_have_their_own_states(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-states", "alpha");
+    let file = write_pool(&home.root, "alpha", "machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\nworkspaces: []\n");
+    let mut s = Settings::open_workspaces(cx);
+    assert!(s.drawn("workspaces-empty"), "no workspaces yet");
+    assert!(s.drawn("machine-row-hub") && s.drawn("machine-status-hub"));
+    assert!(!s.drawn("machine-error-hub"));
+
+    std::fs::write(&file, "machines: [not yaml").unwrap();
+    s.load_workspaces();
+    assert!(s.drawn("workspaces-error"), "a failed reread keeps the rows, with its error");
+    assert!(s.drawn("workspaces-empty"));
+
+    // A fresh page over the broken file: the error and Retry in place of
+    // the table, no machines, and the rest of Settings still works.
+    s.key("escape");
+    s.open_settings();
+    let page = s.workspaces();
+    s.load_workspaces();
+    assert!(s.read(|_, cx| matches!(page.read(cx).state().load(), Load::Failed(_))));
+    assert!(s.drawn("workspaces-failed") && s.drawn("workspaces-retry"));
+    assert!(!s.drawn("workspaces-table") && !s.drawn("machines-heading"));
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    s.click("workspaces-retry");
+    s.saved();
+    assert!(s.drawn("workspace-row-alpha") && s.drawn("machines-heading"));
+}
+
+#[gpui::test]
+fn switching_projects_reloads_workspaces_for_the_new_project(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-switch", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    crate::views::workflows_state::tests::write_project(&home.root, "beta");
+    let (hub, _feeds) = crate::feeds::tests::canned_hub();
+    cx.update(|cx| cx.set_global(hub));
+    let mut s = Settings::open_workspaces(cx);
+    let before = s.workspaces();
+    assert!(s.drawn("workspace-row-charlie"));
+    s.update(|w, window, cx| w.switch_to("beta", window, cx));
+    s.saved();
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces), "still on Workspaces");
+    let after = s.workspaces();
+    assert_ne!(before.entity_id(), after.entity_id(), "a fresh page");
+    assert_eq!(s.read(|_, cx| after.read(cx).state().project().to_string()), "beta");
+    assert!(!s.drawn("workspace-row-charlie"), "alpha's rows went with its page");
+    s.load_workspaces();
+    assert!(s.drawn("workspace-row-alpha") && !s.drawn("workspace-row-charlie"), "beta's one workspace");
+}
+
+#[gpui::test]
+fn a_long_name_and_path_clip_inside_their_column(cx: &mut TestAppContext) {
+    let home = Home::with_project("ws-long", "alpha");
+    let long = "a-very-long-workspace-name-that-keeps-going-well-past-its-column-and-then-some-more";
+    write_pool(
+        &home.root,
+        "alpha",
+        &format!(
+            "machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp/{0}/{0}/{0}\nworkspaces:\n  - name: {long}\n    machine: hub\n",
+            "deeply-nested-directory-name-for-the-project"
+        ),
+    );
+    let mut s = Settings::open_workspaces(cx);
+    let name: &'static str = Box::leak(format!("workspace-name-{long}").into_boxed_str());
+    let path: &'static str = Box::leak(format!("workspace-path-{long}").into_boxed_str());
+    let tags: &'static str = Box::leak(format!("workspace-tags-{long}").into_boxed_str());
+    let tags = s.bounds(tags).expect("the tags column");
+    for selector in [name, path] {
+        let b = s.bounds(selector).expect(selector);
+        assert!(b.right() < tags.left(), "{selector} stops short of the columns after it");
+    }
+    let row: &'static str = Box::leak(format!("workspace-row-{long}").into_boxed_str());
+    let table = s.bounds("workspaces-table").unwrap();
+    assert!(s.bounds(row).unwrap().right() <= table.right());
 }

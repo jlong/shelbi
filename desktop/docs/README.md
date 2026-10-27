@@ -118,6 +118,7 @@ is left, and how it was verified.
 | `dt-add-project-wizard` | Add Project is a wizard in its own 800 × 580 window (folder, then where settings live, then Create Project) from every entry point and the first launch; the one-form overlay is gone | [`status/dt-add-project-wizard.md`](status/dt-add-project-wizard.md) |
 | `dt-project-creation-checklist` | Create Project shows screen 03: a checklist of the creation engine's stages (config, agents, workflows), a failure with Try Again that finishes the same project, then a created screen that waits for Open Project | [`status/dt-project-creation-checklist.md`](status/dt-project-creation-checklist.md) |
 | `dt-wizard-workflow-summary` | Screen 04: the Task and Subtask workflows a new project was created with, then Okay re-reads the catalog and opens the project on its Orchestrator (a failed open stays on 04 and retries the open, never the creation) | [`status/dt-wizard-workflow-summary.md`](status/dt-wizard-workflow-summary.md) |
+| `dt-workspace-settings-index` | Settings ▸ Workspaces (⌘5, before Workflows): the project's workspaces (worktree, machine, effective tags, effective slot) and the machines that host them (SSH host, root directory, count, Local or SSH reachability), read off the UI thread; its buttons ask for the workspace and machine forms through explicit intents | [`status/dt-workspace-settings-index.md`](status/dt-workspace-settings-index.md) |
 
 The plan's Phase 7 also rewrites the product docs in the ContextStore
 (`Product/vision.md`, `principles.md`, `positioning.md`) to describe one
