@@ -7,9 +7,21 @@
 //! Settings title beside it, the Global section's page rows (each with its
 //! number key), then a divider and the project switcher (the palette's
 //! Projects column, the TUI's switcher) over the project's page rows. Only
-//! the pages the TUI can show are listed ([`OFFERED`]): General for now, a
-//! summary of where the settings live with the Open in editor paths; the
-//! follow-up pages join the set as they land.
+//! the pages the TUI can show are listed ([`OFFERED`]); the follow-up pages
+//! join the set as they land:
+//!
+//! - General (`tui-settings-general`): the appearance (Auto / Dark / Light)
+//!   and the external editor command, over the shared
+//!   [`GeneralForm`](shelbi_app::settings::general::GeneralForm), then a
+//!   summary of where the settings live with the Open in editor paths. Both
+//!   controls save at once, as the desktop app's do: a theme when it is
+//!   picked (it repaints every surface on the next frame once the write
+//!   lands), the editor when Enter commits what was typed. A save shows as
+//!   pending until it lands, and a failed one puts the control back.
+//! - Terminal: what the host terminal owns (the font, its ANSI palette,
+//!   window effects), its sixteen colors as sessions draw them here, and a
+//!   short session drawn through the sessions' own cell mapping. Nothing on
+//!   it edits: the TUI never changes the host terminal's palette.
 //!
 //! Keys, all terminal-safe (no Command chords) and never forwarded to a
 //! session while Settings shows:
@@ -19,9 +31,9 @@
 //! - Tab / Shift-Tab (and the global Ctrl+H / Ctrl+L) move focus between
 //!   the sidebar and the page;
 //! - a page's number (`1`) opens it from either;
-//! - Esc closes the innermost thing first: the unsaved-edits prompt, then
-//!   Settings itself (back to the view, selection and focus it was opened
-//!   over; no session stops).
+//! - Esc closes the innermost thing first: the editor command being typed,
+//!   the unsaved-edits prompt, then Settings itself (back to the view,
+//!   selection and focus it was opened over; no session stops).
 //!
 //! Mouse: a click opens a row, runs a page action or answers the prompt;
 //! the wheel moves the sidebar selection or scrolls the page.
@@ -30,26 +42,35 @@
 //! and carries out the [`SettingsAction`]s that need it (leaving, switching
 //! project, running an effect, starting a load or a save off the UI thread).
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
+    buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use shelbi_app::settings::general::{self, Change, GeneralForm, SaveStatus};
 use shelbi_app::settings::summary::{self, FileState, GeneralSummary, ProjectSummary};
+use shelbi_app::settings::terminal_preview;
 use shelbi_app::settings::{
     Header, Job, JobState, LeaveGuard, PageSet, SettingsNav, SettingsPage, Ticket,
 };
 use shelbi_app::{EditTarget, Effect};
 use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
+use shelbi_state::{EditorSource, ThemePreference, UserConfig};
 
 use crate::panel::{self, PAD};
 use crate::theme::palette;
 
 /// The pages the TUI offers. A follow-up page joins here once it draws.
-pub(crate) const OFFERED: PageSet = PageSet::NONE.with(SettingsPage::General);
+pub(crate) const OFFERED: PageSet = PageSet::NONE
+    .with(SettingsPage::General)
+    .with(SettingsPage::Terminal);
 
 /// Where keyboard focus sits inside Settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,13 +117,25 @@ pub(crate) enum SettingsAction {
     Reload,
     /// The prompt's Save: start the page's save.
     Save,
+    /// Write this preference to `config.yaml` (an immediate-save control).
+    Write(Change),
+    /// Open this file in the user's editor (`config.yaml`).
+    EditFile(PathBuf),
 }
 
-/// What a page's action row does.
+/// What a page's focusable row does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Does {
     Run(Effect),
     Reload,
+    /// The theme's segmented control (←/→, or Enter for the next one).
+    Theme,
+    /// The editor command's field (Enter types, Enter again saves).
+    Editor,
+    /// Clear the editor override, back to the fallback.
+    ClearEditor,
+    /// Open a file in the editor.
+    EditFile(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,13 +150,20 @@ struct PageAction {
 enum Hit {
     Stop(Stop),
     Action(usize),
+    /// A theme's segment.
+    Theme(ThemePreference),
     PromptSave,
     PromptDiscard,
     PromptCancel,
 }
 
-/// A blocking save the shell runs off the UI thread.
-pub(crate) type SaveWork = Box<dyn FnOnce() -> Result<(), String> + Send>;
+/// A blocking save the shell runs off the UI thread: the config as written
+/// when it wrote `config.yaml`.
+pub(crate) type SaveWork = Box<dyn FnOnce() -> Result<Option<UserConfig>, String> + Send>;
+
+/// Writes one preference change to `config.yaml` (blocking; run off the UI
+/// thread): [`Change::write`] in production, a fixture in tests.
+pub(crate) type ConfigWriter = Arc<dyn Fn(&Change) -> Result<UserConfig, String> + Send + Sync>;
 
 /// The prompt's buttons, left to right.
 const PROMPT_BUTTONS: [&str; 3] = ["Save", "Discard", "Cancel"];
@@ -159,6 +199,10 @@ pub(crate) struct SettingsShell {
     stop: Stop,
     /// The General page's summary, loaded per project.
     general: Job<GeneralSummary>,
+    /// The General page's appearance and editor controls.
+    form: GeneralForm,
+    /// A theme loaded or saved that the shell hasn't applied yet.
+    theme_out: Option<ThemePreference>,
     /// The page's selected action row and scroll offset.
     action: usize,
     scroll: u16,
@@ -187,6 +231,8 @@ impl Default for SettingsShell {
             nav,
             region: Region::Sidebar,
             general: Job::default(),
+            form: GeneralForm::default(),
+            theme_out: None,
             action: 0,
             scroll: 0,
             guard: LeaveGuard::default(),
@@ -228,6 +274,11 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn form(&self) -> &GeneralForm {
+        &self.form
+    }
+
+    #[cfg(test)]
     pub(crate) fn prompting(&self) -> bool {
         self.guard.prompt().is_some() || self.guard.leaving_after_save()
     }
@@ -240,6 +291,8 @@ impl SettingsShell {
         self.region = Region::Sidebar;
         self.guard.cancel();
         self.save_error = None;
+        self.form.cancel_edit();
+        self.form.clear_status();
     }
 
     pub(crate) fn set_region(&mut self, region: Region) {
@@ -252,37 +305,49 @@ impl SettingsShell {
         if self.test_edits.is_some() {
             return true;
         }
-        false
+        self.form.dirty()
     }
 
     /// The shown page's save, if it has anything to save.
-    pub(crate) fn begin_save(&mut self, project: Option<&str>) -> Option<(Ticket, SaveWork)> {
+    pub(crate) fn begin_save(&mut self, project: Option<&str>, writer: &ConfigWriter) -> Option<(Ticket, SaveWork)> {
         #[cfg(test)]
         if let Some(result) = self.test_edits.clone() {
             let ticket = self.save.begin(project);
-            return Some((ticket, Box::new(move || result)));
+            return Some((ticket, Box::new(move || result.map(|()| None))));
         }
-        let _ = project;
+        // General: the editor command typed but not committed.
+        if self.form.dirty() {
+            if let Some(change) = self.form.commit_edit() {
+                let ticket = self.save.begin(project);
+                let writer = writer.clone();
+                return Some((ticket, Box::new(move || writer(&change).map(Some))));
+            }
+        }
         self.guard.forget_save();
         None
     }
 
     /// A save landed. Returns where to go when the prompt's Save started it
     /// and it worked.
-    pub(crate) fn saved(&mut self, ticket: &Ticket, result: Result<(), String>) -> SettingsAction {
+    pub(crate) fn saved(&mut self, ticket: &Ticket, result: Result<Option<UserConfig>, String>) -> SettingsAction {
         let ok = result.is_ok();
-        if !self.save.complete(ticket, result.clone()) {
+        if !self.save.complete(ticket, result.clone().map(|_| ())) {
             self.dropped += 1;
             return SettingsAction::Stay;
         }
         match result {
-            Ok(()) => {
+            Ok(written) => {
                 self.save_error = None;
+                if let Some(cfg) = written {
+                    self.config_written(Ok(cfg));
+                }
                 #[cfg(test)]
                 {
                     self.test_edits = None;
                 }
             }
+            // The form says why its own save failed.
+            Err(e) if self.form.saving() => self.config_written(Err(e)),
             Err(e) => self.save_error = Some(e),
         }
         match self.guard.saved(ok) {
@@ -297,7 +362,34 @@ impl SettingsShell {
         {
             self.test_edits = None;
         }
+        self.form.cancel_edit();
         self.save_error = None;
+    }
+
+    /// A preference write landed: the form takes it, and a theme it saved is
+    /// handed to the shell to apply.
+    pub(crate) fn config_written(&mut self, result: Result<UserConfig, String>) {
+        if let Some(theme) = self.form.saved_result(result) {
+            self.theme_out = Some(theme);
+        }
+    }
+
+    /// The theme `config.yaml` now holds, once, when a load or a save brought
+    /// it in: the shell applies it to every surface.
+    pub(crate) fn take_theme(&mut self) -> Option<ThemePreference> {
+        self.theme_out.take()
+    }
+
+    /// A paste (or a dropped file's path) while Settings shows: into the
+    /// editor command being typed, else nowhere.
+    pub(crate) fn paste(&mut self, text: &str) -> bool {
+        match self.form.draft_mut() {
+            Some(field) if self.region == Region::Page => {
+                field.paste(text);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Ask to leave for `leave`: through the prompt when the page is dirty.
@@ -369,6 +461,16 @@ impl SettingsShell {
     pub(crate) fn loaded(&mut self, ticket: &Ticket, result: Result<GeneralSummary, String>) -> bool {
         let taken = self.general.complete(ticket, result);
         if taken {
+            if let Some(summary) = self.general.done() {
+                // What config.yaml holds now (it may have been edited outside
+                // Shelbi): the form shows it, and the TUI follows its theme.
+                let global = &summary.global;
+                let waiting = self.form.saving();
+                self.form.load(global.preferences.clone(), global.env_editor.clone());
+                if let (Ok(prefs), false) = (&global.preferences, waiting) {
+                    self.theme_out = Some(prefs.theme);
+                }
+            }
             let n = self.actions().len();
             self.action = self.action.min(n.saturating_sub(1));
         } else {
@@ -413,8 +515,47 @@ impl SettingsShell {
 
     // --- the page's actions -----------------------------------------------
 
-    /// The shown page's action rows.
+    /// The shown page's focusable rows, top to bottom.
     fn actions(&self) -> Vec<PageAction> {
+        match self.nav.page() {
+            SettingsPage::General => self.general_actions(),
+            // Terminal only explains and shows: nothing on it acts.
+            SettingsPage::Terminal
+            | SettingsPage::Keybindings
+            | SettingsPage::Workspaces
+            | SettingsPage::Workflows
+            | SettingsPage::Agents => Vec::new(),
+        }
+    }
+
+    /// General's rows: the theme and the editor (once `config.yaml` reads),
+    /// Edit config.yaml, then the summary's actions.
+    fn general_actions(&self) -> Vec<PageAction> {
+        let mut out = Vec::new();
+        if let JobState::Done(summary) = self.general.state() {
+            if self.form.saved().is_some() {
+                out.push(PageAction { label: "Theme".into(), note: None, does: Does::Theme });
+                out.push(PageAction { label: "Command".into(), note: None, does: Does::Editor });
+                if self.form.editor().is_some() {
+                    out.push(PageAction {
+                        label: "Clear the editor setting".into(),
+                        note: Some(format!("use {}", self.form.fallback_editor().0)),
+                        does: Does::ClearEditor,
+                    });
+                }
+            }
+            out.push(PageAction {
+                label: "Edit config.yaml".into(),
+                note: Some("in your editor".into()),
+                does: Does::EditFile(summary.global.config.path().to_path_buf()),
+            });
+        }
+        out.extend(self.summary_actions());
+        out
+    }
+
+    /// The General summary's actions.
+    fn summary_actions(&self) -> Vec<PageAction> {
         let switch = PageAction {
             label: "Switch project…".into(),
             note: None,
@@ -473,7 +614,44 @@ impl SettingsShell {
         match action.does {
             Does::Run(effect) => SettingsAction::Run(effect),
             Does::Reload => SettingsAction::Reload,
+            Does::Theme => write(self.form.step_theme(1)),
+            Does::Editor => {
+                self.form.begin_edit();
+                SettingsAction::Stay
+            }
+            Does::ClearEditor => write(self.form.clear_editor()),
+            Does::EditFile(path) => SettingsAction::EditFile(path),
         }
+    }
+
+    /// Whether the editor command is being typed (it takes the page's keys).
+    fn typing(&self) -> bool {
+        self.region == Region::Page && self.form.draft().is_some()
+    }
+
+    /// A key while the editor command is typed: Enter saves it, Esc puts it
+    /// back, the rest edits the field. Nothing else on the page answers.
+    fn field_key(&mut self, k: KeyEvent) -> SettingsAction {
+        let Some(field) = self.form.draft_mut() else {
+            return SettingsAction::Stay;
+        };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.form.cancel_edit(),
+            KeyCode::Enter => return write(self.form.commit_edit()),
+            KeyCode::Backspace => field.backspace(),
+            KeyCode::Delete => field.delete(),
+            KeyCode::Left => field.left(),
+            KeyCode::Right => field.right(),
+            KeyCode::Home => field.home(),
+            KeyCode::End => field.end(),
+            KeyCode::Char('a') if ctrl => field.home(),
+            KeyCode::Char('e') if ctrl => field.end(),
+            KeyCode::Char('u') if ctrl => field.clear(),
+            KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => field.insert(c),
+            _ => {}
+        }
+        SettingsAction::Stay
     }
 
     // --- input ---------------------------------------------------------------
@@ -487,6 +665,9 @@ impl SettingsShell {
         if self.save.running() {
             // The prompt's save is running: wait for it.
             return SettingsAction::Stay;
+        }
+        if self.typing() {
+            return self.field_key(k);
         }
         let chord = crate::keymap::chord_from_event(k);
         let sidebar = chord.and_then(|c| keymaps.sidebar.dispatch(c));
@@ -520,11 +701,18 @@ impl SettingsShell {
                 SettingsAction::Stay
             }
             Region::Page => {
-                let n = self.actions().len();
-                if up {
+                let actions = self.actions();
+                let n = actions.len();
+                let on_theme = actions.get(self.action).is_some_and(|a| a.does == Does::Theme);
+                if n == 0 && (up || down) {
+                    // Nothing to choose: the arrows scroll.
+                    self.scroll = if down { self.scroll.saturating_add(1) } else { self.scroll.saturating_sub(1) };
+                } else if up {
                     self.action = self.action.saturating_sub(1);
                 } else if down {
                     self.action = (self.action + 1).min(n.saturating_sub(1));
+                } else if on_theme && matches!(k.code, KeyCode::Left | KeyCode::Right) {
+                    return write(self.form.step_theme(if k.code == KeyCode::Left { -1 } else { 1 }));
                 } else if activate {
                     return self.run_action(self.action);
                 } else {
@@ -601,6 +789,11 @@ impl SettingsShell {
                 _ => SettingsAction::Stay,
             };
         }
+        if self.typing() && over_main && hit != Some(Hit::Action(self.action)) {
+            // The command being typed keeps the page: Enter saves it, Esc
+            // puts it back. The sidebar still answers (through the prompt).
+            return SettingsAction::Stay;
+        }
         match m.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let down = matches!(m.kind, MouseEventKind::ScrollDown);
@@ -624,7 +817,15 @@ impl SettingsShell {
                 }
                 match hit {
                     Some(Hit::Stop(stop)) => self.activate_stop(stop),
+                    // A click in the field being typed leaves it typing.
+                    Some(Hit::Action(i)) if self.typing() && i == self.action => SettingsAction::Stay,
                     Some(Hit::Action(i)) => self.run_action(i),
+                    Some(Hit::Theme(theme)) => {
+                        if let Some(i) = self.actions().iter().position(|a| a.does == Does::Theme) {
+                            self.action = i;
+                        }
+                        write(self.form.choose_theme(theme))
+                    }
                     _ => SettingsAction::Stay,
                 }
             }
@@ -639,7 +840,7 @@ impl SettingsShell {
     pub(crate) fn render(&mut self, f: &mut Frame, sidebar: Rect, main: Rect, chrome: &Chrome<'_>) {
         self.hits.clear();
         self.render_sidebar(f, sidebar, chrome.project_label);
-        let hints = hints(self.region, chrome.keymaps, chrome.style);
+        let hints = hints(self.region, self.nav.page(), self.typing(), chrome.keymaps, chrome.style);
         self.render_page(f, main, chrome.status, &hints);
         if self.guard.prompt().is_some() || self.save.running() {
             self.render_prompt(f, main);
@@ -778,6 +979,7 @@ impl SettingsShell {
             return;
         }
         let actions = self.actions();
+        self.action = self.action.min(actions.len().saturating_sub(1));
         let rows = self.page_rows(content.width as usize, &actions);
         // Keep the focused action in view, then clamp to the content.
         let max = (rows.len() as u16).saturating_sub(content.height);
@@ -805,7 +1007,23 @@ impl SettingsShell {
                 continue;
             }
             let line = match row.action {
-                Some(a) => action_line(&actions[a], self.region == Region::Page && a == self.action, rect.width as usize),
+                Some(a) => {
+                    let selected = self.region == Region::Page && a == self.action;
+                    let width = rect.width as usize;
+                    match &actions[a].does {
+                        Does::Theme => {
+                            let (line, segments) = theme_line(self.form.theme(), selected, label_width(width), width);
+                            for (x, w, theme) in segments {
+                                if x + w <= rect.width {
+                                    self.hits.push((Rect { x: rect.x + x, width: w, ..rect }, Hit::Theme(theme)));
+                                }
+                            }
+                            line
+                        }
+                        Does::Editor => editor_line(&self.form, selected, label_width(width), width),
+                        _ => action_line(&actions[a], selected, width),
+                    }
+                }
                 None => row.line.clone(),
             };
             f.render_widget(Paragraph::new(line), rect);
@@ -818,9 +1036,9 @@ impl SettingsShell {
     /// The shown page's rows at `width`.
     fn page_rows(&self, width: usize, actions: &[PageAction]) -> Vec<Row> {
         match self.nav.page() {
-            SettingsPage::General => general_rows(&self.general, self.save_error.as_deref(), width, actions),
+            SettingsPage::General => general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions),
+            SettingsPage::Terminal => terminal_rows(width),
             SettingsPage::Keybindings
-            | SettingsPage::Terminal
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
             | SettingsPage::Agents => Vec::new(),
@@ -890,6 +1108,11 @@ impl SettingsShell {
     }
 }
 
+/// A preference change to save, if there is one.
+fn write(change: Option<Change>) -> SettingsAction {
+    change.map_or(SettingsAction::Stay, SettingsAction::Write)
+}
+
 /// One rendered page row: a line of text, or one of the page's actions
 /// (drawn with its focus state at render time).
 struct Row {
@@ -907,90 +1130,281 @@ impl Row {
     }
 }
 
-/// The General page: where this computer's settings and the shown
-/// project's live, then the Open in editor paths.
-fn general_rows(job: &Job<GeneralSummary>, save_error: Option<&str>, width: usize, actions: &[PageAction]) -> Vec<Row> {
+/// The General page: the appearance and the editor, then where this
+/// computer's settings and the shown project's live, and the Open in editor
+/// paths. Each focusable row sits at its index in `actions`.
+fn general_rows(
+    job: &Job<GeneralSummary>,
+    form: &GeneralForm,
+    save_error: Option<&str>,
+    width: usize,
+    actions: &[PageAction],
+) -> Vec<Row> {
+    let at = |does: &Does| actions.iter().position(|a| a.does == *does);
+    let action_row = |i: usize| Row { line: Line::raw(""), action: Some(i) };
     let mut rows = vec![Row::text(Line::from(Span::styled(
         "General",
         Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
     )))];
-    wrapped(&mut rows, "Where Shelbi keeps your settings, and the files behind them.", width, Style::default().fg(palette().muted));
+    wrapped(&mut rows, "Your appearance and editor, saved to config.yaml as you change them.", width, Style::default().fg(palette().muted));
     if let Some(e) = save_error {
         wrapped(&mut rows, &format!("Couldn't save: {e}"), width, Style::default().fg(palette().red));
     }
+    if let Some(message) = form.status().message() {
+        let color = match form.status() {
+            SaveStatus::Failed(_) => palette().red,
+            SaveStatus::Saved => palette().green,
+            _ => palette().yellow,
+        };
+        wrapped(&mut rows, &message, width, Style::default().fg(color));
+    }
     rows.push(Row::blank());
-    let label_w = 17.min(width / 2);
-    match job.state() {
+    let label_w = label_width(width);
+    let summary = match job.state() {
         JobState::Idle | JobState::Running => {
             rows.push(Row::text(Line::from(Span::styled(
                 "Loading…",
                 Style::default().fg(palette().muted).add_modifier(Modifier::ITALIC),
             ))));
+            None
         }
         JobState::Failed(e) => {
             wrapped(&mut rows, &format!("Couldn't read the settings: {e}"), width, Style::default().fg(palette().red));
             wrapped(&mut rows, "Press r, or choose Try again.", width, Style::default().fg(palette().muted));
+            None
         }
-        JobState::Done(summary) => {
-            heading(&mut rows, "This computer");
-            let g = &summary.global;
-            field(&mut rows, "Settings folder", &summary::display_path(&g.home), label_w, width, None);
-            let (config, color) = match &g.config {
-                FileState::Present(_) => (format!("Theme: {}", summary::theme_label(g.theme)), None),
-                FileState::Missing(_) => ("Not created yet: the defaults apply".to_string(), None),
-                FileState::Invalid { error, .. } => (format!("Doesn't read: {error}"), Some(palette().red)),
-            };
-            field(&mut rows, "config.yaml", &config, label_w, width, color);
-            let mut keys = match &g.keys {
-                FileState::Present(_) => "Your overrides".to_string(),
-                FileState::Missing(_) => "Built-in defaults".to_string(),
-                FileState::Invalid { error, .. } => format!("Doesn't read: {error}"),
-            };
-            let mut keys_color = None;
-            if g.keymap_problems > 0 {
-                keys.push_str(&format!(" · {}", summary::count(g.keymap_problems, "problem")));
-                keys_color = Some(palette().yellow);
-            }
-            field(&mut rows, "keys.yaml", &keys, label_w, width, keys_color);
-            field(&mut rows, "Editor", &g.editor, label_w, width, None);
+        JobState::Done(summary) => Some(summary),
+    };
+    if let Some(summary) = summary {
+        if let Some(e) = form.unreadable() {
+            heading(&mut rows, "Appearance and editor");
+            wrapped(&mut rows, &format!("config.yaml doesn't read: {e}"), width, Style::default().fg(palette().red));
+            wrapped(
+                &mut rows,
+                "Shelbi leaves it as it is. Fix it in your editor; Settings reads it again when you come back.",
+                width,
+                Style::default().fg(palette().muted),
+            );
             rows.push(Row::blank());
-            match &summary.project {
-                None => {
-                    heading(&mut rows, "Project");
-                    wrapped(&mut rows, "No project is open.", width, Style::default().fg(palette().foreground));
-                    wrapped(
-                        &mut rows,
-                        "Switch to a project, or add one, to see where its settings live.",
-                        width,
-                        Style::default().fg(palette().muted),
-                    );
-                }
-                Some(Err(e)) => {
-                    heading(&mut rows, "Project");
-                    wrapped(&mut rows, &format!("Couldn't read this project's settings: {e}"), width, Style::default().fg(palette().red));
-                    wrapped(
-                        &mut rows,
-                        "Try again, fix its project settings in your editor, or switch project.",
-                        width,
-                        Style::default().fg(palette().muted),
-                    );
-                }
-                Some(Ok(p)) => project_rows(&mut rows, p, label_w, width),
+        }
+        if let Some(i) = at(&Does::Theme) {
+            heading(&mut rows, "Appearance");
+            rows.push(action_row(i));
+            wrapped(
+                &mut rows,
+                "Auto is dark here: a terminal doesn't report its appearance. The theme colors Shelbi's lists and panels, never your sessions.",
+                width,
+                Style::default().fg(palette().muted),
+            );
+            rows.push(Row::blank());
+        }
+        if let Some(i) = at(&Does::Editor) {
+            heading(&mut rows, "Editor");
+            rows.push(action_row(i));
+            if form.draft().is_some() {
+                wrapped(&mut rows, "⏎ saves · Esc puts it back · blank clears it", width, Style::default().fg(palette().yellow));
+            } else {
+                wrapped(
+                    &mut rows,
+                    "What Open in editor and a review's Edit view run. Arguments are kept (code --wait).",
+                    width,
+                    Style::default().fg(palette().muted),
+                );
             }
+            let (runs, source) = form.effective_editor();
+            field(&mut rows, "Shelbi runs", &format!("{runs} ({})", general::source_label(source)), label_w, width, None);
+            if source == EditorSource::Config {
+                let (fallback, source) = form.fallback_editor();
+                field(&mut rows, "Without it", &format!("{fallback} ({})", general::source_label(source)), label_w, width, None);
+            }
+            if let Some(i) = at(&Does::ClearEditor) {
+                rows.push(action_row(i));
+            }
+            rows.push(Row::blank());
+        }
+        heading(&mut rows, "This computer");
+        let g = &summary.global;
+        field(&mut rows, "Settings folder", &summary::display_path(&g.home), label_w, width, None);
+        let (config, color) = match &g.config {
+            FileState::Present(_) => ("Your settings".to_string(), None),
+            FileState::Missing(_) => ("Not created yet: the defaults apply".to_string(), None),
+            FileState::Invalid { error, .. } => (format!("Doesn't read: {error}"), Some(palette().red)),
+        };
+        field(&mut rows, "config.yaml", &config, label_w, width, color);
+        let mut keys = match &g.keys {
+            FileState::Present(_) => "Your overrides".to_string(),
+            FileState::Missing(_) => "Built-in defaults".to_string(),
+            FileState::Invalid { error, .. } => format!("Doesn't read: {error}"),
+        };
+        let mut keys_color = None;
+        if g.keymap_problems > 0 {
+            keys.push_str(&format!(" · {}", summary::count(g.keymap_problems, "problem")));
+            keys_color = Some(palette().yellow);
+        }
+        field(&mut rows, "keys.yaml", &keys, label_w, width, keys_color);
+        if let Some(i) = actions.iter().position(|a| matches!(a.does, Does::EditFile(_))) {
+            rows.push(action_row(i));
+        }
+        rows.push(Row::blank());
+        match &summary.project {
+            None => {
+                heading(&mut rows, "Project");
+                wrapped(&mut rows, "No project is open.", width, Style::default().fg(palette().foreground));
+                wrapped(
+                    &mut rows,
+                    "Switch to a project, or add one, to see where its settings live.",
+                    width,
+                    Style::default().fg(palette().muted),
+                );
+            }
+            Some(Err(e)) => {
+                heading(&mut rows, "Project");
+                wrapped(&mut rows, &format!("Couldn't read this project's settings: {e}"), width, Style::default().fg(palette().red));
+                wrapped(
+                    &mut rows,
+                    "Try again, fix its project settings in your editor, or switch project.",
+                    width,
+                    Style::default().fg(palette().muted),
+                );
+            }
+            Some(Ok(p)) => project_rows(&mut rows, p, label_w, width),
         }
     }
-    if !actions.is_empty() {
+    // The summary's own actions, after everything above.
+    let first = actions
+        .iter()
+        .position(|a| matches!(a.does, Does::Run(_) | Does::Reload))
+        .unwrap_or(actions.len());
+    if first < actions.len() {
         rows.push(Row::blank());
         let title = match job.done().and_then(|s| s.project.as_ref()) {
             Some(Ok(_)) => "Open in editor",
             _ => "What you can do",
         };
         heading(&mut rows, title);
-        for i in 0..actions.len() {
-            rows.push(Row { line: Line::raw(""), action: Some(i) });
+        for i in first..actions.len() {
+            rows.push(action_row(i));
         }
     }
     rows
+}
+
+/// The Terminal page: what the host terminal owns, its sixteen colors as
+/// sessions draw them, and a short session drawn the way sessions are.
+fn terminal_rows(width: usize) -> Vec<Row> {
+    let muted = Style::default().fg(palette().muted);
+    let mut rows = vec![Row::text(Line::from(Span::styled(
+        "Terminal",
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+    )))];
+    wrapped(
+        &mut rows,
+        "Your terminal app draws Shelbi, so it owns how sessions look: the font and its size, the ANSI colors, window opacity and blur, and keyboard options such as Option as Meta. Change them in your terminal's settings.",
+        width,
+        Style::default().fg(palette().foreground),
+    );
+    wrapped(
+        &mut rows,
+        "Shelbi never changes your terminal's colors. Its theme (General) colors only Shelbi's own lists and panels.",
+        width,
+        muted,
+    );
+    rows.push(Row::blank());
+    heading(&mut rows, "Your terminal's colors");
+    swatch_rows(&mut rows, width);
+    rows.push(Row::blank());
+    heading(&mut rows, "Preview");
+    wrapped(&mut rows, "A session as Shelbi draws it here, in those colors.", width, muted);
+    rows.extend(preview_lines(width).into_iter().map(Row::text));
+    rows.push(Row::blank());
+    heading(&mut rows, "The desktop app");
+    wrapped(
+        &mut rows,
+        "The desktop app has its own terminal font, colors and window effects (under desktop: in config.yaml). They don't apply here.",
+        width,
+        muted,
+    );
+    rows
+}
+
+/// The sixteen ANSI colors, regular over bright, painted as a session's
+/// cells are ([`ansi_swatches`](super::terminal_view::ansi_swatches)): the
+/// host terminal's own palette, what a session's colors look like here. A narrow page
+/// puts each row's label above its swatches and narrows them.
+fn swatch_rows(rows: &mut Vec<Row>, width: usize) {
+    let colors = super::terminal_view::ansi_swatches();
+    const NAMES: [&str; 8] = ["blk", "red", "grn", "yel", "blu", "mag", "cyn", "wht"];
+    const LABEL: usize = 9;
+    let label_style = Style::default().fg(palette().gray);
+    let inline = width >= LABEL + 8 * 4;
+    let room = if inline { width - LABEL } else { width };
+    // Each swatch and the gap after it.
+    let (swatch, gap) = match room / 8 {
+        n if n >= 4 => (3, 1),
+        n if n >= 2 => (n - 1, 1),
+        _ => (1, 0),
+    };
+    let indent = if inline { " ".repeat(LABEL) } else { String::new() };
+    // Swatches a row holds: all eight unless the page is narrower than that.
+    let per_row = (room / (swatch + gap).max(1)).clamp(1, 8);
+    for (label, colors) in [("Regular", &colors[..8]), ("Bright", &colors[8..])] {
+        if !inline {
+            rows.push(Row::text(Line::from(Span::styled(panel::truncate_right(label, width), label_style))));
+        }
+        for (i, chunk) in colors.chunks(per_row).enumerate() {
+            let mut spans = Vec::new();
+            if inline && i == 0 {
+                spans.push(Span::styled(format!("{label:<LABEL$}"), label_style));
+            }
+            for (j, color) in chunk.iter().enumerate() {
+                spans.push(Span::styled(" ".repeat(swatch), Style::default().bg(*color)));
+                if j + 1 < chunk.len() {
+                    spans.push(Span::raw(" ".repeat(gap)));
+                }
+            }
+            rows.push(Row::text(Line::from(spans)));
+        }
+    }
+    if swatch == 3 {
+        let names: String = NAMES.iter().map(|n| format!("{n} ")).collect();
+        rows.push(Row::text(Line::from(Span::styled(format!("{indent}{}", names.trim_end()), Style::default().fg(palette().muted)))));
+    }
+}
+
+/// The shared short preview session, run through a session's emulator and
+/// drawn with the sessions' own cell mapping, one line per row.
+fn preview_lines(width: usize) -> Vec<Line<'static>> {
+    let cols = width.clamp(1, 80) as u16;
+    let rows = terminal_preview::SHORT_ROWS;
+    let pane = super::terminal_view::TerminalPane::canned(
+        shelbi_term::Size::new(cols, rows),
+        &terminal_preview::short(cols),
+    );
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+    pane.render(&mut buf, area, true);
+    (0..rows).map(|y| buffer_line(&buf, y)).collect()
+}
+
+/// Row `y` of `buf` as a line, runs of one style merged.
+fn buffer_line(buf: &Buffer, y: u16) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut style = Style::default();
+    for x in 0..buf.area.width {
+        let cell = &buf[(x, y)];
+        let cell_style = cell.style();
+        if cell_style != style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        style = cell_style;
+        run.push_str(cell.symbol());
+    }
+    let run = run.trim_end().to_string();
+    if !run.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
 }
 
 fn project_rows(rows: &mut Vec<Row>, p: &ProjectSummary, label_w: usize, width: usize) {
@@ -1069,6 +1483,95 @@ fn edit_note(target: &EditTarget) -> String {
     }
 }
 
+/// The label column's width on a page `width` wide.
+fn label_width(width: usize) -> usize {
+    17.min(width / 2)
+}
+
+/// The focus marker and, when there is room for it beside the control, the
+/// row's label in its column.
+fn item_label(label: &str, selected: bool, label_w: usize, width: usize) -> String {
+    let marker = if selected { "› " } else { "  " };
+    if width >= 36 {
+        let w = label_w.saturating_sub(2);
+        format!("{marker}{:<w$}", panel::truncate_right(label, w.saturating_sub(1)))
+    } else {
+        marker.to_string()
+    }
+}
+
+/// The theme's segmented control: `› Theme   Auto  Dark  Light`, the chosen
+/// one filled. Returns the line and each segment's column, width and theme.
+fn theme_line(chosen: ThemePreference, selected: bool, label_w: usize, width: usize) -> (Line<'static>, Vec<(u16, u16, ThemePreference)>) {
+    let left = item_label("Theme", selected, label_w, width);
+    let label_style = if selected {
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().gray)
+    };
+    let mut x = panel::display_width(&left);
+    let mut spans = vec![Span::styled(left, label_style)];
+    let mut segments = Vec::new();
+    for theme in general::THEMES {
+        let text = format!(" {} ", general::theme_label(theme));
+        let w = text.chars().count();
+        if x + w > width {
+            break;
+        }
+        let style = if theme == chosen {
+            selected_style(selected)
+        } else {
+            Style::default().fg(palette().gray)
+        };
+        segments.push((x as u16, w as u16, theme));
+        spans.push(Span::styled(text, style));
+        spans.push(Span::raw(" "));
+        x += w + 1;
+    }
+    (Line::from(spans), segments)
+}
+
+/// The editor command's row: its value (or "Not set"), or, while it is
+/// typed, the field with its caret, scrolled to keep the caret in view.
+fn editor_line(form: &GeneralForm, selected: bool, label_w: usize, width: usize) -> Line<'static> {
+    let left = item_label("Command", selected, label_w, width);
+    let room = width.saturating_sub(panel::display_width(&left)).max(1);
+    let label_style = if selected {
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().gray)
+    };
+    let mut spans = vec![Span::styled(left, label_style)];
+    match form.draft() {
+        Some(field) => {
+            let chars: Vec<char> = field.text().chars().collect();
+            let caret = field.caret();
+            let start = (caret + 1).saturating_sub(room);
+            let shown: String = chars.iter().skip(start).take(room).collect();
+            let at = caret - start;
+            let before: String = shown.chars().take(at).collect();
+            let under: String = shown.chars().nth(at).map_or(" ".to_string(), String::from);
+            let after: String = shown.chars().skip(at + 1).collect();
+            let fill = Style::default().fg(palette().white).bg(palette().selection);
+            spans.push(Span::styled(before, fill));
+            spans.push(Span::styled(under, fill.add_modifier(Modifier::REVERSED)));
+            let used = at + 1 + after.chars().count();
+            spans.push(Span::styled(format!("{after}{}", " ".repeat(room.saturating_sub(used))), fill));
+        }
+        None => match form.editor() {
+            Some(command) => spans.push(Span::styled(
+                panel::truncate_right(command, room),
+                Style::default().fg(if selected { palette().white } else { palette().foreground }),
+            )),
+            None => spans.push(Span::styled(
+                panel::truncate_right("Not set", room),
+                Style::default().fg(palette().muted).add_modifier(Modifier::ITALIC),
+            )),
+        },
+    }
+    Line::from(spans)
+}
+
 /// An action row: `› label   note`, the selection fill when focused.
 fn action_line(action: &PageAction, selected: bool, width: usize) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
@@ -1134,7 +1637,10 @@ fn render_band(f: &mut Frame, area: Rect, text: &str, style: Style) {
 }
 
 /// The key hints for the focused region, in the user's sidebar chords.
-fn hints(region: Region, keymaps: &Keymaps, style: DisplayStyle) -> String {
+fn hints(region: Region, page: SettingsPage, typing: bool, keymaps: &Keymaps, style: DisplayStyle) -> String {
+    if typing {
+        return "type the command · ⏎ save · Esc put back".to_string();
+    }
     let letter = |a: SidebarAction| {
         keymaps
             .sidebar
@@ -1149,7 +1655,11 @@ fn hints(region: Region, keymaps: &Keymaps, style: DisplayStyle) -> String {
     };
     match region {
         Region::Sidebar => format!("{moves} move · ⏎ open · Tab page · Esc back"),
-        Region::Page => format!("{moves} choose · ⏎ run · r reload · Tab sidebar · Esc back"),
+        Region::Page if page == SettingsPage::General => {
+            format!("{moves} choose · ←→ theme · ⏎ run · r reload · Tab sidebar · Esc back")
+        }
+        // Nothing on the page acts: the arrows scroll it.
+        Region::Page => format!("{moves} scroll · Tab sidebar · Esc back"),
     }
 }
 
@@ -1163,8 +1673,8 @@ pub(crate) fn fixture_summary(project: Option<&str>) -> GeneralSummary {
         global: GlobalSummary {
             home: PathBuf::from("/h/.shelbi"),
             config: FileState::Present(PathBuf::from("/h/.shelbi/config.yaml")),
-            theme: shelbi_state::ThemePreference::Auto,
-            editor: "vim".into(),
+            preferences: Ok(general::Preferences::default()),
+            env_editor: None,
             keys: FileState::Missing(PathBuf::from("/h/.shelbi/keys.yaml")),
             keymap_problems: 0,
         },
@@ -1192,12 +1702,74 @@ pub(crate) fn fixture_summary(project: Option<&str>) -> GeneralSummary {
     }
 }
 
+/// The `config.yaml` a test shell reads and writes in place of
+/// `~/.shelbi`: what it holds (`Err` for a file that doesn't read), a
+/// failure to inject into the next writes, and how many writes landed.
+#[cfg(test)]
+pub(crate) struct FixtureConfig {
+    pub config: Result<UserConfig, String>,
+    pub fail_writes: Option<String>,
+    pub writes: usize,
+}
+
+#[cfg(test)]
+impl Default for FixtureConfig {
+    fn default() -> Self {
+        FixtureConfig {
+            config: Ok(UserConfig::default()),
+            fail_writes: None,
+            writes: 0,
+        }
+    }
+}
+
+/// A test shell's reader and writer over one [`FixtureConfig`]: the reader
+/// is [`fixture_summary`] with the store's preferences, the writer applies a
+/// change to the store as `update_user_config` does to the file (refusing
+/// one that doesn't read, keeping it as it was on an injected failure).
+#[cfg(test)]
+pub(crate) fn fixture_io(
+    store: &Arc<std::sync::Mutex<FixtureConfig>>,
+) -> (super::SettingsReader, ConfigWriter) {
+    let read = store.clone();
+    let reader: super::SettingsReader = Arc::new(move |project| {
+        let mut summary = fixture_summary(project);
+        summary.global.preferences = match &read.lock().unwrap().config {
+            Ok(cfg) => Ok(general::Preferences::from_config(cfg)),
+            Err(e) => Err(e.clone()),
+        };
+        summary
+    });
+    let write = store.clone();
+    let writer: ConfigWriter = Arc::new(move |change| {
+        let mut store = write.lock().unwrap();
+        if let Some(e) = store.fail_writes.clone() {
+            return Err(format!("Couldn't save config.yaml: {e}"));
+        }
+        let cfg = match &mut store.config {
+            Ok(cfg) => cfg,
+            Err(e) => return Err(format!("Couldn't save config.yaml: {e}")),
+        };
+        change.apply(cfg);
+        let written = cfg.clone();
+        store.writes += 1;
+        Ok(written)
+    });
+    (reader, writer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A writer over a fresh fixture config.
+    fn writer() -> ConfigWriter {
+        fixture_io(&Arc::new(std::sync::Mutex::new(FixtureConfig::default()))).1
     }
 
     /// The built-in keymaps (read-only: no disk).
@@ -1210,7 +1782,12 @@ mod tests {
         let s = SettingsShell::default();
         assert_eq!(
             s.stops(),
-            [Stop::Back, Stop::Page(SettingsPage::General), Stop::Switcher]
+            [
+                Stop::Back,
+                Stop::Page(SettingsPage::General),
+                Stop::Page(SettingsPage::Terminal),
+                Stop::Switcher
+            ]
         );
         assert_eq!(s.page(), SettingsPage::General);
     }
@@ -1221,10 +1798,13 @@ mod tests {
         s.open();
         let km = keymaps();
         s.handle_key(key(KeyCode::Char('j')), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Terminal));
+        s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher);
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher, "stops at the bottom");
         s.handle_key(key(KeyCode::Char('k')), &km);
+        s.handle_key(key(KeyCode::Up), &km);
         s.handle_key(key(KeyCode::Up), &km);
         assert_eq!(s.stop, Stop::Back);
         s.handle_key(key(KeyCode::Up), &km);
@@ -1237,6 +1817,7 @@ mod tests {
         let mut s = SettingsShell::default();
         s.open();
         let km = keymaps();
+        s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::OpenSwitcher);
         assert_eq!(s.handle_key(key(KeyCode::Tab), &km), SettingsAction::Stay);
@@ -1254,7 +1835,7 @@ mod tests {
         let mut s = SettingsShell::default();
         s.open();
         s.handle_key(key(KeyCode::Char('w')), &km);
-        assert_eq!(s.stop, Stop::Switcher, "the user's nav_down moves the selection");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Terminal), "the user's nav_down moves the selection");
     }
 
     #[test]
@@ -1265,10 +1846,12 @@ mod tests {
         assert!(s.begin_load(Some("proj"), false).is_none(), "already loading for proj");
         assert!(s.loaded(&t, Ok(fixture_summary(Some("proj")))));
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
-        assert_eq!(labels, ["Edit Project Settings", "Edit Zen Mode"]);
+        assert_eq!(labels, ["Theme", "Command", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode"]);
         let km = keymaps();
         s.set_region(Region::Page);
-        s.handle_key(key(KeyCode::Char('j')), &km);
+        for _ in 0..4 {
+            s.handle_key(key(KeyCode::Char('j')), &km);
+        }
         assert_eq!(
             s.handle_key(key(KeyCode::Enter), &km),
             SettingsAction::Run(Effect::OpenEditor {
@@ -1280,7 +1863,7 @@ mod tests {
         let t = s.begin_load(None, true).unwrap();
         s.loaded(&t, Ok(fixture_summary(None)));
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
-        assert_eq!(labels, ["Switch project…", "Add project…"]);
+        assert_eq!(labels, ["Theme", "Command", "Edit config.yaml", "Switch project…", "Add project…"]);
         // A failed read offers Try again.
         let t = s.begin_load(Some("proj"), true).unwrap();
         s.loaded(&t, Err("gone".into()));
@@ -1311,13 +1894,13 @@ mod tests {
         let km = keymaps();
         s.request(Leave::Project("beta".into()));
         assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Save, "Save is the default button");
-        let (ticket, work) = s.begin_save(Some("proj")).expect("a dirty page saves");
+        let (ticket, work) = s.begin_save(Some("proj"), &writer()).expect("a dirty page saves");
         assert_eq!(s.saved(&ticket, work()), SettingsAction::Stay);
         assert_eq!(s.save_error.as_deref(), Some("disk full"));
         s.test_edits = Some(Ok(()));
         s.request(Leave::Project("beta".into()));
         s.handle_key(key(KeyCode::Char('s')), &km);
-        let (ticket, work) = s.begin_save(Some("proj")).unwrap();
+        let (ticket, work) = s.begin_save(Some("proj"), &writer()).unwrap();
         assert_eq!(s.saved(&ticket, work()), SettingsAction::SwitchProject("beta".into()));
         assert!(s.save_error.is_none());
     }
@@ -1354,7 +1937,7 @@ mod tests {
         let mut s = SettingsShell::default();
         let t = s.begin_load(None, false).unwrap();
         s.loaded(&t, Ok(fixture_summary(None)));
-        let text = screen(&mut s, 100, 30);
+        let text = screen(&mut s, 100, 40);
         for want in ["No project is open.", "Switch project…", "Add project…", "This computer"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
@@ -1362,7 +1945,7 @@ mod tests {
         broken.project = Some(Err("projects/proj.yaml: bad indent".into()));
         let t = s.begin_load(Some("proj"), true).unwrap();
         s.loaded(&t, Ok(broken));
-        let text = screen(&mut s, 100, 30);
+        let text = screen(&mut s, 100, 40);
         for want in ["Couldn't read this project's settings", "proj.yaml: bad", "Try again", "Edit Project Settings"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
@@ -1372,6 +1955,269 @@ mod tests {
         let text = screen(&mut s, 100, 30);
         assert!(text.contains("Couldn't read the settings: the read stopped"), "{text}");
         assert!(text.contains("Press r"), "{text}");
+    }
+
+    /// A shell's Settings on General's page, loaded from `summary`, its
+    /// focus on the page's first row (the theme).
+    fn on_general(summary: GeneralSummary) -> SettingsShell {
+        let mut s = SettingsShell::default();
+        s.open();
+        let t = s.begin_load(Some("proj"), false).unwrap();
+        assert!(s.loaded(&t, Ok(summary)));
+        s.set_region(Region::Page);
+        s
+    }
+
+    fn written(theme: ThemePreference, editor: Option<&str>) -> UserConfig {
+        UserConfig {
+            theme,
+            editor: editor.map(str::to_string),
+            ..UserConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_theme_saves_at_once_shows_pending_and_a_failure_goes_back() {
+        let mut s = on_general(fixture_summary(Some("proj")));
+        assert_eq!(s.take_theme(), Some(ThemePreference::Auto), "a load hands the file's theme to the shell");
+        let km = keymaps();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Right), &km),
+            SettingsAction::Write(Change::Theme(ThemePreference::Dark))
+        );
+        assert!(screen(&mut s, 100, 30).contains("Saving…"), "pending until the write lands");
+        assert_eq!(s.handle_key(key(KeyCode::Right), &km), SettingsAction::Stay, "one save at a time");
+        s.config_written(Ok(written(ThemePreference::Dark, None)));
+        assert_eq!(s.take_theme(), Some(ThemePreference::Dark));
+        assert!(screen(&mut s, 100, 30).contains("Saved to ~/.shelbi/config.yaml"));
+
+        // ← wraps, Enter steps on; a failed write puts the control back.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Left), &km),
+            SettingsAction::Write(Change::Theme(ThemePreference::Auto))
+        );
+        s.config_written(Err("Couldn't save config.yaml: read-only file system".into()));
+        assert_eq!(s.take_theme(), None, "nothing to apply");
+        assert_eq!(s.form().theme(), ThemePreference::Dark);
+        let text = screen(&mut s, 100, 30);
+        assert!(text.contains("read-only file system"), "{text}");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &km),
+            SettingsAction::Write(Change::Theme(ThemePreference::Light))
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_segment_picks_that_theme() {
+        let mut s = on_general(fixture_summary(Some("proj")));
+        let text = screen(&mut s, 100, 30);
+        let (x, y) = text
+            .lines()
+            .enumerate()
+            .find_map(|(y, l)| l.find(" Light ").map(|x| (l[..x].chars().count() + 1, y)))
+            .unwrap_or_else(|| panic!("{text}"));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x as u16,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        let side = Rect::new(0, 0, 28, 30);
+        let main = Rect::new(28, 0, 72, 30);
+        assert_eq!(
+            s.handle_mouse(click, side, main),
+            SettingsAction::Write(Change::Theme(ThemePreference::Light))
+        );
+    }
+
+    #[test]
+    fn the_editor_takes_every_key_while_typed_and_saves_only_on_enter() {
+        let mut s = on_general(fixture_summary(Some("proj")));
+        let km = keymaps();
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Stay, "Enter starts typing");
+        assert!(s.typing());
+        // Letters, digits, `r`, `q`, the nav keys: all typed, nothing acts.
+        for c in "code -w1rqjk".chars() {
+            assert_eq!(s.handle_key(key(KeyCode::Char(c)), &km), SettingsAction::Stay);
+        }
+        assert_eq!(s.form().draft().unwrap().text(), "code -w1rqjk");
+        assert_eq!(s.handle_key(key(KeyCode::Tab), &km), SettingsAction::Stay);
+        assert_eq!(s.region(), Region::Page, "Tab doesn't leave the field");
+        assert!(screen(&mut s, 100, 30).contains("⏎ save · Esc put back"));
+        // Esc puts it back without a write.
+        assert_eq!(s.handle_key(key(KeyCode::Esc), &km), SettingsAction::Stay);
+        assert!(!s.typing() && s.form().editor().is_none());
+        assert!(s.region() == Region::Page, "Esc closed the field, not Settings");
+
+        s.handle_key(key(KeyCode::Enter), &km);
+        assert!(s.paste("code --wait"), "a paste types into the field");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &km),
+            SettingsAction::Write(Change::Editor(Some("code --wait".into())))
+        );
+        s.config_written(Ok(written(ThemePreference::Auto, Some("code --wait"))));
+        let text = screen(&mut s, 100, 40);
+        for want in ["code --wait", "Shelbi runs      code --wait (your setting)", "Without it       vim (the default)", "Clear the editor setting"] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+        // Clearing restores the fallback.
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Write(Change::Editor(None)));
+        s.config_written(Ok(written(ThemePreference::Auto, None)));
+        let text = screen(&mut s, 100, 40);
+        assert!(text.contains("Not set") && text.contains("vim (the default)"), "{text}");
+        assert!(!text.contains("Clear the editor setting"), "{text}");
+    }
+
+    #[test]
+    fn the_fallback_names_editor_from_the_environment() {
+        let mut summary = fixture_summary(Some("proj"));
+        summary.global.env_editor = Some("nvim -p".into());
+        let mut s = on_general(summary);
+        assert!(screen(&mut s, 100, 30).contains("nvim -p ($EDITOR)"));
+    }
+
+    #[test]
+    fn leaving_with_a_typed_command_asks_and_save_writes_it() {
+        let mut s = on_general(fixture_summary(Some("proj")));
+        let km = keymaps();
+        s.handle_key(key(KeyCode::Down), &km);
+        s.handle_key(key(KeyCode::Enter), &km);
+        s.paste("hx");
+        // Back from the sidebar (a click, or Ctrl+H then Enter).
+        s.set_region(Region::Sidebar);
+        assert_eq!(s.request(Leave::Back), SettingsAction::Stay);
+        assert!(s.prompting(), "unsaved: the prompt asks");
+        assert_eq!(s.handle_key(key(KeyCode::Char('s')), &km), SettingsAction::Save);
+        let (ticket, work) = s.begin_save(Some("proj"), &writer()).expect("the typed command saves");
+        let result = work();
+        assert_eq!(result.as_ref().unwrap().as_ref().unwrap().editor.as_deref(), Some("hx"));
+        assert_eq!(s.saved(&ticket, result), SettingsAction::Leave);
+        assert_eq!(s.form().editor(), Some("hx"));
+    }
+
+    #[test]
+    fn a_config_that_doesnt_read_offers_no_controls_and_keeps_the_file() {
+        let mut summary = fixture_summary(Some("proj"));
+        summary.global.config = FileState::Invalid {
+            path: PathBuf::from("/h/.shelbi/config.yaml"),
+            error: "did not find expected key at line 2".into(),
+        };
+        summary.global.preferences = Err("did not find expected key at line 2".into());
+        let mut s = on_general(summary);
+        assert_eq!(s.take_theme(), None, "nothing to apply from a file that doesn't read");
+        let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
+        assert_eq!(labels, ["Edit config.yaml", "Edit Project Settings", "Edit Zen Mode"]);
+        let text = screen(&mut s, 100, 30);
+        assert!(text.contains("config.yaml doesn't read: did not find expected key"), "{text}");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &keymaps()),
+            SettingsAction::EditFile(PathBuf::from("/h/.shelbi/config.yaml"))
+        );
+    }
+
+    #[test]
+    fn general_is_readable_in_light_while_typing() {
+        crate::theme::with_appearance(shelbi_app::theme::Appearance::Light, || {
+            let mut summary = fixture_summary(Some("proj"));
+            summary.global.preferences = Ok(general::Preferences {
+                theme: ThemePreference::Light,
+                editor: Some("code --wait".into()),
+            });
+            let mut s = on_general(summary);
+            let km = keymaps();
+            s.handle_key(key(KeyCode::Down), &km);
+            s.handle_key(key(KeyCode::Enter), &km);
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+            term.draw(|f| {
+                let chrome = Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac };
+                s.render(f, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40), &chrome);
+            })
+            .unwrap();
+            crate::theme::assert_light_readable("settings-general-typing", term.backend().buffer());
+        });
+    }
+
+    /// The Terminal page's rows at `width`, as drawn text and their spans.
+    fn terminal_page(width: usize) -> Vec<Line<'static>> {
+        terminal_rows(width).into_iter().map(|r| r.line).collect()
+    }
+
+    #[test]
+    fn terminal_explains_what_the_host_owns_and_offers_no_controls() {
+        let mut s = SettingsShell::default();
+        s.open();
+        assert_eq!(s.handle_key(key(KeyCode::Char('3')), &keymaps()), SettingsAction::Load);
+        assert_eq!(s.page(), SettingsPage::Terminal);
+        assert!(s.actions().is_empty(), "nothing on it acts");
+        let text = screen(&mut s, 110, 50);
+        for want in ["Terminal", "owns how sessions look", "window opacity and blur", "never changes your terminal's colors", "Regular", "Bright", "Preview", "Claude Code", "They don't apply here"] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+        // No controls for the host's settings.
+        for absent in ["Font", "Opacity", "Blur", "Option as Meta:", "Install"] {
+            assert!(!text.contains(absent), "{absent:?} is the host's:\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_swatches_paint_the_terminal_s_own_sixteen_colors() {
+        let rows = terminal_page(80);
+        let backgrounds = |label: &str| -> Vec<Color> {
+            let line = rows
+                .iter()
+                .find(|l| l.spans.first().is_some_and(|s| s.content.starts_with(label)))
+                .unwrap_or_else(|| panic!("{label}"));
+            line.spans.iter().filter_map(|s| s.style.bg).filter(|c| *c != Color::Reset).collect()
+        };
+        assert_eq!(
+            backgrounds("Regular"),
+            [Color::Black, Color::Red, Color::Green, Color::Yellow, Color::Blue, Color::Magenta, Color::Cyan, Color::Gray]
+        );
+        assert_eq!(
+            backgrounds("Bright"),
+            [Color::DarkGray, Color::LightRed, Color::LightGreen, Color::LightYellow, Color::LightBlue, Color::LightMagenta, Color::LightCyan, Color::White]
+        );
+    }
+
+    #[test]
+    fn the_preview_draws_through_the_session_cell_mapping() {
+        let lines = preview_lines(80);
+        assert_eq!(lines.len(), terminal_preview::SHORT_ROWS as usize);
+        let fg_of = |needle: &str| -> Option<Color> {
+            lines.iter().find_map(|l| l.spans.iter().find(|s| s.content.contains(needle)).and_then(|s| s.style.fg))
+        };
+        assert_eq!(fg_of("▐▛"), Some(Color::LightRed), "the mascot is bright red");
+        assert_eq!(fg_of("(crates/"), Some(Color::Cyan));
+        assert_eq!(fg_of("(cargo test"), Some(Color::Yellow));
+        assert_eq!(fg_of("187 -"), Some(Color::Red));
+        assert_eq!(fg_of("187 +"), Some(Color::Green));
+        assert_eq!(fg_of("⏵⏵"), Some(Color::LightMagenta));
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(text.last().unwrap().starts_with("? for shortcuts"), "{text:#?}");
+    }
+
+    #[test]
+    fn the_terminal_page_fits_narrow_widths() {
+        for width in [60, 40, 24, 12, 3, 1] {
+            let rows = terminal_page(width);
+            // Text wraps (a heading clips); the swatches and the preview are
+            // sized to the page.
+            let swatches = rows.iter().filter(|l| l.spans.iter().any(|s| s.style.bg.is_some_and(|c| c != Color::Reset)));
+            for line in swatches.chain(preview_lines(width).iter()) {
+                assert!(line.width() <= width, "{width}: {:?} is {} wide", line, line.width());
+            }
+            // Each color still shows, narrower.
+            let painted = rows.iter().flat_map(|l| &l.spans).filter(|s| s.style.bg.is_some_and(|c| c != Color::Reset)).count();
+            assert_eq!(painted, 16, "{width}: sixteen swatches");
+        }
+        let mut s = SettingsShell::default();
+        s.open();
+        s.handle_key(key(KeyCode::Char('3')), &keymaps());
+        for (w, h) in [(40, 12), (30, 8), (12, 4)] {
+            screen(&mut s, w.max(29), h);
+        }
     }
 
     #[test]

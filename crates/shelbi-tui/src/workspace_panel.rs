@@ -55,7 +55,29 @@ pub use shelbi_app::workspace_panel::WsEffect;
 #[derive(Debug, Clone)]
 pub struct WsStatus {
     pub text: String,
-    pub color: Color,
+    pub tone: StatusTone,
+}
+
+/// A status's colour, as a theme token: resolved when the panel draws, so a
+/// theme change (Settings ▸ General) repaints an open panel's status too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    Yellow,
+    Cyan,
+    Green,
+    Muted,
+}
+
+impl StatusTone {
+    pub fn color(self) -> Color {
+        let p = crate::theme::palette();
+        match self {
+            StatusTone::Yellow => p.yellow,
+            StatusTone::Cyan => p.cyan,
+            StatusTone::Green => p.green,
+            StatusTone::Muted => p.muted,
+        }
+    }
 }
 
 /// The workspace panel's full state.
@@ -235,7 +257,7 @@ pub fn render_full(f: &mut Frame, app: &mut WorkspacePanel, area: Rect) {
         },
         app.selected == 0, // Back is always rows[0].
         &app.status.text,
-        Style::default().fg(app.status.color).add_modifier(Modifier::BOLD),
+        Style::default().fg(app.status.tone.color()).add_modifier(Modifier::BOLD),
     );
     let btn_w = (BACK_BTN_WIDTH as u16).min(area.width.saturating_sub(PAD)).max(1);
     push_hit(
@@ -382,7 +404,7 @@ mod tests {
     fn in_progress() -> WsStatus {
         WsStatus {
             text: "IN PROGRESS".into(),
-            color: palette().yellow,
+            tone: StatusTone::Yellow,
         }
     }
 
@@ -433,12 +455,12 @@ mod tests {
         use shelbi_app::theme::Appearance;
         crate::theme::with_appearance(Appearance::Light, || {
             let statuses = [
-                ("in-progress", "IN PROGRESS", palette().yellow),
-                ("review", "READY FOR REVIEW", palette().cyan),
-                ("done", "DONE", palette().green),
-                ("custom", "BLOCKED", palette().muted),
+                ("in-progress", "IN PROGRESS", StatusTone::Yellow),
+                ("review", "READY FOR REVIEW", StatusTone::Cyan),
+                ("done", "DONE", StatusTone::Green),
+                ("custom", "BLOCKED", StatusTone::Muted),
             ];
-            for (i, (name, text, color)) in statuses.into_iter().enumerate() {
+            for (i, (name, text, tone)) in statuses.into_iter().enumerate() {
                 let mut app = WorkspacePanel::new(
                     "/Users/j/my-project/.shelbi/wt/alpha",
                     "Vim".to_string(),
@@ -447,7 +469,7 @@ mod tests {
                     BODY,
                     WsStatus {
                         text: text.into(),
-                        color,
+                        tone,
                     },
                 );
                 app.status_line = "agent restarted".into();
@@ -516,7 +538,7 @@ mod tests {
             "b",
             WsStatus {
                 text: "READY FOR REVIEW".into(),
-                color: palette().cyan,
+                tone: StatusTone::Cyan,
             },
         );
         let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();

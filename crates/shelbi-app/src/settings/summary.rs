@@ -1,14 +1,14 @@
 //! The General summary: where this computer's settings and the shown
-//! project's live, read from the real config files, for the TUI's first
-//! Settings page (the pages that edit each one replace its line as they
-//! land). Every read here is blocking IO, so a client runs [`read`] off its
+//! project's live, read from the real config files, for the TUI's General
+//! page, with the appearance and editor preferences its controls edit
+//! ([`super::general`]). Every read here is blocking IO, so a client runs [`read`] off its
 //! UI thread under a [`Job`](super::Job) ticket.
 
 use std::path::{Path, PathBuf};
 
-use shelbi_state::ThemePreference;
-
 use crate::command::EditItem;
+
+use super::general::Preferences;
 
 /// A config file and whether it is there and reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,10 +37,10 @@ pub struct GlobalSummary {
     pub home: PathBuf,
     /// `config.yaml`.
     pub config: FileState,
-    /// Its `theme:`.
-    pub theme: ThemePreference,
-    /// The editor Open in editor runs (`editor:`, else `$EDITOR`, else vim).
-    pub editor: String,
+    /// Its appearance and editor settings, or why it doesn't read.
+    pub preferences: Result<Preferences, String>,
+    /// `$EDITOR`, the editor's fallback without an `editor:` setting.
+    pub env_editor: Option<String>,
     /// `keys.yaml`.
     pub keys: FileState,
     /// Bindings in `keys.yaml` the loader refused (unknown actions, bad
@@ -87,15 +87,15 @@ pub fn read(project: Option<&str>) -> GeneralSummary {
 pub fn read_global() -> GlobalSummary {
     let home = shelbi_state::shelbi_home().unwrap_or_else(|_| PathBuf::from("~/.shelbi"));
     let config_path = home.join("config.yaml");
-    let (config, theme) = match shelbi_state::load_user_config() {
-        Ok(cfg) if config_path.exists() => (FileState::Present(config_path), cfg.theme),
-        Ok(cfg) => (FileState::Missing(config_path), cfg.theme),
+    let (config, preferences) = match shelbi_state::load_user_config() {
+        Ok(cfg) if config_path.exists() => (FileState::Present(config_path), Ok(Preferences::from_config(&cfg))),
+        Ok(cfg) => (FileState::Missing(config_path), Ok(Preferences::from_config(&cfg))),
         Err(e) => (
             FileState::Invalid {
                 path: config_path,
                 error: e.to_string(),
             },
-            ThemePreference::Auto,
+            Err(e.to_string()),
         ),
     };
     // Validated, not loaded: `load_keymaps` runs its one-shot migrations,
@@ -118,8 +118,8 @@ pub fn read_global() -> GlobalSummary {
     GlobalSummary {
         home,
         config,
-        theme,
-        editor: shelbi_state::resolve_editor(),
+        preferences,
+        env_editor: std::env::var("EDITOR").ok(),
         keys,
         keymap_problems,
     }
@@ -156,16 +156,6 @@ pub fn display_path(path: &Path) -> String {
     crate::add_project_wizard::tilde(path, home.as_deref())
 }
 
-/// The `theme:` setting as the page names it. The TUI can't read the
-/// terminal's appearance, so Auto is dark there.
-pub fn theme_label(theme: ThemePreference) -> &'static str {
-    match theme {
-        ThemePreference::Auto => "Auto (dark in a terminal)",
-        ThemePreference::Dark => "Dark",
-        ThemePreference::Light => "Light",
-    }
-}
-
 /// `n` `noun`s, pluralized the simple way the page needs.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 {
@@ -198,11 +188,5 @@ mod tests {
             .path(),
             p.as_path()
         );
-    }
-
-    #[test]
-    fn the_theme_reads_as_the_page_names_it() {
-        assert_eq!(theme_label(ThemePreference::Light), "Light");
-        assert!(theme_label(ThemePreference::Auto).starts_with("Auto"));
     }
 }

@@ -22,8 +22,13 @@
 //!   project it was for and a generation, so a completion that lands after
 //!   the user moved on (another project, a newer request) is dropped.
 //! - [`summary`]: what the TUI's General page summarizes.
+//! - [`general`]: the General page's appearance and editor preferences, and
+//!   where a save of them stands.
+//! - [`terminal_preview`]: the Terminal page's canned preview session.
 
+pub mod general;
 pub mod summary;
+pub mod terminal_preview;
 
 /// A page of Settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

@@ -111,6 +111,27 @@ paths on every `cargo test`.
   and adds pages as their follow-ups land. The TUI's switcher is the
   palette's Projects column, and a switch keeps Settings up for the new
   project. See [`status/tui-settings-shell.md`](status/tui-settings-shell.md).
+- **Settings ▸ General** (`tui-settings-general`): both clients edit the
+  shared `theme:` (Auto, Dark, Light, from `shelbi_app::settings::general`'s
+  `THEMES` and labels) as an immediate-save control with the shared
+  `SaveStatus` (Saving…, Saved, or why it failed). The TUI saves one narrow
+  change (`general::Change`) through `update_user_config` and applies the
+  theme once the write lands; the desktop applies it at once and writes its
+  whole form. Auto follows the system in the desktop and is dark in the TUI
+  (a terminal doesn't report its appearance). The TUI's General also edits
+  `editor:` (Enter commits, clearing restores `$EDITOR` then `vim`) and keeps
+  its summary of where the settings live; the desktop's General has no editor
+  field and instead edits the CLI path, notifications and window effects,
+  which are the desktop's own.
+- **Settings ▸ Terminal**: the desktop edits its own terminals' font, size,
+  Option key, scrollbar and ANSI colors (`desktop:` in `config.yaml`) and
+  previews them. In the TUI the host terminal owns all of that, so its
+  Terminal page explains so, shows the sixteen ANSI colors as sessions draw
+  them (the host's palette) and the shared preview session
+  (`shelbi_app::settings::terminal_preview`) drawn through the sessions' own
+  cell mapping. It has no controls, never writes `desktop:` and never sends
+  palette escape sequences to the host. See
+  [`status/tui-settings-general.md`](status/tui-settings-general.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

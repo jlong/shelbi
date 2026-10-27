@@ -41,6 +41,10 @@ editor: code --wait
 theme: light
 ```
 
+The TUI's Settings ▸ General edits `editor` too: it shows the command Shelbi
+runs and where it comes from (this key, `$EDITOR`, or the `vim` default), saves
+what you type when you press Enter, and clearing it brings back the fallback.
+
 The `editor` display label in the switcher is the program's basename with its
 first letter upper-cased — `hx` shows as **Edit in Hx**, `code --wait` as
 **Edit in Code**.
@@ -57,8 +61,11 @@ product.
 | `dark` | dark | dark |
 | `light` | light, for a terminal with a light background | light |
 
-The TUI reads the setting once at startup, so restart it after a change. A
-missing key is `auto`. The dark theme follows your terminal's own palette for
+Both clients set it in Settings ▸ General. In the TUI a change saves at
+once and repaints every surface on the next frame, with no restart and no
+effect on running sessions. The TUI also reads `config.yaml` again whenever
+its Settings opens, so an edit made in a text editor or in the desktop app
+shows there. A missing key is `auto`. The dark theme follows your terminal's own palette for
 its status colors; the light theme pins every color, so it reads the same in
 any light terminal.
 
