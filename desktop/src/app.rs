@@ -4465,6 +4465,8 @@ impl ShelbiWindow {
         let rule = self.column.target() == Occupant::Review;
         // The collapsed main area's titlebar row opens as the sidebar leaves,
         // its Show button fixed beside the traffic lights.
+        // Where the main area starts: a machine dialog centers over it.
+        let main_left = placement.map_or(0.0, |p| p.visible + if rule { 1.0 } else { 0.0 });
         let titlebar = MainTitlebar {
             open: placement.map_or(1.0, |p| p.titlebar),
             left: placement.map_or(0.0, |p| p.visible + if rule { 1.0 } else { 0.0 }),
@@ -4560,6 +4562,15 @@ impl ShelbiWindow {
             shell.children(column).children(handle).child(main)
         };
 
+        // Settings ▸ Workspaces' machine dialog, over the whole window (under
+        // an overlay opened on top of it).
+        let machine_form = match &self.route {
+            Route::Settings(view) => view
+                .read(cx)
+                .machine_form()
+                .map(|form| crate::views::machine_form::render_layer(form, px(main_left), &theme)),
+            _ => None,
+        };
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
         let layer = self.overlay.as_ref().map(|o| {
@@ -4627,6 +4638,7 @@ impl ShelbiWindow {
                 }))
             })
             .child(shell.flex_1().min_h_0())
+            .children(machine_form)
             .children(layer)
             .children(probe)
             .into_any_element()

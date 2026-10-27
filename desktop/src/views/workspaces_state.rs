@@ -20,13 +20,14 @@
 //! labels say so.
 //!
 //! The page's buttons don't edit the config themselves: each asks for a
-//! form through an [`Intent`] (the workspace and machine forms are their own
-//! tasks), which the window routes back to whoever handles it.
+//! form through an [`Intent`], which the window routes back to whoever
+//! handles it (Add machine and Configure open the machine form,
+//! `super::machine_form`; the workspace forms are their own task).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{MachineKind, Project, Reachability};
+use shelbi_core::{Machine, MachineKind, Project, Reachability};
 
 /// A form the page asks for: what its buttons, rows and menus do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +82,8 @@ pub struct MachineRow {
     pub work_dir: String,
     /// How many of the project's workspaces it hosts.
     pub workspaces: usize,
+    /// The machine as declared, every field (its Configure form edits it).
+    pub config: Machine,
 }
 
 /// The page's rows.
@@ -141,6 +144,7 @@ impl PoolIndex {
                 },
                 work_dir: local(m.kind, &m.work_dir),
                 workspaces: project.workspaces.iter().filter(|w| w.machine == m.name).count(),
+                config: m.clone(),
             })
             .collect();
         PoolIndex {
@@ -487,6 +491,7 @@ workspaces:
                     host: None,
                     work_dir: "~/Projects/my-project".into(),
                     workspaces: 3,
+                    config: project(POOL).machines[0].clone(),
                 },
                 MachineRow {
                     name: "Build server".into(),
@@ -494,6 +499,7 @@ workspaces:
                     host: Some("build-server".into()),
                     work_dir: "/home/me/my-project".into(),
                     workspaces: 2,
+                    config: project(POOL).machines[1].clone(),
                 },
             ]
         );

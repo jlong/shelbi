@@ -48,8 +48,11 @@
 //! way. The Workspaces page ([`WorkspacesPage`]) lists the project's
 //! workspace pool and its machines; what its buttons ask for goes to the
 //! window ([`SettingsEvent::OpenPoolForm`]), which hands it back here
-//! ([`SettingsView::open_pool_form`]) until the workspace and machine forms
-//! take it.
+//! ([`SettingsView::open_pool_form`]). Add machine and Configure open the
+//! machine form ([`MachineFormView`]), a dialog the window draws over
+//! everything ([`SettingsView::machine_form`]); a save rereads the page,
+//! whose change refreshes the window. The workspace intents open the file
+//! the pool is declared in until their forms take them.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -72,6 +75,8 @@ use super::agent_editor::{AgentEditor, AgentEditorEvent};
 use super::agents::{AgentsEvent, AgentsPage};
 use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
+use super::machine_form::{self, MachineFormEvent, MachineFormView};
+use super::machine_form_state::MachineForm;
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use super::workflow_editor::{EditorEvent, WorkflowEditor};
@@ -303,6 +308,14 @@ pub enum SettingsEvent {
     PoolChanged,
 }
 
+/// An open machine dialog.
+struct OpenForm {
+    view: Entity<MachineFormView>,
+    /// What had the keyboard when it opened.
+    restore: Option<gpui::FocusHandle>,
+    _subscription: Subscription,
+}
+
 /// The settings view.
 pub struct SettingsView {
     /// The page shown.
@@ -347,6 +360,9 @@ pub struct SettingsView {
     agent_editor: Option<(Entity<AgentEditor>, Subscription)>,
     /// The project's Workspaces page.
     workspaces: Entity<WorkspacesPage>,
+    /// The Add machine / Configure machine dialog while it's open, and what
+    /// had the keyboard before it (it gets it back).
+    machine_form: Option<OpenForm>,
     /// The page's scroll, and whether to bring the Workflows page's
     /// Statuses into view once it has drawn (the editor's Manage project
     /// statuses).
@@ -470,6 +486,7 @@ impl SettingsView {
             agents,
             agent_editor: None,
             workspaces,
+            machine_form: None,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
             loaded: false,
@@ -558,11 +575,73 @@ impl SettingsView {
     }
 
     /// Open the form `intent` asks for (Settings ▸ Workspaces' buttons, rows
-    /// and menus, through the window). The workspace and machine forms are
-    /// their own tasks; until they take it, the page opens the file the pool
-    /// is declared in.
+    /// and menus, through the window): Add machine's empty SSH draft, or
+    /// Configure's over the machine as the page last read it. The workspace
+    /// forms are their own task; until they take theirs, the page opens the
+    /// file the pool is declared in.
     pub fn open_pool_form(&mut self, intent: &Intent, window: &mut Window, cx: &mut Context<Self>) {
-        self.workspaces.update(cx, |p, cx| p.edit_in_yaml(intent, window, cx));
+        let page = self.workspaces.read(cx).state();
+        let project = page.project().to_string();
+        let form = match intent {
+            Intent::AddMachine => MachineForm::add(&project),
+            Intent::ConfigureMachine(name) => {
+                let row = page.index().and_then(|i| i.machines.iter().find(|m| &m.name == name)).cloned();
+                let Some(row) = row else {
+                    // Gone since the page drew it: show the list as it is now.
+                    self.workspaces.update(cx, |p, cx| {
+                        p.state_mut().set_error(format!("Machine {name} isn’t declared any more."));
+                        p.load(window, cx);
+                    });
+                    return;
+                };
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                MachineForm::configure(&project, &row.config, row.workspaces, home.as_deref())
+            }
+            Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => {
+                self.workspaces.update(cx, |p, cx| p.edit_in_yaml(intent, window, cx));
+                return;
+            }
+        };
+        if self.machine_form.is_some() {
+            return;
+        }
+        let restore = window.focused(cx);
+        let engine = machine_form::Engine::current(cx);
+        let view = cx.new(|cx| MachineFormView::new(form, engine, window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, event: &MachineFormEvent, window, cx| {
+            let saved = matches!(event, MachineFormEvent::Saved(_));
+            this.close_machine_form(saved, window, cx);
+        });
+        self.machine_form = Some(OpenForm {
+            view,
+            restore,
+            _subscription: sub,
+        });
+        cx.notify();
+    }
+
+    /// The machine dialog, while it's open: the window draws it over
+    /// everything.
+    pub fn machine_form(&self) -> Option<Entity<MachineFormView>> {
+        self.machine_form.as_ref().map(|f| f.view.clone())
+    }
+
+    /// The dialog closed (Cancel, Esc, or a save that took): the keyboard
+    /// goes back where it was, and after a save the page reads the config
+    /// again, so its rows and (through [`SettingsEvent::PoolChanged`]) the
+    /// window's sidebar and pickers follow.
+    fn close_machine_form(&mut self, saved: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.machine_form.take() else {
+            return;
+        };
+        if saved {
+            self.workspaces.update(cx, |p, cx| p.load(window, cx));
+        }
+        match form.restore {
+            Some(handle) => window.focus(&handle, cx),
+            None => cx.emit(SettingsEvent::Leave),
+        }
+        cx.notify();
     }
 
     /// Open workflow `name` in the editor, over the Workflows page's model

@@ -81,6 +81,8 @@ pub mod keybindings;
 pub mod keybindings_state;
 pub mod machines;
 pub mod machines_state;
+pub mod machine_form;
+pub mod machine_form_state;
 pub mod markdown;
 pub mod overlay;
 pub mod palette;
