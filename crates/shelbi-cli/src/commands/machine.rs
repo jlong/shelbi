@@ -12,6 +12,7 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use shelbi_core::{Machine, MachineKind};
 use shelbi_orchestrator::machine as m;
+use shelbi_orchestrator::machine_readiness as r;
 use shelbi_state::machine_state::{self, MachineRecord, SOURCE_PATH, SOURCE_SHELBI_BIN};
 
 use super::require_project;
@@ -23,6 +24,14 @@ pub enum MachineCmd {
     /// installs the matching release to `~/.shelbi/bin/shelbi`. Idempotent: a
     /// second run with a compatible binary in place changes nothing.
     Setup {
+        /// Machine name, as declared under `machines:` in the project YAML.
+        name: String,
+    },
+    /// Check that a machine is ready for this project: SSH connects, a
+    /// compatible `shelbi` is there, Git is usable, and the project directory
+    /// is a writable checkout root. Reads only; installs and creates nothing.
+    /// Records the verified binary when everything checks out.
+    Check {
         /// Machine name, as declared under `machines:` in the project YAML.
         name: String,
     },
@@ -43,6 +52,12 @@ pub fn run(project_opt: Option<String>, cmd: MachineCmd) -> Result<()> {
                 .machine(&name)
                 .ok_or_else(|| anyhow!("no machine named `{name}` in project `{project}`"))?;
             setup(machine)
+        }
+        MachineCmd::Check { name } => {
+            let machine = p
+                .machine(&name)
+                .ok_or_else(|| anyhow!("no machine named `{name}` in project `{project}`"))?;
+            check(machine)
         }
         MachineCmd::Status { name } => match name {
             Some(n) => {
@@ -77,7 +92,7 @@ fn setup(machine: &Machine) -> Result<()> {
             report_action(&machine.name, &action);
             // Persist the resolved binary so `status` can show it even when a
             // later reachability probe is slow.
-            if let Some(rec) = record_from_action(&action) {
+            if let Some(rec) = record_from_action(&action, &ssh_host(machine)) {
                 let _ = machine_state::save_machine_record(&machine.name, Some(rec));
             }
             Ok(())
@@ -125,7 +140,15 @@ fn report_action(name: &str, action: &m::SetupAction) {
     }
 }
 
-fn record_from_action(action: &m::SetupAction) -> Option<MachineRecord> {
+/// The SSH destination a machine connects to (its host, else its name).
+fn ssh_host(machine: &Machine) -> String {
+    match machine.host() {
+        shelbi_core::Host::Ssh { host } => host,
+        shelbi_core::Host::Local => machine.name.clone(),
+    }
+}
+
+fn record_from_action(action: &m::SetupAction, host: &str) -> Option<MachineRecord> {
     let (path, version, compatible, source) = match action {
         m::SetupAction::AlreadyCompatible {
             path,
@@ -142,7 +165,44 @@ fn record_from_action(action: &m::SetupAction) -> Option<MachineRecord> {
         compatible,
         source: source.to_string(),
         checked_at: chrono::Utc::now(),
+        host: Some(host.to_string()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// check
+
+fn check(machine: &Machine) -> Result<()> {
+    if matches!(machine.kind, MachineKind::Local) {
+        println!("{}: local machine — nothing to check over SSH.", machine.name);
+        return Ok(());
+    }
+    let host = ssh_host(machine);
+    let target = r::ReadinessTarget {
+        host: host.clone(),
+        work_dir: machine.work_dir.display().to_string(),
+    };
+    let readiness = r::check_host(&target, Default::default());
+    if let Some(message) = readiness.connection_message(&host) {
+        return Err(anyhow!("{}: {message}", machine.name));
+    }
+    let report = readiness.report().expect("reached");
+    let issues = report.issues();
+    if issues.is_empty() {
+        let _ = r::save_verified_record(&machine.name, &host, &readiness);
+        println!("{}: ready. {}", machine.name, report.ready_summary());
+        return Ok(());
+    }
+    for issue in &issues {
+        println!("{}: {}", machine.name, issue.message(&target.work_dir));
+    }
+    if readiness.offers_install() {
+        println!(
+            "{}: run `shelbi machine setup {}` to install a compatible CLI.",
+            machine.name, machine.name
+        );
+    }
+    Err(anyhow!("{}: not ready", machine.name))
 }
 
 // ---------------------------------------------------------------------------
@@ -185,10 +245,11 @@ fn status_row(machine: &Machine, hub: &m::Version) -> [String; 5] {
     match m::probe_machine(&exec, hub) {
         m::MachineProbe::Unreachable { .. } => unreachable_row(machine, "unreachable"),
         m::MachineProbe::AuthDenied { .. } => unreachable_row(machine, "auth-denied"),
+        m::MachineProbe::HostKey { .. } => unreachable_row(machine, "host-key"),
         m::MachineProbe::Reachable(r) => {
             let eff = r.effective(hub);
             // Refresh the durable record for a resolved, present binary.
-            if let Some(rec) = m::record_for(&eff) {
+            if let Some(rec) = m::record_for(&eff, &ssh_host(machine)) {
                 let _ = machine_state::save_machine_record(&machine.name, Some(rec));
             }
             let version = eff
@@ -210,7 +271,8 @@ fn status_row(machine: &Machine, hub: &m::Version) -> [String; 5] {
 /// Row for an unreachable/auth-denied machine, falling back to the last
 /// recorded resolution for context (never "missing").
 fn unreachable_row(machine: &Machine, reach: &str) -> [String; 5] {
-    match machine_state::load_machine_record(&machine.name) {
+    let record = machine_state::load_machine_record(&machine.name).filter(|rec| rec.is_for_host(&ssh_host(machine)));
+    match record {
         Some(rec) => [
             machine.name.clone(),
             reach.into(),

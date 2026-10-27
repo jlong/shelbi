@@ -25,6 +25,8 @@
 //! the rest of Shelbi's "drive the host's own tools" design.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use shelbi_core::Host;
@@ -315,6 +317,9 @@ pub struct SshExec {
     host: Host,
     label: String,
     deadline: Duration,
+    /// Trips to kill an in-flight script (and refuse new ones), for a caller
+    /// whose result no one will read any more (a closed form).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl SshExec {
@@ -324,6 +329,7 @@ impl SshExec {
             host,
             label: label.into(),
             deadline: ssh_deadline(),
+            cancel: None,
         }
     }
 
@@ -336,6 +342,23 @@ impl SshExec {
             host,
             label: label.into(),
             deadline,
+            cancel: None,
+        }
+    }
+
+    /// Kill the in-flight script when `cancel` trips (the call returns
+    /// `Interrupted`), and refuse to start one after it has.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn cancelled(&self) -> io::Result<()> {
+        match &self.cancel {
+            Some(c) if c.load(Ordering::Acquire) => {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -349,8 +372,13 @@ impl RemoteExec for SshExec {
         // A deadline is the only reliable bound on a Tailscale-SSH web-auth
         // wedge (see `shelbi_ssh::run_with_deadline`): on timeout it returns
         // `TimedOut`, which we surface as Unreachable rather than "no binary".
-        let out =
-            shelbi_ssh::run_with_deadline(&self.host, ["sh", "-c", script], self.deadline)?;
+        self.cancelled()?;
+        let out = shelbi_ssh::run_with_deadline_cancellable(
+            &self.host,
+            ["sh", "-c", script],
+            self.deadline,
+            self.cancel.as_deref(),
+        )?;
         Ok(ExecOutput {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -364,6 +392,7 @@ impl RemoteExec for SshExec {
         // No wall-clock deadline here: the stdin payload is a release tarball
         // and a slow link must not look like an unreachable host. Transport
         // death still surfaces as a non-zero exit, which the caller classifies.
+        self.cancelled()?;
         let mut cmd = shelbi_ssh::build_command(&self.host, ["sh", "-c", script]);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -513,6 +542,10 @@ pub enum MachineProbe {
     /// SSH connected but authentication/authorization was refused (locked-down
     /// host). Distinct from Unreachable so the message can point at access.
     AuthDenied { detail: String },
+    /// SSH refused the host's key: unknown to `known_hosts` under
+    /// `BatchMode`, or changed since it was recorded. Neither unreachable nor
+    /// an auth refusal: the fix is verifying the key, by hand.
+    HostKey { detail: String },
     /// SSH ran our probe. Carries the platform (or why it is unusable) and the
     /// binaries found on the PATH and under `~/.shelbi/bin`.
     Reachable(ReachableProbe),
@@ -576,6 +609,14 @@ const UNREACHABLE_MARKERS: &[&str] = &[
     "broken pipe",
 ];
 
+/// Substrings that mean SSH refused the host's key (unknown under `BatchMode`,
+/// or changed), matched before the auth and connect markers.
+const HOST_KEY_MARKERS: &[&str] = &[
+    "host key verification failed",
+    "remote host identification has changed",
+    "no matching host key",
+];
+
 /// Substrings that mean SSH reached the host but refused access (locked-down).
 const AUTH_MARKERS: &[&str] = &[
     "permission denied",
@@ -615,7 +656,7 @@ fi
 }
 
 /// Slice the text between the first `begin` and the next `end` after it.
-fn between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
+pub(crate) fn between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
     let start = text.find(begin)? + begin.len();
     let rest = &text[start..];
     let stop = rest.find(end)?;
@@ -669,6 +710,11 @@ pub fn classify_probe_failure(out: &ExecOutput) -> Option<MachineProbe> {
         return None;
     }
     let text = format!("{}\n{}", out.stdout, out.stderr).to_ascii_lowercase();
+    if HOST_KEY_MARKERS.iter().any(|m| text.contains(m)) {
+        return Some(MachineProbe::HostKey {
+            detail: first_nonempty_line(&out.stderr),
+        });
+    }
     if AUTH_MARKERS.iter().any(|m| text.contains(m)) {
         return Some(MachineProbe::AuthDenied {
             detail: first_nonempty_line(&out.stderr),
@@ -682,7 +728,7 @@ pub fn classify_probe_failure(out: &ExecOutput) -> Option<MachineProbe> {
     None
 }
 
-fn first_nonempty_line(s: &str) -> String {
+pub(crate) fn first_nonempty_line(s: &str) -> String {
     s.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -749,7 +795,8 @@ pub fn probe_reachability(exec: &dyn RemoteExec) -> Reachability {
         Ok(out) => {
             let error = match classify_probe_failure(&out) {
                 Some(MachineProbe::Unreachable { detail })
-                | Some(MachineProbe::AuthDenied { detail }) => detail,
+                | Some(MachineProbe::AuthDenied { detail })
+                | Some(MachineProbe::HostKey { detail }) => detail,
                 // Ran but failed for some other reason — a bare `true` that
                 // doesn't exit 0 still means the host isn't usably answering.
                 _ => first_nonempty_line(&out.stderr),
@@ -817,9 +864,10 @@ impl ReachableProbe {
 /// hub-side, so show it tilde-relative).
 pub const MANAGED_BIN_DISPLAY: &str = "~/.shelbi/bin/shelbi";
 
-/// Build the durable [`MachineRecord`] for a resolved effective binary. Only
-/// written when the binary actually exists (a resolved version is present).
-pub fn record_for(effective: &EffectiveBinary) -> Option<MachineRecord> {
+/// Build the durable [`MachineRecord`] for a resolved effective binary on
+/// SSH destination `host`. Only written when the binary actually exists (a
+/// resolved version is present).
+pub fn record_for(effective: &EffectiveBinary, host: &str) -> Option<MachineRecord> {
     let version = effective.version?;
     Some(MachineRecord {
         path: effective.path.clone(),
@@ -827,6 +875,7 @@ pub fn record_for(effective: &EffectiveBinary) -> Option<MachineRecord> {
         compatible: effective.compatible,
         source: effective.source.to_string(),
         checked_at: chrono::Utc::now(),
+        host: Some(host.to_string()),
     })
 }
 
@@ -862,6 +911,7 @@ pub enum SetupAction {
 pub enum SetupError {
     Unreachable(String),
     AuthDenied(String),
+    HostKey(String),
     UnsupportedPlatform(PlatformError),
     ReadOnlyHome(String),
     /// Neither the remote nor the hub could fetch the artifact.
@@ -913,6 +963,11 @@ impl SetupError {
                 "SSH refused access: {d}\n\
                  Manual steps: fix key/agent auth so `ssh <host>` logs in non-interactively, \
                  then re-run `shelbi machine setup`."
+            ),
+            SetupError::HostKey(d) => format!(
+                "SSH doesn't trust the machine's host key: {d}\n\
+                 Manual steps: run `ssh <host>` from the hub once and verify the key it offers \
+                 (or fix the changed entry in ~/.ssh/known_hosts), then re-run."
             ),
             SetupError::UnsupportedPlatform(p) => p.message(),
             SetupError::ReadOnlyHome(d) => format!(
@@ -1069,6 +1124,7 @@ pub fn setup(
     let reachable = match probe {
         MachineProbe::Unreachable { detail } => return Err(SetupError::Unreachable(detail)),
         MachineProbe::AuthDenied { detail } => return Err(SetupError::AuthDenied(detail)),
+        MachineProbe::HostKey { detail } => return Err(SetupError::HostKey(detail)),
         MachineProbe::Reachable(r) => r,
     };
 
@@ -1342,6 +1398,11 @@ mod tests {
         assert!(matches!(
             classify_probe_failure(&out(255, "", "Permission denied (publickey).")),
             Some(MachineProbe::AuthDenied { .. })
+        ));
+        // A refused host key is its own failure, not an unreachable host.
+        assert!(matches!(
+            classify_probe_failure(&out(255, "", "Host key verification failed.\r\nConnection closed")),
+            Some(MachineProbe::HostKey { .. })
         ));
         // A clean run is not a failure.
         assert!(classify_probe_failure(&out(0, "ok", "")).is_none());

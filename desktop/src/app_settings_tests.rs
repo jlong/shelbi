@@ -3065,9 +3065,11 @@ fn a_long_name_and_path_clip_inside_their_column(cx: &mut TestAppContext) {
 
 // ---- Add machine / Configure machine (`dt-machine-settings-forms`) ---------
 
-use crate::views::machine_form::tests::{recording_readiness, save_with, QuietOps};
+use crate::views::machine_form::tests::{recording_readiness, recording_records, save_with, QuietOps, Records};
 use crate::views::machine_form::{Engine as MachineEngine, MachineFormView};
-use crate::views::machine_form_state::{Check, CheckOutcome, Field as MachineField, ReadinessIntent};
+use crate::views::machine_form_state::{
+    samples, Check, CheckOutcome, Field as MachineField, Focus as MachineFocus, ReadinessIntent,
+};
 
 impl Settings {
     /// Settings ▸ Workspaces over `pool`, the machine form saving through
@@ -3076,7 +3078,8 @@ impl Settings {
         cx.update(|cx| {
             cx.set_global(MachineEngine {
                 save: save_with(ops),
-                readiness: recording_readiness(CheckOutcome::Reachable).0,
+                readiness: recording_readiness(CheckOutcome::Checked(samples::needs_cli())).0,
+                record: recording_records().0,
             })
         });
         Settings::open_workspaces(cx)
@@ -3341,13 +3344,12 @@ fn a_connection_check_writes_nothing_and_goes_stale_with_the_host(cx: &mut TestA
     let home = Home::with_project("mf-check", "alpha");
     let file = write_pool(&home.root, "alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
-    let (readiness, seen) = recording_readiness(CheckOutcome::NeedsCli {
-        message: "shelbi isn’t installed on build-server".into(),
-    });
+    let (readiness, seen) = recording_readiness(CheckOutcome::Checked(samples::needs_cli()));
     cx.update(|cx| {
         cx.set_global(MachineEngine {
             save: save_with(QuietOps::default()),
             readiness,
+            record: recording_records().0,
         })
     });
     let mut s = Settings::open_workspaces(cx);
@@ -3371,6 +3373,153 @@ fn a_connection_check_writes_nothing_and_goes_stale_with_the_host(cx: &mut TestA
     s.type_in_form(MachineField::Host, "build-2");
     assert_eq!(check(&s), Check::NotChecked, "a new host isn't checked");
     assert!(!s.drawn("machine-install-cli"));
+}
+
+impl Settings {
+    /// Settings ▸ Workspaces whose machine checks answer `outcome`, recording
+    /// what they'd write to the machine records.
+    fn open_checked(cx: &mut TestAppContext, outcome: CheckOutcome) -> (Settings, Records) {
+        let (record, records) = recording_records();
+        cx.update(|cx| {
+            cx.set_global(MachineEngine {
+                save: save_with(QuietOps::default()),
+                readiness: recording_readiness(outcome).0,
+                record,
+            })
+        });
+        (Settings::open_workspaces(cx), records)
+    }
+
+    fn check_title(&self) -> String {
+        self.read(|_, cx| self.form().read(cx).state().panel().title)
+    }
+
+    /// Press `focus` without letting its work run, and the check's stop flag.
+    fn press_unparked(&mut self, focus: MachineFocus) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let form = self.form();
+        self.h
+            .cx
+            .update(|window, cx| form.update(cx, |f, cx| f.press_button(focus, window, cx)));
+        self.read(|_, cx| form.read(cx).running_flag()).expect("a check is running")
+    }
+}
+
+#[gpui::test]
+fn a_verified_draft_is_recorded_only_once_it_is_added(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-verified-add", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "GPU box");
+    s.type_in_form(MachineField::Host, "gpu-alias");
+    s.type_in_form(MachineField::WorkDir, "/srv/my project");
+    s.click("machine-test");
+    s.saved();
+    assert_eq!(s.check_title(), "Connection successful");
+    assert!(s.drawn("machine-check-title"));
+    assert!(records.lock().unwrap().is_empty(), "an unsaved draft records nothing");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "a check writes no config");
+
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.machine_form().is_none());
+    assert_eq!(
+        *records.lock().unwrap(),
+        [("GPU box".to_string(), "gpu-alias".to_string(), true)],
+        "recorded under the saved name, bound to its host"
+    );
+}
+
+#[gpui::test]
+fn cancelling_a_verified_draft_records_nothing(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-verified-cancel", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "GPU box");
+    s.type_in_form(MachineField::Host, "gpu-alias");
+    s.type_in_form(MachineField::WorkDir, "/srv/p");
+    s.click("machine-test");
+    s.saved();
+    s.key("escape");
+    s.saved();
+    assert!(s.machine_form().is_none());
+    assert!(records.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+}
+
+#[gpui::test]
+fn an_unverified_save_records_nothing(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-unverified", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::needs_cli()));
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "GPU box");
+    s.type_in_form(MachineField::Host, "gpu-alias");
+    s.type_in_form(MachineField::WorkDir, "/srv/p");
+    s.click("machine-test");
+    s.saved();
+    assert_eq!(s.check_title(), "Shelbi CLI needed");
+    s.click("machine-submit");
+    s.saved();
+    assert!(shelbi_state::load_project("alpha").unwrap().machine("GPU box").is_some(), "saving isn't gated");
+    assert!(records.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn a_configured_machine_verified_at_its_saved_host_is_recorded_and_an_edit_unverifies(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-verified-configure", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
+    s.click("machine-configure-Build server");
+    s.click("machine-test");
+    s.saved();
+    assert_eq!(s.check_title(), "Connection successful");
+    assert_eq!(
+        *records.lock().unwrap(),
+        [("Build server".to_string(), "build-server".to_string(), true)]
+    );
+    s.type_in_form(MachineField::WorkDir, "/srv/elsewhere");
+    assert_eq!(s.check_title(), "Not checked yet", "editing the directory drops the success");
+    s.type_in_form(MachineField::Host, "build-2");
+    s.click("machine-test");
+    s.saved();
+    assert_eq!(records.lock().unwrap().len(), 1, "a new host isn't the committed one until saved");
+}
+
+#[gpui::test]
+fn closing_the_form_or_editing_its_host_stops_the_running_check(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+    let home = Home::with_project("mf-cancel-check", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
+    s.click("machine-configure-Build server");
+    let flag = s.press_unparked(MachineFocus::Test);
+    assert!(!flag.load(Ordering::Acquire));
+    // Typed into the host before the check's work runs.
+    let host = {
+        let form = s.form();
+        s.read(|_, cx| form.read(cx).input(MachineField::Host).clone())
+    };
+    s.h.cx.update(|window, cx| {
+        let focus = gpui::Focusable::focus_handle(host.read(cx), cx);
+        window.focus(&focus, cx);
+    });
+    s.h.cx.simulate_input("x");
+    s.settle();
+    assert_ne!(s.form_text(MachineField::Host), "build-server");
+    assert!(flag.load(Ordering::Acquire), "an edit stops the stale check");
+    assert_eq!(s.check_title(), "Not checked yet", "and its answer is dropped");
+
+    let flag = s.press_unparked(MachineFocus::Test);
+    let form = s.form();
+    s.h.cx.update(|_, cx| form.update(cx, |_, cx| cx.emit(crate::views::machine_form::MachineFormEvent::Cancelled)));
+    s.saved();
+    assert!(s.machine_form().is_none());
+    assert!(flag.load(Ordering::Acquire), "closing stops it");
+    assert!(records.lock().unwrap().is_empty(), "a closed form takes no answer");
 }
 
 #[gpui::test]

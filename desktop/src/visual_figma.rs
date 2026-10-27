@@ -1360,17 +1360,17 @@ impl Run {
     /// machine on the gpu box (2528:9870), each with a passing readiness
     /// check landed so the region draws as the frames do. Their states no
     /// frame draws (`state-machine-*`, checked by eye): a fresh Add machine
-    /// (not checked yet), this Mac's form (no SSH), a check that failed, and
-    /// one asking for the CLI.
+    /// (not checked yet), this Mac's form (no SSH), a check running, one that
+    /// couldn't connect, one asking for the CLI, an install running and one
+    /// that failed, and a directory that needs attention.
     fn machine_forms(&mut self) {
-        use crate::views::machine_form_state::{CheckOutcome, Field};
+        use crate::views::machine_form_state::{samples, CheckOutcome, Field, ReadinessIntent};
         use crate::views::settings_nav::SettingsPage;
         use crate::views::workspaces_state::Intent;
-        let ready = || {
-            Some(CheckOutcome::Ready {
-                detail: "Shelbi, Git, and project directory are ready.".into(),
-            })
-        };
+        type Step = (ReadinessIntent, Option<CheckOutcome>);
+        let test = |outcome: Option<CheckOutcome>| vec![(ReadinessIntent::Test, outcome)];
+        let ready = || test(Some(CheckOutcome::Checked(samples::ready())));
+        let needs_cli = (ReadinessIntent::Test, Some(CheckOutcome::Checked(samples::needs_cli())));
         let typed: &[(Field, &str)] = &[
             (Field::Name, "Linux workstation"),
             (Field::Host, "linux-workstation"),
@@ -1378,30 +1378,52 @@ impl Run {
             (Field::Tags, "linux, gpu"),
         ];
         // A shot: its name, the form, what's typed, the check landed.
-        type Shot<'a> = (&'a str, Intent, &'a [(Field, &'a str)], Option<CheckOutcome>);
+        // A shot: its name, the form, what's typed, the checks run in turn.
+        type Shot<'a> = (&'a str, Intent, &'a [(Field, &'a str)], Vec<Step>);
+        let gpu = || Intent::ConfigureMachine("gpu".into());
         let shots: Vec<Shot> = vec![
             ("settings-machine-add", Intent::AddMachine, typed, ready()),
-            ("settings-machine-configure", Intent::ConfigureMachine("gpu".into()), &[], ready()),
-            ("state-machine-add-empty", Intent::AddMachine, &[], None),
-            ("state-machine-configure-local", Intent::ConfigureMachine("hub".into()), &[], None),
+            ("settings-machine-configure", gpu(), &[], ready()),
+            ("state-machine-add-empty", Intent::AddMachine, &[], vec![]),
+            ("state-machine-configure-local", Intent::ConfigureMachine("hub".into()), &[], vec![]),
+            ("state-machine-checking", gpu(), &[], test(None)),
             (
                 "state-machine-check-failed",
-                Intent::ConfigureMachine("gpu".into()),
+                gpu(),
                 &[],
-                Some(CheckOutcome::Failed {
-                    message: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
-                }),
+                test(Some(CheckOutcome::Checked(samples::unreachable()))),
+            ),
+            ("state-machine-needs-cli", gpu(), &[], vec![needs_cli.clone()]),
+            (
+                "state-machine-installing",
+                gpu(),
+                &[],
+                vec![needs_cli.clone(), (ReadinessIntent::InstallCli, None)],
             ),
             (
-                "state-machine-needs-cli",
-                Intent::ConfigureMachine("gpu".into()),
+                "state-machine-install-failed",
+                gpu(),
                 &[],
-                Some(CheckOutcome::NeedsCli {
-                    message: "gpu.lan has no Shelbi CLI, or an older one than this app.".into(),
-                }),
+                vec![
+                    needs_cli,
+                    (
+                        ReadinessIntent::InstallCli,
+                        Some(crate::views::machine_form::install_outcome(Err(
+                            shelbi_orchestrator::machine::SetupError::ReadOnlyHome(
+                                "mkdir: /home/me/.shelbi: Read-only file system".into(),
+                            ),
+                        ))),
+                    ),
+                ],
+            ),
+            (
+                "state-machine-needs-attention",
+                gpu(),
+                &[],
+                test(Some(CheckOutcome::Checked(samples::no_directory()))),
             ),
         ];
-        for (screen, intent, typed, outcome) in shots {
+        for (screen, intent, typed, steps) in shots {
             let handle = self.open();
             handle
                 .update(&mut self.cx, |w, window, cx| {
@@ -1425,8 +1447,8 @@ impl Run {
                         for (field, text) in typed {
                             f.type_into(*field, text, window, cx);
                         }
-                        if let Some(outcome) = outcome.clone() {
-                            f.offscreen_check(outcome, cx);
+                        for (intent, outcome) in &steps {
+                            f.offscreen_check(*intent, outcome.clone(), cx);
                         }
                     });
                 })
@@ -3040,6 +3062,7 @@ workspaces:
             compatible: true,
             source: shelbi_state::machine_state::SOURCE_PATH.into(),
             checked_at: now,
+            host: None,
         }),
     )
     .unwrap();

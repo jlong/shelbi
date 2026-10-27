@@ -49,6 +49,21 @@ pub struct MachineRecord {
     pub source: String,
     /// When this resolution was last refreshed.
     pub checked_at: DateTime<Utc>,
+    /// The SSH destination the binary was resolved on. Records are keyed by
+    /// machine name, which is a per-project label: a reader that knows the
+    /// machine's host ignores a record taken on another host
+    /// ([`MachineRecord::is_for_host`]) rather than show or run another
+    /// machine's binary. `None` on records written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl MachineRecord {
+    /// Whether this record can describe a machine reached at `host`: it was
+    /// resolved there, or it predates host binding.
+    pub fn is_for_host(&self, host: &str) -> bool {
+        self.host.as_deref().is_none_or(|h| h == host)
+    }
 }
 
 /// State file recording each machine's resolved binary:
@@ -122,6 +137,7 @@ mod tests {
             compatible,
             source: source.to_string(),
             checked_at: Utc::now(),
+            host: None,
         }
     }
 
@@ -165,6 +181,21 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_record_binds_to_the_host_it_was_resolved_on() {
+        let legacy = rec("/usr/bin/shelbi", "0.9.0", true, SOURCE_PATH);
+        assert!(legacy.is_for_host("anything"), "an unbound record still reads");
+        let bound = MachineRecord {
+            host: Some("build-server".into()),
+            ..legacy
+        };
+        assert!(bound.is_for_host("build-server"));
+        assert!(!bound.is_for_host("build-2"));
+        // An old file without the key still parses.
+        let old = r#"{"path":"/p","version":"0.9.0","compatible":true,"source":"path","checked_at":"2026-01-01T00:00:00Z"}"#;
+        assert_eq!(serde_json::from_str::<MachineRecord>(old).unwrap().host, None);
     }
 
     #[test]

@@ -1209,7 +1209,12 @@ impl MachinesModel {
                     remote: if is_local {
                         None
                     } else {
-                        input.records.get(&m.name).cloned()
+                        let host = m.host.as_deref().unwrap_or(&m.name);
+                        input
+                            .records
+                            .get(&m.name)
+                            .filter(|r| r.is_for_host(host))
+                            .cloned()
                     },
                     reachability: if is_local {
                         Reachability::Reachable
@@ -1835,6 +1840,7 @@ mod tests {
                 compatible: true,
                 source: "path".into(),
                 checked_at: chrono::Utc::now(),
+                host: None,
             },
         );
         let mut statuses = HashMap::new();

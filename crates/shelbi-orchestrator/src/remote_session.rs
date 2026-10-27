@@ -371,15 +371,27 @@ pub fn resolve_remote_bin(machine: &str) -> Result<String> {
 ///
 /// The session backend addresses a target by [`Host`] alone, so it looks up the
 /// machine record keyed by the SSH hostname (machine name and host coincide in
-/// the common config) and uses its path; failing that it falls back to `shelbi`
-/// on the remote PATH. The authoritative compatibility gate runs at dispatch
+/// the common config), else a compatible record resolved on that host under
+/// another machine name (a labelled machine such as "Build server"), and uses
+/// its path; failing that it falls back to `shelbi` on the remote PATH. The authoritative compatibility gate runs at dispatch
 /// ([`resolve_remote_bin`], which has the machine name), so this only picks the
 /// binary to drive once dispatch has cleared it.
 pub(crate) fn relay_bin_for_host(host: &Host) -> String {
     match host {
-        Host::Ssh { host } => shelbi_state::machine_state::load_machine_record(host)
-            .map(|rec| rec.path)
-            .unwrap_or_else(|| "shelbi".to_string()),
+        Host::Ssh { host } => {
+            let records = shelbi_state::machine_state::load_machine_records();
+            records
+                .get(host)
+                .filter(|rec| rec.is_for_host(host))
+                .or_else(|| {
+                    records
+                        .values()
+                        .filter(|rec| rec.compatible && rec.host.as_deref() == Some(host.as_str()))
+                        .max_by_key(|rec| rec.checked_at)
+                })
+                .map(|rec| rec.path.clone())
+                .unwrap_or_else(|| "shelbi".to_string())
+        }
         Host::Local => "shelbi".to_string(),
     }
 }
@@ -658,6 +670,7 @@ mod tests {
             compatible,
             source: shelbi_state::machine_state::SOURCE_PATH.to_string(),
             checked_at: chrono::Utc::now(),
+            host: None,
         }
     }
 
@@ -766,6 +779,21 @@ mod tests {
             relay_bin_for_host(&Host::Ssh { host: "box".into() }),
             "/opt/shelbi"
         );
+        // A labelled machine's record, bound to its host, serves that host
+        // (and only it).
+        shelbi_state::machine_state::save_machine_record(
+            "Build server",
+            Some(shelbi_state::machine_state::MachineRecord {
+                host: Some("build-server".into()),
+                ..rec("/home/u/.shelbi/bin/shelbi", "0.9.0", true)
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            relay_bin_for_host(&Host::Ssh { host: "build-server".into() }),
+            "/home/u/.shelbi/bin/shelbi"
+        );
+        assert_eq!(relay_bin_for_host(&Host::Ssh { host: "build-2".into() }), "shelbi");
         std::env::remove_var("SHELBI_HOME");
     }
 }
