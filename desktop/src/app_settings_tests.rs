@@ -109,7 +109,7 @@ impl Settings {
     /// The settings sidebar row the selection chip is on.
     fn selected_row(&mut self) -> Option<SettingsPage> {
         let at = self.bounds("settings-nav-selection")?.origin;
-        settings_nav::pages().find(|p| self.bounds(p.selector()).is_some_and(|b| b.contains(&at)))
+        shelbi_app::settings::pages().find(|p| self.bounds(p.selector()).is_some_and(|b| b.contains(&at)))
     }
 
     fn window_focused(&mut self) -> bool {

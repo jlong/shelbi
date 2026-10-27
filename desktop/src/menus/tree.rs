@@ -341,6 +341,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::RejectReview { .. } => Placement::GoReview,
         CommandKind::ToggleZen => Placement::View,
         CommandKind::OpenErrorLog => Placement::View,
+        CommandKind::OpenSettings => Placement::App,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
         CommandKind::NewWindow => Placement::File,
@@ -408,7 +409,9 @@ fn app_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSp
         items: vec![
             app("About Shelbi", AppCommand::About),
             MenuEntry::Separator,
-            app("Settings…", AppCommand::Settings),
+            // The registry's Settings, with ⌘, (bound to the window's
+            // OpenSettings for good; here it labels the item).
+            slot("action:settings", "Settings…", fixed_shortcut(AppCommand::Settings)),
             MenuEntry::Separator,
             MenuEntry::Services,
             MenuEntry::Separator,

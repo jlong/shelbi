@@ -45,6 +45,8 @@ pub trait CommandHost {
     fn toggle_zen(&mut self);
     /// Open the project's error log.
     fn open_error_log(&mut self);
+    /// Open Settings (on the page last used), as ⌘, does.
+    fn open_settings(&mut self);
     /// Open the add-project form.
     fn open_add_project(&mut self);
     /// Open a review task: a queued one asks which slot to load it onto.
@@ -75,6 +77,8 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::LoadReview { task_id } => host.load_review(task_id),
         CommandKind::ToggleZen => host.toggle_zen(),
         CommandKind::OpenErrorLog => host.open_error_log(),
+        // The registry's Settings: the same Settings ⌘, opens.
+        CommandKind::OpenSettings => host.open_settings(),
         // The window switches in place (dt-switch-project-in-window). A bare
         // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
@@ -125,6 +129,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
     match kind {
         CommandKind::ShowView(_) => false,
         CommandKind::OpenErrorLog => false,
+        // Settings itself is local; its pages' saves are their own.
+        CommandKind::OpenSettings => false,
         // Edits a local file in the user's editor.
         CommandKind::OpenEditor { .. } => false,
         // Only this client lets go.
@@ -225,6 +231,9 @@ mod tests {
         fn open_error_log(&mut self) {
             self.0.push("error-log".into());
         }
+        fn open_settings(&mut self) {
+            self.0.push("settings".into());
+        }
         fn open_add_project(&mut self) {
             self.0.push("add-project".into());
         }
@@ -276,6 +285,7 @@ mod tests {
             (CommandKind::LoadReview { task_id: s("t1") }, "load-review:t1"),
             (CommandKind::ToggleZen, "toggle-zen"),
             (CommandKind::OpenErrorLog, "error-log"),
+            (CommandKind::OpenSettings, "settings"),
             (
                 CommandKind::SwitchProject {
                     project: String::new(),
@@ -370,6 +380,7 @@ mod tests {
                 "show:machines",
                 "show:orch",
                 "error-log",
+                "settings",
                 "new-window",
                 "detach",
                 "editor:edit:project",

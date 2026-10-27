@@ -14,8 +14,8 @@
 //! Integrations joins [`SECTIONS`] with its page. No footer: the frame draws
 //! no Zen pill and no settings gear.
 //!
-//! [`SettingsNav`] is the toolkit-free part: the page shown and the row the
-//! keys moved to.
+//! [`SettingsNav`] (from `shelbi_app::settings`, shared with the TUI) is the
+//! toolkit-free part: the page shown and the row the keys moved to.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -36,37 +36,19 @@ use crate::theme::Theme;
 /// The Settings title's size.
 const TITLE_SIZE: f32 = 18.0;
 
-/// A page of Settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SettingsPage {
-    /// Theme, the Shelbi CLI, and notifications.
-    #[default]
-    General,
-    /// `keys.yaml`.
-    Keybindings,
-    /// The terminals' font, size, and Option key.
-    Terminal,
-    /// The project's workspace pool and the machines that host it.
-    Workspaces,
-    /// The project's workflows and status catalog.
-    Workflows,
-    /// The project's agents and their shared instructions.
-    Agents,
+// The pages, their sections and numbers, and the sidebar's navigation are
+// shared with the TUI (`shelbi_app::settings`); this client offers every page
+// (`SettingsNav::default`).
+pub use shelbi_app::settings::{Header, SettingsNav, SettingsPage, SECTIONS};
+
+/// How a page looks in this client: its icon and its nav row's selector.
+pub trait PageLook {
+    fn icon(self) -> Icon;
+    fn selector(self) -> &'static str;
 }
 
-impl SettingsPage {
-    pub fn label(self) -> &'static str {
-        match self {
-            SettingsPage::General => "General",
-            SettingsPage::Keybindings => "Keybindings",
-            SettingsPage::Terminal => "Terminal",
-            SettingsPage::Workspaces => "Workspaces",
-            SettingsPage::Workflows => "Workflows",
-            SettingsPage::Agents => "Agents",
-        }
-    }
-
-    pub fn icon(self) -> Icon {
+impl PageLook for SettingsPage {
+    fn icon(self) -> Icon {
         match self {
             SettingsPage::General => icons::WRENCH_SCREWDRIVER,
             SettingsPage::Keybindings => icons::KEYBOARD_KEY,
@@ -77,28 +59,7 @@ impl SettingsPage {
         }
     }
 
-    /// Its ⌘N while Settings is open. Fixed per page rather than counted:
-    /// the frames number Workflows 4 and Agents 6. They give Workspaces
-    /// Terminal's 3 too; it takes the free 5 instead, so each chord opens one
-    /// page (the sidebar lists it before Workflows all the same).
-    pub fn shortcut(self) -> u8 {
-        match self {
-            SettingsPage::General => 1,
-            SettingsPage::Keybindings => 2,
-            SettingsPage::Terminal => 3,
-            SettingsPage::Workspaces => 5,
-            SettingsPage::Workflows => 4,
-            SettingsPage::Agents => 6,
-        }
-    }
-
-    /// The page ⌘`n` opens.
-    pub fn for_shortcut(n: u8) -> Option<SettingsPage> {
-        pages().find(|p| p.shortcut() == n)
-    }
-
-    /// Its nav row's selector.
-    pub fn selector(self) -> &'static str {
+    fn selector(self) -> &'static str {
         match self {
             SettingsPage::General => "settings-nav-general",
             SettingsPage::Keybindings => "settings-nav-keybindings",
@@ -109,39 +70,6 @@ impl SettingsPage {
         }
     }
 }
-
-/// What heads a section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Header {
-    /// A title.
-    Title(&'static str),
-    /// The project switcher, after a divider: the section's pages edit the
-    /// shown project.
-    Project,
-}
-
-/// A group of pages under a header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Section {
-    pub header: Header,
-    pub pages: &'static [SettingsPage],
-}
-
-/// The sidebar's sections, in order.
-pub const SECTIONS: &[Section] = &[
-    Section {
-        header: Header::Title("Global"),
-        pages: &[
-            SettingsPage::General,
-            SettingsPage::Keybindings,
-            SettingsPage::Terminal,
-        ],
-    },
-    Section {
-        header: Header::Project,
-        pages: &[SettingsPage::Workspaces, SettingsPage::Workflows, SettingsPage::Agents],
-    },
-];
 
 /// The project section's switcher, as one frame draws it.
 pub struct ProjectSwitcher<'a> {
@@ -156,63 +84,6 @@ pub struct ProjectSwitcher<'a> {
     pub open: bool,
     /// The column's width, which the menu spans.
     pub width: f32,
-}
-
-/// Every page, in the order the sidebar draws (and the keys walk) them.
-pub fn pages() -> impl Iterator<Item = SettingsPage> {
-    SECTIONS.iter().flat_map(|s| s.pages.iter().copied())
-}
-
-/// Where the settings sidebar stands: the page shown, and the row the keys
-/// moved the selection to (Enter opens it). The page outlives a visit, so
-/// Settings reopens on the page last used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SettingsNav {
-    page: SettingsPage,
-    cursor: Option<SettingsPage>,
-}
-
-impl SettingsNav {
-    /// The page shown.
-    pub fn page(&self) -> SettingsPage {
-        self.page
-    }
-
-    /// The selected row: the keys' row, else the page's.
-    pub fn selected(&self) -> SettingsPage {
-        self.cursor.unwrap_or(self.page)
-    }
-
-    /// Show `page`; the selection goes back to its row.
-    pub fn show(&mut self, page: SettingsPage) {
-        self.page = page;
-        self.cursor = None;
-    }
-
-    /// Settings opened: on `page` when one was asked for, else the last.
-    pub fn open(&mut self, page: Option<SettingsPage>) {
-        self.show(page.unwrap_or(self.page));
-    }
-
-    /// Move the selection a row down or up, stopping at the ends.
-    pub fn step(&mut self, down: bool) {
-        let all: Vec<SettingsPage> = pages().collect();
-        let at = all.iter().position(|p| *p == self.selected()).unwrap_or(0);
-        let next = if down {
-            (at + 1).min(all.len() - 1)
-        } else {
-            at.saturating_sub(1)
-        };
-        self.cursor = Some(all[next]);
-    }
-
-    /// Open the selected row. Returns whether the page changed.
-    pub fn activate(&mut self) -> bool {
-        let page = self.selected();
-        let changed = page != self.page;
-        self.show(page);
-        changed
-    }
 }
 
 /// The section header: Base/Medium, 20pt in, 8pt above and 4pt below.
@@ -413,84 +284,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pages_are_numbered_in_order() {
-        let all: Vec<_> = pages().collect();
-        assert_eq!(
-            all,
-            [
-                SettingsPage::General,
-                SettingsPage::Keybindings,
-                SettingsPage::Terminal,
-                SettingsPage::Workspaces,
-                SettingsPage::Workflows,
-                SettingsPage::Agents
-            ]
-        );
-        assert_eq!(
-            all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(),
-            [1, 2, 3, 5, 4, 6]
-        );
-        assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
-        assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
-        assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Workspaces));
-        assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
-        assert_eq!(SettingsPage::for_shortcut(7), None);
-        assert_eq!(
-            SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 3)]
-        );
-    }
-
-    #[test]
-    fn every_page_has_its_own_chord_label_and_selector() {
-        let all: Vec<_> = pages().collect();
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a chord");
-                assert_ne!(a.label(), b.label());
-                assert_ne!(a.selector(), b.selector());
-            }
-            assert_eq!(SettingsPage::for_shortcut(a.shortcut()), Some(*a), "its chord opens it");
-        }
-    }
-
-    #[test]
-    fn the_keys_move_the_selection_and_enter_opens_it() {
-        let mut nav = SettingsNav::default();
-        assert_eq!(
-            (nav.page(), nav.selected()),
-            (SettingsPage::General, SettingsPage::General)
-        );
-        nav.step(false);
-        assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        for _ in 0..6 {
-            nav.step(true);
-        }
-        assert_eq!(
-            nav.selected(),
-            SettingsPage::Agents,
-            "crosses into the project section and stops at the bottom"
-        );
-        assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
-        assert!(nav.activate());
-        assert_eq!(
-            (nav.page(), nav.selected()),
-            (SettingsPage::Agents, SettingsPage::Agents)
-        );
-        assert!(!nav.activate(), "already shown");
-    }
-
-    #[test]
-    fn settings_reopens_on_the_last_page_unless_one_is_asked_for() {
-        let mut nav = SettingsNav::default();
-        nav.show(SettingsPage::Keybindings);
-        nav.step(true);
-        nav.open(None);
-        assert_eq!(
-            (nav.page(), nav.selected()),
-            (SettingsPage::Keybindings, SettingsPage::Keybindings)
-        );
-        nav.open(Some(SettingsPage::Terminal));
-        assert_eq!(nav.page(), SettingsPage::Terminal);
+    fn every_page_has_its_own_icon_and_selector() {
+        let all: Vec<_> = shelbi_app::settings::pages().collect();
+        let selectors: std::collections::HashSet<_> = all.iter().map(|p| p.selector()).collect();
+        assert_eq!(selectors.len(), all.len());
+        let icons: Vec<String> = all.iter().map(|p| format!("{:?}", p.icon())).collect();
+        let distinct: std::collections::HashSet<_> = icons.iter().collect();
+        assert_eq!(distinct.len(), all.len());
+        // This client offers every page, numbered as the frames number them.
+        assert_eq!(SettingsNav::default().available(), shelbi_app::settings::PageSet::ALL);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6]);
     }
 }

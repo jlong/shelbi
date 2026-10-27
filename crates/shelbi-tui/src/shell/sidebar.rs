@@ -300,6 +300,23 @@ impl SidebarView {
             .is_some_and(|s| contains(s, x, y))
     }
 
+    /// Whether `(x, y)` lands on the Settings gear at the end of the title row
+    /// (the shell opens Settings, as the sidebar's `,` does).
+    pub fn settings_hit(&self, area: Rect, x: u16, y: u16) -> bool {
+        if area.width == 0 || area.height == 0 || !contains(area, x, y) {
+            return false;
+        }
+        let header = self.geometry(area).header;
+        let gear = settings_gear_rect(header);
+        // A cell either side of the glyph counts, so the target isn't one column.
+        let target = Rect {
+            x: gear.x.saturating_sub(1),
+            width: gear.width + 2,
+            ..gear
+        };
+        header.width > SETTINGS_GEAR_W + 3 && contains(target, x, y)
+    }
+
     /// Map a click at viewer `(x, y)` to the selection index of the row there,
     /// or `None` for a header / blank / footer / out-of-bounds cell. Matches
     /// [`Self::render`]'s geometry: the nav block interleaves item rows with
@@ -402,17 +419,23 @@ impl SidebarView {
         }
         // The title sits on row 1 (a blank row above it); fall back to row 0 on
         // a header clamped to a single row.
-        let title_y = header.y + if header.height >= 2 { 1 } else { 0 };
+        let gear = settings_gear_rect(header);
         let title_rect = Rect {
-            y: title_y,
+            y: gear.y,
             height: 1,
             ..header
-        };
+        }
+        .inner(LIST_INDENT);
+        // The title leaves the row's last two columns to the Settings gear.
+        let gear_room = if title_rect.width > SETTINGS_GEAR_W + 1 { SETTINGS_GEAR_W + 1 } else { 0 };
         Paragraph::new(Line::from(Span::styled(
-            self.project_label.clone(),
+            truncate_ellipsis(&self.project_label, title_rect.width.saturating_sub(gear_room) as usize),
             Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
         )))
-        .render(title_rect.inner(LIST_INDENT), buf);
+        .render(title_rect, buf);
+        if gear_room > 0 {
+            Paragraph::new(Span::styled(SETTINGS_GEAR, Style::default().fg(palette().gray))).render(gear, buf);
+        }
 
         if let Some(search) = search {
             render_search_box(buf, search, &chrome.palette);
@@ -614,6 +637,22 @@ struct SidebarGeometry {
     nav: Rect,
     rest: Option<Rect>,
     footer: Rect,
+}
+
+/// The Settings gear drawn at the end of the title row.
+const SETTINGS_GEAR: &str = "⚙";
+const SETTINGS_GEAR_W: u16 = 1;
+
+/// Where the gear sits in `header`: the title row's last column inside the
+/// 1-col indent.
+fn settings_gear_rect(header: Rect) -> Rect {
+    let y = header.y + if header.height >= 2 { 1 } else { 0 };
+    Rect {
+        x: header.right().saturating_sub(1 + SETTINGS_GEAR_W),
+        y,
+        width: SETTINGS_GEAR_W,
+        height: 1,
+    }
 }
 
 /// Height of the header block: a blank row (0), the project title (row 1), a

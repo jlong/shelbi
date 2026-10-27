@@ -48,6 +48,7 @@ pub const CONTEXTS: &[KeymapContext] = &[
             Action::Sidebar(SidebarAction::NavDown),
             Action::Sidebar(SidebarAction::Activate),
             Action::Sidebar(SidebarAction::Refresh),
+            Action::Sidebar(SidebarAction::OpenSettings),
             Action::Sidebar(SidebarAction::Quit),
         ],
     },

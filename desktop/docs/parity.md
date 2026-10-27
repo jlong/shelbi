@@ -40,6 +40,7 @@ paths on every `cargo test`.
 | Reject | `action:reject-review:<id>` | Reason prompt; Ctrl+D sent it; the task went back to `todo` | Same (Reviews ▸ … ▸ Reject…) |
 | Zen toggle | `action:toggle-zen` | First off-to-on shows the intro; confirm turned Zen on; again turned it off | Same; the View menu item relabels on/off |
 | Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) |
+| Settings | `action:settings` | Added after this walk (`tui-settings-shell`), covered by both smoke tests: Settings over the view, its sidebar in the sidebar's column (also `,` in the sidebar and the ⚙ beside the project title) | The existing Settings, on the page last used (Shelbi ▸ Settings…, ⌘,) |
 | Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The sidebar's project switcher (File ▸ Switch Project…) |
 | Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | The window switches to `pb` in place, and back to where `pa` was left (File ▸ Open Project ▸ pb; `dt-switch-project-in-window`) |
 | New Window | `action:new-window` | Not offered: the registry lists it only for a multi-window client (`CommandModel::multi_window`); the TUI's arm says to run `shelbi` in another terminal | A second window on the current project, cascaded (File ▸ New Window, ⌘⇧N, and the palette) |
@@ -101,6 +102,15 @@ paths on every `cargo test`.
   is otherwise in the Settings button's tooltip), and a clickable Zen pill
   ("Zen mode on" / "off") in place of the band. Machines is in neither
   client's sidebar (the palette, and the desktop's Go menu).
+- **Settings** (`tui-settings-shell`): both clients draw it in place of the
+  sidebar over one model (`shelbi_app::settings`: the pages and numbers, the
+  pages each client offers, the navigation, the leave prompt, the stale-load
+  tickets). The desktop offers every page, under ⌘, and ⌘1 to ⌘6; the TUI
+  offers a General summary of where the settings live, with the Open in
+  editor paths, under the palette, the sidebar's `,` and the page's digit,
+  and adds pages as their follow-ups land. The TUI's switcher is the
+  palette's Projects column, and a switch keeps Settings up for the new
+  project. See [`status/tui-settings-shell.md`](status/tui-settings-shell.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

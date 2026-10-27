@@ -455,7 +455,9 @@ fn render_default_keymap() -> String {
                 .default_chords()
                 .iter()
                 .filter_map(|s| KeyChord::parse(s).ok())
-                .map(|c| c.canonical())
+                // Quoted where YAML needs it (`','` would start a flow
+                // separator bare).
+                .map(|c| shelbi_state::keymap::edit::yaml_scalar(&c.canonical()))
                 .collect();
             match chords.as_slice() {
                 [] => {

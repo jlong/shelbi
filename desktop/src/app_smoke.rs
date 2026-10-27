@@ -216,7 +216,7 @@ fn keystrokes_for(text: &str) -> String {
 fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     let commands = h.commands();
-    assert_eq!(commands.len(), 22, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 23, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");

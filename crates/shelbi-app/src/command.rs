@@ -44,6 +44,8 @@ pub enum CommandKind {
     ToggleZen,
     /// Open the per-project error log.
     OpenErrorLog,
+    /// Open Settings (the desktop app's ⌘,; the TUI's sidebar `,`).
+    OpenSettings,
     /// Switch to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow.
@@ -162,6 +164,7 @@ impl CommandKind {
             },
             CommandKind::ToggleZen => Effect::Mutate(Mutation::ToggleZen { project: p() }),
             CommandKind::OpenErrorLog => Effect::OpenErrorLog { project: p() },
+            CommandKind::OpenSettings => Effect::OpenSettings,
             CommandKind::SwitchProject { project } => Effect::SwitchProject {
                 project: project.clone(),
             },
@@ -344,7 +347,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// the review decisions (approve / reject), the error-log action, switch-project targets,
+    /// the review decisions (approve / reject), the error-log action, Settings, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -462,6 +465,22 @@ impl CommandRegistry {
                 color: DecorationColor::Default,
             }),
             subtitle: Some("Review recent errors and warnings".to_string()),
+            shortcut: None,
+            hidden_until_query: false,
+        });
+
+        // Settings: always offered (its Global pages need no project). The
+        // Open in editor commands below stay as the advanced path.
+        out.push(Command {
+            id: "action:settings".to_string(),
+            title: "Settings".to_string(),
+            kind: CommandKind::OpenSettings,
+            entry_kind: EntryKind::Action,
+            decoration: Some(Decoration {
+                glyph: "⚙️".into(),
+                color: DecorationColor::Default,
+            }),
+            subtitle: Some("Change how Shelbi looks and works".to_string()),
             shortcut: None,
             hidden_until_query: false,
         });
@@ -666,6 +685,7 @@ impl CommandKind {
         match id {
             "action:toggle-zen" => Some(CommandKind::ToggleZen),
             "action:error-log" => Some(CommandKind::OpenErrorLog),
+            "action:settings" => Some(CommandKind::OpenSettings),
             "action:switch-project" => Some(CommandKind::SwitchProject {
                 project: String::new(),
             }),
@@ -776,6 +796,7 @@ mod tests {
             "action:approve-review:T-12",
             "action:reject-review:T-12",
             "action:error-log",
+            "action:settings",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -1018,6 +1039,22 @@ mod tests {
         assert!(!hidden("action:toggle-zen"));
         assert!(!hidden("review:T-12"));
         assert!(!hidden("action:quit-shelbi"));
+        assert!(!hidden("action:settings"));
+    }
+
+    #[test]
+    fn settings_is_offered_with_or_without_a_project() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        let cmd = reg.resolve("action:settings", &m).expect("offered");
+        assert_eq!(cmd.kind(), &CommandKind::OpenSettings);
+        assert!(!cmd.is_mutating());
+        assert_eq!(cmd.effect("alpha"), Effect::OpenSettings);
+        m.project = None;
+        assert!(reg.resolve("action:settings", &m).is_some(), "its Global pages need no project");
+        let entries = reg.entries(&model());
+        let hits = shelbi_palette::search(&entries, "settings");
+        assert_eq!(hits[0].0.id, "action:settings", "it outranks the Edit … Settings openers");
     }
 
     #[test]

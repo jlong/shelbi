@@ -30,6 +30,7 @@ use shelbi_app::command::{
 use shelbi_app::command_model::edit_target_path;
 use shelbi_app::overlay::{add_project, review_reject};
 use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader, ReviewTarget};
+use shelbi_app::settings::{PageSet, SettingsNav, SettingsPage};
 use shelbi_app::{
     ClientState, CommandKind, CommandRegistry, EditTarget, Effect, ExecOutcome, Executor, Focus,
     Mutation, Overlay, View,
@@ -115,6 +116,10 @@ enum Performed {
 struct Scenario {
     model: CommandModel,
     client: ClientState,
+    /// The settings sidebar's navigation, kept across visits as both clients
+    /// keep it, and whether Settings is open over the view.
+    settings: SettingsNav,
+    settings_open: bool,
     effects: Vec<Effect>,
     performed: Vec<Performed>,
 }
@@ -129,6 +134,8 @@ impl Scenario {
         Scenario {
             model: fixture(),
             client,
+            settings: SettingsNav::default(),
+            settings_open: false,
             effects: Vec::new(),
             performed: Vec::new(),
         }
@@ -169,6 +176,13 @@ impl Executor for Scenario {
             }
             Effect::OpenErrorLog { .. } => {
                 self.client.open_overlay(Overlay::ErrorLog);
+                Performed::Nothing
+            }
+            // Settings stands over the view (it isn't one): the client's view
+            // is what its Back returns to, so it is left alone.
+            Effect::OpenSettings => {
+                self.settings.open(None);
+                self.settings_open = true;
                 Performed::Nothing
             }
             Effect::AddProject => {
@@ -225,6 +239,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::LoadReview { .. } => "a_review_resolves_then_opens_or_asks_for_a_slot",
         CommandKind::ToggleZen => "the_zen_toggle_is_a_daemon_mutation_and_relabels",
         CommandKind::OpenErrorLog => "the_error_log_opens_its_overlay",
+        CommandKind::OpenSettings => "settings_opens_over_the_view_on_the_last_page",
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
         CommandKind::AddProject => "add_project_collects_the_form_then_mutates",
         CommandKind::NewWindow => "new_window_reaches_the_host_on_a_multi_window_client",
@@ -268,6 +283,7 @@ fn every_command_kind_has_a_scenario() {
             "action:approve-review:T-9",
             "action:reject-review:T-9",
             "action:error-log",
+            "action:settings",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -434,6 +450,37 @@ fn the_error_log_opens_its_overlay() {
         }
     );
     assert_eq!(s.client.overlay(), Some(&Overlay::ErrorLog));
+}
+
+#[test]
+fn settings_opens_over_the_view_on_the_last_page() {
+    let mut s = Scenario::new();
+    s.client.set_view(View::Activity);
+    s.client.focus_sidebar();
+    assert_eq!(s.invoke("action:settings"), Effect::OpenSettings);
+    assert_eq!(s.last(), &Performed::Nothing, "client-local: nothing reaches the daemon");
+    assert!(s.settings_open);
+    assert_eq!(s.settings.page(), SettingsPage::General, "the first visit opens General");
+    assert_eq!(s.client.view(), &View::Activity, "the view under Settings stays for Back");
+    assert_eq!(s.client.overlay(), None, "Settings isn't an overlay");
+    assert_eq!(s.client.remembered_view(PROJECT), Some(&View::Activity));
+
+    // Leave on Terminal; the next visit reopens there.
+    s.settings.show(SettingsPage::Terminal);
+    s.settings_open = false;
+    s.invoke("action:settings");
+    assert_eq!(s.settings.page(), SettingsPage::Terminal);
+
+    // With no project open it is still offered (its Global pages need none).
+    let mut m = fixture();
+    m.project = None;
+    assert!(CommandRegistry::new().resolve("action:settings", &m).is_some());
+
+    // A client that offers fewer pages (the TUI's first) never opens a page
+    // it lacks, even one the other client left Settings on.
+    let mut tui = SettingsNav::new(PageSet::of(&[SettingsPage::General]));
+    tui.open(Some(SettingsPage::Terminal));
+    assert_eq!(tui.page(), SettingsPage::General);
 }
 
 #[test]
