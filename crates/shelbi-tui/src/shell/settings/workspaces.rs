@@ -16,7 +16,8 @@
 //! workspace, the workspace rows, Add machine and the machine rows; Enter
 //! runs the selected one (a workspace row opens Edit); `n` is New workspace
 //! from anywhere on the page, `e` edits and `d` / Delete removes the selected
-//! workspace (through the confirmation); `r` reads the config again.
+//! workspace (through the confirmation), `m` is Add machine and `c`
+//! configures the selected machine; `r` reads the config again.
 //!
 //! The form and the confirmation are a modal layer over the main area: while
 //! one is up it takes every key and click. Its fields edit at the end of the
@@ -28,9 +29,11 @@
 //! workspace; the request then runs off the UI thread through the shared
 //! service, and the form stays busy (sent once) until it lands.
 //!
-//! Add machine and a machine row's Configure open the file the pool is
-//! declared in, in the user's editor, and say so: the machine form is its own
-//! task.
+//! Add machine and a machine row (Enter, or `c` on it) open the machine form
+//! ([`super::machine_form`]): Add machine for a new SSH machine, Configure
+//! machine for an existing one (SSH or local). It's the same modal layer, and
+//! its save runs the same way, through the shared machine service; a rename
+//! carries the machine's workspaces along and the cursor follows the machine.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,13 +52,15 @@ use shelbi_app::settings::workspace_form::{
     self as form, Action, ConfirmFocus, Focus, Key, MachineChoice, Outcome, RemoveConfirm,
     WorkspaceForm, LOCATION_HELP,
 };
+use shelbi_app::settings::machine_form::{self as mform, MachineForm};
 use shelbi_app::settings::workspaces::{
     kind_label, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
 };
 use shelbi_app::settings::{Job, Ticket};
-use shelbi_core::pool::PoolError;
+use shelbi_core::pool::{MachineChange, PoolError};
 
+use super::machine_form;
 use crate::panel;
 use crate::theme::palette;
 
@@ -86,8 +91,9 @@ pub(crate) enum Ask {
     /// Run this request off the UI thread; its result comes back under the
     /// ticket ([`WorkspacesPage::finished`]).
     Run(Ticket, Box<form::Job>),
-    /// Open this file in the user's editor.
-    Edit(PathBuf),
+    /// Run this machine save off the UI thread; its result comes back under
+    /// the ticket ([`WorkspacesPage::machine_finished`]).
+    RunMachine(Ticket, Box<mform::Job>),
 }
 
 /// What a finished request asks of the shell.
@@ -106,6 +112,8 @@ enum Layer {
     Form { form: Box<WorkspaceForm>, fresh: bool },
     /// Remove workspace…, from a row.
     Confirm(RemoveConfirm),
+    /// Add machine / Configure machine.
+    Machine(Box<MachineForm>),
 }
 
 /// What a click at a recorded rect hits.
@@ -115,6 +123,8 @@ enum Hit {
     Option(usize),
     ConfirmCancel,
     ConfirmRemove,
+    /// A control of the machine form.
+    Machine(mform::Focus),
 }
 
 /// The page's state. One per Settings: it outlives a visit.
@@ -130,9 +140,14 @@ pub(crate) struct WorkspacesPage {
     /// The workspace the cursor goes to once the next read lands (the one
     /// just created or renamed).
     follow: Option<String>,
+    /// The machine the cursor goes to once the next read lands (the one just
+    /// added or saved).
+    follow_machine: Option<String>,
     layer: Option<Layer>,
     /// The latest request's ticket.
     run: Job<()>,
+    /// The latest machine save's ticket.
+    machine_run: Job<()>,
     /// The remotes' prober, while the page shows (never under test).
     prober: Option<ReachabilityProber>,
     home: Option<PathBuf>,
@@ -150,8 +165,10 @@ impl Default for WorkspacesPage {
             loaded_at: None,
             cursor: 0,
             follow: None,
+            follow_machine: None,
             layer: None,
             run: Job::default(),
+            machine_run: Job::default(),
             prober: None,
             home: std::env::var_os("HOME").map(PathBuf::from),
             dropped: 0,
@@ -179,7 +196,15 @@ impl WorkspacesPage {
         match &self.layer {
             Some(Layer::Confirm(c)) => Some(c),
             Some(Layer::Form { form, .. }) => form.confirm(),
-            None => None,
+            Some(Layer::Machine(_)) | None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn machine_form(&self) -> Option<&MachineForm> {
+        match &self.layer {
+            Some(Layer::Machine(form)) => Some(form),
+            _ => None,
         }
     }
 
@@ -249,6 +274,9 @@ impl WorkspacesPage {
         if let Some(name) = self.follow.take() {
             self.select_workspace(&name);
         }
+        if let Some(name) = self.follow_machine.take() {
+            self.select_machine(&name);
+        }
         self.cursor = self.cursor.min(self.items().len().saturating_sub(1));
         self.retarget_prober();
         // An open form offers the machines as now declared.
@@ -274,9 +302,11 @@ impl WorkspacesPage {
         self.load.reset();
         self.loaded_at = None;
         self.run.reset();
+        self.machine_run.reset();
         self.layer = None;
         self.cursor = 0;
         self.follow = None;
+        self.follow_machine = None;
         self.retarget_prober();
     }
 
@@ -377,6 +407,14 @@ impl WorkspacesPage {
         self.index().and_then(|i| i.workspaces.get(w)).map(|w| w.name.clone())
     }
 
+    /// The selected machine's name, when a machine row is selected.
+    fn selected_machine(&self) -> Option<String> {
+        match self.items().get(self.cursor) {
+            Some(Item::Machine(m)) => self.index().and_then(|i| i.machines.get(*m)).map(|m| m.name.clone()),
+            _ => None,
+        }
+    }
+
     /// The selected workspace's name, when a workspace row is selected.
     fn selected_workspace(&self) -> Option<String> {
         match self.items().get(self.cursor) {
@@ -417,25 +455,24 @@ impl WorkspacesPage {
                 }
                 Ask::Stay
             }
-            // The machine form is its own task: until the TUI has one, the
-            // file the pool is declared in opens in the editor, and the page
-            // says so.
-            Intent::AddMachine | Intent::ConfigureMachine(_) => match self.pool_file() {
-                Some(file) => {
-                    let what = match &intent {
-                        Intent::ConfigureMachine(m) => format!("Configure {m} under machines: in"),
-                        _ => "Add the machine under machines: in".to_string(),
-                    };
-                    self.note(format!("{what} {}.", file.display()));
-                    Ask::Edit(file)
+            Intent::AddMachine => {
+                if self.index().is_some() {
+                    self.layer = Some(Layer::Machine(Box::new(MachineForm::add(&project))));
                 }
-                None => Ask::Stay,
-            },
+                Ask::Stay
+            }
+            Intent::ConfigureMachine(name) => {
+                let row = self.index().and_then(|i| i.machines.iter().find(|m| m.name == name)).cloned();
+                match row {
+                    Some(row) => {
+                        let form = MachineForm::configure(&project, &row.config, row.workspaces, self.home.as_deref());
+                        self.layer = Some(Layer::Machine(Box::new(form)));
+                    }
+                    None => self.note(format!("{name} isn’t declared any more.")),
+                }
+                Ask::Stay
+            }
         }
-    }
-
-    fn pool_file(&self) -> Option<PathBuf> {
-        self.index().and_then(|i| i.file.clone())
     }
 
     fn note(&mut self, text: String) {
@@ -447,7 +484,8 @@ impl WorkspacesPage {
     // --- keys and clicks ---------------------------------------------------
 
     /// A page key that isn't the shared moves (those the settings shell
-    /// handles): `n`, `e`, `d` / Delete.
+    /// handles): `n`, `e`, `d` / Delete, `m` (Add machine), `c` (Configure
+    /// the selected machine).
     pub(crate) fn page_key(&mut self, k: KeyEvent) -> Option<Ask> {
         if !k.modifiers.difference(KeyModifiers::SHIFT).is_empty() || self.index().is_none() {
             return None;
@@ -458,6 +496,8 @@ impl WorkspacesPage {
             KeyCode::Char('d') | KeyCode::Delete => {
                 self.selected_workspace().map(|w| self.open(Intent::RemoveWorkspace(w)))
             }
+            KeyCode::Char('m') => Some(self.open(Intent::AddMachine)),
+            KeyCode::Char('c') => self.selected_machine().map(|m| self.open(Intent::ConfigureMachine(m))),
             _ => None,
         }
     }
@@ -466,6 +506,10 @@ impl WorkspacesPage {
     pub(crate) fn layer_key(&mut self, k: KeyEvent) -> Ask {
         let action = match self.layer.as_mut() {
             None => return Ask::Stay,
+            Some(Layer::Machine(form)) => {
+                let action = machine_form::key(form, k);
+                return self.act_machine(action);
+            }
             Some(Layer::Confirm(c)) => match confirm_key(k) {
                 Some(key) => c.key(key),
                 None => Action::Stay,
@@ -478,6 +522,9 @@ impl WorkspacesPage {
     /// A paste (or a dropped file's path) while the form shows: onto the
     /// focused text field, as one line. Returns whether a field took it.
     pub(crate) fn paste(&mut self, pasted: &str) -> bool {
+        if let Some(Layer::Machine(form)) = self.layer.as_mut() {
+            return machine_form::paste(form, pasted);
+        }
         let Some(Layer::Form { form, fresh }) = self.layer.as_mut() else {
             return false;
         };
@@ -503,6 +550,10 @@ impl WorkspacesPage {
         else {
             return Ask::Stay;
         };
+        if let (Some(Layer::Machine(form)), Hit::Machine(focus)) = (self.layer.as_mut(), hit) {
+            let action = machine_form::click(form, focus);
+            return self.act_machine(action);
+        }
         let action = match (self.layer.as_mut(), hit) {
             (Some(Layer::Confirm(c)), Hit::ConfirmCancel) => c.cancel(),
             (Some(Layer::Confirm(c)), Hit::ConfirmRemove) => c.remove(),
@@ -552,6 +603,81 @@ impl WorkspacesPage {
         }
     }
 
+    /// Carry out what the machine form said.
+    fn act_machine(&mut self, action: mform::Action) -> Ask {
+        match action {
+            mform::Action::Cancel => {
+                self.layer = None;
+                Ask::Stay
+            }
+            mform::Action::Save(run, request) => {
+                let Some(Layer::Machine(form)) = &self.layer else {
+                    return Ask::Stay;
+                };
+                let project = form.project().to_string();
+                let ticket = self.machine_run.begin(Some(&project));
+                Ask::RunMachine(ticket, Box::new(mform::Job { project, run, request: *request }))
+            }
+            // The TUI has no folder chooser (the directory is typed) and no
+            // connection check yet: the form never offers them.
+            mform::Action::Stay | mform::Action::Browse | mform::Action::Test | mform::Action::InstallCli => {
+                Ask::Stay
+            }
+        }
+    }
+
+    /// A machine save finished. A current one answers its form (closing it
+    /// on success, the cursor following the machine; keeping the draft and
+    /// saying why on failure); one whose form went (Settings closed) still
+    /// says what happened; one for another project, or superseded, is
+    /// dropped. Any committed change asks for a refresh of its project.
+    pub(crate) fn machine_finished(
+        &mut self,
+        ticket: &Ticket,
+        job: &mform::Job,
+        result: Result<MachineChange, PoolError>,
+    ) -> Landed {
+        let committed = result.is_ok().then(|| job.project.clone());
+        if !self.machine_run.complete(ticket, Ok(())) {
+            self.dropped += 1;
+            return Landed { committed };
+        }
+        let added = matches!(job.request, mform::SaveRequest::Add(_));
+        // The ticket is current, so a form that's saving sent it; any other
+        // form up now was opened after this one went.
+        let change = match self.layer.as_mut() {
+            Some(Layer::Machine(form)) if form.saving() => {
+                let change = form.finish_save(job.run, result);
+                if change.is_some() {
+                    self.layer = None;
+                }
+                change
+            }
+            _ => match result {
+                Ok(change) => Some(change),
+                Err(e) => {
+                    self.note(form::sentence(&mform::refusal_message(&e)));
+                    None
+                }
+            },
+        };
+        if let Some(change) = change {
+            self.note(mform::notice(&change, added));
+            self.follow_machine = Some(change.machine.name.clone());
+        }
+        Landed { committed }
+    }
+
+    /// Put the cursor on machine `name`'s row, when it's listed.
+    fn select_machine(&mut self, name: &str) {
+        let Some(m) = self.index().and_then(|i| i.machines.iter().position(|m| m.name == name)) else {
+            return;
+        };
+        if let Some(at) = self.items().iter().position(|i| *i == Item::Machine(m)) {
+            self.cursor = at;
+        }
+    }
+
     fn done(&mut self, outcome: &Outcome) {
         self.layer = None;
         if let Some(state) = self.state.as_mut() {
@@ -586,7 +712,7 @@ impl WorkspacesPage {
         let action = match self.layer.as_mut() {
             Some(Layer::Form { form, .. }) => form.finished(result),
             Some(Layer::Confirm(c)) => c.finished(result),
-            None => match result {
+            Some(Layer::Machine(_)) | None => match result {
                 Ok(outcome) => Action::Done(outcome),
                 Err(e) => {
                     self.note(form::sentence(&e.to_string()));
@@ -691,15 +817,8 @@ impl WorkspacesPage {
                     "Machines",
                     Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
                 ))));
-                let file = index
-                    .file
-                    .as_ref()
-                    .and_then(|f| f.file_name())
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "the project’s YAML".into());
-                let in_editor = format!("in {file}, in your editor");
                 rows.push(PageRow::item(
-                    action_line("Add machine…", Some(&in_editor), sel(Item::AddMachine), width),
+                    action_line("Add machine…", Some("m"), sel(Item::AddMachine), width),
                     at(Item::AddMachine),
                 ));
                 for (i, m) in index.machines.iter().enumerate() {
@@ -711,9 +830,8 @@ impl WorkspacesPage {
                 rows.push(PageRow::blank());
                 text(
                     &mut rows,
-                    "Reachable means SSH answered: it doesn’t check the Shelbi CLI, Git, or the project there. \
-                     The machine form isn’t in the TUI yet: Add machine and Configure open the file the pool is \
-                     declared in.",
+                    "Reachable means SSH answered the status probe: it doesn’t check the Shelbi CLI, Git, or the \
+                     project there. ⏎ or c on a machine configures it.",
                     Style::default().fg(palette().muted),
                 );
             }
@@ -732,6 +850,12 @@ impl WorkspacesPage {
                 let c = c.clone();
                 self.render_confirm(f, main, &c);
             }
+            Layer::Machine(form) => {
+                let probe = self.configured_status(form);
+                let mut hits = Vec::new();
+                machine_form::render(f, main, form, probe.as_ref(), &mut hits);
+                self.hits = hits.into_iter().map(|(r, focus)| (r, Hit::Machine(focus))).collect();
+            }
             Layer::Form { form, fresh } => {
                 let (form, fresh) = (form.clone(), *fresh);
                 self.render_form(f, main, &form, fresh);
@@ -741,6 +865,14 @@ impl WorkspacesPage {
                 }
             }
         }
+    }
+
+    /// What the reachability probe last saw of the machine `form`
+    /// configures, as the page shows it.
+    fn configured_status(&self, form: &MachineForm) -> Option<MachineStatus> {
+        let name = &form.configured()?.name;
+        let row = self.index()?.machines.iter().find(|m| &m.name == name)?;
+        Some(self.state.as_ref()?.status(row))
     }
 
     fn render_form(&mut self, f: &mut Frame, main: Rect, form: &WorkspaceForm, fresh: bool) {
@@ -1137,7 +1269,7 @@ fn confirm_key(k: KeyEvent) -> Option<Key> {
 }
 
 /// `label` padded to the label column, then `value`.
-fn field_line(label: &str, label_w: usize, value: Vec<Span<'static>>) -> Line<'static> {
+pub(super) fn field_line(label: &str, label_w: usize, value: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![Span::styled(
         format!("{:<label_w$}", panel::truncate_right(label, label_w.saturating_sub(1))),
         Style::default().fg(palette().gray),
@@ -1148,7 +1280,7 @@ fn field_line(label: &str, label_w: usize, value: Vec<Span<'static>>) -> Line<'s
 
 /// A one-line text box `[text▏   ]`: the caret at the end while focused,
 /// the whole text selected while a suggestion waits to be typed over.
-fn text_box(text: &str, width: usize, focused: bool, selected: bool) -> Vec<Span<'static>> {
+pub(super) fn text_box(text: &str, width: usize, focused: bool, selected: bool) -> Vec<Span<'static>> {
     let room = width.saturating_sub(1);
     let shown = panel::truncate_left(text, room);
     let caret = if focused && !selected { "▏" } else { "" };
@@ -1178,7 +1310,7 @@ fn control_style(focused: bool) -> Style {
 }
 
 /// A button: the selection fill while focused; dim while it can't run.
-fn button_style(focused: bool, enabled: bool, primary: bool) -> Style {
+pub(super) fn button_style(focused: bool, enabled: bool, primary: bool) -> Style {
     if !enabled {
         return Style::default().fg(palette().muted).bg(palette().status_bar);
     }
@@ -1484,6 +1616,20 @@ mod tests {
         out
     }
 
+    /// A drawn layer read as prose: its frame dropped and every run of
+    /// whitespace, line breaks included, one space. A hint wraps wherever
+    /// the platform's wording puts its words (`this Mac` on macOS, `this
+    /// computer` elsewhere), so a phrase is looked for here, not per line.
+    fn prose(shown: &str) -> String {
+        shown
+            .chars()
+            .map(|c| if matches!(c, '│' | '─' | '┌' | '┐' | '└' | '┘') { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn the_page_lists_workspaces_then_machines_with_derived_paths_tags_and_slots() {
         let page = loaded();
@@ -1516,7 +1662,7 @@ mod tests {
             "from 0, in the order the project declares them",
             "Machines",
             "Add machine…",
-            "in my-project.yaml, in your editor",
+            "⏎ or c on a machine configures it",
             "SSH · build-server",
             "Checking…",
             "3 workspaces",
@@ -1895,17 +2041,320 @@ mod tests {
         assert_eq!(page.state().unwrap().notice(), Some("Created echo."));
     }
 
+    // --- the machine form (tui-settings-machine-forms) ----------------------
+
+    fn item_at(page: &WorkspacesPage, item: Item) -> usize {
+        page.items().iter().position(|i| *i == item).expect("listed")
+    }
+
+    /// Tab to `focus` inside the open machine form.
+    fn tab_to_machine(page: &mut WorkspacesPage, focus: mform::Focus) {
+        for _ in 0..10 {
+            if page.machine_form().unwrap().focus() == focus {
+                return;
+            }
+            page.layer_key(key(KeyCode::Tab));
+        }
+        panic!("never reached {focus:?}");
+    }
+
+    fn run_machine(ask: Ask) -> (Ticket, mform::Job) {
+        match ask {
+            Ask::RunMachine(ticket, job) => {
+                assert_eq!(job.project, PROJECT);
+                (ticket, *job)
+            }
+            other => panic!("expected a machine save, got {other:?}"),
+        }
+    }
+
+    fn machine_change(name: &str, previous: Option<&str>, workspaces: &[&str]) -> MachineChange {
+        MachineChange {
+            machine: shelbi_core::Machine {
+                name: name.into(),
+                kind: shelbi_core::MachineKind::Ssh,
+                work_dir: "/srv/p".into(),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            },
+            previous_name: previous.map(str::to_string),
+            workspaces: workspaces.iter().map(|w| w.to_string()).collect(),
+        }
+    }
+
     #[test]
-    fn machine_actions_open_the_pool_file_and_say_so() {
+    fn machine_rows_open_the_form_with_the_machines_own_values() {
         let mut page = loaded();
-        let add = page.items().iter().position(|i| *i == Item::AddMachine).unwrap();
-        let file = PathBuf::from("/h/.shelbi/projects/my-project.yaml");
-        assert_eq!(page.activate(add), Ask::Edit(file.clone()));
-        assert!(page.state().unwrap().notice().unwrap().contains("my-project.yaml"));
-        let remote = page.items().iter().position(|i| *i == Item::Machine(1)).unwrap();
-        assert_eq!(page.activate(remote), Ask::Edit(file));
-        assert!(page.state().unwrap().notice().unwrap().starts_with("Configure Build server"));
-        assert!(!page.modal(), "no unfinished machine form opens");
+        let text = text(&page, 100);
+        assert!(text.contains("Add machine…  m"), "{text}");
+        assert!(!text.contains("in your editor"), "{text}");
+        assert_eq!(page.activate(item_at(&page, Item::AddMachine)), Ask::Stay);
+        let form = page.machine_form().expect("Add machine opens the form");
+        assert_eq!((form.title(), form.remote()), ("Add machine", true));
+        for field in [mform::Field::Name, mform::Field::Host, mform::Field::WorkDir, mform::Field::Tags] {
+            assert_eq!(form.text(field), "", "an empty draft");
+        }
+        page.layer_key(key(KeyCode::Esc));
+        assert!(!page.modal());
+
+        // Enter on the SSH machine: its values, as the page read them.
+        page.activate(item_at(&page, Item::Machine(1)));
+        let form = page.machine_form().unwrap();
+        assert_eq!(form.title(), "Configure machine");
+        assert_eq!(form.text(mform::Field::Name), "Build server");
+        assert_eq!(form.text(mform::Field::Host), "build-server");
+        assert_eq!(form.text(mform::Field::WorkDir), "/home/me/my-project", "a remote path as declared");
+        assert_eq!(form.description(), "Build server runs 2 workspaces for this project.");
+        page.layer_key(key(KeyCode::Esc));
+
+        // `c` on the local machine: its directory `~`-shortened, no SSH host.
+        page.cursor = item_at(&page, Item::Machine(0));
+        assert_eq!(page.page_key(key(KeyCode::Char('c'))), Some(Ask::Stay));
+        let form = page.machine_form().unwrap();
+        assert!(!form.remote());
+        assert_eq!(form.text(mform::Field::WorkDir), "~/Projects/my-project");
+        assert_eq!(form.fields_shown(), [mform::Field::Name, mform::Field::WorkDir, mform::Field::Tags]);
+        page.layer_key(key(KeyCode::Esc));
+        // `m` from anywhere on the page; `c` only on a machine row.
+        page.cursor = 0;
+        assert_eq!(page.page_key(key(KeyCode::Char('c'))), None);
+        page.page_key(key(KeyCode::Char('m')));
+        assert_eq!(page.machine_form().unwrap().title(), "Add machine");
+    }
+
+    #[test]
+    fn the_ssh_and_local_forms_show_their_own_fields() {
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('m')));
+        let shown = screen(&mut page, 100, 44);
+        let help = page.machine_form().unwrap().work_dir_help();
+        assert!(help.contains("remote’s home"), "{help}");
+        let read = prose(&shown);
+        for want in ["Add machine", "Kind", "SSH", "Name", "SSH host", "never asks for a password", "Project directory", &help, "Machine tags", "Connection", "Not checked", "Cancel"] {
+            assert!(read.contains(want), "{want:?}:\n{shown}");
+        }
+        page.layer_key(key(KeyCode::Esc));
+        page.activate(item_at(&page, Item::Machine(0)));
+        let shown = screen(&mut page, 100, 44);
+        let help = page.machine_form().unwrap().work_dir_help();
+        assert!(help.contains("~ is your home"), "{help}");
+        let read = prose(&shown);
+        for want in ["Configure machine", &format!("Local ({})", shelbi_app::settings::workspaces::LOCAL_LABEL), "~/Projects/my-project", &help, "Save changes"] {
+            assert!(read.contains(want), "{want:?}:\n{shown}");
+        }
+        for absent in ["SSH host", "Connection", "Not checked"] {
+            assert!(!shown.contains(absent), "the local form has no {absent:?}:\n{shown}");
+        }
+    }
+
+    #[test]
+    fn add_machine_sends_exactly_the_draft_once_and_remote_paths_stay_remote() {
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('m')));
+        type_text(&mut page, "gpu box");
+        page.layer_key(key(KeyCode::Tab));
+        type_text(&mut page, "gpu.lan");
+        page.layer_key(key(KeyCode::Down)); // ↓ moves like Tab
+        assert!(page.paste("~/src/my project\n"), "a path pastes onto the field");
+        page.layer_key(key(KeyCode::Tab));
+        type_text(&mut page, "cuda, linux");
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        let mform::SaveRequest::Add(fields) = &job.request else { panic!("an add") };
+        assert_eq!(fields.name, "gpu box");
+        assert_eq!(fields.host.as_deref(), Some("gpu.lan"));
+        assert_eq!(fields.work_dir, "~/src/my project", "a remote `~` is the remote's: never expanded here");
+        assert_eq!(fields.tags, ["cuda", " linux"]);
+        assert!(page.machine_form().unwrap().saving());
+        assert_eq!(page.layer_key(key(KeyCode::Enter)), Ask::Stay, "one save at a time");
+        assert_eq!(page.layer_key(key(KeyCode::Esc)), Ask::Stay, "Cancel waits for the save");
+        type_text(&mut page, "x");
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::Tags), "cuda, linux", "no edits while saving");
+        assert!(screen(&mut page, 100, 44).contains("Saving…"));
+
+        let landed = page.machine_finished(&ticket, &job, Ok(machine_change("gpu box", None, &[])));
+        assert_eq!(landed.committed.as_deref(), Some(PROJECT));
+        assert!(!page.modal(), "success closes the form");
+        assert_eq!(page.state().unwrap().notice(), Some("Added gpu box."));
+        assert_eq!(page.follow_machine.as_deref(), Some("gpu box"), "the cursor follows once the page rereads");
+    }
+
+    #[test]
+    fn refusals_keep_the_draft_beside_their_field_and_a_retry_saves() {
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('m')));
+        type_text(&mut page, "build server");
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        let refused = PoolError::invalid(shelbi_core::pool::PoolField::Name, "machine `Build server` already exists");
+        let landed = page.machine_finished(&ticket, &job, Err(refused));
+        assert_eq!(landed.committed, None);
+        let form = page.machine_form().expect("the draft stays");
+        assert_eq!(form.text(mform::Field::Name), "build server");
+        assert_eq!(form.focus(), mform::Focus::Field(mform::Field::Name));
+        let shown = screen(&mut page, 100, 44);
+        assert!(shown.contains("Machine `Build server` already exists."), "{shown}");
+
+        // A lifecycle refusal shows over the buttons; the draft is kept.
+        page.layer_key(key(KeyCode::Backspace));
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        page.machine_finished(&ticket, &job, Err(PoolError::Unsafe("workspace `alpha` has a live session".into())));
+        let shown = screen(&mut page, 100, 44);
+        assert!(shown.contains("Workspace `alpha` has a live session."), "{shown}");
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::Name), "build serve");
+        // Retry.
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        page.machine_finished(&ticket, &job, Ok(machine_change("build serve", None, &[])));
+        assert!(!page.modal());
+    }
+
+    #[test]
+    fn cancel_writes_nothing_and_drops_the_draft() {
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        type_text(&mut page, "-2");
+        tab_to_machine(&mut page, mform::Focus::Cancel);
+        assert_eq!(page.layer_key(key(KeyCode::Enter)), Ask::Stay);
+        assert!(!page.modal(), "Cancel closes");
+        page.activate(item_at(&page, Item::Machine(1)));
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::Name), "Build server", "a fresh draft");
+        page.hidden();
+        assert!(!page.modal(), "leaving the page drops the draft");
+    }
+
+    #[test]
+    fn a_rename_says_its_workspaces_followed() {
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        page.layer_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut page, "GPU box");
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        let mform::SaveRequest::Update(update) = &job.request else { panic!("an update") };
+        assert_eq!(update.name, "Build server");
+        assert_eq!(update.fields.name, "GPU box");
+        assert_eq!(update.expected.as_ref().map(|m| m.host.as_deref()), Some(Some("build-server")));
+        page.machine_finished(&ticket, &job, Ok(machine_change("GPU box", Some("Build server"), &["bravo", "review"])));
+        assert_eq!(
+            page.state().unwrap().notice(),
+            Some("Renamed Build server to GPU box; its 2 workspaces moved with it.")
+        );
+    }
+
+    #[test]
+    fn the_probe_is_labeled_and_a_draft_starts_not_checked() {
+        let mut page = loaded();
+        let probe = shelbi_app::settings::workspaces::probe_key("Build server", "build-server");
+        page.state_mut().unwrap().set_reachability(HashMap::from([(probe, Reachability::Reachable)]));
+        page.activate(item_at(&page, Item::Machine(1)));
+        let shown = screen(&mut page, 100, 44);
+        assert!(shown.contains("Not checked"), "{shown}");
+        assert!(shown.contains("Last status probe: build-server answered over SSH"), "{shown}");
+        for never in ["Connection successful", "Ready", "Verified"] {
+            assert!(!shown.contains(never), "nothing claims readiness: {never:?}\n{shown}");
+        }
+        // A new host was never probed: the old host's word goes.
+        page.layer_key(key(KeyCode::Tab));
+        type_text(&mut page, "-2");
+        let shown = screen(&mut page, 100, 44);
+        assert!(shown.contains("Not checked") && !shown.contains("Last status probe"), "{shown}");
+        // A new draft has nothing probed at all.
+        page.layer_key(key(KeyCode::Esc));
+        page.page_key(key(KeyCode::Char('m')));
+        assert!(!screen(&mut page, 100, 44).contains("Last status probe"));
+    }
+
+    #[test]
+    fn machine_results_for_a_closed_form_or_another_project_are_handled_safely() {
+        // Settings closed mid-save: the result still says what happened, and
+        // a form opened since isn't answered by it.
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('m')));
+        type_text(&mut page, "gpu");
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        page.hidden();
+        page.page_key(key(KeyCode::Char('m')));
+        type_text(&mut page, "other");
+        let landed = page.machine_finished(&ticket, &job, Ok(machine_change("gpu", None, &[])));
+        assert_eq!(landed.committed.as_deref(), Some(PROJECT));
+        assert_eq!(page.state().unwrap().notice(), Some("Added gpu."));
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::Name), "other", "the new draft is untouched");
+
+        // A failure for a closed form says why on the page.
+        page.layer_key(key(KeyCode::Enter));
+        let (ticket, job) = (page.machine_run.begin(Some(PROJECT)), job);
+        page.hidden();
+        page.machine_finished(&ticket, &job, Err(PoolError::Persistence("disk full".into())));
+        assert_eq!(page.state().unwrap().notice(), Some("Disk full."));
+
+        // A project switch: dropped, though the commit is still reported.
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('m')));
+        type_text(&mut page, "gpu");
+        let (ticket, job) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        page.project_changed();
+        let landed = page.machine_finished(&ticket, &job, Ok(machine_change("gpu", None, &[])));
+        assert_eq!(page.dropped(), 1);
+        assert_eq!(landed.committed.as_deref(), Some(PROJECT));
+        assert!(!page.modal());
+    }
+
+    #[test]
+    fn the_machine_form_draws_at_any_size_and_scrolls_to_the_focus() {
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        for (w, h) in [(1, 1), (10, 3), (20, 8), (30, 10), (50, 12), (200, 60)] {
+            screen(&mut page, w, h);
+        }
+        // Narrow: labels stack over their fields.
+        let shown = screen(&mut page, 34, 60);
+        assert!(shown.contains("SSH host") && shown.contains("build-server"), "{shown}");
+        // Short: the focused control stays in view.
+        tab_to_machine(&mut page, mform::Focus::Submit);
+        let shown = screen(&mut page, 90, 12);
+        assert!(shown.contains("Save changes"), "{shown}");
+        assert!(page.hits.iter().any(|(_, h)| *h == Hit::Machine(mform::Focus::Submit)));
+        tab_to_machine(&mut page, mform::Focus::Field(mform::Field::Name));
+        let shown = screen(&mut page, 90, 12);
+        assert!(shown.contains("Build server"), "{shown}");
+    }
+
+    #[test]
+    fn clicks_reach_the_machine_forms_controls() {
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 44)).unwrap();
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        let click = |page: &mut WorkspacesPage, hit: Hit| {
+            let (r, _) = *page.hits.iter().find(|(_, h)| *h == hit).expect("drawn");
+            page.layer_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x,
+                row: r.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        click(&mut page, Hit::Machine(mform::Focus::Field(mform::Field::Tags)));
+        assert_eq!(page.machine_form().unwrap().focus(), mform::Focus::Field(mform::Field::Tags));
+        assert!(matches!(click(&mut page, Hit::Machine(mform::Focus::Submit)), Ask::RunMachine(..)));
+        page.layer = None;
+        page.activate(item_at(&page, Item::Machine(1)));
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        click(&mut page, Hit::Machine(mform::Focus::Cancel));
+        assert!(!page.modal());
+    }
+
+    #[test]
+    fn path_entry_edits_at_the_end_like_a_terminal_line() {
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        tab_to_machine(&mut page, mform::Focus::Field(mform::Field::WorkDir));
+        page.layer_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::WorkDir), "/home/me/");
+        type_text(&mut page, "other");
+        page.layer_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        page.layer_key(key(KeyCode::Backspace));
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::WorkDir), "/home/me");
+        page.layer_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(page.machine_form().unwrap().text(mform::Field::WorkDir), "");
     }
 
     #[test]

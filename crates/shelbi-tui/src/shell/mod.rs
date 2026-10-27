@@ -126,6 +126,8 @@ enum SettingsMsg {
     PoolLoaded(Ticket, Result<PoolIndex, String>),
     /// A workspace request (create, save, remove) finished.
     PoolDone(Ticket, Box<Result<PoolOutcome, PoolError>>),
+    /// A machine save landed.
+    MachineDone(Ticket, Box<shelbi_app::settings::machine_form::Job>, Box<Result<shelbi_core::pool::MachineChange, PoolError>>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -1205,6 +1207,8 @@ struct ShellState {
     /// The shared workspace operations the Workspaces forms run
     /// (`pool_admin`'s in production; a test scripts them).
     pool_service: PoolService,
+    /// Runs the machine form's saves (the shared service; scripted in tests).
+    machine_service: shelbi_app::settings::machine_form::MachineService,
     /// How many refreshes were asked for (a test checks a committed pool
     /// change refreshes the sidebar).
     #[cfg(test)]
@@ -1338,6 +1342,10 @@ impl ShellState {
         #[cfg(test)]
         let (pool_reader, pool_service): (PoolReader, PoolService) =
             (Arc::new(settings::fixture_pool), settings::unavailable_pool_service());
+        #[cfg(not(test))]
+        let machine_service = shelbi_orchestrator::pool_admin::machine_service();
+        #[cfg(test)]
+        let machine_service = settings::unavailable_machine_service();
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1399,6 +1407,7 @@ impl ShellState {
             agents_reader,
             pool_reader,
             pool_service,
+            machine_service,
             #[cfg(test)]
             refresh_requests: std::cell::Cell::new(0),
             status: None,
@@ -2332,6 +2341,28 @@ impl ShellState {
         }
     }
 
+    /// Run a machine form's save off the UI thread through the shared
+    /// service; the result comes back under `ticket`.
+    fn run_machine(&mut self, ticket: Ticket, job: Box<shelbi_app::settings::machine_form::Job>) {
+        let service = self.machine_service.clone();
+        let tx = self.settings_tx.clone();
+        let (sent, sent_job) = (ticket.clone(), job.clone());
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-machine-save".into())
+            .spawn(move || {
+                let result = service.run(&sent_job.project, &sent_job.request);
+                let _ = tx.send(SettingsMsg::MachineDone(sent, sent_job, Box::new(result)));
+            });
+        if let Err(e) = spawned {
+            let landed = self.settings.machine_finished(
+                &ticket,
+                &job,
+                Err(PoolError::Provisioning(format!("couldn't start the save: {e}"))),
+            );
+            self.pool_landed(landed);
+        }
+    }
+
     /// A Workspaces request committed a change (or not): refresh what shows
     /// the project's pool when it's the shown project (the page, the
     /// sidebar's tree and the machines view, which the refresher rereads from
@@ -2549,6 +2580,10 @@ impl ShellState {
                     let landed = self.settings.pool_finished(&ticket, *result);
                     self.pool_landed(landed);
                 }
+                SettingsMsg::MachineDone(ticket, job, result) => {
+                    let landed = self.settings.machine_finished(&ticket, &job, *result);
+                    self.pool_landed(landed);
+                }
             }
         }
         if self.settings_open() {
@@ -2606,6 +2641,7 @@ impl ShellState {
                         SettingsAction::CommitAgents(job) => self.commit_agents(*job),
             SettingsAction::Status(text) => self.status = Some(text),
             SettingsAction::RunPool(ticket, job) => self.run_pool(ticket, job),
+            SettingsAction::RunMachine(ticket, job) => self.run_machine(ticket, job),
         }
         self.dirty = true;
     }
@@ -8835,6 +8871,7 @@ machines:
     host: devbox.lan
     work_dir: /home/u/proj
     tags: [linux]
+    forward: tcp
 workspaces:
   - name: alpha
     machine: hub
@@ -9131,6 +9168,271 @@ workspaces:
         );
         assert_eq!(st.refresh_requests.get(), refreshes, "beta isn't refreshed for proj's change");
         assert!(st.settings.workspaces().form().is_none());
+    }
+
+    // --- Settings ▸ Workspaces ▸ machines (tui-settings-machine-forms) ------
+
+    use shelbi_app::settings::machine_form::{Field as MachineField, Focus as MachineFocus};
+
+    /// [`workspaces_state`] with the machine form saving through
+    /// `pool_admin` over `ops` too.
+    fn machines_state(ops: Arc<FakeOps>) -> ShellState {
+        let mut st = workspaces_state(ops.clone());
+        st.machine_service = shelbi_orchestrator::pool_admin::machine_service_with(ops);
+        st
+    }
+
+    /// Drain Settings until the machine form's save lands.
+    fn settle_machine(st: &mut ShellState) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                !st.settings.workspaces().machine_form().is_some_and(|f| f.saving())
+            }),
+            "the save lands"
+        );
+    }
+
+    /// Wait for the page's machine rows to show `name`.
+    fn settle_machine_rows(st: &mut ShellState, name: &str) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings
+                    .workspaces()
+                    .state()
+                    .and_then(|s| s.index())
+                    .is_some_and(|i| i.machines.iter().any(|m| m.name == name))
+            }),
+            "the page reads the pool again ({name})"
+        );
+    }
+
+    fn type_str(st: &mut ShellState, text: &str) {
+        for c in text.chars() {
+            type_key(st, c);
+        }
+    }
+
+    fn ctrl(st: &mut ShellState, c: char) {
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
+    }
+
+    /// Open Configure on machine row `m` (0 = hub, 1 = devbox) from the
+    /// page's first row.
+    fn configure(st: &mut ShellState, m: usize) {
+        // New, alpha, bravo, Add machine, then the machines.
+        for _ in 0..(4 + m) {
+            press(st, KeyCode::Down);
+        }
+        press(st, KeyCode::Enter);
+        assert_eq!(st.settings.workspaces().machine_form().expect("the form opens").title(), "Configure machine");
+    }
+
+    fn add_machine_from_the_keyboard(in_repo: bool) {
+        let home = PoolHome::new(in_repo);
+        let ops = Arc::new(FakeOps::default());
+        let mut st = machines_state(ops.clone());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 44)).unwrap();
+        let before = home.text();
+        let refreshes = st.refresh_requests.get();
+        type_key(&mut st, 'm');
+        type_str(&mut st, "gpu");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "gpu.lan");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "/srv/proj");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "cuda, big-ram");
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = format!("{:?}", term.backend().buffer());
+        assert!(screen.contains("Add machine") && screen.contains("Not checked"), "the form draws over the page");
+        assert_eq!(home.text(), before, "nothing written before Add machine");
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::Enter); // swallowed while saving
+        settle_machine(&mut st);
+        assert!(st.settings.workspaces().machine_form().is_none(), "success closes the form");
+        let after = home.text();
+        for want in ["- name: gpu", "host: gpu.lan", "work_dir: /srv/proj", "cuda", "big-ram", "# The pool, as a person wrote it."] {
+            assert!(after.contains(want), "{want:?}: {after}");
+        }
+        assert_eq!(after.matches("- name: gpu").count(), 1, "saved once: {after}");
+        if let Some(shared) = &home.shared {
+            assert_eq!(std::fs::read_to_string(shared).unwrap(), PROJECT_HEAD, "the committed file is untouched");
+        }
+        assert!(ops.calls().is_empty(), "adding provisions nothing: {:?}", ops.calls());
+        settle_machine_rows(&mut st, "gpu");
+        let page = st.settings.workspaces();
+        assert_eq!(page.state().unwrap().notice(), Some("Added gpu."));
+        let gpu = page.state().unwrap().index().unwrap().machines.iter().position(|m| m.name == "gpu").unwrap();
+        assert_eq!(page.items()[page.cursor()], settings::workspaces::Item::Machine(gpu), "the cursor follows");
+        assert!(st.refresh_requests.get() > refreshes, "the sidebar and runtime views refresh");
+    }
+
+    #[test]
+    fn adding_a_machine_writes_the_global_config_through_the_shared_service() {
+        add_machine_from_the_keyboard(false);
+    }
+
+    #[test]
+    fn adding_a_machine_writes_the_in_repo_local_config_through_the_shared_service() {
+        add_machine_from_the_keyboard(true);
+    }
+
+    #[test]
+    fn a_rename_carries_its_workspaces_and_keeps_forwarding() {
+        let home = PoolHome::new(true);
+        let mut st = machines_state(Arc::new(FakeOps::default()));
+        configure(&mut st, 1);
+        // Esc first: nothing is written.
+        let before = home.text();
+        type_str(&mut st, "-x");
+        press(&mut st, KeyCode::Esc);
+        assert!(st.settings.workspaces().machine_form().is_none());
+        assert_eq!(home.text(), before, "Cancel returns unchanged");
+        press(&mut st, KeyCode::Enter); // the same row again
+        ctrl(&mut st, 'u');
+        type_str(&mut st, "gpubox");
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        let after = home.text();
+        assert!(after.contains("- name: gpubox") && !after.contains("name: devbox"), "{after}");
+        assert!(after.contains("machine: gpubox") && !after.contains("machine: devbox"), "bravo follows: {after}");
+        assert!(after.contains("forward: tcp") && after.contains("host: devbox.lan"), "unowned fields kept: {after}");
+        assert_eq!(std::fs::read_to_string(home.shared.as_ref().unwrap()).unwrap(), PROJECT_HEAD);
+        settle_machine_rows(&mut st, "gpubox");
+        assert_eq!(
+            st.settings.workspaces().state().unwrap().notice(),
+            Some("Renamed devbox to gpubox; its workspace moved with it.")
+        );
+        let bravo = &st.settings.workspaces().state().unwrap().index().unwrap().workspaces[1];
+        assert_eq!((bravo.name.as_str(), bravo.machine.as_str()), ("bravo", "gpubox"), "the rows follow too");
+    }
+
+    #[test]
+    fn a_guarded_directory_change_reports_the_refusal_then_saves_once_idle() {
+        let home = PoolHome::new(false);
+        let ops = Arc::new(FakeOps::default());
+        ops.active.lock().unwrap().insert("bravo".into(), "fix-login".into());
+        let mut st = machines_state(ops.clone());
+        configure(&mut st, 1);
+        let before = home.text();
+        press(&mut st, KeyCode::Tab); // SSH host
+        press(&mut st, KeyCode::Tab); // Project directory
+        assert_eq!(
+            st.settings.workspaces().machine_form().unwrap().focus(),
+            MachineFocus::Field(MachineField::WorkDir)
+        );
+        ctrl(&mut st, 'u');
+        type_str(&mut st, "/srv/elsewhere");
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        let form = st.settings.workspaces().machine_form().expect("the refusal keeps the draft");
+        assert!(form.error().unwrap().contains("fix-login"), "{:?}", form.error());
+        assert_eq!(form.text(MachineField::WorkDir), "/srv/elsewhere");
+        assert_eq!(home.text(), before, "nothing orphaned, nothing written");
+        // The task finishes: the same draft saves.
+        ops.active.lock().unwrap().clear();
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        assert!(st.settings.workspaces().machine_form().is_none());
+        assert!(home.text().contains("work_dir: /srv/elsewhere"), "{}", home.text());
+    }
+
+    #[test]
+    fn duplicate_and_invalid_drafts_are_refused_beside_their_field() {
+        let home = PoolHome::new(false);
+        let mut st = machines_state(Arc::new(FakeOps::default()));
+        let before = home.text();
+        type_key(&mut st, 'm');
+        type_str(&mut st, "HUB");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "x.lan");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "/srv/p");
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        let form = st.settings.workspaces().machine_form().unwrap();
+        assert!(form.field_error(MachineField::Name).unwrap().contains("already exists"), "{:?}", form.field_error(MachineField::Name));
+        // A remote `~` must be written out in full, on the remote.
+        ctrl(&mut st, 'u');
+        type_str(&mut st, "gpu");
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Tab);
+        ctrl(&mut st, 'u');
+        type_str(&mut st, "~/proj");
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        let form = st.settings.workspaces().machine_form().unwrap();
+        assert!(form.field_error(MachineField::WorkDir).unwrap().contains("home directory out in full"), "{:?}", form.field_error(MachineField::WorkDir));
+        assert_eq!(home.text(), before, "nothing written");
+    }
+
+    #[test]
+    fn configuring_the_local_machine_expands_its_home_directory() {
+        let home = PoolHome::new(false);
+        let mut st = machines_state(Arc::new(FakeOps::default()));
+        configure(&mut st, 0);
+        assert!(!st.settings.workspaces().machine_form().unwrap().remote());
+        press(&mut st, KeyCode::Tab); // Project directory: no SSH host here
+        ctrl(&mut st, 'u');
+        type_str(&mut st, "~/proj-elsewhere");
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        assert!(st.settings.workspaces().machine_form().is_none());
+        let after = home.text();
+        assert!(after.contains("/proj-elsewhere") && !after.contains("~/proj-elsewhere"), "{after}");
+        assert!(after.contains("kind: local"), "{after}");
+    }
+
+    #[test]
+    fn a_machine_save_still_running_at_a_project_switch_lands_without_touching_the_new_project() {
+        let _home = PoolHome::new(false);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut st = machines_state(Arc::new(FakeOps::default()));
+        let g = gate.clone();
+        let mut service = settings::unavailable_machine_service();
+        service.add = Arc::new(move |_, fields| {
+            let (open, cv) = &*g;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            Ok(shelbi_core::pool::MachineChange {
+                machine: shelbi_core::Machine {
+                    name: fields.name.clone(),
+                    kind: fields.kind,
+                    work_dir: PathBuf::from("/srv/p"),
+                    host: None,
+                    tags: Vec::new(),
+                    forward: None,
+                },
+                previous_name: None,
+                workspaces: Vec::new(),
+            })
+        });
+        st.machine_service = service;
+        type_key(&mut st, 'm');
+        type_str(&mut st, "gpu");
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.workspaces().machine_form().unwrap().saving());
+        st.switch_project("beta");
+        assert!(st.settings.workspaces().machine_form().is_none(), "the draft goes with the project");
+        let refreshes = st.refresh_requests.get();
+        {
+            let (open, cv) = &*gate;
+            *open.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.dropped() > 0
+            }),
+            "the old project's result lands and is dropped"
+        );
+        assert_eq!(st.refresh_requests.get(), refreshes, "beta isn't refreshed for proj's change");
+        assert!(st.settings.workspaces().machine_form().is_none());
     }
 
     #[test]

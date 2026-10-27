@@ -469,6 +469,28 @@ pub fn workspace_service_with(
     }
 }
 
+/// The machine operations as the clients' Add machine / Configure machine
+/// forms run them (`shelbi_app::settings::machine_form::MachineService`),
+/// against the live world.
+pub fn machine_service() -> shelbi_app::settings::machine_form::MachineService {
+    shelbi_app::settings::machine_form::MachineService {
+        add: std::sync::Arc::new(add_machine),
+        update: std::sync::Arc::new(update_machine),
+    }
+}
+
+/// [`machine_service`] over `ops`: a test's scripted machines, the real
+/// config.
+pub fn machine_service_with(
+    ops: std::sync::Arc<dyn PoolOps + Send + Sync>,
+) -> shelbi_app::settings::machine_form::MachineService {
+    let (a, u) = (ops.clone(), ops);
+    shelbi_app::settings::machine_form::MachineService {
+        add: std::sync::Arc::new(move |p, fields| add_machine_with(&*a, p, fields)),
+        update: std::sync::Arc::new(move |p, req| update_machine_with(&*u, p, req)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Machines
 

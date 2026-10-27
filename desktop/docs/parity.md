@@ -169,10 +169,17 @@ paths on every `cargo test`.
   field at its end (type, Backspace, Ctrl+U), and adds `n` / `e` / `d` on the
   page. The TUI says the automatic slot rule in full under the field
   (`SLOT_AUTOMATIC_HELP`); the desktop shows its number in the placeholder
-  only. Add machine and Configure open the machine dialog in the desktop and
-  the pool file in the editor in the TUI, which says so (the TUI's machine
-  form is its own task). See
-  [`status/tui-settings-workspaces.md`](status/tui-settings-workspaces.md).
+  only. Add machine and Configure open the machine form in both
+  (`tui-settings-machine-forms`): the same draft
+  (`shelbi_app::settings::machine_form`) saved through the same service
+  (`pool_admin::machine_service`). The desktop adds Choose… for this Mac's
+  directory and its connection check (Test connection, Install CLI); the TUI
+  types the directory as a terminal line, adds `m` / `c` on the page, and
+  says a draft is Not checked, with the status probe's last word on the
+  saved host labeled as the probe's, until the readiness task brings the
+  check. See
+  [`status/tui-settings-workspaces.md`](status/tui-settings-workspaces.md)
+  and [`status/tui-settings-machine-forms.md`](status/tui-settings-machine-forms.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the
