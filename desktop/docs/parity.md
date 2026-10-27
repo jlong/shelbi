@@ -172,14 +172,24 @@ paths on every `cargo test`.
   only. Add machine and Configure open the machine form in both
   (`tui-settings-machine-forms`): the same draft
   (`shelbi_app::settings::machine_form`) saved through the same service
-  (`pool_admin::machine_service`). The desktop adds Choose… for this Mac's
-  directory and its connection check (Test connection, Install CLI); the TUI
-  types the directory as a terminal line, adds `m` / `c` on the page, and
-  says a draft is Not checked, with the status probe's last word on the
-  saved host labeled as the probe's, until the readiness task brings the
-  check. See
-  [`status/tui-settings-workspaces.md`](status/tui-settings-workspaces.md)
-  and [`status/tui-settings-machine-forms.md`](status/tui-settings-machine-forms.md).
+  (`pool_admin::machine_service`). Both run the same connection check
+  (`tui-settings-machine-readiness`: `shelbi_app::settings::machine_check`
+  over `machine_readiness::service`): Test connection / Test again, Install
+  CLI when it can help, the same panel titles and messages, the same
+  binding of a result to the draft's host and directory, and the same
+  records. The desktop adds Choose… for this Mac's directory and shows the
+  check as the Figma region (icon, title, detail); the TUI types the
+  directory as a terminal line, adds `m` / `c` on the page, lists the
+  check's stages (`ReadinessForm::stages`: SSH, Platform, Shelbi CLI, Git,
+  Project directory, each with its result) with the elapsed time while it
+  runs, offers Stop check (the desktop's Test button is disabled while a
+  check runs, and a check stops when its dialog closes), and says on the
+  page what an install did to the machine when the form it ran for has
+  closed. Both keep the status probe's last word on the saved host labeled
+  as the probe's. See
+  [`status/tui-settings-workspaces.md`](status/tui-settings-workspaces.md),
+  [`status/tui-settings-machine-forms.md`](status/tui-settings-machine-forms.md)
+  and [`status/tui-settings-machine-readiness.md`](status/tui-settings-machine-readiness.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

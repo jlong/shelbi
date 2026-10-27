@@ -6,6 +6,12 @@ runs a real readiness check, and its green "Connection successful" (Figma
 `2526:9557`, `2528:9870`) shows only after the remote has verified a
 compatible Shelbi CLI, a usable Git and the project's root directory.
 
+Since `tui-settings-machine-readiness` the form's check region, `CheckStop`,
+the record decisions and the install notes below live in
+`shelbi_app::settings::machine_check` and `machine_readiness::{report,
+install_outcome, service}`, shared with the TUI
+([`tui-settings-machine-readiness.md`](tui-settings-machine-readiness.md)).
+
 ## The shared engine
 
 `shelbi_orchestrator::machine_readiness`, on top of `machine` (the

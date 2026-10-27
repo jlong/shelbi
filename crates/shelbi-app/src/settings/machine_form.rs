@@ -28,14 +28,13 @@
 //! - **Saving** runs once at a time ([`MachineForm::begin_save`] refuses a
 //!   second); an answer for an older save is dropped.
 //!
-//! The connection check (Test connection, Install CLI) is the readiness
-//! service's, which lives in the orchestrator: a client that runs it layers
-//! its region over this draft ([`Controls::checks`] puts its buttons in the
-//! Tab order, [`MachineForm::check_key`] says what a result is for, and
-//! [`MachineForm::mark`] puts a target's complaint on its field). Until then
-//! a draft is [`NOT_CHECKED`], and what the page's reachability probe last
-//! saw of the saved host is only ever shown labeled as that
-//! ([`MachineForm::probe_note`]).
+//! The connection check (Test connection, Install CLI) layers over this
+//! draft ([`super::machine_check::ReadinessForm`], which both clients run):
+//! [`Controls::checks`] puts its buttons in the Tab order,
+//! [`MachineForm::check_key`] says what a result is for, and
+//! [`MachineForm::mark`] puts a target's complaint on its field. What the
+//! page's reachability probe last saw of the saved host is only ever shown
+//! labeled as that ([`MachineForm::probe_note`]).
 //!
 //! Keys ([`MachineForm::key`]): Tab and ⇧Tab move through the fields and
 //! buttons, Return submits from a field (or activates the focused button),
@@ -49,9 +48,6 @@ use shelbi_core::{Machine, MachineKind};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use super::workspaces::{tilde, MachineStatus, LOCAL_PHRASE};
-
-/// What a draft's connection region says before anything checked it.
-pub const NOT_CHECKED: &str = "Not checked";
 
 /// The Machine tags field's helper.
 pub const TAGS_HELP: &str = "Every workspace on this machine inherits these tags. Separate them with commas.";

@@ -29,6 +29,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use shelbi_app::settings::machine_check::{
+    CheckOutcome, Reach, ReadinessIntent, ReadinessRequest, ReadinessService, Record, RecordFn, Report, Stage,
+    StageKind, StageState, VerifiedCli,
+};
 use shelbi_core::{shell_escape, Host};
 use shelbi_state::machine_state::{self, MachineRecord};
 
@@ -52,60 +56,14 @@ pub struct ReadinessTarget {
     pub work_dir: String,
 }
 
-/// Which part of a [`ReadinessTarget`] can't be checked as typed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetField {
-    Host,
-    WorkDir,
-}
-
-/// Why a target can't be checked at all, before any SSH: what to correct.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetError {
-    pub field: TargetField,
-    pub message: String,
-}
+pub use shelbi_app::settings::machine_check::{TargetError, TargetField};
 
 /// Validate a target before anything runs: a destination `ssh` takes as a host
 /// (no leading `-` it would read as an option, no whitespace), and an absolute
-/// remote directory. The same rules the machine service saves by.
+/// remote directory. The same rules the machine service saves by (shared with
+/// the forms: [`shelbi_app::settings::machine_check::validate_target`]).
 pub fn validate_target(target: &ReadinessTarget) -> Result<(), TargetError> {
-    let host = target.host.trim();
-    let invalid = |field, message: String| Err(TargetError { field, message });
-    if host.is_empty() {
-        return invalid(TargetField::Host, "Enter the SSH host to test.".into());
-    }
-    if !crate::pool_admin::usable_ssh_host(host) {
-        return invalid(
-            TargetField::Host,
-            format!("`{}` isn’t a host SSH can connect to.", host.escape_debug()),
-        );
-    }
-    let dir = target.work_dir.trim();
-    if dir.is_empty() {
-        return invalid(
-            TargetField::WorkDir,
-            "Enter the project’s directory on the machine to test it.".into(),
-        );
-    }
-    if dir.chars().any(char::is_control) {
-        return invalid(
-            TargetField::WorkDir,
-            format!("`{}` isn’t a valid path.", dir.escape_debug()),
-        );
-    }
-    if !dir.starts_with('/') {
-        let hint = if dir == "~" || dir.starts_with("~/") {
-            " Write the remote home directory out in full."
-        } else {
-            ""
-        };
-        return invalid(
-            TargetField::WorkDir,
-            format!("`{dir}` isn’t an absolute path.{hint}"),
-        );
-    }
-    Ok(())
+    shelbi_app::settings::machine_check::validate_target(&target.host, &target.work_dir)
 }
 
 // ===========================================================================
@@ -117,8 +75,11 @@ pub fn validate_target(target: &ReadinessTarget) -> Result<(), TargetError> {
 pub enum Readiness {
     /// The target can't be checked as typed (nothing ran).
     Invalid(TargetError),
-    /// SSH couldn't connect or timed out. Says nothing about the remote.
+    /// SSH couldn't connect. Says nothing about the remote.
     Unreachable { detail: String },
+    /// SSH didn't answer within [`READINESS_DEADLINE`] (a wedged host, a VPN
+    /// or Tailscale login waiting). Says nothing about the remote.
+    TimedOut { detail: String },
     /// SSH connected but refused to log in (keys, agent, user).
     AuthDenied { detail: String },
     /// SSH refused the host's key (unknown under `BatchMode`, or changed).
@@ -252,6 +213,11 @@ impl Readiness {
             Readiness::Unreachable { detail } => format!(
                 "SSH couldn’t reach {host}: {detail}. Check the machine is on and the host or SSH \
                  alias is right, then test again."
+            ),
+            Readiness::TimedOut { detail } => format!(
+                "SSH didn’t answer from {host} within {}s: {detail}. Check the machine is on and \
+                 reachable (a VPN or Tailscale login may be waiting), then test again.",
+                READINESS_DEADLINE.as_secs()
             ),
             Readiness::AuthDenied { detail } => format!(
                 "SSH reached {host} but couldn’t log in: {detail}. Make sure `ssh {host}` logs in \
@@ -508,6 +474,9 @@ pub fn check(exec: &dyn RemoteExec, hub: &Version, target: &ReadinessTarget) -> 
     }
     match exec.run_script(&readiness_script(target.work_dir.trim())) {
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Readiness::Cancelled,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Readiness::TimedOut {
+            detail: first_nonempty_line(&e.to_string()),
+        },
         Err(e) => Readiness::Unreachable {
             detail: first_nonempty_line(&e.to_string()),
         },
@@ -582,30 +551,293 @@ pub fn save_verified_record(machine: &str, host: &str, readiness: &Readiness) ->
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::machine::{ExecOutput, HubFetchError};
-    use shelbi_state::machine_state::{SOURCE_PATH, SOURCE_SHELBI_BIN};
-    use std::cell::RefCell;
-    use std::io;
+// ===========================================================================
+// The forms' report and service (`shelbi_app::settings::machine_check`)
+// ===========================================================================
 
-    fn v(major: u64, minor: u64, patch: u64) -> Version {
-        Version { major, minor, patch }
+/// What a check found, as the machine forms show it: how far SSH got, one
+/// stage per thing checked with a concise result, the actionable messages,
+/// whether Install CLI can help, and the verified binary. A connection
+/// failure leaves every stage after SSH unchecked.
+pub fn report(readiness: &Readiness, target: &ReadinessTarget) -> Report {
+    let host = target.host.trim();
+    let message = || readiness.connection_message(host).unwrap_or_default();
+    let unreached = |reach, result: &str| Report::unreached(reach, result, message());
+    match readiness {
+        Readiness::Invalid(e) => unreached(Reach::Invalid(e.field), "Can’t test as typed"),
+        Readiness::Unreachable { .. } => unreached(Reach::Unreachable, "Couldn’t connect"),
+        Readiness::TimedOut { .. } => unreached(
+            Reach::TimedOut,
+            &format!("No answer in {}s", READINESS_DEADLINE.as_secs()),
+        ),
+        Readiness::AuthDenied { .. } => unreached(Reach::AuthDenied, "Login refused"),
+        Readiness::HostKey { .. } => unreached(Reach::HostKey, "Host key not trusted"),
+        Readiness::Cancelled => Report::cancelled(),
+        Readiness::Reached(r) => reached_report(readiness, r, target.work_dir.trim()),
     }
+}
 
-    fn hub() -> Version {
-        v(0, 9, 0)
+fn reached_report(readiness: &Readiness, r: &RemoteReport, work_dir: &str) -> Report {
+    use StageState::{Attention, Passed, Skipped};
+    let cli_ok = matches!(r.cli, CliStatus::Compatible { .. });
+    let git_ok = matches!(r.git, GitStatus::Usable { .. });
+    let platform = match r.platform.clone().and_then(|p| p.artifact().map(|_| p)) {
+        Ok(p) => Stage::new(StageKind::Platform, Passed, format!("{} {}", p.os, p.arch)),
+        // A compatible CLI built from source runs there; nothing to install.
+        Err(e) if cli_ok => Stage::new(
+            StageKind::Platform,
+            Passed,
+            format!("{} (no release; CLI present)", platform_words(&e)),
+        ),
+        Err(e) => Stage::new(StageKind::Platform, Attention, format!("No release for {}", platform_words(&e))),
+    };
+    let cli = match &r.cli {
+        CliStatus::Compatible { path, version, .. } => {
+            Stage::new(StageKind::Cli, Passed, format!("shelbi {version} at {path}"))
+        }
+        CliStatus::Missing => Stage::new(StageKind::Cli, Attention, "Not installed"),
+        CliStatus::Incompatible { version, compat, .. } => Stage::new(
+            StageKind::Cli,
+            Attention,
+            match (version, compat) {
+                (Some(v), Some(Compat::TooOld)) => format!("shelbi {v} is too old"),
+                (Some(v), Some(Compat::TooNew)) => format!("shelbi {v} is too new"),
+                (Some(v), _) => format!("shelbi {v} doesn’t match"),
+                (None, _) => "No version reported".to_string(),
+            },
+        ),
+    };
+    let git = match &r.git {
+        GitStatus::Usable { path, version } => Stage::new(
+            StageKind::Git,
+            Passed,
+            if version.is_empty() { path.clone() } else { version.clone() },
+        ),
+        GitStatus::LoginShellOnly { .. } => Stage::new(StageKind::Git, Attention, "Only on the login shell’s PATH"),
+        GitStatus::Missing => Stage::new(StageKind::Git, Attention, "Not installed"),
+    };
+    let dir_result = |d: &DirStatus| match d {
+        DirStatus::Usable => "Checkout root".to_string(),
+        DirStatus::Missing => "Doesn’t exist".into(),
+        DirStatus::NotADirectory => "Not a directory".into(),
+        DirStatus::NotAccessible => "Can’t be opened".into(),
+        DirStatus::ReadOnly => "Not writable".into(),
+        DirStatus::NotARepository => "Not a Git checkout".into(),
+        DirStatus::NotRepoRoot { root } => format!("Inside the checkout at {root}"),
+        DirStatus::GitRefused { .. } => "Git refused to read it".into(),
+        DirStatus::Unchecked => "Couldn’t be checked".into(),
+    };
+    let dir = match &r.dir {
+        DirStatus::Usable => Stage::new(StageKind::Directory, Passed, dir_result(&r.dir)),
+        DirStatus::Unchecked if !git_ok => Stage::new(StageKind::Directory, Skipped, "Needs Git to check"),
+        d => Stage::new(StageKind::Directory, Attention, dir_result(d)),
+    };
+    let verified = match (&r.cli, readiness.is_ready()) {
+        (CliStatus::Compatible { path, version, source }, true) => Some(VerifiedCli {
+            path: path.clone(),
+            version: version.to_string(),
+            source: source.to_string(),
+        }),
+        _ => None,
+    };
+    Report {
+        reach: Reach::Reached,
+        stages: vec![
+            Stage::new(StageKind::Ssh, Passed, "Connected and logged in"),
+            platform,
+            cli,
+            git,
+            dir,
+        ],
+        // Install CLI can't help on a platform without a release, so the CLI's
+        // message (which offers it) gives way to the platform's.
+        messages: r
+            .issues()
+            .iter()
+            .filter(|i| r.offers_install() || !matches!(i, Issue::Cli(_)))
+            .map(|i| i.message(work_dir))
+            .collect(),
+        offers_install: r.offers_install(),
+        verified,
     }
+}
 
-    fn target() -> ReadinessTarget {
-        ReadinessTarget {
-            host: "build-server".into(),
-            work_dir: "/home/me/my project".into(),
+/// The OS and CPU a [`PlatformError`] names, in a few words.
+fn platform_words(e: &PlatformError) -> String {
+    match e {
+        PlatformError::UnsupportedOs(os) if os.is_empty() => "an unknown OS".into(),
+        PlatformError::UnsupportedOs(os) => os.clone(),
+        PlatformError::UnsupportedArch(arch) => arch.clone(),
+        PlatformError::UnsupportedCombo { os, arch } => format!("{os} {arch}"),
+    }
+}
+
+/// Install CLI's answer, from the shared setup's: what it did (and whether it
+/// changed the machine) with the check run again afterwards, or why it failed
+/// and whether installing again could help.
+pub fn install_outcome(result: Result<Installed, SetupError>, target: &ReadinessTarget) -> CheckOutcome {
+    match result {
+        Ok(done) => CheckOutcome::Installed {
+            note: install_note(&done.action),
+            changed: matches!(done.action, SetupAction::Installed { .. }),
+            report: report(&done.readiness, target),
+        },
+        Err(e) => CheckOutcome::InstallFailed {
+            retry: !matches!(
+                e,
+                SetupError::Unreachable(_) | SetupError::AuthDenied(_) | SetupError::HostKey(_)
+            ),
+            message: install_failure(&e),
+        },
+    }
+}
+
+/// Why setup failed, and what to do next, in the form's words.
+pub fn install_failure(e: &SetupError) -> String {
+    let d = |d: &str| d.trim().trim_end_matches('.').to_string();
+    let here = shelbi_app::settings::workspaces::LOCAL_PHRASE;
+    match e {
+        SetupError::Unreachable(x) => format!("SSH couldn’t reach the machine: {}. Check it’s on, then test again.", d(x)),
+        SetupError::AuthDenied(x) => format!(
+            "SSH couldn’t log in: {}. Make sure your keys log in without a prompt, then test again.",
+            d(x)
+        ),
+        SetupError::HostKey(x) => format!(
+            "SSH doesn’t trust the machine’s host key: {}. Verify it with `ssh` in a terminal, then test again.",
+            d(x)
+        ),
+        SetupError::UnsupportedPlatform(p) => Issue::UnsupportedPlatform(p.clone()).message(""),
+        SetupError::ReadOnlyHome(x) => format!(
+            "Couldn’t write ~/.shelbi/bin on the machine: {}. Make its home directory writable, then install again.",
+            d(x)
+        ),
+        SetupError::NoNetwork(x) => format!(
+            "Neither the machine nor {here} could download the release: {}. Check the network, then install again.",
+            d(x)
+        ),
+        SetupError::InstallFailed(x) => format!(
+            "The install failed: {}. Install again, or put a compatible shelbi on the machine’s PATH and test again.",
+            d(x)
+        ),
+    }
+}
+
+/// What the shared setup did, in a sentence.
+pub fn install_note(action: &SetupAction) -> String {
+    match action {
+        SetupAction::AlreadyCompatible { path, version, .. } => {
+            format!("Shelbi {version} was already installed at {path}.")
+        }
+        SetupAction::Installed {
+            path,
+            version,
+            alongside,
+            via_hub_copy,
+        } => {
+            let how = if *via_hub_copy {
+                format!(
+                    " (copied from {}; the machine has no outbound network)",
+                    shelbi_app::settings::workspaces::LOCAL_PHRASE
+                )
+            } else {
+                String::new()
+            };
+            let beside = alongside
+                .as_ref()
+                .map(|old| format!(" The older one at {} was left as it was.", old.path))
+                .unwrap_or_default();
+            format!("Installed Shelbi {version} at {path}{how}.{beside}")
         }
     }
+}
 
-    fn out(code: i32, stdout: &str, stderr: &str) -> ExecOutput {
+/// Record a verified binary for a machine the project has (hub state,
+/// `machine_state`, never project config), bound to the host it was verified
+/// on.
+pub fn record_verified(record: &Record) -> shelbi_core::Result<()> {
+    machine_state::save_machine_record(
+        &record.machine,
+        Some(MachineRecord {
+            path: record.cli.path.clone(),
+            version: record.cli.version.clone(),
+            compatible: true,
+            source: record.cli.source.clone(),
+            checked_at: chrono::Utc::now(),
+            host: Some(record.host.clone()),
+        }),
+    )
+}
+
+/// Opens a [`RemoteExec`] to `host`: with the stop flag for a check (bounded
+/// by [`READINESS_DEADLINE`]), without for an install (install-sized, runs to
+/// its end).
+pub type Connect = dyn Fn(&str, Option<Arc<AtomicBool>>) -> Box<dyn RemoteExec> + Send + Sync;
+
+/// The live readiness service: checks and installs over the user's own `ssh`
+/// (their config, keys and the shared ControlMaster), the hub's `curl` for the
+/// no-network copy, and the machine record store.
+pub fn service() -> ReadinessService {
+    service_with(
+        Arc::new(|host, cancel| -> Box<dyn RemoteExec> {
+            let ssh = Host::Ssh { host: host.to_string() };
+            match cancel {
+                Some(cancel) => Box::new(
+                    m::SshExec::with_deadline(ssh, host, READINESS_DEADLINE).with_cancel(cancel),
+                ),
+                None => Box::new(m::SshExec::new(ssh, host)),
+            }
+        }),
+        Arc::new(m::CurlHubFetch),
+        Arc::new(|record| {
+            if let Err(e) = record_verified(record) {
+                tracing::warn!(machine = %record.machine, host = %record.host, error = %e, "couldn't record the verified machine");
+            }
+        }),
+        m::hub_version(),
+    )
+}
+
+/// [`service`] over `connect`, `fetch` and `record` for this hub's `hub`
+/// version: a test's scripted remote, hub fetch and records.
+pub fn service_with(
+    connect: Arc<Connect>,
+    fetch: Arc<dyn HubFetch + Send + Sync>,
+    record: Arc<RecordFn>,
+    hub: Version,
+) -> ReadinessService {
+    ReadinessService {
+        check: Arc::new(move |request: &ReadinessRequest, cancel| {
+            let target = ReadinessTarget {
+                host: request.target.host.clone(),
+                work_dir: request.target.work_dir.clone(),
+            };
+            match request.intent {
+                ReadinessIntent::Test | ReadinessIntent::TestAgain => {
+                    let exec = connect(target.host.trim(), Some(cancel));
+                    CheckOutcome::Checked(report(&check(&*exec, &hub, &target), &target))
+                }
+                ReadinessIntent::InstallCli => {
+                    let exec = connect(target.host.trim(), None);
+                    install_outcome(install_cli(&*exec, &*fetch, &hub, &target), &target)
+                }
+            }
+        }),
+        record,
+    }
+}
+
+/// Scripted remotes and hub fetches (this crate's tests and the clients'):
+/// a remote's answers as fake filesystem facts, replayed in order.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{Connect, M_DIR, M_DIRINFO, M_GITLOGIN, M_GITPATH, M_GITVER};
+    use crate::machine::{ExecOutput, HubFetch, HubFetchError, RemoteExec};
+
+    pub fn out(code: i32, stdout: &str, stderr: &str) -> ExecOutput {
         ExecOutput {
             code: Some(code),
             stdout: stdout.into(),
@@ -613,15 +845,24 @@ mod tests {
         }
     }
 
+    /// The install script's stdout for an install of `version`.
+    pub fn installed(version: &str) -> String {
+        format!("\u{1}INSB\u{1}shelbi {version}\u{1}INSE\u{1}\n")
+    }
+
     /// A remote's answers to the check, as fake filesystem facts.
-    struct Remote<'a> {
-        uname: (&'a str, &'a str),
-        path_bin: Option<(&'a str, &'a str)>,
-        home_bin: Option<(&'a str, &'a str)>,
-        git: Option<&'a str>,
-        git_login: Option<&'a str>,
-        dir: &'a str,
-        info: &'a str,
+    #[derive(Clone)]
+    pub struct Remote<'a> {
+        pub uname: (&'a str, &'a str),
+        /// `(path, shelbi --version)` on the login PATH.
+        pub path_bin: Option<(&'a str, &'a str)>,
+        /// `(path, shelbi --version)` at `~/.shelbi/bin/shelbi`.
+        pub home_bin: Option<(&'a str, &'a str)>,
+        pub git: Option<&'a str>,
+        pub git_login: Option<&'a str>,
+        /// The directory's state token (`ok`, `missing`, `notroot`, ...).
+        pub dir: &'a str,
+        pub info: &'a str,
     }
 
     impl Default for Remote<'_> {
@@ -640,7 +881,7 @@ mod tests {
 
     impl Remote<'_> {
         /// The check script's stdout, with login-shell noise around it.
-        fn stdout(&self) -> String {
+        pub fn stdout(&self) -> String {
             let mut s = String::from("Last login: yesterday\n");
             let mark = |s: &mut String, (b, e): (&str, &str), v: &str| s.push_str(&format!("{b}{v}{e}\n"));
             s.push_str(&format!("\u{1}OSB\u{1}{}\u{1}OSM\u{1}{}\u{1}OSE\u{1}\n", self.uname.0, self.uname.1));
@@ -662,31 +903,49 @@ mod tests {
             s
         }
 
-        fn check(&self) -> Readiness {
-            check(&Script::new(vec![Ok(out(0, &self.stdout(), ""))]), &hub(), &target())
+        /// The check's reply: this stdout, exit 0.
+        pub fn reply(&self) -> io::Result<ExecOutput> {
+            Ok(out(0, &self.stdout(), ""))
         }
     }
 
-    /// Scripted remote: each call pops the next reply and remembers the script.
-    struct Script {
-        replies: RefCell<Vec<io::Result<ExecOutput>>>,
-        scripts: RefCell<Vec<String>>,
-        stdin: RefCell<Vec<Vec<u8>>>,
+    /// Scripted remote: each call pops the next reply and remembers the
+    /// script (and any stdin) it was sent.
+    #[derive(Default)]
+    pub struct Script {
+        replies: Mutex<Vec<io::Result<ExecOutput>>>,
+        pub scripts: Mutex<Vec<String>>,
+        pub stdin: Mutex<Vec<Vec<u8>>>,
+        /// The hosts [`connector`] opened, in order.
+        pub hosts: Mutex<Vec<String>>,
+        /// While set, a call through [`connector`] waits: until it's cleared,
+        /// or until the connection's stop flag trips (it answers
+        /// `Interrupted`, as `ssh` killed by the flag does).
+        pub hold: AtomicBool,
     }
 
     impl Script {
-        fn new(replies: Vec<io::Result<ExecOutput>>) -> Self {
-            Script {
-                replies: RefCell::new(replies.into_iter().rev().collect()),
-                scripts: RefCell::new(Vec::new()),
-                stdin: RefCell::new(Vec::new()),
-            }
+        pub fn new(replies: Vec<io::Result<ExecOutput>>) -> Self {
+            let s = Script::default();
+            *s.replies.lock().unwrap() = replies.into_iter().rev().collect();
+            s
         }
+
+        /// Add replies after those queued.
+        pub fn push(&self, replies: Vec<io::Result<ExecOutput>>) {
+            let mut queued = self.replies.lock().unwrap();
+            let mut all: Vec<_> = queued.drain(..).rev().collect();
+            all.extend(replies);
+            *queued = all.into_iter().rev().collect();
+        }
+
+        /// Replies not yet taken.
+        pub fn pending(&self) -> usize {
+            self.replies.lock().unwrap().len()
+        }
+
         fn pop(&self) -> io::Result<ExecOutput> {
-            self.replies
-                .borrow_mut()
-                .pop()
-                .expect("an unexpected remote call")
+            self.replies.lock().unwrap().pop().expect("an unexpected remote call")
         }
     }
 
@@ -695,28 +954,123 @@ mod tests {
             "fake"
         }
         fn run_script(&self, script: &str) -> io::Result<ExecOutput> {
-            self.scripts.borrow_mut().push(script.to_string());
+            self.scripts.lock().unwrap().push(script.to_string());
             self.pop()
         }
         fn run_script_with_stdin(&self, script: &str, stdin: &[u8]) -> io::Result<ExecOutput> {
-            self.scripts.borrow_mut().push(script.to_string());
-            self.stdin.borrow_mut().push(stdin.to_vec());
+            self.scripts.lock().unwrap().push(script.to_string());
+            self.stdin.lock().unwrap().push(stdin.to_vec());
             self.pop()
         }
     }
 
-    struct Fetch(RefCell<Option<Result<Vec<u8>, HubFetchError>>>);
-    impl HubFetch for Fetch {
-        fn fetch_verified(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, HubFetchError> {
-            self.0.borrow_mut().take().expect("an unexpected hub fetch")
-        }
-    }
-    fn no_fetch() -> Fetch {
-        Fetch(RefCell::new(None))
+    /// One connection to the scripted remote, with its stop flag.
+    struct Conn {
+        script: Arc<Script>,
+        cancel: Option<Arc<AtomicBool>>,
     }
 
-    fn installed(version: &str) -> String {
-        format!("\u{1}INSB\u{1}shelbi {version}\u{1}INSE\u{1}\n")
+    impl Conn {
+        /// As `SshExec`: a tripped flag refuses to start (and kills a held
+        /// call).
+        fn wait(&self) -> io::Result<()> {
+            let stopped = || self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Acquire));
+            loop {
+                if stopped() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                }
+                if !self.script.hold.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
+    impl RemoteExec for Conn {
+        fn label(&self) -> &str {
+            "fake"
+        }
+        fn run_script(&self, script: &str) -> io::Result<ExecOutput> {
+            self.wait()?;
+            self.script.run_script(script)
+        }
+        fn run_script_with_stdin(&self, script: &str, stdin: &[u8]) -> io::Result<ExecOutput> {
+            self.wait()?;
+            self.script.run_script_with_stdin(script, stdin)
+        }
+    }
+
+    /// A [`Connect`] onto `script`: every host reaches it.
+    pub fn connector(script: Arc<Script>) -> Arc<Connect> {
+        Arc::new(move |host, cancel| -> Box<dyn RemoteExec> {
+            script.hosts.lock().unwrap().push(host.to_string());
+            Box::new(Conn {
+                script: script.clone(),
+                cancel,
+            })
+        })
+    }
+
+    /// A scripted hub fetch: serves its one answer, once.
+    #[derive(Default)]
+    pub struct Fetch(Mutex<Option<Result<Vec<u8>, HubFetchError>>>);
+
+    impl Fetch {
+        /// No fetch expected.
+        pub fn none() -> Self {
+            Fetch::default()
+        }
+
+        /// Serve the release tarball `bytes`.
+        pub fn serving(bytes: Vec<u8>) -> Self {
+            Fetch(Mutex::new(Some(Ok(bytes))))
+        }
+
+        /// Whether its answer was taken.
+        pub fn taken(&self) -> bool {
+            self.0.lock().unwrap().is_none()
+        }
+    }
+
+    impl HubFetch for Fetch {
+        fn fetch_verified(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, HubFetchError> {
+            self.0.lock().unwrap().take().expect("an unexpected hub fetch")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::fake::{installed, out, Fetch, Remote, Script};
+    use crate::machine::ExecOutput;
+    use shelbi_state::machine_state::{SOURCE_PATH, SOURCE_SHELBI_BIN};
+    use std::io;
+
+    fn v(major: u64, minor: u64, patch: u64) -> Version {
+        Version { major, minor, patch }
+    }
+
+    fn hub() -> Version {
+        v(0, 9, 0)
+    }
+
+    fn target() -> ReadinessTarget {
+        ReadinessTarget {
+            host: "build-server".into(),
+            work_dir: "/home/me/my project".into(),
+        }
+    }
+
+    impl Remote<'_> {
+        fn check(&self) -> Readiness {
+            check(&Script::new(vec![Ok(out(0, &self.stdout(), ""))]), &hub(), &target())
+        }
+    }
+
+    fn no_fetch() -> Fetch {
+        Fetch::none()
     }
 
     // ---- target validation ------------------------------------------------
@@ -747,7 +1101,7 @@ mod tests {
             Readiness::Invalid(e) => assert!(e.message.contains("home directory out in full")),
             other => panic!("{other:?}"),
         }
-        assert!(exec.scripts.borrow().is_empty());
+        assert!(exec.scripts.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -766,7 +1120,7 @@ mod tests {
     fn connection_failures_are_never_a_missing_cli() {
         let run = |reply: io::Result<ExecOutput>| check(&Script::new(vec![reply]), &hub(), &target());
         let timeout = run(Err(io::Error::new(io::ErrorKind::TimedOut, "command did not finish within 30s")));
-        assert!(matches!(timeout, Readiness::Unreachable { .. }));
+        assert!(matches!(timeout, Readiness::TimedOut { .. }), "the deadline is its own answer");
         let refused = run(Ok(out(255, "", "ssh: connect to host build-server port 22: Connection refused")));
         assert!(matches!(refused, Readiness::Unreachable { ref detail } if detail.contains("Connection refused")));
         let auth = run(Ok(out(255, "", "me@build-server: Permission denied (publickey).")));
@@ -944,7 +1298,7 @@ mod tests {
         let done = install_cli(&exec, &no_fetch(), &hub(), &target()).unwrap();
         assert!(matches!(done.action, SetupAction::AlreadyCompatible { .. }));
         assert!(done.readiness.is_ready());
-        assert_eq!(exec.scripts.borrow().len(), 2, "no install script ran");
+        assert_eq!(exec.scripts.lock().unwrap().len(), 2, "no install script ran");
     }
 
     #[test]
@@ -972,7 +1326,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(done.readiness.is_ready());
-        let scripts = exec.scripts.borrow();
+        let scripts = exec.scripts.lock().unwrap();
         assert!(scripts[1].contains(".shelbi/bin"), "the install targets ~/.shelbi/bin");
         assert!(!scripts[1].contains("/usr/bin/shelbi"), "never over the package binary");
     }
@@ -994,10 +1348,10 @@ mod tests {
             Ok(out(0, &installed("0.9.0"), "")),
             Ok(out(0, &after.stdout(), "")),
         ]);
-        let fetch = Fetch(RefCell::new(Some(Ok(b"tarball".to_vec()))));
+        let fetch = Fetch::serving(b"tarball".to_vec());
         let done = install_cli(&exec, &fetch, &hub(), &target()).unwrap();
         assert!(matches!(done.action, SetupAction::Installed { via_hub_copy: true, .. }));
-        assert_eq!(exec.stdin.borrow()[0], b"tarball");
+        assert_eq!(exec.stdin.lock().unwrap()[0], b"tarball");
         assert!(done.readiness.is_ready());
     }
 
@@ -1058,7 +1412,7 @@ mod tests {
         assert!(!done.readiness.is_ready(), "the directory still needs attention");
         assert_eq!(done.readiness.report().unwrap().issues(), [Issue::Dir(DirStatus::Missing)]);
         // Nothing in any script creates or clones it.
-        for s in exec.scripts.borrow().iter() {
+        for s in exec.scripts.lock().unwrap().iter() {
             assert!(!s.contains("git clone") && !s.contains("mkdir -p \"$D\""));
         }
     }
@@ -1128,5 +1482,304 @@ mod tests {
         assert_eq!(run(&root_path.join("nope")).dir, DirStatus::Missing);
         assert!(!root_path.join("nope").exists(), "the check creates nothing");
         assert_eq!(run(&root_path).dir, DirStatus::NotARepository);
+    }
+
+    // ---- the forms' report and service --------------------------------------
+
+    fn stages(r: &Report) -> Vec<(StageKind, StageState)> {
+        r.stages.iter().map(|s| (s.kind, s.state)).collect()
+    }
+
+    fn state(r: &Report, kind: StageKind) -> (StageState, String) {
+        let s = r.stage(kind).unwrap();
+        (s.state, s.result.clone())
+    }
+
+    #[test]
+    fn a_ready_machine_passes_every_stage() {
+        let r = report(&Remote::default().check(), &target());
+        assert!(r.is_ready());
+        assert!(r.stages.iter().all(|s| s.state == StageState::Passed), "{:?}", r.stages);
+        assert_eq!(state(&r, StageKind::Platform).1, "Linux x86_64");
+        assert_eq!(state(&r, StageKind::Cli).1, "shelbi 0.9.2 at /usr/local/bin/shelbi");
+        assert_eq!(state(&r, StageKind::Git).1, "git version 2.43.0");
+        let v = r.verified.unwrap();
+        assert_eq!((v.path.as_str(), v.version.as_str(), v.source.as_str()), ("/usr/local/bin/shelbi", "0.9.2", SOURCE_PATH));
+        assert!(r.messages.is_empty());
+    }
+
+    #[test]
+    fn connection_failures_fail_ssh_and_check_nothing_else() {
+        let run = |reply: io::Result<ExecOutput>| {
+            report(&check(&Script::new(vec![reply]), &hub(), &target()), &target())
+        };
+        for (reply, reach, result) in [
+            (
+                Err(io::Error::new(io::ErrorKind::TimedOut, "command did not finish within 30s")),
+                Reach::TimedOut,
+                "No answer in 30s",
+            ),
+            (Ok(out(255, "", "ssh: connect to host build-server port 22: Connection refused")), Reach::Unreachable, "Couldn’t connect"),
+            (Ok(out(255, "", "me@build-server: Permission denied (publickey).")), Reach::AuthDenied, "Login refused"),
+            (Ok(out(255, "", "Host key verification failed.")), Reach::HostKey, "Host key not trusted"),
+        ] {
+            let r = run(reply);
+            assert_eq!(r.reach, reach);
+            assert_eq!(state(&r, StageKind::Ssh), (StageState::Failed, result.to_string()));
+            assert!(r.stages[1..].iter().all(|s| s.state == StageState::Skipped), "{reach:?}");
+            assert!(!r.is_ready() && !r.offers_install && r.verified.is_none());
+            assert!(r.messages[0].contains("build-server"), "says what to do: {:?}", r.messages);
+        }
+        let r = run(Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
+        assert_eq!(r.reach, Reach::Cancelled);
+        let invalid = report(
+            &check(&Script::new(vec![]), &hub(), &ReadinessTarget { host: "-x".into(), work_dir: "/p".into() }),
+            &target(),
+        );
+        assert_eq!(invalid.reach, Reach::Invalid(TargetField::Host));
+    }
+
+    #[test]
+    fn each_problem_is_its_own_stage() {
+        let cases: Vec<(Remote, StageKind, &str, bool)> = vec![
+            (Remote { path_bin: None, ..Remote::default() }, StageKind::Cli, "Not installed", true),
+            (
+                Remote { path_bin: Some(("/usr/bin/shelbi", "shelbi 0.1.0")), ..Remote::default() },
+                StageKind::Cli,
+                "shelbi 0.1.0 is too old",
+                true,
+            ),
+            (
+                Remote { path_bin: Some(("/usr/bin/shelbi", "shelbi 9.0.0")), ..Remote::default() },
+                StageKind::Cli,
+                "shelbi 9.0.0 is too new",
+                true,
+            ),
+            (
+                Remote { path_bin: Some(("/usr/bin/shelbi", "weird")), ..Remote::default() },
+                StageKind::Cli,
+                "No version reported",
+                true,
+            ),
+            (
+                Remote { uname: ("FreeBSD", "amd64"), path_bin: None, ..Remote::default() },
+                StageKind::Platform,
+                "No release for FreeBSD",
+                false,
+            ),
+            (
+                Remote { uname: ("Linux", "aarch64"), path_bin: None, ..Remote::default() },
+                StageKind::Platform,
+                "No release for Linux arm64",
+                false,
+            ),
+            (Remote { git: None, dir: "unchecked", ..Remote::default() }, StageKind::Git, "Not installed", false),
+            (
+                Remote { git: None, git_login: Some("/opt/homebrew/bin/git"), dir: "unchecked", ..Remote::default() },
+                StageKind::Git,
+                "Only on the login shell’s PATH",
+                false,
+            ),
+            (Remote { dir: "missing", ..Remote::default() }, StageKind::Directory, "Doesn’t exist", false),
+            (Remote { dir: "readonly", ..Remote::default() }, StageKind::Directory, "Not writable", false),
+            (
+                Remote { dir: "notroot", info: "/home/me", ..Remote::default() },
+                StageKind::Directory,
+                "Inside the checkout at /home/me",
+                false,
+            ),
+            (
+                Remote { dir: "gitfail", info: "fatal: not a git repository", ..Remote::default() },
+                StageKind::Directory,
+                "Not a Git checkout",
+                false,
+            ),
+        ];
+        for (remote, kind, result, install) in cases {
+            let r = report(&remote.check(), &target());
+            assert_eq!(r.reach, Reach::Reached);
+            assert_eq!(state(&r, StageKind::Ssh).0, StageState::Passed, "SSH got there");
+            assert_eq!(state(&r, kind), (StageState::Attention, result.to_string()), "{kind:?}");
+            assert_eq!(r.first_problem().map(|s| s.kind), Some(kind));
+            assert_eq!(r.offers_install, install, "{kind:?} {result}");
+            assert!(!r.is_ready() && r.verified.is_none());
+            assert!(!r.messages.is_empty());
+        }
+        // Without Git the directory waits for it rather than failing.
+        let r = report(&Remote { git: None, dir: "unchecked", ..Remote::default() }.check(), &target());
+        assert_eq!(state(&r, StageKind::Directory), (StageState::Skipped, "Needs Git to check".to_string()));
+        // A compatible CLI on a platform without a release is fine.
+        let r = report(
+            &Remote { uname: ("Linux", "aarch64"), ..Remote::default() }.check(),
+            &target(),
+        );
+        assert!(r.is_ready(), "{:?}", stages(&r));
+    }
+
+    fn service(script: &Arc<Script>, fetch: fake::Fetch) -> (ReadinessService, Arc<std::sync::Mutex<Vec<Record>>>) {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = records.clone();
+        let s = service_with(
+            fake::connector(script.clone()),
+            Arc::new(fetch),
+            Arc::new(move |r: &Record| seen.lock().unwrap().push(r.clone())),
+            hub(),
+        );
+        (s, records)
+    }
+
+    fn request(intent: ReadinessIntent, record_as: Option<&str>) -> ReadinessRequest {
+        ReadinessRequest {
+            run: 1,
+            intent,
+            target: shelbi_app::settings::machine_check::ReadinessTarget {
+                project: "p".into(),
+                machine: record_as.map(str::to_string),
+                name: "build".into(),
+                host: "build-server".into(),
+                work_dir: "/home/me/my project".into(),
+                record_as: record_as.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn the_service_checks_installs_and_records_a_saved_machine() {
+        let missing = Remote { path_bin: None, ..Remote::default() };
+        let after = Remote {
+            path_bin: None,
+            home_bin: Some(("/home/me/.shelbi/bin/shelbi", "shelbi 0.9.0")),
+            ..Remote::default()
+        };
+        let script = Arc::new(Script::new(vec![missing.reply()]));
+        let (s, records) = service(&script, fake::Fetch::none());
+        let checked = s.run(&request(ReadinessIntent::Test, Some("build")), Arc::default());
+        assert!(checked.offers_install() && !checked.is_ready());
+        assert!(records.lock().unwrap().is_empty(), "nothing verified");
+        assert_eq!(script.hosts.lock().unwrap().as_slice(), ["build-server"]);
+
+        // Install: setup's probe, the install, the check again.
+        script.push(vec![missing.reply(), Ok(out(0, &installed("0.9.0"), "")), after.reply()]);
+        let done = s.run(&request(ReadinessIntent::InstallCli, Some("build")), Arc::default());
+        let CheckOutcome::Installed { note, changed, report } = &done else { panic!("{done:?}") };
+        assert!(*changed && note.starts_with("Installed Shelbi 0.9.0 at ~/.shelbi/bin/shelbi"), "{note}");
+        assert!(report.is_ready());
+        assert!(done.side_effect("build-server").is_some());
+        let rec = records.lock().unwrap();
+        assert_eq!(rec.len(), 1, "the saved machine is recorded at once");
+        assert_eq!((rec[0].machine.as_str(), rec[0].cli.path.as_str()), ("build", "/home/me/.shelbi/bin/shelbi"));
+        assert_eq!(script.pending(), 0);
+    }
+
+    #[test]
+    fn the_service_copies_from_the_hub_and_keeps_a_package_binary() {
+        let old = Remote { path_bin: Some(("/usr/bin/shelbi", "shelbi 0.8.0")), ..Remote::default() };
+        let after = Remote {
+            path_bin: Some(("/usr/bin/shelbi", "shelbi 0.8.0")),
+            home_bin: Some(("/home/me/.shelbi/bin/shelbi", "shelbi 0.9.0")),
+            ..Remote::default()
+        };
+        let script = Arc::new(Script::new(vec![
+            old.reply(),
+            Ok(out(20, "", "curl: (6) Could not resolve host: github.com")),
+            Ok(out(0, &installed("0.9.0"), "")),
+            after.reply(),
+        ]));
+        let fetch = fake::Fetch::serving(b"tarball".to_vec());
+        let (s, records) = service(&script, fetch);
+        let done = s.run(&request(ReadinessIntent::InstallCli, None), Arc::default());
+        let CheckOutcome::Installed { note, report, .. } = &done else { panic!("{done:?}") };
+        assert!(note.contains("copied from"), "{note}");
+        assert!(note.contains("/usr/bin/shelbi was left as it was"), "{note}");
+        assert!(report.is_ready());
+        assert_eq!(script.stdin.lock().unwrap()[0], b"tarball");
+        for sent in script.scripts.lock().unwrap().iter() {
+            assert!(!sent.contains("> /usr/bin/shelbi") && !sent.contains("rm /usr/bin/shelbi"), "never over the package binary");
+        }
+        assert!(records.lock().unwrap().is_empty(), "a draft records nothing");
+    }
+
+    #[test]
+    fn the_service_reports_a_failed_install_and_retries() {
+        let missing = Remote { path_bin: None, ..Remote::default() };
+        let script = Arc::new(Script::new(vec![
+            missing.reply(),
+            Ok(out(10, "", "mkdir: /home/me/.shelbi: Read-only file system")),
+        ]));
+        let (s, _) = service(&script, fake::Fetch::none());
+        let failed = s.run(&request(ReadinessIntent::InstallCli, None), Arc::default());
+        let CheckOutcome::InstallFailed { message, retry } = &failed else { panic!("{failed:?}") };
+        assert!(*retry && message.contains("~/.shelbi/bin"), "{message}");
+        assert!(failed.offers_install());
+
+        let script = Arc::new(Script::new(vec![Ok(out(255, "", "me@build-server: Permission denied (publickey)."))]));
+        let (s, _) = service(&script, fake::Fetch::none());
+        let failed = s.run(&request(ReadinessIntent::InstallCli, None), Arc::default());
+        assert!(matches!(failed, CheckOutcome::InstallFailed { retry: false, .. }), "a login failure isn't retried");
+    }
+
+    #[test]
+    fn a_stopped_check_answers_cancelled() {
+        let script = Arc::new(Script::new(vec![Remote::default().reply()]));
+        script.hold.store(true, std::sync::atomic::Ordering::Release);
+        let (s, records) = service(&script, fake::Fetch::none());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let running = std::thread::spawn(move || s.run(&request(ReadinessIntent::Test, Some("build")), flag));
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let outcome = running.join().unwrap();
+        assert_eq!(outcome.report().map(|r| r.reach), Some(Reach::Cancelled));
+        assert!(records.lock().unwrap().is_empty());
+        assert_eq!(script.pending(), 1, "the remote never answered");
+    }
+
+    #[test]
+    fn install_answers_say_what_setup_did() {
+        use crate::machine::{parse_version, ResolvedBinary};
+        let v = parse_version("0.9.0").unwrap();
+        let ready = Remote::default().check();
+        let installed = install_outcome(
+            Ok(Installed {
+                action: SetupAction::Installed {
+                    path: "~/.shelbi/bin/shelbi".into(),
+                    version: v,
+                    alongside: Some(ResolvedBinary {
+                        path: "/usr/bin/shelbi".into(),
+                        version: parse_version("0.8.0"),
+                    }),
+                    via_hub_copy: true,
+                },
+                readiness: ready.clone(),
+            }),
+            &target(),
+        );
+        let CheckOutcome::Installed { note, changed, .. } = &installed else { panic!() };
+        let here = shelbi_app::settings::workspaces::LOCAL_PHRASE;
+        assert!(note.contains("~/.shelbi/bin/shelbi") && note.contains(&format!("copied from {here}")), "{note}");
+        assert!(note.contains("/usr/bin/shelbi was left as it was"));
+        assert!(*changed && installed.is_ready());
+
+        let reused = install_outcome(
+            Ok(Installed {
+                action: SetupAction::AlreadyCompatible {
+                    path: "/usr/local/bin/shelbi".into(),
+                    version: v,
+                    source: "path",
+                },
+                readiness: ready,
+            }),
+            &target(),
+        );
+        assert!(
+            matches!(reused, CheckOutcome::Installed { ref note, changed: false, .. } if note.contains("already installed"))
+        );
+        assert_eq!(reused.side_effect("build-server"), None, "nothing changed there");
+
+        let down = install_outcome(Err(SetupError::Unreachable("timed out".into())), &target());
+        assert!(!down.offers_install(), "a failed connection is retried with Test again");
+        let home = install_outcome(Err(SetupError::ReadOnlyHome("Read-only file system".into())), &target());
+        assert!(home.offers_install());
+        let CheckOutcome::InstallFailed { message, .. } = home else { panic!() };
+        assert!(message.starts_with("Couldn’t write ~/.shelbi/bin") && message.contains("install again"));
     }
 }

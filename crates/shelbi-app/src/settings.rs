@@ -33,11 +33,14 @@
 //!   its machines and their reachability) and its New / Edit / Remove
 //!   workspace forms, over the shared pool service.
 //! - [`machine_form`]: the Add machine / Configure machine forms' draft,
-//!   over the shared machine service.
+//!   over the shared machine service, and [`machine_check`]: their
+//!   connection check (readiness stages, Install CLI) over the readiness
+//!   service.
 
 pub mod agents;
 pub mod general;
 pub mod keybindings;
+pub mod machine_check;
 pub mod machine_form;
 pub mod summary;
 pub mod terminal_preview;

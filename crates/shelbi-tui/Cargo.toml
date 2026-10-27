@@ -44,6 +44,9 @@ shelbi-state = { workspace = true, features = ["test-support"] }
 # The Settings ▸ Agents tests write a fixture project (`settings::agents::fixture`);
 # Settings ▸ Workspaces' tests build their pools from the shared fixtures.
 shelbi-app = { workspace = true, features = ["test-support"] }
+# The machine forms' readiness tests drive the live readiness service over
+# scripted remotes and hub fetches (`machine_readiness::fake`).
+shelbi-orchestrator = { workspace = true, features = ["test-support"] }
 # The shell's real-PTY key-echo test (AC4) spawns a genuine `shelbi_session::run`
 # on a thread and reads the echoed bytes back through a client, so it needs the
 # session server and a temp `SHELBI_HOME` (`libc`, for the kill signal, is a

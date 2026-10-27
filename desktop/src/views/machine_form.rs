@@ -35,20 +35,20 @@
 //! nothing.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     FontWeight, Global, Pixels, Stateful, Subscription, Window,
 };
 use gpui_kit::component::input::{InputEvent, InputState};
-use shelbi_orchestrator::machine::SetupAction;
-use shelbi_orchestrator::machine_readiness::{self, Readiness};
+pub use shelbi_app::settings::machine_check::CheckStop;
+use shelbi_app::settings::machine_check::{CheckFn, Record, RecordFn};
+use shelbi_orchestrator::machine_readiness;
 use shelbi_orchestrator::pool_admin::{self, MachineChange, PoolError};
 
 use super::machine_form_state::{
-    Action, Check, CheckOutcome, Field, Focus, MachineForm, ReadinessIntent, ReadinessRequest, SaveRequest, Tone,
+    Action, Check, Field, Focus, MachineForm, ReadinessRequest, SaveRequest, Tone,
 };
 use super::workflow_editor::{footnote, text_field};
 use crate::assets::{heroicon, icons};
@@ -73,10 +73,7 @@ const CHECK_ICON: f32 = 16.0;
 pub type SaveFn = dyn Fn(&str, &SaveRequest) -> Result<MachineChange, PoolError> + Send + Sync;
 /// [`Engine::readiness`]'s signature: the request, and a flag that trips
 /// when no one will read the answer (a check should stop).
-pub type ReadinessFn = dyn Fn(&ReadinessRequest, Arc<AtomicBool>) -> CheckOutcome + Send + Sync;
-/// [`Engine::record`]'s signature: the machine's name in the project, its SSH
-/// destination, and the check that verified it.
-pub type RecordFn = dyn Fn(&str, &str, &Readiness) + Send + Sync;
+pub type ReadinessFn = CheckFn;
 
 /// The blocking work the form runs off the UI thread. A gpui global, so a
 /// test can set its own; otherwise [`Engine::real`].
@@ -103,10 +100,13 @@ impl Engine {
                 SaveRequest::Add(fields) => pool_admin::add_machine(project, fields),
                 SaveRequest::Update(update) => pool_admin::update_machine(project, update),
             }),
-            readiness: Arc::new(remote_readiness),
-            record: Arc::new(|machine, host, readiness| {
-                if let Err(e) = machine_readiness::save_verified_record(machine, host, readiness) {
-                    tracing::warn!(machine, host, error = %e, "couldn't record the verified machine");
+            readiness: {
+                let live = machine_readiness::service();
+                live.check
+            },
+            record: Arc::new(|record: &Record| {
+                if let Err(e) = machine_readiness::record_verified(record) {
+                    tracing::warn!(machine = %record.machine, host = %record.host, error = %e, "couldn't record the verified machine");
                 }
             }),
         }
@@ -122,160 +122,6 @@ impl Engine {
         return tests::quiet_engine();
         #[cfg(not(test))]
         Engine::real()
-    }
-}
-
-/// The readiness service: Test connection / Test again check the draft's
-/// host and directory; Install CLI runs the shared remote setup and checks
-/// again.
-fn remote_readiness(request: &ReadinessRequest, cancel: Arc<AtomicBool>) -> CheckOutcome {
-    let target = request.target.remote();
-    match request.intent {
-        ReadinessIntent::Test | ReadinessIntent::TestAgain => {
-            CheckOutcome::Checked(machine_readiness::check_host(&target, cancel))
-        }
-        ReadinessIntent::InstallCli => install_outcome(machine_readiness::install_cli_on_host(&target)),
-    }
-}
-
-/// Install CLI's answer, from the shared setup's.
-pub fn install_outcome(
-    result: Result<machine_readiness::Installed, shelbi_orchestrator::machine::SetupError>,
-) -> CheckOutcome {
-    use shelbi_orchestrator::machine::SetupError;
-    match result {
-        Ok(done) => CheckOutcome::Installed {
-            note: install_note(&done.action),
-            readiness: done.readiness,
-        },
-        Err(e) => CheckOutcome::InstallFailed {
-            retry: !matches!(
-                e,
-                SetupError::Unreachable(_) | SetupError::AuthDenied(_) | SetupError::HostKey(_)
-            ),
-            message: install_failure(&e),
-        },
-    }
-}
-
-/// Why setup failed, and what to do next, in the form's words.
-fn install_failure(e: &shelbi_orchestrator::machine::SetupError) -> String {
-    use shelbi_orchestrator::machine::SetupError;
-    use shelbi_orchestrator::machine_readiness::Issue;
-    let d = |d: &str| d.trim().trim_end_matches('.').to_string();
-    match e {
-        SetupError::Unreachable(x) => format!("SSH couldn’t reach the machine: {}. Check it’s on, then test again.", d(x)),
-        SetupError::AuthDenied(x) => format!(
-            "SSH couldn’t log in: {}. Make sure your keys log in without a prompt, then test again.",
-            d(x)
-        ),
-        SetupError::HostKey(x) => format!(
-            "SSH doesn’t trust the machine’s host key: {}. Verify it with `ssh` in a terminal, then test again.",
-            d(x)
-        ),
-        SetupError::UnsupportedPlatform(p) => Issue::UnsupportedPlatform(p.clone()).message(""),
-        SetupError::ReadOnlyHome(x) => format!(
-            "Couldn’t write ~/.shelbi/bin on the machine: {}. Make its home directory writable, then install again.",
-            d(x)
-        ),
-        SetupError::NoNetwork(x) => format!(
-            "Neither the machine nor this Mac could download the release: {}. Check the network, then install again.",
-            d(x)
-        ),
-        SetupError::InstallFailed(x) => format!(
-            "The install failed: {}. Install again, or put a compatible shelbi on the machine’s PATH and test again.",
-            d(x)
-        ),
-    }
-}
-
-/// What the shared setup did, in a sentence.
-fn install_note(action: &SetupAction) -> String {
-    match action {
-        SetupAction::AlreadyCompatible { path, version, .. } => {
-            format!("Shelbi {version} was already installed at {path}.")
-        }
-        SetupAction::Installed {
-            path,
-            version,
-            alongside,
-            via_hub_copy,
-        } => {
-            let how = if *via_hub_copy {
-                " (copied from this Mac; the machine has no outbound network)"
-            } else {
-                ""
-            };
-            let beside = alongside
-                .as_ref()
-                .map(|old| format!(" The older one at {} was left as it was.", old.path))
-                .unwrap_or_default();
-            format!("Installed Shelbi {version} at {path}{how}.{beside}")
-        }
-    }
-}
-
-/// The form's running check and whether the form has closed, shared with
-/// its owner: closing stops the check at once (the view itself lives on until
-/// the next frame), and a closed form takes no answer.
-#[derive(Clone, Default)]
-pub struct CheckStop(Arc<Mutex<StopState>>);
-
-#[derive(Default)]
-struct StopState {
-    closed: bool,
-    running: Option<(u64, Arc<AtomicBool>)>,
-}
-
-impl CheckStop {
-    fn lock(&self) -> std::sync::MutexGuard<'_, StopState> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Check `run` starts: its stop flag (already tripped on a closed form).
-    fn start(&self, run: u64) -> Arc<AtomicBool> {
-        let mut s = self.lock();
-        let flag = Arc::new(AtomicBool::new(s.closed));
-        s.running = Some((run, flag.clone()));
-        flag
-    }
-
-    /// Check `run` answered.
-    fn finish(&self, run: u64) {
-        let mut s = self.lock();
-        if s.running.as_ref().is_some_and(|(r, _)| *r == run) {
-            s.running = None;
-        }
-    }
-
-    /// Stop the running check unless it's `live` (the one the form still
-    /// shows).
-    fn stop_unless(&self, live: Option<u64>) {
-        let mut s = self.lock();
-        if s.running.as_ref().is_some_and(|(r, _)| Some(*r) != live) {
-            if let Some((_, flag)) = s.running.take() {
-                flag.store(true, Ordering::Release);
-            }
-        }
-    }
-
-    /// The form closed: stop its check, and take no more answers. (An
-    /// install doesn't read its flag; it runs to its end.)
-    pub fn close(&self) {
-        let mut s = self.lock();
-        s.closed = true;
-        if let Some((_, flag)) = s.running.take() {
-            flag.store(true, Ordering::Release);
-        }
-    }
-
-    pub fn closed(&self) -> bool {
-        self.lock().closed
-    }
-
-    #[cfg(test)]
-    fn running_flag(&self) -> Option<Arc<AtomicBool>> {
-        self.lock().running.as_ref().map(|(_, f)| f.clone())
     }
 }
 
@@ -393,7 +239,7 @@ impl MachineFormView {
 
     /// The running check's stop flag.
     #[cfg(test)]
-    pub fn running_flag(&self) -> Option<Arc<AtomicBool>> {
+    pub fn running_flag(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         self.stop.running_flag()
     }
 
@@ -423,7 +269,12 @@ impl MachineFormView {
     /// Land a readiness outcome as the service would (`--visual-figma`);
     /// `None` leaves `intent` running.
     #[cfg(feature = "visual-check")]
-    pub fn offscreen_check(&mut self, intent: ReadinessIntent, outcome: Option<CheckOutcome>, cx: &mut Context<Self>) {
+    pub fn offscreen_check(
+        &mut self,
+        intent: super::machine_form_state::ReadinessIntent,
+        outcome: Option<super::machine_form_state::CheckOutcome>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(request) = self.state.begin_check(intent) {
             if let Some(outcome) = outcome {
                 self.state.finish_check(request.run, outcome);
@@ -496,12 +347,10 @@ impl MachineFormView {
         self.stop.stop_unless(self.state.running());
     }
 
-    /// Record `readiness` for `machine` at `host`, off the UI thread.
-    fn record(&self, machine: String, host: String, readiness: Readiness, cx: &mut Context<Self>) {
-        let record = self.engine.record.clone();
-        cx.background_executor()
-            .spawn(async move { record(&machine, &host, &readiness) })
-            .detach();
+    /// Write `record`, off the UI thread.
+    fn record(&self, record: Record, cx: &mut Context<Self>) {
+        let write = self.engine.record.clone();
+        cx.background_executor().spawn(async move { write(&record) }).detach();
     }
 
     fn save(&mut self, run: u64, request: SaveRequest, window: &mut Window, cx: &mut Context<Self>) {
@@ -509,22 +358,14 @@ impl MachineFormView {
         let project = self.state.project().to_string();
         // What the check verified for the draft being saved: recorded once
         // the save commits it, for the host it commits.
-        let verified = self
-            .state
-            .verified()
-            .cloned()
-            .map(|r| (self.state.check_key().host, r));
+        let verified = self.state.save_verified();
         let task = cx.background_executor().spawn(async move { save(&project, &request) });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |this, window, cx| {
                 if let Some(change) = this.state.finish_save(run, result) {
-                    let saved = &change.machine;
-                    let host = saved.host.clone().unwrap_or_else(|| saved.name.clone());
-                    if let Some((checked, readiness)) = verified {
-                        if checked == host && saved.kind == shelbi_core::MachineKind::Ssh {
-                            this.record(saved.name.clone(), host, readiness, cx);
-                        }
+                    if let Some(record) = verified.and_then(|v| v.record(&change)) {
+                        this.record(record, cx);
                     }
                     cx.emit(MachineFormEvent::Saved(change));
                     return;
@@ -541,6 +382,8 @@ impl MachineFormView {
         let readiness = self.engine.readiness.clone();
         let run = request.run;
         let cancel = self.stop.start(run);
+        let record_request = request.clone();
+        let stopped = cancel.clone();
         let task = cx.background_executor().spawn(async move { readiness(&request, cancel) });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = task.await;
@@ -550,14 +393,10 @@ impl MachineFormView {
                 // already has, at its saved host, is recorded now (even if
                 // the form closed or moved on meanwhile: it's still true of
                 // that machine); a draft's waits for a save.
-                let key = match this.state.check() {
-                    Check::Checking { run: r, key, .. } if *r == run => Some(key.clone()),
-                    _ => None,
-                };
-                let committed = key.as_ref().and_then(|k| this.state.committed_name(k)).map(str::to_string);
-                if let (Some(name), Some(key), Some(readiness)) = (committed, key, outcome.readiness()) {
-                    if readiness.is_ready() {
-                        this.record(name, key.host, readiness.clone(), cx);
+                // A stopped check's answer counts for nothing.
+                if !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Some(record) = record_request.record(&outcome) {
+                        this.record(record, cx);
                     }
                 }
                 if this.stop.closed() {
@@ -708,10 +547,7 @@ impl MachineFormView {
         };
         let (title, detail) = (panel.title, panel.detail);
         let checking = matches!(self.state.check(), Check::Checking { .. });
-        let test_label = match self.state.test_intent() {
-            ReadinessIntent::TestAgain => "Test again",
-            _ => "Test connection",
-        };
+        let test_label = self.state.test_label();
         let test = if checking {
             style::disabled_button("machine-test", test_label, ButtonKind::Secondary, ButtonSize::Small, &theme)
                 .into_any_element()
@@ -927,7 +763,7 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use super::super::machine_form_state::samples;
+    use super::super::machine_form_state::{samples, CheckOutcome};
     use shelbi_core::{Machine, Project, WorkspaceSpec};
     use shelbi_orchestrator::pool_admin::{HookWiring, PoolOps, SessionState, WorktreeState};
 
@@ -1001,15 +837,16 @@ pub(crate) mod tests {
         (f, seen)
     }
 
-    /// The records written: `(machine, host, ready)`.
+    /// The records written: `(machine, host, verified)`.
     pub(crate) type Records = Arc<Mutex<Vec<(String, String, bool)>>>;
 
-    /// A record store that remembers what it was asked to write.
+    /// A record store that remembers what it was asked to write. Only a
+    /// verified binary is ever handed over, so each is `true`.
     pub(crate) fn recording_records() -> (Arc<RecordFn>, Records) {
         let seen: Records = Arc::default();
         let log = seen.clone();
-        let f: Arc<RecordFn> = Arc::new(move |machine: &str, host: &str, r: &Readiness| {
-            log.lock().unwrap().push((machine.into(), host.into(), r.is_ready()));
+        let f: Arc<RecordFn> = Arc::new(move |r: &Record| {
+            log.lock().unwrap().push((r.machine.clone(), r.host.clone(), !r.cli.path.is_empty()));
         });
         (f, seen)
     }
@@ -1022,45 +859,5 @@ pub(crate) mod tests {
             readiness: recording_readiness(CheckOutcome::Checked(samples::needs_cli())).0,
             record: recording_records().0,
         }
-    }
-
-    #[test]
-    fn install_answers_say_what_setup_did() {
-        use shelbi_orchestrator::machine::{parse_version, ResolvedBinary, SetupError};
-        use shelbi_orchestrator::machine_readiness::Installed;
-        let v = parse_version("0.9.0").unwrap();
-        let installed = install_outcome(Ok(Installed {
-            action: SetupAction::Installed {
-                path: "~/.shelbi/bin/shelbi".into(),
-                version: v,
-                alongside: Some(ResolvedBinary {
-                    path: "/usr/bin/shelbi".into(),
-                    version: parse_version("0.8.0"),
-                }),
-                via_hub_copy: true,
-            },
-            readiness: samples::ready(),
-        }));
-        let CheckOutcome::Installed { note, .. } = &installed else { panic!() };
-        assert!(note.contains("~/.shelbi/bin/shelbi") && note.contains("copied from this Mac"));
-        assert!(note.contains("/usr/bin/shelbi was left as it was"));
-        assert!(installed.is_ready());
-
-        let reused = install_outcome(Ok(Installed {
-            action: SetupAction::AlreadyCompatible {
-                path: "/usr/local/bin/shelbi".into(),
-                version: v,
-                source: "path",
-            },
-            readiness: samples::ready(),
-        }));
-        assert!(matches!(reused, CheckOutcome::Installed { ref note, .. } if note.contains("already installed")));
-
-        let down = install_outcome(Err(SetupError::Unreachable("timed out".into())));
-        assert!(!down.offers_install(), "a failed connection is retried with Test again");
-        let home = install_outcome(Err(SetupError::ReadOnlyHome("Read-only file system".into())));
-        assert!(home.offers_install());
-        let CheckOutcome::InstallFailed { message, .. } = home else { panic!() };
-        assert!(message.starts_with("Couldn’t write ~/.shelbi/bin") && message.contains("install again"));
     }
 }

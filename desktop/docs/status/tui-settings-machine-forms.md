@@ -106,9 +106,8 @@ never answered by it.
 
 - No Choose… folder picker: the directory is typed or pasted, with terminal
   line editing.
-- No Test connection / Install CLI yet: that's `tui-settings-machine-readiness`.
-  The desktop's region shows "Not checked yet" with Test connection; the
-  TUI's says Not checked with what isn't verified, and the probe's last word.
+- No Test connection / Install CLI yet: that's `tui-settings-machine-readiness`
+  (since delivered: see [`tui-settings-machine-readiness.md`](tui-settings-machine-readiness.md)).
 - Kind is a read-only row (the desktop shows it through the form's title and
   description).
 - The page's footnote and the Add machine row no longer mention the editor.

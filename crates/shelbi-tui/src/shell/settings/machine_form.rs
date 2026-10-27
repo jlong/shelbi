@@ -19,11 +19,18 @@
 //! Add machine / Save changes; while the save runs the form is busy (one
 //! save at a time, Cancel waits for it).
 //!
-//! An SSH machine's connection region says the draft is Not checked: the
-//! readiness check (Test connection, Install CLI) is its own task. On
-//! Configure, what the page's reachability probe last saw of the saved host
-//! shows under it, labeled as the probe's (only SSH answering), and goes as
-//! soon as the host is edited.
+//! An SSH machine's form has the connection check
+//! (`shelbi_app::settings::machine_check`, the desktop's): Test connection /
+//! Test again checks the draft as typed (saved or not) and lists what it
+//! found per stage (SSH, Platform, Shelbi CLI, Git, Project directory) with
+//! what to do about anything that needs attention; Install CLI shows when the
+//! check found no compatible CLI on a platform with a release, runs the
+//! shared remote setup and checks again. While a check runs the region says
+//! so with a spinner and how long it's been, and Test becomes Stop check
+//! (an install can't be stopped: it runs to its end). On Configure, what the
+//! page's reachability probe last saw of the saved host shows under it,
+//! labeled as the probe's (only SSH answering), and goes as soon as the host
+//! is edited.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -33,7 +40,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
-use shelbi_app::settings::machine_form::{self as mform, Action, Field, Focus, MachineForm, NOT_CHECKED};
+use std::time::Duration;
+
+use shelbi_app::settings::machine_check::{Action, Field, Focus, ReadinessForm, StageState, Tone};
+use shelbi_app::settings::machine_form as mform;
 use shelbi_app::settings::workspace_form::sentence;
 use shelbi_app::settings::workspaces::{MachineStatus, LOCAL_LABEL};
 use shelbi_core::ForwardMode;
@@ -48,21 +58,32 @@ pub(crate) const HOST_HELP: &str = "A host name or an alias from your SSH config
                                     existing SSH keys and config and never asks for a password. Empty uses the \
                                     name.";
 
-/// What the connection region says under Not checked.
-pub(crate) const NOT_CHECKED_HELP: &str = "Nothing has checked this draft yet: SSH, the Shelbi CLI, Git and the \
-                                           project directory aren’t verified until a readiness check runs.";
+/// The spinner's frames, a tenth of a second each.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Whether pressing Test stops the check running now (an install can't be
+/// stopped).
+fn stops(form: &ReadinessForm, focus: Focus) -> bool {
+    focus == Focus::Test && form.running().is_some() && !form.installing()
+}
 
 /// The form's key: the TUI's text editing (at the end of the text) and its
-/// arrows, over the shared form's keys.
-pub(super) fn key(form: &mut MachineForm, k: KeyEvent) -> Action {
+/// arrows, over the shared form's keys. Enter or Space on Stop check stops
+/// the check (the page trips its flag).
+pub(super) fn key(form: &mut ReadinessForm, k: KeyEvent) -> Action {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
     let field = match form.focus() {
         Focus::Field(f) => Some(f),
         _ => None,
     };
-    let shared = |form: &mut MachineForm, code: Key| {
-        let action = form.key(KeyChord::new(code, Mods::NONE), false).unwrap_or(Action::Stay);
+    let pressing = matches!(k.code, KeyCode::Enter) || (k.code == KeyCode::Char(' ') && !ctrl && !alt);
+    if pressing && stops(form, form.focus()) {
+        form.stop_check();
+        return Action::Stay;
+    }
+    let shared = |form: &mut ReadinessForm, code: Key| {
+        let action = form.key(KeyChord::new(code, Mods::NONE)).unwrap_or(Action::Stay);
         // Cancel waits for a save in flight to land.
         if action == Action::Cancel && form.saving() {
             Action::Stay
@@ -91,7 +112,7 @@ pub(super) fn key(form: &mut MachineForm, k: KeyEvent) -> Action {
 }
 
 /// A text edit of `field`, at the end of its text.
-fn edit(form: &mut MachineForm, field: Field, code: KeyCode, ctrl: bool, alt: bool) {
+fn edit(form: &mut ReadinessForm, field: Field, code: KeyCode, ctrl: bool, alt: bool) {
     let mut text = form.text(field).to_string();
     match code {
         KeyCode::Backspace if alt => delete_word(&mut text),
@@ -116,7 +137,7 @@ fn delete_word(text: &mut String) {
 
 /// A paste (or a dropped file's path) onto the focused field, as one line.
 /// Returns whether a field took it.
-pub(super) fn paste(form: &mut MachineForm, pasted: &str) -> bool {
+pub(super) fn paste(form: &mut ReadinessForm, pasted: &str) -> bool {
     let Focus::Field(field) = form.focus() else {
         return false;
     };
@@ -131,8 +152,13 @@ pub(super) fn paste(form: &mut MachineForm, pasted: &str) -> bool {
 }
 
 /// A click on `focus`: a field takes the keyboard, a button is pressed.
-pub(super) fn click(form: &mut MachineForm, focus: Focus) -> Action {
+pub(super) fn click(form: &mut ReadinessForm, focus: Focus) -> Action {
     if form.saving() {
+        return Action::Stay;
+    }
+    if stops(form, focus) {
+        form.set_focus(focus);
+        form.stop_check();
         return Action::Stay;
     }
     match focus {
@@ -144,6 +170,14 @@ pub(super) fn click(form: &mut MachineForm, focus: Focus) -> Action {
     }
 }
 
+/// What the page knows of a form beyond its state: how long its check has
+/// been running, and what an install whose answer the form dropped did.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Extra<'a> {
+    pub elapsed: Option<Duration>,
+    pub aside: Option<&'a str>,
+}
+
 /// Draw `form` over `main`, centred, recording each control's rect in
 /// `hits`. `probe` is what the page's reachability probe last saw of the
 /// configured machine. Below 40 columns the labels stack over their fields;
@@ -152,8 +186,9 @@ pub(super) fn click(form: &mut MachineForm, focus: Focus) -> Action {
 pub(super) fn render(
     f: &mut Frame,
     main: Rect,
-    form: &MachineForm,
+    form: &ReadinessForm,
     probe: Option<&MachineStatus>,
+    extra: Extra<'_>,
     hits: &mut Vec<(Rect, Focus)>,
 ) {
     let width = 78.min(main.width.saturating_sub(2));
@@ -229,15 +264,95 @@ pub(super) fn render(
             ],
         );
     }
-    // Connection: a draft is Not checked; the probe's last word is its own.
+    // Connection: what the readiness check found, its buttons, and the
+    // probe's last word (its own, never readiness).
     if form.remote() {
         lines.push(Line::raw(""));
-        labeled(
-            &mut lines,
-            "Connection",
-            vec![Span::styled(NOT_CHECKED.to_string(), Style::default().fg(palette().yellow))],
-        );
-        under(&mut lines, NOT_CHECKED_HELP, muted);
+        let panel = form.panel();
+        let (glyph, tone) = match panel.tone {
+            Tone::Idle => ("○".to_string(), palette().gray),
+            Tone::Busy => (spinner(extra.elapsed).to_string(), palette().yellow),
+            Tone::Success => ("✓".to_string(), palette().green),
+            Tone::Warning => ("!".to_string(), palette().yellow),
+            Tone::Error => ("✗".to_string(), palette().red),
+        };
+        let mut title = vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(tone)),
+            Span::styled(panel.title.clone(), Style::default().fg(tone).add_modifier(Modifier::BOLD)),
+        ];
+        if let (Tone::Busy, Some(elapsed)) = (panel.tone, extra.elapsed) {
+            title.push(Span::styled(format!("  {}s", elapsed.as_secs()), muted));
+        }
+        let first = lines.len();
+        labeled(&mut lines, "Connection", title);
+        // The stages: what each found (or that it waits).
+        let stage_w = form.stages().iter().map(|s| s.kind.label().chars().count()).max().unwrap_or(0) + 1;
+        for stage in form.stages() {
+            let (mark, color) = match stage.state {
+                StageState::Waiting => ("·".to_string(), palette().muted),
+                StageState::Running => (spinner(extra.elapsed).to_string(), palette().yellow),
+                StageState::Passed => ("✓".to_string(), palette().green),
+                StageState::Attention => ("!".to_string(), palette().yellow),
+                StageState::Failed => ("✗".to_string(), palette().red),
+                StageState::Skipped => ("–".to_string(), palette().muted),
+            };
+            let label = format!("{:<stage_w$}", stage.kind.label());
+            let room = value_w.saturating_sub(2 + stage_w).max(8);
+            let result_style = match stage.state {
+                StageState::Waiting | StageState::Skipped => muted,
+                _ => Style::default().fg(palette().foreground),
+            };
+            // A long result (a path) wraps under itself.
+            for (i, part) in wrap(&stage.result, room).into_iter().enumerate() {
+                let lead = if i == 0 {
+                    vec![
+                        Span::styled(format!("{mark} "), Style::default().fg(color)),
+                        Span::styled(label.clone(), Style::default().fg(palette().gray)),
+                    ]
+                } else {
+                    vec![Span::raw(" ".repeat(2 + stage_w))]
+                };
+                let mut spans = vec![Span::raw(" ".repeat(label_w))];
+                spans.extend(lead);
+                spans.push(Span::styled(part, result_style));
+                lines.push(Line::from(spans));
+            }
+        }
+        let detail_style = match panel.tone {
+            Tone::Error => red,
+            Tone::Warning => Style::default().fg(palette().yellow),
+            _ => muted,
+        };
+        under(&mut lines, &panel.detail, detail_style);
+        if let Some(aside) = extra.aside {
+            under(&mut lines, aside, Style::default().fg(palette().gray));
+        }
+        // Test connection / Test again (Stop check while one runs), and
+        // Install CLI when it can help.
+        let row = lines.len();
+        let running = form.running().is_some();
+        let mut buttons = vec![(
+            Focus::Test,
+            format!(" {} ", if stops(form, Focus::Test) { "Stop check" } else { form.test_label() }),
+            button_style(form.focus() == Focus::Test, !form.saving() && (!running || stops(form, Focus::Test)), false),
+        )];
+        if form.offers_install() {
+            buttons.push((
+                Focus::InstallCli,
+                " Install CLI ".to_string(),
+                button_style(form.focus() == Focus::InstallCli, !form.saving(), true),
+            ));
+        }
+        let mut x = label_w;
+        let mut spans = vec![Span::raw(" ".repeat(label_w))];
+        for (focus, label, style) in buttons {
+            let w = panel::display_width(&label);
+            controls.push((first, row + 1, row, x as u16, w as u16, focus));
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+            x += w + 1;
+        }
+        lines.push(Line::from(spans));
         if let Some(note) = probe.and_then(|s| form.probe_note(s)) {
             let style = match probe {
                 Some(MachineStatus::Unreachable(_)) => red,
@@ -276,6 +391,10 @@ pub(super) fn render(
     lines.push(Line::from(spans));
     let hint = if form.saving() {
         "Saving… (nothing else runs until this lands)".to_string()
+    } else if form.installing() {
+        "Installing… it runs to its end · Esc closes the form".to_string()
+    } else if form.running().is_some() {
+        "Checking… Stop check or Esc stops it · nothing is saved until you save".to_string()
     } else {
         format!("Tab next · ⏎ {} · Esc cancel", form.submit_label().to_lowercase())
     };
@@ -309,6 +428,12 @@ pub(super) fn render(
             hits.push((Rect { x: content.x + x, y: content.y + y as u16, width: w.max(1), height: 1 }, focus));
         }
     }
+}
+
+/// The spinner's frame `elapsed` into a check.
+fn spinner(elapsed: Option<Duration>) -> char {
+    let tenths = elapsed.map_or(0, |e| e.as_millis() / 100) as usize;
+    SPINNER[tenths % SPINNER.len()]
 }
 
 /// The lines to skip so the focused control's block (its line and what's
