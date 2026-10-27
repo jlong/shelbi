@@ -541,12 +541,31 @@ pub fn resolve_editor() -> String {
 /// then `vim`, skipping blank/whitespace values at each layer. Split out so
 /// the precedence is unit-testable without touching the filesystem or env.
 pub(crate) fn resolve_editor_from(config: Option<String>, env: Option<String>) -> String {
-    for candidate in [config, env].into_iter().flatten() {
-        if !candidate.trim().is_empty() {
-            return candidate;
+    resolve_editor_source(config.as_deref(), env.as_deref()).0
+}
+
+/// Which layer of [`resolve_editor`] named the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSource {
+    /// `config.yaml`'s `editor:`.
+    Config,
+    /// The `$EDITOR` environment variable.
+    Env,
+    /// Neither: [`DEFAULT_EDITOR`].
+    Default,
+}
+
+/// [`resolve_editor`]'s precedence over given values, with the layer that
+/// won: `config`, then `env`, then `vim`, skipping blank values. A setting
+/// shows what Shelbi runs, and what it falls back to without the override
+/// (`config` `None`).
+pub fn resolve_editor_source(config: Option<&str>, env: Option<&str>) -> (String, EditorSource) {
+    for (candidate, source) in [(config, EditorSource::Config), (env, EditorSource::Env)] {
+        if let Some(c) = candidate.filter(|c| !c.trim().is_empty()) {
+            return (c.to_string(), source);
         }
     }
-    DEFAULT_EDITOR.to_string()
+    (DEFAULT_EDITOR.to_string(), EditorSource::Default)
 }
 
 /// Human-facing name of an editor command for the "Edit in <name>"
@@ -575,39 +594,50 @@ pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
     atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
 }
 
-/// Load the user config, apply `edit`, and write it back, keeping every
-/// top-level key this build doesn't model (a newer client's settings) instead
-/// of dropping it the way a plain [`save_user_config`] round-trip would. Keys
-/// the edited config omits on save (a cleared `editor`, an `auto` theme, an
-/// empty `desktop:` block) are removed. YAML comments are not preserved.
-/// Returns the config as written.
+/// Load the user config, apply `edit`, and write back only what the edit
+/// changed. The file is read fresh, so a write never carries stale values
+/// for settings it didn't touch, and it is patched as text
+/// ([`yaml_edit`](crate::yaml_edit)): comments, key order, keys this build
+/// doesn't model (a newer client's settings, at the top level or inside
+/// `desktop:`) and the spelling of untouched values all survive. Keys the
+/// edited config omits on save (a cleared `editor`, an `auto` theme, an
+/// empty `desktop:` block) are removed. An edit that changes nothing writes
+/// nothing.
+///
+/// A file that doesn't read (not YAML, not a mapping, or a value this build
+/// can't load) is an error and is left exactly as it is, as is the file when
+/// the write fails. Returns the config as written.
 pub fn update_user_config(edit: impl FnOnce(&mut UserConfig)) -> Result<UserConfig> {
-    use serde_yaml::{Mapping, Value};
+    use crate::yaml_edit;
+    use shelbi_core::Error;
 
     let path = user_config_path()?;
-    let mut raw: Mapping = if path.exists() {
-        match serde_yaml::from_str::<Value>(&fs::read_to_string(&path)?)? {
-            Value::Mapping(m) => m,
-            _ => Mapping::new(),
-        }
-    } else {
-        Mapping::new()
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
     };
-    let mut cfg: UserConfig = serde_yaml::from_value(Value::Mapping(raw.clone()))?;
-    edit(&mut cfg);
-
-    let Value::Mapping(known) = serde_yaml::to_value(&cfg)? else {
-        unreachable!("UserConfig serializes to a mapping");
-    };
-    for key in ["keymap", "editor", "theme", "desktop"] {
-        raw.remove(key);
+    let unreadable = |e: &dyn std::fmt::Display| Error::Other(format!("{} {e}", path.display()));
+    let raw = yaml_edit::parse(&text).map_err(|e| unreadable(&e))?;
+    if !raw.is_mapping() {
+        return Err(unreadable(&"isn't a mapping of settings"));
     }
-    for (key, value) in known {
-        raw.insert(key, value);
+    let before: UserConfig = serde_yaml::from_value(raw.clone())?;
+    let mut after = before.clone();
+    edit(&mut after);
+    if after == before {
+        return Ok(after);
     }
+    let target = yaml_edit::merge(
+        &raw,
+        &serde_yaml::to_value(&before)?,
+        &serde_yaml::to_value(&after)?,
+        &[],
+    );
+    let patched = yaml_edit::patch(&text, &target).map_err(|e| unreadable(&e))?;
     ensure_dir(&shelbi_home()?)?;
-    atomic_write(&path, serde_yaml::to_string(&Value::Mapping(raw))?.as_bytes())?;
-    Ok(cfg)
+    atomic_write(&path, patched.text.as_bytes())?;
+    Ok(after)
 }
 
 /// Write a self-documenting `~/.shelbi/config.yaml` when one doesn't already
@@ -728,6 +758,100 @@ mod tests {
         let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
         assert!(!text.contains("theme") && !text.contains("desktop"), "{text}");
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn update_user_config_patches_only_what_changed() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = home.join("config.yaml");
+        // The scaffold's comments, a desktop block with a key this build
+        // doesn't know and a value spelled its own way, and an unknown
+        // top-level key.
+        let original = format!(
+            "{}\ndesktop:\n  window_opacity: 0.85 # Ghostty's shape\n  future_desktop_key: [a, b]\n\
+             future_key:\n  nested: 1\n",
+            shelbi_core::scaffold::CONFIG_YAML
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let written = update_user_config(|c| c.editor = Some("code --wait".into())).unwrap();
+        assert_eq!(written.editor.as_deref(), Some("code --wait"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "## Color theme for the TUI and the desktop app",
+            "# theme: auto",
+            "zen_toggle: alt-z",
+            "window_opacity: 0.85 # Ghostty's shape",
+            "future_desktop_key: [a, b]",
+            "future_key:\n  nested: 1",
+        ] {
+            assert!(text.contains(kept), "{kept:?} survives:\n{text}");
+        }
+        let back = load_user_config().unwrap();
+        assert_eq!(back.editor.as_deref(), Some("code --wait"), "arguments kept");
+        assert_eq!(back.desktop.window_opacity, Some(85));
+
+        update_user_config(|c| c.theme = ThemePreference::Light).unwrap();
+        update_user_config(|c| c.editor = None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("theme: light"), "{text}");
+        assert!(!text.contains("editor: code"), "a cleared editor is removed:\n{text}");
+        assert!(text.contains("future_desktop_key") && text.contains("# editor: vim"), "{text}");
+
+        // Back to auto removes the key; what's left is the original file.
+        update_user_config(|c| c.theme = ThemePreference::Auto).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // An edit that changes nothing doesn't write.
+        std::fs::write(&path, "theme:   dark   # mine\n").unwrap();
+        update_user_config(|c| c.theme = ThemePreference::Dark).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme:   dark   # mine\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn update_user_config_leaves_an_unreadable_file_alone() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = home.join("config.yaml");
+        for bad in ["theme: [dark\n", "just a string\n", "- a\n- b\n", "theme: purple\n"] {
+            std::fs::write(&path, bad).unwrap();
+            let result = update_user_config(|c| c.editor = Some("hx".into()));
+            assert!(result.is_err(), "{bad:?} refuses the edit");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "{bad:?} untouched");
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_user_config_reports_a_failed_write_and_keeps_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = home.join("config.yaml");
+        std::fs::write(&path, "editor: hx\n").unwrap();
+        // A read-only folder: the atomic write's temp file can't be made.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = update_user_config(|c| c.theme = ThemePreference::Light);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "the failed write is reported");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "editor: hx\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn the_editor_source_names_the_layer_that_won() {
+        assert_eq!(
+            resolve_editor_source(Some("code --wait"), Some("nvim")),
+            ("code --wait".to_string(), EditorSource::Config)
+        );
+        assert_eq!(resolve_editor_source(Some(" "), Some("nvim")), ("nvim".to_string(), EditorSource::Env));
+        assert_eq!(resolve_editor_source(None, Some("")), ("vim".to_string(), EditorSource::Default));
     }
 
     #[test]

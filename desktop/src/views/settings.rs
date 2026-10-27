@@ -16,8 +16,8 @@
 //!   `TerminalSettings` global, which a change sets at once (before the
 //!   write), and which the view follows, so a size changed elsewhere shows
 //!   here too;
-//! - `theme:` (`auto | dark | light`), shared with the TUI, which reads it on
-//!   its next start;
+//! - `theme:` (`auto | dark | light`), shared with the TUI, which reads it
+//!   when it starts and whenever its Settings opens (and edits it there too);
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
 //!   reads, typed or chosen with Browse.
 //!
@@ -68,6 +68,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
+use shelbi_app::settings::general::{theme_label, SaveStatus, THEMES};
 use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, TerminalScrollbar, ThemePreference, UserConfig};
 use shelbi_term::render::Rgb as TermRgb;
 
@@ -270,14 +271,6 @@ impl SettingsValues {
     }
 }
 
-/// Where the last save stands, shown under the form.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SaveState {
-    Idle,
-    Saved,
-    Failed(String),
-}
-
 /// What the settings view tells its window.
 #[derive(Debug, Clone)]
 pub enum SettingsEvent {
@@ -371,7 +364,9 @@ pub struct SettingsView {
     /// False until the config has been read, so an early blur can't save
     /// blank values over it.
     loaded: bool,
-    state: SaveState,
+    /// Where the last save stands, shown under the form (shared with the
+    /// TUI's General page).
+    state: SaveStatus,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -493,7 +488,7 @@ impl SettingsView {
             theme_track: SlideTrack::shared(),
             option_track: SlideTrack::shared(),
             scrollbar_track: SlideTrack::shared(),
-            state: SaveState::Idle,
+            state: SaveStatus::Idle,
             _subscriptions: subscriptions,
         };
         view.follow_window_look(cx);
@@ -804,7 +799,7 @@ impl SettingsView {
                 match cfg {
                     Ok(cfg) => this.fill(&cfg, window, cx),
                     Err(e) => {
-                        this.state = SaveState::Failed(format!("Couldn't read config.yaml: {e}"));
+                        this.state = SaveStatus::Failed(format!("Couldn't read config.yaml: {e}"));
                     }
                 }
                 cx.notify();
@@ -1064,7 +1059,7 @@ impl SettingsView {
     #[cfg(test)]
     fn save_in_memory(&mut self, values: SettingsValues, cx: &mut Context<Self>) {
         values.apply(&mut self.saved);
-        self.state = SaveState::Saved;
+        self.state = SaveStatus::Saved;
         cx.emit(SettingsEvent::Saved);
         cx.notify();
     }
@@ -1072,6 +1067,7 @@ impl SettingsView {
     /// Write `values` to `config.yaml` off the UI thread.
     #[cfg(not(test))]
     fn write(&mut self, values: SettingsValues, cx: &mut Context<Self>) {
+        self.state = SaveStatus::Saving;
         let write = cx.background_executor().spawn(async move {
             shelbi_state::update_user_config(|cfg| values.apply(cfg))
                 .map(|_| ())
@@ -1083,9 +1079,9 @@ impl SettingsView {
                 this.state = match result {
                     Ok(()) => {
                         cx.emit(SettingsEvent::Saved);
-                        SaveState::Saved
+                        SaveStatus::Saved
                     }
-                    Err(e) => SaveState::Failed(e),
+                    Err(e) => SaveStatus::Failed(e),
                 };
                 cx.notify();
             })
@@ -1195,15 +1191,6 @@ impl SettingsView {
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
-/// A theme choice's segment label.
-fn theme_label(value: ThemePreference) -> &'static str {
-    match value {
-        ThemePreference::Auto => "Auto",
-        ThemePreference::Dark => "Dark",
-        ThemePreference::Light => "Light",
-    }
-}
-
 /// An Option-key choice's segment label.
 fn option_label(value: OptionAsMeta) -> &'static str {
     match value {
@@ -1272,11 +1259,13 @@ impl Render for SettingsView {
                 .child(motion::probe(&self.theme_track, id))
                 .on_click(cx.listener(move |this, _, window, cx| this.set_theme(value, window, cx)))
         };
-        let status: Option<(SharedString, gpui::Hsla)> = match &self.state {
-            SaveState::Idle => None,
-            SaveState::Saved => Some(("Saved to ~/.shelbi/config.yaml".into(), theme.form_hint)),
-            SaveState::Failed(e) => Some((e.clone().into(), theme.error)),
-        };
+        let status: Option<(SharedString, gpui::Hsla)> = self.state.message().map(|text| {
+            let color = match &self.state {
+                SaveStatus::Failed(_) => theme.error,
+                _ => theme.form_hint,
+            };
+            (text.into(), color)
+        });
         let current = self.theme;
         let option_as_meta = self.option_as_meta;
         let option_chip_slide = chips.1;
@@ -1383,10 +1372,8 @@ impl Render for SettingsView {
                     controls::segmented_track(&theme)
                         .child(motion::origin_probe(&self.theme_track))
                         .children(theme_chip.map(floating))
-                        .child(chip("Auto", ThemePreference::Auto, current, cx))
-                        .child(chip("Dark", ThemePreference::Dark, current, cx))
-                        .child(chip("Light", ThemePreference::Light, current, cx)),
-                    Some("Shared with the TUI, which picks it up on its next start.".into()),
+                        .children(THEMES.map(|t| chip(theme_label(t), t, current, cx))),
+                    Some("Shared with the TUI, which picks it up when it starts or opens Settings.".into()),
                     &theme,
                 ))
                 .child(self.render_translucency(&theme, cx))

@@ -99,7 +99,9 @@ struct SettingsReturn {
 /// What a Settings background job sends back.
 enum SettingsMsg {
     Loaded(Ticket, Box<GeneralSummary>),
-    Saved(Ticket, Result<(), String>),
+    Saved(Ticket, Result<Option<shelbi_state::UserConfig>, String>),
+    /// An immediate-save preference write landed (General's theme or editor).
+    Written(Result<shelbi_state::UserConfig, String>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -1115,6 +1117,13 @@ struct ShellState {
     settings_rx: Receiver<SettingsMsg>,
     /// Reads Settings' General summary (disk in production; a fixture in tests).
     settings_reader: SettingsReader,
+    /// Writes General's preferences to `config.yaml` (disk in production; the
+    /// fixture in tests).
+    settings_writer: settings::ConfigWriter,
+    /// The config the test reader and writer share, in place of
+    /// `~/.shelbi/config.yaml`.
+    #[cfg(test)]
+    settings_store: Arc<std::sync::Mutex<settings::FixtureConfig>>,
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
@@ -1200,8 +1209,12 @@ impl ShellState {
         #[cfg(not(test))]
         let settings_reader: SettingsReader =
             Arc::new(shelbi_app::settings::summary::read);
+        #[cfg(not(test))]
+        let settings_writer: settings::ConfigWriter = Arc::new(|change| change.write());
         #[cfg(test)]
-        let settings_reader: SettingsReader = Arc::new(settings::fixture_summary);
+        let settings_store = Arc::new(std::sync::Mutex::new(settings::FixtureConfig::default()));
+        #[cfg(test)]
+        let (settings_reader, settings_writer) = settings::fixture_io(&settings_store);
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1255,6 +1268,9 @@ impl ShellState {
             settings_tx,
             settings_rx,
             settings_reader,
+            settings_writer,
+            #[cfg(test)]
+            settings_store,
             status: None,
             job: None,
             pending_editor: None,
@@ -1846,9 +1862,12 @@ impl ShellState {
     /// can keep typing there afterward. Native board/activity/machines views
     /// have no terminal session, so a drop over one is a no-op.
     fn deliver_paste(&mut self, text: &str) {
-        // Settings has no text field yet; a paste (or a dropped file) never
-        // reaches the session hidden under it.
+        // Over Settings a paste goes into the editor command being typed, if
+        // it is; it (or a dropped file) never reaches the session under it.
         if self.settings_open() {
+            if self.settings.paste(text) {
+                self.dirty = true;
+            }
             return;
         }
         match self.main_view {
@@ -2029,7 +2048,8 @@ impl ShellState {
             selection: self.client.sidebar_selection(),
         });
         self.settings.open();
-        self.load_settings(false);
+        // Read again on every visit: config.yaml may have changed outside.
+        self.load_settings(true);
         self.dirty = true;
     }
 
@@ -2078,7 +2098,7 @@ impl ShellState {
     /// UI thread.
     fn save_settings(&mut self) {
         let project = self.client.project().map(str::to_string);
-        let Some((ticket, work)) = self.settings.begin_save(project.as_deref()) else {
+        let Some((ticket, work)) = self.settings.begin_save(project.as_deref(), &self.settings_writer) else {
             return;
         };
         let tx = self.settings_tx.clone();
@@ -2109,9 +2129,33 @@ impl ShellState {
                     let action = self.settings.saved(&ticket, result);
                     self.apply_settings_action(action);
                 }
+                SettingsMsg::Written(result) => self.settings.config_written(result),
             }
         }
+        // A theme config.yaml now holds (read on entering Settings or after
+        // an outside edit, or just saved): every surface paints in it from
+        // the next frame. Sessions are untouched; only colors change.
+        if let Some(theme) = self.settings.take_theme() {
+            crate::theme::install(theme);
+            self.dirty = true;
+        }
         landed
+    }
+
+    /// Write one preference off the UI thread (General's immediate-save
+    /// controls). The form shows it pending until the result lands.
+    fn write_setting(&mut self, change: shelbi_app::settings::general::Change) {
+        let writer = self.settings_writer.clone();
+        let tx = self.settings_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-write".into())
+            .spawn(move || {
+                let _ = tx.send(SettingsMsg::Written(writer(&change)));
+            });
+        if let Err(e) = spawned {
+            self.settings
+                .config_written(Err(format!("Couldn't start the save: {e}")));
+        }
     }
 
     /// Carry out what a Settings key or click asked for.
@@ -2125,6 +2169,8 @@ impl ShellState {
             SettingsAction::Load => self.load_settings(false),
             SettingsAction::Reload => self.load_settings(true),
             SettingsAction::Save => self.save_settings(),
+            SettingsAction::Write(change) => self.write_setting(change),
+            SettingsAction::EditFile(path) => self.pending_editor = Some(path),
         }
         self.dirty = true;
     }
@@ -4303,26 +4349,25 @@ fn agent_display_name(task: &shelbi_state::IssueFile) -> String {
 /// in-progress workspace, so `IN PROGRESS` (bold yellow) is the usual case; the
 /// other arms keep it robust if the column changes under an open sidebar.
 fn status_for_column(column: &shelbi_core::Column) -> crate::workspace_panel::WsStatus {
-    use crate::theme::palette;
     if *column == shelbi_core::Column::in_progress() {
         crate::workspace_panel::WsStatus {
             text: "IN PROGRESS".into(),
-            color: palette().yellow,
+            tone: crate::workspace_panel::StatusTone::Yellow,
         }
     } else if *column == shelbi_core::Column::review() {
         crate::workspace_panel::WsStatus {
             text: "READY FOR REVIEW".into(),
-            color: palette().cyan,
+            tone: crate::workspace_panel::StatusTone::Cyan,
         }
     } else if *column == shelbi_core::Column::done() {
         crate::workspace_panel::WsStatus {
             text: "DONE".into(),
-            color: palette().green,
+            tone: crate::workspace_panel::StatusTone::Green,
         }
     } else {
         crate::workspace_panel::WsStatus {
             text: column.as_str().to_uppercase(),
-            color: palette().muted,
+            tone: crate::workspace_panel::StatusTone::Muted,
         }
     }
 }
@@ -4355,7 +4400,7 @@ fn ws_status_from_model(
 fn default_ws_status() -> crate::workspace_panel::WsStatus {
     crate::workspace_panel::WsStatus {
         text: "IDLE".into(),
-        color: palette().muted,
+        tone: crate::workspace_panel::StatusTone::Muted,
     }
 }
 
@@ -4598,6 +4643,7 @@ impl Drop for RawGuard {
 mod tests {
     use super::*;
     use shelbi_app::view::{NavItem, WorkspaceRow};
+    use shelbi_state::ThemePreference;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {
@@ -7611,7 +7657,9 @@ mod tests {
     fn esc_closes_the_innermost_first_and_typing_in_the_switcher_stays_in_it() {
         let mut st = settings_state();
         st.dispatch_effect(Effect::OpenSettings);
-        // Down to the project switcher; Enter opens the palette's Projects column.
+        // Down past Terminal to the project switcher; Enter opens the
+        // palette's Projects column.
+        press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Down);
         assert_eq!(st.settings.stop(), settings::Stop::Switcher);
         press(&mut st, KeyCode::Enter);
@@ -7706,25 +7754,21 @@ mod tests {
             let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             draw_frame(&mut term, &mut st).unwrap();
             let screen = screen_text(&term);
-            for want in [
-                "Settings",
-                "Global",
-                "General",
-                "▾ proj",
-                "This computer",
-                "Settings folder",
-                "PROJ",
-                "Open in editor",
-                "Edit Project Settings",
-                "Esc back",
-            ] {
+            // The controls lead; a short terminal scrolls to the summary.
+            let mut wants = vec!["Settings", "Global", "General", "Terminal", "▾ proj", "Appearance", "Theme", "Editor", "Esc back"];
+            if h >= 48 {
+                wants.extend(["This computer", "Settings folder", "PROJ", "Open in editor", "Edit Project Settings"]);
+            } else {
+                wants.push("↓ more");
+            }
+            for want in wants {
                 assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
             }
             assert!(!screen.contains("Orchestrator"), "{w}x{h}: the nav sidebar is replaced:\n{screen}");
             // The settings sidebar sits in the sidebar's column, the page in main.
             let (bx, _) = find_on_screen(&term, "Settings").unwrap();
             assert!(contains(st.sidebar_rect, bx, 1), "{w}x{h}");
-            let (gx, gy) = find_on_screen(&term, "This computer").unwrap();
+            let (gx, gy) = find_on_screen(&term, "Appearance").unwrap();
             assert!(contains(st.main_rect, gx, gy), "{w}x{h}");
         }
     }
@@ -7761,7 +7805,11 @@ mod tests {
         settle_settings(&mut st);
         st.effect_tap = Some(Vec::new());
         press(&mut st, KeyCode::Tab);
-        press(&mut st, KeyCode::Char('j'));
+        // Past the theme, the editor command and Edit config.yaml, then
+        // Edit Project Settings, to Edit Zen Mode.
+        for _ in 0..4 {
+            press(&mut st, KeyCode::Char('j'));
+        }
         press(&mut st, KeyCode::Enter);
         assert_eq!(
             st.effect_tap.as_ref().unwrap().last(),
@@ -7778,7 +7826,8 @@ mod tests {
         st.dispatch_effect(Effect::OpenSettings);
         settle_settings(&mut st);
         st.effect_tap = Some(Vec::new());
-        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        // Tall enough that the summary's actions show under the controls.
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 48)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         let (x, y) = find_on_screen(&term, "Edit Project Settings").unwrap();
         st.handle_event(Event::Mouse(left_click(x, y)));
@@ -7792,7 +7841,7 @@ mod tests {
         // The wheel over the sidebar moves its selection.
         let side = st.sidebar_content_rect();
         st.handle_event(Event::Mouse(wheel(false, side.x + 2, side.y + 6)));
-        assert_eq!(st.settings.stop(), settings::Stop::Switcher);
+        assert_eq!(st.settings.stop(), settings::Stop::Page(shelbi_app::settings::SettingsPage::Terminal));
         assert_eq!(st.settings.region(), settings::Region::Sidebar);
         // A click on the back button leaves.
         draw_frame(&mut term, &mut st).unwrap();
@@ -7831,6 +7880,163 @@ mod tests {
             "the save lands and Settings leaves"
         );
         assert!(st.settings.test_edits.is_none(), "the edits were saved");
+    }
+
+    // --- Settings ▸ General (tui-settings-general) -----------------------------
+
+    /// Drain Settings' background work until `done` holds.
+    fn settle_until(st: &mut ShellState, what: &str, mut done: impl FnMut(&ShellState) -> bool) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                done(st)
+            }),
+            "{what}"
+        );
+    }
+
+    /// Settings open on General, loaded, the keys on its page (the theme).
+    fn on_general_page(st: &mut ShellState) {
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(st);
+        st.poll_settings();
+        press(st, KeyCode::Tab);
+    }
+
+    fn pick_theme(st: &mut ShellState, key: KeyCode) {
+        press(st, key);
+        settle_until(st, "the theme's write lands", |st| !st.settings.form().saving());
+    }
+
+    #[test]
+    fn a_theme_change_repaints_every_surface_live() {
+        use shelbi_app::theme::Appearance;
+        let mut st = settings_state();
+        on_general_page(&mut st);
+        assert_eq!(crate::theme::appearance(), Appearance::Dark);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let dark_canvas = term.backend().buffer().clone();
+
+        // Auto → Dark → Light, saved and applied without leaving Settings.
+        pick_theme(&mut st, KeyCode::Right);
+        assert_eq!(crate::theme::appearance(), Appearance::Dark);
+        pick_theme(&mut st, KeyCode::Right);
+        assert_eq!(crate::theme::appearance(), Appearance::Light, "applied once saved");
+        assert_eq!(st.settings_store.lock().unwrap().config.as_ref().unwrap().theme, ThemePreference::Light);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_ne!(term.backend().buffer(), &dark_canvas, "Settings itself repainted");
+        crate::theme::assert_light_readable("live-light-settings", term.backend().buffer());
+
+        // Every other surface draws light from its next frame: the sidebar
+        // and the session chrome, the palette overlay, the board.
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings_open());
+        draw_frame(&mut term, &mut st).unwrap();
+        crate::theme::assert_light_readable("live-light-session", term.backend().buffer());
+        st.open_palette();
+        draw_frame(&mut term, &mut st).unwrap();
+        let mut palette = term.backend().buffer().clone();
+        for cell in palette.content.iter_mut().filter(|c| c.symbol() == "●") {
+            // The loaded project's pulse breathes down into the panel by
+            // design (the palette's own light test pins it at its peak).
+            cell.set_symbol(" ");
+        }
+        crate::theme::assert_light_readable("live-light-palette", &palette);
+        press(&mut st, KeyCode::Esc);
+        st.show(RowTarget::Native(View::Issues));
+        draw_frame(&mut term, &mut st).unwrap();
+        crate::theme::assert_light_readable("live-light-board", term.backend().buffer());
+
+        // Auto goes back to dark: a terminal doesn't report its appearance.
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        on_general_page(&mut st);
+        pick_theme(&mut st, KeyCode::Right);
+        assert_eq!(crate::theme::appearance(), Appearance::Dark, "Auto is dark in the TUI");
+        crate::theme::uninstall_for_test();
+    }
+
+    #[test]
+    fn a_failed_theme_write_keeps_the_file_and_the_look() {
+        use shelbi_app::theme::Appearance;
+        let mut st = settings_state();
+        on_general_page(&mut st);
+        st.settings_store.lock().unwrap().fail_writes = Some("Permission denied (os error 13)".into());
+        press(&mut st, KeyCode::Left);
+        settle_until(&mut st, "the failed write lands", |st| !st.settings.form().saving());
+        assert_eq!(crate::theme::appearance(), Appearance::Dark, "nothing applied");
+        assert_eq!(st.settings.form().theme(), ThemePreference::Auto, "the control went back");
+        let store = st.settings_store.lock().unwrap();
+        assert_eq!(store.config.as_ref().unwrap().theme, ThemePreference::Auto);
+        assert_eq!(store.writes, 0);
+        drop(store);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Permission denied"), "{}", screen_text(&term));
+        crate::theme::uninstall_for_test();
+    }
+
+    #[test]
+    fn an_outside_edit_is_read_on_entering_settings_and_after_the_editor() {
+        use shelbi_app::theme::Appearance;
+        let mut st = settings_state();
+        on_general_page(&mut st);
+        press(&mut st, KeyCode::Esc);
+        // config.yaml edited outside Shelbi (another client, a text editor).
+        {
+            let mut store = st.settings_store.lock().unwrap();
+            let cfg = store.config.as_mut().unwrap();
+            cfg.theme = ThemePreference::Light;
+            cfg.editor = Some("zed --wait".into());
+        }
+        on_general_page(&mut st);
+        settle_until(&mut st, "the fresh read lands", |st| st.settings.form().editor() == Some("zed --wait"));
+        assert_eq!(crate::theme::appearance(), Appearance::Light, "the TUI follows the file");
+
+        // Edit config.yaml from Settings: on the editor's return the page
+        // reads it again (the run loop's `load_settings(true)`).
+        st.settings_store.lock().unwrap().config.as_mut().unwrap().theme = ThemePreference::Dark;
+        st.load_settings(true);
+        settle_until(&mut st, "the read after the editor lands", |st| st.settings.form().theme() == ThemePreference::Dark);
+        assert_eq!(crate::theme::appearance(), Appearance::Dark);
+
+        // A file that doesn't read: the controls go, the file stays as it was.
+        st.settings_store.lock().unwrap().config = Err("mapping values are not allowed here".into());
+        st.load_settings(true);
+        settle_until(&mut st, "the failed read lands", |st| st.settings.form().unreadable().is_some());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let text = screen_text(&term);
+        assert!(text.contains("config.yaml doesn't read: mapping values"), "{text}");
+        assert!(!text.contains("Auto   Dark   Light"), "no theme control over a broken file:\n{text}");
+        assert_eq!(crate::theme::appearance(), Appearance::Dark, "the look stays");
+        crate::theme::uninstall_for_test();
+    }
+
+    #[test]
+    fn the_editor_command_saves_with_its_arguments_and_clears_to_the_fallback() {
+        let mut st = settings_state();
+        on_general_page(&mut st);
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        for c in "code --wait".chars() {
+            press(&mut st, KeyCode::Char(c));
+        }
+        assert_eq!(st.settings_store.lock().unwrap().writes, 0, "no write per keystroke");
+        press(&mut st, KeyCode::Enter);
+        settle_until(&mut st, "the editor's write lands", |st| !st.settings.form().saving());
+        assert_eq!(
+            st.settings_store.lock().unwrap().config.as_ref().unwrap().editor.as_deref(),
+            Some("code --wait")
+        );
+        // Clear the editor setting: the row under the command.
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        settle_until(&mut st, "the clear lands", |st| !st.settings.form().saving());
+        assert_eq!(st.settings_store.lock().unwrap().config.as_ref().unwrap().editor, None);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("vim (the default)"), "{}", screen_text(&term));
     }
 
     #[test]

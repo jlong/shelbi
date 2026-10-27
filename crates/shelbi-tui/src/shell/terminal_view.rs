@@ -62,6 +62,15 @@ impl TerminalPane {
         }
     }
 
+    /// A pane with no session behind it, showing `bytes` fed to a fresh
+    /// `size` emulator (Settings ▸ Terminal's preview): drawn by the same
+    /// [`TerminalPane::render`] as a live session.
+    pub(crate) fn canned(size: Size, bytes: &[u8]) -> Self {
+        let mut pane = Self::new(size);
+        pane.view.feed(bytes);
+        pane
+    }
+
     /// The session's current grid size (what the PTY is locked to). Used by
     /// tests to assert the pane reflowed to a requested viewport size.
     #[cfg(test)]
@@ -367,6 +376,18 @@ fn dist2(r: u8, g: u8, b: u8, r2: u8, g2: u8, b2: u8) -> u32 {
         (x * x) as u32
     };
     d(r, r2) + d(g, g2) + d(b, b2)
+}
+
+/// The sixteen ANSI colors as a session's cells draw them (regular 0 to 7,
+/// then bright 8 to 15): the host terminal's own palette. Settings ▸
+/// Terminal paints its swatches with these.
+pub(crate) fn ansi_swatches() -> [RatColor; 16] {
+    use NamedColor::*;
+    [
+        Black, Red, Green, Yellow, Blue, Magenta, Cyan, White,
+        BrightBlack, BrightRed, BrightGreen, BrightYellow, BrightBlue, BrightMagenta, BrightCyan, BrightWhite,
+    ]
+    .map(named_to_rat)
 }
 
 fn named_to_rat(n: NamedColor) -> RatColor {

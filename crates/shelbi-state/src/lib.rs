@@ -172,9 +172,9 @@ pub use ssh_control::{
     TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_SPAN,
 };
 pub use user_config::{
-    editor_display_name, load_user_config, resolve_editor, save_user_config,
+    editor_display_name, load_user_config, resolve_editor, resolve_editor_source, save_user_config,
     scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, DesktopConfig,
-    DesktopNotifications, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
+    DesktopNotifications, EditorSource, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };
 pub use workflows::{

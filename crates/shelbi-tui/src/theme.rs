@@ -1,17 +1,21 @@
 //! The TUI's colors: the shared tokens ([`shelbi_app::theme`]) as ratatui
 //! colors.
 //!
-//! The theme is chosen once at startup from `~/.shelbi/config.yaml::theme`
-//! ([`install_from_config`]); every surface reads it through [`palette`]
-//! (`palette().gray`, `palette().selection`, ...), never a color literal.
-//! `auto` is dark here, because a terminal doesn't report its appearance.
+//! The theme is chosen at startup from `~/.shelbi/config.yaml::theme`
+//! ([`install_from_config`]) and changes live when Settings ▸ General saves a
+//! new one ([`install`] again); every surface reads it through [`palette`]
+//! (`palette().gray`, `palette().selection`, ...) as it draws, never a color
+//! literal or a color kept from an earlier frame, so the next frame paints
+//! everything in the new theme. `auto` is dark here, because a terminal
+//! doesn't report its appearance.
 //!
 //! A token with a terminal palette slot ([`Swatch::term`]) converts to that
 //! slot (`Color::DarkGray`, `Color::Indexed(236)`), so the dark theme paints
 //! exactly what the TUI always has and follows the user's terminal colors.
 
 use std::cell::Cell;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use ratatui::style::Color;
@@ -56,21 +60,41 @@ static LIGHT_TOKENS: LazyLock<Theme> = LazyLock::new(Theme::light);
 static DARK: LazyLock<Palette> = LazyLock::new(|| DARK_TOKENS.map(to_color));
 static LIGHT: LazyLock<Palette> = LazyLock::new(|| LIGHT_TOKENS.map(to_color));
 
-/// The appearance chosen at startup. Unset (tests, or before startup) is dark.
-static INSTALLED: OnceLock<Appearance> = OnceLock::new();
+/// The appearance in effect: [`DARK_SET`] or [`LIGHT_SET`]; unset (tests, or
+/// before startup) is dark.
+static INSTALLED: AtomicU8 = AtomicU8::new(UNSET);
+const UNSET: u8 = 0;
+#[cfg_attr(test, allow(dead_code))]
+const DARK_SET: u8 = 1;
+const LIGHT_SET: u8 = 2;
 
 thread_local! {
     /// A per-thread override, so a test can render one surface in light
     /// without touching the process-wide choice other tests read.
     static OVERRIDE: Cell<Option<Appearance>> = const { Cell::new(None) };
+    /// What [`install`] chose, in a test: per thread, so one test's theme
+    /// change doesn't repaint another's.
+    #[cfg(test)]
+    static TEST_INSTALLED: Cell<Option<Appearance>> = const { Cell::new(None) };
 }
 
-/// Choose the theme for this process from a `theme:` setting. The first call
-/// wins; later calls are ignored (the TUI picks its theme once, at startup).
+/// Choose the theme from a `theme:` setting, for every surface from the next
+/// frame on (at startup, and again when Settings saves a new one). Returns
+/// the appearance it resolved to.
 pub fn install(pref: ThemePreference) -> Appearance {
     // A terminal can't report its appearance, so `auto` resolves to dark.
     let appearance = Theme::for_preference(pref, None).appearance;
-    *INSTALLED.get_or_init(|| appearance)
+    #[cfg(test)]
+    TEST_INSTALLED.with(|t| t.set(Some(appearance)));
+    #[cfg(not(test))]
+    INSTALLED.store(
+        match appearance {
+            Appearance::Dark => DARK_SET,
+            Appearance::Light => LIGHT_SET,
+        },
+        Ordering::Relaxed,
+    );
+    appearance
 }
 
 /// [`install`] from `~/.shelbi/config.yaml::theme`. A missing or unreadable
@@ -82,11 +106,26 @@ pub fn install_from_config() -> Appearance {
     install(pref)
 }
 
-fn appearance() -> Appearance {
-    OVERRIDE
-        .with(Cell::get)
-        .or_else(|| INSTALLED.get().copied())
-        .unwrap_or(Appearance::Dark)
+/// The appearance every surface draws in now.
+pub fn appearance() -> Appearance {
+    if let Some(a) = OVERRIDE.with(Cell::get) {
+        return a;
+    }
+    #[cfg(test)]
+    if let Some(a) = TEST_INSTALLED.with(Cell::get) {
+        return a;
+    }
+    match INSTALLED.load(Ordering::Relaxed) {
+        LIGHT_SET => Appearance::Light,
+        _ => Appearance::Dark,
+    }
+}
+
+/// Forget this thread's [`install`] (a test that installed a theme puts the
+/// default back).
+#[cfg(test)]
+pub(crate) fn uninstall_for_test() {
+    TEST_INSTALLED.with(|t| t.set(None));
 }
 
 /// The resolved theme's colors.
@@ -324,6 +363,17 @@ mod tests {
             assert!(other);
         });
         assert_eq!(palette(), &*DARK, "override restored");
+    }
+
+    #[test]
+    fn install_switches_the_palette_and_auto_is_dark() {
+        assert_eq!(install(ThemePreference::Light), Appearance::Light);
+        assert_eq!(palette(), &*LIGHT, "the next draw paints light");
+        assert_eq!(install(ThemePreference::Auto), Appearance::Dark, "a terminal can't report its appearance");
+        assert_eq!(palette(), &*DARK);
+        install(ThemePreference::Light);
+        assert_eq!(install(ThemePreference::Dark), Appearance::Dark, "not first-call-wins any more");
+        uninstall_for_test();
     }
 
     #[test]
