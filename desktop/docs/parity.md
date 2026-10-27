@@ -90,12 +90,12 @@ paths on every `cargo test`.
   bare "Switch Project" opens each client's switcher (the TUI's palette
   Projects column, the desktop's sidebar switcher).
 - **The sidebar** (`dt-figma-sidebar`): the desktop draws Figma's
-  Navigation component over the same rows (`SidebarModel::rows`, regrouped by
-  `views/sidebar.rs` `layout`): the review sections above Workspaces (the TUI
-  keeps Workspaces first), each section collapsible (remembered per project
+  Navigation component over the same rows (`SidebarModel::rows`, laid out by
+  `views/sidebar.rs` `layout` in the shared order: Workspaces, then the review
+  sections, as in the TUI), each section collapsible (remembered per project
   in `desktop-view.json`), the Activity view labeled "Changelog" (the TUI and
   the shared model keep "Activity"), fixed chords (⌘O Orchestrator, ⌘I Issues,
-  ⌘L Changelog, ⌘1 to ⌘9 the reviews then the working workspaces, each
+  ⌘L Changelog, ⌘1 to ⌘9 the working workspaces then the reviews, each
   hinted on its row and taken even from a focused terminal), a review's
   tracker number on its second line, the version line only on a mismatch (it
   is otherwise in the Settings button's tooltip), and a clickable Zen pill
@@ -230,8 +230,8 @@ equivalent datum.
 |---|---|---|
 | `project_label` | sidebar header title (`shell/sidebar.rs` `render_header`) | sidebar header title (`views/sidebar.rs` `render_header`); window title, and so the Window menu's list (`app.rs` `set_window_title`, at window build and on every switch); "Quit X?" prompt (`app.rs` `confirm_quit_project`); notification bodies (`notify.rs` `observe_sidebar`, `observe_orchestrator`) |
 | `nav` | nav block rows, glyph picked from the label (`shell/sidebar.rs` `render_nav`, `nav_glyph`); palette view entries | nav rows, Heroicon picked from the view, with their ⌘O / ⌘I / ⌘L hints (`views/sidebar.rs` `render_nav_row`, `nav_icon`); palette view entries; Go menu with the same chords (`menus/tree.rs`) |
-| `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows, below the review sections, collapsible (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) |
-| `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for review sections with their count badges, collapsible, above Workspaces (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) |
+| `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows, above the review sections, collapsible (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) |
+| `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for review sections with their count badges, collapsible, below Workspaces (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) |
 | `config_error` | red wrapped `! message` row under Workspaces (`shell/sidebar.rs` `render_row`, `config_error_lines`) | red `! message` row under Workspaces (`views/sidebar.rs` `render_row`); also gates review-closed reconcile (`app.rs` `update_review_row`) |
 | `board_loading` | italic "Loading…" placeholder row (`shell/sidebar.rs` `render_row`) | italic "Loading…" placeholder row (`views/sidebar.rs` `render_row`); also suppresses notifications on a cold skeleton (`notify.rs` `observe_sidebar`) and the review-closed reconcile (`app.rs` `update_review_row`) |
 | `collapsed_machines` | machine group `▸`/`▾` glyph, `(N, M active)` suffix, hidden rows (via `rows()`, `shell/sidebar.rs` `render_row`); toggled in `shell/mod.rs` | same glyph, suffix and hidden rows (via `rows()`, `views/sidebar.rs` `row_text`); toggled in `app.rs` |

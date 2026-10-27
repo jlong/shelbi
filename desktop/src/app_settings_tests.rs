@@ -199,8 +199,8 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
     s.key("cmd-1");
     let mut calls = Vec::new();
     commands::dispatch_command(
-        &CommandKind::LoadReview {
-            task_id: "t-1".into(),
+        &CommandKind::FocusWorkspace {
+            workspace: "alpha-1".into(),
         },
         &mut calls,
     );

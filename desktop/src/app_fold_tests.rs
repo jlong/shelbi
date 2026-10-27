@@ -4,8 +4,8 @@
 //! it is, Reduce Motion and a restore land at once, and the keys, chords
 //! and selection follow what is collapsed, not what is still drawn.
 //!
-//! The window is the smoke test's headless one ([`Harness`]: the queued
-//! review `T-9` is ⌘1, the working workspace `alpha-1` ⌘2) with an injected
+//! The window is the smoke test's headless one ([`Harness`]: the working
+//! workspace `alpha-1` is ⌘1, the queued review `T-9` ⌘2) with an injected
 //! clock and Reduce Motion setting.
 
 use std::cell::Cell;
@@ -21,6 +21,8 @@ use crate::theme::fold::FOLD;
 
 const QUEUED: &str = "sidebar-section-Queued for Review";
 const QUEUED_BODY: &str = "sidebar-body-queued";
+const WORKSPACES: &str = "sidebar-section-Workspaces";
+const WORKSPACES_BODY: &str = "sidebar-body-workspaces";
 
 struct Fold {
     h: Harness,
@@ -87,28 +89,28 @@ impl Fold {
 #[gpui::test]
 fn a_section_folds_closed_and_the_rows_below_glide_up(cx: &mut TestAppContext) {
     let mut f = Fold::open(cx);
-    let full = f.height(QUEUED_BODY);
+    let full = f.height(WORKSPACES_BODY);
     assert!(full > 20.0, "the open body has its rows' height: {full}");
-    let ws_open = f.top("sidebar-section-Workspaces");
+    let q_open = f.top(QUEUED);
 
-    f.click(QUEUED);
+    f.click(WORKSPACES);
     assert!(f.animating(), "the fold runs");
-    assert!(f.bounds("sidebar-review-T-9").is_some(), "its rows are drawn while it closes");
-    assert!((f.height(QUEUED_BODY) - full).abs() < 0.5, "it starts at its full height");
+    assert!(f.bounds("sidebar-ws-alpha-1").is_some(), "its rows are drawn while it closes");
+    assert!((f.height(WORKSPACES_BODY) - full).abs() < 0.5, "it starts at its full height");
 
     f.advance(Duration::from_millis(50));
-    let mid = f.height(QUEUED_BODY);
+    let mid = f.height(WORKSPACES_BODY);
     assert!(mid > 0.0 && mid < full - 1.0, "part-way: {mid} of {full}");
-    let ws_mid = f.top("sidebar-section-Workspaces");
-    assert!(ws_mid < ws_open, "the next section glides up: {ws_mid} vs {ws_open}");
+    let q_mid = f.top(QUEUED);
+    assert!(q_mid < q_open, "the next section glides up: {q_mid} vs {q_open}");
 
     f.advance(FOLD);
     assert!(!f.animating(), "settled");
-    assert!(f.bounds("sidebar-review-T-9").is_none(), "closed: its rows are gone");
-    assert!(f.bounds(QUEUED).is_some(), "the header stays");
-    let ws_closed = f.top("sidebar-section-Workspaces");
-    assert!((ws_open - ws_closed - full).abs() < 0.5, "it moved up by the body's height");
-    assert!(ws_closed < ws_mid);
+    assert!(f.bounds("sidebar-ws-alpha-1").is_none(), "closed: its rows are gone");
+    assert!(f.bounds(WORKSPACES).is_some(), "the header stays");
+    let q_closed = f.top(QUEUED);
+    assert!((q_open - q_closed - full).abs() < 0.5, "it moved up by the body's height");
+    assert!(q_closed < q_mid);
 }
 
 #[gpui::test]
@@ -191,38 +193,38 @@ fn a_restore_lands_without_a_fold(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_keys_skip_a_closing_sections_rows(cx: &mut TestAppContext) {
     let mut f = Fold::open(cx);
-    // Activity's row, the last nav row, just above the queued review.
+    // Activity's row, the last nav row, just above the workspace.
     f.update(|w, cx| {
         let row = w.target_at(2).unwrap();
         w.select_row(row, cx);
         cx.notify();
     });
-    f.click(QUEUED);
+    f.click(WORKSPACES);
     assert!(f.animating());
     f.update(|w, cx| w.step_selection(true, cx));
     assert_eq!(
         f.selected(),
-        Some(SidebarTarget::Workspace("alpha-1".into())),
-        "Down skips the review folding away"
+        Some(SidebarTarget::Review("T-9".into())),
+        "Down skips the workspace folding away"
     );
     f.update(|w, cx| w.step_selection(false, cx));
     assert_eq!(f.selected(), Some(SidebarTarget::View(View::Activity)), "and so does Up");
 
     // A click on a row folding away does nothing.
     f.h.take_calls();
-    f.click("sidebar-review-T-9");
+    f.click("sidebar-ws-alpha-1");
     assert!(f.h.take_calls().is_empty(), "a closing row isn't clickable");
 
     // The chords keep their rows mid-fold.
-    f.h.key("cmd-2");
-    assert!(
-        f.h.take_calls().contains(&HostCall::ShowView(View::Session("alpha-1".into()))),
-        "⌘2 is still alpha-1"
-    );
     f.h.key("cmd-1");
     assert!(
+        f.h.take_calls().contains(&HostCall::ShowView(View::Session("alpha-1".into()))),
+        "⌘1 is still alpha-1"
+    );
+    f.h.key("cmd-2");
+    assert!(
         f.h.take_calls().contains(&HostCall::LoadReview("T-9".into())),
-        "⌘1 is still the review"
+        "⌘2 is still the review"
     );
 }
 
@@ -233,16 +235,16 @@ fn the_selection_rides_with_its_row_through_a_fold(cx: &mut TestAppContext) {
     f.h.take_calls();
     f.advance(Duration::from_secs(1));
     let before = f.top("sidebar-selection");
-    let row = f.top("sidebar-ws-alpha-1");
-    f.click(QUEUED);
+    let row = f.top("sidebar-review-T-9");
+    f.click(WORKSPACES);
     f.advance(Duration::from_millis(50));
-    assert_eq!(f.selected(), Some(SidebarTarget::Workspace("alpha-1".into())));
+    assert_eq!(f.selected(), Some(SidebarTarget::Review("T-9".into())));
     assert!(f.bounds("sliding-chip").is_none(), "the chip stays on its row, not sliding");
     let mid = f.top("sidebar-selection");
     assert!(mid < before, "it moves up with its row");
-    assert!((mid - f.top("sidebar-ws-alpha-1") - (before - row)).abs() < 0.5);
+    assert!((mid - f.top("sidebar-review-T-9") - (before - row)).abs() < 0.5);
     f.advance(FOLD);
-    assert!((f.top("sidebar-selection") - f.top("sidebar-ws-alpha-1") - (before - row)).abs() < 0.5);
+    assert!((f.top("sidebar-selection") - f.top("sidebar-review-T-9") - (before - row)).abs() < 0.5);
 }
 
 #[gpui::test]
@@ -309,7 +311,9 @@ fn a_machine_group_folds_too(cx: &mut TestAppContext) {
     let mid = f.height(body);
     assert!(mid > 0.0 && mid < full, "part-way: {mid} of {full}");
     // A collapsed group's rows take no chord (they aren't in the shared
-    // rows), from the fold's first frame: ⌘3 would have been box-1.
+    // rows), from the fold's first frame: box-1's ⌘2 passes to the review.
+    f.h.key("cmd-2");
+    assert!(f.h.take_calls().contains(&HostCall::LoadReview("T-9".into())));
     f.h.key("cmd-3");
     assert!(f.h.take_calls().is_empty());
     f.advance(FOLD);
