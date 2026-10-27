@@ -65,6 +65,8 @@
 //! 03 (`add-project-writing-config`, `-creating-agents`,
 //! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
 //! `SHELBI_VISUAL_ONLY=add-project` renders just those.
+//! `cli-check`, `cli-install` and `cli-ready-<theme>.png` are the first
+//! launch's CLI setup screens before them; `SHELBI_VISUAL_ONLY=cli-setup`.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the issue detail.
@@ -1936,6 +1938,69 @@ impl Run {
         self.cx.update(crate::theme::motion::sync_reduce_motion);
     }
 
+    /// The first launch's CLI setup (`dt-wizard-cli-setup`) in the wizard's
+    /// 800 × 580, over scripted bootstrap states (nothing runs): `cli-
+    /// check` (looking for the CLI, Figma 2478:8507), `cli-install` (an
+    /// install's checks, 2480:8522), `cli-ready` (2480:8577), and `cli-
+    /// failed` (an offline install; no frame).
+    /// `SHELBI_VISUAL_ONLY=cli-setup` renders just these.
+    fn cli_setup_windows(&mut self) {
+        use crate::platform::install::Step;
+        use crate::platform::{BootstrapEvent, BootstrapState};
+        use crate::views::add_project::SIZE;
+        use crate::views::cli_setup::{CliSetupView, Deps};
+
+        let screens: [(&str, Vec<BootstrapState>); 4] = [
+            ("cli-check", vec![BootstrapState::FindingCli]),
+            (
+                "cli-install",
+                vec![
+                    BootstrapState::InstallingCli { step: Step::Installing },
+                    BootstrapState::FindingCli,
+                ],
+            ),
+            ("cli-ready", vec![BootstrapState::Ready(crate::app::inert_ready())]),
+            // No frame: the offline install's failure screen, for a look.
+            (
+                "cli-failed",
+                vec![BootstrapState::Failed(crate::platform::Failure::InstallFailed(
+                    crate::platform::install::InstallError::new(
+                        crate::platform::install::InstallErrorKind::Network,
+                        "The CLI couldn't be downloaded from GitHub.",
+                    )
+                    .with_detail([
+                        "https://github.com/jlong/shelbi/releases/download/v0.11.0/checksums.txt".to_string(),
+                        "curl: (6) Could not resolve host: github.com".to_string(),
+                    ]),
+                ))],
+            ),
+        ];
+        for (screen, states) in screens {
+            let deps = Deps {
+                start: Rc::new(move |_| {
+                    let (tx, rx) = async_channel::unbounded();
+                    for state in states.clone() {
+                        let _ = tx.send_blocking(BootstrapEvent::State(state));
+                    }
+                    rx
+                }),
+                plan: Arc::new(Vec::new),
+                next: Rc::new(|_, _, _| {}),
+                dwell: Duration::from_secs(3600),
+            };
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| CliSetupView::new(deps, window, cx))
+                })
+                .expect("open the offscreen window");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
     /// Run and draw a window that isn't the shell a few times over.
     fn settle_sheet(&mut self, window: AnyWindowHandle) {
         for _ in 0..5 {
@@ -2167,6 +2232,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "cli-setup") {
+            self.cli_setup_windows();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
             self.components();
             self.review_confirm_states(&orch);
@@ -2261,6 +2331,7 @@ impl Run {
         self.review_confirm_states(&orch);
         self.about_windows();
         self.add_project_windows();
+        self.cli_setup_windows();
 
         let missing: Vec<&str> = SCREENS
             .iter()

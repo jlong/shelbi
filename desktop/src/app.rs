@@ -205,6 +205,34 @@ impl Shell {
     }
 }
 
+/// The app's attached-client id (a fresh one before the shell exists).
+pub fn client_id(cx: &App) -> String {
+    cx.try_global::<Shell>()
+        .map(|s| s.client_id.clone())
+        .unwrap_or_else(shelbi_client::fresh_client_id)
+}
+
+/// Bootstrap reached Shelbi outside a project window (the first launch's
+/// setup): windows opened from now on reuse it instead of bootstrapping.
+pub fn share_ready(ready: Ready, cx: &mut App) {
+    if cx.has_global::<Shell>() {
+        cx.global_mut::<Shell>().ready = Some(ready);
+    }
+}
+
+/// The CLI the app runs, once bootstrap found it, and whether a terminal
+/// finds it by name (`Ready::on_login_path`).
+pub fn running_cli(cx: &App) -> Option<(std::path::PathBuf, bool)> {
+    let ready = cx.try_global::<Shell>()?.ready.as_ref()?;
+    Some((ready.cli.path.clone(), ready.on_login_path))
+}
+
+/// The shared bootstrap result, once one is (tests).
+#[cfg(test)]
+pub fn shared_ready(cx: &App) -> Option<Ready> {
+    cx.try_global::<Shell>().and_then(|s| s.ready.clone())
+}
+
 /// Open the windows a launch restores (`window_state::launch_plan`).
 pub fn open_launch_windows(plan: Vec<LaunchWindow>, cx: &mut App) {
     for w in plan {
@@ -4601,7 +4629,7 @@ impl ShelbiWindow {
 /// A bootstrap result that points nowhere: the shell renders, and nothing
 /// can reach a real CLI or daemon (the tap stops commands before they would).
 #[cfg(any(test, feature = "visual-check"))]
-fn inert_ready() -> Ready {
+pub(crate) fn inert_ready() -> Ready {
     use crate::platform::control::ControlHandle;
     use crate::platform::discovery::{Candidate, CliSource};
     Ready {
@@ -4611,6 +4639,7 @@ fn inert_ready() -> Ready {
         },
         cli_version: None,
         env: Arc::new(Default::default()),
+        on_login_path: true,
         control: ControlHandle::new(
             "/nonexistent/control.sock".into(),
             APP_VERSION.into(),

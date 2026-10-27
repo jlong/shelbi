@@ -14,6 +14,7 @@ use gpui::{
 use super::sidebar;
 use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
+use crate::platform::install::{InstallError, InstallErrorKind};
 use crate::platform::version::{ProtocolCheck, VersionCheck};
 use crate::platform::{BootstrapState, Failure, RelaunchNotice};
 use crate::theme::style::{self, ButtonKind, ButtonSize};
@@ -95,6 +96,7 @@ pub struct Screen {
 pub fn failure_screen(failure: &Failure) -> Screen {
     match failure {
         Failure::CliNotFound(nf) => cli_not_found(nf),
+        Failure::InstallFailed(e) => install_failed(e),
         Failure::DaemonFailedToStart { cli, failure } => {
             let mut body = vec![failure.reason.clone()];
             body.push(format!("The app ran `{} daemon`.", cli.display()));
@@ -191,6 +193,46 @@ fn cli_not_found(nf: &CliNotFound) -> Screen {
                 .map(|p| p.display().to_string())
                 .collect(),
         )),
+        action: ScreenAction::Retry,
+    }
+}
+
+/// No CLI was found and the app's install of one failed: what broke, and
+/// the ways forward (try again, or install it another way).
+fn install_failed(e: &InstallError) -> Screen {
+    use InstallErrorKind as K;
+    let title = match e.kind {
+        K::Network => "The shelbi CLI couldn't be downloaded",
+        K::NotPublished => "This version of Shelbi has no CLI download",
+        K::Integrity => "The shelbi CLI download didn't verify",
+        K::Unwritable => "Shelbi can't install the CLI",
+        K::Unsupported => "There's no shelbi CLI for this Mac",
+        K::Busy => "The shelbi CLI is already being installed",
+        K::InvalidPackage | K::PostInstallCheck | K::Failed => "The shelbi CLI didn't install",
+    };
+    let mut fix = vec![FixStep::say(match e.kind {
+        K::Network => "Check your internet connection, then try again.",
+        K::NotPublished => {
+            "A development build has no published CLI: point the app at one you built (below)."
+        }
+        K::Unwritable => {
+            "Make sure ~/bin and ~/share/shelbi are folders you can write to, then try again."
+        }
+        K::Busy => "Wait for it to finish, then try again.",
+        K::Integrity | K::InvalidPackage | K::PostInstallCheck | K::Failed | K::Unsupported => {
+            "Try again. Anything already installed was left as it was."
+        }
+    })];
+    fix.push(FixStep::run("Or install it with Homebrew:", INSTALL_COMMAND));
+    fix.push(FixStep::run(
+        format!("Or tell the app where shelbi is, in {}:", config_path_label()),
+        "desktop:\n  cli_path: /path/to/shelbi",
+    ));
+    Screen {
+        title: title.into(),
+        body: vec![e.message.clone()],
+        fix,
+        details: (!e.detail.is_empty()).then(|| ("Details:".to_string(), e.detail.clone())),
         action: ScreenAction::Retry,
     }
 }

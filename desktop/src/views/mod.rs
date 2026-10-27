@@ -42,6 +42,8 @@
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
+//! - the first launch's CLI check, install, and Ready before the Add Project
+//!   wizard: **`dt-wizard-cli-setup`** (`cli_setup`)
 //! - the new-release notice: **`dt-packaging`** (`update`)
 //! - About Shelbi and the Acknowledgements window it opens:
 //!   **`dt-about-bundled-software`** (`about`, `bundled_software`, over
@@ -65,6 +67,7 @@ pub mod board_list;
 pub mod board_scroll;
 pub mod bootstrap;
 pub mod bundled_software;
+pub mod cli_setup;
 pub mod board_state;
 pub mod chat;
 pub mod column_swap;

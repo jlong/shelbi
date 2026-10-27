@@ -56,7 +56,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Div, Entity, FocusHandle, Focusable, Global, Hsla,
+    div, prelude::*, px, AnyElement, AnyWindowHandle, App, Context, Div, Entity, FocusHandle, Focusable, Global, Hsla,
     PathPromptOptions, SharedString, Stateful, Subscription, Window, WindowHandle,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -173,9 +173,10 @@ impl ScaffoldReporter for Forward {
 /// new window opens on it), or say why it couldn't.
 pub type OnCreated = Rc<dyn Fn(&str, Option<WindowHandle<ShelbiWindow>>, &mut App) -> Result<(), String>>;
 
-/// The open wizard, so asking again brings it to the front.
+/// The open wizard (or the first launch's setup window it follows), so
+/// asking again brings it to the front.
 #[derive(Default)]
-struct OpenWizard(Option<WindowHandle<AddProjectView>>);
+struct OpenWizard(Option<AnyWindowHandle>);
 
 impl Global for OpenWizard {}
 
@@ -188,7 +189,7 @@ pub fn show(origin: Origin, from: Option<WindowHandle<ShelbiWindow>>, cx: &mut A
         }
     }
     let cwd = launch_dir();
-    let opened = cx.open_window(super::about::options("Add Project", SIZE, false, cx), |window, cx| {
+    let window = cx.open_window(super::about::options("Add Project", SIZE, false, cx), |window, cx| {
         cx.new(|cx| {
             AddProjectView::new(
                 origin,
@@ -201,13 +202,38 @@ pub fn show(origin: Origin, from: Option<WindowHandle<ShelbiWindow>>, cx: &mut A
             )
         })
     });
-    match opened {
+    match window {
         Ok(handle) => {
-            cx.set_global(OpenWizard(Some(handle)));
+            opened(handle.into(), cx);
             cx.activate(true);
         }
         Err(e) => tracing::error!(error = %e, "could not open Add Project"),
     }
+}
+
+/// `window` is the wizard's (or the setup window the wizard follows):
+/// asking for Add Project brings it to the front.
+pub fn opened(window: AnyWindowHandle, cx: &mut App) {
+    cx.set_global(OpenWizard(Some(window)));
+}
+
+/// Make `window` (the first launch's setup window, `cli_setup`) the wizard,
+/// on screen 01: the same window, its root replaced.
+pub fn replace_root(window: &mut Window, cx: &mut App) {
+    let cwd = launch_dir();
+    window.set_window_title("Add Project");
+    window.replace_root(cx, |window, cx| {
+        AddProjectView::new(
+            Origin::FirstLaunch,
+            None,
+            cwd,
+            Engine::real(cx.try_global::<Catalog>().cloned()),
+            Rc::new(crate::app::open_added_project),
+            window,
+            cx,
+        )
+    });
+    opened(window.window_handle(), cx);
 }
 
 /// What a typed relative path resolves against: the working directory, or
