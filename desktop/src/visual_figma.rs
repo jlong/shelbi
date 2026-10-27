@@ -50,7 +50,8 @@
 //! keyboard's focus ring, a hot handle, an action row dragged and its
 //! handle focused, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
-//! narrowed), and the form components' sheets
+//! narrowed; `state-issues-workspace-open` / `-workflow-open`: a filter
+//! chip's menu open), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs;
 //! `button-sizes` has none: each Button size with each content mix, pixel
 //! checked). `SHELBI_VISUAL_ONLY=buttons` renders just the components and
@@ -2380,6 +2381,29 @@ impl Run {
             });
         }
         self.capture(handle, "issues");
+
+        // Each filter chip with its menu open: the chip in the Select style
+        // whether or not its filter is set (Workspace: unset; Workflow: set).
+        for (screen, workspace) in [("state-issues-workspace-open", true), ("state-issues-workflow-open", false)] {
+            if let (Some(board), _, _) = self.views(handle) {
+                board.update(&mut self.cx, |v, cx| {
+                    let state = v.state_mut();
+                    if workspace {
+                        state.open_workspace_dropdown();
+                    } else {
+                        state.open_workflow_dropdown();
+                    }
+                    cx.notify();
+                });
+            }
+            self.capture(handle, screen);
+            if let (Some(board), _, _) = self.views(handle) {
+                board.update(&mut self.cx, |v, cx| {
+                    v.state_mut().mode = crate::views::board_state::Mode::Board;
+                    cx.notify();
+                });
+            }
+        }
 
         // `/`, then a query: the search narrows the cards as it is typed.
         self.cx.simulate_keystrokes(handle.into(), "/ t e r m i n a l");
