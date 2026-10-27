@@ -1,5 +1,6 @@
-//! The overlay layer: the command palette and the five dialogs (error log,
-//! review load, reject reason, Zen intro, add project).
+//! The overlay layer: the command palette and the four dialogs (error log,
+//! review load, reject reason, Zen intro). Add Project is its own window
+//! (`views::add_project`).
 //!
 //! One overlay is open at a time, held by the window as an [`ActiveOverlay`]
 //! and mirrored into its `ClientState` as a `shelbi_app::nav::Overlay`. Each
@@ -13,7 +14,6 @@
 //! window). [`render_layer`] draws the open overlay over a dimmed backdrop;
 //! the per-overlay views live beside this file and in `views::palette`.
 
-pub mod add_project;
 pub mod error_log;
 pub mod review_confirm;
 pub mod review_reject;
@@ -21,13 +21,11 @@ pub mod zen_intro;
 
 use gpui::{div, prelude::*, px, AnyElement, Context, Hsla, MouseButton, ScrollHandle, Window};
 use shelbi_app::nav;
-use shelbi_app::overlay::add_project::{self as form, Form};
 use shelbi_app::overlay::error_log::{ErrorLogOutcome, Viewer};
 use shelbi_app::overlay::palette::{Palette, PaletteStep, ProjectEntry};
 use shelbi_app::overlay::review_confirm::{self as confirm, Dialog, Slot};
 use shelbi_app::overlay::review_reject::{self as reject, RejectPrompt};
 use shelbi_app::overlay::zen_intro::{self as zen, IntroOutcome, IntroState};
-use shelbi_core::ConfigMode;
 use shelbi_palette::Entry;
 use shelbi_state::keymap::{Key, KeyChord, Keymaps};
 
@@ -56,12 +54,6 @@ pub enum OverlayEvent {
         confirmed: bool,
         dont_show_again: bool,
     },
-    /// The add-project form submitted; the window validates and scaffolds.
-    AddProjectSubmit {
-        name: String,
-        root: String,
-        mode: ConfigMode,
-    },
     /// The error log's `c`: clear the project's on-disk log.
     ClearErrors { project: String },
     /// Put this text on the clipboard (the error log's copy).
@@ -86,8 +78,6 @@ pub enum ActiveOverlay {
         prompt: RejectPrompt,
     },
     ZenIntro { project: String, state: IntroState },
-    /// `busy` while a submit is validating and scaffolding.
-    AddProject { form: Form, busy: bool },
 }
 
 impl ActiveOverlay {
@@ -141,13 +131,6 @@ impl ActiveOverlay {
         }
     }
 
-    pub fn add_project(cwd: &std::path::Path) -> Self {
-        ActiveOverlay::AddProject {
-            form: Form::new(cwd),
-            busy: false,
-        }
-    }
-
     /// The navigation model's name for this overlay.
     pub fn nav(&self) -> nav::Overlay {
         match self {
@@ -160,7 +143,6 @@ impl ActiveOverlay {
                 task_id: task_id.clone(),
             },
             ActiveOverlay::ZenIntro { .. } => nav::Overlay::ZenIntro,
-            ActiveOverlay::AddProject { .. } => nav::Overlay::AddProject,
         }
     }
 
@@ -224,20 +206,6 @@ impl ActiveOverlay {
             ActiveOverlay::ZenIntro { project, state } => {
                 let outcome = zen::step_intro(state, chord);
                 zen_event(project, state, outcome)
-            }
-            ActiveOverlay::AddProject { form, busy } => {
-                if *busy {
-                    return OverlayEvent::Stay;
-                }
-                match form.handle_key(chord) {
-                    form::Step::Continue => OverlayEvent::Stay,
-                    form::Step::Cancel => OverlayEvent::Close,
-                    form::Step::Submit => OverlayEvent::AddProjectSubmit {
-                        name: form.name().to_string(),
-                        root: form.root().to_string(),
-                        mode: form.mode(),
-                    },
-                }
             }
         }
     }
@@ -364,9 +332,6 @@ pub fn render_layer<H: OverlayHost>(
             (review_reject::render(prompt, theme, cx), false)
         }
         ActiveOverlay::ZenIntro { state, .. } => (zen_intro::render(state, theme, cx), false),
-        ActiveOverlay::AddProject { form, busy } => {
-            (add_project::render(form, *busy, size, theme, cx), false)
-        }
     };
     let closes = overlay.closes_on_backdrop();
     let phase = entering.unwrap_or(1.0);
@@ -637,25 +602,6 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn the_add_project_form_submits_its_values_and_holds_while_busy() {
-        let mut o = ActiveOverlay::add_project(std::path::Path::new("/tmp/web"));
-        assert_eq!(o.nav(), nav::Overlay::AddProject);
-        typed(&mut o, "Web");
-        assert_eq!(
-            o.handle_key(chord("enter"), &keymaps()),
-            OverlayEvent::AddProjectSubmit {
-                name: "Web".into(),
-                root: "/tmp/web".into(),
-                mode: ConfigMode::Global
-            }
-        );
-        if let ActiveOverlay::AddProject { busy, .. } = &mut o {
-            *busy = true;
-        }
-        assert_eq!(o.handle_key(chord("esc"), &keymaps()), OverlayEvent::Stay);
-    }
 }
 
 /// The overlays rendered in a gpui test window.
@@ -898,10 +844,6 @@ mod render_tests {
             (
                 ActiveOverlay::zen_intro("alpha"),
                 vec!["zen-intro", "zen-checkbox", "zen-cancel", "zen-enable"],
-            ),
-            (
-                ActiveOverlay::add_project(std::path::Path::new("/tmp/web")),
-                vec!["add-project", "add-project-name", "add-project-root", "add-project-config", "add-project-status"],
             ),
             (ActiveOverlay::error_log("alpha"), vec!["error-log", "error-log-copy", "error-log-clear"]),
         ];

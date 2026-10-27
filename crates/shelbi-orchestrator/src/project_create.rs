@@ -225,6 +225,62 @@ pub fn detect_root(cwd: &Path, root: &str) -> shelbi_app::overlay::add_project::
     }
 }
 
+/// The desktop Add Project wizard's folder check for the path field's text
+/// `root` (resolved against `cwd`, `~` expanded) and, after a clash, the
+/// typed `name`: what the folder is (a repo, a worktree, a plain folder),
+/// the project name and id it gives (the folder's own name unless `name` is
+/// given), whether that id is already registered, and where each config mode
+/// would keep its settings. The same checks [`validate_add_project`] runs at
+/// creation, so the wizard can't continue with a folder that would fail them.
+/// Runs git and reads the Shelbi home: keep it off any UI thread.
+pub fn check_folder(
+    cwd: &Path,
+    root: &str,
+    name: Option<&str>,
+) -> shelbi_app::add_project_wizard::FolderCheck {
+    use shelbi_app::add_project_wizard::{FolderCheck, Problem, Repo};
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return FolderCheck::failed(PathBuf::new(), Problem::Empty);
+    }
+    let path = absolutize(cwd, Path::new(trimmed));
+    let repo = match validate_root(&path) {
+        RootValidation::NotExists => return FolderCheck::failed(path, Problem::NotFound),
+        RootValidation::NotDirectory => return FolderCheck::failed(path, Problem::NotDirectory),
+        RootValidation::NotGitRepo => Repo::NotGit,
+        // A worktree's `.git` is a file pointing at the main repo's gitdir.
+        RootValidation::Ok if path.join(".git").is_file() => Repo::Worktree,
+        RootValidation::Ok => Repo::Git,
+    };
+    let name = match name.map(str::trim) {
+        Some(n) => Some(n.to_string()),
+        None => project_name_from_root(&path),
+    };
+    let slug = name
+        .as_deref()
+        .and_then(|n| shelbi_core::normalize_project_name(n.trim()).ok());
+    let problem = match &slug {
+        None => Some(Problem::NoName),
+        Some(slug) => match project_name_collides(slug) {
+            Ok(true) => Some(Problem::Taken { slug: slug.clone() }),
+            Ok(false) => None,
+            Err(e) => Some(Problem::Unreadable(e.to_string())),
+        },
+    };
+    let global_dir = slug
+        .as_deref()
+        .and_then(|s| shelbi_state::projects_dir().ok().map(|d| d.join(s)));
+    FolderCheck {
+        in_repo_dir: path.join(".shelbi"),
+        path,
+        name,
+        slug,
+        repo: Some(repo),
+        problem,
+        global_dir,
+    }
+}
+
 /// Why [`add_project`] didn't create the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddProjectError {
@@ -954,6 +1010,79 @@ mod tests {
             add_project("web", "web", ConfigMode::Global, &home),
             Err(AddProjectError::Invalid(msg)) if msg.contains("already")
         ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn check_folder_reports_the_folder_its_name_and_clashes() {
+        use shelbi_app::add_project_wizard::{Problem, Repo};
+        let _g = lock_env();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let projects = home.join("projects");
+
+        // A repo whose path has spaces; its name keeps its case, its id
+        // slugifies, and outside-the-project settings live under the home.
+        let repo = home.join("My Code/Web App");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let c = check_folder(&home, "My Code/Web App", None);
+        assert_eq!(c.path, repo);
+        assert_eq!(c.repo, Some(Repo::Git));
+        assert_eq!(c.name.as_deref(), Some("Web App"));
+        assert_eq!(c.slug.as_deref(), Some("web-app"));
+        assert_eq!(c.problem, None);
+        assert_eq!(c.in_repo_dir, repo.join(".shelbi"));
+        assert_eq!(c.global_dir, Some(projects.join("web-app")));
+
+        // A worktree, a plain folder (allowed), a file, a missing path.
+        let wt = home.join("wt/alpha");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /tmp/elsewhere\n").unwrap();
+        assert_eq!(check_folder(&home, "wt/alpha", None).repo, Some(Repo::Worktree));
+        let plain = check_folder(&home, "wt", None);
+        assert_eq!((plain.repo, plain.problem), (Some(Repo::NotGit), None));
+        std::fs::write(home.join("file.txt"), "x").unwrap();
+        assert_eq!(check_folder(&home, "file.txt", None).problem, Some(Problem::NotDirectory));
+        assert_eq!(check_folder(&home, "nope", None).problem, Some(Problem::NotFound));
+        assert_eq!(check_folder(&home, "  ", None).problem, Some(Problem::Empty));
+
+        // A registered id clashes, whatever the case or spacing of the name
+        // that slugifies to it; a typed name gets past it.
+        std::fs::write(projects.join("web-app.yaml"), "name: web-app\n").unwrap();
+        assert_eq!(
+            check_folder(&home, "My Code/Web App", None).problem,
+            Some(Problem::Taken { slug: "web-app".into() })
+        );
+        assert_eq!(
+            check_folder(&home, "My Code/Web App", Some("WEB app")).problem,
+            Some(Problem::Taken { slug: "web-app".into() })
+        );
+        let renamed = check_folder(&home, "My Code/Web App", Some("Web App 2"));
+        assert_eq!((renamed.slug.as_deref(), renamed.problem), (Some("web-app-2"), None));
+        assert_eq!(check_folder(&home, "My Code/Web App", Some("!!")).problem, Some(Problem::NoName));
+
+        // Checking wrote nothing.
+        assert!(!repo.join(".shelbi").exists());
+        assert!(!projects.join("web-app-2.yaml").exists());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn the_wizards_request_creates_an_in_repo_project_in_a_worktree() {
+        let _g = lock_env();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let wt = home.join("src/alpha wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /tmp/elsewhere\n").unwrap();
+
+        let c = check_folder(&home, &wt.display().to_string(), None);
+        let (name, root) = (c.name.unwrap(), c.path.display().to_string());
+        assert_eq!(add_project(&name, &root, ConfigMode::InRepo, &home), Ok("alpha-wt".to_string()));
+        assert!(wt.join(IN_REPO_CONFIG_REL).is_file());
+        assert!(shelbi_state::has_project_registration("alpha-wt").unwrap());
 
         std::env::remove_var("SHELBI_HOME");
     }

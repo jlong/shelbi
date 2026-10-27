@@ -45,6 +45,7 @@
 //! asserts the invariant against the resolved dependency tree.
 
 pub mod activity;
+pub mod add_project_wizard;
 pub mod board;
 pub mod changes;
 pub mod command;

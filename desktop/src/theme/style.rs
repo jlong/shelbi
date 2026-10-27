@@ -56,6 +56,9 @@ pub const UI_FAMILY: &str = "Geist";
 /// rather than a size, a line height and a weight apiece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
+    /// `Desktop/Title`: 24 / 32, semibold. A full-window step's title (the
+    /// Add Project wizard).
+    Title,
     /// `Desktop/Heading`: 20 / 28, bold. A page or dialog title.
     Heading,
     /// `Desktop/Base/Regular`: 14 / 18. Body text, nav labels, card titles'
@@ -82,6 +85,7 @@ impl Type {
     /// The font size in points.
     pub fn size(self) -> f32 {
         match self {
+            Type::Title => 24.0,
             Type::Heading => 20.0,
             Type::Base | Type::BaseMedium | Type::BaseSemibold => 14.0,
             Type::Small | Type::SmallMedium => 13.0,
@@ -92,6 +96,7 @@ impl Type {
     /// The line height in points.
     pub fn line_height(self) -> f32 {
         match self {
+            Type::Title => 32.0,
             Type::Heading => 28.0,
             Type::Base | Type::BaseMedium | Type::BaseSemibold | Type::Small | Type::SmallMedium => 18.0,
             Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 16.0,
@@ -102,7 +107,7 @@ impl Type {
         match self {
             Type::Base | Type::Small | Type::XSmall => FontWeight::NORMAL,
             Type::BaseMedium | Type::SmallMedium | Type::XSmallMedium => FontWeight::MEDIUM,
-            Type::BaseSemibold | Type::XSmallSemibold => FontWeight::SEMIBOLD,
+            Type::Title | Type::BaseSemibold | Type::XSmallSemibold => FontWeight::SEMIBOLD,
             Type::Heading => FontWeight::BOLD,
         }
     }

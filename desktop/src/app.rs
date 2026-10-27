@@ -82,6 +82,7 @@ use gpui::{
     SharedString, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowHandle,
     WindowId, WindowOptions,
 };
+use shelbi_app::add_project_wizard::Origin;
 use shelbi_app::command::{EditItem, ProjectItem};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::overlay::error_log::Viewer;
@@ -90,8 +91,6 @@ use shelbi_app::overlay::review_confirm::Slot;
 use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
 use shelbi_app::view::{SidebarModel, SidebarTarget};
 use shelbi_app::{CommandKind, CommandRegistry, EditTarget, Mutation};
-use shelbi_core::ConfigMode;
-use shelbi_orchestrator::project_create::AddProjectError;
 use shelbi_proto::control::DetachSelector;
 use shelbi_state::DesktopNotifications;
 
@@ -267,6 +266,22 @@ pub fn open_new_window(project: &str, cx: &mut App) {
         b
     });
     open_window(project, slot, state, bounds, cx);
+}
+
+/// The Add Project wizard created `slug`: the catalog re-reads, and the
+/// window the wizard was opened from switches to the new project, or (when
+/// there is none, as on the first launch, or it has since closed) a new
+/// window opens on it.
+pub fn open_added_project(slug: String, from: Option<WindowHandle<ShelbiWindow>>, cx: &mut App) {
+    if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
+        catalog.refresh(|| {});
+    }
+    let switched = from.is_some_and(|h| {
+        h.update(cx, |w, window, cx| w.project_added(&slug, window, cx)).is_ok()
+    });
+    if !switched {
+        open_new_window(&slug, cx);
+    }
 }
 
 /// A clicked notification: the window already showing its project comes up
@@ -657,8 +672,6 @@ pub struct ShelbiWindow {
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
     overlay: Option<ActiveOverlay>,
     palette_inputs: PaletteInputs,
-    /// The repo path an add-project detection is running for.
-    detecting: Option<String>,
     /// Bumped on each transient status, so a flash only clears its own.
     flash_generation: u64,
     /// The Workspace view, created the first time a workspace is shown.
@@ -896,7 +909,6 @@ impl ShelbiWindow {
             machines: None,
             overlay: None,
             palette_inputs: PaletteInputs::default(),
-            detecting: None,
             flash_generation: 0,
             workspace: None,
             workspace_return: None,
@@ -1450,7 +1462,6 @@ impl ShelbiWindow {
         self.review_loader = ReviewLoader::default();
         self.overlay = None;
         self.overlay_opened = None;
-        self.detecting = None;
         self.client.close_overlay();
         // Detach the sessions now (the daemon's stay), then drop the views.
         if let Some(chat) = self.chat.take() {
@@ -3199,7 +3210,6 @@ impl ShelbiWindow {
     /// Close the overlay and hand keys back to where focus was.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let closed = self.overlay.take();
-        self.detecting = None;
         self.client.close_overlay();
         match self.client.focus() {
             Focus::Main => self.focus_main_view(window, cx),
@@ -3270,7 +3280,7 @@ impl ShelbiWindow {
     /// Act on what the open overlay resolved to.
     fn apply_overlay_event(&mut self, event: OverlayEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            OverlayEvent::Stay => self.detect_add_project(cx),
+            OverlayEvent::Stay => {}
             OverlayEvent::Close => self.close_overlay(window, cx),
             OverlayEvent::FocusSidebar => {
                 self.client.focus_sidebar();
@@ -3303,9 +3313,6 @@ impl ShelbiWindow {
             } => {
                 self.close_overlay(window, cx);
                 self.run_zen(project, Some((confirmed, dont_show_again)), cx);
-            }
-            OverlayEvent::AddProjectSubmit { name, root, mode } => {
-                self.submit_add_project(name, root, mode, window, cx)
             }
             OverlayEvent::ClearErrors { project } => {
                 if let Some(ActiveOverlay::ErrorLog {
@@ -3440,94 +3447,19 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// `AddProject`: the form, its repo path prefilled with the working
-    /// directory (the home directory when the app was opened from Finder).
+    /// `AddProject`: the Add Project wizard's window (or the open one to
+    /// the front). This window is where a created project opens.
     fn open_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = std::env::current_dir()
-            .ok()
-            .filter(|d| d.parent().is_some())
-            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        self.open_overlay(ActiveOverlay::add_project(&cwd), window, cx);
-        self.detect_add_project(cx);
+        let from = window.window_handle().downcast::<ShelbiWindow>();
+        // After this update, so the wizard's first frame isn't nested in ours.
+        cx.defer(move |cx| crate::views::add_project::show(Origin::Workspace, from, cx));
     }
 
-    /// Run the form's "Detected:" check off the UI thread when its repo path
-    /// changed (one at a time; a newer path is checked when the older lands).
-    fn detect_add_project(&mut self, cx: &mut Context<Self>) {
-        let Some(ActiveOverlay::AddProject { form, .. }) = &self.overlay else {
-            return;
-        };
-        let Some(root) = form.detection_due() else {
-            return;
-        };
-        if self.detecting.is_some() {
-            return;
-        }
-        self.detecting = Some(root.clone());
-        let cwd = form.cwd().to_path_buf();
-        let detect = cx.background_executor().spawn({
-            let root = root.clone();
-            async move { shelbi_orchestrator::project_create::detect_root(&cwd, &root) }
-        });
-        cx.spawn(async move |this, cx| {
-            let detected = detect.await;
-            this.update(cx, |this, cx| {
-                this.detecting = None;
-                if let Some(ActiveOverlay::AddProject { form, .. }) = &mut this.overlay {
-                    form.set_detected(&root, detected);
-                }
-                this.detect_add_project(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Run the form's `Mutation::AddProject` off the UI thread. A validation
-    /// error goes back on the form; success switches this window to the new
-    /// project.
-    fn submit_add_project(
-        &mut self,
-        name: String,
-        root: String,
-        mode: ConfigMode,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(ActiveOverlay::AddProject { form, busy }) = &mut self.overlay else {
-            return;
-        };
-        *busy = true;
-        let cwd = form.cwd().to_path_buf();
-        let mutation = Mutation::AddProject { name, root, mode };
-        let work = cx
-            .background_executor()
-            .spawn(async move { commands::run_add_project(&mutation, &cwd) });
-        cx.spawn_in(_window, async move |this, cx| {
-            let result = work.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(slug) => {
-                    this.close_overlay(window, cx);
-                    this.flash(format!("Created project {slug}."), cx);
-                    if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
-                        catalog.refresh(|| {});
-                    }
-                    // The new project takes this window.
-                    this.switch_to(&slug, window, cx);
-                }
-                Err(AddProjectError::Invalid(msg)) | Err(AddProjectError::Failed(msg)) => {
-                    if let Some(ActiveOverlay::AddProject { form, busy }) = &mut this.overlay {
-                        *busy = false;
-                        form.set_error(msg);
-                    }
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+    /// A project the Add Project wizard created: this window switches to it.
+    pub(crate) fn project_added(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        self.flash(format!("Created project {slug}."), cx);
+        self.switch_to(slug, window, cx);
     }
 
     /// `LoadReview`: open a review task. Already shown, it just takes focus;
@@ -3801,7 +3733,6 @@ impl ShelbiWindow {
                     }
                 }
             }
-            self.detect_add_project(cx);
         }
         cx.notify();
     }

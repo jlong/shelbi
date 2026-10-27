@@ -14,7 +14,8 @@ project at a time and switches projects in place (File ▸ New Window, ⌘⇧N,
 opens another), with the sidebar, the Orchestrator chat, the Issues board and task
 detail, Activity, Machines, the Workspace view (an agent with a user shell
 beside it, local or remote), and the Review view; the command palette and the
-overlays (error log, add project, load for review, reject, Zen intro); native
+overlays (error log, load for review, reject, Zen intro); the Add Project
+wizard (also what a first launch with no project opens); native
 menus and system notifications. `scripts/bundle.sh` packages it as a signed,
 notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask. Each
 piece's story is in its status doc (`docs/README.md` lists them).

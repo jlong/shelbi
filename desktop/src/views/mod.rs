@@ -48,6 +48,7 @@
 //! `crate::commands`; they never hold domain logic of their own.
 
 pub mod about;
+pub mod add_project;
 pub mod activity;
 pub mod activity_labels;
 mod activity_list;
