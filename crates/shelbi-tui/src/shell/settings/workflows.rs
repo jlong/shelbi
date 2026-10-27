@@ -901,29 +901,26 @@ impl WorkflowsPage {
         let cols = WorkflowCols::fit(&workflows, width);
         rows.push(Row::text(cols.heading()));
         for w in &workflows {
-            rows.push(Row { line: cols.line(w, selected(index), width), action: Some(index) });
+            rows.push(Row::item(cols.line(w, selected(index), width), index));
             error_rows(&mut rows, state.error_at(&Target::Workflow(w.name.clone())), width);
             index += 1;
         }
         for u in state.unreadable() {
             let text = format!("⚠ {}  Can’t be edited here: {}", u.name, u.error);
-            rows.push(Row {
-                line: plain_line(&text, selected(index), width, Style::default().fg(palette().red)),
-                action: Some(index),
-            });
+            rows.push(Row::item(plain_line(&text, selected(index), width, Style::default().fg(palette().red)), index));
             error_rows(&mut rows, state.error_at(&Target::Workflow(u.name.clone())), width);
             index += 1;
         }
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Workflow { from })) => {
-                rows.push(Row { line: input_line("Name ", text, width), action: Some(index) });
+                rows.push(Row::item(input_line("Name ", text, width), index));
                 let help = match from {
                     Some(from) => format!("Duplicate of {from}. Enter to create, Esc to cancel."),
                     None => "Enter to create, Esc to cancel.".to_string(),
                 };
                 wrapped(&mut rows, &format!("    {help}"), width, muted);
             }
-            _ => rows.push(Row { line: add_line("+ New workflow", selected(index), width), action: Some(index) }),
+            _ => rows.push(Row::item(add_line("+ New workflow", selected(index), width), index)),
         }
         error_rows(&mut rows, state.error_at(&Target::NewWorkflow), width);
         index += 1;
@@ -940,13 +937,13 @@ impl WorkflowsPage {
                 Some(Modal::Rename { id, text }) if *id == s.id => cols.rename_line(s, text, width),
                 _ => cols.line(s, selected(index), width),
             };
-            rows.push(Row { line, action: Some(index) });
+            rows.push(Row::item(line, index));
             error_rows(&mut rows, state.error_at(&Target::Status(s.id.clone())), width);
             index += 1;
         }
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Status { category })) => {
-                rows.push(Row { line: input_line("Name ", text, width), action: Some(index) });
+                rows.push(Row::item(input_line("Name ", text, width), index));
                 let id = state.new_status_id(&text.text()).unwrap_or_else(|| "…".into());
                 rows.push(Row::text(Line::from(vec![
                     Span::styled("    id ", muted),
@@ -957,14 +954,11 @@ impl WorkflowsPage {
                 ])));
                 wrapped(&mut rows, "    Enter to add, Esc to cancel.", width, muted);
             }
-            _ => rows.push(Row { line: add_line("+ New status", selected(index), width), action: Some(index) }),
+            _ => rows.push(Row::item(add_line("+ New status", selected(index), width), index)),
         }
         error_rows(&mut rows, state.error_at(&Target::NewStatus), width);
         index += 1;
-        rows.push(Row {
-            line: add_line("Edit statuses.yaml in your editor", selected(index), width),
-            action: Some(index),
-        });
+        rows.push(Row::item(add_line("Edit statuses.yaml in your editor", selected(index), width), index));
         wrapped(&mut rows, RENAME_NOTE, width, muted);
 
         // The legend.

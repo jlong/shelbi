@@ -2822,8 +2822,8 @@ mod tests {
     use chrono::TimeZone;
 
     /// Serializes the tests that point `SHELBI_HOME` at a temp dir and stub
-    /// `gh` (both process-global).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// `gh` (both process-global), with every other such test in the crate.
+    use crate::test_env::ENV_LOCK;
 
     fn no_cache() -> TaskCache {
         TaskCache::new()

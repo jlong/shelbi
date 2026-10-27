@@ -107,7 +107,7 @@ paths on every `cargo test`.
   pages each client offers, the navigation, the leave prompt, the stale-load
   tickets). The desktop offers every page, under ⌘, and ⌘1 to ⌘6; the TUI
   offers a General summary of where the settings live, with the Open in
-  editor paths, and Keybindings, Terminal and Workflows, under the palette,
+  editor paths, and Keybindings, Terminal, Workflows and Agents, under the palette,
   the sidebar's `,` and the page's digit, and adds pages as their follow-ups
   land. The TUI's switcher is the palette's Projects column, and a switch
   keeps Settings up for the new project. See [`status/tui-settings-shell.md`](status/tui-settings-shell.md).
@@ -148,6 +148,15 @@ paths on every `cargo test`.
   keys (`a` add, `u` reset, Backspace remove), a stepping context control,
   and a `⚠` on chords the terminal can't send. See
   [`status/tui-settings-keybindings.md`](status/tui-settings-keybindings.md).
+- **Settings ▸ Agents** (`tui-settings-agents`): both clients draw the page
+  over one state (`shelbi_app::settings::agents`: the rows, the guards on
+  Reset and Delete, the serialized save queue, the confirm copy, the
+  preview), and both edit the shared instructions in place. The desktop's
+  row click and pencil open its agent details editor; the TUI's Enter goes
+  through one hook that opens `instructions.md` in the user's editor until
+  the TUI has a details editor (`tui-agent-editor`). The desktop's ⋮ menu is
+  the TUI's `m` (and the row's `⋮`); its table stacks under 72 columns. See
+  [`status/tui-settings-agents.md`](status/tui-settings-agents.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

@@ -25,6 +25,8 @@
 //! - [`settings`] — Settings' pages and sections, the settings sidebar's
 //!   navigation over the pages a client offers, and the hooks a page uses
 //!   for background loads and saves and the unsaved-edits leave prompt.
+//! - [`text_area`] — a multi-line text buffer with a caret, for the editors
+//!   both clients' toolkit-free states type into.
 //! - [`theme`] — the named color tokens (dark and light) both clients
 //!   paint with, and the `theme:` preference resolution.
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
@@ -64,6 +66,7 @@ pub mod review;
 pub mod session;
 pub mod settings;
 pub mod supervision;
+pub mod text_area;
 pub mod theme;
 pub mod view;
 pub mod workspace_panel;
@@ -81,3 +84,10 @@ pub use view::{
     BoardFilters, ErrorLogModel, IssueCard, IssueColumn, IssuesModel,
     MachinesModel, ReviewPanelModel, SidebarModel, TaskDetailModel,
 };
+
+/// Serializes the tests that point the process-global `SHELBI_HOME` at a
+/// throwaway directory: every such test in the crate takes this one lock.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

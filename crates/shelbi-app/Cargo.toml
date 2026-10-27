@@ -25,6 +25,10 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# Test fixtures other crates' tests build on (`settings::agents::fixture`).
+test-support = []
+
 [dev-dependencies]
 # The activity title-cache tests drive a stubbed `gh` through the store.
 shelbi-state = { workspace = true, features = ["test-support"] }

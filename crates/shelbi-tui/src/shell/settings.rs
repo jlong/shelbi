@@ -28,6 +28,10 @@
 //! - Workflows (`tui-settings-workflows`, [`workflows`]): the project's
 //!   workflows and status catalog, edited in place and saved as each edit is
 //!   made, over the shared `shelbi_app::settings::workflows` state.
+//! - Agents (`tui-settings-agents`, [`agents`]): the project's agents (New,
+//!   Duplicate, a guarded Reset and Delete, Edit YAML) and an in-place
+//!   editor for their shared instructions, over the shared
+//!   `shelbi_app::settings::agents` state.
 //!
 //! Keys, all terminal-safe (no Command chords) and never forwarded to a
 //! session while Settings shows:
@@ -72,13 +76,17 @@ use shelbi_app::{EditTarget, Effect};
 use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
 use shelbi_state::{EditorSource, ThemePreference, UserConfig};
 use shelbi_state::workflow_config::WorkflowConfig;
+use shelbi_state::agents_config::AgentsConfig;
 
 use super::keybindings::{KeysAction, KeysPage};
 use crate::panel::{self, PAD};
 use crate::theme::palette;
 
+mod agents;
 mod workflows;
 
+pub(crate) use agents::CommitJob;
+use agents::{AgentsHit, AgentsPage, Outcome};
 pub(crate) use workflows::EditFile;
 use workflows::{Nav, WorkflowsPage};
 
@@ -99,7 +107,8 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::General)
     .with(SettingsPage::Keybindings)
     .with(SettingsPage::Terminal)
-    .with(SettingsPage::Workflows);
+    .with(SettingsPage::Workflows)
+    .with(SettingsPage::Agents);
 
 /// A page's background read the shell starts ([`SettingsShell::begin_page_load`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +119,8 @@ pub(crate) enum Load {
     Keys(Ticket),
     /// The Workflows page: this project's workflow config.
     Workflows(Ticket, String),
+    /// The Agents page's model: page `id`, for `project`.
+    Agents { id: u64, ticket: Ticket, project: String },
 }
 
 /// Where keyboard focus sits inside Settings.
@@ -136,6 +147,9 @@ pub(crate) enum Leave {
     Page(SettingsPage),
     /// Another project (the switcher, or the palette's switch).
     Project(String),
+    /// Close the Agents page's shared-instructions editor, staying on the
+    /// page.
+    Editor,
 }
 
 /// What the shell does after a Settings key or click.
@@ -159,7 +173,8 @@ pub(crate) enum SettingsAction {
     Save,
     /// Write this preference to `config.yaml` (an immediate-save control).
     Write(Change),
-    /// Open this file in the user's editor (`config.yaml`).
+    /// Open this file in the user's editor (`config.yaml`, an agent's Edit
+    /// YAML); the page reads again when the editor returns.
     EditFile(PathBuf),
     /// The Workflows page queued a save: start it off the UI thread
     /// ([`SettingsShell::begin_commit`]).
@@ -178,6 +193,19 @@ pub(crate) enum SettingsAction {
     /// The bindings in effect changed ([`SettingsShell::keymaps`]): the
     /// shell, its views, the palette and the hints take them.
     ApplyKeymaps,
+    /// Run an Agents page save off the UI thread.
+    CommitAgents(Box<CommitJob>),
+    /// Say this on the shell's status line (a save for a project no longer
+    /// shown failed).
+    Status(String),
+}
+
+/// A save the shell runs off the UI thread for the unsaved-edits prompt.
+pub(crate) enum SaveStart {
+    /// A blocking save (General's editor command).
+    Work(Ticket, SaveWork),
+    /// The Agents page's shared instructions, through its save queue.
+    Commit(Box<CommitJob>),
 }
 
 /// What a page's focusable row does.
@@ -204,7 +232,7 @@ struct PageAction {
 
 /// What a click at a recorded rect hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Hit {
+pub(crate) enum Hit {
     Stop(Stop),
     Action(usize),
     /// A theme's segment.
@@ -212,6 +240,8 @@ enum Hit {
     PromptSave,
     PromptDiscard,
     PromptCancel,
+    /// Something on the Agents page.
+    Agents(AgentsHit),
 }
 
 /// A blocking save the shell runs off the UI thread: the config as written
@@ -267,6 +297,15 @@ pub(crate) struct SettingsShell {
     /// The Keybindings page. It holds the bindings in effect for the whole
     /// shell (seeded at launch), so it lives whether or not Settings shows.
     keys: KeysPage,
+    /// The Agents page, for the shown project.
+    agents: AgentsPage,
+    /// The id the next project's Agents page gets.
+    next_agents_id: u64,
+    /// Agents pages a project switch replaced while a save ran: the shell
+    /// finishes their queued saves (nothing shows them).
+    retired: Vec<(u64, shelbi_app::settings::agents::AgentsState)>,
+    /// The page's text start column at the last draw (editor clicks).
+    page_x: u16,
     /// The page's selected action row and scroll offset.
     action: usize,
     scroll: u16,
@@ -301,6 +340,10 @@ impl Default for SettingsShell {
             theme_out: None,
             workflows: WorkflowsPage::default(),
             keys: KeysPage::new(None),
+            agents: AgentsPage::new(0, None),
+            next_agents_id: 1,
+            retired: Vec::new(),
+            page_x: 0,
             action: 0,
             scroll: 0,
             guard: LeaveGuard::default(),
@@ -361,6 +404,16 @@ impl SettingsShell {
         &self.keys
     }
 
+    #[cfg(test)]
+    pub(crate) fn agents_page(&self) -> &AgentsPage {
+        &self.agents
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired(&self) -> usize {
+        self.retired.len()
+    }
+
     pub(crate) fn keys_mut(&mut self) -> &mut KeysPage {
         &mut self.keys
     }
@@ -419,26 +472,36 @@ impl SettingsShell {
         if self.test_edits.is_some() {
             return true;
         }
-        self.form.dirty()
+        self.form.dirty() || self.agents.dirty()
     }
 
-    /// The shown page's save, if it has anything to save.
-    pub(crate) fn begin_save(&mut self, project: Option<&str>, writer: &ConfigWriter) -> Option<(Ticket, SaveWork)> {
+    /// The shown page's save, if it has anything to save: the shared
+    /// instructions' editor saves through the Agents page's queue.
+    pub(crate) fn begin_save(&mut self, project: Option<&str>, writer: &ConfigWriter) -> Option<SaveStart> {
         #[cfg(test)]
         if let Some(result) = self.test_edits.clone() {
             let ticket = self.save.begin(project);
-            return Some((ticket, Box::new(move || result.map(|()| None))));
+            return Some(SaveStart::Work(ticket, Box::new(move || result.map(|()| None))));
         }
         // General: the editor command typed but not committed.
         if self.form.dirty() {
             if let Some(change) = self.form.commit_edit() {
                 let ticket = self.save.begin(project);
                 let writer = writer.clone();
-                return Some((ticket, Box::new(move || writer(&change).map(Some))));
+                return Some(SaveStart::Work(ticket, Box::new(move || writer(&change).map(Some))));
             }
+        }
+        if self.agents.dirty() {
+            // A save queued behind one in flight starts when that lands.
+            return self.agents.save_shared().map(|job| SaveStart::Commit(Box::new(job)));
         }
         self.guard.forget_save();
         None
+    }
+
+    /// Whether a save the prompt started is still running.
+    fn prompt_saving(&self) -> bool {
+        self.save.running() || (self.guard.leaving_after_save() && self.agents.state().saving())
     }
 
     /// A save landed. Returns where to go when the prompt's Save started it
@@ -477,6 +540,7 @@ impl SettingsShell {
             self.test_edits = None;
         }
         self.form.cancel_edit();
+        self.agents.close_editor();
         self.save_error = None;
     }
 
@@ -503,6 +567,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Workflows {
             return self.workflows.paste(text);
+        }
+        if self.nav.page() == SettingsPage::Agents {
+            return self.region == Region::Page && self.guard.prompt().is_none() && self.agents.paste(text);
         }
         match self.form.draft_mut() {
             Some(field) if self.region == Region::Page => {
@@ -532,6 +599,11 @@ impl SettingsShell {
 
     /// Carry out a leave the prompt let through.
     fn go(&mut self, leave: Leave) -> SettingsAction {
+        if leave != Leave::Editor {
+            // Leaving the page: an editor left open (with nothing unsaved,
+            // or the prompt let it go) closes.
+            self.agents.close_editor();
+        }
         match leave {
             Leave::Back => SettingsAction::Leave,
             Leave::Page(page) => {
@@ -544,6 +616,10 @@ impl SettingsShell {
                 SettingsAction::Load
             }
             Leave::Project(project) => SettingsAction::SwitchProject(project),
+            Leave::Editor => {
+                self.agents.close_editor();
+                SettingsAction::Stay
+            }
         }
     }
 
@@ -552,6 +628,7 @@ impl SettingsShell {
     pub(crate) fn project_changed(&mut self) {
         self.general.reset();
         self.workflows.project_changed();
+        self.replace_agents(None);
         self.save.reset();
         self.action = 0;
         self.scroll = 0;
@@ -571,7 +648,7 @@ impl SettingsShell {
                 }
                 Some(self.general.begin(project))
             }
-            // Keybindings and Workflows read through `begin_page_load`,
+            // Keybindings, Workflows and Agents read through `begin_page_load`,
             // Terminal reads nothing, and the rest aren't offered yet.
             SettingsPage::Keybindings
             | SettingsPage::Terminal
@@ -592,8 +669,81 @@ impl SettingsShell {
                 let ticket = self.workflows.begin_load(project, force)?;
                 Some(Load::Workflows(ticket, project?.to_string()))
             }
-            SettingsPage::Terminal | SettingsPage::Workspaces | SettingsPage::Agents => None,
+            // The Agents page reads its files each time it's shown (as the
+            // desktop's does), to pick up hand edits.
+            SettingsPage::Agents => {
+                if self.agents.project() != project {
+                    self.replace_agents(project);
+                }
+                let ticket = self.agents.begin_load(force)?;
+                Some(Load::Agents {
+                    id: self.agents.id(),
+                    ticket,
+                    project: project?.to_string(),
+                })
+            }
+            SettingsPage::Terminal | SettingsPage::Workspaces => None,
         }
+    }
+
+    /// A new Agents page for `project`. The old one's saves still in flight
+    /// finish (its queue too), but nothing they hand back reaches the new
+    /// page.
+    fn replace_agents(&mut self, project: Option<&str>) {
+        let id = self.next_agents_id;
+        self.next_agents_id += 1;
+        let old = std::mem::replace(&mut self.agents, AgentsPage::new(id, project));
+        if old.state().saving() {
+            let old_id = old.id();
+            self.retired.push((old_id, old.into_state()));
+        }
+    }
+
+    /// An Agents read landed for page `id`. Returns whether it was taken.
+    pub(crate) fn agents_loaded(&mut self, id: u64, ticket: &Ticket, result: Result<AgentsConfig, String>) -> bool {
+        let taken = id == self.agents.id() && self.agents.loaded(ticket, result);
+        if !taken {
+            self.dropped += 1;
+        }
+        taken
+    }
+
+    /// An Agents save landed for page `id`: the next queued save to run
+    /// (that page's), and what the shell does next (leave, once the prompt's
+    /// save landed; say why a retired page's save failed).
+    pub(crate) fn agents_committed(&mut self, id: u64, done: shelbi_app::settings::agents::Committed) -> (Option<CommitJob>, SettingsAction) {
+        if id != self.agents.id() {
+            let Some(at) = self.retired.iter().position(|(r, _)| *r == id) else {
+                self.dropped += 1;
+                return (None, SettingsAction::Stay);
+            };
+            let error = done.error.clone();
+            let state = &mut self.retired[at].1;
+            let project = state.project().to_string();
+            let next = state.committed(done).map(|(config, edit)| CommitJob { id, project: project.clone(), config, edit });
+            if next.is_none() {
+                self.retired.remove(at);
+            }
+            let action = match error {
+                Some(e) => SettingsAction::Status(format!("Couldn't save {project}'s agents: {e}")),
+                None => SettingsAction::Stay,
+            };
+            return (next, action);
+        }
+        let shared = matches!(done.edit, shelbi_app::settings::agents::Edit::SetSharedInstructions { .. });
+        // An agent added, removed or reset: the General summary's count is
+        // read again when next shown.
+        if done.error.is_none() && !shared {
+            self.general.reset();
+        }
+        let prompt_save = shared && self.guard.leaving_after_save();
+        let ok = done.error.is_none();
+        let next = self.agents.committed(done);
+        let action = match prompt_save.then(|| self.guard.saved(ok)).flatten() {
+            Some(leave) => self.go(leave),
+            None => SettingsAction::Stay,
+        };
+        (next, action)
     }
 
     /// The Workflows page's read landed. Returns whether it was taken.
@@ -845,9 +995,15 @@ impl SettingsShell {
         if self.guard.prompt().is_some() {
             return self.prompt_key(k);
         }
-        if self.save.running() {
+        if self.prompt_saving() {
             // The prompt's save is running: wait for it.
             return SettingsAction::Stay;
+        }
+        let on_agents = self.region == Region::Page && self.nav.page() == SettingsPage::Agents;
+        if on_agents && self.agents.captures() {
+            // A menu, a confirm, the new row or the editor: every key is its.
+            let outcome = self.agents.handle_key(k, keymaps);
+            return self.outcome(outcome);
         }
         // A capture or the search holds every key (Esc, Tab, digits too).
         if self.keys_focused() && self.keys.holds_keys() {
@@ -897,6 +1053,21 @@ impl SettingsShell {
             }
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
+            Region::Page if on_agents => {
+                match self.agents.handle_key(k, keymaps) {
+                    Outcome::Pass => {}
+                    outcome => return self.outcome(outcome),
+                }
+                match k.code {
+                    KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
+                    KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+                    KeyCode::Home => self.scroll = 0,
+                    KeyCode::End => self.scroll = u16::MAX,
+                    KeyCode::Char('r') if k.modifiers.is_empty() => return SettingsAction::Reload,
+                    _ => {}
+                }
+                SettingsAction::Stay
+            }
             Region::Page => {
                 let actions = self.actions();
                 let n = actions.len();
@@ -930,6 +1101,19 @@ impl SettingsShell {
     fn keys_key(&mut self, k: KeyEvent, keymaps: &Keymaps) -> SettingsAction {
         let action = self.keys.handle_key(k, keymaps);
         keys_action(action)
+    }
+
+    /// Carry out what the Agents page asked for.
+    fn outcome(&mut self, outcome: Outcome) -> SettingsAction {
+        match outcome {
+            Outcome::Stay | Outcome::Pass => SettingsAction::Stay,
+            Outcome::Commit(job) => SettingsAction::CommitAgents(Box::new(job)),
+            Outcome::Run(effect) => SettingsAction::Run(effect),
+            Outcome::EditFile(path) => SettingsAction::EditFile(path),
+            Outcome::CloseEditor => self.request(Leave::Editor),
+            Outcome::ShowPage(page) => self.request(Leave::Page(page)),
+            Outcome::Reload => SettingsAction::Reload,
+        }
     }
 
     /// A key while the unsaved-edits prompt asks: `s` / Save, `d` / Discard,
@@ -1001,6 +1185,16 @@ impl SettingsShell {
                 _ => SettingsAction::Stay,
             };
         }
+        // The Agents page's actions menu is modal too: a click outside it
+        // closes it.
+        if self.nav.page() == SettingsPage::Agents
+            && self.agents.menu_open()
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !matches!(hit, Some(Hit::Agents(AgentsHit::MenuItem(_))))
+        {
+            self.agents.close_menu();
+            return SettingsAction::Stay;
+        }
         if self.typing() && over_main && hit != Some(Hit::Action(self.action)) {
             // The command being typed keeps the page: Enter saves it, Esc
             // puts it back. The sidebar still answers (through the prompt).
@@ -1039,6 +1233,11 @@ impl SettingsShell {
                     Some(Hit::Action(i)) if self.typing() && i == self.action => SettingsAction::Stay,
                     Some(Hit::Action(i)) if on_workflows => self.workflows.click_item(i),
                     Some(Hit::Action(i)) => self.run_action(i),
+                    Some(Hit::Agents(h)) => {
+                        let column = m.column.saturating_sub(self.page_x);
+                        let outcome = self.agents.click(h, column);
+                        self.outcome(outcome)
+                    }
                     Some(Hit::Theme(theme)) => {
                         if let Some(i) = self.actions().iter().position(|a| a.does == Does::Theme) {
                             self.action = i;
@@ -1065,6 +1264,8 @@ impl SettingsShell {
             self.keys.hints()
         } else if on_workflows && (self.region == Region::Page || self.workflows.modal_open()) {
             self.workflows.hints(&moves)
+        } else if self.region == Region::Page && self.nav.page() == SettingsPage::Agents {
+            self.agents.hints(&moves)
         } else {
             hints(self.region, self.nav.page(), self.typing(), &moves)
         };
@@ -1073,7 +1274,10 @@ impl SettingsShell {
         if on_workflows {
             self.workflows.render_modal(f, main);
         }
-        if self.guard.prompt().is_some() || self.save.running() {
+        if self.nav.page() == SettingsPage::Agents {
+            self.render_agents_menu(f, main);
+        }
+        if self.guard.prompt().is_some() || self.prompt_saving() {
             self.render_prompt(f, main);
         }
     }
@@ -1214,22 +1418,31 @@ impl SettingsShell {
             self.keys.render(f, content, focused);
             return;
         }
+        self.page_x = content.x;
         let actions = self.actions();
         self.action = self.action.min(actions.len().saturating_sub(1));
-        let rows = self.page_rows(content.width as usize, &actions);
-        // Workflows draws its rows whole; General's action rows are drawn
-        // here, with their focus.
+        let rows = self.page_rows(content.width as usize, content.height as usize, &actions);
+        // Workflows and Agents draw their rows whole; General's action rows
+        // are drawn here, with their focus.
         let on_workflows = self.nav.page() == SettingsPage::Workflows;
+        let draws_own = on_workflows || self.nav.page() == SettingsPage::Agents;
         let focus = if on_workflows { self.workflows.cursor() } else { self.action };
-        // Keep the focused action in view, then clamp to the content.
+        // Keep the focused rows in view: the last marked, then the first (an
+        // editor marks its caret and its buttons), then clamp to the content.
         let max = (rows.len() as u16).saturating_sub(content.height);
         if self.region == Region::Page {
-            if let Some(at) = rows.iter().position(|r| r.action == Some(focus)) {
+            let focused = |r: &Row| r.focus || (r.action.is_some() && r.action == Some(focus));
+            let first = rows.iter().position(focused);
+            let last = rows.iter().rposition(focused);
+            for at in [last, first].into_iter().flatten() {
+                // A row with more below it stays off the last line, which
+                // says "↓ more".
+                let room = if at + 1 < rows.len() { content.height.saturating_sub(1).max(1) } else { content.height };
                 let at = at as u16;
                 if at < self.scroll {
                     self.scroll = at;
-                } else if at >= self.scroll + content.height {
-                    self.scroll = at + 1 - content.height;
+                } else if at >= self.scroll + room {
+                    self.scroll = at + 1 - room;
                 }
             }
         }
@@ -1247,7 +1460,7 @@ impl SettingsShell {
                 continue;
             }
             let line = match row.action {
-                Some(a) if !on_workflows => {
+                Some(a) if !draws_own => {
                     let selected = self.region == Region::Page && a == self.action;
                     let width = rect.width as usize;
                     match &actions[a].does {
@@ -1270,17 +1483,89 @@ impl SettingsShell {
             if let Some(a) = row.action {
                 self.hits.push((Rect { x: area.x, width: area.width, ..rect }, Hit::Action(a)));
             }
+            if let Some(hit) = row.hit {
+                let full = Rect { x: area.x, width: area.width, ..rect };
+                match row.split {
+                    // Two targets on one row: left of `at`, and from it on.
+                    Some((at, right)) => {
+                        let at = (content.x + at).min(full.right());
+                        self.hits.push((Rect { width: at - full.x, ..full }, hit));
+                        self.hits.push((Rect { x: at, width: full.right() - at, ..full }, right));
+                    }
+                    None => self.hits.push((full, hit)),
+                }
+            }
         }
     }
 
-    /// The shown page's rows at `width`.
-    fn page_rows(&self, width: usize, actions: &[PageAction]) -> Vec<Row> {
+    /// The shown page's rows at `width` (`height` rows of content).
+    fn page_rows(&mut self, width: usize, height: usize, actions: &[PageAction]) -> Vec<Row> {
         match self.nav.page() {
             SettingsPage::General => general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions),
             SettingsPage::Terminal => terminal_rows(width),
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
+            SettingsPage::Agents => {
+                let focused = self.region == Region::Page;
+                self.agents.rows(width, height, focused)
+            }
             // Keybindings draws itself.
-            SettingsPage::Keybindings | SettingsPage::Workspaces | SettingsPage::Agents => Vec::new(),
+            SettingsPage::Keybindings | SettingsPage::Workspaces => Vec::new(),
+        }
+    }
+
+    /// The Agents page's actions menu, over the page: the row's actions,
+    /// each with its key; the selected one, when refused, with why.
+    fn render_agents_menu(&mut self, f: &mut Frame, area: Rect) {
+        let Some((name, items)) = self.agents.menu_lines() else {
+            return;
+        };
+        let width = 46.min(area.width);
+        let text_w = width.saturating_sub(4) as usize;
+        let mut lines: Vec<(Line, Option<usize>)> = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            let (label, why, selected) = (&item.label, &item.why, &item.selected);
+            let disabled = why.is_some();
+            let style = match (*selected, disabled) {
+                (true, false) => selected_style(true),
+                (true, true) => Style::default().fg(palette().muted).bg(palette().selection),
+                (false, false) => Style::default().fg(palette().foreground),
+                (false, true) => Style::default().fg(palette().muted),
+            };
+            let text = format!(" {}", panel::truncate_right(label, text_w));
+            let pad = (text_w + 1).saturating_sub(panel::display_width(&text));
+            lines.push((Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style)), Some(i)));
+            if let (true, Some(why)) = (*selected, why) {
+                for part in shelbi_app::overlay::error_log::wrap(why, text_w.saturating_sub(2).max(1)) {
+                    lines.push((Line::from(Span::styled(format!("   {part}"), Style::default().fg(palette().yellow))), None));
+                }
+            }
+        }
+        let height = (lines.len() as u16 + 2).min(area.height);
+        if width < 12 || height < 3 {
+            return;
+        }
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        f.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette().divider_active))
+            .title(Span::styled(
+                format!(" {} ", panel::truncate_right(&name, text_w)),
+                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        for (n, (line, item)) in lines.into_iter().take(inner.height as usize).enumerate() {
+            let r = Rect { x: inner.x + 1, y: inner.y + n as u16, width: inner.width.saturating_sub(2), height: 1 };
+            f.render_widget(Paragraph::new(line), r);
+            if let Some(i) = item {
+                self.hits.insert(0, (r, Hit::Agents(AgentsHit::MenuItem(i))));
+            }
         }
     }
 
@@ -1307,8 +1592,10 @@ impl SettingsShell {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let text_w = inner.width.saturating_sub(2) as usize;
-        let message = if self.save.running() {
+        let message = if self.prompt_saving() {
             "Saving…".to_string()
+        } else if self.guard.prompt() == Some(&Leave::Editor) {
+            "Save your changes to the shared instructions?".to_string()
         } else {
             format!("Save your changes to {} before leaving?", self.nav.page().label())
         };
@@ -1321,7 +1608,7 @@ impl SettingsShell {
             Paragraph::new(lines),
             Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(1), ..inner },
         );
-        if self.save.running() {
+        if self.prompt_saving() {
             return;
         }
         // The buttons on the last row, left to right.
@@ -1363,14 +1650,31 @@ fn keys_action(action: KeysAction) -> SettingsAction {
 
 /// One rendered page row: a line of text, or one of the page's actions
 /// (drawn with its focus state at render time).
-struct Row {
+pub(crate) struct Row {
     line: Line<'static>,
     action: Option<usize>,
+    /// What a click on it hits (a page that draws its own focus).
+    hit: Option<Hit>,
+    /// It holds the page's focus: scrolling keeps it in view.
+    focus: bool,
+    /// A second click target on the row: from this column of the page's
+    /// text on, this hit.
+    split: Option<(u16, Hit)>,
 }
 
 impl Row {
     fn text(line: Line<'static>) -> Row {
-        Row { line, action: None }
+        Row { line, action: None, hit: None, focus: false, split: None }
+    }
+
+    /// The page's focusable row `index`.
+    fn item(line: Line<'static>, index: usize) -> Row {
+        Row { action: Some(index), ..Row::text(line) }
+    }
+
+    /// A row a click hits, drawn focused (or not) by the page.
+    fn hit(line: Line<'static>, hit: Hit, focus: bool) -> Row {
+        Row { line, action: None, hit: Some(hit), focus, split: None }
     }
 
     fn blank() -> Row {
@@ -1389,7 +1693,7 @@ fn general_rows(
     actions: &[PageAction],
 ) -> Vec<Row> {
     let at = |does: &Does| actions.iter().position(|a| a.does == *does);
-    let action_row = |i: usize| Row { line: Line::raw(""), action: Some(i) };
+    let action_row = |i: usize| Row::item(Line::raw(""), i);
     let mut rows = vec![Row::text(Line::from(Span::styled(
         "General",
         Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
@@ -1679,14 +1983,14 @@ fn project_rows(rows: &mut Vec<Row>, p: &ProjectSummary, label_w: usize, width: 
     field(rows, "Machines", &summary::count(p.machines, "machine"), label_w, width, None);
 }
 
-fn heading(rows: &mut Vec<Row>, text: &str) {
+pub(crate) fn heading(rows: &mut Vec<Row>, text: &str) {
     rows.push(Row::text(Line::from(Span::styled(
         text.to_string(),
         Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
     ))));
 }
 
-fn wrapped(rows: &mut Vec<Row>, text: &str, width: usize, style: Style) {
+pub(crate) fn wrapped(rows: &mut Vec<Row>, text: &str, width: usize, style: Style) {
     for line in shelbi_app::overlay::error_log::wrap(text, width.max(1)) {
         rows.push(Row::text(Line::from(Span::styled(line, style))));
     }
@@ -1867,7 +2171,7 @@ fn page_line(page: SettingsPage, selected: bool, focused: bool, active: bool, wi
 
 /// The selection fill: white and bold while its list has focus, gray when
 /// focus is elsewhere (the sidebar's convention).
-fn selected_style(focused: bool) -> Style {
+pub(crate) fn selected_style(focused: bool) -> Style {
     let style = Style::default().bg(palette().selection);
     if focused {
         style.fg(palette().white).add_modifier(Modifier::BOLD)
@@ -1885,7 +2189,7 @@ fn render_band(f: &mut Frame, area: Rect, text: &str, style: Style) {
 }
 
 /// The up / down hint in the user's sidebar chords.
-fn moves(keymaps: &Keymaps, style: DisplayStyle) -> String {
+pub(crate) fn moves(keymaps: &Keymaps, style: DisplayStyle) -> String {
     let letter = |a: SidebarAction| {
         keymaps
             .sidebar
@@ -2040,7 +2344,8 @@ mod tests {
                 Stop::Page(SettingsPage::Keybindings),
                 Stop::Page(SettingsPage::Terminal),
                 Stop::Switcher,
-                Stop::Page(SettingsPage::Workflows)
+                Stop::Page(SettingsPage::Workflows),
+                Stop::Page(SettingsPage::Agents)
             ]
         );
         assert_eq!(s.page(), SettingsPage::General);
@@ -2060,7 +2365,10 @@ mod tests {
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows));
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows), "stops at the bottom");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Agents));
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Agents), "stops at the bottom");
+        s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Up), &km);
@@ -2159,13 +2467,13 @@ mod tests {
         let km = keymaps();
         s.request(Leave::Project("beta".into()));
         assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Save, "Save is the default button");
-        let (ticket, work) = s.begin_save(Some("proj"), &writer()).expect("a dirty page saves");
+        let Some(SaveStart::Work(ticket, work)) = s.begin_save(Some("proj"), &writer()) else { panic!("a dirty page saves") };
         assert_eq!(s.saved(&ticket, work()), SettingsAction::Stay);
         assert_eq!(s.save_error.as_deref(), Some("disk full"));
         s.test_edits = Some(Ok(()));
         s.request(Leave::Project("beta".into()));
         s.handle_key(key(KeyCode::Char('s')), &km);
-        let (ticket, work) = s.begin_save(Some("proj"), &writer()).unwrap();
+        let Some(SaveStart::Work(ticket, work)) = s.begin_save(Some("proj"), &writer()) else { panic!("a dirty page saves") };
         assert_eq!(s.saved(&ticket, work()), SettingsAction::SwitchProject("beta".into()));
         assert!(s.save_error.is_none());
     }
@@ -2356,7 +2664,7 @@ mod tests {
         assert_eq!(s.request(Leave::Back), SettingsAction::Stay);
         assert!(s.prompting(), "unsaved: the prompt asks");
         assert_eq!(s.handle_key(key(KeyCode::Char('s')), &km), SettingsAction::Save);
-        let (ticket, work) = s.begin_save(Some("proj"), &writer()).expect("the typed command saves");
+        let Some(SaveStart::Work(ticket, work)) = s.begin_save(Some("proj"), &writer()) else { panic!("the typed command saves") };
         let result = work();
         assert_eq!(result.as_ref().unwrap().as_ref().unwrap().editor.as_deref(), Some("hx"));
         assert_eq!(s.saved(&ticket, result), SettingsAction::Leave);
