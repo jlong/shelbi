@@ -1289,8 +1289,15 @@ fn render_row<H: SidebarHost>(
     let row = &entry.row;
     let selector = row_selector(row);
     let text = row_text(row, props.model);
+    // A row's element is its row's, not its position's: its fade (the
+    // spring's state lives under the element) stays with it as rows arrive,
+    // leave and reorder above it. The blanks between sections repeat.
+    let id: gpui::ElementId = match row {
+        SidebarRow::Blank => ("sidebar-row", index).into(),
+        _ => SharedString::from(selector.clone()).into(),
+    };
     let base = div()
-        .id(("sidebar-row", index))
+        .id(id)
         .debug_selector({
             let selector = selector.clone();
             move || selector
