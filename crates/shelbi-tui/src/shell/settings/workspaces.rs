@@ -36,6 +36,7 @@
 //! carries the machine's workspaces along and the cursor follows the machine.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,7 +53,8 @@ use shelbi_app::settings::workspace_form::{
     self as form, Action, ConfirmFocus, Focus, Key, MachineChoice, Outcome, RemoveConfirm,
     WorkspaceForm, LOCATION_HELP,
 };
-use shelbi_app::settings::machine_form::{self as mform, MachineForm};
+use shelbi_app::settings::machine_check::{self as mcheck, CheckOutcome, CheckStop, ReadinessForm, ReadinessRequest};
+use shelbi_app::settings::machine_form as mform;
 use shelbi_app::settings::workspaces::{
     kind_label, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
@@ -94,7 +96,28 @@ pub(crate) enum Ask {
     /// Run this machine save off the UI thread; its result comes back under
     /// the ticket ([`WorkspacesPage::machine_finished`]).
     RunMachine(Ticket, Box<mform::Job>),
+    /// Run this readiness request off the UI thread; its outcome comes back
+    /// to [`WorkspacesPage::check_finished`].
+    RunCheck(Box<CheckJob>),
 }
+
+/// A machine form's readiness request, for the shell's worker thread: the
+/// form it's for (an answer for a form since closed answers no form), and
+/// the flag that stops it.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckJob {
+    pub form: u64,
+    pub request: ReadinessRequest,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl PartialEq for CheckJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.form == other.form && self.request == other.request
+    }
+}
+
+impl Eq for CheckJob {}
 
 /// What a finished request asks of the shell.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -102,6 +125,23 @@ pub(crate) struct Landed {
     /// A change was committed to this project's config: refresh what shows
     /// it (the page, the sidebar) when it's the shown project.
     pub committed: Option<String>,
+    /// The verified binary to record for the machine the save committed
+    /// (hub state, off the UI thread).
+    pub record: Option<mcheck::Record>,
+}
+
+/// An open Add machine / Configure machine form.
+#[derive(Debug, Clone)]
+pub(crate) struct MachineLayer {
+    /// Which form this is (a check's answer names it).
+    id: u64,
+    form: ReadinessForm,
+    /// Stops its running check when it goes stale or the form closes.
+    stop: CheckStop,
+    /// When the job running now started (the region's elapsed time).
+    started: Option<Instant>,
+    /// What an install whose answer the form dropped did on the machine.
+    aside: Option<String>,
 }
 
 /// The modal layer over the page.
@@ -113,7 +153,7 @@ enum Layer {
     /// Remove workspace…, from a row.
     Confirm(RemoveConfirm),
     /// Add machine / Configure machine.
-    Machine(Box<MachineForm>),
+    Machine(Box<MachineLayer>),
 }
 
 /// What a click at a recorded rect hits.
@@ -148,6 +188,11 @@ pub(crate) struct WorkspacesPage {
     run: Job<()>,
     /// The latest machine save's ticket.
     machine_run: Job<()>,
+    /// What that save records once it commits: the check that verified its
+    /// draft.
+    save_verified: Option<mcheck::SaveVerified>,
+    /// The last machine form's id.
+    forms: u64,
     /// The remotes' prober, while the page shows (never under test).
     prober: Option<ReachabilityProber>,
     home: Option<PathBuf>,
@@ -169,6 +214,8 @@ impl Default for WorkspacesPage {
             layer: None,
             run: Job::default(),
             machine_run: Job::default(),
+            save_verified: None,
+            forms: 0,
             prober: None,
             home: std::env::var_os("HOME").map(PathBuf::from),
             dropped: 0,
@@ -201,11 +248,26 @@ impl WorkspacesPage {
     }
 
     #[cfg(test)]
-    pub(crate) fn machine_form(&self) -> Option<&MachineForm> {
+    pub(crate) fn machine_form(&self) -> Option<&ReadinessForm> {
         match &self.layer {
-            Some(Layer::Machine(form)) => Some(form),
+            Some(Layer::Machine(m)) => Some(&m.form),
             _ => None,
         }
+    }
+
+    /// The open machine form's stop, and what it says of a dropped install.
+    #[cfg(test)]
+    pub(crate) fn machine_layer(&self) -> Option<(&CheckStop, Option<&str>)> {
+        match &self.layer {
+            Some(Layer::Machine(m)) => Some((&m.stop, m.aside.as_deref())),
+            _ => None,
+        }
+    }
+
+    /// Whether a machine form's check or install is running (the region
+    /// animates).
+    pub(crate) fn checking(&self) -> bool {
+        matches!(&self.layer, Some(Layer::Machine(m)) if m.form.running().is_some())
     }
 
     pub(crate) fn dropped(&self) -> usize {
@@ -303,7 +365,8 @@ impl WorkspacesPage {
         self.loaded_at = None;
         self.run.reset();
         self.machine_run.reset();
-        self.layer = None;
+        self.save_verified = None;
+        self.close_layer();
         self.cursor = 0;
         self.follow = None;
         self.follow_machine = None;
@@ -314,8 +377,41 @@ impl WorkspacesPage {
     /// desktop's dialog does, and the prober stops. A request already sent
     /// still lands ([`Self::finished`]).
     pub(crate) fn hidden(&mut self) {
-        self.layer = None;
+        if let Some(note) = self.close_layer() {
+            self.note(note);
+        }
         self.prober = None;
+    }
+
+    /// Close the layer. A machine form's check stops; an install keeps
+    /// running, and what it did (or that it's still going) is what's left to
+    /// say once the form is gone: nothing about the machine is saved.
+    fn close_layer(&mut self) -> Option<String> {
+        let Some(Layer::Machine(m)) = self.layer.take() else {
+            return None;
+        };
+        m.stop.close();
+        let host = m.form.check_key().host;
+        if m.form.installing() {
+            return Some(format!(
+                "Nothing was saved. The Shelbi CLI install on {host} keeps running; this page says what it \
+                 did when it finishes."
+            ));
+        }
+        match m.form.check() {
+            mcheck::Check::Done { outcome, key } => outcome.side_effect(&key.host).map(|e| format!("Nothing was saved. {e}")),
+            _ => None,
+        }
+    }
+
+    fn new_machine_layer(form: ReadinessForm, id: u64) -> Layer {
+        Layer::Machine(Box::new(MachineLayer {
+            id,
+            form,
+            stop: CheckStop::default(),
+            started: None,
+            aside: None,
+        }))
     }
 
     /// The page shows: start probing its remotes.
@@ -457,7 +553,8 @@ impl WorkspacesPage {
             }
             Intent::AddMachine => {
                 if self.index().is_some() {
-                    self.layer = Some(Layer::Machine(Box::new(MachineForm::add(&project))));
+                    self.forms += 1;
+                    self.layer = Some(Self::new_machine_layer(ReadinessForm::add(&project), self.forms));
                 }
                 Ask::Stay
             }
@@ -465,8 +562,9 @@ impl WorkspacesPage {
                 let row = self.index().and_then(|i| i.machines.iter().find(|m| m.name == name)).cloned();
                 match row {
                     Some(row) => {
-                        let form = MachineForm::configure(&project, &row.config, row.workspaces, self.home.as_deref());
-                        self.layer = Some(Layer::Machine(Box::new(form)));
+                        let form = ReadinessForm::configure(&project, &row.config, row.workspaces, self.home.as_deref());
+                        self.forms += 1;
+                        self.layer = Some(Self::new_machine_layer(form, self.forms));
                     }
                     None => self.note(format!("{name} isn’t declared any more.")),
                 }
@@ -506,8 +604,8 @@ impl WorkspacesPage {
     pub(crate) fn layer_key(&mut self, k: KeyEvent) -> Ask {
         let action = match self.layer.as_mut() {
             None => return Ask::Stay,
-            Some(Layer::Machine(form)) => {
-                let action = machine_form::key(form, k);
+            Some(Layer::Machine(m)) => {
+                let action = machine_form::key(&mut m.form, k);
                 return self.act_machine(action);
             }
             Some(Layer::Confirm(c)) => match confirm_key(k) {
@@ -522,8 +620,10 @@ impl WorkspacesPage {
     /// A paste (or a dropped file's path) while the form shows: onto the
     /// focused text field, as one line. Returns whether a field took it.
     pub(crate) fn paste(&mut self, pasted: &str) -> bool {
-        if let Some(Layer::Machine(form)) = self.layer.as_mut() {
-            return machine_form::paste(form, pasted);
+        if let Some(Layer::Machine(m)) = self.layer.as_mut() {
+            let took = machine_form::paste(&mut m.form, pasted);
+            m.stop.stop_unless(m.form.running());
+            return took;
         }
         let Some(Layer::Form { form, fresh }) = self.layer.as_mut() else {
             return false;
@@ -550,8 +650,8 @@ impl WorkspacesPage {
         else {
             return Ask::Stay;
         };
-        if let (Some(Layer::Machine(form)), Hit::Machine(focus)) = (self.layer.as_mut(), hit) {
-            let action = machine_form::click(form, focus);
+        if let (Some(Layer::Machine(m)), Hit::Machine(focus)) = (self.layer.as_mut(), hit) {
+            let action = machine_form::click(&mut m.form, focus);
             return self.act_machine(action);
         }
         let action = match (self.layer.as_mut(), hit) {
@@ -603,26 +703,76 @@ impl WorkspacesPage {
         }
     }
 
-    /// Carry out what the machine form said.
-    fn act_machine(&mut self, action: mform::Action) -> Ask {
+    /// Carry out what the machine form said. Whatever it did, a check the
+    /// draft has moved off (an edit to its host or directory, a Stop check)
+    /// is stopped.
+    fn act_machine(&mut self, action: mcheck::Action) -> Ask {
+        let Some(Layer::Machine(m)) = self.layer.as_mut() else {
+            return Ask::Stay;
+        };
+        m.stop.stop_unless(m.form.running());
+        if m.form.running().is_none() {
+            m.started = None;
+        }
+        m.form.settle_focus();
         match action {
-            mform::Action::Cancel => {
-                self.layer = None;
+            mcheck::Action::Cancel => {
+                if let Some(note) = self.close_layer() {
+                    self.note(note);
+                }
                 Ask::Stay
             }
-            mform::Action::Save(run, request) => {
-                let Some(Layer::Machine(form)) = &self.layer else {
-                    return Ask::Stay;
-                };
-                let project = form.project().to_string();
+            mcheck::Action::Save(run, request) => {
+                let project = m.form.project().to_string();
+                self.save_verified = m.form.save_verified();
                 let ticket = self.machine_run.begin(Some(&project));
-                Ask::RunMachine(ticket, Box::new(mform::Job { project, run, request: *request }))
+                Ask::RunMachine(ticket, Box::new(mform::Job { project, run, request }))
             }
-            // The TUI has no folder chooser (the directory is typed) and no
-            // connection check yet: the form never offers them.
-            mform::Action::Stay | mform::Action::Browse | mform::Action::Test | mform::Action::InstallCli => {
-                Ask::Stay
+            mcheck::Action::Check(request) => {
+                m.started = Some(Instant::now());
+                m.aside = None;
+                let cancel = m.stop.start(request.run);
+                Ask::RunCheck(Box::new(CheckJob {
+                    form: m.id,
+                    request,
+                    cancel,
+                }))
             }
+            // The TUI has no folder chooser (the directory is typed): the
+            // form never offers it.
+            mcheck::Action::Stay | mcheck::Action::Browse => Ask::Stay,
+        }
+    }
+
+    /// A readiness request finished. It answers its form when that form is
+    /// still up and still waiting on it; an install's answer otherwise still
+    /// says what it did to the machine: on the form, when the draft has moved
+    /// on, else on the page (nothing about the machine was saved). Returns
+    /// what to say on the shell's status line when the page can't (the
+    /// project switched).
+    pub(crate) fn check_finished(&mut self, form: u64, request: &ReadinessRequest, outcome: CheckOutcome) -> Option<String> {
+        let effect = outcome.side_effect(&request.target.host);
+        if let Some(Layer::Machine(m)) = self.layer.as_mut() {
+            if m.id == form {
+                m.stop.finish(request.run);
+                if m.form.finish_check(request.run, outcome) {
+                    m.started = None;
+                    m.form.settle_focus();
+                    return None;
+                }
+                if effect.is_some() {
+                    m.aside = effect;
+                }
+                return None;
+            }
+        }
+        let effect = effect?;
+        match &self.state {
+            Some(s) if s.project() == request.target.project => {
+                self.note(effect);
+                None
+            }
+            _ => Some(format!("{}: {effect}", request.target.project)),
         }
     }
 
@@ -640,16 +790,19 @@ impl WorkspacesPage {
         let committed = result.is_ok().then(|| job.project.clone());
         if !self.machine_run.complete(ticket, Ok(())) {
             self.dropped += 1;
-            return Landed { committed };
+            return Landed { committed, record: None };
         }
+        let verified = self.save_verified.take();
         let added = matches!(job.request, mform::SaveRequest::Add(_));
         // The ticket is current, so a form that's saving sent it; any other
         // form up now was opened after this one went.
         let change = match self.layer.as_mut() {
-            Some(Layer::Machine(form)) if form.saving() => {
-                let change = form.finish_save(job.run, result);
+            Some(Layer::Machine(m)) if m.form.saving() => {
+                let change = m.form.finish_save(job.run, result);
                 if change.is_some() {
-                    self.layer = None;
+                    if let Some(Layer::Machine(m)) = self.layer.take() {
+                        m.stop.close();
+                    }
                 }
                 change
             }
@@ -661,11 +814,12 @@ impl WorkspacesPage {
                 }
             },
         };
+        let record = change.as_ref().and_then(|c| verified.and_then(|v| v.record(c)));
         if let Some(change) = change {
             self.note(mform::notice(&change, added));
             self.follow_machine = Some(change.machine.name.clone());
         }
-        Landed { committed }
+        Landed { committed, record }
     }
 
     /// Put the cursor on machine `name`'s row, when it's listed.
@@ -707,7 +861,7 @@ impl WorkspacesPage {
         let committed = result.is_ok().then(|| ticket.project().unwrap_or_default().to_string());
         if !self.run.complete(ticket, Ok(())) {
             self.dropped += 1;
-            return Landed { committed };
+            return Landed { committed, record: None };
         }
         let action = match self.layer.as_mut() {
             Some(Layer::Form { form, .. }) => form.finished(result),
@@ -723,7 +877,7 @@ impl WorkspacesPage {
         if let Action::Done(outcome) = &action {
             self.done(outcome);
         }
-        Landed { committed }
+        Landed { committed, record: None }
     }
 
     /// A committed change elsewhere: the page's next show reads again.
@@ -850,10 +1004,14 @@ impl WorkspacesPage {
                 let c = c.clone();
                 self.render_confirm(f, main, &c);
             }
-            Layer::Machine(form) => {
-                let probe = self.configured_status(form);
+            Layer::Machine(m) => {
+                let probe = self.configured_status(&m.form);
+                let extra = machine_form::Extra {
+                    elapsed: m.started.map(|at| at.elapsed()),
+                    aside: m.aside.as_deref(),
+                };
                 let mut hits = Vec::new();
-                machine_form::render(f, main, form, probe.as_ref(), &mut hits);
+                machine_form::render(f, main, &m.form, probe.as_ref(), extra, &mut hits);
                 self.hits = hits.into_iter().map(|(r, focus)| (r, Hit::Machine(focus))).collect();
             }
             Layer::Form { form, fresh } => {
@@ -869,7 +1027,7 @@ impl WorkspacesPage {
 
     /// What the reachability probe last saw of the machine `form`
     /// configures, as the page shows it.
-    fn configured_status(&self, form: &MachineForm) -> Option<MachineStatus> {
+    fn configured_status(&self, form: &ReadinessForm) -> Option<MachineStatus> {
         let name = &form.configured()?.name;
         let row = self.index()?.machines.iter().find(|m| &m.name == name)?;
         Some(self.state.as_ref()?.status(row))
@@ -2430,5 +2588,346 @@ mod tests {
         assert_eq!(page.form().unwrap().machine(), "Build server");
         term.draw(|f| page.render_layer(f, f.area())).unwrap();
         assert!(matches!(click(&mut page, Hit::Control(Focus::Submit)), Ask::Run(..)));
+    }
+
+    // --- the connection check ------------------------------------------------
+
+    use shelbi_app::settings::machine_check::{Reach, ReadinessIntent, ReadinessService, Record, StageKind, StageState};
+    use shelbi_orchestrator::machine_readiness::fake::{self, installed, out, Remote, Script};
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// The live readiness service over a scripted remote and hub fetch (hub
+    /// version 0.9.0), its records kept in memory.
+    fn readiness(script: &Arc<Script>, fetch: fake::Fetch) -> (ReadinessService, Arc<Mutex<Vec<Record>>>) {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let seen = records.clone();
+        let service = shelbi_orchestrator::machine_readiness::service_with(
+            fake::connector(script.clone()),
+            Arc::new(fetch),
+            Arc::new(move |r: &Record| seen.lock().unwrap().push(r.clone())),
+            shelbi_orchestrator::machine::parse_version("0.9.0").unwrap(),
+        );
+        (service, records)
+    }
+
+    fn run_check(ask: Ask) -> CheckJob {
+        match ask {
+            Ask::RunCheck(job) => *job,
+            other => panic!("expected a readiness request, got {other:?}"),
+        }
+    }
+
+    /// Run `job` through `service` as the shell's thread would, and hand the
+    /// outcome back.
+    fn answer(page: &mut WorkspacesPage, job: &CheckJob, service: &ReadinessService) -> Option<String> {
+        let outcome = service.run(&job.request, job.cancel.clone());
+        page.check_finished(job.form, &job.request, outcome)
+    }
+
+    /// Add machine with `gpu` at `gpu.lan`, `/srv/proj`, its Test focused.
+    fn gpu_draft() -> WorkspacesPage {
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('m')));
+        type_text(&mut page, "gpu");
+        page.layer_key(key(KeyCode::Tab));
+        type_text(&mut page, "gpu.lan");
+        page.layer_key(key(KeyCode::Tab));
+        type_text(&mut page, "/srv/proj");
+        tab_to_machine(&mut page, mform::Focus::Test);
+        page
+    }
+
+    fn missing_cli<'a>() -> Remote<'a> {
+        Remote { path_bin: None, ..Remote::default() }
+    }
+
+    #[test]
+    fn a_check_tests_the_unsaved_draft_and_lists_each_stage() {
+        let mut page = gpu_draft();
+        let before = prose(&screen(&mut page, 100, 50));
+        for stage in ["SSH", "Platform", "Shelbi CLI", "Git", "Project directory"] {
+            assert!(before.contains(stage), "{stage} is listed before a check: {before}");
+        }
+        assert!(before.contains("Not checked yet") && before.contains("Test connection"), "{before}");
+
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        assert_eq!(job.request.intent, ReadinessIntent::Test);
+        assert_eq!(
+            (job.request.target.host.as_str(), job.request.target.work_dir.as_str(), job.request.target.record_as.as_deref()),
+            ("gpu.lan", "/srv/proj", None),
+            "exactly the draft as typed, and it isn't a saved machine"
+        );
+        assert!(page.checking());
+        let running = prose(&screen(&mut page, 100, 50));
+        for want in ["Checking…", "Connecting to gpu.lan", "Waiting for SSH", "Stop check"] {
+            assert!(running.contains(want), "{want:?}: {running}");
+        }
+        assert_eq!(page.layer_key(key(KeyCode::Char('x'))), Ask::Stay, "the keys stay in the form");
+
+        let script = Arc::new(Script::new(vec![Remote::default().reply()]));
+        let (service, records) = readiness(&script, fake::Fetch::none());
+        assert_eq!(answer(&mut page, &job, &service), None);
+        assert!(!page.checking());
+        let done = prose(&screen(&mut page, 100, 50));
+        for want in [
+            "✓ Connection successful",
+            "✓ SSH Connected and logged in",
+            "✓ Platform Linux x86_64",
+            "✓ Shelbi CLI shelbi 0.9.2 at /usr/local/bin/shelbi",
+            "✓ Git git version 2.43.0",
+            "✓ Project directory Checkout root",
+            "Test again",
+        ] {
+            assert!(done.contains(want), "{want:?}: {done}");
+        }
+        assert!(records.lock().unwrap().is_empty(), "an unsaved draft records nothing");
+        assert!(page.machine_form().is_some() && page.state().unwrap().notice().is_none(), "nothing was saved");
+        assert_eq!(script.hosts.lock().unwrap().as_slice(), ["gpu.lan"]);
+    }
+
+    #[test]
+    fn each_failure_says_which_stage_and_what_to_do() {
+        type Case<'a> = (std::io::Result<shelbi_orchestrator::machine::ExecOutput>, &'a str, StageKind, StageState, bool);
+        let timed_out = || Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "command did not finish within 30s"));
+        let cases: Vec<Case> = vec![
+            (Ok(out(255, "", "gpu.lan: Permission denied (publickey).")), "SSH couldn’t log in", StageKind::Ssh, StageState::Failed, false),
+            (timed_out(), "Connection timed out", StageKind::Ssh, StageState::Failed, false),
+            (Ok(out(255, "", "ssh: connect to host gpu.lan port 22: Connection refused")), "Couldn’t connect", StageKind::Ssh, StageState::Failed, false),
+            (Remote { uname: ("FreeBSD", "amd64"), path_bin: None, ..Remote::default() }.reply(), "Unsupported platform", StageKind::Platform, StageState::Attention, false),
+            (missing_cli().reply(), "Shelbi CLI needed", StageKind::Cli, StageState::Attention, true),
+            (
+                Remote { path_bin: Some(("/usr/bin/shelbi", "shelbi 0.1.0")), ..Remote::default() }.reply(),
+                "Shelbi CLI needed",
+                StageKind::Cli,
+                StageState::Attention,
+                true,
+            ),
+            (Remote { git: None, dir: "unchecked", ..Remote::default() }.reply(), "Git needed", StageKind::Git, StageState::Attention, false),
+            (Remote { dir: "missing", ..Remote::default() }.reply(), "Project directory needs attention", StageKind::Directory, StageState::Attention, false),
+        ];
+        let mut page = gpu_draft();
+        for (reply, title, kind, state, install) in cases {
+            let script = Arc::new(Script::new(vec![reply]));
+            let (service, _) = readiness(&script, fake::Fetch::none());
+            tab_to_machine(&mut page, mform::Focus::Test);
+            let job = run_check(page.layer_key(key(KeyCode::Enter)));
+            answer(&mut page, &job, &service);
+            let form = page.machine_form().unwrap();
+            assert_eq!(form.panel().title, title);
+            let stage = form.stages().into_iter().find(|s| s.kind == kind).unwrap();
+            assert_eq!(stage.state, state, "{title}");
+            assert_eq!(form.offers_install(), install, "{title}");
+            let shown = prose(&screen(&mut page, 100, 50));
+            assert!(shown.contains(title), "{title}: {shown}");
+            assert!(!shown.contains("Connection successful"), "{shown}");
+            let offered = page.hits.iter().any(|(_, h)| *h == Hit::Machine(mform::Focus::InstallCli));
+            assert_eq!(offered, install, "{title}: {shown}");
+            if !install {
+                assert!(!shown.contains("Install CLI"), "nothing points at a button that isn't there: {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn install_cli_installs_rechecks_and_a_failure_can_be_retried() {
+        let mut page = gpu_draft();
+        let script = Arc::new(Script::new(vec![missing_cli().reply()]));
+        let (service, _) = readiness(&script, fake::Fetch::none());
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        answer(&mut page, &job, &service);
+        tab_to_machine(&mut page, mform::Focus::InstallCli);
+
+        // The first install can't write ~/.shelbi/bin.
+        script.push(vec![missing_cli().reply(), Ok(out(10, "", "mkdir: /home/me/.shelbi: Read-only file system"))]);
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        assert_eq!(job.request.intent, ReadinessIntent::InstallCli);
+        let shown = prose(&screen(&mut page, 100, 50));
+        assert!(shown.contains("Installing the Shelbi CLI…") && shown.contains("Installing on gpu.lan"), "{shown}");
+        assert!(!shown.contains("Stop check"), "an install runs to its end: {shown}");
+        answer(&mut page, &job, &service);
+        let form = page.machine_form().unwrap();
+        assert_eq!(form.panel().title, "Couldn’t install the CLI");
+        assert!(form.panel().detail.contains("~/.shelbi/bin"));
+        assert!(form.offers_install(), "it can be tried again");
+
+        // Again, with no outbound network on the machine: copied from here.
+        let after = Remote {
+            path_bin: None,
+            home_bin: Some(("/home/me/.shelbi/bin/shelbi", "shelbi 0.9.0")),
+            ..Remote::default()
+        };
+        let script = Arc::new(Script::new(vec![
+            missing_cli().reply(),
+            Ok(out(20, "", "curl: (6) Could not resolve host: github.com")),
+            Ok(out(0, &installed("0.9.0"), "")),
+            after.reply(),
+        ]));
+        let (service, _) = readiness(&script, fake::Fetch::serving(b"tarball".to_vec()));
+        tab_to_machine(&mut page, mform::Focus::InstallCli);
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        answer(&mut page, &job, &service);
+        let form = page.machine_form().unwrap();
+        assert!(form.verified().is_some(), "checked again after the install");
+        let shown = prose(&screen(&mut page, 100, 50));
+        assert!(shown.contains("Connection successful"), "{shown}");
+        assert!(shown.contains("Installed Shelbi 0.9.0 at ~/.shelbi/bin/shelbi (copied from"), "{shown}");
+        assert_eq!(script.stdin.lock().unwrap()[0], b"tarball");
+        assert_eq!(page.machine_form().unwrap().focus(), mform::Focus::Test, "Install CLI went; focus stays in the form");
+    }
+
+    #[test]
+    fn stop_an_edit_or_closing_stops_the_check_and_drops_its_answer() {
+        let script = Arc::new(Script::new(vec![Remote::default().reply()]));
+        let (service, _) = readiness(&script, fake::Fetch::none());
+
+        // Stop check.
+        let mut page = gpu_draft();
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        assert!(!job.cancel.load(Ordering::Acquire));
+        assert_eq!(page.layer_key(key(KeyCode::Enter)), Ask::Stay, "Enter on Stop check stops it");
+        assert!(job.cancel.load(Ordering::Acquire), "its flag trips");
+        assert!(prose(&screen(&mut page, 100, 50)).contains("Check stopped"));
+        let outcome = service.run(&job.request, job.cancel.clone());
+        assert_eq!(outcome.report().map(|r| r.reach), Some(Reach::Cancelled), "the check stopped");
+        page.check_finished(job.form, &job.request, outcome);
+        assert!(page.machine_form().unwrap().verified().is_none());
+
+        // An edit to the host.
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        page.layer_key(key(KeyCode::BackTab)); // Tags
+        page.layer_key(key(KeyCode::BackTab)); // Project directory
+        page.layer_key(key(KeyCode::BackTab)); // SSH host
+        type_text(&mut page, "2");
+        assert!(job.cancel.load(Ordering::Acquire), "a new host stops the old host's check");
+        assert!(!page.checking());
+        page.check_finished(job.form, &job.request, mcheck::CheckOutcome::Checked(mcheck::samples::ready()));
+        assert!(page.machine_form().unwrap().verified().is_none(), "the old host's answer is dropped");
+
+        // Closing the form.
+        tab_to_machine(&mut page, mform::Focus::Test);
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        page.layer_key(key(KeyCode::Esc));
+        assert!(!page.modal() && job.cancel.load(Ordering::Acquire));
+        assert_eq!(page.check_finished(job.form, &job.request, mcheck::CheckOutcome::Checked(mcheck::samples::ready())), None);
+        assert_eq!(page.state().unwrap().notice(), None, "a closed form's check says nothing");
+        page.page_key(key(KeyCode::Char('m')));
+        assert_eq!(page.machine_form().unwrap().check(), &mcheck::Check::NotChecked, "a new form isn't answered");
+    }
+
+    #[test]
+    fn an_install_outlives_its_form_and_says_what_it_did() {
+        let installed_ready = || {
+            let after = Remote {
+                path_bin: None,
+                home_bin: Some(("/home/me/.shelbi/bin/shelbi", "shelbi 0.9.0")),
+                ..Remote::default()
+            };
+            Arc::new(Script::new(vec![missing_cli().reply(), Ok(out(0, &installed("0.9.0"), "")), after.reply()]))
+        };
+        let needs_cli = |page: &mut WorkspacesPage| {
+            let script = Arc::new(Script::new(vec![missing_cli().reply()]));
+            let (service, _) = readiness(&script, fake::Fetch::none());
+            tab_to_machine(page, mform::Focus::Test);
+            let job = run_check(page.layer_key(key(KeyCode::Enter)));
+            answer(page, &job, &service);
+            tab_to_machine(page, mform::Focus::InstallCli);
+            run_check(page.layer_key(key(KeyCode::Enter)))
+        };
+
+        // Closed while installing: the page says it continues, then what it did.
+        let mut page = gpu_draft();
+        let job = needs_cli(&mut page);
+        page.layer_key(key(KeyCode::Esc));
+        assert!(!job.cancel.load(Ordering::Acquire) || page.machine_form().is_none());
+        let notice = page.state().unwrap().notice().unwrap().to_string();
+        assert!(notice.starts_with("Nothing was saved. The Shelbi CLI install on gpu.lan keeps running"), "{notice}");
+        let (service, _) = readiness(&installed_ready(), fake::Fetch::none());
+        assert_eq!(answer(&mut page, &job, &service), None);
+        let notice = page.state().unwrap().notice().unwrap().to_string();
+        assert!(notice.starts_with("On gpu.lan: Installed Shelbi 0.9.0"), "{notice}");
+
+        // Installed, then cancelled: the page says the CLI stays.
+        let mut page = gpu_draft();
+        let job = needs_cli(&mut page);
+        answer(&mut page, &job, &service_for(installed_ready()));
+        page.layer_key(key(KeyCode::Esc));
+        let notice = page.state().unwrap().notice().unwrap().to_string();
+        assert!(notice.starts_with("Nothing was saved. On gpu.lan: Installed Shelbi 0.9.0"), "{notice}");
+
+        // The draft moved on while installing: the form says what it did.
+        let mut page = gpu_draft();
+        let job = needs_cli(&mut page);
+        page.layer_key(key(KeyCode::BackTab));
+        page.layer_key(key(KeyCode::BackTab));
+        type_text(&mut page, "x"); // the directory changes
+        answer(&mut page, &job, &service_for(installed_ready()));
+        let (_, aside) = page.machine_layer().unwrap();
+        assert!(aside.is_some_and(|a| a.starts_with("On gpu.lan: Installed")), "{aside:?}");
+        assert_eq!(page.machine_form().unwrap().check(), &mcheck::Check::NotChecked, "the new directory isn't checked");
+        assert!(prose(&screen(&mut page, 100, 50)).contains("On gpu.lan: Installed"));
+
+        // The project switched: the status line says it.
+        let mut page = gpu_draft();
+        let job = needs_cli(&mut page);
+        page.project_changed();
+        let status = answer(&mut page, &job, &service_for(installed_ready())).expect("said on the status line");
+        assert!(status.starts_with(&format!("{PROJECT}: On gpu.lan: Installed")), "{status}");
+    }
+
+    fn service_for(script: Arc<Script>) -> ReadinessService {
+        readiness(&script, fake::Fetch::none()).0
+    }
+
+    #[test]
+    fn a_save_records_only_the_check_that_verified_what_it_saved() {
+        let mut page = gpu_draft();
+        let script = Arc::new(Script::new(vec![Remote::default().reply()]));
+        let (service, records) = readiness(&script, fake::Fetch::none());
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        answer(&mut page, &job, &service);
+        tab_to_machine(&mut page, mform::Focus::Submit);
+        let (ticket, save) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        let mut change = machine_change("gpu", None, &[]);
+        change.machine.host = Some("gpu.lan".into());
+        let landed = page.machine_finished(&ticket, &save, Ok(change));
+        let record = landed.record.expect("the verified binary is recorded once saved");
+        assert_eq!((record.machine.as_str(), record.host.as_str()), ("gpu", "gpu.lan"));
+        assert_eq!(record.cli.path, "/usr/local/bin/shelbi");
+        assert!(records.lock().unwrap().is_empty(), "the check itself recorded nothing");
+
+        // Unverified: nothing to record.
+        let mut page = gpu_draft();
+        tab_to_machine(&mut page, mform::Focus::Submit);
+        let (ticket, save) = run_machine(page.layer_key(key(KeyCode::Enter)));
+        let landed = page.machine_finished(&ticket, &save, Ok(machine_change("gpu", None, &[])));
+        assert_eq!(landed.record, None);
+
+        // A configured machine checked at its saved host records at once.
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        tab_to_machine(&mut page, mform::Focus::Test);
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        assert_eq!(job.request.target.record_as.as_deref(), Some("Build server"));
+        let script = Arc::new(Script::new(vec![Remote::default().reply()]));
+        let (service, records) = readiness(&script, fake::Fetch::none());
+        answer(&mut page, &job, &service);
+        assert_eq!(records.lock().unwrap().len(), 1);
+        assert_eq!(page.state().unwrap().notice(), None, "and saves nothing");
+    }
+
+    #[test]
+    fn the_region_fits_a_narrow_terminal() {
+        let mut page = gpu_draft();
+        let job = run_check(page.layer_key(key(KeyCode::Enter)));
+        let script = Arc::new(Script::new(vec![missing_cli().reply()]));
+        answer(&mut page, &job, &service_for(script));
+        let shown = screen(&mut page, 36, 60);
+        let read = prose(&shown);
+        for want in ["Shelbi CLI needed", "Install CLI", "Test again"] {
+            assert!(read.contains(want), "{want:?}:\n{shown}");
+        }
+        // Every control is still reachable by click.
+        assert!(page.hits.iter().any(|(_, h)| *h == Hit::Machine(mform::Focus::InstallCli)));
     }
 }

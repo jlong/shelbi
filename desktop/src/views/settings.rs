@@ -77,7 +77,7 @@ use super::agents::{AgentsEvent, AgentsPage};
 use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::machine_form::{self, MachineFormEvent, MachineFormView};
-use super::machine_form_state::MachineForm;
+use super::machine_form_state;
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use super::workflow_editor::{EditorEvent, WorkflowEditor};
@@ -587,7 +587,7 @@ impl SettingsView {
         let page = self.workspaces.read(cx).state();
         let project = page.project().to_string();
         let form = match intent {
-            Intent::AddMachine => MachineForm::add(&project),
+            Intent::AddMachine => machine_form_state::add(&project),
             Intent::ConfigureMachine(name) => {
                 let row = page.index().and_then(|i| i.machines.iter().find(|m| &m.name == name)).cloned();
                 let Some(row) = row else {
@@ -599,7 +599,7 @@ impl SettingsView {
                     return;
                 };
                 let home = std::env::var_os("HOME").map(PathBuf::from);
-                MachineForm::configure(&project, &row.config, row.workspaces, home.as_deref())
+                machine_form_state::configure(&project, &row.config, row.workspaces, home.as_deref())
             }
             // The window's workspace dialog (`ShelbiWindow::open_pool_form`).
             Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => return,

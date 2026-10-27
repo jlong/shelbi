@@ -274,6 +274,12 @@ pub fn with_replaced(p: &Project, name: &str, spec: &WorkspaceSpec) -> Project {
 // ---------------------------------------------------------------------------
 // Field helpers
 
+/// A string `ssh` takes as its destination: no whitespace or control
+/// characters, and no leading `-` (which `ssh` would read as an option).
+pub fn usable_ssh_host(h: &str) -> bool {
+    !h.is_empty() && !h.starts_with('-') && !h.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// Tags as entered → tags as stored: trimmed, empties dropped, exact
 /// duplicates removed (first one kept), case unchanged. A tag with
 /// whitespace or a comma inside is refused.

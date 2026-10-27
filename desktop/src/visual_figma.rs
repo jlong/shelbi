@@ -1408,11 +1408,15 @@ impl Run {
                     needs_cli,
                     (
                         ReadinessIntent::InstallCli,
-                        Some(crate::views::machine_form::install_outcome(Err(
-                            shelbi_orchestrator::machine::SetupError::ReadOnlyHome(
+                        Some(shelbi_orchestrator::machine_readiness::install_outcome(
+                            Err(shelbi_orchestrator::machine::SetupError::ReadOnlyHome(
                                 "mkdir: /home/me/.shelbi: Read-only file system".into(),
-                            ),
-                        ))),
+                            )),
+                            &shelbi_orchestrator::machine_readiness::ReadinessTarget {
+                                host: "gpu.lan".into(),
+                                work_dir: "/home/me/my-project".into(),
+                            },
+                        )),
                     ),
                 ],
             ),

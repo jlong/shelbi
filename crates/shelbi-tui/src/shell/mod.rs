@@ -128,6 +128,12 @@ enum SettingsMsg {
     PoolDone(Ticket, Box<Result<PoolOutcome, PoolError>>),
     /// A machine save landed.
     MachineDone(Ticket, Box<shelbi_app::settings::machine_form::Job>, Box<Result<shelbi_core::pool::MachineChange, PoolError>>),
+    /// Machine form `u64`'s readiness request (check or install) finished.
+    CheckDone(
+        u64,
+        Box<shelbi_app::settings::machine_check::ReadinessRequest>,
+        Box<shelbi_app::settings::machine_check::CheckOutcome>,
+    ),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -1209,6 +1215,10 @@ struct ShellState {
     pool_service: PoolService,
     /// Runs the machine form's saves (the shared service; scripted in tests).
     machine_service: shelbi_app::settings::machine_form::MachineService,
+    /// Runs the machine form's readiness checks and Install CLI, and records
+    /// what they verify (`machine_readiness`'s in production; scripted in
+    /// tests).
+    readiness_service: shelbi_app::settings::machine_check::ReadinessService,
     /// How many refreshes were asked for (a test checks a committed pool
     /// change refreshes the sidebar).
     #[cfg(test)]
@@ -1346,6 +1356,10 @@ impl ShellState {
         let machine_service = shelbi_orchestrator::pool_admin::machine_service();
         #[cfg(test)]
         let machine_service = settings::unavailable_machine_service();
+        #[cfg(not(test))]
+        let readiness_service = shelbi_orchestrator::machine_readiness::service();
+        #[cfg(test)]
+        let readiness_service = settings::unavailable_readiness_service();
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1408,6 +1422,7 @@ impl ShellState {
             pool_reader,
             pool_service,
             machine_service,
+            readiness_service,
             #[cfg(test)]
             refresh_requests: std::cell::Cell::new(0),
             status: None,
@@ -2363,12 +2378,49 @@ impl ShellState {
         }
     }
 
+    /// Run a machine form's readiness request (a check, or Install CLI then a
+    /// check) off the UI thread through the shared service, which records
+    /// what it verified of a machine the project has; the outcome comes back
+    /// for the form that asked. A check stops when its flag trips (the form
+    /// closed, or moved off it); an install runs to its end.
+    fn run_check(&mut self, job: settings::workspaces::CheckJob) {
+        let service = self.readiness_service.clone();
+        let tx = self.settings_tx.clone();
+        let settings::workspaces::CheckJob { form, request, cancel } = job;
+        let sent = request.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-machine-check".into())
+            .spawn(move || {
+                let outcome = service.run(&sent, cancel);
+                let _ = tx.send(SettingsMsg::CheckDone(form, Box::new(sent), Box::new(outcome)));
+            });
+        if let Err(e) = spawned {
+            let outcome = shelbi_app::settings::machine_check::CheckOutcome::Checked(
+                shelbi_app::settings::machine_check::Report::unreached(
+                    shelbi_app::settings::machine_check::Reach::Unreachable,
+                    "Didn’t start",
+                    format!("Couldn’t start the check: {e}."),
+                ),
+            );
+            let action = self.settings.check_finished(form, &request, outcome);
+            self.apply_settings_action(action);
+        }
+    }
+
     /// A Workspaces request committed a change (or not): refresh what shows
     /// the project's pool when it's the shown project (the page, the
     /// sidebar's tree and the machines view, which the refresher rereads from
     /// the config; dispatch and routing read it on every use). A change to
     /// another project reads again when that project is next shown.
     fn pool_landed(&mut self, landed: settings::workspaces::Landed) {
+        // The check that verified the saved machine: its binary is recorded
+        // for dispatch and the machines views (hub state, off the UI thread).
+        if let Some(record) = landed.record {
+            let write = self.readiness_service.record.clone();
+            let _ = std::thread::Builder::new()
+                .name("shelbi-shell-settings-machine-record".into())
+                .spawn(move || write(&record));
+        }
         let Some(project) = landed.committed else {
             return;
         };
@@ -2584,6 +2636,10 @@ impl ShellState {
                     let landed = self.settings.machine_finished(&ticket, &job, *result);
                     self.pool_landed(landed);
                 }
+                SettingsMsg::CheckDone(form, request, outcome) => {
+                    let action = self.settings.check_finished(form, &request, *outcome);
+                    self.apply_settings_action(action);
+                }
             }
         }
         if self.settings_open() {
@@ -2642,6 +2698,7 @@ impl ShellState {
             SettingsAction::Status(text) => self.status = Some(text),
             SettingsAction::RunPool(ticket, job) => self.run_pool(ticket, job),
             SettingsAction::RunMachine(ticket, job) => self.run_machine(ticket, job),
+            SettingsAction::RunCheck(job) => self.run_check(*job),
         }
         self.dirty = true;
     }
@@ -9277,6 +9334,110 @@ workspaces:
     #[test]
     fn adding_a_machine_writes_the_in_repo_local_config_through_the_shared_service() {
         add_machine_from_the_keyboard(true);
+    }
+
+    /// The machine form's readiness check and Install CLI from real key
+    /// events: the work runs on its own thread (the loop keeps taking keys,
+    /// which stay in the form), nothing is written to the project's config
+    /// until Add machine, and the binary the check verified is recorded once
+    /// the save commits it.
+    #[test]
+    fn a_machine_check_and_install_run_off_the_loop_and_save_nothing() {
+        use shelbi_orchestrator::machine_readiness::fake::{self, installed, out, Remote, Script};
+        use std::sync::atomic::Ordering;
+        let home = PoolHome::new(false);
+        let ops = Arc::new(FakeOps::default());
+        let mut st = machines_state(ops);
+        let missing = Remote { path_bin: None, ..Remote::default() };
+        let script = Arc::new(Script::new(vec![missing.reply()]));
+        script.hold.store(true, Ordering::Release);
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = records.clone();
+        st.readiness_service = shelbi_orchestrator::machine_readiness::service_with(
+            fake::connector(script.clone()),
+            Arc::new(fake::Fetch::none()),
+            Arc::new(move |r: &shelbi_app::settings::machine_check::Record| seen.lock().unwrap().push(r.clone())),
+            shelbi_orchestrator::machine::parse_version("0.9.0").unwrap(),
+        );
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
+        let before = home.text();
+        type_key(&mut st, 'm');
+        type_str(&mut st, "gpu");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "gpu.lan");
+        press(&mut st, KeyCode::Tab);
+        type_str(&mut st, "/srv/proj");
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Tab);
+        assert_eq!(
+            st.settings.workspaces().machine_form().unwrap().focus(),
+            shelbi_app::settings::machine_form::Focus::Test
+        );
+
+        // The check holds on the remote; the loop goes on taking keys.
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.workspaces().checking(), "the check runs off the loop");
+        press(&mut st, KeyCode::BackTab);
+        type_str(&mut st, "cuda");
+        let page = st.settings.workspaces();
+        assert_eq!(page.machine_form().unwrap().text(shelbi_app::settings::machine_form::Field::Tags), "cuda", "keys reach the form");
+        assert!(page.checking(), "a tag edit doesn't touch the check");
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = format!("{:?}", term.backend().buffer());
+        assert!(screen.contains("Checking…") && screen.contains("Stop check"), "progress shows");
+
+        script.hold.store(false, Ordering::Release);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                !st.settings.workspaces().checking()
+            }),
+            "the check lands"
+        );
+        let form_now = st.settings.workspaces().machine_form().unwrap();
+        assert_eq!(form_now.panel().title, "Shelbi CLI needed");
+        assert!(form_now.offers_install());
+
+        // Install CLI, then the check again.
+        let after = Remote {
+            path_bin: None,
+            home_bin: Some(("/home/me/.shelbi/bin/shelbi", "shelbi 0.9.0")),
+            ..Remote::default()
+        };
+        script.push(vec![missing.reply(), Ok(out(0, &installed("0.9.0"), "")), after.reply()]);
+        press(&mut st, KeyCode::Tab); // Test
+        press(&mut st, KeyCode::Tab); // Install CLI
+        press(&mut st, KeyCode::Enter);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                !st.settings.workspaces().checking()
+            }),
+            "the install lands"
+        );
+        let form_now = st.settings.workspaces().machine_form().unwrap();
+        assert_eq!(form_now.panel().title, "Connection successful");
+        assert_eq!(home.text(), before, "neither the check nor the install wrote the config");
+        assert!(records.lock().unwrap().is_empty(), "an unsaved draft records nothing");
+
+        // Add machine saves it, and records what the check verified.
+        for _ in 0..3 {
+            press(&mut st, KeyCode::Tab);
+            if st.settings.workspaces().machine_form().unwrap().focus() == shelbi_app::settings::machine_form::Focus::Submit {
+                break;
+            }
+        }
+        press(&mut st, KeyCode::Enter);
+        settle_machine(&mut st);
+        assert!(st.settings.workspaces().machine_form().is_none(), "saved");
+        assert!(home.text().contains("host: gpu.lan"), "{}", home.text());
+        assert!(
+            wait_until(Duration::from_secs(5), || records.lock().unwrap().len() == 1),
+            "the verified binary is recorded"
+        );
+        let record = records.lock().unwrap()[0].clone();
+        assert_eq!((record.machine.as_str(), record.host.as_str()), ("gpu", "gpu.lan"));
+        assert_eq!(record.cli.path, "/home/me/.shelbi/bin/shelbi");
     }
 
     #[test]

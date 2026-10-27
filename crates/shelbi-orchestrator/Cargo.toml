@@ -41,6 +41,11 @@ globset = "0.4"
 tungstenite = { workspace = true }
 libc = { workspace = true }
 
+[features]
+# Scripted remotes and hub fetches (`machine_readiness::fake`) other crates'
+# tests drive the readiness service with.
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }

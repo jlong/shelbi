@@ -716,11 +716,7 @@ pub fn plan_machine(p: &Project, fields: &MachineFields, current: Option<&Machin
     })
 }
 
-/// A string `ssh` takes as its destination: no whitespace or control
-/// characters, and no leading `-` (which `ssh` would read as an option).
-pub fn usable_ssh_host(h: &str) -> bool {
-    !h.is_empty() && !h.starts_with('-') && !h.chars().any(|c| c.is_whitespace() || c.is_control())
-}
+pub use shelbi_core::pool::usable_ssh_host;
 
 // ---------------------------------------------------------------------------
 // Internals

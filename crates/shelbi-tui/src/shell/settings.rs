@@ -216,6 +216,9 @@ pub(crate) enum SettingsAction {
     /// Run a machine save off the UI thread
     /// ([`SettingsShell::machine_finished`] takes its result).
     RunMachine(Ticket, Box<shelbi_app::settings::machine_form::Job>),
+    /// Run a machine form's readiness request off the UI thread
+    /// ([`SettingsShell::check_finished`] takes its outcome).
+    RunCheck(Box<workspaces::CheckJob>),
 }
 
 /// A save the shell runs off the UI thread for the unsaved-edits prompt.
@@ -763,6 +766,21 @@ impl SettingsShell {
         landed
     }
 
+    /// A machine form's readiness request finished (see
+    /// [`WorkspacesPage::check_finished`]): what to say on the status line,
+    /// if the page can't say it.
+    pub(crate) fn check_finished(
+        &mut self,
+        form: u64,
+        request: &shelbi_app::settings::machine_check::ReadinessRequest,
+        outcome: shelbi_app::settings::machine_check::CheckOutcome,
+    ) -> SettingsAction {
+        match self.workspaces.check_finished(form, request, outcome) {
+            Some(status) => SettingsAction::Status(status),
+            None => SettingsAction::Stay,
+        }
+    }
+
     /// A change was committed to the pool: the Workspaces page reads again
     /// when next shown.
     pub(crate) fn pool_stale(&mut self) {
@@ -775,7 +793,9 @@ impl SettingsShell {
         if self.nav.page() != SettingsPage::Workspaces {
             return (false, false);
         }
-        (self.workspaces.take_probes(), self.workspaces.reload_due(now))
+        // A machine form's running check animates its spinner and clock.
+        let animate = self.workspaces.checking();
+        (self.workspaces.take_probes() || animate, self.workspaces.reload_due(now))
     }
 
     /// What the Workspaces page's [`Ask`] means to the shell.
@@ -785,6 +805,7 @@ impl SettingsShell {
             Ask::Reload => SettingsAction::Reload,
             Ask::Run(ticket, job) => SettingsAction::RunPool(ticket, job),
             Ask::RunMachine(ticket, job) => SettingsAction::RunMachine(ticket, job),
+            Ask::RunCheck(job) => SettingsAction::RunCheck(job),
         }
     }
 
@@ -2489,6 +2510,19 @@ pub(crate) fn unavailable_pool_service() -> workspace_form::PoolService {
         add: std::sync::Arc::new(move |_, _| Err(no())),
         update: std::sync::Arc::new(move |_, _| Err(no())),
         remove: std::sync::Arc::new(move |_, _| Err(no())),
+    }
+}
+
+/// A readiness service that reaches nothing (tests that don't script one):
+/// every check answers unreachable and nothing is recorded.
+#[cfg(test)]
+pub(crate) fn unavailable_readiness_service() -> shelbi_app::settings::machine_check::ReadinessService {
+    use shelbi_app::settings::machine_check::{CheckOutcome, Reach, ReadinessService, Report};
+    ReadinessService {
+        check: std::sync::Arc::new(|_, _| {
+            CheckOutcome::Checked(Report::unreached(Reach::Unreachable, "Couldn’t connect", "no readiness service in this test"))
+        }),
+        record: std::sync::Arc::new(|_| {}),
     }
 }
 
