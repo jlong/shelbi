@@ -1532,7 +1532,7 @@ mod tests {
             let slug = slug.unwrap();
             assert!(opened.borrow().is_empty(), "nothing opens before Okay");
             step(&mut vcx, Focus::Primary);
-            assert_eq!(*opened.borrow(), [slug.clone()]);
+            assert_eq!(*opened.borrow(), std::slice::from_ref(&slug));
 
             let project = shelbi_state::load_project(&slug).unwrap();
             assert_eq!(project.default_workflow.as_deref(), Some(shelbi_core::TASK_WORKFLOW_NAME));
