@@ -456,3 +456,79 @@ fn add_project_opens_the_wizard_window_once(cx: &mut TestAppContext) {
     assert_eq!(cx.update(|cx| cx.windows().len()), before);
     assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
 }
+
+/// The Add Project wizard's Okay from a window on alpha that was left in
+/// Settings, with view state saved for the new project's id from an earlier
+/// project: the same window lands on gamma's Orchestrator, Settings closed,
+/// nothing of the old state restored, and no window opened.
+#[gpui::test]
+fn okay_from_a_project_window_lands_on_the_new_projects_orchestrator(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    leave_alpha_on_its_workspace(cx, h);
+    update(cx, h, |w, window, cx| w.open_settings(None, window, cx));
+    assert!(read(cx, h, |w, _| matches!(w.route, Route::Settings(_))));
+    cx.update(|cx| {
+        cx.global::<Catalog>().remember_view(
+            "gamma",
+            ProjectViewState {
+                view: Some("tasks".into()),
+                ..Default::default()
+            },
+        )
+    });
+    let before = cx.update(|cx| cx.windows().len());
+
+    let opened = cx.update(|cx| open_added_project("gamma", Some(h), cx));
+    cx.run_until_parked();
+    assert_eq!(opened, Ok(()));
+    draw(cx, h);
+    draw(cx, h);
+    assert_eq!(cx.update(|cx| cx.windows().len()), before, "no window opened");
+    assert_eq!(windows(cx), [("gamma".to_string(), 0)]);
+    read(cx, h, |w, _| {
+        assert!(matches!(w.route, Route::View), "Settings stayed with alpha");
+        assert_eq!(w.client.view(), &View::Session("orch".into()), "the Orchestrator, not gamma's old board");
+        assert_eq!(w.model.project_label, "Gamma");
+    });
+    // alpha keeps where it was left.
+    let alpha = cx.update(|cx| cx.global::<Catalog>().view_state("alpha"));
+    assert_eq!(alpha.view.as_deref(), Some("alpha-1"));
+
+    // Okay again (a retried open): the window that shows it comes up, still
+    // one window.
+    let again = cx.update(|cx| open_added_project("gamma", Some(h), cx));
+    cx.run_until_parked();
+    assert_eq!(again, Ok(()));
+    assert_eq!(windows(cx), [("gamma".to_string(), 0)]);
+}
+
+/// The first launch's Okay: no window to switch, so one opens on the new
+/// project's Orchestrator; Okay again reuses it.
+#[gpui::test]
+fn okay_on_the_first_launch_opens_one_window(cx: &mut TestAppContext) {
+    let _f = fixture(cx);
+    assert!(windows(cx).is_empty());
+    assert_eq!(cx.update(|cx| open_added_project("gamma", None, cx)), Ok(()));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), [("gamma".to_string(), 0)]);
+    let h = cx.update(|cx| cx.global::<Shell>().windows[0].handle);
+    draw(cx, h);
+    draw(cx, h);
+    assert_eq!(read(cx, h, |w, _| w.client.view().clone()), View::Session("orch".into()));
+    assert_eq!(cx.update(|cx| open_added_project("gamma", None, cx)), Ok(()));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), [("gamma".to_string(), 0)], "no second window");
+}
+
+/// A project the catalog doesn't list yet can't open: an error for the
+/// wizard to show, and the window stays where it was.
+#[gpui::test]
+fn okay_for_a_project_the_catalog_lacks_is_an_error(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    let opened = cx.update(|cx| open_added_project("delta", Some(h), cx));
+    assert!(opened.is_err());
+    cx.run_until_parked();
+    assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
+}

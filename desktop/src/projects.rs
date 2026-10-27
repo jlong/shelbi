@@ -91,46 +91,62 @@ impl Catalog {
         inner.remembered.insert(project.to_string());
     }
 
+    /// Start `project` over: no view state from a project that had its id
+    /// before (a project just created opens on its Orchestrator), and a
+    /// refresh never brings one back from disk.
+    pub fn forget_view(&self, project: &str) {
+        self.remember_view(project, ProjectViewState::default());
+    }
+
     /// Re-read the catalog on a background thread, then call `done` there.
     pub fn refresh(&self, done: impl FnOnce() + Send + 'static) {
-        let inner = self.inner.clone();
+        let catalog = self.clone();
         let spawned = std::thread::Builder::new()
             .name("shelbi-desktop-projects".into())
             .spawn(move || {
-                let summaries = shelbi_state::list_projects().unwrap_or_default();
-                let projects: Vec<ProjectEntry> = summaries
-                    .iter()
-                    .map(|p| ProjectEntry {
-                        name: p.name.clone(),
-                        label: p.display_label().to_string(),
-                    })
-                    .collect();
-                let skeletons = projects
-                    .iter()
-                    .filter_map(|p| {
-                        shelbi_orchestrator::sidebar_model::read_config_skeleton(&p.name)
-                            .map(|m| (p.name.clone(), m))
-                    })
-                    .collect();
-                let views: Vec<(String, ProjectViewState)> = projects
-                    .iter()
-                    .map(|p| (p.name.clone(), ProjectViewState::load(&p.name)))
-                    .collect();
-                {
-                    let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
-                    guard.projects = projects;
-                    guard.skeletons = skeletons;
-                    for (name, view) in views {
-                        if !guard.remembered.contains(&name) {
-                            guard.views.insert(name, view);
-                        }
-                    }
-                }
+                catalog.reload();
                 done();
             });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "could not refresh the project list");
         }
+    }
+
+    /// Re-read the catalog here and now (blocking: run it off the UI
+    /// thread).
+    pub fn reload(&self) {
+        let summaries = shelbi_state::list_projects().unwrap_or_default();
+        let projects: Vec<ProjectEntry> = summaries
+            .iter()
+            .map(|p| ProjectEntry {
+                name: p.name.clone(),
+                label: p.display_label().to_string(),
+            })
+            .collect();
+        let skeletons = projects
+            .iter()
+            .filter_map(|p| {
+                shelbi_orchestrator::sidebar_model::read_config_skeleton(&p.name)
+                    .map(|m| (p.name.clone(), m))
+            })
+            .collect();
+        let views: Vec<(String, ProjectViewState)> = projects
+            .iter()
+            .map(|p| (p.name.clone(), ProjectViewState::load(&p.name)))
+            .collect();
+        let mut guard = self.lock();
+        guard.projects = projects;
+        guard.skeletons = skeletons;
+        for (name, view) in views {
+            if !guard.remembered.contains(&name) {
+                guard.views.insert(name, view);
+            }
+        }
+    }
+
+    /// Whether `project` is in the catalog (as of its last refresh).
+    pub fn lists(&self, project: &str) -> bool {
+        self.lock().projects.iter().any(|p| p.name == project)
     }
 
     #[cfg(any(test, feature = "visual-check"))]
@@ -268,5 +284,22 @@ mod tests {
         };
         catalog.remember_view("web", state.clone());
         assert_eq!(catalog.view_state("web"), state);
+        // A project created under the id starts over.
+        catalog.forget_view("web");
+        assert_eq!(catalog.view_state("web"), ProjectViewState::default());
+        assert!(catalog.inner.lock().unwrap().remembered.contains("web"), "a refresh keeps it forgotten");
+    }
+
+    #[test]
+    fn lists_answers_from_the_last_refresh() {
+        let catalog = Catalog::with(
+            vec![ProjectEntry {
+                name: "web".into(),
+                label: "Web App".into(),
+            }],
+            vec![SidebarModel::skeleton("Web App")],
+        );
+        assert!(catalog.lists("web"));
+        assert!(!catalog.lists("api"));
     }
 }

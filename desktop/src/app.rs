@@ -244,8 +244,8 @@ fn windows_showing(project: &str, me: Option<WindowId>, cx: &App) -> Vec<WindowH
 
 /// File ▸ New Window: another window on `project`, cascaded off the
 /// frontmost one (whose sidebar width and collapse it takes), in the lowest
-/// free slot.
-pub fn open_new_window(project: &str, cx: &mut App) {
+/// free slot. `None` when the window couldn't open (logged).
+pub fn open_new_window(project: &str, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
     let mut state = WindowState::default();
     let mut cascade = None;
     if let Some(from) = frontmost(cx) {
@@ -265,23 +265,34 @@ pub fn open_new_window(project: &str, cx: &mut App) {
         b.origin.y += px(CASCADE);
         b
     });
-    open_window(project, slot, state, bounds, cx);
+    open_window(project, slot, state, bounds, cx)
 }
 
-/// The Add Project wizard created `slug`: the catalog re-reads, and the
-/// window the wizard was opened from switches to the new project, or (when
-/// there is none, as on the first launch, or it has since closed) a new
-/// window opens on it.
-pub fn open_added_project(slug: String, from: Option<WindowHandle<ShelbiWindow>>, cx: &mut App) {
-    if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
-        catalog.refresh(|| {});
+/// The Add Project wizard created `slug` and the user pressed Okay (the
+/// wizard has re-read the catalog first): it opens on its Orchestrator. A
+/// window already showing it (an earlier Okay got that far) comes up, else
+/// the window the wizard was opened from switches to it, else (the first
+/// launch, or that window has since closed) a new window opens on it. Where
+/// a project with this id was left before doesn't come back. An error leaves
+/// everything as it was, for the wizard to show and try again.
+pub fn open_added_project(slug: &str, from: Option<WindowHandle<ShelbiWindow>>, cx: &mut App) -> Result<(), String> {
+    let catalog = cx.try_global::<Catalog>().cloned();
+    if let Some(catalog) = &catalog {
+        if !catalog.lists(slug) {
+            return Err(format!("Shelbi can’t find the project “{slug}” yet."));
+        }
+        catalog.forget_view(slug);
     }
-    let switched = from.is_some_and(|h| {
-        h.update(cx, |w, window, cx| w.project_added(&slug, window, cx)).is_ok()
-    });
-    if !switched {
-        open_new_window(&slug, cx);
+    let shown = windows_showing(slug, None, cx).into_iter().next();
+    for handle in shown.into_iter().chain(from) {
+        if handle.update(cx, |w, window, cx| w.project_added(slug, window, cx)).is_ok() {
+            return Ok(());
+        }
     }
+    let handle = open_new_window(slug, cx).ok_or_else(|| format!("Shelbi couldn’t open a window for “{slug}”."))?;
+    handle
+        .update(cx, |w, window, cx| w.project_added(slug, window, cx))
+        .map_err(|e| e.to_string())
 }
 
 /// A clicked notification: the window already showing its project comes up
@@ -314,7 +325,7 @@ fn open_window(
     state: WindowState,
     bounds: Option<Bounds<gpui::Pixels>>,
     cx: &mut App,
-) {
+) -> Option<WindowHandle<ShelbiWindow>> {
     let bounds = bounds.unwrap_or_else(|| match state.frame {
         Some(f) if f.width >= 400.0 && f.height >= 300.0 => Bounds {
             origin: gpui::point(px(f.x), px(f.y)),
@@ -364,8 +375,12 @@ fn open_window(
         Ok(handle) => {
             cx.global_mut::<Shell>().windows.push(OpenWindow { handle, slot });
             let _ = handle.update(cx, |w, _, cx| w.record_slot(cx));
+            Some(handle)
         }
-        Err(e) => tracing::error!(project, error = %e, "could not open a window"),
+        Err(e) => {
+            tracing::error!(project, error = %e, "could not open a window");
+            None
+        }
     }
 }
 
@@ -2020,7 +2035,9 @@ impl ShelbiWindow {
                     let project = self.project.clone();
                     // After this update, so the new window's first frame
                     // isn't nested in ours.
-                    cx.defer(move |cx| open_new_window(&project, cx));
+                    cx.defer(move |cx| {
+                        open_new_window(&project, cx);
+                    });
                 }
             }
             HostCall::OpenSwitcher => self.open_switcher(cx),
@@ -3455,11 +3472,25 @@ impl ShelbiWindow {
         cx.defer(move |cx| crate::views::add_project::show(Origin::Workspace, from, cx));
     }
 
-    /// A project the Add Project wizard created: this window switches to it.
+    /// A project the Add Project wizard created: this window comes up on its
+    /// Orchestrator. Settings or a review open over the old project don't
+    /// follow the switch, and nothing saved for the id is restored (the
+    /// caller has cleared the catalog's copy). Already showing it (a window
+    /// just opened on it, or an earlier Okay), it lands on the Orchestrator
+    /// all the same.
     pub(crate) fn project_added(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
         window.activate_window();
         self.flash(format!("Created project {slug}."), cx);
-        self.switch_to(slug, window, cx);
+        self.settings_over_review = false;
+        if !matches!(self.route, Route::View) {
+            self.set_route(Route::View);
+        }
+        if self.shows(slug) {
+            self.adopt_view_state(ProjectViewState::default());
+            cx.notify();
+        } else {
+            self.switch_to(slug, window, cx);
+        }
     }
 
     /// `LoadReview`: open a review task. Already shown, it just takes focus;

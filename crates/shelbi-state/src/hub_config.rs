@@ -89,10 +89,14 @@ impl ProjectSummary {
     }
 }
 
-/// Scan `~/.shelbi/projects/*.yaml`, decorate each with the hub config's
+/// Scan the registered projects, decorate each with the hub config's
 /// last-launched timestamp, and return them sorted most-recently-launched
-/// first (alphabetical for never-launched projects). Files that fail to
-/// parse are skipped silently — the picker shouldn't refuse to open just
+/// first (alphabetical for never-launched projects). Both registration
+/// shapes count: the flat global `~/.shelbi/projects/<id>.yaml`, and the
+/// in-repo split's `~/.shelbi/projects/<id>/local.yaml` (read with the
+/// committed half, without migrating anything). The split wins over a stale
+/// flat file for the same id, as in [`crate::load_project`]. Files that fail
+/// to parse are skipped silently — the picker shouldn't refuse to open just
 /// because one YAML is malformed.
 pub fn list_projects() -> Result<Vec<ProjectSummary>> {
     let dir = projects_dir()?;
@@ -100,10 +104,23 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
         return Ok(Vec::new());
     }
     let cfg = load_hub_config().unwrap_or_default();
-    let mut out = Vec::new();
+    let mut found: BTreeMap<String, Project> = BTreeMap::new();
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
+        // An in-repo registration: its directory, holding `local.yaml`.
+        if path.is_dir() {
+            if !path.join("local.yaml").is_file() {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if let Ok(project) = crate::load_project_bare(&id) {
+                found.insert(id, project);
+            }
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
@@ -113,6 +130,9 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => continue,
         };
+        if dir.join(&id).join("local.yaml").is_file() {
+            continue;
+        }
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(_) => continue,
@@ -121,6 +141,10 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
             Ok(p) => p,
             Err(_) => continue,
         };
+        found.insert(id, project);
+    }
+    let mut out = Vec::new();
+    for (id, project) in found {
         let last_launched = cfg.projects.get(&id).and_then(|m| m.last_launched);
         out.push(ProjectSummary {
             name: id,

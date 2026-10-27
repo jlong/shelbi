@@ -328,8 +328,8 @@ heroicons! {
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
     ARROW_LEFT = "arrow-left";
-    /// The drawing `ARROW_RIGHT_BUTTON` widens; no view draws it at 20pt.
-    #[allow(dead_code)]
+    /// The drawing `ARROW_RIGHT_BUTTON` widens; the Add Project wizard's
+    /// workflow cards draw it at 12pt between statuses.
     ARROW_RIGHT = "arrow-right";
     ARROW_PATH = "arrow-path";
     ARROW_UTURN_LEFT = "arrow-uturn-left";

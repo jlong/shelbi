@@ -33,12 +33,19 @@ const SEGMENTS: usize = 54;
 
 /// The spinner in `color`. `id` keys its animation.
 pub fn spinner(id: impl Into<ElementId>, color: Hsla) -> impl IntoElement {
+    spinner_sized(id, color, SIZE)
+}
+
+/// [`spinner`] scaled to `size` (its ring and dot with it): a button's
+/// pending action draws it at 16pt.
+pub fn spinner_sized(id: impl Into<ElementId>, color: Hsla, size: f32) -> impl IntoElement {
+    let scale = size / SIZE;
     div()
         .flex_none()
-        .size(px(SIZE))
+        .size(px(size))
         .with_animation(id, Animation::new(PERIOD).repeat(), move |d, turn| {
             d.child(
-                canvas(|_, _, _| {}, move |bounds, _, window, _| paint(bounds, turn, color, window))
+                canvas(|_, _, _| {}, move |bounds, _, window, _| paint(bounds, turn, scale, color, window))
                     .size_full(),
             )
         })
@@ -49,10 +56,12 @@ fn opacity_at(at: f32) -> f32 {
     (at / OPAQUE_AT).clamp(0.0, 1.0)
 }
 
-/// Paint the ring in `bounds`, `turn` (0..1) of the way round.
-fn paint(bounds: Bounds<Pixels>, turn: f32, color: Hsla, window: &mut Window) {
+/// Paint the ring in `bounds`, `turn` (0..1) of the way round, at `scale`
+/// of its drawn size.
+fn paint(bounds: Bounds<Pixels>, turn: f32, scale: f32, color: Hsla, window: &mut Window) {
     let center = bounds.center();
-    let radius = SIZE / 2.0 - THICKNESS / 2.0;
+    let thickness = THICKNESS * scale;
+    let radius = (SIZE / 2.0 - THICKNESS / 2.0) * scale;
     // Screen angles run clockwise from three o'clock; the tail starts at six.
     let start = FRAC_PI_2 + turn * TAU;
     let at = |fraction: f32| {
@@ -69,7 +78,7 @@ fn paint(bounds: Bounds<Pixels>, turn: f32, color: Hsla, window: &mut Window) {
         if alpha <= 0.0 {
             continue;
         }
-        let mut path = PathBuilder::stroke(px(THICKNESS));
+        let mut path = PathBuilder::stroke(px(thickness));
         path.move_to(at(from));
         path.arc_to(point(px(radius), px(radius)), px(0.0), false, true, at(to));
         if let Ok(path) = path.build() {
@@ -78,7 +87,7 @@ fn paint(bounds: Bounds<Pixels>, turn: f32, color: Hsla, window: &mut Window) {
     }
     // The head's dot, centered on the ring.
     let head = at(SWEEP);
-    let dot = THICKNESS / 2.0;
+    let dot = thickness / 2.0;
     let mut path = PathBuilder::fill();
     path.move_to(point(head.x + px(dot), head.y));
     path.arc_to(point(px(dot), px(dot)), px(0.0), false, true, point(head.x - px(dot), head.y));

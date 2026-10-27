@@ -59,10 +59,10 @@
 //! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
 //! and Acknowledgements at their frames' sizes (with `state-bundled-*`);
 //! `SHELBI_VISUAL_ONLY=about` renders just those.
-//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02
-//! and 03 (`add-project-writing-config`, `-creating-agents`,
-//! `-adding-workflows`) at 800 × 580; `SHELBI_VISUAL_ONLY=add-project`
-//! renders just those.
+//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02,
+//! 03 (`add-project-writing-config`, `-creating-agents`,
+//! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
+//! `SHELBI_VISUAL_ONLY=add-project` renders just those.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the issue detail.
@@ -1752,6 +1752,7 @@ impl Run {
                 }
             }),
             create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
+            refresh: Arc::new(|| {}),
         };
         let states: [(&str, Option<ConfigMode>, bool); 4] = [
             ("add-project-folder", None, false),
@@ -1765,7 +1766,7 @@ impl Run {
                 .cx
                 .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
                     cx.new(|cx| {
-                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| {}), window, cx)
+                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| Ok(())), window, cx)
                     })
                 })
                 .expect("open the offscreen window");
@@ -1797,10 +1798,12 @@ impl Run {
 
         // Screen 03 (`dt-project-creation-checklist`): each stage running,
         // the ones before it checked (2484:8673, 2514:45915, 2514:45972);
-        // `-failed` (no Figma frame) stopped in Creating agents, and
-        // `-created` the screen after it with a warning (its Figma frame is
-        // `dt-wizard-workflow-summary`'s). Reduce Motion holds the spinner at
-        // its drawn angle.
+        // `-failed` (no Figma frame) stopped in Creating agents. Screen 04
+        // (`dt-wizard-workflow-summary`): `add-project-ready` as Figma's
+        // 2484:8897 draws it, and with no frames `-ready-warned` (the commit
+        // guard's disclosure under the cards), `-opening` (Okay pressed, the
+        // project opening) and `-open-failed` (the open failed, Okay to try
+        // again). Reduce Motion holds the spinners at their drawn angle.
         use crate::views::add_project::Report;
         use shelbi_app::add_project_wizard::Stage;
         use shelbi_orchestrator::project_create::AddProjectError;
@@ -1829,21 +1832,27 @@ impl Run {
             0,
             Report::Warning(shelbi_orchestrator::githook::hub_branch_guard_disclosure(&home.join("Projects/my-project"))),
         );
-        let frames: [(&str, Run); 5] = [
-            ("add-project-writing-config", running(0)),
-            ("add-project-creating-agents", running(1)),
-            ("add-project-adding-workflows", running(2)),
-            ("add-project-failed", (failed, Some(Err(AddProjectError::Failed("failed".into()))))),
-            ("add-project-created", (created, Some(Ok("my-project".into())))),
+        let ready = || -> Run { (up_to(3), Some(Ok("my-project".into()))) };
+        // Okay pressed: `None` still opening, `Some` the open's failure.
+        let open_failed: Option<Option<&str>> = Some(Some("Shelbi couldn’t open a window for “my-project”."));
+        let frames: [(&str, Run, Option<Option<&str>>); 8] = [
+            ("add-project-writing-config", running(0), None),
+            ("add-project-creating-agents", running(1), None),
+            ("add-project-adding-workflows", running(2), None),
+            ("add-project-failed", (failed, Some(Err(AddProjectError::Failed("failed".into())))), None),
+            ("add-project-ready", ready(), None),
+            ("add-project-ready-warned", (created, Some(Ok("my-project".into()))), None),
+            ("add-project-opening", ready(), Some(None)),
+            ("add-project-open-failed", ready(), open_failed),
         ];
         self.cx.update(|cx| cx.set_reduce_motion(true));
-        for (screen, (reports, result)) in frames {
+        for (screen, (reports, result), open) in frames {
             let engine = engine.clone();
             let handle = self
                 .cx
                 .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
                     cx.new(|cx| {
-                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| {}), window, cx)
+                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| Ok(())), window, cx)
                     })
                 })
                 .expect("open the offscreen window");
@@ -1860,6 +1869,13 @@ impl Run {
                     view.update(cx, |v, cx| v.preview_creating(reports, result, window, cx))
                 })
                 .unwrap();
+            if let Some(failure) = open {
+                self.cx
+                    .update_window(window, |_, window, cx| {
+                        view.update(cx, |v, cx| v.preview_open(failure, window, cx))
+                    })
+                    .unwrap();
+            }
             self.settle_sheet(window);
             self.write_sized(window, screen, SIZE.0 as u32);
             let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
