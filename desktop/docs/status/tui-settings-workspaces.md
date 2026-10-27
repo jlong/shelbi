@@ -73,8 +73,9 @@ click until it closes: Name, Machine (the picker), Tags, Worktree (derived,
 read-only, follows the name and machine), Slot (empty shows `Automatic (n)`
 with the rule spelled out), Remove workspace… (Edit), Cancel and Create
 workspace / Save changes. Fields edit at the end of the text: type,
-Backspace, Ctrl+U clears; New's suggested name is replaced by the first key
-typed. Tab / Shift-Tab, and ↑ / ↓ between text fields, move; on Machine ↑ / ↓
+Backspace, Ctrl+U clears, and a paste (or a dropped file's path) lands on
+the focused text field as one line; New's suggested name is replaced by the
+first key typed or the paste. Tab / Shift-Tab, and ↑ / ↓ between text fields, move; on Machine ↑ / ↓
 open the picker and walk it, Enter picks, Esc closes it; ← / → walk the
 buttons; Enter is the default action (on Cancel or Remove, that button); Esc
 cancels. The machine's inherited tags are said under Tags, never copied into
@@ -138,7 +139,7 @@ desktop's dialog against the TUI's editor hand-off).
 - `shelbi_app::settings::workspaces::tests` and
   `shelbi_app::settings::workspace_form::tests`: the desktop's tests, moved
   with the state.
-- `shell::settings::workspaces::tests` (17): rows (derived paths, `+tag`,
+- `shell::settings::workspaces::tests` (19): rows (derived paths, `+tag`,
   explicit and automatic slots, counts), honest reachability with the
   configuration kept, loading / failed / empty / no-project states, a stale
   read dropped, New from the keyboard sending exactly the draft (suggestion
@@ -148,9 +149,10 @@ desktop's dialog against the TUI's editor hand-off).
   apart and the loaded entry as `expected`, the machine picker by keyboard,
   Cancel and Esc, removal (Cancel first, never forced, active-task and
   unpushed refusals, then success), hook-merge errors keeping the draft and
-  retrying the same request, results after a project switch and after
-  Settings closed, machine actions opening the pool file, a reread offering a
-  new machine, drawing at any size, and clicks.
+  retrying the same request, a paste onto the focused field, results after
+  a project switch and after Settings closed, machine actions opening the
+  pool file, a reread offering a new machine, drawing at any size, and
+  clicks.
 - `shell::tests` (6, through the real event path with the real reader and
   `pool_admin` over a scripted `PoolOps` in a throwaway `SHELBI_HOME`):
   create from the keyboard in the global and the in-repo config (written once
