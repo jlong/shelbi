@@ -7390,6 +7390,43 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    /// The switcher's list (`list_projects`) includes an in-repo project,
+    /// registered only by its split `<name>/local.yaml`, once, with the
+    /// split's own repo even when a stale flat file names another.
+    #[test]
+    fn list_projects_includes_in_repo_registrations() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut p = fixture_project("myapp", None);
+        p.repo = repo.to_string_lossy().into_owned();
+        p.machines[0].work_dir = repo.clone();
+        save_project(&p).unwrap();
+        save_global_project("flat", &fresh_repo());
+        apply_migration_plan(&plan_in_repo_migration("myapp").unwrap()).unwrap();
+        assert!(!home.join("projects/myapp.yaml").exists());
+
+        let names = |list: Vec<ProjectSummary>| -> Vec<(String, String)> {
+            list.into_iter().map(|p| (p.name, p.repo_path)).collect()
+        };
+        let repo_path = repo.to_string_lossy().into_owned();
+        let listed = names(list_projects().unwrap());
+        assert!(listed.contains(&("myapp".to_string(), repo_path.clone())), "{listed:?}");
+        assert!(listed.iter().any(|(n, _)| n == "flat"), "{listed:?}");
+
+        std::fs::write(
+            home.join("projects/myapp.yaml"),
+            "name: myapp\nrepo: /stale/wrong/path\nmachines: []\n",
+        )
+        .unwrap();
+        let listed = names(list_projects().unwrap());
+        let mine: Vec<_> = listed.iter().filter(|(n, _)| n == "myapp").collect();
+        assert_eq!(mine, [&("myapp".to_string(), repo_path)], "the split, once");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     /// A stale flat `<name>.yaml` sitting alongside an in-repo split must NOT
     /// shadow it: once `local.yaml` exists, the committed shared + local halves
     /// are authoritative. Guards the "stale flat file cannot shadow the split"

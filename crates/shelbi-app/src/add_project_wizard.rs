@@ -10,8 +10,12 @@
 //! the host forwards ([`Wizard::stage_started`], [`Wizard::stage_finished`],
 //! [`Wizard::stage_failed`]). A failure keeps the checked rows and offers
 //! Try Again, which asks for the same project as an [`Attempt::Retry`]. Once
-//! it's created the wizard moves on to [`Screen::Created`] with the new
-//! project's identity, and waits there for the user before the host opens it.
+//! it's created the wizard moves on to screen 04 ([`Screen::Created`]) with
+//! the new project's identity and the workflows it was created with
+//! ([`created_workflows`]), and waits there for Okay before the host opens
+//! it. Opening is a step of its own ([`Wizard::opening`]): a failure there
+//! ([`Wizard::open_failed`]) keeps screen 04 and its Okay retries the open,
+//! never the creation.
 //!
 //! The wizard never touches the filesystem. What the chosen folder is (a
 //! repo, a worktree, missing, already a project) takes disk and git, so the
@@ -26,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use shelbi_core::ConfigMode;
+use shelbi_core::{ConfigMode, StatusCategory, Workflow};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 /// The footer's step count ("Step 1 of 3"): the folder, the settings, the
@@ -41,11 +45,21 @@ pub const SETTINGS_TITLE: &str = "Where should settings live?";
 pub const SETTINGS_INTRO: &str =
     "Choose how Shelbi stores settings, agent instructions, and workflows for this project.";
 pub const CREATING_TITLE: &str = "Setting your project up for Shelbi";
-pub const CREATED_TITLE: &str = "Your project is ready";
+pub const CREATED_TITLE: &str = "You’re all set!";
+pub const CREATED_INTRO: &str =
+    "Two workflows have been added to your project. Workflows control how work gets done with Shelbi.";
 /// Screen 03's button after a failure.
 pub const RETRY_LABEL: &str = "Try Again";
-/// The created screen's button.
-pub const OPEN_LABEL: &str = "Open Project";
+/// Screen 04's button.
+pub const OKAY_LABEL: &str = "Okay";
+/// Screen 04's footer note.
+pub const WORKFLOWS_NOTE: &str = "You can change workflows at any time in Workspace Settings.";
+
+/// Screen 04's line under each shipped workflow's name.
+pub const TASK_SUMMARY: &str =
+    "Work on a feature or fix, review the result, then merge it into your project.";
+pub const SUBTASK_SUMMARY: &str =
+    "Break a task into smaller pieces. Completed work merges into its parent task.";
 
 /// Screen 01's box before a folder is chosen.
 pub const CHOOSE_PROMPT: &str = "Choose your local project folder.";
@@ -77,8 +91,8 @@ pub enum Screen {
     Settings,
     /// 03: the creation's checklist.
     Creating,
-    /// 04: the project exists; the user moves on from here
-    /// ([`Action::Open`]).
+    /// 04: the project exists, with the workflows it was created with; Okay
+    /// opens it ([`Action::Open`]).
     Created,
 }
 
@@ -151,6 +165,90 @@ pub struct Created {
     /// What the engine warned about while creating it (the commit guard's
     /// disclosure, a hook left alone), in order.
     pub warnings: Vec<String>,
+}
+
+/// One of screen 04's workflow cards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowOverview {
+    /// The workflow's id (`task`).
+    pub name: String,
+    /// Its name as the card shows it (`Task`).
+    pub title: String,
+    /// A new project's `default_workflow`: the card's Default badge.
+    pub default: bool,
+    pub summary: String,
+    /// The statuses a task moves through, in order (Canceled, the way out,
+    /// isn't one of them).
+    pub statuses: Vec<OverviewStatus>,
+}
+
+/// A status in a [`WorkflowOverview`]'s sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverviewStatus {
+    pub id: String,
+    /// The status's name in the screen's sentence case (`To do`).
+    pub label: String,
+    /// Which status icon and color it takes.
+    pub category: StatusCategory,
+}
+
+/// The workflows a new project is created with, as screen 04 shows them:
+/// the shipped Task and Subtask workflows (`shelbi_core::task_workflow` and
+/// `subtask_workflow`, the definitions the scaffolder writes), their statuses
+/// named from the shipped `statuses.yaml` (`default_project_statuses`), and
+/// Task marked as the default (the project's `default_workflow`).
+pub fn created_workflows() -> Vec<WorkflowOverview> {
+    let catalog = shelbi_core::default_project_statuses();
+    [shelbi_core::task_workflow(), shelbi_core::subtask_workflow()]
+        .into_iter()
+        .map(|wf| {
+            let wf = wf.clone().resolve_against(&catalog).unwrap_or(wf);
+            overview(&wf)
+        })
+        .collect()
+}
+
+fn overview(wf: &Workflow) -> WorkflowOverview {
+    let summary = match wf.name.as_str() {
+        shelbi_core::TASK_WORKFLOW_NAME => TASK_SUMMARY.to_string(),
+        shelbi_core::SUBTASK_WORKFLOW_NAME => SUBTASK_SUMMARY.to_string(),
+        _ => wf.description.clone().unwrap_or_default(),
+    };
+    WorkflowOverview {
+        name: wf.name.clone(),
+        title: capitalized(&wf.name),
+        default: wf.name == shelbi_core::TASK_WORKFLOW_NAME,
+        summary,
+        statuses: wf
+            .statuses
+            .iter()
+            .filter(|s| s.category != StatusCategory::Archived)
+            .map(|s| OverviewStatus {
+                id: s.id.clone(),
+                label: status_label(&s.name),
+                category: s.category,
+            })
+            .collect(),
+    }
+}
+
+/// A status's name in sentence case: the stock `Todo` and `In Progress`
+/// read `To do` and `In progress` (as the board's headers read `TO DO`),
+/// any other name as it is.
+pub fn status_label(name: &str) -> String {
+    match name {
+        "Todo" => "To do".to_string(),
+        "In Progress" | "InProgress" => "In progress".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// The footer line: "Step 2 of 3".
@@ -308,7 +406,8 @@ pub enum Action {
     /// Run the creation engine for this request (once per press: a running
     /// creation takes no second one).
     Create(CreateRequest),
-    /// Open the created project and close the wizard.
+    /// Open the created project (its Orchestrator), then close the wizard.
+    /// The host answers a failure with [`Wizard::open_failed`].
     Open(Created),
 }
 
@@ -366,6 +465,10 @@ pub struct Wizard {
     in_flight: Option<CheckKey>,
     progress: Progress,
     created: Option<Created>,
+    /// Okay was pressed and the host is opening the project.
+    opening: bool,
+    /// Why the last open failed (Okay tries again).
+    open_error: Option<String>,
     home: Option<PathBuf>,
 }
 
@@ -385,6 +488,8 @@ impl Wizard {
             in_flight: None,
             progress: Progress::default(),
             created: None,
+            opening: false,
+            open_error: None,
             home,
         }
     }
@@ -450,6 +555,26 @@ impl Wizard {
     /// The project, once created.
     pub fn created(&self) -> Option<&Created> {
         self.created.as_ref()
+    }
+
+    /// Screen 04: Okay was pressed and the host is opening the project.
+    pub fn opening(&self) -> bool {
+        self.opening
+    }
+
+    /// Screen 04: why opening the project failed.
+    pub fn open_error(&self) -> Option<&str> {
+        self.open_error.as_deref()
+    }
+
+    /// The host couldn't open the created project: screen 04 stays, with
+    /// `message`, and Okay opens it again (the project isn't created again).
+    pub fn open_failed(&mut self, message: impl Into<String>) {
+        if self.screen == Screen::Created && self.opening {
+            self.opening = false;
+            self.open_error = Some(message.into());
+            self.focus = Focus::Primary;
+        }
     }
 
     /// The text the next check is for.
@@ -518,7 +643,7 @@ impl Wizard {
             Screen::Settings => self.check().is_some_and(FolderCheck::usable),
             // Try Again, once a creation has failed.
             Screen::Creating => !self.progress.running && self.progress.failed.is_some(),
-            Screen::Created => self.created.is_some(),
+            Screen::Created => self.created.is_some() && !self.opening,
         }
     }
 
@@ -646,10 +771,11 @@ impl Wizard {
         }
     }
 
-    /// Continue, Create Project, Try Again or Open Project: the screen's
-    /// primary action, when enabled. Create Project moves to
-    /// [`Screen::Creating`] and Try Again runs again, and neither can be
-    /// pressed while the engine works, so a request is never sent twice.
+    /// Continue, Create Project, Try Again or Okay: the screen's primary
+    /// action, when enabled. Create Project moves to [`Screen::Creating`] and
+    /// Try Again runs again, and neither can be pressed while the engine
+    /// works, so a request is never sent twice; Okay can't be pressed while
+    /// the host opens the project, so it opens once.
     pub fn primary(&mut self) -> Action {
         if !self.primary_enabled() {
             return Action::Stay;
@@ -676,7 +802,11 @@ impl Wizard {
             }
             Screen::Creating => self.retry(),
             Screen::Created => match &self.created {
-                Some(created) => Action::Open(created.clone()),
+                Some(created) => {
+                    self.opening = true;
+                    self.open_error = None;
+                    Action::Open(created.clone())
+                }
                 None => Action::Stay,
             },
         }
@@ -805,10 +935,10 @@ impl Wizard {
             }
             // Return is the default button's, wherever focus is.
             Key::Enter if bare => self.primary(),
-            // While the engine works it can't be stopped halfway; once
-            // it's done or failed, Esc closes.
+            // While the engine works it can't be stopped halfway, nor the
+            // project's opening; once it's done or failed, Esc closes.
             Key::Esc if bare => {
-                if self.progress.running {
+                if self.progress.running || self.opening {
                     Action::Stay
                 } else {
                     Action::Close
@@ -1144,6 +1274,96 @@ mod tests {
         // A late event changes nothing.
         w.stage_failed(Stage::Config, "late");
         assert_eq!(w.failure(), None);
+    }
+
+    /// The wizard on screen 04, `acme` created.
+    fn created() -> Wizard {
+        let mut w = creating();
+        w.creation_succeeded("acme");
+        assert_eq!(w.screen(), Screen::Created);
+        w
+    }
+
+    #[test]
+    fn screen_four_waits_for_okay_and_opens_once() {
+        let mut w = created();
+        assert_eq!(w.screen().title(), "You’re all set!");
+        assert!(w.primary_enabled());
+        assert!(!w.back_enabled(), "nothing to go back to once it exists");
+        assert!(matches!(w.handle_key(key(Key::Enter), false), Action::Open(c) if c.slug == "acme"));
+        assert!(w.opening());
+        assert!(!w.primary_enabled(), "Okay waits while the project opens");
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay, "a second Return opens nothing");
+        assert_eq!(w.activate(Focus::Primary), Action::Stay, "nor a second click");
+        assert_eq!(w.handle_key(key(Key::Esc), false), Action::Stay, "Esc waits for the open");
+        assert!(w.tab_order().is_empty());
+    }
+
+    #[test]
+    fn a_failed_open_keeps_screen_four_and_okay_opens_again() {
+        let mut w = created();
+        assert!(matches!(w.primary(), Action::Open(_)));
+        w.open_failed("no window");
+        assert_eq!(w.screen(), Screen::Created);
+        assert_eq!(w.open_error(), Some("no window"));
+        assert!(!w.opening());
+        assert_eq!(w.tab_order(), [Focus::Primary]);
+        // Okay again: the open, never a creation.
+        assert!(matches!(w.handle_key(key(Key::Enter), false), Action::Open(c) if c.slug == "acme"));
+        assert_eq!(w.open_error(), None, "the old reason goes with the new try");
+        // Esc closes once nothing runs: the project stays created.
+        w.open_failed("again");
+        assert_eq!(w.handle_key(key(Key::Esc), false), Action::Close);
+        // A failure report with no open in flight changes nothing.
+        let mut w = created();
+        w.open_failed("stale");
+        assert_eq!(w.open_error(), None);
+    }
+
+    #[test]
+    fn the_overview_is_the_shipped_task_and_subtask_workflows() {
+        use StatusCategory::*;
+        let workflows = created_workflows();
+        let shape: Vec<(&str, &str, bool)> =
+            workflows.iter().map(|w| (w.name.as_str(), w.title.as_str(), w.default)).collect();
+        assert_eq!(shape, [("task", "Task", true), ("subtask", "Subtask", false)]);
+        assert_eq!(CREATED_INTRO.split_whitespace().next(), Some("Two"));
+        assert_eq!(workflows.len(), 2, "the intro says two");
+        assert_eq!(workflows[0].summary, TASK_SUMMARY);
+        assert_eq!(workflows[1].summary, SUBTASK_SUMMARY);
+        let seq = |w: &WorkflowOverview| -> Vec<(String, StatusCategory)> {
+            w.statuses.iter().map(|s| (s.label.clone(), s.category)).collect()
+        };
+        let owned = |v: &[(&str, StatusCategory)]| -> Vec<(String, StatusCategory)> {
+            v.iter().map(|(l, c)| (l.to_string(), *c)).collect()
+        };
+        assert_eq!(
+            seq(&workflows[0]),
+            owned(&[("Backlog", Backlog), ("To do", Ready), ("In progress", Active), ("Review", Handoff), ("Done", Done)])
+        );
+        assert_eq!(
+            seq(&workflows[1]),
+            owned(&[("Backlog", Backlog), ("To do", Ready), ("In progress", Active), ("Done", Done)])
+        );
+        // The ids are the shipped workflows' own, in their order, less the
+        // way out (Canceled).
+        for (overview, shipped) in workflows.iter().zip([shelbi_core::task_workflow(), shelbi_core::subtask_workflow()]) {
+            let ids: Vec<&str> = overview.statuses.iter().map(|s| s.id.as_str()).collect();
+            let want: Vec<&str> = shipped
+                .statuses
+                .iter()
+                .filter(|s| s.category != Archived)
+                .map(|s| s.id.as_str())
+                .collect();
+            assert_eq!(ids, want);
+        }
+    }
+
+    #[test]
+    fn status_labels_read_in_sentence_case() {
+        assert_eq!(status_label("Todo"), "To do");
+        assert_eq!(status_label("In Progress"), "In progress");
+        assert_eq!(status_label("QA"), "QA");
     }
 
     #[test]

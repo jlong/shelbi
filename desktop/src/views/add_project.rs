@@ -5,7 +5,8 @@
 //!
 //! Screen 03 is "03 · Project · Writing config" 2484:8673, "Creating
 //! agents" 2514:45915 and "Adding workflows" 2514:45972
-//! (`dt-project-creation-checklist`).
+//! (`dt-project-creation-checklist`), and screen 04 is "04 · Workflows ·
+//! Project ready" 2484:8897 (`dt-wizard-workflow-summary`).
 //!
 //! Every Add Project entry point (the sidebar's switcher, the palette and
 //! File menu, the empty-project chooser) and the first launch with no
@@ -33,16 +34,22 @@
 //!   finishes the partly created project rather than calling its own
 //!   registration a clash). Closing the window mid-run drops the run's
 //!   events and result; nothing restarts it.
-//! - Created, the wizard shows the project's name and anything the engine
-//!   warned about, and waits for Open Project before opening it
-//!   ([`crate::app::open_added_project`]) and closing. (The workflow summary
-//!   that goes here is `dt-wizard-workflow-summary`.)
+//! - **04**, once the engine has created the project, shows the two
+//!   workflows it was created with ([`wiz::created_workflows`]: the shipped
+//!   Task and Subtask definitions and statuses) and anything the engine
+//!   warned about, and waits for Okay. Okay re-reads the project catalog off
+//!   the UI thread ([`Engine::refresh`]), then opens the project on its
+//!   Orchestrator ([`crate::app::open_added_project`]) and closes. While
+//!   that runs Okay is disabled, with a spinner beside it; if the project
+//!   can't be opened, 04 stays with the reason and Okay opens it again (the
+//!   project is never created twice). Closing 04 leaves the project created,
+//!   in the switcher.
 //!
 //! Keys: Tab / ⇧Tab move focus (the focus ring shows once the keyboard is
 //! used), Return is the enabled primary action, Space activates the focused
 //! button or card, the arrows move between the cards, Esc and ⌘W cancel
-//! (Esc waits while the engine runs). Cancelling before Create Project
-//! writes nothing.
+//! (Esc waits while the engine runs, and while Okay opens the project).
+//! Cancelling before Create Project writes nothing.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -55,7 +62,7 @@ use gpui::{
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use shelbi_app::add_project_wizard::{
     self as wiz, Action, Attempt, CreateRequest, FolderCheck, Focus, Origin, RowState, Screen, Stage,
-    Tone, Wizard,
+    Tone, Wizard, WorkflowOverview,
 };
 use shelbi_app::exec::Mutation;
 use shelbi_core::ConfigMode;
@@ -67,6 +74,7 @@ use crate::commands;
 use crate::assets::{heroicon, icons};
 use crate::elements::{controls, spinner};
 use crate::keys::chord_from_keystroke;
+use crate::projects::Catalog;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::{self, Theme};
 
@@ -83,6 +91,9 @@ pub type CheckFn = dyn Fn(&Path, &str, Option<&str>) -> FolderCheck + Send + Syn
 pub type CreateFn =
     dyn Fn(&CreateRequest, &Path, &mut dyn ScaffoldReporter) -> Result<String, AddProjectError> + Send + Sync;
 
+/// [`Engine::refresh`]'s signature.
+pub type RefreshFn = dyn Fn() + Send + Sync;
+
 /// The blocking work the wizard runs off the UI thread. A test swaps in its
 /// own, so nothing reads or writes a real Shelbi home.
 #[derive(Clone)]
@@ -91,12 +102,21 @@ pub struct Engine {
     pub check: Arc<CheckFn>,
     /// Create the project, reporting as it goes; its id on success.
     pub create: Arc<CreateFn>,
+    /// Re-read the project catalog, so the created project is in it before
+    /// it opens (Okay).
+    pub refresh: Arc<RefreshFn>,
 }
 
 impl Engine {
-    /// The shared engine `shelbi init` and the TUI's form use.
-    pub fn real() -> Self {
+    /// The shared engine `shelbi init` and the TUI's form use, refreshing
+    /// `catalog` (the app's).
+    pub fn real(catalog: Option<Catalog>) -> Self {
         Engine {
+            refresh: Arc::new(move || {
+                if let Some(catalog) = &catalog {
+                    catalog.reload();
+                }
+            }),
             check: Arc::new(shelbi_orchestrator::project_create::check_folder),
             create: Arc::new(|request, cwd, out| {
                 let mutation = Mutation::AddProject {
@@ -148,9 +168,10 @@ impl ScaffoldReporter for Forward {
     }
 }
 
-/// What to do with a created project: open it (the window the wizard came
-/// from switches to it, else a new window opens on it).
-pub type OnCreated = Rc<dyn Fn(String, Option<WindowHandle<ShelbiWindow>>, &mut App)>;
+/// What to do with a created project once the catalog has it: open it on
+/// its Orchestrator (the window the wizard came from switches to it, else a
+/// new window opens on it), or say why it couldn't.
+pub type OnCreated = Rc<dyn Fn(&str, Option<WindowHandle<ShelbiWindow>>, &mut App) -> Result<(), String>>;
 
 /// The open wizard, so asking again brings it to the front.
 #[derive(Default)]
@@ -173,7 +194,7 @@ pub fn show(origin: Origin, from: Option<WindowHandle<ShelbiWindow>>, cx: &mut A
                 origin,
                 from,
                 cwd,
-                Engine::real(),
+                Engine::real(cx.try_global::<Catalog>().cloned()),
                 Rc::new(crate::app::open_added_project),
                 window,
                 cx,
@@ -214,6 +235,8 @@ pub struct AddProjectView {
     /// The latest creation run; a report or result from an earlier one is
     /// dropped.
     run: u64,
+    /// Screen 04's cards.
+    workflows: Vec<WorkflowOverview>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -294,6 +317,7 @@ impl AddProjectView {
             engine,
             on_created,
             run: 0,
+            workflows: wiz::created_workflows(),
             _subscriptions: subscriptions,
         }
     }
@@ -341,17 +365,7 @@ impl AddProjectView {
                 return;
             }
             Action::Create(request) => self.create(request, window, cx),
-            Action::Open(created) => {
-                // The project's window first, then close this one, so the
-                // first launch's app never runs out of windows.
-                let (from, on_created) = (self.from, self.on_created.clone());
-                let me = window.window_handle();
-                cx.defer(move |cx| {
-                    on_created(created.slug, from, cx);
-                    me.update(cx, |_, window, _| window.remove_window()).ok();
-                });
-                return;
-            }
+            Action::Open(created) => self.open(created.slug, window, cx),
         }
         self.after_change(window, cx);
     }
@@ -465,6 +479,39 @@ impl AddProjectView {
         .detach();
     }
 
+    /// Okay: re-read the catalog off the UI thread, then open the project
+    /// (at the app's top level, not nested in this window's update) and
+    /// close the wizard, its window after the project's so the first
+    /// launch's app never runs out of windows. A failure stays on 04 for
+    /// Okay to try again. A closed wizard still opens the project it was
+    /// asked to (the user pressed Okay).
+    fn open(&mut self, slug: String, window: &mut Window, cx: &mut Context<Self>) {
+        let refresh = self.engine.refresh.clone();
+        let reread = cx.background_executor().spawn(async move { refresh() });
+        let (from, on_created) = (self.from, self.on_created.clone());
+        let Some(me) = window.window_handle().downcast::<AddProjectView>() else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            reread.await;
+            let opened = cx.update(|cx| on_created(&slug, from, cx));
+            match opened {
+                Ok(()) => {
+                    me.update(cx, |_, window, _| window.remove_window()).ok();
+                }
+                Err(why) => {
+                    tracing::warn!(target: "shelbi::add_project", project = %slug, "could not open the project: {why}");
+                    me.update(cx, |this, window, cx| {
+                        this.wizard.open_failed(why);
+                        this.after_change(window, cx);
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Screen 03 as the engine's `reports` leave it, and its `result` if
     /// it has ended, without running the engine (the visual harness, tests):
     /// the chosen folder's Continue and Create Project, the request dropped.
@@ -483,6 +530,17 @@ impl AddProjectView {
         }
         if let Some(result) = result {
             self.finished(self.run, result, window, cx);
+        }
+        self.after_change(window, cx);
+    }
+
+    /// Screen 04 with Okay pressed, without opening anything (the visual
+    /// harness): still opening, or failed with `failure`.
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn preview_open(&mut self, failure: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.wizard.primary();
+        if let Some(why) = failure {
+            self.wizard.open_failed(why);
         }
         self.after_change(window, cx);
     }
@@ -528,12 +586,14 @@ impl AddProjectView {
 
     /// Back and Continue / Create Project, under the step count. Screen 03
     /// keeps the row's height (Figma's spacer) with nothing in it while the
-    /// engine runs, and Try Again after a failure; the created screen has
-    /// Open Project.
+    /// engine runs, and Try Again after a failure; 04 has its note and Okay.
     fn footer(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let screen = self.wizard.screen();
-        if matches!(screen, Screen::Creating | Screen::Created) {
-            let label = if screen == Screen::Created { wiz::OPEN_LABEL } else { wiz::RETRY_LABEL };
+        if screen == Screen::Created {
+            return self.created_footer(window, theme, cx);
+        }
+        if screen == Screen::Creating {
+            let label = wiz::RETRY_LABEL;
             let button = self.wizard.primary_enabled().then(|| {
                 style::button("add-project-primary", label, ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
                     .on_click(cx.listener(|this, _, window, cx| this.click(Focus::Primary, window, cx)))
@@ -580,6 +640,42 @@ impl AddProjectView {
             .child(div().flex_1())
             .child(back)
             .child(primary)
+    }
+
+    /// Screen 04's footer: the note, and Okay (disabled, a spinner beside
+    /// it, while the project opens).
+    fn created_footer(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let opening = self.wizard.opening();
+        let okay = if self.wizard.primary_enabled() {
+            style::button("add-project-primary", wiz::OKAY_LABEL, ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
+                .on_click(cx.listener(|this, _, window, cx| this.click(Focus::Primary, window, cx)))
+        } else {
+            style::disabled_button("add-project-primary", wiz::OKAY_LABEL, ButtonKind::Primary, ButtonSize::Base, theme)
+        };
+        let pending = opening.then(|| {
+            div()
+                .debug_selector(|| "add-project-opening".into())
+                .flex_none()
+                .child(spinner::spinner_sized("add-project-opening", theme.progress, 16.0))
+        });
+        div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(32.0))
+            .w_full()
+            .child(
+                div()
+                    .debug_selector(|| "add-project-workflows-note".into())
+                    .type_style(Type::SmallMedium)
+                    .text_color(theme.muted)
+                    .child(wiz::WORKFLOWS_NOTE),
+            )
+            .child(div().flex_1())
+            .children(pending)
+            .child(okay)
     }
 
     fn browse_button(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -736,6 +832,82 @@ impl AddProjectView {
     }
 }
 
+/// One of screen 04's cards: the workflow's name (and Default badge), what
+/// it's for, and the statuses a task moves through, each with its status
+/// icon.
+fn workflow_card(workflow: &WorkflowOverview, theme: &Theme) -> Div {
+    let selector = format!("add-project-workflow-{}", workflow.name);
+    let badge = workflow.default.then(|| {
+        div()
+            .debug_selector(|| "add-project-default-badge".into())
+            .flex_none()
+            .px(px(4.0))
+            .rounded(px(2.0))
+            .bg(theme.workflow_badge)
+            .type_style(Type::XSmall)
+            .text_color(theme.workflow_badge_text)
+            .child("Default")
+    });
+    let mut sequence = div().flex().flex_row().flex_wrap().items_center().gap(px(8.0)).w_full();
+    for (i, status) in workflow.statuses.iter().enumerate() {
+        if i > 0 {
+            sequence = sequence.child(
+                heroicon(icons::ARROW_RIGHT)
+                    .size(px(12.0))
+                    .text_color(theme.muted),
+            );
+        }
+        let id = format!("{selector}-status-{}", status.id);
+        sequence = sequence.child(
+            div()
+                .debug_selector(move || id)
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap(px(6.0))
+                .child(style::status_icon(status.category, theme))
+                .child(
+                    div()
+                        .type_style(Type::Base)
+                        .text_color(theme.foreground)
+                        .child(status.label.clone()),
+                ),
+        );
+    }
+    div()
+        .debug_selector(move || selector)
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .w_full()
+        .p(px(20.0))
+        .rounded(px(12.0))
+        // `surface/depth-10`, as screen 01's box.
+        .bg(theme.toolbar)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .type_style(Type::BaseSemibold)
+                        .text_color(theme.text_loud)
+                        .child(workflow.title.clone()),
+                )
+                .children(badge),
+        )
+        .child(
+            div()
+                .type_style(Type::Base)
+                .text_color(theme.foreground)
+                .child(workflow.summary.clone()),
+        )
+        .child(div().pt(px(4.0)).child(sequence))
+}
+
 /// Screen 03's checklist: a row per stage, the failed one with its reason
 /// under it.
 fn checklist(wizard: &Wizard, theme: &Theme) -> Div {
@@ -878,10 +1050,7 @@ impl Render for AddProjectView {
             Screen::Folder => Some(wiz::FOLDER_INTRO.to_string()),
             Screen::Settings => Some(wiz::SETTINGS_INTRO.to_string()),
             Screen::Creating => None,
-            Screen::Created => self
-                .wizard
-                .created()
-                .map(|c| format!("“{}” is set up for Shelbi.", c.name)),
+            Screen::Created => Some(wiz::CREATED_INTRO.to_string()),
         };
         let details = div()
             .flex()
@@ -897,24 +1066,31 @@ impl Render for AddProjectView {
                 .child(self.card(ConfigMode::InRepo, window, &theme, cx))
                 .child(self.card(ConfigMode::Global, window, &theme, cx)),
             Screen::Creating => details.child(checklist(&self.wizard, &theme)),
-            // What the engine warned about (the commit guard it installed, a
-            // hook it left alone), under the checked list.
-            Screen::Created => details.child(checklist(&self.wizard, &theme)).children(
-                self.wizard.created().map(|c| {
+            // The workflows, then what the engine warned about (the commit
+            // guard it installed, a hook it left alone: its disclosure) and
+            // why an open failed.
+            Screen::Created => details
+                .children(self.workflows.iter().map(|w| workflow_card(w, &theme)))
+                .children(self.wizard.created().filter(|c| !c.warnings.is_empty()).map(|c| {
                     div()
                         .debug_selector(|| "add-project-warnings".into())
                         .flex()
                         .flex_col()
-                        .gap(px(8.0))
-                        .pl(px(44.0))
+                        .gap(px(4.0))
                         .children(c.warnings.iter().map(|line| {
                             div()
                                 .type_style(Type::Small)
-                                .text_color(theme.foreground)
+                                .text_color(theme.muted)
                                 .child(line.clone())
                         }))
-                }),
-            ),
+                }))
+                .children(self.wizard.open_error().map(|why| {
+                    div()
+                        .debug_selector(|| "add-project-open-error".into())
+                        .type_style(Type::Base)
+                        .text_color(theme.error)
+                        .child(why.to_string())
+                })),
         };
         let root: AnyElement = div()
             .id("add-project")
@@ -962,7 +1138,8 @@ impl Render for AddProjectView {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use gpui::{TestAppContext, VisualTestContext};
@@ -1005,7 +1182,12 @@ mod tests {
         cx: VisualTestContext,
         view: Entity<AddProjectView>,
         created: Arc<Mutex<Vec<CreateRequest>>>,
+        /// Each open the wizard asked for.
         opened: Rc<RefCell<Vec<String>>>,
+        /// How many of the next opens fail.
+        open_fails: Rc<Cell<usize>>,
+        /// Catalog re-reads, and the opens asked for when each ran.
+        refreshed: Arc<AtomicUsize>,
         windows: usize,
     }
 
@@ -1036,8 +1218,16 @@ mod tests {
         super::super::about::tests::init(cx);
         let created = Arc::new(Mutex::new(Vec::new()));
         let opened = Rc::new(RefCell::new(Vec::new()));
+        let open_fails = Rc::new(Cell::new(0));
+        let refreshed = Arc::new(AtomicUsize::new(0));
         let engine = Engine {
             check: Arc::new(fake_check),
+            refresh: Arc::new({
+                let refreshed = refreshed.clone();
+                move || {
+                    refreshed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
             create: Arc::new({
                 let created = created.clone();
                 move |request, cwd, out| {
@@ -1047,8 +1237,17 @@ mod tests {
             }),
         };
         let on_created: OnCreated = Rc::new({
-            let opened = opened.clone();
-            move |slug, _, _| opened.borrow_mut().push(slug)
+            let (opened, open_fails) = (opened.clone(), open_fails.clone());
+            move |slug, _, _| {
+                opened.borrow_mut().push(slug.to_string());
+                match open_fails.get() {
+                    0 => Ok(()),
+                    n => {
+                        open_fails.set(n - 1);
+                        Err("Shelbi couldn’t open a window.".into())
+                    }
+                }
+            }
         });
         let mut view = None;
         let window = cx.add_window(|window, cx| {
@@ -1065,6 +1264,8 @@ mod tests {
             view: view.unwrap(),
             created,
             opened,
+            open_fails,
+            refreshed,
             windows,
         }
     }
@@ -1208,8 +1409,180 @@ mod tests {
         assert!(r.window_open());
         r.click("add-project-primary");
         assert_eq!(*r.opened.borrow(), ["repo"]);
-        assert!(!r.window_open(), "Open Project closes the wizard");
+        assert_eq!(r.refreshed.load(Ordering::SeqCst), 1, "the catalog re-read before it opened");
+        assert!(!r.window_open(), "Okay closes the wizard");
         assert_eq!(r.created.lock().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn screen_four_shows_the_created_workflows_and_its_okay(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
+        for drawn in [
+            "add-project-workflow-task",
+            "add-project-workflow-subtask",
+            "add-project-default-badge",
+            "add-project-workflows-note",
+            "add-project-primary",
+            "add-project-warnings",
+        ] {
+            assert!(r.drawn(drawn), "{drawn}");
+        }
+        for status in [
+            "add-project-workflow-task-status-backlog",
+            "add-project-workflow-task-status-todo",
+            "add-project-workflow-task-status-in-progress",
+            "add-project-workflow-task-status-review",
+            "add-project-workflow-task-status-done",
+            "add-project-workflow-subtask-status-backlog",
+            "add-project-workflow-subtask-status-todo",
+            "add-project-workflow-subtask-status-in-progress",
+            "add-project-workflow-subtask-status-done",
+        ] {
+            assert!(r.drawn(status), "{status}");
+        }
+        assert!(!r.drawn("add-project-workflow-subtask-status-review"), "Subtask has no review");
+        assert!(!r.drawn("add-project-workflow-task-status-canceled"));
+        assert!(!r.drawn("add-project-step"), "no step count on 04");
+        assert!(!r.drawn("add-project-back"));
+        assert!(!r.drawn("add-project-checklist"));
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Primary, "Okay has focus, and Return");
+    }
+
+    #[gpui::test]
+    fn a_failed_creation_never_reaches_screen_four(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::Workspace, scripted(Some(Stage::Workflows), "repo"));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Creating);
+        assert!(!r.drawn("add-project-workflow-task"));
+        assert!(r.drawn("add-project-row-workflows-failed"));
+        r.keys("enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Created, "the retry got through");
+        assert!(r.opened.borrow().is_empty(), "nothing opens before Okay");
+    }
+
+    #[gpui::test]
+    fn a_failed_open_stays_on_four_and_okay_opens_without_creating_again(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::FirstLaunch, scripted(None, "repo"));
+        r.open_fails.set(1);
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        r.keys("enter");
+        assert_eq!(*r.opened.borrow(), ["repo"]);
+        assert!(r.window_open(), "the wizard stays for another try");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
+        assert!(r.drawn("add-project-open-error"));
+        assert!(!r.wizard(|w| w.opening()));
+        r.click("add-project-primary");
+        assert_eq!(*r.opened.borrow(), ["repo", "repo"]);
+        assert!(!r.window_open());
+        assert_eq!(r.created.lock().unwrap().len(), 1, "the project was created once");
+        assert_eq!(r.refreshed.load(Ordering::SeqCst), 2);
+    }
+
+    /// The whole flow over the real engine, folder check and catalog, in a
+    /// throwaway `SHELBI_HOME` and Git repo, in each storage mode: folder,
+    /// settings, the checklist, 04, then Okay re-reads the catalog (which
+    /// now lists the project) and asks for it to open. The workflows 04
+    /// showed are the ones on disk, and Task is the project's default.
+    #[gpui::test]
+    fn the_real_engine_creates_what_screen_four_shows_in_both_modes(cx: &mut TestAppContext) {
+        let _lock = crate::test_env::lock();
+        let base = std::env::temp_dir().join(format!("shb-add-04-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let prev = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", base.join("home"));
+        super::super::about::tests::init(cx);
+        for (mode, folder) in [(ConfigMode::Global, "outside"), (ConfigMode::InRepo, "inside")] {
+            let repo = base.join(folder);
+            std::fs::create_dir_all(&repo).unwrap();
+            let git = std::process::Command::new("git").arg("init").arg("-q").arg(&repo).status().unwrap();
+            assert!(git.success());
+            let catalog = Catalog::default();
+            let opened = Rc::new(RefCell::new(Vec::new()));
+            let on_created: OnCreated = Rc::new({
+                let (opened, catalog) = (opened.clone(), catalog.clone());
+                move |slug, _, _| {
+                    assert!(catalog.lists(slug), "the catalog re-read before the open");
+                    opened.borrow_mut().push(slug.to_string());
+                    Ok(())
+                }
+            });
+            let window = cx.add_window(|window, cx| {
+                AddProjectView::new(Origin::FirstLaunch, None, base.clone(), Engine::real(Some(catalog.clone())), on_created, window, cx)
+            });
+            let mut vcx = VisualTestContext::from_window(window.into(), cx);
+            let view = window.update(&mut vcx, |_, _, cx| cx.entity()).unwrap();
+            vcx.update(|window, cx| view.update(cx, |v, cx| v.folder_picked(Some(&repo), window, cx)));
+            vcx.run_until_parked();
+            let step = |vcx: &mut VisualTestContext, focus: Focus| {
+                vcx.update(|window, cx| view.update(cx, |v, cx| v.click(focus, window, cx)));
+                vcx.run_until_parked();
+            };
+            step(&mut vcx, Focus::Primary);
+            step(&mut vcx, Focus::Card(mode));
+            step(&mut vcx, Focus::Primary);
+            let (screen, slug, shown) = view.read_with(&vcx, |v, _| {
+                (v.wizard().screen(), v.wizard().created().map(|c| c.slug.clone()), v.workflows.clone())
+            });
+            assert_eq!(screen, Screen::Created, "{mode:?}: {:?}", view.read_with(&vcx, |v, _| v.wizard().failure().map(|(s, m)| (s, m.to_string()))));
+            let slug = slug.unwrap();
+            assert!(opened.borrow().is_empty(), "nothing opens before Okay");
+            step(&mut vcx, Focus::Primary);
+            assert_eq!(*opened.borrow(), [slug.clone()]);
+
+            let project = shelbi_state::load_project(&slug).unwrap();
+            assert_eq!(project.default_workflow.as_deref(), Some(shelbi_core::TASK_WORKFLOW_NAME));
+            for card in &shown {
+                let on_disk = shelbi_state::load_workflow(&slug, &card.name).unwrap();
+                let ids: Vec<&str> = on_disk
+                    .statuses
+                    .iter()
+                    .filter(|s| s.category != shelbi_core::StatusCategory::Archived)
+                    .map(|s| s.id.as_str())
+                    .collect();
+                let cards: Vec<&str> = card.statuses.iter().map(|s| s.id.as_str()).collect();
+                assert_eq!(cards, ids, "{mode:?} {}", card.name);
+                for status in &card.statuses {
+                    let disk = on_disk.status(&status.id).unwrap();
+                    assert_eq!(status.category, disk.category);
+                    assert_eq!(status.label, wiz::status_label(&disk.name));
+                }
+            }
+            let in_repo = repo.join(".shelbi").exists();
+            assert_eq!(in_repo, mode == ConfigMode::InRepo, "{mode:?} kept its settings where chosen");
+        }
+        match prev {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[gpui::test]
+    fn okay_pressed_again_while_it_opens_does_nothing(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        // Three presses before anything runs: one open.
+        let view = r.view.clone();
+        r.cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.click(Focus::Primary, window, cx);
+                assert!(v.wizard().opening());
+                v.click(Focus::Primary, window, cx);
+                v.key(KeyChord { code: Key::Enter, mods: Mods::NONE }, window, cx);
+                v.key(KeyChord { code: Key::Esc, mods: Mods::NONE }, window, cx);
+            })
+        });
+        assert!(r.drawn("add-project-opening"), "the spinner shows while it opens");
+        r.cx.run_until_parked();
+        assert_eq!(*r.opened.borrow(), ["repo"]);
+        assert_eq!(r.refreshed.load(Ordering::SeqCst), 1);
+        assert!(!r.window_open());
     }
 
     #[gpui::test]
@@ -1218,8 +1591,10 @@ mod tests {
         r.pick(Some("/repo"));
         r.keys("enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
-        for row in ["add-project-row-config-done", "add-project-row-agents-done", "add-project-row-workflows-done"] {
-            assert!(r.drawn(row), "{row}");
+        // 04 draws the workflows in the checklist's place; every row was
+        // checked on the way.
+        for stage in Stage::ALL {
+            assert_eq!(r.wizard(|w| w.row(stage)), RowState::Done, "{stage:?}");
         }
         assert_eq!(
             r.wizard(|w| w.created().map(|c| c.warnings.clone())),
