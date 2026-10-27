@@ -20,8 +20,11 @@
 //!
 //! [`controls`] holds the Figma form components (segmented control,
 //! labeled control, textbox, picker, checkbox) every form composes.
+//!
+//! [`spinner`] is the Figma Spinner: the progress ring a running step shows.
 
 pub mod clamped_text;
 pub mod controls;
 pub mod exact_text;
+pub mod spinner;
 pub mod terminal;

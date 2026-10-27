@@ -321,6 +321,7 @@ until a new role has its row here, with the values the palette really has.
 | `icon_green` | `#31d924` | `#5ac351` | `icon/green`: a working workspace |
 | `icon_yellow` | `#ffdd64` | `#ffca0d` | `icon/yellow`: awaiting input |
 | `icon_purple` | `#e374ff` | `#b247e7` | `icon/purple`: a review status |
+| `progress` | `#62cdf6` | `#f21478` | `progress/default` (`icon/cyan` / `icon/red`): the Add Project checklist's spinner, fading to transparent along its tail |
 
 ### Rules
 

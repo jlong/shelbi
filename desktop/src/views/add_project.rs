@@ -3,6 +3,10 @@
 //! 2481:8810, "02 · Settings · In the project" 2483:8653 and "Outside the
 //! project" 2483:8897).
 //!
+//! Screen 03 is "03 · Project · Writing config" 2484:8673, "Creating
+//! agents" 2514:45915 and "Adding workflows" 2514:45972
+//! (`dt-project-creation-checklist`).
+//!
 //! Every Add Project entry point (the sidebar's switcher, the palette and
 //! File menu, the empty-project chooser) and the first launch with no
 //! project open this one window, fixed at 800 × 580 with only the traffic
@@ -19,14 +23,26 @@
 //! - **02** picks where settings live: two cards, one selected, with the
 //!   real paths for the chosen folder.
 //! - **Create Project** runs [`Engine::create`] (the shared
-//!   `project_create::add_project`) once, off the UI thread; success opens
-//!   the project ([`crate::app::open_added_project`]) and closes the
-//!   wizard, a failure returns to 02 with the reason.
+//!   `project_create::add_project`) once, off the UI thread, and **03**
+//!   shows it as a checklist: the engine reports each stage starting,
+//!   finishing or failing through a [`ScaffoldReporter`] whose events cross
+//!   to the UI thread over a channel, and the wizard checks a row only when
+//!   its stage finishes. There's no footer while it runs. A failure keeps
+//!   the checked rows, marks the one that failed with the reason, and
+//!   offers Try Again, which runs the same request as a retry (the engine
+//!   finishes the partly created project rather than calling its own
+//!   registration a clash). Closing the window mid-run drops the run's
+//!   events and result; nothing restarts it.
+//! - Created, the wizard shows the project's name and anything the engine
+//!   warned about, and waits for Open Project before opening it
+//!   ([`crate::app::open_added_project`]) and closing. (The workflow summary
+//!   that goes here is `dt-wizard-workflow-summary`.)
 //!
 //! Keys: Tab / ⇧Tab move focus (the focus ring shows once the keyboard is
 //! used), Return is the enabled primary action, Space activates the focused
-//! button or card, the arrows move between the cards, Esc and ⌘W cancel.
-//! Cancelling writes nothing.
+//! button or card, the arrows move between the cards, Esc and ⌘W cancel
+//! (Esc waits while the engine runs). Cancelling before Create Project
+//! writes nothing.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -38,16 +54,18 @@ use gpui::{
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use shelbi_app::add_project_wizard::{
-    self as wiz, Action, CreateRequest, FolderCheck, Focus, Origin, Screen, Tone, Wizard,
+    self as wiz, Action, Attempt, CreateRequest, FolderCheck, Focus, Origin, RowState, Screen, Stage,
+    Tone, Wizard,
 };
 use shelbi_app::exec::Mutation;
 use shelbi_core::ConfigMode;
-use shelbi_orchestrator::project_create::AddProjectError;
+use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::commands;
-use crate::elements::controls;
+use crate::assets::{heroicon, icons};
+use crate::elements::{controls, spinner};
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::{self, Theme};
@@ -60,8 +78,10 @@ const INTRO_W: f32 = 600.0;
 /// [`Engine::check`]'s signature: the launch directory, the path field's
 /// text, the typed name.
 pub type CheckFn = dyn Fn(&Path, &str, Option<&str>) -> FolderCheck + Send + Sync;
-/// [`Engine::create`]'s signature: the request and the launch directory.
-pub type CreateFn = dyn Fn(&CreateRequest, &Path) -> Result<String, AddProjectError> + Send + Sync;
+/// [`Engine::create`]'s signature: the request, the launch directory, and
+/// where to report the stages and warnings.
+pub type CreateFn =
+    dyn Fn(&CreateRequest, &Path, &mut dyn ScaffoldReporter) -> Result<String, AddProjectError> + Send + Sync;
 
 /// The blocking work the wizard runs off the UI thread. A test swaps in its
 /// own, so nothing reads or writes a real Shelbi home.
@@ -69,7 +89,7 @@ pub type CreateFn = dyn Fn(&CreateRequest, &Path) -> Result<String, AddProjectEr
 pub struct Engine {
     /// What the path field's folder is (`project_create::check_folder`).
     pub check: Arc<CheckFn>,
-    /// Create the project; its id on success.
+    /// Create the project, reporting as it goes; its id on success.
     pub create: Arc<CreateFn>,
 }
 
@@ -78,15 +98,53 @@ impl Engine {
     pub fn real() -> Self {
         Engine {
             check: Arc::new(shelbi_orchestrator::project_create::check_folder),
-            create: Arc::new(|request, cwd| {
+            create: Arc::new(|request, cwd, out| {
                 let mutation = Mutation::AddProject {
                     name: request.name.clone(),
                     root: request.root.clone(),
                     mode: request.mode,
                 };
-                commands::run_add_project(&mutation, cwd)
+                let attempt = match request.attempt {
+                    Attempt::New => engine::Attempt::New,
+                    Attempt::Retry => engine::Attempt::Retry,
+                };
+                commands::run_add_project(&mutation, attempt, cwd, out)
             }),
         }
+    }
+}
+
+/// What the engine reported, on its way to the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Report {
+    Started(Stage),
+    Finished(Stage),
+    Failed(Stage, String),
+    Warning(String),
+}
+
+/// The engine's reporter: stages and warnings go to the wizard over
+/// `sender`; the progress lines (the CLI prints them) go to the log. A
+/// closed window has dropped the receiver, and the reports go nowhere.
+struct Forward(async_channel::Sender<Report>);
+
+impl ScaffoldReporter for Forward {
+    fn note(&mut self, line: &str) {
+        tracing::debug!(target: "shelbi::add_project", "{line}");
+    }
+    fn warn(&mut self, line: &str) {
+        tracing::warn!(target: "shelbi::add_project", "{line}");
+        let _ = self.0.try_send(Report::Warning(line.to_string()));
+    }
+    fn stage_started(&mut self, stage: ScaffoldStage) {
+        let _ = self.0.try_send(Report::Started(stage.into()));
+    }
+    fn stage_finished(&mut self, stage: ScaffoldStage) {
+        let _ = self.0.try_send(Report::Finished(stage.into()));
+    }
+    fn stage_failed(&mut self, stage: ScaffoldStage, error: &str) {
+        tracing::warn!(target: "shelbi::add_project", ?stage, "{error}");
+        let _ = self.0.try_send(Report::Failed(stage.into(), error.to_string()));
     }
 }
 
@@ -153,6 +211,9 @@ pub struct AddProjectView {
     cwd: PathBuf,
     engine: Engine,
     on_created: OnCreated,
+    /// The latest creation run; a report or result from an earlier one is
+    /// dropped.
+    run: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -232,6 +293,7 @@ impl AddProjectView {
             cwd,
             engine,
             on_created,
+            run: 0,
             _subscriptions: subscriptions,
         }
     }
@@ -279,6 +341,17 @@ impl AddProjectView {
                 return;
             }
             Action::Create(request) => self.create(request, window, cx),
+            Action::Open(created) => {
+                // The project's window first, then close this one, so the
+                // first launch's app never runs out of windows.
+                let (from, on_created) = (self.from, self.on_created.clone());
+                let me = window.window_handle();
+                cx.defer(move |cx| {
+                    on_created(created.slug, from, cx);
+                    me.update(cx, |_, window, _| window.remove_window()).ok();
+                });
+                return;
+            }
         }
         self.after_change(window, cx);
     }
@@ -366,37 +439,86 @@ impl AddProjectView {
         self.after_change(window, cx);
     }
 
-    /// Create Project: the engine, once, off the UI thread. Success opens
-    /// the project, then closes the wizard (in that order, so the first
-    /// launch's app never runs out of windows); a failure goes back on 02.
-    /// Should the wizard close mid-creation, a project that got created
-    /// still opens.
+    /// Create Project or Try Again: the engine, off the UI thread, its
+    /// reports crossing back over a channel as they happen, then its result.
+    /// Everything lands through a weak handle, so a closed window takes
+    /// nothing more; `run` drops anything from an earlier run.
     fn create(&mut self, request: CreateRequest, window: &mut Window, cx: &mut Context<Self>) {
+        self.run += 1;
+        let run = self.run;
+        let (sender, reports) = async_channel::unbounded();
         let (create, cwd) = (self.engine.create.clone(), self.cwd.clone());
-        let work = cx.background_executor().spawn(async move { create(&request, &cwd) });
-        let (from, on_created) = (self.from, self.on_created.clone());
-        let me = window.window_handle().downcast::<Self>();
-        cx.spawn(async move |_, cx| {
+        let work = cx
+            .background_executor()
+            .spawn(async move { create(&request, &cwd, &mut Forward(sender)) });
+        cx.spawn_in(window, async move |this, cx| {
+            // The sender goes when the engine returns, ending this loop.
+            while let Ok(report) = reports.recv().await {
+                if this.update_in(cx, |this, window, cx| this.report(run, report, window, cx)).is_err() {
+                    return;
+                }
+            }
             let result = work.await;
-            cx.update(|cx| match result {
-                Ok(slug) => {
-                    on_created(slug, from, cx);
-                    if let Some(me) = me {
-                        me.update(cx, |_, window, _| window.remove_window()).ok();
-                    }
-                }
-                Err(AddProjectError::Invalid(msg) | AddProjectError::Failed(msg)) => {
-                    if let Some(me) = me {
-                        me.update(cx, |this, window, cx| {
-                            this.wizard.creation_failed(msg);
-                            this.after_change(window, cx);
-                        })
-                        .ok();
-                    }
-                }
-            });
+            this.update_in(cx, |this, window, cx| this.finished(run, result, window, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Screen 03 as the engine's `reports` leave it, and its `result` if
+    /// it has ended, without running the engine (the visual harness, tests):
+    /// the chosen folder's Continue and Create Project, the request dropped.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub(crate) fn preview_creating(
+        &mut self,
+        reports: Vec<Report>,
+        result: Option<Result<String, AddProjectError>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.wizard.primary();
+        let _ = self.wizard.primary();
+        for report in reports {
+            self.report(self.run, report, window, cx);
+        }
+        if let Some(result) = result {
+            self.finished(self.run, result, window, cx);
+        }
+        self.after_change(window, cx);
+    }
+
+    /// One report from run `run`.
+    fn report(&mut self, run: u64, report: Report, window: &mut Window, cx: &mut Context<Self>) {
+        if run != self.run {
+            return;
+        }
+        match report {
+            Report::Started(stage) => self.wizard.stage_started(stage),
+            Report::Finished(stage) => self.wizard.stage_finished(stage),
+            Report::Failed(stage, message) => self.wizard.stage_failed(stage, message),
+            Report::Warning(line) => self.wizard.warning(&line),
+        }
+        self.after_change(window, cx);
+    }
+
+    /// Run `run` ended: on to the created screen, or the failure on 03.
+    fn finished(
+        &mut self,
+        run: u64,
+        result: Result<String, AddProjectError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if run != self.run {
+            return;
+        }
+        match result {
+            Ok(slug) => self.wizard.creation_succeeded(slug),
+            Err(AddProjectError::Invalid(msg) | AddProjectError::Failed(msg)) => {
+                self.wizard.creation_failed(msg)
+            }
+        }
+        self.after_change(window, cx);
     }
 
     /// Whether `focus` shows the keyboard's ring.
@@ -404,9 +526,27 @@ impl AddProjectView {
         self.keyboard && self.wizard.focus() == focus && self.focus.is_focused(window)
     }
 
-    /// Back and Continue / Create Project, under the step count.
+    /// Back and Continue / Create Project, under the step count. Screen 03
+    /// keeps the row's height (Figma's spacer) with nothing in it while the
+    /// engine runs, and Try Again after a failure; the created screen has
+    /// Open Project.
     fn footer(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let screen = self.wizard.screen();
+        if matches!(screen, Screen::Creating | Screen::Created) {
+            let label = if screen == Screen::Created { wiz::OPEN_LABEL } else { wiz::RETRY_LABEL };
+            let button = self.wizard.primary_enabled().then(|| {
+                style::button("add-project-primary", label, ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.click(Focus::Primary, window, cx)))
+            });
+            return div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .justify_end()
+                .h(px(32.0))
+                .w_full()
+                .children(button);
+        }
         let back = if self.wizard.back_enabled() {
             style::button("add-project-back", "Back", ButtonKind::Secondary, ButtonSize::Base, self.ring(Focus::Back, window), theme)
                 .on_click(cx.listener(|this, _, window, cx| this.click(Focus::Back, window, cx)))
@@ -415,7 +555,7 @@ impl AddProjectView {
         };
         let label = match screen {
             Screen::Folder => "Continue",
-            Screen::Settings | Screen::Creating => "Create Project",
+            _ => "Create Project",
         };
         let primary = if self.wizard.primary_enabled() {
             style::button("add-project-primary", label, ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
@@ -596,6 +736,104 @@ impl AddProjectView {
     }
 }
 
+/// Screen 03's checklist: a row per stage, the failed one with its reason
+/// under it.
+fn checklist(wizard: &Wizard, theme: &Theme) -> Div {
+    div()
+        .debug_selector(|| "add-project-checklist".into())
+        .flex()
+        .flex_col()
+        .gap(px(24.0))
+        .w_full()
+        .children(Stage::ALL.into_iter().map(|stage| {
+            let state = wizard.row(stage);
+            let reason = wizard.failure().filter(|(s, _)| *s == stage).map(|(_, why)| {
+                div()
+                    .debug_selector(|| "add-project-failure".into())
+                    // Under the label: past the 32pt status and the 12pt gap.
+                    .pl(px(44.0))
+                    .type_style(Type::Base)
+                    .text_color(theme.error)
+                    .child(why.to_string())
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .w_full()
+                .child(checklist_row(stage, state, theme))
+                .children(reason)
+        }))
+}
+
+/// One checklist row: the Step Status, then the label (muted while pending,
+/// loud and medium while running or failed, the body color once done).
+fn checklist_row(stage: Stage, state: RowState, theme: &Theme) -> Div {
+    let (style, color) = match state {
+        RowState::Pending => (Type::Base, theme.muted),
+        RowState::Active | RowState::Failed => (Type::BaseMedium, theme.text_loud),
+        RowState::Done => (Type::Base, theme.foreground),
+    };
+    let id = row_selector(stage);
+    div()
+        .debug_selector(move || format!("{id}-{}", row_state_name(state)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .h(px(32.0))
+        .w_full()
+        .child(step_status(stage, state, theme))
+        .child(div().type_style(style).text_color(color).child(stage.label()))
+}
+
+/// The Figma Step Status: Incomplete (an empty circle in the overlay fill),
+/// In Progress (the spinner), Complete (a green check on the Success fill).
+/// Failed isn't in Figma: an x on the Danger fill, the same way.
+fn step_status(stage: Stage, state: RowState, theme: &Theme) -> AnyElement {
+    let circle = || {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(spinner::SIZE))
+            .rounded_full()
+    };
+    match state {
+        RowState::Pending => circle().bg(theme.background).into_any_element(),
+        RowState::Active => {
+            spinner::spinner(SharedString::from(row_selector(stage)), theme.progress).into_any_element()
+        }
+        RowState::Done => circle()
+            .bg(theme.success_fill)
+            .child(heroicon(icons::CHECK).text_color(theme.icon_green))
+            .into_any_element(),
+        RowState::Failed => circle()
+            .bg(theme.danger_fill)
+            .child(heroicon(icons::X_MARK).text_color(theme.error))
+            .into_any_element(),
+    }
+}
+
+/// A stage's row, for tests and the visual harness.
+fn row_selector(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Config => "add-project-row-config",
+        Stage::Agents => "add-project-row-agents",
+        Stage::Workflows => "add-project-row-workflows",
+    }
+}
+
+fn row_state_name(state: RowState) -> &'static str {
+    match state {
+        RowState::Pending => "pending",
+        RowState::Active => "active",
+        RowState::Done => "done",
+        RowState::Failed => "failed",
+    }
+}
+
 /// A status line's color.
 fn tone_color(tone: Tone, theme: &Theme) -> Hsla {
     match tone {
@@ -635,13 +873,15 @@ impl Render for AddProjectView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let screen = self.wizard.screen();
+        // Screen 03 has its title alone.
         let intro = match screen {
-            Screen::Folder => wiz::FOLDER_INTRO.to_string(),
-            Screen::Settings => wiz::SETTINGS_INTRO.to_string(),
-            Screen::Creating => {
-                let name = self.wizard.check().and_then(|c| c.name.clone()).unwrap_or_default();
-                format!("Setting up {name}…")
-            }
+            Screen::Folder => Some(wiz::FOLDER_INTRO.to_string()),
+            Screen::Settings => Some(wiz::SETTINGS_INTRO.to_string()),
+            Screen::Creating => None,
+            Screen::Created => self
+                .wizard
+                .created()
+                .map(|c| format!("“{}” is set up for Shelbi.", c.name)),
         };
         let details = div()
             .flex()
@@ -655,15 +895,26 @@ impl Render for AddProjectView {
             Screen::Folder => details.child(self.folder_box(window, &theme, cx)),
             Screen::Settings => details
                 .child(self.card(ConfigMode::InRepo, window, &theme, cx))
-                .child(self.card(ConfigMode::Global, window, &theme, cx))
-                .children(self.wizard.error().map(|msg| {
+                .child(self.card(ConfigMode::Global, window, &theme, cx)),
+            Screen::Creating => details.child(checklist(&self.wizard, &theme)),
+            // What the engine warned about (the commit guard it installed, a
+            // hook it left alone), under the checked list.
+            Screen::Created => details.child(checklist(&self.wizard, &theme)).children(
+                self.wizard.created().map(|c| {
                     div()
-                        .debug_selector(|| "add-project-error".into())
-                        .type_style(Type::Small)
-                        .text_color(theme.error)
-                        .child(msg.to_string())
-                })),
-            Screen::Creating => details,
+                        .debug_selector(|| "add-project-warnings".into())
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .pl(px(44.0))
+                        .children(c.warnings.iter().map(|line| {
+                            div()
+                                .type_style(Type::Small)
+                                .text_color(theme.foreground)
+                                .child(line.clone())
+                        }))
+                }),
+            ),
         };
         let root: AnyElement = div()
             .id("add-project")
@@ -694,13 +945,13 @@ impl Render for AddProjectView {
                             .text_color(theme.text_loud)
                             .child(screen.title()),
                     )
-                    .child(
+                    .children(intro.map(|intro| {
                         div()
                             .w(px(INTRO_W))
                             .type_style(Type::Base)
                             .text_color(theme.foreground)
-                            .child(intro),
-                    ),
+                            .child(intro)
+                    })),
             )
             .child(details)
             .child(self.footer(window, &theme, cx))
@@ -758,7 +1009,30 @@ mod tests {
         windows: usize,
     }
 
+    /// A creation engine that reports the stages up to `fail_at` (all of
+    /// them when `None`) the way the real one does, warns once, then fails
+    /// there or returns `slug`. A retry always gets through.
+    fn scripted(fail_at: Option<Stage>, slug: &'static str) -> Arc<CreateFn> {
+        Arc::new(move |request, _, out| {
+            out.warn("shelbi: installed the commit guard");
+            for stage in ScaffoldStage::ALL {
+                out.stage_started(stage);
+                if fail_at == Some(stage.into()) && request.attempt == Attempt::New {
+                    out.stage_failed(stage, "agents is a file");
+                    return Err(AddProjectError::Failed("Add project failed: agents is a file".into()));
+                }
+                out.stage_finished(stage);
+            }
+            Ok(slug.to_string())
+        })
+    }
+
     fn rig(cx: &mut TestAppContext, origin: Origin, result: Result<String, AddProjectError>) -> Rig {
+        let create: Arc<CreateFn> = Arc::new(move |_, _, _| result.clone());
+        rig_with(cx, origin, create)
+    }
+
+    fn rig_with(cx: &mut TestAppContext, origin: Origin, create: Arc<CreateFn>) -> Rig {
         super::super::about::tests::init(cx);
         let created = Arc::new(Mutex::new(Vec::new()));
         let opened = Rc::new(RefCell::new(Vec::new()));
@@ -766,9 +1040,9 @@ mod tests {
             check: Arc::new(fake_check),
             create: Arc::new({
                 let created = created.clone();
-                move |request, _| {
+                move |request, cwd, out| {
                     created.lock().unwrap().push(request.clone());
-                    result.clone()
+                    create(request, cwd, out)
                 }
             }),
         };
@@ -921,22 +1195,111 @@ mod tests {
         r.keys("enter enter");
         assert_eq!(
             *r.created.lock().unwrap(),
-            [CreateRequest { name: "repo".into(), root: "/repo".into(), mode: ConfigMode::InRepo }]
+            [CreateRequest {
+                name: "repo".into(),
+                root: "/repo".into(),
+                mode: ConfigMode::InRepo,
+                attempt: Attempt::New,
+            }]
         );
+        // Created, it waits for the user before opening the project.
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
+        assert!(r.opened.borrow().is_empty(), "nothing opens before Open Project");
+        assert!(r.window_open());
+        r.click("add-project-primary");
         assert_eq!(*r.opened.borrow(), ["repo"]);
-        assert!(!r.window_open(), "success closes the wizard");
+        assert!(!r.window_open(), "Open Project closes the wizard");
+        assert_eq!(r.created.lock().unwrap().len(), 1);
     }
 
     #[gpui::test]
-    fn a_failed_create_returns_to_settings_with_the_reason(cx: &mut TestAppContext) {
-        let mut r = rig(cx, Origin::Workspace, Err(AddProjectError::Invalid("a project already lives at `repo`".into())));
+    fn the_engines_stages_check_the_rows_and_its_warnings_carry_over(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
+        for row in ["add-project-row-config-done", "add-project-row-agents-done", "add-project-row-workflows-done"] {
+            assert!(r.drawn(row), "{row}");
+        }
+        assert_eq!(
+            r.wizard(|w| w.created().map(|c| c.warnings.clone())),
+            Some(vec!["Installed the commit guard".to_string()])
+        );
+        assert!(r.drawn("add-project-warnings"));
+    }
+
+    #[gpui::test]
+    fn a_failed_stage_keeps_its_rows_and_try_again_finishes_the_project(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::Workspace, scripted(Some(Stage::Agents), "repo"));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Creating, "it stays on the checklist");
+        assert!(r.drawn("add-project-row-config-done"));
+        assert!(r.drawn("add-project-row-agents-failed"));
+        assert!(r.drawn("add-project-row-workflows-pending"));
+        assert!(r.drawn("add-project-failure"));
+        assert_eq!(r.wizard(|w| w.failure().map(|(s, m)| (s, m.to_string()))), Some((Stage::Agents, "agents is a file".into())));
+        assert!(r.opened.borrow().is_empty());
+
+        r.click("add-project-primary");
+        let attempts: Vec<Attempt> = r.created.lock().unwrap().iter().map(|c| c.attempt).collect();
+        assert_eq!(attempts, [Attempt::New, Attempt::Retry], "Try Again retries the same request");
+        assert_eq!(r.created.lock().unwrap()[1].root, "/repo");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
+        r.keys("enter");
+        assert_eq!(*r.opened.borrow(), ["repo"]);
+    }
+
+    #[gpui::test]
+    fn each_row_state_draws_from_the_engines_reports(cx: &mut TestAppContext) {
+        let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
+        r.pick(Some("/repo"));
+        // On to 03 without running an engine, then feed the view reports the
+        // way the channel does.
+        let view = r.view.clone();
+        r.cx.update(|window, cx| view.update(cx, |v, cx| v.preview_creating(Vec::new(), None, window, cx)));
+        assert_eq!(r.wizard(|w| (w.screen(), w.running())), (Screen::Creating, true));
+        let report = |r: &mut Rig, report: Report| {
+            let view = r.view.clone();
+            r.cx.update(|window, cx| view.update(cx, |v, cx| v.report(v.run, report, window, cx)));
+            r.cx.run_until_parked();
+        };
+        assert!(r.drawn("add-project-row-config-pending"));
+        assert!(!r.drawn("add-project-primary"), "no footer button while it runs");
+        assert!(!r.drawn("add-project-step"));
+        report(&mut r, Report::Started(Stage::Config));
+        assert!(r.drawn("add-project-row-config-active"));
+        assert!(r.drawn("add-project-row-agents-pending"));
+        report(&mut r, Report::Finished(Stage::Config));
+        report(&mut r, Report::Started(Stage::Agents));
+        assert!(r.drawn("add-project-row-config-done"));
+        assert!(r.drawn("add-project-row-agents-active"));
+        assert!(r.drawn("add-project-row-workflows-pending"));
+        // A report from an older run is dropped.
+        let view = r.view.clone();
+        r.cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.report(v.run + 1, Report::Finished(Stage::Agents), window, cx))
+        });
+        assert!(r.drawn("add-project-row-agents-active"));
+    }
+
+    #[gpui::test]
+    fn closing_mid_creation_drops_its_reports_and_opens_nothing(cx: &mut TestAppContext) {
+        let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
         r.keys("enter");
-        r.keys("enter");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
-        assert!(r.drawn("add-project-error"));
-        assert!(r.opened.borrow().is_empty());
-        assert!(r.window_open());
+        // Create Project, and the window closes before the engine reports.
+        let view = r.view.clone();
+        r.cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.click(Focus::Primary, window, cx);
+                window.remove_window();
+            })
+        });
+        r.cx.run_until_parked();
+        assert!(!r.window_open());
+        assert!(r.opened.borrow().is_empty(), "an abandoned wizard opens nothing");
+        assert!(r.created.lock().unwrap().len() <= 1, "no second run");
     }
 
     #[gpui::test]
