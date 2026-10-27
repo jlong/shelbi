@@ -1,27 +1,13 @@
-//! The Add machine and Configure machine forms' state, toolkit-free
-//! (`dt-machine-settings-forms`, Figma frames 2526:9557 and 2528:9870).
+//! The Add machine and Configure machine forms' state
+//! (`dt-machine-settings-forms`, Figma frames 2526:9557 and 2528:9870): the
+//! shared draft (`shelbi_app::settings::machine_form`, which the TUI's form
+//! edits too) with the desktop's connection check region over it.
 //!
-//! A form edits a draft of one of the project's machines: [`MachineForm::add`]
-//! a new SSH machine, [`MachineForm::configure`] an existing one (SSH or this
-//! Mac) from the values the Workspaces page last read, with how many of the
-//! project's workspaces it hosts. The draft is the fields' text as typed;
-//! nothing is validated or written here. Add machine / Save changes hands it
-//! to the shared machine service as a [`SaveRequest`]
-//! (`shelbi_orchestrator::pool_admin::{add_machine, update_machine}`), which
-//! validates it against the config as it is then, refuses a change that would
-//! strand the machine's workspaces, and writes it. Its refusal comes back to
-//! [`MachineForm::finish_save`]: a field's error marks the field, anything
-//! else shows over the actions, and the draft stays as typed either way.
+//! The draft is the fields' text as typed; Add machine / Save changes hands
+//! it to the shared machine service as a [`SaveRequest`] and its refusal
+//! comes back to [`MachineForm::finish_save`] (see the shared module). This
+//! Mac's form adds Choose… beside its directory (the native folder chooser).
 //!
-//! - **Kind** never changes: Add machine is always SSH, and Configure keeps
-//!   the machine's own (this Mac's form has no SSH host or connection check).
-//! - **Project directory** is `Machine::work_dir`, the project's root on the
-//!   machine (workspace worktrees go under it). This Mac's shows `~`-shortened
-//!   and the service expands it again; a remote's is never expanded here (a
-//!   `~` on it is the remote's home, which the service asks to have written
-//!   out in full).
-//! - **Machine tags** are typed comma-separated; the service trims and
-//!   normalizes them. Every workspace on the machine inherits them.
 //! - **Connection check** (SSH only): Test connection, Test again and Install
 //!   CLI each make a [`ReadinessRequest`] for the draft as it stands, which
 //!   the readiness service (`shelbi_orchestrator::machine_readiness`) runs off
@@ -33,51 +19,21 @@
 //!   either drops a check back to not checked (an install keeps running, and
 //!   its answer is dropped if the draft has moved on), and an answer for an
 //!   older request is dropped. A check writes nothing to the project.
-//! - **Saving** runs once at a time ([`MachineForm::begin_save`] refuses a
-//!   second); an answer for an older save is dropped.
 //!
-//! Keys ([`MachineForm::key`]): Tab and ⇧Tab move through the fields and
-//! buttons, Return submits from a field (or activates the focused button),
-//! Space activates the focused button, Esc cancels.
+//! Keys ([`MachineForm::key`]): the shared form's (Tab and ⇧Tab move, Return
+//! submits from a field or activates the focused button, Space activates the
+//! focused button, Esc cancels), with the check's buttons in the Tab order.
 
+use std::ops::Deref;
 use std::path::Path;
 
-use shelbi_core::{Machine, MachineKind};
+use shelbi_app::settings::machine_form::{self as draft, Controls};
+use shelbi_core::Machine;
 use shelbi_orchestrator::machine_readiness::{self as readiness, Issue, Readiness, TargetField};
-use shelbi_orchestrator::pool_admin::{MachineChange, MachineFields, PoolError, PoolField, UpdateMachine};
-use shelbi_state::keymap::{Key, KeyChord, Mods};
+use shelbi_orchestrator::pool_admin::{MachineChange, PoolError};
+use shelbi_state::keymap::KeyChord;
 
-/// What the form adds or edits.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    /// A new SSH machine.
-    Add,
-    /// An existing machine: `expected` as the page read it (a save checks
-    /// it's still that), and the workspaces it hosts.
-    Configure { expected: Machine, workspaces: usize },
-}
-
-/// A text field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Field {
-    Name,
-    Host,
-    WorkDir,
-    Tags,
-}
-
-/// What has the keyboard: a field, or a button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Field(Field),
-    /// Choose… beside this Mac's directory.
-    Browse,
-    /// Test connection / Test again.
-    Test,
-    InstallCli,
-    Cancel,
-    Submit,
-}
+pub use shelbi_app::settings::machine_form::{CheckKey, Field, Focus, SaveRequest};
 
 /// What a key or a button asks the view to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,13 +48,6 @@ pub enum Action {
     Browse,
     /// Run this readiness request.
     Check(ReadinessRequest),
-}
-
-/// The save the service runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SaveRequest {
-    Add(MachineFields),
-    Update(UpdateMachine),
 }
 
 /// Which readiness button was pressed.
@@ -208,13 +157,6 @@ pub struct Panel {
     pub detail: String,
 }
 
-/// The host and directory a check result is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckKey {
-    pub host: String,
-    pub work_dir: String,
-}
-
 /// The connection check region. `Checking` with [`ReadinessIntent::InstallCli`]
 /// is an install in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,168 +166,56 @@ pub enum Check {
     Done { key: CheckKey, outcome: CheckOutcome },
 }
 
-/// An add or configure form's state.
+/// An add or configure form's state: the shared draft (read through
+/// `Deref`) and the connection check region.
 #[derive(Debug, Clone)]
 pub struct MachineForm {
-    project: String,
-    mode: Mode,
-    kind: MachineKind,
-    name: String,
-    host: String,
-    work_dir: String,
-    tags: String,
-    /// The service's complaint about one field.
-    field_error: Option<(Field, String)>,
-    /// A refusal or failure not about one field.
-    error: Option<String>,
-    /// The save in flight.
-    saving: Option<u64>,
-    runs: u64,
+    draft: draft::MachineForm,
     check: Check,
-    focus: Focus,
+    /// Readiness requests made, for their run ids.
+    runs: u64,
+}
+
+impl Deref for MachineForm {
+    type Target = draft::MachineForm;
+
+    fn deref(&self) -> &draft::MachineForm {
+        &self.draft
+    }
 }
 
 impl MachineForm {
     /// Add machine: an empty SSH draft.
     pub fn add(project: &str) -> Self {
-        MachineForm {
-            project: project.to_string(),
-            mode: Mode::Add,
-            kind: MachineKind::Ssh,
-            name: String::new(),
-            host: String::new(),
-            work_dir: String::new(),
-            tags: String::new(),
-            field_error: None,
-            error: None,
-            saving: None,
-            runs: 0,
-            check: Check::NotChecked,
-            focus: Focus::Field(Field::Name),
-        }
+        Self::over(draft::MachineForm::add(project))
     }
 
     /// Configure `machine` (as the page read it), which hosts `workspaces`
     /// of the project's workspaces. This Mac's directory is shortened
     /// against `home`.
     pub fn configure(project: &str, machine: &Machine, workspaces: usize, home: Option<&Path>) -> Self {
-        let work_dir = match machine.kind {
-            MachineKind::Local => shelbi_app::settings::workspaces::tilde(&machine.work_dir, home),
-            MachineKind::Ssh => machine.work_dir.display().to_string(),
-        };
+        Self::over(draft::MachineForm::configure(project, machine, workspaces, home))
+    }
+
+    fn over(draft: draft::MachineForm) -> Self {
         MachineForm {
-            kind: machine.kind,
-            name: machine.name.clone(),
-            host: machine.host.clone().unwrap_or_default(),
-            work_dir,
-            tags: machine.tags.join(", "),
-            mode: Mode::Configure {
-                expected: machine.clone(),
-                workspaces,
-            },
-            ..MachineForm::add(project)
+            draft: draft.with_controls(Controls { browse: true, checks: true }),
+            check: Check::NotChecked,
+            runs: 0,
         }
-    }
-
-    pub fn project(&self) -> &str {
-        &self.project
-    }
-
-    /// Whether it's an SSH machine's form (SSH host, connection check).
-    pub fn remote(&self) -> bool {
-        self.kind == MachineKind::Ssh
-    }
-
-    /// The machine being configured, as loaded.
-    pub fn configured(&self) -> Option<&Machine> {
-        match &self.mode {
-            Mode::Configure { expected, .. } => Some(expected),
-            Mode::Add => None,
-        }
-    }
-
-    pub fn text(&self, field: Field) -> &str {
-        match field {
-            Field::Name => &self.name,
-            Field::Host => &self.host,
-            Field::WorkDir => &self.work_dir,
-            Field::Tags => &self.tags,
-        }
-    }
-
-    pub fn title(&self) -> &'static str {
-        match self.mode {
-            Mode::Add => "Add machine",
-            Mode::Configure { .. } => "Configure machine",
-        }
-    }
-
-    /// The line under the title: what Add does, or the machine's place in
-    /// the project.
-    pub fn description(&self) -> String {
-        match &self.mode {
-            Mode::Add => "Connect another machine to run workspaces over SSH.".into(),
-            Mode::Configure { expected, workspaces } => {
-                let runs = match workspaces {
-                    0 => "runs no workspaces".to_string(),
-                    1 => "runs 1 workspace".to_string(),
-                    n => format!("runs {n} workspaces"),
-                };
-                format!("{} {runs} for this project.", expected.name)
-            }
-        }
-    }
-
-    pub fn submit_label(&self) -> &'static str {
-        match self.mode {
-            Mode::Add => "Add machine",
-            Mode::Configure { .. } => "Save changes",
-        }
-    }
-
-    /// The service's error for `field`, if it marked one.
-    pub fn field_error(&self, field: Field) -> Option<&str> {
-        self.field_error
-            .as_ref()
-            .filter(|(f, _)| *f == field)
-            .map(|(_, e)| e.as_str())
-    }
-
-    /// The error over the actions.
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    pub fn saving(&self) -> bool {
-        self.saving.is_some()
     }
 
     pub fn check(&self) -> &Check {
         &self.check
     }
 
-    pub fn focus(&self) -> Focus {
-        self.focus
-    }
-
     /// `field` was edited to `text`. Its error and the form's go (the user
     /// is acting on them), and a new host or directory drops the check
     /// done (or running) for the old one.
     pub fn set(&mut self, field: Field, text: &str) {
-        let slot = match field {
-            Field::Name => &mut self.name,
-            Field::Host => &mut self.host,
-            Field::WorkDir => &mut self.work_dir,
-            Field::Tags => &mut self.tags,
-        };
-        if slot == text {
+        if !self.draft.set(field, text) {
             return;
         }
-        *slot = text.to_string();
-        if self.field_error.as_ref().is_some_and(|(f, _)| *f == field) {
-            self.field_error = None;
-        }
-        self.error = None;
         let key = self.check_key();
         let stale = match &self.check {
             Check::NotChecked => false,
@@ -402,89 +232,11 @@ impl MachineForm {
         }
     }
 
-    /// The fields for the service, as typed (it trims and validates them).
-    pub fn fields(&self) -> MachineFields {
-        let host = self.host.trim();
-        MachineFields {
-            name: self.name.clone(),
-            kind: self.kind,
-            host: (self.remote() && !host.is_empty()).then(|| host.to_string()),
-            work_dir: self.work_dir.clone(),
-            tags: self.tags.split(',').map(str::to_string).collect(),
-        }
-    }
-
-    /// The save for the draft, unless one is running.
-    pub fn begin_save(&mut self) -> Option<(u64, SaveRequest)> {
-        if self.saving.is_some() {
-            return None;
-        }
-        self.runs += 1;
-        self.saving = Some(self.runs);
-        self.error = None;
-        self.field_error = None;
-        let fields = self.fields();
-        let request = match &self.mode {
-            Mode::Add => SaveRequest::Add(fields),
-            Mode::Configure { expected, .. } => SaveRequest::Update(UpdateMachine {
-                name: expected.name.clone(),
-                expected: Some(expected.clone()),
-                fields,
-            }),
-        };
-        Some((self.runs, request))
-    }
-
     /// Save `run` answered. Returns the change when it took (the form
     /// closes); a refusal stays with the draft. An answer for another save
     /// is dropped.
     pub fn finish_save(&mut self, run: u64, result: Result<MachineChange, PoolError>) -> Option<MachineChange> {
-        if self.saving != Some(run) {
-            return None;
-        }
-        self.saving = None;
-        match result {
-            Ok(change) => Some(change),
-            Err(e) => {
-                self.refused(e);
-                None
-            }
-        }
-    }
-
-    /// Show the service's refusal: on its field when it names one the form
-    /// shows (focus moves there), else over the actions.
-    fn refused(&mut self, e: PoolError) {
-        let field = match &e {
-            PoolError::Invalid { field: Some(f), .. } => match f {
-                PoolField::Name => Some(Field::Name),
-                PoolField::Host if self.remote() => Some(Field::Host),
-                PoolField::WorkDir => Some(Field::WorkDir),
-                PoolField::Tags => Some(Field::Tags),
-                _ => None,
-            },
-            _ => None,
-        };
-        let message = refusal_message(&e);
-        match field {
-            Some(f) => {
-                self.field_error = Some((f, message));
-                self.focus = Focus::Field(f);
-            }
-            None => self.error = Some(message),
-        }
-    }
-
-    /// The draft's check key: the SSH destination and the directory.
-    pub fn check_key(&self) -> CheckKey {
-        let host = match self.host.trim() {
-            "" => self.name.trim(),
-            h => h,
-        };
-        CheckKey {
-            host: host.to_string(),
-            work_dir: self.work_dir.trim().to_string(),
-        }
+        self.draft.finish_save(run, result)
     }
 
     /// The readiness button's intent now: Test connection before a result
@@ -522,15 +274,6 @@ impl MachineForm {
             Check::Checking { run, .. } => Some(*run),
             _ => None,
         }
-    }
-
-    /// The configured machine's name, when the draft still names its saved
-    /// SSH destination: a check there is about a machine the project already
-    /// has, so a verified binary can be recorded for it before a save.
-    pub fn committed_name(&self, key: &CheckKey) -> Option<&str> {
-        let saved = self.configured()?;
-        let host = saved.host.as_deref().unwrap_or(&saved.name);
-        (saved.kind == MachineKind::Ssh && host == key.host).then_some(saved.name.as_str())
     }
 
     /// What the connection check region shows now.
@@ -587,8 +330,7 @@ impl MachineForm {
                 TargetField::Host => Field::Host,
                 TargetField::WorkDir => Field::WorkDir,
             };
-            self.field_error = Some((field, e.message));
-            self.focus = Focus::Field(field);
+            self.draft.mark(field, e.message);
             return None;
         }
         self.runs += 1;
@@ -602,9 +344,9 @@ impl MachineForm {
             run,
             intent,
             target: ReadinessTarget {
-                project: self.project.clone(),
+                project: self.project().to_string(),
                 machine: self.configured().map(|m| m.name.clone()),
-                name: self.name.trim().to_string(),
+                name: self.text(Field::Name).trim().to_string(),
                 host: key.host,
                 work_dir: key.work_dir,
             },
@@ -627,83 +369,48 @@ impl MachineForm {
     }
 
     /// The controls Tab visits, in order.
+    #[cfg(test)]
     pub fn focus_order(&self) -> Vec<Focus> {
-        let mut order = vec![Focus::Field(Field::Name)];
-        if self.remote() {
-            order.push(Focus::Field(Field::Host));
-        }
-        order.push(Focus::Field(Field::WorkDir));
-        if !self.remote() {
-            order.push(Focus::Browse);
-        }
-        order.push(Focus::Field(Field::Tags));
-        if self.remote() {
-            order.push(Focus::Test);
-            if self.offers_install() {
-                order.push(Focus::InstallCli);
-            }
-        }
-        order.extend([Focus::Cancel, Focus::Submit]);
-        order
+        self.draft.focus_order(self.offers_install())
     }
 
     /// Give `focus` the keyboard (a click on a field or button).
     pub fn set_focus(&mut self, focus: Focus) {
-        self.focus = focus;
+        self.draft.set_focus(focus);
     }
 
     /// Keep focus on a control the form shows (Install CLI comes and goes).
     pub fn settle_focus(&mut self) {
-        if !self.focus_order().contains(&self.focus) {
-            self.focus = Focus::Test;
-        }
-    }
-
-    fn step_focus(&mut self, forward: bool) {
-        let order = self.focus_order();
-        let at = order.iter().position(|f| *f == self.focus).unwrap_or(0);
-        let next = if forward {
-            (at + 1) % order.len()
-        } else {
-            (at + order.len() - 1) % order.len()
-        };
-        self.focus = order[next];
+        let install = self.offers_install();
+        self.draft.settle_focus(install);
     }
 
     /// A press of `focus` (a click, or Space / Return on it).
     pub fn press(&mut self, focus: Focus) -> Action {
-        self.focus = focus;
-        match focus {
-            Focus::Field(_) | Focus::Submit => self.submit(),
-            Focus::Cancel => Action::Cancel,
-            Focus::Browse => Action::Browse,
-            Focus::Test => self.begin_check(self.test_intent()).map_or(Action::Stay, Action::Check),
-            Focus::InstallCli => self
-                .begin_check(ReadinessIntent::InstallCli)
-                .map_or(Action::Stay, Action::Check),
-        }
-    }
-
-    /// Add machine / Save changes.
-    pub fn submit(&mut self) -> Action {
-        self.begin_save().map_or(Action::Stay, |(run, request)| Action::Save(run, request))
+        let action = self.draft.press(focus);
+        self.lift(action)
     }
 
     /// A key the form takes: Tab and ⇧Tab, Return and Esc anywhere, Space
     /// on a button. `None` lets it through (to the field).
     pub fn key(&mut self, chord: KeyChord) -> Option<Action> {
-        let bare = chord.mods == Mods::NONE;
-        let on_button = !matches!(self.focus, Focus::Field(_));
-        match chord.code {
-            Key::Tab if bare => self.step_focus(true),
-            Key::Tab if chord.mods == Mods::SHIFT => self.step_focus(false),
-            Key::BackTab if bare || chord.mods == Mods::SHIFT => self.step_focus(false),
-            Key::Esc if bare => return Some(Action::Cancel),
-            Key::Enter if bare => return Some(self.press(self.focus)),
-            Key::Char(' ') if bare && on_button => return Some(self.press(self.focus)),
-            _ => return None,
+        let install = self.offers_install();
+        let action = self.draft.key(chord, install)?;
+        Some(self.lift(action))
+    }
+
+    /// The shared form's action, with the check's buttons run here.
+    fn lift(&mut self, action: draft::Action) -> Action {
+        match action {
+            draft::Action::Stay => Action::Stay,
+            draft::Action::Cancel => Action::Cancel,
+            draft::Action::Save(run, request) => Action::Save(run, *request),
+            draft::Action::Browse => Action::Browse,
+            draft::Action::Test => self.begin_check(self.test_intent()).map_or(Action::Stay, Action::Check),
+            draft::Action::InstallCli => self
+                .begin_check(ReadinessIntent::InstallCli)
+                .map_or(Action::Stay, Action::Check),
         }
-        Some(Action::Stay)
     }
 }
 
@@ -806,20 +513,11 @@ pub mod samples {
     }
 }
 
-/// What a refusal says to the user: the service's message, with what to do
-/// next for the kinds that need it.
-pub fn refusal_message(e: &PoolError) -> String {
-    match e {
-        PoolError::Conflict(m) => format!("{m}. Cancel and open the machine again to see the change."),
-        PoolError::NotFound(m) => format!("{m}. It may have been removed elsewhere; cancel to see the list again."),
-        PoolError::Version(m) => format!("{m}. Restart Shelbi so the app and its daemon match, then try again."),
-        e => e.to_string(),
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use shelbi_core::MachineKind;
+    use shelbi_state::keymap::{Key, Mods};
     use std::path::PathBuf;
 
     fn remote() -> Machine {
@@ -861,25 +559,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn configure_fills_the_machines_values_and_its_workspace_count() {
-        let f = MachineForm::configure("p", &remote(), 2, None);
-        assert_eq!(f.text(Field::Name), "Build server");
-        assert_eq!(f.text(Field::Host), "build-server");
-        assert_eq!(f.text(Field::WorkDir), "/home/me/my-project");
-        assert_eq!(f.text(Field::Tags), "linux, gpu");
-        assert_eq!(f.description(), "Build server runs 2 workspaces for this project.");
-        assert_eq!(f.submit_label(), "Save changes");
-        assert_eq!(
-            MachineForm::configure("p", &remote(), 1, None).description(),
-            "Build server runs 1 workspace for this project."
-        );
-        assert_eq!(
-            MachineForm::configure("p", &remote(), 0, None).description(),
-            "Build server runs no workspaces for this project."
-        );
-    }
-
-    #[test]
     fn this_macs_form_has_no_ssh_and_a_shortened_directory() {
         let f = MachineForm::configure("p", &local(), 3, Some(Path::new("/Users/me")));
         assert!(!f.remote());
@@ -899,78 +578,6 @@ pub(crate) mod tests {
         assert_eq!((fields.kind, fields.host), (MachineKind::Local, None), "the kind stays local");
         let mut f = f;
         assert_eq!(f.begin_check(ReadinessIntent::Test), None, "nothing to test");
-    }
-
-    #[test]
-    fn a_remote_directory_is_never_shortened_against_this_mac() {
-        let mut m = remote();
-        m.work_dir = PathBuf::from("/Users/me/my-project");
-        let f = MachineForm::configure("p", &m, 0, Some(Path::new("/Users/me")));
-        assert_eq!(f.text(Field::WorkDir), "/Users/me/my-project");
-        let mut f = MachineForm::add("p");
-        f.set(Field::WorkDir, "~/src/my project");
-        assert_eq!(f.fields().work_dir, "~/src/my project", "handed on as typed");
-    }
-
-    #[test]
-    fn tags_split_on_commas_for_the_service() {
-        let mut f = MachineForm::add("p");
-        f.set(Field::Tags, "linux, gpu,,  big-ram ");
-        assert_eq!(f.fields().tags, ["linux", " gpu", "", "  big-ram "]);
-        let normalized = shelbi_orchestrator::pool_admin::normalize_tags(&f.fields().tags).unwrap();
-        assert_eq!(normalized, ["linux", "gpu", "big-ram"]);
-    }
-
-    #[test]
-    fn an_alias_is_the_host_and_an_empty_host_falls_back_to_the_name() {
-        let mut f = MachineForm::add("p");
-        f.set(Field::Name, "gpu-box");
-        assert_eq!(f.fields().host, None);
-        assert_eq!(f.check_key().host, "gpu-box", "as ssh does");
-        f.set(Field::Host, "  devbox ");
-        assert_eq!(f.fields().host.as_deref(), Some("devbox"));
-    }
-
-    #[test]
-    fn configure_saves_as_an_update_expecting_the_loaded_machine() {
-        let mut f = MachineForm::configure("p", &remote(), 2, None);
-        f.set(Field::Tags, "linux");
-        let (run, request) = f.begin_save().unwrap();
-        let SaveRequest::Update(update) = request else { panic!("an update") };
-        assert_eq!(update.name, "Build server");
-        assert_eq!(update.expected, Some(remote()));
-        assert_eq!(update.fields.tags, ["linux"]);
-        assert!(f.saving());
-        assert_eq!(f.begin_save(), None, "one save at a time");
-        assert_eq!(f.submit(), Action::Stay);
-        assert_eq!(f.finish_save(run + 1, Err(PoolError::Persistence("x".into()))), None);
-        assert!(f.saving(), "another run's answer is dropped");
-    }
-
-    #[test]
-    fn a_refusal_keeps_the_draft_and_marks_its_field() {
-        let mut f = MachineForm::add("p");
-        f.set(Field::Name, "build");
-        f.set(Field::Host, "build-2");
-        let (run, _) = f.begin_save().unwrap();
-        let refused = PoolError::Invalid {
-            field: Some(PoolField::Name),
-            message: "machine `Build` already exists".into(),
-        };
-        assert_eq!(f.finish_save(run, Err(refused)), None);
-        assert!(!f.saving());
-        assert_eq!(f.field_error(Field::Name), Some("machine `Build` already exists"));
-        assert_eq!(f.focus(), Focus::Field(Field::Name));
-        assert_eq!((f.text(Field::Name), f.text(Field::Host)), ("build", "build-2"));
-        f.set(Field::Name, "build-3");
-        assert_eq!(f.field_error(Field::Name), None, "editing it clears its error");
-
-        let (run, _) = f.begin_save().unwrap();
-        f.finish_save(run, Err(PoolError::Unsafe("workspace `alpha` has a live session".into())));
-        assert_eq!(f.error(), Some("workspace `alpha` has a live session"));
-        let (run, _) = f.begin_save().unwrap();
-        f.finish_save(run, Err(PoolError::Conflict("machine `Build server` changed since it was loaded".into())));
-        assert!(f.error().unwrap().contains("open the machine again"));
     }
 
     use super::samples;
@@ -1127,17 +734,6 @@ pub(crate) mod tests {
         assert!(f.field_error(Field::WorkDir).unwrap().contains("home directory"));
         assert_eq!(f.focus(), Focus::Field(Field::WorkDir));
         assert_eq!(f.check(), &Check::NotChecked);
-    }
-
-    #[test]
-    fn only_the_saved_host_is_a_committed_identity() {
-        let f = MachineForm::configure("p", &remote(), 0, None);
-        assert_eq!(f.committed_name(&f.check_key()), Some("Build server"));
-        let mut f = f;
-        f.set(Field::Host, "build-2");
-        assert_eq!(f.committed_name(&f.check_key()), None);
-        let add = MachineForm::add("p");
-        assert_eq!(add.committed_name(&add.check_key()), None, "an unsaved draft commits nothing");
     }
 
     #[test]

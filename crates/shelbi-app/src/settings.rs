@@ -32,10 +32,13 @@
 //! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
 //!   its machines and their reachability) and its New / Edit / Remove
 //!   workspace forms, over the shared pool service.
+//! - [`machine_form`]: the Add machine / Configure machine forms' draft,
+//!   over the shared machine service.
 
 pub mod agents;
 pub mod general;
 pub mod keybindings;
+pub mod machine_form;
 pub mod summary;
 pub mod terminal_preview;
 pub mod workflows;

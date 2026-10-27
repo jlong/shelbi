@@ -86,6 +86,7 @@ use crate::panel::{self, PAD};
 use crate::theme::palette;
 
 mod agents;
+mod machine_form;
 mod workflows;
 pub(crate) mod workspaces;
 
@@ -212,6 +213,9 @@ pub(crate) enum SettingsAction {
     /// Run a workspace request off the UI thread
     /// ([`SettingsShell::pool_finished`] takes its result).
     RunPool(Ticket, Box<workspace_form::Job>),
+    /// Run a machine save off the UI thread
+    /// ([`SettingsShell::machine_finished`] takes its result).
+    RunMachine(Ticket, Box<shelbi_app::settings::machine_form::Job>),
 }
 
 /// A save the shell runs off the UI thread for the unsaved-edits prompt.
@@ -746,6 +750,19 @@ impl SettingsShell {
         landed
     }
 
+    /// A machine save finished (see [`WorkspacesPage::machine_finished`]).
+    pub(crate) fn machine_finished(
+        &mut self,
+        ticket: &Ticket,
+        job: &shelbi_app::settings::machine_form::Job,
+        result: Result<shelbi_core::pool::MachineChange, PoolError>,
+    ) -> Landed {
+        let before = self.workspaces.dropped();
+        let landed = self.workspaces.machine_finished(ticket, job, result);
+        self.dropped += self.workspaces.dropped() - before;
+        landed
+    }
+
     /// A change was committed to the pool: the Workspaces page reads again
     /// when next shown.
     pub(crate) fn pool_stale(&mut self) {
@@ -767,7 +784,7 @@ impl SettingsShell {
             Ask::Stay => SettingsAction::Stay,
             Ask::Reload => SettingsAction::Reload,
             Ask::Run(ticket, job) => SettingsAction::RunPool(ticket, job),
-            Ask::Edit(file) => SettingsAction::EditFile(file),
+            Ask::RunMachine(ticket, job) => SettingsAction::RunMachine(ticket, job),
         }
     }
 
@@ -2472,6 +2489,16 @@ pub(crate) fn unavailable_pool_service() -> workspace_form::PoolService {
         add: std::sync::Arc::new(move |_, _| Err(no())),
         update: std::sync::Arc::new(move |_, _| Err(no())),
         remove: std::sync::Arc::new(move |_, _| Err(no())),
+    }
+}
+
+/// A machine service that refuses everything (tests that don't save).
+#[cfg(test)]
+pub(crate) fn unavailable_machine_service() -> shelbi_app::settings::machine_form::MachineService {
+    let no = || PoolError::Version("no machine service in this test".into());
+    shelbi_app::settings::machine_form::MachineService {
+        add: std::sync::Arc::new(move |_, _| Err(no())),
+        update: std::sync::Arc::new(move |_, _| Err(no())),
     }
 }
 
