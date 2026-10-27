@@ -1616,6 +1616,20 @@ mod tests {
         out
     }
 
+    /// A drawn layer read as prose: its frame dropped and every run of
+    /// whitespace, line breaks included, one space. A hint wraps wherever
+    /// the platform's wording puts its words (`this Mac` on macOS, `this
+    /// computer` elsewhere), so a phrase is looked for here, not per line.
+    fn prose(shown: &str) -> String {
+        shown
+            .chars()
+            .map(|c| if matches!(c, '│' | '─' | '┌' | '┐' | '└' | '┘') { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn the_page_lists_workspaces_then_machines_with_derived_paths_tags_and_slots() {
         let page = loaded();
@@ -2114,14 +2128,20 @@ mod tests {
         let mut page = loaded();
         page.page_key(key(KeyCode::Char('m')));
         let shown = screen(&mut page, 100, 44);
-        for want in ["Add machine", "Kind", "SSH", "Name", "SSH host", "never asks for a password", "Project directory", "remote’s home", "Machine tags", "Connection", "Not checked", "Cancel"] {
-            assert!(shown.contains(want), "{want:?}:\n{shown}");
+        let help = page.machine_form().unwrap().work_dir_help();
+        assert!(help.contains("remote’s home"), "{help}");
+        let read = prose(&shown);
+        for want in ["Add machine", "Kind", "SSH", "Name", "SSH host", "never asks for a password", "Project directory", &help, "Machine tags", "Connection", "Not checked", "Cancel"] {
+            assert!(read.contains(want), "{want:?}:\n{shown}");
         }
         page.layer_key(key(KeyCode::Esc));
         page.activate(item_at(&page, Item::Machine(0)));
         let shown = screen(&mut page, 100, 44);
-        for want in ["Configure machine", &format!("Local ({})", shelbi_app::settings::workspaces::LOCAL_LABEL), "~/Projects/my-project", "~ is your home", "Save changes"] {
-            assert!(shown.contains(want), "{want:?}:\n{shown}");
+        let help = page.machine_form().unwrap().work_dir_help();
+        assert!(help.contains("~ is your home"), "{help}");
+        let read = prose(&shown);
+        for want in ["Configure machine", &format!("Local ({})", shelbi_app::settings::workspaces::LOCAL_LABEL), "~/Projects/my-project", &help, "Save changes"] {
+            assert!(read.contains(want), "{want:?}:\n{shown}");
         }
         for absent in ["SSH host", "Connection", "Not checked"] {
             assert!(!shown.contains(absent), "the local form has no {absent:?}:\n{shown}");
