@@ -22,22 +22,30 @@
 //! holding up the page.
 //!
 //! The buttons, rows and menu items ask for a form ([`WorkspacesEvent::Open`]
-//! with an [`Intent`]). Add machine and Configure open the machine form
-//! (`super::machine_form`); until the workspace forms handle theirs the
-//! settings view sends them to [`WorkspacesPage::edit_in_yaml`], which opens
-//! the file the pool is declared in. A reread that finds the pool changed tells the window
+//! with an [`Intent`]). The window opens the workspace dialogs for the
+//! workspace intents (`super::workspace_dialog`); Add machine and Configure
+//! open the machine form (`super::machine_form`). A reread that finds the
+//! pool changed tells the window
 //! ([`WorkspacesEvent::Changed`]) so its sidebar refreshes too.
+//!
+//! New workspace and each row's edit and ⋮ buttons take the keyboard
+//! (Return or Space presses them, Esc hands the keys back to the settings
+//! sidebar), and remember which one asked for a dialog: when it closes,
+//! focus returns there ([`WorkspacesPage::restore_focus`]), to the renamed
+//! row's button after a rename, or to the next row's after a removal.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, ClickEvent, Context, Div, EventEmitter, FontWeight, SharedString,
-    Stateful, Subscription, Task, Window,
+    deferred, div, prelude::*, px, AnyElement, ClickEvent, Context, Div, EventEmitter, FocusHandle, FontWeight,
+    KeyDownEvent, Role, SharedString, Stateful, Task, Window,
 };
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
 use shelbi_core::MachineKind;
 
-use super::workflows::{header_button, popup, row_button, table, MENU_GAP, ROW_BUTTON};
+use super::workflows::{popup, row_button, table, MENU_GAP, ROW_BUTTON};
+use super::workspace_form_state::Outcome;
 use super::workspaces_state::{
     kind_label, read, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
@@ -69,6 +77,19 @@ pub enum WorkspacesEvent {
     /// A reread found the pool changed: what the window shows from the
     /// config (its sidebar's workspaces) should follow.
     Changed,
+    /// Esc on one of the page's buttons: the keys go back to the settings
+    /// sidebar.
+    Leave,
+}
+
+/// The control a dialog was asked for from, for focus to return to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Origin {
+    New,
+    /// A row's edit button (or the row itself).
+    Edit(String),
+    /// A row's ⋮ button (its menu's items).
+    More(String),
 }
 
 /// The Workspaces page.
@@ -78,33 +99,30 @@ pub struct WorkspacesPage {
     menu: Option<String>,
     /// Where the open menu's button last painted (its own click toggles it).
     menu_anchor: style::Anchor,
+    /// New workspace's focus, and each row's edit and ⋮ buttons'.
+    new_focus: FocusHandle,
+    row_focus: HashMap<String, (FocusHandle, FocusHandle)>,
+    /// What asked for the open dialog.
+    origin: Option<Origin>,
     /// Re-read the config on the next draw (the page was shown again).
     reload: bool,
-    /// Re-read the config when the window is next active (an edit sent the
-    /// user to their editor).
-    reload_on_return: bool,
     /// The remotes' prober, once the project has one; never under test.
     prober: Option<ReachabilityProber>,
     _poll: Option<Task<()>>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl WorkspacesPage {
     pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let subscriptions = vec![cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() && std::mem::take(&mut this.reload_on_return) {
-                this.load(window, cx);
-            }
-        })];
         let mut page = WorkspacesPage {
             state: WorkspacesState::new(project),
             menu: None,
             menu_anchor: Default::default(),
+            new_focus: cx.focus_handle(),
+            row_focus: HashMap::new(),
+            origin: None,
             reload: false,
-            reload_on_return: false,
             prober: None,
             _poll: None,
-            _subscriptions: subscriptions,
         };
         // A test's page never reads the real `~/.shelbi`.
         if !cfg!(test) {
@@ -196,11 +214,74 @@ impl WorkspacesPage {
         }
     }
 
-    /// Ask for the form `intent` names.
-    fn open(&mut self, intent: Intent, cx: &mut Context<Self>) {
+    /// Ask for the form `intent` names, from `origin`.
+    fn open(&mut self, intent: Intent, origin: Origin, cx: &mut Context<Self>) {
         self.menu = None;
+        self.origin = Some(origin);
         cx.emit(WorkspacesEvent::Open(intent));
         cx.notify();
+    }
+
+    /// Row `name`'s edit and ⋮ buttons' focus.
+    fn row_handles(&mut self, name: &str, cx: &mut Context<Self>) -> (FocusHandle, FocusHandle) {
+        self.row_focus
+            .entry(name.to_string())
+            .or_insert_with(|| (cx.focus_handle(), cx.focus_handle()))
+            .clone()
+    }
+
+    /// A dialog closed (`done`: what it did): give the keyboard back to the
+    /// control that asked for it. After a rename that's the renamed row's;
+    /// after a removal, the next row's edit button (else the previous one's,
+    /// else New workspace).
+    pub fn restore_focus(&mut self, done: Option<&Outcome>, window: &mut Window, cx: &mut Context<Self>) {
+        let origin = self.origin.take();
+        let handle = match (done, origin) {
+            (Some(Outcome::Removed(removed)), _) => {
+                let rows: Vec<String> = self
+                    .state
+                    .index()
+                    .map(|i| i.workspaces.iter().map(|w| w.name.clone()).collect())
+                    .unwrap_or_default();
+                let at = rows.iter().position(|n| *n == removed.name);
+                let neighbor = at.and_then(|at| rows.get(at + 1).or(at.checked_sub(1).and_then(|p| rows.get(p))));
+                match neighbor.cloned() {
+                    Some(name) => self.row_handles(&name, cx).0,
+                    None => self.new_focus.clone(),
+                }
+            }
+            (_, Some(Origin::Edit(name))) => {
+                let name = done.and_then(Outcome::workspace).map(str::to_string).unwrap_or(name);
+                self.row_handles(&name, cx).0
+            }
+            (_, Some(Origin::More(name))) => {
+                let name = done.and_then(Outcome::workspace).map(str::to_string).unwrap_or(name);
+                self.row_handles(&name, cx).1
+            }
+            (_, Some(Origin::New) | None) => self.new_focus.clone(),
+        };
+        window.focus(&handle, cx);
+        if let Some(warnings) = done.map(Outcome::warnings).filter(|w| !w.is_empty()) {
+            self.state.set_notice(Some(warnings.join(" ")));
+        }
+        cx.notify();
+    }
+
+    /// Whether `handle` holds the keyboard (a test asks where focus went).
+    #[cfg(test)]
+    pub fn focused(&self, window: &Window) -> Option<String> {
+        if self.new_focus.is_focused(window) {
+            return Some("new".into());
+        }
+        self.row_focus.iter().find_map(|(name, (edit, more))| {
+            if edit.is_focused(window) {
+                Some(format!("edit {name}"))
+            } else if more.is_focused(window) {
+                Some(format!("more {name}"))
+            } else {
+                None
+            }
+        })
     }
 
     fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -213,50 +294,41 @@ impl WorkspacesPage {
         self.menu = if self.menu.as_deref() == Some(name) { None } else { Some(name.to_string()) };
         cx.notify();
     }
-
-    /// Handle a workspace `intent` until its form does: open the file the pool is
-    /// declared in, in the user's editor, and read it again when the window
-    /// is back in front.
-    pub fn edit_in_yaml(&mut self, intent: &Intent, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
-        self.reload_on_return = true;
-        let project = self.state.project().to_string();
-        let file = self.state.index().and_then(|i| i.file.clone());
-        let what = match intent {
-            Intent::NewWorkspace => "Add the workspace under `workspaces:`".to_string(),
-            Intent::EditWorkspace(name) => format!("Edit {name} under `workspaces:`"),
-            Intent::RemoveWorkspace(name) => format!("Remove {name} from `workspaces:`"),
-            Intent::AddMachine => "Add the machine under `machines:`".to_string(),
-            Intent::ConfigureMachine(name) => format!("Edit {name} under `machines:`"),
-        };
-        let open = cx.background_executor().spawn(async move {
-            let path = file
-                .or_else(|| super::workspaces_state::pool_file(&project))
-                .filter(|p| p.exists())
-                .ok_or_else(|| "Couldn’t find the project’s config file.".to_string())?;
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let editor = super::external_edit::open_file(&path).map_err(|e| format!("Couldn’t open {name}: {e}"))?;
-            Ok::<_, String>(format!(
-                "Opened {name} in {editor}. {what}; the page reads it again when you come back."
-            ))
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let opened = open.await;
-            this.update(cx, |this, cx| {
-                match opened {
-                    Ok(notice) => this.state.set_notice(Some(notice)),
-                    Err(e) => this.state.set_error(e),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
 }
 
 impl EventEmitter<WorkspacesEvent> for WorkspacesPage {}
+
+/// Return or Space, unmodified: a focused button's press.
+fn is_press(e: &KeyDownEvent) -> bool {
+    let k = &e.keystroke;
+    !k.modifiers.modified() && matches!(k.key.as_str(), "enter" | "space")
+}
+
+impl WorkspacesPage {
+    /// A key on a focused button that opens `intent`: Return or Space opens
+    /// it, Esc leaves.
+    fn button_key(&mut self, e: &KeyDownEvent, intent: Intent, origin: Origin, cx: &mut Context<Self>) {
+        if self.leave_key(e, cx) {
+            return;
+        }
+        if is_press(e) {
+            cx.stop_propagation();
+            self.open(intent, origin, cx);
+        }
+    }
+
+    /// Esc on a focused button: the keys go back to the settings sidebar.
+    fn leave_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let k = &e.keystroke;
+        if k.modifiers.modified() || k.key != "escape" {
+            return false;
+        }
+        cx.stop_propagation();
+        self.menu = None;
+        cx.emit(WorkspacesEvent::Leave);
+        true
+    }
+}
 
 /// A section's heading (`Machines heading`, 2524:10990): the title over its
 /// description, 8pt apart, and the section's button centered beside them.
@@ -318,9 +390,17 @@ fn clipped(id: String, text: String) -> Stateful<Div> {
 }
 
 impl WorkspacesPage {
-    fn render_workspaces(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let new_workspace = header_button("workspaces-new", icons::PLUS, "New workspace", theme)
-            .on_click(cx.listener(|this, _, _, cx| this.open(Intent::NewWorkspace, cx)));
+    fn render_workspaces(&mut self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+        let new_focused = self.new_focus.is_focused(window);
+        let new_workspace =
+            style::small_icon_button("workspaces-new", icons::PLUS, "New workspace", ButtonKind::Secondary, new_focused, theme)
+                .role(Role::Button)
+                .aria_label("New workspace")
+                .track_focus(&self.new_focus)
+                .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                    this.button_key(e, Intent::NewWorkspace, Origin::New, cx)
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.open(Intent::NewWorkspace, Origin::New, cx)));
         let headings = div()
             .flex()
             .flex_row()
@@ -340,11 +420,14 @@ impl WorkspacesPage {
                 "No workspaces yet. New workspace adds one.",
                 theme,
             )],
-            Load::Loaded(index) => index
-                .workspaces
-                .iter()
-                .map(|w| self.render_workspace_row(w, theme, cx))
-                .collect(),
+            Load::Loaded(index) => {
+                let index = index.clone();
+                index
+                    .workspaces
+                    .iter()
+                    .map(|w| self.render_workspace_row(w, theme, window, cx))
+                    .collect()
+            }
         };
         let body = match self.state.load() {
             Load::Failed(e) => self.render_failure(e, theme, cx).into_any_element(),
@@ -412,23 +495,47 @@ impl WorkspacesPage {
             .child(retry)
     }
 
-    fn render_workspace_row(&self, w: &WorkspaceRow, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_workspace_row(&mut self, w: &WorkspaceRow, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let name = w.name.clone();
+        let (edit_focus, more_focus) = self.row_handles(&name, cx);
+        let ring = |handle: &FocusHandle| handle.is_focused(window).then(|| style::focus_bands(6.0, theme));
         let edit = {
             let name = name.clone();
+            let key_name = name.clone();
             row_button(format!("workspace-edit-{name}"), icons::PENCIL_BUTTON, false, theme)
+                .relative()
+                .role(Role::Button)
+                .aria_label(format!("Edit {name}"))
+                .track_focus(&edit_focus)
+                .children(ring(&edit_focus).into_iter().flatten())
                 .tooltip(style::tooltip("Edit workspace"))
+                .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
+                    this.button_key(e, Intent::EditWorkspace(key_name.clone()), Origin::Edit(key_name.clone()), cx)
+                }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    this.open(Intent::EditWorkspace(name.clone()), cx);
+                    this.open(Intent::EditWorkspace(name.clone()), Origin::Edit(name.clone()), cx);
                 }))
         };
         let more = {
             let open = self.menu.as_deref() == Some(name.as_str());
             let name = name.clone();
+            let key_name = name.clone();
             row_button(format!("workspace-more-{name}"), icons::ELLIPSIS_VERTICAL_BUTTON, false, theme)
+                .relative()
+                .role(Role::Button)
+                .aria_label(format!("More actions for {name}"))
+                .aria_expanded(open)
+                .track_focus(&more_focus)
+                .children(ring(&more_focus).into_iter().flatten())
                 .tooltip(style::tooltip("More"))
                 .when(open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
+                .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
+                    if !this.leave_key(e, cx) && is_press(e) {
+                        cx.stop_propagation();
+                        this.toggle_menu(&key_name, cx);
+                    }
+                }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     this.toggle_menu(&name, cx);
@@ -513,7 +620,9 @@ impl WorkspacesPage {
             .px(px(12.0))
             .py(px(16.0))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open(Intent::EditWorkspace(edit_row.clone()), cx)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.open(Intent::EditWorkspace(edit_row.clone()), Origin::Edit(edit_row.clone()), cx)
+            }))
             .child(
                 div()
                     .flex()
@@ -554,11 +663,15 @@ impl WorkspacesPage {
     /// A workspace's ⋮ menu: Edit, a rule, Remove.
     fn render_menu(&self, name: &str, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let item = |id: String, label: &'static str, intent: Intent, danger: bool, cx: &mut Context<Self>| {
-            let row = style::menu_row(SharedString::from(id), false, theme).child(label);
+            let row = style::menu_row(SharedString::from(id), false, theme)
+                .role(Role::MenuItem)
+                .aria_label(label)
+                .child(label);
             let row = if danger { row.text_color(theme.error) } else { row };
+            let origin = Origin::More(name.to_string());
             row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 cx.stop_propagation();
-                this.open(intent.clone(), cx);
+                this.open(intent.clone(), origin.clone(), cx);
             }))
         };
         let edit = item(
@@ -597,8 +710,8 @@ impl WorkspacesPage {
     }
 
     fn render_machines(&self, index: &PoolIndex, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let add = header_button("machines-add", icons::PLUS, "Add machine", theme)
-            .on_click(cx.listener(|this, _, _, cx| this.open(Intent::AddMachine, cx)));
+        let add = style::small_icon_button("machines-add", icons::PLUS, "Add machine", ButtonKind::Secondary, false, theme)
+            .on_click(cx.listener(|this, _, _, cx| this.open(Intent::AddMachine, Origin::New, cx)));
         let mut rows: Vec<AnyElement> = Vec::new();
         for (i, m) in index.machines.iter().enumerate() {
             if i > 0 {
@@ -653,7 +766,7 @@ impl WorkspacesPage {
                 theme,
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.open(Intent::ConfigureMachine(name.clone()), cx)
+                this.open(Intent::ConfigureMachine(name.clone()), Origin::New, cx)
             }))
         };
         let detail = div()
@@ -761,7 +874,7 @@ impl Render for WorkspacesPage {
             .gap(px(24.0))
             .children(error)
             .children(notice)
-            .child(self.render_workspaces(&theme, cx))
+            .child(self.render_workspaces(&theme, window, cx))
             .when_some(machines, |d, machines| {
                 d.child(div().h(px(1.0)).w_full().bg(theme.divider_strong)).child(machines)
             })

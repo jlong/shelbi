@@ -321,6 +321,28 @@ fn plan_workspace_add_without_a_local_machine_needs_one_named() {
 }
 
 #[test]
+fn plan_workspace_update_checks_the_new_name_machine_and_tags() {
+    let p = fixture_project();
+    let alpha = p.workspace("alpha").unwrap().clone();
+    let mut req = update_req("alpha", "alpha", "devbox");
+    req.tags = vec![" gpu ".into(), "gpu".into()];
+    req.slot = Some(0);
+    let spec = plan_workspace_update(&p, &alpha, &req).unwrap();
+    assert_eq!(spec.machine, "devbox");
+    assert_eq!(spec.tags, ["gpu"]);
+    assert_eq!(spec.slot, Some(0));
+    // Keeping its own name is no collision; taking bravo's is.
+    let err = plan_workspace_update(&p, &alpha, &update_req("alpha", "bravo", "hub")).unwrap_err();
+    assert!(matches!(err, PoolError::Invalid { field: Some(PoolField::Name), .. }), "{err}");
+    let err = plan_workspace_update(&p, &alpha, &update_req("alpha", "alpha", "ghost")).unwrap_err();
+    assert!(matches!(err, PoolError::Invalid { field: Some(PoolField::Machine), .. }), "{err}");
+    let mut req = update_req("alpha", "alpha", "hub");
+    req.tags = vec!["two words".into()];
+    let err = plan_workspace_update(&p, &alpha, &req).unwrap_err();
+    assert!(matches!(err, PoolError::Invalid { field: Some(PoolField::Tags), .. }), "{err}");
+}
+
+#[test]
 fn tags_are_trimmed_deduplicated_and_keep_their_case() {
     let tags: Vec<String> = [" gpu ", "", "GPU", "gpu", "review", "  "]
         .iter()

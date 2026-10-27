@@ -414,26 +414,8 @@ pub fn update_workspace_with(
             return Err(changed_elsewhere("workspace", &req.name));
         }
     }
-    if req.new_name != current.name {
-        check_workspace_name(&p, &req.new_name, Some(&current.name))?;
-    }
-    machine_of(&p, &req.machine)
-        .map_err(|_| PoolError::invalid(PoolField::Machine, format!("unknown machine `{}`", req.machine)))?;
-    let spec = WorkspaceSpec {
-        name: req.new_name.clone(),
-        machine: req.machine.clone(),
-        tags: normalize_tags(&req.tags)?,
-        slot: req.slot,
-    };
-    let replaced: Vec<WorkspaceSpec> = p
-        .workspaces
-        .iter()
-        .map(|w| if w.name == current.name { spec.clone() } else { w.clone() })
-        .collect();
-    let candidate = with_workspaces(&p, replaced);
-    candidate
-        .validate_workspaces()
-        .map_err(|e| PoolError::invalid(PoolField::Machine, e.to_string()))?;
+    let spec = plan_workspace_update(&p, &current, req)?;
+    let candidate = with_replaced(&p, &current.name, &spec);
     let entries: Vec<PoolEntry<WorkspaceSpec>> = pool
         .workspaces()
         .iter()
@@ -577,6 +559,39 @@ pub fn update_workspace_with(
         }
     }
     Ok(change(&saved, &candidate, &spec.name, previous_name, previous_machine, hooks, warnings))
+}
+
+/// Validate and resolve an [`UpdateWorkspace`] of `current` against `p`
+/// without touching disk: an invalid or colliding new name, an unknown
+/// machine, and bad tags are refused. A form checks its draft with this
+/// before it sends the edit; [`update_workspace`] runs it again against the
+/// config as it is then.
+pub fn plan_workspace_update(p: &Project, current: &WorkspaceSpec, req: &UpdateWorkspace) -> Result<WorkspaceSpec> {
+    if req.new_name != current.name {
+        check_workspace_name(p, &req.new_name, Some(&current.name))?;
+    }
+    machine_of(p, &req.machine)
+        .map_err(|_| PoolError::invalid(PoolField::Machine, format!("unknown machine `{}`", req.machine)))?;
+    let spec = WorkspaceSpec {
+        name: req.new_name.clone(),
+        machine: req.machine.clone(),
+        tags: normalize_tags(&req.tags)?,
+        slot: req.slot,
+    };
+    with_replaced(p, &current.name, &spec)
+        .validate_workspaces()
+        .map_err(|e| PoolError::invalid(PoolField::Machine, e.to_string()))?;
+    Ok(spec)
+}
+
+/// `p` with workspace `name` replaced by `spec`, in its place.
+fn with_replaced(p: &Project, name: &str, spec: &WorkspaceSpec) -> Project {
+    let replaced = p
+        .workspaces
+        .iter()
+        .map(|w| if w.name == name { spec.clone() } else { w.clone() })
+        .collect();
+    with_workspaces(p, replaced)
 }
 
 /// Remove a workspace: refuse an active task and work at risk (unless

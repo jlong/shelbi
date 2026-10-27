@@ -20,12 +20,13 @@
 //! labels say so.
 //!
 //! The page's buttons don't edit the config themselves: each asks for a
-//! form through an [`Intent`], which the window routes back to whoever
-//! handles it (Add machine and Configure open the machine form,
-//! `super::machine_form`; the workspace forms are their own task).
+//! form through an [`Intent`], which the window routes to its form (the
+//! workspace intents open `super::workspace_dialog`, Add machine and
+//! Configure the machine form, `super::machine_form`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use shelbi_core::{Machine, MachineKind, Project, Reachability};
 
@@ -86,6 +87,20 @@ pub struct MachineRow {
     pub config: Machine,
 }
 
+/// The project the rows were built from: what the workspace dialog edits
+/// against (its machines and workspaces as declared, the slot resolver).
+/// Two are equal when their pools are.
+#[derive(Debug, Clone)]
+pub struct PoolSource(pub Arc<Project>);
+
+impl PartialEq for PoolSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.machines == other.0.machines && self.0.workspaces == other.0.workspaces
+    }
+}
+
+impl Eq for PoolSource {}
+
 /// The page's rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PoolIndex {
@@ -94,6 +109,8 @@ pub struct PoolIndex {
     /// The file the pool is declared in (`projects/<p>/local.yaml` for an
     /// in-repo project, else `projects/<p>.yaml`).
     pub file: Option<PathBuf>,
+    /// The project read.
+    pub source: Option<PoolSource>,
 }
 
 impl PoolIndex {
@@ -151,6 +168,7 @@ impl PoolIndex {
             workspaces,
             machines,
             file: None,
+            source: Some(PoolSource(Arc::new(project.clone()))),
         }
     }
 

@@ -101,6 +101,7 @@ use crate::platform::{
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::update::{self as update_view, UpdateState};
+use crate::views::workspace_dialog::{Body as DialogBody, WorkspaceDialog, WorkspaceDialogEvent};
 use crate::views::workspaces_state::Intent;
 use shelbi_state::keymap::{
     DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
@@ -787,6 +788,9 @@ pub struct ShelbiWindow {
     /// The forms Settings ▸ Workspaces asked for, in order.
     #[cfg(test)]
     pool_forms: Vec<Intent>,
+    /// The New / Edit workspace dialog or a removal's confirmation, over the
+    /// whole window while Settings shows.
+    pool_dialog: Option<(Entity<WorkspaceDialog>, Subscription)>,
     /// How often a pool change asked the feed for a refresh.
     #[cfg(test)]
     pool_refreshes: usize,
@@ -997,6 +1001,7 @@ impl ShelbiWindow {
             edited_agents: Vec::new(),
             #[cfg(test)]
             pool_forms: Vec::new(),
+            pool_dialog: None,
             #[cfg(test)]
             pool_refreshes: 0,
             drawn_once: false,
@@ -1518,6 +1523,9 @@ impl ShelbiWindow {
             self.review_loader.cancel(&task);
         }
         self.review_loader = ReviewLoader::default();
+        // A workspace dialog's draft is the old project's: it goes unsaved
+        // (a job it already sent finishes against that project).
+        self.pool_dialog = None;
         self.overlay = None;
         self.overlay_opened = None;
         self.client.close_overlay();
@@ -1792,6 +1800,8 @@ impl ShelbiWindow {
     fn set_route(&mut self, route: Route) {
         self.route = route;
         self.cursor = None;
+        // A workspace dialog belongs to the settings view it was opened from.
+        self.pool_dialog = None;
     }
 
     /// What the main area shows.
@@ -2142,17 +2152,73 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Open the form Settings ▸ Workspaces asks for (New workspace, a
-    /// workspace's edit button, row or menu, Add machine, Configure). The
-    /// workspace and machine forms are their own tasks and take it here;
-    /// until then the settings view opens the file the pool is declared in.
+    /// Open the form Settings ▸ Workspaces asks for: New workspace, a
+    /// workspace's edit button, row or menu item, and Remove workspace… open
+    /// a workspace dialog over the window; Add machine and Configure go to
+    /// the settings view, which opens its machine form. One dialog at a time.
     fn open_pool_form(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(test)]
         self.pool_forms.push(intent.clone());
-        if let Route::Settings(view) = &self.route {
-            view.update(cx, |v, cx| v.open_pool_form(&intent, window, cx));
+        let Route::Settings(view) = &self.route else {
+            return;
+        };
+        let view = view.clone();
+        if self.pool_dialog.is_some() || view.read(cx).machine_form().is_some() {
+            return;
+        }
+        let page = view.read(cx).workspaces();
+        let dialog = match intent {
+            // A dialog that can't open (the pool not read yet, a workspace
+            // gone) leaves the page as it was.
+            Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => {
+                DialogBody::for_intent(&intent, &page, cx)
+                    .map(|body| cx.new(|cx| WorkspaceDialog::new(body, page, window, cx)))
+            }
+            Intent::AddMachine | Intent::ConfigureMachine(_) => {
+                view.update(cx, |v, cx| v.open_pool_form(&intent, window, cx));
+                None
+            }
+        };
+        if let Some(dialog) = dialog {
+            let sub = cx.subscribe_in(&dialog, window, |this, _, event: &WorkspaceDialogEvent, window, cx| match event {
+                WorkspaceDialogEvent::Closed { done } => this.close_pool_dialog(done.clone(), window, cx),
+            });
+            self.pool_dialog = Some((dialog, sub));
         }
         cx.notify();
+    }
+
+    /// The workspace dialog closed: drop it, read the pool again after a
+    /// change, and give the keyboard back to the button that opened it.
+    fn close_pool_dialog(
+        &mut self,
+        done: Option<crate::views::workspace_form_state::Outcome>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pool_dialog = None;
+        if let Route::Settings(view) = &self.route {
+            view.update(cx, |v, cx| v.pool_dialog_closed(done.as_ref(), window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Open the dialog `intent` asks for, its Machine picker open when
+    /// `picker` (`--visual-figma`).
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_open_pool_form(&mut self, intent: Intent, picker: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_pool_form(intent, window, cx);
+        if picker {
+            if let Some((dialog, _)) = &self.pool_dialog {
+                dialog.update(cx, |d, cx| d.offscreen_open_picker(window, cx));
+            }
+        }
+    }
+
+    /// The open workspace dialog (tests).
+    #[cfg(test)]
+    pub(crate) fn pool_dialog(&self) -> Option<Entity<WorkspaceDialog>> {
+        self.pool_dialog.as_ref().map(|(d, _)| d.clone())
     }
 
     /// The project's workspaces or machines changed on disk: read the feed
@@ -3791,6 +3857,20 @@ impl ShelbiWindow {
     /// A menu item: a registry command runs exactly as the palette runs it.
     fn menu_invoke(&mut self, invoke: &menus::MenuInvoke, window: &mut Window, cx: &mut Context<Self>) {
         use menus::tree::{AppCommand, MenuAction};
+        // A workspace dialog is modal: ⌘W closes it (discarding its draft);
+        // the menus' commands wait until it's gone.
+        if let Some((dialog, _)) = &self.pool_dialog {
+            match &invoke.target {
+                MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
+                MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
+                MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) | MenuAction::Command(_) => {}
+                MenuAction::App(other) => {
+                    menus::run_app_command(*other, cx);
+                }
+            }
+            return;
+        }
         match &invoke.target {
             MenuAction::Command(id) => {
                 // The palette closes before running its entry; so does a menu
@@ -3865,6 +3945,11 @@ impl ShelbiWindow {
         }
         if self.overlay.is_some() {
             self.overlay_key(event, window, cx);
+            return;
+        }
+        // A workspace dialog is modal: it takes its keys ahead of everything
+        // (`WorkspaceDialog::key`), and nothing behind it gets any.
+        if self.pool_dialog.is_some() {
             return;
         }
         let Some(chord) = chord else {
@@ -4571,6 +4656,14 @@ impl ShelbiWindow {
                 .map(|form| crate::views::machine_form::render_layer(form, px(main_left), &theme)),
             _ => None,
         };
+
+        // The workspace dialog, over the whole window, its panel centered over
+        // the main area.
+        let pool_dialog = self.pool_dialog.as_ref().map(|(dialog, _)| {
+            let inset = placement.map_or(0.0, |p| p.visible);
+            dialog.update(cx, |d, _| d.set_inset(inset));
+            dialog.clone()
+        });
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
         let layer = self.overlay.as_ref().map(|o| {
@@ -4639,6 +4732,7 @@ impl ShelbiWindow {
             })
             .child(shell.flex_1().min_h_0())
             .children(machine_form)
+            .children(pool_dialog)
             .children(layer)
             .children(probe)
             .into_any_element()
