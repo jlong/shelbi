@@ -77,7 +77,7 @@ panics down to 1x1.
 | Key | On a workflow | On a status | Elsewhere |
 |---|---|---|---|
 | up / down (the user's sidebar nav, arrows) | move | move | move |
-| Enter | Edit (YAML for now, see below) | Rename | the `+` row's form, Edit YAML |
+| Enter | Edit (the workflow editor, see below) | Rename | the `+` row's form, Edit YAML |
 | `m` or `.` | actions menu | actions menu | actions menu |
 | `n` | New workflow | New status | by section |
 | `c` | Duplicate | Change category | |
@@ -127,11 +127,12 @@ Settings on it, a page switch to it, a project switch), on `r`, and when the
 user's editor returns from Edit YAML (the run loop's editor handoff already
 reloads Settings). A read that lands while a save runs is left to the save.
 
-**Edit, and Edit YAML.** The workflow editor is a separate task. Until it lands, Edit (Enter, `e`, the
-menu) is routed through `SettingsAction::EditWorkflow` to
-`ShellState::edit_workflow`, which opens the workflow's YAML in the user's
-editor; the editor task replaces that body. Edit YAML stays an explicit
-action either way. A file that's gone says so at its row instead of opening.
+**Edit, and Edit YAML.** Edit (Enter, `e`, the menu) is routed through
+`SettingsAction::EditWorkflow` to `ShellState::edit_workflow`, which now
+opens the workflow editor (`tui-workflow-editor-form`, see
+[`tui-workflow-editor-form.md`](tui-workflow-editor-form.md)). Edit YAML
+stays an explicit action. A file that's gone says so at its row instead of
+opening.
 
 **Mouse.** A click selects a row; a click on the selected row opens its
 menu; a click on a `+` row, Edit YAML or an unreadable file runs it. Menu,

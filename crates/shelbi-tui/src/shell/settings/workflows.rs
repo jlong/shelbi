@@ -118,6 +118,14 @@ enum ModalHit {
     Cancel,
 }
 
+/// Where the cursor goes once the page's next read lands (the workflow
+/// editor closed over it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Select {
+    Workflow(String),
+    FirstStatus,
+}
+
 /// The keys the shell resolved from the user's sidebar keymap.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Nav {
@@ -153,6 +161,8 @@ pub(crate) struct WorkflowsPage {
     select_after: Option<Item>,
     /// Saves dropped as stale (their project moved on).
     dropped: usize,
+    /// Where the cursor goes when the next read lands.
+    select_on_load: Option<Select>,
     /// The modal's click targets, from the last draw.
     hits: Vec<(Rect, ModalHit)>,
 }
@@ -193,6 +203,27 @@ impl WorkflowsPage {
         self.modal = None;
     }
 
+    /// Put the cursor on `select` now, and again when the next read lands
+    /// (the editor may have renamed or added rows).
+    pub(crate) fn select_after_load(&mut self, select: Select) {
+        self.select_on_load = Some(select);
+        self.apply_select();
+    }
+
+    fn apply_select(&mut self) {
+        let Some(select) = self.select_on_load.as_ref() else {
+            return;
+        };
+        let items = self.items();
+        let at = match select {
+            Select::Workflow(name) => items.iter().position(|i| *i == Item::Workflow(name.clone())),
+            Select::FirstStatus => items.iter().position(|i| matches!(i, Item::Status(_))),
+        };
+        if let Some(i) = at {
+            self.cursor = i;
+        }
+    }
+
     /// Show `message` at `target`.
     pub(crate) fn set_error(&mut self, target: Target, message: String) {
         if let Some(state) = self.state.as_mut() {
@@ -209,6 +240,7 @@ impl WorkflowsPage {
         self.pending = None;
         self.modal = None;
         self.select_after = None;
+        self.select_on_load = None;
         self.cursor = 0;
     }
 
@@ -242,6 +274,10 @@ impl WorkflowsPage {
             return false;
         };
         let taken = state.loaded(result);
+        if taken {
+            self.apply_select();
+            self.select_on_load = None;
+        }
         self.clamp_cursor();
         taken
     }
@@ -403,7 +439,7 @@ impl WorkflowsPage {
             return SettingsAction::Stay;
         };
         match act {
-            Act::EditWorkflow(name) => SettingsAction::EditWorkflow(name),
+            Act::EditWorkflow(name) => SettingsAction::EditWorkflow { name, status: None },
             Act::WorkflowYaml(name) => SettingsAction::EditYaml(EditFile {
                 path: config.workflow_path(&name),
                 target: Target::Workflow(name),
@@ -1031,7 +1067,7 @@ impl WorkflowsPage {
         }
     }
 
-    fn popup(area: Rect, width: u16, height: u16) -> Option<Rect> {
+    pub(super) fn popup(area: Rect, width: u16, height: u16) -> Option<Rect> {
         let width = width.min(area.width);
         let height = height.min(area.height);
         (width >= 12 && height >= 3).then(|| Rect {
@@ -1042,7 +1078,7 @@ impl WorkflowsPage {
         })
     }
 
-    fn frame(f: &mut Frame, rect: Rect, title: &str) -> Rect {
+    pub(super) fn frame(f: &mut Frame, rect: Rect, title: &str) -> Rect {
         f.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1141,7 +1177,7 @@ impl WorkflowsPage {
 }
 
 /// Error lines under a row, indented and red.
-fn error_rows(rows: &mut Vec<Row>, error: Option<&str>, width: usize) {
+pub(super) fn error_rows(rows: &mut Vec<Row>, error: Option<&str>, width: usize) {
     if let Some(e) = error {
         for line in shelbi_app::overlay::error_log::wrap(e, width.saturating_sub(4).max(1)) {
             rows.push(Row::text(Line::from(Span::styled(
@@ -1154,7 +1190,7 @@ fn error_rows(rows: &mut Vec<Row>, error: Option<&str>, width: usize) {
 
 /// A focusable row of plain text in `style`, with the selection fill when
 /// `selected` (`Some(focused)`).
-fn plain_line(text: &str, selected: Option<bool>, width: usize, style: Style) -> Line<'static> {
+pub(super) fn plain_line(text: &str, selected: Option<bool>, width: usize, style: Style) -> Line<'static> {
     let marker = if selected.is_some() { "› " } else { "  " };
     let text = panel::truncate_right(&format!("{marker}{text}"), width);
     match selected {
@@ -1167,7 +1203,7 @@ fn plain_line(text: &str, selected: Option<bool>, width: usize, style: Style) ->
 }
 
 /// A `+ New …` or Edit YAML row, in the action color.
-fn add_line(text: &str, selected: Option<bool>, width: usize) -> Line<'static> {
+pub(super) fn add_line(text: &str, selected: Option<bool>, width: usize) -> Line<'static> {
     plain_line(text, selected, width, Style::default().fg(palette().cyan))
 }
 
@@ -1179,7 +1215,7 @@ fn input_line(label: &str, text: &LineEdit, width: usize) -> Line<'static> {
 }
 
 /// Pad or cut `text` to exactly `w` columns.
-fn cell(text: &str, w: usize) -> String {
+pub(super) fn cell(text: &str, w: usize) -> String {
     let t = panel::truncate_right(text, w);
     let pad = w.saturating_sub(panel::display_width(&t));
     format!("{t}{}", " ".repeat(pad))
@@ -1356,7 +1392,7 @@ impl StatusCols {
 }
 
 /// Fill a selected row's line to `width` with the selection color.
-fn pad_selected(spans: &mut Vec<Span<'static>>, selected: Option<bool>, width: usize) {
+pub(super) fn pad_selected(spans: &mut Vec<Span<'static>>, selected: Option<bool>, width: usize) {
     let used: usize = spans.iter().map(|s| panel::display_width(&s.content)).sum();
     if let Some(focused) = selected {
         spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), selected_style(focused)));
@@ -1371,7 +1407,7 @@ pub(crate) struct LineEdit {
 }
 
 impl LineEdit {
-    fn new(text: &str) -> LineEdit {
+    pub(super) fn new(text: &str) -> LineEdit {
         let chars: Vec<char> = text.chars().collect();
         LineEdit { caret: chars.len(), chars }
     }
@@ -1380,14 +1416,14 @@ impl LineEdit {
         self.chars.iter().collect()
     }
 
-    fn insert(&mut self, c: char) {
+    pub(super) fn insert(&mut self, c: char) {
         self.chars.insert(self.caret, c);
         self.caret += 1;
     }
 
     /// Edit with `k`: printable characters type; Backspace, Delete, ←/→,
     /// Home/End (and Ctrl+A/E), Ctrl+U clears to the start.
-    fn key(&mut self, k: KeyEvent) {
+    pub(super) fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('a') if ctrl => self.caret = 0,
@@ -1414,7 +1450,7 @@ impl LineEdit {
 
     /// The field's spans in at most `width` columns, scrolled to keep the
     /// caret in view, the caret's cell reversed.
-    fn spans(&self, width: usize) -> Vec<Span<'static>> {
+    pub(super) fn spans(&self, width: usize) -> Vec<Span<'static>> {
         let width = width.max(2);
         let start = (self.caret + 1).saturating_sub(width);
         let shown: Vec<char> = self.chars.iter().skip(start).take(width).copied().collect();
@@ -1432,4 +1468,4 @@ impl LineEdit {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

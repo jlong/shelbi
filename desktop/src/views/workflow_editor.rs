@@ -52,7 +52,7 @@ use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflow_editor_state::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, Change, DetailsForm, EditorState,
-    Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ACTIONS, STRATEGIES,
+    Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, TextForm, ACTIONS, STRATEGIES,
 };
 use super::sidebar;
 use super::workflow_builder_state::BuilderState;
@@ -366,26 +366,26 @@ impl WorkflowEditor {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let w = state.workflow();
-        let git = state.git_form();
-        let review = state.review_form().clone();
+        // The draft's text, through the shared form both clients fill their
+        // fields from.
+        let form = state.text_form(self.details.as_ref().map(|d| d.index));
+        let review = form.review.clone();
         let mut values = vec![
             (self.name.clone(), state.typed_name().to_string()),
-            (self.description.clone(), w.description.clone().unwrap_or_default()),
-            (self.base_branch.clone(), git.base_branch),
-            (self.branch.clone(), git.branch),
-            (self.params.clone(), state.params_text()),
+            (self.description.clone(), form.description),
+            (self.base_branch.clone(), form.base_branch),
+            (self.branch.clone(), form.branch),
+            (self.params.clone(), form.params),
             (self.review.serve.clone(), review.serve),
             (self.review.setup.clone(), review.setup),
             (self.review.ready.clone(), review.ready),
             (self.review.url.clone(), review.url),
             (self.review.workdir.clone(), review.workdir),
         ];
-        let ids: Vec<String> = w.statuses.iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<String> = form.tags.iter().map(|(id, _)| id.clone()).collect();
         self.tags.retain(|id, _| ids.contains(id));
-        for id in &ids {
-            let text = state.tags_text(id);
-            if let Some((input, _)) = self.tags.get(id) {
+        for (id, text) in form.tags {
+            if let Some((input, _)) = self.tags.get(&id) {
                 values.push((input.clone(), text));
                 continue;
             }
@@ -395,7 +395,7 @@ impl WorkflowEditor {
                     this.typed(cx);
                 }
             });
-            self.tags.insert(id.clone(), (input, sub));
+            self.tags.insert(id, (input, sub));
         }
         for (input, value) in values {
             let typing = input.read(cx).focus_handle(cx).is_focused(window);
@@ -422,36 +422,29 @@ impl WorkflowEditor {
         }
     }
 
+    /// What the text fields hold (the shared [`TextForm`]).
+    fn text_form(&self, cx: &App) -> TextForm {
+        let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        let mut tags: Vec<(String, String)> = self.tags.iter().map(|(id, (input, _))| (id.clone(), value(input))).collect();
+        tags.sort();
+        TextForm {
+            description: value(&self.description),
+            base_branch: value(&self.base_branch),
+            branch: value(&self.branch),
+            params: value(&self.params),
+            review: self.review_form(cx),
+            tags,
+            details: self.details.as_ref().map(|d| (d.index, self.details_form(d, cx))),
+        }
+    }
+
     /// What the text fields hold, as changes (Save applies those that
     /// differ from the draft).
     fn texts(&self, cx: &App) -> Vec<Change> {
-        let Some(state) = self.state.as_ref() else {
-            return Vec::new();
-        };
-        let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
-        let mut texts = vec![
-            Change::Description(value(&self.description)),
-            Change::Git(GitForm {
-                base_branch: value(&self.base_branch),
-                branch: value(&self.branch),
-                merge_strategy: state.git_form().merge_strategy,
-            }),
-            Change::RequiredParams(value(&self.params)),
-            Change::Review(self.review_form(cx)),
-        ];
-        for (id, (input, _)) in &self.tags {
-            texts.push(Change::Tags {
-                id: id.clone(),
-                text: value(input),
-            });
+        match self.state.as_ref() {
+            Some(state) => state.text_changes(&self.text_form(cx)),
+            None => Vec::new(),
         }
-        if let Some(details) = &self.details {
-            texts.push(Change::Details {
-                index: details.index,
-                form: self.details_form(details, cx),
-            });
-        }
-        texts
     }
 
     fn review_form(&self, cx: &App) -> ReviewForm {
@@ -479,14 +472,9 @@ impl WorkflowEditor {
     /// A text field changed: make each text change that differs from the
     /// draft (none does when the view itself filled the field).
     fn typed(&mut self, cx: &mut Context<Self>) {
-        let texts = self.texts(cx);
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        for change in texts {
-            if state.differs(&change) {
-                state.change(change);
-            }
+        let form = self.text_form(cx);
+        if let Some(state) = self.state.as_mut() {
+            state.type_texts(&form);
         }
         cx.notify();
     }

@@ -163,7 +163,7 @@ fn the_page_lists_workflows_statuses_and_the_legend() {
 fn every_row_is_reachable_by_keys_and_enter_does_its_main_thing() {
     let _home = Home::new("walk");
     let mut page = page();
-    assert_eq!(press(&mut page, key(KeyCode::Enter)), SettingsAction::EditWorkflow("task".into()));
+    assert_eq!(press(&mut page, key(KeyCode::Enter)), SettingsAction::EditWorkflow { name: "task".into(), status: None });
     let n = page.items().len();
     for _ in 0..n + 2 {
         press(&mut page, key(KeyCode::Down));
