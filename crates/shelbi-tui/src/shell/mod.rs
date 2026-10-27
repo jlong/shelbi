@@ -114,6 +114,10 @@ enum SettingsMsg {
     KeysLoaded(Ticket, Result<String, String>),
     /// A save to `keys.yaml`: the file's new text, or why it failed.
     KeysSaved(Result<String, String>),
+    /// The Agents page `id`'s read.
+    AgentsLoaded(u64, Ticket, Box<Result<shelbi_state::agents_config::AgentsConfig, String>>),
+    /// The Agents page `id`'s save.
+    AgentsCommitted(u64, Box<shelbi_app::settings::agents::Committed>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -154,6 +158,11 @@ impl KeysStore for DiskKeys {
         shelbi_app::settings::keybindings::ensure_keys_file()
     }
 }
+
+/// Reads a project's agents for Settings ▸ Agents (blocking; run off the UI
+/// thread).
+type AgentsReader =
+    Arc<dyn Fn(&str) -> Result<shelbi_state::agents_config::AgentsConfig, String> + Send + Sync>;
 
 /// Resolved inputs the shell needs to build a [`ReviewInterface`], read off the
 /// UI thread (board + project config lookups).
@@ -1179,6 +1188,9 @@ struct ShellState {
     workflows_reader: WorkflowsReader,
     /// `keys.yaml` for the Keybindings page (disk in production).
     keys_store: Arc<dyn KeysStore>,
+    /// Reads Settings ▸ Agents' model (disk; in tests only a test's own
+    /// `SHELBI_HOME`).
+    agents_reader: AgentsReader,
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
@@ -1292,6 +1304,14 @@ impl ShellState {
         let workflows_reader: WorkflowsReader = Arc::new(shelbi_app::settings::workflows::load);
         #[cfg(test)]
         let workflows_reader: WorkflowsReader = Arc::new(|_: &str| Err("tests read no ~/.shelbi".to_string()));
+        // The Agents page reads (and its saves write) a project's files; a
+        // test that lands on it without its own `SHELBI_HOME` reads nothing.
+        let agents_reader: AgentsReader = Arc::new(|project: &str| {
+            if cfg!(test) && std::env::var_os("SHELBI_HOME").is_none() {
+                return Err("tests read no ~/.shelbi".to_string());
+            }
+            shelbi_state::agents_config::AgentsConfig::load(project).map_err(|e| e.to_string())
+        });
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1350,6 +1370,7 @@ impl ShellState {
             settings_store,
             workflows_reader,
             keys_store,
+            agents_reader,
             status: None,
             job: None,
             pending_editor: None,
@@ -2200,6 +2221,15 @@ impl ShellState {
                         let _ = tx.send(SettingsMsg::WorkflowsLoaded(sent, Box::new(config)));
                     })
             }
+            settings::Load::Agents { id, ticket: sent, project } => {
+                let reader = self.agents_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings-agents".into())
+                    .spawn(move || {
+                        let config = reader(&project);
+                        let _ = tx.send(SettingsMsg::AgentsLoaded(id, sent, Box::new(config)));
+                    })
+            }
         };
         if let Err(e) = spawned {
             let why = format!("couldn't start the read: {e}");
@@ -2214,7 +2244,27 @@ impl ShellState {
                 settings::Load::Workflows(ticket, _) => {
                     self.settings.workflows_loaded(&ticket, Err(why));
                 }
+                settings::Load::Agents { id, ticket, .. } => {
+                    self.settings.agents_loaded(id, &ticket, Err(why));
+                }
             }
+        }
+    }
+
+    /// Run one Agents page save off the UI thread; it comes back through
+    /// `settings_rx` under its page's id, and the page's next queued save
+    /// starts then.
+    fn commit_agents(&mut self, job: settings::CommitJob) {
+        let tx = self.settings_tx.clone();
+        let settings::CommitJob { id, project, config, edit } = job;
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-commit".into())
+            .spawn(move || {
+                let done = shelbi_app::settings::agents::commit(&project, &config, edit);
+                let _ = tx.send(SettingsMsg::AgentsCommitted(id, Box::new(done)));
+            });
+        if let Err(e) = spawned {
+            self.status = Some(format!("couldn't start the save: {e}"));
         }
     }
 
@@ -2350,8 +2400,10 @@ impl ShellState {
     /// UI thread.
     fn save_settings(&mut self) {
         let project = self.client.project().map(str::to_string);
-        let Some((ticket, work)) = self.settings.begin_save(project.as_deref(), &self.settings_writer) else {
-            return;
+        let (ticket, work) = match self.settings.begin_save(project.as_deref(), &self.settings_writer) {
+            None => return,
+            Some(settings::SaveStart::Commit(job)) => return self.commit_agents(*job),
+            Some(settings::SaveStart::Work(ticket, work)) => (ticket, work),
         };
         let tx = self.settings_tx.clone();
         let sent = ticket.clone();
@@ -2393,6 +2445,16 @@ impl ShellState {
                     self.apply_settings_action(action);
                 }
                 SettingsMsg::KeysSaved(result) => self.keys_saved(result),
+                SettingsMsg::AgentsLoaded(id, ticket, config) => {
+                    self.settings.agents_loaded(id, &ticket, *config);
+                }
+                SettingsMsg::AgentsCommitted(id, done) => {
+                    let (next, action) = self.settings.agents_committed(id, *done);
+                    if let Some(job) = next {
+                        self.commit_agents(job);
+                    }
+                    self.apply_settings_action(action);
+                }
             }
         }
         // A theme config.yaml now holds (read on entering Settings or after
@@ -2440,6 +2502,8 @@ impl ShellState {
             SettingsAction::SaveKeys(change) => self.save_keys(change),
             SettingsAction::OpenKeys => self.open_keys_file(),
             SettingsAction::ApplyKeymaps => self.apply_keymaps(),
+                        SettingsAction::CommitAgents(job) => self.commit_agents(*job),
+            SettingsAction::Status(text) => self.status = Some(text),
         }
         self.dirty = true;
     }
@@ -8509,5 +8573,77 @@ mod tests {
             draw_frame(&mut term, &mut st).unwrap();
             crate::theme::assert_light_readable("settings", term.backend().buffer());
         });
+    }
+
+    // --- Settings ▸ Agents (tui-settings-agents), through the real event path
+
+    /// A fixture project `proj` (and `beta`) in a throwaway `SHELBI_HOME`.
+    fn agents_home(tag: &str) -> shelbi_app::settings::agents::fixture::Home {
+        let lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = shelbi_app::settings::agents::fixture::Home::new(&format!("shell-{tag}"), "proj", lock);
+        home.add_project("beta");
+        home
+    }
+
+    /// Drain Settings' background work until `done` holds.
+    fn settle_agents(st: &mut ShellState, what: &str, mut done: impl FnMut(&ShellState) -> bool) {
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                st.poll_settings();
+                done(st)
+            }),
+            "{what}"
+        );
+    }
+
+    #[test]
+    fn the_agents_page_loads_edits_yaml_and_saves_shared_instructions_off_the_ui_thread() {
+        let home = agents_home("page");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.dispatch_effect(Effect::OpenSettings);
+        // Its number opens it, from the sidebar.
+        type_key(&mut st, '6');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Agents);
+        settle_agents(&mut st, "the agents load", |st| st.settings.agents_page().state().config().is_some());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let text = screen_text(&term);
+        assert!(text.contains("orchestrator") && text.contains("Customized"), "{text}");
+
+        // Edit YAML hands the user's editor agent.yaml, and the page reads
+        // again when it returns (the run loop's reload).
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Down);
+        type_key(&mut st, 'y');
+        let path = st.pending_editor.take().expect("the editor is queued");
+        assert_eq!(path, home.agents().join("orchestrator/agent.yaml"));
+
+        // The shared instructions: open the editor, paste (a dropped file's
+        // path goes there too, never to the session), save with Ctrl+S.
+        for _ in 0..20 {
+            press(&mut st, KeyCode::Down);
+        }
+        press(&mut st, KeyCode::Enter);
+        st.handle_event(Event::Paste("Pasted.\r\n".into()));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        let preamble = home.agents().join("_shared/preamble.md");
+        settle_agents(&mut st, "the save lands", |st| !st.settings.agents_page().state().saving());
+        assert!(std::fs::read_to_string(&preamble).unwrap().starts_with("Pasted.\nYou are working"));
+        assert!(st.settings.agents_page().editor_text().is_none(), "the editor closed");
+
+        // A switch over Settings keeps the page, now for beta.
+        st.dispatch_effect(Effect::SwitchProject { project: "beta".into() });
+        assert!(st.settings_open());
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Agents);
+        settle_agents(&mut st, "beta's agents load", |st| {
+            st.settings.agents_page().project() == Some("beta") && st.settings.agents_page().state().config().is_some()
+        });
+        assert_eq!(
+            st.settings.agents_page().state().shared_instructions(),
+            shelbi_app::settings::agents::fixture::PREAMBLE,
+            "beta's own preamble"
+        );
     }
 }

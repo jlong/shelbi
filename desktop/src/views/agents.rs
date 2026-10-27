@@ -38,8 +38,9 @@ use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Textarea
 use shelbi_state::agents_config::{AgentSummary, AgentsConfig, Provenance};
 
 use super::agents_state::{
-    commit, preview, runner_label, status_chips, Committed, Confirm, Edit, StatusChip, Target, AgentsState,
-    PREVIEW_LINES,
+    commit, preview, runner_label, status_chips, unreadable_message, AgentsState, Committed, Confirm, Edit,
+    StatusChip, Target, AGENTS_HELPER, NOT_ASSIGNED, NO_SHARED, PREVIEW_LINES, SHARED_FOOTNOTE, SHARED_HELPER,
+    SHARED_TITLE, UNSET_RUNNER,
 };
 use super::workflows::{header_button, popup, row_button, row_error, section_header, table, MENU_GAP, ROW_BUTTON};
 use crate::assets::icons;
@@ -207,10 +208,7 @@ impl AgentsPage {
     }
 
     fn committed(&mut self, done: Committed, window: &mut Window, cx: &mut Context<Self>) {
-        let created = match (&done.edit, &done.error) {
-            (Edit::CreateAgent { name } | Edit::DuplicateAgent { name, .. }, None) => Some(name.clone()),
-            _ => None,
-        };
+        let created = done.created().map(str::to_string);
         let next = self.state.committed(done);
         if !self.state.editing_shared {
             self.shared_input = None;
@@ -371,7 +369,7 @@ impl AgentsPage {
             .gap(px(24.0))
             .child(section_header(
                 "Agents",
-                "Configure the roles, instructions, and skills agents use in this project.",
+                AGENTS_HELPER,
                 vec![new_agent.into_any_element()],
                 theme,
             ))
@@ -426,7 +424,7 @@ impl AgentsPage {
             .w(px(RUNNER_W))
             .child(div().truncate().type_style(Type::Base).text_color(theme.form_text).child(match a.preferred_runner {
                 Some(runner) => runner_label(runner),
-                None => "Project default",
+                None => UNSET_RUNNER,
             }))
             .children(a.runner_recommended.then(|| {
                 let selector = format!("agent-recommended-{name}");
@@ -448,7 +446,7 @@ impl AgentsPage {
             .w(px(STATUSES_W))
             .type_style(Type::Small)
             .when(chips.is_empty(), |d| {
-                d.child(div().text_color(theme.form_hint).child("Not assigned"))
+                d.child(div().text_color(theme.form_hint).child(NOT_ASSIGNED))
             })
             .children(chips.into_iter().map(|chip| status_chip(&name, chip, theme)));
         let row_id = SharedString::from(format!("agent-row-{name}"));
@@ -559,7 +557,7 @@ impl AgentsPage {
                         div()
                             .type_style(Type::Small)
                             .text_color(theme.error)
-                            .child(format!("Can’t be edited here: {error}")),
+                            .child(unreadable_message(error)),
                     ),
             )
             .child(
@@ -690,23 +688,10 @@ impl AgentsPage {
     /// Reset or Delete waiting under its row: what it does, Cancel and the
     /// action.
     fn render_confirm(&self, confirm: Confirm, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let name = confirm.agent().to_string();
-        let (text, label, kind, id) = match &confirm {
-            Confirm::Reset(_) => (
-                format!(
-                    "Reset {name} to the shipped default? Its instructions, agent.yaml and skills go back to \
-                     what Shelbi ships, and your changes to them are lost."
-                ),
-                "Reset",
-                ButtonKind::Danger,
-                "agent-confirm-reset",
-            ),
-            Confirm::Delete(_) => (
-                format!("Delete {name}? Its directory, with its instructions and skills, is removed."),
-                "Delete",
-                ButtonKind::Danger,
-                "agent-confirm-delete",
-            ),
+        let (text, label, kind) = (confirm.message(), confirm.label(), ButtonKind::Danger);
+        let id = match &confirm {
+            Confirm::Reset(_) => "agent-confirm-reset",
+            Confirm::Delete(_) => "agent-confirm-delete",
         };
         div()
             .debug_selector(|| "agent-confirm".into())
@@ -831,8 +816,8 @@ impl AgentsPage {
             .w_full()
             .gap(px(24.0))
             .child(section_header(
-                "Shared instructions",
-                "Project context included before every agent’s own instructions.",
+                SHARED_TITLE,
+                SHARED_HELPER,
                 buttons,
                 theme,
             ))
@@ -841,7 +826,7 @@ impl AgentsPage {
                 div()
                     .type_style(Type::Small)
                     .text_color(theme.form_hint)
-                    .child("Changes apply to new agent sessions. Existing sessions keep their current instructions."),
+                    .child(SHARED_FOOTNOTE),
             )
     }
 }
@@ -930,7 +915,7 @@ fn render_preview(markdown: &str, theme: &Theme) -> Div {
         .type_style(Type::Base)
         .text_color(theme.form_text);
     if blocks.is_empty() {
-        return well.child(div().text_color(theme.form_hint).child("No shared instructions yet."));
+        return well.child(div().text_color(theme.form_hint).child(NO_SHARED));
     }
     well.children(blocks.into_iter().map(|b| {
         div()

@@ -28,7 +28,9 @@
 //! - [`workflows`]: the Workflows page's state (the project's workflows and
 //!   status catalog, the edits it saves as they're made, and their guards).
 //! - [`keybindings`]: the Keybindings page's bindings editor.
+//! - [`agents`]: the Agents page's state (its rows, guards, and saves).
 
+pub mod agents;
 pub mod general;
 pub mod keybindings;
 pub mod summary;
