@@ -324,6 +324,7 @@ mod tests {
                 "action:toggle-zen",
                 "review:T-9",
                 "action:error-log",
+                "action:settings",
                 "action:detach",
                 "action:quit-project",
                 "action:quit-shelbi",

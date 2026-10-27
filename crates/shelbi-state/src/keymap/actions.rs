@@ -48,6 +48,10 @@ pub enum SidebarAction {
     NavDown,
     Activate,
     Refresh,
+    /// Open Settings in place of the sidebar (the desktop app's ⌘, as a
+    /// terminal-safe key: the sidebar has focus, so it never reaches an
+    /// agent).
+    OpenSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,6 +129,7 @@ impl Action {
                 SidebarAction::NavDown => "Sidebar: move selection down",
                 SidebarAction::Activate => "Sidebar: activate selection",
                 SidebarAction::Refresh => "Sidebar: refresh",
+                SidebarAction::OpenSettings => "Sidebar: open Settings",
             },
             Action::Kanban(a) => match a {
                 KanbanAction::NavLeft => "Kanban: focus column to the left",
@@ -196,6 +201,7 @@ impl Action {
                 SidebarAction::NavDown => "Move selection down",
                 SidebarAction::Activate => "Open selection",
                 SidebarAction::Refresh => "Refresh",
+                SidebarAction::OpenSettings => "Open Settings",
             },
             Action::Kanban(a) => match a {
                 KanbanAction::NavLeft => "Focus previous column",
@@ -267,6 +273,9 @@ impl Action {
                 // the kanban's "enter or space" affordance.
                 SidebarAction::Activate => &["enter", "space"],
                 SidebarAction::Refresh => &["r"],
+                // The comma of the desktop's ⌘, on its own: free in the
+                // sidebar, and no terminal mangles it.
+                SidebarAction::OpenSettings => &[","],
             },
             Action::Kanban(a) => match a {
                 KanbanAction::NavLeft => &["h", "left"],
@@ -353,6 +362,7 @@ impl Action {
                 SidebarAction::NavDown => "nav_down",
                 SidebarAction::Activate => "activate",
                 SidebarAction::Refresh => "refresh",
+                SidebarAction::OpenSettings => "open_settings",
             },
             Action::Kanban(a) => match a {
                 KanbanAction::NavLeft => "nav_left",
@@ -418,6 +428,7 @@ impl Action {
             SidebarAction::NavDown,
             SidebarAction::Activate,
             SidebarAction::Refresh,
+            SidebarAction::OpenSettings,
         ];
         const KANBAN: &[KanbanAction] = &[
             KanbanAction::NavLeft,

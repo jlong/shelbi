@@ -738,3 +738,70 @@ fn a_dropped_file_pastes_into_the_open_workspace_content_session() {
         "focus follows the drop to the workspace content view",
     );
 }
+
+#[test]
+fn settings_keys_never_reach_the_agent_and_back_returns_to_the_live_session() {
+    // tui-settings-shell: while Settings shows over a live session, every key
+    // (letters, digits, Enter, Tab, Ctrl+C) and a paste stay Settings'; the
+    // session keeps running underneath, and once Esc leaves, typing reaches it
+    // again. Proven against a real PTY whose `cat` echoes what it receives.
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    let sock = spawn_cat(home.path(), "tuisettings/orch");
+    let _cleanup = Cleanup { sock: sock.clone() };
+    let (_observer, obs_events) = attach_observer(&sock);
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st = ShellState::new("tuisettings", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+    st.show(RowTarget::Session(SessionRef::Orchestrator));
+    wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        matches!(st.sessions.state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the shell's main area should bind the session live");
+
+    st.dispatch_effect(shelbi_app::Effect::OpenSettings);
+    assert!(st.settings_open());
+    for kev in [
+        KeyEvent::new(KeyCode::Char('a'), NONE),
+        KeyEvent::new(KeyCode::Char('j'), NONE),
+        KeyEvent::new(KeyCode::Char('k'), NONE),
+        KeyEvent::new(KeyCode::Char('1'), NONE),
+        KeyEvent::new(KeyCode::Enter, NONE),
+        KeyEvent::new(KeyCode::Tab, NONE),
+        KeyEvent::new(KeyCode::Char('c'), CTRL),
+        KeyEvent::new(KeyCode::Char('q'), NONE),
+    ] {
+        st.handle_event(Event::Key(kev));
+        pump(&mut st);
+    }
+    st.handle_event(Event::Paste("pasted".into()));
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(out.is_empty(), "no Settings key reached the agent: {out:?}");
+    assert!(!st.should_quit, "q and Ctrl+C don't quit from Settings");
+    assert!(
+        matches!(st.sessions.state(), MainState::Live(_)),
+        "the session stays live under Settings"
+    );
+
+    st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, NONE)));
+    assert!(!st.settings_open());
+    st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('z'), NONE)));
+    let saw = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out, b"z").then_some(())
+    });
+    assert!(saw.is_some(), "after Back, typing reaches the agent again: {out:?}");
+    assert_eq!(out, b"z", "and only what was typed after Back");
+}

@@ -130,7 +130,7 @@ use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::{SettingsEvent, SettingsView};
-use crate::views::settings_nav::{self, SettingsNav, SettingsPage};
+use crate::views::settings_nav::{self, PageLook, SettingsNav, SettingsPage};
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
 use crate::window_state::{self, Frame, LaunchWindow, ProjectViewState, WindowSession, WindowState};
 use crate::theme::style::{Type, Typography};
@@ -496,6 +496,7 @@ pub enum HostCall {
     QuitShelbi,
     ToggleZen,
     OpenErrorLog,
+    OpenSettings,
     OpenAddProject,
     LoadReview(String),
     ApproveReview(String),
@@ -537,6 +538,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_error_log(&mut self) {
         self.push(HostCall::OpenErrorLog);
+    }
+    fn open_settings(&mut self) {
+        self.push(HostCall::OpenSettings);
     }
     fn open_add_project(&mut self) {
         self.push(HostCall::OpenAddProject);
@@ -2087,6 +2091,7 @@ impl ShelbiWindow {
             HostCall::QuitShelbi => self.confirm_quit_shelbi(window, cx),
             HostCall::ToggleZen => self.toggle_zen(window, cx),
             HostCall::OpenErrorLog => self.open_error_log(window, cx),
+            HostCall::OpenSettings => self.open_settings(None, window, cx),
             HostCall::OpenAddProject => self.open_add_project(window, cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
@@ -3937,6 +3942,8 @@ impl ShelbiWindow {
                     feed.request();
                 }
             }
+            // The sidebar's `,`, the TUI's Settings key; ⌘, works anywhere.
+            (Some(SidebarAction::OpenSettings), _) => self.open_settings(None, window, cx),
             // `q` / Ctrl+C close the TUI; a window closes with ⌘W instead.
             (Some(SidebarAction::Quit), _) | (None, _) => return,
         }
