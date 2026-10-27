@@ -3633,17 +3633,35 @@ fn append_dispatch_status(project: &str, task_id: &str, workspace: &str, status:
 /// modify-user-config principle, every such write leaves a visible trace. The
 /// no-op wiring cases ([`SettingsWireResult::Wired`]) call nothing.
 pub fn disclose_settings_selfheal(workspace: &str) {
-    if let Err(e) = shelbi_state::append_settings_selfheal_event(
+    if let Err(e) = append_settings_selfheal_event(workspace) {
+        eprintln!("shelbi: failed to record settings self-heal in events.log: {e}");
+    }
+    eprintln!("{}", settings_selfheal_notice(workspace));
+}
+
+/// The `events.log` half of [`disclose_settings_selfheal`], for a caller that
+/// can't print (the desktop, through `pool_admin`). Logs a failed append
+/// instead of printing it.
+pub fn record_settings_selfheal(workspace: &str) {
+    if let Err(e) = append_settings_selfheal_event(workspace) {
+        tracing::warn!(workspace, error = %e, "failed to record settings self-heal in events.log");
+    }
+}
+
+/// The one-line notice [`disclose_settings_selfheal`] prints.
+pub fn settings_selfheal_notice(workspace: &str) -> String {
+    format!(
+        "shelbi: self-healed {WORKTREE_SETTINGS_LOCAL_REL} for workspace `{workspace}` \
+         — merged Shelbi's hook block into your settings (user content preserved)"
+    )
+}
+
+fn append_settings_selfheal_event(workspace: &str) -> shelbi_core::Result<()> {
+    shelbi_state::append_settings_selfheal_event(
         workspace,
         WORKTREE_SETTINGS_LOCAL_REL,
         "hooks-merged",
-    ) {
-        eprintln!("shelbi: failed to record settings self-heal in events.log: {e}");
-    }
-    eprintln!(
-        "shelbi: self-healed {WORKTREE_SETTINGS_LOCAL_REL} for workspace `{workspace}` \
-         — merged Shelbi's hook block into your settings (user content preserved)"
-    );
+    )
 }
 
 /// The minimum claude version that understands `--permission-mode auto`.

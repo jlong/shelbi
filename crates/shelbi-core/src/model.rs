@@ -1479,7 +1479,7 @@ fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
 /// `role: Review` (any case) config loads as `tags: [review]`, `role: Dev`
 /// as no tags. `role` is read-only legacy input and is never written back
 /// out (see [`WorkspaceSpecRaw`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "WorkspaceSpecRaw")]
 pub struct WorkspaceSpec {
     pub name: String,
@@ -1587,7 +1587,7 @@ where
 // ---------------------------------------------------------------------------
 // Machine / Host
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Machine {
     pub name: String,
     pub kind: MachineKind,
