@@ -22,6 +22,9 @@
 //!   window effects), its sixteen colors as sessions draw them here, and a
 //!   short session drawn through the sessions' own cell mapping. Nothing on
 //!   it edits: the TUI never changes the host terminal's palette.
+//! - Workflows (`tui-settings-workflows`, [`workflows`]): the project's
+//!   workflows and status catalog, edited in place and saved as each edit is
+//!   made, over the shared `shelbi_app::settings::workflows` state.
 //!
 //! Keys, all terminal-safe (no Command chords) and never forwarded to a
 //! session while Settings shows:
@@ -60,17 +63,46 @@ use shelbi_app::settings::terminal_preview;
 use shelbi_app::settings::{
     Header, Job, JobState, LeaveGuard, PageSet, SettingsNav, SettingsPage, Ticket,
 };
+use shelbi_app::settings::workflows::{Committed, Edit, Target};
 use shelbi_app::{EditTarget, Effect};
 use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
 use shelbi_state::{EditorSource, ThemePreference, UserConfig};
+use shelbi_state::workflow_config::WorkflowConfig;
 
 use crate::panel::{self, PAD};
 use crate::theme::palette;
 
+mod workflows;
+
+pub(crate) use workflows::EditFile;
+use workflows::{Nav, WorkflowsPage};
+
+/// Workflow `name`'s row on the Workflows page (the shell's tests select it).
+#[cfg(test)]
+pub(crate) fn workflows_item_workflow(name: &str) -> workflows::Item {
+    workflows::Item::Workflow(name.to_string())
+}
+
+/// Status `id`'s row on the Workflows page.
+#[cfg(test)]
+pub(crate) fn workflows_item_status(id: &str) -> workflows::Item {
+    workflows::Item::Status(id.to_string())
+}
+
 /// The pages the TUI offers. A follow-up page joins here once it draws.
 pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::General)
-    .with(SettingsPage::Terminal);
+    .with(SettingsPage::Terminal)
+    .with(SettingsPage::Workflows);
+
+/// A page's background read the shell starts ([`SettingsShell::begin_page_load`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Load {
+    /// The General summary.
+    General(Ticket),
+    /// The Workflows page: this project's workflow config.
+    Workflows(Ticket, String),
+}
 
 /// Where keyboard focus sits inside Settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +153,15 @@ pub(crate) enum SettingsAction {
     Write(Change),
     /// Open this file in the user's editor (`config.yaml`).
     EditFile(PathBuf),
+    /// The Workflows page queued a save: start it off the UI thread
+    /// ([`SettingsShell::begin_commit`]).
+    Commit,
+    /// Open workflow `name`'s editor. The workflow editor is its own task;
+    /// until it lands the shell opens the workflow's YAML.
+    EditWorkflow(String),
+    /// Edit YAML on the Workflows page: open a workflow config file in the
+    /// user's editor, scaffolding it first when it is missing.
+    EditYaml(EditFile),
 }
 
 /// What a page's focusable row does.
@@ -189,6 +230,8 @@ pub(crate) struct Chrome<'a> {
     /// The user's keymaps, for the hints.
     pub keymaps: &'a Keymaps,
     pub style: DisplayStyle,
+    /// Whether a project is open (the project pages need one).
+    pub has_project: bool,
 }
 
 /// Settings' state. One per shell: it outlives a visit, so Settings reopens
@@ -203,6 +246,8 @@ pub(crate) struct SettingsShell {
     form: GeneralForm,
     /// A theme loaded or saved that the shell hasn't applied yet.
     theme_out: Option<ThemePreference>,
+    /// The Workflows page.
+    workflows: WorkflowsPage,
     /// The page's selected action row and scroll offset.
     action: usize,
     scroll: u16,
@@ -217,6 +262,8 @@ pub(crate) struct SettingsShell {
     dropped: usize,
     /// Rects from the last draw, for clicks.
     hits: Vec<(Rect, Hit)>,
+    /// Whether a project was open at the last draw.
+    has_project: bool,
     /// Unsaved edits a test injects (General edits nothing yet): `Some` is
     /// dirty, and its value is what the save returns.
     #[cfg(test)]
@@ -233,6 +280,7 @@ impl Default for SettingsShell {
             general: Job::default(),
             form: GeneralForm::default(),
             theme_out: None,
+            workflows: WorkflowsPage::default(),
             action: 0,
             scroll: 0,
             guard: LeaveGuard::default(),
@@ -241,6 +289,7 @@ impl Default for SettingsShell {
             save_error: None,
             dropped: 0,
             hits: Vec::new(),
+            has_project: false,
             #[cfg(test)]
             test_edits: None,
         }
@@ -273,6 +322,15 @@ impl SettingsShell {
         &self.general
     }
 
+    pub(crate) fn workflows(&self) -> &WorkflowsPage {
+        &self.workflows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workflows_mut(&mut self) -> &mut WorkflowsPage {
+        &mut self.workflows
+    }
+
     #[cfg(test)]
     pub(crate) fn form(&self) -> &GeneralForm {
         &self.form
@@ -293,6 +351,7 @@ impl SettingsShell {
         self.save_error = None;
         self.form.cancel_edit();
         self.form.clear_status();
+        self.workflows.close_modal();
     }
 
     pub(crate) fn set_region(&mut self, region: Region) {
@@ -381,8 +440,12 @@ impl SettingsShell {
     }
 
     /// A paste (or a dropped file's path) while Settings shows: into the
-    /// editor command being typed, else nowhere.
+    /// editor command or the workflow name being typed, else nowhere.
+    /// Returns whether a field took it.
     pub(crate) fn paste(&mut self, text: &str) -> bool {
+        if self.nav.page() == SettingsPage::Workflows {
+            return self.workflows.paste(text);
+        }
         match self.form.draft_mut() {
             Some(field) if self.region == Region::Page => {
                 field.paste(text);
@@ -429,6 +492,7 @@ impl SettingsShell {
     /// anything still loading for the old project is dropped when it lands.
     pub(crate) fn project_changed(&mut self) {
         self.general.reset();
+        self.workflows.project_changed();
         self.save.reset();
         self.action = 0;
         self.scroll = 0;
@@ -448,13 +512,55 @@ impl SettingsShell {
                 }
                 Some(self.general.begin(project))
             }
-            // Not offered yet: nothing to load.
+            // Terminal reads nothing, Workflows reads through
+            // `begin_page_load`, and the rest aren't offered yet.
             SettingsPage::Keybindings
             | SettingsPage::Terminal
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
             | SettingsPage::Agents => None,
         }
+    }
+
+    /// Start the shown page's read for `project` (see [`Self::begin_load`]
+    /// for General's; Workflows reads again on every visit, to show hand
+    /// edits).
+    pub(crate) fn begin_page_load(&mut self, project: Option<&str>, force: bool) -> Option<Load> {
+        match self.nav.page() {
+            SettingsPage::General => self.begin_load(project, force).map(Load::General),
+            SettingsPage::Workflows => {
+                let ticket = self.workflows.begin_load(project, force)?;
+                Some(Load::Workflows(ticket, project?.to_string()))
+            }
+            SettingsPage::Keybindings | SettingsPage::Terminal | SettingsPage::Workspaces | SettingsPage::Agents => None,
+        }
+    }
+
+    /// The Workflows page's read landed. Returns whether it was taken.
+    pub(crate) fn workflows_loaded(&mut self, ticket: &Ticket, result: Result<WorkflowConfig, String>) -> bool {
+        let taken = self.workflows.loaded(ticket, result);
+        if !taken {
+            self.dropped += 1;
+        }
+        taken
+    }
+
+    /// The Workflows page's next save, if one waits: its ticket, project,
+    /// model and edit.
+    pub(crate) fn begin_commit(&mut self) -> Option<(Ticket, String, WorkflowConfig, Edit)> {
+        self.workflows.begin_commit()
+    }
+
+    /// A Workflows save landed. Returns whether it saved for the shown
+    /// project (the shell refreshes the board then).
+    pub(crate) fn committed(&mut self, ticket: &Ticket, done: Committed) -> bool {
+        self.workflows.committed(ticket, done)
+    }
+
+    /// Show `message` at `target` on the Workflows page (a file that
+    /// couldn't be opened).
+    pub(crate) fn workflows_error(&mut self, target: Target, message: String) {
+        self.workflows.set_error(target, message);
     }
 
     /// A load landed. Returns whether it was taken (a stale one is dropped).
@@ -626,7 +732,7 @@ impl SettingsShell {
 
     /// Whether the editor command is being typed (it takes the page's keys).
     fn typing(&self) -> bool {
-        self.region == Region::Page && self.form.draft().is_some()
+        self.region == Region::Page && self.nav.page() == SettingsPage::General && self.form.draft().is_some()
     }
 
     /// A key while the editor command is typed: Enter saves it, Esc puts it
@@ -671,6 +777,18 @@ impl SettingsShell {
         }
         let chord = crate::keymap::chord_from_event(k);
         let sidebar = chord.and_then(|c| keymaps.sidebar.dispatch(c));
+        let up = k.code == KeyCode::Up || sidebar == Some(SidebarAction::NavUp);
+        let down = k.code == KeyCode::Down || sidebar == Some(SidebarAction::NavDown);
+        let activate = sidebar == Some(SidebarAction::Activate)
+            || matches!(chord.map(|c| c.code), Some(Key::Enter));
+        let nav = Nav { up, down, activate };
+        let on_workflows = self.nav.page() == SettingsPage::Workflows;
+        if on_workflows && self.workflows.modal_open() {
+            // A menu, picker, confirm or name field holds every key (Esc
+            // closes it, not Settings; digits and Tab type or pick).
+            self.region = Region::Page;
+            return self.workflows.handle_key(k, nav);
+        }
         match k.code {
             KeyCode::Esc => return self.request(Leave::Back),
             KeyCode::Tab | KeyCode::BackTab => {
@@ -687,10 +805,6 @@ impl SettingsShell {
             }
             _ => {}
         }
-        let up = k.code == KeyCode::Up || sidebar == Some(SidebarAction::NavUp);
-        let down = k.code == KeyCode::Down || sidebar == Some(SidebarAction::NavDown);
-        let activate = sidebar == Some(SidebarAction::Activate)
-            || matches!(chord.map(|c| c.code), Some(Key::Enter));
         match self.region {
             Region::Sidebar => {
                 if up || down {
@@ -700,6 +814,7 @@ impl SettingsShell {
                 }
                 SettingsAction::Stay
             }
+            Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page => {
                 let actions = self.actions();
                 let n = actions.len();
@@ -780,6 +895,16 @@ impl SettingsShell {
             .map(|(_, h)| *h);
         let over_sidebar = panel::in_rect(sidebar, m.column, m.row);
         let over_main = panel::in_rect(main, m.column, m.row);
+        let on_workflows = self.nav.page() == SettingsPage::Workflows;
+        if on_workflows && self.workflows.modal_open() && self.guard.prompt().is_none() {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                if let Some(action) = self.workflows.click_modal(m.column, m.row) {
+                    return action;
+                }
+            } else if !matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                return SettingsAction::Stay;
+            }
+        }
         if self.guard.prompt().is_some() {
             // The prompt is modal: only its buttons answer.
             return match (m.kind, hit) {
@@ -819,6 +944,7 @@ impl SettingsShell {
                     Some(Hit::Stop(stop)) => self.activate_stop(stop),
                     // A click in the field being typed leaves it typing.
                     Some(Hit::Action(i)) if self.typing() && i == self.action => SettingsAction::Stay,
+                    Some(Hit::Action(i)) if on_workflows => self.workflows.click_item(i),
                     Some(Hit::Action(i)) => self.run_action(i),
                     Some(Hit::Theme(theme)) => {
                         if let Some(i) = self.actions().iter().position(|a| a.does == Does::Theme) {
@@ -840,8 +966,18 @@ impl SettingsShell {
     pub(crate) fn render(&mut self, f: &mut Frame, sidebar: Rect, main: Rect, chrome: &Chrome<'_>) {
         self.hits.clear();
         self.render_sidebar(f, sidebar, chrome.project_label);
-        let hints = hints(self.region, self.nav.page(), self.typing(), chrome.keymaps, chrome.style);
+        let moves = moves(chrome.keymaps, chrome.style);
+        let on_workflows = self.nav.page() == SettingsPage::Workflows;
+        let hints = if on_workflows && (self.region == Region::Page || self.workflows.modal_open()) {
+            self.workflows.hints(&moves)
+        } else {
+            hints(self.region, self.nav.page(), self.typing(), &moves)
+        };
+        self.has_project = chrome.has_project;
         self.render_page(f, main, chrome.status, &hints);
+        if on_workflows {
+            self.workflows.render_modal(f, main);
+        }
         if self.guard.prompt().is_some() || self.save.running() {
             self.render_prompt(f, main);
         }
@@ -981,10 +1117,14 @@ impl SettingsShell {
         let actions = self.actions();
         self.action = self.action.min(actions.len().saturating_sub(1));
         let rows = self.page_rows(content.width as usize, &actions);
+        // Workflows draws its rows whole; General's action rows are drawn
+        // here, with their focus.
+        let on_workflows = self.nav.page() == SettingsPage::Workflows;
+        let focus = if on_workflows { self.workflows.cursor() } else { self.action };
         // Keep the focused action in view, then clamp to the content.
         let max = (rows.len() as u16).saturating_sub(content.height);
         if self.region == Region::Page {
-            if let Some(at) = rows.iter().position(|r| r.action == Some(self.action)) {
+            if let Some(at) = rows.iter().position(|r| r.action == Some(focus)) {
                 let at = at as u16;
                 if at < self.scroll {
                     self.scroll = at;
@@ -1007,7 +1147,7 @@ impl SettingsShell {
                 continue;
             }
             let line = match row.action {
-                Some(a) => {
+                Some(a) if !on_workflows => {
                     let selected = self.region == Region::Page && a == self.action;
                     let width = rect.width as usize;
                     match &actions[a].does {
@@ -1024,7 +1164,7 @@ impl SettingsShell {
                         _ => action_line(&actions[a], selected, width),
                     }
                 }
-                None => row.line.clone(),
+                _ => row.line.clone(),
             };
             f.render_widget(Paragraph::new(line), rect);
             if let Some(a) = row.action {
@@ -1038,10 +1178,8 @@ impl SettingsShell {
         match self.nav.page() {
             SettingsPage::General => general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions),
             SettingsPage::Terminal => terminal_rows(width),
-            SettingsPage::Keybindings
-            | SettingsPage::Workspaces
-            | SettingsPage::Workflows
-            | SettingsPage::Agents => Vec::new(),
+            SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
+            SettingsPage::Keybindings | SettingsPage::Workspaces | SettingsPage::Agents => Vec::new(),
         }
     }
 
@@ -1636,11 +1774,8 @@ fn render_band(f: &mut Frame, area: Rect, text: &str, style: Style) {
     f.render_widget(Paragraph::new(Span::styled(format!("{text}{}", " ".repeat(pad)), style)), area);
 }
 
-/// The key hints for the focused region, in the user's sidebar chords.
-fn hints(region: Region, page: SettingsPage, typing: bool, keymaps: &Keymaps, style: DisplayStyle) -> String {
-    if typing {
-        return "type the command · ⏎ save · Esc put back".to_string();
-    }
+/// The up / down hint in the user's sidebar chords.
+fn moves(keymaps: &Keymaps, style: DisplayStyle) -> String {
     let letter = |a: SidebarAction| {
         keymaps
             .sidebar
@@ -1649,10 +1784,17 @@ fn hints(region: Region, page: SettingsPage, typing: bool, keymaps: &Keymaps, st
             .find(|c| matches!(c.code, Key::Char(_)))
             .map(|c| crate::keymap::format_chord_or_unbound(Some(c), style))
     };
-    let moves = match (letter(SidebarAction::NavUp), letter(SidebarAction::NavDown)) {
+    match (letter(SidebarAction::NavUp), letter(SidebarAction::NavDown)) {
         (Some(u), Some(d)) => format!("↑↓/{u}{d}"),
         _ => "↑↓".to_string(),
-    };
+    }
+}
+
+/// The key hints for the focused region.
+fn hints(region: Region, page: SettingsPage, typing: bool, moves: &str) -> String {
+    if typing {
+        return "type the command · ⏎ save · Esc put back".to_string();
+    }
     match region {
         Region::Sidebar => format!("{moves} move · ⏎ open · Tab page · Esc back"),
         Region::Page if page == SettingsPage::General => {
@@ -1786,7 +1928,8 @@ mod tests {
                 Stop::Back,
                 Stop::Page(SettingsPage::General),
                 Stop::Page(SettingsPage::Terminal),
-                Stop::Switcher
+                Stop::Switcher,
+                Stop::Page(SettingsPage::Workflows)
             ]
         );
         assert_eq!(s.page(), SettingsPage::General);
@@ -1802,7 +1945,10 @@ mod tests {
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher);
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Switcher, "stops at the bottom");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows));
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows), "stops at the bottom");
+        s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Up), &km);
         s.handle_key(key(KeyCode::Up), &km);
@@ -1917,6 +2063,7 @@ mod tests {
                 status: None,
                 keymaps: &km,
                 style: DisplayStyle::Mac,
+                has_project: true,
             };
             s.render(f, side, main, &chrome);
         })
@@ -2131,7 +2278,7 @@ mod tests {
             s.handle_key(key(KeyCode::Enter), &km);
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
             term.draw(|f| {
-                let chrome = Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac };
+                let chrome = Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true };
                 s.render(f, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40), &chrome);
             })
             .unwrap();
@@ -2239,6 +2386,7 @@ mod tests {
                     status: Some("status"),
                     keymaps: &km,
                     style: DisplayStyle::Mac,
+                    has_project: true,
                 };
                 s.render(f, side, main, &chrome);
             })

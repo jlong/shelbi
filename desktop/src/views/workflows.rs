@@ -40,7 +40,8 @@ use shelbi_core::StatusCategory;
 use shelbi_state::workflow_config::{StatusSummary, WorkflowConfig, WorkflowSummary};
 
 use super::workflows_state::{
-    category_help, category_label, commit, Committed, Draft, Edit, Target, WorkflowsState, CATEGORIES,
+    category_help, category_label, commit, prepare_statuses_yaml, prepare_workflow_yaml, Committed, Draft, Edit,
+    Target, WorkflowsState, CATEGORIES, RENAME_NOTE, STATUSES_HELP, WORKFLOWS_HELP,
 };
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::controls;
@@ -386,13 +387,7 @@ impl WorkflowsPage {
             return;
         };
         let project = self.state.project().to_string();
-        let prepare = move |path: &Path| {
-            if !path.exists() {
-                shelbi_state::scaffold_project_statuses(&project)
-                    .map_err(|e| format!("Couldn't write statuses.yaml: {e}"))?;
-            }
-            Ok(())
-        };
+        let prepare = move |path: &Path| prepare_statuses_yaml(&project, path);
         self.open_yaml(path, Target::Page, prepare, window, cx);
     }
 
@@ -403,14 +398,8 @@ impl WorkflowsPage {
         let Some(path) = self.state.config().map(|c| c.workflow_path(name)) else {
             return;
         };
-        let file = format!("{name}.yaml");
-        let prepare = move |path: &Path| {
-            if path.exists() {
-                Ok(())
-            } else {
-                Err(format!("Couldn't find {file}."))
-            }
-        };
+        let stem = name.to_string();
+        let prepare = move |path: &Path| prepare_workflow_yaml(&stem, path);
         self.open_yaml(path, Target::Workflow(name.to_string()), prepare, window, cx);
         cx.notify();
     }
@@ -588,7 +577,7 @@ impl WorkflowsPage {
             .gap(px(24.0))
             .child(section_header(
                 "Workflows",
-                "Configure the statuses, agents, and transitions for each kind of work.",
+                WORKFLOWS_HELP,
                 vec![new_workflow.into_any_element()],
                 theme,
             ))
@@ -964,8 +953,7 @@ impl WorkflowsPage {
             .child(style::anchor_probe(&self.statuses_anchor))
             .child(section_header(
                 "Statuses",
-                "Work transitions through statuses in workflows. Configure the statuses, agents, and \
-                 transitions for each kind of work.",
+                STATUSES_HELP,
                 vec![edit_yaml.into_any_element(), new_status.into_any_element()],
                 theme,
             ))
@@ -979,7 +967,7 @@ impl WorkflowsPage {
                         div()
                             .type_style(Type::Small)
                             .text_color(theme.form_hint)
-                            .child("Renaming a status keeps its ID, so existing workflow references stay intact."),
+                            .child(RENAME_NOTE),
                     ),
             )
             .child(
