@@ -2599,6 +2599,34 @@ pub fn append_workspace_pane_event(
     emit_event_body(&body)
 }
 
+/// Append `<rfc3339> project=<project> workspace=<name> orphan_reap=failed attempt=<n> retry_in=<secs>s reason=<short>`
+/// to `~/.shelbi/events.log`. Emitted by the poller's orphaned-slot reaper when
+/// its kill did not take (a remote session that survived the kill, or a machine
+/// that could not confirm it) — the failure counterpart of
+/// `pane_alive=false reason=orphaned-slot-reaped`. Deliberately NOT a
+/// `pane_alive=` line: the slot is still live (or unknown), and a false death
+/// would trip the orchestrator's pane-death rules and crash supervision. The
+/// reaper backs off between attempts, so this fires once per attempt rather
+/// than every poll.
+///
+/// `reason` is folded to a single token (whitespace → `_`) like every other
+/// free-text field so the record stays parseable.
+pub fn append_orphan_reap_failed_event(
+    project: &str,
+    workspace: &str,
+    attempt: u32,
+    retry_in_secs: u64,
+    reason: &str,
+) -> Result<()> {
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let reason = sanitize_reason(reason);
+    let body = format!(
+        "project={project} workspace={workspace} orphan_reap=failed attempt={attempt} retry_in={retry_in_secs}s reason={reason}"
+    );
+    emit_event_body(&body)
+}
+
 /// Append `<rfc3339> rebase task=<id> workspace=<name> branch=<branch> base=<base> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff
 /// when it auto-rebases a workspace's branch onto the branch the work merges

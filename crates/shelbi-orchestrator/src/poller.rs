@@ -538,13 +538,13 @@ fn run_workspace_poll_loop(
     // extra confirming tick for a genuinely wedged session.
     let mut reap_wedged_streak: HashMap<String, u32> = HashMap::new();
 
-    // When this slot first read as orphaned-by-board (no active task points at
-    // it). `None` = not currently orphaned. The reaper debounces off this so a
-    // dispatch racing a stale remote-board snapshot is never reaped mid-flight;
-    // see `maybe_reconcile_orphaned_pane`. Per-thread and in-memory like the
-    // rest: a poller restart re-seeds it to `None`, which only re-arms the full
-    // grace window for a slot that was already mid-reap — harmless.
-    let mut orphan_since: Option<Instant> = None;
+    // The orphan reaper's per-slot state: when this slot first read as
+    // orphaned-by-board (the grace clock a dispatch racing a stale remote-board
+    // snapshot is protected by) plus the backoff after a failed reap; see
+    // `maybe_reconcile_orphaned_pane`. Per-thread and in-memory like the rest:
+    // a poller restart re-seeds it empty, which only re-arms the full grace
+    // window for a slot that was already mid-reap — harmless.
+    let mut orphan_reap = OrphanReap::default();
 
     // Bring this poll thread under the cancellation model
     // (`rt-daemon-cancellation`). The job guard, scoped to this (project,
@@ -604,7 +604,7 @@ fn run_workspace_poll_loop(
             &mut last_agent_exited,
             &mut supervision,
             &mut limit_resume,
-            &mut orphan_since,
+            &mut orphan_reap,
             &mut reap_wedged_streak,
         );
 
@@ -1553,7 +1553,7 @@ fn poll_one(
     last_agent_exited: &mut bool,
     supervision: &mut SupervisionState,
     limit_resume: &mut LimitResumeState,
-    orphan_since: &mut Option<Instant>,
+    orphan_reap: &mut OrphanReap,
     reap_wedged_streak: &mut HashMap<String, u32>,
 ) {
     // Gate the whole tick before reading/consuming ready or transition
@@ -1646,7 +1646,7 @@ fn poll_one(
         *idle_debounce_streak = 0;
         *last_agent_exited = false;
         *limit_resume = LimitResumeState::Idle;
-        *orphan_since = None;
+        *orphan_reap = OrphanReap::default();
         return;
     }
 
@@ -1661,7 +1661,7 @@ fn poll_one(
     // (we just returned on a dead one) and short-circuits the rest of the tick
     // when it reaps — there's nothing left to observe. (A review slot's teardown
     // lives in `handle_review_slot` above, not here.)
-    if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr, orphan_since) {
+    if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr, orphan_reap) {
         *last_dialog = None;
         *unknown_dialog_streak = 0;
         *idle_debounce_streak = 0;
@@ -6262,6 +6262,37 @@ fn maybe_reap_orphaned_review_slot(
 const ORPHAN_REAP_GRACE: Duration =
     Duration::from_secs(3 * shelbi_state::BOARD_CACHE_TTL.as_secs());
 
+/// First retry delay after a failed orphan reap. Doubles per consecutive
+/// failure up to [`ORPHAN_REAP_RETRY_MAX`], so a remote session that will not
+/// die (a SIGTERM-ignoring child, a machine that answers the probe but not the
+/// kill) is retried on a widening cadence instead of every poll.
+const ORPHAN_REAP_RETRY_BASE: Duration = Duration::from_secs(60);
+
+/// Ceiling on the failed-reap backoff.
+const ORPHAN_REAP_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// The orphan reaper's per-slot state, carried across ticks by the poll thread.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct OrphanReap {
+    /// When this slot first read as orphaned-by-board. `None` = not currently
+    /// orphaned. The grace clock behind [`ORPHAN_REAP_GRACE`].
+    since: Option<Instant>,
+    /// Consecutive failed reap attempts on the current orphan.
+    failures: u32,
+    /// After a failed reap, the earliest instant the next attempt may run.
+    retry_at: Option<Instant>,
+}
+
+impl OrphanReap {
+    /// The backoff after the `failures`-th consecutive failure (1-based).
+    fn backoff(failures: u32) -> Duration {
+        let shift = failures.saturating_sub(1).min(16);
+        ORPHAN_REAP_RETRY_BASE
+            .saturating_mul(1u32 << shift)
+            .min(ORPHAN_REAP_RETRY_MAX)
+    }
+}
+
 /// Reap a dev workspace pane orphaned by a manual board move. Fires when a
 /// live, non-user-shell pane on a non-`review` workspace has no active
 /// (`active`-category) task assigned to it — the state a hand move out of
@@ -6305,14 +6336,22 @@ const ORPHAN_REAP_GRACE: Duration =
 /// the orphaned-by-board condition must persist past [`ORPHAN_REAP_GRACE`]
 /// (which outlasts the cache's staleness bound) before we act. By then the
 /// snapshot has refreshed from the backend, so a card still absent is genuinely
-/// gone (a real hand move-away), not a stale read. `orphan_since` carries the
+/// gone (a real hand move-away), not a stale read. `state.since` carries the
 /// grace clock across ticks; it is reset whenever the condition clears.
+///
+/// A reap is logged (`pane_alive=false reason=orphaned-slot-reaped`) only once
+/// the kill is confirmed: [`crate::workspace::kill_workspace_pane`] verifies a
+/// remote session actually died. A kill that did not take logs a distinct
+/// `orphan_reap=failed` line instead (never a `pane_alive=false`, which would
+/// read as a death to the orchestrator and crash supervision) and backs off
+/// ([`ORPHAN_REAP_RETRY_BASE`], doubling to [`ORPHAN_REAP_RETRY_MAX`]) so a
+/// session that will not die is retried on a widening cadence, not every poll.
 fn maybe_reconcile_orphaned_pane(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     host: &shelbi_core::Host,
     addr: &SessionTarget,
-    orphan_since: &mut Option<Instant>,
+    state: &mut OrphanReap,
 ) -> bool {
     // Require a WARM board read: "no active task points here" may only reap when
     // it comes from a trusted read. A stale snapshot (a rate-limit park serving
@@ -6330,8 +6369,8 @@ fn maybe_reconcile_orphaned_pane(
     if !workspace_orphaned_by_board(project, workspace, &tasks) {
         // An active task points at the slot (or the snapshot just caught up to
         // a dispatch): the slot isn't orphaned, so drop any in-flight grace
-        // clock and leave the pane alone.
-        *orphan_since = None;
+        // clock (and failed-reap backoff) and leave the pane alone.
+        *state = OrphanReap::default();
         return false;
     }
 
@@ -6341,8 +6380,15 @@ fn maybe_reconcile_orphaned_pane(
     // reads live, so its grace window is spent against an already-authoritative
     // read; the cost is a bounded delay before a genuinely orphaned pane is
     // reclaimed, which teardown tolerates.
-    let first_seen = orphan_since.get_or_insert_with(Instant::now);
+    let first_seen = state.since.get_or_insert_with(Instant::now);
     if first_seen.elapsed() < ORPHAN_REAP_GRACE {
+        return false;
+    }
+
+    // A previous reap of this orphan failed: hold off until its backoff
+    // elapses, so a session that will not die is not re-killed (and re-logged)
+    // every poll.
+    if state.retry_at.is_some_and(|at| Instant::now() < at) {
         return false;
     }
 
@@ -6409,11 +6455,32 @@ fn maybe_reconcile_orphaned_pane(
             // Reaped: the slot is idle now, so clear the grace clock. A later
             // re-dispatch to this slot starts its own fresh grace window rather
             // than inheriting this one.
-            *orphan_since = None;
+            *state = OrphanReap::default();
             true
         }
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, error = %e, "reap of orphaned dev pane failed");
+            // The kill did not take (or could not be confirmed). Record it once
+            // per attempt as a failure, not a death, and back off before the
+            // next try. The grace clock stays armed: the slot is still orphaned.
+            state.failures = state.failures.saturating_add(1);
+            let backoff = OrphanReap::backoff(state.failures);
+            state.retry_at = Some(Instant::now() + backoff);
+            if let Err(log_err) = shelbi_state::append_orphan_reap_failed_event(
+                &project.name,
+                &workspace.name,
+                state.failures,
+                backoff.as_secs(),
+                &e.to_string(),
+            ) {
+                tracing::warn!(workspace = %workspace.name, error = %log_err, "append_orphan_reap_failed_event failed");
+            }
+            tracing::warn!(
+                workspace = %workspace.name,
+                attempt = state.failures,
+                retry_in_secs = backoff.as_secs(),
+                error = %e,
+                "reap of orphaned dev pane failed; backing off",
+            );
             false
         }
     }
@@ -8749,7 +8816,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         let mut last_dialog = None;
         let mut supervision = SupervisionState::default();
         let mut limit_resume = LimitResumeState::default();
-        let mut orphan_since: Option<Instant> = None;
+        let mut orphan_reap = OrphanReap::default();
         poll_one(
             &project,
             &project.workspaces[0],
@@ -8760,7 +8827,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             &mut false,
             &mut supervision,
             &mut limit_resume,
-            &mut orphan_since,
+            &mut orphan_reap,
             &mut HashMap::new(),
         );
         daemon.join().unwrap();
@@ -11699,22 +11766,22 @@ transitions:
         // First observation: orphaned-by-board, but the grace clock was unset,
         // so the reaper arms it and declines to act — the pane (a live,
         // just-dispatched slot in the real bug) is left alone.
-        let mut orphan_since: Option<Instant> = None;
+        let mut orphan = OrphanReap::default();
         assert!(
-            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan),
             "a freshly-observed orphan must not be reaped inside the grace window",
         );
-        let armed = orphan_since.expect("the grace clock must be armed on first observation");
+        let armed = orphan.since.expect("the grace clock must be armed on first observation");
 
         // Still inside the grace window on the next tick: no reap, and the
         // clock keeps its original start (not reset forward), so the window
         // actually elapses instead of restarting every tick.
         assert!(
-            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan),
             "an orphan still inside the grace window must not be reaped",
         );
         assert_eq!(
-            orphan_since,
+            orphan.since,
             Some(armed),
             "the grace clock must not be pushed forward while the condition holds",
         );
@@ -11725,13 +11792,232 @@ transitions:
         task.column = Column::in_progress();
         shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
         assert!(
-            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan),
             "a slot with an active assigned task must never be reaped",
         );
         assert!(
-            orphan_since.is_none(),
+            orphan.since.is_none(),
             "the grace clock must clear once the orphaned condition lifts",
         );
+    }
+
+    /// Stub SSH seam for the remote orphan-reap tests: `launch` runs the session
+    /// in-process ([`shelbi_session::run`] on a thread, under the test's
+    /// `SHELBI_HOME`) and `open_relay` bridges an in-process
+    /// [`shelbi_client::serve_relay`] over a socket pair, standing in for
+    /// `ssh <host> shelbi relay`. Only SSH is faked: probe / kill ride the real
+    /// `SessionProcessBackend` remote branch and relay stack.
+    struct InProcessRemoteSeam;
+
+    impl crate::remote_session::RemoteSsh for InProcessRemoteSeam {
+        fn launch(&self, _host: &Host, _bin: &str, spec: &shelbi_session::SpawnSpec) -> shelbi_core::Result<()> {
+            let root = shelbi_state::sessions_dir()?;
+            std::fs::create_dir_all(&root)?;
+            let id = shelbi_session::layout::derive_id_now(&spec.name);
+            let sock = shelbi_session::layout::SessionPaths::new(&root, &id).sock();
+            // Run the launch line under a plain `sh -c` rather than the
+            // production `$SHELL -lc`, so no login profile runs in a test.
+            let line = spec.child_argv.last().cloned().unwrap_or_default();
+            let args = shelbi_session::RunArgs {
+                id,
+                name: spec.name.clone(),
+                cwd: std::env::temp_dir(),
+                cols: spec.cols,
+                rows: spec.rows,
+                task: None,
+                raw_output_log: false,
+                child_argv: vec!["/bin/sh".into(), "-c".into(), line],
+                manage_daemon: false,
+            };
+            std::thread::spawn(move || shelbi_session::run(args));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::os::unix::net::UnixStream::connect(&sock).is_err() {
+                if Instant::now() >= deadline {
+                    return Err(shelbi_core::Error::Other("stub session never accepted".into()));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        }
+
+        fn open_relay(&self, _host: &Host, _bin: &str) -> shelbi_core::Result<crate::remote_session::RelayHandle> {
+            let root = shelbi_state::sessions_dir()?;
+            let (hub, relay) = std::os::unix::net::UnixStream::pair()?;
+            let relay_read = relay.try_clone()?;
+            let server = std::thread::spawn(move || {
+                let _ = shelbi_client::serve_relay(Box::new(relay_read), Box::new(relay), &root);
+            });
+            let hub_read = hub.try_clone()?;
+            let channel = shelbi_client::RelayChannel::new(Box::new(hub_read), Box::new(hub))
+                .map_err(|e| shelbi_core::Error::Other(format!("relay channel: {e}")))?;
+            Ok(crate::remote_session::RelayHandle::new(channel, Box::new(server)))
+        }
+    }
+
+    /// Isolated home + stub seam for a remote orphan-reap test. Restores the
+    /// env and seam on drop and SIGKILLs the stub session in case a test left
+    /// it running.
+    struct RemoteReapFixture {
+        _home: tempfile::TempDir,
+        project: Project,
+        host: Host,
+        addr: SessionTarget,
+        prior_home: Option<std::ffi::OsString>,
+        prior_hub_sock: Option<std::ffi::OsString>,
+    }
+
+    impl RemoteReapFixture {
+        /// A project whose one workspace `delta` lives on SSH machine `devbox`,
+        /// with its card moved off the slot (parked in `review`, not active) so
+        /// the board reads the slot as orphaned, and a live stub agent running
+        /// `launch_line` in the slot's remote session.
+        fn new(launch_line: &str) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let prior_home = std::env::var_os("SHELBI_HOME");
+            let prior_hub_sock = std::env::var_os("SHELBI_HUB_SOCK");
+            std::env::set_var("SHELBI_HOME", home.path());
+            // Never reach the real hub: events fall back to this home's
+            // events.log because no daemon listens on this path.
+            std::env::set_var("SHELBI_HUB_SOCK", home.path().join("no-hub.sock"));
+            crate::remote_session::set_test_seam(Some(std::sync::Arc::new(InProcessRemoteSeam)));
+
+            let work_dir = home.path().join("repo");
+            std::fs::create_dir_all(&work_dir).unwrap();
+            let mut project = local_project(&work_dir);
+            project.name = "remote-reap".into();
+            project.machines[0] = Machine {
+                name: "devbox".into(),
+                kind: MachineKind::Ssh,
+                work_dir: work_dir.clone(),
+                host: Some("devbox".into()),
+                tags: Vec::new(),
+                forward: None,
+            };
+            project.workspaces[0].name = "delta".into();
+            project.workspaces[0].machine = "devbox".into();
+            shelbi_state::save_project(&project).unwrap();
+            let mut task = in_progress_task("t-supplanted", "delta");
+            task.column = Column::review();
+            shelbi_state::save_task(&project.name, &task, "supplanted").unwrap();
+
+            let host = project.machines[0].host();
+            let addr = crate::workspace::workspace_target(&project, &project.workspaces[0]).unwrap();
+            let fixture = Self {
+                _home: home,
+                project,
+                host,
+                addr,
+                prior_home,
+                prior_hub_sock,
+            };
+            backend().spawn(&fixture.host, &fixture.addr, Some(launch_line)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !backend().probe(&fixture.host, &fixture.addr, None).is_alive() {
+                assert!(Instant::now() < deadline, "stub remote session never came up");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            fixture
+        }
+
+        /// Grace already spent, so the next pass is entitled to reap.
+        fn past_grace() -> OrphanReap {
+            OrphanReap {
+                since: Instant::now().checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1)),
+                ..OrphanReap::default()
+            }
+        }
+
+        fn reap(&self, state: &mut OrphanReap) -> bool {
+            maybe_reconcile_orphaned_pane(&self.project, &self.project.workspaces[0], &self.host, &self.addr, state)
+        }
+
+        fn event_lines(&self, needle: &str) -> usize {
+            let log = shelbi_state::events_log_path().unwrap();
+            std::fs::read_to_string(log)
+                .map(|b| b.lines().filter(|l| l.contains(needle)).count())
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for RemoteReapFixture {
+        fn drop(&mut self) {
+            let name = crate::session_process_backend::session_name(&self.addr);
+            let _ = crate::remote_session::signal(&self.host, &name, Some(libc::SIGKILL));
+            crate::remote_session::set_test_seam(None);
+            match &self.prior_home {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            match &self.prior_hub_sock {
+                Some(v) => std::env::set_var("SHELBI_HUB_SOCK", v),
+                None => std::env::remove_var("SHELBI_HUB_SOCK"),
+            }
+        }
+    }
+
+    /// The remote orphan-reap loop: a card supplanted off an SSH workspace left
+    /// its remote agent running while the reaper logged a reap every pass (its
+    /// kill addressed `w-delta/orch`, a session that doesn't exist, and "no live
+    /// session" read as success). One pass must now actually end the remote
+    /// session and log exactly one reap.
+    #[test]
+    fn orphan_reaper_kills_a_remote_session_and_logs_one_reap() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        let mut state = RemoteReapFixture::past_grace();
+
+        assert!(fx.reap(&mut state), "a live remote orphan past its grace must be reaped");
+        assert_eq!(
+            backend().probe(&fx.host, &fx.addr, None),
+            crate::session_backend::Liveness::Dead,
+            "the remote session must be gone once the reaper reports a reap",
+        );
+        assert_eq!(fx.event_lines("reason=orphaned-slot-reaped"), 1);
+        assert_eq!(state, OrphanReap::default(), "a confirmed reap clears the reaper state");
+
+        // The next pass finds nothing live and logs nothing more.
+        let mut next = RemoteReapFixture::past_grace();
+        assert!(!fx.reap(&mut next));
+        assert_eq!(fx.event_lines("reason=orphaned-slot-reaped"), 1);
+        assert_eq!(fx.event_lines("orphan_reap=failed"), 0);
+    }
+
+    /// A remote kill that does not take (the agent ignores SIGTERM) must log a
+    /// distinct failure — never a `pane_alive=false` death — and back off rather
+    /// than retrying (and re-logging) every pass.
+    #[test]
+    fn orphan_reaper_logs_a_failed_remote_reap_once_and_backs_off() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("trap '' TERM; exec sleep 600");
+        let mut state = RemoteReapFixture::past_grace();
+
+        assert!(!fx.reap(&mut state), "a reap whose kill did not take is not a reap");
+        assert!(backend().probe(&fx.host, &fx.addr, None).is_alive());
+        assert_eq!(fx.event_lines("reason=orphaned-slot-reaped"), 0);
+        assert_eq!(fx.event_lines("orphan_reap=failed attempt=1 retry_in=60s"), 1);
+        assert_eq!(state.failures, 1);
+        assert!(state.retry_at.is_some_and(|at| at > Instant::now()));
+        assert!(state.since.is_some(), "the slot is still orphaned; the grace clock stays armed");
+
+        // Inside the backoff: no attempt, no new event of either kind.
+        assert!(!fx.reap(&mut state));
+        assert!(!fx.reap(&mut state));
+        assert_eq!(fx.event_lines("orphan_reap=failed"), 1);
+        assert_eq!(fx.event_lines("pane_alive=false"), 0);
+
+        // Backoff elapsed: the retry fails again and the next delay doubles.
+        state.retry_at = Some(Instant::now());
+        assert!(!fx.reap(&mut state));
+        assert_eq!(fx.event_lines("orphan_reap=failed attempt=2 retry_in=120s"), 1);
+        assert_eq!(fx.event_lines("pane_alive=false"), 0);
+    }
+
+    #[test]
+    fn orphan_reap_backoff_doubles_to_its_ceiling() {
+        assert_eq!(OrphanReap::backoff(1), ORPHAN_REAP_RETRY_BASE);
+        assert_eq!(OrphanReap::backoff(2), ORPHAN_REAP_RETRY_BASE * 2);
+        assert_eq!(OrphanReap::backoff(3), ORPHAN_REAP_RETRY_BASE * 4);
+        assert_eq!(OrphanReap::backoff(40), ORPHAN_REAP_RETRY_MAX);
     }
 
 
