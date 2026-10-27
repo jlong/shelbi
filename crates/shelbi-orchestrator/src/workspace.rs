@@ -2352,19 +2352,61 @@ fn terminate_process_group(_pgid: i32) -> bool {
 /// lifecycle event.
 pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: &str) -> Result<()> {
     stop_review_server(workspace_name);
-    // Remote workspaces are standalone `shelbi-w-<name>` sessions, killed by
-    // session name; local workspaces are per-workspace sessions under the
-    // project. In both cases a transport-answered "already gone" short-circuits.
-    let kill_target = match host {
-        Host::Local => target.clone(),
-        Host::Ssh { .. } => SessionTarget::session(target.session_name()),
-    };
+    // Kill the slot itself on every host. A remote workspace's slot target
+    // (`shelbi-w-<name>`, `agent`) maps to the remote session `w-<name>/ws/agent`;
+    // re-addressing it as the bare *session* `shelbi-w-<name>` (the tmux-era
+    // kill-session shape) maps to `w-<name>/orch`, a name no remote session
+    // carries, so the relay answered "no live session", the kill read that as
+    // "already gone", and the real agent kept running while the orphan reaper
+    // logged a reap every pass. A transport-answered "already gone" still
+    // short-circuits here.
     if !workspace_slot_alive(host, target)? {
         return Ok(());
     }
     let _ = shelbi_state::mark_expected_teardown(workspace_name);
-    backend().kill(host, &kill_target)?;
+    backend().kill(host, target)?;
+    if host.is_ssh() {
+        // A remote kill rides the relay and tolerates "no live session" as
+        // success, so a kill that reached nothing would look identical to one
+        // that worked. Confirm the remote session actually went away before
+        // reporting Ok: callers (the orphan reaper above all) log the slot's
+        // death on Ok, and must not log one for a session that is still live.
+        confirm_remote_slot_dead(host, target, REMOTE_KILL_CONFIRM_DEADLINE)?;
+    }
     Ok(())
+}
+
+/// How long [`kill_workspace_pane`] waits for a killed remote session to exit.
+/// The session tears down once its child's process group is gone, which a
+/// SIGTERM'd agent does within a second or two; this bounds a child that
+/// ignores SIGTERM (or a wedged relay) so teardown fails loudly instead of
+/// blocking the poller.
+const REMOTE_KILL_CONFIRM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Poll the remote slot until it reads [`Liveness::Dead`] or `deadline`
+/// passes. `Err` names what the last probe saw: still alive (the kill did not
+/// take) or unreachable (the machine could not confirm either way).
+fn confirm_remote_slot_dead(
+    host: &Host,
+    target: &SessionTarget,
+    deadline: std::time::Duration,
+) -> Result<()> {
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        let last = match backend().probe(host, target, Some(probe_deadline())) {
+            Liveness::Dead => return Ok(()),
+            Liveness::Alive => "still live".to_string(),
+            Liveness::Unreachable { reason } => format!("unreachable: {reason}"),
+        };
+        if std::time::Instant::now() >= until {
+            return Err(Error::Other(format!(
+                "remote session `{}` survived kill ({last}) after {}s",
+                target.label(),
+                deadline.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Spec for `start_workspace_on_task`. We don't take a `&Issue` because the
