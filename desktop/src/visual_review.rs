@@ -23,7 +23,7 @@
 //!   (the sidebar as it was);
 //! - the overlays over the shell: `palette-entering.png` (the palette
 //!   sliding in), `palette.png`, `dialog-review-confirm.png`,
-//!   `dialog-reject.png`, `dialog-zen.png`, `dialog-add-project.png` and
+//!   `dialog-reject.png`, `dialog-zen.png` and
 //!   `dialog-error-log.png`.
 
 use std::cell::Cell;
@@ -476,10 +476,6 @@ impl Run {
             ),
             ("dialog-reject.png", Some(ActiveOverlay::reject_reason("cold-start"))),
             ("dialog-zen.png", Some(ActiveOverlay::zen_intro("demo"))),
-            (
-                "dialog-add-project.png",
-                Some(ActiveOverlay::add_project(std::path::Path::new("/Users/me/src/demo"))),
-            ),
             ("dialog-error-log.png", Some(log)),
         ] {
             self.handle

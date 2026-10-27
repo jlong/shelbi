@@ -58,6 +58,8 @@
 //! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
 //! and Acknowledgements at their frames' sizes (with `state-bundled-*`);
 //! `SHELBI_VISUAL_ONLY=about` renders just those.
+//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01 and
+//! 02 at 800 × 580; `SHELBI_VISUAL_ONLY=add-project` renders just those.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the issue detail.
@@ -1716,6 +1718,81 @@ impl Run {
         }
     }
 
+    /// The Add Project wizard (`dt-add-project-wizard`) in an 800 × 580
+    /// window, over a canned folder check (nothing reads the disk): `add-
+    /// project-folder` (no folder yet, Figma 2481:8574), `add-project-
+    /// folder-selected` (`~/Projects/my-project`, a Git repository,
+    /// 2481:8810) and `add-project-settings-in-repo` / `-global` (each card
+    /// selected, 2483:8653 / 2483:8897). `SHELBI_VISUAL_ONLY=add-project`
+    /// renders just these.
+    fn add_project_windows(&mut self) {
+        use crate::views::add_project::{AddProjectView, Engine, SIZE};
+        use shelbi_app::add_project_wizard::{FolderCheck, Focus, Origin, Repo};
+        use shelbi_core::ConfigMode;
+
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/Users/me"));
+        let folder = home.join("Projects/my-project");
+        let engine = Engine {
+            check: Arc::new({
+                let home = home.clone();
+                move |_, root, _| {
+                    let path = shelbi_orchestrator::project_create::absolutize(&home, Path::new(root.trim()));
+                    FolderCheck {
+                        in_repo_dir: path.join(".shelbi"),
+                        global_dir: Some(home.join(".shelbi/projects/my-project")),
+                        path,
+                        name: Some("My project".into()),
+                        slug: Some("my-project".into()),
+                        repo: Some(Repo::Git),
+                        problem: None,
+                    }
+                }
+            }),
+            create: Arc::new(|_, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
+        };
+        let states: [(&str, Option<ConfigMode>, bool); 4] = [
+            ("add-project-folder", None, false),
+            ("add-project-folder-selected", None, true),
+            ("add-project-settings-in-repo", Some(ConfigMode::InRepo), true),
+            ("add-project-settings-global", Some(ConfigMode::Global), true),
+        ];
+        for (screen, mode, pick) in states {
+            let engine = engine.clone();
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| {}), window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            if pick {
+                self.cx
+                    .update_window(window, |_, window, cx| {
+                        view.update(cx, |v, cx| v.folder_picked(Some(&folder), window, cx))
+                    })
+                    .unwrap();
+                self.settle_sheet(window);
+            }
+            if let Some(mode) = mode {
+                self.cx
+                    .update_window(window, |_, window, cx| {
+                        view.update(cx, |v, cx| {
+                            v.click(Focus::Primary, window, cx);
+                            v.click(Focus::Card(mode), window, cx);
+                        })
+                    })
+                    .unwrap();
+            }
+            self.settle_sheet(window);
+            self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
     /// Run and draw a window that isn't the shell a few times over.
     fn settle_sheet(&mut self, window: AnyWindowHandle) {
         for _ in 0..5 {
@@ -1937,6 +2014,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "add-project") {
+            self.add_project_windows();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
             self.components();
             self.review_confirm_states(&orch);
@@ -2030,6 +2112,7 @@ impl Run {
         self.sidebar_states(&orch);
         self.review_confirm_states(&orch);
         self.about_windows();
+        self.add_project_windows();
 
         let missing: Vec<&str> = SCREENS
             .iter()

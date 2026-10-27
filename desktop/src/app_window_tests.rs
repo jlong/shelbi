@@ -375,9 +375,13 @@ fn quitting_the_shown_project_keeps_the_window(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("chooser").is_some(), "the chooser is drawn");
     assert!(vcx.debug_bounds("chooser-alpha").is_some());
     assert!(vcx.debug_bounds("chooser-add").is_some());
+    // Its Add Project… row asks for the wizard.
+    taken(cx, h);
+    let add = vcx.debug_bounds("chooser-add").unwrap();
+    vcx.simulate_click(add.center(), gpui::Modifiers::none());
+    assert_eq!(taken(cx, h), [HostCall::OpenAddProject]);
     // Its keys pick a project (the tap records the switch); a menu offers
     // nothing that needs a project.
-    taken(cx, h);
     update(cx, h, |w, window, cx| {
         assert!(w.chooser_key(Key::Down, window, cx));
         assert!(w.chooser_key(Key::Enter, window, cx));
@@ -427,4 +431,28 @@ fn a_launch_reopens_the_open_windows_and_a_close_forgets_one(cx: &mut TestAppCon
     let alpha = cx.update(|cx| cx.global::<Shell>().windows[0].handle);
     update(cx, alpha, |_, window, _| window.remove_window());
     assert!(cx.update(|cx| cx.global::<Shell>().session.slots[0].open));
+}
+
+#[gpui::test]
+fn add_project_opens_the_wizard_window_once(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    let before = cx.update(|cx| cx.windows().len());
+    for _ in 0..2 {
+        update(cx, h, |w, window, cx| w.perform(HostCall::OpenAddProject, window, cx));
+        cx.run_until_parked();
+    }
+    assert_eq!(cx.update(|cx| cx.windows().len()), before + 1, "one wizard, raised the second time");
+    let wizard = cx
+        .update(|cx| cx.windows().into_iter().find_map(|w| w.downcast::<crate::views::add_project::AddProjectView>()))
+        .expect("the wizard window");
+    let screen = cx.update(|cx| wizard.read(cx).unwrap().wizard().screen());
+    assert_eq!(screen, shelbi_app::add_project_wizard::Screen::Folder);
+    // Cancelling closes it and writes nothing; the project window stays.
+    wizard
+        .update(cx, |_, window, cx| window.dispatch_action(Box::new(CloseWindow), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), before);
+    assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
 }

@@ -321,9 +321,10 @@ fn main() {
             // project window shows the notice when there is.
             views::update::spawn_check(cx);
 
+            // No project yet: the first launch opens on the Add Project
+            // wizard (closing it, the last window, quits).
             if plan.is_empty() {
-                tracing::error!("no Shelbi project found: run `shelbi init` in a repository");
-                cx.quit();
+                views::add_project::show(shelbi_app::add_project_wizard::Origin::FirstLaunch, None, cx);
                 return;
             }
             app::open_launch_windows(plan, cx);
