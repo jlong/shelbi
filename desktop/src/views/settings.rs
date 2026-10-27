@@ -307,7 +307,16 @@ struct OpenForm {
     view: Entity<MachineFormView>,
     /// What had the keyboard when it opened.
     restore: Option<gpui::FocusHandle>,
+    /// Stops the form's running check when it closes, however it closes
+    /// (Cancel, a save, a project switch dropping this view).
+    stop: machine_form::CheckStop,
     _subscription: Subscription,
+}
+
+impl Drop for OpenForm {
+    fn drop(&mut self) {
+        self.stop.close();
+    }
 }
 
 /// The settings view.
@@ -605,9 +614,11 @@ impl SettingsView {
             let saved = matches!(event, MachineFormEvent::Saved(_));
             this.close_machine_form(saved, window, cx);
         });
+        let stop = view.read(cx).stopper();
         self.machine_form = Some(OpenForm {
             view,
             restore,
+            stop,
             _subscription: sub,
         });
         cx.notify();
@@ -630,7 +641,7 @@ impl SettingsView {
         if saved {
             self.workspaces.update(cx, |p, cx| p.load(window, cx));
         }
-        match form.restore {
+        match form.restore.clone() {
             Some(handle) => window.focus(&handle, cx),
             None => cx.emit(SettingsEvent::Leave),
         }

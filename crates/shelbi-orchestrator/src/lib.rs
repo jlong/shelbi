@@ -29,6 +29,7 @@ pub mod handoff;
 pub mod lifecycle;
 pub mod load;
 pub mod machine;
+pub mod machine_readiness;
 pub mod machines_model;
 pub mod migration;
 pub mod mutate;

@@ -540,6 +540,7 @@ mod tests {
             compatible,
             source: "path".into(),
             checked_at: chrono::Utc::now(),
+            host: None,
         };
         let mut gpu = entry(
             "gpu",
