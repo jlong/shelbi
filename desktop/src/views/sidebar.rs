@@ -126,14 +126,14 @@ pub fn drag_width_cols(pointer_x: f32, window_px: f32) -> u16 {
 /// A collapsible section of the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Section {
+    Workspaces,
     Ready,
     Queued,
-    Workspaces,
 }
 
 impl Section {
-    /// The component's order, top to bottom.
-    pub const ORDER: [Section; 3] = [Section::Ready, Section::Queued, Section::Workspaces];
+    /// Top to bottom, the shared model's (and the TUI's) order.
+    pub const ORDER: [Section; 3] = [Section::Workspaces, Section::Ready, Section::Queued];
 
     /// The section a shared row label heads.
     fn of_label(label: &str) -> Option<Section> {
@@ -227,10 +227,10 @@ impl Entry {
 }
 
 /// The sidebar as the Navigation component lays it out: the nav, then the
-/// Ready, Queued and Workspaces sections (the shared rows regrouped), each
-/// header carrying its count and collapse state, a collapsed section's rows
-/// left out. Reviews and working workspaces are numbered 1 to 9 in that
-/// order whether or not their section is collapsed, so a chord keeps its row.
+/// shared rows' Workspaces, Ready and Queued sections in the shared order,
+/// each header carrying its count and collapse state, a collapsed section's
+/// rows left out. Working workspaces and reviews are numbered 1 to 9 top to
+/// bottom whether or not their section is collapsed, so a chord keeps its row.
 ///
 /// The window selects and activates over this list's selectable rows, so
 /// what the keyboard walks is what is drawn.
@@ -257,7 +257,6 @@ pub fn layout(model: &SidebarModel, collapsed: &BTreeSet<Section>) -> Vec<Entry>
             _ => None,
         })
     };
-    groups.sort_by_key(|g| section_of(g).map_or(usize::MAX, |s| s as usize));
 
     let mut next = 1u8;
     let mut number = || {
@@ -1359,27 +1358,46 @@ fn render_row<H: SidebarHost>(
             let openness = props.folds.openness(&Body::Machine(name.clone()), *collapsed, props.now);
             let chevron = glyph(glyphs::CHEVRON_DOWN)
                 .text_color(quiet_glyph(theme))
-                .with_transformation(fold::chevron(openness));
+                .with_transformation(fold::chevron(openness))
+                .debug_selector({
+                    let name = name.clone();
+                    move || format!("sidebar-machine-chevron-{name}")
+                });
+            // The name then its chevron, as a section header draws them.
             item(base)
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(chevron)
                 .child(
                     div()
-                        .flex_1()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .min_w_0()
-                        .truncate()
-                        .type_style(Type::SmallMedium)
-                        .text_color(theme.muted)
-                        .child(text.label),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .type_style(Type::SmallMedium)
+                                .text_color(theme.muted)
+                                .child(text.label)
+                                .debug_selector({
+                                    let name = name.clone();
+                                    move || format!("sidebar-machine-name-{name}")
+                                }),
+                        )
+                        .child(chevron),
                 )
+                .child(div().flex_1())
                 .children(text.right.map(|right| {
+                    let name = name.clone();
                     div()
                         .flex_none()
                         .type_style(Type::XSmall)
                         .text_color(theme.muted)
                         .child(right)
+                        .debug_selector(move || format!("sidebar-machine-count-{name}"))
                 }))
                 .into_any_element()
         }
@@ -1394,6 +1412,7 @@ fn render_row<H: SidebarHost>(
                 .flex_row()
                 .items_center()
                 .gap_2()
+                // A machine's workspaces sit a chevron and a gap in from its name.
                 .when(*indent, |d| d.pl(px(8.0 + 12.0 + 8.0)))
                 .child(render_glyph(workspace_glyph(*badge, theme)))
                 .child(
@@ -1756,11 +1775,11 @@ mod tests {
         let group = mid.iter().find(|e| row_selector(&e.row) == "sidebar-machine-hub").unwrap();
         assert!(matches!(group.row, SidebarRow::MachineGroup { collapsed: true, .. }));
         // The chords are the collapsed layout's: none on the closing
-        // machine's rows, so the next machine's row takes ⌘4 (not ⌘6).
+        // machine's rows, so the next machine's row takes ⌘1 (not ⌘3).
         let chord = |sel: &str| mid.iter().find(|e| row_selector(&e.row) == sel).and_then(|e| e.shortcut);
         assert_eq!(chord("sidebar-ws-alpha"), None);
-        assert_eq!(chord("sidebar-review-Q-1"), Some(2), "a section's rows keep theirs");
-        assert_eq!(chord("sidebar-ws-echo"), Some(4));
+        assert_eq!(chord("sidebar-ws-echo"), Some(1));
+        assert_eq!(chord("sidebar-review-Q-1"), Some(3), "a section's rows keep theirs");
         // Only what is collapsed counts as closing.
         let closing: Vec<String> = mid
             .iter()
@@ -1769,7 +1788,7 @@ mod tests {
             .collect();
         assert_eq!(
             closing,
-            ["sidebar-review-Q-1", "sidebar-review-Q-2", "sidebar-ws-alpha", "sidebar-ws-bravo", "sidebar-ws-charlie", "sidebar-ws-delta"]
+            ["sidebar-ws-alpha", "sidebar-ws-bravo", "sidebar-ws-charlie", "sidebar-ws-delta", "sidebar-review-Q-1", "sidebar-review-Q-2"]
         );
 
         let settled = drawn(&m, &collapsed, &folds, t0 + fold::FOLD);
@@ -1801,24 +1820,27 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_puts_the_review_sections_before_the_workspaces() {
-        let entries = layout(&model(), &BTreeSet::new());
+    fn the_layout_keeps_the_shared_section_order() {
+        let mut m = model();
+        m.workspaces.push(ws("echo", "box", Some("T-3"), WorkspaceBadge::Working));
+        let entries = layout(&m, &BTreeSet::new());
         let names = selectors(&entries);
         let at = |s: &str| names.iter().position(|n| n == s).unwrap_or_else(|| panic!("{s}"));
-        assert!(at("sidebar-nav-Activity") < at("sidebar-section-Ready for Review"));
+        assert!(at("sidebar-nav-Activity") < at("sidebar-section-Workspaces"));
+        assert!(at("sidebar-section-Workspaces") < at("sidebar-machine-hub"));
+        assert!(at("sidebar-ws-echo") < at("sidebar-section-Ready for Review"));
         assert!(at("sidebar-section-Ready for Review") < at("sidebar-review-R-1"));
         assert!(at("sidebar-review-R-1") < at("sidebar-section-Queued for Review"));
-        assert!(at("sidebar-review-Q-2") < at("sidebar-section-Workspaces"));
-        assert!(at("sidebar-section-Workspaces") < at("sidebar-ws-alpha"));
-        // The shared model, untouched, still leads with the workspaces (the
-        // TUI's order).
-        let shared: Vec<String> = model().rows().iter().map(row_selector).collect();
-        let pos = |s: &str| shared.iter().position(|n| n == s).unwrap();
-        assert!(pos("sidebar-section-Workspaces") < pos("sidebar-section-Ready for Review"));
+        assert!(at("sidebar-section-Queued for Review") < at("sidebar-review-Q-2"));
+        // Row for row the shared model's (the TUI's) order.
+        let shared: Vec<String> = m.rows().iter().map(row_selector).collect();
+        assert_eq!(names, shared);
+        let heads: Vec<Section> = entries.iter().filter_map(|e| e.head.as_ref().map(|h| h.section)).collect();
+        assert_eq!(heads, Section::ORDER);
     }
 
     #[test]
-    fn reviews_then_working_workspaces_are_numbered() {
+    fn working_workspaces_then_reviews_are_numbered() {
         let entries = layout(&model(), &BTreeSet::new());
         let numbered: Vec<(String, u8)> = entries
             .iter()
@@ -1827,11 +1849,11 @@ mod tests {
         assert_eq!(
             numbered,
             [
-                ("sidebar-review-R-1".to_string(), 1),
-                ("sidebar-review-Q-1".to_string(), 2),
-                ("sidebar-review-Q-2".to_string(), 3),
-                ("sidebar-ws-alpha".to_string(), 4),
-                ("sidebar-ws-charlie".to_string(), 5),
+                ("sidebar-ws-alpha".to_string(), 1),
+                ("sidebar-ws-charlie".to_string(), 2),
+                ("sidebar-review-R-1".to_string(), 3),
+                ("sidebar-review-Q-1".to_string(), 4),
+                ("sidebar-review-Q-2".to_string(), 5),
             ],
             "idle workspaces take no chord"
         );
@@ -1869,17 +1891,18 @@ mod tests {
         // A chord keeps its row while its section is collapsed.
         assert_eq!(
             folded.iter().find(|e| row_selector(&e.row) == "sidebar-review-R-1").unwrap().shortcut,
-            Some(1)
+            Some(3)
         );
     }
 
     #[test]
     fn the_selection_key_walks_the_laid_out_rows() {
         let entries = layout(&model(), &BTreeSet::new());
-        // Selectable: 3 nav, R-1, Q-1, Q-2, then the workspaces.
+        // Selectable: 3 nav, the four workspaces, then R-1, Q-1, Q-2.
         assert_eq!(selected_key(&entries, 0).as_deref(), Some("sidebar-nav-Orchestrator"));
-        assert_eq!(selected_key(&entries, 3).as_deref(), Some("sidebar-review-R-1"));
-        assert_eq!(selected_key(&entries, 6).as_deref(), Some("sidebar-ws-alpha"));
+        assert_eq!(selected_key(&entries, 3).as_deref(), Some("sidebar-ws-alpha"));
+        assert_eq!(selected_key(&entries, 7).as_deref(), Some("sidebar-review-R-1"));
+        assert_eq!(selected_key(&entries, 9).as_deref(), Some("sidebar-review-Q-2"));
         assert_eq!(selected_key(&entries, 99), None);
     }
 
@@ -2167,13 +2190,14 @@ mod render_tests {
             "sidebar-project-title",
             "sidebar-nav-Orchestrator",
             "sidebar-nav-Activity",
-            "sidebar-review-T-9",
             "sidebar-section-Workspaces",
             "sidebar-machine-hub",
             "sidebar-ws-alpha",
             "sidebar-ws-bravo",
             "sidebar-machine-devbox",
             "sidebar-ws-delta",
+            "sidebar-section-Ready for Review",
+            "sidebar-review-T-9",
             "sidebar-settings",
             "sidebar-zen",
         ];
@@ -2212,9 +2236,27 @@ mod render_tests {
     }
 
     #[gpui::test]
+    fn a_machine_rows_chevron_follows_its_name(cx: &mut TestAppContext) {
+        // A collapsed group, so it shows its count.
+        let mut model = fixture_model();
+        model.collapsed_machines.insert("devbox".into());
+        let (_, mut cx) = open(cx, model, 0, None);
+        let b = |cx: &mut VisualTestContext, s: &'static str| cx.debug_bounds(s).unwrap_or_else(|| panic!("{s}"));
+        let row = b(&mut cx, "sidebar-machine-devbox");
+        let name = b(&mut cx, "sidebar-machine-name-devbox");
+        let chevron = b(&mut cx, "sidebar-machine-chevron-devbox");
+        let count = b(&mut cx, "sidebar-machine-count-devbox");
+        assert_eq!((name.left() - row.left()).as_f32(), 8.0, "the name leads the row");
+        assert_eq!((chevron.left() - name.right()).as_f32(), 4.0, "the chevron 4pt past the name");
+        assert_eq!(chevron.size.width.as_f32(), 12.0);
+        assert_eq!((row.right() - count.right()).as_f32(), 8.0, "the count at the far right");
+        assert!(chevron.right() < count.left());
+    }
+
+    #[gpui::test]
     fn the_selection_marks_the_selected_row(cx: &mut TestAppContext) {
-        // Selectable rows: 3 nav, T-9, hub, alpha, bravo, devbox, delta.
-        let (_, mut cx) = open(cx, fixture_model(), 5, None);
+        // Selectable rows: 3 nav, hub, alpha, bravo, devbox, delta, T-9.
+        let (_, mut cx) = open(cx, fixture_model(), 4, None);
         let marker = cx.debug_bounds("sidebar-selection").expect("a selection");
         let row = cx.debug_bounds("sidebar-ws-alpha").unwrap();
         assert!(row.contains(&marker.origin), "the marker sits in alpha's row");
@@ -2328,7 +2370,7 @@ mod render_tests {
         assert_eq!(
             events,
             [
-                SidebarEvent::Activate(5),
+                SidebarEvent::Activate(4),
                 SidebarEvent::Activate(1),
                 SidebarEvent::OpenSettings,
                 SidebarEvent::ToggleSection(Section::Workspaces),

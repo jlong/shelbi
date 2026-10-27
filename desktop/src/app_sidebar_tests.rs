@@ -5,8 +5,8 @@
 //! Toggle sidebar buttons.
 //!
 //! The window is the smoke test's headless one ([`Harness`]): one review
-//! (`T-9`, queued) and one working workspace (`alpha-1`), so `T-9` is ⌘1 and
-//! `alpha-1` is ⌘2.
+//! (`T-9`, queued) and one working workspace (`alpha-1`), so `alpha-1` is ⌘1
+//! and `T-9` is ⌘2.
 
 use std::rc::Rc;
 
@@ -50,19 +50,19 @@ fn the_numbered_chords_open_their_rows(cx: &mut TestAppContext) {
     h.key("cmd-1");
     assert_eq!(
         h.take_calls(),
-        calls_of(CommandKind::LoadReview {
-            task_id: "T-9".into()
-        })
-    );
-    h.key("cmd-2");
-    assert_eq!(
-        h.take_calls(),
         calls_of(CommandKind::FocusWorkspace {
             workspace: "alpha-1".into()
         })
     );
     let selected = h.window.read_with(&h.cx, |w, cx| w.selected(cx));
     assert_eq!(selected, Some(SidebarTarget::Workspace("alpha-1".into())), "its row is selected");
+    h.key("cmd-2");
+    assert_eq!(
+        h.take_calls(),
+        calls_of(CommandKind::LoadReview {
+            task_id: "T-9".into()
+        })
+    );
     // Nothing is numbered 3.
     h.key("cmd-3");
     assert!(h.take_calls().is_empty());
@@ -74,7 +74,7 @@ fn a_collapsed_sections_chord_still_opens_its_row(cx: &mut TestAppContext) {
     h.click_selector("sidebar-section-Workspaces");
     h.draw();
     assert!(h.cx.debug_bounds("sidebar-ws-alpha-1").is_none());
-    h.key("cmd-2");
+    h.key("cmd-1");
     assert_eq!(
         h.take_calls(),
         calls_of(CommandKind::FocusWorkspace {
@@ -130,10 +130,10 @@ fn collapsing_a_section_keeps_the_selection_on_its_row(cx: &mut TestAppContext) 
     let mut h = open(cx);
     h.key("cmd-2");
     h.take_calls();
-    // Collapse the review section above the selected workspace.
-    h.click_selector("sidebar-section-Queued for Review");
+    // Collapse the Workspaces section above the selected review.
+    h.click_selector("sidebar-section-Workspaces");
     let selected = h.window.read_with(&h.cx, |w, cx| w.selected(cx));
-    assert_eq!(selected, Some(SidebarTarget::Workspace("alpha-1".into())));
+    assert_eq!(selected, Some(SidebarTarget::Review("T-9".into())));
 }
 
 #[gpui::test]

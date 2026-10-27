@@ -121,3 +121,16 @@ variable measured from the 1x PNGs.
   renders draw no traffic lights at all.
 - In full screen AppKit hides the lights and gpui restores their frames; the
   titlebar row keeps its 52pt with the buttons at the right.
+
+## Follow-up: the shared section order (`dt-sidebar-order-chevron`)
+
+- `layout` no longer regroups the shared rows: the sections run Workspaces,
+  Ready for review, Queued for review, row for row `SidebarModel::rows` (the
+  TUI's order), and `Section::ORDER` and the enum follow it. The ⌘1 to ⌘9
+  chords still number top to bottom, so the working workspaces now come
+  before the reviews; the selection, the keys and the folds walk the same
+  list.
+- A machine group's chevron sits after its name (4pt, as on a section
+  header: same glyph, color and 12pt size, same fold rotation), the
+  collapsed count stays at the far right, and the whole row still toggles.
+  Its workspaces keep their 28pt indent.
