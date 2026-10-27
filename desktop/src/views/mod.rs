@@ -80,7 +80,6 @@ pub mod external_edit;
 pub mod font_picker;
 pub mod issues;
 pub mod keybindings;
-pub mod keybindings_state;
 pub mod machines;
 pub mod machines_state;
 pub mod machine_form;

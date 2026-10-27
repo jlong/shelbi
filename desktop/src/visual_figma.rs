@@ -1782,7 +1782,7 @@ impl Run {
     /// bindings (Reset all enabled).
     fn keybindings_states(&mut self) {
         use crate::views::keybindings::KeybindingsPage;
-        use crate::views::keybindings_state::Slot;
+        use shelbi_app::settings::keybindings::Slot;
         use crate::views::settings_nav::SettingsPage;
         use gpui::{Context, Entity, Window};
         use shelbi_state::keymap::{Action, GlobalAction, SidebarAction};

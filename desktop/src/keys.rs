@@ -118,20 +118,6 @@ pub fn keycap_keys(chord: &KeyChord) -> Vec<String> {
     keys
 }
 
-/// Every spelling a search for `chord` should find it by: its keycap
-/// (`⌃P`), the shared Mac and spelled-out forms (`Ctrl+P`) and `keys.yaml`'s
-/// (`ctrl-p`), lowercased.
-pub fn chord_search_text(chord: &KeyChord) -> String {
-    [
-        keycap_keys(chord).concat(),
-        format_chord(chord, DisplayStyle::Mac),
-        format_chord(chord, DisplayStyle::Linux),
-        chord.canonical(),
-    ]
-    .join(" ")
-    .to_lowercase()
-}
-
 /// [`nav_view_chord`] as the sidebar and the Go menu show it (`⌘O`).
 pub fn nav_view_hotkey(view: &View) -> Option<String> {
     nav_view_chord(view).map(|c| chord_text(&c, DisplayStyle::Mac))
@@ -320,10 +306,6 @@ mod tests {
             assert_eq!(caps(spec), want, "{spec}");
         }
         assert_eq!(keycap_keys(&KeyChord::parse("ctrl-shift-p").unwrap()), ["⌃", "⇧", "P"]);
-        let text = chord_search_text(&KeyChord::parse("ctrl-p").unwrap());
-        for needle in ["⌃p", "ctrl+p", "ctrl-p"] {
-            assert!(text.contains(needle), "{needle} in {text}");
-        }
     }
 
     fn chord(spec: &str, key_char: Option<&str>) -> String {

@@ -163,6 +163,12 @@ impl ActivityApp {
         &self.keymaps
     }
 
+    /// Take new bindings (the shell's, after a Settings ▸ Keybindings
+    /// save) for the footer hints and the handler.
+    pub fn set_keymaps(&mut self, keymaps: Keymaps) {
+        self.keymaps = keymaps;
+    }
+
     /// Cached host-platform chord-display convention. Read by the footer
     /// renderer instead of probing the OS each frame.
     pub fn display_style(&self) -> DisplayStyle {
