@@ -2780,8 +2780,8 @@ fn a_rename_is_read_only_for_shipped_agents_and_waits_for_save(cx: &mut TestAppC
 // ---- Settings ▸ Workspaces (`dt-workspace-settings-index`) -------------------
 
 use crate::views::workspaces::WorkspacesPage;
-use crate::views::workspaces_state::tests::{write_pool, POOL};
-use crate::views::workspaces_state::{probe_key, Intent, Load};
+use shelbi_app::settings::workspaces::fixtures::{write_pool, POOL};
+use shelbi_app::settings::workspaces::{probe_key, Intent, Load};
 
 impl Settings {
     /// Settings on Workspaces (⌘5), its page loaded from the test's home.
@@ -2866,8 +2866,8 @@ fn workspaces_sits_before_workflows_on_its_own_chord(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext) {
-    let home = Home::with_project("ws-rows", "alpha");
-    write_pool(&home.root, "alpha", POOL);
+    let _home = Home::with_project("ws-rows", "alpha");
+    write_pool("alpha", POOL);
     let mut s = Settings::open(cx);
     s.open_settings();
     s.key("cmd-5");
@@ -2893,8 +2893,8 @@ fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn a_remote_that_cant_be_reached_keeps_its_configuration(cx: &mut TestAppContext) {
-    let home = Home::with_project("ws-down", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("ws-down", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_workspaces(cx);
     let page = s.workspaces();
     let status = |s: &Settings| {
@@ -2929,8 +2929,8 @@ fn a_remote_that_cant_be_reached_keeps_its_configuration(cx: &mut TestAppContext
 
 #[gpui::test]
 fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
-    let home = Home::with_project("ws-intents", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("ws-intents", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_workspaces(cx);
     // The workspace intents open their dialogs (Esc closes each).
     s.click("workspaces-new");
@@ -2971,8 +2971,8 @@ fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_reread_that_finds_a_change_refreshes_the_window(cx: &mut TestAppContext) {
-    let home = Home::with_project("ws-reread", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("ws-reread", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_workspaces(cx);
     s.load_workspaces();
     assert_eq!(s.read(|w, _| w.pool_refreshes), 0, "nothing changed yet");
@@ -2989,8 +2989,8 @@ fn a_reread_that_finds_a_change_refreshes_the_window(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn an_empty_pool_and_a_broken_config_have_their_own_states(cx: &mut TestAppContext) {
-    let home = Home::with_project("ws-states", "alpha");
-    let file = write_pool(&home.root, "alpha", "machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\nworkspaces: []\n");
+    let _home = Home::with_project("ws-states", "alpha");
+    let file = write_pool("alpha", "machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\nworkspaces: []\n");
     let mut s = Settings::open_workspaces(cx);
     assert!(s.drawn("workspaces-empty"), "no workspaces yet");
     assert!(s.drawn("machine-row-hub") && s.drawn("machine-status-hub"));
@@ -3010,7 +3010,7 @@ fn an_empty_pool_and_a_broken_config_have_their_own_states(cx: &mut TestAppConte
     assert!(s.read(|_, cx| matches!(page.read(cx).state().load(), Load::Failed(_))));
     assert!(s.drawn("workspaces-failed") && s.drawn("workspaces-retry"));
     assert!(!s.drawn("workspaces-table") && !s.drawn("machines-heading"));
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    write_pool("alpha", SMALL_POOL);
     s.click("workspaces-retry");
     s.saved();
     assert!(s.drawn("workspace-row-alpha") && s.drawn("machines-heading"));
@@ -3019,7 +3019,7 @@ fn an_empty_pool_and_a_broken_config_have_their_own_states(cx: &mut TestAppConte
 #[gpui::test]
 fn switching_projects_reloads_workspaces_for_the_new_project(cx: &mut TestAppContext) {
     let home = Home::with_project("ws-switch", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    write_pool("alpha", SMALL_POOL);
     crate::views::workflows_state::tests::write_project(&home.root, "beta");
     let (hub, _feeds) = crate::feeds::tests::canned_hub();
     cx.update(|cx| cx.set_global(hub));
@@ -3039,10 +3039,9 @@ fn switching_projects_reloads_workspaces_for_the_new_project(cx: &mut TestAppCon
 
 #[gpui::test]
 fn a_long_name_and_path_clip_inside_their_column(cx: &mut TestAppContext) {
-    let home = Home::with_project("ws-long", "alpha");
+    let _home = Home::with_project("ws-long", "alpha");
     let long = "a-very-long-workspace-name-that-keeps-going-well-past-its-column-and-then-some-more";
     write_pool(
-        &home.root,
         "alpha",
         &format!(
             "machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp/{0}/{0}/{0}\nworkspaces:\n  - name: {long}\n    machine: hub\n",
@@ -3126,8 +3125,8 @@ impl Settings {
 
 #[gpui::test]
 fn add_machine_saves_a_validated_ssh_draft(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-add", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-add", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machines-add");
     assert!(s.drawn("machine-form-layer") && s.drawn("machine-form"));
@@ -3162,9 +3161,8 @@ fn add_machine_saves_a_validated_ssh_draft(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn configure_opens_the_machines_values_and_saves_its_tags_for_its_workspaces(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-configure", "alpha");
+    let _home = Home::with_project("mf-configure", "alpha");
     let file = write_pool(
-        &home.root,
         "alpha",
         &SMALL_POOL.replace("    tags: [linux]\n", "    tags: [linux]\n    forward: tcp # pinned by hand\n"),
     );
@@ -3190,8 +3188,8 @@ fn configure_opens_the_machines_values_and_saves_its_tags_for_its_workspaces(cx:
 
 #[gpui::test]
 fn this_macs_form_has_no_ssh_and_chooses_its_folder(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-local", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-local", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machine-configure-This Mac");
     assert!(s.drawn("machine-name") && s.drawn("machine-work-dir") && s.drawn("machine-browse"));
@@ -3210,8 +3208,8 @@ fn this_macs_form_has_no_ssh_and_chooses_its_folder(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_local_tilde_expands_here_and_a_remote_one_is_refused(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-tilde", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-tilde", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machines-add");
@@ -3236,8 +3234,8 @@ fn a_local_tilde_expands_here_and_a_remote_one_is_refused(cx: &mut TestAppContex
 
 #[gpui::test]
 fn a_duplicate_name_keeps_the_draft_with_its_error(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-dup", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-dup", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machines-add");
@@ -3256,8 +3254,8 @@ fn a_duplicate_name_keeps_the_draft_with_its_error(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn moving_a_machine_with_an_active_workspace_is_refused(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-unsafe", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-unsafe", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let ops = QuietOps {
         active: Some(("charlie".into(), "t-1".into())),
@@ -3284,8 +3282,8 @@ fn moving_a_machine_with_an_active_workspace_is_refused(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn a_change_made_elsewhere_meanwhile_is_a_conflict(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-conflict", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-conflict", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machine-configure-Build server");
     let elsewhere = std::fs::read_to_string(&file).unwrap().replace("tags: [linux]", "tags: [linux, arm]");
@@ -3300,8 +3298,8 @@ fn a_change_made_elsewhere_meanwhile_is_a_conflict(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn cancel_and_escape_discard_the_draft(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-cancel", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-cancel", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machines-add");
@@ -3323,8 +3321,8 @@ fn cancel_and_escape_discard_the_draft(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_keyboard_moves_through_the_form(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-keys", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-keys", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let mut s = Settings::open_machines(cx, QuietOps::default());
     s.click("machines-add");
     s.key("tab");
@@ -3341,8 +3339,8 @@ fn the_keyboard_moves_through_the_form(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_connection_check_writes_nothing_and_goes_stale_with_the_host(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-check", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-check", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let (readiness, seen) = recording_readiness(CheckOutcome::Checked(samples::needs_cli()));
     cx.update(|cx| {
@@ -3406,8 +3404,8 @@ impl Settings {
 
 #[gpui::test]
 fn a_verified_draft_is_recorded_only_once_it_is_added(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-verified-add", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-verified-add", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
     s.click("machines-add");
@@ -3433,8 +3431,8 @@ fn a_verified_draft_is_recorded_only_once_it_is_added(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn cancelling_a_verified_draft_records_nothing(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-verified-cancel", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-verified-cancel", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let before = std::fs::read_to_string(&file).unwrap();
     let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
     s.click("machines-add");
@@ -3452,8 +3450,8 @@ fn cancelling_a_verified_draft_records_nothing(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn an_unverified_save_records_nothing(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-unverified", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-unverified", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::needs_cli()));
     s.click("machines-add");
     s.type_in_form(MachineField::Name, "GPU box");
@@ -3470,8 +3468,8 @@ fn an_unverified_save_records_nothing(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_configured_machine_verified_at_its_saved_host_is_recorded_and_an_edit_unverifies(cx: &mut TestAppContext) {
-    let home = Home::with_project("mf-verified-configure", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-verified-configure", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
     s.click("machine-configure-Build server");
     s.click("machine-test");
@@ -3492,8 +3490,8 @@ fn a_configured_machine_verified_at_its_saved_host_is_recorded_and_an_edit_unver
 #[gpui::test]
 fn closing_the_form_or_editing_its_host_stops_the_running_check(cx: &mut TestAppContext) {
     use std::sync::atomic::Ordering;
-    let home = Home::with_project("mf-cancel-check", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("mf-cancel-check", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let (mut s, records) = Settings::open_checked(cx, CheckOutcome::Checked(samples::ready()));
     s.click("machine-configure-Build server");
     let flag = s.press_unparked(MachineFocus::Test);
@@ -3525,7 +3523,7 @@ fn closing_the_form_or_editing_its_host_stops_the_running_check(cx: &mut TestApp
 #[gpui::test]
 fn switching_projects_closes_the_form(cx: &mut TestAppContext) {
     let home = Home::with_project("mf-switch", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    write_pool("alpha", SMALL_POOL);
     crate::views::workflows_state::tests::write_project(&home.root, "beta");
     let (hub, _feeds) = crate::feeds::tests::canned_hub();
     cx.update(|cx| cx.set_global(hub));
@@ -3574,7 +3572,7 @@ use shelbi_core::{Machine, Project, WorkspaceSpec};
 use shelbi_orchestrator::pool_admin::{HookWiring, PoolOps, SessionState, WorktreeState};
 
 use crate::views::workspace_dialog::{DialogService, WorkspaceDialog};
-use crate::views::workspace_form_state::{Focus as Ctl, PoolService};
+use shelbi_app::settings::workspace_form::Focus as Ctl;
 
 /// The machines as the dialogs' service sees them: which worktrees exist
 /// (by machine and workspace), which workspaces have an active task or work
@@ -3659,7 +3657,7 @@ impl Settings {
     /// Settings ▸ Workspaces over SMALL_POOL, the dialogs' service over
     /// `ops`.
     fn open_pool_dialogs(cx: &mut TestAppContext, ops: &Arc<FakeOps>) -> Settings {
-        let service = PoolService::with_ops(ops.clone());
+        let service = shelbi_orchestrator::pool_admin::workspace_service_with(ops.clone());
         cx.update(|cx| cx.set_global(DialogService(service)));
         Settings::open_workspaces(cx)
     }
@@ -3706,8 +3704,8 @@ impl Settings {
 
 #[gpui::test]
 fn new_workspace_creates_one_through_the_shared_service(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-new", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-new", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     let mut s = Settings::open_pool_dialogs(cx, &ops);
     s.click("workspaces-new");
@@ -3750,8 +3748,8 @@ fn new_workspace_creates_one_through_the_shared_service(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn edit_starts_from_the_row_and_saves_only_its_own_tags(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-edit", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-edit", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     let mut s = Settings::open_pool_dialogs(cx, &ops);
     s.click("workspace-edit-charlie");
@@ -3773,8 +3771,8 @@ fn edit_starts_from_the_row_and_saves_only_its_own_tags(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn a_rename_moves_the_worktree_and_focus_follows_the_new_name(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-rename", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-rename", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     let mut s = Settings::open_pool_dialogs(cx, &ops);
     s.click("workspace-edit-alpha");
@@ -3791,8 +3789,8 @@ fn a_rename_moves_the_worktree_and_focus_follows_the_new_name(cx: &mut TestAppCo
 
 #[gpui::test]
 fn a_refused_save_keeps_the_dialog_and_every_value(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-refused", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-refused", "alpha");
+    let file = write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     ops.active.lock().unwrap().insert("charlie".into(), "fix-login".into());
     let mut s = Settings::open_pool_dialogs(cx, &ops);
@@ -3823,8 +3821,8 @@ fn a_refused_save_keeps_the_dialog_and_every_value(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_second_submit_while_one_is_out_sends_nothing(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-once", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-once", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     let mut s = Settings::open_pool_dialogs(cx, &ops);
     s.click("workspaces-new");
@@ -3852,8 +3850,8 @@ fn a_second_submit_while_one_is_out_sends_nothing(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_dialog_holds_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-modal", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-modal", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     let mut s = Settings::open_pool_dialogs(cx, &ops);
     s.click("workspace-edit-alpha");
@@ -3905,8 +3903,8 @@ fn the_dialog_holds_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn removal_confirms_refuses_work_at_risk_then_removes(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-remove", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-remove", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     ops.at_risk.lock().unwrap().insert("alpha".into(), "2 unpushed commits on jlong/x".into());
     let mut s = Settings::open_pool_dialogs(cx, &ops);
@@ -3942,8 +3940,8 @@ fn removal_confirms_refuses_work_at_risk_then_removes(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn edits_remove_workspace_confirms_over_the_form(cx: &mut TestAppContext) {
-    let home = Home::with_project("wsd-edit-remove", "alpha");
-    write_pool(&home.root, "alpha", SMALL_POOL);
+    let _home = Home::with_project("wsd-edit-remove", "alpha");
+    write_pool("alpha", SMALL_POOL);
     let ops = FakeOps::small_pool();
     let mut s = Settings::open_pool_dialogs(cx, &ops);
     s.click("workspace-edit-charlie");
@@ -3962,7 +3960,7 @@ fn edits_remove_workspace_confirms_over_the_form(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_project_switch_drops_the_draft_unsaved(cx: &mut TestAppContext) {
     let home = Home::with_project("wsd-switch", "alpha");
-    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let file = write_pool("alpha", SMALL_POOL);
     crate::views::workflows_state::tests::write_project(&home.root, "beta");
     let (hub, _feeds) = crate::feeds::tests::canned_hub();
     cx.update(|cx| cx.set_global(hub));

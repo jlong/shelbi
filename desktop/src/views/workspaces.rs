@@ -12,7 +12,8 @@
 //! icon, name, SSH host, root project directory and workspace count; its
 //! status badge; Configure) and its footnote.
 //!
-//! The config is read off the UI thread ([`workspaces_state::read`]), and
+//! The config is read off the UI thread
+//! ([`shelbi_app::settings::workspaces::read`]), and
 //! read again each time the page is shown and when the window comes back to
 //! the front after an edit sent the user to their editor. Until it lands
 //! the table says it's loading; a config that can't be read shows its error
@@ -45,8 +46,8 @@ use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REA
 use shelbi_core::MachineKind;
 
 use super::workflows::{popup, row_button, table, MENU_GAP, ROW_BUTTON};
-use super::workspace_form_state::Outcome;
-use super::workspaces_state::{
+use shelbi_app::settings::workspace_form::Outcome;
+use shelbi_app::settings::workspaces::{
     kind_label, read, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
 };

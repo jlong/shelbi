@@ -1300,7 +1300,7 @@ impl Run {
     /// eye, New with the Machine picker open and the removal's confirmation.
     fn settings_workspaces(&mut self) {
         use crate::views::settings_nav::SettingsPage;
-        use crate::views::workspaces_state::{Intent, MachineStatus};
+        use shelbi_app::settings::workspaces::{Intent, MachineStatus};
         let down = shelbi_core::Reachability::Unreachable {
             error: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
         };
@@ -1366,7 +1366,7 @@ impl Run {
     fn machine_forms(&mut self) {
         use crate::views::machine_form_state::{samples, CheckOutcome, Field, ReadinessIntent};
         use crate::views::settings_nav::SettingsPage;
-        use crate::views::workspaces_state::Intent;
+        use shelbi_app::settings::workspaces::Intent;
         type Step = (ReadinessIntent, Option<CheckOutcome>);
         let test = |outcome: Option<CheckOutcome>| vec![(ReadinessIntent::Test, outcome)];
         let ready = || test(Some(CheckOutcome::Checked(samples::ready())));

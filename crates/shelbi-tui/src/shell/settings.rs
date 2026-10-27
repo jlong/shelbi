@@ -32,6 +32,9 @@
 //!   Duplicate, a guarded Reset and Delete, Edit YAML) and an in-place
 //!   editor for their shared instructions, over the shared
 //!   `shelbi_app::settings::agents` state.
+//! - Workspaces (`tui-settings-workspaces`, [`workspaces`]): the project's
+//!   workspace pool and the machines that host it, with the New / Edit /
+//!   Remove workspace forms over the shared pool service.
 //!
 //! Keys, all terminal-safe (no Command chords) and never forwarded to a
 //! session while Settings shows:
@@ -84,11 +87,16 @@ use crate::theme::palette;
 
 mod agents;
 mod workflows;
+pub(crate) mod workspaces;
 
 pub(crate) use agents::CommitJob;
 use agents::{AgentsHit, AgentsPage, Outcome};
 pub(crate) use workflows::EditFile;
 use workflows::{Nav, WorkflowsPage};
+use shelbi_app::settings::workspace_form::{self, Outcome as PoolOutcome};
+use shelbi_app::settings::workspaces::PoolIndex;
+use shelbi_core::pool::PoolError;
+use workspaces::{Ask, Landed, WorkspacesPage};
 
 /// Workflow `name`'s row on the Workflows page (the shell's tests select it).
 #[cfg(test)]
@@ -107,6 +115,7 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::General)
     .with(SettingsPage::Keybindings)
     .with(SettingsPage::Terminal)
+    .with(SettingsPage::Workspaces)
     .with(SettingsPage::Workflows)
     .with(SettingsPage::Agents);
 
@@ -121,6 +130,8 @@ pub(crate) enum Load {
     Workflows(Ticket, String),
     /// The Agents page's model: page `id`, for `project`.
     Agents { id: u64, ticket: Ticket, project: String },
+    /// The Workspaces page: this project's pool.
+    Workspaces(Ticket, String),
 }
 
 /// Where keyboard focus sits inside Settings.
@@ -198,6 +209,9 @@ pub(crate) enum SettingsAction {
     /// Say this on the shell's status line (a save for a project no longer
     /// shown failed).
     Status(String),
+    /// Run a workspace request off the UI thread
+    /// ([`SettingsShell::pool_finished`] takes its result).
+    RunPool(Ticket, Box<workspace_form::Job>),
 }
 
 /// A save the shell runs off the UI thread for the unsaved-edits prompt.
@@ -304,6 +318,8 @@ pub(crate) struct SettingsShell {
     /// Agents pages a project switch replaced while a save ran: the shell
     /// finishes their queued saves (nothing shows them).
     retired: Vec<(u64, shelbi_app::settings::agents::AgentsState)>,
+    /// The Workspaces page, loaded per project.
+    workspaces: WorkspacesPage,
     /// The page's text start column at the last draw (editor clicks).
     page_x: u16,
     /// The page's selected action row and scroll offset.
@@ -343,6 +359,7 @@ impl Default for SettingsShell {
             agents: AgentsPage::new(0, None),
             next_agents_id: 1,
             retired: Vec::new(),
+            workspaces: WorkspacesPage::default(),
             page_x: 0,
             action: 0,
             scroll: 0,
@@ -410,6 +427,11 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn workspaces(&self) -> &WorkspacesPage {
+        &self.workspaces
+    }
+
+    #[cfg(test)]
     pub(crate) fn retired(&self) -> usize {
         self.retired.len()
     }
@@ -452,11 +474,17 @@ impl SettingsShell {
         self.form.clear_status();
         self.workflows.close_modal();
         self.keys.blur();
+        if self.nav.page() == SettingsPage::Workspaces {
+            self.workspaces.shown();
+        }
     }
 
-    /// Settings closed: anything the Keybindings page held open ends.
+    /// Settings closed: anything the Keybindings page held open ends, an
+    /// open workspace form's draft goes (a request it sent still lands), and
+    /// the Workspaces page stops probing.
     pub(crate) fn close(&mut self) {
         self.keys.blur();
+        self.workspaces.hidden();
     }
 
     pub(crate) fn set_region(&mut self, region: Region) {
@@ -559,8 +587,8 @@ impl SettingsShell {
     }
 
     /// A paste (or a dropped file's path) while Settings shows: into the
-    /// Keybindings search, the editor command or the workflow name being
-    /// typed, else nowhere. Returns whether a field took it.
+    /// Keybindings search, the editor command, the workflow name or the
+    /// workspace form field being typed, else nowhere. Returns whether a field took it.
     pub(crate) fn paste(&mut self, text: &str) -> bool {
         if self.nav.page() == SettingsPage::Keybindings {
             return self.keys_focused() && self.keys.paste(text);
@@ -570,6 +598,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Agents {
             return self.region == Region::Page && self.guard.prompt().is_none() && self.agents.paste(text);
+        }
+        if self.nav.page() == SettingsPage::Workspaces {
+            return self.workspaces.paste(text);
         }
         match self.form.draft_mut() {
             Some(field) if self.region == Region::Page => {
@@ -608,10 +639,17 @@ impl SettingsShell {
             Leave::Back => SettingsAction::Leave,
             Leave::Page(page) => {
                 self.keys.blur();
+                let from = self.nav.page();
                 if self.nav.show(page) {
                     self.stop = Stop::Page(page);
                     self.action = 0;
                     self.scroll = 0;
+                    if from == SettingsPage::Workspaces {
+                        self.workspaces.hidden();
+                    }
+                    if page == SettingsPage::Workspaces {
+                        self.workspaces.shown();
+                    }
                 }
                 SettingsAction::Load
             }
@@ -628,6 +666,7 @@ impl SettingsShell {
     pub(crate) fn project_changed(&mut self) {
         self.general.reset();
         self.workflows.project_changed();
+        self.workspaces.project_changed();
         self.replace_agents(None);
         self.save.reset();
         self.action = 0;
@@ -648,8 +687,8 @@ impl SettingsShell {
                 }
                 Some(self.general.begin(project))
             }
-            // Keybindings, Workflows and Agents read through `begin_page_load`,
-            // Terminal reads nothing, and the rest aren't offered yet.
+            // The other pages read through `begin_page_load`; Terminal reads
+            // nothing.
             SettingsPage::Keybindings
             | SettingsPage::Terminal
             | SettingsPage::Workspaces
@@ -682,7 +721,53 @@ impl SettingsShell {
                     project: project?.to_string(),
                 })
             }
-            SettingsPage::Terminal | SettingsPage::Workspaces => None,
+            SettingsPage::Workspaces => {
+                let ticket = self.workspaces.begin_load(project, force)?;
+                Some(Load::Workspaces(ticket, project?.to_string()))
+            }
+            SettingsPage::Terminal => None,
+        }
+    }
+
+    /// A Workspaces read landed. Returns whether the pool changed from an
+    /// earlier read (the shell refreshes its sidebar too).
+    pub(crate) fn pool_loaded(&mut self, ticket: &Ticket, read: Result<PoolIndex, String>) -> bool {
+        let before = self.workspaces.dropped();
+        let changed = self.workspaces.loaded(ticket, read);
+        self.dropped += self.workspaces.dropped() - before;
+        changed
+    }
+
+    /// A workspace request finished (see [`WorkspacesPage::finished`]).
+    pub(crate) fn pool_finished(&mut self, ticket: &Ticket, result: Result<PoolOutcome, PoolError>) -> Landed {
+        let before = self.workspaces.dropped();
+        let landed = self.workspaces.finished(ticket, result);
+        self.dropped += self.workspaces.dropped() - before;
+        landed
+    }
+
+    /// A change was committed to the pool: the Workspaces page reads again
+    /// when next shown.
+    pub(crate) fn pool_stale(&mut self) {
+        self.workspaces.mark_stale();
+    }
+
+    /// The run loop's tick: fold the prober's latest results in, and say
+    /// whether the shown Workspaces page is due to read the config again.
+    pub(crate) fn tick(&mut self, now: std::time::Instant) -> (bool, bool) {
+        if self.nav.page() != SettingsPage::Workspaces {
+            return (false, false);
+        }
+        (self.workspaces.take_probes(), self.workspaces.reload_due(now))
+    }
+
+    /// What the Workspaces page's [`Ask`] means to the shell.
+    fn ask(&self, ask: Ask) -> SettingsAction {
+        match ask {
+            Ask::Stay => SettingsAction::Stay,
+            Ask::Reload => SettingsAction::Reload,
+            Ask::Run(ticket, job) => SettingsAction::RunPool(ticket, job),
+            Ask::Edit(file) => SettingsAction::EditFile(file),
         }
     }
 
@@ -992,6 +1077,12 @@ impl SettingsShell {
     /// A key while Settings shows (after the shell took the palette and focus
     /// chords). Every key is Settings': none reaches a session.
     pub(crate) fn handle_key(&mut self, k: KeyEvent, keymaps: &Keymaps) -> SettingsAction {
+        if self.nav.page() == SettingsPage::Workspaces && self.workspaces.modal() {
+            // The workspace form (or the removal's confirmation) is modal.
+            self.region = Region::Page;
+            let ask = self.workspaces.layer_key(k);
+            return self.ask(ask);
+        }
         if self.guard.prompt().is_some() {
             return self.prompt_key(k);
         }
@@ -1053,6 +1144,26 @@ impl SettingsShell {
             }
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
+            Region::Page if self.nav.page() == SettingsPage::Workspaces => {
+                if up || down {
+                    self.workspaces.step(down);
+                } else if activate {
+                    let ask = self.workspaces.activate(self.workspaces.cursor());
+                    return self.ask(ask);
+                } else if let Some(ask) = self.workspaces.page_key(k) {
+                    return self.ask(ask);
+                } else {
+                    match k.code {
+                        KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
+                        KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+                        KeyCode::Home => self.scroll = 0,
+                        KeyCode::End => self.scroll = u16::MAX,
+                        KeyCode::Char('r') if k.modifiers.is_empty() => return SettingsAction::Reload,
+                        _ => {}
+                    }
+                }
+                SettingsAction::Stay
+            }
             Region::Page if on_agents => {
                 match self.agents.handle_key(k, keymaps) {
                     Outcome::Pass => {}
@@ -1166,6 +1277,10 @@ impl SettingsShell {
             .map(|(_, h)| *h);
         let over_sidebar = panel::in_rect(sidebar, m.column, m.row);
         let over_main = panel::in_rect(main, m.column, m.row);
+        if self.nav.page() == SettingsPage::Workspaces && self.workspaces.modal() {
+            let ask = self.workspaces.layer_mouse(m);
+            return self.ask(ask);
+        }
         let on_workflows = self.nav.page() == SettingsPage::Workflows;
         if on_workflows && self.workflows.modal_open() && self.guard.prompt().is_none() {
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
@@ -1232,6 +1347,10 @@ impl SettingsShell {
                     // A click in the field being typed leaves it typing.
                     Some(Hit::Action(i)) if self.typing() && i == self.action => SettingsAction::Stay,
                     Some(Hit::Action(i)) if on_workflows => self.workflows.click_item(i),
+                    Some(Hit::Action(i)) if self.nav.page() == SettingsPage::Workspaces => {
+                        let ask = self.workspaces.activate(i);
+                        self.ask(ask)
+                    }
                     Some(Hit::Action(i)) => self.run_action(i),
                     Some(Hit::Agents(h)) => {
                         let column = m.column.saturating_sub(self.page_x);
@@ -1276,6 +1395,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Agents {
             self.render_agents_menu(f, main);
+        }
+        if self.nav.page() == SettingsPage::Workspaces {
+            self.workspaces.render_layer(f, main);
         }
         if self.guard.prompt().is_some() || self.prompt_saving() {
             self.render_prompt(f, main);
@@ -1422,11 +1544,17 @@ impl SettingsShell {
         let actions = self.actions();
         self.action = self.action.min(actions.len().saturating_sub(1));
         let rows = self.page_rows(content.width as usize, content.height as usize, &actions);
-        // Workflows and Agents draw their rows whole; General's action rows
-        // are drawn here, with their focus.
-        let on_workflows = self.nav.page() == SettingsPage::Workflows;
-        let draws_own = on_workflows || self.nav.page() == SettingsPage::Agents;
-        let focus = if on_workflows { self.workflows.cursor() } else { self.action };
+        // Workflows, Workspaces and Agents draw their rows whole; General's
+        // action rows are drawn here, with their focus.
+        let draws_own = matches!(
+            self.nav.page(),
+            SettingsPage::Workflows | SettingsPage::Workspaces | SettingsPage::Agents
+        );
+        let focus = match self.nav.page() {
+            SettingsPage::Workflows => self.workflows.cursor(),
+            SettingsPage::Workspaces => self.workspaces.cursor(),
+            _ => self.action,
+        };
         // Keep the focused rows in view: the last marked, then the first (an
         // editor marks its caret and its buttons), then clamp to the content.
         let max = (rows.len() as u16).saturating_sub(content.height);
@@ -1508,8 +1636,14 @@ impl SettingsShell {
                 let focused = self.region == Region::Page;
                 self.agents.rows(width, height, focused)
             }
+            SettingsPage::Workspaces => self
+                .workspaces
+                .rows(width, self.region == Region::Page)
+                .into_iter()
+                .map(|r| Row { action: r.item, ..Row::text(r.line) })
+                .collect(),
             // Keybindings draws itself.
-            SettingsPage::Keybindings | SettingsPage::Workspaces => Vec::new(),
+            SettingsPage::Keybindings => Vec::new(),
         }
     }
 
@@ -2211,6 +2345,9 @@ fn hints(region: Region, page: SettingsPage, typing: bool, moves: &str) -> Strin
     }
     match region {
         Region::Sidebar => format!("{moves} move · ⏎ open · Tab page · Esc back"),
+        Region::Page if page == SettingsPage::Workspaces => {
+            format!("{moves} choose · ⏎ open · n new · e edit · d remove · r reload · Tab sidebar · Esc back")
+        }
         Region::Page if page == SettingsPage::General => {
             format!("{moves} choose · ←→ theme · ⏎ run · r reload · Tab sidebar · Esc back")
         }
@@ -2314,6 +2451,30 @@ pub(crate) fn fixture_io(
     (reader, writer)
 }
 
+/// The Workspaces page's pool for `project` with no disk read: the shared
+/// fixture's local and SSH machines and five workspaces.
+#[cfg(test)]
+pub(crate) fn fixture_pool(project: &str) -> Result<PoolIndex, String> {
+    use shelbi_app::settings::workspaces::fixtures::{project as pool_project, POOL};
+    let mut p = pool_project(POOL);
+    p.name = project.to_string();
+    let mut index = PoolIndex::build(&p, Some(std::path::Path::new("/Users/me")));
+    index.file = Some(std::path::PathBuf::from(format!("/h/.shelbi/projects/{project}.yaml")));
+    Ok(index)
+}
+
+/// A pool service that refuses everything: what a test that doesn't script
+/// the service gets, so nothing reaches the hub or a real config.
+#[cfg(test)]
+pub(crate) fn unavailable_pool_service() -> workspace_form::PoolService {
+    let no = || PoolError::Version("no pool service in this test".into());
+    workspace_form::PoolService {
+        add: std::sync::Arc::new(move |_, _| Err(no())),
+        update: std::sync::Arc::new(move |_, _| Err(no())),
+        remove: std::sync::Arc::new(move |_, _| Err(no())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2344,6 +2505,7 @@ mod tests {
                 Stop::Page(SettingsPage::Keybindings),
                 Stop::Page(SettingsPage::Terminal),
                 Stop::Switcher,
+                Stop::Page(SettingsPage::Workspaces),
                 Stop::Page(SettingsPage::Workflows),
                 Stop::Page(SettingsPage::Agents)
             ]
@@ -2363,11 +2525,14 @@ mod tests {
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher);
         s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Workspaces));
+        s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows));
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Agents));
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Agents), "stops at the bottom");
+        s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);

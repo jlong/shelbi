@@ -102,13 +102,10 @@ pub fn workspace_target(project: &Project, workspace: &WorkspaceSpec) -> Result<
 }
 
 /// `<machine.work_dir>/.shelbi/wt/<workspace-name>` — the workspace's persistent
-/// worktree path on its machine.
+/// worktree path on its machine (`shelbi_core::pool::workspace_worktree`, which
+/// the clients' toolkit-free settings state derives it with too).
 pub fn workspace_worktree(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
-    machine
-        .work_dir
-        .join(".shelbi")
-        .join("wt")
-        .join(&workspace.name)
+    shelbi_core::pool::workspace_worktree(machine, workspace)
 }
 
 /// Identity shown in the shell's idle-workspace placeholder (the main area a

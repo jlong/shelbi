@@ -102,7 +102,7 @@ use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::update::{self as update_view, UpdateState};
 use crate::views::workspace_dialog::{Body as DialogBody, WorkspaceDialog, WorkspaceDialogEvent};
-use crate::views::workspaces_state::Intent;
+use shelbi_app::settings::workspaces::Intent;
 use shelbi_state::keymap::{
     DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
@@ -2192,7 +2192,7 @@ impl ShelbiWindow {
     /// change, and give the keyboard back to the button that opened it.
     fn close_pool_dialog(
         &mut self,
-        done: Option<crate::views::workspace_form_state::Outcome>,
+        done: Option<shelbi_app::settings::workspace_form::Outcome>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

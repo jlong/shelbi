@@ -5,6 +5,7 @@ pub mod integration;
 pub mod login_env;
 pub mod model;
 pub mod placeholders;
+pub mod pool;
 pub mod scaffold;
 pub mod session_health;
 pub mod shell;

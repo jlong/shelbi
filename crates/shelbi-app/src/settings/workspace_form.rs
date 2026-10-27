@@ -1,6 +1,7 @@
-//! The workspace dialogs' state, toolkit-free (`dt-workspace-settings-forms`):
-//! New workspace and Edit workspace (Figma 2528:9683 and 2526:9184), and the
-//! confirmation that removes one.
+//! The workspace dialogs' state, toolkit-free (`dt-workspace-settings-forms`,
+//! shared with the TUI by `tui-settings-workspaces`): New workspace and Edit
+//! workspace (Figma 2528:9683 and 2526:9184), and the confirmation that
+//! removes one.
 //!
 //! [`WorkspaceForm`] holds the draft (the name, machine, tags and slot as
 //! typed), the machines to pick from, what each field's last check said, the
@@ -12,8 +13,8 @@
 //! key does, and which request a submit sends.
 //!
 //! A submit checks the draft with the service's own planners
-//! ([`pool_admin::plan_workspace_add`], [`pool_admin::plan_workspace_update`],
-//! [`pool_admin::parse_slot`]) against the project as the page last read it,
+//! ([`pool::plan_workspace_add`], [`pool::plan_workspace_update`],
+//! [`pool::parse_slot`]) against the project as the page last read it,
 //! and only then hands back a [`Job`]; the service checks it all again
 //! against the config as it is when it runs. While the job is out the form
 //! is busy: another submit, Cancel and Esc do nothing. Its result closes the
@@ -36,13 +37,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use shelbi_core::{MachineKind, Project, WorkspaceSpec};
-use shelbi_orchestrator::pool_admin::{
-    self, AddWorkspace, PoolError, PoolField, RemoveWorkspace, UpdateWorkspace, WorkspaceChange,
-    WorkspaceRemoved,
+use shelbi_core::pool::{
+    self, workspace_worktree, AddWorkspace, PoolError, PoolField, RemoveWorkspace, UpdateWorkspace,
+    WorkspaceChange, WorkspaceRemoved,
 };
-use shelbi_orchestrator::workspace::workspace_worktree;
 
-use super::workspaces_state::{tilde, MachineRow, MachineStatus};
+use super::workspaces::{tilde, MachineRow, MachineStatus, LOCAL_LABEL};
 
 /// The names a new workspace is offered, in order: the first one the project
 /// doesn't use yet.
@@ -59,6 +59,10 @@ pub const LOCATION_HELP: &str = "Determined by the machine’s project directory
 pub const TAGS_HELP: &str = "Tags help workflows find a workspace with the right capabilities.";
 /// The Slot field's helper.
 pub const SLOT_HELP: &str = "Used by workflows for per-workspace ports. Leave empty for automatic numbering.";
+/// What automatic numbering is, where there's room to say it (the TUI's
+/// form): the fallback [`Project::workspace_slot`] resolves an empty slot to.
+pub const SLOT_AUTOMATIC_HELP: &str =
+    "Automatic numbers a machine’s workspaces from 0, in the order the project declares them.";
 
 /// Which dialog the form is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,11 +94,11 @@ impl MachineChoice {
         }
     }
 
-    /// What it is, under its name in the picker: `This Mac`, or `SSH ·
+    /// What it is, under its name in the picker: [`LOCAL_LABEL`], or `SSH ·
     /// <host> · Reachable`.
     pub fn detail(&self) -> String {
         match (&self.host, &self.status) {
-            (None, _) => "This Mac".into(),
+            (None, _) => LOCAL_LABEL.into(),
             (Some(host), status) => format!("SSH · {host} · {}", status.label()),
         }
     }
@@ -173,6 +177,22 @@ impl Outcome {
         match self {
             Outcome::Added(c) | Outcome::Updated(c) => &c.warnings,
             Outcome::Removed(r) => &r.warnings,
+        }
+    }
+
+    /// One line saying what happened, for a page's notice: the warnings
+    /// when there are any, else what was done.
+    pub fn notice(&self) -> String {
+        if !self.warnings().is_empty() {
+            return self.warnings().iter().map(|w| sentence(w)).collect::<Vec<_>>().join(" ");
+        }
+        match self {
+            Outcome::Added(c) => format!("Created {}.", c.workspace.name),
+            Outcome::Updated(c) => match &c.previous_name {
+                Some(old) => format!("Renamed {old} to {}.", c.workspace.name),
+                None => format!("Saved {}.", c.workspace.name),
+            },
+            Outcome::Removed(r) => format!("Removed {}.", r.name),
         }
     }
 }
@@ -446,7 +466,7 @@ impl WorkspaceForm {
             name: self.trimmed_name().to_string(),
             machine: self.machine.clone(),
             tags: split_tags(&self.tags),
-            slot: pool_admin::parse_slot(&self.slot).ok().flatten(),
+            slot: pool::parse_slot(&self.slot).ok().flatten(),
         }
     }
 
@@ -533,7 +553,7 @@ impl WorkspaceForm {
         self.trimmed_name() != original.name
             || self.machine != original.machine
             || split_tags(&self.tags) != original.tags
-            || pool_admin::parse_slot(&self.slot) != Ok(original.slot)
+            || pool::parse_slot(&self.slot) != Ok(original.slot)
     }
 
     /// Whether the default action (Create workspace, Save changes) can run.
@@ -765,7 +785,7 @@ impl WorkspaceForm {
         if name.is_empty() {
             errors.name = Some("Enter a name for the workspace.".into());
         }
-        let slot = pool_admin::parse_slot(&self.slot).map_err(|e| errors.add(&e)).ok().flatten();
+        let slot = pool::parse_slot(&self.slot).map_err(|e| errors.add(&e)).ok().flatten();
         let tags = split_tags(&self.tags);
         let op = match &self.mode {
             Mode::New => {
@@ -776,7 +796,7 @@ impl WorkspaceForm {
                     slot,
                 };
                 if errors.name.is_none() {
-                    if let Err(e) = pool_admin::plan_workspace_add(&self.source, &req) {
+                    if let Err(e) = pool::plan_workspace_add(&self.source, &req) {
                         errors.add(&e);
                     }
                 }
@@ -792,7 +812,7 @@ impl WorkspaceForm {
                     slot,
                 };
                 if errors.name.is_none() {
-                    if let Err(e) = pool_admin::plan_workspace_update(&self.source, original, &req) {
+                    if let Err(e) = pool::plan_workspace_update(&self.source, original, &req) {
                         errors.add(&e);
                     }
                 }
@@ -975,7 +995,11 @@ pub type AddFn = dyn Fn(&str, &AddWorkspace) -> Result<WorkspaceChange, PoolErro
 pub type UpdateFn = dyn Fn(&str, &UpdateWorkspace) -> Result<WorkspaceChange, PoolError> + Send + Sync;
 pub type RemoveFn = dyn Fn(&str, &RemoveWorkspace) -> Result<WorkspaceRemoved, PoolError> + Send + Sync;
 
-/// The shared workspace operations the dialogs run, off the UI thread.
+/// The shared workspace operations the forms run, off the UI thread. This
+/// crate can't reach them (`shelbi_orchestrator::pool_admin` depends on it),
+/// so a client builds one from `pool_admin::workspace_service` (the live
+/// world) or `pool_admin::workspace_service_with` (a test's scripted
+/// machines), or from closures of its own.
 #[derive(Clone)]
 pub struct PoolService {
     pub add: Arc<AddFn>,
@@ -984,26 +1008,6 @@ pub struct PoolService {
 }
 
 impl PoolService {
-    /// `pool_admin`'s operations against the live world.
-    pub fn live() -> Self {
-        PoolService {
-            add: Arc::new(pool_admin::add_workspace),
-            update: Arc::new(pool_admin::update_workspace),
-            remove: Arc::new(pool_admin::remove_workspace),
-        }
-    }
-
-    /// `pool_admin`'s operations over `ops` (a test's scripted machines).
-    #[cfg(test)]
-    pub fn with_ops(ops: Arc<dyn pool_admin::PoolOps + Send + Sync>) -> Self {
-        let (a, u, r) = (ops.clone(), ops.clone(), ops);
-        PoolService {
-            add: Arc::new(move |p, req| pool_admin::add_workspace_with(&*a, p, req)),
-            update: Arc::new(move |p, req| pool_admin::update_workspace_with(&*u, p, req)),
-            remove: Arc::new(move |p, req| pool_admin::remove_workspace_with(&*r, p, req)),
-        }
-    }
-
     /// Run `job`. Blocks: call it off the UI thread.
     pub fn run(&self, job: &Job) -> Result<Outcome, PoolError> {
         match &job.op {
@@ -1017,8 +1021,8 @@ impl PoolService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::workspaces_state::tests::{project, POOL};
-    use crate::views::workspaces_state::PoolIndex;
+    use crate::settings::workspaces::fixtures::{project, POOL};
+    use crate::settings::workspaces::PoolIndex;
 
     fn source() -> Arc<Project> {
         Arc::new(project(POOL))
@@ -1052,7 +1056,7 @@ mod tests {
             previous_machine: None,
             slot: 0,
             worktree: PathBuf::new(),
-            hooks: pool_admin::HooksOutcome::Skipped,
+            hooks: pool::HooksOutcome::Skipped,
             warnings: Vec::new(),
         }
     }
