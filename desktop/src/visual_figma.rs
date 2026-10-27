@@ -26,7 +26,8 @@
 //! `7-…`, and settings-workflow-form against
 //! `workflows/4-workflow-form.png` in the frame's 1440x1283 window,
 //! settings-agents against `agents/1-agents-index.png`,
-//! settings-agent-details against `agents/2-agent-details.png`) and
+//! settings-agent-details against `agents/2-agent-details.png`,
+//! settings-workspaces against the Workspaces frame 2523:8879) and
 //! command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
@@ -58,7 +59,8 @@
 //! the Load for review dialog's focus states.
 //! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
 //! and Acknowledgements at their frames' sizes (with `state-bundled-*`);
-//! `SHELBI_VISUAL_ONLY=about` renders just those.
+//! `SHELBI_VISUAL_ONLY=about` renders just those;
+//! `SHELBI_VISUAL_ONLY=workspaces` renders just Settings ▸ Workspaces.
 //! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02,
 //! 03 (`add-project-writing-config`, `-creating-agents`,
 //! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
@@ -1183,6 +1185,7 @@ impl Run {
         self.save(handle, "state-settings-cli-focused");
         self.settings_workflows();
         self.settings_agents();
+        self.settings_workspaces();
         self.keybindings_states();
         self.components();
     }
@@ -1276,6 +1279,56 @@ impl Run {
         if !had_agents {
             let _ = std::fs::remove_dir_all(&agents);
         }
+    }
+
+    /// Settings ▸ Workspaces (the Workspaces frame, 2523:8879) over the
+    /// fixture project's pool: four workspaces on the hub and one on the gpu
+    /// box, which answers reachable. The frame's names, paths and slots are
+    /// its own sample data; the layout and styling are what compare. Its
+    /// states no frame draws (`state-workspaces-*`, checked by eye): the gpu
+    /// box unreachable, and a workspace's ⋮ menu.
+    fn settings_workspaces(&mut self) {
+        use crate::views::settings_nav::SettingsPage;
+        use crate::views::workspaces_state::MachineStatus;
+        let down = shelbi_core::Reachability::Unreachable {
+            error: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
+        };
+        for (screen, reachability, want, menu) in [
+            ("settings-workspaces", shelbi_core::Reachability::Reachable, "Reachable", false),
+            ("state-workspaces-unreachable", down, "Unreachable", false),
+            ("state-workspaces-menu", shelbi_core::Reachability::Reachable, "Reachable", true),
+        ] {
+            crate::views::machines::stub_reachability(reachability);
+            let handle = self.open();
+            handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.offscreen_open_settings(SettingsPage::Workspaces, window, cx)
+                })
+                .unwrap();
+            let page = handle
+                .update(&mut self.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).workspaces()))
+                .unwrap()
+                .expect("Settings is open");
+            let ready = self.wait(handle, Duration::from_secs(10), |cx| {
+                page.update(cx, |p, cx| {
+                    p.take_probes(cx);
+                    let state = p.state();
+                    state.index().is_some_and(|i| {
+                        i.workspaces.len() == 5
+                            && i.machines.get(1).is_some_and(|m| {
+                                let status = state.status(m);
+                                status != MachineStatus::Checking && status.label() == want
+                            })
+                    })
+                })
+            });
+            self.expect(&format!("{screen}: five workspaces, the gpu box {want}"), ready);
+            if menu {
+                page.update(&mut self.cx, |p, cx| p.offscreen_open_menu("alpha", cx));
+            }
+            self.save(handle, screen);
+        }
+        crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
     }
 
     /// The agent details editor (the Agent Details frame, 2405:6965,
@@ -2091,6 +2144,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "settings") {
             self.settings();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "workspaces") {
+            self.settings_workspaces();
             return;
         }
 

@@ -45,7 +45,11 @@
 //! agents and edits their shared instructions, through
 //! `shelbi_state::agents_config`; an agent opened from it shows in its
 //! details editor ([`AgentEditor`]), which takes the whole view the same
-//! way.
+//! way. The Workspaces page ([`WorkspacesPage`]) lists the project's
+//! workspace pool and its machines; what its buttons ask for goes to the
+//! window ([`SettingsEvent::OpenPoolForm`]), which hands it back here
+//! ([`SettingsView::open_pool_form`]) until the workspace and machine forms
+//! take it.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -72,6 +76,8 @@ use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use super::workflow_editor::{EditorEvent, WorkflowEditor};
 use super::workflows::{WorkflowsEvent, WorkflowsPage};
+use super::workspaces::{WorkspacesEvent, WorkspacesPage};
+use super::workspaces_state::Intent;
 use crate::assets::icons;
 use crate::elements::controls::{self, Slider, SliderEvent};
 use crate::elements::terminal::colors::{self, AnsiOverrides};
@@ -290,6 +296,11 @@ pub enum SettingsEvent {
     /// Show `page`, as its row in the settings sidebar does (a link on
     /// another page).
     ShowPage(SettingsPage),
+    /// Settings ▸ Workspaces asks for a workspace or machine form.
+    OpenPoolForm(Intent),
+    /// The project's workspaces or machines changed on disk (an edit
+    /// landed): what the window shows from them should follow.
+    PoolChanged,
 }
 
 /// The settings view.
@@ -334,6 +345,8 @@ pub struct SettingsView {
     agents: Entity<AgentsPage>,
     /// The agent details editor, while an agent is open in it.
     agent_editor: Option<(Entity<AgentEditor>, Subscription)>,
+    /// The project's Workspaces page.
+    workspaces: Entity<WorkspacesPage>,
     /// The page's scroll, and whether to bring the Workflows page's
     /// Statuses into view once it has drawn (the editor's Manage project
     /// statuses).
@@ -368,6 +381,7 @@ impl SettingsView {
         let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
         let workflows = cx.new(|cx| WorkflowsPage::new(project, window, cx));
         let agents = cx.new(|cx| AgentsPage::new(project, window, cx));
+        let workspaces = cx.new(|cx| WorkspacesPage::new(project, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -395,6 +409,10 @@ impl SettingsView {
             cx.subscribe(&agents, |_, _, event: &AgentsEvent, cx| match event {
                 AgentsEvent::Edit(name) => cx.emit(SettingsEvent::EditAgent(name.clone())),
                 AgentsEvent::ShowWorkflows => cx.emit(SettingsEvent::ShowPage(SettingsPage::Workflows)),
+            }),
+            cx.subscribe(&workspaces, |_, _, event: &WorkspacesEvent, cx| match event {
+                WorkspacesEvent::Open(intent) => cx.emit(SettingsEvent::OpenPoolForm(intent.clone())),
+                WorkspacesEvent::Changed => cx.emit(SettingsEvent::PoolChanged),
             }),
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -451,6 +469,7 @@ impl SettingsView {
             editor: None,
             agents,
             agent_editor: None,
+            workspaces,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
             loaded: false,
@@ -530,6 +549,20 @@ impl SettingsView {
     #[cfg(any(test, feature = "visual-check"))]
     pub(crate) fn agents(&self) -> Entity<AgentsPage> {
         self.agents.clone()
+    }
+
+    /// The Workspaces page's view.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub(crate) fn workspaces(&self) -> Entity<WorkspacesPage> {
+        self.workspaces.clone()
+    }
+
+    /// Open the form `intent` asks for (Settings ▸ Workspaces' buttons, rows
+    /// and menus, through the window). The workspace and machine forms are
+    /// their own tasks; until they take it, the page opens the file the pool
+    /// is declared in.
+    pub fn open_pool_form(&mut self, intent: &Intent, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspaces.update(cx, |p, cx| p.edit_in_yaml(intent, window, cx));
     }
 
     /// Open workflow `name` in the editor, over the Workflows page's model
@@ -666,6 +699,7 @@ impl SettingsView {
             match page {
                 SettingsPage::Workflows => self.workflows.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Agents => self.agents.update(cx, |p, _| p.reload_when_drawn()),
+                SettingsPage::Workspaces => self.workspaces.update(cx, |p, _| p.reload_when_drawn()),
                 _ => {}
             }
             self.page = page;
@@ -1315,6 +1349,8 @@ impl Render for SettingsView {
             SettingsPage::Workflows => page.child(self.workflows.clone()),
             // The Agents frame (2377:41040): the page scrolls.
             SettingsPage::Agents => page.child(self.agents.clone()),
+            // The Workspaces frame (2523:8879): the page scrolls.
+            SettingsPage::Workspaces => page.child(self.workspaces.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -1389,7 +1425,12 @@ impl Render for SettingsView {
             ),
         };
         // `config.yaml`'s save line belongs to the pages that write it.
-        let status = status.filter(|_| !matches!(shown, SettingsPage::Keybindings | SettingsPage::Workflows | SettingsPage::Agents));
+        let status = status.filter(|_| {
+            !matches!(
+                shown,
+                SettingsPage::Keybindings | SettingsPage::Workflows | SettingsPage::Agents | SettingsPage::Workspaces
+            )
+        });
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
             .into_any_element()
     }
@@ -1596,6 +1637,7 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Terminal => "settings-page-terminal",
         SettingsPage::Workflows => "settings-page-workflows",
         SettingsPage::Agents => "settings-page-agents",
+        SettingsPage::Workspaces => "settings-page-workspaces",
     }
 }
 

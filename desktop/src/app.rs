@@ -101,6 +101,7 @@ use crate::platform::{
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::update::{self as update_view, UpdateState};
+use crate::views::workspaces_state::Intent;
 use shelbi_state::keymap::{
     DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
 };
@@ -751,6 +752,12 @@ pub struct ShelbiWindow {
     /// The agents a test's window was asked to open the details of.
     #[cfg(test)]
     edited_agents: Vec<String>,
+    /// The forms Settings ▸ Workspaces asked for, in order.
+    #[cfg(test)]
+    pool_forms: Vec<Intent>,
+    /// How often a pool change asked the feed for a refresh.
+    #[cfg(test)]
+    pool_refreshes: usize,
     /// The shell has been drawn at least once (gpui has a frame to answer
     /// action-availability questions from).
     drawn_once: bool,
@@ -956,6 +963,10 @@ impl ShelbiWindow {
             edited_workflows: Vec::new(),
             #[cfg(test)]
             edited_agents: Vec::new(),
+            #[cfg(test)]
+            pool_forms: Vec::new(),
+            #[cfg(test)]
+            pool_refreshes: 0,
             drawn_once: false,
             #[cfg(any(test, feature = "visual-check"))]
             tap: None,
@@ -2098,6 +2109,33 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Open the form Settings ▸ Workspaces asks for (New workspace, a
+    /// workspace's edit button, row or menu, Add machine, Configure). The
+    /// workspace and machine forms are their own tasks and take it here;
+    /// until then the settings view opens the file the pool is declared in.
+    fn open_pool_form(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.pool_forms.push(intent.clone());
+        if let Route::Settings(view) = &self.route {
+            view.update(cx, |v, cx| v.open_pool_form(&intent, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// The project's workspaces or machines changed on disk: read the feed
+    /// now, so the sidebar's workspace tree (and the workspace shown, if it
+    /// went) follow without waiting out its timer.
+    fn pool_changed(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.pool_refreshes += 1;
+        }
+        if let Some(feed) = &self._feed {
+            feed.request();
+        }
+        cx.notify();
+    }
+
     /// Whether the workflow editor (or the agent editor) holds the window.
     fn editing_workflow(&self, cx: &App) -> bool {
         matches!(&self.route, Route::Settings(view) if view.read(cx).editing())
@@ -3064,6 +3102,8 @@ impl ShelbiWindow {
                     SettingsEvent::EditWorkflow(name) => this.edit_workflow(name.clone(), window, cx),
                     SettingsEvent::EditAgent(name) => this.edit_agent(name.clone(), window, cx),
                     SettingsEvent::ShowPage(page) => this.show_settings_page(*page, cx),
+                    SettingsEvent::OpenPoolForm(intent) => this.open_pool_form(intent.clone(), window, cx),
+                    SettingsEvent::PoolChanged => this.pool_changed(cx),
                     SettingsEvent::EditorClosed => {
                         // The settings sidebar comes back on the page the
                         // editor closed onto (the agent editor's links go
