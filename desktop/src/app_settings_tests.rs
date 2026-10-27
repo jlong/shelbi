@@ -2932,13 +2932,22 @@ fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
     let home = Home::with_project("ws-intents", "alpha");
     let file = write_pool(&home.root, "alpha", SMALL_POOL);
     let mut s = Settings::open_workspaces(cx);
+    // The workspace intents open their dialogs (Esc closes each).
     s.click("workspaces-new");
+    assert!(s.drawn("workspace-dialog"));
+    s.key("escape");
     s.click("workspace-edit-alpha");
+    assert!(s.drawn("workspace-dialog"));
+    s.key("escape");
     s.click("workspace-row-charlie");
+    s.key("escape");
     s.click("workspace-more-alpha");
     assert!(s.drawn("workspace-menu"));
     s.click("workspace-menu-remove-alpha");
     assert!(!s.drawn("workspace-menu"), "the menu closes");
+    assert!(s.drawn("workspace-remove-prompt"));
+    s.key("escape");
+    assert!(!s.drawn("workspace-dialog-scrim"));
     s.click("machines-add");
     s.key("escape");
     s.click("machine-configure-Build server");
@@ -2954,30 +2963,27 @@ fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
             Intent::ConfigureMachine("Build server".into()),
         ]
     );
-    // Until the workspace forms take theirs, each opens the file the pool
-    // lives in; the machine intents open the machine form.
-    assert_eq!(opened(&file), 4);
-    assert!(s.drawn("workspaces-notice"));
+    // Every intent opens its dialog; none opens the file the pool lives in.
+    assert_eq!(opened(&file), 0);
+    assert!(!s.drawn("workspaces-notice"));
     assert!(s.drawn("machine-form"));
 }
 
 #[gpui::test]
-fn an_edit_shows_on_return_and_refreshes_the_window(cx: &mut TestAppContext) {
+fn a_reread_that_finds_a_change_refreshes_the_window(cx: &mut TestAppContext) {
     let home = Home::with_project("ws-reread", "alpha");
     let file = write_pool(&home.root, "alpha", SMALL_POOL);
     let mut s = Settings::open_workspaces(cx);
-    s.click("workspace-edit-alpha");
-    s.saved();
+    s.load_workspaces();
     assert_eq!(s.read(|w, _| w.pool_refreshes), 0, "nothing changed yet");
     let edited = std::fs::read_to_string(&file).unwrap().replace("tags: [frontend]", "tags: [frontend, web]");
     std::fs::write(&file, edited).unwrap();
-    s.come_back();
+    s.load_workspaces();
     assert_eq!(s.workspace_tags("alpha"), ["frontend", "web"]);
     assert_eq!(s.read(|w, _| w.pool_refreshes), 1, "the window rereads its feed");
 
     // A reread with nothing new doesn't.
-    s.click("workspace-edit-alpha");
-    s.come_back();
+    s.load_workspaces();
     assert_eq!(s.read(|w, _| w.pool_refreshes), 1);
 }
 
@@ -3408,4 +3414,418 @@ fn an_in_repo_project_saves_machines_to_its_local_half(cx: &mut TestAppContext) 
     assert!(std::fs::read_to_string(&local).unwrap().contains("arm box"));
     assert_eq!(std::fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap(), shared, "the committed half is untouched");
     assert!(s.drawn("machine-row-arm box"));
+}
+
+// ---- The workspace dialogs (`dt-workspace-settings-forms`) -------------------
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use shelbi_core::{Machine, Project, WorkspaceSpec};
+use shelbi_orchestrator::pool_admin::{HookWiring, PoolOps, SessionState, WorktreeState};
+
+use crate::views::workspace_dialog::{DialogService, WorkspaceDialog};
+use crate::views::workspace_form_state::{Focus as Ctl, PoolService};
+
+/// The machines as the dialogs' service sees them: which worktrees exist
+/// (by machine and workspace), which workspaces have an active task or work
+/// at risk, and every side effect asked for.
+#[derive(Default)]
+struct FakeOps {
+    present: Mutex<HashSet<(String, String)>>,
+    active: Mutex<HashMap<String, String>>,
+    at_risk: Mutex<HashMap<String, String>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeOps {
+    /// SMALL_POOL's worktrees, all clean.
+    fn small_pool() -> Arc<FakeOps> {
+        let ops = FakeOps::default();
+        for (m, w) in [("This Mac", "alpha"), ("Build server", "charlie")] {
+            ops.present.lock().unwrap().insert((m.into(), w.into()));
+        }
+        Arc::new(ops)
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn call(&self, c: String) {
+        self.calls.lock().unwrap().push(c);
+    }
+}
+
+impl PoolOps for FakeOps {
+    fn check_version(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn active_task(&self, _: &Project, workspace: &str) -> Result<Option<String>, String> {
+        Ok(self.active.lock().unwrap().get(workspace).cloned())
+    }
+    fn open_assignments(&self, _: &Project, workspace: &str) -> Result<Vec<String>, String> {
+        Ok(self.active.lock().unwrap().get(workspace).cloned().into_iter().collect())
+    }
+    fn session(&self, _: &Project, _: &WorkspaceSpec) -> SessionState {
+        SessionState::Dead
+    }
+    fn worktree(&self, machine: &Machine, w: &WorkspaceSpec) -> WorktreeState {
+        if let Some(reason) = self.at_risk.lock().unwrap().get(&w.name) {
+            return WorktreeState::AtRisk(reason.clone());
+        }
+        if self.present.lock().unwrap().contains(&(machine.name.clone(), w.name.clone())) {
+            WorktreeState::Clean
+        } else {
+            WorktreeState::Missing
+        }
+    }
+    fn materialize(&self, _: &Project, machine: &Machine, w: &WorkspaceSpec) -> Result<(), String> {
+        self.call(format!("materialize {} {:?} {}", machine.name, machine.kind, w.name));
+        self.present.lock().unwrap().insert((machine.name.clone(), w.name.clone()));
+        Ok(())
+    }
+    fn wire_hooks(&self, _: &Project, _: &Machine, _: &WorkspaceSpec) -> Result<HookWiring, String> {
+        Ok(HookWiring::Wired)
+    }
+    fn move_worktree(&self, _: &Project, machine: &Machine, from: &WorkspaceSpec, to: &WorkspaceSpec) -> Result<(), String> {
+        self.call(format!("move {} {} {}", machine.name, from.name, to.name));
+        let mut present = self.present.lock().unwrap();
+        present.remove(&(machine.name.clone(), from.name.clone()));
+        present.insert((machine.name.clone(), to.name.clone()));
+        Ok(())
+    }
+    fn remove_worktree(&self, _: &Project, machine: &Machine, w: &WorkspaceSpec) -> Result<(), String> {
+        self.call(format!("remove {} {}", machine.name, w.name));
+        self.present.lock().unwrap().remove(&(machine.name.clone(), w.name.clone()));
+        Ok(())
+    }
+    fn kill_session(&self, _: &Project, w: &WorkspaceSpec) -> Result<(), String> {
+        self.call(format!("kill {}", w.name));
+        Ok(())
+    }
+}
+
+impl Settings {
+    /// Settings ▸ Workspaces over SMALL_POOL, the dialogs' service over
+    /// `ops`.
+    fn open_pool_dialogs(cx: &mut TestAppContext, ops: &Arc<FakeOps>) -> Settings {
+        let service = PoolService::with_ops(ops.clone());
+        cx.update(|cx| cx.set_global(DialogService(service)));
+        Settings::open_workspaces(cx)
+    }
+
+    fn dialog(&self) -> Option<Entity<WorkspaceDialog>> {
+        self.read(|w, _| w.pool_dialog())
+    }
+
+    fn with_dialog<R>(&self, f: impl FnOnce(&WorkspaceDialog, &App) -> R) -> R {
+        let dialog = self.dialog().expect("a dialog is open");
+        self.read(|_, cx| f(dialog.read(cx), cx))
+    }
+
+    fn field(&self, focus: Ctl) -> String {
+        self.with_dialog(|d, cx| d.input(focus).read(cx).value().to_string())
+    }
+
+    /// Replace a dialog field's text by typing, as the user would.
+    fn type_in(&mut self, focus: Ctl, text: &str) {
+        let input = self.with_dialog(|d, _| d.input(focus));
+        self.update(|_, window, cx| {
+            let handle = gpui::Focusable::focus_handle(input.read(cx), cx);
+            window.focus(&handle, cx);
+            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        });
+        self.h.cx.simulate_input(text);
+        self.settle();
+    }
+
+    fn dialog_focus(&self) -> Ctl {
+        self.with_dialog(|d, _| d.form().expect("a form").focus())
+    }
+
+    /// Which page button holds the keyboard.
+    fn page_focus(&mut self) -> Option<String> {
+        let page = self.workspaces();
+        self.h.cx.update(|window, cx| page.read(cx).focused(window))
+    }
+
+    fn declared(&self) -> Vec<WorkspaceSpec> {
+        shelbi_state::load_project("alpha").unwrap().workspaces
+    }
+}
+
+#[gpui::test]
+fn new_workspace_creates_one_through_the_shared_service(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-new", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspaces-new");
+    assert!(s.drawn("workspace-dialog") && s.drawn("workspace-dialog-scrim"));
+    assert_eq!(s.field(Ctl::Name), "bravo", "the first unused name");
+    assert_eq!(s.field(Ctl::Location), "/tmp/my-project/.shelbi/wt/bravo");
+    assert_eq!(s.field(Ctl::Slot), "", "Automatic");
+    assert!(!s.drawn("workspace-dialog-remove"), "no Remove in New");
+    // Name and Machine share the first row; the actions sit at the right.
+    let name = s.bounds("workspace-dialog-name").unwrap();
+    let machine = s.bounds("workspace-dialog-machine").unwrap();
+    assert!((name.top() - machine.top()).abs() < px(1.0) && name.right() < machine.left());
+    let panel = s.bounds("workspace-dialog").unwrap();
+    assert!((panel.size.width - px(600.0)).abs() < px(1.0));
+    let submit = s.bounds("workspace-dialog-submit").unwrap();
+    assert!((panel.right() - submit.right() - px(33.0)).abs() < px(1.5), "bottom right");
+
+    s.type_in(Ctl::Name, "echo");
+    assert_eq!(s.field(Ctl::Location), "/tmp/my-project/.shelbi/wt/echo", "follows the name");
+    // A remote destination: the picker lists the configured machines.
+    s.click("workspace-dialog-machine-button");
+    assert!(s.drawn("workspace-dialog-machines"));
+    s.click("workspace-dialog-machine-Build server");
+    assert!(!s.drawn("workspace-dialog-machines"));
+    assert_eq!(s.field(Ctl::Location), "/home/me/my-project/.shelbi/wt/echo");
+    assert!(s.drawn("workspace-dialog-tags"), "the machine's linux is explained");
+    assert!(s.with_dialog(|d, _| d.form().unwrap().inherited_note().unwrap().contains("linux")));
+    s.type_in(Ctl::Slot, "0");
+    s.click("workspace-dialog-submit");
+    s.saved();
+
+    assert!(s.dialog().is_none(), "closes on success");
+    assert_eq!(ops.calls(), ["materialize Build server Ssh echo"]);
+    let echo = s.declared().into_iter().find(|w| w.name == "echo").expect("declared");
+    assert_eq!((echo.machine.as_str(), echo.slot, echo.tags.len()), ("Build server", Some(0), 0));
+    assert!(s.drawn("workspace-row-echo"), "the page reread the pool");
+    assert_eq!(s.read(|w, _| w.pool_refreshes), 1, "and the sidebar follows");
+    assert_eq!(s.page_focus().as_deref(), Some("new"), "focus back on New workspace");
+}
+
+#[gpui::test]
+fn edit_starts_from_the_row_and_saves_only_its_own_tags(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-edit", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspace-edit-charlie");
+    assert_eq!(s.field(Ctl::Name), "charlie", "the row's own workspace, not a fixture");
+    assert_eq!(s.field(Ctl::Tags), "", "linux is the machine's");
+    assert_eq!(s.field(Ctl::Location), "/home/me/my-project/.shelbi/wt/charlie");
+    assert!(s.drawn("workspace-dialog-remove"));
+    assert!(s.with_dialog(|d, _| !d.form().unwrap().can_submit()), "nothing to save yet");
+    s.type_in(Ctl::Tags, "gpu");
+    s.key("enter");
+    s.saved();
+    assert!(s.dialog().is_none());
+    let charlie = s.declared().into_iter().find(|w| w.name == "charlie").unwrap();
+    assert_eq!(charlie.tags, ["gpu"], "the machine's linux wasn't copied in");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("tags: [linux]"), "nor dropped from the machine");
+    assert!(ops.calls().is_empty(), "tags alone are a config edit");
+    assert_eq!(s.page_focus().as_deref(), Some("edit charlie"));
+}
+
+#[gpui::test]
+fn a_rename_moves_the_worktree_and_focus_follows_the_new_name(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-rename", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspace-edit-alpha");
+    s.type_in(Ctl::Name, "alpha-web");
+    assert_eq!(s.field(Ctl::Location), "/tmp/my-project/.shelbi/wt/alpha-web");
+    assert!(s.with_dialog(|d, _| d.form().unwrap().location_help().starts_with("Saving moves")));
+    s.click("workspace-dialog-submit");
+    s.saved();
+    assert!(s.dialog().is_none());
+    assert_eq!(ops.calls(), ["move This Mac alpha alpha-web"]);
+    assert!(s.declared().iter().any(|w| w.name == "alpha-web"));
+    assert_eq!(s.page_focus().as_deref(), Some("edit alpha-web"));
+}
+
+#[gpui::test]
+fn a_refused_save_keeps_the_dialog_and_every_value(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-refused", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    ops.active.lock().unwrap().insert("charlie".into(), "fix-login".into());
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    let before = std::fs::read_to_string(&file).unwrap();
+    s.click("workspace-edit-charlie");
+    s.type_in(Ctl::Name, "charlie-2");
+    s.type_in(Ctl::Slot, "4");
+    s.click("workspace-dialog-submit");
+    s.saved();
+    assert!(s.dialog().is_some(), "an error doesn't close it");
+    assert!(s.drawn("workspace-dialog-error"));
+    assert!(s.with_dialog(|d, _| d.form().unwrap().errors().general.clone().unwrap().contains("fix-login")));
+    assert_eq!((s.field(Ctl::Name), s.field(Ctl::Slot)), ("charlie-2".into(), "4".into()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing written");
+
+    // A check the form makes itself shows beside its field.
+    s.type_in(Ctl::Name, "alpha");
+    s.click("workspace-dialog-submit");
+    assert!(s.drawn("workspace-dialog-name-error"));
+    assert_eq!(s.dialog_focus(), Ctl::Name);
+
+    // Esc discards the draft and returns focus to the row.
+    s.key("escape");
+    assert!(s.dialog().is_none());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    assert_eq!(s.page_focus().as_deref(), Some("edit charlie"));
+}
+
+#[gpui::test]
+fn a_second_submit_while_one_is_out_sends_nothing(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-once", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspaces-new");
+    let dialog = s.dialog().unwrap();
+    // Two Returns and an Esc before the job has run, then a frame.
+    let window = s.h.window.clone();
+    s.h.cx.update(|window_cx, cx| window.update(cx, |_, cx| {
+        let window = window_cx;
+        dialog.update(cx, |d, cx| {
+            let enter = shelbi_state::keymap::KeyChord::parse("enter").unwrap();
+            d.key(enter, window, cx);
+            assert!(d.running());
+            assert!(d.form().unwrap().busy());
+            d.key(enter, window, cx);
+            let esc = shelbi_state::keymap::KeyChord::parse("esc").unwrap();
+            d.key(esc, window, cx);
+        })
+    }));
+    s.h.cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(s.drawn("workspace-dialog-spinner"), "in-progress feedback");
+    s.saved();
+    assert_eq!(ops.calls(), ["materialize This Mac Local bravo"], "one request");
+    assert!(s.dialog().is_none());
+}
+
+#[gpui::test]
+fn the_dialog_holds_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-modal", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspace-edit-alpha");
+    assert_eq!(s.dialog_focus(), Ctl::Name);
+    let mut order = Vec::new();
+    for _ in 0..8 {
+        s.key("tab");
+        order.push(s.dialog_focus());
+    }
+    assert_eq!(
+        order,
+        [
+            Ctl::Machine,
+            Ctl::Tags,
+            Ctl::Location,
+            Ctl::Slot,
+            Ctl::Remove,
+            Ctl::Cancel,
+            Ctl::Submit,
+            Ctl::Name,
+        ],
+        "Tab never leaves the dialog"
+    );
+    s.key("shift-tab");
+    assert_eq!(s.dialog_focus(), Ctl::Submit);
+    // The settings sidebar's chords wait.
+    s.key("cmd-4");
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces));
+    assert!(s.dialog().is_some());
+    // The machine picker from the keyboard.
+    s.key("tab");
+    s.key("tab");
+    assert_eq!(s.dialog_focus(), Ctl::Machine);
+    s.key("down");
+    assert!(s.drawn("workspace-dialog-machines"));
+    s.key("down");
+    s.key("enter");
+    assert!(!s.drawn("workspace-dialog-machines"));
+    assert!(s.dialog().is_some(), "Return picked; it didn't save");
+    assert_eq!(s.with_dialog(|d, _| d.form().unwrap().machine().to_string()), "Build server");
+    s.key("escape");
+    assert!(s.dialog().is_none());
+    assert_eq!(s.page_focus().as_deref(), Some("edit alpha"));
+    // Esc on the page's button hands the keys back to the settings sidebar.
+    s.key("escape");
+    assert_eq!(s.page_focus(), None);
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces));
+}
+
+#[gpui::test]
+fn removal_confirms_refuses_work_at_risk_then_removes(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-remove", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    ops.at_risk.lock().unwrap().insert("alpha".into(), "2 unpushed commits on jlong/x".into());
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspace-more-alpha");
+    s.click("workspace-menu-remove-alpha");
+    assert!(s.drawn("workspace-remove-prompt"));
+    let body = s.with_dialog(|d, _| d.confirm().unwrap().body());
+    assert!(body.contains("/tmp/my-project/.shelbi/wt/alpha on This Mac"), "{body}");
+    // Return on the default (Cancel) does nothing destructive.
+    s.key("enter");
+    assert!(s.dialog().is_none());
+    assert_eq!(s.page_focus().as_deref(), Some("more alpha"));
+
+    s.click("workspace-more-alpha");
+    s.click("workspace-menu-remove-alpha");
+    s.click("workspace-remove-confirm");
+    s.saved();
+    assert!(s.drawn("workspace-remove-error"), "the refusal shows in the confirmation");
+    assert!(s.with_dialog(|d, _| d.confirm().unwrap().error().unwrap().contains("unpushed")));
+    assert!(s.declared().iter().any(|w| w.name == "alpha"), "nothing forced");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("remove")));
+
+    ops.at_risk.lock().unwrap().clear();
+    s.click("workspace-remove-confirm");
+    s.saved();
+    assert!(s.dialog().is_none());
+    assert_eq!(ops.calls(), ["kill alpha", "remove This Mac alpha"]);
+    assert!(!s.declared().iter().any(|w| w.name == "alpha"));
+    assert!(!s.drawn("workspace-row-alpha") && s.drawn("workspace-row-charlie"));
+    assert_eq!(s.page_focus().as_deref(), Some("edit charlie"), "the next row");
+    assert_eq!(s.read(|w, _| w.pool_refreshes), 1);
+}
+
+#[gpui::test]
+fn edits_remove_workspace_confirms_over_the_form(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-edit-remove", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    s.click("workspace-edit-charlie");
+    s.click("workspace-dialog-remove");
+    assert!(s.drawn("workspace-remove-prompt") && s.drawn("workspace-dialog"));
+    s.click("workspace-remove-cancel");
+    assert!(!s.drawn("workspace-remove-prompt") && s.drawn("workspace-dialog"), "back to the form");
+    s.click("workspace-dialog-remove");
+    s.click("workspace-remove-confirm");
+    s.saved();
+    assert!(s.dialog().is_none());
+    assert!(ops.calls().contains(&"remove Build server charlie".to_string()), "the remote's worktree");
+    assert_eq!(s.page_focus().as_deref(), Some("edit alpha"), "the row before it, the last one gone");
+}
+
+#[gpui::test]
+fn a_project_switch_drops_the_draft_unsaved(cx: &mut TestAppContext) {
+    let home = Home::with_project("wsd-switch", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    crate::views::workflows_state::tests::write_project(&home.root, "beta");
+    let (hub, _feeds) = crate::feeds::tests::canned_hub();
+    cx.update(|cx| cx.set_global(hub));
+    let ops = FakeOps::small_pool();
+    let mut s = Settings::open_pool_dialogs(cx, &ops);
+    let before = std::fs::read_to_string(&file).unwrap();
+    s.click("workspaces-new");
+    s.type_in(Ctl::Name, "golf");
+    s.update(|w, window, cx| w.switch_to("beta", window, cx));
+    s.saved();
+    assert!(s.dialog().is_none(), "the draft went with alpha's settings");
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    assert!(ops.calls().is_empty());
 }

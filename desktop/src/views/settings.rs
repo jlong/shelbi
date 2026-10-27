@@ -47,12 +47,12 @@
 //! details editor ([`AgentEditor`]), which takes the whole view the same
 //! way. The Workspaces page ([`WorkspacesPage`]) lists the project's
 //! workspace pool and its machines; what its buttons ask for goes to the
-//! window ([`SettingsEvent::OpenPoolForm`]), which hands it back here
-//! ([`SettingsView::open_pool_form`]). Add machine and Configure open the
+//! window ([`SettingsEvent::OpenPoolForm`]), which opens the workspace
+//! dialogs itself (`super::workspace_dialog`) and hands Add machine and
+//! Configure back here ([`SettingsView::open_pool_form`]). Those open the
 //! machine form ([`MachineFormView`]), a dialog the window draws over
 //! everything ([`SettingsView::machine_form`]); a save rereads the page,
-//! whose change refreshes the window. The workspace intents open the file
-//! the pool is declared in until their forms take them.
+//! whose change refreshes the window.
 //!
 //! The rows are the Figma form components (`elements::controls`).
 //!
@@ -82,6 +82,7 @@ use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use super::workflow_editor::{EditorEvent, WorkflowEditor};
 use super::workflows::{WorkflowsEvent, WorkflowsPage};
+use super::workspace_form_state::Outcome;
 use super::workspaces::{WorkspacesEvent, WorkspacesPage};
 use super::workspaces_state::Intent;
 use crate::assets::icons;
@@ -424,6 +425,7 @@ impl SettingsView {
             cx.subscribe(&workspaces, |_, _, event: &WorkspacesEvent, cx| match event {
                 WorkspacesEvent::Open(intent) => cx.emit(SettingsEvent::OpenPoolForm(intent.clone())),
                 WorkspacesEvent::Changed => cx.emit(SettingsEvent::PoolChanged),
+                WorkspacesEvent::Leave => cx.emit(SettingsEvent::Leave),
             }),
             cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -564,16 +566,14 @@ impl SettingsView {
     }
 
     /// The Workspaces page's view.
-    #[cfg(any(test, feature = "visual-check"))]
     pub(crate) fn workspaces(&self) -> Entity<WorkspacesPage> {
         self.workspaces.clone()
     }
 
-    /// Open the form `intent` asks for (Settings ▸ Workspaces' buttons, rows
-    /// and menus, through the window): Add machine's empty SSH draft, or
-    /// Configure's over the machine as the page last read it. The workspace
-    /// forms are their own task; until they take theirs, the page opens the
-    /// file the pool is declared in.
+    /// Open the machine form `intent` asks for (Settings ▸ Workspaces' Add
+    /// machine and Configure, through the window): Add machine's empty SSH
+    /// draft, or Configure's over the machine as the page last read it. The
+    /// window opens the workspace dialogs itself.
     pub fn open_pool_form(&mut self, intent: &Intent, window: &mut Window, cx: &mut Context<Self>) {
         let page = self.workspaces.read(cx).state();
         let project = page.project().to_string();
@@ -592,10 +592,8 @@ impl SettingsView {
                 let home = std::env::var_os("HOME").map(PathBuf::from);
                 MachineForm::configure(&project, &row.config, row.workspaces, home.as_deref())
             }
-            Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => {
-                self.workspaces.update(cx, |p, cx| p.edit_in_yaml(intent, window, cx));
-                return;
-            }
+            // The window's workspace dialog (`ShelbiWindow::open_pool_form`).
+            Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => return,
         };
         if self.machine_form.is_some() {
             return;
@@ -637,6 +635,20 @@ impl SettingsView {
             None => cx.emit(SettingsEvent::Leave),
         }
         cx.notify();
+    }
+
+    /// A workspace dialog closed (`done`: what it changed): read the pool
+    /// again after a change, and give the keyboard back to the control that
+    /// opened it.
+    pub fn pool_dialog_closed(&mut self, done: Option<&Outcome>, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspaces.update(cx, |p, cx| {
+            // A test's page reads its throwaway home again only if it read it
+            // before (never the real `~/.shelbi`).
+            if done.is_some() && (!cfg!(test) || p.state().index().is_some()) {
+                p.load(window, cx);
+            }
+            p.restore_focus(done, window, cx);
+        });
     }
 
     /// Open workflow `name` in the editor, over the Workflows page's model

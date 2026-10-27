@@ -30,7 +30,8 @@
 //! settings-workspaces against the Workspaces frame 2523:8879,
 //! settings-machine-add and settings-machine-configure against the Add
 //! machine and Configure machine frames 2526:9557 and 2528:9870, with
-//! `state-machine-*` beside them) and
+//! `state-machine-*` beside them, settings-workspaces-new and -edit against
+//! 2528:9683 and 2526:9184) and
 //! command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
@@ -1293,16 +1294,25 @@ impl Run {
     /// its own sample data; the layout and styling are what compare. Its
     /// states no frame draws (`state-workspaces-*`, checked by eye): the gpu
     /// box unreachable, and a workspace's ⋮ menu.
+    ///
+    /// Then its dialogs (`dt-workspace-settings-forms`): New workspace
+    /// (2528:9683) and Edit workspace over alpha (2526:9184), and, checked by
+    /// eye, New with the Machine picker open and the removal's confirmation.
     fn settings_workspaces(&mut self) {
         use crate::views::settings_nav::SettingsPage;
-        use crate::views::workspaces_state::MachineStatus;
+        use crate::views::workspaces_state::{Intent, MachineStatus};
         let down = shelbi_core::Reachability::Unreachable {
             error: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
         };
-        for (screen, reachability, want, menu) in [
-            ("settings-workspaces", shelbi_core::Reachability::Reachable, "Reachable", false),
-            ("state-workspaces-unreachable", down, "Unreachable", false),
-            ("state-workspaces-menu", shelbi_core::Reachability::Reachable, "Reachable", true),
+        let up = || shelbi_core::Reachability::Reachable;
+        for (screen, reachability, want, menu, dialog) in [
+            ("settings-workspaces", up(), "Reachable", false, None),
+            ("state-workspaces-unreachable", down, "Unreachable", false, None),
+            ("state-workspaces-menu", up(), "Reachable", true, None),
+            ("settings-workspaces-new", up(), "Reachable", false, Some(Intent::NewWorkspace)),
+            ("settings-workspaces-edit", up(), "Reachable", false, Some(Intent::EditWorkspace("alpha".into()))),
+            ("state-workspaces-new-picker", up(), "Reachable", true, Some(Intent::NewWorkspace)),
+            ("state-workspaces-remove", up(), "Reachable", false, Some(Intent::RemoveWorkspace("alpha".into()))),
         ] {
             crate::views::machines::stub_reachability(reachability);
             let handle = self.open();
@@ -1329,8 +1339,15 @@ impl Run {
                 })
             });
             self.expect(&format!("{screen}: five workspaces, the gpu box {want}"), ready);
-            if menu {
-                page.update(&mut self.cx, |p, cx| p.offscreen_open_menu("alpha", cx));
+            match dialog {
+                Some(intent) => {
+                    handle
+                        .update(&mut self.cx, |w, window, cx| w.offscreen_open_pool_form(intent, menu, window, cx))
+                        .unwrap();
+                    self.settle(handle);
+                }
+                None if menu => page.update(&mut self.cx, |p, cx| p.offscreen_open_menu("alpha", cx)),
+                None => {}
             }
             self.save(handle, screen);
         }
