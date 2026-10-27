@@ -2940,6 +2940,7 @@ fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
     s.click("workspace-menu-remove-alpha");
     assert!(!s.drawn("workspace-menu"), "the menu closes");
     s.click("machines-add");
+    s.key("escape");
     s.click("machine-configure-Build server");
     s.saved();
     assert_eq!(
@@ -2953,9 +2954,11 @@ fn the_buttons_ask_the_window_for_their_forms(cx: &mut TestAppContext) {
             Intent::ConfigureMachine("Build server".into()),
         ]
     );
-    // Until the forms take them, each opens the file the pool lives in.
-    assert_eq!(opened(&file), 6);
+    // Until the workspace forms take theirs, each opens the file the pool
+    // lives in; the machine intents open the machine form.
+    assert_eq!(opened(&file), 4);
     assert!(s.drawn("workspaces-notice"));
+    assert!(s.drawn("machine-form"));
 }
 
 #[gpui::test]
@@ -3052,4 +3055,357 @@ fn a_long_name_and_path_clip_inside_their_column(cx: &mut TestAppContext) {
     let row: &'static str = Box::leak(format!("workspace-row-{long}").into_boxed_str());
     let table = s.bounds("workspaces-table").unwrap();
     assert!(s.bounds(row).unwrap().right() <= table.right());
+}
+
+// ---- Add machine / Configure machine (`dt-machine-settings-forms`) ---------
+
+use crate::views::machine_form::tests::{recording_readiness, save_with, QuietOps};
+use crate::views::machine_form::{Engine as MachineEngine, MachineFormView};
+use crate::views::machine_form_state::{Check, CheckOutcome, Field as MachineField, ReadinessIntent};
+
+impl Settings {
+    /// Settings ▸ Workspaces over `pool`, the machine form saving through
+    /// the shared service over `ops`.
+    fn open_machines(cx: &mut TestAppContext, ops: QuietOps) -> Settings {
+        cx.update(|cx| {
+            cx.set_global(MachineEngine {
+                save: save_with(ops),
+                readiness: recording_readiness(CheckOutcome::Reachable).0,
+            })
+        });
+        Settings::open_workspaces(cx)
+    }
+
+    fn machine_form(&self) -> Option<Entity<MachineFormView>> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).machine_form(),
+            _ => None,
+        })
+    }
+
+    fn form(&self) -> Entity<MachineFormView> {
+        self.machine_form().expect("the machine form is open")
+    }
+
+    fn form_text(&self, field: MachineField) -> String {
+        let form = self.form();
+        self.read(|_, cx| form.read(cx).input(field).read(cx).value().to_string())
+    }
+
+    fn type_in_form(&mut self, field: MachineField, text: &str) {
+        let input = {
+            let form = self.form();
+            self.read(|_, cx| form.read(cx).input(field).clone())
+        };
+        self.type_into(input, text);
+    }
+
+    fn form_focused(&mut self, field: MachineField) -> bool {
+        let form = self.form();
+        let handle = self.read(|_, cx| gpui::Focusable::focus_handle(form.read(cx).input(field).read(cx), cx));
+        self.h.cx.update(|window, _| handle.is_focused(window))
+    }
+
+    fn machine_names(&self) -> Vec<String> {
+        let page = self.workspaces();
+        self.read(|_, cx| match page.read(cx).state().load() {
+            Load::Loaded(index) => index.machines.iter().map(|m| m.name.clone()).collect(),
+            _ => Vec::new(),
+        })
+    }
+}
+
+#[gpui::test]
+fn add_machine_saves_a_validated_ssh_draft(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-add", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    assert!(s.drawn("machine-form-layer") && s.drawn("machine-form"));
+    assert!(s.drawn("machine-host") && s.drawn("machine-check"), "an SSH draft");
+    for field in [MachineField::Name, MachineField::Host, MachineField::WorkDir, MachineField::Tags] {
+        assert_eq!(s.form_text(field), "", "no sample values");
+    }
+    assert!(s.form_focused(MachineField::Name), "the keyboard starts on Name");
+    assert_eq!(s.pool_forms(), [Intent::AddMachine]);
+    assert_eq!(opened(&file), 0, "no YAML file opened");
+
+    s.type_in_form(MachineField::Name, "GPU box");
+    s.type_in_form(MachineField::Host, "gpu-alias");
+    s.type_in_form(MachineField::WorkDir, "/srv/my project");
+    s.type_in_form(MachineField::Tags, "gpu, linux");
+    let refreshes = s.read(|w, _| w.pool_refreshes);
+    s.click("machine-submit");
+    s.saved();
+
+    assert!(s.machine_form().is_none(), "the form closed");
+    let p = shelbi_state::load_project("alpha").unwrap();
+    let m = p.machine("GPU box").expect("declared");
+    assert_eq!(m.kind, shelbi_core::MachineKind::Ssh);
+    assert_eq!(m.host.as_deref(), Some("gpu-alias"), "an SSH config alias, as typed");
+    assert_eq!(m.work_dir, std::path::PathBuf::from("/srv/my project"));
+    assert_eq!(m.tags, ["gpu", "linux"]);
+    assert_eq!(s.machine_names(), ["This Mac", "Build server", "GPU box"], "the page reread");
+    assert!(s.drawn("machine-row-GPU box"));
+    assert_eq!(s.read(|w, _| w.pool_refreshes), refreshes + 1, "the sidebar follows");
+    assert!(s.window_focused(), "the keys go back where they were");
+}
+
+#[gpui::test]
+fn configure_opens_the_machines_values_and_saves_its_tags_for_its_workspaces(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-configure", "alpha");
+    let file = write_pool(
+        &home.root,
+        "alpha",
+        &SMALL_POOL.replace("    tags: [linux]\n", "    tags: [linux]\n    forward: tcp # pinned by hand\n"),
+    );
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machine-configure-Build server");
+    assert_eq!(s.form_text(MachineField::Name), "Build server");
+    assert_eq!(s.form_text(MachineField::Host), "build-server");
+    assert_eq!(s.form_text(MachineField::WorkDir), "/home/me/my-project");
+    assert_eq!(s.form_text(MachineField::Tags), "linux");
+    let description = s.read(|_, cx| s.form().read(cx).state().description());
+    assert_eq!(description, "Build server runs 1 workspace for this project.");
+
+    s.type_in_form(MachineField::Tags, "linux, gpu");
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.machine_form().is_none());
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("forward: tcp # pinned by hand"), "the field the form doesn't own survives:\n{text}");
+    let p = shelbi_state::load_project("alpha").unwrap();
+    assert_eq!(p.machine("Build server").unwrap().forward, Some(shelbi_core::ForwardMode::Tcp));
+    assert_eq!(s.workspace_tags("charlie"), ["gpu", "linux"], "charlie inherits the new tag");
+}
+
+#[gpui::test]
+fn this_macs_form_has_no_ssh_and_chooses_its_folder(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-local", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machine-configure-This Mac");
+    assert!(s.drawn("machine-name") && s.drawn("machine-work-dir") && s.drawn("machine-browse"));
+    assert!(!s.drawn("machine-host") && !s.drawn("machine-check"), "nothing SSH");
+    assert_eq!(s.form_text(MachineField::WorkDir), "/tmp/my-project");
+    let form = s.form();
+    let picked = std::env::temp_dir().join("My Projects").join("app");
+    s.update(|_, window, cx| form.update(cx, |f, cx| f.folder_picked(Some(&picked), window, cx)));
+    s.settle();
+    s.click("machine-submit");
+    s.saved();
+    let p = shelbi_state::load_project("alpha").unwrap();
+    let m = p.machine("This Mac").unwrap();
+    assert_eq!((m.kind, m.work_dir.clone()), (shelbi_core::MachineKind::Local, picked), "still local");
+}
+
+#[gpui::test]
+fn a_local_tilde_expands_here_and_a_remote_one_is_refused(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-tilde", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "box");
+    s.type_in_form(MachineField::WorkDir, "~/my project");
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.machine_form().is_some(), "the draft stays");
+    assert!(s.drawn("machine-work-dir-error"), "never expanded against this Mac's home");
+    assert_eq!(s.form_text(MachineField::WorkDir), "~/my project");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing written");
+    s.key("escape");
+
+    s.click("machine-configure-This Mac");
+    s.type_in_form(MachineField::WorkDir, "~/my project");
+    s.click("machine-submit");
+    s.saved();
+    let home_dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let p = shelbi_state::load_project("alpha").unwrap();
+    assert_eq!(p.machine("This Mac").unwrap().work_dir, home_dir.join("my project"));
+}
+
+#[gpui::test]
+fn a_duplicate_name_keeps_the_draft_with_its_error(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-dup", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "build server");
+    s.type_in_form(MachineField::Host, "other-host");
+    s.type_in_form(MachineField::WorkDir, "/srv/p");
+    s.key("enter");
+    s.saved();
+    assert!(s.drawn("machine-name-error"), "on the field");
+    assert!(s.form_focused(MachineField::Name), "the keyboard goes to it");
+    assert_eq!(s.form_text(MachineField::Host), "other-host", "the draft stays");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    s.type_in_form(MachineField::Name, "build server 2");
+    assert!(!s.drawn("machine-name-error"), "editing clears it");
+}
+
+#[gpui::test]
+fn moving_a_machine_with_an_active_workspace_is_refused(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-unsafe", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let ops = QuietOps {
+        active: Some(("charlie".into(), "t-1".into())),
+        ..QuietOps::default()
+    };
+    let mut s = Settings::open_machines(cx, ops);
+    s.click("machine-configure-Build server");
+    s.type_in_form(MachineField::WorkDir, "/srv/elsewhere");
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.drawn("machine-form-error"), "why, over the actions");
+    assert_eq!(s.form_text(MachineField::WorkDir), "/srv/elsewhere");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "no workspace orphaned");
+
+    // Its rename alone is safe: its workspaces follow it.
+    s.type_in_form(MachineField::WorkDir, "/home/me/my-project");
+    s.type_in_form(MachineField::Name, "Builder");
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.machine_form().is_none());
+    let p = shelbi_state::load_project("alpha").unwrap();
+    assert_eq!(p.workspace("charlie").unwrap().machine, "Builder");
+}
+
+#[gpui::test]
+fn a_change_made_elsewhere_meanwhile_is_a_conflict(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-conflict", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machine-configure-Build server");
+    let elsewhere = std::fs::read_to_string(&file).unwrap().replace("tags: [linux]", "tags: [linux, arm]");
+    std::fs::write(&file, &elsewhere).unwrap();
+    s.type_in_form(MachineField::Tags, "x86");
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.drawn("machine-form-error"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), elsewhere, "the other edit isn't overwritten");
+    assert_eq!(s.form_text(MachineField::Tags), "x86");
+}
+
+#[gpui::test]
+fn cancel_and_escape_discard_the_draft(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-cancel", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "box");
+    s.key("escape");
+    assert!(s.machine_form().is_none());
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces), "Esc closed only the form");
+    assert!(s.window_focused());
+    s.click("machine-configure-Build server");
+    s.type_in_form(MachineField::Tags, "zzz");
+    s.click("machine-cancel");
+    assert!(s.machine_form().is_none());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+    // A fresh form doesn't remember the discarded draft.
+    s.click("machines-add");
+    assert_eq!(s.form_text(MachineField::Name), "");
+}
+
+#[gpui::test]
+fn the_keyboard_moves_through_the_form(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-keys", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    s.key("tab");
+    assert!(s.form_focused(MachineField::Host));
+    s.key("tab");
+    assert!(s.form_focused(MachineField::WorkDir));
+    s.key("shift-tab");
+    s.key("shift-tab");
+    assert!(s.form_focused(MachineField::Name));
+    s.key("cmd-4");
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces), "the sidebar's chords wait for the form");
+    assert!(s.machine_form().is_some());
+}
+
+#[gpui::test]
+fn a_connection_check_writes_nothing_and_goes_stale_with_the_host(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-check", "alpha");
+    let file = write_pool(&home.root, "alpha", SMALL_POOL);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let (readiness, seen) = recording_readiness(CheckOutcome::NeedsCli {
+        message: "shelbi isn’t installed on build-server".into(),
+    });
+    cx.update(|cx| {
+        cx.set_global(MachineEngine {
+            save: save_with(QuietOps::default()),
+            readiness,
+        })
+    });
+    let mut s = Settings::open_workspaces(cx);
+    s.click("machine-configure-Build server");
+    let check = |s: &Settings| s.read(|_, cx| s.form().read(cx).state().check().clone());
+    assert_eq!(check(&s), Check::NotChecked, "never the successful fixture");
+    assert!(!s.drawn("machine-install-cli"));
+    s.click("machine-test");
+    s.saved();
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].intent, ReadinessIntent::Test);
+    assert_eq!(requests[0].target.host, "build-server");
+    assert_eq!(requests[0].target.machine.as_deref(), Some("Build server"));
+    assert!(s.drawn("machine-install-cli"), "the check asks for the CLI");
+    s.click("machine-install-cli");
+    s.saved();
+    assert_eq!(seen.lock().unwrap()[1].intent, ReadinessIntent::InstallCli);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "checks never touch the config");
+
+    s.type_in_form(MachineField::Host, "build-2");
+    assert_eq!(check(&s), Check::NotChecked, "a new host isn't checked");
+    assert!(!s.drawn("machine-install-cli"));
+}
+
+#[gpui::test]
+fn switching_projects_closes_the_form(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-switch", "alpha");
+    write_pool(&home.root, "alpha", SMALL_POOL);
+    crate::views::workflows_state::tests::write_project(&home.root, "beta");
+    let (hub, _feeds) = crate::feeds::tests::canned_hub();
+    cx.update(|cx| cx.set_global(hub));
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "box");
+    s.update(|w, window, cx| w.switch_to("beta", window, cx));
+    s.saved();
+    assert!(s.machine_form().is_none(), "alpha's draft went with its page");
+    assert!(!s.drawn("machine-form-layer"));
+    let beta = shelbi_state::load_project("beta").unwrap();
+    assert!(beta.machine("box").is_none());
+}
+
+#[gpui::test]
+fn an_in_repo_project_saves_machines_to_its_local_half(cx: &mut TestAppContext) {
+    let home = Home::with_project("mf-in-repo", "alpha");
+    let projects = home.root.join("projects");
+    let repo = home.root.join("repo");
+    std::fs::create_dir_all(repo.join(".shelbi")).unwrap();
+    let shared = "name: My project\ndefault_branch: main\ndefault_workflow: task\norchestrator:\n  runner: claude\n\
+                  agent_runners:\n  claude:\n    command: claude\n    flags: []\n";
+    std::fs::write(repo.join(".shelbi/project.yaml"), shared).unwrap();
+    let local = projects.join("alpha").join("local.yaml");
+    std::fs::write(&local, format!("repo: {}\n{SMALL_POOL}", repo.display())).unwrap();
+    std::fs::remove_file(projects.join("alpha.yaml")).unwrap();
+    let mut s = Settings::open_machines(cx, QuietOps::default());
+    s.click("machines-add");
+    s.type_in_form(MachineField::Name, "arm box");
+    s.type_in_form(MachineField::Host, "arm");
+    s.type_in_form(MachineField::WorkDir, "/srv/p");
+    s.click("machine-submit");
+    s.saved();
+    assert!(s.machine_form().is_none());
+    assert!(std::fs::read_to_string(&local).unwrap().contains("arm box"));
+    assert_eq!(std::fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap(), shared, "the committed half is untouched");
+    assert!(s.drawn("machine-row-arm box"));
 }

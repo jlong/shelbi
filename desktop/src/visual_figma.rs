@@ -27,7 +27,10 @@
 //! `workflows/4-workflow-form.png` in the frame's 1440x1283 window,
 //! settings-agents against `agents/1-agents-index.png`,
 //! settings-agent-details against `agents/2-agent-details.png`,
-//! settings-workspaces against the Workspaces frame 2523:8879) and
+//! settings-workspaces against the Workspaces frame 2523:8879,
+//! settings-machine-add and settings-machine-configure against the Add
+//! machine and Configure machine frames 2526:9557 and 2528:9870, with
+//! `state-machine-*` beside them) and
 //! command-palette, plus the
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
@@ -60,7 +63,8 @@
 //! `about-<theme>.png` and `bundled-software-<theme>.png` are About Shelbi
 //! and Acknowledgements at their frames' sizes (with `state-bundled-*`);
 //! `SHELBI_VISUAL_ONLY=about` renders just those;
-//! `SHELBI_VISUAL_ONLY=workspaces` renders just Settings ▸ Workspaces.
+//! `SHELBI_VISUAL_ONLY=workspaces` renders just Settings ▸ Workspaces and its
+//! machine dialogs.
 //! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02,
 //! 03 (`add-project-writing-config`, `-creating-agents`,
 //! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
@@ -1331,6 +1335,87 @@ impl Run {
             self.save(handle, screen);
         }
         crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
+        self.machine_forms();
+    }
+
+    /// Settings ▸ Workspaces' machine dialogs over the page: Add machine
+    /// (Figma 2526:9557) with the frame's sample values typed, and Configure
+    /// machine on the gpu box (2528:9870), each with a passing readiness
+    /// check landed so the region draws as the frames do. Their states no
+    /// frame draws (`state-machine-*`, checked by eye): a fresh Add machine
+    /// (not checked yet), this Mac's form (no SSH), a check that failed, and
+    /// one asking for the CLI.
+    fn machine_forms(&mut self) {
+        use crate::views::machine_form_state::{CheckOutcome, Field};
+        use crate::views::settings_nav::SettingsPage;
+        use crate::views::workspaces_state::Intent;
+        let ready = || {
+            Some(CheckOutcome::Ready {
+                detail: "Shelbi, Git, and project directory are ready.".into(),
+            })
+        };
+        let typed: &[(Field, &str)] = &[
+            (Field::Name, "Linux workstation"),
+            (Field::Host, "linux-workstation"),
+            (Field::WorkDir, "/home/me/my-project"),
+            (Field::Tags, "linux, gpu"),
+        ];
+        // A shot: its name, the form, what's typed, the check landed.
+        type Shot<'a> = (&'a str, Intent, &'a [(Field, &'a str)], Option<CheckOutcome>);
+        let shots: Vec<Shot> = vec![
+            ("settings-machine-add", Intent::AddMachine, typed, ready()),
+            ("settings-machine-configure", Intent::ConfigureMachine("gpu".into()), &[], ready()),
+            ("state-machine-add-empty", Intent::AddMachine, &[], None),
+            ("state-machine-configure-local", Intent::ConfigureMachine("hub".into()), &[], None),
+            (
+                "state-machine-check-failed",
+                Intent::ConfigureMachine("gpu".into()),
+                &[],
+                Some(CheckOutcome::Failed {
+                    message: "ssh: connect to host gpu.lan port 22: Operation timed out".into(),
+                }),
+            ),
+            (
+                "state-machine-needs-cli",
+                Intent::ConfigureMachine("gpu".into()),
+                &[],
+                Some(CheckOutcome::NeedsCli {
+                    message: "gpu.lan has no Shelbi CLI, or an older one than this app.".into(),
+                }),
+            ),
+        ];
+        for (screen, intent, typed, outcome) in shots {
+            let handle = self.open();
+            handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.offscreen_open_settings(SettingsPage::Workspaces, window, cx)
+                })
+                .unwrap();
+            let settings = handle
+                .update(&mut self.cx, |w, _, _| w.offscreen_settings())
+                .unwrap()
+                .expect("Settings is open");
+            let page = settings.read_with(&self.cx, |v, _| v.workspaces());
+            let loaded = self.wait(handle, Duration::from_secs(10), |cx| {
+                page.read_with(cx, |p, _| p.state().index().is_some_and(|i| i.machines.len() == 2))
+            });
+            self.expect(&format!("{screen}: the pool loaded"), loaded);
+            handle
+                .update(&mut self.cx, |_, window, cx| {
+                    settings.update(cx, |v, cx| v.open_pool_form(&intent, window, cx));
+                    let form = settings.read(cx).machine_form().expect("the machine form opened");
+                    form.update(cx, |f, cx| {
+                        for (field, text) in typed {
+                            f.type_into(*field, text, window, cx);
+                        }
+                        if let Some(outcome) = outcome.clone() {
+                            f.offscreen_check(outcome, cx);
+                        }
+                    });
+                })
+                .unwrap();
+            self.save(handle, screen);
+        }
     }
 
     /// The agent details editor (the Agent Details frame, 2405:6965,

@@ -22,10 +22,10 @@
 //! holding up the page.
 //!
 //! The buttons, rows and menu items ask for a form ([`WorkspacesEvent::Open`]
-//! with an [`Intent`]); the workspace and machine forms are their own tasks.
-//! Until one handles an intent the settings view sends it to
-//! [`WorkspacesPage::edit_in_yaml`], which opens the file the pool is
-//! declared in. A reread that finds the pool changed tells the window
+//! with an [`Intent`]). Add machine and Configure open the machine form
+//! (`super::machine_form`); until the workspace forms handle theirs the
+//! settings view sends them to [`WorkspacesPage::edit_in_yaml`], which opens
+//! the file the pool is declared in. A reread that finds the pool changed tells the window
 //! ([`WorkspacesEvent::Changed`]) so its sidebar refreshes too.
 
 use std::time::Duration;
@@ -144,13 +144,12 @@ impl WorkspacesPage {
     }
 
     /// The page's state.
-    #[cfg(any(test, feature = "visual-check"))]
     pub fn state(&self) -> &WorkspacesState {
         &self.state
     }
 
-    /// The page's state, for a test to fold probe results into.
-    #[cfg(test)]
+    /// The page's state: a test folds probe results into it, and a form
+    /// that can't open says why on it.
     pub fn state_mut(&mut self) -> &mut WorkspacesState {
         &mut self.state
     }
@@ -215,7 +214,7 @@ impl WorkspacesPage {
         cx.notify();
     }
 
-    /// Handle `intent` until its form does: open the file the pool is
+    /// Handle a workspace `intent` until its form does: open the file the pool is
     /// declared in, in the user's editor, and read it again when the window
     /// is back in front.
     pub fn edit_in_yaml(&mut self, intent: &Intent, window: &mut Window, cx: &mut Context<Self>) {
