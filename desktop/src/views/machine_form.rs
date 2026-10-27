@@ -597,7 +597,7 @@ impl MachineFormView {
     pub fn folder_picked(&mut self, path: Option<&Path>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = path {
             let home = std::env::var_os("HOME").map(PathBuf::from);
-            let text = super::workspaces_state::tilde(path, home.as_deref());
+            let text = shelbi_app::settings::workspaces::tilde(path, home.as_deref());
             self.work_dir.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
             self.state.set(Field::WorkDir, &text);
             self.state.set_focus(Focus::Field(Field::WorkDir));

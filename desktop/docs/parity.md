@@ -157,6 +157,22 @@ paths on every `cargo test`.
   the TUI has a details editor (`tui-agent-editor`). The desktop's ⋮ menu is
   the TUI's `m` (and the row's `⋮`); its table stacks under 72 columns. See
   [`status/tui-settings-agents.md`](status/tui-settings-agents.md).
+- **Settings ▸ Workspaces** (`tui-settings-workspaces`): both clients show
+  the same rows (`shelbi_app::settings::workspaces`: each workspace's name,
+  derived worktree, machine and Local or SSH, own and inherited tags, and
+  effective slot; each machine's host or Local, root directory, workspace
+  count and SSH-only reachability) and run the same New / Edit workspace
+  form and removal confirmation (`shelbi_app::settings::workspace_form`)
+  through the same service (`pool_admin::workspace_service`). The desktop
+  draws the forms as a 600pt dialog over the window with a toolkit text
+  input; the TUI draws them as a modal box over the main area and edits each
+  field at its end (type, Backspace, Ctrl+U), and adds `n` / `e` / `d` on the
+  page. The TUI says the automatic slot rule in full under the field
+  (`SLOT_AUTOMATIC_HELP`); the desktop shows its number in the placeholder
+  only. Add machine and Configure open the machine dialog in the desktop and
+  the pool file in the editor in the TUI, which says so (the TUI's machine
+  form is its own task). See
+  [`status/tui-settings-workspaces.md`](status/tui-settings-workspaces.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

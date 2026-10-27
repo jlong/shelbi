@@ -156,6 +156,8 @@ serde_json = "1"
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 # Issue fixtures in the board tests carry timestamps.
 chrono = "0.4"
+# Settings ▸ Workspaces' tests build their pools from the shared fixtures.
+shelbi-app = { path = "../crates/shelbi-app", features = ["test-support"] }
 
 [profile.release]
 lto = "thin"

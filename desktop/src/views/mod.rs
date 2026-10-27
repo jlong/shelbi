@@ -38,9 +38,10 @@
 //!   `workflow_graph`'s layout and `workflow_builder_state`)
 //! - Settings ▸ Workspaces, the pool and its machines as configuration:
 //!   **`dt-workspace-settings-index`** (`workspaces`, over
-//!   `workspaces_state`); its New / Edit workspace dialogs and the removal
-//!   confirmation: **`dt-workspace-settings-forms`** (`workspace_dialog`,
-//!   over `workspace_form_state`)
+//!   `shelbi_app::settings::workspaces`); its New / Edit workspace dialogs
+//!   and the removal confirmation: **`dt-workspace-settings-forms`**
+//!   (`workspace_dialog`, over `shelbi_app::settings::workspace_form`; both
+//!   states shared with the TUI since `tui-settings-workspaces`)
 //!
 //! - bootstrap progress, failure screens, and the relaunch bar:
 //!   **`dt-platform-bootstrap`** (`bootstrap`)
@@ -99,9 +100,7 @@ pub mod update;
 pub mod workflows;
 pub mod workflows_state;
 pub mod workspace_dialog;
-pub mod workspace_form_state;
 pub mod workspaces;
-pub mod workspaces_state;
 pub mod workflow_editor;
 pub mod workflow_editor_state;
 mod workflow_builder;

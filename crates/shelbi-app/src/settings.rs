@@ -29,6 +29,9 @@
 //!   status catalog, the edits it saves as they're made, and their guards).
 //! - [`keybindings`]: the Keybindings page's bindings editor.
 //! - [`agents`]: the Agents page's state (its rows, guards, and saves).
+//! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
+//!   its machines and their reachability) and its New / Edit / Remove
+//!   workspace forms, over the shared pool service.
 
 pub mod agents;
 pub mod general;
@@ -36,6 +39,8 @@ pub mod keybindings;
 pub mod summary;
 pub mod terminal_preview;
 pub mod workflows;
+pub mod workspace_form;
+pub mod workspaces;
 
 /// A page of Settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

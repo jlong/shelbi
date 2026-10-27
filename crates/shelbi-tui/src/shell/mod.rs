@@ -79,8 +79,12 @@ use overlays::{ActiveOverlay, OverlayEvent};
 use refresh::ShellSnapshot;
 use review::{ReviewAction, ReviewInterface};
 use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
+use settings::workspaces::PoolReader;
 use settings::{SettingsAction, SettingsShell};
 use shelbi_app::settings::keybindings::Change as KeysChange;
+use shelbi_app::settings::workspace_form::{Outcome as PoolOutcome, PoolService};
+use shelbi_app::settings::workspaces::PoolIndex;
+use shelbi_core::pool::PoolError;
 use shelbi_app::settings::summary::GeneralSummary;
 use shelbi_app::settings::workflows::Committed;
 use shelbi_app::settings::Ticket;
@@ -118,6 +122,10 @@ enum SettingsMsg {
     AgentsLoaded(u64, Ticket, Box<Result<shelbi_state::agents_config::AgentsConfig, String>>),
     /// The Agents page `id`'s save.
     AgentsCommitted(u64, Box<shelbi_app::settings::agents::Committed>),
+    /// The Workspaces page's read of a project's pool.
+    PoolLoaded(Ticket, Result<PoolIndex, String>),
+    /// A workspace request (create, save, remove) finished.
+    PoolDone(Ticket, Box<Result<PoolOutcome, PoolError>>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -1191,6 +1199,16 @@ struct ShellState {
     /// Reads Settings ▸ Agents' model (disk; in tests only a test's own
     /// `SHELBI_HOME`).
     agents_reader: AgentsReader,
+    /// Reads Settings ▸ Workspaces' pool (disk in production; a fixture in
+    /// tests).
+    pool_reader: PoolReader,
+    /// The shared workspace operations the Workspaces forms run
+    /// (`pool_admin`'s in production; a test scripts them).
+    pool_service: PoolService,
+    /// How many refreshes were asked for (a test checks a committed pool
+    /// change refreshes the sidebar).
+    #[cfg(test)]
+    refresh_requests: std::cell::Cell<usize>,
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
@@ -1312,6 +1330,14 @@ impl ShellState {
             }
             shelbi_state::agents_config::AgentsConfig::load(project).map_err(|e| e.to_string())
         });
+        #[cfg(not(test))]
+        let (pool_reader, pool_service): (PoolReader, PoolService) = (
+            Arc::new(shelbi_app::settings::workspaces::read),
+            shelbi_orchestrator::pool_admin::workspace_service(),
+        );
+        #[cfg(test)]
+        let (pool_reader, pool_service): (PoolReader, PoolService) =
+            (Arc::new(settings::fixture_pool), settings::unavailable_pool_service());
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1371,6 +1397,10 @@ impl ShellState {
             workflows_reader,
             keys_store,
             agents_reader,
+            pool_reader,
+            pool_service,
+            #[cfg(test)]
+            refresh_requests: std::cell::Cell::new(0),
             status: None,
             job: None,
             pending_editor: None,
@@ -1663,6 +1693,8 @@ impl ShellState {
     /// Ask the current project's refreshers (the core snapshot and the activity
     /// feed) for fresh data. No-op before the workers are started.
     fn request_refresh(&self) {
+        #[cfg(test)]
+        self.refresh_requests.set(self.refresh_requests.get() + 1);
         if let Some(w) = self.workers.as_ref() {
             w.refresher.request();
             w.activity_refresher.request();
@@ -2230,6 +2262,14 @@ impl ShellState {
                         let _ = tx.send(SettingsMsg::AgentsLoaded(id, sent, Box::new(config)));
                     })
             }
+            settings::Load::Workspaces(sent, project) => {
+                let reader = self.pool_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings-pool".into())
+                    .spawn(move || {
+                        let _ = tx.send(SettingsMsg::PoolLoaded(sent, reader(&project)));
+                    })
+            }
         };
         if let Err(e) = spawned {
             let why = format!("couldn't start the read: {e}");
@@ -2246,6 +2286,9 @@ impl ShellState {
                 }
                 settings::Load::Agents { id, ticket, .. } => {
                     self.settings.agents_loaded(id, &ticket, Err(why));
+                }
+                settings::Load::Workspaces(ticket, _) => {
+                    self.settings.pool_loaded(&ticket, Err(why));
                 }
             }
         }
@@ -2265,6 +2308,47 @@ impl ShellState {
             });
         if let Err(e) = spawned {
             self.status = Some(format!("couldn't start the save: {e}"));
+        }
+    }
+
+    /// Run a Workspaces request (create, save, remove) off the UI thread
+    /// through the shared service; the result comes back under `ticket`.
+    fn run_pool(&mut self, ticket: Ticket, job: Box<shelbi_app::settings::workspace_form::Job>) {
+        let service = self.pool_service.clone();
+        let tx = self.settings_tx.clone();
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-pool-run".into())
+            .spawn(move || {
+                let result = service.run(&job);
+                let _ = tx.send(SettingsMsg::PoolDone(sent, Box::new(result)));
+            });
+        if let Err(e) = spawned {
+            let landed = self.settings.pool_finished(
+                &ticket,
+                Err(PoolError::Provisioning(format!("couldn't start the request: {e}"))),
+            );
+            self.pool_landed(landed);
+        }
+    }
+
+    /// A Workspaces request committed a change (or not): refresh what shows
+    /// the project's pool when it's the shown project (the page, the
+    /// sidebar's tree and the machines view, which the refresher rereads from
+    /// the config; dispatch and routing read it on every use). A change to
+    /// another project reads again when that project is next shown.
+    fn pool_landed(&mut self, landed: settings::workspaces::Landed) {
+        let Some(project) = landed.committed else {
+            return;
+        };
+        if self.client.project() == Some(project.as_str()) {
+            self.request_refresh();
+            // The Workspaces page reads again now when it's shown, else when
+            // it next is.
+            self.settings.pool_stale();
+            if self.settings_open() {
+                self.load_settings(false);
+            }
         }
     }
 
@@ -2455,6 +2539,23 @@ impl ShellState {
                     }
                     self.apply_settings_action(action);
                 }
+                SettingsMsg::PoolLoaded(ticket, read) => {
+                    // An edit made elsewhere: the sidebar follows the page.
+                    if self.settings.pool_loaded(&ticket, read) {
+                        self.request_refresh();
+                    }
+                }
+                SettingsMsg::PoolDone(ticket, result) => {
+                    let landed = self.settings.pool_finished(&ticket, *result);
+                    self.pool_landed(landed);
+                }
+            }
+        }
+        if self.settings_open() {
+            let (probed, due) = self.settings.tick(Instant::now());
+            landed |= probed;
+            if due {
+                self.load_settings(true);
             }
         }
         // A theme config.yaml now holds (read on entering Settings or after
@@ -2504,6 +2605,7 @@ impl ShellState {
             SettingsAction::ApplyKeymaps => self.apply_keymaps(),
                         SettingsAction::CommitAgents(job) => self.commit_agents(*job),
             SettingsAction::Status(text) => self.status = Some(text),
+            SettingsAction::RunPool(ticket, job) => self.run_pool(ticket, job),
         }
         self.dirty = true;
     }
@@ -8645,5 +8747,407 @@ mod tests {
             shelbi_app::settings::agents::fixture::PREAMBLE,
             "beta's own preamble"
         );
+    }
+
+    // --- Settings ▸ Workspaces (tui-settings-workspaces), end to end --------
+
+    /// A scripted [`pool_admin::PoolOps`]: worktrees are a set keyed by
+    /// (machine, workspace) that materialize / move / remove update, and
+    /// every call is recorded. The config is real: `pool_admin` reads and
+    /// writes it under the test's `SHELBI_HOME`.
+    #[derive(Default)]
+    struct FakeOps {
+        calls: Mutex<Vec<String>>,
+        present: Mutex<std::collections::HashSet<(String, String)>>,
+        active: Mutex<HashMap<String, String>>,
+        hooks_merge: Mutex<bool>,
+    }
+
+    impl FakeOps {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl shelbi_orchestrator::pool_admin::PoolOps for FakeOps {
+        fn check_version(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn active_task(&self, _: &shelbi_core::Project, ws: &str) -> Result<Option<String>, String> {
+            Ok(self.active.lock().unwrap().get(ws).cloned())
+        }
+        fn open_assignments(&self, _: &shelbi_core::Project, _: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+        fn session(&self, _: &shelbi_core::Project, _: &shelbi_core::WorkspaceSpec) -> shelbi_orchestrator::pool_admin::SessionState {
+            shelbi_orchestrator::pool_admin::SessionState::Dead
+        }
+        fn worktree(&self, m: &shelbi_core::Machine, w: &shelbi_core::WorkspaceSpec) -> shelbi_orchestrator::pool_admin::WorktreeState {
+            if self.present.lock().unwrap().contains(&(m.name.clone(), w.name.clone())) {
+                shelbi_orchestrator::pool_admin::WorktreeState::Clean
+            } else {
+                shelbi_orchestrator::pool_admin::WorktreeState::Missing
+            }
+        }
+        fn materialize(&self, _: &shelbi_core::Project, m: &shelbi_core::Machine, w: &shelbi_core::WorkspaceSpec) -> Result<(), String> {
+            self.record(format!("materialize {} {}", m.name, w.name));
+            self.present.lock().unwrap().insert((m.name.clone(), w.name.clone()));
+            Ok(())
+        }
+        fn wire_hooks(&self, _: &shelbi_core::Project, _: &shelbi_core::Machine, w: &shelbi_core::WorkspaceSpec) -> Result<shelbi_orchestrator::pool_admin::HookWiring, String> {
+            self.record(format!("wire {}", w.name));
+            Ok(if *self.hooks_merge.lock().unwrap() {
+                shelbi_orchestrator::pool_admin::HookWiring::MergeRequired("merge Shelbi's hooks into .claude/settings.local.json".into())
+            } else {
+                shelbi_orchestrator::pool_admin::HookWiring::Wired
+            })
+        }
+        fn move_worktree(&self, _: &shelbi_core::Project, m: &shelbi_core::Machine, from: &shelbi_core::WorkspaceSpec, to: &shelbi_core::WorkspaceSpec) -> Result<(), String> {
+            self.record(format!("move {} {} {}", m.name, from.name, to.name));
+            let mut present = self.present.lock().unwrap();
+            present.remove(&(m.name.clone(), from.name.clone()));
+            present.insert((m.name.clone(), to.name.clone()));
+            Ok(())
+        }
+        fn remove_worktree(&self, _: &shelbi_core::Project, m: &shelbi_core::Machine, w: &shelbi_core::WorkspaceSpec) -> Result<(), String> {
+            self.record(format!("remove {} {}", m.name, w.name));
+            self.present.lock().unwrap().remove(&(m.name.clone(), w.name.clone()));
+            Ok(())
+        }
+        fn kill_session(&self, _: &shelbi_core::Project, w: &shelbi_core::WorkspaceSpec) -> Result<(), String> {
+            self.record(format!("kill {}", w.name));
+            Ok(())
+        }
+    }
+
+    const POOL_YAML: &str = "\
+# The pool, as a person wrote it.
+machines:
+  - name: hub
+    kind: local
+    work_dir: /tmp/shelbi-tui-pool-hub
+  - name: devbox
+    kind: ssh
+    host: devbox.lan
+    work_dir: /home/u/proj
+    tags: [linux]
+workspaces:
+  - name: alpha
+    machine: hub
+  - name: bravo
+    machine: devbox
+    tags: [gpu]
+";
+
+    const PROJECT_HEAD: &str = "name: Proj\ndefault_branch: main\norchestrator:\n  runner: claude\n\
+                                agent_runners:\n  claude:\n    command: claude\n    flags: []\n";
+
+    /// A temp `SHELBI_HOME` holding project `proj`, its pool in the global
+    /// YAML or (in-repo) in `projects/proj/local.yaml`. Holds the env lock.
+    struct PoolHome {
+        root: PathBuf,
+        /// The file the pool is declared in.
+        file: PathBuf,
+        /// In-repo only: the shared project file, which a pool edit leaves
+        /// alone.
+        shared: Option<PathBuf>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PoolHome {
+        fn new(in_repo: bool) -> PoolHome {
+            let lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = std::env::temp_dir().join(format!(
+                "shelbi-tui-pool-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::env::set_var("SHELBI_HOME", &root);
+            let projects = root.join("projects");
+            std::fs::create_dir_all(&projects).unwrap();
+            let (file, shared) = if in_repo {
+                let repo = root.join("repo");
+                std::fs::create_dir_all(repo.join(".shelbi")).unwrap();
+                let shared = repo.join(".shelbi/project.yaml");
+                std::fs::write(&shared, PROJECT_HEAD).unwrap();
+                std::fs::create_dir_all(projects.join("proj")).unwrap();
+                let local = projects.join("proj/local.yaml");
+                std::fs::write(&local, format!("repo: {}\n{POOL_YAML}", repo.display())).unwrap();
+                (local, Some(shared))
+            } else {
+                let global = projects.join("proj.yaml");
+                std::fs::write(&global, format!("{PROJECT_HEAD}repo: ''\n{POOL_YAML}")).unwrap();
+                (global, None)
+            };
+            PoolHome {
+                root,
+                file,
+                shared,
+                _lock: lock,
+            }
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(&self.file).unwrap()
+        }
+    }
+
+    impl Drop for PoolHome {
+        fn drop(&mut self) {
+            std::env::remove_var("SHELBI_HOME");
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Settings open on Workspaces over the real reader and `pool_admin`
+    /// over `ops`, the page focused and read.
+    fn workspaces_state(ops: Arc<FakeOps>) -> ShellState {
+        let mut st = settings_state();
+        st.pool_reader = Arc::new(shelbi_app::settings::workspaces::read);
+        st.pool_service = shelbi_orchestrator::pool_admin::workspace_service_with(ops);
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        type_key(&mut st, '5');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces, "5 opens Workspaces");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.workspaces().state().and_then(|s| s.index()).is_some()
+            }),
+            "the pool reads"
+        );
+        press(&mut st, KeyCode::Tab);
+        st
+    }
+
+    /// Drain Settings until the page's form or confirmation has an answer.
+    fn settle_pool(st: &mut ShellState) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                let page = st.settings.workspaces();
+                !page.form().is_some_and(|f| f.busy()) && !page.confirm().is_some_and(|c| c.busy())
+            }),
+            "the request lands"
+        );
+    }
+
+    /// Wait for the page's rows to show `name` (or, `present` false, not).
+    fn settle_rows(st: &mut ShellState, name: &str, present: bool) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings
+                    .workspaces()
+                    .state()
+                    .and_then(|s| s.index())
+                    .is_some_and(|i| i.workspaces.iter().any(|w| w.name == name) == present)
+            }),
+            "the page reads the pool again ({name} present: {present})"
+        );
+    }
+
+    fn create_from_the_keyboard(in_repo: bool) {
+        let home = PoolHome::new(in_repo);
+        let ops = Arc::new(FakeOps::default());
+        let mut st = workspaces_state(ops.clone());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = format!("{:?}", term.backend().buffer());
+        assert!(screen.contains("alpha") && screen.contains("devbox"), "the page draws the pool");
+        let before = home.text();
+        let refreshes = st.refresh_requests.get();
+        type_key(&mut st, 'n');
+        for c in "zeta".chars() {
+            type_key(&mut st, c);
+        }
+        press(&mut st, KeyCode::Tab); // Machine
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter); // devbox
+        press(&mut st, KeyCode::Tab); // Tags
+        for c in "web".chars() {
+            type_key(&mut st, c);
+        }
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = format!("{:?}", term.backend().buffer());
+        assert!(screen.contains("It also gets linux from devbox"), "inherited tags show apart");
+        assert!(screen.contains("/home/u/proj/.shelbi/wt/zeta"), "the derived location");
+        assert_eq!(home.text(), before, "nothing written before Create");
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::Enter); // a second Enter is swallowed while busy
+        settle_pool(&mut st);
+        assert!(st.settings.workspaces().form().is_none(), "success closes the form");
+        assert_eq!(
+            ops.calls().iter().filter(|c| c.starts_with("materialize")).collect::<Vec<_>>(),
+            ["materialize devbox zeta"],
+            "one request, through the shared service"
+        );
+        let after = home.text();
+        assert!(after.contains("- name: zeta") && after.contains("machine: devbox"), "{after}");
+        assert!(after.contains("# The pool, as a person wrote it."), "comments survive: {after}");
+        if let Some(shared) = &home.shared {
+            assert_eq!(std::fs::read_to_string(shared).unwrap(), PROJECT_HEAD, "the shared file is untouched");
+        }
+        settle_rows(&mut st, "zeta", true);
+        let page = st.settings.workspaces();
+        let zeta = page.state().unwrap().index().unwrap().workspaces.iter().position(|w| w.name == "zeta").unwrap();
+        assert_eq!(
+            page.items()[page.cursor()],
+            settings::workspaces::Item::Workspace(zeta),
+            "the selection follows the new workspace"
+        );
+        assert!(st.refresh_requests.get() > refreshes, "the sidebar refreshes too");
+        assert_eq!(st.settings.workspaces().state().unwrap().notice(), Some("Created zeta."));
+    }
+
+    #[test]
+    fn creating_a_workspace_writes_the_global_config_through_the_shared_service() {
+        create_from_the_keyboard(false);
+    }
+
+    #[test]
+    fn creating_a_workspace_writes_the_in_repo_local_config_through_the_shared_service() {
+        create_from_the_keyboard(true);
+    }
+
+    #[test]
+    fn edit_and_rename_go_through_the_lifecycle_and_cancel_writes_nothing() {
+        let home = PoolHome::new(false);
+        let ops = Arc::new(FakeOps::default());
+        ops.present.lock().unwrap().insert(("hub".into(), "alpha".into()));
+        let mut st = workspaces_state(ops.clone());
+        let before = home.text();
+        // Down to alpha, edit, type, Esc: nothing written.
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        assert_eq!(st.settings.workspaces().form().unwrap().title(), "Edit workspace");
+        type_key(&mut st, 'x');
+        press(&mut st, KeyCode::Esc);
+        assert!(st.settings.workspaces().form().is_none());
+        assert_eq!(home.text(), before, "Cancel preserves the config");
+        // Rename alpha to alpha2: the worktree moves, the config follows.
+        type_key(&mut st, 'e');
+        type_key(&mut st, '2');
+        press(&mut st, KeyCode::Enter);
+        settle_pool(&mut st);
+        assert!(ops.calls().contains(&"move hub alpha alpha2".to_string()), "{:?}", ops.calls());
+        assert!(home.text().contains("- name: alpha2"));
+        settle_rows(&mut st, "alpha2", true);
+        assert_eq!(st.settings.workspaces().state().unwrap().notice(), Some("Renamed alpha to alpha2."));
+    }
+
+    #[test]
+    fn removal_honors_the_active_task_guard_then_removes_when_idle() {
+        let home = PoolHome::new(false);
+        let ops = Arc::new(FakeOps::default());
+        ops.active.lock().unwrap().insert("alpha".into(), "fix-login".into());
+        let mut st = workspaces_state(ops.clone());
+        press(&mut st, KeyCode::Down); // alpha
+        type_key(&mut st, 'd');
+        press(&mut st, KeyCode::Tab); // Remove workspace
+        press(&mut st, KeyCode::Enter);
+        settle_pool(&mut st);
+        let confirm = st.settings.workspaces().confirm().expect("the refusal stays up");
+        assert!(confirm.error().unwrap().contains("fix-login"), "{:?}", confirm.error());
+        assert!(home.text().contains("- name: alpha"), "nothing removed");
+        assert!(!ops.calls().iter().any(|c| c.starts_with("remove")), "{:?}", ops.calls());
+        // The task finishes; the same confirmation retries.
+        ops.active.lock().unwrap().clear();
+        press(&mut st, KeyCode::Enter);
+        settle_pool(&mut st);
+        assert!(st.settings.workspaces().confirm().is_none());
+        assert!(!home.text().contains("- name: alpha"), "{}", home.text());
+        settle_rows(&mut st, "alpha", false);
+    }
+
+    #[test]
+    fn a_hook_merge_refusal_keeps_the_draft_and_writes_nothing() {
+        let home = PoolHome::new(false);
+        let ops = Arc::new(FakeOps::default());
+        *ops.hooks_merge.lock().unwrap() = true;
+        let mut st = workspaces_state(ops.clone());
+        let before = home.text();
+        type_key(&mut st, 'n');
+        press(&mut st, KeyCode::Enter);
+        settle_pool(&mut st);
+        let form = st.settings.workspaces().form().expect("the form stays");
+        assert_eq!(form.name(), "charlie", "the suggested name the draft kept");
+        assert!(form.errors().general.as_deref().unwrap().contains("settings.local.json"));
+        assert_eq!(home.text(), before, "the workspace wasn't declared");
+    }
+
+    #[test]
+    fn a_request_still_running_at_a_project_switch_lands_without_touching_the_new_project() {
+        let _home = PoolHome::new(false);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut st = workspaces_state(Arc::new(FakeOps::default()));
+        // A service that waits for the test before it answers.
+        let g = gate.clone();
+        let mut service = settings::unavailable_pool_service();
+        service.add = Arc::new(move |_, req| {
+            let (open, cv) = &*g;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            Ok(shelbi_core::pool::WorkspaceChange {
+                workspace: shelbi_core::WorkspaceSpec {
+                    name: req.name.clone(),
+                    machine: "hub".into(),
+                    tags: Vec::new(),
+                    slot: None,
+                },
+                previous_name: None,
+                previous_machine: None,
+                slot: 0,
+                worktree: PathBuf::new(),
+                hooks: shelbi_core::pool::HooksOutcome::Skipped,
+                warnings: Vec::new(),
+            })
+        });
+        st.pool_service = service;
+        type_key(&mut st, 'n');
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.workspaces().form().unwrap().busy());
+        st.switch_project("beta");
+        assert!(st.settings.workspaces().form().is_none(), "the draft goes with the project");
+        let refreshes = st.refresh_requests.get();
+        {
+            let (open, cv) = &*gate;
+            *open.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.dropped() > 0
+            }),
+            "the old project's result lands and is dropped"
+        );
+        assert_eq!(st.refresh_requests.get(), refreshes, "beta isn't refreshed for proj's change");
+        assert!(st.settings.workspaces().form().is_none());
+    }
+
+    #[test]
+    fn the_tui_has_no_whole_project_serializer_for_the_pool() {
+        // The pool is written only by `pool_admin` (comment-preserving,
+        // conflict-checked): no TUI settings code serializes a project.
+        for (name, src) in [
+            ("settings.rs", include_str!("settings.rs")),
+            ("settings/workspaces.rs", include_str!("settings/workspaces.rs")),
+        ] {
+            for banned in ["save_project", "write_project", "serde_yaml::to_string", "to_yaml_string", "fs::write("] {
+                let hits: Vec<&str> = src
+                    .lines()
+                    .filter(|l| l.contains(banned) && !l.trim_start().starts_with("//"))
+                    .collect();
+                assert!(hits.is_empty(), "{name} uses {banned}: {hits:?}");
+            }
+        }
     }
 }

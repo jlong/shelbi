@@ -36,12 +36,12 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
 use super::workflow_editor::{readonly_field, text_field};
-use super::workspace_form_state::{
+use shelbi_app::settings::workspace_form::{
     Action, ConfirmFocus, Focus, Job, Key, MachineChoice, Outcome, PoolService, RemoveConfirm, WorkspaceForm,
     SLOT_HELP, TAGS_HELP,
 };
 use super::workspaces::WorkspacesPage;
-use super::workspaces_state::{Intent, WorkspacesState};
+use shelbi_app::settings::workspaces::{Intent, WorkspacesState};
 use crate::assets::icons;
 use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
@@ -139,7 +139,7 @@ impl WorkspaceDialog {
         let service = cx
             .try_global::<DialogService>()
             .map(|s| s.0.clone())
-            .unwrap_or_else(PoolService::live);
+            .unwrap_or_else(shelbi_orchestrator::pool_admin::workspace_service);
         let focus = cx.focus_handle();
         let input = |text: &str, window: &mut Window, cx: &mut Context<Self>| {
             let text = text.to_string();
@@ -674,7 +674,7 @@ impl WorkspaceDialog {
                                 .flex_none()
                                 .type_style(Type::XSmall)
                                 .text_color(match m.status {
-                                    super::workspaces_state::MachineStatus::Unreachable(_) => theme.error,
+                                    shelbi_app::settings::workspaces::MachineStatus::Unreachable(_) => theme.error,
                                     _ => theme.form_hint,
                                 })
                                 .child(m.detail()),

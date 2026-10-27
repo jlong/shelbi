@@ -270,7 +270,7 @@ impl MachineForm {
     /// against `home`.
     pub fn configure(project: &str, machine: &Machine, workspaces: usize, home: Option<&Path>) -> Self {
         let work_dir = match machine.kind {
-            MachineKind::Local => super::workspaces_state::tilde(&machine.work_dir, home),
+            MachineKind::Local => shelbi_app::settings::workspaces::tilde(&machine.work_dir, home),
             MachineKind::Ssh => machine.work_dir.display().to_string(),
         };
         MachineForm {

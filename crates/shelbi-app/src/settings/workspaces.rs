@@ -1,15 +1,15 @@
-//! Settings ▸ Workspaces' state, toolkit-free (`dt-workspace-settings-index`):
-//! the project's workspace pool and the machines that host it, as the
-//! project config declares them, with each remote's live SSH reachability
-//! folded over.
+//! Settings ▸ Workspaces' state, toolkit-free (`dt-workspace-settings-index`,
+//! shared with the TUI by `tui-settings-workspaces`): the project's
+//! workspace pool and the machines that host it, as the project config
+//! declares them, with each remote's live SSH reachability folded over.
 //!
 //! [`PoolIndex::build`] maps a loaded [`Project`] to the page's rows: the
 //! workspaces in declaration order with their derived worktree path
-//! (`workspace::workspace_worktree`), machine, effective tags (their own
-//! plus the machine's, [`Project::effective_tags`]) and effective slot
-//! ([`Project::workspace_slot`]: explicit, else the zero-based place among
-//! the machine's workspaces); then the machines, each with its SSH host, its
-//! root project directory and how many workspaces it hosts.
+//! ([`shelbi_core::pool::workspace_worktree`]), machine, effective tags
+//! (their own plus the machine's, [`Project::effective_tags`]) and effective
+//! slot ([`Project::workspace_slot`]: explicit, else the zero-based place
+//! among the machine's workspaces); then the machines, each with its SSH
+//! host, its root project directory and how many workspaces it hosts.
 //!
 //! The read ([`read`]) and the probes run off the UI thread. A read that
 //! lands for another project than the page's is dropped
@@ -20,9 +20,8 @@
 //! labels say so.
 //!
 //! The page's buttons don't edit the config themselves: each asks for a
-//! form through an [`Intent`], which the window routes to its form (the
-//! workspace intents open `super::workspace_dialog`, Add machine and
-//! Configure the machine form, `super::machine_form`).
+//! form through an [`Intent`], which the client routes to whoever handles it
+//! (the workspace forms, [`super::workspace_form`]; the machine form).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -135,7 +134,7 @@ impl PoolIndex {
                     })
                     .collect();
                 let path = match machine {
-                    Some(m) => local(m.kind, &shelbi_orchestrator::workspace::workspace_worktree(m, w)),
+                    Some(m) => local(m.kind, &shelbi_core::pool::workspace_worktree(m, w)),
                     None => String::new(),
                 };
                 WorkspaceRow {
@@ -202,7 +201,7 @@ pub fn pool_file(project: &str) -> Option<PathBuf> {
 
 /// `path` with `home` shortened to `~`.
 pub fn tilde(path: &Path, home: Option<&Path>) -> String {
-    shelbi_app::add_project_wizard::tilde(path, home)
+    crate::add_project_wizard::tilde(path, home)
 }
 
 /// A remote's probe key: its name and the host probed, so a machine whose
@@ -211,10 +210,16 @@ pub fn probe_key(machine: &str, host: &str) -> String {
     format!("{machine}\n{host}")
 }
 
+/// What the local machine is called where a form describes it: this Mac in
+/// the desktop app, this computer wherever else the TUI runs.
+pub const LOCAL_LABEL: &str = if cfg!(target_os = "macos") { "This Mac" } else { "This computer" };
+/// [`LOCAL_LABEL`] inside a sentence.
+pub const LOCAL_PHRASE: &str = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
+
 /// A machine's status badge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineStatus {
-    /// This Mac: never probed.
+    /// The local machine: never probed.
     Local,
     /// A remote not probed yet, or its host just changed.
     Checking,
@@ -237,7 +242,7 @@ impl MachineStatus {
     /// What the badge means, as its tooltip: reachability is only SSH.
     pub fn help(&self) -> String {
         match self {
-            MachineStatus::Local => "Workspaces here run on this Mac.".into(),
+            MachineStatus::Local => format!("Workspaces here run on {LOCAL_PHRASE}."),
             MachineStatus::Checking => "Checking whether SSH can reach it.".into(),
             MachineStatus::Reachable => {
                 "SSH reached it. This doesn’t check the Shelbi CLI, Git, or the project there.".into()
@@ -397,12 +402,15 @@ pub fn kind_label(kind: Option<MachineKind>) -> &'static str {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
+/// Fixtures both clients' tests build a pool from (`test-support`).
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
+    use std::path::PathBuf;
+
+    use shelbi_core::Project;
 
     /// A project from `yaml`'s machines and workspaces.
-    pub(crate) fn project(pool: &str) -> Project {
+    pub fn project(pool: &str) -> Project {
         let yaml = format!(
             "name: My project\nrepo: ''\ndefault_branch: main\norchestrator:\n  runner: claude\n\
              agent_runners:\n  claude:\n    command: claude\n    flags: []\n{pool}"
@@ -412,10 +420,10 @@ pub(crate) mod tests {
         p
     }
 
-    /// Replace project `name`'s YAML under `root` (a test's
+    /// Replace project `name`'s global YAML (under the test's
     /// `SHELBI_HOME`) with one declaring `pool`.
-    pub(crate) fn write_pool(root: &Path, name: &str, pool: &str) -> PathBuf {
-        let file = root.join("projects").join(format!("{name}.yaml"));
+    pub fn write_pool(name: &str, pool: &str) -> PathBuf {
+        let file = shelbi_state::projects_dir().unwrap().join(format!("{name}.yaml"));
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(
             &file,
@@ -428,7 +436,7 @@ pub(crate) mod tests {
         file
     }
 
-    pub(crate) const POOL: &str = "\
+    pub const POOL: &str = "\
 machines:
   - name: This Mac
     kind: local
@@ -454,6 +462,12 @@ workspaces:
     machine: Build server
     tags: [gpu, linux]
 ";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{project, POOL};
+    use super::*;
 
     fn index() -> PoolIndex {
         PoolIndex::build(&project(POOL), Some(Path::new("/Users/me")))
