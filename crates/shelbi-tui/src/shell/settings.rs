@@ -22,6 +22,9 @@
 //!   window effects), its sixteen colors as sessions draw them here, and a
 //!   short session drawn through the sessions' own cell mapping. Nothing on
 //!   it edits: the TUI never changes the host terminal's palette.
+//! - Keybindings (`tui-settings-keybindings`, [`super::keybindings`]): the
+//!   bindings editor over `keys.yaml`; a saved change applies to the whole
+//!   TUI at once.
 //! - Workflows (`tui-settings-workflows`, [`workflows`]): the project's
 //!   workflows and status catalog, edited in place and saved as each edit is
 //!   made, over the shared `shelbi_app::settings::workflows` state.
@@ -58,6 +61,7 @@ use ratatui::{
     Frame,
 };
 use shelbi_app::settings::general::{self, Change, GeneralForm, SaveStatus};
+use shelbi_app::settings::keybindings::Change as KeysChange;
 use shelbi_app::settings::summary::{self, FileState, GeneralSummary, ProjectSummary};
 use shelbi_app::settings::terminal_preview;
 use shelbi_app::settings::{
@@ -69,6 +73,7 @@ use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
 use shelbi_state::{EditorSource, ThemePreference, UserConfig};
 use shelbi_state::workflow_config::WorkflowConfig;
 
+use super::keybindings::{KeysAction, KeysPage};
 use crate::panel::{self, PAD};
 use crate::theme::palette;
 
@@ -92,6 +97,7 @@ pub(crate) fn workflows_item_status(id: &str) -> workflows::Item {
 /// The pages the TUI offers. A follow-up page joins here once it draws.
 pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::General)
+    .with(SettingsPage::Keybindings)
     .with(SettingsPage::Terminal)
     .with(SettingsPage::Workflows);
 
@@ -100,6 +106,8 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
 pub(crate) enum Load {
     /// The General summary.
     General(Ticket),
+    /// The Keybindings page: `keys.yaml`.
+    Keys(Ticket),
     /// The Workflows page: this project's workflow config.
     Workflows(Ticket, String),
 }
@@ -162,6 +170,14 @@ pub(crate) enum SettingsAction {
     /// Edit YAML on the Workflows page: open a workflow config file in the
     /// user's editor, scaffolding it first when it is missing.
     EditYaml(EditFile),
+    /// Write this change to `keys.yaml` off the UI thread (the Keybindings
+    /// page), then hand the result to [`SettingsShell::keys_saved`].
+    SaveKeys(KeysChange),
+    /// Open `keys.yaml` in the user's editor.
+    OpenKeys,
+    /// The bindings in effect changed ([`SettingsShell::keymaps`]): the
+    /// shell, its views, the palette and the hints take them.
+    ApplyKeymaps,
 }
 
 /// What a page's focusable row does.
@@ -248,6 +264,9 @@ pub(crate) struct SettingsShell {
     theme_out: Option<ThemePreference>,
     /// The Workflows page.
     workflows: WorkflowsPage,
+    /// The Keybindings page. It holds the bindings in effect for the whole
+    /// shell (seeded at launch), so it lives whether or not Settings shows.
+    keys: KeysPage,
     /// The page's selected action row and scroll offset.
     action: usize,
     scroll: u16,
@@ -281,6 +300,7 @@ impl Default for SettingsShell {
             form: GeneralForm::default(),
             theme_out: None,
             workflows: WorkflowsPage::default(),
+            keys: KeysPage::new(None),
             action: 0,
             scroll: 0,
             guard: LeaveGuard::default(),
@@ -337,6 +357,32 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn keys(&self) -> &KeysPage {
+        &self.keys
+    }
+
+    pub(crate) fn keys_mut(&mut self) -> &mut KeysPage {
+        &mut self.keys
+    }
+
+    /// The bindings in effect.
+    pub(crate) fn keymaps(&self) -> &Keymaps {
+        self.keys.keymaps()
+    }
+
+    /// Whether the Keybindings page shows with the keyboard.
+    fn keys_focused(&self) -> bool {
+        self.nav.page() == SettingsPage::Keybindings && self.region == Region::Page
+    }
+
+    /// Whether `k` should reach Settings ahead of the shell's own chords
+    /// (the palette, the focus moves): a capture takes every key, the
+    /// search plain typing.
+    pub(crate) fn takes_key_first(&self, k: &KeyEvent) -> bool {
+        self.guard.prompt().is_none() && self.keys_focused() && self.keys.takes_key_first(k)
+    }
+
+    #[cfg(test)]
     pub(crate) fn prompting(&self) -> bool {
         self.guard.prompt().is_some() || self.guard.leaving_after_save()
     }
@@ -352,9 +398,18 @@ impl SettingsShell {
         self.form.cancel_edit();
         self.form.clear_status();
         self.workflows.close_modal();
+        self.keys.blur();
+    }
+
+    /// Settings closed: anything the Keybindings page held open ends.
+    pub(crate) fn close(&mut self) {
+        self.keys.blur();
     }
 
     pub(crate) fn set_region(&mut self, region: Region) {
+        if region != self.region {
+            self.keys.blur();
+        }
         self.region = region;
     }
 
@@ -440,9 +495,12 @@ impl SettingsShell {
     }
 
     /// A paste (or a dropped file's path) while Settings shows: into the
-    /// editor command or the workflow name being typed, else nowhere.
-    /// Returns whether a field took it.
+    /// Keybindings search, the editor command or the workflow name being
+    /// typed, else nowhere. Returns whether a field took it.
     pub(crate) fn paste(&mut self, text: &str) -> bool {
+        if self.nav.page() == SettingsPage::Keybindings {
+            return self.keys_focused() && self.keys.paste(text);
+        }
         if self.nav.page() == SettingsPage::Workflows {
             return self.workflows.paste(text);
         }
@@ -477,6 +535,7 @@ impl SettingsShell {
         match leave {
             Leave::Back => SettingsAction::Leave,
             Leave::Page(page) => {
+                self.keys.blur();
                 if self.nav.show(page) {
                     self.stop = Stop::Page(page);
                     self.action = 0;
@@ -512,8 +571,8 @@ impl SettingsShell {
                 }
                 Some(self.general.begin(project))
             }
-            // Terminal reads nothing, Workflows reads through
-            // `begin_page_load`, and the rest aren't offered yet.
+            // Keybindings and Workflows read through `begin_page_load`,
+            // Terminal reads nothing, and the rest aren't offered yet.
             SettingsPage::Keybindings
             | SettingsPage::Terminal
             | SettingsPage::Workspaces
@@ -523,16 +582,17 @@ impl SettingsShell {
     }
 
     /// Start the shown page's read for `project` (see [`Self::begin_load`]
-    /// for General's; Workflows reads again on every visit, to show hand
-    /// edits).
+    /// for General's; Keybindings and Workflows read again on every visit,
+    /// to show edits made in an editor or the desktop app).
     pub(crate) fn begin_page_load(&mut self, project: Option<&str>, force: bool) -> Option<Load> {
         match self.nav.page() {
             SettingsPage::General => self.begin_load(project, force).map(Load::General),
+            SettingsPage::Keybindings => self.keys.begin_load().map(Load::Keys),
             SettingsPage::Workflows => {
                 let ticket = self.workflows.begin_load(project, force)?;
                 Some(Load::Workflows(ticket, project?.to_string()))
             }
-            SettingsPage::Keybindings | SettingsPage::Terminal | SettingsPage::Workspaces | SettingsPage::Agents => None,
+            SettingsPage::Terminal | SettingsPage::Workspaces | SettingsPage::Agents => None,
         }
     }
 
@@ -583,6 +643,23 @@ impl SettingsShell {
             self.dropped += 1;
         }
         taken
+    }
+
+    /// A read of `keys.yaml` landed.
+    pub(crate) fn keys_loaded(&mut self, ticket: &Ticket, result: Result<String, String>) -> SettingsAction {
+        if self.keys.loaded(ticket, result) {
+            SettingsAction::ApplyKeymaps
+        } else {
+            SettingsAction::Stay
+        }
+    }
+
+    /// A save of `keys.yaml` landed: what to do, and whether to read the
+    /// file again after (a read was asked for while it was out).
+    pub(crate) fn keys_saved(&mut self, result: Result<String, String>) -> (SettingsAction, bool) {
+        let (changed, reload) = self.keys.saved(result);
+        let action = if changed { SettingsAction::ApplyKeymaps } else { SettingsAction::Stay };
+        (action, reload)
     }
 
     // --- the sidebar's stops ----------------------------------------------
@@ -772,6 +849,10 @@ impl SettingsShell {
             // The prompt's save is running: wait for it.
             return SettingsAction::Stay;
         }
+        // A capture or the search holds every key (Esc, Tab, digits too).
+        if self.keys_focused() && self.keys.holds_keys() {
+            return self.keys_key(k, keymaps);
+        }
         if self.typing() {
             return self.field_key(k);
         }
@@ -815,6 +896,7 @@ impl SettingsShell {
                 SettingsAction::Stay
             }
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
+            Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
             Region::Page => {
                 let actions = self.actions();
                 let n = actions.len();
@@ -843,6 +925,11 @@ impl SettingsShell {
                 SettingsAction::Stay
             }
         }
+    }
+
+    fn keys_key(&mut self, k: KeyEvent, keymaps: &Keymaps) -> SettingsAction {
+        let action = self.keys.handle_key(k, keymaps);
+        keys_action(action)
     }
 
     /// A key while the unsaved-edits prompt asks: `s` / Save, `d` / Discard,
@@ -920,6 +1007,12 @@ impl SettingsShell {
             return SettingsAction::Stay;
         }
         match m.kind {
+            _ if over_main && self.nav.page() == SettingsPage::Keybindings => {
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.region = Region::Page;
+                }
+                keys_action(self.keys.handle_mouse(m))
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let down = matches!(m.kind, MouseEventKind::ScrollDown);
                 if over_sidebar {
@@ -936,7 +1029,7 @@ impl SettingsShell {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if over_sidebar {
-                    self.region = Region::Sidebar;
+                    self.set_region(Region::Sidebar);
                 } else if over_main {
                     self.region = Region::Page;
                 }
@@ -968,7 +1061,9 @@ impl SettingsShell {
         self.render_sidebar(f, sidebar, chrome.project_label);
         let moves = moves(chrome.keymaps, chrome.style);
         let on_workflows = self.nav.page() == SettingsPage::Workflows;
-        let hints = if on_workflows && (self.region == Region::Page || self.workflows.modal_open()) {
+        let hints = if self.keys_focused() {
+            self.keys.hints()
+        } else if on_workflows && (self.region == Region::Page || self.workflows.modal_open()) {
             self.workflows.hints(&moves)
         } else {
             hints(self.region, self.nav.page(), self.typing(), &moves)
@@ -1114,6 +1209,11 @@ impl SettingsShell {
         if content.width == 0 || content.height == 0 {
             return;
         }
+        if self.nav.page() == SettingsPage::Keybindings {
+            let focused = self.region == Region::Page;
+            self.keys.render(f, content, focused);
+            return;
+        }
         let actions = self.actions();
         self.action = self.action.min(actions.len().saturating_sub(1));
         let rows = self.page_rows(content.width as usize, &actions);
@@ -1179,6 +1279,7 @@ impl SettingsShell {
             SettingsPage::General => general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions),
             SettingsPage::Terminal => terminal_rows(width),
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
+            // Keybindings draws itself.
             SettingsPage::Keybindings | SettingsPage::Workspaces | SettingsPage::Agents => Vec::new(),
         }
     }
@@ -1249,6 +1350,15 @@ impl SettingsShell {
 /// A preference change to save, if there is one.
 fn write(change: Option<Change>) -> SettingsAction {
     change.map_or(SettingsAction::Stay, SettingsAction::Write)
+}
+
+/// What the shell does for a Keybindings page action.
+fn keys_action(action: KeysAction) -> SettingsAction {
+    match action {
+        KeysAction::Stay => SettingsAction::Stay,
+        KeysAction::Save(change) => SettingsAction::SaveKeys(change),
+        KeysAction::OpenFile => SettingsAction::OpenKeys,
+    }
 }
 
 /// One rendered page row: a line of text, or one of the page's actions
@@ -1927,6 +2037,7 @@ mod tests {
             [
                 Stop::Back,
                 Stop::Page(SettingsPage::General),
+                Stop::Page(SettingsPage::Keybindings),
                 Stop::Page(SettingsPage::Terminal),
                 Stop::Switcher,
                 Stop::Page(SettingsPage::Workflows)
@@ -1941,6 +2052,8 @@ mod tests {
         s.open();
         let km = keymaps();
         s.handle_key(key(KeyCode::Char('j')), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Keybindings));
+        s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Terminal));
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher);
@@ -1950,6 +2063,7 @@ mod tests {
         assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows), "stops at the bottom");
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
+        s.handle_key(key(KeyCode::Up), &km);
         s.handle_key(key(KeyCode::Up), &km);
         s.handle_key(key(KeyCode::Up), &km);
         assert_eq!(s.stop, Stop::Back);
@@ -1963,8 +2077,9 @@ mod tests {
         let mut s = SettingsShell::default();
         s.open();
         let km = keymaps();
-        s.handle_key(key(KeyCode::Down), &km);
-        s.handle_key(key(KeyCode::Down), &km);
+        for _ in 0..3 {
+            s.handle_key(key(KeyCode::Down), &km);
+        }
         assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::OpenSwitcher);
         assert_eq!(s.handle_key(key(KeyCode::Tab), &km), SettingsAction::Stay);
         assert_eq!(s.region(), Region::Page);
@@ -1981,7 +2096,11 @@ mod tests {
         let mut s = SettingsShell::default();
         s.open();
         s.handle_key(key(KeyCode::Char('w')), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Terminal), "the user's nav_down moves the selection");
+        assert_eq!(
+            s.stop,
+            Stop::Page(SettingsPage::Keybindings),
+            "the user's nav_down moves the selection"
+        );
     }
 
     #[test]

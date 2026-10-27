@@ -27,8 +27,10 @@
 //! - [`terminal_preview`]: the Terminal page's canned preview session.
 //! - [`workflows`]: the Workflows page's state (the project's workflows and
 //!   status catalog, the edits it saves as they're made, and their guards).
+//! - [`keybindings`]: the Keybindings page's bindings editor.
 
 pub mod general;
+pub mod keybindings;
 pub mod summary;
 pub mod terminal_preview;
 pub mod workflows;

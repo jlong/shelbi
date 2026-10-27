@@ -107,10 +107,10 @@ paths on every `cargo test`.
   pages each client offers, the navigation, the leave prompt, the stale-load
   tickets). The desktop offers every page, under ⌘, and ⌘1 to ⌘6; the TUI
   offers a General summary of where the settings live, with the Open in
-  editor paths, under the palette, the sidebar's `,` and the page's digit,
-  and adds pages as their follow-ups land. The TUI's switcher is the
-  palette's Projects column, and a switch keeps Settings up for the new
-  project. See [`status/tui-settings-shell.md`](status/tui-settings-shell.md).
+  editor paths, and Keybindings, Terminal and Workflows, under the palette,
+  the sidebar's `,` and the page's digit, and adds pages as their follow-ups
+  land. The TUI's switcher is the palette's Projects column, and a switch
+  keeps Settings up for the new project. See [`status/tui-settings-shell.md`](status/tui-settings-shell.md).
 - **Settings ▸ General** (`tui-settings-general`): both clients edit the
   shared `theme:` (Auto, Dark, Light, from `shelbi_app::settings::general`'s
   `THEMES` and labels) as an immediate-save control with the shared
@@ -140,6 +140,14 @@ paths on every `cargo test`.
   selected rather than opening its editor, and draws a status as `●` in the
   board's category color. See
   [`status/tui-settings-workflows.md`](status/tui-settings-workflows.md).
+- **Settings ▸ Keybindings** (`tui-settings-keybindings`): one editor state
+  (`shelbi_app::settings::keybindings`: rows, search, context filter,
+  capture, conflicts, the edits and their save), the same `keys.yaml`, and a
+  change applies only once written. The desktop draws keycaps with hover
+  buttons and a context picker; the TUI draws its display style with row
+  keys (`a` add, `u` reset, Backspace remove), a stepping context control,
+  and a `⚠` on chords the terminal can't send. See
+  [`status/tui-settings-keybindings.md`](status/tui-settings-keybindings.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

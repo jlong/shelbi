@@ -15,19 +15,22 @@
 //! While capturing, a keystroke interceptor takes every key before the
 //! window's own bindings and menus can (⌘ chords, Ctrl+P, Esc), so any chord
 //! can be bound. A finished capture is written to `keys.yaml` as it is on
-//! disk (`shelbi_state::keymap::edit`, comments kept) off the UI thread, and
-//! [`KeybindingsEvent::Saved`] hands the window the merged keymaps, which it
-//! takes for its keys and menus at once (other windows reread `keys.yaml`
-//! when they come to the front, as for any edit to it).
+//! disk (`shelbi_state::keymap::edit`, comments kept) off the UI thread; once
+//! it lands, the page shows it and [`KeybindingsEvent::Saved`] hands the
+//! window the merged keymaps, which it takes for its keys and menus at once
+//! (other windows reread `keys.yaml` when they come to the front, as for any
+//! edit to it). The state, the filters and the capture rules are shared with
+//! the TUI (`shelbi_app::settings::keybindings`); the keycaps, the picker
+//! and the hover buttons are this client's.
 
 use gpui::{
     div, prelude::*, px, relative, App, ClickEvent, Context, Entity, EventEmitter, Focusable, MouseButton,
     SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
+use shelbi_app::settings::keybindings::{self as shared, Group, KeyOutcome, KeybindingsState, Row, Slot};
 use shelbi_state::keymap::{Action, KeyChord, Keymaps, CONTEXTS};
 
-use super::keybindings_state::{conflict_message, Group, KeyOutcome, KeybindingsState, Row, Slot};
 use crate::assets::{heroicon, icons};
 use crate::elements::controls;
 use crate::keys::{chord_from_keystroke, keycap_keys};
@@ -97,7 +100,7 @@ impl KeybindingsPage {
             }),
         ];
         let mut page = KeybindingsPage {
-            state: KeybindingsState::new(Some(project.to_string())),
+            state: KeybindingsState::new(Some(project.to_string()), keycap_text),
             search,
             picker_open: false,
             picker_anchor: Default::default(),
@@ -117,10 +120,9 @@ impl KeybindingsPage {
     /// migrations, so the file is the one the TUI reads) and show it.
     pub fn load(&mut self, cx: &mut Context<Self>) {
         let project = self.state.project().map(str::to_string);
-        let read = cx.background_executor().spawn(async move {
-            shelbi_state::keymap::load_keymaps(project.as_deref());
-            shelbi_state::keymap::edit::read_keys_file().map_err(|e| format!("Couldn't read keys.yaml: {e}"))
-        });
+        let read = cx
+            .background_executor()
+            .spawn(async move { shared::read_keys(project.as_deref()) });
         cx.spawn(async move |this, cx| {
             let text = read.await;
             this.update(cx, |this, cx| {
@@ -135,9 +137,13 @@ impl KeybindingsPage {
         .detach();
     }
 
-    /// Show `text` (a `keys.yaml`).
+    /// Show `text` (a `keys.yaml`). One that doesn't parse is refused: the
+    /// bindings on show (the window's) stay, and the page says why.
     fn show(&mut self, text: String) {
-        self.state.load(text);
+        match self.state.load(text) {
+            Ok(()) => self.error = None,
+            Err(e) => self.error = Some(format!("{e}. Fix it in keys.yaml.")),
+        }
         self.reserved = reserved_conflicts(self.state.keymaps());
     }
 
@@ -154,32 +160,24 @@ impl KeybindingsPage {
             KeyOutcome::Cancelled | KeyOutcome::Conflict => {}
             KeyOutcome::Save(change) => {
                 self.error = None;
-                self.reserved = reserved_conflicts(self.state.keymaps());
                 // A test's window never writes the real `~/.shelbi`: it takes
-                // the change as written.
+                // the change as written onto the text on show.
                 if cfg!(test) {
-                    cx.emit(KeybindingsEvent::Saved(Box::new(self.state.keymaps().clone())));
+                    let written = change
+                        .apply(self.state.text(), self.state.project())
+                        .map_err(|e| e.to_string());
+                    self.land(written, cx);
                     cx.notify();
                     return true;
                 }
                 let project = self.state.project().map(str::to_string);
-                let write = cx.background_executor().spawn(async move {
-                    shelbi_state::keymap::edit::update_keys_file(|text| change.apply(text, project.as_deref()))
-                });
+                let write = cx
+                    .background_executor()
+                    .spawn(async move { change.save(project.as_deref()) });
                 cx.spawn(async move |this, cx| {
                     let written = write.await;
                     this.update(cx, |this, cx| {
-                        match written {
-                            Ok(text) => {
-                                this.show(text);
-                                cx.emit(KeybindingsEvent::Saved(Box::new(this.state.keymaps().clone())));
-                            }
-                            // Back to what is on disk.
-                            Err(e) => {
-                                this.error = Some(format!("Couldn't save keys.yaml: {e}"));
-                                this.load(cx);
-                            }
-                        }
+                        this.land(written, cx);
                         cx.notify();
                     })
                     .ok();
@@ -190,6 +188,18 @@ impl KeybindingsPage {
         }
         cx.notify();
         true
+    }
+
+    /// A save landed: the page shows the file it wrote and the window takes
+    /// its keymaps; a failed one leaves both as they were.
+    fn land(&mut self, written: Result<String, String>, cx: &mut Context<Self>) {
+        match self.state.saved(written) {
+            Ok(()) => {
+                self.reserved = reserved_conflicts(self.state.keymaps());
+                cx.emit(KeybindingsEvent::Saved(Box::new(self.state.keymaps().clone())));
+            }
+            Err(e) => self.error = Some(format!("Couldn't save keys.yaml: {e}")),
+        }
     }
 
     /// End an open capture (the page is leaving the screen).
@@ -534,7 +544,7 @@ impl KeybindingsPage {
                     .pb(px(10.0))
                     .type_style(Type::XSmall)
                     .text_color(theme.error)
-                    .child(conflict_message(&c))
+                    .child(self.state.conflict_message(&c))
             }))
             .child(hover)
     }
@@ -680,27 +690,14 @@ fn keycap(id: String, keys: Vec<String>, capturing: bool, theme: &Theme) -> gpui
     }
 }
 
-/// `~/.shelbi/keys.yaml`, the shared key bindings.
-pub fn keys_yaml_path() -> Option<std::path::PathBuf> {
-    shelbi_state::shelbi_home()
-        .ok()
-        .map(|home| home.join(shelbi_state::keymap::KEYS_FILENAME))
+/// A chord as its keycap spells it (`⌃P`), for the shared search and the
+/// conflict line.
+fn keycap_text(chord: &KeyChord) -> String {
+    keycap_keys(chord).concat()
 }
 
-/// The stub a missing `keys.yaml` starts as: comments only, so it changes no
-/// binding.
-const KEYS_STUB: &str = "# Shelbi key bindings, shared by the TUI and the desktop app.\n\
-# Override a built-in chord per mode; unlisted actions keep their defaults.\n\
-# `shelbi config lint` checks this file.\n";
-
 fn open_keys_yaml() -> Result<(), String> {
-    let path = keys_yaml_path().ok_or("No Shelbi home directory.")?;
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&path, KEYS_STUB).map_err(|e| format!("Couldn't create keys.yaml: {e}"))?;
-    }
+    let path = shared::ensure_keys_file()?;
     let status = std::process::Command::new("open")
         .arg("-t")
         .arg(&path)

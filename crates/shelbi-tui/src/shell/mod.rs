@@ -23,6 +23,7 @@ mod refresh;
 // desktop app).
 use shelbi_app::session::relaunch;
 mod review;
+mod keybindings;
 mod session;
 mod settings;
 mod sidebar;
@@ -79,6 +80,7 @@ use refresh::ShellSnapshot;
 use review::{ReviewAction, ReviewInterface};
 use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
 use settings::{SettingsAction, SettingsShell};
+use shelbi_app::settings::keybindings::Change as KeysChange;
 use shelbi_app::settings::summary::GeneralSummary;
 use shelbi_app::settings::workflows::Committed;
 use shelbi_app::settings::Ticket;
@@ -108,6 +110,10 @@ enum SettingsMsg {
     WorkflowsLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
     /// One Workflows edit, applied and saved.
     WorkflowsCommitted(Ticket, Box<Committed>),
+    /// A read of `keys.yaml`.
+    KeysLoaded(Ticket, Result<String, String>),
+    /// A save to `keys.yaml`: the file's new text, or why it failed.
+    KeysSaved(Result<String, String>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -116,6 +122,38 @@ type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
 /// Reads a project's workflow config for Settings ▸ Workflows (blocking; run
 /// off the UI thread).
 type WorkflowsReader = Arc<dyn Fn(&str) -> Result<WorkflowConfig, String> + Send + Sync>;
+
+/// `keys.yaml` for the Keybindings page: the file on disk in production, an
+/// in-memory one under test (no test touches the real `~/.shelbi`). Every
+/// call blocks; the shell runs reads and saves off the UI thread.
+pub(crate) trait KeysStore: Send + Sync {
+    /// The file's text (missing: empty).
+    fn read(&self, project: Option<&str>) -> Result<String, String>;
+    /// Apply `change` to the file as it is now and write it; its new text.
+    fn save(&self, change: &KeysChange, project: Option<&str>) -> Result<String, String>;
+    /// The file's path for an editor, created as a comments-only stub when
+    /// missing.
+    fn ensure(&self) -> Result<PathBuf, String>;
+}
+
+/// The real `~/.shelbi/keys.yaml`.
+#[cfg(not(test))]
+struct DiskKeys;
+
+#[cfg(not(test))]
+impl KeysStore for DiskKeys {
+    fn read(&self, project: Option<&str>) -> Result<String, String> {
+        shelbi_app::settings::keybindings::read_keys(project)
+    }
+
+    fn save(&self, change: &KeysChange, project: Option<&str>) -> Result<String, String> {
+        change.save(project)
+    }
+
+    fn ensure(&self) -> Result<PathBuf, String> {
+        shelbi_app::settings::keybindings::ensure_keys_file()
+    }
+}
 
 /// Resolved inputs the shell needs to build a [`ReviewInterface`], read off the
 /// UI thread (board + project config lookups).
@@ -948,7 +986,9 @@ fn build_embedded_apps(project: &str, keymaps: &Keymaps) -> (KanbanApp, Activity
     // Board moves go through the shelbi-app executor (daemon-backed when
     // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
     kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
-    let activity = ActivityApp::new(project);
+    let mut activity = ActivityApp::new(project);
+    // The feed's footer hints follow the shell's bindings, not a second read.
+    activity.set_keymaps(keymaps.clone());
     // The machines view probes remote reachability in the background (off the UI
     // thread and the refresh worker); the prober winds down when the app drops.
     let mut machines = MachinesApp::new(project);
@@ -1137,6 +1177,8 @@ struct ShellState {
     /// Reads Settings ▸ Workflows' config (disk in production; in tests a
     /// refusal unless a test points it at its own `SHELBI_HOME`).
     workflows_reader: WorkflowsReader,
+    /// `keys.yaml` for the Keybindings page (disk in production).
+    keys_store: Arc<dyn KeysStore>,
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
@@ -1197,6 +1239,24 @@ impl ShellState {
         // failure degrades to the embedded defaults; the sidebar surfaces the
         // diagnostic count.
         let (keymaps, diags) = load_keymaps(Some(project));
+        #[cfg(not(test))]
+        let keys_store: Arc<dyn KeysStore> = Arc::new(DiskKeys);
+        #[cfg(test)]
+        let keys_store: Arc<dyn KeysStore> = Arc::new(tests::MemKeys::default());
+        let mut settings = SettingsShell::default();
+        // The Keybindings page holds the bindings in effect: seed it from the
+        // file the keymaps above came from, so what it lists is what runs.
+        let keymaps = {
+            let keys = settings.keys_mut();
+            keys.set_project(Some(project.to_string()));
+            keys.set_kitty(caps.kitty);
+            let seeded = keys_store.read(Some(project)).is_ok_and(|text| keys.seed(text));
+            if seeded {
+                keys.keymaps().clone()
+            } else {
+                keymaps
+            }
+        };
         let palette_chord = keymaps
             .global
             .first_chord_for(GlobalAction::OpenPalette)
@@ -1280,7 +1340,7 @@ impl ShellState {
             notice,
             overlay: None,
             palette_chord,
-            settings: SettingsShell::default(),
+            settings,
             settings_return: None,
             settings_tx,
             settings_rx,
@@ -1289,6 +1349,7 @@ impl ShellState {
             #[cfg(test)]
             settings_store,
             workflows_reader,
+            keys_store,
             status: None,
             job: None,
             pending_editor: None,
@@ -1673,6 +1734,10 @@ impl ShellState {
         // never shown (the fresh reads refill them). Interaction state (selection,
         // scroll, in-flight optimistic moves) resetting is correct: it belonged to
         // the project we left.
+        // The new project's bindings (its `projects.<name>` block over the
+        // defaults), from the file already in effect: no read.
+        self.settings.keys_mut().set_project(Some(project.to_string()));
+        self.apply_keymaps();
         let (mut kanban, activity, machines) = build_embedded_apps(project, &self.keymaps);
         // Show the board's own "Loading…" overlay (not bare empty columns) until
         // the first off-thread read for the new project lands.
@@ -1880,8 +1945,9 @@ impl ShellState {
     /// can keep typing there afterward. Native board/activity/machines views
     /// have no terminal session, so a drop over one is a no-op.
     fn deliver_paste(&mut self, text: &str) {
-        // Over Settings a paste goes into the editor command being typed, if
-        // it is; it (or a dropped file) never reaches the session under it.
+        // Over Settings a paste goes into the Keybindings search or the
+        // field being typed, if one has the keyboard; it (or a dropped file)
+        // never reaches the session under it.
         if self.settings_open() {
             if self.settings.paste(text) {
                 self.dirty = true;
@@ -1914,6 +1980,14 @@ impl ShellState {
 
     fn handle_key(&mut self, k: KeyEvent) {
         if !terminal_view::is_actionable(&k) {
+            return;
+        }
+        // A Keybindings capture takes every key ahead of the shell's own (the
+        // palette chord, the focus moves, Ctrl+C), and its search plain
+        // typing: none of them acts, and none reaches a session.
+        if self.settings_open() && self.settings.takes_key_first(&k) {
+            let action = self.settings.handle_key(k, &self.keymaps);
+            self.apply_settings_action(action);
             return;
         }
         // The palette-open chord opens the command palette from anywhere — a
@@ -2077,6 +2151,7 @@ impl ShellState {
         let Some(ret) = self.settings_return.take() else {
             return;
         };
+        self.settings.close();
         match ret.focus {
             Focus::Main => self.client.focus_main(),
             Focus::Sidebar => self.client.focus_sidebar(),
@@ -2108,6 +2183,14 @@ impl ShellState {
                         let _ = tx.send(SettingsMsg::Loaded(sent, Box::new(summary)));
                     })
             }
+            settings::Load::Keys(sent) => {
+                let store = self.keys_store.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-keys".into())
+                    .spawn(move || {
+                        let _ = tx.send(SettingsMsg::KeysLoaded(sent, store.read(project.as_deref())));
+                    })
+            }
             settings::Load::Workflows(sent, project) => {
                 let reader = self.workflows_reader.clone();
                 std::thread::Builder::new()
@@ -2123,6 +2206,10 @@ impl ShellState {
             match load {
                 settings::Load::General(ticket) => {
                     self.settings.loaded(&ticket, Err(why));
+                }
+                settings::Load::Keys(ticket) => {
+                    let action = self.settings.keys_loaded(&ticket, Err(why));
+                    self.apply_settings_action(action);
                 }
                 settings::Load::Workflows(ticket, _) => {
                     self.settings.workflows_loaded(&ticket, Err(why));
@@ -2205,6 +2292,60 @@ impl ShellState {
         });
     }
 
+    /// Write a Keybindings change to `keys.yaml` off the UI thread (the page
+    /// starts no other until it lands).
+    fn save_keys(&mut self, change: KeysChange) {
+        let project = self.client.project().map(str::to_string);
+        let store = self.keys_store.clone();
+        let tx = self.settings_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-keys-save".into())
+            .spawn(move || {
+                let _ = tx.send(SettingsMsg::KeysSaved(store.save(&change, project.as_deref())));
+            });
+        if let Err(e) = spawned {
+            self.keys_saved(Err(format!("couldn't start the save: {e}")));
+        }
+    }
+
+    /// A `keys.yaml` save landed: the shell takes the bindings it wrote.
+    fn keys_saved(&mut self, result: Result<String, String>) {
+        let (action, reload) = self.settings.keys_saved(result);
+        self.apply_settings_action(action);
+        if reload && self.settings_open() {
+            self.load_settings(true);
+        }
+    }
+
+    /// Open `keys.yaml` in the user's editor (a stub first when missing); the
+    /// run loop hands it the terminal, and the page rereads the file after.
+    fn open_keys_file(&mut self) {
+        match self.keys_store.ensure() {
+            Ok(path) => self.pending_editor = Some(path),
+            Err(e) => self.settings.keys_mut().open_failed(e),
+        }
+    }
+
+    /// Run with the bindings in effect: the Keybindings page's, after a save
+    /// or a read of `keys.yaml` it took. Every consumer follows at once: the
+    /// shell's key routing, the palette chord and its mode, the embedded
+    /// board, activity feed and task popover (keys and footers), the sidebar
+    /// footer, and Settings' own hints.
+    fn apply_keymaps(&mut self) {
+        let keymaps = self.settings.keymaps().clone();
+        self.palette_chord = keymaps
+            .global
+            .first_chord_for(GlobalAction::OpenPalette)
+            .copied();
+        self.kanban.keymaps = keymaps.clone();
+        self.activity.set_keymaps(keymaps.clone());
+        if let Some(ActiveOverlay::TaskDescription { keymaps: k, .. }) = self.overlay.as_mut() {
+            **k = keymaps.clone();
+        }
+        self.keymaps = keymaps;
+        self.dirty = true;
+    }
+
     /// Start the shown page's save (the unsaved-edits prompt's Save) off the
     /// UI thread.
     fn save_settings(&mut self) {
@@ -2247,6 +2388,11 @@ impl ShellState {
                 SettingsMsg::WorkflowsCommitted(ticket, done) => {
                     self.workflows_committed(&ticket, *done);
                 }
+                SettingsMsg::KeysLoaded(ticket, result) => {
+                    let action = self.settings.keys_loaded(&ticket, result);
+                    self.apply_settings_action(action);
+                }
+                SettingsMsg::KeysSaved(result) => self.keys_saved(result),
             }
         }
         // A theme config.yaml now holds (read on entering Settings or after
@@ -2291,6 +2437,9 @@ impl ShellState {
             SettingsAction::Commit => self.start_workflows_commit(),
             SettingsAction::EditWorkflow(name) => self.edit_workflow(&name),
             SettingsAction::EditYaml(file) => self.edit_settings_file(file),
+            SettingsAction::SaveKeys(change) => self.save_keys(change),
+            SettingsAction::OpenKeys => self.open_keys_file(),
+            SettingsAction::ApplyKeymaps => self.apply_keymaps(),
         }
         self.dirty = true;
     }
@@ -2429,6 +2578,7 @@ impl ShellState {
     /// where the notice is first armed (`rt-tui-headless-startup-block`).
     fn set_caps(&mut self, caps: Caps) {
         self.caps = caps;
+        self.settings.keys_mut().set_kitty(caps.kitty);
         self.notice = caps.keyboard_notice().map(|text| Notice {
             text,
             until: Instant::now() + Duration::from_secs(NOTICE_SECS),
@@ -2531,6 +2681,7 @@ impl ShellState {
             )
         {
             self.settings_return = None;
+            self.settings.close();
         }
         match effect {
             Effect::ShowView(v) => self.show_view_effect(v),
@@ -4766,6 +4917,10 @@ mod tests {
     use super::*;
     use shelbi_app::view::{NavItem, WorkspaceRow};
     use shelbi_state::ThemePreference;
+
+    // Settings ▸ Keybindings through the real event path (`tests/keybindings.rs`).
+    mod keybindings;
+    pub(super) use keybindings::MemKeys;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {
@@ -7689,6 +7844,9 @@ mod tests {
     /// faked, on the orchestrator session (focus on main).
     fn settings_state() -> ShellState {
         let mut st = test_state();
+        // The built-in width, whatever a concurrent test saved under a
+        // shared SHELBI_HOME (the layouts below depend on it).
+        st.client.set_sidebar_width(shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH);
         st.palette_inputs = Arc::new(FixturePaletteInputs);
         st.show(RowTarget::Session(SessionRef::Orchestrator));
         st
@@ -7779,8 +7937,9 @@ mod tests {
     fn esc_closes_the_innermost_first_and_typing_in_the_switcher_stays_in_it() {
         let mut st = settings_state();
         st.dispatch_effect(Effect::OpenSettings);
-        // Down past Terminal to the project switcher; Enter opens the
-        // palette's Projects column.
+        // Down past Keybindings and Terminal to the project switcher; Enter
+        // opens the palette's Projects column.
+        press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Down);
         assert_eq!(st.settings.stop(), settings::Stop::Switcher);
@@ -7962,6 +8121,8 @@ mod tests {
         );
         // The wheel over the sidebar moves its selection.
         let side = st.sidebar_content_rect();
+        st.handle_event(Event::Mouse(wheel(false, side.x + 2, side.y + 6)));
+        assert_eq!(st.settings.stop(), settings::Stop::Page(shelbi_app::settings::SettingsPage::Keybindings));
         st.handle_event(Event::Mouse(wheel(false, side.x + 2, side.y + 6)));
         assert_eq!(st.settings.stop(), settings::Stop::Page(shelbi_app::settings::SettingsPage::Terminal));
         assert_eq!(st.settings.region(), settings::Region::Sidebar);
