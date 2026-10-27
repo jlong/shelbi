@@ -50,6 +50,7 @@ pub mod issue_auth;
 pub mod issue_migrate;
 pub mod issue_store;
 pub mod keymap;
+pub mod pool_config;
 pub mod workflow_config;
 pub mod yaml_edit;
 mod migrate;
@@ -1028,6 +1029,27 @@ pub struct GitWorktreeLock(#[allow(dead_code)] FileLockGuard);
 pub fn lock_git_worktrees(project: &str) -> Result<GitWorktreeLock> {
     let path = project_dir(project)?.join("git-worktrees.lock");
     Ok(GitWorktreeLock(acquire_file_lock(&path)?))
+}
+
+/// Public RAII handle for the per-project pool-config lock. Released when
+/// dropped.
+#[must_use = "the pool-config lock is released as soon as the guard is dropped"]
+pub struct PoolConfigLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the exclusive per-project pool-config lock is held.
+///
+/// Serializes the machine/workspace lifecycle operations
+/// (`shelbi_orchestrator::pool_admin`): each one reads the pool, checks it
+/// against the live state, provisions, and writes the config back, and two of
+/// them interleaving (a CLI `workspace add` and a desktop edit) could each
+/// pass validation against the same pool. Take it before any
+/// [`WorkspaceLock`] and the [`GitWorktreeLock`]; nothing takes it while
+/// holding either. [`pool_config::PoolConfig::save`] doesn't take it (an
+/// `flock` isn't reentrant across descriptors); it re-reads the file
+/// instead, which also catches hand edits.
+pub fn lock_pool_config(project: &str) -> Result<PoolConfigLock> {
+    let path = project_dir(project)?.join("pool-config.lock");
+    Ok(PoolConfigLock(acquire_file_lock(&path)?))
 }
 
 /// Public RAII handle for the per-project dashboard-bootstrap lock. Wraps a
