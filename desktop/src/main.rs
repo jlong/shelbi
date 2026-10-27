@@ -231,16 +231,7 @@ fn main() {
     // upgrade) one window on the launch project with its old frame.
     let (session, plan) = match mode {
         Mode::App => {
-            let session = WindowSession::load();
-            let named = projects::named_project();
-            let known = projects::project_names();
-            let plan = launch_plan(
-                session.as_ref(),
-                named.as_deref(),
-                projects::launch_project().as_deref(),
-                &|p| known.contains(p),
-                &WindowState::load_legacy,
-            );
+            let (session, plan) = read_launch_plan();
             (session.unwrap_or_default(), plan)
         }
         _ => (WindowSession::default(), Vec::new()),
@@ -321,15 +312,32 @@ fn main() {
             // project window shows the notice when there is.
             views::update::spawn_check(cx);
 
-            // No project yet: the first launch opens on the Add Project
-            // wizard (closing it, the last window, quits).
+            // No project yet: the first launch checks for the CLI (installing
+            // it when there is none), then becomes the Add Project wizard
+            // (closing it, the last window, quits).
             if plan.is_empty() {
-                views::add_project::show(shelbi_app::add_project_wizard::Origin::FirstLaunch, None, cx);
+                views::cli_setup::show(cx);
                 return;
             }
             app::open_launch_windows(plan, cx);
             cx.activate(true);
         });
+}
+
+/// The windows a launch opens now, and the saved window slots they came
+/// from: local reads (the slots, the project list), no daemon.
+pub(crate) fn read_launch_plan() -> (Option<WindowSession>, Vec<window_state::LaunchWindow>) {
+    let session = WindowSession::load();
+    let named = projects::named_project();
+    let known = projects::project_names();
+    let plan = launch_plan(
+        session.as_ref(),
+        named.as_deref(),
+        projects::launch_project().as_deref(),
+        &|p| known.contains(p),
+        &WindowState::load_legacy,
+    );
+    (session, plan)
 }
 
 /// Log to stderr, `warn` and up by default (`RUST_LOG` overrides), so a

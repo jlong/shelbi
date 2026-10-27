@@ -4,7 +4,8 @@
 //! The app is a client of the `shelbi` CLI package: it embeds neither the
 //! daemon nor the session process. Launched from Finder it has no shell
 //! `PATH`, so [`Bootstrap`] resolves the login-shell environment ([`env`]),
-//! finds `shelbi` ([`discovery`]), has it start the daemon ([`daemon`]),
+//! finds `shelbi` ([`discovery`]) or, when there is none, installs the
+//! release matching the app ([`install`]), has it start the daemon ([`daemon`]),
 //! connects to the control socket and checks the versions match exactly
 //! ([`control`], [`version`]), and fails at the step that broke with what its
 //! screen needs to name the fix. `views::bootstrap` renders each state.
@@ -23,6 +24,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod env;
 pub mod font_smoothing;
+pub mod install;
 pub mod motion;
 pub mod print_version;
 pub mod relaunch;

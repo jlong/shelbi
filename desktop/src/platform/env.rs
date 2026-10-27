@@ -56,6 +56,22 @@ pub fn path_dirs(env: &Env) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// `env` with `dir` appended to its `PATH` when it isn't there: the CLI's
+/// own directory (`~/bin` after the app installed it), so the app's children
+/// find `shelbi` by name even when the user's shell setup doesn't list it.
+pub fn with_dir_on_path(mut env: Env, dir: &std::path::Path) -> Env {
+    if path_dirs(&env).iter().any(|d| d == dir) {
+        return env;
+    }
+    let dir = dir.display().to_string();
+    let path = match env.get("PATH").filter(|p| !p.is_empty()) {
+        Some(path) => format!("{path}:{dir}"),
+        None => dir,
+    };
+    env.insert("PATH".to_string(), path);
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +95,16 @@ mod tests {
             "the app has none, so neither does the child"
         );
         assert_eq!(env["PATH"], "/opt/homebrew/bin:/usr/bin");
+    }
+
+    #[test]
+    fn the_clis_dir_joins_the_end_of_path_once() {
+        let env: Env = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into();
+        let env = with_dir_on_path(env, std::path::Path::new("/Users/me/bin"));
+        assert_eq!(env["PATH"], "/usr/bin:/bin:/Users/me/bin");
+        let again = with_dir_on_path(env.clone(), std::path::Path::new("/Users/me/bin"));
+        assert_eq!(again, env);
+        assert_eq!(with_dir_on_path(Env::new(), std::path::Path::new("/b"))["PATH"], "/b");
     }
 
     #[test]

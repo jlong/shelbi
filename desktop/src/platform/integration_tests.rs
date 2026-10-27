@@ -5,8 +5,8 @@
 //! the `shelbi` binary crate, which the app can't link.)
 //!
 //! Only the login-shell capture is replaced (it would run the developer's own
-//! shell); discovery, the daemon start, the hello, and the version check are
-//! the real code.
+//! shell); discovery, the CLI install (from a `file://` release fixture), the
+//! daemon start, the hello, and the version check are the real code.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -25,6 +25,7 @@ use super::control::ControlError;
 use super::daemon::DaemonFailure;
 use super::discovery::CliSource;
 use super::env::{self, Env};
+use super::install::{self, InstallError, InstallErrorKind};
 use super::version::{ProtocolCheck, APP_VERSION};
 
 const LOCATION_VARS: [&str; 3] = ["SHELBI_HOME", "SHELBI_HUB_SOCK", "SHELBI_CONTROL_SOCK"];
@@ -80,22 +81,43 @@ impl Sandbox {
     ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let cli = self.bin.join("shelbi");
-        let protocol = match protocol {
-            Some(p) => format!("echo {p}"),
-            None => "exit 2".to_string(),
-        };
-        let script = format!(
-            "#!/bin/sh\n\
-             case \"$1\" in\n\
-               --version) echo \"shelbi {version}\" ;;\n\
-               __control-protocol) {protocol} ;;\n\
-               daemon) {daemon_body} ;;\n\
-               *) exit 64 ;;\n\
-             esac\n"
-        );
-        std::fs::write(&cli, script).unwrap();
+        std::fs::write(&cli, cli_script(version, protocol, daemon_body)).unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
         cli
+    }
+
+    /// Publish a release of the fake CLI the way goreleaser does (the
+    /// archive, its plugin, `checksums.txt`) under the sandbox; its download
+    /// URL base.
+    fn publish_release(&self, version: &str, daemon_body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let pkg = self.home.join("pkg");
+        let plugin = pkg.join("plugins").join(install::PLUGIN);
+        for file in install::PLUGIN_FILES {
+            let path = plugin.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, file).unwrap();
+        }
+        let cli = pkg.join("shelbi");
+        let script = cli_script(version, Some(CONTROL_PROTOCOL_VERSION), daemon_body);
+        std::fs::write(&cli, script).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let release = self.home.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        let name = install::archive_name(std::env::consts::ARCH).unwrap();
+        let archive = release.join(&name);
+        let tar = std::process::Command::new("/usr/bin/tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&pkg)
+            .args(["shelbi", "plugins"])
+            .status()
+            .unwrap();
+        assert!(tar.success());
+        let sum = install::sha256_file(&archive).unwrap();
+        std::fs::write(release.join(install::CHECKSUMS), format!("{sum}  {name}\n")).unwrap();
+        format!("file://{}", release.display())
     }
 
     /// A `daemon` body that records its start, then stays up (as a real
@@ -121,8 +143,28 @@ impl Sandbox {
             },
             path: format!("{}:/usr/bin:/bin", self.bin.display()),
             home: self.home.clone(),
+            release_base: None,
         }
     }
+}
+
+/// The fake `shelbi`'s script: `--version` prints `version`, `daemon` runs
+/// `daemon_body`, `__control-protocol` prints `protocol` (`None`: a usage
+/// error, as before the command existed).
+fn cli_script(version: &str, protocol: Option<u32>, daemon_body: &str) -> String {
+    let protocol = match protocol {
+        Some(p) => format!("echo {p}"),
+        None => "exit 2".to_string(),
+    };
+    format!(
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+           --version) echo \"shelbi {version}\" ;;\n\
+           __control-protocol) {protocol} ;;\n\
+           daemon) {daemon_body} ;;\n\
+           *) exit 64 ;;\n\
+         esac\n"
+    )
 }
 
 impl Drop for Sandbox {
@@ -144,6 +186,8 @@ struct TestPlatform {
     real: SystemPlatform,
     path: String,
     home: PathBuf,
+    /// Where an install downloads from (`None`: nowhere, so it fails).
+    release_base: Option<String>,
 }
 
 impl Platform for TestPlatform {
@@ -169,6 +213,19 @@ impl Platform for TestPlatform {
     }
     fn cli_control_protocol(&mut self, cli: &Path, env: &Env) -> Option<u32> {
         self.real.cli_control_protocol(cli, env)
+    }
+    fn install_cli(
+        &mut self,
+        version: &str,
+        env: &Env,
+        progress: &mut dyn FnMut(install::Step),
+    ) -> Result<PathBuf, InstallError> {
+        let base = self
+            .release_base
+            .clone()
+            .unwrap_or_else(|| format!("file://{}/no-release", self.home.display()));
+        let plan = install::Plan::new(version, &self.home, std::env::consts::ARCH, Some(&base))?;
+        install::install(&plan, &install::SystemIo { env: env.clone() }, progress)
     }
     fn start_daemon(&mut self, cli: &Path, env: &Env) -> Result<(), DaemonFailure> {
         self.real.start_daemon(cli, env)
@@ -376,6 +433,7 @@ fn boot_to_ready(
         .map(|e| match e {
             BootstrapEvent::State(BootstrapState::ResolvingEnv) => "env",
             BootstrapEvent::State(BootstrapState::FindingCli) => "cli",
+            BootstrapEvent::State(BootstrapState::InstallingCli { .. }) => "install",
             BootstrapEvent::State(BootstrapState::StartingDaemon { .. }) => "daemon",
             BootstrapEvent::State(BootstrapState::Connecting { .. }) => "connect",
             BootstrapEvent::State(BootstrapState::Ready(_)) => "ready",
@@ -558,4 +616,71 @@ fn an_older_daemon_protocol_under_a_current_cli_is_a_stale_daemon() {
             },
         }
     );
+}
+
+#[test]
+fn a_missing_cli_is_installed_from_the_release_and_the_next_launch_finds_it() {
+    let sandbox = Sandbox::new("install");
+    let base = sandbox.publish_release(APP_VERSION, &sandbox.staying_daemon());
+    let mut platform = sandbox.platform();
+    platform.release_base = Some(base);
+    let rx = Bootstrap::spawn(platform, APP_VERSION.to_string());
+    wait_for(
+        "the installed CLI to be asked to start the daemon",
+        Duration::from_secs(30),
+        || sandbox.started_marker().exists(),
+    );
+    let _daemon = TestDaemon::serve(&sandbox.home, APP_VERSION);
+    let events = events_until(&rx, Duration::from_secs(30), is_terminal);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, BootstrapEvent::State(BootstrapState::InstallingCli { .. }))),
+        "{events:?}"
+    );
+    let Some(BootstrapEvent::State(BootstrapState::Ready(ready))) = events.last() else {
+        panic!("expected Ready: {events:?}")
+    };
+    // `~/bin/shelbi` (the sandbox's `bin/` is its home's), and the plugin
+    // beside it under `~/share/shelbi/plugins`.
+    assert_eq!(ready.cli.path, sandbox.bin.join("shelbi"));
+    assert_eq!(ready.cli_version.as_deref(), Some(APP_VERSION));
+    let plugin = sandbox.home.join("share/shelbi/plugins").join(install::PLUGIN);
+    for file in install::PLUGIN_FILES {
+        assert!(plugin.join(file).is_file(), "{file}");
+    }
+
+    // Relaunch with the release gone: the installed CLI is found, and
+    // nothing is downloaded.
+    std::fs::remove_dir_all(sandbox.home.join("release")).unwrap();
+    let rx = Bootstrap::spawn(sandbox.platform(), APP_VERSION.to_string());
+    let events = events_until(&rx, Duration::from_secs(30), is_terminal);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, BootstrapEvent::State(BootstrapState::InstallingCli { .. }))),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(BootstrapEvent::State(BootstrapState::Ready(_)))),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn an_unreachable_release_fails_the_install_and_installs_nothing() {
+    let sandbox = Sandbox::new("install-fail");
+    let rx = Bootstrap::spawn(sandbox.platform(), APP_VERSION.to_string());
+    let events = events_until(&rx, Duration::from_secs(30), is_terminal);
+    let Some(BootstrapEvent::State(BootstrapState::Failed(Failure::InstallFailed(e)))) =
+        events.last()
+    else {
+        panic!("expected InstallFailed: {events:?}")
+    };
+    assert!(
+        matches!(e.kind, InstallErrorKind::Network | InstallErrorKind::NotPublished),
+        "{e:?}"
+    );
+    assert!(!sandbox.bin.join("shelbi").exists());
+    assert!(!sandbox.started_marker().exists(), "no daemon start without a CLI");
 }

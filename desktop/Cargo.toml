@@ -85,6 +85,10 @@ chrono = "0.4"
 # alacritty_terminal).
 unicode-width = "0.2"
 
+# The CLI install's archive check against the release's `checksums.txt`
+# (already in the tree).
+sha2 = "0.10"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

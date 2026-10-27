@@ -63,6 +63,13 @@ A tag push runs these jobs in `release.yml`:
    stays green; with them, anything short of notarized fails the job.
    `macos-15` rather than `macos-14` because the app's floor is macOS 15 and the
    script runs the bundled binary as a smoke check.
+   The app also depends on this release's CLI assets: when a Mac has no
+   `shelbi` (the zip without the cask), its first launch downloads
+   `shelbi_Darwin_arm64.tar.gz` and `checksums.txt` from the release tagged
+   with **its own version** and installs them under `~/bin` and
+   `~/share/shelbi/plugins` (`desktop/src/platform/install.rs`). Renaming the
+   archive, its checksum file, or the plugin's path inside it breaks that
+   install.
 7. **`homebrew-pr`** also writes `Casks/shelbi-desktop.rb`
    (`scripts/release/update-homebrew-cask.rb`) into the same tap PR when
    `desktop-release` notarized the app; a failed or unsigned desktop build never

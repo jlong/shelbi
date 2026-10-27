@@ -3,7 +3,8 @@
 //! Order: the `desktop.cli_path` setting in `~/.shelbi/config.yaml`, then the
 //! login shell's `PATH`, then the places Shelbi gets installed when that
 //! `PATH` doesn't say (`/opt/homebrew/bin`, `/usr/local/bin`,
-//! `~/.cargo/bin`). A set override is the only candidate: a typo in it is
+//! `~/.cargo/bin`, and `~/bin`, where the app's own install and
+//! `scripts/install.sh` put it). A set override is the only candidate: a typo in it is
 //! reported, never papered over by a different `shelbi` found elsewhere.
 //!
 //! The order and the search are pure ([`candidates`], [`discover`]) so they
@@ -75,6 +76,7 @@ pub fn known_locations(home: Option<&Path>) -> Vec<PathBuf> {
     ];
     if let Some(home) = home {
         dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join("bin"));
     }
     dirs
 }
@@ -222,16 +224,17 @@ mod tests {
     }
 
     #[test]
-    fn order_is_login_path_then_homebrew_then_usr_local_then_cargo() {
+    fn order_is_login_path_then_homebrew_then_usr_local_then_cargo_then_home_bin() {
         let home = Path::new("/Users/me");
-        let cands = candidates(None, &[PathBuf::from("/Users/me/bin")], Some(home));
+        let cands = candidates(None, &[PathBuf::from("/Users/me/.local/bin")], Some(home));
         assert_eq!(
             paths(&cands),
             [
-                "/Users/me/bin/shelbi",
+                "/Users/me/.local/bin/shelbi",
                 "/opt/homebrew/bin/shelbi",
                 "/usr/local/bin/shelbi",
                 "/Users/me/.cargo/bin/shelbi",
+                "/Users/me/bin/shelbi",
             ]
         );
         assert_eq!(cands[0].source, CliSource::LoginPath);
@@ -305,7 +308,7 @@ mod tests {
         assert_eq!(found.path, PathBuf::from("/usr/local/bin/shelbi"));
 
         let none = discover(None, &[PathBuf::from("/x")], Some(home), |_| false).unwrap_err();
-        assert_eq!(none.searched.len(), 4);
+        assert_eq!(none.searched.len(), 5);
         assert_eq!(none.setting, None);
     }
 

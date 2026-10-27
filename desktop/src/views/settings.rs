@@ -1314,11 +1314,7 @@ impl Render for SettingsView {
                 .child(controls::labeled_control(
                     "Shelbi CLI",
                     cli,
-                    Some(
-                        "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
-                         in Homebrew, or in ~/.cargo/bin. Takes effect on the next launch."
-                            .into(),
-                    ),
+                    Some(cli_help(crate::app::running_cli(cx), std::env::var_os("HOME").map(PathBuf::from)).into()),
                     &theme,
                 ))
                 .child(controls::labeled_control(
@@ -1630,6 +1626,31 @@ impl SettingsView {
 }
 
 /// The selector of a page's marker (tests find the page shown by it).
+/// The Shelbi CLI field's helper line. `running`: the CLI the app runs and
+/// whether a terminal finds it by name; one it doesn't (an install in
+/// `~/bin` on a shell whose `PATH` lacks it) gets the line that fixes that.
+/// The app never edits shell startup files itself.
+pub fn cli_help(running: Option<(PathBuf, bool)>, home: Option<PathBuf>) -> String {
+    let mut help = String::from(
+        "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
+         in Homebrew, ~/.cargo/bin, or ~/bin. Takes effect on the next launch.",
+    );
+    if let Some((cli, false)) = running {
+        let dir = cli.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let shown = match home.as_deref().and_then(|h| dir.strip_prefix(h).ok()) {
+            Some(rest) if rest.as_os_str().is_empty() => "$HOME".to_string(),
+            Some(rest) => format!("$HOME/{}", rest.display()),
+            None => dir.display().to_string(),
+        };
+        help.push_str(&format!(
+            " Your shell's PATH doesn't include {}, so a terminal won't find shelbi: \
+             add `export PATH=\"{shown}:$PATH\"` to ~/.zshrc (or your shell's startup file).",
+            dir.display()
+        ));
+    }
+    help
+}
+
 pub fn page_selector(page: SettingsPage) -> &'static str {
     match page {
         SettingsPage::General => "settings-page-general",
@@ -1643,6 +1664,17 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cli_help_says_how_to_reach_an_install_off_the_terminals_path() {
+        let home = Some(PathBuf::from("/Users/me"));
+        let plain = super::cli_help(None, home.clone());
+        assert!(plain.contains("~/bin"), "{plain}");
+        assert_eq!(super::cli_help(Some(("/opt/homebrew/bin/shelbi".into(), true)), home.clone()), plain);
+        let off = super::cli_help(Some(("/Users/me/bin/shelbi".into(), false)), home);
+        assert!(off.contains("export PATH=\"$HOME/bin:$PATH\""), "{off}");
+        assert!(off.contains("/Users/me/bin, so"), "{off}");
+    }
+
     use super::*;
 
     #[test]

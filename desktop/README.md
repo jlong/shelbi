@@ -9,19 +9,40 @@ background refresh) and talk to the same daemon and sessions. The plan is
 Status: feature parity with the TUI. Every command in the shared registry
 runs in both clients (`docs/parity.md` records the walk), every view renders
 natively, and no not-implemented path is left. On launch the app finds the
-`shelbi` CLI, starts the daemon, and checks versions; a window shows one
+`shelbi` CLI (installing it on a Mac that has none), starts the daemon, and
+checks versions; a window shows one
 project at a time and switches projects in place (File ▸ New Window, ⌘⇧N,
 opens another), with the sidebar, the Orchestrator chat, the Issues board and task
 detail, Activity, Machines, the Workspace view (an agent with a user shell
 beside it, local or remote), and the Review view; the command palette and the
 overlays (error log, load for review, reject, Zen intro); the Add Project
-wizard (also what a first launch with no project opens); native
+wizard (what a first launch with no project opens, after its CLI check);
+native
 menus and system notifications. `scripts/bundle.sh` packages it as a signed,
 notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask. Each
 piece's story is in its status doc (`docs/README.md` lists them).
 
-The app is a client of the `shelbi` CLI and needs it installed
-(`brew install jlong/shelbi/shelbi`); the cask depends on the formula.
+The app is a client of the `shelbi` CLI. The cask depends on the formula,
+so a Homebrew install has it. Without it (the app's zip on its own, a
+removed formula), the first launch installs it: "Let's get Shelbi ready"
+checks for the CLI and, when none is found, downloads the prebuilt CLI from
+the GitHub release **matching the app's version** (`shelbi_Darwin_arm64.tar.gz`,
+checked against that release's `checksums.txt`), installs the executable at
+`~/bin/shelbi` and its system plugin under `~/share/shelbi/plugins/`, starts
+the daemon through it, and only then shows Ready and opens the Add Project
+wizard. No Homebrew, administrator rights, or Rust toolchain are needed, and
+nothing is built from source. A CLI that is found but the wrong version, or a
+`desktop.cli_path` that points nowhere, is reported, never installed over. A
+failed install (offline, an unwritable folder, a checksum mismatch) leaves
+whatever was there and offers Try Again. `SHELBI_DESKTOP_CLI_DOWNLOAD_URL`
+points the download at another directory holding the archive and
+`checksums.txt` (any URL curl takes, `file://` included), for testing.
+
+The app runs its children with the CLI's folder on their `PATH`, so an
+install in `~/bin` works at once; it never edits shell startup files. If your
+shell's `PATH` lacks `~/bin`, Settings ▸ General says so under Shelbi CLI;
+to run `shelbi` in a terminal, add `export PATH="$HOME/bin:$PATH"` to
+`~/.zshrc` (or your shell's startup file).
 
 ## Settings
 
@@ -40,7 +61,7 @@ window at once.
 theme: auto                          # auto (follows the system), dark, light; shared with the TUI
 editor: code --wait                  # edit:* commands, "Open in editor", Cmd+click; then $EDITOR, then vim
 desktop:
-  cli_path: ~/src/shelbi/target/debug/shelbi   # skip discovery (login PATH, Homebrew, ~/.cargo/bin)
+  cli_path: ~/src/shelbi/target/debug/shelbi   # skip discovery (login PATH, Homebrew, ~/.cargo/bin, ~/bin) and the install
   terminal_font_family: Source Code Pro   # the default; bundled with the app
   terminal_font_size: 14             # points, 6 to 72 (Settings and ⌘+ / ⌘− step within 8 to 32)
   option_as_meta: false              # true, left, or right (Ghostty's shape)
@@ -190,8 +211,8 @@ desktop/
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
-  src/platform/        bootstrap: login env, CLI discovery, daemon start, version check, relaunch;
-                       --print-version (print_version.rs), the daily release check (update.rs)
+  src/platform/        bootstrap: login env, CLI discovery, the CLI install (install.rs), daemon start,
+                       version check, relaunch; --print-version (print_version.rs), the daily release check (update.rs)
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
   src/elements/        custom elements, chiefly the terminal (elements/terminal/)
   src/drops/           image and file-promise drops onto a terminal (AppKit hooks on gpui's window)
@@ -216,6 +237,7 @@ Which subtask fills what:
 | `views/` workspace | `dt-workspace-view` |
 | `views/` review | `dt-review-view` |
 | native menus, notifications | `dt-menus-notifications` |
+| first-launch CLI install (`platform/install.rs`) and its screens (`views/cli_setup.rs`) | `dt-wizard-cli-setup` |
 | bundle, signing, cask, update notice (`platform/update.rs`, `views/update.rs`) | `dt-packaging` |
 | smoke tests (`app_smoke.rs`), `docs/parity.md`, docs | `dt-parity-audit` |
 
@@ -384,7 +406,8 @@ resized to the spike window.
 `assets/icon/`), signed, notarized, stapled, then zipped as
 `target/bundle/Shelbi-<version>-arm64.zip` with a `.sha256` beside it. It
 bundles no CLI: the app is a client of the `shelbi` formula, and the Homebrew
-cask (`shelbi-desktop`) depends on it.
+cask (`shelbi-desktop`) depends on it. The zip alone works too: its first
+launch installs the CLI from the same release (see above).
 
 ```sh
 desktop/scripts/bundle.sh              # build + bundle (+ sign/notarize when it can)
