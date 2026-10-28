@@ -45,7 +45,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
@@ -56,7 +56,7 @@ use shelbi_app::settings::workspace_form::{
 use shelbi_app::settings::machine_check::{self as mcheck, CheckOutcome, CheckStop, ReadinessForm, ReadinessRequest};
 use shelbi_app::settings::machine_form as mform;
 use shelbi_app::settings::workspaces::{
-    kind_label, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
+    kind_label, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
 };
 use shelbi_app::settings::{Job, Ticket};
@@ -64,7 +64,9 @@ use shelbi_core::pool::{MachineChange, PoolError};
 
 use super::machine_form;
 use super::modal_form::FormLines;
+use super::HoverKey;
 use crate::panel;
+use crate::table::{Cell, Column, Table, TableLine};
 use crate::textbox::Textbox;
 use crate::theme::palette;
 
@@ -944,18 +946,10 @@ impl WorkspacesPage {
                     at(Item::New),
                 ));
                 rows.push(PageRow::blank());
-                if index.workspaces.is_empty() {
-                    text(&mut rows, "No workspaces yet: New workspace adds one.", Style::default().fg(palette().muted));
-                } else {
-                    let cols = Columns::for_rows(&index.workspaces, width);
-                    rows.push(PageRow::text(cols.header()));
-                    for (i, w) in index.workspaces.iter().enumerate() {
-                        let item = Item::Workspace(i);
-                        let selected = sel(item);
-                        for line in cols.workspace(w, selected) {
-                            rows.push(PageRow::item(line, at(item)));
-                        }
-                    }
+                let selected = (0..index.workspaces.len()).find(|&i| sel(Item::Workspace(i)));
+                for line in workspace_table(&index.workspaces).selected(selected, true).lines(width) {
+                    let item = line.row.and_then(|i| at(Item::Workspace(i)));
+                    rows.push(PageRow::table(line, WORKSPACES_TABLE, item));
                 }
                 rows.push(PageRow::blank());
                 text(
@@ -977,10 +971,25 @@ impl WorkspacesPage {
                     action_line("Add machine…", Some("m"), sel(Item::AddMachine), width),
                     at(Item::AddMachine),
                 ));
-                for (i, m) in index.machines.iter().enumerate() {
-                    let item = Item::Machine(i);
-                    for line in machine_lines(m, &state.status(m), sel(item), width) {
-                        rows.push(PageRow::item(line, at(item)));
+                rows.push(PageRow::blank());
+                let statuses: Vec<MachineStatus> = index.machines.iter().map(|m| state.status(m)).collect();
+                let selected = (0..index.machines.len()).find(|&i| sel(Item::Machine(i)));
+                let lines = machine_table(&index.machines, &statuses).selected(selected, true).lines(width);
+                let ends: Vec<bool> = (0..lines.len()).map(|n| lines.get(n + 1).map(|l| l.row) != Some(lines[n].row)).collect();
+                for (line, ends_row) in lines.into_iter().zip(ends) {
+                    let row = line.row;
+                    let item = row.and_then(|i| at(Item::Machine(i)));
+                    rows.push(PageRow::table(line, MACHINES_TABLE, item));
+                    // Why a machine is unreachable, under its row's last line.
+                    if let (Some(i), true) = (row, ends_row) {
+                        if let MachineStatus::Unreachable(e) = &statuses[i] {
+                            for l in shelbi_app::overlay::error_log::wrap(&format!("SSH couldn’t reach it: {e}"), width.saturating_sub(2).max(1)) {
+                                rows.push(PageRow::item(
+                                    Line::from(Span::styled(format!("  {l}"), Style::default().fg(palette().red))),
+                                    item,
+                                ));
+                            }
+                        }
                     }
                 }
                 rows.push(PageRow::blank());
@@ -1186,7 +1195,7 @@ impl WorkspacesPage {
             width,
             height,
         };
-        f.render_widget(Clear, rect);
+        super::clear_layer(f, rect, main);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette().divider_active))
@@ -1240,7 +1249,7 @@ impl WorkspacesPage {
             width,
             height,
         };
-        f.render_widget(Clear, rect);
+        super::clear_layer(f, rect, main);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette().red))
@@ -1273,11 +1282,24 @@ impl WorkspacesPage {
 pub(crate) struct PageRow {
     pub line: Line<'static>,
     pub item: Option<usize>,
+    /// A table's line: its row, for the pointer's hover (`Row::table`).
+    pub table_row: Option<HoverKey>,
+    pub hover: Option<Line<'static>>,
 }
 
 impl PageRow {
     fn text(line: Line<'static>) -> PageRow {
-        PageRow { line, item: None }
+        PageRow { line, item: None, table_row: None, hover: None }
+    }
+
+    /// Table `table`'s line, a line of selectable row `item`.
+    fn table(l: TableLine, table: u8, item: Option<usize>) -> PageRow {
+        PageRow {
+            line: l.line,
+            item,
+            table_row: Some((table, l.row.unwrap_or(usize::MAX))),
+            hover: l.hover,
+        }
     }
 
     fn blank() -> PageRow {
@@ -1285,7 +1307,7 @@ impl PageRow {
     }
 
     fn item(line: Line<'static>, item: Option<usize>) -> PageRow {
-        PageRow { line, item }
+        PageRow { item, ..PageRow::text(line) }
     }
 }
 
@@ -1452,173 +1474,86 @@ fn fill(text: String, selected: bool, style: Style, width: usize) -> Line<'stati
     }
 }
 
-/// The workspace table's column widths.
-struct Columns {
-    name: usize,
-    machine: usize,
-    tags: usize,
-    slot: usize,
-    width: usize,
-}
+/// The page's tables, for the pointer's hover (`HoverKey`).
+const WORKSPACES_TABLE: u8 = 0;
+const MACHINES_TABLE: u8 = 1;
 
-impl Columns {
-    fn for_rows(rows: &[WorkspaceRow], width: usize) -> Columns {
-        let name = rows.iter().map(|w| panel::display_width(&w.name)).max().unwrap_or(0).clamp(4, 18) + 2;
-        let machine = rows
-            .iter()
-            .map(|w| panel::display_width(&machine_cell(w)))
-            .max()
-            .unwrap_or(0)
-            .clamp(7, 26)
-            + 2;
-        let slot = 8;
-        let tags = width.saturating_sub(2 + name + machine + slot).max(4);
-        Columns { name, machine, tags, slot, width }
-    }
-
-    fn header(&self) -> Line<'static> {
-        let text = format!(
-            "  {:<n$}{:<m$}{:<t$}{:<s$}",
-            "Name",
-            "Machine",
-            "Tags",
-            "Slot",
-            n = self.name,
-            m = self.machine,
-            t = self.tags,
-            s = self.slot
-        );
-        Line::from(Span::styled(
-            panel::truncate_right(&text, self.width),
-            Style::default().fg(palette().muted).add_modifier(Modifier::BOLD),
-        ))
-    }
-
-    /// A workspace's two lines: its fields, then its worktree under the name.
-    fn workspace(&self, w: &WorkspaceRow, selected: bool) -> Vec<Line<'static>> {
-        let bg = |s: Style| if selected { s.bg(palette().selection) } else { s };
-        let marker = if selected { "› " } else { "  " };
-        let cell = |s: &str, w: usize| format!("{:<w$}", panel::truncate_right(s, w.saturating_sub(1)));
-        let mut spans = vec![
-            Span::styled(marker.to_string(), bg(Style::default().fg(palette().white))),
-            Span::styled(
-                cell(&w.name, self.name),
-                bg(Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
-            ),
-            Span::styled(cell(&machine_cell(w), self.machine), bg(Style::default().fg(palette().foreground))),
-        ];
-        // Tags: own plain, inherited `+tag` muted, or No tags.
-        let mut used = 0usize;
-        if w.tags.is_empty() {
-            let t = "No tags";
-            spans.push(Span::styled(t.to_string(), bg(Style::default().fg(palette().muted))));
-            used += t.len();
+/// The workspaces table, as the desktop's: Workspace (its worktree under
+/// the name), Machine (its kind under it), Tags, Slot. Tags go first when
+/// it's narrow, then Slot, then Machine.
+fn workspace_table(rows: &[WorkspaceRow]) -> Table {
+    let mut table = Table::new(vec![
+        Column::new("Workspace").min(12).max(48).fill(),
+        Column::new("Machine").min(8).max(24).drop(1),
+        Column::new("Tags").min(8).max(32).drop(3),
+        Column::new("Slot").min(4).max(8).drop(2),
+    ])
+    .empty("No workspaces yet. New workspace adds one.");
+    let muted = Style::default().fg(palette().muted);
+    for w in rows {
+        let name = Cell::text(w.name.clone(), Style::default().fg(palette().white).add_modifier(Modifier::BOLD))
+            .and_end(w.path.clone(), muted);
+        let machine = Cell::text(w.machine.clone(), Style::default().fg(palette().foreground))
+            .and(kind_label(w.machine_kind), muted);
+        // Own tags plain, inherited `+tag` muted, or No tags.
+        let tags = if w.tags.is_empty() {
+            Cell::text("No tags", muted)
         } else {
+            let mut spans = Vec::new();
             for (i, tag) in w.tags.iter().enumerate() {
-                let text = format!("{}{}{}", if i > 0 { " " } else { "" }, if tag.inherited { "+" } else { "" }, tag.name);
-                let tw = panel::display_width(&text);
-                if used + tw + 1 > self.tags {
-                    spans.push(Span::styled("…".to_string(), bg(Style::default().fg(palette().muted))));
-                    used += 1;
-                    break;
+                if i > 0 {
+                    spans.push(Span::raw(" "));
                 }
-                let style = if tag.inherited {
-                    Style::default().fg(palette().muted)
+                let (text, style) = if tag.inherited {
+                    (format!("+{}", tag.name), muted)
                 } else {
-                    Style::default().fg(palette().cyan)
+                    (tag.name.clone(), Style::default().fg(palette().cyan))
                 };
-                spans.push(Span::styled(text, bg(style)));
-                used += tw;
+                spans.push(Span::styled(text, style));
             }
-        }
-        spans.push(Span::styled(" ".repeat(self.tags.saturating_sub(used)), bg(Style::default())));
-        let slot = if w.slot_explicit { w.slot.to_string() } else { format!("{} auto", w.slot) };
-        spans.push(Span::styled(
-            cell(&slot, self.slot),
-            bg(Style::default().fg(if w.slot_explicit { palette().foreground } else { palette().muted })),
-        ));
-        let first = pad_line(spans, self.width, selected);
-        let path = format!("    {}", panel::truncate_left(&w.path, self.width.saturating_sub(4)));
-        let second = pad_line(
-            vec![Span::styled(path, bg(Style::default().fg(palette().muted)))],
-            self.width,
-            selected,
-        );
-        vec![first, second]
+            Cell::spans(spans)
+        };
+        let slot = if w.slot_explicit {
+            Cell::text(w.slot.to_string(), Style::default().fg(palette().foreground))
+        } else {
+            Cell::text(format!("{} auto", w.slot), muted)
+        };
+        table.push(vec![name, machine, tags, slot]);
     }
+    table
 }
 
-/// A workspace's machine cell: `This Mac · Local`, `gpu · SSH`.
-fn machine_cell(w: &WorkspaceRow) -> String {
-    format!("{} · {}", w.machine, kind_label(w.machine_kind))
-}
-
-/// A machine's lines: name, kind and host, status; then its root directory
-/// and workspace count; then why it's unreachable.
-fn machine_lines(m: &MachineRow, status: &MachineStatus, selected: bool, width: usize) -> Vec<Line<'static>> {
-    let bg = |s: Style| if selected { s.bg(palette().selection) } else { s };
-    let marker = if selected { "› " } else { "  " };
-    let kind = match &m.host {
-        Some(host) => format!("SSH · {host}"),
-        None => "Local".into(),
-    };
-    let status_color = match status {
-        MachineStatus::Reachable => palette().green,
-        MachineStatus::Unreachable(_) => palette().red,
-        MachineStatus::Local => palette().gray,
-        MachineStatus::Checking => palette().muted,
-    };
-    let mut spans = vec![
-        Span::styled(marker.to_string(), bg(Style::default().fg(palette().white))),
-        Span::styled(m.name.clone(), bg(Style::default().fg(palette().white).add_modifier(Modifier::BOLD))),
-        Span::styled(format!("  {kind}"), bg(Style::default().fg(palette().foreground))),
-    ];
-    if m.host.is_some() {
-        spans.push(Span::styled(format!("  {}", status.label()), bg(Style::default().fg(status_color))));
-    }
-    if selected {
-        spans.push(Span::styled("  ⏎ configure".to_string(), bg(Style::default().fg(palette().muted))));
-    }
-    let mut out = vec![pad_line(spans, width, selected)];
-    let detail = format!("    {} · {}", m.work_dir, workspace_count(m.workspaces));
-    out.push(pad_line(
-        vec![Span::styled(panel::truncate_right(&detail, width), bg(Style::default().fg(palette().muted)))],
-        width,
-        selected,
-    ));
-    if let MachineStatus::Unreachable(e) = status {
-        let why = format!("    SSH couldn’t reach it: {e}");
-        out.push(pad_line(
-            vec![Span::styled(panel::truncate_right(&why, width), bg(Style::default().fg(palette().red)))],
-            width,
-            selected,
-        ));
-    }
-    out
-}
-
-/// `spans` clipped to `width`, padded with the selection fill when
-/// selected.
-fn pad_line(spans: Vec<Span<'static>>, width: usize, selected: bool) -> Line<'static> {
-    let mut out = Vec::new();
-    let mut used = 0usize;
-    for s in spans {
-        let w = panel::display_width(&s.content);
-        if used + w > width {
-            let room = width.saturating_sub(used);
-            if room > 0 {
-                out.push(Span::styled(panel::truncate_right(&s.content, room), s.style));
-                used = width;
+/// The machines table: Machine, SSH host (with the probe's status under a
+/// remote's host), Project directory, Workspaces. The directory goes first
+/// when it's narrow, then the count, then the host.
+fn machine_table(rows: &[MachineRow], statuses: &[MachineStatus]) -> Table {
+    let mut table = Table::new(vec![
+        Column::new("Machine").min(12).max(32).fill(),
+        Column::new("SSH host").min(8).max(28).drop(1),
+        Column::new("Project directory").min(10).max(40).drop(3),
+        Column::new("Workspaces").min(4).max(10).drop(2),
+    ])
+    .empty("No machines yet. Add machine adds one.");
+    let muted = Style::default().fg(palette().muted);
+    for (m, status) in rows.iter().zip(statuses) {
+        let name = Cell::text(m.name.clone(), Style::default().fg(palette().white).add_modifier(Modifier::BOLD));
+        let host = match &m.host {
+            Some(host) => {
+                let color = match status {
+                    MachineStatus::Reachable => palette().green,
+                    MachineStatus::Unreachable(_) => palette().red,
+                    MachineStatus::Local => palette().gray,
+                    MachineStatus::Checking => palette().muted,
+                };
+                Cell::text(host.clone(), Style::default().fg(palette().foreground))
+                    .and(status.label(), Style::default().fg(color))
             }
-            break;
-        }
-        used += w;
-        out.push(s);
+            None => Cell::text(status.label(), muted),
+        };
+        let dir = Cell::end(m.work_dir.clone(), Style::default().fg(palette().foreground));
+        table.push(vec![name, host, dir, Cell::text(m.workspaces.to_string(), Style::default().fg(palette().foreground))]);
     }
-    if selected && used < width {
-        out.push(Span::styled(" ".repeat(width - used), Style::default().bg(palette().selection)));
-    }
-    Line::from(out)
+    table
 }
 
 #[cfg(test)]
@@ -1740,9 +1675,11 @@ mod tests {
         let text = text(&page, 100);
         for want in [
             "New workspace…",
+            "Workspace ",
+            "│ Machine ",
+            "│ Tags ",
+            "│ Slot",
             "alpha",
-            "This Mac · Local",
-            "Build server · SSH",
             "~/Projects/my-project/.shelbi/wt/alpha",
             "/home/me/my-project/.shelbi/wt/charlie",
             "frontend",
@@ -1753,18 +1690,62 @@ mod tests {
             "Machines",
             "Add machine…",
             "⏎ or c on a machine configures it",
-            "SSH · build-server",
+            "│ SSH host ",
+            "│ Project directory ",
+            "│ Workspaces",
             "Checking…",
-            "3 workspaces",
-            "2 workspaces",
         ] {
             assert!(text.contains(want), "{want:?} in:\n{text}");
         }
+        // A workspace's machine has its kind under it, as the desktop's.
+        let lines: Vec<&str> = text.lines().collect();
+        let at = |name: &str| lines.iter().position(|l| l.starts_with(&format!("  {name} "))).unwrap();
+        assert!(lines[at("alpha")].contains("│ This Mac ") && lines[at("alpha") + 1].contains("│ Local "));
+        assert!(lines[at("charlie")].contains("│ Build server ") && lines[at("charlie") + 1].contains("│ SSH "));
+        // A machine: its host (local says so), its directory, its count.
+        let mac = lines[at("This Mac")];
+        assert!(mac.contains("│ Local ") && mac.contains("│ ~/Projects/my-project ") && mac.contains("│ 3 "), "{mac}");
+        let build = lines[at("Build server")];
+        assert!(build.contains("│ build-server ") && build.contains("│ 2 "), "{build}");
         // review's explicit slot shows bare; delta's own linux isn't marked.
         let review = text.lines().find(|l| l.contains("review") && l.contains("This Mac")).unwrap();
         assert!(review.trim_end().ends_with('7'), "{review}");
         let delta = text.lines().find(|l| l.contains("delta")).unwrap();
         assert!(delta.contains("gpu linux") && !delta.contains("+linux"), "{delta}");
+    }
+
+    #[test]
+    fn the_selected_row_is_a_pill_over_both_its_lines_and_narrow_drops_columns() {
+        let mut page = loaded();
+        page.step(true); // Workspace(0), alpha
+        let rows = page.rows(100, true);
+        let alpha: Vec<&PageRow> = rows.iter().filter(|r| r.item == Some(1)).collect();
+        assert_eq!(alpha.len(), 2, "name over its worktree");
+        for r in &alpha {
+            let text = r.line.to_string();
+            assert!(text.starts_with('▐') && text.ends_with('▌'), "{text:?}");
+            assert_eq!(r.line.spans[0].style.fg, Some(palette().selection), "the cap carries the fill");
+            assert_eq!(crate::table::bg_at(&r.line, 10), Some(palette().selection));
+            assert!(r.hover.is_none(), "the selection has no hover look");
+        }
+        // The other rows have one, for the pointer.
+        let bravo = rows.iter().find(|r| r.item == Some(2)).unwrap();
+        assert_eq!(crate::table::bg_at(bravo.hover.as_ref().unwrap(), 10), Some(palette().row_hover));
+        // The header and its rule are table lines nothing lights.
+        let header = rows.iter().find(|r| r.line.to_string().contains("Workspace ")).unwrap();
+        assert_eq!(header.table_row.map(|k| k.1), Some(usize::MAX));
+        // Narrow: Tags go, then Slot; the rest is cut, never wrapped.
+        let narrow = text(&page, 40);
+        assert!(!narrow.contains("│ Tags") && narrow.contains("│ Slot"), "{narrow}");
+        let tiny = text(&page, 24);
+        assert!(!tiny.contains("│ Slot") && tiny.contains("│ Machine"), "{tiny}");
+        for w in 0..24 {
+            for r in page.rows(w, true) {
+                if r.table_row.is_some() {
+                    assert!(crate::panel::display_width(&r.line.to_string()) <= w.max(1) + 2 * crate::table::BLEED);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1780,10 +1761,14 @@ mod tests {
         let text = text(&page, 100);
         assert!(text.contains("Unreachable"), "{text}");
         assert!(text.contains("SSH couldn’t reach it: Connection timed out"), "{text}");
-        assert!(text.contains("/home/me/my-project · 2 workspaces"), "the configuration stays:\n{text}");
+        let build = text.lines().find(|l| l.starts_with("  Build server ")).unwrap();
+        assert!(build.contains("│ /home/me/my-project ") && build.contains("│ 2 "), "the configuration stays:\n{text}");
         assert!(text.contains("Reachable means SSH answered"), "{text}");
         page.state_mut().unwrap().set_reachability(HashMap::from([(key, Reachability::Reachable)]));
-        assert!(self::text(&page, 100).contains("SSH · build-server  Reachable"));
+        let text = self::text(&page, 100);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.starts_with("  Build server ")).unwrap();
+        assert!(lines[at].contains("│ build-server ") && lines[at + 1].contains("│ Reachable "), "{text}");
     }
 
     #[test]

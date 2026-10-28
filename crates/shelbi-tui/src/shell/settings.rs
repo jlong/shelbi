@@ -89,6 +89,7 @@ use shelbi_state::agents_config::AgentsConfig;
 
 use super::keybindings::{KeysAction, KeysPage};
 use crate::panel::{self, PAD};
+use crate::table::{self, TableLine};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
@@ -324,6 +325,9 @@ pub(crate) struct Chrome<'a> {
     pub style: DisplayStyle,
     /// Whether a project is open (the project pages need one).
     pub has_project: bool,
+    /// Where the pointer is (`None`: off the window, or under an overlay),
+    /// for the tables' hover.
+    pub pointer: Option<(u16, u16)>,
 }
 
 /// Settings' state. One per shell: it outlives a visit, so Settings reopens
@@ -373,6 +377,11 @@ pub(crate) struct SettingsShell {
     dropped: usize,
     /// Rects from the last draw, for clicks.
     hits: Vec<(Rect, Hit)>,
+    /// Each drawn table line's rect and its row, from the last draw: what
+    /// the pointer lights.
+    hover_rects: Vec<(Rect, HoverKey)>,
+    /// The table row drawn lit for the pointer at the last draw.
+    hover_shown: Option<HoverKey>,
     /// Whether a project was open at the last draw.
     has_project: bool,
     /// Unsaved edits a test injects (General edits nothing yet): `Some` is
@@ -408,6 +417,8 @@ impl Default for SettingsShell {
             save_error: None,
             dropped: 0,
             hits: Vec::new(),
+            hover_rects: Vec::new(),
+            hover_shown: None,
             has_project: false,
             #[cfg(test)]
             test_edits: None,
@@ -1805,6 +1816,8 @@ impl SettingsShell {
     /// rect) and the shown page into `main`.
     pub(crate) fn render(&mut self, f: &mut Frame, sidebar: Rect, main: Rect, chrome: &Chrome<'_>) {
         self.hits.clear();
+        self.hover_rects.clear();
+        self.hover_shown = None;
         let moves = moves(chrome.keymaps, chrome.style);
         self.has_project = chrome.has_project;
         if let Some(editor) = self.editor.as_mut() {
@@ -1838,7 +1851,9 @@ impl SettingsShell {
             hints(self.region, self.nav.page(), self.typing(), &moves)
         };
         self.has_project = chrome.has_project;
-        self.render_page(f, main, chrome.status, &hints);
+        // What's over the page (a prompt, a menu, a form) takes the pointer.
+        let pointer = chrome.pointer.filter(|_| !self.page_covered());
+        self.render_page(f, main, chrome.status, &hints, pointer);
         if on_workflows {
             self.workflows.render_modal(f, main);
         }
@@ -1958,7 +1973,25 @@ impl SettingsShell {
         }
     }
 
-    fn render_page(&mut self, f: &mut Frame, area: Rect, status: Option<&str>, hints: &str) {
+    /// Whether something drawn over the page holds it: the unsaved-edits
+    /// prompt, a page's menu, modal or form.
+    fn page_covered(&self) -> bool {
+        self.guard.prompt().is_some()
+            || match self.nav.page() {
+                SettingsPage::Workflows => self.workflows.modal_open(),
+                SettingsPage::Agents => self.agents.menu_open(),
+                SettingsPage::Workspaces => self.workspaces.modal(),
+                _ => false,
+            }
+    }
+
+    /// Whether the pointer at `pointer` lights a different table row than
+    /// the last draw did (the shell repaints when it does).
+    pub(crate) fn hover_moved(&self, pointer: Option<(u16, u16)>) -> bool {
+        hovered(&self.hover_rects, pointer) != self.hover_shown
+    }
+
+    fn render_page(&mut self, f: &mut Frame, area: Rect, status: Option<&str>, hints: &str, pointer: Option<(u16, u16)>) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -1986,7 +2019,7 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Keybindings {
             let focused = self.region == Region::Page;
-            self.keys.render(f, content, focused);
+            self.hover_shown = self.keys.render(f, content, focused, pointer, &mut self.hover_rects);
             return;
         }
         self.page_x = content.x;
@@ -2025,7 +2058,18 @@ impl SettingsShell {
         }
         self.scroll = self.scroll.min(max);
         let clipped_below = self.scroll < max;
-        for (i, row) in rows.iter().skip(self.scroll as usize).take(content.height as usize).enumerate() {
+        let shown = rows.iter().skip(self.scroll as usize).take(content.height as usize);
+        let shown_h = (content.height as usize).saturating_sub(usize::from(clipped_below));
+        // Each table line's rect (out in the gutter), then the row the
+        // pointer is on: all its lines draw lit.
+        for (i, row) in shown.clone().take(shown_h).enumerate() {
+            if let Some(key) = row.table_row {
+                let rect = Rect { y: content.y + i as u16, height: 1, ..content };
+                self.hover_rects.push((bleed_rect(rect, area), key));
+            }
+        }
+        self.hover_shown = hovered(&self.hover_rects, pointer);
+        for (i, row) in shown.enumerate() {
             let rect = Rect { y: content.y + i as u16, height: 1, ..content };
             let last = i as u16 + 1 == content.height;
             if last && clipped_below {
@@ -2036,7 +2080,13 @@ impl SettingsShell {
                 );
                 continue;
             }
+            if row.table_row.is_some() {
+                let lit = row.table_row == self.hover_shown;
+                let line = row.hover.as_ref().filter(|_| lit).unwrap_or(&row.line);
+                f.render_widget(Paragraph::new(line.clone()), bleed_rect(rect, area));
+            }
             let line = match row.action {
+                _ if row.table_row.is_some() => None,
                 Some(a) if !draws_own => {
                     let selected = self.region == Region::Page && a == self.action;
                     let width = rect.width as usize;
@@ -2048,16 +2098,18 @@ impl SettingsShell {
                                     self.hits.push((Rect { x: rect.x + x, width: w, ..rect }, Hit::Theme(theme)));
                                 }
                             }
-                            line
+                            Some(line)
                         }
                         // The field's rows come drawn (`general_rows`).
-                        Does::Editor => row.line.clone(),
-                        _ => action_line(&actions[a], selected, width),
+                        Does::Editor => Some(row.line.clone()),
+                        _ => Some(action_line(&actions[a], selected, width)),
                     }
                 }
-                _ => row.line.clone(),
+                _ => Some(row.line.clone()),
             };
-            f.render_widget(Paragraph::new(line), rect);
+            if let Some(line) = line {
+                f.render_widget(Paragraph::new(line), rect);
+            }
             if let Some(a) = row.action {
                 self.hits.push((Rect { x: area.x, width: area.width, ..rect }, Hit::Action(a)));
             }
@@ -2093,7 +2145,7 @@ impl SettingsShell {
                 .workspaces
                 .rows(width, self.region == Region::Page)
                 .into_iter()
-                .map(|r| Row { action: r.item, ..Row::text(r.line) })
+                .map(|r| Row { action: r.item, table_row: r.table_row, hover: r.hover, ..Row::text(r.line) })
                 .collect(),
             // Keybindings draws itself.
             SettingsPage::Keybindings => Vec::new(),
@@ -2137,7 +2189,7 @@ impl SettingsShell {
             width,
             height,
         };
-        f.render_widget(Clear, rect);
+        clear_layer(f, rect, area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette().divider_active))
@@ -2168,7 +2220,7 @@ impl SettingsShell {
             width,
             height,
         };
-        f.render_widget(Clear, rect);
+        clear_layer(f, rect, area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette().divider_active))
@@ -2251,11 +2303,24 @@ pub(crate) struct Row {
     /// A second click target on the row: from this column of the page's
     /// text on, this hit.
     split: Option<(u16, Hit)>,
+    /// A table's line: the table row it belongs to (the pointer lights all
+    /// of a row's lines), drawn [`table::BLEED`] columns out into the
+    /// gutter.
+    table_row: Option<HoverKey>,
+    /// The table line as drawn while the pointer is on its row.
+    hover: Option<Line<'static>>,
 }
 
 impl Row {
     fn text(line: Line<'static>) -> Row {
-        Row { line, action: None, hit: None, focus: false, split: None }
+        Row { line, action: None, hit: None, focus: false, split: None, table_row: None, hover: None }
+    }
+
+    /// Table `table`'s line `l`: drawn out in the gutter, lit with its row.
+    /// The header and its rule draw out too, but nothing lights them.
+    pub(crate) fn table(l: TableLine, table: u8) -> Row {
+        let key = (table, l.row.unwrap_or(usize::MAX));
+        Row { table_row: Some(key), hover: l.hover, ..Row::text(l.line) }
     }
 
     /// The page's focusable row `index`.
@@ -2265,7 +2330,7 @@ impl Row {
 
     /// A row a click hits, drawn focused (or not) by the page.
     fn hit(line: Line<'static>, hit: Hit, focus: bool) -> Row {
-        Row { line, action: None, hit: Some(hit), focus, split: None }
+        Row { hit: Some(hit), focus, ..Row::text(line) }
     }
 
     fn blank() -> Row {
@@ -2782,6 +2847,34 @@ pub(crate) fn selected_style(focused: bool) -> Style {
     }
 }
 
+/// A table row's identity on a page, for the pointer's hover: the table
+/// (a page numbers its tables) and the row in it. A table's header and
+/// rule are row `usize::MAX`, which never has a hover look.
+pub(crate) type HoverKey = (u8, usize);
+
+/// The table row whose drawn line is under `pointer`.
+pub(crate) fn hovered(drawn: &[(Rect, HoverKey)], pointer: Option<(u16, u16)>) -> Option<HoverKey> {
+    let (x, y) = pointer?;
+    drawn.iter().find(|(r, _)| panel::in_rect(*r, x, y)).map(|(_, k)| *k).filter(|k| k.1 != usize::MAX)
+}
+
+/// A content row's rect widened by [`table::BLEED`] each side, within
+/// `area`: where a table line draws.
+pub(crate) fn bleed_rect(rect: Rect, area: Rect) -> Rect {
+    let bleed = table::BLEED as u16;
+    let x = rect.x.saturating_sub(bleed).max(area.x);
+    let right = (rect.right() + bleed).min(area.right());
+    Rect { x, width: right.saturating_sub(x), ..rect }
+}
+
+/// Clear `rect` for a layer over the page, and [`table::BLEED`] columns
+/// each side of it within `within`, so a lit table row's half-block caps
+/// behind it don't peek out at its edges.
+pub(crate) fn clear_layer(f: &mut Frame, rect: Rect, within: Rect) {
+    let wide = bleed_rect(rect, within);
+    f.render_widget(Clear, Rect { y: rect.y, height: rect.height, ..wide });
+}
+
 /// A one-row band of `text`, padded across `area`.
 fn render_band(f: &mut Frame, area: Rect, text: &str, style: Style) {
     let w = area.width as usize;
@@ -3169,6 +3262,7 @@ mod tests {
                 keymaps: &km,
                 style: DisplayStyle::Mac,
                 has_project: true,
+                pointer: None,
             };
             s.render(f, side, main, &chrome);
         })
@@ -3408,7 +3502,7 @@ mod tests {
             s.handle_key(key(KeyCode::Enter), &km);
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
             term.draw(|f| {
-                let chrome = Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true };
+                let chrome = Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true, pointer: None };
                 s.render(f, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40), &chrome);
             })
             .unwrap();
@@ -3517,6 +3611,7 @@ mod tests {
                     keymaps: &km,
                     style: DisplayStyle::Mac,
                     has_project: true,
+                    pointer: None,
                 };
                 s.render(f, side, main, &chrome);
             })

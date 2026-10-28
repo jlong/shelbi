@@ -42,13 +42,15 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use shelbi_app::settings::keybindings::{Change, KeyOutcome, KeybindingsState, Row, Slot};
+use shelbi_app::settings::keybindings::{Change, Group, KeyOutcome, KeybindingsState, Row, Slot};
 use shelbi_app::settings::{Job, Ticket};
 use shelbi_state::keymap::{
     format_chord, Action, DisplayStyle, Key, KeyChord, Keymaps, Mods, SidebarAction,
 };
 
+use super::settings::{bleed_rect, hovered, HoverKey};
 use crate::panel;
+use crate::table::{self, Cell, Column, Table};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
@@ -616,11 +618,20 @@ impl KeysPage {
     }
 
     /// Draw the page into `area` (the main area's content rect). `focused`
-    /// is whether the page has the keyboard.
-    pub(crate) fn render(&mut self, f: &mut Frame, area: Rect, focused: bool) {
+    /// is whether the page has the keyboard. Each drawn table line's rect
+    /// lands in `tables` (with its row); the row under `pointer` draws lit,
+    /// and comes back.
+    pub(crate) fn render(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        focused: bool,
+        pointer: Option<(u16, u16)>,
+        tables: &mut Vec<(Rect, HoverKey)>,
+    ) -> Option<HoverKey> {
         self.hits.clear();
         if area.width == 0 || area.height == 0 {
-            return;
+            return None;
         }
         self.clamp();
         let width = area.width as usize;
@@ -644,7 +655,23 @@ impl KeysPage {
         let max = lines.len().saturating_sub(height) as u16;
         self.scroll = self.scroll.min(max);
         let clipped_below = self.scroll < max;
-        for (i, line) in lines.iter().skip(self.scroll as usize).take(height).enumerate() {
+        // The page draws in the main area's content rect; a table line
+        // reaches into its gutter.
+        let outer = Rect {
+            x: area.x.saturating_sub(table::BLEED as u16),
+            width: area.width + 2 * table::BLEED as u16,
+            ..area
+        };
+        let shown = lines.iter().skip(self.scroll as usize).take(height);
+        let shown_h = height.saturating_sub(usize::from(clipped_below));
+        for (i, line) in shown.clone().take(shown_h).enumerate() {
+            if let Some(key) = line.table_row {
+                let rect = Rect { y: area.y + i as u16, height: 1, ..area };
+                tables.push((bleed_rect(rect, outer), key));
+            }
+        }
+        let lit = hovered(tables, pointer);
+        for (i, line) in shown.enumerate() {
             let y = area.y + i as u16;
             let rect = Rect { y, height: 1, ..area };
             if i + 1 == height && clipped_below {
@@ -654,7 +681,17 @@ impl KeysPage {
                 );
                 continue;
             }
-            f.render_widget(Paragraph::new(line.line.clone()), rect);
+            if line.table_row.is_some() {
+                let wide = bleed_rect(rect, outer);
+                let drawn = line.hover.as_ref().filter(|_| line.table_row == lit).unwrap_or(&line.line);
+                f.render_widget(Paragraph::new(drawn.clone()), wide);
+                // The row's whole drawn width takes its click.
+                if let Some(stop) = line.stop {
+                    self.hits.push((wide, Hit::Stop(stop)));
+                }
+            } else {
+                f.render_widget(Paragraph::new(line.line.clone()), rect);
+            }
             for (x0, x1, hit) in &line.hits {
                 let x = area.x + *x0;
                 let w = x1.saturating_sub(*x0).min(area.right().saturating_sub(x));
@@ -663,6 +700,7 @@ impl KeysPage {
                 }
             }
         }
+        lit
     }
 
     /// Every line of the page at `width`.
@@ -754,38 +792,107 @@ impl KeysPage {
             };
             wrapped(&mut out, hint, width, Style::default().fg(palette().muted));
         }
-        for group in &groups {
+        // Every context's labels take one width, so the rules line up
+        // from table to table.
+        let label_w = groups
+            .iter()
+            .flat_map(|g| g.rows.iter().map(|r| 2 + panel::display_width(r.label)).chain([panel::display_width(g.context.title)]))
+            .max()
+            .unwrap_or(12)
+            .clamp(12, 44);
+        for (g, group) in groups.iter().enumerate() {
             out.push(PageLine::blank());
-            let title = group.context.title;
-            let hint = group.context.hint;
-            let room = width.saturating_sub(panel::display_width(title) + 2);
-            let mut spans = vec![Span::styled(
-                panel::truncate_right(title, width),
-                Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
-            )];
-            if room >= hint.chars().count() {
-                spans.push(Span::raw(" ".repeat(room - hint.chars().count() + 2)));
-                spans.push(Span::styled(hint, Style::default().fg(palette().muted)));
-            }
-            out.push(PageLine::text(Line::from(spans)));
-            for row in &group.rows {
-                self.row_lines(&mut out, row, width, focused);
-            }
+            self.group_lines(&mut out, g as u8, group, label_w, width, focused);
         }
         out
     }
 
-    /// A row's line (or two, when its chords don't fit beside the label),
-    /// then its capture, conflict or note line.
-    fn row_lines(&self, out: &mut Vec<PageLine>, row: &Row, width: usize, focused: bool) {
+    /// A context's table: headed by its title and when it applies (the
+    /// desktop's group header), a row per action, its label and its
+    /// chords; under a row, its capture, conflict or note.
+    fn group_lines(&self, out: &mut Vec<PageLine>, g: u8, group: &Group, label_w: usize, width: usize, focused: bool) {
+        let chips: Vec<_> = group
+            .rows
+            .iter()
+            .map(|row| self.chips(row, focused && self.stop == Stop::Row(row.action)))
+            .collect();
+        // The chords' column takes the width the labels leave, never less
+        // than its widest chords (its header, when it can't fit, is cut);
+        // when even that won't fit, the labels are cut.
+        let widest = chips
+            .iter()
+            .map(|c| c.iter().map(|(t, _, _)| panel::display_width(t)).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        let mut table = Table::new(vec![
+            Column::new(group.context.title)
+                .min(label_w)
+                .max(label_w)
+                .title_style(Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD)),
+            Column::new(group.context.hint)
+                .min(widest.max(6))
+                .max(widest.max(6))
+                .fill()
+                .title_style(Style::default().fg(palette().muted)),
+        ]);
+        for (row, row_chips) in group.rows.iter().zip(&chips) {
+            let selected = focused && self.stop == Stop::Row(row.action);
+            let gutter = if row.customized {
+                Span::styled("● ", Style::default().fg(palette().yellow))
+            } else {
+                Span::raw("  ")
+            };
+            let label_style = if selected {
+                Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette().foreground)
+            };
+            let spans: Vec<Span<'static>> = row_chips.iter().map(|(t, st, _)| Span::styled(t.clone(), *st)).collect();
+            table.push(vec![Cell::spans(vec![gutter, Span::styled(row.label, label_style)]), Cell::spans(spans)]);
+        }
+        let selected = group.rows.iter().position(|r| focused && self.stop == Stop::Row(r.action));
+        let table = table.selected(selected, focused);
+        // Where the chords' column starts (from the page's text) and how
+        // wide it is: a chord past its edge can't be clicked.
+        let chords = table.column_x(width, 1).map(|x| (x, table.layout(width)[1].unwrap_or(0)));
+        let lines = table.lines(width);
+        for (n, l) in lines.iter().enumerate() {
+            let mut line = PageLine::text(l.line.clone());
+            line.table_row = Some((g, l.row.unwrap_or(usize::MAX)));
+            line.hover = l.hover.clone();
+            if let Some(r) = l.row {
+                let row = &group.rows[r];
+                line.stop = Some(Stop::Row(row.action));
+                if let Some((x0, w)) = chords {
+                    let mut x = x0 as u16;
+                    let end = (x0 + w) as u16;
+                    for (text, _, hit) in &chips[r] {
+                        let cw = panel::display_width(text) as u16;
+                        if let Some(hit) = hit {
+                            if x < end {
+                                line.hits.push((x, (x + cw).min(end), *hit));
+                            }
+                        }
+                        x += cw;
+                    }
+                }
+                out.push(line);
+                if lines.get(n + 1).map(|next| next.row) != Some(l.row) {
+                    self.under_lines(out, row, width, focused);
+                }
+            } else {
+                out.push(line);
+            }
+        }
+    }
+
+    /// A row's chords as chips: `⌃P or ⌃Space`, the picked one filled,
+    /// then `+` on the selected row; each with what a click on it does.
+    fn chips(&self, row: &Row, selected: bool) -> Vec<(String, Style, Option<Hit>)> {
         let action = row.action;
-        let selected = focused && self.stop == Stop::Row(action);
         let capture = self.state.capture().filter(|c| c.action == action);
         let capturing = |slot: Slot| capture.is_some_and(|c| c.slot == slot);
         let shown = row.shown();
-
-        // The chords: `⌃P or ⌃Space`, the picked one filled, then `+` on the
-        // selected row.
         let mut chips: Vec<(String, Style, Option<Hit>)> = Vec::new();
         let or = || (" or ".to_string(), Style::default().fg(palette().muted), None);
         for (i, (at, chord)) in shown.iter().enumerate() {
@@ -831,57 +938,17 @@ impl KeysPage {
             chips.push((" ".into(), Style::default(), None));
             chips.push((" + ".into(), style, Some(Hit::Add(action))));
         }
-        let chips_w: usize = chips.iter().map(|(t, _, _)| panel::display_width(t)).sum();
+        chips
+    }
 
-        let gutter = if row.customized {
-            Span::styled("●", Style::default().fg(palette().yellow))
-        } else {
-            Span::raw(" ")
-        };
-        let label_style = if selected {
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(palette().foreground)
-        };
-        let marker = if selected { "›" } else { " " };
-        let lead = 3; // gutter, marker, space
-        let fits = lead + 12 + 1 + chips_w <= width;
-        let label_w = if fits {
-            width.saturating_sub(lead + 1 + chips_w)
-        } else {
-            width.saturating_sub(lead)
-        };
-        let label = panel::truncate_right(row.label, label_w);
-        let mut spans = vec![
-            gutter,
-            Span::styled(marker, Style::default().fg(palette().cyan)),
-            Span::raw(" "),
-            Span::styled(label.clone(), label_style),
-        ];
-        let mut hits = Vec::new();
-        let mut line_x;
-        if fits {
-            let gap = width.saturating_sub(lead + panel::display_width(&label) + chips_w);
-            spans.push(Span::raw(" ".repeat(gap)));
-            line_x = (width - chips_w) as u16;
-            push_chips(&mut spans, &mut hits, &chips, &mut line_x);
-            let mut line = PageLine::stop(Line::from(spans), Stop::Row(action), width);
-            line.hits.extend(hits);
-            out.push(line);
-        } else {
-            out.push(PageLine::stop(Line::from(spans), Stop::Row(action), width));
-            // The chords on their own line, indented under the label.
-            let indent = lead.min(width);
-            let mut spans = vec![Span::raw(" ".repeat(indent))];
-            line_x = indent as u16;
-            push_chips(&mut spans, &mut hits, &chips, &mut line_x);
-            let mut line = PageLine::under(Line::from(spans));
-            line.hits = hits;
-            out.push(line);
-        }
-
-        // Under the row: the conflict, the capture's keys, or why the picked
-        // chord can't be sent here.
+    /// Under a row: the conflict, the capture's keys, or why the picked
+    /// chord can't be sent here.
+    fn under_lines(&self, out: &mut Vec<PageLine>, row: &Row, width: usize, focused: bool) {
+        let action = row.action;
+        let selected = focused && self.stop == Stop::Row(action);
+        let capture = self.state.capture().filter(|c| c.action == action);
+        // Under the label's text (past the gutter).
+        let lead = 2;
         let under = |out: &mut Vec<PageLine>, text: &str, style: Style| {
             for l in shelbi_app::overlay::error_log::wrap(text, width.saturating_sub(lead).max(1)) {
                 out.push(PageLine::under(Line::from(vec![
@@ -900,6 +967,7 @@ impl KeysPage {
                 ),
             }
         } else if selected {
+            let shown = row.shown();
             let picked = shown.get(self.slot).map(|(_, c)| *c);
             if let Some(note) = picked.and_then(|c| chord_note(&c, self.kitty)) {
                 under(out, &format!("⚠ {note}"), Style::default().fg(palette().yellow));
@@ -918,11 +986,16 @@ struct PageLine {
     stop: Option<Stop>,
     hits: Vec<(u16, u16, Hit)>,
     under_row: bool,
+    /// A table's line: its row, for the pointer's hover. Drawn out into
+    /// the gutter.
+    table_row: Option<HoverKey>,
+    /// The table line as drawn while the pointer is on its row.
+    hover: Option<Line<'static>>,
 }
 
 impl PageLine {
     fn text(line: Line<'static>) -> Self {
-        PageLine { line, stop: None, hits: Vec::new(), under_row: false }
+        PageLine { line, stop: None, hits: Vec::new(), under_row: false, table_row: None, hover: None }
     }
 
     fn blank() -> Self {
@@ -931,32 +1004,11 @@ impl PageLine {
 
     /// A stop's line, the whole width its click target.
     fn stop(line: Line<'static>, stop: Stop, width: usize) -> Self {
-        PageLine {
-            line,
-            stop: Some(stop),
-            hits: vec![(0, width as u16, Hit::Stop(stop))],
-            under_row: false,
-        }
+        PageLine { stop: Some(stop), hits: vec![(0, width as u16, Hit::Stop(stop))], ..PageLine::text(line) }
     }
 
     fn under(line: Line<'static>) -> Self {
-        PageLine { line, stop: None, hits: Vec::new(), under_row: true }
-    }
-}
-
-fn push_chips(
-    spans: &mut Vec<Span<'static>>,
-    hits: &mut Vec<(u16, u16, Hit)>,
-    chips: &[(String, Style, Option<Hit>)],
-    x: &mut u16,
-) {
-    for (text, style, hit) in chips {
-        let w = panel::display_width(text) as u16;
-        if let Some(hit) = hit {
-            hits.push((*x, *x + w, *hit));
-        }
-        spans.push(Span::styled(text.clone(), *style));
-        *x += w;
+        PageLine { under_row: true, ..PageLine::text(line) }
     }
 }
 

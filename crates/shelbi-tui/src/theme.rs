@@ -228,8 +228,9 @@ pub(crate) fn with_appearance<R>(appearance: Appearance, f: impl FnOnce() -> R) 
 /// background, else the light canvas, standing in for a light terminal's
 /// default). 3:1 is the floor for every glyph on screen; the 4.5:1 text bar
 /// is checked per token in `shelbi_app::theme`. Block glyphs (`▄▀█▏` and the
-/// rest of U+2580..U+259F) are shapes painted in their fill color, so they're
-/// exempt from the contrast check.
+/// rest of U+2580..U+259F) are shapes painted in their fill color, and
+/// box-drawing rules (`│─┼`, U+2500..U+257F, the tables' quiet lines) are
+/// shapes too, so they're exempt from the contrast check.
 ///
 /// With `SHELBI_THEME_DUMP=<dir>` set, also writes `<dir>/<name>.html`, the
 /// buffer drawn on the light canvas, for checking a surface by eye.
@@ -263,7 +264,7 @@ pub(crate) fn assert_light_readable(name: &str, buf: &ratatui::buffer::Buffer) {
             let symbol = cell.symbol();
             let is_text = symbol
                 .chars()
-                .any(|c| !c.is_whitespace() && !('\u{2580}'..='\u{259f}').contains(&c));
+                .any(|c| !c.is_whitespace() && !('\u{2500}'..='\u{259f}').contains(&c));
             if is_text && !cell.modifier.contains(ratatui::style::Modifier::DIM) {
                 let ratio = fg.contrast_ratio(bg);
                 if ratio < 3.0 {

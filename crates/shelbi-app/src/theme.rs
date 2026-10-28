@@ -226,6 +226,12 @@ pub struct Theme<C = Swatch> {
     /// A read-only or disabled text field's fill: quieter than
     /// [`Theme::input`], its text muted.
     pub input_disabled: C,
+    /// A settings table's cell rules (`│`, `─`, `┼`): the desktop tables'
+    /// `input_border` edge, quiet so the columns read before the lines.
+    pub table_rule: C,
+    /// A table row under the pointer: lighter than [`Theme::selection`],
+    /// which wins when a row is both.
+    pub row_hover: C,
     /// `color/divider` (was `DIVIDER_DIM`): the sidebar's right-edge rule at
     /// rest.
     pub divider: C,
@@ -312,6 +318,8 @@ impl Theme {
             input_focus: Swatch::rgb(0x213a40),
             input_invalid: Swatch::rgb(0x402527),
             input_disabled: Swatch::rgb(0x222222),
+            table_rule: Swatch::rgb(0x444444),
+            row_hover: Swatch::rgb(0x2d2d2d),
             divider: Swatch::rgb(0x414141),
             zen: Swatch::rgb(0x007f00),
 
@@ -364,6 +372,8 @@ impl Theme {
             input_focus: Swatch::rgb(0xd9eef1),
             input_invalid: Swatch::rgb(0xf9e1e1),
             input_disabled: Swatch::rgb(0xf4f4f4),
+            table_rule: Swatch::rgb(0xd6d6d6),
+            row_hover: Swatch::rgb(0xececec),
             divider: Swatch::rgb(0xd0d0d0),
             zen: Swatch::rgb(0x007f00),
 
@@ -455,6 +465,8 @@ impl<C: Copy> Theme<C> {
             input_focus,
             input_invalid,
             input_disabled,
+            table_rule,
+            row_hover,
             divider,
             zen,
             divider_active,
@@ -500,6 +512,8 @@ impl<C: Copy> Theme<C> {
             input_focus: f(input_focus),
             input_invalid: f(input_invalid),
             input_disabled: f(input_disabled),
+            table_rule: f(table_rule),
+            row_hover: f(row_hover),
             divider: f(divider),
             zen: f(zen),
             divider_active: f(divider_active),
@@ -558,6 +572,8 @@ const TOKEN_NAMES: &[&str] = &[
     "input_focus",
     "input_invalid",
     "input_disabled",
+    "table_rule",
+    "row_hover",
     "divider",
     "zen",
     "divider_active",
@@ -753,6 +769,14 @@ mod tests {
                     assert_contrast(&theme, fg, fill, 4.5);
                 }
             }
+            // A row under the pointer reads as a selected one does (its
+            // muted cells as a field's placeholder), and apart from the
+            // selection.
+            for fg in ["white", "gray", "foreground"] {
+                assert_contrast(&theme, fg, "row_hover", 4.5);
+            }
+            assert_contrast(&theme, "muted", "row_hover", 3.0);
+            assert_ne!(token(&theme, "row_hover").rgb, token(&theme, "selection").rgb, "hover and selection differ");
             // A field's placeholder and a read-only field's text.
             assert_contrast(&theme, "muted", "input", 3.0);
             assert_contrast(&theme, "muted", "input_disabled", 3.0);

@@ -40,10 +40,11 @@ use shelbi_app::settings::workflows::{
 };
 use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::StatusCategory;
-use shelbi_state::workflow_config::{StatusSummary, WorkflowConfig, WorkflowSummary};
+use shelbi_state::workflow_config::{StatusSummary, UnreadableWorkflow, WorkflowConfig, WorkflowSummary};
 
 use super::{box_rows, heading, selected_style, wrapped, Row, SettingsAction};
 use crate::panel;
+use crate::table::{Cell, Column, Table, TableLine};
 use crate::textbox::Textbox;
 use crate::theme::palette;
 
@@ -929,25 +930,25 @@ impl WorkflowsPage {
             }
         }
         let selected = |i: usize| (i == self.cursor).then_some(focused);
+        // The cursor's row in a table whose first row is item `base`.
+        let picked = |base: usize, len: usize| (self.cursor >= base && self.cursor < base + len).then(|| self.cursor - base);
         let mut index = 0usize;
 
         // Workflows.
         rows.push(Row::blank());
         heading(&mut rows, "Workflows");
         let workflows = state.workflows();
-        let cols = WorkflowCols::fit(&workflows, width);
-        rows.push(Row::text(cols.heading()));
-        for w in &workflows {
-            rows.push(Row::item(cols.line(w, selected(index), width), index));
-            error_rows(&mut rows, state.error_at(&Target::Workflow(w.name.clone())), width);
-            index += 1;
-        }
-        for u in state.unreadable() {
-            let text = format!("⚠ {}  Can’t be edited here: {}", u.name, u.error);
-            rows.push(Row::item(plain_line(&text, selected(index), width, Style::default().fg(palette().red)), index));
-            error_rows(&mut rows, state.error_at(&Target::Workflow(u.name.clone())), width);
-            index += 1;
-        }
+        let unreadable = state.unreadable();
+        let table = workflow_table(&workflows, unreadable);
+        let table = table.selected(picked(index, workflows.len() + unreadable.len()), focused);
+        let errors: Vec<Option<&str>> = workflows
+            .iter()
+            .map(|w| w.name.as_str())
+            .chain(unreadable.iter().map(|u| u.name.as_str()))
+            .map(|name| state.error_at(&Target::Workflow(name.to_string())))
+            .collect();
+        table_rows(&mut rows, table.lines(width), WORKFLOWS_TABLE, index, |rows, r| error_rows(rows, errors[r], width));
+        index += workflows.len() + unreadable.len();
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Workflow { from })) => {
                 let refused = state.error_at(&Target::NewWorkflow);
@@ -970,24 +971,26 @@ impl WorkflowsPage {
         heading(&mut rows, "Statuses");
         wrapped(&mut rows, STATUSES_HELP, width, muted);
         let statuses = state.statuses();
-        let cols = StatusCols::fit(&statuses, width);
-        rows.push(Row::text(cols.heading()));
-        for s in &statuses {
-            let refused = state.error_at(&Target::Status(s.id.clone()));
-            match &self.modal {
-                // Renamed in a field under its row.
-                Some(Modal::Rename { id, text }) if *id == s.id => {
-                    rows.push(Row::item(cols.line(s, Some(true), width), index));
-                    draft_rows(&mut rows, text, "Status name", refused, index, width);
-                    wrapped(&mut rows, "Enter to rename, Esc to cancel.", width, muted);
+        // A status renamed in a field under its row shows selected.
+        let renaming = match &self.modal {
+            Some(Modal::Rename { id, text }) => statuses.iter().position(|s| s.id == *id).map(|at| (at, text)),
+            _ => None,
+        };
+        let table = match renaming {
+            Some((at, _)) => status_table(&statuses).selected(Some(at), true),
+            None => status_table(&statuses).selected(picked(index, statuses.len()), focused),
+        };
+        table_rows(&mut rows, table.lines(width), STATUSES_TABLE, index, |rows, r| {
+            let refused = state.error_at(&Target::Status(statuses[r].id.clone()));
+            match renaming {
+                Some((at, text)) if at == r => {
+                    draft_rows(rows, text, "Status name", refused, index + r, width);
+                    wrapped(rows, "Enter to rename, Esc to cancel.", width, muted);
                 }
-                _ => {
-                    rows.push(Row::item(cols.line(s, selected(index), width), index));
-                    error_rows(&mut rows, refused, width);
-                }
+                _ => error_rows(rows, refused, width),
             }
-            index += 1;
-        }
+        });
+        index += statuses.len();
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Status { category })) => {
                 let refused = state.error_at(&Target::NewStatus);
@@ -1244,155 +1247,98 @@ pub(super) fn cell(text: &str, w: usize) -> String {
     format!("{t}{}", " ".repeat(pad))
 }
 
-/// The workflow table's columns at a width.
-struct WorkflowCols {
-    name: usize,
-    /// 0 when there's no room for descriptions.
-    description: usize,
-    counts: bool,
-}
+/// The page's tables, for the pointer's hover (`HoverKey`).
+const WORKFLOWS_TABLE: u8 = 0;
+const STATUSES_TABLE: u8 = 1;
 
-const STATUSES_COL: usize = 10;
-const TRANSITIONS_COL: usize = 12;
-
-impl WorkflowCols {
-    fn fit(rows: &[WorkflowSummary], width: usize) -> WorkflowCols {
-        let longest = rows.iter().map(|r| r.name.chars().count() + if r.is_default { 9 } else { 0 }).max().unwrap_or(4);
-        let counts = width >= 44;
-        let room = width.saturating_sub(2 + if counts { STATUSES_COL + TRANSITIONS_COL } else { 0 });
-        let name = (longest + 2).clamp(8, 30).min(room);
-        let description = room.saturating_sub(name);
-        WorkflowCols { name, description: if description >= 12 { description } else { 0 }, counts }
-    }
-
-    fn heading(&self) -> Line<'static> {
-        let mut text = format!("  {}", cell("Name", self.name));
-        if self.description > 0 {
-            text.push_str(&cell("Description", self.description));
+/// A table's `lines` as page rows, table row `r` the page's item
+/// `base + r`; `under` adds what goes under each row (its error, a rename
+/// field) after the row's last line.
+pub(super) fn table_rows(
+    rows: &mut Vec<Row>,
+    lines: Vec<TableLine>,
+    table: u8,
+    base: usize,
+    mut under: impl FnMut(&mut Vec<Row>, usize),
+) {
+    let ends: Vec<bool> = (0..lines.len()).map(|n| lines.get(n + 1).map(|l| l.row) != Some(lines[n].row)).collect();
+    for (line, ends_row) in lines.into_iter().zip(ends) {
+        let r = line.row;
+        let mut row = Row::table(line, table);
+        row.action = r.map(|r| base + r);
+        rows.push(row);
+        if let (Some(r), true) = (r, ends_row) {
+            under(rows, r);
         }
-        if self.counts {
-            text.push_str(&format!("{:>STATUSES_COL$}{:>TRANSITIONS_COL$}", "Statuses", "Transitions"));
-        }
-        Line::from(Span::styled(text, Style::default().fg(palette().muted)))
-    }
-
-    fn line(&self, w: &WorkflowSummary, selected: Option<bool>, width: usize) -> Line<'static> {
-        let marker = if selected.is_some() { "› " } else { "  " };
-        let badge = if w.is_default { " default" } else { "" };
-        let name_room = self.name.saturating_sub(panel::display_width(badge) + 1);
-        let name = panel::truncate_right(&w.name, name_room.max(1));
-        let name_pad = self.name.saturating_sub(panel::display_width(&name) + panel::display_width(badge));
-        let description = if self.description > 0 {
-            cell(w.description.as_deref().unwrap_or(""), self.description.saturating_sub(1)) + " "
-        } else {
-            String::new()
-        };
-        let counts = if self.counts {
-            format!("{:>STATUSES_COL$}{:>TRANSITIONS_COL$}", w.statuses, w.transitions)
-        } else {
-            String::new()
-        };
-        let (base, badge_style, name_style, muted) = match selected {
-            Some(focused) => {
-                let s = selected_style(focused);
-                (s, s.fg(palette().cyan), s, s)
-            }
-            None => (
-                Style::default(),
-                Style::default().fg(palette().cyan),
-                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-                Style::default().fg(palette().foreground),
-            ),
-        };
-        let mut spans = vec![
-            Span::styled(marker.to_string(), base),
-            Span::styled(name, name_style),
-            Span::styled(badge.to_string(), badge_style),
-            Span::styled(" ".repeat(name_pad), base),
-            Span::styled(description, muted),
-            Span::styled(counts, muted),
-        ];
-        pad_selected(&mut spans, selected, width);
-        Line::from(spans)
     }
 }
 
-/// The status table's columns at a width.
-struct StatusCols {
-    name: usize,
-    /// 0 when there's no room.
-    id: usize,
-    category: usize,
-    used_in: usize,
+/// The workflows table, as the desktop's: Workflow (its Default badge, its
+/// description under it), Statuses, Transitions. A workflow file that
+/// doesn't read is a row saying why. Transitions go first when it's
+/// narrow, then Statuses.
+fn workflow_table(workflows: &[WorkflowSummary], unreadable: &[UnreadableWorkflow]) -> Table {
+    let mut table = Table::new(vec![
+        Column::new("Workflow").min(10).max(60).fill(),
+        Column::new("Statuses").min(8).max(10).drop(1),
+        Column::new("Transitions").min(11).max(12).drop(2),
+    ])
+    .empty("No workflows yet. New workflow adds one.");
+    let count = |n: usize| Cell::text(n.to_string(), Style::default().fg(palette().foreground));
+    for w in workflows {
+        let mut name = vec![Span::styled(w.name.clone(), Style::default().fg(palette().white).add_modifier(Modifier::BOLD))];
+        if w.is_default {
+            name.push(Span::raw(" "));
+            name.push(Span::styled(
+                " Default ",
+                Style::default().fg(palette().workflow_badge_fg).bg(palette().workflow_badge_bg),
+            ));
+        }
+        let mut cell = Cell::spans(name);
+        if let Some(d) = w.description.as_deref().filter(|d| !d.is_empty()) {
+            cell = cell.and(d.to_string(), Style::default().fg(palette().muted));
+        }
+        table.push(vec![cell, count(w.statuses), count(w.transitions)]);
+    }
+    for u in unreadable {
+        let red = Style::default().fg(palette().red);
+        let cell = Cell::text(format!("⚠ {}", u.name), red.add_modifier(Modifier::BOLD))
+            .and(format!("Can’t be edited here: {}", u.error), red);
+        table.push(vec![cell]);
+    }
+    table
 }
 
-impl StatusCols {
-    fn fit(rows: &[StatusSummary], width: usize) -> StatusCols {
-        let longest_name = rows.iter().map(|r| r.name.chars().count()).max().unwrap_or(6);
-        let longest_id = rows.iter().map(|r| r.id.chars().count()).max().unwrap_or(2);
-        let room = width.saturating_sub(4);
-        let name = (longest_name + 2).clamp(8, 24).min(room);
-        let category = 10.min(room.saturating_sub(name));
-        let mut left = room.saturating_sub(name + category);
-        let id = if width >= 60 { (longest_id + 2).clamp(6, 22).min(left) } else { 0 };
-        left = left.saturating_sub(id);
-        let used_in = if left >= 8 { left } else { 0 };
-        StatusCols { name, id, category, used_in }
-    }
-
-    fn heading(&self) -> Line<'static> {
-        let mut text = format!("    {}", cell("Status", self.name));
-        if self.id > 0 {
-            text.push_str(&cell("ID", self.id));
-        }
-        text.push_str(&cell("Category", self.category));
-        if self.used_in > 0 {
-            text.push_str(&cell("Used in", self.used_in));
-        }
-        Line::from(Span::styled(text, Style::default().fg(palette().muted)))
-    }
-
-    fn tail(&self, s: &StatusSummary) -> (String, String, String) {
-        let id = if self.id > 0 { cell(&s.id, self.id) } else { String::new() };
-        let category = cell(category_label(s.category), self.category);
-        let used = if self.used_in == 0 {
-            String::new()
-        } else if s.used_in.is_empty() {
-            cell("—", self.used_in)
-        } else {
-            cell(&s.used_in.join(", "), self.used_in)
-        };
-        (id, category, used)
-    }
-
-    fn line(&self, s: &StatusSummary, selected: Option<bool>, width: usize) -> Line<'static> {
-        let marker = if selected.is_some() { "› " } else { "  " };
+/// The statuses table, as the desktop's: Name (its category's dot),
+/// ID, Category, Used in. ID goes first when it's narrow, then Used in,
+/// then Category.
+fn status_table(statuses: &[StatusSummary]) -> Table {
+    let mut table = Table::new(vec![
+        Column::new("Name").min(8).max(28),
+        Column::new("ID").min(4).max(24).drop(3),
+        Column::new("Category").min(8).max(12).drop(1),
+        Column::new("Used in").min(8).max(60).fill().drop(2),
+    ])
+    .empty("No statuses yet. New status adds one.");
+    for s in statuses {
         let color = crate::kanban::category_color(s.category);
-        let (id, category, used) = self.tail(s);
-        let (base, glyph, name, muted, cat) = match selected {
-            Some(focused) => {
-                let st = selected_style(focused);
-                (st, st.fg(color), st, st, st)
-            }
-            None => (
-                Style::default(),
-                Style::default().fg(color),
-                Style::default().fg(palette().white),
-                Style::default().fg(palette().foreground),
-                Style::default().fg(color),
-            ),
+        let name = Cell::spans(vec![
+            Span::styled("● ", Style::default().fg(color)),
+            Span::styled(s.name.clone(), Style::default().fg(palette().white)),
+        ]);
+        let used = if s.used_in.is_empty() {
+            Cell::text("—", Style::default().fg(palette().muted))
+        } else {
+            Cell::text(s.used_in.join(", "), Style::default().fg(palette().foreground))
         };
-        let mut spans = vec![
-            Span::styled(marker.to_string(), base),
-            Span::styled("● ", glyph),
-            Span::styled(cell(&s.name, self.name), name),
-            Span::styled(id, muted),
-            Span::styled(category, cat),
-            Span::styled(used, muted),
-        ];
-        pad_selected(&mut spans, selected, width);
-        Line::from(spans)
+        table.push(vec![
+            name,
+            Cell::text(s.id.clone(), Style::default().fg(palette().foreground)),
+            Cell::text(category_label(s.category), Style::default().fg(color)),
+            used,
+        ]);
     }
+    table
 }
 
 /// Fill a selected row's line to `width` with the selection color.
