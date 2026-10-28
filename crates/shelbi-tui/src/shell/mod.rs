@@ -27,6 +27,7 @@ mod keybindings;
 mod session;
 mod settings;
 mod sidebar;
+mod stray_output;
 mod workspace;
 mod terminal_view;
 
@@ -346,6 +347,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // while it runs. The first frame draws immediately (below), before any of
     // this completes.
     state.status = Some(STARTUP_STATUS.to_string());
+    // GitHub retry notices go to the status band and `tui.log`, not the
+    // terminal under the frame (`tui-stderr-corrupts-screen`).
+    state.retry_notices = Some(stray_output::install_retry_notices());
     state.spawn_startup();
 
     // React to the daemon poller's layout events (review opened/closed/agent
@@ -559,6 +563,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_settings() {
             state.dirty = true;
         }
+        if state.poll_retry_notices(Instant::now()) {
+            state.dirty = true;
+        }
         if ring {
             let mut out = io::stdout();
             let _ = out.write_all(b"\x07");
@@ -576,6 +583,8 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
 
     // Stop the background client-count poller (its thread exits on the next tick).
     count_stop.store(true, Ordering::SeqCst);
+    // Anything retrying past here prints to the restored terminal as usual.
+    stray_output::uninstall_retry_notices();
 
     // Decide the on-exit action(s) before touching the terminal: a daemon-asked
     // re-exec (carry the view forward and replace the process) and/or a daemon
@@ -1230,6 +1239,16 @@ struct ShellState {
     /// A transient status line shown at the bottom of the main area (effect
     /// results, deferred-feature notes, background-job outcomes).
     status: Option<String>,
+    /// GitHub retry notices from any thread (`stray_output`), installed by the
+    /// run loop; `None` in tests that don't install the sink.
+    retry_notices: Option<Receiver<stray_output::RetryNoticeMsg>>,
+    /// The newest retry notice and when it stops showing. It takes the status
+    /// band over [`Self::status`] while it shows, without replacing it.
+    retry_notice: Option<(String, Instant)>,
+    /// Clear the terminal and paint every cell on the next draw: Ctrl+L, a
+    /// resize, focus regained. Recovers the screen from anything written over
+    /// it outside ratatui.
+    full_redraw: bool,
     /// A pending off-UI-thread job; its `String` is the status to show when it
     /// finishes. Blocking commands (e.g. the Zen toggle) run here so they never
     /// freeze the one event loop.
@@ -1430,6 +1449,9 @@ impl ShellState {
             #[cfg(test)]
             refresh_requests: std::cell::Cell::new(0),
             status: None,
+            retry_notices: None,
+            retry_notice: None,
+            full_redraw: false,
             job: None,
             pending_editor: None,
             palette_inputs: Arc::new(DiskPaletteInputs),
@@ -1454,6 +1476,40 @@ impl ShellState {
             }
             None => None,
         }
+    }
+
+    /// Take any GitHub retry notices that arrived, the newest showing for at
+    /// least [`NOTICE_SECS`] (or the whole wait, if longer), and drop one whose
+    /// time is up. Returns whether the status band changed.
+    fn poll_retry_notices(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some(rx) = &self.retry_notices {
+            while let Ok((line, wait)) = rx.try_recv() {
+                let shown = wait.max(Duration::from_secs(NOTICE_SECS));
+                self.retry_notice = Some((line, now + shown));
+                changed = true;
+            }
+        }
+        if matches!(&self.retry_notice, Some((_, until)) if now >= *until) {
+            self.retry_notice = None;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The status band's text: a showing retry notice, else the status line.
+    fn status_text(&self) -> Option<String> {
+        self.retry_notice
+            .as_ref()
+            .map(|(line, _)| line.clone())
+            .or_else(|| self.status.clone())
+    }
+
+    /// Whether `k` is the redraw key: the `FocusMain` chord (Ctrl+L by
+    /// default), which also repaints, as Ctrl+L conventionally does.
+    fn is_redraw_key(&self, k: &KeyEvent) -> bool {
+        crate::keymap::chord_from_event(*k)
+            .is_some_and(|chord| self.keymaps.global.dispatch(chord) == Some(GlobalAction::FocusMain))
     }
 
     fn apply_snapshot(&mut self, snap: ShellSnapshot) {
@@ -1969,6 +2025,18 @@ impl ShellState {
     // --- event handling ----------------------------------------------------
 
     fn handle_event(&mut self, ev: Event) {
+        // A full repaint on resize, focus regained, and Ctrl+L (wherever focus
+        // is, overlay or not; the key still does its usual job below), so
+        // anything written over the screen outside ratatui is wiped.
+        let repaint = match &ev {
+            Event::Resize(_, _) | Event::FocusGained => true,
+            Event::Key(k) => terminal_view::is_actionable(k) && self.is_redraw_key(k),
+            _ => false,
+        };
+        if repaint {
+            self.full_redraw = true;
+            self.dirty = true;
+        }
         // An open overlay captures input: keys and clicks drive it, not the
         // sidebar or the agent beneath it.
         if self.overlay.is_some() {
@@ -4527,6 +4595,12 @@ fn draw_frame<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     state: &mut ShellState,
 ) -> Result<()> {
+    // Ctrl+L / resize / focus regained: clear the screen and forget the last
+    // frame, so every cell is painted again (stray text over the frame is
+    // wiped, not just the cells ratatui thinks changed).
+    if std::mem::take(&mut state.full_redraw) {
+        term.clear()?;
+    }
     // Compute layout up front so we can report the main-area size to the live
     // session before painting.
     let full = Rect {
@@ -4596,7 +4670,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
     // cleared for good (so it is emitted exactly once per run).
     let notice = state.notice_text(Instant::now());
     let searching = state.search_input.clone();
-    let status = state.status.clone();
+    let status = state.status_text();
     // Take the overlay out so the draw closure can render it with a mutable
     // borrow while it holds shared borrows of the rest of `state`; it is put
     // back right after the draw.
@@ -5178,6 +5252,9 @@ fn restore_terminal() {
     );
     let _ = disable_raw_mode();
     let _ = out.flush();
+    // Give stderr back to the terminal, so an editor, a panic message or the
+    // detach note reaches the user.
+    stray_output::restore_stderr();
 }
 
 /// RAII terminal setup: raw mode, alternate screen, mouse/focus/paste capture,
@@ -5202,6 +5279,9 @@ fn enter_terminal_modes() -> io::Result<()> {
         out,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
+    // While the frame owns the screen, stderr goes to `tui.log`: a stray
+    // write from a library or child process can't land on top of it.
+    stray_output::redirect_stderr();
     Ok(())
 }
 
@@ -5255,6 +5335,8 @@ mod tests {
     // Settings ▸ Keybindings through the real event path (`tests/keybindings.rs`).
     mod keybindings;
     pub(super) use keybindings::MemKeys;
+    // Stray stderr and the full repaint (`tests/stray_output.rs`).
+    mod stray_output;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {

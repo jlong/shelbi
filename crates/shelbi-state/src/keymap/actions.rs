@@ -37,7 +37,9 @@ pub enum GlobalAction {
     /// open, the review panel). Vim-style `Ctrl+H`.
     FocusSidebar,
     /// Move keyboard focus right: to the main pane (or, while a review is
-    /// open, the review content view). Vim-style `Ctrl+L`.
+    /// open, the review content view). Vim-style `Ctrl+L`, so it also does
+    /// what Ctrl+L conventionally does: a full clear-and-redraw of the screen,
+    /// which recovers the TUI from anything written over it.
     FocusMain,
 }
 
@@ -121,7 +123,7 @@ impl Action {
                 GlobalAction::ZenToggle => "Toggle Zen Mode",
                 GlobalAction::OpenPalette => "Open command palette",
                 GlobalAction::FocusSidebar => "Focus the nav sidebar (left)",
-                GlobalAction::FocusMain => "Focus the main pane (right)",
+                GlobalAction::FocusMain => "Focus the main pane (right) and redraw the screen",
             },
             Action::Sidebar(a) => match a {
                 SidebarAction::Quit => "Quit sidebar",
@@ -193,7 +195,7 @@ impl Action {
                 GlobalAction::ZenToggle => "Toggle Zen mode",
                 GlobalAction::OpenPalette => "Open command palette",
                 GlobalAction::FocusSidebar => "Focus sidebar",
-                GlobalAction::FocusMain => "Focus main pane",
+                GlobalAction::FocusMain => "Focus main pane and redraw",
             },
             Action::Sidebar(a) => match a {
                 SidebarAction::Quit => "Quit",

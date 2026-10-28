@@ -31,6 +31,11 @@ mod event_log;
 pub mod gh_budget;
 pub mod gh_requests;
 mod gh_retry;
+pub use gh_retry::{
+    clear_retry_notice_sink, set_retry_notice_sink, NoticeSink, RetryKind, RetryNotice,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use gh_retry::notify_retry_for_test;
 pub mod github_store;
 mod hub_config;
 mod hub_version;
