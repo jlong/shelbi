@@ -1078,13 +1078,15 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
 
     // Top / bottom half-block bleed rows: the fill as the glyph's foreground on
     // the terminal's default (transparent) background, exactly like the nav
-    // selection bleed (and the settings' text fields, which share the caps).
-    let (above, below) = crate::textbox::caps(width, palette().search);
+    // selection bleed.
+    let bleed_style = Style::default().fg(palette().search);
     if label_y > top {
-        Paragraph::new(above).render(Rect { y: top, height: 1, ..area }, buf);
+        Paragraph::new(Line::from(Span::styled(BLEED_ABOVE.repeat(width), bleed_style)))
+            .render(Rect { y: top, height: 1, ..area }, buf);
     }
     if bottom < area.bottom() {
-        Paragraph::new(below).render(Rect { y: bottom, height: 1, ..area }, buf);
+        Paragraph::new(Line::from(Span::styled(BLEED_BELOW.repeat(width), bleed_style)))
+            .render(Rect { y: bottom, height: 1, ..area }, buf);
     }
 
     // Label row, on the solid search fill. Measure in *display* columns, not

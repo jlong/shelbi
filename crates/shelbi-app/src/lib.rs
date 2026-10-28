@@ -39,6 +39,9 @@
 //!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
 //!   classification, and the per-pane restart controller over
 //!   [`supervision`], the crash-loop core the daemon poller shares.
+//! - [`about`] — About Shelbi's words and links (the tagline, the project's
+//!   URLs, the copyright and license), so both clients' About screens read
+//!   the same.
 //!
 //! # No UI toolkit
 //!
@@ -49,6 +52,7 @@
 //! (`shelbi-tui`, `shelbi-cli`). The `tests/no_ui_deps.rs` integration test
 //! asserts the invariant against the resolved dependency tree.
 
+pub mod about;
 pub mod activity;
 pub mod add_project_wizard;
 pub mod board;

@@ -43,13 +43,15 @@ name; the sections below describe the window as first built.
 - Links in `text/link` (the credits' two in `text/muted`), the
   hovered-link color (`text/bold`) under the pointer, all opening in the
   browser: Website `https://shelbi.dev`, Documentation
-  `https://shelbi.dev/docs` (the Help menu's `DOCS_URL`), GitHub
+  `https://shelbi.dev/docs` (the Help menu's too), GitHub
   `https://github.com/jlong/shelbi`, MIT License
   `https://github.com/jlong/shelbi/blob/main/LICENSE`, Sponsored by
-  32pixels `https://32pixels.co`.
-- **© year: the build's year**, not a literal 2026: `build.rs` sets
+  32pixels `https://32pixels.co`. These words and links (and the tagline,
+  the copyright holder and year) now live in `shelbi_app::about`, shared
+  with the TUI's About overlay (`tui-about`); the About menu item runs the
+  registry's `action:about`, as the palette does.- **© year: the build's year**, not a literal 2026: `build.rs` sets
   `SHELBI_BUILD_YEAR` from `SOURCE_DATE_EPOCH` when set (a reproducible
-  build), else the clock. It reads 2026 today, as the frame does, and a
+  build), else the clock (`shelbi-app`'s `build.rs` since `tui-about`). It reads 2026 today, as the frame does, and a
   release built in a later year says that year. (Caveat: a local build
   only re-runs the build script when its inputs change, so a dev build can
   keep last year's until then; release builds are fresh.)

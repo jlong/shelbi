@@ -113,17 +113,6 @@ fn status_ids() -> Vec<String> {
     WorkflowConfig::load(PROJECT).unwrap().statuses().iter().map(|s| s.id.clone()).collect()
 }
 
-/// The text in each field on `screen`: the line under each `▄` cap,
-/// trimmed.
-fn boxed(screen: &str) -> Vec<String> {
-    let lines: Vec<&str> = screen.lines().collect();
-    lines
-        .windows(2)
-        .filter(|w| w[0].trim_start().starts_with('▄'))
-        .map(|w| w[1].trim().to_string())
-        .collect()
-}
-
 #[test]
 fn the_page_lists_workflows_statuses_and_the_legend() {
     let _home = Home::new("rows");
@@ -212,7 +201,7 @@ fn n_types_a_new_workflow_and_enter_creates_it() {
     assert!(page.modal_open());
     typed(&mut page, "hotfix");
     let text = render(&mut page, 100, 40);
-    assert!(boxed(&text).iter().any(|t| t == "hotfix"), "{text}");
+    assert!(text.contains("› Name hotfix"), "{text}");
     assert!(text.contains("Enter to create, Esc to cancel."), "{text}");
     // Digits and letters type, they don't run actions.
     typed(&mut page, "2");
@@ -246,7 +235,7 @@ fn duplicate_offers_a_free_name_and_set_default_moves_the_badge() {
     let mut page = page();
     press(&mut page, key(KeyCode::Char('c')));
     let text = render(&mut page, 100, 40);
-    assert!(boxed(&text).iter().any(|t| t == "task-copy"), "{text}");
+    assert!(text.contains("› Name task-copy"), "{text}");
     assert!(text.contains("Duplicate of task."), "{text}");
     press(&mut page, key(KeyCode::Enter));
     drain(&mut page);
@@ -326,7 +315,7 @@ fn a_status_renames_in_place_and_keeps_its_id() {
     press(&mut page, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     typed(&mut page, "Up next");
     let text = render(&mut page, 100, 40);
-    assert!(boxed(&text).iter().any(|t| t == "Up next"), "typed in a field under its row:\n{text}");
+    assert!(text.contains("● Up next"), "{text}");
     assert_eq!(press(&mut page, key(KeyCode::Enter)), SettingsAction::Commit);
     drain(&mut page);
     assert!(home.read("statuses.yaml").contains("- id: todo\n  name: Up next\n"));
@@ -564,7 +553,7 @@ fn a_paste_types_into_the_name_and_nowhere_else() {
     assert!(!page.modal_open());
     press(&mut page, key(KeyCode::Char('n')));
     page.paste("from\nclipboard");
-    assert!(boxed(&render(&mut page, 100, 40)).iter().any(|t| t == "fromclipboard"));
+    assert!(render(&mut page, 100, 40).contains("› Name fromclipboard"));
 }
 
 #[test]

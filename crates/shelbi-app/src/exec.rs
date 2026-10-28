@@ -36,6 +36,9 @@ pub enum Effect {
     /// Open Contact Us, the feedback dialog (a client-local dialog; the
     /// send is the dialog's own).
     SendFeedback,
+    /// Show About Shelbi: this build's version and the project's links (a
+    /// client-local view; nothing stops).
+    OpenAbout,
     /// Switch the client to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow (the host collects the form, then calls

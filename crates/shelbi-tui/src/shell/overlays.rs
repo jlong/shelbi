@@ -63,6 +63,8 @@ pub enum OverlayEvent {
     },
     /// The Add-project form was cancelled.
     AddProjectCancel,
+    /// About Shelbi asked to open this page in the browser; it stays open.
+    OpenUrl(String),
 }
 
 /// The overlay currently drawn over the main area, with its runtime state.
@@ -87,6 +89,8 @@ pub enum ActiveOverlay {
     AddProject {
         form: overlay::add_project::Form,
     },
+    /// About Shelbi (the palette's "About Shelbi", Settings ▸ General).
+    About(overlay::about::About),
     /// The full task-description popover, opened from the review panel's `More`
     /// link. Reuses the board's task-detail renderer
     /// ([`crate::kanban::render_task_popover_into`]) so the board and the review
@@ -178,6 +182,12 @@ impl ActiveOverlay {
         }
     }
 
+    /// Open About Shelbi. `truecolor` draws the icon in 24-bit color, else in
+    /// the xterm-256 palette.
+    pub fn about(truecolor: bool) -> Self {
+        ActiveOverlay::About(overlay::about::About::new(truecolor))
+    }
+
     /// Open the task-description popover for `task` (the review panel's `More`).
     /// `keymaps` / `style` render the footer's chord hints the same way the
     /// board popover does.
@@ -262,6 +272,7 @@ impl ActiveOverlay {
                     mode: form.mode(),
                 },
             },
+            ActiveOverlay::About(about) => about_event(about.handle_key(ev)),
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 // The popover is read-only here: Esc/q close it, j/k and the page
                 // chords scroll the body. The board's move / open-workspace
@@ -349,6 +360,8 @@ impl ActiveOverlay {
                 }
                 OverlayEvent::Stay
             }
+            // Takes the full window: the panel centers itself in it.
+            ActiveOverlay::About(about) => about_event(about.handle_mouse(m, area)),
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 match m.kind {
                     MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(1),
@@ -384,6 +397,8 @@ impl ActiveOverlay {
             // paths and validation messages never truncate (the tmux dialog
             // filled the whole palette window for the same reason).
             ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 48, 14),
+            // Sized to its content, and to the window when that's smaller.
+            ActiveOverlay::About(about) => about.rect(area),
             // The same 80%×80% centered box the board's task popover uses, so
             // the review and the board show the task at the identical size.
             ActiveOverlay::TaskDescription { .. } => crate::kanban::popover_rect(area),
@@ -415,6 +430,7 @@ impl ActiveOverlay {
                 overlay::zen_intro::render_intro(f, rect, state)
             }
             ActiveOverlay::AddProject { form } => form.render(f, rect),
+            ActiveOverlay::About(about) => about.render(f.buffer_mut(), area),
             ActiveOverlay::TaskDescription {
                 task,
                 scroll,
@@ -450,6 +466,14 @@ fn dialog_rows(dialog: &overlay::review_confirm::Dialog) -> usize {
         4
     } else {
         2
+    }
+}
+
+fn about_event(step: overlay::about::Step) -> OverlayEvent {
+    match step {
+        overlay::about::Step::Stay => OverlayEvent::Stay,
+        overlay::about::Step::Close => OverlayEvent::Close,
+        overlay::about::Step::Open(url) => OverlayEvent::OpenUrl(url.to_string()),
     }
 }
 
@@ -529,6 +553,7 @@ mod tests {
                 state: overlay::zen_intro::IntroState::default(),
             },
             ActiveOverlay::add_project(Path::new("/tmp/alpha")),
+            ActiveOverlay::about(true),
             ActiveOverlay::task_description(
                 sample_task(),
                 keymaps(),

@@ -128,7 +128,7 @@ fn a_status_is_selected_and_edited_by_keys_in_the_panel_and_the_form_shows_it() 
     press(&mut ed, key(KeyCode::Enter));
     assert_eq!(b(&ed).selected_status(), Some("in-progress"));
     assert_eq!(ed.cursor_item(), Some(Item::PanelStatus), "the keys go to the panel");
-    let screen = render(&mut ed, 120, 60);
+    let screen = render(&mut ed, 120, 34);
     for want in ["Status", "◐ In Progress", "Category", "Active", "Owner", "Agent", "developer", "Outgoing transitions", "→ Review · Push branch, Open PR", "+ Add transition", "Remove from workflow"] {
         assert!(screen.contains(want), "{want}:\n{screen}");
     }
@@ -161,8 +161,7 @@ fn a_status_is_selected_and_edited_by_keys_in_the_panel_and_the_form_shows_it() 
     assert_eq!(ed.cursor_item(), Some(Item::Status("in-progress".into())));
     assert_eq!(ed.typed_text(&Text::Tags("in-progress".into())), "gpu");
     let rows = render(&mut ed, 120, 60);
-    let at = rows.lines().position(|l| l.trim() == "Initial status").expect("the picker's label");
-    assert!(rows.lines().nth(at + 2).is_some_and(|l| l.contains(" In Progress")), "{rows}");
+    assert!(rows.contains("Initial status     In Progress"), "{rows}");
     // Save from the Builder writes them.
     press(&mut ed, key(KeyCode::Char('v')));
     press(&mut ed, ctrl('s'));
@@ -261,7 +260,7 @@ fn add_transition_by_keys_chooses_source_destination_configures_and_confirms() {
     assert_eq!(ts.len(), count + 1);
     assert_eq!(ts[count], ("todo".into(), "review".into(), vec![TransitionAction::OpenPr, TransitionAction::PushBranch]));
     assert_eq!(b(&ed).selection, Some(Selection::Transition { index: count, added: true }));
-    assert!(render(&mut ed, 120, 60).contains("Transition added. Save changes"));
+    assert!(render(&mut ed, 120, 40).contains("Transition added. Save changes"));
     assert!(ed.builder.canvas().unwrap().transition_route(count).is_some(), "drawn");
     assert_eq!(home.read("task.yaml"), before, "the draft only");
     // The Form lists it.
@@ -483,13 +482,11 @@ fn resizing_with_the_panel_open_keeps_the_selection_and_the_row() {
     press(&mut ed, key(KeyCode::Enter));
     go(&mut ed, Item::Agent("review".into()));
     // Wide: the panel beside the canvas.
-    let wide = render(&mut ed, 130, 50);
+    let wide = render(&mut ed, 130, 34);
     assert!(wide.contains("◐ In Progress") && wide.contains("Outgoing transitions"), "{wide}");
-    // Narrow: the panel in the canvas's place, the same row (scrolled to
-    // it, under ← Graph).
+    // Narrow: the panel in the canvas's place, the same row, ← Graph.
     let narrow = render(&mut ed, 80, 24);
-    assert!(!narrow.contains("◐ In Progress") && narrow.contains("Agent"), "{narrow}");
-    assert!(ed.items().contains(&Item::PanelBack), "← Graph is the panel's first row");
+    assert!(!narrow.contains("◐ In Progress") && narrow.contains("← Graph"), "{narrow}");
     assert_eq!(ed.cursor_item(), Some(Item::Agent("review".into())));
     assert_eq!(b(&ed).selected_status(), Some("review"));
     // ← Graph: the canvas, the same selection.
@@ -627,7 +624,7 @@ fn the_panel_keeps_a_line_under_the_focus_when_it_clips() {
         let lines: Vec<&str> = screen.lines().collect();
         let item = ed.cursor_item().unwrap();
         if ed.section_of(&item) == Section::Panel && item != Item::PanelBack {
-            let at = focused_lines(&mut ed, 80, 16).iter().position(|f| *f).unwrap_or_else(|| panic!("{item:?} in view:\n{screen}"));
+            let at = lines.iter().position(|l| l.contains('›')).unwrap_or_else(|| panic!("{item:?} in view:\n{screen}"));
             if let Some(more) = lines.iter().position(|l| l.contains("↓ more")) {
                 assert!(at < more, "{item:?} keeps a line under it:\n{screen}");
             }

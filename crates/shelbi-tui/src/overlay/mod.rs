@@ -19,6 +19,9 @@
 //!   these same types, so the tmux runtime is byte-identical until cutover.
 
 // Submodules are added as each overlay is ported (removing-tmux Phase 4d).
+// About Shelbi is the single-process TUI's own (the tmux popups never had it).
+pub mod about;
+mod about_icon;
 pub mod add_project;
 pub mod error_log;
 pub mod palette;

@@ -22,6 +22,7 @@
 pub mod tree;
 
 use gpui::{actions, App, Global, KeyBinding, Menu, MenuItem, SystemMenuType};
+use shelbi_app::CommandKind;
 
 use crate::app::{CloseWindow, OpenSettings, ToggleSidebar};
 use crate::elements::terminal::{FontZoom, TerminalSettings};
@@ -128,13 +129,30 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     // The client actions that need no window. A window handles every
     // `MenuInvoke` first (`ShelbiWindow::menu_invoke`) and hands these back
-    // to [`run_app_command`].
-    cx.on_action(|invoke: &MenuInvoke, cx| {
-        if let MenuAction::App(command) = &invoke.target {
+    // to [`run_app_command`] / [`run_windowless_command`]; with no window
+    // open they land here.
+    cx.on_action(|invoke: &MenuInvoke, cx| match &invoke.target {
+        MenuAction::App(command) => {
             run_app_command(*command, cx);
+        }
+        MenuAction::Command(id) => {
+            run_windowless_command(id, cx);
         }
     });
     cx.set_global(MenuBar::default());
+}
+
+/// Run a registry command that needs no window (About Shelbi, its own
+/// window), so it works with no window open or a modal dialog up. Returns
+/// false for any other command (a window runs those).
+pub fn run_windowless_command(id: &str, cx: &mut App) -> bool {
+    match CommandKind::from_id(id) {
+        Some(CommandKind::OpenAbout) => {
+            crate::views::about::show_about(cx);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Run a client action that needs no window. Returns false for one that does
@@ -145,8 +163,7 @@ pub fn run_app_command(command: AppCommand, cx: &mut App) -> bool {
         AppCommand::HideOthers => cx.hide_other_apps(),
         AppCommand::ShowAll => cx.unhide_other_apps(),
         AppCommand::QuitClient => cx.quit(),
-        AppCommand::About => crate::views::about::show_about(cx),
-        AppCommand::Documentation => cx.open_url(tree::DOCS_URL),
+        AppCommand::Documentation => cx.open_url(shelbi_app::about::DOCS_URL),
         AppCommand::ReportIssue => cx.open_url(tree::ISSUES_URL),
         // The terminal font is app-wide: every window's terminals follow.
         AppCommand::FontBigger => {

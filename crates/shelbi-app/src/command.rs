@@ -49,6 +49,8 @@ pub enum CommandKind {
     /// Send Feedback: open Contact Us (the sidebar footer's megaphone in
     /// both clients; the desktop's Help ▸ Send Feedback…).
     SendFeedback,
+    /// Show About Shelbi (the desktop's About window, the TUI's overlay).
+    OpenAbout,
     /// Switch to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow.
@@ -169,6 +171,7 @@ impl CommandKind {
             CommandKind::OpenErrorLog => Effect::OpenErrorLog { project: p() },
             CommandKind::OpenSettings => Effect::OpenSettings,
             CommandKind::SendFeedback => Effect::SendFeedback,
+            CommandKind::OpenAbout => Effect::OpenAbout,
             CommandKind::SwitchProject { project } => Effect::SwitchProject {
                 project: project.clone(),
             },
@@ -351,7 +354,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// the review decisions (approve / reject), the error-log action, Settings, Send Feedback, switch-project targets,
+    /// the review decisions (approve / reject), the error-log action, Settings, Send Feedback, About, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -503,6 +506,20 @@ impl CommandRegistry {
             subtitle: Some("Contact Us about a bug, a feature, or anything else".to_string()),
             shortcut: None,
             hidden_until_query: false,
+        });
+
+        // About: always offered (it needs no project), as the desktop's app
+        // menu always has it. Hidden until the user types, like the other
+        // rarely used commands, so `about` surfaces it.
+        out.push(Command {
+            id: "action:about".to_string(),
+            title: "About Shelbi".to_string(),
+            kind: CommandKind::OpenAbout,
+            entry_kind: EntryKind::Action,
+            decoration: None,
+            subtitle: Some("Version, links, and license".to_string()),
+            shortcut: None,
+            hidden_until_query: true,
         });
 
         // Switch-project: the generic entry plus one per other project.
@@ -707,6 +724,7 @@ impl CommandKind {
             "action:error-log" => Some(CommandKind::OpenErrorLog),
             "action:settings" => Some(CommandKind::OpenSettings),
             "action:send-feedback" => Some(CommandKind::SendFeedback),
+            "action:about" => Some(CommandKind::OpenAbout),
             "action:switch-project" => Some(CommandKind::SwitchProject {
                 project: String::new(),
             }),
@@ -819,6 +837,7 @@ mod tests {
             "action:error-log",
             "action:settings",
             "action:send-feedback",
+            "action:about",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -1096,6 +1115,25 @@ mod tests {
         let entries = reg.entries(&model());
         let hits = shelbi_palette::search(&entries, "feedback");
         assert_eq!(hits[0].0.id, "action:send-feedback");
+    }
+
+    #[test]
+    fn about_is_offered_with_or_without_a_project_and_surfaces_on_a_query() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        let cmd = reg.resolve("action:about", &m).expect("offered");
+        assert_eq!(cmd.title(), "About Shelbi");
+        assert_eq!(cmd.kind(), &CommandKind::OpenAbout);
+        assert!(!cmd.is_mutating());
+        assert_eq!(cmd.effect("alpha"), Effect::OpenAbout);
+        assert!(cmd.hidden_until_query());
+        m.project = None;
+        assert!(reg.resolve("action:about", &m).is_some(), "it needs no project");
+        let entries = reg.entries(&model());
+        for query in ["about", "about shelbi"] {
+            let hits = shelbi_palette::search(&entries, query);
+            assert_eq!(hits[0].0.id, "action:about", "{query}");
+        }
     }
 
     #[test]
