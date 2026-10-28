@@ -12,9 +12,9 @@ pub(crate) mod tests {
 
     use super::fixture;
 
-    /// A throwaway `SHELBI_HOME` holding project `my-project` (its YAML, an
-    /// `agents/` for the developer and review agents, and the frame's two
-    /// workflows over the default catalog), set for the test's length. Tests
+    /// A throwaway `SHELBI_HOME` holding one project (its YAML, an `agents/`
+    /// for the developer and review agents, and the frame's two workflows
+    /// over the default catalog), set for the test's length. Tests
     /// that set it run one at a time ([`crate::test_env::lock`]).
     pub(crate) struct Home {
         pub root: PathBuf,
@@ -23,14 +23,8 @@ pub(crate) mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
-    pub(crate) const PROJECT: &str = "my-project";
-
     impl Home {
-        pub(crate) fn new(tag: &str) -> Home {
-            Home::with_project(tag, PROJECT)
-        }
-
-        /// [`Home::new`] with the fixture project named `project`.
+        /// The fixture project, named `project`.
         pub(crate) fn with_project(tag: &str, project: &str) -> Home {
             let lock = crate::test_env::lock();
             let root = PathBuf::from(format!("/tmp/shb-wf-{tag}-{}", std::process::id()));

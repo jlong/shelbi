@@ -35,7 +35,8 @@
 //! - Settings ▸ Workflows and the workflow editor: **`dt-wf-settings-index`**
 //!   (`workflows`), **`dt-wf-editor-form`** (`workflow_editor`, its Form),
 //!   **`dt-wf-editor-builder`** (`workflow_builder`, the Builder canvas over
-//!   `workflow_graph`'s layout and `workflow_builder_state`)
+//!   `workflow_graph`'s layout and `workflow_builder_state`, both shared
+//!   with the TUI's Builder since `tui-workflow-editor-builder`)
 //! - Settings ▸ Workspaces, the pool and its machines as configuration:
 //!   **`dt-workspace-settings-index`** (`workspaces`, over
 //!   `shelbi_app::settings::workspaces`); its New / Edit workspace dialogs

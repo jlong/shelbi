@@ -8989,6 +8989,97 @@ mod tests {
         });
     }
 
+    // --- The workflow editor's Builder (tui-workflow-editor-builder), through
+    // the shell's real key and mouse path ---
+
+    fn builder_state(home: &WorkflowsHome, name: &str) -> ShellState {
+        let mut st = editor_state(home, name);
+        type_key(&mut st, 'v');
+        let editor = st.settings.editor().unwrap();
+        assert_eq!(editor.state().unwrap().mode, shelbi_app::settings::workflow_editor::Mode::Builder);
+        st
+    }
+
+    #[test]
+    fn the_builder_adds_a_transition_by_keys_through_the_shell_and_saves_it() {
+        let home = WorkflowsHome::new("bld-shell");
+        let mut st = builder_state(&home, "task");
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        for want in ["Builder", "Form", "◌ Backlog", "○ To Do", "◐ In Progress", "Initial"] {
+            assert!(screen.contains(want), "{want}:\n{screen}");
+        }
+        assert!(!screen.contains("▾ proj"), "it covers both columns:\n{screen}");
+        // Backlog (the keyboard's first node), Add transition, → Canceled.
+        press(&mut st, KeyCode::Down);
+        type_key(&mut st, 'a');
+        press(&mut st, KeyCode::Right);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Transition from Backlog to Canceled"), "{}", screen_text(&term));
+        press(&mut st, KeyCode::Enter);
+        // Configure: the panel takes the canvas's place at 80x24.
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("New transition") && screen.contains("← Backlog"), "{screen}");
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::Enter);
+        select_in_editor(&mut st, settings::EditorItem::ConfirmNew);
+        press(&mut st, KeyCode::Enter);
+        let before = std::fs::read_to_string(home.file("proj", "task.yaml")).unwrap();
+        let editor = st.settings.editor().unwrap();
+        assert!(editor.is_dirty());
+        assert!(editor.state().unwrap().transitions().iter().any(|t| t.from == "backlog" && t.to == "canceled"));
+        // Save, off the UI thread, as the Form's.
+        st.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        settle_editor(&mut st);
+        let after = std::fs::read_to_string(home.file("proj", "task.yaml")).unwrap();
+        assert_ne!(after, before);
+        assert!(after.contains("from: backlog") && after.contains("to: canceled"), "{after}");
+        // The Form shows it, from the same (now saved) draft.
+        type_key(&mut st, 'v');
+        draw_frame(&mut term, &mut st).unwrap();
+        let editor = st.settings.editor().unwrap();
+        assert!(editor.items().iter().any(|i| matches!(i, settings::EditorItem::Transition(4))));
+    }
+
+    #[test]
+    fn the_builder_selects_with_the_mouse_through_the_shell() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let home = WorkflowsHome::new("bld-mouse");
+        let mut st = builder_state(&home, "task");
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "◑ Review").expect("Review on the canvas");
+        st.handle_event(Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y + 1, modifiers: KeyModifiers::NONE }));
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Outgoing transitions") && screen.contains("→ Done · Push branch, Merge"), "{screen}");
+    }
+
+    #[test]
+    fn the_builder_renders_readable_in_light_and_dark() {
+        use shelbi_app::theme::Appearance;
+        let home = WorkflowsHome::new("bld-light");
+        let mut st = builder_state(&home, "task");
+        // A selection, so the panel and the emphasis show too.
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            crate::theme::with_appearance(appearance, || {
+                for (w, h) in [(80, 24), (160, 48)] {
+                    let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                    draw_frame(&mut term, &mut st).unwrap();
+                    let screen = screen_text(&term);
+                    assert!(screen.contains("Status") && screen.contains("Backlog"), "{appearance:?} {w}x{h}:\n{screen}");
+                    if appearance == Appearance::Light {
+                        crate::theme::assert_light_readable(&format!("workflow-builder-{w}x{h}"), term.backend().buffer());
+                    }
+                }
+            });
+        }
+    }
+
     #[test]
     fn settings_renders_readable_in_light() {
         use shelbi_app::theme::Appearance;

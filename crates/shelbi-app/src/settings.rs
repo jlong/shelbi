@@ -38,6 +38,10 @@
 //!   service.
 //! - [`workflow_editor`]: one workflow's editor (its draft, the changes the
 //!   Form and the Builder make to it, Save, Discard and the leave prompt).
+//! - [`workflow_graph`] and [`workflow_builder`]: the Builder's graph (the
+//!   statuses' columns and rows, routes, hit-testing, arrow-key neighbors)
+//!   and its selection (a status, a transition, one being drawn or added,
+//!   Back), over that same draft.
 
 pub mod agent_editor;
 pub mod agents;
@@ -47,7 +51,9 @@ pub mod machine_check;
 pub mod machine_form;
 pub mod summary;
 pub mod terminal_preview;
+pub mod workflow_builder;
 pub mod workflow_editor;
+pub mod workflow_graph;
 pub mod workflows;
 pub mod workspace_form;
 pub mod workspaces;

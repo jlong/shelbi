@@ -125,9 +125,9 @@ fn it_opens_after_its_read_with_the_header_and_every_section() {
     assert!(header.contains("← Back") && header.contains("task default"), "{header}");
     assert!(header.contains("Save changes") && header.contains("Discard") && header.contains("⋮ Actions"), "{header}");
     assert_eq!(ed.cursor_item(), Some(Item::Back));
-    // No Builder yet: no Builder | Form control.
-    assert_eq!(VIEWS, &[Mode::Form]);
-    assert!(!header.contains("Builder"));
+    // It opens on the Form, the Builder | Form control in the header.
+    assert_eq!(ed.state().unwrap().mode, Mode::Form);
+    assert!(header.contains("Builder") && header.contains("Form"), "{header}");
     // A workflow that isn't there says so.
     let mut gone = WorkflowEditorPage::open(PROJECT, "nope", None, None);
     drain(&mut gone);
@@ -630,7 +630,17 @@ fn it_scrolls_to_keep_the_focus_in_view_at_80x24_and_tab_steps_sections() {
     for _ in 0..n {
         press(&mut ed, key(KeyCode::Down));
         let screen = render(&mut ed, 80, 24);
-        if matches!(ed.cursor_item(), Some(Item::Back | Item::Save | Item::Discard | Item::Actions)) {
+        // The header's controls (Builder | Form among them) stay on its
+        // pinned first line.
+        if let Some(item) = ed.cursor_item().filter(|i| i.section() == Section::Header) {
+            let label = match item {
+                Item::Back => "← Back",
+                Item::View => "Builder",
+                Item::Save => "Save changes",
+                Item::Discard => "Discard",
+                _ => "⋮ Actions",
+            };
+            assert!(screen.lines().next().is_some_and(|l| l.contains(label)), "{item:?} in the header:\n{screen}");
             continue;
         }
         assert!(screen.lines().skip(2).any(|l| l.trim_start().starts_with('›')), "{:?} in view:\n{screen}", ed.cursor_item());
@@ -676,3 +686,5 @@ fn renders_without_panicking_at_tiny_sizes() {
     press(&mut ed, key(KeyCode::Char('m')));
     render(&mut ed, 12, 4);
 }
+
+mod builder;
