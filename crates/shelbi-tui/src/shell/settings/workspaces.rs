@@ -63,7 +63,9 @@ use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::pool::{MachineChange, PoolError};
 
 use super::machine_form;
+use super::modal_form::FormLines;
 use crate::panel;
+use crate::textbox::Textbox;
 use crate::theme::palette;
 
 /// Reads a project's pool (blocking; run off the UI thread).
@@ -1039,52 +1041,46 @@ impl WorkspacesPage {
             return;
         }
         let inner_w = width.saturating_sub(4) as usize;
-        let label_w = 11usize.min(inner_w / 3);
-        let value_w = inner_w.saturating_sub(label_w);
         let errors = form.errors();
-        let wrap = |s: &str, w: usize| shelbi_app::overlay::error_log::wrap(s, w.max(1));
-
-        // Lay the content out as lines, recording which line each control
-        // sits on for clicks.
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut controls: Vec<(usize, u16, u16, Hit)> = Vec::new();
         let muted = Style::default().fg(palette().muted);
         let red = Style::default().fg(palette().red);
-        for l in wrap(&form.description(), inner_w) {
-            lines.push(Line::from(Span::styled(l, muted)));
+        let focus = form.focus();
+
+        // Lay the content out as lines, each field its label over its box,
+        // recording where each control sits for clicks.
+        let mut out: FormLines<Hit> = FormLines::new(inner_w);
+        out.text(&form.description(), muted);
+        out.blank();
+        fn error(e: &Option<String>, red: Style) -> Option<(&str, Style)> {
+            e.as_deref().map(|e| (e, red))
         }
-        lines.push(Line::raw(""));
-        let under = |lines: &mut Vec<Line<'static>>, text: &str, style: Style| {
-            for l in wrap(text, value_w) {
-                lines.push(Line::from(vec![Span::raw(" ".repeat(label_w)), Span::styled(l, style)]));
-            }
-        };
-        let box_w = value_w.saturating_sub(2).clamp(4, 40);
         // Name.
-        let name_focus = form.focus() == Focus::Name;
-        controls.push((lines.len(), label_w as u16, box_w as u16 + 2, Hit::Control(Focus::Name)));
-        lines.push(field_line("Name", label_w, text_box(form.name(), box_w, name_focus, fresh && name_focus)));
-        if let Some(e) = &errors.name {
-            under(&mut lines, e, red);
-        }
-        // Machine: the picker, and what the machine is.
-        let machine_focus = form.focus() == Focus::Machine;
+        let on = focus == Focus::Name;
+        let name = form.name();
+        let field = Textbox::new(name).focused(on).invalid(errors.name.is_some()).selected(fresh && on);
+        let field = if on && !fresh { field.caret_at_end() } else { field };
+        out.field("Name", field, on, false, &[error(&errors.name, red)].into_iter().flatten().collect::<Vec<_>>(), Hit::Control(Focus::Name));
+        out.blank();
+        // Machine: the picker (its menu under it while open), and what the
+        // machine is.
+        let on = focus == Focus::Machine;
         let detail = form.machine_choice().map(MachineChoice::detail).unwrap_or_else(|| "Not declared".into());
-        let picker = format!(" {} ▾ ", form.machine());
-        let picker_w = panel::display_width(&picker).min(value_w) as u16;
-        controls.push((lines.len(), label_w as u16, picker_w, Hit::Control(Focus::Machine)));
-        lines.push(field_line(
-            "Machine",
-            label_w,
-            vec![
-                Span::styled(panel::truncate_right(&picker, value_w), control_style(machine_focus)),
-                Span::styled(format!("  {detail}"), muted),
-            ],
-        ));
+        let picker = Textbox::new(form.machine())
+            .placeholder("Choose a machine")
+            .focused(on)
+            .invalid(errors.machine.is_some())
+            .trail("▾");
+        let mut under = vec![(detail.as_str(), muted)];
+        under.extend(error(&errors.machine, red));
+        if form.menu().is_some() {
+            under.clear();
+        }
+        out.field("Machine", picker, on, false, &under, Hit::Control(Focus::Machine));
         if let Some(open) = form.menu() {
+            let first = out.lines.len();
             for (i, m) in form.machines().iter().enumerate() {
-                let text = format!(" {}  {} ", m.name, m.detail());
-                let text = panel::truncate_right(&text, value_w);
+                let text = panel::truncate_right(&format!(" {}  {} ", m.name, m.detail()), inner_w);
+                let pad = inner_w.saturating_sub(panel::display_width(&text));
                 let style = if i == open {
                     Style::default().fg(palette().white).bg(palette().selection).add_modifier(Modifier::BOLD)
                 } else if matches!(m.status, MachineStatus::Unreachable(_)) {
@@ -1092,79 +1088,70 @@ impl WorkspacesPage {
                 } else {
                     Style::default().fg(palette().gray)
                 };
-                controls.push((lines.len(), label_w as u16, panel::display_width(&text) as u16, Hit::Option(i)));
-                lines.push(Line::from(vec![Span::raw(" ".repeat(label_w)), Span::styled(text, style)]));
+                let line = out.lines.len();
+                out.lines.push(Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style)));
+                out.control(first, line, 0, inner_w, Hit::Option(i));
+            }
+            if let Some(e) = &errors.machine {
+                out.text(e, red);
             }
         }
-        if let Some(e) = &errors.machine {
-            under(&mut lines, e, red);
-        }
+        out.blank();
         // Tags: the workspace's own; the machine's said under.
-        let tags_focus = form.focus() == Focus::Tags;
-        controls.push((lines.len(), label_w as u16, box_w as u16 + 2, Hit::Control(Focus::Tags)));
-        lines.push(field_line("Tags", label_w, text_box(form.tags(), box_w, tags_focus, false)));
-        under(&mut lines, form::TAGS_HELP, muted);
-        if let Some(note) = form.inherited_note() {
-            under(&mut lines, &note, muted);
-        }
-        if let Some(e) = &errors.tags {
-            under(&mut lines, e, red);
-        }
+        let on = focus == Focus::Tags;
+        let tags = form.tags();
+        let field = Textbox::new(tags).placeholder("Optional tags").focused(on).invalid(errors.tags.is_some());
+        let field = if on { field.caret_at_end() } else { field };
+        let note = form.inherited_note();
+        let mut under = vec![(form::TAGS_HELP, muted)];
+        under.extend(note.as_deref().map(|n| (n, muted)));
+        under.extend(error(&errors.tags, red));
+        out.field("Tags", field, on, false, &under, Hit::Control(Focus::Tags));
+        out.blank();
         // Worktree location: derived, read-only.
-        let loc_focus = form.focus() == Focus::Location;
-        controls.push((lines.len(), label_w as u16, value_w as u16, Hit::Control(Focus::Location)));
-        let location = panel::truncate_left(&form.location(), value_w.saturating_sub(12).max(8));
-        lines.push(field_line(
-            "Worktree",
-            label_w,
-            vec![
-                Span::styled(location, if loc_focus { control_style(true) } else { Style::default().fg(palette().gray) }),
-                Span::styled("  read-only", muted),
-            ],
-        ));
+        let on = focus == Focus::Location;
+        let location = form.location();
         let help = form.location_help();
-        under(&mut lines, &help, if help == LOCATION_HELP { muted } else { Style::default().fg(palette().yellow) });
+        let help_style = if help == LOCATION_HELP { muted } else { Style::default().fg(palette().yellow) };
+        let field = Textbox::new(&location).focused(on).disabled(true).clip_left(true).trail("read-only");
+        out.field("Worktree location", field, on, true, &[(help.as_str(), help_style)], Hit::Control(Focus::Location));
+        out.blank();
         // Slot: empty is Automatic.
-        let slot_focus = form.focus() == Focus::Slot;
-        let slot_w = 12.min(box_w);
-        controls.push((lines.len(), label_w as u16, slot_w as u16 + 2, Hit::Control(Focus::Slot)));
-        let mut slot = text_box(form.slot(), slot_w, slot_focus, false);
-        if form.slot().trim().is_empty() {
-            slot.push(Span::styled(format!("  {}", form.slot_placeholder()), muted));
-        }
-        lines.push(field_line("Slot", label_w, slot));
-        under(&mut lines, form::SLOT_HELP, muted);
-        under(&mut lines, form::SLOT_AUTOMATIC_HELP, muted);
-        if let Some(e) = &errors.slot {
-            under(&mut lines, e, red);
-        }
+        let on = focus == Focus::Slot;
+        let slot = form.slot();
+        let placeholder = form.slot_placeholder();
+        let field = Textbox::new(slot).placeholder(&placeholder).focused(on).invalid(errors.slot.is_some());
+        let field = if on { field.caret_at_end() } else { field };
+        let mut under = vec![(form::SLOT_HELP, muted), (form::SLOT_AUTOMATIC_HELP, muted)];
+        under.extend(error(&errors.slot, red));
+        out.field("Slot (optional)", field, on, false, &under, Hit::Control(Focus::Slot));
+        // The footer: a refusal over the buttons, then the key hint.
+        out.footer();
         if let Some(e) = &errors.general {
-            lines.push(Line::raw(""));
-            for l in wrap(e, inner_w) {
-                lines.push(Line::from(Span::styled(l, red)));
-            }
+            out.blank();
+            out.text(e, red);
         }
-        lines.push(Line::raw(""));
+        out.blank();
         // The buttons: Remove at the left (Edit), Cancel and the default
         // action at the right.
-        let button_row = lines.len();
+        let button_row = out.lines.len();
         let mut buttons: Vec<(Focus, String, Style)> = Vec::new();
         if !form.is_new() {
-            buttons.push((Focus::Remove, " Remove workspace… ".into(), button_style(form.focus() == Focus::Remove, true, false)));
+            buttons.push((Focus::Remove, " Remove workspace… ".into(), button_style(focus == Focus::Remove, true, false)));
         }
-        buttons.push((Focus::Cancel, " Cancel ".into(), button_style(form.focus() == Focus::Cancel, !form.busy(), false)));
+        buttons.push((Focus::Cancel, " Cancel ".into(), button_style(focus == Focus::Cancel, !form.busy(), false)));
         buttons.push((
             Focus::Submit,
             format!(" {} ", form.submit_label()),
-            button_style(form.focus() == Focus::Submit, form.can_submit(), true),
+            button_style(focus == Focus::Submit, form.can_submit(), true),
         ));
         let total: usize = buttons.iter().map(|(_, t, _)| panel::display_width(t) + 1).sum();
         let mut spans = Vec::new();
         let mut x = 0usize;
-        for (i, (focus, label, style)) in buttons.iter().enumerate() {
-            if i == 0 && *focus == Focus::Remove {
+        for (i, (button, label, style)) in buttons.iter().enumerate() {
+            if i == 0 && *button == Focus::Remove {
                 spans.push(Span::styled(label.clone(), *style));
-                controls.push((button_row, x as u16, panel::display_width(label) as u16, Hit::Control(*focus)));
+                out.control(button_row, button_row, x, panel::display_width(label), Hit::Control(*button));
                 x += panel::display_width(label);
                 let gap = inner_w.saturating_sub(total).max(1);
                 spans.push(Span::raw(" ".repeat(gap)));
@@ -1177,12 +1164,12 @@ impl WorkspacesPage {
                 x += gap;
             }
             spans.push(Span::styled(label.clone(), *style));
-            controls.push((button_row, x as u16, panel::display_width(label) as u16, Hit::Control(*focus)));
+            out.control(button_row, button_row, x, panel::display_width(label), Hit::Control(*button));
             x += panel::display_width(label);
             spans.push(Span::raw(" "));
             x += 1;
         }
-        lines.push(Line::from(spans));
+        out.lines.push(Line::from(spans));
         let hint = if form.busy() {
             "Working… (nothing else runs until this lands)".to_string()
         } else if form.menu().is_some() {
@@ -1190,9 +1177,9 @@ impl WorkspacesPage {
         } else {
             format!("Tab next · ⏎ {} · Esc cancel", form.submit_label().to_lowercase())
         };
-        lines.push(Line::from(Span::styled(hint, muted)));
+        out.lines.push(Line::from(Span::styled(panel::truncate_right(&hint, inner_w), muted)));
 
-        let height = (lines.len() as u16 + 2).min(main.height);
+        let height = (out.lines.len() as u16 + 2).min(main.height);
         let rect = Rect {
             x: main.x + (main.width - width) / 2,
             y: main.y + (main.height - height) / 2,
@@ -1210,26 +1197,12 @@ impl WorkspacesPage {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let content = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-        // Keep the focused control in view when the terminal is short.
-        let focus_line = controls
-            .iter()
-            .find(|(_, _, _, h)| *h == Hit::Control(form.focus()))
-            .map(|(l, ..)| *l)
-            .unwrap_or(0);
-        let skip = if (focus_line as u16) < content.height {
-            0
-        } else {
-            focus_line + 1 - content.height as usize
+        // An open menu keeps its highlighted machine in view.
+        let focus = match form.menu() {
+            Some(open) => Hit::Option(open),
+            None => Hit::Control(focus),
         };
-        f.render_widget(Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()), content);
-        for (line, x, w, hit) in controls {
-            let Some(y) = (line as u16).checked_sub(skip as u16) else {
-                continue;
-            };
-            if y < content.height {
-                self.hits.push((Rect { x: content.x + x, y: content.y + y, width: w.max(1), height: 1 }, hit));
-            }
-        }
+        out.render(f, content, focus, &mut self.hits);
     }
 
     fn render_confirm(&mut self, f: &mut Frame, main: Rect, c: &RemoveConfirm) {
@@ -1423,47 +1396,6 @@ fn confirm_key(k: KeyEvent) -> Option<Key> {
         KeyCode::Esc => Some(Key::Esc),
         KeyCode::Char(' ') => Some(Key::Space),
         _ => None,
-    }
-}
-
-/// `label` padded to the label column, then `value`.
-pub(super) fn field_line(label: &str, label_w: usize, value: Vec<Span<'static>>) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        format!("{:<label_w$}", panel::truncate_right(label, label_w.saturating_sub(1))),
-        Style::default().fg(palette().gray),
-    )];
-    spans.extend(value);
-    Line::from(spans)
-}
-
-/// A one-line text box `[text▏   ]`: the caret at the end while focused,
-/// the whole text selected while a suggestion waits to be typed over.
-pub(super) fn text_box(text: &str, width: usize, focused: bool, selected: bool) -> Vec<Span<'static>> {
-    let room = width.saturating_sub(1);
-    let shown = panel::truncate_left(text, room);
-    let caret = if focused && !selected { "▏" } else { "" };
-    let pad = width.saturating_sub(panel::display_width(&shown) + panel::display_width(caret));
-    let frame = Style::default().fg(if focused { palette().cyan } else { palette().ansi_dark_gray });
-    let body = if selected {
-        Style::default().fg(palette().white).bg(palette().selection)
-    } else {
-        Style::default().fg(palette().foreground)
-    };
-    vec![
-        Span::styled("[", frame),
-        Span::styled(shown, body),
-        Span::styled(caret.to_string(), Style::default().fg(palette().cyan)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled("]", frame),
-    ]
-}
-
-/// A focusable non-text control (the picker).
-fn control_style(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(palette().white).bg(palette().selection).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette().cyan)
     }
 }
 
@@ -2349,7 +2281,10 @@ mod tests {
         let form = page.machine_form().expect("the draft stays");
         assert_eq!(form.text(mform::Field::Name), "build server");
         assert_eq!(form.focus(), mform::Focus::Field(mform::Field::Name));
-        let shown = screen(&mut page, 100, 44);
+        // Under its own field: beside SSH host on a wide form, so read it
+        // where the two stack.
+        let shown = prose(&screen(&mut page, 60, 60));
+        assert!(shown.contains("Name ▄▄▄"), "{shown}");
         assert!(shown.contains("Machine `Build server` already exists."), "{shown}");
 
         // A lifecycle refusal shows over the buttons; the draft is kept.
@@ -2403,7 +2338,7 @@ mod tests {
         let probe = shelbi_app::settings::workspaces::probe_key("Build server", "build-server");
         page.state_mut().unwrap().set_reachability(HashMap::from([(probe, Reachability::Reachable)]));
         page.activate(item_at(&page, Item::Machine(1)));
-        let shown = screen(&mut page, 100, 44);
+        let shown = screen(&mut page, 100, 64);
         assert!(shown.contains("Not checked"), "{shown}");
         assert!(shown.contains("Last status probe: build-server answered over SSH"), "{shown}");
         for never in ["Connection successful", "Ready", "Verified"] {
@@ -2541,7 +2476,7 @@ mod tests {
         let mut page = loaded();
         page.page_key(key(KeyCode::Char('n')));
         let shown = screen(&mut page, 90, 40);
-        for want in ["New workspace", "Name", "echo", "Machine", "This Mac ▾", "Worktree", "read-only", "Automatic (3)", "Create workspace", "Cancel"] {
+        for want in ["New workspace", "Name", "echo", "Machine", "This Mac", "▾", "Worktree location", "read-only", "Automatic (3)", "Create workspace", "Cancel"] {
             assert!(shown.contains(want), "{want:?}:\n{shown}");
         }
         assert!(!shown.contains("Remove workspace"), "New has no Remove");
@@ -2562,6 +2497,109 @@ mod tests {
         }
         page.layer_key(key(KeyCode::Esc));
         assert!(page.form().is_some() && page.confirm().is_none(), "Esc goes back to the form");
+    }
+
+    /// The cells of `hit`'s rects on the last frame, top to bottom.
+    fn hit_rows(page: &WorkspacesPage, hit: Hit) -> Vec<Rect> {
+        let mut rects: Vec<Rect> = page.hits.iter().filter(|(_, h)| *h == hit).map(|(r, _)| *r).collect();
+        rects.sort_by_key(|r| r.y);
+        rects
+    }
+
+    #[test]
+    fn a_fields_three_rows_take_its_click_and_its_state_shows_in_the_fill() {
+        let mut page = loaded();
+        page.page_key(key(KeyCode::Char('n')));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 60)).unwrap();
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        // Tags: its cap above, its text, its cap below, each the box's width.
+        let rows = hit_rows(&page, Hit::Control(Focus::Tags));
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!((rows[1].y, rows[2].y), (rows[0].y + 1, rows[0].y + 2));
+        assert!(rows.iter().all(|r| r.width == rows[0].width && r.width > 40));
+        let buf = term.backend().buffer().clone();
+        assert_eq!(buf[(rows[0].x, rows[0].y)].symbol(), "▄");
+        assert_eq!(buf[(rows[2].x, rows[2].y)].symbol(), "▀");
+        assert_eq!(buf[(rows[1].x + 1, rows[1].y)].bg, palette().input, "at rest");
+        for row in &rows {
+            tab_to(&mut page, Focus::Name);
+            page.layer_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.x + row.width / 2,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(page.form().unwrap().focus(), Focus::Tags, "a click on row {}", row.y);
+        }
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let tags = hit_rows(&page, Hit::Control(Focus::Tags));
+        // (Its first cell is the caret, on the empty field.)
+        assert_eq!(buf[(tags[1].x + 1, tags[1].y)].bg, palette().white, "the caret");
+        assert_eq!(buf[(tags[1].right() - 1, tags[1].y)].bg, palette().input_focus, "focused");
+        assert_eq!(buf[(tags[0].x, tags[0].y)].fg, palette().input_focus, "the caps take the fill");
+        // Read-only: Worktree location, its text muted on the quiet fill.
+        let location = hit_rows(&page, Hit::Control(Focus::Location));
+        let cell = &buf[(location[1].x + 1, location[1].y)];
+        assert_eq!((cell.bg, cell.fg), (palette().input_disabled, palette().muted));
+        // Refused: the error fill, and why under it.
+        tab_to(&mut page, Focus::Name);
+        while !page.form().unwrap().name().is_empty() {
+            page.layer_key(key(KeyCode::Backspace));
+        }
+        tab_to(&mut page, Focus::Submit);
+        page.layer_key(key(KeyCode::Enter));
+        let error = page.form().unwrap().errors().name.clone().expect("a refusal");
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let name = hit_rows(&page, Hit::Control(Focus::Name));
+        assert_eq!(buf[(name[1].right() - 1, name[1].y)].bg, palette().input_invalid);
+        let under: String = (name[2].x..name[2].right()).map(|x| buf[(x, name[2].y + 1)].symbol().to_string()).collect();
+        assert!(error.starts_with(under.trim()), "{under:?} under the field: {error:?}");
+    }
+
+    #[test]
+    fn name_and_ssh_host_sit_side_by_side_and_each_takes_its_own_clicks() {
+        let mut page = loaded();
+        page.activate(item_at(&page, Item::Machine(1)));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        let name = hit_rows(&page, Hit::Machine(mform::Focus::Field(mform::Field::Name)));
+        let host = hit_rows(&page, Hit::Machine(mform::Focus::Field(mform::Field::Host)));
+        assert_eq!((name.len(), host.len()), (3, 3));
+        assert_eq!(name[0].y, host[0].y, "one row");
+        assert!(name[0].right() < host[0].x, "a gap between: {name:?} {host:?}");
+        for row in &host {
+            tab_to_machine(&mut page, mform::Focus::Field(mform::Field::Name));
+            page.layer_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.right() - 1,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(page.machine_form().unwrap().focus(), mform::Focus::Field(mform::Field::Host), "row {}", row.y);
+        }
+        // Narrow, they stack.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 60)).unwrap();
+        term.draw(|f| page.render_layer(f, f.area())).unwrap();
+        let name = hit_rows(&page, Hit::Machine(mform::Focus::Field(mform::Field::Name)));
+        let host = hit_rows(&page, Hit::Machine(mform::Focus::Field(mform::Field::Host)));
+        assert!(host[0].y > name[2].y && host[0].x == name[0].x, "{name:?} {host:?}");
+    }
+
+    #[test]
+    fn the_forms_read_in_light() {
+        crate::theme::with_appearance(shelbi_app::theme::Appearance::Light, || {
+            let mut page = loaded();
+            page.page_key(key(KeyCode::Char('n')));
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 50)).unwrap();
+            term.draw(|f| page.render_layer(f, f.area())).unwrap();
+            crate::theme::assert_light_readable("workspace-form", term.backend().buffer());
+            page.layer = None;
+            page.activate(item_at(&page, Item::Machine(1)));
+            term.draw(|f| page.render_layer(f, f.area())).unwrap();
+            crate::theme::assert_light_readable("machine-form", term.backend().buffer());
+        });
     }
 
     #[test]

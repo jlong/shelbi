@@ -62,14 +62,13 @@ use shelbi_app::settings::{Job, Ticket};
 use shelbi_app::text_area::TextArea;
 use shelbi_state::agents_config::{AgentsConfig, SkillLayout};
 
-use super::workflow_editor::picker_line;
-use super::workflows::{add_line, cell, error_rows, plain_line, LineEdit, Nav, WorkflowsPage};
-use super::{heading, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
+use super::workflows::{add_line, plain_line, LineEdit, Nav, WorkflowsPage};
+use super::{field_rows, follow, heading, picker_rows, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
 use crate::panel::{self, PAD};
+use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
 /// A multi-line field's left rule.
-const AREA_PREFIX: &str = "│ ";
 /// The instructions' preview, in lines, while not being edited.
 const PREVIEW_LINES: usize = 10;
 
@@ -1395,7 +1394,8 @@ impl AgentEditorPage {
     /// A mouse event over the editor: a click selects a row (a second click
     /// does its Enter), answers a menu or a prompt; the wheel scrolls.
     pub(crate) fn handle_mouse(&mut self, m: MouseEvent) -> EditorAction {
-        let hit = self.hits.iter().find(|(r, _)| panel::in_rect(*r, m.column, m.row)).map(|(_, h)| *h);
+        // The last drawn wins: a menu over the page takes its own clicks.
+        let hit = self.hits.iter().rev().find(|(r, _)| panel::in_rect(*r, m.column, m.row)).map(|(_, h)| *h);
         match m.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.modal.is_none() => {
                 let down = matches!(m.kind, MouseEventKind::ScrollDown);
@@ -1521,23 +1521,17 @@ impl AgentEditorPage {
         // then clamp to the content.
         let max = (rows.len() as u16).saturating_sub(content.height);
         if self.follow_cursor {
-            let caret = rows.iter().position(|r| r.focus);
-            let at = caret.or_else(|| rows.iter().position(|r| r.action == Some(self.cursor)));
-            if let Some(at) = at {
-                // The row's notes and error lines too, when they fit.
-                // At least one line under it: the last line shows "↓ more"
-                // while rows are clipped below.
-                let end = if caret.is_some() {
-                    1
-                } else {
-                    rows.iter().skip(at + 1).take_while(|r| r.action.is_none() && !r.focus).count().clamp(1, 3) as u16
-                };
-                let at = at as u16;
-                if at < self.scroll {
-                    self.scroll = at;
-                } else if at + end >= self.scroll + content.height {
-                    self.scroll = (at + end + 1).saturating_sub(content.height).min(at);
+            match rows.iter().position(|r| r.focus) {
+                // The caret's line, one line under it.
+                Some(at) => {
+                    let at = at as u16;
+                    if at < self.scroll {
+                        self.scroll = at;
+                    } else if at + 1 >= self.scroll + content.height {
+                        self.scroll = (at + 2).saturating_sub(content.height).min(at);
+                    }
                 }
+                None => self.scroll = follow(&rows, self.cursor, self.scroll, content.height),
             }
         }
         self.scroll = self.scroll.min(max);
@@ -1645,29 +1639,29 @@ impl AgentEditorPage {
         // `Some(true)` on the cursor's row only (the rows draw no
         // unfocused selection).
         let selected = |item: &Item| (index(item) == Some(self.cursor)).then_some(true);
-        let label_w = 18.min(width / 3).max(6);
         let note = |rows: &mut Vec<Row>, text: &str| note_rows(rows, text, width);
-        let errors = |rows: &mut Vec<Row>, f: Field| error_rows(rows, state.error_at(&f), width);
+        // What's said under a field: flush with its box.
+        let help = |rows: &mut Vec<Row>, text: &str| wrapped(rows, text, width, muted);
+        let errors = |rows: &mut Vec<Row>, f: Field| {
+            if let Some(e) = state.error_at(&f) {
+                wrapped(rows, e, width, red);
+            }
+        };
 
         // Agent.
         heading(&mut rows, "Agent");
         let blocked = state.rename_blocked();
-        let line = self.field_line("Name", &Text::Name, "", selected(&Item::Text(Text::Name)) == Some(true), label_w, width, blocked.is_some());
-        rows.push(Row { action: index(&Item::Text(Text::Name)), ..Row::text(line) });
+        let on = selected(&Item::Text(Text::Name)) == Some(true);
+        let invalid = state.error_at(&Field::Name).is_some();
+        self.field(&mut rows, "Name", &Text::Name, "", on, blocked.is_some(), invalid, index(&Item::Text(Text::Name)), width);
         if let Some(why) = &blocked {
-            note(&mut rows, &format!("Locked: {why}"));
+            help(&mut rows, &format!("Locked: {why}"));
         }
         errors(&mut rows, Field::Name);
-        let line = self.field_line(
-            "Description",
-            &Text::Description,
-            DESCRIPTION_PLACEHOLDER,
-            selected(&Item::Text(Text::Description)) == Some(true),
-            label_w,
-            width,
-            false,
-        );
-        rows.push(Row { action: index(&Item::Text(Text::Description)), ..Row::text(line) });
+        rows.push(Row::blank());
+        let on = selected(&Item::Text(Text::Description)) == Some(true);
+        let invalid = state.error_at(&Field::Description).is_some();
+        self.field(&mut rows, "Description", &Text::Description, DESCRIPTION_PLACEHOLDER, on, false, invalid, index(&Item::Text(Text::Description)), width);
         errors(&mut rows, Field::Description);
 
         // Instructions.
@@ -1682,8 +1676,9 @@ impl AgentEditorPage {
         let on = selected(&Item::Area(Area::Instructions)) == Some(true);
         let window = if editing { height.saturating_sub(4).clamp(3, 30) } else { PREVIEW_LINES };
         area_rows(&mut rows, &self.instructions, &mut self.area, editing, on, at, window, width);
-        let errors = |rows: &mut Vec<Row>, f: Field| error_rows(rows, self.state.as_ref().and_then(|s| s.error_at(&f)), width);
-        errors(&mut rows, Field::Instructions);
+        if let Some(e) = self.state.as_ref().and_then(|s| s.error_at(&Field::Instructions)) {
+            wrapped(&mut rows, e, width, red);
+        }
         let state = self.state.as_ref().expect("loaded");
         rows.push(Row {
             action: index(&Item::EditInstructions),
@@ -1724,17 +1719,18 @@ impl AgentEditorPage {
         rows.push(Row { action: index(&Item::AddSkill), ..Row::text(add_line("+ Add skill", selected(&Item::AddSkill), width)) });
         if self.skill_form.is_some() {
             for (label, text, placeholder) in [
-                ("  Skill name", Text::SkillName, "lowercase-with-dashes"),
-                ("  Description", Text::SkillDescription, SKILL_DESCRIPTION_PLACEHOLDER),
+                ("Skill name", Text::SkillName, "lowercase-with-dashes"),
+                ("Description", Text::SkillDescription, SKILL_DESCRIPTION_PLACEHOLDER),
             ] {
                 let item = Item::Text(text.clone());
-                let line = self.field_line(label, &text, placeholder, selected(&item) == Some(true), label_w, width, false);
-                rows.push(Row { action: index(&item), ..Row::text(line) });
+                rows.push(Row::blank());
+                self.field(&mut rows, label, &text, placeholder, selected(&item) == Some(true), false, false, index(&item), width);
             }
-            rows.push(Row::text(Line::from(Span::styled("    Instructions (SKILL.md body)", Style::default().fg(palette().gray)))));
+            rows.push(Row::blank());
             let editing = self.editing == Some(Area::SkillBody);
             let at = index(&Item::Area(Area::SkillBody));
             let on = selected(&Item::Area(Area::SkillBody)) == Some(true);
+            rows.push(Row { action: at, ..Row::text(textbox::label("Instructions (SKILL.md body)", on || editing, false, width)) });
             let window = if editing { height.saturating_sub(6).clamp(3, 16) } else { 4 };
             if let Some(form) = self.skill_form.as_ref() {
                 let mut view = if editing { self.area } else { AreaView::default() };
@@ -1753,19 +1749,22 @@ impl AgentEditorPage {
             };
             rows.push(Row {
                 action: index(&Item::SkillAdd),
-                ..Row::text(Line::from(vec![Span::raw("    "), button("Add skill", &Item::SkillAdd)]))
+                ..Row::text(Line::from(vec![button("Add skill", &Item::SkillAdd)]))
             });
             rows.push(Row {
                 action: index(&Item::SkillCancel),
-                ..Row::text(Line::from(vec![Span::raw("    "), button("Cancel", &Item::SkillCancel)]))
+                ..Row::text(Line::from(vec![button("Cancel", &Item::SkillCancel)]))
             });
         }
         let state = self.state.as_ref().expect("loaded");
         let item = Item::Text(Text::Import);
-        let line = self.field_line("Import skill", &Text::Import, "a path: ~/skills/lint or lint.md", selected(&item) == Some(true), label_w, width, false);
-        rows.push(Row { action: index(&item), ..Row::text(line) });
-        note(&mut rows, IMPORT_HELP);
-        error_rows(&mut rows, state.error_at(&Field::NewSkill), width);
+        rows.push(Row::blank());
+        let invalid = state.error_at(&Field::NewSkill).is_some();
+        self.field(&mut rows, "Import skill", &Text::Import, "a path: ~/skills/lint or lint.md", selected(&item) == Some(true), false, invalid, index(&item), width);
+        help(&mut rows, IMPORT_HELP);
+        if let Some(e) = state.error_at(&Field::NewSkill) {
+            wrapped(&mut rows, e, width, red);
+        }
 
         // Runner preferences.
         rows.push(Row::blank());
@@ -1776,33 +1775,26 @@ impl AgentEditorPage {
         };
         let blocked = state.options_blocked();
         let picker = |rows: &mut Vec<Row>, label: &str, value: &str, item: Item, dim: bool| {
-            let on = selected(&item) == Some(true);
-            let mut line = picker_line(label, value, on, label_w, width);
-            if dim && !on {
-                line = Line::from(Span::styled(
-                    format!("  {} {}", cell(label, label_w), panel::truncate_right(value, width.saturating_sub(label_w + 3))),
-                    muted,
-                ));
-            }
-            rows.push(Row { action: index(&item), ..Row::text(line) });
+            rows.push(Row::blank());
+            picker_rows(rows, label, value, selected(&item) == Some(true), dim, index(&item), width);
         };
         picker(&mut rows, "Preferred runner", &current(state.runner_choices(), "Project default"), Item::Runner, false);
-        note(&mut rows, &state.runner_note());
+        help(&mut rows, &state.runner_note());
         errors(&mut rows, Field::Runner);
         let model = current(state.model_choices(), state.model().unwrap_or("Use runner default"));
         picker(&mut rows, "Model", &model, Item::Model, blocked.is_some());
         if self.custom_model.is_some() {
             let item = Item::Text(Text::CustomModel);
-            let line = self.field_line("  Custom model", &Text::CustomModel, "a model name", selected(&item) == Some(true), label_w, width, false);
-            rows.push(Row { action: index(&item), ..Row::text(line) });
+            rows.push(Row::blank());
+            self.field(&mut rows, "Custom model", &Text::CustomModel, "a model name", selected(&item) == Some(true), false, false, index(&item), width);
         }
-        note(&mut rows, &with_source(&state.model_note(), state.model_in_effect().map(|(_, s)| s)));
+        help(&mut rows, &with_source(&state.model_note(), state.model_in_effect().map(|(_, s)| s)));
         errors(&mut rows, Field::Model);
         picker(&mut rows, "Reasoning effort", &current(state.effort_choices(), "Use runner default"), Item::Effort, blocked.is_some());
-        note(&mut rows, &state.effort_note());
+        help(&mut rows, &state.effort_note());
         errors(&mut rows, Field::Effort);
         picker(&mut rows, "Permissions", &current(state.permission_choices(), "Use project settings"), Item::Permissions, false);
-        note(&mut rows, &state.permissions_note());
+        help(&mut rows, &state.permissions_note());
         errors(&mut rows, Field::Permissions);
 
         // Workflow assignments.
@@ -1854,38 +1846,29 @@ impl AgentEditorPage {
         rows
     }
 
-    /// A text field's row: its label, then the text (the line editor while
-    /// typed), the placeholder when empty. A `locked` field's value is
-    /// muted.
+    /// A text field's rows: its label over its box holding the text (the
+    /// line editor's, caret and all, while typed), the placeholder when
+    /// empty. A `locked` field is drawn disabled; an `invalid` one in the
+    /// error fill.
     #[allow(clippy::too_many_arguments)]
-    fn field_line(
+    fn field(
         &self,
+        rows: &mut Vec<Row>,
         label: &str,
         text: &Text,
         placeholder: &str,
         selected: bool,
-        label_w: usize,
-        width: usize,
         locked: bool,
-    ) -> Line<'static> {
-        let marker = if selected { "› " } else { "  " };
-        let head = format!("{marker}{}", cell(label, label_w));
-        let head_style = if selected { selected_style(true) } else { Style::default().fg(palette().gray) };
-        let mut spans = vec![Span::styled(head, head_style), Span::raw(" ")];
-        let room = width.saturating_sub(label_w + 3);
-        match &self.typing {
-            Some((t, edit)) if t == text => spans.extend(edit.spans(room)),
-            _ => {
-                let value = self.text(text);
-                if value.is_empty() {
-                    spans.push(Span::styled(panel::truncate_right(placeholder, room), Style::default().fg(palette().muted)));
-                } else {
-                    let style = Style::default().fg(if locked { palette().gray } else { palette().white });
-                    spans.push(Span::styled(panel::truncate_right(&value, room), style));
-                }
-            }
-        }
-        Line::from(spans)
+        invalid: bool,
+        action: Option<usize>,
+        width: usize,
+    ) {
+        let (value, caret) = match &self.typing {
+            Some((t, edit)) if t == text => (edit.text(), Some(edit.caret())),
+            _ => (self.text(text), None),
+        };
+        let field = Textbox::new(&value).caret(caret).placeholder(placeholder).focused(selected).disabled(locked).invalid(invalid);
+        field_rows(rows, label, field, selected, locked, action, width);
     }
 
     fn render_modal(&mut self, f: &mut Frame, area: Rect) {
@@ -2042,10 +2025,11 @@ fn with_source(note: &str, source: Option<Source>) -> String {
     }
 }
 
-/// A multi-line field's rows: while `editing`, a `window` of its wrapped
-/// lines kept around the caret (the caret's row marked as the page's
-/// focus); otherwise a preview of its first `window` lines and how many
-/// more there are. Every row is item `at`'s, so a click on it selects it.
+/// A multi-line field's rows: the text on the field's fill between its
+/// caps; while `editing`, a `window` of its wrapped lines kept around the
+/// caret (the caret's row marked as the page's focus), otherwise a preview
+/// of its first `window` lines; then how many more there are. Every row is
+/// item `at`'s, so a click on it selects it.
 #[allow(clippy::too_many_arguments)]
 fn area_rows(
     rows: &mut Vec<Row>,
@@ -2057,10 +2041,11 @@ fn area_rows(
     window: usize,
     width: usize,
 ) {
-    let text_w = width.saturating_sub(2 + AREA_PREFIX.chars().count()).max(1);
+    let box_w = width.min(textbox::MAX_W);
+    let text_w = textbox::room(box_w).max(1);
     let (wrapped_rows, (caret_row, caret_col)) = text.wrapped(text_w);
-    let rule = Style::default().fg(if editing || selected { palette().cyan } else { palette().ansi_dark_gray });
-    let style = Style::default().fg(palette().foreground);
+    let focused = editing || selected;
+    let style = textbox::area_text(focused, false).bg(textbox::fill(focused, false, false));
     let lines = text.lines();
     let window = if editing { window.min(wrapped_rows.len() + 1).max(3.min(window)) } else { window.min(wrapped_rows.len()) };
     if editing {
@@ -2073,26 +2058,25 @@ fn area_rows(
         view.top = view.top.min(wrapped_rows.len().saturating_sub(1));
     }
     let top = if editing { view.top } else { 0 };
-    let marker = if selected && !editing { "› " } else { "  " };
+    let mut body = Vec::new();
+    let mut caret_at = None;
     for v in top..top + window.max(1) {
-        let mut spans = vec![Span::styled(marker, Style::default().fg(palette().cyan)), Span::styled(AREA_PREFIX, rule)];
-        let mut focus = false;
+        let mut spans = Vec::new();
         if let Some(&(line, start)) = wrapped_rows.get(v) {
             let chars: Vec<char> =
                 lines[line].iter().skip(start).take(text_w).map(|c| if c.is_control() { ' ' } else { *c }).collect();
-            if editing && v == caret_row {
-                focus = true;
-                let before: String = chars.iter().take(caret_col).collect();
-                let caret: String = chars.get(caret_col).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
-                let after: String = chars.iter().skip(caret_col + 1).collect();
-                spans.push(Span::styled(before, style));
-                spans.push(Span::styled(caret, Style::default().fg(palette().canvas).bg(palette().white)));
-                spans.push(Span::styled(after, style));
-            } else {
-                spans.push(Span::styled(chars.into_iter().collect::<String>(), style));
+            let caret = (editing && v == caret_row).then_some(caret_col);
+            if caret.is_some() {
+                caret_at = Some(body.len());
             }
+            textbox::caret_spans(&mut spans, &chars, caret, text_w, style);
         }
-        rows.push(Row { action: at, focus, ..Row::text(Line::from(spans)) });
+        body.push(spans);
+    }
+    for (i, line) in textbox::area(body, focused, false, false, box_w).into_iter().enumerate() {
+        // Row 0 is the cap above: the text's rows start at 1.
+        let focus = caret_at.is_some_and(|c| c + 1 == i);
+        rows.push(Row { action: at, focus, ..Row::text(line) });
     }
     let below = wrapped_rows.len().saturating_sub(top + window);
     let more = if editing {
@@ -2109,7 +2093,7 @@ fn area_rows(
         None
     };
     if let Some(more) = more {
-        rows.push(Row { action: at, ..Row::text(Line::from(Span::styled(format!("    {more}"), Style::default().fg(palette().muted)))) });
+        rows.push(Row { action: at, ..Row::text(Line::from(Span::styled(more, Style::default().fg(palette().muted)))) });
     }
 }
 

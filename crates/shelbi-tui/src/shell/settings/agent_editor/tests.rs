@@ -118,6 +118,12 @@ fn render(ed: &mut AgentEditorPage, w: u16, h: u16) -> String {
     out
 }
 
+fn render_buf(ed: &mut AgentEditorPage, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| ed.render(f, f.area(), None, "↑↓")).unwrap();
+    term.backend().buffer().clone()
+}
+
 fn page_text(ed: &mut AgentEditorPage) -> String {
     ed.rows(110, 40)
         .into_iter()
@@ -603,7 +609,11 @@ fn the_focused_row_stays_in_view_at_80x24_and_long_instructions_scroll() {
         ed.cursor = i;
         ed.follow_cursor = true;
         let screen = render(&mut ed, 80, 24);
-        let marked = screen.lines().skip(2).take(21).any(|l| l.contains('›'));
+        // Focus shows as the `›` marker, or as a focused field's fill.
+        let marked = screen.lines().skip(2).take(21).any(|l| l.contains('›')) || {
+            let buf = render_buf(&mut ed, 80, 24);
+            (2..23).any(|y| (0..80).any(|x| buf[(x, y)].bg == crate::theme::palette().input_focus))
+        };
         let header = i < 4;
         assert!(header || marked, "row {i} ({:?}) in view:\n{screen}", ed.cursor_item());
     }
@@ -657,6 +667,25 @@ fn it_reads_in_light_with_a_menu_open() {
 }
 
 #[test]
+fn a_click_on_any_row_of_a_fields_box_types_in_it() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let _home = home("field-click");
+    let mut ed = editor("developer");
+    let screen = render(&mut ed, 110, 60);
+    let label = screen.lines().position(|l| l.trim() == "Description").unwrap_or_else(|| panic!("{screen}"));
+    for y in label + 1..=label + 3 {
+        press(&mut ed, key(KeyCode::Esc));
+        ed.cursor = 0;
+        render(&mut ed, 110, 60);
+        ed.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 40, row: y as u16, modifiers: KeyModifiers::NONE });
+        assert_eq!(ed.cursor_item(), Some(Item::Text(Text::Description)), "row {y}");
+        // Typed in: the caret's block shows in the box.
+        let buf = render_buf(&mut ed, 110, 60);
+        assert!((0..110).any(|x| buf[(x, label as u16 + 2)].bg == crate::theme::palette().white), "row {y}: the caret");
+    }
+}
+
+#[test]
 fn clicks_select_then_open_and_answer_menus() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     let _home = home("mouse");
@@ -675,7 +704,8 @@ fn clicks_select_then_open_and_answer_menus() {
     ed.handle_mouse(click(10, y as u16));
     assert_eq!(ed.modal_title().as_deref(), Some("Preferred runner"), "a second opens");
     let screen = render(&mut ed, 110, 60);
-    let (y, line) = screen.lines().enumerate().find(|(_, l)| l.contains(" Codex ")).unwrap();
+    // The menu's entry (a note on the page may name Codex too).
+    let (y, line) = screen.lines().enumerate().find(|(_, l)| l.contains("│ Codex ")).unwrap();
     let x = line.find(" Codex ").map(|b| line[..b].chars().count()).unwrap() as u16 + 1;
     ed.handle_mouse(click(x, y as u16));
     assert_eq!(ed.state().unwrap().agent().preferred_runner(), Some(RunnerKind::Codex));

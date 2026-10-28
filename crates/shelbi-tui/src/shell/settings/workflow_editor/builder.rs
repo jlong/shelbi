@@ -51,18 +51,17 @@ use ratatui::{
 };
 use shelbi_app::settings::workflow_builder::{move_action, BuilderState, Removal, Selection};
 use shelbi_app::settings::workflow_editor::{
-    action_label, owner_label, Change, EditorState, Field, Mode, ACTIONS, DETAILS_READY, DETAILS_TARGET, DETAILS_TIMEOUT,
-    DETAILS_URL, RUN_HELP, TAGS_PLACEHOLDER,
+    action_label, owner_label, Change, EditorState, Field, Mode, ACTIONS, TAGS_PLACEHOLDER,
 };
 use shelbi_app::settings::workflow_graph::{EdgeKind, Graph, Pt, Side};
 use shelbi_app::settings::workflows::category_label;
 use shelbi_core::{StatusCategory, TransitionAction, Workflow};
 
 use super::canvas::{self, Border, Canvas, EdgeIn, Input, Look, NodeLook, Route};
-use super::{picker_line, Act, Choice, EditorAction, Hit, Item, Pick, Section, Text, WorkflowEditorPage};
+use super::{Act, Choice, EditorAction, Hit, Item, Pick, Section, Text, WorkflowEditorPage};
 use crate::panel;
 use crate::shell::settings::workflows::{add_line, error_rows, plain_line, Nav};
-use crate::shell::settings::{heading, wrapped, Row};
+use crate::shell::settings::{follow, heading, picker_rows, wrapped, Row};
 use crate::theme::palette;
 
 /// From this width the panel sits beside the canvas; narrower, it takes the
@@ -1149,19 +1148,8 @@ impl WorkflowEditorPage {
         }
         let rows = self.panel_rows(width);
         let max = (rows.len() as u16).saturating_sub(body.height);
-        if let Some(at) = rows.iter().position(|r| r.action == Some(self.cursor)) {
-            // The Form's rule: its error lines when they fit, and at least
-            // one line under it, since the last line shows "↓ more" while
-            // rows are clipped below.
-            let end = rows.iter().skip(at + 1).take_while(|r| r.action.is_none()).count().clamp(1, 3) as u16;
-            let at = at as u16;
-            let scroll = &mut self.builder.panel_scroll;
-            if at < *scroll {
-                *scroll = at;
-            } else if at + end >= *scroll + body.height {
-                *scroll = (at + end + 1).saturating_sub(body.height).min(at);
-            }
-        }
+        // The Form's rule.
+        self.builder.panel_scroll = follow(&rows, self.cursor, self.builder.panel_scroll, body.height);
         self.builder.panel_scroll = self.builder.panel_scroll.min(max);
         let clipped = self.builder.panel_scroll < max;
         for (i, row) in rows.iter().skip(self.builder.panel_scroll as usize).take(body.height as usize).enumerate() {
@@ -1188,20 +1176,21 @@ impl WorkflowEditorPage {
         let index = |item: &Item| items.iter().position(|it| it == item);
         // Only the cursor's row shows the selection.
         let selected = |item: &Item| (index(item) == Some(self.cursor)).then_some(true);
-        let label_w = 14.min(width * 2 / 5).max(4);
         let row = |rows: &mut Vec<Row>, item: Item, line: Line<'static>| rows.push(Row { action: index(&item), ..Row::text(line) });
         let button = |rows: &mut Vec<Row>, item: Item, text: &str, style: Style| {
             let line = plain_line(text, selected(&item), width, style);
             row(rows, item, line);
         };
+        // A picker or a field a blank row under what's before it: its label
+        // over its box.
         let picker = |rows: &mut Vec<Row>, label: &str, value: &str, item: Item| {
-            let line = picker_line(label, value, selected(&item) == Some(true), label_w, width);
-            row(rows, item, line);
+            rows.push(Row::blank());
+            picker_rows(rows, label, value, selected(&item) == Some(true), false, index(&item), width);
         };
         let field = |rows: &mut Vec<Row>, label: &str, text: Text, placeholder: &str| {
             let item = Item::Text(text.clone());
-            let line = self.field_line(label, &text, placeholder, selected(&item) == Some(true), label_w, width);
-            row(rows, item, line);
+            rows.push(Row::blank());
+            self.field(rows, label, &text, placeholder, selected(&item) == Some(true), false, index(&item), width);
         };
         let b = &self.builder.state;
         if index(&Item::PanelBack).is_some() {
@@ -1235,14 +1224,16 @@ impl WorkflowEditorPage {
                     return rows;
                 };
                 picker(&mut rows, "Status", &format!("{} {}", category_glyph(s.category), s.name), Item::PanelStatus);
-                rows.push(Row::text(Line::from(vec![
-                    Span::styled(format!("  {}", super::cell("Category", label_w)), Style::default().fg(palette().gray)),
-                    Span::styled(format!(" {}", category_label(s.category)), Style::default().fg(palette().foreground)),
-                ])));
+                rows.push(Row::blank());
+                rows.push(Row::text(Line::from(Span::styled("Category", Style::default().fg(palette().gray)))));
+                rows.push(Row::text(Line::from(Span::styled(category_label(s.category), Style::default().fg(palette().foreground)))));
                 picker(&mut rows, "Owner", owner_label(s.owner), Item::Owner(id.clone()));
                 picker(&mut rows, "Agent", s.agent.as_deref().unwrap_or("None"), Item::Agent(id.clone()));
-                field(&mut rows, "Tags", Text::Tags(id.clone()), TAGS_PLACEHOLDER);
-                error_rows(&mut rows, state.error_at(&Field::Status(id.clone())), width);
+                field(&mut rows, "Workspace tags", Text::Tags(id.clone()), TAGS_PLACEHOLDER);
+                if let Some(e) = state.error_at(&Field::Status(id.clone())) {
+                    wrapped(&mut rows, e, width, Style::default().fg(palette().red));
+                }
+                rows.push(Row::blank());
                 if index(&Item::SetInitial(id.clone())).is_some() {
                     button(&mut rows, Item::SetInitial(id.clone()), "Set as initial", Style::default().fg(palette().cyan));
                 } else {
@@ -1284,17 +1275,7 @@ impl WorkflowEditorPage {
                 if self.details == Some(i) {
                     rows.push(Row::blank());
                     heading(&mut rows, "Details");
-                    field(&mut rows, DETAILS_TARGET.0, Text::Target, DETAILS_TARGET.1);
-                    wrapped(&mut rows, &format!("  Run: {RUN_HELP}"), width, muted);
-                    for line in 0..self.run.len() {
-                        field(&mut rows, "  $", Text::Run(line), "");
-                    }
-                    let add = Item::AddRun;
-                    let line = add_line("  + Add command", selected(&add), width);
-                    row(&mut rows, add, line);
-                    field(&mut rows, DETAILS_READY.0, Text::Ready, DETAILS_READY.1);
-                    field(&mut rows, DETAILS_TIMEOUT.0, Text::Timeout, DETAILS_TIMEOUT.1);
-                    field(&mut rows, DETAILS_URL.0, Text::Url, DETAILS_URL.1);
+                    self.details_rows(&mut rows, width);
                 }
                 if added {
                     rows.push(Row::blank());
