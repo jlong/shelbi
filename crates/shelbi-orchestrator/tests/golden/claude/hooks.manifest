@@ -11,10 +11,12 @@ fi
 LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
 LOG=.shelbi/messages/$TASK_ID.log
 # A pid file can outlive its tail and the OS may have reused the pid, so only
-# ever signal a pid whose command line is still exactly this task's tail.
+# ever signal a pid whose command line is still this task's tail (either form:
+# `-n 0` is what hooks started before the relay pinned its start offset).
 is_task_tail() {
   case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
   case "$(ps -ww -o command= -p "$1" 2>/dev/null)" in
+    "tail -f -c +"[0-9]*" $LOG"|*/"tail -f -c +"[0-9]*" $LOG") return 0 ;;
     "tail -f -n 0 $LOG"|*/"tail -f -n 0 $LOG") return 0 ;;
   esac
   return 1
@@ -26,7 +28,11 @@ if [ -f "$LOCKDIR/pid" ]; then
 fi
 mkdir -p "$LOCKDIR"
 touch "$LOG"
-tail -f -n 0 "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
+# Relay from the log's end as of now, not wherever it is once `tail` gets
+# around to opening the file: on a loaded machine that can be after this hook
+# returns, and a message appended in between would never be relayed.
+START=$(($(wc -c < "$LOG") + 1))
+tail -f -c +$START "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
 TAIL_PID=$!
 echo "$TAIL_PID" > "$LOCKDIR/pid"
 # Watchdog: the tail must not outlive the agent session that started it.
