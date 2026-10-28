@@ -36,6 +36,8 @@
 //!   over the shared machine service, and [`machine_check`]: their
 //!   connection check (readiness stages, Install CLI) over the readiness
 //!   service.
+//! - [`workflow_editor`]: one workflow's editor (its draft, the changes the
+//!   Form and the Builder make to it, Save, Discard and the leave prompt).
 
 pub mod agents;
 pub mod general;
@@ -44,6 +46,7 @@ pub mod machine_check;
 pub mod machine_form;
 pub mod summary;
 pub mod terminal_preview;
+pub mod workflow_editor;
 pub mod workflows;
 pub mod workspace_form;
 pub mod workspaces;

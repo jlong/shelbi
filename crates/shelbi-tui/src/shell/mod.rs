@@ -134,6 +134,8 @@ enum SettingsMsg {
         Box<shelbi_app::settings::machine_check::ReadinessRequest>,
         Box<shelbi_app::settings::machine_check::CheckOutcome>,
     ),
+    /// The workflow editor's read, save, duplicate or delete.
+    Editor(Ticket, Box<settings::EditorDone>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -1220,7 +1222,7 @@ struct ShellState {
     /// tests).
     readiness_service: shelbi_app::settings::machine_check::ReadinessService,
     /// How many refreshes were asked for (a test checks a committed pool
-    /// change refreshes the sidebar).
+    /// change refreshes the sidebar, and a saved workflow the board).
     #[cfg(test)]
     refresh_requests: std::cell::Cell<usize>,
     /// A transient status line shown at the bottom of the main area (effect
@@ -2217,6 +2219,7 @@ impl ShellState {
             selection: self.client.sidebar_selection(),
         });
         self.settings.open();
+        self.settings.project_shown(self.client.project());
         // Read again on every visit: config.yaml may have changed outside.
         self.load_settings(true);
         self.dirty = true;
@@ -2246,6 +2249,12 @@ impl ShellState {
     /// back through `settings_rx` under the load's ticket.
     fn load_settings(&mut self, force: bool) {
         let project = self.client.project().map(str::to_string);
+        if force {
+            // The workflow editor reads its files again too (back from the
+            // user's editor): for its own project only.
+            self.settings.reload_editor(project.as_deref());
+            self.start_editor_work();
+        }
         let Some(load) = self.settings.begin_page_load(project.as_deref(), force) else {
             return;
         };
@@ -2489,24 +2498,49 @@ impl ShellState {
         }
     }
 
-    /// Open workflow `name`'s editor. The workflow editor is its own task;
-    /// until it lands this opens the workflow's YAML in the user's editor,
-    /// as the desktop did before its editor existed.
-    fn edit_workflow(&mut self, name: &str) {
-        let Some(path) = self
-            .settings
-            .workflows()
-            .state()
-            .and_then(|s| s.config())
-            .map(|c| c.workflow_path(name))
-        else {
+    /// Open workflow `name`'s editor in Settings (`tui-workflow-editor-form`),
+    /// on status `status`'s row when given (an agent's assignment).
+    fn edit_workflow(&mut self, name: &str, status: Option<String>) {
+        let project = self.client.project().map(str::to_string);
+        let action = self.settings.open_editor(project.as_deref(), name, status);
+        self.apply_settings_action(action);
+    }
+
+    /// Start the workflow editor's waiting work (its read, save, duplicate
+    /// or delete) off the UI thread. The result comes back through
+    /// `settings_rx` under the work's ticket, so a result for an editor (or
+    /// a project) no longer shown is dropped.
+    fn start_editor_work(&mut self) {
+        let Some((ticket, work)) = self.settings.take_editor_work() else {
             return;
         };
-        self.edit_settings_file(settings::EditFile {
-            path,
-            target: shelbi_app::settings::workflows::Target::Workflow(name.to_string()),
-            statuses_of: None,
-        });
+        let tx = self.settings_tx.clone();
+        let reader = self.workflows_reader.clone();
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-workflow-editor".into())
+            .spawn(move || {
+                let done = settings::run_work(work, &*reader);
+                let _ = tx.send(SettingsMsg::Editor(sent, Box::new(done)));
+            });
+        if let Err(e) = spawned {
+            // The thread took the work with it: report it as a failed read.
+            let done = settings::EditorDone::Loaded(
+                Err(format!("couldn't start the work: {e}")),
+                shelbi_app::settings::workflow_editor::ProjectGit::default(),
+            );
+            self.editor_landed(&ticket, done);
+        }
+    }
+
+    /// The editor's work landed: refresh the board when it wrote the files
+    /// (its columns follow the workflows), and carry on.
+    fn editor_landed(&mut self, ticket: &Ticket, done: settings::EditorDone) {
+        let (action, wrote) = self.settings.editor_landed(ticket, done);
+        if wrote {
+            self.request_refresh();
+        }
+        self.apply_settings_action(action);
     }
 
     /// Write a Keybindings change to `keys.yaml` off the UI thread (the page
@@ -2640,6 +2674,7 @@ impl ShellState {
                     let action = self.settings.check_finished(form, &request, *outcome);
                     self.apply_settings_action(action);
                 }
+                SettingsMsg::Editor(ticket, done) => self.editor_landed(&ticket, *done),
             }
         }
         if self.settings_open() {
@@ -2689,7 +2724,8 @@ impl ShellState {
             SettingsAction::Write(change) => self.write_setting(change),
             SettingsAction::EditFile(path) => self.pending_editor = Some(path),
             SettingsAction::Commit => self.start_workflows_commit(),
-            SettingsAction::EditWorkflow(name) => self.edit_workflow(&name),
+            SettingsAction::EditWorkflow { name, status } => self.edit_workflow(&name, status),
+            SettingsAction::EditorWork => self.start_editor_work(),
             SettingsAction::EditYaml(file) => self.edit_settings_file(file),
             SettingsAction::SaveKeys(change) => self.save_keys(change),
             SettingsAction::OpenKeys => self.open_keys_file(),
@@ -4108,6 +4144,7 @@ impl ShellState {
         // never selects a sidebar/panel row or reaches the main/content pane.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && self.on_divider(m.column, m.row)
+            && !(self.settings_open() && self.settings.covers_columns())
         {
             self.sidebar_dragging = true;
             self.update_sidebar_drag(m.column);
@@ -4562,6 +4599,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         .or_else(|| state.client.project().map(str::to_string))
         .unwrap_or_else(|| "No project".to_string());
     let has_project = state.client.project().is_some();
+    let settings_covers = state.settings.covers_columns();
     let settings = &mut state.settings;
     let keymaps = &state.keymaps;
     let display_style = state.display_style;
@@ -4713,7 +4751,9 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // neither the nav sidebar nor the review panel (whichever holds that
         // column) can cover it. Its column was kept clear by rendering the
         // content one column narrower above.
-        render_divider(frame.buffer_mut(), sidebar_rect, divider_active);
+        if !(is_settings && settings_covers) {
+            render_divider(frame.buffer_mut(), sidebar_rect, divider_active);
+        }
 
         // Dim the main area under an open overlay so the modal reads as on top
         // (the overlay's own `Clear` un-dims the cells it occupies).
@@ -8716,7 +8756,7 @@ mod tests {
         // A missing workflow file says so at its row rather than opening.
         std::fs::remove_file(home.file("proj", "subtask.yaml")).unwrap();
         st.settings.workflows_mut().select(&settings::workflows_item_workflow("subtask"));
-        press(&mut st, KeyCode::Enter);
+        type_key(&mut st, 'y');
         assert!(st.pending_editor.is_none());
         let state = st.settings.workflows().state().unwrap();
         assert_eq!(
@@ -8754,6 +8794,163 @@ mod tests {
             let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
             draw_frame(&mut term, &mut st).unwrap();
             crate::theme::assert_light_readable("settings-workflows-shell", term.backend().buffer());
+        });
+    }
+
+    // --- The workflow editor (tui-workflow-editor-form), through the shell ---
+
+    /// Settings ▸ Workflows with workflow `name`'s editor open and loaded.
+    fn editor_state(home: &WorkflowsHome, name: &str) -> ShellState {
+        let mut st = workflows_state(home);
+        press(&mut st, KeyCode::Tab);
+        st.settings.workflows_mut().select(&settings::workflows_item_workflow(name));
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.editor().is_some(), "Enter on a workflow opens its editor");
+        settle_editor(&mut st);
+        st
+    }
+
+    /// Drain Settings until the editor's draft is loaded and nothing runs.
+    fn settle_editor(st: &mut ShellState) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.editor().is_some_and(|e| e.state().is_some() && !e.busy())
+            }),
+            "the editor loads and settles"
+        );
+    }
+
+    fn select_in_editor(st: &mut ShellState, item: settings::EditorItem) {
+        assert!(st.settings.editor_mut().unwrap().select(&item), "{item:?}");
+    }
+
+    /// Type `text` into the editor's description, Enter to stop.
+    fn type_description(st: &mut ShellState, text: &str) {
+        select_in_editor(st, settings::EditorItem::Text(settings::EditorText::Description));
+        press(st, KeyCode::Enter);
+        for c in text.chars() {
+            type_key(st, c);
+        }
+        press(st, KeyCode::Enter);
+    }
+
+    #[test]
+    fn the_editor_takes_both_columns_at_80x24() {
+        let home = WorkflowsHome::new("ed-draw");
+        let mut st = editor_state(&home, "task");
+        for (w, h) in [(80, 24), (160, 48)] {
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            draw_frame(&mut term, &mut st).unwrap();
+            let screen = screen_text(&term);
+            for want in ["← Back", "task default", "Save changes", "Discard", "⋮ Actions", "Workflow", "Name"] {
+                assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
+            }
+            assert!(!screen.contains("▾ proj"), "the settings sidebar is hidden:\n{screen}");
+            let (x, _) = find_on_screen(&term, "← Back").unwrap();
+            assert!(x < st.main_rect.x, "{w}x{h}: the editor starts in the sidebar's column");
+            for line in screen.lines() {
+                assert!(crate::panel::display_width(line) <= w as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn a_save_runs_off_the_ui_thread_refreshes_and_back_lands_on_its_row() {
+        let home = WorkflowsHome::new("ed-save");
+        let mut st = editor_state(&home, "subtask");
+        let before = std::fs::read_to_string(home.file("proj", "subtask.yaml")).unwrap();
+        type_description(&mut st, " Saved.");
+        assert_eq!(std::fs::read_to_string(home.file("proj", "subtask.yaml")).unwrap(), before, "not before Save");
+        let refreshes = st.refresh_requests.get();
+        st.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        settle_editor(&mut st);
+        assert!(std::fs::read_to_string(home.file("proj", "subtask.yaml")).unwrap().contains("parent task. Saved."));
+        assert!(st.refresh_requests.get() > refreshes, "the board refreshes after a save");
+        // Back: the Workflows page, its row selected, the index current.
+        press(&mut st, KeyCode::Esc);
+        assert!(st.settings_open() && st.settings.editor().is_none());
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_settings();
+                st.settings.workflows().state().is_some_and(|s| {
+                    s.workflows().into_iter().any(|w| w.name == "subtask" && w.description.is_some_and(|d| d.ends_with("Saved.")))
+                })
+            }),
+            "the index reads again and shows the save"
+        );
+        assert_eq!(st.settings.workflows().cursor_item(), Some(settings::workflows_item_workflow("subtask")));
+    }
+
+    #[test]
+    fn edit_yaml_from_the_editor_reloads_it_on_return() {
+        let home = WorkflowsHome::new("ed-yaml");
+        let mut st = editor_state(&home, "task");
+        type_key(&mut st, 'y');
+        let path = st.pending_editor.take().expect("the editor is queued");
+        assert_eq!(path, home.file("proj", "task.yaml"));
+        let text = std::fs::read_to_string(&path).unwrap().replace("Branch work", "Edited by hand");
+        std::fs::write(&path, text).unwrap();
+        // The run loop's return path.
+        st.load_settings(true);
+        assert!(wait_until(Duration::from_secs(5), || {
+            st.poll_settings();
+            st.settings
+                .editor()
+                .and_then(|e| e.state())
+                .is_some_and(|s| s.workflow().description.as_deref().is_some_and(|d| d.starts_with("Edited by hand")))
+        }));
+        assert_eq!(st.client.project(), Some("proj"), "the project stays");
+    }
+
+    #[test]
+    fn a_project_switch_with_unsaved_edits_asks_and_save_goes_on() {
+        let home = WorkflowsHome::new("ed-switch");
+        let mut st = editor_state(&home, "subtask");
+        type_description(&mut st, " Before the switch.");
+        st.dispatch_effect(Effect::SwitchProject { project: "beta".into() });
+        assert!(st.settings.prompting(), "Save / Discard / Cancel first");
+        assert_eq!(st.client.project(), Some("proj"));
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Save your changes to subtask"), "{}", screen_text(&term));
+        // Cancel stays with the edits.
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings.prompting() && st.settings.editor().is_some_and(|e| e.is_dirty()));
+        // Save: it saves, then switches; the editor (the old project's) goes.
+        st.dispatch_effect(Effect::SwitchProject { project: "beta".into() });
+        type_key(&mut st, 's');
+        assert!(wait_until(Duration::from_secs(5), || {
+            st.poll_settings();
+            st.client.project() == Some("beta")
+        }));
+        assert!(std::fs::read_to_string(home.file("proj", "subtask.yaml")).unwrap().contains("Before the switch."));
+        assert!(st.settings_open() && st.settings.editor().is_none());
+    }
+
+    #[test]
+    fn an_agents_assignment_opens_the_editor_on_its_status() {
+        let home = WorkflowsHome::new("ed-link");
+        let mut st = workflows_state(&home);
+        st.apply_settings_action(settings::SettingsAction::EditWorkflow {
+            name: "task".into(),
+            status: Some("review".into()),
+        });
+        settle_editor(&mut st);
+        let editor = st.settings.editor().unwrap();
+        assert_eq!(editor.cursor_item(), Some(settings::EditorItem::Status("review".into())));
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workflows, "Back lands on Workflows");
+    }
+
+    #[test]
+    fn the_editor_renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        let home = WorkflowsHome::new("ed-light");
+        let mut st = editor_state(&home, "task");
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
+            draw_frame(&mut term, &mut st).unwrap();
+            crate::theme::assert_light_readable("settings-workflow-editor", term.backend().buffer());
         });
     }
 

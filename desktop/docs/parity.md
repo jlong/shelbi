@@ -190,6 +190,15 @@ paths on every `cargo test`.
   [`status/tui-settings-workspaces.md`](status/tui-settings-workspaces.md),
   [`status/tui-settings-machine-forms.md`](status/tui-settings-machine-forms.md)
   and [`status/tui-settings-machine-readiness.md`](status/tui-settings-machine-readiness.md).
+- **The workflow editor** (`tui-workflow-editor-form`): both clients edit
+  one draft (`shelbi_app::settings::workflow_editor`: the changes, the text
+  form, Save, Discard, the leave prompt, the guards). The TUI has the Form
+  only until its Builder lands, reaches a row's cells through its keys or
+  menu (the desktop has a picker per cell and drags), lists Run commands one
+  per row, asks before Delete, asks Reload or Keep editing on an on-disk
+  conflict (the desktop points at Discard), and asks before a project
+  switch. See
+  [`status/tui-workflow-editor-form.md`](status/tui-workflow-editor-form.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

@@ -27,7 +27,10 @@
 //!   TUI at once.
 //! - Workflows (`tui-settings-workflows`, [`workflows`]): the project's
 //!   workflows and status catalog, edited in place and saved as each edit is
-//!   made, over the shared `shelbi_app::settings::workflows` state.
+//!   made, over the shared `shelbi_app::settings::workflows` state. Editing a
+//!   workflow opens its editor (`tui-workflow-editor-form`,
+//!   [`workflow_editor`]) over both Settings columns: one draft over the
+//!   shared `shelbi_app::settings::workflow_editor` state, written at Save.
 //! - Agents (`tui-settings-agents`, [`agents`]): the project's agents (New,
 //!   Duplicate, a guarded Reset and Delete, Edit YAML) and an in-place
 //!   editor for their shared instructions, over the shared
@@ -87,17 +90,23 @@ use crate::theme::palette;
 
 mod agents;
 mod machine_form;
+mod workflow_editor;
 mod workflows;
 pub(crate) mod workspaces;
 
 pub(crate) use agents::CommitJob;
 use agents::{AgentsHit, AgentsPage, Outcome};
+pub(crate) use workflow_editor::{run_work, EditorDone, EditorWork};
+use workflow_editor::{EditorAction, Landed, WorkflowEditorPage};
 pub(crate) use workflows::EditFile;
 use workflows::{Nav, WorkflowsPage};
 use shelbi_app::settings::workspace_form::{self, Outcome as PoolOutcome};
 use shelbi_app::settings::workspaces::PoolIndex;
 use shelbi_core::pool::PoolError;
-use workspaces::{Ask, Landed, WorkspacesPage};
+use workspaces::{Ask, Landed as PoolLanded, WorkspacesPage};
+
+#[cfg(test)]
+pub(crate) use workflow_editor::{Item as EditorItem, Text as EditorText};
 
 /// Workflow `name`'s row on the Workflows page (the shell's tests select it).
 #[cfg(test)]
@@ -191,9 +200,12 @@ pub(crate) enum SettingsAction {
     /// The Workflows page queued a save: start it off the UI thread
     /// ([`SettingsShell::begin_commit`]).
     Commit,
-    /// Open workflow `name`'s editor. The workflow editor is its own task;
-    /// until it lands the shell opens the workflow's YAML.
-    EditWorkflow(String),
+    /// Open workflow `name`'s editor, on status `status`'s row when given
+    /// (an agent's workflow-status assignment): [`SettingsShell::open_editor`].
+    EditWorkflow { name: String, status: Option<String> },
+    /// The workflow editor has work to run off the UI thread
+    /// ([`SettingsShell::take_editor_work`]).
+    EditorWork,
     /// Edit YAML on the Workflows page: open a workflow config file in the
     /// user's editor, scaffolding it first when it is missing.
     EditYaml(EditFile),
@@ -329,6 +341,8 @@ pub(crate) struct SettingsShell {
     workspaces: WorkspacesPage,
     /// The page's text start column at the last draw (editor clicks).
     page_x: u16,
+    /// The workflow editor, while it shows (over both columns).
+    editor: Option<WorkflowEditorPage>,
     /// The page's selected action row and scroll offset.
     action: usize,
     scroll: u16,
@@ -368,6 +382,7 @@ impl Default for SettingsShell {
             retired: Vec::new(),
             workspaces: WorkspacesPage::default(),
             page_x: 0,
+            editor: None,
             action: 0,
             scroll: 0,
             guard: LeaveGuard::default(),
@@ -409,6 +424,7 @@ impl SettingsShell {
         &self.general
     }
 
+    #[cfg(test)]
     pub(crate) fn workflows(&self) -> &WorkflowsPage {
         &self.workflows
     }
@@ -507,7 +523,151 @@ impl SettingsShell {
         if self.test_edits.is_some() {
             return true;
         }
-        self.form.dirty() || self.agents.dirty()
+        self.form.dirty()
+            || self.agents.dirty()
+            || self.editor.as_ref().is_some_and(WorkflowEditorPage::is_dirty)
+    }
+
+    // --- the workflow editor -------------------------------------------------
+
+    #[cfg(test)]
+    pub(crate) fn editor(&self) -> Option<&WorkflowEditorPage> {
+        self.editor.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editor_mut(&mut self) -> Option<&mut WorkflowEditorPage> {
+        self.editor.as_mut()
+    }
+
+    /// Whether Settings draws over both columns (the workflow editor, like
+    /// the desktop's, hides the settings sidebar): the shell paints no
+    /// divider and starts no sidebar drag then.
+    pub(crate) fn covers_columns(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Open workflow `name` of `project` in the editor, on Settings ▸
+    /// Workflows (Back returns there), with status `status`'s row selected
+    /// when given. The draft shows at once when the Workflows page has the
+    /// project's config; a read starts either way.
+    pub(crate) fn open_editor(&mut self, project: Option<&str>, name: &str, status: Option<String>) -> SettingsAction {
+        let Some(project) = project else {
+            return SettingsAction::Stay;
+        };
+        if self.nav.show(SettingsPage::Workflows) {
+            self.action = 0;
+            self.scroll = 0;
+        }
+        self.stop = Stop::Page(SettingsPage::Workflows);
+        self.region = Region::Page;
+        self.workflows.close_modal();
+        let config = self.workflows.state().filter(|s| s.project() == project).and_then(|s| s.config());
+        self.editor = Some(WorkflowEditorPage::open(project, name, config, status));
+        SettingsAction::EditorWork
+    }
+
+    /// The editor's work to run now (the shell runs it off the UI thread and
+    /// hands it back to [`Self::editor_landed`]).
+    pub(crate) fn take_editor_work(&mut self) -> Option<(Ticket, EditorWork)> {
+        self.editor.as_mut()?.take_work()
+    }
+
+    /// Read the editor's files again (back from the user's editor, Settings
+    /// reopened): only for the project it edits; the draft takes them only
+    /// if it holds no edits when they land.
+    pub(crate) fn reload_editor(&mut self, project: Option<&str>) {
+        match self.editor.as_mut() {
+            Some(editor) if Some(editor.project()) == project => editor.reload(),
+            Some(_) => self.editor = None,
+            None => {}
+        }
+    }
+
+    /// Settings shows (again) for `project`: an editor left open for
+    /// another project goes.
+    pub(crate) fn project_shown(&mut self, project: Option<&str>) {
+        if self.editor.as_ref().is_some_and(|e| Some(e.project()) != project) {
+            self.editor = None;
+        }
+    }
+
+    /// The editor's work landed. Returns what to do next, and whether it
+    /// wrote the files (the shell refreshes the board then).
+    pub(crate) fn editor_landed(&mut self, ticket: &Ticket, done: EditorDone) -> (SettingsAction, bool) {
+        let Some(landed) = self.editor.as_mut().and_then(|e| e.landed(ticket, done)) else {
+            self.dropped += 1;
+            return (SettingsAction::Stay, false);
+        };
+        // A save Settings' own prompt started (a project switch) goes on
+        // once it lands, or stays when it failed.
+        let settings_save = self.guard.leaving_after_save();
+        let busy = self.editor.as_ref().is_some_and(WorkflowEditorPage::busy);
+        match landed {
+            Landed::Stay => {
+                if settings_save && !busy {
+                    self.guard.saved(false);
+                }
+                (SettingsAction::Stay, false)
+            }
+            Landed::Wrote => {
+                if settings_save {
+                    if let Some(leave) = self.guard.saved(true) {
+                        return (self.go(leave), true);
+                    }
+                }
+                // The Workflows index under the editor reads again.
+                (SettingsAction::Reload, true)
+            }
+            Landed::Then(leave) => {
+                let action = match self.editor.as_mut() {
+                    Some(editor) => editor.then(leave),
+                    None => EditorAction::Stay,
+                };
+                let next = self.route_editor(action);
+                let next = if next == SettingsAction::Stay { SettingsAction::Reload } else { next };
+                (next, true)
+            }
+            Landed::Close { wrote, notice } => {
+                self.close_editor(false);
+                if let Some(notice) = notice {
+                    self.workflows.set_error(Target::Page, notice);
+                }
+                (SettingsAction::Reload, wrote)
+            }
+        }
+    }
+
+    /// Carry out what the editor asked.
+    fn route_editor(&mut self, action: EditorAction) -> SettingsAction {
+        match action {
+            EditorAction::Stay => SettingsAction::Stay,
+            EditorAction::Work => SettingsAction::EditorWork,
+            EditorAction::Close => {
+                self.close_editor(false);
+                SettingsAction::Reload
+            }
+            EditorAction::ManageStatuses => {
+                self.close_editor(true);
+                SettingsAction::Reload
+            }
+            EditorAction::EditYaml(file) => SettingsAction::EditYaml(file),
+        }
+    }
+
+    /// Close the editor, back to the Workflows page: its workflow's row
+    /// selected, or the first status (Manage project statuses).
+    fn close_editor(&mut self, statuses: bool) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        self.region = Region::Page;
+        self.stop = Stop::Page(SettingsPage::Workflows);
+        if statuses {
+            self.workflows.select_after_load(workflows::Select::FirstStatus);
+        } else {
+            self.workflows.select_after_load(workflows::Select::Workflow(editor.name().to_string()));
+        }
     }
 
     /// The shown page's save, if it has anything to save: the shared
@@ -536,7 +696,9 @@ impl SettingsShell {
 
     /// Whether a save the prompt started is still running.
     fn prompt_saving(&self) -> bool {
-        self.save.running() || (self.guard.leaving_after_save() && self.agents.state().saving())
+        self.save.running()
+            || (self.guard.leaving_after_save()
+                && (self.agents.state().saving() || self.editor.as_ref().is_some_and(WorkflowEditorPage::busy)))
     }
 
     /// A save landed. Returns where to go when the prompt's Save started it
@@ -576,6 +738,9 @@ impl SettingsShell {
         }
         self.form.cancel_edit();
         self.agents.close_editor();
+        if let Some(editor) = self.editor.as_mut() {
+            editor.discard_for_settings();
+        }
         self.save_error = None;
     }
 
@@ -597,6 +762,9 @@ impl SettingsShell {
     /// Keybindings search, the editor command, the workflow name or the
     /// workspace form field being typed, else nowhere. Returns whether a field took it.
     pub(crate) fn paste(&mut self, text: &str) -> bool {
+        if let Some(editor) = self.editor.as_mut() {
+            return editor.paste(text);
+        }
         if self.nav.page() == SettingsPage::Keybindings {
             return self.keys_focused() && self.keys.paste(text);
         }
@@ -620,7 +788,11 @@ impl SettingsShell {
 
     /// Ask to leave for `leave`: through the prompt when the page is dirty.
     pub(crate) fn request(&mut self, leave: Leave) -> SettingsAction {
-        if leave == Leave::Page(self.nav.page()) {
+        if self.editor.as_ref().is_some_and(WorkflowEditorPage::busy) {
+            // The editor's save, duplicate or delete is running: wait for it.
+            return SettingsAction::Stay;
+        }
+        if leave == Leave::Page(self.nav.page()) && self.editor.is_none() {
             // Already shown: just put the selection back on its row.
             self.stop = Stop::Page(self.nav.page());
             return SettingsAction::Stay;
@@ -645,6 +817,7 @@ impl SettingsShell {
         match leave {
             Leave::Back => SettingsAction::Leave,
             Leave::Page(page) => {
+                self.editor = None;
                 self.keys.blur();
                 let from = self.nav.page();
                 if self.nav.show(page) {
@@ -671,6 +844,8 @@ impl SettingsShell {
     /// The shown project changed: the page stays, its project data goes, and
     /// anything still loading for the old project is dropped when it lands.
     pub(crate) fn project_changed(&mut self) {
+        // The editor was the old project's: its work is dropped when it lands.
+        self.editor = None;
         self.general.reset();
         self.workflows.project_changed();
         self.workspaces.project_changed();
@@ -746,7 +921,7 @@ impl SettingsShell {
     }
 
     /// A workspace request finished (see [`WorkspacesPage::finished`]).
-    pub(crate) fn pool_finished(&mut self, ticket: &Ticket, result: Result<PoolOutcome, PoolError>) -> Landed {
+    pub(crate) fn pool_finished(&mut self, ticket: &Ticket, result: Result<PoolOutcome, PoolError>) -> PoolLanded {
         let before = self.workspaces.dropped();
         let landed = self.workspaces.finished(ticket, result);
         self.dropped += self.workspaces.dropped() - before;
@@ -759,7 +934,7 @@ impl SettingsShell {
         ticket: &Ticket,
         job: &shelbi_app::settings::machine_form::Job,
         result: Result<shelbi_core::pool::MachineChange, PoolError>,
-    ) -> Landed {
+    ) -> PoolLanded {
         let before = self.workspaces.dropped();
         let landed = self.workspaces.machine_finished(ticket, job, result);
         self.dropped += self.workspaces.dropped() - before;
@@ -893,7 +1068,10 @@ impl SettingsShell {
     /// Show `message` at `target` on the Workflows page (a file that
     /// couldn't be opened).
     pub(crate) fn workflows_error(&mut self, target: Target, message: String) {
-        self.workflows.set_error(target, message);
+        match self.editor.as_mut() {
+            Some(editor) => editor.open_failed(message),
+            None => self.workflows.set_error(target, message),
+        }
     }
 
     /// A load landed. Returns whether it was taken (a stale one is dropped).
@@ -1148,6 +1326,11 @@ impl SettingsShell {
         let activate = sidebar == Some(SidebarAction::Activate)
             || matches!(chord.map(|c| c.code), Some(Key::Enter));
         let nav = Nav { up, down, activate };
+        if let Some(editor) = self.editor.as_mut() {
+            // The editor holds every key (Esc goes Back through its guard).
+            let action = editor.handle_key(k, nav);
+            return self.route_editor(action);
+        }
         let on_workflows = self.nav.page() == SettingsPage::Workflows;
         if on_workflows && self.workflows.modal_open() {
             // A menu, picker, confirm or name field holds every key (Esc
@@ -1290,6 +1473,14 @@ impl SettingsShell {
         match choice {
             0 => {
                 self.guard.save();
+                if let Some(editor) = self.editor.as_mut() {
+                    let action = editor.save_for_settings();
+                    if action == EditorAction::Stay {
+                        // A field refused its text: stay, its error showing.
+                        self.guard.forget_save();
+                    }
+                    return self.route_editor(action);
+                }
                 SettingsAction::Save
             }
             1 => {
@@ -1318,6 +1509,12 @@ impl SettingsShell {
         if self.nav.page() == SettingsPage::Workspaces && self.workspaces.modal() {
             let ask = self.workspaces.layer_mouse(m);
             return self.ask(ask);
+        }
+        if self.guard.prompt().is_none() {
+            if let Some(editor) = self.editor.as_mut() {
+                let action = editor.handle_mouse(m);
+                return self.route_editor(action);
+            }
         }
         let on_workflows = self.nav.page() == SettingsPage::Workflows;
         if on_workflows && self.workflows.modal_open() && self.guard.prompt().is_none() {
@@ -1414,8 +1611,19 @@ impl SettingsShell {
     /// rect) and the shown page into `main`.
     pub(crate) fn render(&mut self, f: &mut Frame, sidebar: Rect, main: Rect, chrome: &Chrome<'_>) {
         self.hits.clear();
-        self.render_sidebar(f, sidebar, chrome.project_label);
         let moves = moves(chrome.keymaps, chrome.style);
+        self.has_project = chrome.has_project;
+        if let Some(editor) = self.editor.as_mut() {
+            // Both columns, as the desktop's editor takes the window.
+            let x = sidebar.x.min(main.x);
+            let area = Rect { x, width: main.right().saturating_sub(x), ..main };
+            editor.render(f, area, chrome.status, &moves);
+            if self.guard.prompt().is_some() {
+                self.render_prompt(f, area);
+            }
+            return;
+        }
+        self.render_sidebar(f, sidebar, chrome.project_label);
         let on_workflows = self.nav.page() == SettingsPage::Workflows;
         let hints = if self.keys_focused() {
             self.keys.hints()
@@ -1768,6 +1976,8 @@ impl SettingsShell {
             "Saving…".to_string()
         } else if self.guard.prompt() == Some(&Leave::Editor) {
             "Save your changes to the shared instructions?".to_string()
+        } else if let Some(editor) = self.editor.as_ref() {
+            format!("Save your changes to {} before leaving?", editor.name())
         } else {
             format!("Save your changes to {} before leaving?", self.nav.page().label())
         };
