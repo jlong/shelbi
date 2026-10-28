@@ -3602,7 +3602,10 @@ mod pr_create_tests {
             repository_id: report.repository_id.clone(),
             base_branch: report.base_branch.clone(),
             base_sha: report.base_sha.clone(),
-            integration_sha: report.integration_sha.clone(),
+            integration_sha: report
+                .integration_sha
+                .clone()
+                .expect("clean probe has an integration commit"),
             head_sha: report.head_sha.clone(),
             published_head_sha: Some(report.published_head_sha.clone()),
         }
@@ -4512,7 +4515,10 @@ esac
         assert_eq!(task_branch_head(&worktree), reviewed_head);
 
         assert_eq!(result.unwrap(), 379);
-        assert_eq!(remote_head(&origin), report.integration_sha);
+        assert_eq!(
+            remote_head(&origin),
+            report.integration_sha.as_deref().unwrap()
+        );
         assert_eq!(task_branch_head(&worktree), reviewed_head);
         assert_eq!(local_head(&worktree), replacement_head);
         assert_eq!(
@@ -4601,7 +4607,10 @@ esac
         assert_eq!(pr, 42);
         assert_ne!(report.head_sha, old_task_head, "the stale task must rebase");
         assert_eq!(report.head_sha, task_branch_head(&worktree));
-        assert_eq!(report.integration_sha, remote_head(&origin));
+        assert_eq!(
+            report.integration_sha.as_deref().unwrap(),
+            remote_head(&origin)
+        );
         assert_eq!(
             git_stdout(&worktree, &["rev-parse", "origin/main"]),
             stale_tracking_main,
@@ -4638,7 +4647,10 @@ esac
         assert_eq!(report.danger_paths.matched, vec!["task.txt"]);
         assert_eq!(report.local_checks.len(), 1);
         assert_eq!(report.local_checks[0].exit_code, 0);
-        assert_eq!(report.local_checks[0].output_tail, report.integration_sha);
+        assert_eq!(
+            report.local_checks[0].output_tail,
+            report.integration_sha.as_deref().unwrap()
+        );
 
         assert_eq!(local_head(&worktree), replacement_head);
         assert_eq!(
@@ -5043,7 +5055,7 @@ esac
         assert_eq!(result.unwrap(), 42);
         assert_eq!(
             remote_head(&origin),
-            report.integration_sha,
+            report.integration_sha.as_deref().unwrap(),
             "pr-create must replace the pre-rebase remote tip with the reviewed \
              integration commit"
         );
@@ -5100,7 +5112,7 @@ esac
         assert_eq!(report.published_head_sha, published_head);
         assert_ne!(unknown_head, published_head);
         assert_ne!(unknown_head, report.head_sha);
-        assert_ne!(unknown_head, report.integration_sha);
+        assert_ne!(unknown_head, report.integration_sha.as_deref().unwrap());
 
         let err = result.unwrap_err();
         assert!(
@@ -5205,7 +5217,7 @@ esac
         assert_eq!(result.unwrap(), 42);
         assert_eq!(
             remote_head(&origin),
-            second.integration_sha,
+            second.integration_sha.as_deref().unwrap(),
             "pr-create must replace the still-published remote tip with the reviewed \
              integration commit"
         );
@@ -5356,7 +5368,7 @@ esac
         );
         assert_eq!(
             remote_head(&origin),
-            report.integration_sha,
+            report.integration_sha.as_deref().unwrap(),
             "pr-create's own push must advance the remote tip to the reviewed \
              integration commit"
         );
@@ -6805,10 +6817,13 @@ pub struct ProbeReport {
     pub base_branch: String,
     pub base_sha: String,
     /// Prebuilt squash commit whose sole parent is `base_sha` and whose tree
-    /// is exactly `head_sha`'s tree. Local checks and hosted PR CI run on this
-    /// object, and landing only advances the base ref from `base_sha` to this
-    /// exact OID.
-    pub integration_sha: String,
+    /// is the three-way integration of `head_sha` onto it: `base_sha` plus the
+    /// branch's changes since its merge-base (exactly `head_sha`'s tree when
+    /// the head already contains the base). Local checks and hosted PR CI run
+    /// on this object, and landing only advances the base ref from `base_sha`
+    /// to this exact OID. `null` when `merge_conflict` reports conflicts: no
+    /// correct integration exists, so there is nothing to publish or land.
+    pub integration_sha: Option<String>,
     /// The branch tip every fact in this report was computed against,
     /// captured *after* the optional rebase. The orchestrator hands it
     /// back to `shelbi zen pr-create`, `ci-watch`, and `pr-merge` together with
@@ -6843,6 +6858,10 @@ pub struct ProbeReport {
     /// rebase was aborted (the durable task ref stays at its pre-rebase commit)
     /// and the local checks were skipped — `files` names the conflicting paths.
     pub rebase_conflict: ConflictProbe,
+    /// What landing changes on the base: `base_sha` -> `integration_sha`, the
+    /// exact commit that merges, so a branch whose integration would revert
+    /// work on the base shows those reverts here. Falls back to the branch's
+    /// three-dot diff against the base when there is no integration commit.
     pub diff_size: DiffSize,
     /// Ahead/behind and patch-id redundancy of the published branch head
     /// against the current base. Lets a caller flag a stale-base or
@@ -7113,7 +7132,6 @@ fn probe_isolated_task_ref(
         )));
     }
     let merge_conflict = probe_merge_conflict(host, probe_worktree, &head_sha, &base_sha)?;
-    let diff_size = probe_diff_size(host, probe_worktree, &head_sha, &base_sha)?;
     // Divergence is measured from `initial_head` — the *published* branch head,
     // before this probe's optional rebase — not from `head_sha`. Under
     // `RebaseOntoDefault` a redundant commit whose content is already in the
@@ -7132,37 +7150,64 @@ fn probe_isolated_task_ref(
         &head_sha,
         &base_sha,
     )?;
+    // A rebase conflict leaves `head_sha` at a tip that does not contain the
+    // base. On linear history the integration below is still the real
+    // three-way result, but a conflicted replay of merge-commit history is no
+    // evidence of what that tip really carries, so refuse it outright.
+    refuse_conflicted_merge_history(
+        host,
+        probe_worktree,
+        branch,
+        &base_sha,
+        &head_sha,
+        &rebase_conflict,
+    )?;
+    // The integration commit is base plus the branch's changes, never the
+    // head's tree when the head predates the base. A three-way merge that
+    // conflicts has no correct tree: `merge_conflict` already reports it, and
+    // the report carries no integration commit to publish or land.
+    require_squash_strategy(project.merge_strategy().as_str())?;
+    let integration_sha = if merge_conflict.conflicts {
+        None
+    } else {
+        Some(create_squash_integration_commit(
+            host,
+            probe_worktree,
+            &base_sha,
+            &head_sha,
+            project.merge_strategy().as_str(),
+        )?)
+    };
+    let diff_size = match &integration_sha {
+        Some(integration_sha) => {
+            probe_diff_size(host, probe_worktree, &base_sha, integration_sha, false)?
+        }
+        None => probe_diff_size(host, probe_worktree, &base_sha, &head_sha, true)?,
+    };
     // A rebase conflict was aborted back to the pre-probe commit. Testing
     // that stale content would be misleading, so the conflict itself blocks
     // the merge and local checks stay empty.
-    let integration_sha = create_squash_integration_commit(
-        host,
-        probe_worktree,
-        &base_sha,
-        &head_sha,
-        project.merge_strategy().as_str(),
-    )?;
-    checkout_probe_commit(host, probe_worktree, &integration_sha)?;
+    let checked_head = integration_sha.as_deref().unwrap_or(&head_sha).to_string();
+    checkout_probe_commit(host, probe_worktree, &checked_head)?;
     scrub_isolated_probe_worktree(host, probe_worktree)?;
-    let local_checks = if rebase_conflict.conflicts {
-        Vec::new()
-    } else {
-        probe_local_checks(
+    let local_checks = match &integration_sha {
+        Some(integration_sha) if !rebase_conflict.conflicts => probe_local_checks(
             host,
             probe_worktree,
             shared_cargo_target,
             shared_node_cache,
-            &integration_sha,
+            integration_sha,
             project,
             workflow,
             task,
-        )?
+        )?,
+        _ => Vec::new(),
     };
 
     let final_temp_head = probe_head_sha(host, probe_worktree, "HEAD^{commit}")?;
-    if final_temp_head != integration_sha {
+    if final_temp_head != checked_head {
         return Err(Error::Other(format!(
-            "a local Zen check moved the isolated integration checkout from {integration_sha} to \
+            "a local Zen check moved the isolated integration checkout from {checked_head} to \
              {final_temp_head}; refusing to report results for a different commit"
         )));
     }
@@ -7201,6 +7246,16 @@ fn probe_isolated_task_ref(
     })
 }
 
+fn require_squash_strategy(strategy: &str) -> Result<()> {
+    if strategy != "squash" {
+        return Err(Error::Other(format!(
+            "Zen exact-ref integration supports only `git.merge_strategy: squash`; `{strategy}` \
+             requires a human to merge the PR because GitHub cannot atomically lease its base"
+        )));
+    }
+    Ok(())
+}
+
 fn create_squash_integration_commit(
     host: &Host,
     worktree: &std::path::Path,
@@ -7208,14 +7263,9 @@ fn create_squash_integration_commit(
     head_sha: &str,
     strategy: &str,
 ) -> Result<String> {
-    if strategy != "squash" {
-        return Err(Error::Other(format!(
-            "Zen exact-ref integration supports only `git.merge_strategy: squash`; `{strategy}` \
-             requires a human to merge the PR because GitHub cannot atomically lease its base"
-        )));
-    }
+    require_squash_strategy(strategy)?;
     let wt = worktree.to_string_lossy();
-    let tree = probe_head_sha(host, worktree, &format!("{head_sha}^{{tree}}"))?;
+    let tree = expected_integration_tree(host, worktree, base_sha, head_sha)?;
     // Fail closed if the ambient git identity is missing: `git commit-tree`
     // would otherwise auto-synthesize a `user@host` identity, silently
     // attributing the landed commit to a fabricated author.
@@ -7230,14 +7280,245 @@ fn create_squash_integration_commit(
     )?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: "git commit-tree <reviewed-tree> -p <reviewed-base>".into(),
+            cmd: "git commit-tree <integration-tree> -p <reviewed-base>".into(),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
     let integration_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
     verify_integration_commit(host, &wt, base_sha, head_sha, &integration_sha)?;
+    verify_integration_scope(host, worktree, base_sha, head_sha, &integration_sha)?;
     Ok(integration_sha)
+}
+
+/// The tree a squash integration of `head_sha` onto `base_sha` must carry:
+/// the base as it stands plus the branch's own changes since its merge-base.
+///
+/// When the base is an ancestor of the head (the clean-rebase and up-to-date
+/// cases) that is exactly the head's tree. Otherwise the head predates the
+/// base, and its tree would silently revert everything that landed on the base
+/// since the branch's merge-base, so the tree is the real three-way result of
+/// `git merge-tree`. A conflicted three-way merge has no correct tree and
+/// fails closed.
+fn expected_integration_tree(
+    host: &Host,
+    worktree: &std::path::Path,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<String> {
+    // Resolve both ends first so a missing object fails with the commit it
+    // names rather than an opaque ancestry or merge error.
+    let head_tree = probe_head_sha(host, worktree, &format!("{head_sha}^{{tree}}"))?;
+    probe_head_sha(host, worktree, &format!("{base_sha}^{{commit}}"))?;
+    if probe_is_ancestor(host, worktree, base_sha, head_sha)? {
+        return Ok(head_tree);
+    }
+    let wt = worktree.to_string_lossy().into_owned();
+    let out = probe_run(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            base_sha,
+            head_sha,
+        ],
+    )
+    .map_err(Error::Io)?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let tree = lines.next().unwrap_or_default().trim().to_string();
+    match out.status.code() {
+        Some(0) if !tree.is_empty() => Ok(tree),
+        Some(1) => {
+            let files: Vec<&str> = lines
+                .take_while(|l| !l.trim().is_empty())
+                .map(str::trim)
+                .collect();
+            Err(Error::Other(format!(
+                "reviewed head {head_sha} does not contain base {base_sha} and its three-way \
+                 merge with the base conflicts in {}; no correct integration commit exists, \
+                 rebase the branch onto the base",
+                if files.is_empty() {
+                    "(unknown files)".to_string()
+                } else {
+                    files.join(", ")
+                }
+            )))
+        }
+        _ => Err(Error::Command {
+            cmd: format!("git -C {wt} merge-tree --write-tree --name-only {base_sha} {head_sha}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+    }
+}
+
+/// `git merge-base --is-ancestor ancestor descendant`, with any exit other
+/// than 0 (yes) or 1 (no) surfaced as an error rather than read as "no".
+fn probe_is_ancestor(
+    host: &Host,
+    worktree: &std::path::Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool> {
+    let wt = worktree.to_string_lossy().into_owned();
+    let out = probe_run(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ],
+    )
+    .map_err(Error::Io)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::Command {
+            cmd: format!("git -C {wt} merge-base --is-ancestor {ancestor} {descendant}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+    }
+}
+
+/// Independent check that the integration commit changes nothing on the base
+/// beyond what the branch itself changed: every path `base_sha ->
+/// integration_sha` adds, modifies, or deletes must be a path the branch
+/// touched since its merge-base with the base. A path the branch never touched
+/// that the integration still drops or rewrites is a revert of work that
+/// landed on the base after the branch was cut, so the probe fails closed and
+/// names it.
+fn verify_integration_scope(
+    host: &Host,
+    worktree: &std::path::Path,
+    base_sha: &str,
+    head_sha: &str,
+    integration_sha: &str,
+) -> Result<()> {
+    let wt = worktree.to_string_lossy().into_owned();
+    let merge_base = probe_run_capture(
+        host,
+        ["git", "-C", wt.as_str(), "merge-base", base_sha, head_sha],
+    )?
+    .trim()
+    .to_string();
+    let branch_paths: std::collections::HashSet<String> = probe_run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            merge_base.as_str(),
+            head_sha,
+        ],
+    )?
+    .split('\0')
+    .filter(|p| !p.is_empty())
+    .map(str::to_string)
+    .collect();
+    let integration_changes = probe_run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "-z",
+            base_sha,
+            integration_sha,
+        ],
+    )?;
+    let mut fields = integration_changes.split('\0').filter(|f| !f.is_empty());
+    let mut dropped = Vec::new();
+    let mut rewritten = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        if branch_paths.contains(path) {
+            continue;
+        }
+        if status.starts_with('D') {
+            dropped.push(path.to_string());
+        } else {
+            rewritten.push(path.to_string());
+        }
+    }
+    if dropped.is_empty() && rewritten.is_empty() {
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    if !dropped.is_empty() {
+        parts.push(format!("drops {}", dropped.join(", ")));
+    }
+    if !rewritten.is_empty() {
+        parts.push(format!("rewrites {}", rewritten.join(", ")));
+    }
+    Err(Error::Other(format!(
+        "integration commit {integration_sha} {} present at base {base_sha} that branch head \
+         {head_sha} never touched (merge-base {merge_base}); that would revert work already on \
+         the base, refusing to report a landable integration",
+        parts.join(" and ")
+    )))
+}
+
+/// A rebase that conflicts on a branch whose history carries merge commits is
+/// not a trustworthy signal either way: `git rebase` linearizes the merge and
+/// replays both sides, so a stale integration or side branch folded into the
+/// tip can conflict spuriously, or hide what the tip's tree really contains.
+/// Fail closed rather than build an integration commit from that history.
+fn refuse_conflicted_merge_history(
+    host: &Host,
+    worktree: &std::path::Path,
+    branch: &str,
+    base_sha: &str,
+    head_sha: &str,
+    rebase_conflict: &ConflictProbe,
+) -> Result<()> {
+    if !rebase_conflict.conflicts {
+        return Ok(());
+    }
+    let wt = worktree.to_string_lossy().into_owned();
+    let range = format!("{base_sha}..{head_sha}");
+    let merges = probe_run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "rev-list",
+            "--merges",
+            range.as_str(),
+        ],
+    )?;
+    let merges: Vec<&str> = merges.split_whitespace().collect();
+    if merges.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "task branch `{branch}` at {head_sha} carries merge commit(s) {} and does not rebase \
+         cleanly onto base {base_sha} (conflicts in {}); refusing to build an integration \
+         commit from merge history that may predate the base. Rebase or flatten the branch \
+         onto the base and hand it off again",
+        merges.join(", "),
+        if rebase_conflict.files.is_empty() {
+            "(unknown files)".to_string()
+        } else {
+            rebase_conflict.files.join(", ")
+        }
+    )))
 }
 
 /// Resolve the worker's real commit message (subject + body) from `head_sha`
@@ -7274,9 +7555,23 @@ fn require_git_identity(host: &Host, wt: &str) -> Result<()> {
 
 fn checkout_probe_commit(host: &Host, worktree: &std::path::Path, oid: &str) -> Result<()> {
     let wt = worktree.to_string_lossy();
-    // The candidate tree is already byte-for-byte the checked-out head tree.
-    // Move only this detached worktree's HEAD so checks observe the candidate
-    // commit identity without running checkout hooks a second time.
+    // When the candidate tree is byte-for-byte the checked-out head tree (the
+    // head already contains the base), only HEAD moves. A three-way candidate
+    // over a head that predates the base differs, so its files are written
+    // with `read-tree -u --reset` first. Neither path runs checkout hooks a
+    // second time.
+    let current_tree = probe_head_sha(host, worktree, "HEAD^{tree}")?;
+    let candidate_tree = probe_head_sha(host, worktree, &format!("{oid}^{{tree}}"))?;
+    if current_tree != candidate_tree {
+        let out = run_in_dir(host, &wt, &["git", "read-tree", "-u", "--reset", oid])?;
+        if !out.status.success() {
+            return Err(Error::Command {
+                cmd: format!("git -C {wt} read-tree -u --reset {oid}"),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+    }
     let out = run_in_dir(host, &wt, &["git", "update-ref", "--no-deref", "HEAD", oid])?;
     if out.status.success() {
         Ok(())
@@ -7306,15 +7601,14 @@ fn verify_integration_commit(
         std::path::Path::new(wt),
         &format!("{integration_sha}^{{tree}}"),
     )?;
-    let head_tree = probe_head_sha(
-        host,
-        std::path::Path::new(wt),
-        &format!("{head_sha}^{{tree}}"),
-    )?;
-    let head_tree_matches = head_tree == integration_tree;
-    // The sole-parent==base and tree==reviewed-head checks are the integrity
-    // guarantee: the commit's only parent is the reviewed base and its tree is
-    // byte-for-byte the reviewed head. No message trailer is required.
+    let expected_tree =
+        expected_integration_tree(host, std::path::Path::new(wt), base_sha, head_sha)?;
+    let tree_matches = expected_tree == integration_tree;
+    // The sole-parent==base and tree==three-way-result checks are the
+    // integrity guarantee: the commit's only parent is the reviewed base and
+    // its tree is the base plus the reviewed head's changes (byte-for-byte the
+    // reviewed head whenever the head already contains the base). A head tree
+    // that predates the base never passes. No message trailer is required.
     let parent_count = run_in_dir(
         host,
         wt,
@@ -7323,14 +7617,11 @@ fn verify_integration_commit(
     let parent_fields = String::from_utf8_lossy(&parent_count.stdout)
         .split_whitespace()
         .count();
-    if !parent_count.status.success()
-        || parent_fields != 2
-        || parent != base_sha
-        || !head_tree_matches
-    {
+    if !parent_count.status.success() || parent_fields != 2 || parent != base_sha || !tree_matches {
         return Err(Error::Other(format!(
             "integration commit {integration_sha} does not have sole parent {base_sha} and \
-             the exact tree of reviewed head {head_sha}; refusing an arbitrary leased update"
+             the three-way integration tree of reviewed head {head_sha} onto that base; \
+             refusing an arbitrary leased update"
         )));
     }
     Ok(())
@@ -9820,18 +10111,22 @@ fn probe_rebase_would_conflict_in(
 fn probe_diff_size(
     host: &Host,
     worktree: &std::path::Path,
-    branch: &str,
-    main: &str,
+    from: &str,
+    to: &str,
+    three_dot: bool,
 ) -> Result<DiffSize> {
     let wt = worktree.to_string_lossy().into_owned();
-    // Three-dot (merge-base) diff, not two-dot. Two-dot `main..branch`
-    // diffs the two tips, so anything that landed on `main` after this
-    // branch was cut leaks into the count as spurious removals (or masks
-    // real additions) — the -402 phantom in the task report was another
-    // branch's churn that had just merged into main. Three-dot
-    // `main...branch` diffs against the *merge base*, which is exactly
-    // what a squash-merge of this branch will apply.
-    let range = format!("{main}...{branch}");
+    // The probe measures `base..integration` two-dot: the integration commit's
+    // sole parent is the base, so that is exactly what landing changes, and a
+    // revert of work already on the base shows up as removals. Without an
+    // integration commit it falls back to the branch's three-dot `base...head`
+    // (merge-base) diff, which ignores churn that landed on the base after the
+    // branch was cut instead of counting it as spurious removals.
+    let range = if three_dot {
+        format!("{from}...{to}")
+    } else {
+        format!("{from}..{to}")
+    };
     let stdout = probe_run_capture(
         host,
         [
@@ -10266,7 +10561,7 @@ mod probe_tests {
             std::fs::write(r.join("a.txt"), "1\n2\n3\n").unwrap();
             std::fs::write(r.join("b.txt"), "x\n").unwrap();
         });
-        let size = probe_diff_size(&Host::Local, &repo, "feature", "main").unwrap();
+        let size = probe_diff_size(&Host::Local, &repo, "main", "feature", true).unwrap();
         assert_eq!(size.files, 2);
         assert_eq!(size.lines_added, 4);
         assert_eq!(size.lines_removed, 0);
@@ -10283,7 +10578,7 @@ mod probe_tests {
         run_git(repo, &["add", "x"]);
         run_git(repo, &["commit", "-q", "-m", "init"]);
         run_git(repo, &["branch", "feature"]);
-        let size = probe_diff_size(&Host::Local, repo, "feature", "main").unwrap();
+        let size = probe_diff_size(&Host::Local, repo, "main", "feature", true).unwrap();
         assert_eq!(size, DiffSize::default());
     }
 
@@ -10318,7 +10613,7 @@ mod probe_tests {
         run_git(repo, &["add", "other.txt"]);
         run_git(repo, &["commit", "-q", "-m", "unrelated merge into main"]);
 
-        let size = probe_diff_size(&Host::Local, repo, "feature", "main").unwrap();
+        let size = probe_diff_size(&Host::Local, repo, "main", "feature", true).unwrap();
         assert_eq!(size.files, 1, "only feature's own file should count");
         assert_eq!(size.lines_added, 3);
         assert_eq!(size.lines_removed, 0, "no main-side churn should leak in");
@@ -10338,7 +10633,7 @@ mod probe_tests {
         std::fs::remove_file(repo.join("a.txt")).unwrap();
         run_git(repo, &["commit", "-q", "-am", "remove"]);
         run_git(repo, &["checkout", "-q", "main"]);
-        let size = probe_diff_size(&Host::Local, repo, "feature", "main").unwrap();
+        let size = probe_diff_size(&Host::Local, repo, "main", "feature", true).unwrap();
         assert_eq!(size.files, 1);
         assert_eq!(size.lines_added, 0);
         assert_eq!(size.lines_removed, 3);
@@ -11660,6 +11955,14 @@ mod probe_tests {
             "local checks must be skipped on rebase conflict, got {:?}",
             report.local_checks
         );
+        // The three-way merge conflicts too, so no correct integration commit
+        // exists and the report carries none to publish or land.
+        assert!(
+            report.merge_conflict.conflicts,
+            "{:?}",
+            report.merge_conflict
+        );
+        assert_eq!(report.integration_sha, None);
         assert_eq!(report.head_sha, task_head);
         assert_eq!(branch_sha(&wt, "shelbi/task1"), task_head);
         assert_eq!(head_sha(&wt), detached_workspace_head);
@@ -11757,6 +12060,222 @@ mod probe_tests {
         assert_eq!(decision.detail, "rebase-conflict");
     }
 
+    /// Reproduce the `tui-about` (#1933) history: the task branch tip is a
+    /// two-parent merge commit whose first parent is the task work rebased
+    /// onto main at the time and whose second parent is an older integration
+    /// commit cut from an even older main. The merge keeps the first parent's
+    /// tree (`-s ours`). Main then moves on (#1935: a new `textbox.rs` and a
+    /// converted `seed.txt`), so the tip's tree predates the base.
+    ///
+    /// `conflicting_replay` gives the older integration commit different
+    /// `feature.txt` content, so a sequential rebase of the tip (which
+    /// linearizes the merge and replays both sides) conflicts on it, as the
+    /// real rebase did. Otherwise the older commit replays as a no-op.
+    ///
+    /// Returns the temp base, the worktree, the new base (`main` and
+    /// `origin/main`), and the merge-commit tip.
+    fn merge_commit_tip_behind_main(
+        conflicting_replay: bool,
+    ) -> (tempfile::TempDir, PathBuf, String, String) {
+        let (base, origin, wt) = setup_origin_and_worktree();
+
+        // The older integration commit, cut from the original main.
+        run_git(&wt, &["checkout", "-q", "-b", "old-integration"]);
+        let old_feature = if conflicting_replay {
+            "older feature\n"
+        } else {
+            "feature\n"
+        };
+        std::fs::write(wt.join("feature.txt"), old_feature).unwrap();
+        run_git(&wt, &["add", "feature.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "older integration commit"]);
+
+        // #1934 lands; the task work is rebased onto it.
+        advance_origin_main(base.path(), &origin, "1934 footer", |r| {
+            std::fs::write(r.join("footer.txt"), "footer\n").unwrap();
+        });
+        run_git(&wt, &["fetch", "-q", "origin"]);
+        run_git(
+            &wt,
+            &["checkout", "-q", "-b", "shelbi/task1", "origin/main"],
+        );
+        std::fs::write(wt.join("feature.txt"), "feature\n").unwrap();
+        run_git(&wt, &["add", "feature.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work rebased onto main"]);
+        let rebased = head_sha(&wt);
+
+        // The tip: merge the older integration commit, keeping our tree.
+        run_git(
+            &wt,
+            &["merge", "-q", "-s", "ours", "--no-edit", "old-integration"],
+        );
+        let tip = head_sha(&wt);
+        assert_eq!(
+            probe_git_stdout(&wt, &["rev-parse", &format!("{tip}^{{tree}}")]),
+            probe_git_stdout(&wt, &["rev-parse", &format!("{rebased}^{{tree}}")]),
+            "the merge-commit tip must carry its first parent's tree"
+        );
+
+        // #1935 lands after the tip was built.
+        advance_origin_main(base.path(), &origin, "1935 textbox", |r| {
+            std::fs::write(r.join("textbox.rs"), "pub struct Textbox;\n").unwrap();
+            std::fs::write(r.join("seed.txt"), "seed\nconverted\n").unwrap();
+        });
+        run_git(&wt, &["fetch", "-q", "origin"]);
+        // AsIs reads its base from the local default branch; keep it current.
+        run_git(&wt, &["branch", "-f", "main", "origin/main"]);
+        let new_base = probe_git_stdout(&wt, &["rev-parse", "origin/main"]);
+        detach_for_handoff(&wt, "shelbi/task1");
+        (base, wt, new_base, tip)
+    }
+
+    #[test]
+    fn integration_keeps_main_commits_a_merge_commit_tip_predates() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        let (base, wt, new_base, tip) = merge_commit_tip_behind_main(false);
+
+        // The check reads the working tree, proving the integration's files
+        // (not the stale tip's) are what the local checks see.
+        let project = probe_project(
+            base.path(),
+            &["test -f textbox.rs && grep -q converted seed.txt && test -f feature.txt"],
+        );
+        let task = probe_task("shelbi/task1");
+        let report =
+            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::AsIs).unwrap();
+
+        assert_eq!(report.base_sha, new_base);
+        assert_eq!(report.head_sha, tip, "AsIs reports the unrebased tip");
+        assert!(
+            !report.rebase_conflict.conflicts,
+            "{:?}",
+            report.rebase_conflict
+        );
+        assert!(
+            !report.merge_conflict.conflicts,
+            "{:?}",
+            report.merge_conflict
+        );
+        let integration = report.integration_sha.clone().expect("integration commit");
+        assert_eq!(
+            probe_git_stdout(&wt, &["rev-parse", &format!("{integration}^")]),
+            new_base,
+            "the integration commit's sole parent is the reviewed base"
+        );
+        // Before the fix the integration took the tip's tree verbatim, which
+        // deleted textbox.rs and reverted seed.txt.
+        assert_eq!(
+            probe_git_stdout(&wt, &["show", &format!("{integration}:textbox.rs")]),
+            "pub struct Textbox;"
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["show", &format!("{integration}:seed.txt")]),
+            "seed\nconverted"
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["show", &format!("{integration}:feature.txt")]),
+            "feature"
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["diff", "--name-only", &new_base, &integration]),
+            "feature.txt",
+            "landing changes only what the branch changed"
+        );
+        // diff_size is base -> integration: the one added file, no removals.
+        assert_eq!(
+            report.diff_size,
+            DiffSize {
+                files: 1,
+                lines_added: 1,
+                lines_removed: 0,
+            }
+        );
+        assert_eq!(report.local_checks.len(), 1);
+        assert_eq!(
+            report.local_checks[0].exit_code, 0,
+            "{}",
+            report.local_checks[0].output_tail
+        );
+        assert_eq!(
+            branch_sha(&wt, "shelbi/task1"),
+            tip,
+            "AsIs never moves the ref"
+        );
+    }
+
+    #[test]
+    fn probe_fails_closed_when_a_merge_commit_tip_does_not_rebase() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // The incident: the rebase conflicts replaying the older integration
+        // commit, the three-way merge looks clean, and the old probe built its
+        // integration commit from the tip's stale tree.
+        let (base, wt, _new_base, tip) = merge_commit_tip_behind_main(true);
+
+        let project = probe_project(base.path(), &["true"]);
+        let task = probe_task("shelbi/task1");
+        let error = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("merge commit"), "{error}");
+        assert!(error.contains(&tip), "names the merge-commit tip: {error}");
+        assert!(error.contains("feature.txt"), "names the conflict: {error}");
+        assert_eq!(
+            branch_sha(&wt, "shelbi/task1"),
+            tip,
+            "a refused probe leaves the task ref where it was"
+        );
+    }
+
+    #[test]
+    fn integration_scope_rejects_a_tree_that_reverts_untouched_base_files() {
+        let _lock = crate::test_lock::acquire();
+        let (_base, wt, new_base, tip) = merge_commit_tip_behind_main(false);
+        let host = Host::Local;
+
+        // The integration the old probe built: the tip's tree on the new base.
+        let tip_tree = probe_git_stdout(&wt, &["rev-parse", &format!("{tip}^{{tree}}")]);
+        let stale = probe_git_stdout(
+            &wt,
+            &[
+                "commit-tree",
+                &tip_tree,
+                "-p",
+                &new_base,
+                "-m",
+                "stale integration",
+            ],
+        );
+        let error = verify_integration_scope(&host, &wt, &new_base, &tip, &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("drops textbox.rs"), "{error}");
+        assert!(error.contains("rewrites seed.txt"), "{error}");
+        // pr-create and pr-merge re-verify a pinned identity the same way, so
+        // an identity carrying the stale integration is refused there too.
+        let error = verify_integration_commit(&host, wt.to_str().unwrap(), &new_base, &tip, &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("three-way integration tree"), "{error}");
+
+        // The real integration passes both checks.
+        let integration =
+            create_squash_integration_commit(&host, &wt, &new_base, &tip, "squash").unwrap();
+        verify_integration_scope(&host, &wt, &new_base, &tip, &integration).unwrap();
+        assert_eq!(
+            probe_git_stdout(&wt, &["show", &format!("{integration}:textbox.rs")]),
+            "pub struct Textbox;"
+        );
+    }
+
     #[test]
     fn probe_on_current_worktree_does_not_rewrite_and_runs_checks() {
         let _lock = crate::test_lock::acquire();
@@ -11807,14 +12326,23 @@ mod probe_tests {
             "head_sha must be the (unmoved) branch tip"
         );
         assert_eq!(
-            probe_git_stdout(&wt, &["rev-parse", &format!("{}^", report.integration_sha)]),
+            probe_git_stdout(
+                &wt,
+                &[
+                    "rev-parse",
+                    &format!("{}^", report.integration_sha.as_deref().unwrap())
+                ]
+            ),
             report.base_sha,
             "the integration candidate must descend directly from the reviewed base"
         );
         assert_eq!(
             probe_git_stdout(
                 &wt,
-                &["rev-parse", &format!("{}^{{tree}}", report.integration_sha)],
+                &[
+                    "rev-parse",
+                    &format!("{}^{{tree}}", report.integration_sha.as_deref().unwrap())
+                ],
             ),
             probe_git_stdout(&wt, &["rev-parse", &format!("{}^{{tree}}", report.head_sha)]),
             "the candidate must contain exactly the reviewed head tree"
@@ -11960,9 +12488,10 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
             report.local_checks[0].output_tail
         );
         assert!(
-            report.local_checks[0]
-                .output_tail
-                .contains(&format!("checked:{}", report.integration_sha)),
+            report.local_checks[0].output_tail.contains(&format!(
+                "checked:{}",
+                report.integration_sha.as_deref().unwrap()
+            )),
             "check must run against the exact integration commit: {}",
             report.local_checks[0].output_tail
         );
@@ -12828,9 +13357,10 @@ chmod +x node_modules/.bin/pnpm-reviewed
         assert_eq!(report.head_sha, reviewed_head);
         assert_eq!(report.local_checks[0].exit_code, 0);
         assert!(
-            report.local_checks[0]
-                .output_tail
-                .contains(&format!("pnpm-reviewed:{}", report.integration_sha)),
+            report.local_checks[0].output_tail.contains(&format!(
+                "pnpm-reviewed:{}",
+                report.integration_sha.as_deref().unwrap()
+            )),
             "{}",
             report.local_checks[0].output_tail
         );
@@ -14530,7 +15060,7 @@ mod dry_run_tests {
             repository: "github.com/example/repo".into(),
             base_branch: "main".into(),
             base_sha: "basebeef".into(),
-            integration_sha: "integrationbeef".into(),
+            integration_sha: Some("integrationbeef".into()),
             head_sha: "deadbeef".into(),
             published_head_sha: "deadbeef".into(),
             local_checks: vec![LocalCheck {
