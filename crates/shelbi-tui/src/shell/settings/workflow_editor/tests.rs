@@ -85,6 +85,19 @@ fn on_disk(name: &str) -> shelbi_core::Workflow {
     WorkflowConfig::load(PROJECT).unwrap().workflow(name).unwrap().clone()
 }
 
+/// Which of the screen's lines show the focus: a `›` marker, or a focused
+/// field's fill.
+fn focused_lines(ed: &mut WorkflowEditorPage, w: u16, h: u16) -> Vec<bool> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| ed.render(f, f.area(), None, "↑↓")).unwrap();
+    let buf = term.backend().buffer();
+    (0..h)
+        .map(|y| {
+            (0..w).any(|x| buf[(x, y)].symbol() == "›" || buf[(x, y)].bg == crate::theme::palette().input_focus)
+        })
+        .collect()
+}
+
 fn render(ed: &mut WorkflowEditorPage, w: u16, h: u16) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| ed.render(f, f.area(), None, "↑↓")).unwrap();
@@ -643,7 +656,7 @@ fn it_scrolls_to_keep_the_focus_in_view_at_80x24_and_tab_steps_sections() {
             assert!(screen.lines().next().is_some_and(|l| l.contains(label)), "{item:?} in the header:\n{screen}");
             continue;
         }
-        assert!(screen.lines().skip(2).any(|l| l.trim_start().starts_with('›')), "{:?} in view:\n{screen}", ed.cursor_item());
+        assert!(focused_lines(&mut ed, 80, 24).into_iter().skip(2).any(|f| f), "{:?} in view:\n{screen}", ed.cursor_item());
     }
     assert_eq!(ed.cursor_item(), Some(Item::Delete));
     // The wheel scrolls without moving the focus.
