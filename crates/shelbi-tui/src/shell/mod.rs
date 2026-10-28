@@ -17,6 +17,7 @@
 //! shelbi-app's [`ClientState`]. This crate adds no model logic.
 
 mod caps;
+mod acknowledgements;
 mod overlays;
 mod refresh;
 // The relaunchers moved to `shelbi_app::session::relaunch` (shared with the
@@ -103,6 +104,14 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 struct SettingsReturn {
     focus: Focus,
     selection: usize,
+}
+
+/// Where Acknowledgements' Done returns to: the view it covers, and About
+/// over it again when About's link opened it (the desktop's About window
+/// stays open under its Acknowledgements window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AckReturn {
+    about: bool,
 }
 
 /// What a Settings background job sends back.
@@ -1203,6 +1212,10 @@ struct ShellState {
     /// palette also always opens on Ctrl+Space (the plan's reserved key), so the
     /// opener is the union of this chord and Ctrl+Space.
     palette_chord: Option<KeyChord>,
+    /// Acknowledgements (`tui-acknowledgements`): `Some` while it shows,
+    /// full screen over everything (Settings included), with where Done
+    /// returns to.
+    acknowledgements: Option<(acknowledgements::Acknowledgements, AckReturn)>,
     /// Settings (`tui-settings-shell`): its pages' state, kept across visits.
     settings: SettingsShell,
     /// `Some` while Settings shows, standing in the sidebar's column and the
@@ -1455,6 +1468,7 @@ impl ShellState {
             notice,
             overlay: None,
             palette_chord,
+            acknowledgements: None,
             settings,
             settings_return: None,
             settings_tx,
@@ -1632,6 +1646,7 @@ impl ShellState {
         let (x, y) = self.pointer?;
         if self.overlay.is_some()
             || self.settings_open()
+            || self.acknowledgements_open()
             || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_))
             || !contains(self.sidebar_rect, x, y)
         {
@@ -2140,6 +2155,24 @@ impl ShellState {
             }
             return;
         }
+        // Acknowledgements stands over everything like a window of its own:
+        // it takes every key and click (none reaches Settings or a session
+        // under it), and a paste types into its search.
+        let area = self.full_area();
+        if let Some((view, _)) = self.acknowledgements.as_mut() {
+            let step = match ev {
+                Event::Key(k) if terminal_view::is_actionable(&k) => view.handle_key(k),
+                Event::Mouse(m) => view.handle_mouse(m, area),
+                Event::Paste(s) => {
+                    view.paste(&s);
+                    acknowledgements::Step::Stay
+                }
+                Event::Resize(_, _) => acknowledgements::Step::Stay,
+                _ => return,
+            };
+            self.apply_acknowledgements_step(step);
+            return;
+        }
         match ev {
             Event::Key(k) => self.handle_key(k),
             Event::Mouse(m) => self.handle_mouse(m),
@@ -2341,6 +2374,48 @@ impl ShellState {
         if let Some(ActiveOverlay::Palette(p)) = &mut self.overlay {
             p.focus_projects();
         }
+    }
+
+    // --- Acknowledgements (tui-acknowledgements) ---------------------------
+
+    fn acknowledgements_open(&self) -> bool {
+        self.acknowledgements.is_some()
+    }
+
+    /// Show Acknowledgements over everything, on the first entry. What's
+    /// under it keeps running; `ret` says where Done goes back to.
+    fn open_acknowledgements(&mut self, ret: AckReturn) {
+        if !self.acknowledgements_open() {
+            let view = acknowledgements::Acknowledgements::new(crate::licenses::browser());
+            self.acknowledgements = Some((view, ret));
+        }
+        self.dirty = true;
+    }
+
+    /// Done / Esc: the view under it shows again, and About over it when
+    /// About opened it (focused on its Acknowledgements link).
+    fn leave_acknowledgements(&mut self) {
+        let Some((_, ret)) = self.acknowledgements.take() else {
+            return;
+        };
+        if ret.about {
+            let link = crate::overlay::about::Target::Link(shelbi_app::about::AboutLink::Acknowledgements);
+            self.overlay = Some(ActiveOverlay::About(crate::overlay::about::About::focused(
+                self.caps.truecolor,
+                link,
+            )));
+        }
+        self.dirty = true;
+    }
+
+    /// Carry out what an Acknowledgements key or click asked for.
+    fn apply_acknowledgements_step(&mut self, step: acknowledgements::Step) {
+        match step {
+            acknowledgements::Step::Stay => {}
+            acknowledgements::Step::Leave => self.leave_acknowledgements(),
+            acknowledgements::Step::Open(url) => self.open_url(url.to_string()),
+        }
+        self.dirty = true;
     }
 
     // --- Settings (tui-settings-shell) -------------------------------------
@@ -2970,6 +3045,10 @@ impl ShellState {
             }
             OverlayEvent::OpenUrl(url) => self.open_url(url),
             OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
+            OverlayEvent::OpenAcknowledgements => {
+                self.overlay = None;
+                self.open_acknowledgements(AckReturn { about: true });
+            }
         }
     }
 
@@ -3241,6 +3320,8 @@ impl ShellState {
             }
             // Over whatever is showing, Settings included.
             Effect::OpenAbout => self.overlay = Some(ActiveOverlay::about(self.caps.truecolor)),
+            // Full screen over whatever is showing, Settings included.
+            Effect::OpenAcknowledgements => self.open_acknowledgements(AckReturn { about: false }),
             // A bare switch (the palette's "Switch Project") picks the target in
             // the Projects column; a named one switches.
             Effect::SwitchProject { project } if project.is_empty() => self.open_project_switcher(),
@@ -4847,6 +4928,9 @@ fn draw_frame<B: ratatui::backend::Backend>(
     let mut review = state.review.take();
     // Likewise for the workspace interface (the workspace-sidebar task).
     let mut workspace = state.workspace.take();
+    // Acknowledgements, full screen over everything when it shows.
+    let mut acknowledgements = state.acknowledgements.take();
+    let is_ack = acknowledgements.is_some();
 
     // Borrow what the closure needs. `sidebar_view` is owned and `main_view` is
     // cloned (cheap) so the closure can disjointly borrow the embedded views
@@ -4889,7 +4973,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // Native views render through the `Frame` (their own `render_full`), so
         // they must run before the shared buffer is taken below.
         match &main_view {
-            _ if is_settings => {}
+            _ if is_settings || is_ack => {}
             MainView::Native(View::Issues) => crate::kanban::render_full(frame, kanban, main_rect),
             MainView::Native(View::Activity) => {
                 crate::activity::render_full(frame, activity, main_rect)
@@ -4915,7 +4999,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
             // interface is open: then that panel takes the sidebar's column
             // (rendered at the frame level below), so there are only two columns,
             // panel and content (`rt-review-screen-hangs-on-connecting`).
-            if !is_panel && !is_settings {
+            if !is_panel && !is_settings && !is_ack {
                 if let Some(view) = &sidebar_view {
                     view.render(buf, content_rect, selection, !focus_main, &sidebar_chrome);
                 }
@@ -4928,7 +5012,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
                 orchestrator_status.as_deref(),
             );
             match &main_view {
-                _ if is_settings => {}
+                _ if is_settings || is_ack => {}
                 MainView::Session if orch_down.is_some() => {
                     render_placeholder(buf, main_rect, orch_down.as_deref().unwrap_or_default())
                 }
@@ -4979,7 +5063,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
 
             // The review / workspace panel carries its own status line, so the
             // shell's bottom-row status/search band is only for the other views.
-            if !is_panel && !is_settings {
+            if !is_panel && !is_settings && !is_ack {
                 if let Some(q) = &searching {
                     render_search_prompt(buf, main_rect, q);
                 } else if let Some(s) = &status {
@@ -4996,7 +5080,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // The review interface renders with a mutable frame borrow: the panel
         // into the sidebar's column (`sidebar_rect`), the content terminal view
         // into the main area (`main_rect`) — two columns, panel and content.
-        if let Some(r) = review.as_mut().filter(|_| !is_settings) {
+        if let Some(r) = review.as_mut().filter(|_| !is_settings && !is_ack) {
             let cur = r.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
@@ -5005,14 +5089,14 @@ fn draw_frame<B: ratatui::backend::Backend>(
 
         // The workspace interface renders the same way — panel into the sidebar
         // column, content terminal view into the main area.
-        if let Some(w) = workspace.as_mut().filter(|_| !is_settings) {
+        if let Some(w) = workspace.as_mut().filter(|_| !is_settings && !is_ack) {
             let cur = w.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
             }
         }
 
-        if is_settings {
+        if is_settings && !is_ack {
             let chrome = settings::Chrome {
                 project_label: &project_label,
                 status: status.as_deref(),
@@ -5028,8 +5112,17 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // neither the nav sidebar nor the review panel (whichever holds that
         // column) can cover it. Its column was kept clear by rendering the
         // content one column narrower above.
-        if !(is_settings && settings_covers) {
+        if !(is_settings && settings_covers) && !is_ack {
             render_divider(frame.buffer_mut(), sidebar_rect, divider_active);
+        }
+
+        // Acknowledgements over all of it (the lost-session banner aside),
+        // owning the cursor (its search's caret).
+        if let Some((view, _)) = acknowledgements.as_mut() {
+            let cur = view.render(frame.buffer_mut(), area);
+            if overlay.is_none() {
+                cursor = cur;
+            }
         }
 
         // Dim the main area under an open overlay so the modal reads as on top
@@ -5051,6 +5144,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
     state.overlay = overlay;
     state.review = review;
     state.workspace = workspace;
+    state.acknowledgements = acknowledgements;
     res.context("drawing the shell")?;
     Ok(())
 }
@@ -8340,6 +8434,7 @@ mod tests {
             "action:settings",
             "action:send-feedback",
             "action:about",
+            "action:acknowledgements",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -8470,7 +8565,9 @@ mod tests {
         st.handle_event(Event::Mouse(left_click(x, y)));
         assert_eq!(st.opened_urls, [about::GITHUB_URL]);
         assert!(matches!(st.overlay, Some(ActiveOverlay::About(_))));
-        // The keyboard: the clicked link holds focus; Tab, then Enter.
+        // The keyboard: the clicked link holds focus; Tab past
+        // Acknowledgements, then Enter.
+        press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Enter);
         assert_eq!(st.opened_urls, [about::GITHUB_URL, about::LICENSE_URL]);
@@ -8487,6 +8584,93 @@ mod tests {
         st.handle_event(Event::Mouse(left_click(x, y)));
         assert!(st.overlay.is_none(), "Close closes it");
         assert!(st.settings_open(), "back on Settings");
+    }
+
+    #[test]
+    fn acknowledgements_open_from_the_palette_over_the_view_and_done_returns() {
+        let mut st = settings_state();
+        st.client.focus_sidebar();
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        for c in "Acknowledgements".chars() {
+            type_key(&mut st, c);
+        }
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette is open");
+        };
+        assert_eq!(p.results()[p.selected()].0.id, "action:acknowledgements");
+        press(&mut st, KeyCode::Enter);
+        assert!(st.overlay.is_none());
+        assert!(st.acknowledgements_open(), "the palette's Acknowledgements opens it");
+        let focus = st.client.focus();
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Acknowledgements") && screen.contains("Alacritty Terminal"), "{screen}");
+        assert!(screen.contains("Search acknowledgements"));
+        // Full screen: the sidebar's column is its list, not the nav.
+        assert!(!screen.contains("Orchestrator"), "the nav sidebar is covered:\n{screen}");
+
+        // It takes every key: typing searches, nothing reaches the view.
+        type_key(&mut st, '/');
+        for c in "rata".chars() {
+            type_key(&mut st, c);
+        }
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains(" rata ") && screen.contains("The Ratatui Developers"), "{screen}");
+        // A paste types into the search too.
+        st.handle_event(Event::Paste("tui".into()));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains(" ratatui "));
+        // View source opens the entry's page.
+        let (x, y) = find_on_screen(&term, "View source").expect("View source shows");
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert_eq!(st.opened_urls, ["https://github.com/ratatui/ratatui"]);
+        assert!(st.acknowledgements_open(), "and stays");
+        // Done returns to the view, as it was.
+        let (x, y) = find_on_screen(&term, "Done").expect("Done shows");
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert!(!st.acknowledgements_open());
+        assert!(st.overlay.is_none(), "no About: the palette opened it");
+        assert_eq!(st.client.focus(), focus);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(!screen_text(&term).contains("Search acknowledgements"));
+    }
+
+    #[test]
+    fn abouts_acknowledgements_link_opens_it_and_esc_brings_about_back() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        st.dispatch_effect(Effect::OpenAbout);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "Acknowledgements").expect("About shows the link");
+        st.handle_event(Event::Mouse(left_click(x + 1, y)));
+        assert!(st.overlay.is_none(), "About gives way");
+        assert!(st.acknowledgements_open());
+        assert!(st.settings_open(), "Settings stays under it");
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Search acknowledgements"), "over Settings:\n{screen}");
+        // Keys go to it, not to Settings: ↓ moves its list.
+        press(&mut st, KeyCode::Down);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Timon Post"), "Crossterm selected");
+        // Esc: About again, on its Acknowledgements link, over Settings.
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.acknowledgements_open());
+        let Some(ActiveOverlay::About(about)) = &st.overlay else {
+            panic!("About comes back");
+        };
+        assert_eq!(
+            about.focus(),
+            crate::overlay::about::Target::Link(shelbi_app::about::AboutLink::Acknowledgements)
+        );
+        assert!(st.settings_open());
+        // Enter on the focused link opens it again.
+        press(&mut st, KeyCode::Enter);
+        assert!(st.acknowledgements_open());
     }
 
     #[test]

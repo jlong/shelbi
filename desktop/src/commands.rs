@@ -51,6 +51,8 @@ pub trait CommandHost {
     fn send_feedback(&mut self);
     /// Show the About Shelbi window (or the open one to the front).
     fn open_about(&mut self);
+    /// Show the Acknowledgements window (or the open one to the front).
+    fn open_acknowledgements(&mut self);
     /// Open the add-project form.
     fn open_add_project(&mut self);
     /// Open a review task: a queued one asks which slot to load it onto.
@@ -88,6 +90,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::SendFeedback => host.send_feedback(),
         // Shelbi ▸ About Shelbi: its own small window.
         CommandKind::OpenAbout => host.open_about(),
+        // About's Acknowledgements link, Help ▸ Acknowledgements: its own
+        // window.
+        CommandKind::OpenAcknowledgements => host.open_acknowledgements(),
         // The window switches in place (dt-switch-project-in-window). A bare
         // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
@@ -144,6 +149,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::SendFeedback => false,
         // Only shows this build's version and the project's links.
         CommandKind::OpenAbout => false,
+        // Only shows the bundled software's licenses, built in.
+        CommandKind::OpenAcknowledgements => false,
         // Edits a local file in the user's editor.
         CommandKind::OpenEditor { .. } => false,
         // Only this client lets go.
@@ -253,6 +260,9 @@ mod tests {
         fn open_about(&mut self) {
             self.0.push("about".into());
         }
+        fn open_acknowledgements(&mut self) {
+            self.0.push("acknowledgements".into());
+        }
         fn open_add_project(&mut self) {
             self.0.push("add-project".into());
         }
@@ -307,6 +317,7 @@ mod tests {
             (CommandKind::OpenSettings, "settings"),
             (CommandKind::SendFeedback, "send-feedback"),
             (CommandKind::OpenAbout, "about"),
+            (CommandKind::OpenAcknowledgements, "acknowledgements"),
             (
                 CommandKind::SwitchProject {
                     project: String::new(),
@@ -404,6 +415,7 @@ mod tests {
                 "settings",
                 "send-feedback",
                 "about",
+                "acknowledgements",
                 "new-window",
                 "detach",
                 "editor:edit:project",

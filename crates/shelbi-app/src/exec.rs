@@ -39,6 +39,9 @@ pub enum Effect {
     /// Show About Shelbi: this build's version and the project's links (a
     /// client-local view; nothing stops).
     OpenAbout,
+    /// Show Acknowledgements: the bundled software and each license (a
+    /// client-local view; nothing stops).
+    OpenAcknowledgements,
     /// Switch the client to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow (the host collects the form, then calls

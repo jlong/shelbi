@@ -68,6 +68,9 @@ pub enum OverlayEvent {
     /// Contact Us sent this: the shell posts it off the UI thread and hands
     /// the answer back to the dialog.
     FeedbackSend(shelbi_app::feedback::Submission),
+    /// About Shelbi's Acknowledgements link: the bundled software, in its
+    /// place.
+    OpenAcknowledgements,
 }
 
 /// The overlay currently drawn over the main area, with its runtime state.
@@ -505,6 +508,7 @@ fn about_event(step: overlay::about::Step) -> OverlayEvent {
         overlay::about::Step::Stay => OverlayEvent::Stay,
         overlay::about::Step::Close => OverlayEvent::Close,
         overlay::about::Step::Open(url) => OverlayEvent::OpenUrl(url.to_string()),
+        overlay::about::Step::Acknowledgements => OverlayEvent::OpenAcknowledgements,
     }
 }
 

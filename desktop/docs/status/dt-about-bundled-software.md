@@ -130,7 +130,7 @@ packages (the cargo registry, or `vendor/`). Nothing is fetched at runtime.
 `the_texts_are_the_shipped_licenses` checks each names its license and
 copyright holder as the file does.
 
-### The long tail (`build_support/licenses.rs`)
+### The long tail (`crates/shelbi-app/build_support/licenses.rs`, shared with the TUI since `tui-acknowledgements`)
 
 A small build script (no `cargo-about`: it would be a new tool in the
 build, and the walk is ~40 lines), run from `build.rs`:
