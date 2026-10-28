@@ -1,12 +1,18 @@
-//! Acknowledgements' generated data (`dt-about-bundled-software`): every
-//! Rust crate compiled into the app, with its license texts, read at build
-//! time from `cargo metadata` and the crates' own files.
+//! Acknowledgements' generated data (`dt-about-bundled-software`,
+//! `tui-acknowledgements`): every Rust crate compiled into a Shelbi binary,
+//! with its license texts, read at build time from `cargo metadata` and the
+//! crates' own files. Shared by the two binaries' build scripts (the
+//! desktop app's `desktop/build.rs`, the `shelbi` binary's through
+//! `crates/shelbi-tui/build.rs`), each `#[path]`-including this file and
+//! calling [`generate`] with its own [`Config`]; the data's types and the
+//! list built from it are `shelbi_app::licenses`.
 //!
 //! - **Which crates ship**: `cargo metadata --filter-platform <target>`
 //!   resolves the lockfile for the target being built; the walk starts at
-//!   this crate and follows only normal dependencies, and stops at a
-//!   proc-macro (its code runs in the compiler, not the app). Build and dev
-//!   dependencies never ship, so they are left out too.
+//!   the binary's package ([`Config::root`]) and follows only normal
+//!   dependencies, and stops at a proc-macro (its code runs in the compiler,
+//!   not the binary). Build and dev dependencies never ship, so they are
+//!   left out too.
 //! - **Which text**: a crate's license files are the `LICENSE*`, `LICENCE*`,
 //!   `COPYING*`, `UNLICENSE*`, `NOTICE*` and `COPYRIGHT*` files in its
 //!   package, each classified by what it says (falling back to its name).
@@ -21,9 +27,9 @@
 //!   that does, else gets the standard MIT text with the authors its
 //!   manifest names, or a note pointing at its repository for any other
 //!   license.
-//! - **What comes out**: `$OUT_DIR/licenses.rs`, `include!`d by
-//!   `src/licenses.rs`: the long tail ([`LONG_TAIL_SKIP`] and Shelbi's own
-//!   crates aside) as `CRATES` and one text, `CRATE_NOTICES`, that lists
+//! - **What comes out**: `$OUT_DIR/licenses.rs`, `include!`d by the
+//!   binary's list: the long tail ([`Config::long_tail_skip`] and Shelbi's
+//!   own crates aside) as `CRATES` and one text, `CRATE_NOTICES`, that lists
 //!   them and then each distinct notice once with the crates it covers; the
 //!   featured entries' texts (`crate_text`); and every shipped crate
 //!   (`SHIPPED`), for the tests.
@@ -38,31 +44,24 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Crates Acknowledgements lists on their own (with the license files it
-/// shows for them), so the generated long tail leaves them out.
-const LONG_TAIL_SKIP: &[&str] = &[
-    "alacritty_terminal",
-    "gpui-pre",
-    "gpui-kit",
-    "nucleo-matcher",
-    "option-ext",
-    "portable-pty",
-    "termwiz",
-];
-
-/// The license files a featured entry shows, `(crate, file)`. gpui-kit's
-/// package ships no license file, so its entry shows gpui-base's (the same
-/// repository's Apache License); Lucide's icons ship inside gpui-kit-assets.
-const FEATURED_FILES: &[(&str, &str)] = &[
-    ("alacritty_terminal", "LICENSE-APACHE"),
-    ("gpui-pre", "LICENSE-APACHE"),
-    ("gpui-base", "LICENSE-APACHE"),
-    ("gpui-kit-assets", "LICENSE-LUCIDE"),
-    ("nucleo-matcher", "LICENSE"),
-    ("option-ext", "LICENSE.txt"),
-    ("portable-pty", "LICENSE.md"),
-    ("termwiz", "LICENSE.md"),
-];
+/// What one binary's list is built from.
+pub struct Config {
+    /// The package whose binary ships the crates: `None` for the crate
+    /// running the build script (the desktop app), else a workspace
+    /// member's name (`shelbi`, the binary the TUI ships in).
+    pub root: Option<&'static str>,
+    /// What the long tail's text says the crates are compiled into (`the
+    /// app`, `the shelbi binary`).
+    pub subject: &'static str,
+    /// Crates the list shows on their own (with the license files it shows
+    /// for them), so the generated long tail leaves them out.
+    pub long_tail_skip: &'static [&'static str],
+    /// The license files a featured entry shows, `(crate, file)`.
+    pub featured_files: &'static [(&'static str, &'static str)],
+    /// Files besides this one whose change regenerates the list (the
+    /// lockfile and manifests), relative to the build script's crate.
+    pub rerun_if_changed: &'static [&'static str],
+}
 
 /// The license families, in the order Shelbi takes a crate under one when
 /// it offers a choice: the shortest notice first.
@@ -366,8 +365,9 @@ fn notice(p: &Package, all: &[Package]) -> String {
     parts.join("\n\n")
 }
 
-/// Run `cargo metadata` and walk what ships.
-fn shipped(manifest_dir: &Path, target: &str) -> Vec<Package> {
+/// Run `cargo metadata` and walk what `root`'s binary ships (`None`: the
+/// crate in `manifest_dir`).
+fn shipped(manifest_dir: &Path, target: &str, root: Option<&str>) -> Vec<Package> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let out = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--locked", "--offline", "--filter-platform", target])
@@ -392,7 +392,17 @@ fn shipped(manifest_dir: &Path, target: &str) -> Vec<Package> {
         .iter()
         .map(|n| (n["id"].as_str().expect("id"), n))
         .collect();
-    let root = meta["resolve"]["root"].as_str().expect("root");
+    let root = match root {
+        None => meta["resolve"]["root"].as_str().expect("root"),
+        // A workspace member: a path package of that name.
+        Some(name) => meta["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .find(|p| p["name"] == name && p["source"].is_null())
+            .and_then(|p| p["id"].as_str())
+            .unwrap_or_else(|| panic!("no workspace package {name} for the bundled-software list")),
+    };
     let proc_macro = |p: &Value| {
         p["targets"].as_array().into_iter().flatten().any(|t| {
             t["kind"].as_array().into_iter().flatten().any(|k| k == "proc-macro")
@@ -444,7 +454,7 @@ fn shipped(manifest_dir: &Path, target: &str) -> Vec<Package> {
 }
 
 /// The long tail's one text: the crates, then each distinct notice once.
-fn crate_notices(tail: &[&Package], all: &[Package]) -> String {
+fn crate_notices(tail: &[&Package], all: &[Package], subject: &str) -> String {
     let mut groups: BTreeMap<String, Vec<&Package>> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     for p in tail {
@@ -457,7 +467,7 @@ fn crate_notices(tail: &[&Package], all: &[Package]) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "These {} open source Rust crates are compiled into the app, besides the ones listed on their own. \
+        "These {} open source Rust crates are compiled into {subject}, besides the ones listed on their own. \
          Each is listed with its version and its license as an SPDX expression. Where a crate offers a \
          choice of licenses, Shelbi uses it under the one whose notice follows.\n",
         tail.len()
@@ -474,21 +484,21 @@ fn crate_notices(tail: &[&Package], all: &[Package]) -> String {
     s
 }
 
-/// Write `$OUT_DIR/licenses.rs`.
-pub fn generate() {
-    println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=build_support/licenses.rs");
+/// Write `$OUT_DIR/licenses.rs` for `config`'s binary.
+pub fn generate(config: &Config) {
+    for path in config.rerun_if_changed {
+        println!("cargo:rerun-if-changed={path}");
+    }
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let target = std::env::var("TARGET").expect("TARGET");
-    let all = shipped(&manifest_dir, &target);
+    let all = shipped(&manifest_dir, &target, config.root);
 
     let tail: Vec<&Package> = all
         .iter()
-        .filter(|p| !p.own && !LONG_TAIL_SKIP.contains(&p.name.as_str()))
+        .filter(|p| !p.own && !config.long_tail_skip.contains(&p.name.as_str()))
         .collect();
 
-    let mut src = String::from("// Generated by build_support/licenses.rs. Do not edit.\n\n");
+    let mut src = String::from("// Generated by crates/shelbi-app/build_support/licenses.rs. Do not edit.\n\n");
     src.push_str("/// The long tail: every shipped crate not listed on its own.\npub const CRATES: &[Crate] = &[\n");
     for p in &tail {
         let _ = writeln!(
@@ -498,7 +508,7 @@ pub fn generate() {
         );
     }
     src.push_str("];\n\n");
-    let _ = writeln!(src, "/// The long tail's text.\npub const CRATE_NOTICES: &str = {:?};\n", crate_notices(&tail, &all));
+    let _ = writeln!(src, "/// The long tail's text.\npub const CRATE_NOTICES: &str = {:?};\n", crate_notices(&tail, &all, config.subject));
 
     src.push_str("/// Every shipped crate (Shelbi's own included), for the tests.\n#[allow(dead_code)]\npub const SHIPPED: &[Crate] = &[\n");
     for p in &all {
@@ -511,11 +521,13 @@ pub fn generate() {
     src.push_str("];\n\n");
 
     src.push_str("/// A featured entry's license file: `(crate, file)` to its version and text.\npub fn crate_text(name: &str, file: &str) -> Option<(&'static str, &'static str)> {\n    match (name, file) {\n");
-    for (name, file) in FEATURED_FILES {
+    for (name, file) in config.featured_files {
+        // The newest, where two versions ship (crossterm's).
         let p = all
             .iter()
+            .rev()
             .find(|p| p.name == *name)
-            .unwrap_or_else(|| panic!("{name} no longer ships: update FEATURED_FILES and src/licenses.rs"));
+            .unwrap_or_else(|| panic!("{name} no longer ships: update the build script's featured files and its list"));
         let text = std::fs::read_to_string(p.dir.join(file))
             .unwrap_or_else(|e| panic!("{name}'s {file}: {e}"));
         let _ = writeln!(src, "        ({name:?}, {file:?}) => Some(({:?}, {:?})),", p.version, normalize(&text));

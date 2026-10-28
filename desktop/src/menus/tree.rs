@@ -326,7 +326,7 @@ pub enum Placement {
     File,
     /// The app menu: detach and the quit pair.
     App,
-    /// Help: Send Feedback….
+    /// Help: Send Feedback…, Acknowledgements.
     Help,
     /// Board-only mutations the registry never lists (they act on a card).
     Board,
@@ -345,6 +345,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::OpenSettings => Placement::App,
         CommandKind::SendFeedback => Placement::Help,
         CommandKind::OpenAbout => Placement::App,
+        CommandKind::OpenAcknowledgements => Placement::Help,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
         CommandKind::NewWindow => Placement::File,
@@ -630,6 +631,9 @@ fn help_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuS
             // The registry's Send Feedback: Contact Us, as the sidebar
             // footer's megaphone opens it.
             slot("action:send-feedback", "Send Feedback\u{2026}", None),
+            MenuEntry::Separator,
+            // The registry's Acknowledgements, as About's link opens it.
+            slot("action:acknowledgements", "Acknowledgements", None),
         ],
     }
 }

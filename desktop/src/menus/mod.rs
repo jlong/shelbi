@@ -142,13 +142,17 @@ pub fn init(cx: &mut App) {
     cx.set_global(MenuBar::default());
 }
 
-/// Run a registry command that needs no window (About Shelbi, its own
-/// window), so it works with no window open or a modal dialog up. Returns
+/// Run a registry command that needs no window (About Shelbi and
+/// Acknowledgements, each its own window), so it works with no window open or a modal dialog up. Returns
 /// false for any other command (a window runs those).
 pub fn run_windowless_command(id: &str, cx: &mut App) -> bool {
     match CommandKind::from_id(id) {
         Some(CommandKind::OpenAbout) => {
             crate::views::about::show_about(cx);
+            true
+        }
+        Some(CommandKind::OpenAcknowledgements) => {
+            crate::views::about::show_bundled_software(cx);
             true
         }
         _ => false,

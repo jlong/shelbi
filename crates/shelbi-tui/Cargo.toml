@@ -35,6 +35,11 @@ tracing = { workspace = true }
 # stall the first draw (`rt-tui-headless-startup-block`).
 libc = { workspace = true }
 
+[build-dependencies]
+# `build.rs` (`crates/shelbi-app/build_support/licenses.rs`) reads `cargo
+# metadata`'s JSON for Acknowledgements' crate list (already in the tree).
+serde_json = { workspace = true }
+
 [dev-dependencies]
 # The sidebar's degraded-render test seeds an on-disk board snapshot for a
 # remote (github) backend so a cold process serves it while a live read fails;

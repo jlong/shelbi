@@ -42,23 +42,32 @@ pub fn bleed_block_lines<'a>(
     let n = content.len();
     let mut out: Vec<Line<'a>> = Vec::with_capacity(nav_lines(n));
     let mut content = content.into_iter();
+    let fill_of = |p: usize| (selected == Some(p)).then_some(fill);
     for p in 0..=n {
-        let glyph = if selected == Some(p) {
-            Some(BLEED_ABOVE)
-        } else if p > 0 && selected == Some(p - 1) {
-            Some(BLEED_BELOW)
-        } else {
-            None
-        };
-        out.push(match glyph {
-            Some(g) => Line::from(Span::styled(g.repeat(width), Style::default().fg(fill))),
-            None => Line::raw(""),
-        });
+        let above = p.checked_sub(1).and_then(fill_of);
+        out.push(bleed_separator(above, fill_of(p), width));
         if let Some(line) = content.next() {
             out.push(line);
         }
     }
     out
+}
+
+/// One separator row of a bleed block: `above` (the fill of the item over
+/// it, if it has one) bleeds down into the row's top half as `▀`, `below`
+/// (the item under it) up into its bottom half as `▄`. With both, the row
+/// is `▀` in `above` over `below` as the background, so two pills (a
+/// selection over a hovered row) meet without a gap; with neither it is
+/// blank. [`bleed_block_lines`] is one-line items over this; a list of
+/// taller items (Acknowledgements' name over license) puts one between
+/// each pair.
+pub fn bleed_separator<'a>(above: Option<Color>, below: Option<Color>, width: usize) -> Line<'a> {
+    match (above, below) {
+        (Some(a), Some(b)) => Line::from(Span::styled(BLEED_BELOW.repeat(width), Style::default().fg(a).bg(b))),
+        (Some(a), None) => Line::from(Span::styled(BLEED_BELOW.repeat(width), Style::default().fg(a))),
+        (None, Some(b)) => Line::from(Span::styled(BLEED_ABOVE.repeat(width), Style::default().fg(b))),
+        (None, None) => Line::raw(""),
+    }
 }
 
 /// Map the palette's ratatui-free [`DecorationColor`] to a ratatui

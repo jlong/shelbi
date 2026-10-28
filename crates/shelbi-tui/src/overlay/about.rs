@@ -16,9 +16,9 @@
 //!
 //! Tab (or an arrow) moves focus through the links and Close; Enter or
 //! Space activates it; a click opens a link or closes. A link the pointer is
-//! over is underlined. Acknowledgements isn't shown yet: the TUI's list of
-//! bundled software comes with `tui-acknowledgements`, and [`shown`] adds it
-//! back.
+//! over is underlined. Acknowledgements opens the TUI's list of the bundled
+//! software (`shell::acknowledgements`) in About's place; its Done brings
+//! About back, focused on the link.
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -62,22 +62,13 @@ pub enum Step {
     /// Open this page in the browser; the overlay stays up, as the
     /// desktop's window does.
     Open(&'static str),
+    /// Show Acknowledgements (the bundled software) in About's place.
+    Acknowledgements,
 }
 
-/// Whether the TUI shows `link`. Every link but Acknowledgements, whose
-/// screen (the bundled software list) isn't in the TUI yet.
-fn shown(link: AboutLink) -> bool {
-    link != AboutLink::Acknowledgements
-}
-
-/// The focus order: the shown links as they read, then Close.
+/// The focus order: the links as they read, then Close.
 fn targets() -> Vec<Target> {
-    about::LINKS
-        .into_iter()
-        .filter(|l| shown(*l))
-        .map(Target::Link)
-        .chain([Target::Close])
-        .collect()
+    about::LINKS.into_iter().map(Target::Link).chain([Target::Close]).collect()
 }
 
 /// The overlay's state: what has focus, what the pointer is over, and
@@ -97,6 +88,15 @@ impl About {
             focus: Target::Close,
             hover: None,
             truecolor,
+        }
+    }
+
+    /// Opened again with `focus` focused (back from Acknowledgements, on
+    /// its link).
+    pub fn focused(truecolor: bool, focus: Target) -> Self {
+        About {
+            focus,
+            ..About::new(truecolor)
         }
     }
 
@@ -279,6 +279,7 @@ impl About {
 fn activate(target: Target) -> Step {
     match target {
         Target::Close => Step::Close,
+        Target::Link(AboutLink::Acknowledgements) => Step::Acknowledgements,
         Target::Link(link) => link.url().map_or(Step::Stay, Step::Open),
     }
 }
@@ -382,21 +383,17 @@ fn rows(width: usize, icon: bool) -> Vec<Row> {
         out.push(Row::Center(vec![Piece::text(line, Role::Body)]));
     }
     out.push(Row::Gap);
-    let links = about::LINKS_ROW.into_iter().filter(|l| shown(*l));
     out.extend(pack(
-        links.map(|l| Piece::link(l, Role::Link)).collect(),
+        about::LINKS_ROW.into_iter().map(|l| Piece::link(l, Role::Link)).collect(),
         Some(Piece::text(" ", Role::Body)),
         width,
     ));
     out.push(Row::Gap);
-    if shown(AboutLink::Acknowledgements) {
-        out.push(Row::Center(vec![Piece::link(AboutLink::Acknowledgements, Role::Link)]));
-        out.push(Row::Gap);
-    }
+    out.push(Row::Center(vec![Piece::link(AboutLink::Acknowledgements, Role::Link)]));
+    out.push(Row::Gap);
     out.push(Row::Center(vec![Piece::text(about::copyright(), Role::Muted)]));
-    let credits = about::CREDITS_ROW.into_iter().filter(|l| shown(*l));
     out.extend(pack(
-        credits.map(|l| Piece::link(l, Role::MutedLink)).collect(),
+        about::CREDITS_ROW.into_iter().map(|l| Piece::link(l, Role::MutedLink)).collect(),
         Some(Piece::text("·", Role::Muted)),
         width,
     ));
@@ -681,7 +678,7 @@ mod tests {
         let mut about = About::new(true);
         assert_eq!(about.focus(), Target::Close);
         let mut seen = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             about.handle_key(key(KeyCode::Tab));
             seen.push(about.focus());
         }
@@ -692,6 +689,7 @@ mod tests {
                 Target::Link(Website),
                 Target::Link(Documentation),
                 Target::Link(GitHub),
+                Target::Link(Acknowledgements),
                 Target::Link(License),
                 Target::Link(Sponsor),
                 Target::Close,
@@ -710,14 +708,21 @@ mod tests {
         let mut about = About::new(true);
         assert_eq!(about.handle_key(key(KeyCode::Enter)), Step::Close);
         let mut opened = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             about.handle_key(key(KeyCode::Tab));
             opened.push(about.handle_key(key(KeyCode::Enter)));
         }
+        let open = |url| Step::Open(url);
         assert_eq!(
             opened,
-            [about::WEBSITE_URL, about::DOCS_URL, about::GITHUB_URL, about::LICENSE_URL, about::SPONSOR_URL]
-                .map(Step::Open)
+            [
+                open(about::WEBSITE_URL),
+                open(about::DOCS_URL),
+                open(about::GITHUB_URL),
+                Step::Acknowledgements,
+                open(about::LICENSE_URL),
+                open(about::SPONSOR_URL),
+            ]
         );
         assert_eq!(about.handle_key(key(KeyCode::Char(' '))), Step::Open(about::SPONSOR_URL));
         assert_eq!(about.handle_key(key(KeyCode::Esc)), Step::Close);

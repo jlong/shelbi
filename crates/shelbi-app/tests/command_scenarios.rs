@@ -188,6 +188,9 @@ impl Executor for Scenario {
             // About is each client's own surface (the desktop's window, the
             // TUI's overlay): the host shows it; the client's view stays.
             Effect::OpenAbout => Performed::Host(effect.clone()),
+            // Acknowledgements likewise (the desktop's window, the TUI's
+            // full-screen view, Done returning to what was under it).
+            Effect::OpenAcknowledgements => Performed::Host(effect.clone()),
             Effect::AddProject => {
                 self.client.open_overlay(Overlay::AddProject);
                 Performed::Nothing
@@ -248,6 +251,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::OpenSettings => "settings_opens_over_the_view_on_the_last_page",
         CommandKind::SendFeedback => "send_feedback_reaches_the_host_and_leaves_the_view",
         CommandKind::OpenAbout => "about_reaches_the_host_with_or_without_a_project",
+        CommandKind::OpenAcknowledgements => "acknowledgements_reach_the_host_with_or_without_a_project",
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
         CommandKind::AddProject => "add_project_collects_the_form_then_mutates",
         CommandKind::NewWindow => "new_window_reaches_the_host_on_a_multi_window_client",
@@ -294,6 +298,7 @@ fn every_command_kind_has_a_scenario() {
             "action:settings",
             "action:send-feedback",
             "action:about",
+            "action:acknowledgements",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -516,6 +521,19 @@ fn about_reaches_the_host_with_or_without_a_project() {
     let mut m = fixture();
     m.project = None;
     assert!(CommandRegistry::new().resolve("action:about", &m).is_some());
+}
+
+#[test]
+fn acknowledgements_reach_the_host_with_or_without_a_project() {
+    let mut s = Scenario::new();
+    s.client.set_view(View::Issues);
+    assert_eq!(s.invoke("action:acknowledgements"), Effect::OpenAcknowledgements);
+    assert_eq!(s.last(), &Performed::Host(Effect::OpenAcknowledgements), "nothing reaches the daemon");
+    assert_eq!(s.client.view(), &View::Issues, "the view under it stays");
+
+    let mut m = fixture();
+    m.project = None;
+    assert!(CommandRegistry::new().resolve("action:acknowledgements", &m).is_some());
 }
 
 #[test]

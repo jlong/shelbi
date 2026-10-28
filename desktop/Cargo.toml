@@ -147,8 +147,9 @@ visual-check = ["gpui_platform/test-support", "dep:image"]
 bench = ["dep:flate2", "dep:libc"]
 
 [build-dependencies]
-# `build_support/licenses.rs` reads `cargo metadata`'s JSON for Bundled
-# Software's crate list (already in the tree).
+# `crates/shelbi-app/build_support/licenses.rs` (run by build.rs) reads
+# `cargo metadata`'s JSON for Bundled Software's crate list (already in the
+# tree).
 serde_json = "1"
 
 [dev-dependencies]

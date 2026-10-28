@@ -12,6 +12,7 @@ mod app;
 mod error_report;
 mod handlers;
 mod kanban;
+mod licenses;
 mod keymap;
 mod machines;
 mod markdown;

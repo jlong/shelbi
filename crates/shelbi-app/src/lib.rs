@@ -44,6 +44,9 @@
 //! - [`about`] — About Shelbi's words and links (the tagline, the project's
 //!   URLs, the copyright and license), so both clients' About screens read
 //!   the same.
+//! - [`licenses`] — Acknowledgements: the bundled software's entries and
+//!   license tables, the search / selection browser over them, and a
+//!   license text's paragraph layout.
 //!
 //! # No UI toolkit
 //!
@@ -65,6 +68,7 @@ pub mod exec;
 pub mod exec_daemon;
 pub mod feedback;
 pub mod layout_sub;
+pub mod licenses;
 pub mod nav;
 pub mod overlay;
 pub mod reachability;

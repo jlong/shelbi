@@ -72,7 +72,7 @@ impl BundledSoftwareView {
             }),
         ];
         BundledSoftwareView {
-            browser: Browser::new(),
+            browser: licenses::browser(),
             search,
             focus,
             list_scroll: ScrollHandle::new(),

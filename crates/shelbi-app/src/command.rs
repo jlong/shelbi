@@ -51,6 +51,10 @@ pub enum CommandKind {
     SendFeedback,
     /// Show About Shelbi (the desktop's About window, the TUI's overlay).
     OpenAbout,
+    /// Show Acknowledgements, the bundled software and its licenses (About's
+    /// Acknowledgements link; the desktop's window, the TUI's full-screen
+    /// view).
+    OpenAcknowledgements,
     /// Switch to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow.
@@ -172,6 +176,7 @@ impl CommandKind {
             CommandKind::OpenSettings => Effect::OpenSettings,
             CommandKind::SendFeedback => Effect::SendFeedback,
             CommandKind::OpenAbout => Effect::OpenAbout,
+            CommandKind::OpenAcknowledgements => Effect::OpenAcknowledgements,
             CommandKind::SwitchProject { project } => Effect::SwitchProject {
                 project: project.clone(),
             },
@@ -354,7 +359,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// the review decisions (approve / reject), the error-log action, Settings, Send Feedback, About, switch-project targets,
+    /// the review decisions (approve / reject), the error-log action, Settings, Send Feedback, About, Acknowledgements, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -518,6 +523,19 @@ impl CommandRegistry {
             entry_kind: EntryKind::Action,
             decoration: None,
             subtitle: Some("Version, links, and license".to_string()),
+            shortcut: None,
+            hidden_until_query: true,
+        });
+
+        // Acknowledgements: About's link to the bundled software, offered
+        // the same way (no project needed, surfaced by typing).
+        out.push(Command {
+            id: "action:acknowledgements".to_string(),
+            title: "Acknowledgements".to_string(),
+            kind: CommandKind::OpenAcknowledgements,
+            entry_kind: EntryKind::Action,
+            decoration: None,
+            subtitle: Some("Bundled open source software and licenses".to_string()),
             shortcut: None,
             hidden_until_query: true,
         });
@@ -725,6 +743,7 @@ impl CommandKind {
             "action:settings" => Some(CommandKind::OpenSettings),
             "action:send-feedback" => Some(CommandKind::SendFeedback),
             "action:about" => Some(CommandKind::OpenAbout),
+            "action:acknowledgements" => Some(CommandKind::OpenAcknowledgements),
             "action:switch-project" => Some(CommandKind::SwitchProject {
                 project: String::new(),
             }),
@@ -838,6 +857,7 @@ mod tests {
             "action:settings",
             "action:send-feedback",
             "action:about",
+            "action:acknowledgements",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -1133,6 +1153,25 @@ mod tests {
         for query in ["about", "about shelbi"] {
             let hits = shelbi_palette::search(&entries, query);
             assert_eq!(hits[0].0.id, "action:about", "{query}");
+        }
+    }
+
+    #[test]
+    fn acknowledgements_is_offered_with_or_without_a_project_and_surfaces_on_a_query() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        let cmd = reg.resolve("action:acknowledgements", &m).expect("offered");
+        assert_eq!(cmd.title(), "Acknowledgements");
+        assert_eq!(cmd.kind(), &CommandKind::OpenAcknowledgements);
+        assert!(!cmd.is_mutating());
+        assert_eq!(cmd.effect("alpha"), Effect::OpenAcknowledgements);
+        assert!(cmd.hidden_until_query());
+        m.project = None;
+        assert!(reg.resolve("action:acknowledgements", &m).is_some(), "it needs no project");
+        let entries = reg.entries(&model());
+        for query in ["acknowledgements", "ackno"] {
+            let hits = shelbi_palette::search(&entries, query);
+            assert_eq!(hits[0].0.id, "action:acknowledgements", "{query}");
         }
     }
 

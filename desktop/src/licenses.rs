@@ -5,23 +5,18 @@
 //!
 //! Every text is embedded at build time. The fonts' and icons' come from
 //! the license files vendored beside them under `assets/`; the crates' are
-//! read out of their packages by the build script (`build_support/licenses.rs`,
-//! which also walks `cargo metadata` for the long tail). Nothing is fetched
-//! at runtime.
+//! read out of their packages by the build script (`build.rs`, running
+//! `crates/shelbi-app/build_support/licenses.rs`, which also walks `cargo
+//! metadata` for the long tail). Nothing is fetched at runtime.
 //!
-//! The entries are listed by name (the long tail last); [`Entry::matches`]
-//! is the window's search.
+//! The types, the crate entries the TUI's list shares, the search and the
+//! paragraph layout are `shelbi_app::licenses`; this is the app's own list
+//! and the license text as its text view reads it ([`license_markdown`]).
 
 use std::sync::LazyLock;
 
-/// A shipped Rust crate: its name, version and license as an SPDX
-/// expression (`Cargo.toml`'s `license`, an old `/` spelled `OR`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Crate {
-    pub name: &'static str,
-    pub version: &'static str,
-    pub license: &'static str,
-}
+use shelbi_app::licenses::{self as shared, Block, Table};
+pub use shelbi_app::licenses::{Browser, Crate, Entry};
 
 /// The build script's output: `CRATES` (the long tail), `CRATE_NOTICES`
 /// (its text), `SHIPPED` (every shipped crate) and `crate_text` (a featured
@@ -33,61 +28,13 @@ mod generated {
 
 pub use generated::{CRATES, SHIPPED};
 
-/// One row of Acknowledgements and the detail it opens.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    /// The row's and the detail's name.
-    pub name: &'static str,
-    /// The row's second line: the license, short.
-    pub license: &'static str,
-    /// Who made it and what it is (`Adobe · Terminal typeface`).
-    pub attribution: String,
-    /// What it does in Shelbi, one line.
-    pub description: &'static str,
-    /// Where View source goes.
-    pub source: &'static str,
-    /// The license text's heading.
-    pub license_title: &'static str,
-    /// The complete license text, as shipped.
-    pub text: &'static str,
-    /// The crates the entry stands for (the long tail's), searched by name
-    /// and license too.
-    pub crates: &'static [Crate],
-}
-
-impl Entry {
-    /// Whether `query` (already lowercased and trimmed) finds this entry:
-    /// in its name or its license, or in one of its crates' names or
-    /// licenses. An empty query finds everything.
-    pub fn matches(&self, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        let has = |s: &str| s.to_lowercase().contains(query);
-        has(self.name)
-            || has(self.license)
-            || has(self.license_title)
-            || self.crates.iter().any(|c| has(c.name) || has(c.license))
-    }
-}
-
-/// A featured crate's license file, as the build script read it.
-fn crate_text(name: &str, file: &str) -> &'static str {
-    generated::crate_text(name, file).map(|(_, text)| text).unwrap_or_else(|| {
-        // The build script panics before this can happen: it reads every
-        // file `FEATURED_FILES` names.
-        panic!("{name}'s {file} isn't in the build's license table")
-    })
-}
-
-/// A featured crate's version, from the lockfile.
-fn crate_version(name: &str) -> &'static str {
-    SHIPPED
-        .iter()
-        .find(|c| c.name == name)
-        .map(|c| c.version)
-        .unwrap_or_default()
-}
+/// The app's license table.
+const TABLE: Table = Table {
+    crates: CRATES,
+    notices: generated::CRATE_NOTICES,
+    shipped: SHIPPED,
+    crate_text: generated::crate_text,
+};
 
 /// Symbols Nerd Font Mono's glyph sets keep their upstream licenses; the
 /// font's own README lists them (Nerd Fonts' `license-audit.md` has each in
@@ -102,6 +49,11 @@ pub fn entries() -> &'static [Entry] {
     &ENTRIES
 }
 
+/// A browser over [`entries`], as the window opens on.
+pub fn browser() -> Browser {
+    Browser::new(entries())
+}
+
 fn build() -> Vec<Entry> {
     let entry = |name, license, attribution: String, description, source, license_title, text| Entry {
         name,
@@ -113,16 +65,8 @@ fn build() -> Vec<Entry> {
         text,
         crates: &[],
     };
-    let mut list = vec![
-        entry(
-            "Alacritty Terminal",
-            "Apache 2.0",
-            format!("The Alacritty Project · Terminal emulator {}", crate_version("alacritty_terminal")),
-            "Reads every session's output into the screen its terminal pane draws.",
-            "https://github.com/alacritty/alacritty",
-            "Apache License 2.0",
-            crate_text("alacritty_terminal", "LICENSE-APACHE"),
-        ),
+    let mut list = shared::shared_entries(&TABLE);
+    list.extend([
         entry(
             "Geist",
             "SIL OFL 1.1",
@@ -144,22 +88,22 @@ fn build() -> Vec<Entry> {
         entry(
             "GPUI",
             "Apache 2.0",
-            format!("Zed Industries · UI framework {}", crate_version("gpui-pre")),
+            format!("Zed Industries · UI framework {}", TABLE.version("gpui-pre")),
             "The GPU-accelerated UI framework the app is built with.",
             "https://github.com/zed-industries/zed",
             "Apache License 2.0",
-            crate_text("gpui-pre", "LICENSE-APACHE"),
+            TABLE.text("gpui-pre", "LICENSE-APACHE"),
         ),
         entry(
             "gpui-kit",
             "Apache 2.0",
-            format!("Longbridge · Component library {}", crate_version("gpui-kit")),
+            format!("Longbridge · Component library {}", TABLE.version("gpui-kit")),
             "The text views, inputs and other components the app's views build on.",
             "https://github.com/longbridge/gpui-kit",
             "Apache License 2.0",
             // gpui-kit's package ships no license file; gpui-base, from the
             // same repository and release, ships its Apache License.
-            crate_text("gpui-base", "LICENSE-APACHE"),
+            TABLE.text("gpui-base", "LICENSE-APACHE"),
         ),
         entry(
             "Heroicons",
@@ -177,34 +121,7 @@ fn build() -> Vec<Entry> {
             "The few icons gpui-kit's components draw for themselves, like a dropdown's caret.",
             "https://github.com/lucide-icons/lucide",
             "ISC License",
-            crate_text("gpui-kit-assets", "LICENSE-LUCIDE"),
-        ),
-        entry(
-            "nucleo-matcher",
-            "MPL 2.0",
-            format!("Pascal Kuthe · Fuzzy matcher {}", crate_version("nucleo-matcher")),
-            "Ranks the command palette's results as you type.",
-            "https://github.com/helix-editor/nucleo",
-            "Mozilla Public License 2.0",
-            crate_text("nucleo-matcher", "LICENSE"),
-        ),
-        entry(
-            "option-ext",
-            "MPL 2.0",
-            format!("Simon Ochsenreither · Rust library {}", crate_version("option-ext")),
-            "A helper inside the dirs crate, which finds your home and config folders.",
-            "https://github.com/soc/option-ext",
-            "Mozilla Public License 2.0",
-            crate_text("option-ext", "LICENSE.txt"),
-        ),
-        entry(
-            "portable-pty",
-            "MIT",
-            format!("Wez Furlong · Pseudoterminals {}", crate_version("portable-pty")),
-            "Opens the pseudoterminal each Shelbi session runs its program in.",
-            "https://github.com/wezterm/wezterm",
-            "MIT License",
-            crate_text("portable-pty", "LICENSE.md"),
+            TABLE.text("gpui-kit-assets", "LICENSE-LUCIDE"),
         ),
         entry(
             "Source Code Pro",
@@ -224,97 +141,13 @@ fn build() -> Vec<Entry> {
             "MIT License, with the glyph sets' own licenses",
             NERD_TEXT.as_str(),
         ),
-        entry(
-            "termwiz",
-            "MIT",
-            format!("Wez Furlong · Terminal toolkit {}", crate_version("termwiz")),
-            "Parses the escape sequences in session output.",
-            "https://github.com/wezterm/wezterm",
-            "MIT License",
-            crate_text("termwiz", "LICENSE.md"),
-        ),
-    ];
-    list.sort_by_key(|e| e.name.to_lowercase());
-    list.push(Entry {
-        name: "Rust crates",
-        license: "Various licenses",
-        attribution: format!("{} open source libraries", CRATES.len()),
-        description: "The other Rust crates compiled into the app, each with its version, license and notice.",
-        source: "https://github.com/jlong/shelbi/blob/main/desktop/Cargo.lock",
-        license_title: "Licenses and notices",
-        text: generated::CRATE_NOTICES,
-        crates: CRATES,
-    });
-    list
-}
-
-/// Acknowledgements' list: the search and the selected entry, as indices
-/// into [`entries`]. The selection stays on a row the search shows: one it
-/// hides moves to the first that matches, and with nothing matching there is
-/// none until the search shows rows again.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Browser {
-    query: String,
-    selected: usize,
-}
-
-impl Browser {
-    /// The first entry selected, nothing searched.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn query(&self) -> &str {
-        &self.query
-    }
-
-    /// The rows the search shows, in order.
-    pub fn visible(&self) -> Vec<usize> {
-        let q = self.query.trim().to_lowercase();
-        entries()
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.matches(&q))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// The selected entry, unless the search hides every row.
-    pub fn selected(&self) -> Option<usize> {
-        self.visible().contains(&self.selected).then_some(self.selected)
-    }
-
-    /// Search for `query`, keeping the selection if it still shows.
-    pub fn set_query(&mut self, query: &str) {
-        self.query = query.to_string();
-        let visible = self.visible();
-        if !visible.contains(&self.selected) {
-            if let Some(first) = visible.first() {
-                self.selected = *first;
-            }
-        }
-    }
-
-    /// Select entry `ix` (a clicked row).
-    pub fn select(&mut self, ix: usize) {
-        if ix < entries().len() {
-            self.selected = ix;
-        }
-    }
-
-    /// Move the selection `delta` rows through the visible ones (↑ / ↓),
-    /// stopping at either end.
-    pub fn step(&mut self, delta: isize) {
-        let visible = self.visible();
-        let Some(at) = visible.iter().position(|i| *i == self.selected) else {
-            if let Some(first) = visible.first() {
-                self.selected = *first;
-            }
-            return;
-        };
-        let to = (at as isize + delta).clamp(0, visible.len() as isize - 1) as usize;
-        self.selected = visible[to];
-    }
+    ]);
+    let tail = shared::long_tail(
+        &TABLE,
+        "The other Rust crates compiled into the app, each with its version, license and notice.",
+        "https://github.com/jlong/shelbi/blob/main/desktop/Cargo.lock",
+    );
+    shared::listed(list, tail)
 }
 
 /// Symbols Nerd Font Mono's text: the build's MIT license, then what the
@@ -324,107 +157,27 @@ static NERD_TEXT: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// A license text as the detail's text view reads it (Markdown, with every
-/// character literal): the `title` as a heading, then each paragraph of
-/// `text` (a run of lines between blank ones) reflowed to the pane's width,
-/// as the frame sets them: a file's hard wrap joins up, its indentation
-/// drops, but a list item, a rule (`-----`) or a copyright line starts a
-/// line of its own, and a list of crates (every line `name version ·
-/// license`) keeps its lines. A short line in capitals (`PREAMBLE`, `TERMS
-/// AND CONDITIONS`), alone or over body text, is a section heading.
+/// character literal): the `title` as a heading, then `text`'s blocks
+/// ([`shelbi_app::licenses::license_blocks`], the paragraphs reflowed as
+/// the frame sets them): a section heading as a `####`, a paragraph's lines
+/// a hard break apart.
 pub fn license_markdown(title: &str, text: &str) -> String {
     let mut out = format!("# {}", escape(title));
-    let text = text.replace("\r\n", "\n");
-    let mut paragraph: Vec<&str> = Vec::new();
-    let flush = |paragraph: &mut Vec<&str>, out: &mut String| {
-        if paragraph.is_empty() {
-            return;
-        }
-        let mut body: &[&str] = paragraph;
-        let heads_body = body.len() == 1 || body.get(1).is_some_and(|l| l.chars().any(char::is_lowercase));
-        if is_section_heading(body[0]) && heads_body {
-            out.push_str("\n\n#### ");
-            out.push_str(&escape(body[0]));
-            body = &body[1..];
-        }
-        if !body.is_empty() {
-            let lines: Vec<String> = reflow(body).iter().map(|l| escape(l)).collect();
-            out.push_str("\n\n");
-            // A backslash at a line's end is a hard break.
-            out.push_str(&lines.join("\\\n"));
-        }
-        paragraph.clear();
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            flush(&mut paragraph, &mut out);
-        } else {
-            paragraph.push(line);
-        }
-    }
-    flush(&mut paragraph, &mut out);
-    out
-}
-
-/// A paragraph's lines joined where the file only wrapped them.
-fn reflow(lines: &[&str]) -> Vec<String> {
-    if lines.iter().all(|l| l.contains(" · ")) {
-        return lines.iter().map(|l| l.to_string()).collect();
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut after_rule = false;
-    for line in lines {
-        let rule = is_rule(line);
-        let own_line = rule || after_rule || starts_item(line) || starts_copyright(line);
-        match out.last_mut() {
-            Some(last) if !own_line => {
-                last.push(' ');
-                last.push_str(line);
+    for block in shared::license_blocks(text) {
+        match block {
+            Block::Heading(heading) => {
+                out.push_str("\n\n#### ");
+                out.push_str(&escape(&heading));
             }
-            _ => out.push(line.to_string()),
+            Block::Paragraph(lines) => {
+                let lines: Vec<String> = lines.iter().map(|l| escape(l)).collect();
+                out.push_str("\n\n");
+                // A backslash at a line's end is a hard break.
+                out.push_str(&lines.join("\\\n"));
+            }
         }
-        after_rule = rule;
     }
     out
-}
-
-/// `-----`, `=====`: a line drawn with one character.
-fn is_rule(line: &str) -> bool {
-    line.len() >= 3 && line.chars().all(|c| matches!(c, '-' | '=' | '_' | '*'))
-}
-
-/// A list item: `- x`, `* x`, `• x`, `1. x`, `2) x`, `a) x`, `(b) x`,
-/// `(iv) x`.
-fn starts_item(line: &str) -> bool {
-    let mut chars = line.chars();
-    if let (Some(c), Some(' ')) = (chars.next(), chars.next()) {
-        if matches!(c, '-' | '*' | '•' | '+') {
-            return true;
-        }
-    }
-    let rest = line.strip_prefix('(').unwrap_or(line);
-    let marker: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
-    let after = &rest[marker.len()..];
-    let numbered = !marker.is_empty()
-        && (marker.chars().all(|c| c.is_ascii_digit()) && marker.len() <= 3
-            || marker.chars().count() == 1 && marker.chars().all(|c| c.is_ascii_alphabetic())
-            || marker.len() <= 4 && marker.chars().all(|c| matches!(c, 'i' | 'v' | 'x')));
-    numbered && (after.starts_with(". ") || after.starts_with(") "))
-}
-
-/// `Copyright (c) 2018 …`, `© 2023 Adobe`.
-fn starts_copyright(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    lower.starts_with("copyright") || lower.starts_with('©') || lower.starts_with("(c) ")
-}
-
-/// `PREAMBLE`, `PERMISSION & CONDITIONS`: a short line with letters and no
-/// lowercase ones.
-fn is_section_heading(line: &str) -> bool {
-    line.chars().count() <= 64
-        && line.chars().filter(|c| c.is_alphabetic()).count() >= 3
-        && !line.chars().any(char::is_lowercase)
-        && !is_rule(line)
 }
 
 /// `s` with every ASCII punctuation character escaped, so Markdown reads it
@@ -482,10 +235,11 @@ mod tests {
     /// every other shipped crate except Shelbi's own.
     #[test]
     fn the_list_is_what_ships() {
-        for name in ["alacritty_terminal", "gpui-pre", "gpui-kit", "gpui-kit-assets", "nucleo-matcher", "option-ext", "portable-pty", "termwiz"] {
-            assert!(SHIPPED.iter().any(|c| c.name == name), "{name} doesn't ship");
+        let mut featured = shared::SHARED_FEATURED.to_vec();
+        featured.extend(["gpui-pre", "gpui-kit"]);
+        for name in featured.iter().chain(&["gpui-kit-assets"]) {
+            assert!(SHIPPED.iter().any(|c| c.name == *name), "{name} doesn't ship");
         }
-        let featured = ["alacritty_terminal", "gpui-pre", "gpui-kit", "nucleo-matcher", "option-ext", "portable-pty", "termwiz"];
         for c in SHIPPED {
             let own = c.name.starts_with("shelbi");
             let listed = CRATES.contains(c);
@@ -550,36 +304,15 @@ mod tests {
         assert!(found("zzzz-nothing").is_empty());
     }
 
+    /// The search and the arrows are `shelbi_app::licenses::Browser`'s
+    /// (tested there); over the app's list it opens on the first entry.
     #[test]
-    fn the_browser_opens_on_the_first_entry_and_arrows_move_through_the_rows() {
-        let mut b = Browser::new();
-        assert_eq!(b.selected(), Some(0));
-        b.step(-1);
-        assert_eq!(b.selected(), Some(0), "stops at the top");
-        b.step(1);
-        b.step(1);
-        assert_eq!(b.selected(), Some(2));
-        b.step(100);
-        assert_eq!(b.selected(), Some(entries().len() - 1), "stops at the bottom");
-    }
-
-    #[test]
-    fn a_search_keeps_a_selection_it_shows_and_moves_one_it_hides() {
-        let ix = |name: &str| entries().iter().position(|e| e.name == name).unwrap();
-        let mut b = Browser::new();
-        b.select(ix("Geist Mono"));
-        b.set_query("geist");
-        assert_eq!(b.visible(), [ix("Geist"), ix("Geist Mono")]);
-        assert_eq!(b.selected(), Some(ix("Geist Mono")), "still shown, still selected");
-        b.set_query("MPL");
-        assert_eq!(b.selected(), Some(ix("nucleo-matcher")), "hidden: the first match");
-        b.step(1);
-        assert_eq!(b.selected(), Some(ix("option-ext")), "the arrows move through the matches");
-        b.set_query("zzzz-nothing");
-        assert_eq!(b.selected(), None);
-        assert!(b.visible().is_empty());
-        b.set_query("");
-        assert_eq!(b.selected(), Some(ix("option-ext")), "cleared: the selection comes back");
+    fn the_browser_opens_on_the_first_entry() {
+        let mut b = browser();
+        assert_eq!(b.selected_entry().map(|e| e.name), Some("Alacritty Terminal"));
+        b.set_query("ofl");
+        let names: Vec<&str> = b.visible().into_iter().map(|i| entries()[i].name).collect();
+        assert_eq!(names, ["Geist", "Geist Mono", "Source Code Pro"]);
     }
 
     #[test]
