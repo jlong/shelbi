@@ -557,6 +557,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_create_job() {
             state.dirty = true;
         }
+        if state.poll_feedback_job() {
+            state.dirty = true;
+        }
         if state.poll_startup() {
             state.dirty = true;
         }
@@ -1279,6 +1282,11 @@ struct ShellState {
     /// thread, so the result is typed ([`CreateOutcome`]) rather than a bare
     /// status string.
     create_job: Option<Receiver<CreateOutcome>>,
+    /// How Contact Us sends: the live endpoint, or a test's fake (never the
+    /// network in a test).
+    feedback_service: shelbi_app::feedback::FeedbackService,
+    /// The Contact Us send that's out, off the UI thread.
+    feedback_job: Option<Receiver<Result<(), shelbi_app::feedback::FeedbackError>>>,
     should_quit: bool,
     dirty: bool,
 }
@@ -1393,6 +1401,11 @@ impl ShellState {
         let readiness_service = shelbi_orchestrator::machine_readiness::service();
         #[cfg(test)]
         let readiness_service = settings::unavailable_readiness_service();
+        #[cfg(not(test))]
+        let feedback_service =
+            shelbi_app::feedback::FeedbackService::live(shelbi_app::feedback::Client::Tui, env!("CARGO_PKG_VERSION"));
+        #[cfg(test)]
+        let feedback_service = shelbi_app::feedback::FeedbackService::offline(shelbi_app::feedback::Client::Tui);
         Self {
             client,
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
@@ -1471,6 +1484,8 @@ impl ShellState {
             #[cfg(test)]
             opened_urls: Vec::new(),
             create_job: None,
+            feedback_service,
+            feedback_job: None,
             should_quit: false,
             dirty: true,
         }
@@ -2116,8 +2131,11 @@ impl ShellState {
                     self.dirty = true;
                 }
                 Event::Resize(_, _) => self.dirty = true,
-                // Bracketed paste, focus changes, and key releases are ignored
-                // while an overlay is up.
+                // A paste goes into the overlay's text field (Contact Us),
+                // never the session under it.
+                Event::Paste(text) if self.overlay.as_mut().unwrap().paste(&text) => self.dirty = true,
+                // Focus changes and key releases are ignored while an overlay
+                // is up.
                 _ => {}
             }
             return;
@@ -2951,6 +2969,7 @@ impl ShellState {
                 self.submit_add_project(name, root, mode)
             }
             OverlayEvent::OpenUrl(url) => self.open_url(url),
+            OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
         }
     }
 
@@ -2969,6 +2988,52 @@ impl ShellState {
                 Err(e) => format!("open browser failed: {e}"),
             }
         });
+    }
+
+    /// Post Contact Us's `submission` off the UI thread (it remembers the
+    /// name and email, then waits on the endpoint); [`Self::poll_feedback_job`]
+    /// hands the answer back to the dialog. The dialog stays up and sending
+    /// meanwhile: it can't send again or close.
+    fn send_feedback(&mut self, submission: shelbi_app::feedback::Submission) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let service = self.feedback_service.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-feedback".into())
+            .spawn(move || {
+                let _ = tx.send(service.send(&submission));
+            });
+        match spawned {
+            Ok(_) => self.feedback_job = Some(rx),
+            Err(e) => self.feedback_landed(Err(shelbi_app::feedback::FeedbackError::Network(e.to_string()))),
+        }
+    }
+
+    /// The Contact Us send came back: hand it to the dialog. Returns `true`
+    /// when it did (so the caller redraws).
+    fn poll_feedback_job(&mut self) -> bool {
+        let result = match &self.feedback_job {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    Err(shelbi_app::feedback::FeedbackError::Network("the send stopped unexpectedly".to_string()))
+                }
+            },
+            None => return false,
+        };
+        self.feedback_job = None;
+        self.feedback_landed(result);
+        true
+    }
+
+    fn feedback_landed(&mut self, result: Result<(), shelbi_app::feedback::FeedbackError>) {
+        if let Err(e) = &result {
+            tracing::warn!("feedback wasn't sent: {e}");
+        }
+        if let Some(ActiveOverlay::Feedback(dialog)) = self.overlay.as_mut() {
+            dialog.finished(result);
+        }
+        self.dirty = true;
     }
 
     /// Validate the submitted add-project form. On success, close the form and
@@ -3169,12 +3234,10 @@ impl ShellState {
             }
             Effect::OpenEditor { target } => self.open_editor(&target),
             Effect::OpenSettings => self.open_settings(),
-            // Contact Us is the desktop's dialog so far (`tui-feedback-dialog`
-            // brings it here): say where it is, as New Window does.
+            // Contact Us, over everything, from the name and email given last.
             Effect::SendFeedback => {
-                self.status = Some(
-                    "Contact Us is in the desktop app; or open github.com/jlong/shelbi/issues".to_string(),
-                )
+                let remembered = self.feedback_service.remembered();
+                self.overlay = Some(ActiveOverlay::feedback(remembered, self.caps.emoji));
             }
             // Over whatever is showing, Settings included.
             Effect::OpenAbout => self.overlay = Some(ActiveOverlay::about(self.caps.truecolor)),
@@ -5442,6 +5505,8 @@ mod tests {
     pub(super) use keybindings::MemKeys;
     // Stray stderr and the full repaint (`tests/stray_output.rs`).
     mod stray_output;
+    // Contact Us opened, typed into and sent (`tests/feedback.rs`).
+    mod feedback;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {
@@ -8484,10 +8549,10 @@ mod tests {
         );
         assert!(!st.settings_open(), "neither opens Settings");
 
-        // Until Contact Us comes to the TUI, Send Feedback says where it is.
+        // Send Feedback opens Contact Us.
         st.effect_tap = None;
         st.dispatch_effect(Effect::SendFeedback);
-        assert!(st.status.as_deref().is_some_and(|s| s.contains("Contact Us")), "{:?}", st.status);
+        assert!(matches!(st.overlay, Some(ActiveOverlay::Feedback(_))));
     }
 
     /// The footer's hover follows the pointer, repaints only when it changes,

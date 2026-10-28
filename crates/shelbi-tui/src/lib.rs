@@ -15,6 +15,7 @@ mod kanban;
 mod keymap;
 mod machines;
 mod markdown;
+mod modal_form;
 pub mod overlay;
 mod panel;
 mod review_panel;

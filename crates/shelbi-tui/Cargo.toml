@@ -53,3 +53,5 @@ shelbi-orchestrator = { workspace = true, features = ["test-support"] }
 # regular dependency above).
 shelbi-session = { workspace = true }
 tempfile = "3"
+# Contact Us's request bodies, read back from the fake endpoint.
+serde_json = { workspace = true }

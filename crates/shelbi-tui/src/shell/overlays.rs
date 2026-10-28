@@ -65,6 +65,9 @@ pub enum OverlayEvent {
     AddProjectCancel,
     /// About Shelbi asked to open this page in the browser; it stays open.
     OpenUrl(String),
+    /// Contact Us sent this: the shell posts it off the UI thread and hands
+    /// the answer back to the dialog.
+    FeedbackSend(shelbi_app::feedback::Submission),
 }
 
 /// The overlay currently drawn over the main area, with its runtime state.
@@ -91,6 +94,8 @@ pub enum ActiveOverlay {
     },
     /// About Shelbi (the palette's "About Shelbi", Settings ▸ General).
     About(overlay::about::About),
+    /// Contact Us (boxed: its draft is the largest of the overlays').
+    Feedback(Box<overlay::feedback::FeedbackDialog>),
     /// The full task-description popover, opened from the review panel's `More`
     /// link. Reuses the board's task-detail renderer
     /// ([`crate::kanban::render_task_popover_into`]) so the board and the review
@@ -188,6 +193,21 @@ impl ActiveOverlay {
         ActiveOverlay::About(overlay::about::About::new(truecolor))
     }
 
+    /// Open Contact Us from the name and email `remembered`; `emoji`: the
+    /// terminal draws the megaphone.
+    pub fn feedback(remembered: shelbi_app::feedback::Remembered, emoji: bool) -> Self {
+        ActiveOverlay::Feedback(Box::new(overlay::feedback::FeedbackDialog::new(remembered, emoji)))
+    }
+
+    /// Bracketed paste into the overlay's text field, if one is being typed
+    /// in. Only Contact Us takes one so far.
+    pub fn paste(&mut self, text: &str) -> bool {
+        match self {
+            ActiveOverlay::Feedback(dialog) => dialog.paste(text),
+            _ => false,
+        }
+    }
+
     /// Open the task-description popover for `task` (the review panel's `More`).
     /// `keymaps` / `style` render the footer's chord hints the same way the
     /// board popover does.
@@ -273,6 +293,7 @@ impl ActiveOverlay {
                 },
             },
             ActiveOverlay::About(about) => about_event(about.handle_key(ev)),
+            ActiveOverlay::Feedback(dialog) => feedback_event(dialog.handle_key(ev)),
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 // The popover is read-only here: Esc/q close it, j/k and the page
                 // chords scroll the body. The board's move / open-workspace
@@ -362,6 +383,13 @@ impl ActiveOverlay {
             }
             // Takes the full window: the panel centers itself in it.
             ActiveOverlay::About(about) => about_event(about.handle_mouse(m, area)),
+            ActiveOverlay::Feedback(dialog) => {
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    feedback_event(dialog.handle_click(m.column, m.row))
+                } else {
+                    OverlayEvent::Stay
+                }
+            }
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 match m.kind {
                     MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(1),
@@ -399,6 +427,8 @@ impl ActiveOverlay {
             ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 48, 14),
             // Sized to its content, and to the window when that's smaller.
             ActiveOverlay::About(about) => about.rect(area),
+            // Centered and as tall as its content (the desktop's dialog).
+            ActiveOverlay::Feedback(dialog) => dialog.rect(area),
             // The same 80%×80% centered box the board's task popover uses, so
             // the review and the board show the task at the identical size.
             ActiveOverlay::TaskDescription { .. } => crate::kanban::popover_rect(area),
@@ -431,6 +461,7 @@ impl ActiveOverlay {
             }
             ActiveOverlay::AddProject { form } => form.render(f, rect),
             ActiveOverlay::About(about) => about.render(f.buffer_mut(), area),
+            ActiveOverlay::Feedback(dialog) => dialog.render(f, rect),
             ActiveOverlay::TaskDescription {
                 task,
                 scroll,
@@ -474,6 +505,14 @@ fn about_event(step: overlay::about::Step) -> OverlayEvent {
         overlay::about::Step::Stay => OverlayEvent::Stay,
         overlay::about::Step::Close => OverlayEvent::Close,
         overlay::about::Step::Open(url) => OverlayEvent::OpenUrl(url.to_string()),
+    }
+}
+
+fn feedback_event(step: overlay::feedback::Step) -> OverlayEvent {
+    match step {
+        overlay::feedback::Step::Stay => OverlayEvent::Stay,
+        overlay::feedback::Step::Send(submission) => OverlayEvent::FeedbackSend(submission),
+        overlay::feedback::Step::Close => OverlayEvent::Close,
     }
 }
 
@@ -554,6 +593,7 @@ mod tests {
             },
             ActiveOverlay::add_project(Path::new("/tmp/alpha")),
             ActiveOverlay::about(true),
+            ActiveOverlay::feedback(shelbi_app::feedback::Remembered::default(), true),
             ActiveOverlay::task_description(
                 sample_task(),
                 keymaps(),

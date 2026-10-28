@@ -25,6 +25,8 @@
 //! - [`settings`] — Settings' pages and sections, the settings sidebar's
 //!   navigation over the pages a client offers, and the hooks a page uses
 //!   for background loads and saves and the unsaved-edits leave prompt.
+//! - [`feedback`] — Contact Us: the form's state, what a report sends
+//!   and how, shared by the desktop's dialog and the TUI's.
 //! - [`text_area`] — a multi-line text buffer with a caret, for the editors
 //!   both clients' toolkit-free states type into.
 //! - [`theme`] — the named color tokens (dark and light) both clients
@@ -61,6 +63,7 @@ pub mod command;
 pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
+pub mod feedback;
 pub mod layout_sub;
 pub mod nav;
 pub mod overlay;

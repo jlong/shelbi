@@ -12,7 +12,8 @@
 //! the Base size. A send that worked swaps the form for the thank-you:
 //! the heart, "Thank you!", the line under it, and Close.
 //!
-//! [`FeedbackForm`] holds the draft and decides everything; this view
+//! [`FeedbackForm`] (shared with the TUI's dialog) holds the draft and
+//! decides everything, the words included; this view
 //! paints it, keeps the text fields in step with it and runs the send
 //! through [`FeedbackService`] on the background executor. While it runs,
 //! Send Message is the disabled "Sending…" with a spinner, and nothing can
@@ -34,12 +35,12 @@ use gpui_kit::base::input::Textarea;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
-use super::feedback_state::{Action, FeedbackForm, Focus, Key};
 use super::workflow_editor::text_field;
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::{controls, spinner};
 use crate::keys::chord_from_keystroke;
-use crate::platform::feedback::{FeedbackService, Kind, Submission};
+use crate::platform::feedback::{self, form, FeedbackGlobal, FeedbackService, Kind, Submission};
+use form::{Action, FeedbackForm, Focus, Key};
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
@@ -55,10 +56,6 @@ const BADGE: f32 = 40.0;
 /// The Message field's height in lines: it grows from the first to the
 /// second, then scrolls.
 const MESSAGE_LINES: (usize, usize) = (5, 9);
-/// What "Include system info" says it adds.
-pub const SYSTEM_INFO_LABEL: &str = "Include system info (macOS version, app version)";
-/// The thank-you's line.
-pub const THANKS: &str = "Your input helps us build a better app.\nWe\u{2019}ll follow up if we have questions.";
 
 /// What the dialog tells the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,10 +89,10 @@ impl FeedbackDialog {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // A test that set no service gets the offline one, never the live.
         #[cfg(not(test))]
-        let fallback = FeedbackService::live;
+        let fallback = feedback::live;
         #[cfg(test)]
-        let fallback = FeedbackService::offline;
-        let service = cx.try_global::<FeedbackService>().cloned().unwrap_or_else(fallback);
+        let fallback = feedback::offline;
+        let service = cx.try_global::<FeedbackGlobal>().map(|g| g.0.clone()).unwrap_or_else(fallback);
         let form = FeedbackForm::new(service.remembered());
         let focus = cx.focus_handle();
         let name = form.name().to_string();
@@ -364,10 +361,10 @@ impl FeedbackDialog {
             .items_center()
             .gap(px(12.0))
             .child(badge(icons::MEGAPHONE, theme.primary_fill, theme.primary_label))
-            .child(title("Contact Us", theme));
-        let name = text_field(&self.name_input, "feedback-name", Some("Name".into()), false, window, cx);
-        let email_invalid = form.error() == Some(super::feedback_state::NO_EMAIL);
-        let email = text_field(&self.email_input, "feedback-email", Some("Email".into()), email_invalid, window, cx);
+            .child(title(form::TITLE, theme));
+        let name = text_field(&self.name_input, "feedback-name", Some(form::NAME.into()), false, window, cx);
+        let email_invalid = form.error() == Some(form::NO_EMAIL);
+        let email = text_field(&self.email_input, "feedback-email", Some(form::EMAIL.into()), email_invalid, window, cx);
         let kind = self.render_kinds(theme, window, cx);
         let message_focused = self.message_input.read(cx).focus_handle(cx).is_focused(window);
         let message = controls::textarea_box(
@@ -382,7 +379,7 @@ impl FeedbackDialog {
                             .left_0()
                             .type_style(Type::Base)
                             .text_color(theme.form_hint)
-                            .child("Message"),
+                            .child(form::MESSAGE),
                     )
                 }),
             message_focused,
@@ -393,13 +390,13 @@ impl FeedbackDialog {
         let on = form.include_system_info();
         let system_info = controls::checkbox(
             "feedback-system-info",
-            SYSTEM_INFO_LABEL,
+            form::system_info_label(),
             on,
             self.ring(Focus::SystemInfo, window),
             theme,
         )
         .role(Role::CheckBox)
-        .aria_label(SYSTEM_INFO_LABEL)
+        .aria_label(form::system_info_label())
         .aria_toggled(if on { Toggled::True } else { Toggled::False })
         .when(!busy, |d| {
             d.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -417,7 +414,7 @@ impl FeedbackDialog {
         let send = if busy {
             style::pending_button(
                 "feedback-send",
-                "Sending\u{2026}",
+                form::SENDING,
                 spinner::spinner_sized("feedback-sending", theme.primary_label, 16.0),
                 ButtonKind::Primary,
                 ButtonSize::Base,
@@ -425,16 +422,16 @@ impl FeedbackDialog {
             )
             .w_full()
             .role(Role::Button)
-            .aria_label("Sending\u{2026}")
+            .aria_label(form::SENDING)
         } else {
-            button("feedback-send", "Send Message", ButtonKind::Primary, true, self.ring(Focus::Send, window), theme)
+            button("feedback-send", form::SEND, ButtonKind::Primary, true, self.ring(Focus::Send, window), theme)
                 .aria_keyshortcuts("Return")
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.press(Focus::Send, window, cx)))
         };
-        let cancel = button("feedback-cancel", "Cancel", ButtonKind::Secondary, !busy, self.ring(Focus::Cancel, window), theme)
+        let cancel = button("feedback-cancel", form::CANCEL, ButtonKind::Secondary, !busy, self.ring(Focus::Cancel, window), theme)
             .aria_keyshortcuts("Escape")
             .when(!busy, |b| b.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.press(Focus::Cancel, window, cx))));
-        panel("feedback-dialog", "Contact Us", theme)
+        panel("feedback-dialog", form::TITLE, theme)
             .child(header)
             .child(
                 div()
@@ -488,10 +485,10 @@ impl FeedbackDialog {
     }
 
     fn render_thanks(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
-        let close = button("feedback-close", "Close", ButtonKind::Secondary, true, self.ring(Focus::Close, window), theme)
+        let close = button("feedback-close", form::CLOSE, ButtonKind::Secondary, true, self.ring(Focus::Close, window), theme)
             .aria_keyshortcuts("Return")
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.press(Focus::Close, window, cx)));
-        panel("feedback-thanks", "Thank you!", theme)
+        panel("feedback-thanks", form::THANKS_TITLE, theme)
             .child(
                 div()
                     .flex()
@@ -499,14 +496,14 @@ impl FeedbackDialog {
                     .items_center()
                     .gap(px(12.0))
                     .child(badge(icons::HEART, theme.magenta_tint, theme.magenta))
-                    .child(title("Thank you!", theme))
+                    .child(title(form::THANKS_TITLE, theme))
                     .child(
                         div()
                             .debug_selector(|| "feedback-thanks-line".into())
                             .type_style(Type::Small)
                             .text_color(theme.form_hint)
                             .text_center()
-                            .child(THANKS),
+                            .child(form::THANKS),
                     ),
             )
             .child(close)

@@ -65,6 +65,11 @@ pub(crate) struct Textbox<'a> {
     clip_left: bool,
     /// Drawn at the box's right edge (a picker's `▾`, a `read-only` note).
     trail: Option<&'a str>,
+    /// The fill at rest in place of [`Theme::input`] (a field on a dialog's
+    /// panel).
+    ///
+    /// [`Theme::input`]: shelbi_app::theme::Theme::input
+    rest: Option<Color>,
 }
 
 impl<'a> Textbox<'a> {
@@ -119,6 +124,11 @@ impl<'a> Textbox<'a> {
         self
     }
 
+    pub(crate) fn rest(mut self, fill: Color) -> Self {
+        self.rest = Some(fill);
+        self
+    }
+
     /// Whether it's typed in (it has a caret).
     pub(crate) fn typing(&self) -> bool {
         self.caret.is_some()
@@ -126,7 +136,11 @@ impl<'a> Textbox<'a> {
 
     /// The box's fill for its state.
     pub(crate) fn fill(&self) -> Color {
-        fill(self.focused || self.caret.is_some(), self.disabled, self.invalid)
+        let focused = self.focused || self.caret.is_some();
+        match self.rest {
+            Some(rest) if !focused && !self.disabled && !self.invalid => rest,
+            _ => fill(focused, self.disabled, self.invalid),
+        }
     }
 
     /// The box's three rows, `width` columns each.
@@ -289,7 +303,11 @@ pub(crate) fn caret_spans(spans: &mut Vec<Span<'static>>, chars: &[char], caret:
 /// `width - 2` columns) on the fill, with the caps above and below the
 /// whole area. A span without a background of its own takes the fill.
 pub(crate) fn area(rows: Vec<Vec<Span<'static>>>, focused: bool, disabled: bool, invalid: bool, width: usize) -> Vec<Line<'static>> {
-    let fill = fill(focused, disabled, invalid);
+    area_in(rows, fill(focused, disabled, invalid), width)
+}
+
+/// [`area`] in `fill`, whatever its state.
+pub(crate) fn area_in(rows: Vec<Vec<Span<'static>>>, fill: Color, width: usize) -> Vec<Line<'static>> {
     let on_fill = Style::default().bg(fill);
     let (above, below) = caps(width, fill);
     let mut lines = vec![above];

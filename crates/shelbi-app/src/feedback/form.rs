@@ -1,12 +1,39 @@
-//! The Contact Us form's state, toolkit-free (`dt-feedback-dialog`): the
-//! draft, where the keyboard is, what Return / Esc / Tab do, the validation,
-//! and the one send in flight. `views::feedback` paints it and runs the send.
+//! The Contact Us form's state, toolkit-free (`dt-feedback-dialog`, moved
+//! here for `tui-feedback-dialog`): the draft, where the keyboard is, what
+//! Return / Esc / Tab do, the validation, and the one send in flight. Each
+//! client paints it and runs the send (the desktop's `views::feedback`, the
+//! TUI's `overlay::feedback`), and both show the words below.
 //!
 //! The controls, in visual (and Tab) order: Name, Email, the kind's
 //! segmented control, Message, "Include system info", Send Message, Cancel.
 //! Once sent, the thank-you view has one control, Close.
 
-use crate::platform::feedback::{FeedbackError, Kind, Remembered, Submission};
+use super::{FeedbackError, Kind, Remembered, Submission};
+
+/// The dialog's title.
+pub const TITLE: &str = "Contact Us";
+/// The fields' placeholders (they have no label over them).
+pub const NAME: &str = "Name";
+pub const EMAIL: &str = "Email";
+pub const MESSAGE: &str = "Message";
+/// The default action, and what it says while a send is out.
+pub const SEND: &str = "Send Message";
+pub const SENDING: &str = "Sending\u{2026}";
+pub const CANCEL: &str = "Cancel";
+/// The thank-you's title, its line and its button.
+pub const THANKS_TITLE: &str = "Thank you!";
+pub const THANKS: &str = "Your input helps us build a better app.\nWe\u{2019}ll follow up if we have questions.";
+pub const CLOSE: &str = "Close";
+
+/// What "Include system info" says it adds: the OS this build sends
+/// ([`super::Os`]).
+pub fn system_info_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Include system info (macOS version, app version)"
+    } else {
+        "Include system info (OS version, app version)"
+    }
+}
 
 /// The message under the form when Email is empty.
 pub const NO_EMAIL: &str = "Please enter your email";

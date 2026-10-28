@@ -1363,7 +1363,7 @@ impl Run {
     /// (`state-feedback-thanks`). Its sends go to a fake endpoint.
     /// `SHELBI_VISUAL_ONLY=feedback` renders just these.
     fn feedback_states(&mut self) {
-        use crate::platform::feedback::{FeedbackService, HttpResponse, SystemInfo};
+        use crate::platform::feedback::{Client, FeedbackGlobal, FeedbackService, HttpResponse, Os, SystemInfo};
         let orch = View::Session("orch".into());
         for (screen, status, sends) in [
             ("state-feedback", 200, false),
@@ -1372,7 +1372,8 @@ impl Run {
             ("state-feedback-thanks", 200, true),
         ] {
             self.cx.update(|cx| {
-                cx.set_global(FeedbackService {
+                cx.set_global(FeedbackGlobal(FeedbackService {
+                    client: Client::Desktop,
                     transport: std::sync::Arc::new(move |_: &str| {
                         Ok(HttpResponse {
                             status,
@@ -1381,11 +1382,11 @@ impl Run {
                     }),
                     system: std::sync::Arc::new(|| SystemInfo {
                         app_version: "0.0.0".into(),
-                        macos_version: "15.0.0".into(),
+                        os: Os::MacOs("15.0.0".into()),
                     }),
                     now: std::sync::Arc::new(|| "2026-10-27T12:00:00Z".into()),
                     remembered: None,
-                })
+                }))
             });
             let handle = self.open();
             self.click(handle, orch.clone());
@@ -1417,7 +1418,7 @@ impl Run {
             self.settle(handle);
             self.save(handle, screen);
         }
-        self.cx.update(|cx| cx.remove_global::<FeedbackService>());
+        self.cx.update(|cx| cx.remove_global::<FeedbackGlobal>());
     }
 
     /// Settings ▸ Workspaces' machine dialogs over the page: Add machine

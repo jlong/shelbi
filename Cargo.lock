@@ -1724,6 +1724,7 @@ version = "0.11.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
  "shelbi-client",
  "shelbi-core",
  "shelbi-palette",
@@ -1871,6 +1872,7 @@ dependencies = [
  "crossterm 0.28.1",
  "libc",
  "ratatui",
+ "serde_json",
  "shelbi-agent",
  "shelbi-app",
  "shelbi-client",

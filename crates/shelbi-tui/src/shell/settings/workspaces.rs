@@ -63,8 +63,8 @@ use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::pool::{MachineChange, PoolError};
 
 use super::machine_form;
-use super::modal_form::FormLines;
 use super::HoverKey;
+use crate::modal_form::FormLines;
 use crate::panel;
 use crate::table::{Cell, Column, Table, TableLine};
 use crate::textbox::Textbox;
