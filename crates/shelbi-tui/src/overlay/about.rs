@@ -30,6 +30,7 @@ use shelbi_app::about::{self, AboutLink};
 use unicode_width::UnicodeWidthStr;
 
 use super::about_icon;
+use crate::button::Button;
 use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
 use crate::theme::{palette, pixel, tokens};
 
@@ -247,29 +248,23 @@ impl About {
         pixel(r, g, b, self.truecolor)
     }
 
-    /// The Close button, drawn as the sidebar's back button is: a row of
-    /// label on its fill, the fill's half rows above and below. Focused, it
-    /// takes the accent fill (the desktop's focused primary button).
+    /// The Close button as Settings' buttons draw (a Secondary button, its
+    /// focus and its lift under the pointer), one of its three rows at a
+    /// time, its caps over the panel's fill.
     fn render_button_row(&self, buf: &mut Buffer, x: u16, y: u16, part: ButtonPart) {
-        let focused = self.focus == Target::Close;
-        let fill = if focused { palette().cyan } else { palette().selection };
-        let panel_fill = palette().search;
-        match part {
-            ButtonPart::Top | ButtonPart::Bottom => {
-                let glyph = if part == ButtonPart::Top { BLEED_ABOVE } else { BLEED_BELOW };
-                let style = Style::default().fg(fill).bg(panel_fill);
-                buf.set_string(x, y, glyph.repeat(BUTTON_W as usize), style);
-            }
-            ButtonPart::Label => {
-                let mut style = Style::default().bg(fill);
-                style = if focused {
-                    style.fg(palette().on_color).add_modifier(Modifier::BOLD)
-                } else if self.hover == Some(Target::Close) {
-                    style.fg(palette().white)
-                } else {
-                    style.fg(palette().gray)
-                };
-                buf.set_string(x, y, format!("  {CLOSE}  "), style);
+        let close = Button::secondary(CLOSE).focused(self.focus == Target::Close).hovered(self.hover == Some(Target::Close));
+        let [above, label, below] = close.spans();
+        let span = match part {
+            ButtonPart::Top => above,
+            ButtonPart::Label => label,
+            ButtonPart::Bottom => below,
+        };
+        buf.set_span(x, y, &span, BUTTON_W);
+        if part != ButtonPart::Label {
+            for dx in 0..BUTTON_W {
+                if let Some(cell) = buf.cell_mut((x + dx, y)) {
+                    cell.set_bg(palette().search);
+                }
             }
         }
     }
@@ -657,20 +652,20 @@ mod tests {
         let (x, y) = cell_of(&buf, CLOSE);
         let left = x - 2;
         assert_eq!(left + BUTTON_W, panel.right() - PAD_X, "flush with the content's right edge");
-        // Focused at open: the accent fill, its half rows above and below.
+        // Focused at open: a button's focus fill, its half rows above and below.
         for dx in 0..BUTTON_W {
-            assert_eq!(buf[(left + dx, y)].bg, palette().cyan);
+            assert_eq!(buf[(left + dx, y)].bg, palette().button_focus);
             assert_eq!(buf[(left + dx, y - 1)].symbol(), BLEED_ABOVE);
-            assert_eq!(buf[(left + dx, y - 1)].fg, palette().cyan);
+            assert_eq!(buf[(left + dx, y - 1)].fg, palette().button_focus);
             assert_eq!(buf[(left + dx, y + 1)].symbol(), BLEED_BELOW);
-            assert_eq!(buf[(left + dx, y + 1)].fg, palette().cyan);
+            assert_eq!(buf[(left + dx, y + 1)].fg, palette().button_focus);
         }
-        // Unfocused, the selection fill.
+        // Unfocused, Settings' Secondary button.
         let mut about = About::new(true);
         about.handle_key(key(KeyCode::Tab));
         let buf = draw(&about, 100, 30);
-        assert_eq!(buf[(x, y)].bg, palette().selection);
-        assert_eq!(buf[(x, y - 1)].fg, palette().selection);
+        assert_eq!(buf[(x, y)].bg, palette().button);
+        assert_eq!(buf[(x, y - 1)].fg, palette().button);
     }
 
     #[test]

@@ -45,7 +45,8 @@ use shelbi_app::Effect;
 use shelbi_state::agents_config::{AgentSummary, AgentsConfig, Provenance};
 use shelbi_state::keymap::{Key, Keymaps, SidebarAction};
 
-use super::{heading, selected_style, wrapped, Hit, Row, OFFERED};
+use super::{section_heading, wrapped, Hit, Row, OFFERED};
+use crate::button::{Align, Button};
 use crate::panel;
 use crate::table::{Cell, Column, Table};
 use crate::textbox::{self, Textbox};
@@ -878,11 +879,19 @@ impl AgentsPage {
     /// drawn when `focused`.
     pub(crate) fn rows(&mut self, width: usize, height: usize, focused: bool) -> Vec<Row> {
         self.settle_focus();
-        let mut rows = vec![Row::text(Line::from(Span::styled(
-            "Agents",
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-        )))];
-        wrapped(&mut rows, AGENTS_HELPER, width, Style::default().fg(palette().muted));
+        let items = self.items();
+        let index = |item: &Item| items.iter().position(|i| i == item);
+        // The focused row draws as selected unless something under it (a
+        // menu, a confirm, the new row) holds the keys.
+        let quiet = focused && self.menu.is_none() && self.state.confirm.is_none() && self.state.draft.is_none();
+        // The Agents section's heading is the page's, as the desktop's, its
+        // New agent button there once the agents read.
+        let new = Button::secondary("New agent").focused(quiet && self.focus == Item::New);
+        let buttons: &[Button] = if index(&Item::New).is_some() { &[new] } else { &[] };
+        let mut rows: Vec<Row> = section_heading("Agents", Some(AGENTS_HELPER), buttons, width)
+            .into_iter()
+            .map(|h| Row::buttons(h, &[index(&Item::New).map(|i| Hit::Agents(AgentsHit::Item(i)))], quiet && self.focus == Item::New))
+            .collect();
         if let Some(e) = self.state.error_at(&Target::Page) {
             wrapped(&mut rows, e, width, Style::default().fg(palette().red));
         }
@@ -896,26 +905,24 @@ impl AgentsPage {
             ))));
         }
         rows.push(Row::blank());
-        let items = self.items();
-        let index = |item: &Item| items.iter().position(|i| i == item);
-        // The focused row draws as selected unless something under it (a
-        // menu, a confirm, the new row) holds the keys.
-        let quiet = focused && self.menu.is_none() && self.state.confirm.is_none() && self.state.draft.is_none();
         if self.project.is_none() {
             wrapped(&mut rows, "No project is open.", width, Style::default().fg(palette().foreground));
             wrapped(&mut rows, "Switch to a project, or add one, to see its agents.", width, Style::default().fg(palette().muted));
             rows.push(Row::blank());
-            for (item, label) in [(Item::SwitchProject, "Switch project…"), (Item::AddProject, "Add project…")] {
-                let i = index(&item);
-                rows.push(self.button_row(label, None, i, quiet && self.focus == item, width));
-            }
+            let buttons = [
+                (Button::secondary("Switch project…").focused(quiet && self.focus == Item::SwitchProject), Item::SwitchProject),
+                (Button::secondary("Add project…").focused(quiet && self.focus == Item::AddProject), Item::AddProject),
+            ];
+            self.button_rows(&mut rows, &buttons, width);
             return rows;
         }
         let Some(config) = self.state.config() else {
             match self.load.state() {
                 JobState::Failed(_) => {
                     wrapped(&mut rows, "Press r, or choose Try again.", width, Style::default().fg(palette().muted));
-                    rows.push(self.button_row("Try again", None, index(&Item::Retry), quiet && self.focus == Item::Retry, width));
+                    rows.push(Row::blank());
+                    let retry = Button::secondary("Try again").focused(quiet && self.focus == Item::Retry);
+                    self.button_rows(&mut rows, &[(retry, Item::Retry)], width);
                 }
                 _ => rows.push(Row::text(Line::from(Span::styled(
                     "Loading…",
@@ -927,8 +934,6 @@ impl AgentsPage {
         let summaries = config.summaries();
         let unreadable: Vec<(String, String)> =
             config.unreadable().iter().map(|u| (u.name.clone(), u.error.clone())).collect();
-        rows.push(self.button_row("+ New agent", Some("n"), index(&Item::New), quiet && self.focus == Item::New, width));
-        rows.push(Row::blank());
         // The table's rows: the agents, then the ones that don't read.
         let names: Vec<String> =
             summaries.iter().map(|a| a.name.clone()).chain(unreadable.iter().map(|(n, _)| n.clone())).collect();
@@ -970,28 +975,48 @@ impl AgentsPage {
         }
         rows.push(Row::blank());
         if OFFERED.contains(SettingsPage::Workflows) {
-            wrapped(&mut rows, "Assign agents to workflow statuses on the Workflows page. Runner and model preferences can be changed for each role.", width, Style::default().fg(palette().muted));
-            rows.push(self.button_row("Workflows", Some(&format!("page {}", SettingsPage::Workflows.shortcut())), index(&Item::Link), quiet && self.focus == Item::Link, width));
+            // The desktop's footnote, its Workflows link a button under it.
+            wrapped(&mut rows, "Assign agents to workflow statuses in Workflows. Runner and model preferences can be changed for each role.", width, Style::default().fg(palette().muted));
+            rows.push(Row::blank());
+            let link = Button::secondary("Workflows").focused(quiet && self.focus == Item::Link);
+            self.button_rows(&mut rows, &[(link, Item::Link)], width);
         } else {
             wrapped(&mut rows, "Agents are assigned to workflow statuses in each workflow's YAML. Runner and model preferences can be changed for each role.", width, Style::default().fg(palette().muted));
         }
+        rows.extend(super::section_rule(width).map(Row::text));
+        // Shared instructions: Edit instructions in its heading; while
+        // they're typed, Cancel and Save under the text.
+        let editing = self.editor.as_ref().map(|e| e.focus);
+        let active = focused && self.focus == Item::Editor;
+        let (buttons, hits, focus) = match editing {
+            None => (
+                vec![Button::secondary("Edit instructions").focused(quiet && self.focus == Item::EditShared)],
+                vec![index(&Item::EditShared).map(|i| Hit::Agents(AgentsHit::Item(i)))],
+                quiet && self.focus == Item::EditShared,
+            ),
+            // While they're typed: Cancel and Save, as the desktop's.
+            Some(on) => (
+                vec![
+                    Button::secondary("Cancel").focused(active && on == EditorFocus::Cancel),
+                    Button::primary("Save").focused(active && on == EditorFocus::Save),
+                ],
+                vec![Some(Hit::Agents(AgentsHit::EditorCancel)), Some(Hit::Agents(AgentsHit::EditorSave))],
+                active && on != EditorFocus::Text,
+            ),
+        };
+        rows.extend(
+            section_heading(SHARED_TITLE, Some(SHARED_HELPER), &buttons, width)
+                .into_iter()
+                .map(|h| Row::buttons(h, &hits, focus)),
+        );
+        let editing = editing.is_some();
         rows.push(Row::blank());
-        heading(&mut rows, SHARED_TITLE);
-        wrapped(&mut rows, SHARED_HELPER, width, Style::default().fg(palette().muted));
-        rows.push(Row::blank());
-        if self.editor.is_some() {
+        if editing {
             self.editor_rows(&mut rows, width, height, focused);
         } else {
             preview_rows(&mut rows, self.state.shared_instructions(), width);
-            rows.push(Row::blank());
-            rows.push(self.button_row(
-                "Edit instructions",
-                Some("in place"),
-                index(&Item::EditShared),
-                quiet && self.focus == Item::EditShared,
-                width,
-            ));
         }
+        rows.push(Row::blank());
         if let Some(e) = self.state.error_at(&Target::Shared) {
             wrapped(&mut rows, e, width, Style::default().fg(palette().red));
         }
@@ -999,25 +1024,17 @@ impl AgentsPage {
         rows
     }
 
-    /// A one-line action row: `› label   note`.
-    fn button_row(&self, label: &str, note: Option<&str>, item: Option<usize>, selected: bool, width: usize) -> Row {
-        let marker = if selected { "› " } else { "  " };
-        let mut text = format!("{marker}{}", panel::truncate_right(label, width.saturating_sub(2)));
-        if let Some(note) = note {
-            if panel::display_width(&text) + 2 + note.chars().count() <= width {
-                text.push_str("  ");
-                text.push_str(note);
-            }
-        }
-        let line = if selected {
-            let pad = width.saturating_sub(panel::display_width(&text));
-            Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), selected_style(true)))
-        } else {
-            Line::from(Span::styled(text, Style::default().fg(palette().cyan)))
-        };
-        match item {
-            Some(i) => Row::hit(line, Hit::Agents(AgentsHit::Item(i)), selected),
-            None => Row::text(line),
+    /// A row of buttons at the left, each one of the page's items.
+    fn button_rows(&self, rows: &mut Vec<Row>, buttons: &[(Button<'_>, Item)], width: usize) {
+        let items = self.items();
+        let shown: Vec<Button> = buttons.iter().map(|(b, _)| *b).collect();
+        let hits: Vec<Option<Hit>> = buttons
+            .iter()
+            .map(|(_, item)| items.iter().position(|i| i == item).map(|i| Hit::Agents(AgentsHit::Item(i))))
+            .collect();
+        let focus = buttons.iter().any(|(_, item)| *item == self.focus);
+        for h in super::button_lines(&shown, width, Align::Left) {
+            rows.push(Row::buttons(h, &hits, focus));
         }
     }
 
@@ -1030,27 +1047,19 @@ impl AgentsPage {
                     Style::default().fg(palette().foreground),
                 ))));
             }
-            let cancel = " Cancel ";
-            let go = format!(" {} ", confirm.label());
-            let style = |on: bool, danger: bool| {
-                if on && danger {
-                    Style::default().fg(palette().on_color).bg(palette().error_button).add_modifier(Modifier::BOLD)
-                } else if on {
-                    selected_style(true)
-                } else {
-                    Style::default().fg(palette().gray).bg(palette().selection)
-                }
-            };
-            let line = Line::from(vec![
-                Span::raw("    "),
-                Span::styled(cancel, style(self.confirm_choice == 0, false)),
-                Span::raw(" "),
-                Span::styled(go.clone(), style(self.confirm_choice == 1, true)),
-            ]);
-            // One row, two buttons: the click splits at the second's start.
-            let mut row = Row::hit(line, Hit::Agents(AgentsHit::ConfirmCancel), true);
-            row.split = Some(((4 + cancel.chars().count() + 1) as u16, Hit::Agents(AgentsHit::ConfirmGo)));
-            rows.push(row);
+            // Cancel, then Reset or Delete (both Danger, as the desktop's).
+            let go = confirm.label();
+            let buttons = [
+                Button::secondary("Cancel").focused(self.confirm_choice == 0),
+                Button::danger(go).focused(self.confirm_choice == 1),
+            ];
+            let hits = [Some(Hit::Agents(AgentsHit::ConfirmCancel)), Some(Hit::Agents(AgentsHit::ConfirmGo))];
+            rows.push(Row::blank());
+            for mut h in super::button_lines(&buttons, width.saturating_sub(4), Align::Left) {
+                h.line.spans.insert(0, Span::raw("    "));
+                h.targets.iter_mut().for_each(|t| t.0 += 4);
+                rows.push(Row::buttons(h, &hits, true));
+            }
         }
         if let Some(e) = self.state.error_at(&Target::Agent(name.to_string())) {
             for line in shelbi_app::overlay::error_log::wrap(e, width.saturating_sub(4).max(1)) {
@@ -1128,33 +1137,16 @@ impl AgentsPage {
         let last = area.len() - 1;
         for (i, line) in area.into_iter().enumerate() {
             let v = editor.top + i.clamp(1, last - 1) - 1;
-            let focus = caret_on && i > 0 && i < last && v == caret_row;
+            // The caret's line holds the focus, and the bottom cap too, so
+            // the page keeps the whole box in view while it's typed in.
+            let focus = caret_on && ((i > 0 && i < last && v == caret_row) || i == last);
             rows.push(Row::hit(line, Hit::Agents(AgentsHit::EditorLine(v)), focus));
         }
         editor.rows = wrapped_rows;
         let more = editor.rows.len() > editor.top + window;
-        let button = |label: &str, on: bool| {
-            if on {
-                Span::styled(format!(" {label} "), selected_style(true))
-            } else {
-                Span::styled(format!(" {label} "), Style::default().fg(palette().gray).bg(palette().selection))
-            }
-        };
-        let save = "Save ^S";
-        let line = Line::from(vec![
-            Span::raw("  "),
-            button(save, active && editor.focus == EditorFocus::Save),
-            Span::raw(" "),
-            button("Cancel Esc", active && editor.focus == EditorFocus::Cancel),
-            Span::styled(
-                if more { "   ↓ more text" } else { "" },
-                Style::default().fg(palette().muted),
-            ),
-        ]);
-        let split = 2 + save.chars().count() + 2 + 1;
-        let mut row = Row::hit(line, Hit::Agents(AgentsHit::EditorSave), active);
-        row.split = Some((split as u16, Hit::Agents(AgentsHit::EditorCancel)));
-        rows.push(row);
+        if more {
+            rows.push(Row::text(Line::from(Span::styled("↓ more text", Style::default().fg(palette().muted)))));
+        }
     }
 
     /// The actions menu over the page: the open row's actions, each with its
@@ -1488,7 +1480,7 @@ mod tests {
         let text = d.screen(160, 60);
         for want in [
             "Agents",
-            "+ New agent",
+            "New agent",
             "Preferred runner",
             "Workflow statuses",
             "orchestrator",
@@ -1710,7 +1702,7 @@ mod tests {
         d.key(KeyCode::Enter);
         assert_eq!(d.page().editor_text().as_deref(), Some(shelbi_app::settings::agents::fixture::PREAMBLE));
         let text = d.screen(140, 44);
-        assert!(text.contains("Save ^S") && text.contains("Cancel Esc"), "the buttons show with the text:\n{text}");
+        assert!(text.contains(" Save ") && text.contains(" Cancel "), "the buttons show with the text:\n{text}");
         // The text on the field's fill between its caps, not a `│ ` gutter.
         assert!(text.contains(&"▄".repeat(60)) && text.contains(&"▀".repeat(60)), "{text}");
         assert!(text.contains("  You are working on Shelbi") && !text.contains("│ You"), "{text}");
@@ -1744,7 +1736,7 @@ mod tests {
         d.keys("Draft ");
         d.key(KeyCode::Esc);
         assert!(d.s.prompting(), "unsaved text: the prompt asks");
-        assert!(d.screen(120, 40).contains("Save your changes to the shared"));
+        assert!(d.screen(120, 40).contains("Save changes to the shared instructions?"));
         d.key(KeyCode::Esc);
         assert!(!d.s.prompting());
         assert!(d.page().editor_text().unwrap().starts_with("Draft "), "Cancel kept the text");

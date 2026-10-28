@@ -157,10 +157,12 @@ fn tab_walks_the_desktops_order_and_each_control_shows_its_focus() {
     assert_eq!(at(&mut d, Focus::Kind, "Feature Request").bg, palette().input_focus);
     assert_eq!(at(&mut d, Focus::Kind, "Bug Report").bg, palette().segment, "the picked one's chip");
     assert_eq!(at(&mut d, Focus::SystemInfo, "Include").fg, palette().cyan);
-    assert_eq!(at(&mut d, Focus::Send, form::SEND).bg, palette().primary_focus);
-    assert_eq!(at(&mut d, Focus::Cancel, form::SEND).bg, palette().primary, "Send at rest");
-    assert_eq!(at(&mut d, Focus::Cancel, form::CANCEL).bg, palette().input_focus);
-    assert_eq!(at(&mut d, Focus::Send, form::CANCEL).bg, palette().dialog_control);
+    // Send and Cancel are Settings' buttons: Primary and Secondary, focus
+    // a solid fill.
+    assert_eq!(at(&mut d, Focus::Send, form::SEND).bg, palette().button_focus);
+    assert_eq!(at(&mut d, Focus::Cancel, form::SEND).bg, palette().button_primary, "Send at rest");
+    assert_eq!(at(&mut d, Focus::Cancel, form::CANCEL).bg, palette().button_focus);
+    assert_eq!(at(&mut d, Focus::Send, form::CANCEL).bg, palette().button);
 }
 
 #[test]
@@ -354,7 +356,7 @@ fn both_themes_paint_the_dialog_from_their_tokens() {
             let (x, y) = find(&buf, form::EMAIL).unwrap();
             assert_eq!(buf[(x, y)].bg, palette().dialog_control, "{appearance:?}");
             let (x, y) = find(&buf, form::SEND).unwrap();
-            assert_eq!((buf[(x, y)].bg, buf[(x, y)].fg), (palette().primary, palette().primary_label));
+            assert_eq!((buf[(x, y)].bg, buf[(x, y)].fg), (palette().button_primary, palette().button_primary_text));
         });
     }
 }

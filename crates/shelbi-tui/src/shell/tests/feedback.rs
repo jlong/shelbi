@@ -182,3 +182,27 @@ fn a_failure_shows_in_the_dialog_and_keeps_the_draft() {
     assert!(dialog(&st).form().sent(), "the retry went");
     assert_eq!(endpoint.bodies().len(), 2);
 }
+
+/// Contact Us's buttons are Settings' buttons: Send Message lifts under the
+/// pointer (found in the drawn frame) and goes back when it leaves.
+#[test]
+fn contact_us_buttons_lift_under_the_pointer() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let moved = |column, row| MouseEvent { kind: MouseEventKind::Moved, column, row, modifiers: KeyModifiers::NONE };
+    let mut st = settings_state();
+    st.dispatch_effect(Effect::SendFeedback);
+    let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 45)).unwrap();
+    draw_frame(&mut term, &mut st).unwrap();
+    let (x, y) = find_on_screen(&term, form::SEND).expect("Send Message");
+    assert_eq!(term.backend().buffer()[(x, y)].bg, palette().button_primary, "at rest");
+    st.dirty = false;
+    st.handle_event(Event::Mouse(moved(x, y)));
+    assert!(st.dirty, "onto the button repaints");
+    draw_frame(&mut term, &mut st).unwrap();
+    assert_eq!(term.backend().buffer()[(x, y)].bg, palette().button_primary_lit, "lit");
+    st.dirty = false;
+    st.handle_event(Event::Mouse(moved(0, 0)));
+    assert!(st.dirty, "off it repaints");
+    draw_frame(&mut term, &mut st).unwrap();
+    assert_eq!(term.backend().buffer()[(x, y)].bg, palette().button_primary);
+}

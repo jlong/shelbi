@@ -245,8 +245,9 @@ fn add_remove_reset_and_reset_all_from_the_keyboard() {
     type_key(&mut st, 'w');
     settle_keys(&mut st);
     assert!(mem.text().contains("nav_up"));
+    // Home is Open keys.yaml; Reset all ends the filter row after it.
     press(&mut st, KeyCode::Home);
-    for _ in 0..2 {
+    for _ in 0..3 {
         press(&mut st, KeyCode::Down);
     }
     assert_eq!(st.settings.keys().stop(), KeyStop::ResetAll);
@@ -376,10 +377,8 @@ fn a_save_lands_on_top_of_an_edit_made_elsewhere_meanwhile() {
 #[test]
 fn open_keys_yaml_hands_off_to_the_editor_and_rereads_after() {
     let (mut st, mem) = keys_shell("");
+    // Open keys.yaml is the header's button, the first stop.
     press(&mut st, KeyCode::Home);
-    for _ in 0..3 {
-        press(&mut st, KeyCode::Down);
-    }
     assert_eq!(st.settings.keys().stop(), KeyStop::OpenKeys);
     press(&mut st, KeyCode::Enter);
     assert_eq!(st.pending_editor, Some(PathBuf::from("/h/.shelbi/keys.yaml")));
@@ -521,7 +520,7 @@ fn every_state_is_usable_at_80x24() {
     press(&mut st, KeyCode::Right);
     press(&mut st, KeyCode::Right);
     let text = screen(&mut st, 80, 24);
-    assert!(text.contains("‹ Sidebar ›"), "{text}");
+    assert!(text.contains(" Sidebar ") && text.contains('▾'), "the dropdown shows the context:\n{text}");
     assert!(!text.contains("Open command palette"), "{text}");
     // Unbound and customized rows say so.
     assert!(text.contains("None") && text.contains('●'), "{text}");

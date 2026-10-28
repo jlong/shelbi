@@ -70,7 +70,15 @@ use shelbi_core::{Owner, StatusCategory};
 use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflows::{add_line, cell, error_rows, pad_selected, plain_line, EditFile, LineEdit, Nav, WorkflowsPage};
-use super::{box_rows, field_rows, follow, heading, picker_rows, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
+use super::{box_rows, button_rows, field_rows, fields_row, RowField, follow, heading, leave_buttons, picker_rows, render_band, selected_style, wrapped, Row, LEAVE_HINT, PROMPT_BUTTONS};
+use crate::button::{self, badge, bar, Align, Button, Piece};
+
+/// The Name and Initial status fields' width in the identity row (the
+/// desktop's 200pt).
+const IDENTITY_W: usize = 24;
+
+/// A [`bar`] tag past every item: the Builder | Form segments.
+const VIEW_TAG: usize = 1 << 20;
 use crate::panel::{self, PAD};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
@@ -1501,8 +1509,9 @@ impl WorkflowEditorPage {
                     KeyCode::Esc => return self.confirm(kind, false),
                     c if c == no => return self.confirm(kind, false),
                     c if c == yes => return self.confirm(kind, true),
-                    KeyCode::Left | KeyCode::BackTab => choice = 0,
-                    KeyCode::Right | KeyCode::Tab => choice = 1,
+                    // Drawn as the desktop's: Cancel, then the action.
+                    KeyCode::Left | KeyCode::BackTab => choice = 1,
+                    KeyCode::Right | KeyCode::Tab => choice = 0,
                     KeyCode::Enter | KeyCode::Char(' ') => return self.confirm(kind, choice == 0),
                     _ => {}
                 }
@@ -1539,11 +1548,12 @@ impl WorkflowEditorPage {
             KeyCode::Esc | KeyCode::Char('c') => self.prompt_choose(2),
             KeyCode::Char('s') => self.prompt_choose(0),
             KeyCode::Char('d') => self.prompt_choose(1),
-            KeyCode::Left | KeyCode::BackTab => {
+            // The buttons run Cancel, Discard, Save left to right.
+            KeyCode::Right | KeyCode::Tab => {
                 self.prompt_choice = self.prompt_choice.saturating_sub(1);
                 EditorAction::Stay
             }
-            KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.prompt_choice = (self.prompt_choice + 1).min(PROMPT_BUTTONS.len() - 1);
                 EditorAction::Stay
             }
@@ -1702,11 +1712,11 @@ impl WorkflowEditorPage {
         let items = self.items();
         self.clamp();
         // The header: never scrolls.
-        let header = Rect { height: 1, ..inner };
+        let header = Rect { height: button::BUTTON_H as u16, ..inner }.intersection(inner);
         self.render_header(f, header, &items);
         let content = Rect {
-            y: inner.y + 2.min(inner.height),
-            height: inner.height.saturating_sub(2),
+            y: inner.y + 4.min(inner.height),
+            height: inner.height.saturating_sub(4),
             ..inner
         };
         if content.height == 0 {
@@ -1736,7 +1746,14 @@ impl WorkflowEditorPage {
                 continue;
             }
             f.render_widget(Paragraph::new(row.line.clone()), rect);
-            if let Some(a) = row.action {
+            if !row.targets.is_empty() {
+                // A row of buttons: each takes its own columns.
+                for &(x, w, hit) in &row.targets {
+                    if let super::Hit::Action(a) = hit {
+                        self.hits.push((Rect { x: rect.x + x, width: w, ..rect }.intersection(rect), Hit::Item(a)));
+                    }
+                }
+            } else if let Some(a) = row.action {
                 self.hits.push((Rect { x: area.x, width: area.width, ..rect }, Hit::Item(a)));
             }
         }
@@ -1748,89 +1765,48 @@ impl WorkflowEditorPage {
     }
 
     fn render_header(&mut self, f: &mut Frame, rect: Rect, items: &[Item]) {
+        // The desktop's title bar: back, the name and its Default badge;
+        // the Builder | Form control; Discard changes, Save changes
+        // (Primary) and the ⋮ menu at the right.
         let state = self.state.as_ref();
         let dirty = state.is_some_and(EditorState::is_dirty);
         let busy = state.is_some_and(EditorState::busy);
         let selected = |item: &Item| items.get(self.cursor) == Some(item);
-        let button = |label: &str, item: &Item, enabled: bool| {
-            let style = if selected(item) {
-                selected_style(true)
-            } else if enabled {
-                Style::default().fg(palette().white).bg(palette().selection)
-            } else {
-                Style::default().fg(palette().muted)
-            };
-            Span::styled(format!(" {label} "), style)
-        };
-        let back = button("← Back", &Item::Back, true);
-        let mut left = vec![back, Span::raw("  ")];
-        left.push(Span::styled(
-            self.name().to_string(),
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-        ));
+        let tag = |item: &Item| items.iter().position(|it| it == item).unwrap_or(usize::MAX);
+        let mut after = Vec::new();
         if state.is_some_and(EditorState::is_default) {
-            left.push(Span::styled(" default", Style::default().fg(palette().cyan)));
+            after.extend([Span::raw("  "), badge("Default")]);
         }
         if dirty {
-            left.push(Span::styled(" ●", Style::default().fg(palette().yellow)));
+            after.push(Span::styled(" ●", Style::default().fg(palette().yellow)));
         }
-        let save = button(if busy { "Saving…" } else { "Save changes" }, &Item::Save, dirty && !busy);
-        let discard = button("Discard", &Item::Discard, dirty && !busy);
-        let actions = button("⋮ Actions", &Item::Actions, state.is_some());
-        // Builder | Form: the view shown filled.
-        let mode = state.map(|s| s.mode);
-        let view_focused = selected(&Item::View);
-        let half = |m: Mode| {
-            let label = match m {
-                Mode::Builder => " Builder ",
-                Mode::Form => " Form ",
-            };
-            let style = match (mode == Some(m), view_focused) {
-                (true, true) => selected_style(true),
-                (true, false) => Style::default().fg(palette().white).bg(palette().selection).add_modifier(Modifier::BOLD),
-                (false, true) => Style::default().fg(palette().cyan).add_modifier(Modifier::UNDERLINED),
-                (false, false) => Style::default().fg(palette().gray),
-            };
-            Span::styled(label, style)
-        };
-        let mut right: Vec<Span<'static>> = VIEWS.iter().map(|&m| half(m)).collect();
-        right.extend([Span::raw("  "), save, Span::raw(" "), discard, Span::raw(" "), actions]);
-        let left_w: usize = left.iter().map(|s| panel::display_width(&s.content)).sum();
-        let right_w: usize = right.iter().map(|s| panel::display_width(&s.content)).sum();
-        let width = rect.width as usize;
-        // Narrow: the name gives way first, then the buttons are cut.
-        let gap = width.saturating_sub(left_w + right_w);
-        let mut spans = left;
-        if left_w + right_w > width {
-            let room = width.saturating_sub(right_w + 10);
-            spans.truncate(2);
-            let name = panel::truncate_right(self.name(), room.max(1));
-            spans.push(Span::styled(name, Style::default().fg(palette().white).add_modifier(Modifier::BOLD)));
+        let left = vec![
+            Piece::button(Button::secondary("←").focused(selected(&Item::Back)), tag(&Item::Back), 0),
+            Piece::title(self.name(), after),
+        ];
+        let mut right = Vec::new();
+        if let Some(mode) = state.map(|s| s.mode) {
+            let labels: Vec<&str> = VIEWS.iter().map(|m| if *m == Mode::Builder { "Builder" } else { "Form" }).collect();
+            let chosen = VIEWS.iter().position(|m| *m == mode).unwrap_or(0);
+            let tags: Vec<usize> = (0..VIEWS.len()).map(|i| VIEW_TAG + i).collect();
+            right.push(Piece::segmented(&labels, chosen, selected(&Item::View), &tags, 1));
         }
-        spans.push(Span::raw(" ".repeat(gap.max(1))));
-        spans.extend(right);
-        f.render_widget(Paragraph::new(Line::from(spans.clone())), rect);
-        // Click targets: walk the spans' widths.
-        let mut x = rect.x;
-        let targets = [(" ← Back ", Item::Back), (" Save changes ", Item::Save), (" Saving… ", Item::Save), (" Discard ", Item::Discard), (" ⋮ Actions ", Item::Actions)];
-        for span in &spans {
-            let w = panel::display_width(&span.content) as u16;
-            let view = match span.content.as_ref() {
-                " Builder " => Some(Mode::Builder),
-                " Form " => Some(Mode::Form),
-                _ => None,
-            };
-            if let (Some(mode), true) = (view, x + w <= rect.right()) {
-                self.hits.push((Rect { x, width: w, ..rect }, Hit::View(mode)));
+        let save = if busy { "Saving…" } else { "Save changes" };
+        right.push(Piece::button(Button::secondary("Discard changes").focused(selected(&Item::Discard)).enabled(dirty && !busy), tag(&Item::Discard), 2));
+        right.push(Piece::button(Button::primary(save).focused(selected(&Item::Save)).enabled(dirty && !busy), tag(&Item::Save), 0));
+        right.push(Piece::button(Button::secondary("⋮").focused(selected(&Item::Actions)).enabled(state.is_some()), tag(&Item::Actions), 0));
+        let (lines, hits) = bar(left, right, rect.width as usize);
+        f.render_widget(Paragraph::new(lines.to_vec()), rect);
+        for (x, w, t) in hits {
+            let r = Rect { x: rect.x + x, width: w, ..rect }.intersection(rect);
+            if r.is_empty() {
+                continue;
             }
-            if let Some((_, item)) = targets.iter().find(|(t, _)| *t == span.content) {
-                if let Some(i) = items.iter().position(|it| it == item) {
-                    if x + w <= rect.right() {
-                        self.hits.push((Rect { x, width: w, ..rect }, Hit::Item(i)));
-                    }
-                }
+            if t >= VIEW_TAG {
+                self.hits.push((r, Hit::View(VIEWS[t - VIEW_TAG])));
+            } else if t != usize::MAX {
+                self.hits.push((r, Hit::Item(t)));
             }
-            x = x.saturating_add(w);
         }
     }
 
@@ -1877,18 +1853,59 @@ impl WorkflowEditorPage {
 
         // Workflow.
         heading(&mut rows, "Workflow");
-        field(&mut rows, "Name", Text::Name, "", erred(Field::Name));
-        field_errors(&mut rows, Field::Name);
-        field(&mut rows, "Description", Text::Description, DESCRIPTION_PLACEHOLDER, erred(Field::Description));
-        field_errors(&mut rows, Field::Description);
+        // Name, Description and Initial status side by side, as the
+        // desktop's identity row.
+        rows.push(Row::blank());
+        let on = |item: &Item| selected(item) == Some(true);
+        let (name, name_caret) = self.field_text(&Text::Name);
+        let (description, description_caret) = self.field_text(&Text::Description);
         let initial = state.initial_status().map(|s| self.catalog_name(&s.id)).unwrap_or_else(|| "—".into());
-        picker(&mut rows, "Initial status", &initial, Item::InitialStatus);
+        let fields = [
+            RowField {
+                label: "Name",
+                textbox: Textbox::new(&name).caret(name_caret).focused(on(&Item::Text(Text::Name))).invalid(erred(Field::Name)),
+                focused: on(&Item::Text(Text::Name)),
+                disabled: false,
+                action: index(&Item::Text(Text::Name)),
+                width: IDENTITY_W,
+            },
+            RowField {
+                label: "Description",
+                textbox: Textbox::new(&description)
+                    .caret(description_caret)
+                    .placeholder(DESCRIPTION_PLACEHOLDER)
+                    .focused(on(&Item::Text(Text::Description)))
+                    .invalid(erred(Field::Description)),
+                focused: on(&Item::Text(Text::Description)),
+                disabled: false,
+                action: index(&Item::Text(Text::Description)),
+                width: 0,
+            },
+            RowField {
+                label: "Initial status",
+                textbox: Textbox::new(&initial).focused(on(&Item::InitialStatus)).trail("▾"),
+                focused: on(&Item::InitialStatus),
+                disabled: false,
+                action: index(&Item::InitialStatus),
+                width: IDENTITY_W,
+            },
+        ];
+        fields_row(&mut rows, &fields, width);
+        field_errors(&mut rows, Field::Name);
+        field_errors(&mut rows, Field::Description);
         field_errors(&mut rows, Field::InitialStatus);
 
         // Statuses.
         rows.push(Row::blank());
         heading(&mut rows, &format!("Statuses ({})", state.workflow().statuses.len()));
         errors(&mut rows, Field::Statuses);
+        // The desktop's column headers, over the rows' columns.
+        let name_w = 16.min(width / 3);
+        if width >= 2 + 2 + name_w + 1 + 22 {
+            let head = format!("    {:<w$} {:<6} {:<14} {}", "Status", "Owner", "Agent", "Workspace tags", w = name_w);
+            let style = Style::default().fg(palette().muted).add_modifier(Modifier::BOLD);
+            rows.push(Row::text(Line::from(Span::styled(panel::truncate_right(&head, width), style))));
+        }
         for s in &state.workflow().statuses {
             let item = Item::Status(s.id.clone());
             let line = self.status_line(s.id.as_str(), selected(&item), width);
@@ -1900,8 +1917,17 @@ impl WorkflowEditorPage {
             }
             errors(&mut rows, Field::Status(s.id.clone()));
         }
-        rows.push(Row { action: index(&Item::AddStatus), ..Row::text(add_line("+ Add status", selected(&Item::AddStatus), width)) });
-        rows.push(Row { action: index(&Item::ManageStatuses), ..Row::text(add_line("Manage project statuses", selected(&Item::ManageStatuses), width)) });
+        rows.push(Row::blank());
+        let on = |item: &Item| selected(item) == Some(true);
+        button_rows(
+            &mut rows,
+            &[
+                (Button::secondary("Add status").focused(on(&Item::AddStatus)), index(&Item::AddStatus)),
+                (Button::secondary("Manage project statuses").focused(on(&Item::ManageStatuses)), index(&Item::ManageStatuses)),
+            ],
+            width,
+            Align::Left,
+        );
 
         // Transitions.
         rows.push(Row::blank());
@@ -1936,7 +1962,9 @@ impl WorkflowEditorPage {
                 rows.push(Row::blank());
             }
         }
-        rows.push(Row { action: index(&Item::AddTransition), ..Row::text(add_line("+ Add transition", selected(&Item::AddTransition), width)) });
+        rows.push(Row::blank());
+        let add = Button::secondary("Add transition").focused(selected(&Item::AddTransition) == Some(true));
+        button_rows(&mut rows, &[(add, index(&Item::AddTransition))], width, Align::Left);
 
         // Git.
         rows.push(Row::blank());
@@ -1980,8 +2008,8 @@ impl WorkflowEditorPage {
         // Delete.
         rows.push(Row::blank());
         let blocked = state.delete_blocked();
-        let style = if blocked.is_some() { muted } else { red };
-        rows.push(Row { action: index(&Item::Delete), ..Row::text(plain_line("Delete workflow…", selected(&Item::Delete), width, style)) });
+        let delete = Button::danger("Delete workflow").focused(selected(&Item::Delete) == Some(true)).enabled(blocked.is_none());
+        button_rows(&mut rows, &[(delete, index(&Item::Delete))], width, Align::Left);
         if let Some(why) = blocked {
             wrapped(&mut rows, &format!("    {why}"), width, muted);
         }
@@ -2113,18 +2141,8 @@ impl WorkflowEditorPage {
                 let skip = (selected + 1).saturating_sub(room.max(1));
                 for (row, (i, c)) in choices.iter().enumerate().skip(skip).take(room).enumerate() {
                     let r = Rect { y: inner.y + row as u16, height: 1, ..inner };
-                    let left = format!(" {}", c.label);
-                    let right = format!("{} ", c.note);
-                    let gap = w.saturating_sub(panel::display_width(&left) + panel::display_width(&right));
-                    let text = panel::truncate_right(&format!("{left}{}{right}", " ".repeat(gap)), w);
-                    let style = if i == selected {
-                        selected_style(true)
-                    } else if c.inert {
-                        Style::default().fg(palette().muted).bg(palette().background)
-                    } else {
-                        Style::default().fg(palette().foreground).bg(palette().background)
-                    };
-                    f.render_widget(Paragraph::new(Span::styled(text, style)), r);
+                    let line = super::menu_line(&c.label, &c.note, w, i == selected, c.inert);
+                    f.render_widget(Paragraph::new(line), r);
                     self.hits.push((r, Hit::Choice(i)));
                 }
                 let first = inner.y + room as u16 + 1;
@@ -2136,67 +2154,43 @@ impl WorkflowEditorPage {
                 }
             }
             Modal::Confirm { kind, choice } => {
-                let (title, message, buttons) = match kind {
+                // Cancel (index 1), then the action (index 0), as the desktop
+                // draws a confirmation.
+                let (title, message, action, hint) = match kind {
                     Confirm::Delete => (
-                        " Delete workflow ",
-                        format!(
-                            "Delete workflow {} and its file? Open issues on it keep it from going.",
-                            self.name()
-                        ),
-                        [" Delete ", " Cancel "],
+                        format!("Delete {}?", self.name()),
+                        "Its file is removed with it. Open issues on it keep it from going.".to_string(),
+                        Button::danger("Delete"),
+                        "←→ choose · ⏎ press · y delete · n or Esc cancel",
                     ),
                     Confirm::Conflict => (
-                        " Changed on disk ",
+                        "Changed on disk".to_string(),
                         "The workflow files changed on disk since they were loaded, so the save was refused. \
                          Reload them (your unsaved edits are discarded), or keep editing."
                             .to_string(),
-                        [" Reload ", " Keep editing "],
+                        Button::danger("Reload"),
+                        "←→ choose · ⏎ press · r reload · k keep editing",
                     ),
                 };
-                self.render_buttons(f, area, title, &message, &buttons, choice);
+                let cancel = if kind == Confirm::Delete { "Cancel" } else { "Keep editing" };
+                let buttons = [(Button::secondary(cancel).focused(choice == 1), 1), (action.focused(choice == 0), 0)];
+                self.render_buttons(f, area, &title, &message, &buttons, hint);
             }
         }
     }
 
     fn render_prompt(&mut self, f: &mut Frame, area: Rect) {
-        let message = format!("Save your changes to {} before leaving?", self.name());
-        let buttons: Vec<String> = PROMPT_BUTTONS.iter().map(|b| format!(" {b} ")).collect();
-        let buttons: Vec<&str> = buttons.iter().map(String::as_str).collect();
-        self.render_buttons(f, area, " Unsaved changes ", &message, &buttons, self.prompt_choice);
+        let title = format!("Save changes to {}?", self.name());
+        let buttons = leave_buttons(self.prompt_choice, true);
+        self.render_buttons(f, area, &title, "Your edits to this workflow haven’t been saved.", &buttons, LEAVE_HINT);
     }
 
-    fn render_buttons(&mut self, f: &mut Frame, area: Rect, title: &str, message: &str, buttons: &[&str], choice: usize) {
-        let lines = shelbi_app::overlay::error_log::wrap(message, 44);
-        let Some(rect) = WorkflowsPage::popup(area, 50, lines.len() as u16 + 4) else {
-            return;
-        };
-        let inner = WorkflowsPage::frame(f, rect, title);
-        for (i, line) in lines.iter().enumerate() {
-            let y = inner.y + i as u16;
-            if y + 1 >= inner.bottom() {
-                break;
-            }
-            f.render_widget(
-                Paragraph::new(Span::styled(format!(" {line}"), Style::default().fg(palette().foreground))),
-                Rect { y, height: 1, ..inner },
-            );
-        }
-        let y = inner.bottom().saturating_sub(1);
-        let mut x = inner.x + 1;
-        for (i, label) in buttons.iter().enumerate() {
-            let w = panel::display_width(label) as u16;
-            if x + w > inner.right() {
-                break;
-            }
-            let style = if i == choice {
-                selected_style(true)
-            } else {
-                Style::default().fg(palette().gray).bg(palette().selection)
-            };
-            let r = Rect { x, y, width: w, height: 1 };
-            f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), r);
+    /// A dialog over the editor (see [`super::render_dialog`]): `buttons`
+    /// in the order drawn, each with its index (a [`Hit::Button`]).
+    fn render_buttons(&mut self, f: &mut Frame, area: Rect, title: &str, body: &str, buttons: &[(Button<'_>, usize)], hint: &str) {
+        let body = [(body.to_string(), Style::default().fg(palette().foreground))];
+        for (r, i) in super::render_dialog(f, area, 60, title, &body, buttons, hint) {
             self.hits.push((r, Hit::Button(i)));
-            x += w + 1;
         }
     }
 }

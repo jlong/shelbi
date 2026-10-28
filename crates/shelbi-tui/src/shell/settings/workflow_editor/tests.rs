@@ -93,7 +93,12 @@ fn focused_lines(ed: &mut WorkflowEditorPage, w: u16, h: u16) -> Vec<bool> {
     let buf = term.backend().buffer();
     (0..h)
         .map(|y| {
-            (0..w).any(|x| buf[(x, y)].symbol() == "›" || buf[(x, y)].bg == crate::theme::palette().input_focus)
+            // A marker, a field's focus fill, or a focused button's.
+            let p = crate::theme::palette();
+            (0..w).any(|x| {
+                let c = &buf[(x, y)];
+                c.symbol() == "›" || [p.input_focus, p.button_focus, p.button_danger_focus].contains(&c.bg)
+            })
         })
         .collect()
 }
@@ -125,18 +130,19 @@ fn it_opens_after_its_read_with_the_header_and_every_section() {
         .collect();
     let text = rows.join("\n");
     for want in [
-        "Workflow", "Name", "Description", "Initial status", "Statuses (6)", "+ Add status", "Manage project statuses",
-        "Transitions (4)", "In Progress → Review", "1. Push branch", "2. Open PR", "+ Add transition", "Git",
+        "Workflow", "Name", "Description", "Initial status", "Statuses (6)", "Add status", "Manage project statuses",
+        "Transitions (4)", "In Progress → Review", "1. Push branch", "2. Open PR", "Add transition", "Git",
         "Base branch", "Branch name", "{{github_user}}/{{id}}", "Merge strategy", "Squash", "Review", "Diff only",
-        "Automation", "Zen settings", "Use project settings", "Required fields", "Delete workflow…",
+        "Automation", "Zen settings", "Use project settings", "Required fields", "Delete workflow",
     ] {
         assert!(text.contains(want), "{want} in:\n{text}");
     }
     assert!(text.contains("The default workflow can’t be deleted"), "the guard says why up front");
     let screen = render(&mut ed, 100, 30);
-    let header = screen.lines().next().unwrap();
-    assert!(header.contains("← Back") && header.contains("task default"), "{header}");
-    assert!(header.contains("Save changes") && header.contains("Discard") && header.contains("⋮ Actions"), "{header}");
+    // The title bar's labels, on its middle row.
+    let header = screen.lines().nth(1).unwrap();
+    assert!(header.contains("←") && header.contains("task   Default"), "{header}");
+    assert!(header.contains("Save changes") && header.contains("Discard changes") && header.contains("⋮"), "{header}");
     assert_eq!(ed.cursor_item(), Some(Item::Back));
     // It opens on the Form, the Builder | Form control in the header.
     assert_eq!(ed.state().unwrap().mode, Mode::Form);
@@ -399,7 +405,7 @@ fn leaving_with_edits_asks_save_discard_or_cancel() {
     // Esc: the prompt, and Cancel keeps the edits.
     assert_eq!(press(&mut ed, key(KeyCode::Esc)), EditorAction::Stay);
     assert_eq!(ed.state().unwrap().prompt(), Some(Leave::Back));
-    assert!(render(&mut ed, 80, 24).contains("Save your changes to task before leaving?"));
+    assert!(render(&mut ed, 80, 24).contains("Save changes to task?"));
     assert_eq!(press(&mut ed, key(KeyCode::Char('c'))), EditorAction::Stay);
     assert!(ed.state().unwrap().prompt().is_none() && ed.is_dirty());
 
@@ -650,10 +656,11 @@ fn it_scrolls_to_keep_the_focus_in_view_at_80x24_and_tab_steps_sections() {
                 Item::Back => "← Back",
                 Item::View => "Builder",
                 Item::Save => "Save changes",
-                Item::Discard => "Discard",
-                _ => "⋮ Actions",
+                // 80 columns leave Discard to the ⋮ menu.
+                Item::Discard => "⋮",
+                _ => "⋮",
             };
-            assert!(screen.lines().next().is_some_and(|l| l.contains(label)), "{item:?} in the header:\n{screen}");
+            assert!(screen.lines().nth(1).is_some_and(|l| l.contains(label)), "{item:?} in the header:\n{screen}");
             continue;
         }
         assert!(focused_lines(&mut ed, 80, 24).into_iter().skip(2).any(|f| f), "{:?} in view:\n{screen}", ed.cursor_item());

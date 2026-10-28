@@ -41,6 +41,7 @@ use shelbi_app::licenses::{license_blocks, Block, Browser, Entry};
 use shelbi_app::overlay::error_log::wrap;
 use unicode_width::UnicodeWidthStr;
 
+use crate::button::Button;
 use crate::panel::truncate_right;
 use crate::sidebar::{bleed_separator, BLEED_ABOVE, BLEED_BELOW};
 use crate::theme::palette;
@@ -633,39 +634,12 @@ struct Look {
     hovered: bool,
 }
 
-/// A button as the About overlay's Close draws: its label on a fill, the
-/// fill's half rows above and below over the terminal's background. Done
-/// is the primary (the accent fill, as the desktop's); View source is
-/// secondary (the selection fill, brighter under the pointer, the accent
-/// while it has the keys, as About's focused Close).
+/// A button as Settings' draw: Done the Primary (the desktop's), View
+/// source Secondary; its focus, and its lift under the pointer this view
+/// tracks.
 fn draw_button(buf: &mut Buffer, rect: Rect, label: &str, look: Look) {
-    let fill = if look.primary || look.focused {
-        palette().cyan
-    } else if look.hovered {
-        palette().button_hover
-    } else {
-        palette().selection
-    };
-    let caps = Style::default().fg(fill);
-    buf.set_string(rect.x, rect.y, BLEED_ABOVE.repeat(rect.width as usize), caps);
-    buf.set_string(rect.x, rect.y + 2, BLEED_BELOW.repeat(rect.width as usize), caps);
-    let mut style = Style::default().bg(fill);
-    style = if look.primary || look.focused {
-        style.fg(palette().on_color).add_modifier(Modifier::BOLD)
-    } else if look.hovered {
-        style.fg(palette().white)
-    } else {
-        style.fg(palette().gray)
-    };
-    if look.primary && look.focused {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    for x in rect.left()..rect.right() {
-        buf[(x, rect.y + 1)].set_symbol(" ").set_style(style);
-    }
-    let w = label.width() as u16;
-    let x = rect.x + rect.width.saturating_sub(w) / 2;
-    buf.set_stringn(x, rect.y + 1, label, rect.width as usize, style);
+    let button = if look.primary { Button::primary(label) } else { Button::secondary(label) };
+    button.focused(look.focused).hovered(look.hovered).draw(buf, rect);
 }
 
 /// A button's columns: its label with two of fill each side.

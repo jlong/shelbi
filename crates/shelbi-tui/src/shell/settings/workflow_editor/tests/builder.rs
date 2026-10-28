@@ -59,7 +59,7 @@ fn screen_has(screen: &str, want: &str) -> bool {
 fn v_switches_views_over_one_draft_carrying_the_place() {
     let _home = Home::new("bld-views");
     let mut ed = editor("task");
-    let header = render(&mut ed, 100, 30).lines().next().unwrap().to_string();
+    let header = render(&mut ed, 100, 30).lines().nth(1).unwrap().to_string();
     assert!(header.contains("Builder") && header.contains("Form"), "{header}");
     assert_eq!(VIEWS, &[Mode::Builder, Mode::Form]);
     // From the Form's Review row: the Builder opens on Review, selected.
@@ -129,7 +129,7 @@ fn a_status_is_selected_and_edited_by_keys_in_the_panel_and_the_form_shows_it() 
     assert_eq!(b(&ed).selected_status(), Some("in-progress"));
     assert_eq!(ed.cursor_item(), Some(Item::PanelStatus), "the keys go to the panel");
     let screen = render(&mut ed, 120, 60);
-    for want in ["Status", "◐ In Progress", "Category", "Active", "Owner", "Agent", "developer", "Outgoing transitions", "→ Review · Push branch, Open PR", "+ Add transition", "Remove from workflow"] {
+    for want in ["Status", "◐ In Progress", "Category", "Active", "Owner", "Agent", "developer", "Outgoing transitions", "→ Review · Push branch, Open PR", " Add transition ", "Remove from workflow"] {
         assert!(screen.contains(want), "{want}:\n{screen}");
     }
     // Owner: User. Agent: None. Tags typed. Set as initial.
@@ -161,7 +161,8 @@ fn a_status_is_selected_and_edited_by_keys_in_the_panel_and_the_form_shows_it() 
     assert_eq!(ed.cursor_item(), Some(Item::Status("in-progress".into())));
     assert_eq!(ed.typed_text(&Text::Tags("in-progress".into())), "gpu");
     let rows = render(&mut ed, 120, 60);
-    let at = rows.lines().position(|l| l.trim() == "Initial status").expect("the picker's label");
+    // Name, Description and Initial status share the identity row.
+    let at = rows.lines().position(|l| l.trim_end().ends_with("Initial status")).expect("the picker's label");
     assert!(rows.lines().nth(at + 2).is_some_and(|l| l.contains(" In Progress")), "{rows}");
     // Save from the Builder writes them.
     press(&mut ed, key(KeyCode::Char('v')));
@@ -391,7 +392,7 @@ fn leaving_the_builder_with_edits_asks_first() {
     assert!(ed.is_dirty());
     assert_eq!(press(&mut ed, key(KeyCode::Esc)), EditorAction::Stay);
     assert!(ed.state().unwrap().prompt().is_some(), "Save / Discard / Cancel");
-    assert!(render(&mut ed, 80, 24).contains("Unsaved changes"));
+    assert!(render(&mut ed, 80, 24).contains("Save changes to task?"));
     press(&mut ed, key(KeyCode::Char('c')));
     assert!(ed.state().unwrap().prompt().is_none() && ed.is_dirty());
     press(&mut ed, key(KeyCode::Esc));

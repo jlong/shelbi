@@ -8,6 +8,7 @@
 use anyhow::Result;
 
 mod activity;
+mod button;
 mod app;
 mod error_report;
 mod handlers;

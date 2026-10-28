@@ -37,7 +37,6 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders},
     Frame,
 };
 use std::time::Duration;
@@ -45,20 +44,23 @@ use std::time::Duration;
 use shelbi_app::settings::machine_check::{Action, Field, Focus, ReadinessForm, StageState, Tone};
 use shelbi_app::settings::machine_form as mform;
 use shelbi_app::settings::workspace_form::sentence;
-use shelbi_app::settings::workspaces::{MachineStatus, LOCAL_LABEL};
+use shelbi_app::settings::workspaces::MachineStatus;
 use shelbi_core::ForwardMode;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use crate::modal_form::{Field as Field2, FormLines};
-use super::workspaces::button_style;
 use crate::panel;
+use crate::button::{Align, Button};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
-/// The SSH host field's helper.
-pub(crate) const HOST_HELP: &str = "A host name or an alias from your SSH config. Shelbi connects with your \
-                                    existing SSH keys and config and never asks for a password. Empty uses the \
-                                    name.";
+/// What's said under the Name and SSH host pair: the desktop's footnote,
+/// and what an empty host does.
+pub(crate) const HOST_HELP: &str = "Use a hostname or an alias from your SSH config. Your existing SSH keys and \
+                                    settings are observed. An empty SSH host uses the name.";
+
+/// What's said under the connection check, as the desktop says it.
+pub(crate) const CHECK_NOTE: &str = "Shelbi checks the remote CLI and offers to install a compatible version when needed.";
 
 /// The spinner's frames, a tenth of a second each.
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -206,13 +208,8 @@ pub(super) fn render(
     // Lay the content out as lines, each field its label over its box,
     // recording each control's block (its own lines and what's said under
     // it) and where it sits.
-    let mut out: FormLines<Focus> = FormLines::new(inner_w);
-    out.text(&form.description(), muted);
-    out.blank();
-    // Kind: read-only.
-    let kind = if form.remote() { "SSH".to_string() } else { format!("Local ({LOCAL_LABEL})") };
-    out.lines.push(textbox::label("Kind", false, false, inner_w));
-    out.text(&kind, Style::default().fg(palette().foreground));
+    let mut out: FormLines<Focus> = FormLines::new(inner_w).with_rest(palette().input_well);
+    out.heading(form.title(), &form.description());
     // What's said under each shown field: its refusal, then its help.
     let shown = form.fields_shown();
     let notes: Vec<(Option<String>, Option<String>)> = shown
@@ -220,7 +217,8 @@ pub(super) fn render(
         .map(|f| {
             let help = match f {
                 Field::Name => None,
-                Field::Host => Some(HOST_HELP.to_string()),
+                // Said under the pair (below).
+                Field::Host => None,
                 Field::WorkDir => Some(form.work_dir_help()),
                 Field::Tags => Some(mform::TAGS_HELP.to_string()),
             };
@@ -248,12 +246,17 @@ pub(super) fn render(
         Field2 { label, textbox, focused, disabled: false, under, hit: Focus::Field(field) }
     };
     let mut fields = shown.iter().copied().peekable();
+    let mut first_field = true;
     while let Some(field) = fields.next() {
-        out.blank();
-        // Name and SSH host side by side, as the desktop sets them.
+        if !std::mem::take(&mut first_field) {
+            out.blank();
+        }
+        // Name and SSH host side by side, as the desktop sets them, its
+        // footnote under both.
         if field == Field::Name && fields.peek() == Some(&Field::Host) {
             fields.next();
             out.pair(spec(Field::Name), spec(Field::Host));
+            out.text(HOST_HELP, muted);
             continue;
         }
         let f = spec(field);
@@ -291,7 +294,6 @@ pub(super) fn render(
         if let (Tone::Busy, Some(elapsed)) = (panel.tone, extra.elapsed) {
             title.push(Span::styled(format!("  {}s", elapsed.as_secs()), muted));
         }
-        let first = out.lines.len();
         out.lines.push(textbox::label("Connection", false, false, inner_w));
         out.lines.push(Line::from(title));
         // The stages: what each found (or that it waits).
@@ -334,32 +336,19 @@ pub(super) fn render(
         if let Some(aside) = extra.aside {
             out.text(aside, gray);
         }
-        // Test connection / Test again (Stop check while one runs), and
-        // Install CLI when it can help.
-        let row = out.lines.len();
+        // Install CLI when it can help, then Test connection / Test again
+        // (Stop check while one runs), as the desktop's.
         let running = form.running().is_some();
-        let mut buttons = vec![(
-            Focus::Test,
-            format!(" {} ", if stops(form, Focus::Test) { "Stop check" } else { form.test_label() }),
-            button_style(form.focus() == Focus::Test, !form.saving() && (!running || stops(form, Focus::Test)), false),
-        )];
+        let mut buttons = Vec::new();
         if form.offers_install() {
-            buttons.push((
-                Focus::InstallCli,
-                " Install CLI ".to_string(),
-                button_style(form.focus() == Focus::InstallCli, !form.saving(), true),
-            ));
+            buttons.push((Button::primary("Install CLI").focused(form.focus() == Focus::InstallCli).enabled(!form.saving()), Focus::InstallCli));
         }
-        let mut x = 0;
-        let mut spans = Vec::new();
-        for (focus, label, style) in buttons {
-            let w = panel::display_width(&label);
-            out.control(first, row, x, w, focus);
-            spans.push(Span::styled(label, style));
-            spans.push(Span::raw(" "));
-            x += w + 1;
-        }
-        out.lines.push(Line::from(spans));
+        let test = if stops(form, Focus::Test) { "Stop check" } else { form.test_label() };
+        let test_on = !form.saving() && (!running || stops(form, Focus::Test));
+        buttons.push((Button::secondary(test).focused(form.focus() == Focus::Test).enabled(test_on), Focus::Test));
+        out.blank();
+        out.buttons(&buttons, Align::Left);
+        out.text(CHECK_NOTE, muted);
         if let Some(note) = probe.and_then(|s| form.probe_note(s)) {
             let style = match probe {
                 Some(MachineStatus::Unreachable(_)) => red,
@@ -375,27 +364,15 @@ pub(super) fn render(
         out.text(&sentence(e), red);
     }
     out.blank();
-    // The buttons, at the right.
-    let button_row = out.lines.len();
-    let buttons = [
-        (Focus::Cancel, " Cancel ".to_string(), button_style(form.focus() == Focus::Cancel, !form.saving(), false)),
-        (
-            Focus::Submit,
-            format!(" {} ", if form.saving() { "Saving…" } else { form.submit_label() }),
-            button_style(form.focus() == Focus::Submit, !form.saving(), true),
-        ),
-    ];
-    let total: usize = buttons.iter().map(|(_, t, _)| panel::display_width(t) + 1).sum();
-    let mut x = inner_w.saturating_sub(total);
-    let mut spans = vec![Span::raw(" ".repeat(x))];
-    for (focus, label, style) in buttons {
-        let w = panel::display_width(&label);
-        out.control(button_row, button_row, x, w, focus);
-        spans.push(Span::styled(label, style));
-        spans.push(Span::raw(" "));
-        x += w + 1;
-    }
-    out.lines.push(Line::from(spans));
+    out.rule();
+    let submit = if form.saving() { "Saving…" } else { form.submit_label() };
+    out.buttons(
+        &[
+            (Button::secondary("Cancel").focused(form.focus() == Focus::Cancel).enabled(!form.saving()), Focus::Cancel),
+            (Button::primary(submit).focused(form.focus() == Focus::Submit).enabled(!form.saving()), Focus::Submit),
+        ],
+        Align::Right,
+    );
     let hint = if form.saving() {
         "Saving… (nothing else runs until this lands)".to_string()
     } else if form.installing() {
@@ -414,17 +391,7 @@ pub(super) fn render(
         width,
         height,
     };
-    super::clear_layer(f, rect, main);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().divider_active))
-        .title(Span::styled(
-            format!(" {} ", form.title()),
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    let content = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    let content = super::overlay_panel(f, rect, main, None);
     out.render(f, content, form.focus(), hits);
 }
 

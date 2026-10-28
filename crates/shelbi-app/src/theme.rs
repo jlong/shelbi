@@ -243,16 +243,44 @@ pub struct Theme<C = Swatch> {
     /// The selected segment of a segmented control: the desktop's canvas
     /// chip on its track.
     pub segment: C,
-    /// A primary button's fill (Send Message): the desktop's
-    /// `primary_fill` tint laid over [`Theme::dialog`].
+    /// Contact Us's megaphone badge: the desktop's `primary_fill` tint laid
+    /// over [`Theme::dialog`]. (Its buttons are the shared `button*` ones.)
     pub primary: C,
-    /// A primary button with the keyboard on it: the tint at the desktop's
-    /// pressed strength.
-    pub primary_focus: C,
-    /// A primary button's label, and the icon on the tinted badge.
+    /// The icon on the [`Theme::primary`] badge.
     pub primary_label: C,
     /// The thank-you's heart badge: magenta tinted over [`Theme::dialog`].
     pub magenta_tint: C,
+    /// A text field's fill at rest on an overlay's [`Theme::search`] panel (a
+    /// dialog's fields): a well darker than the panel, as the desktop
+    /// dialog's textboxes are.
+    pub input_well: C,
+    /// A Secondary button's fill (the TUI's half-block button): the
+    /// desktop's `button/default/background` over the canvas.
+    pub button: C,
+    /// A Secondary button under the pointer.
+    pub button_lit: C,
+    /// A Primary button's fill (a dialog's confirming action): a cyan
+    /// tint, as the desktop's `button/primary/background`.
+    pub button_primary: C,
+    /// A Primary button under the pointer.
+    pub button_primary_lit: C,
+    /// A Primary button's label.
+    pub button_primary_text: C,
+    /// A Danger button's fill (a destructive action): a red tint, as the
+    /// desktop's `button/danger/background`.
+    pub button_danger: C,
+    /// A Danger button under the pointer.
+    pub button_danger_lit: C,
+    /// A Danger button's label.
+    pub button_danger_text: C,
+    /// A Secondary or Primary button with the keyboard: a solid cyan, the
+    /// desktop's focus ring color, so focus can't be missed.
+    pub button_focus: C,
+    /// A Danger button with the keyboard: a solid red.
+    pub button_danger_focus: C,
+    /// A focused button's label, on [`Theme::button_focus`] or
+    /// [`Theme::button_danger_focus`].
+    pub button_focus_text: C,
     /// `color/divider` (was `DIVIDER_DIM`): the sidebar's right-edge rule at
     /// rest.
     pub divider: C,
@@ -345,9 +373,20 @@ impl Theme {
             dialog_control: Swatch::rgb(0x303030),
             segment: Swatch::rgb(0x1c1c1c),
             primary: Swatch::rgb(0x31444b),
-            primary_focus: Swatch::rgb(0x3e6979),
             primary_label: Swatch::rgb(0xb0e6fb),
             magenta_tint: Swatch::rgb(0x433742),
+            input_well: Swatch::rgb(0x1e1e1e),
+            button: Swatch::rgb(0x363636),
+            button_lit: Swatch::rgb(0x464646),
+            button_primary: Swatch::rgb(0x1d3a40),
+            button_primary_lit: Swatch::rgb(0x25505a),
+            button_primary_text: Swatch::rgb(0x7fdbe3),
+            button_danger: Swatch::rgb(0x45242a),
+            button_danger_lit: Swatch::rgb(0x5c2d35),
+            button_danger_text: Swatch::rgb(0xff8f98),
+            button_focus: Swatch::rgb(0x00a6b2),
+            button_danger_focus: Swatch::rgb(0xe04f52),
+            button_focus_text: Swatch::rgb(0x111111),
             divider: Swatch::rgb(0x414141),
             zen: Swatch::rgb(0x007f00),
 
@@ -406,9 +445,20 @@ impl Theme {
             dialog_control: Swatch::rgb(0xe2e2e2),
             segment: Swatch::rgb(0xffffff),
             primary: Swatch::rgb(0xe1eef2),
-            primary_focus: Swatch::rgb(0xc4e6f3),
             primary_label: Swatch::rgb(0x0a6f9e),
             magenta_tint: Swatch::rgb(0xe8d8ea),
+            input_well: Swatch::rgb(0xffffff),
+            button: Swatch::rgb(0xe2e2e2),
+            button_lit: Swatch::rgb(0xd2d2d2),
+            button_primary: Swatch::rgb(0xd6eef1),
+            button_primary_lit: Swatch::rgb(0xbfe3e8),
+            button_primary_text: Swatch::rgb(0x00606a),
+            button_danger: Swatch::rgb(0xf9e1e4),
+            button_danger_lit: Swatch::rgb(0xf1c8ce),
+            button_danger_text: Swatch::rgb(0xa3202f),
+            button_focus: Swatch::rgb(0x007a83),
+            button_danger_focus: Swatch::rgb(0xc23b3e),
+            button_focus_text: Swatch::rgb(0xffffff),
             divider: Swatch::rgb(0xd0d0d0),
             zen: Swatch::rgb(0x007f00),
 
@@ -506,9 +556,20 @@ impl<C: Copy> Theme<C> {
             dialog_control,
             segment,
             primary,
-            primary_focus,
             primary_label,
             magenta_tint,
+            input_well,
+            button,
+            button_lit,
+            button_primary,
+            button_primary_lit,
+            button_primary_text,
+            button_danger,
+            button_danger_lit,
+            button_danger_text,
+            button_focus,
+            button_danger_focus,
+            button_focus_text,
             divider,
             zen,
             divider_active,
@@ -560,9 +621,20 @@ impl<C: Copy> Theme<C> {
             dialog_control: f(dialog_control),
             segment: f(segment),
             primary: f(primary),
-            primary_focus: f(primary_focus),
             primary_label: f(primary_label),
             magenta_tint: f(magenta_tint),
+            input_well: f(input_well),
+            button: f(button),
+            button_lit: f(button_lit),
+            button_primary: f(button_primary),
+            button_primary_lit: f(button_primary_lit),
+            button_primary_text: f(button_primary_text),
+            button_danger: f(button_danger),
+            button_danger_lit: f(button_danger_lit),
+            button_danger_text: f(button_danger_text),
+            button_focus: f(button_focus),
+            button_danger_focus: f(button_danger_focus),
+            button_focus_text: f(button_focus_text),
             divider: f(divider),
             zen: f(zen),
             divider_active: f(divider_active),
@@ -627,9 +699,20 @@ const TOKEN_NAMES: &[&str] = &[
     "dialog_control",
     "segment",
     "primary",
-    "primary_focus",
     "primary_label",
     "magenta_tint",
+    "input_well",
+    "button",
+    "button_lit",
+    "button_primary",
+    "button_primary_lit",
+    "button_primary_text",
+    "button_danger",
+    "button_danger_lit",
+    "button_danger_text",
+    "button_focus",
+    "button_danger_focus",
+    "button_focus_text",
     "divider",
     "zen",
     "divider_active",
@@ -832,6 +915,31 @@ mod tests {
                 assert_contrast(&theme, fg, "row_hover", 4.5);
             }
             assert_contrast(&theme, "muted", "row_hover", 3.0);
+            // A dialog's field well reads apart from its panel.
+            assert_ne!(token(&theme, "input_well").rgb, token(&theme, "search").rgb, "well and panel differ");
+            for fg in ["white", "foreground"] {
+                assert_contrast(&theme, fg, "input_well", 4.5);
+            }
+            assert_contrast(&theme, "muted", "input_well", 3.0);
+            // A button's label at rest, under the pointer, and focused (a
+            // disabled one is a read-only field's muted text on its fill).
+            for fill in ["button", "button_lit"] {
+                assert_contrast(&theme, "white", fill, 4.5);
+            }
+            for fill in ["button_primary", "button_primary_lit"] {
+                assert_contrast(&theme, "button_primary_text", fill, 4.5);
+            }
+            for fill in ["button_danger", "button_danger_lit"] {
+                assert_contrast(&theme, "button_danger_text", fill, 4.5);
+            }
+            for fill in ["button_focus", "button_danger_focus"] {
+                assert_contrast(&theme, "button_focus_text", fill, 4.5);
+            }
+            // Each kind's fill reads apart from a field's, so a button beside
+            // a field reads as a button.
+            for fill in ["button", "button_primary", "button_danger"] {
+                assert_ne!(token(&theme, fill).rgb, token(&theme, "input").rgb, "{fill} and input differ");
+            }
             assert_ne!(token(&theme, "row_hover").rgb, token(&theme, "selection").rgb, "hover and selection differ");
             // A field's placeholder and a read-only field's text.
             assert_contrast(&theme, "muted", "input", 3.0);
@@ -846,13 +954,11 @@ mod tests {
             assert_contrast(&theme, "muted", "dialog_control", 3.0);
             assert_contrast(&theme, "muted", "dialog", 3.0);
             assert_contrast(&theme, "primary_label", "primary", 4.5);
-            assert_contrast(&theme, "white", "primary_focus", 4.5);
             assert_contrast(&theme, "ansi_magenta", "magenta_tint", 3.0);
             for (a, b) in [
                 ("dialog", "dialog_control"),
                 ("dialog_control", "segment"),
                 ("dialog_control", "input_focus"),
-                ("primary", "primary_focus"),
                 ("primary", "dialog_control"),
             ] {
                 assert_ne!(token(&theme, a).rgb, token(&theme, b).rgb, "{a} and {b} differ");

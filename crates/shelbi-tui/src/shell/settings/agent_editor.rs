@@ -63,7 +63,8 @@ use shelbi_app::text_area::TextArea;
 use shelbi_state::agents_config::{AgentsConfig, SkillLayout};
 
 use super::workflows::{add_line, plain_line, LineEdit, Nav, WorkflowsPage};
-use super::{field_rows, follow, heading, picker_rows, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
+use super::{button_rows, field_rows, fields_row, RowField, follow, heading, picker_rows, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
+use crate::button::{self, badge, bar, Align, Button, Piece};
 use crate::panel::{self, PAD};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
@@ -71,6 +72,9 @@ use crate::theme::palette;
 /// A multi-line field's left rule.
 /// The instructions' preview, in lines, while not being edited.
 const PREVIEW_LINES: usize = 10;
+
+/// The Name field's width in the identity row (the desktop's 240pt).
+const NAME_W: usize = 28;
 
 /// A one-line text field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1278,8 +1282,9 @@ impl AgentEditorPage {
                     KeyCode::Esc => return self.confirm(kind, false),
                     c if c == no => return self.confirm(kind, false),
                     c if c == yes => return self.confirm(kind, true),
-                    KeyCode::Left | KeyCode::BackTab => choice = 0,
-                    KeyCode::Right | KeyCode::Tab => choice = 1,
+                    // Drawn as the desktop's: Cancel, then the action.
+                    KeyCode::Left | KeyCode::BackTab => choice = 1,
+                    KeyCode::Right | KeyCode::Tab => choice = 0,
                     KeyCode::Enter | KeyCode::Char(' ') => return self.confirm(kind, choice == 0),
                     _ => {}
                 }
@@ -1354,11 +1359,12 @@ impl AgentEditorPage {
             KeyCode::Esc | KeyCode::Char('c') => self.prompt_choose(2),
             KeyCode::Char('s') => self.prompt_choose(0),
             KeyCode::Char('d') => self.prompt_choose(1),
-            KeyCode::Left | KeyCode::BackTab => {
+            // The buttons run Cancel, Discard, Save left to right.
+            KeyCode::Right | KeyCode::Tab => {
                 self.prompt_choice = self.prompt_choice.saturating_sub(1);
                 EditorAction::Stay
             }
-            KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.prompt_choice = (self.prompt_choice + 1).min(PROMPT_BUTTONS.len() - 1);
                 EditorAction::Stay
             }
@@ -1510,9 +1516,9 @@ impl AgentEditorPage {
         }
         let items = self.items();
         self.clamp();
-        let header = Rect { height: 1, ..inner };
+        let header = Rect { height: button::BUTTON_H as u16, ..inner }.intersection(inner);
         self.render_header(f, header, &items);
-        let content = Rect { y: inner.y + 2.min(inner.height), height: inner.height.saturating_sub(2), ..inner };
+        let content = Rect { y: inner.y + 4.min(inner.height), height: inner.height.saturating_sub(4), ..inner };
         if content.height == 0 {
             return;
         }
@@ -1543,7 +1549,14 @@ impl AgentEditorPage {
                 continue;
             }
             f.render_widget(Paragraph::new(row.line.clone()), rect);
-            if let Some(a) = row.action {
+            if !row.targets.is_empty() {
+                // A row of buttons: each takes its own columns.
+                for &(x, w, hit) in &row.targets {
+                    if let super::Hit::Action(a) = hit {
+                        self.hits.push((Rect { x: rect.x + x, width: w, ..rect }.intersection(rect), Hit::Item(a)));
+                    }
+                }
+            } else if let Some(a) = row.action {
                 self.hits.push((Rect { x: area.x, width: area.width, ..rect }, Hit::Item(a)));
             }
         }
@@ -1555,64 +1568,37 @@ impl AgentEditorPage {
     }
 
     fn render_header(&mut self, f: &mut Frame, rect: Rect, items: &[Item]) {
+        // The desktop's title bar: back, the name and its badge; Discard
+        // changes, Save changes (Primary) and the ⋮ menu at the right.
         let state = self.state.as_ref();
         let dirty = state.is_some_and(AgentEditorState::is_dirty);
         let busy = state.is_some_and(AgentEditorState::busy);
         let selected = |item: &Item| items.get(self.cursor) == Some(item);
-        let button = |label: &str, item: &Item, enabled: bool| {
-            let style = if selected(item) {
-                selected_style(true)
-            } else if enabled {
-                Style::default().fg(palette().white).bg(palette().selection)
-            } else {
-                Style::default().fg(palette().muted)
-            };
-            Span::styled(format!(" {label} "), style)
-        };
-        let bold = Style::default().fg(palette().white).add_modifier(Modifier::BOLD);
-        let mut left = vec![button("← Back", &Item::Back, true), Span::raw("  "), Span::styled(self.name().to_string(), bold)];
-        if let Some(badge) = state.and_then(AgentEditorState::badge) {
-            left.push(Span::styled(format!(" {badge}"), Style::default().fg(palette().cyan)));
+        let tag = |item: &Item| items.iter().position(|it| it == item).unwrap_or(usize::MAX);
+        let mut after = Vec::new();
+        if let Some(b) = state.and_then(AgentEditorState::badge) {
+            after.extend([Span::raw("  "), badge(b)]);
         }
         if dirty {
-            left.push(Span::styled(" ●", Style::default().fg(palette().yellow)));
+            after.push(Span::styled(" ●", Style::default().fg(palette().yellow)));
         }
-        let save = button(if busy { "Saving…" } else { "Save changes" }, &Item::Save, dirty && !busy);
-        let discard = button("Discard", &Item::Discard, dirty && !busy);
-        let actions = button("⋮ Actions", &Item::Actions, state.is_some());
-        let right = [save, Span::raw(" "), discard, Span::raw(" "), actions];
-        let left_w: usize = left.iter().map(|s| panel::display_width(&s.content)).sum();
-        let right_w: usize = right.iter().map(|s| panel::display_width(&s.content)).sum();
-        let width = rect.width as usize;
-        let gap = width.saturating_sub(left_w + right_w);
-        let mut spans = left;
-        if left_w + right_w > width {
-            // Narrow: the name gives way first, then the buttons are cut.
-            let room = width.saturating_sub(right_w + 10);
-            spans.truncate(2);
-            spans.push(Span::styled(panel::truncate_right(self.name(), room.max(1)), bold));
-        }
-        spans.push(Span::raw(" ".repeat(gap.max(1))));
-        spans.extend(right);
-        f.render_widget(Paragraph::new(Line::from(spans.clone())), rect);
-        let mut x = rect.x;
-        let targets = [
-            (" ← Back ", Item::Back),
-            (" Save changes ", Item::Save),
-            (" Saving… ", Item::Save),
-            (" Discard ", Item::Discard),
-            (" ⋮ Actions ", Item::Actions),
+        let left = vec![
+            Piece::button(Button::secondary("←").focused(selected(&Item::Back)), tag(&Item::Back), 0),
+            Piece::title(self.name(), after),
         ];
-        for span in &spans {
-            let w = panel::display_width(&span.content) as u16;
-            if let Some((_, item)) = targets.iter().find(|(t, _)| *t == span.content) {
-                if let Some(i) = items.iter().position(|it| it == item) {
-                    if x + w <= rect.right() {
-                        self.hits.push((Rect { x, width: w, ..rect }, Hit::Item(i)));
-                    }
-                }
+        let save = if busy { "Saving…" } else { "Save changes" };
+        let right = vec![
+            Piece::button(Button::secondary("Discard changes").focused(selected(&Item::Discard)).enabled(dirty && !busy), tag(&Item::Discard), 1),
+            Piece::button(Button::primary(save).focused(selected(&Item::Save)).enabled(dirty && !busy), tag(&Item::Save), 0),
+            Piece::button(Button::secondary("⋮").focused(selected(&Item::Actions)).enabled(state.is_some()), tag(&Item::Actions), 0),
+        ];
+        let (lines, hits) = bar(left, right, rect.width as usize);
+        f.render_widget(Paragraph::new(lines.to_vec()), rect);
+        for (x, w, t) in hits.into_iter().filter(|h| h.2 != usize::MAX) {
+            let r = Rect { x: rect.x + x, width: w, ..rect }.intersection(rect);
+            if !r.is_empty() {
+                self.hits.push((r, Hit::Item(t)));
             }
-            x = x.saturating_add(w);
         }
     }
 
@@ -1650,24 +1636,54 @@ impl AgentEditorPage {
 
         // Agent.
         heading(&mut rows, "Agent");
+        // Name and Description side by side, as the desktop's identity row.
         let blocked = state.rename_blocked();
-        let on = selected(&Item::Text(Text::Name)) == Some(true);
-        let invalid = state.error_at(&Field::Name).is_some();
-        self.field(&mut rows, "Name", &Text::Name, "", on, blocked.is_some(), invalid, index(&Item::Text(Text::Name)), width);
+        let value = |text: &Text| match &self.typing {
+            Some((t, edit)) if t == text => (edit.text(), Some(edit.caret())),
+            _ => (self.text(text), None),
+        };
+        let (name, name_caret) = value(&Text::Name);
+        let (description, description_caret) = value(&Text::Description);
+        let name_on = selected(&Item::Text(Text::Name)) == Some(true);
+        let description_on = selected(&Item::Text(Text::Description)) == Some(true);
+        let fields = [
+            RowField {
+                label: "Name",
+                textbox: Textbox::new(&name)
+                    .caret(name_caret)
+                    .focused(name_on)
+                    .disabled(blocked.is_some())
+                    .invalid(state.error_at(&Field::Name).is_some()),
+                focused: name_on,
+                disabled: blocked.is_some(),
+                action: index(&Item::Text(Text::Name)),
+                width: NAME_W,
+            },
+            RowField {
+                label: "Description",
+                textbox: Textbox::new(&description)
+                    .caret(description_caret)
+                    .placeholder(DESCRIPTION_PLACEHOLDER)
+                    .focused(description_on)
+                    .invalid(state.error_at(&Field::Description).is_some()),
+                focused: description_on,
+                disabled: false,
+                action: index(&Item::Text(Text::Description)),
+                width: 0,
+            },
+        ];
+        rows.push(Row::blank());
+        fields_row(&mut rows, &fields, width);
         if let Some(why) = &blocked {
             help(&mut rows, &format!("Locked: {why}"));
         }
         errors(&mut rows, Field::Name);
-        rows.push(Row::blank());
-        let on = selected(&Item::Text(Text::Description)) == Some(true);
-        let invalid = state.error_at(&Field::Description).is_some();
-        self.field(&mut rows, "Description", &Text::Description, DESCRIPTION_PLACEHOLDER, on, false, invalid, index(&Item::Text(Text::Description)), width);
         errors(&mut rows, Field::Description);
 
         // Instructions.
         rows.push(Row::blank());
         rows.push(Row::text(Line::from(vec![
-            Span::styled("Instructions", Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Instructions", Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
             Span::styled("  Markdown", muted),
         ])));
         wrapped(&mut rows, INSTRUCTIONS_HELPER, width, muted);
@@ -1716,7 +1732,9 @@ impl AgentEditorPage {
             }
             errors(&mut rows, Field::Skill(skill.name.clone()));
         }
-        rows.push(Row { action: index(&Item::AddSkill), ..Row::text(add_line("+ Add skill", selected(&Item::AddSkill), width)) });
+        rows.push(Row::blank());
+        let add = Button::secondary("Add skill").focused(selected(&Item::AddSkill) == Some(true));
+        button_rows(&mut rows, &[(add, index(&Item::AddSkill))], width, Align::Left);
         if self.skill_form.is_some() {
             for (label, text, placeholder) in [
                 ("Skill name", Text::SkillName, "lowercase-with-dashes"),
@@ -1739,22 +1757,17 @@ impl AgentEditorPage {
                     self.area = view;
                 }
             }
-            let button = |label: &str, item: &Item| {
-                let style = if selected(item) == Some(true) {
-                    selected_style(true)
-                } else {
-                    Style::default().fg(palette().gray).bg(palette().selection)
-                };
-                Span::styled(format!(" {label} "), style)
-            };
-            rows.push(Row {
-                action: index(&Item::SkillAdd),
-                ..Row::text(Line::from(vec![button("Add skill", &Item::SkillAdd)]))
-            });
-            rows.push(Row {
-                action: index(&Item::SkillCancel),
-                ..Row::text(Line::from(vec![button("Cancel", &Item::SkillCancel)]))
-            });
+            rows.push(Row::blank());
+            let on = |item: &Item| selected(item) == Some(true);
+            button_rows(
+                &mut rows,
+                &[
+                    (Button::primary("Add skill").focused(on(&Item::SkillAdd)), index(&Item::SkillAdd)),
+                    (Button::secondary("Cancel").focused(on(&Item::SkillCancel)), index(&Item::SkillCancel)),
+                ],
+                width,
+                Align::Left,
+            );
         }
         let state = self.state.as_ref().expect("loaded");
         let item = Item::Text(Text::Import);
@@ -1830,14 +1843,15 @@ impl AgentEditorPage {
         // Reset and Delete.
         rows.push(Row::blank());
         let reset = state.reset_blocked();
-        let style = if reset.is_some() { muted } else { Style::default().fg(palette().cyan) };
-        rows.push(Row { action: index(&Item::Reset), ..Row::text(plain_line("Reset to default", selected(&Item::Reset), width, style)) });
+        let button = Button::secondary("Reset to default").focused(selected(&Item::Reset) == Some(true)).enabled(reset.is_none());
+        button_rows(&mut rows, &[(button, index(&Item::Reset))], width, Align::Left);
         if let Some(why) = reset {
             note(&mut rows, &why);
         }
         let delete = state.delete_blocked();
-        let style = if delete.is_some() { muted } else { red };
-        rows.push(Row { action: index(&Item::Delete), ..Row::text(plain_line("Delete agent…", selected(&Item::Delete), width, style)) });
+        rows.push(Row::blank());
+        let button = Button::danger("Delete agent").focused(selected(&Item::Delete) == Some(true)).enabled(delete.is_none());
+        button_rows(&mut rows, &[(button, index(&Item::Delete))], width, Align::Left);
         if let Some(why) = delete {
             note(&mut rows, &why);
         }
@@ -1889,18 +1903,8 @@ impl AgentEditorPage {
                 let skip = (selected + 1).saturating_sub(room.max(1));
                 for (row, (i, c)) in entries.iter().enumerate().skip(skip).take(room).enumerate() {
                     let r = Rect { y: inner.y + row as u16, height: 1, ..inner };
-                    let left = format!(" {}", c.label);
-                    let right = format!("{} ", c.note);
-                    let gap = w.saturating_sub(panel::display_width(&left) + panel::display_width(&right));
-                    let text = panel::truncate_right(&format!("{left}{}{right}", " ".repeat(gap)), w);
-                    let style = if i == selected {
-                        selected_style(true)
-                    } else if c.inert {
-                        Style::default().fg(palette().muted).bg(palette().background)
-                    } else {
-                        Style::default().fg(palette().foreground).bg(palette().background)
-                    };
-                    f.render_widget(Paragraph::new(Span::styled(text, style)), r);
+                    let line = super::menu_line(&c.label, &c.note, w, i == selected, c.inert);
+                    f.render_widget(Paragraph::new(line), r);
                     self.hits.push((r, Hit::Entry(i)));
                 }
                 let first = inner.y + room as u16 + 1;
@@ -1912,16 +1916,33 @@ impl AgentEditorPage {
                 }
             }
             Modal::Confirm { kind, choice } => {
-                let (title, message, buttons) = match &kind {
-                    Confirm::Delete => (" Delete agent ", format!("{} {DELETE_MESSAGE}", delete_title(self.name())), [" Delete ", " Cancel "]),
-                    Confirm::RemoveSkill(name) => (
-                        " Remove skill ",
-                        format!("Remove skill {name}? Its files are deleted when you save; Discard brings it back."),
-                        [" Remove ", " Cancel "],
+                // Cancel (index 1), then the action (index 0), as the desktop
+                // draws a confirmation.
+                let (title, message, cancel, action, hint) = match &kind {
+                    Confirm::Delete => (
+                        delete_title(self.name()),
+                        DELETE_MESSAGE.to_string(),
+                        "Cancel",
+                        Button::danger("Delete"),
+                        "←→ choose · ⏎ press · y delete · n or Esc cancel",
                     ),
-                    Confirm::Conflict => (" Changed on disk ", CONFLICT_MESSAGE.to_string(), [" Reload ", " Keep editing "]),
+                    Confirm::RemoveSkill(name) => (
+                        format!("Remove skill {name}?"),
+                        "Its files are deleted when you save; Discard brings it back.".to_string(),
+                        "Cancel",
+                        Button::danger("Remove"),
+                        "←→ choose · ⏎ press · y remove · n or Esc cancel",
+                    ),
+                    Confirm::Conflict => (
+                        "Changed on disk".to_string(),
+                        CONFLICT_MESSAGE.to_string(),
+                        "Keep editing",
+                        Button::danger("Reload"),
+                        "←→ choose · ⏎ press · r reload · k keep editing",
+                    ),
                 };
-                self.render_buttons(f, area, title, &message, &buttons, choice);
+                let buttons = [(Button::secondary(cancel).focused(choice == 1), 1), (action.focused(choice == 0), 0)];
+                self.render_buttons(f, area, &title, &message, &buttons, hint);
             }
             Modal::Inspect { name, top } => self.render_inspect(f, area, &name, top),
         }
@@ -1972,40 +1993,16 @@ impl AgentEditorPage {
     }
 
     fn render_prompt(&mut self, f: &mut Frame, area: Rect) {
-        let message = format!("{} {LEAVE_MESSAGE}", leave_title(self.name()));
-        let buttons: Vec<String> = PROMPT_BUTTONS.iter().map(|b| format!(" {b} ")).collect();
-        let buttons: Vec<&str> = buttons.iter().map(String::as_str).collect();
-        self.render_buttons(f, area, " Unsaved changes ", &message, &buttons, self.prompt_choice);
+        let buttons = super::leave_buttons(self.prompt_choice, true);
+        self.render_buttons(f, area, &leave_title(self.name()), LEAVE_MESSAGE, &buttons, super::LEAVE_HINT);
     }
 
-    fn render_buttons(&mut self, f: &mut Frame, area: Rect, title: &str, message: &str, buttons: &[&str], choice: usize) {
-        let lines = shelbi_app::overlay::error_log::wrap(message, 44);
-        let Some(rect) = WorkflowsPage::popup(area, 50, lines.len() as u16 + 4) else {
-            return;
-        };
-        let inner = WorkflowsPage::frame(f, rect, title);
-        for (i, line) in lines.iter().enumerate() {
-            let y = inner.y + i as u16;
-            if y + 1 >= inner.bottom() {
-                break;
-            }
-            f.render_widget(
-                Paragraph::new(Span::styled(format!(" {line}"), Style::default().fg(palette().foreground))),
-                Rect { y, height: 1, ..inner },
-            );
-        }
-        let y = inner.bottom().saturating_sub(1);
-        let mut x = inner.x + 1;
-        for (i, label) in buttons.iter().enumerate() {
-            let w = panel::display_width(label) as u16;
-            if x + w > inner.right() {
-                break;
-            }
-            let style = if i == choice { selected_style(true) } else { Style::default().fg(palette().gray).bg(palette().selection) };
-            let r = Rect { x, y, width: w, height: 1 };
-            f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), r);
+    /// A dialog over the editor (see [`super::render_dialog`]): `buttons`
+    /// in the order drawn, each with its index (a [`Hit::Button`]).
+    fn render_buttons(&mut self, f: &mut Frame, area: Rect, title: &str, body: &str, buttons: &[(Button<'_>, usize)], hint: &str) {
+        let body = [(body.to_string(), Style::default().fg(palette().foreground))];
+        for (r, i) in super::render_dialog(f, area, 60, title, &body, buttons, hint) {
             self.hits.push((r, Hit::Button(i)));
-            x += w + 1;
         }
     }
 }

@@ -141,22 +141,23 @@ fn it_opens_after_its_read_with_the_header_and_every_section() {
     let text = page_text(&mut ed);
     for want in [
         "Agent", "Name", "developer", "Description", "Instructions", "Markdown", INSTRUCTIONS_HELPER,
-        "Edit instructions.md in your editor", "Shared project instructions", "Skills (", "+ Add skill",
+        "Edit instructions.md in your editor", "Shared project instructions", "Skills (", "Add skill",
         "Import skill", "Runner preferences", "Preferred runner", "Model", "Reasoning effort", "Permissions",
         "Workflow assignments", "task / In Progress", "subtask / In Progress", "Manage assignments in Workflows",
-        "Reset to default", "Delete agent…", APPLY_NOTE,
+        "Reset to default", "Delete agent", APPLY_NOTE,
     ] {
         assert!(text.contains(want), "{want} in:\n{text}");
     }
     // The locked rename and delete say why, from the shared guard.
     assert!(text.contains("Locked:") && text.contains("ships with Shelbi"), "{text}");
     let screen = render(&mut ed, 100, 30);
-    let header = screen.lines().next().unwrap();
-    assert!(header.contains("← Back") && header.contains("developer Default"), "{header}");
-    assert!(header.contains("Save changes") && header.contains("Discard") && header.contains("⋮ Actions"), "{header}");
+    // The title bar's labels, on its middle row.
+    let header = screen.lines().nth(1).unwrap();
+    assert!(header.contains("←") && header.contains("developer   Default"), "{header}");
+    assert!(header.contains("Save changes") && header.contains("Discard changes") && header.contains("⋮"), "{header}");
     // A customized one says so; a missing one says it isn't there.
     let mut ed = editor("orchestrator");
-    assert!(render(&mut ed, 100, 10).lines().next().unwrap().contains("orchestrator Customized"));
+    assert!(render(&mut ed, 100, 10).lines().nth(1).unwrap().contains("orchestrator   Customized"));
     let mut gone = AgentEditorPage::open(PROJECT, "nope", None);
     drain(&mut gone);
     assert!(render(&mut gone, 80, 10).contains("There is no agent named nope."));
@@ -412,7 +413,7 @@ fn reset_goes_into_the_draft_and_discard_restores_the_loaded_agent() {
     press(&mut ed, key(KeyCode::Enter));
     save(&mut ed);
     assert!(!std::fs::read_to_string(agent_file(&home, "orchestrator", "instructions.md")).unwrap().contains("release notes"));
-    assert!(render(&mut ed, 100, 10).lines().next().unwrap().contains("orchestrator Default"));
+    assert!(render(&mut ed, 100, 10).lines().nth(1).unwrap().contains("orchestrator   Default"));
 }
 
 #[test]
@@ -446,7 +447,7 @@ fn rename_and_delete_follow_the_shared_guards() {
     go(&mut ed, Item::Delete);
     press(&mut ed, key(KeyCode::Enter));
     assert_eq!(ed.modal_title().as_deref(), Some("Delete agent"));
-    assert!(render(&mut ed, 100, 30).contains("This can’t be undone."));
+    assert!(render(&mut ed, 100, 30).contains("can’t be undone."));
     press(&mut ed, key(KeyCode::Enter));
     assert!(agent_file(&home, "writer", "agent.yaml").exists(), "Cancel is focused");
     go(&mut ed, Item::Delete);
@@ -672,7 +673,8 @@ fn a_click_on_any_row_of_a_fields_box_types_in_it() {
     let _home = home("field-click");
     let mut ed = editor("developer");
     let screen = render(&mut ed, 110, 60);
-    let label = screen.lines().position(|l| l.trim() == "Description").unwrap_or_else(|| panic!("{screen}"));
+    // Name and Description share the identity row: the label's line.
+    let label = screen.lines().position(|l| l.contains("Name") && l.contains("Description")).unwrap_or_else(|| panic!("{screen}"));
     for y in label + 1..=label + 3 {
         press(&mut ed, key(KeyCode::Esc));
         ed.cursor = 0;
@@ -705,7 +707,7 @@ fn clicks_select_then_open_and_answer_menus() {
     assert_eq!(ed.modal_title().as_deref(), Some("Preferred runner"), "a second opens");
     let screen = render(&mut ed, 110, 60);
     // The menu's entry (a note on the page may name Codex too).
-    let (y, line) = screen.lines().enumerate().find(|(_, l)| l.contains("│ Codex ")).unwrap();
+    let (y, line) = screen.lines().enumerate().find(|(_, l)| l.contains("│  Codex ")).unwrap();
     let x = line.find(" Codex ").map(|b| line[..b].chars().count()).unwrap() as u16 + 1;
     ed.handle_mouse(click(x, y as u16));
     assert_eq!(ed.state().unwrap().agent().preferred_runner(), Some(RunnerKind::Codex));

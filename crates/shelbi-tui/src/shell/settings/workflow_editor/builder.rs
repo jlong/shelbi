@@ -61,7 +61,8 @@ use super::canvas::{self, Border, Canvas, EdgeIn, Input, Look, NodeLook, Route};
 use super::{Act, Choice, EditorAction, Hit, Item, Pick, Section, Text, WorkflowEditorPage};
 use crate::panel;
 use crate::shell::settings::workflows::{add_line, error_rows, plain_line, Nav};
-use crate::shell::settings::{follow, heading, picker_rows, wrapped, Row};
+use crate::button::{Align, Button};
+use crate::shell::settings::{button_rows, follow, heading, picker_rows, wrapped, Row};
 use crate::theme::palette;
 
 /// From this width the panel sits beside the canvas; narrower, it takes the
@@ -1136,7 +1137,7 @@ impl WorkflowEditorPage {
         // The title, and ✕.
         let title = Rect { height: 1, ..inner };
         f.render_widget(
-            Paragraph::new(Span::styled(self.panel_title(), Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD))),
+            Paragraph::new(Span::styled(self.panel_title(), Style::default().fg(palette().white).add_modifier(Modifier::BOLD))),
             title,
         );
         let close = Rect { x: title.right().saturating_sub(3), width: 3.min(title.width), ..title };
@@ -1159,7 +1160,13 @@ impl WorkflowEditorPage {
                 continue;
             }
             f.render_widget(Paragraph::new(row.line.clone()), rect);
-            if let Some(a) = row.action {
+            if !row.targets.is_empty() {
+                for &(x, w, hit) in &row.targets {
+                    if let crate::shell::settings::Hit::Action(a) = hit {
+                        self.hits.push((Rect { x: rect.x + x, width: w, ..rect }.intersection(rect), Hit::Item(a)));
+                    }
+                }
+            } else if let Some(a) = row.action {
                 self.hits.push((rect, Hit::Item(a)));
             }
         }
@@ -1180,6 +1187,12 @@ impl WorkflowEditorPage {
         let button = |rows: &mut Vec<Row>, item: Item, text: &str, style: Style| {
             let line = plain_line(text, selected(&item), width, style);
             row(rows, item, line);
+        };
+        // The panel's actions, as the desktop's: half-block buttons.
+        let on = |item: &Item| selected(item) == Some(true);
+        let buttons = |rows: &mut Vec<Row>, list: &[(Button<'_>, Item)]| {
+            let list: Vec<(Button, Option<usize>)> = list.iter().map(|(b, it)| (*b, index(it))).collect();
+            button_rows(rows, &list, width, Align::Left);
         };
         // A picker or a field a blank row under what's before it: its label
         // over its box.
@@ -1235,7 +1248,8 @@ impl WorkflowEditorPage {
                 }
                 rows.push(Row::blank());
                 if index(&Item::SetInitial(id.clone())).is_some() {
-                    button(&mut rows, Item::SetInitial(id.clone()), "Set as initial", Style::default().fg(palette().cyan));
+                    let item = Item::SetInitial(id.clone());
+                    buttons(&mut rows, &[(Button::secondary("Set as initial").focused(on(&item)), item)]);
                 } else {
                     rows.push(Row::text(Line::from(Span::styled("  Initial status", Style::default().fg(palette().cyan)))));
                 }
@@ -1253,12 +1267,12 @@ impl WorkflowEditorPage {
                     wrapped(&mut rows, "  None yet", width, muted);
                 }
                 let add = Item::StartTransition(id.clone());
-                let line = add_line("+ Add transition", selected(&add), width);
-                row(&mut rows, add, line);
+                rows.push(Row::blank());
+                buttons(&mut rows, &[(Button::secondary("Add transition").focused(on(&add)), add)]);
                 rows.push(Row::blank());
                 let only = state.workflow().statuses.len() <= 1;
-                let style = if only { muted } else { Style::default().fg(palette().red) };
-                button(&mut rows, Item::RemoveStatus(id), "Remove from workflow", style);
+                let remove = Item::RemoveStatus(id);
+                buttons(&mut rows, &[(Button::danger("Remove from workflow").focused(on(&remove)).enabled(!only), remove)]);
                 if only {
                     wrapped(&mut rows, "    A workflow needs at least one status.", width, muted);
                 }
@@ -1282,7 +1296,8 @@ impl WorkflowEditorPage {
                     wrapped(&mut rows, "Transition added. Save changes to apply it to this project.", width, muted);
                 }
                 rows.push(Row::blank());
-                button(&mut rows, Item::RemoveTransition(i), "Delete transition", Style::default().fg(palette().red));
+                let delete = Item::RemoveTransition(i);
+                buttons(&mut rows, &[(Button::danger("Delete transition").focused(on(&delete)), delete)]);
             }
             Some(Selection::Draw(d)) => {
                 picker(&mut rows, "From", &name(&d.from), Item::DrawFrom);
@@ -1290,7 +1305,7 @@ impl WorkflowEditorPage {
                 let to = d.over.as_deref().map_or_else(|| "None yet".to_string(), name);
                 picker(&mut rows, "To", &to, Item::DrawTo);
                 rows.push(Row::blank());
-                button(&mut rows, Item::CancelNew, "Cancel", Style::default().fg(palette().gray));
+                buttons(&mut rows, &[(Button::secondary("Cancel connection").focused(on(&Item::CancelNew)), Item::CancelNew)]);
             }
             Some(Selection::New(n)) => {
                 picker(&mut rows, "From", &name(&n.from), Item::NewFrom);
@@ -1299,13 +1314,13 @@ impl WorkflowEditorPage {
                 action_rows(&mut rows, &n.actions, &Item::NewAction, add, &name(&n.from), &name(&n.to));
                 rows.push(Row::blank());
                 error_rows(&mut rows, state.error_at(&Field::Transitions), width);
-                button(&mut rows, Item::CancelNew, "Cancel", Style::default().fg(palette().gray));
-                let confirm = Item::ConfirmNew;
-                let line = match selected(&confirm) {
-                    Some(f) => plain_line("Add transition", Some(f), width, Style::default()),
-                    None => Line::from(vec![Span::raw("  "), Span::styled("Add transition", Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD))]),
-                };
-                row(&mut rows, confirm, line);
+                buttons(
+                    &mut rows,
+                    &[
+                        (Button::secondary("Cancel").focused(on(&Item::CancelNew)), Item::CancelNew),
+                        (Button::primary("Add transition").focused(on(&Item::ConfirmNew)), Item::ConfirmNew),
+                    ],
+                );
             }
             None => {}
         }
