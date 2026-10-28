@@ -39,6 +39,7 @@
 //! - [`workflow_editor`]: one workflow's editor (its draft, the changes the
 //!   Form and the Builder make to it, Save, Discard and the leave prompt).
 
+pub mod agent_editor;
 pub mod agents;
 pub mod general;
 pub mod keybindings;

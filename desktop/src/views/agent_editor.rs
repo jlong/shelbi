@@ -44,8 +44,7 @@ use shelbi_core::StatusCategory;
 use shelbi_state::agents_config::{AgentsConfig, Provenance};
 
 use super::agent_editor_state::{
-    effort_label, permission_label, run_delete, run_duplicate, run_save, runners, AgentEditorState, Change, Field,
-    Leave, SaveJob, SaveOutcome,
+    run_delete, run_duplicate, run_save, AgentEditorState, AgentFile, Change, Field, Leave, SaveJob, SaveOutcome,
 };
 use super::agents_state::runner_label;
 use super::sidebar;
@@ -429,19 +428,21 @@ impl AgentEditor {
         .detach();
     }
 
-    /// Open the agent's `agent.yaml` (as saved) in the user's editor; the
+    /// Open one of the agent's files (as saved: `agent.yaml`,
+    /// `instructions.md`, a skill's `SKILL.md`) in the user's editor; the
     /// draft is read again when the window comes back to the front.
-    fn edit_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn edit_file(&mut self, file: AgentFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let path = state.manifest_file();
+        let path = state.file(&file);
+        let label = file.label();
         self.reload_on_return = true;
         let open = cx.background_executor().spawn(async move {
             if !path.exists() {
-                return Err("Couldn’t find agent.yaml.".to_string());
+                return Err(format!("Couldn’t find {label}."));
             }
-            super::external_edit::open_file(&path).map_err(|e| format!("Couldn’t open agent.yaml: {e}"))
+            super::external_edit::open_file(&path).map_err(|e| format!("Couldn’t open {label}: {e}"))
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = open.await;
@@ -500,10 +501,10 @@ impl AgentEditor {
     fn go(&mut self, then: Leave, window: &mut Window, cx: &mut Context<Self>) {
         match then {
             Leave::Back | Leave::SharedInstructions => cx.emit(AgentEditorEvent::Close),
-            Leave::Workflow(name) => cx.emit(AgentEditorEvent::OpenWorkflow(name)),
+            Leave::Workflow { name, .. } => cx.emit(AgentEditorEvent::OpenWorkflow(name)),
             Leave::Workflows => cx.emit(AgentEditorEvent::ShowWorkflows),
             Leave::Duplicate => self.duplicate(window, cx),
-            Leave::EditYaml => self.edit_yaml(window, cx),
+            Leave::Open(file) => self.edit_file(file, window, cx),
         }
     }
 
@@ -887,9 +888,14 @@ impl AgentEditor {
         let edit_yaml = menu_item("agent-editor-edit-yaml", "Edit YAML", false, &theme).on_click(cx.listener(
             |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                this.leave(Leave::EditYaml, Some(window), cx)
+                this.leave(Leave::Open(AgentFile::Manifest), Some(window), cx)
             },
         ));
+        let edit_instructions = menu_item("agent-editor-edit-instructions", "Edit instructions.md", false, &theme)
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.leave(Leave::Open(AgentFile::Instructions), Some(window), cx)
+            }));
         let duplicate = menu_item("agent-editor-duplicate", "Duplicate", false, &theme).on_click(cx.listener(
             |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
@@ -922,6 +928,7 @@ impl AgentEditor {
         };
         vec![
             edit_yaml.into_any_element(),
+            edit_instructions.into_any_element(),
             duplicate.into_any_element(),
             reset.into_any_element(),
             menu_rule(&theme).into_any_element(),
@@ -1118,6 +1125,14 @@ impl AgentEditor {
             frame().debug_selector(|| "agent-skills".into()).children(skills.into_iter().enumerate().map(|(i, skill)| {
                 let name = skill.name.clone();
                 let selector = format!("agent-skill-{name}");
+                let open = {
+                    let name = name.clone();
+                    row_button(format!("agent-skill-open-{name}"), icons::PENCIL_BUTTON, false, theme)
+                        .tooltip(style::tooltip("Open SKILL.md in your editor"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.leave(Leave::Open(AgentFile::Skill(name.clone())), Some(window), cx)
+                        }))
+                };
                 let remove = row_button(format!("agent-skill-remove-{name}"), icons::TRASH_BUTTON, false, theme)
                     .tooltip(style::tooltip("Remove skill"))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -1144,6 +1159,7 @@ impl AgentEditor {
                             .children(skill.description.clone().map(|d| footnote(d, theme)))
                             .children(error.map(|e| error_line(format!("agent-skill-error-{}", skill.name), e, theme))),
                     )
+                    .child(open)
                     .child(remove)
             }))
         };
@@ -1225,82 +1241,56 @@ impl AgentEditor {
     fn render_runner(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let state = self.state.as_ref().expect("loaded");
         let agent = state.agent();
-        let runner = state.runner();
-        let takes = state.runner_takes_options();
+        // The shared choices: (key, label, the change, selected).
+        let items = |choices: Vec<shelbi_app::settings::agent_editor::Choice>| -> Vec<(String, String, Change, bool)> {
+            choices.into_iter().map(|c| (c.key, c.label, c.change, c.current)).collect()
+        };
+        let current = |choices: &[shelbi_app::settings::agent_editor::Choice], fallback: String| {
+            choices.iter().find(|c| c.current).map_or(fallback, |c| c.label.clone())
+        };
 
-        let preferred = agent.preferred_runner();
+        let runners = state.runner_choices();
         let runner_picker = self.picker(
             Menu::Runner,
             "agent-runner",
-            preferred.map_or("Project default", runner_label).to_string(),
-            {
-                let mut items: Vec<(String, String, Change, bool)> =
-                    vec![("default".into(), "Project default".into(), Change::PreferredRunner(None), preferred.is_none())];
-                items.extend(runners().into_iter().map(|r| {
-                    (r.as_str().to_string(), runner_label(r).to_string(), Change::PreferredRunner(Some(r)), preferred == Some(r))
-                }));
-                items
-            },
+            current(&runners, agent.preferred_runner().map_or("Project default", runner_label).to_string()),
+            items(runners),
             None,
             theme,
             cx,
         );
-        let blocked = (!takes).then(|| format!("{} runners take no model or reasoning effort.", runner_label(runner)));
-        let model = state.model().map(str::to_string);
+        let blocked = state.options_blocked();
+        let models = state.model_choices();
         let model_picker = self.picker(
             Menu::Model,
             "agent-model",
-            model.clone().unwrap_or_else(|| "Use runner default".into()),
-            {
-                let mut items = vec![("default".to_string(), "Use runner default".to_string(), Change::Model(None), model.is_none())];
-                items.extend(state.models().into_iter().map(|m| (m.clone(), m.clone(), Change::Model(Some(m.clone())), model.as_ref() == Some(&m))));
-                items
-            },
+            current(&models, state.model().unwrap_or("Use runner default").to_string()),
+            items(models),
             blocked.clone(),
             theme,
             cx,
         );
-        let effort = state.effort();
+        let efforts = state.effort_choices();
         let effort_picker = self.picker(
             Menu::Effort,
             "agent-effort",
-            effort.map_or("Use runner default", effort_label).to_string(),
-            {
-                let mut items = vec![("default".to_string(), "Use runner default".to_string(), Change::Effort(None), effort.is_none())];
-                items.extend(state.efforts().iter().map(|&e| {
-                    (e.as_str().to_string(), effort_label(e).to_string(), Change::Effort(Some(e)), effort == Some(e))
-                }));
-                items
-            },
+            current(&efforts, "Use runner default".into()),
+            items(efforts),
             blocked,
             theme,
             cx,
         );
-        let mode = agent.permissions_mode().map(str::to_string);
+        let modes = state.permission_choices();
         let permissions_picker = self.picker(
             Menu::Permissions,
             "agent-permissions",
-            mode.as_deref().map_or_else(|| "Use project settings".to_string(), permission_label),
-            {
-                let mut items =
-                    vec![("default".to_string(), "Use project settings".to_string(), Change::Permissions(None), mode.is_none())];
-                items.extend(state.permission_modes().into_iter().map(|m| {
-                    (m.clone(), permission_label(&m), Change::Permissions(Some(m.clone())), mode.as_ref() == Some(&m))
-                }));
-                items
-            },
+            current(&modes, "Use project settings".into()),
+            items(modes),
             None,
             theme,
             cx,
         );
-        let note = if takes {
-            format!("Model and effort apply to {}. Project settings can override these preferences.", runner_label(runner))
-        } else {
-            format!(
-                "{} runners take no model or reasoning effort. Project settings can override these preferences.",
-                runner_label(runner)
-            )
-        };
+        let note = state.runner_footnote();
         let field = |label: &'static str, picker: Div, field: Field, selector: &'static str| {
             labeled(label, picker, theme)
                 .w_full()
@@ -1386,7 +1376,7 @@ impl AgentEditor {
             assignments
                 .into_iter()
                 .map(|a| {
-                    let workflow = a.workflow.clone();
+                    let leave = Leave::Workflow { name: a.workflow.clone(), status: Some(a.status.clone()) };
                     select_button(
                         format!("agent-assignment-{}-{}", a.workflow, a.status),
                         format!("{} / {}", a.workflow, a.status_name),
@@ -1396,7 +1386,7 @@ impl AgentEditor {
                     )
                     .tooltip(style::tooltip(format!("Open the {} workflow", a.workflow)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.leave(Leave::Workflow(workflow.clone()), Some(window), cx)
+                        this.leave(leave.clone(), Some(window), cx)
                     }))
                     .into_any_element()
                 })

@@ -136,6 +136,8 @@ enum SettingsMsg {
     ),
     /// The workflow editor's read, save, duplicate or delete.
     Editor(Ticket, Box<settings::EditorDone>),
+    /// The agent editor's read, save, duplicate or delete.
+    AgentEditor(Ticket, Box<settings::AgentDone>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -2254,6 +2256,7 @@ impl ShellState {
             // user's editor): for its own project only.
             self.settings.reload_editor(project.as_deref());
             self.start_editor_work();
+            self.start_agent_work();
         }
         let Some(load) = self.settings.begin_page_load(project.as_deref(), force) else {
             return;
@@ -2533,6 +2536,36 @@ impl ShellState {
         }
     }
 
+    /// Start the agent editor's waiting work (its read, save, duplicate or
+    /// delete) off the UI thread, through the Agents page's reader. The
+    /// result comes back under the work's ticket, so one for an editor (or
+    /// a project) no longer shown is dropped.
+    fn start_agent_work(&mut self) {
+        let Some((ticket, work)) = self.settings.take_agent_work() else {
+            return;
+        };
+        let tx = self.settings_tx.clone();
+        let reader = self.agents_reader.clone();
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-agent-editor".into())
+            .spawn(move || {
+                let done = settings::run_agent_work(work, &*reader);
+                let _ = tx.send(SettingsMsg::AgentEditor(sent, Box::new(done)));
+            });
+        if let Err(e) = spawned {
+            let done = settings::AgentDone::Loaded(Err(format!("couldn't start the work: {e}")));
+            self.agent_landed(&ticket, done);
+        }
+    }
+
+    /// The agent editor's work landed: carry on (an agent's files never
+    /// change the board).
+    fn agent_landed(&mut self, ticket: &Ticket, done: settings::AgentDone) {
+        let (action, _wrote) = self.settings.agent_landed(ticket, done);
+        self.apply_settings_action(action);
+    }
+
     /// The editor's work landed: refresh the board when it wrote the files
     /// (its columns follow the workflows), and carry on.
     fn editor_landed(&mut self, ticket: &Ticket, done: settings::EditorDone) {
@@ -2675,6 +2708,7 @@ impl ShellState {
                     self.apply_settings_action(action);
                 }
                 SettingsMsg::Editor(ticket, done) => self.editor_landed(&ticket, *done),
+                SettingsMsg::AgentEditor(ticket, done) => self.agent_landed(&ticket, *done),
             }
         }
         if self.settings_open() {
@@ -2726,6 +2760,7 @@ impl ShellState {
             SettingsAction::Commit => self.start_workflows_commit(),
             SettingsAction::EditWorkflow { name, status } => self.edit_workflow(&name, status),
             SettingsAction::EditorWork => self.start_editor_work(),
+            SettingsAction::AgentWork => self.start_agent_work(),
             SettingsAction::EditYaml(file) => self.edit_settings_file(file),
             SettingsAction::SaveKeys(change) => self.save_keys(change),
             SettingsAction::OpenKeys => self.open_keys_file(),
@@ -9037,6 +9072,95 @@ mod tests {
             shelbi_app::settings::agents::fixture::PREAMBLE,
             "beta's own preamble"
         );
+    }
+
+    // --- the agent editor (tui-agent-editor), through the real event path --
+
+    fn settle_agent_editor(st: &mut ShellState, what: &str) {
+        settle_agents(st, what, |st| st.settings.agent_editor().is_some_and(|e| e.state().is_some() && !e.busy()));
+    }
+
+    /// Open Settings ▸ Agents and the agent editor on the page's first
+    /// agent (the orchestrator), through the keys.
+    fn open_agent_editor(st: &mut ShellState) {
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(st, '6');
+        settle_agents(st, "the agents load", |st| st.settings.agents_page().state().config().is_some());
+        press(st, KeyCode::Tab);
+        press(st, KeyCode::Down);
+        press(st, KeyCode::Enter);
+        settle_agent_editor(st, "the editor loads");
+    }
+
+    /// Type `text` at the end of the editor's description, Enter to stop.
+    fn type_agent_description(st: &mut ShellState, text: &str) {
+        let item = settings::AgentItem::Text(settings::AgentText::Description);
+        assert!(st.settings.agent_editor_mut().unwrap().select(&item));
+        press(st, KeyCode::Enter);
+        for c in text.chars() {
+            type_key(st, c);
+        }
+        press(st, KeyCode::Enter);
+    }
+
+    #[test]
+    fn the_agent_editor_saves_off_the_ui_thread_and_a_project_switch_asks_first() {
+        let home = agents_home("agent-editor");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        open_agent_editor(&mut st);
+        assert_eq!(st.settings.agent_editor().map(|e| e.name()), Some("orchestrator"));
+        // It takes both columns, at 80x24.
+        assert!(st.settings.covers_columns());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let text = screen_text(&term);
+        assert!(text.contains("orchestrator Customized") && text.contains("Agent"), "{text}");
+
+        // A typed description saves with Ctrl+S, off the UI thread.
+        type_agent_description(&mut st, " Edited.");
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        settle_agents(&mut st, "the save lands", |st| st.settings.agent_editor().is_some_and(|e| !e.busy() && !e.is_dirty()));
+        let manifest = std::fs::read_to_string(home.agents().join("orchestrator/agent.yaml")).unwrap();
+        assert!(manifest.contains("Edited."), "{manifest}");
+
+        // Unsaved edits, then a switch: Settings asks; Save writes, then switches.
+        type_agent_description(&mut st, " Again.");
+        st.dispatch_effect(Effect::SwitchProject { project: "beta".into() });
+        assert!(st.settings.prompting(), "the switch asks first");
+        assert_eq!(st.client.project(), Some("proj"));
+        type_key(&mut st, 's');
+        settle_agents(&mut st, "saved, then switched", |st| st.client.project() == Some("beta"));
+        let manifest = std::fs::read_to_string(home.agents().join("orchestrator/agent.yaml")).unwrap();
+        assert!(manifest.contains("Edited. Again."), "{manifest}");
+        assert!(st.settings.agent_editor().is_none(), "the old project's editor went with the switch");
+    }
+
+    #[test]
+    fn the_agent_editor_reads_its_files_again_back_from_the_users_editor() {
+        let home = agents_home("agent-editor-yaml");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        // The workflow editor reads the fixture's workflows.
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        open_agent_editor(&mut st);
+        // `e`: instructions.md in the user's editor (nothing unsaved: at once).
+        type_key(&mut st, 'e');
+        let path = st.pending_editor.take().expect("the editor is queued");
+        assert_eq!(path, home.agents().join("orchestrator/instructions.md"));
+        std::fs::write(&path, "# Edited outside\n").unwrap();
+        // The run loop's reload when the editor returns.
+        st.load_settings(true);
+        settle_agents(&mut st, "the editor reads again", |st| {
+            st.settings.agent_editor().and_then(|e| e.state()).is_some_and(|s| s.agent().instructions() == "# Edited outside\n")
+        });
+        // An assignment row opens that workflow's editor on its status.
+        let assignment = st.settings.agent_editor().unwrap().state().unwrap().assignments()[0].clone();
+        assert!(st.settings.agent_editor_mut().unwrap().select(&settings::AgentItem::Assignment(0)));
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.agent_editor().is_none());
+        settle_editor(&mut st);
+        let editor = st.settings.editor().unwrap();
+        assert_eq!(editor.name(), assignment.workflow);
+        assert_eq!(editor.cursor_item(), Some(settings::EditorItem::Status(assignment.status)));
     }
 
     // --- Settings ▸ Workspaces (tui-settings-workspaces), end to end --------

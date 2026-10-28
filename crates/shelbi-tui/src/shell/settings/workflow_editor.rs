@@ -1569,7 +1569,9 @@ impl WorkflowEditorPage {
         if self.follow_cursor {
             if let Some(at) = rows.iter().position(|r| r.action == Some(self.cursor)) {
                 // The row's error lines too, when they fit.
-                let end = rows.iter().skip(at + 1).take_while(|r| r.action.is_none()).count().min(3) as u16;
+                // At least one line under it: the last line shows "↓ more"
+                // while rows are clipped below.
+                let end = rows.iter().skip(at + 1).take_while(|r| r.action.is_none()).count().clamp(1, 3) as u16;
                 let at = at as u16;
                 if at < self.scroll {
                     self.scroll = at;
@@ -1679,7 +1681,9 @@ impl WorkflowEditorPage {
         }
         let items = self.items();
         let index = |item: &Item| items.iter().position(|it| it == item);
-        let selected = |item: &Item| index(item).map(|i| i == self.cursor);
+        // `Some(true)` on the cursor's row only: `Some(false)` would draw
+        // every other row with the unfocused selection fill.
+        let selected = |item: &Item| (index(item) == Some(self.cursor)).then_some(true);
         let label_w = 18.min(width / 3).max(6);
         let field = |rows: &mut Vec<Row>, label: &str, text: Text, placeholder: &str| {
             let item = Item::Text(text.clone());
@@ -1983,7 +1987,7 @@ impl WorkflowEditorPage {
 }
 
 /// A picker's row: its label, then the value with a `▾`.
-fn picker_line(label: &str, value: &str, selected: bool, label_w: usize, width: usize) -> Line<'static> {
+pub(super) fn picker_line(label: &str, value: &str, selected: bool, label_w: usize, width: usize) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
     let head_style = if selected { selected_style(true) } else { Style::default().fg(palette().gray) };
     let room = width.saturating_sub(label_w + 5);
