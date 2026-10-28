@@ -70,8 +70,9 @@ use shelbi_core::{Owner, StatusCategory};
 use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflows::{add_line, cell, error_rows, pad_selected, plain_line, EditFile, LineEdit, Nav, WorkflowsPage};
-use super::{heading, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
+use super::{box_rows, field_rows, follow, heading, picker_rows, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
 use crate::panel::{self, PAD};
+use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 use builder::state_workflow;
 
@@ -1582,7 +1583,8 @@ impl WorkflowEditorPage {
     /// A mouse event over the editor: a click selects a row (a second click
     /// does its Enter), answers a menu or a prompt; the wheel scrolls.
     pub(crate) fn handle_mouse(&mut self, m: MouseEvent) -> EditorAction {
-        let hit = self.hits.iter().find(|(r, _)| panel::in_rect(*r, m.column, m.row)).map(|(_, h)| *h);
+        // The last drawn wins: a menu over the page takes its own clicks.
+        let hit = self.hits.iter().rev().find(|(r, _)| panel::in_rect(*r, m.column, m.row)).map(|(_, h)| *h);
         let asking = self.modal.is_some() || self.state.as_ref().is_some_and(|s| s.prompt().is_some());
         if self.in_builder() && !asking {
             if let Some(action) = self.builder_mouse(m) {
@@ -1723,18 +1725,7 @@ impl WorkflowEditorPage {
         // Keep the focused row in view, then clamp to the content.
         let max = (rows.len() as u16).saturating_sub(content.height);
         if self.follow_cursor {
-            if let Some(at) = rows.iter().position(|r| r.action == Some(self.cursor)) {
-                // The row's error lines too, when they fit.
-                // At least one line under it: the last line shows "↓ more"
-                // while rows are clipped below.
-                let end = rows.iter().skip(at + 1).take_while(|r| r.action.is_none()).count().clamp(1, 3) as u16;
-                let at = at as u16;
-                if at < self.scroll {
-                    self.scroll = at;
-                } else if at + end >= self.scroll + content.height {
-                    self.scroll = (at + end + 1).saturating_sub(content.height).min(at);
-                }
-            }
+            self.scroll = follow(&rows, self.cursor, self.scroll, content.height);
         }
         self.scroll = self.scroll.min(max);
         let clipped_below = self.scroll < max;
@@ -1865,27 +1856,34 @@ impl WorkflowEditorPage {
         // `Some(true)` on the cursor's row only: `Some(false)` would draw
         // every other row with the unfocused selection fill.
         let selected = |item: &Item| (index(item) == Some(self.cursor)).then_some(true);
-        let label_w = 18.min(width / 3).max(6);
-        let field = |rows: &mut Vec<Row>, label: &str, text: Text, placeholder: &str| {
+        // A field (or a picker) a blank row under the one before it, what's
+        // said under it flush with its box.
+        let field = |rows: &mut Vec<Row>, label: &str, text: Text, placeholder: &str, invalid: bool| {
             let item = Item::Text(text.clone());
-            let line = self.field_line(label, &text, placeholder, selected(&item) == Some(true), label_w, width);
-            rows.push(Row { action: index(&item), ..Row::text(line) });
+            rows.push(Row::blank());
+            self.field(rows, label, &text, placeholder, selected(&item) == Some(true), invalid, index(&item), width);
         };
         let picker = |rows: &mut Vec<Row>, label: &str, value: &str, item: Item| {
-            let line = picker_line(label, value, selected(&item) == Some(true), label_w, width);
-            rows.push(Row { action: index(&item), ..Row::text(line) });
+            rows.push(Row::blank());
+            picker_rows(rows, label, value, selected(&item) == Some(true), false, index(&item), width);
         };
         let errors = |rows: &mut Vec<Row>, f: Field| error_rows(rows, state.error_at(&f), width);
+        let field_errors = |rows: &mut Vec<Row>, f: Field| {
+            if let Some(e) = state.error_at(&f) {
+                wrapped(rows, e, width, red);
+            }
+        };
+        let erred = |f: Field| state.error_at(&f).is_some();
 
         // Workflow.
         heading(&mut rows, "Workflow");
-        field(&mut rows, "Name", Text::Name, "");
-        errors(&mut rows, Field::Name);
-        field(&mut rows, "Description", Text::Description, DESCRIPTION_PLACEHOLDER);
-        errors(&mut rows, Field::Description);
+        field(&mut rows, "Name", Text::Name, "", erred(Field::Name));
+        field_errors(&mut rows, Field::Name);
+        field(&mut rows, "Description", Text::Description, DESCRIPTION_PLACEHOLDER, erred(Field::Description));
+        field_errors(&mut rows, Field::Description);
         let initial = state.initial_status().map(|s| self.catalog_name(&s.id)).unwrap_or_else(|| "—".into());
         picker(&mut rows, "Initial status", &initial, Item::InitialStatus);
-        errors(&mut rows, Field::InitialStatus);
+        field_errors(&mut rows, Field::InitialStatus);
 
         // Statuses.
         rows.push(Row::blank());
@@ -1895,6 +1893,11 @@ impl WorkflowEditorPage {
             let item = Item::Status(s.id.clone());
             let line = self.status_line(s.id.as_str(), selected(&item), width);
             rows.push(Row { action: index(&item), ..Row::text(line) });
+            // Its workspace tags typed in a field under it.
+            if matches!(&self.typing, Some((Text::Tags(t), _)) if *t == s.id) {
+                let tags = Text::Tags(s.id.clone());
+                self.field(&mut rows, "Workspace tags", &tags, TAGS_PLACEHOLDER, true, false, index(&item), width);
+            }
             errors(&mut rows, Field::Status(s.id.clone()));
         }
         rows.push(Row { action: index(&Item::AddStatus), ..Row::text(add_line("+ Add status", selected(&Item::AddStatus), width)) });
@@ -1929,15 +1932,8 @@ impl WorkflowEditorPage {
             let line = plain_line(&text, selected(&Item::Details(i)), width, Style::default().fg(palette().cyan));
             rows.push(Row { action: index(&Item::Details(i)), ..Row::text(line) });
             if open {
-                field(&mut rows, &format!("  {}", DETAILS_TARGET.0), Text::Target, DETAILS_TARGET.1);
-                wrapped(&mut rows, &format!("      Run: {RUN_HELP}"), width, muted);
-                for line in 0..self.run.len() {
-                    field(&mut rows, "    $", Text::Run(line), "");
-                }
-                rows.push(Row { action: index(&Item::AddRun), ..Row::text(add_line("      + Add command", selected(&Item::AddRun), width)) });
-                field(&mut rows, &format!("  {}", DETAILS_READY.0), Text::Ready, DETAILS_READY.1);
-                field(&mut rows, &format!("  {}", DETAILS_TIMEOUT.0), Text::Timeout, DETAILS_TIMEOUT.1);
-                field(&mut rows, &format!("  {}", DETAILS_URL.0), Text::Url, DETAILS_URL.1);
+                self.details_rows(&mut rows, width);
+                rows.push(Row::blank());
             }
         }
         rows.push(Row { action: index(&Item::AddTransition), ..Row::text(add_line("+ Add transition", selected(&Item::AddTransition), width)) });
@@ -1947,10 +1943,10 @@ impl WorkflowEditorPage {
         heading(&mut rows, "Git");
         wrapped(&mut rows, GIT_HELP, width, muted);
         let project = state.project_git();
-        field(&mut rows, "Base branch", Text::BaseBranch, &project.base_branch);
-        field(&mut rows, "Branch name", Text::Branch, &project.branch);
+        field(&mut rows, "Base branch", Text::BaseBranch, &project.base_branch, false);
+        field(&mut rows, "Branch name", Text::Branch, &project.branch, false);
         picker(&mut rows, "Merge strategy", strategy_label(state.git_form().merge_strategy), Item::MergeStrategy);
-        errors(&mut rows, Field::Git);
+        field_errors(&mut rows, Field::Git);
 
         // Review.
         rows.push(Row::blank());
@@ -1961,10 +1957,10 @@ impl WorkflowEditorPage {
         if mode == ReviewMode::Serve {
             for (i, (label, placeholder)) in REVIEW_FIELDS.iter().enumerate() {
                 let label = if i == 0 { format!("{label} *") } else { label.to_string() };
-                field(&mut rows, &label, Text::Review(i), placeholder);
+                field(&mut rows, &label, Text::Review(i), placeholder, false);
             }
         }
-        errors(&mut rows, Field::Review);
+        field_errors(&mut rows, Field::Review);
 
         // Automation.
         rows.push(Row::blank());
@@ -1976,10 +1972,10 @@ impl WorkflowEditorPage {
         };
         picker(&mut rows, "Zen settings", &zen, Item::Zen);
         wrapped(&mut rows, &help, width, muted);
-        errors(&mut rows, Field::Zen);
-        field(&mut rows, "Required fields", Text::Params, "None");
+        field_errors(&mut rows, Field::Zen);
+        field(&mut rows, "Required fields", Text::Params, "None", erred(Field::RequiredParams));
         wrapped(&mut rows, PARAMS_HELP, width, muted);
-        errors(&mut rows, Field::RequiredParams);
+        field_errors(&mut rows, Field::RequiredParams);
 
         // Delete.
         rows.push(Row::blank());
@@ -1992,26 +1988,60 @@ impl WorkflowEditorPage {
         rows
     }
 
-    /// A text field's row: its label, then the text (the line editor while
-    /// typed), the placeholder when empty; red label when its field errs.
-    fn field_line(&self, label: &str, text: &Text, placeholder: &str, selected: bool, label_w: usize, width: usize) -> Line<'static> {
-        let marker = if selected { "› " } else { "  " };
-        let head = format!("{marker}{}", cell(label, label_w));
-        let head_style = if selected { selected_style(true) } else { Style::default().fg(palette().gray) };
-        let mut spans = vec![Span::styled(head, head_style), Span::raw(" ")];
-        let room = width.saturating_sub(label_w + 3);
+    /// A text field's rows: its label over its box holding the text (the
+    /// line editor's, caret and all, while typed), the placeholder when
+    /// empty; the error fill when its field is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn field(
+        &self,
+        rows: &mut Vec<Row>,
+        label: &str,
+        text: &Text,
+        placeholder: &str,
+        selected: bool,
+        invalid: bool,
+        action: Option<usize>,
+        width: usize,
+    ) {
+        let (value, caret) = self.field_text(text);
+        let field = Textbox::new(&value).caret(caret).placeholder(placeholder).focused(selected).invalid(invalid);
+        field_rows(rows, label, field, selected, false, action, width);
+    }
+
+    /// A text's value and, while it's typed, the caret.
+    fn field_text(&self, text: &Text) -> (String, Option<usize>) {
         match &self.typing {
-            Some((t, edit)) if t == text => spans.extend(edit.spans(room)),
-            _ => {
-                let value = self.text(text);
-                if value.is_empty() {
-                    spans.push(Span::styled(panel::truncate_right(placeholder, room), Style::default().fg(palette().muted)));
-                } else {
-                    spans.push(Span::styled(panel::truncate_right(&value, room), Style::default().fg(palette().white)));
-                }
-            }
+            Some((t, edit)) if t == text => (edit.text(), Some(edit.caret())),
+            _ => (self.text(text), None),
         }
-        Line::from(spans)
+    }
+
+    /// The open transition's Details: Target, the Run commands under one
+    /// label (a box each), Ready, Timeout and URL.
+    pub(super) fn details_rows(&self, rows: &mut Vec<Row>, width: usize) {
+        let items = self.items();
+        let index = |item: &Item| items.iter().position(|it| it == item);
+        let on = |item: &Item| index(item) == Some(self.cursor);
+        let field = |rows: &mut Vec<Row>, (label, placeholder): (&str, &str), text: Text| {
+            let item = Item::Text(text.clone());
+            rows.push(Row::blank());
+            self.field(rows, label, &text, placeholder, on(&item), false, index(&item), width);
+        };
+        field(rows, DETAILS_TARGET, Text::Target);
+        rows.push(Row::blank());
+        let running = (0..self.run.len()).any(|l| on(&Item::Text(Text::Run(l))));
+        rows.push(Row::text(textbox::label("Run", running, false, width)));
+        for line in 0..self.run.len() {
+            let text = Text::Run(line);
+            let item = Item::Text(text.clone());
+            let (value, caret) = self.field_text(&text);
+            box_rows(rows, Textbox::new(&value).caret(caret).focused(on(&item)), index(&item), width);
+        }
+        rows.push(Row { action: index(&Item::AddRun), ..Row::text(add_line("+ Add command", on(&Item::AddRun).then_some(true), width)) });
+        wrapped(rows, RUN_HELP, width, Style::default().fg(palette().muted));
+        field(rows, DETAILS_READY, Text::Ready);
+        field(rows, DETAILS_TIMEOUT, Text::Timeout);
+        field(rows, DETAILS_URL, Text::Url);
     }
 
     /// A status's row: the handle, its name in its category's color, then
@@ -2051,8 +2081,12 @@ impl WorkflowEditorPage {
         }
         let used: usize = spans.iter().map(|s| panel::display_width(&s.content)).sum();
         let room = width.saturating_sub(used);
-        match &self.typing {
-            Some((_, edit)) if typing_tags => spans.extend(edit.spans(room)),
+        // Typed in, the tags show in the field under the row.
+        let tags = match &self.typing {
+            Some((_, edit)) if typing_tags => edit.text(),
+            _ => tags,
+        };
+        match () {
             _ if tags.is_empty() => spans.push(Span::styled(panel::truncate_right(TAGS_PLACEHOLDER, room), base.fg(palette().muted))),
             _ => spans.push(Span::styled(panel::truncate_right(&format!("[{tags}]"), room), muted)),
         }
@@ -2165,19 +2199,6 @@ impl WorkflowEditorPage {
             x += w + 1;
         }
     }
-}
-
-/// A picker's row: its label, then the value with a `▾`.
-pub(super) fn picker_line(label: &str, value: &str, selected: bool, label_w: usize, width: usize) -> Line<'static> {
-    let marker = if selected { "› " } else { "  " };
-    let head_style = if selected { selected_style(true) } else { Style::default().fg(palette().gray) };
-    let room = width.saturating_sub(label_w + 5);
-    Line::from(vec![
-        Span::styled(format!("{marker}{}", cell(label, label_w)), head_style),
-        Span::raw(" "),
-        Span::styled(panel::truncate_right(value, room), Style::default().fg(palette().white)),
-        Span::styled(" ▾", Style::default().fg(palette().cyan)),
-    ])
 }
 
 mod builder;

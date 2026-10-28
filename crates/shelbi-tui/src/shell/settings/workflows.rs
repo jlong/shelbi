@@ -42,8 +42,9 @@ use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::StatusCategory;
 use shelbi_state::workflow_config::{StatusSummary, WorkflowConfig, WorkflowSummary};
 
-use super::{heading, selected_style, wrapped, Row, SettingsAction};
+use super::{box_rows, heading, selected_style, wrapped, Row, SettingsAction};
 use crate::panel;
+use crate::textbox::Textbox;
 use crate::theme::palette;
 
 /// A row the page's keys stop on.
@@ -949,16 +950,19 @@ impl WorkflowsPage {
         }
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Workflow { from })) => {
-                rows.push(Row::item(input_line("Name ", text, width), index));
+                let refused = state.error_at(&Target::NewWorkflow);
+                draft_rows(&mut rows, text, "Workflow name", refused, index, width);
                 let help = match from {
                     Some(from) => format!("Duplicate of {from}. Enter to create, Esc to cancel."),
                     None => "Enter to create, Esc to cancel.".to_string(),
                 };
-                wrapped(&mut rows, &format!("    {help}"), width, muted);
+                wrapped(&mut rows, &help, width, muted);
             }
-            _ => rows.push(Row::item(add_line("+ New workflow", selected(index), width), index)),
+            _ => {
+                rows.push(Row::item(add_line("+ New workflow", selected(index), width), index));
+                error_rows(&mut rows, state.error_at(&Target::NewWorkflow), width);
+            }
         }
-        error_rows(&mut rows, state.error_at(&Target::NewWorkflow), width);
         index += 1;
 
         // Statuses.
@@ -969,30 +973,40 @@ impl WorkflowsPage {
         let cols = StatusCols::fit(&statuses, width);
         rows.push(Row::text(cols.heading()));
         for s in &statuses {
-            let line = match &self.modal {
-                Some(Modal::Rename { id, text }) if *id == s.id => cols.rename_line(s, text, width),
-                _ => cols.line(s, selected(index), width),
-            };
-            rows.push(Row::item(line, index));
-            error_rows(&mut rows, state.error_at(&Target::Status(s.id.clone())), width);
+            let refused = state.error_at(&Target::Status(s.id.clone()));
+            match &self.modal {
+                // Renamed in a field under its row.
+                Some(Modal::Rename { id, text }) if *id == s.id => {
+                    rows.push(Row::item(cols.line(s, Some(true), width), index));
+                    draft_rows(&mut rows, text, "Status name", refused, index, width);
+                    wrapped(&mut rows, "Enter to rename, Esc to cancel.", width, muted);
+                }
+                _ => {
+                    rows.push(Row::item(cols.line(s, selected(index), width), index));
+                    error_rows(&mut rows, refused, width);
+                }
+            }
             index += 1;
         }
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Status { category })) => {
-                rows.push(Row::item(input_line("Name ", text, width), index));
+                let refused = state.error_at(&Target::NewStatus);
+                draft_rows(&mut rows, text, "Status name", refused, index, width);
                 let id = state.new_status_id(&text.text()).unwrap_or_else(|| "…".into());
                 rows.push(Row::text(Line::from(vec![
-                    Span::styled("    id ", muted),
+                    Span::styled("id ", muted),
                     Span::styled(id, Style::default().fg(palette().foreground)),
                     Span::styled("  category ", muted),
                     Span::styled(category_label(*category), Style::default().fg(crate::kanban::category_color(*category))),
                     Span::styled("  (Tab changes)", muted),
                 ])));
-                wrapped(&mut rows, "    Enter to add, Esc to cancel.", width, muted);
+                wrapped(&mut rows, "Enter to add, Esc to cancel.", width, muted);
             }
-            _ => rows.push(Row::item(add_line("+ New status", selected(index), width), index)),
+            _ => {
+                rows.push(Row::item(add_line("+ New status", selected(index), width), index));
+                error_rows(&mut rows, state.error_at(&Target::NewStatus), width);
+            }
         }
-        error_rows(&mut rows, state.error_at(&Target::NewStatus), width);
         index += 1;
         rows.push(Row::item(add_line("Edit statuses.yaml in your editor", selected(index), width), index));
         wrapped(&mut rows, RENAME_NOTE, width, muted);
@@ -1207,12 +1221,21 @@ pub(super) fn add_line(text: &str, selected: Option<bool>, width: usize) -> Line
     plain_line(text, selected, width, Style::default().fg(palette().cyan))
 }
 
-/// A name being typed: `› <label>` then the text, the caret on its cell.
-fn input_line(label: &str, text: &LineEdit, width: usize) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("› {label}"), Style::default().fg(palette().gray))];
-    spans.extend(text.spans(width.saturating_sub(label.chars().count() + 2)));
-    Line::from(spans)
+/// A name being typed (a new workflow or status, a rename): a field
+/// (`placeholder` while empty) with the caret, then its refusal; every row
+/// is item `index`'s, and the text's row holds the page's focus.
+fn draft_rows(rows: &mut Vec<Row>, text: &LineEdit, placeholder: &str, refused: Option<&str>, index: usize, width: usize) {
+    let typed = text.text();
+    let field = Textbox::new(&typed).placeholder(placeholder).caret(Some(text.caret())).invalid(refused.is_some());
+    rows.push(Row::blank());
+    box_rows(rows, field, Some(index), width.min(DRAFT_W));
+    if let Some(e) = refused {
+        wrapped(rows, e, width, Style::default().fg(palette().red));
+    }
 }
+
+/// A name field's widest (the desktop's draft field).
+const DRAFT_W: usize = 40;
 
 /// Pad or cut `text` to exactly `w` columns.
 pub(super) fn cell(text: &str, w: usize) -> String {
@@ -1370,25 +1393,6 @@ impl StatusCols {
         pad_selected(&mut spans, selected, width);
         Line::from(spans)
     }
-
-    /// The row while its name is being typed.
-    fn rename_line(&self, s: &StatusSummary, text: &LineEdit, width: usize) -> Line<'static> {
-        let color = crate::kanban::category_color(s.category);
-        let (id, category, used) = self.tail(s);
-        let mut spans = vec![
-            Span::styled("› ", Style::default().fg(palette().gray)),
-            Span::styled("● ", Style::default().fg(color)),
-        ];
-        let field = text.spans(self.name.saturating_sub(1).max(1));
-        let typed: usize = field.iter().map(|s| panel::display_width(&s.content)).sum();
-        spans.extend(field);
-        spans.push(Span::raw(" ".repeat(self.name.saturating_sub(typed))));
-        spans.push(Span::styled(id, Style::default().fg(palette().foreground)));
-        spans.push(Span::styled(category, Style::default().fg(color)));
-        spans.push(Span::styled(used, Style::default().fg(palette().foreground)));
-        let _ = width;
-        Line::from(spans)
-    }
 }
 
 /// Fill a selected row's line to `width` with the selection color.
@@ -1414,6 +1418,11 @@ impl LineEdit {
 
     pub(crate) fn text(&self) -> String {
         self.chars.iter().collect()
+    }
+
+    /// The caret's position, in chars.
+    pub(crate) fn caret(&self) -> usize {
+        self.caret
     }
 
     pub(super) fn insert(&mut self, c: char) {
@@ -1446,24 +1455,6 @@ impl LineEdit {
             KeyCode::End => self.caret = self.chars.len(),
             _ => {}
         }
-    }
-
-    /// The field's spans in at most `width` columns, scrolled to keep the
-    /// caret in view, the caret's cell reversed.
-    pub(super) fn spans(&self, width: usize) -> Vec<Span<'static>> {
-        let width = width.max(2);
-        let start = (self.caret + 1).saturating_sub(width);
-        let shown: Vec<char> = self.chars.iter().skip(start).take(width).copied().collect();
-        let at = self.caret - start;
-        let style = Style::default().fg(palette().white).bg(palette().selection);
-        let before: String = shown.iter().take(at).collect();
-        let caret: String = shown.get(at).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
-        let after: String = shown.iter().skip(at + 1).collect();
-        vec![
-            Span::styled(before, style),
-            Span::styled(caret, style.add_modifier(Modifier::REVERSED)),
-            Span::styled(after, style),
-        ]
     }
 }
 

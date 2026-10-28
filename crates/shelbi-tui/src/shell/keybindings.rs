@@ -49,6 +49,7 @@ use shelbi_state::keymap::{
 };
 
 use crate::panel;
+use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
 /// A place the page's keys stop on.
@@ -689,28 +690,21 @@ impl KeysPage {
         out.push(PageLine::blank());
 
         let is = |stop: Stop| focused && self.stop == stop;
-        // The search.
-        let label = "Search  ";
-        let field_w = width.saturating_sub(label.len()).max(1);
-        let mut spans = vec![Span::styled(label, Style::default().fg(palette().gray))];
-        let field_style = if is(Stop::Search) || self.editing {
-            Style::default().fg(palette().white).bg(palette().selection)
-        } else {
-            Style::default().fg(palette().foreground).bg(palette().code_bg)
-        };
-        let text = if self.state.query.is_empty() && !self.editing {
-            Span::styled(
-                pad(&panel::truncate_right("actions or shortcuts", field_w), field_w),
-                field_style.fg(palette().muted),
-            )
-        } else {
-            let cursor = if self.editing { "▏" } else { "" };
-            // The end of a long query stays in view.
-            let shown = tail(&format!("{}{cursor}", self.state.query), field_w);
-            Span::styled(pad(&shown, field_w), field_style)
-        };
-        spans.push(text);
-        out.push(PageLine::stop(Line::from(spans), Stop::Search, width));
+        // The search: a field (its three rows the stop's click target),
+        // the caret at its end while it's typed in.
+        let on = is(Stop::Search) || self.editing;
+        let field = Textbox::new(&self.state.query).placeholder("Search actions or shortcuts").focused(on);
+        let field = if self.editing { field.caret_at_end() } else { field };
+        for (n, line) in field.lines(width.min(textbox::MAX_W)).into_iter().enumerate() {
+            let mut line = PageLine::stop(line, Stop::Search, width);
+            if n > 0 {
+                // Its rows under the first keep it in view with it.
+                line.stop = None;
+                line.under_row = true;
+            }
+            out.push(line);
+        }
+        out.push(PageLine::blank());
 
         // The context filter.
         let context = format!("Context  ‹ {} ›", self.state.context_label());
@@ -992,22 +986,6 @@ fn pad(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
-/// The last `width` columns of `text`.
-fn tail(text: &str, width: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::new();
-    let mut w = 0;
-    for c in chars.iter().rev() {
-        let cw = panel::display_width(&c.to_string());
-        if w + cw > width {
-            break;
-        }
-        w += cw;
-        out.insert(0, *c);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,9 +1018,4 @@ mod tests {
         assert!(chord_note(&chord("ctrl-space"), true).is_some());
     }
 
-    #[test]
-    fn tail_keeps_the_end_of_a_long_query() {
-        assert_eq!(tail("abcdef", 3), "def");
-        assert_eq!(tail("ab", 5), "ab");
-    }
 }
