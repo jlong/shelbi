@@ -544,6 +544,25 @@ pub fn disabled_content_button(
     with_content(d, &id, content, kind, size, theme)
 }
 
+/// The Button component while its action runs: Disable on (no hover,
+/// press, focus or pointer), `spinner` in the Left Icon slot before
+/// `label` (Contact Us' "Sending…").
+pub fn pending_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    spinner: impl IntoElement,
+    kind: ButtonKind,
+    size: ButtonSize,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let c = button_colors(kind, theme);
+    button_shell(id, kind, size, theme)
+        .bg(c.fill)
+        .opacity(0.4)
+        .child(left_slot(size, spinner))
+        .child(label.into())
+}
+
 /// A button with an icon before its label (Load older, Refresh).
 pub fn icon_label_button(
     id: impl Into<SharedString>,

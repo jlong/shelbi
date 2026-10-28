@@ -408,6 +408,8 @@ pub enum SidebarEvent {
     /// The unread-errors button.
     OpenErrors,
     OpenSettings,
+    /// The footer's megaphone: Contact Us.
+    SendFeedback,
     /// The titlebar's Toggle sidebar button.
     Collapse,
     /// The settings sidebar's back button.
@@ -1555,11 +1557,29 @@ fn render_footer<H: SidebarHost>(
         Some(line) => format!("Settings · {line}"),
         None => "Settings".to_string(),
     };
+    // Settings and Send Feedback together in the left corner (Figma
+    // Navigation's footer Toolbar, 4pt apart), the unread-errors badge after
+    // them while there are any, then the flexible space.
     let toolbar = div()
+        .debug_selector(|| "sidebar-footer-toolbar".into())
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
+        .gap_1()
+        .child(
+            toolbar_button("sidebar-settings", heroicon(icons::COG_6_TOOTH), theme)
+                .tooltip(style::tooltip(settings_tip))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.sidebar_event(SidebarEvent::OpenSettings, window, cx)
+                })),
+        )
+        .child(
+            toolbar_button("sidebar-feedback", heroicon(icons::MEGAPHONE), theme)
+                .tooltip(style::tooltip("Send Feedback"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.sidebar_event(SidebarEvent::SendFeedback, window, cx)
+                })),
+        )
         .when(model.unread_errors > 0, |d| {
             d.child(
                 div()
@@ -1586,14 +1606,7 @@ fn render_footer<H: SidebarHost>(
                     })),
             )
         })
-        .child(div().flex_1())
-        .child(
-            toolbar_button("sidebar-settings", heroicon(icons::COG_6_TOOTH), theme)
-                .tooltip(style::tooltip(settings_tip))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.sidebar_event(SidebarEvent::OpenSettings, window, cx)
-                })),
-        );
+        .child(div().flex_1());
 
     div()
         .flex()

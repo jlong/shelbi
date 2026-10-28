@@ -1355,6 +1355,71 @@ impl Run {
         self.machine_forms();
     }
 
+    /// Contact Us (`dt-feedback-dialog`) over the orchestrator, checked by
+    /// eye (the Figma file has no frame for it): fresh (`state-feedback`,
+    /// Name focused), the fields filled and a send refused
+    /// (`state-feedback-error`, the 429), a send out
+    /// (`state-feedback-sending`), and the thank-you
+    /// (`state-feedback-thanks`). Its sends go to a fake endpoint.
+    /// `SHELBI_VISUAL_ONLY=feedback` renders just these.
+    fn feedback_states(&mut self) {
+        use crate::platform::feedback::{FeedbackService, HttpResponse, SystemInfo};
+        let orch = View::Session("orch".into());
+        for (screen, status, sends) in [
+            ("state-feedback", 200, false),
+            ("state-feedback-error", 429, true),
+            ("state-feedback-sending", 0, true),
+            ("state-feedback-thanks", 200, true),
+        ] {
+            self.cx.update(|cx| {
+                cx.set_global(FeedbackService {
+                    transport: std::sync::Arc::new(move |_: &str| {
+                        Ok(HttpResponse {
+                            status,
+                            body: String::new(),
+                        })
+                    }),
+                    system: std::sync::Arc::new(|| SystemInfo {
+                        app_version: "0.0.0".into(),
+                        macos_version: "15.0.0".into(),
+                    }),
+                    now: std::sync::Arc::new(|| "2026-10-27T12:00:00Z".into()),
+                    remembered: None,
+                })
+            });
+            let handle = self.open();
+            self.click(handle, orch.clone());
+            self.settle(handle);
+            let dialog = handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.open_feedback(window, cx);
+                    w.offscreen_feedback()
+                })
+                .unwrap()
+                .expect("Contact Us opened");
+            if sends {
+                handle
+                    .update(&mut self.cx, |_, window, cx| {
+                        dialog.update(cx, |d, cx| {
+                            d.offscreen_fill(
+                                "Ada Lovelace",
+                                "ada@example.com",
+                                "The board stops refreshing after the laptop sleeps.",
+                                window,
+                                cx,
+                            );
+                            // The sending frame holds the send out.
+                            d.offscreen_send(status == 0, window, cx);
+                        })
+                    })
+                    .unwrap();
+            }
+            self.settle(handle);
+            self.save(handle, screen);
+        }
+        self.cx.update(|cx| cx.remove_global::<FeedbackService>());
+    }
+
     /// Settings ▸ Workspaces' machine dialogs over the page: Add machine
     /// (Figma 2526:9557) with the frame's sample values typed, and Configure
     /// machine on the gpu box (2528:9870), each with a passing readiness
@@ -2360,6 +2425,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "feedback") {
+            self.feedback_states();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "cli-setup") {
             self.cli_setup_windows();
             return;
@@ -2460,6 +2530,7 @@ impl Run {
         self.about_windows();
         self.add_project_windows();
         self.cli_setup_windows();
+        self.feedback_states();
 
         let missing: Vec<&str> = SCREENS
             .iter()

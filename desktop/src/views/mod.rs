@@ -51,6 +51,9 @@
 //! - About Shelbi and the Acknowledgements window it opens:
 //!   **`dt-about-bundled-software`** (`about`, `bundled_software`, over
 //!   `crate::licenses`)
+//! - Contact Us, the feedback dialog the sidebar footer's megaphone and
+//!   Help ▸ Send Feedback… open: **`dt-feedback-dialog`** (`feedback`, over
+//!   `feedback_state` and `crate::platform::feedback`)
 //!
 //! Views read view models and invoke registry commands through
 //! `crate::commands`; they never hold domain logic of their own.
@@ -78,6 +81,8 @@ pub mod session_view;
 pub mod workspace;
 pub mod workspace_layout;
 pub mod external_edit;
+pub mod feedback;
+pub mod feedback_state;
 pub mod font_picker;
 pub mod issues;
 pub mod keybindings;
