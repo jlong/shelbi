@@ -450,10 +450,15 @@ pub fn default_statuses_yaml() -> Result<String> {
 // ---------------------------------------------------------------------------
 // Global config.yaml
 
-/// The self-documenting hub-wide `~/.shelbi/config.yaml`. Everything here is
-/// optional (absent/partial files fall back to defaults), so the file ships
-/// the one current knob at its default value with the alternatives documented
-/// inline and a pointer to the sibling `keys.yaml`.
+/// The self-documenting hub-wide `~/.shelbi/config.yaml`, and the settings a
+/// new install starts with: whichever path creates the file (`shelbi init`,
+/// or a client's first settings write) starts from this text, and a client
+/// reading no file at all reads these values. Everything here is optional
+/// (absent/partial files fall back to built-in defaults), so the file ships
+/// the knobs with the alternatives documented inline and a pointer to the
+/// sibling `keys.yaml`. The theme and the desktop window's look are seeded
+/// explicitly (dark, 90% opaque, blur 40) rather than by changing what a
+/// missing key means, so an existing file keeps its look.
 pub const CONFIG_YAML: &str = "\
 ## Shelbi global config — full reference: https://shelbi.dev/docs/configuration/global
 ## Per-user UI preferences, applied across every project on this machine.
@@ -470,9 +475,18 @@ keymap:
 ## The sidebar label reflects the resolved editor name (Edit in Vim, Edit in Helix).
 # editor: vim
 
-## Color theme for the TUI and the desktop app: auto (default), dark, light.
-## auto follows the system appearance in the desktop app and is dark in the TUI.
-# theme: auto
+## Color theme for the TUI and the desktop app: auto, dark, light. auto (what
+## a config without this key gets) follows the system appearance in the
+## desktop app and is dark in the TUI.
+theme: dark
+
+## The desktop app's windows. window_opacity is a percentage, 30 to 100 (100
+## is opaque), and window_blur the blur radius in points (0 to 50) behind a
+## translucent window. Without these keys a window is opaque and clear.
+## Reduce Transparency in macOS's Accessibility settings makes it opaque.
+desktop:
+  window_opacity: 90
+  window_blur: 40
 
 ## Keybinding overrides live in the sibling file ~/.shelbi/keys.yaml.
 ## See https://shelbi.dev/docs/configuration/global
@@ -697,5 +711,10 @@ agent_runners:
             .and_then(|k| k.get("zen_toggle"))
             .and_then(|z| z.as_str());
         assert_eq!(zen, Some("alt-z"));
+        // The new-install look is seeded as explicit values.
+        assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"));
+        let desktop = v.get("desktop").expect("desktop block");
+        assert_eq!(desktop.get("window_opacity").and_then(|o| o.as_u64()), Some(90));
+        assert_eq!(desktop.get("window_blur").and_then(|b| b.as_u64()), Some(40));
     }
 }

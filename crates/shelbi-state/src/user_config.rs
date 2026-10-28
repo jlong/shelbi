@@ -4,8 +4,12 @@
 //!
 //! Holds the Zen Mode toggle chord chosen by the first-run probe, the review
 //! editor, the color theme, and the desktop app's own settings (`desktop:`).
-//! Missing file → defaults (`zen_toggle = AltZ`, `theme = auto`); a missing
-//! `keymap:` block likewise falls back so older partial files keep loading.
+//! Missing file → a new install's settings ([`UserConfig::new_install`]: the
+//! `shelbi init` scaffold, theme dark and a translucent desktop window), and
+//! the first write of the file starts from that scaffold. In an existing
+//! file a missing key keeps its built-in default (`zen_toggle = AltZ`,
+//! `theme = auto`, an opaque window), so older partial files keep loading
+//! and keep their look.
 
 use std::fs;
 use std::path::PathBuf;
@@ -39,7 +43,8 @@ pub struct UserConfig {
     pub editor: Option<String>,
 
     /// Color theme for the TUI and the desktop app (`theme: auto | dark |
-    /// light`). A missing key is [`ThemePreference::Auto`], and `auto` is
+    /// light`). A missing key is [`ThemePreference::Auto`] (a new install's
+    /// file seeds `dark`; see [`UserConfig::new_install`]), and `auto` is
     /// omitted on save (lean on-disk form, like `editor`). The token values
     /// live in `shelbi_app::theme`.
     #[serde(default, skip_serializing_if = "ThemePreference::is_auto")]
@@ -507,12 +512,24 @@ impl ZenToggleChord {
     }
 }
 
-/// Load the user config. Missing file → defaults; that's not an error
-/// because the first-run probe is the path that creates the file.
+impl UserConfig {
+    /// The settings a new install starts with: the `shelbi init` scaffold
+    /// ([`shelbi_core::scaffold::CONFIG_YAML`]) as read, which seeds theme
+    /// dark and a 90% opaque, blur-40 desktop window over the defaults.
+    /// [`UserConfig::default`] stays what an existing file's missing keys
+    /// mean.
+    pub fn new_install() -> UserConfig {
+        serde_yaml::from_str(shelbi_core::scaffold::CONFIG_YAML).expect("the config.yaml scaffold reads")
+    }
+}
+
+/// Load the user config. Missing file → [`UserConfig::new_install`]: not an
+/// error, and what the file will hold once a client writes it (every path
+/// that creates it starts from the scaffold).
 pub fn load_user_config() -> Result<UserConfig> {
     let path = user_config_path()?;
     if !path.exists() {
-        return Ok(UserConfig::default());
+        return Ok(UserConfig::new_install());
     }
     let text = fs::read_to_string(&path)?;
     Ok(serde_yaml::from_str(&text)?)
@@ -602,7 +619,9 @@ pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
 /// `desktop:`) and the spelling of untouched values all survive. Keys the
 /// edited config omits on save (a cleared `editor`, an `auto` theme, an
 /// empty `desktop:` block) are removed. An edit that changes nothing writes
-/// nothing.
+/// nothing. With no file yet, the edit lands on the `shelbi init` scaffold
+/// ([`UserConfig::new_install`]), so a client's first write seeds a new
+/// install's settings with its own change.
 ///
 /// A file that doesn't read (not YAML, not a mapping, or a value this build
 /// can't load) is an error and is left exactly as it is, as is the file when
@@ -614,7 +633,7 @@ pub fn update_user_config(edit: impl FnOnce(&mut UserConfig)) -> Result<UserConf
     let path = user_config_path()?;
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => shelbi_core::scaffold::CONFIG_YAML.to_string(),
         Err(e) => return Err(e.into()),
     };
     let unreadable = |e: &dyn std::fmt::Display| Error::Other(format!("{} {e}", path.display()));
@@ -770,9 +789,11 @@ mod tests {
         // doesn't know and a value spelled its own way, and an unknown
         // top-level key.
         let original = format!(
-            "{}\ndesktop:\n  window_opacity: 0.85 # Ghostty's shape\n  future_desktop_key: [a, b]\n\
-             future_key:\n  nested: 1\n",
-            shelbi_core::scaffold::CONFIG_YAML
+            "{}future_key:\n  nested: 1\n",
+            shelbi_core::scaffold::CONFIG_YAML.replace(
+                "window_opacity: 90\n",
+                "window_opacity: 0.85 # Ghostty's shape\n  future_desktop_key: [a, b]\n",
+            )
         );
         std::fs::write(&path, &original).unwrap();
 
@@ -781,7 +802,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         for kept in [
             "## Color theme for the TUI and the desktop app",
-            "# theme: auto",
+            "theme: dark",
             "zen_toggle: alt-z",
             "window_opacity: 0.85 # Ghostty's shape",
             "future_desktop_key: [a, b]",
@@ -800,8 +821,8 @@ mod tests {
         assert!(!text.contains("editor: code"), "a cleared editor is removed:\n{text}");
         assert!(text.contains("future_desktop_key") && text.contains("# editor: vim"), "{text}");
 
-        // Back to auto removes the key; what's left is the original file.
-        update_user_config(|c| c.theme = ThemePreference::Auto).unwrap();
+        // Back to dark; what's left is the original file.
+        update_user_config(|c| c.theme = ThemePreference::Dark).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
         // An edit that changes nothing doesn't write.
@@ -914,6 +935,8 @@ mod tests {
         assert!(body.contains("https://shelbi.dev/docs/configuration/global"));
         let cfg = load_user_config().unwrap();
         assert_eq!(cfg.keymap.zen_toggle, ZenToggleChord::AltZ);
+        assert_new_install_look(&cfg);
+        assert_eq!(cfg, UserConfig::new_install());
 
         // Second call is a no-op that preserves whatever is on disk (e.g. a
         // value the first-run probe wrote).
@@ -923,6 +946,76 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "keymap:\n  zen_toggle: ctrl-g\n"
         );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Theme dark and a 90% opaque, blur-40 desktop window.
+    fn assert_new_install_look(cfg: &UserConfig) {
+        assert_eq!(cfg.theme, ThemePreference::Dark);
+        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(90), Some(40)));
+    }
+
+    #[test]
+    fn a_new_install_reads_and_first_writes_the_seeded_look() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = home.join("config.yaml");
+
+        // No file: a client reads what a new install starts with.
+        assert_new_install_look(&load_user_config().unwrap());
+        assert_eq!(UserConfig::default().theme, ThemePreference::Auto, "a missing key is still auto");
+
+        // The first write (the desktop's or the TUI's settings) lands on the
+        // scaffold, so the file carries the seeded look with the change.
+        update_user_config(|c| c.desktop.terminal_font_size = Some(15)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("https://shelbi.dev/docs/configuration/global"), "{text}");
+        let cfg = load_user_config().unwrap();
+        assert_new_install_look(&cfg);
+        assert_eq!(cfg.desktop.terminal_font_size, Some(15));
+
+        // The seeded values change as any other: auto and opaque drop their keys.
+        update_user_config(|c| {
+            c.theme = ThemePreference::Auto;
+            c.desktop.window_opacity = None;
+        })
+        .unwrap();
+        let cfg = load_user_config().unwrap();
+        assert_eq!(cfg.theme, ThemePreference::Auto);
+        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (None, Some(40)));
+
+        // A load-modify-save from no file (the legacy zen_toggle migration's
+        // shape) writes the seeded look too.
+        std::fs::remove_file(&path).unwrap();
+        let mut cfg = load_user_config().unwrap();
+        cfg.keymap.zen_toggle = ZenToggleChord::CtrlG;
+        save_user_config(&cfg).unwrap();
+        assert_new_install_look(&load_user_config().unwrap());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn an_existing_config_without_the_keys_keeps_its_look_untouched() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = home.join("config.yaml");
+        let before = "keymap:\n  zen_toggle: ctrl-g\neditor: hx\n";
+        std::fs::write(&path, before).unwrap();
+
+        // Reading and scaffolding leave it byte-for-byte as it was, and it
+        // still reads as auto, opaque and clear.
+        let cfg = load_user_config().unwrap();
+        assert!(!scaffold_user_config_if_missing().unwrap());
+        assert_eq!(cfg.theme, ThemePreference::Auto);
+        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (None, None));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // An unrelated save adds no seeded key.
+        update_user_config(|c| c.editor = Some("vim".into())).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("theme") && !text.contains("window_"), "{text}");
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -975,8 +1068,8 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // A missing key (and a missing file) is `auto`.
-        assert_eq!(load_user_config().unwrap().theme, ThemePreference::Auto);
+        // A missing key is `auto` (a missing file is a new install: dark).
+        assert_eq!(load_user_config().unwrap().theme, ThemePreference::Dark);
         std::fs::write(home.join("config.yaml"), "editor: hx\n").unwrap();
         assert_eq!(load_user_config().unwrap().theme, ThemePreference::Auto);
 

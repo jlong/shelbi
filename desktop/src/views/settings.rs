@@ -1829,6 +1829,36 @@ mod tests {
         assert_eq!(shown, SettingsValues::default());
     }
 
+    /// A first launch (no `config.yaml`) shows a new install's look, and the
+    /// first settings save writes it with the change: the read and write
+    /// [`SettingsView::load`] and [`SettingsView::write`] make, in a throwaway
+    /// `SHELBI_HOME`.
+    #[test]
+    fn a_new_install_shows_and_first_saves_dark_and_translucent() {
+        let _env = crate::test_env::lock();
+        let home = std::env::temp_dir().join(format!("shelbi-dt-new-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let previous = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let shown = SettingsValues::from_config(&shelbi_state::load_user_config().unwrap());
+        assert_eq!(shown.theme, ThemePreference::Dark);
+        assert_eq!(shown.translucency, Translucency { opacity: 90, blur: 40 });
+
+        let changed = SettingsValues { font_size: 16, ..shown };
+        shelbi_state::update_user_config(|cfg| changed.apply(cfg)).unwrap();
+        let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(text.contains("theme: dark") && text.contains("window_opacity: 90"), "{text}");
+        assert!(text.contains("window_blur: 40") && text.contains("terminal_font_size: 16"), "{text}");
+
+        match previous {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn the_size_field_shows_its_unit_and_takes_a_size_with_or_without_it() {
         assert_eq!(size_text(14), "14pt");

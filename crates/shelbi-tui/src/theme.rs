@@ -157,8 +157,8 @@ pub fn install(pref: ThemePreference) -> Appearance {
     appearance
 }
 
-/// [`install`] from `~/.shelbi/config.yaml::theme`. A missing or unreadable
-/// config is `auto`.
+/// [`install`] from `~/.shelbi/config.yaml::theme`. A missing config is a new
+/// install's (`dark`); an unreadable one is `auto`.
 pub fn install_from_config() -> Appearance {
     let pref = shelbi_state::load_user_config()
         .map(|c| c.theme)
