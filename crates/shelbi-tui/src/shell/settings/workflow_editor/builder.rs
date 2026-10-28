@@ -1302,7 +1302,7 @@ impl WorkflowEditorPage {
             Some(Selection::Draw(d)) => {
                 picker(&mut rows, "From", &name(&d.from), Item::DrawFrom);
                 wrapped(&mut rows, "Choose where this transition goes: move to a status on the graph and press ⏎, click one, or pick it here.", width, muted);
-                let to = d.over.as_deref().map_or_else(|| "None yet".to_string(), &name);
+                let to = d.over.as_deref().map_or_else(|| "None yet".to_string(), name);
                 picker(&mut rows, "To", &to, Item::DrawTo);
                 rows.push(Row::blank());
                 button(&mut rows, Item::CancelNew, "Cancel", Style::default().fg(palette().gray));
