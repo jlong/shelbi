@@ -499,6 +499,7 @@ pub enum HostCall {
     ToggleZen,
     OpenErrorLog,
     OpenSettings,
+    SendFeedback,
     OpenAddProject,
     LoadReview(String),
     ApproveReview(String),
@@ -543,6 +544,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_settings(&mut self) {
         self.push(HostCall::OpenSettings);
+    }
+    fn send_feedback(&mut self) {
+        self.push(HostCall::SendFeedback);
     }
     fn open_add_project(&mut self) {
         self.push(HostCall::OpenAddProject);
@@ -2107,6 +2111,7 @@ impl ShelbiWindow {
             HostCall::ToggleZen => self.toggle_zen(window, cx),
             HostCall::OpenErrorLog => self.open_error_log(window, cx),
             HostCall::OpenSettings => self.open_settings(None, window, cx),
+            HostCall::SendFeedback => self.open_feedback(window, cx),
             HostCall::OpenAddProject => self.open_add_project(window, cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
@@ -3903,14 +3908,14 @@ impl ShelbiWindow {
     fn menu_invoke(&mut self, invoke: &menus::MenuInvoke, window: &mut Window, cx: &mut Context<Self>) {
         use menus::tree::{AppCommand, MenuAction};
         // Contact Us is modal like a workspace dialog: ⌘W cancels it, the
-        // rest wait (Help ▸ Send Feedback… included: it's already open).
+        // rest wait (Help ▸ Send Feedback…, a registry command, included:
+        // it's already open).
         if let Some((dialog, _, _)) = &self.feedback {
             match &invoke.target {
                 MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
                 MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
-                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette | AppCommand::SendFeedback)
-                | MenuAction::Command(_) => {}
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) | MenuAction::Command(_) => {}
                 MenuAction::App(other) => {
                     menus::run_app_command(*other, cx);
                 }
@@ -3924,8 +3929,7 @@ impl ShelbiWindow {
                 MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
                 MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
-                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette | AppCommand::SendFeedback)
-                | MenuAction::Command(_) => {}
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) | MenuAction::Command(_) => {}
                 MenuAction::App(other) => {
                     menus::run_app_command(*other, cx);
                 }
@@ -3946,7 +3950,6 @@ impl ShelbiWindow {
             }
             MenuAction::App(command) => match command {
                 AppCommand::Settings => self.open_settings(None, window, cx),
-                AppCommand::SendFeedback => self.open_feedback(window, cx),
                 AppCommand::CloseWindow => self.close_window(window, cx),
                 AppCommand::Minimize => window.minimize_window(),
                 AppCommand::Zoom => window.zoom_window(),
@@ -4349,7 +4352,7 @@ impl SidebarHost for ShelbiWindow {
             SidebarEvent::ToggleZen => self.run(CommandKind::ToggleZen, window, cx),
             SidebarEvent::OpenErrors => self.run(CommandKind::OpenErrorLog, window, cx),
             SidebarEvent::OpenSettings => self.open_settings(None, window, cx),
-            SidebarEvent::SendFeedback => self.open_feedback(window, cx),
+            SidebarEvent::SendFeedback => self.run(CommandKind::SendFeedback, window, cx),
             SidebarEvent::Collapse => self.toggle_sidebar(cx),
             SidebarEvent::LeaveSettings => self.leave_settings(window, cx),
             SidebarEvent::ShowSettingsPage(page) => self.show_settings_page(page, cx),

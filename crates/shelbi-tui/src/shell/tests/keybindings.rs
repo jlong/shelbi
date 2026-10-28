@@ -530,7 +530,7 @@ fn every_state_is_usable_at_80x24() {
 #[test]
 fn chords_this_terminal_cant_send_are_marked() {
     let (mut st, _mem) = keys_shell("defaults:\n  global:\n    open_palette: [ctrl-p, super-k]\n");
-    st.set_caps(Caps { kitty: false, truecolor: true, nested: None });
+    st.set_caps(Caps { kitty: false, truecolor: true, nested: None, emoji: true });
     go_to(&mut st, "command palette");
     press(&mut st, KeyCode::Right);
     let text = screen(&mut st, 100, 30);

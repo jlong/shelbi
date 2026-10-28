@@ -12,6 +12,9 @@
 //!   nesting spike confirmed `extended-keys` is the right thing to recommend).
 //! - **Truecolor** falls back to 256 colors; the renderer quantizes RGB cells
 //!   when this is false.
+//! - **Emoji** need a UTF-8 locale and a terminal with a pictograph font. The
+//!   Linux virtual console (`TERM=linux`) and a non-UTF-8 locale can't draw
+//!   them, so the sidebar footer's buttons fall back to plain words there.
 //!
 //! Detection must never block the first frame (`rt-tui-headless-startup-block`).
 //! crossterm's own `supports_keyboard_enhancement` waits up to **2 s** for the
@@ -45,6 +48,9 @@ pub struct Caps {
     pub truecolor: bool,
     /// The outer multiplexer we are nested in, if any.
     pub nested: Option<Nesting>,
+    /// Emoji (and the pictographs beside them, like `⚙`) draw: a UTF-8
+    /// locale on a terminal that isn't the Linux console.
+    pub emoji: bool,
 }
 
 /// Inside tmux without `extended-keys`: name the exact one-line fix.
@@ -82,6 +88,10 @@ impl Caps {
                 std::env::var("TMUX").ok().as_deref(),
                 std::env::var("STY").ok().as_deref(),
             ),
+            emoji: emoji_from_env(
+                std::env::var("TERM").ok().as_deref(),
+                locale_from_env().as_deref(),
+            ),
         }
     }
 
@@ -98,6 +108,30 @@ impl Caps {
             None => KEYBOARD_NOTICE_GENERIC,
         })
     }
+}
+
+/// The locale that governs character handling, POSIX order: `LC_ALL`, then
+/// `LC_CTYPE`, then `LANG` (the first one set and non-empty).
+fn locale_from_env() -> Option<String> {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty())
+}
+
+/// Pure `TERM` + locale → emoji decision, split out for testing. Safe unless
+/// something says otherwise: the Linux console (and other bare VT terminals)
+/// has no pictograph font, and a locale that names a charset other than UTF-8
+/// can't encode one. No locale at all (common for a GUI-launched terminal on
+/// macOS) is taken as UTF-8.
+pub(crate) fn emoji_from_env(term: Option<&str>, locale: Option<&str>) -> bool {
+    let bare_terminal = term.is_some_and(|t| t == "linux" || t == "dumb" || t.starts_with("vt"));
+    let non_utf8 = locale.is_some_and(|l| {
+        let l = l.to_ascii_lowercase();
+        // `C` / `POSIX` are ASCII-only; a named charset must be UTF-8.
+        l == "c" || l == "posix" || (l.contains('.') && !(l.contains("utf-8") || l.contains("utf8")))
+    });
+    !bare_terminal && !non_utf8
 }
 
 /// Pure `COLORTERM` → truecolor decision, split out for testing.
@@ -252,10 +286,24 @@ mod tests {
 
     #[test]
     fn keyboard_notice_shows_only_without_kitty() {
-        let with = Caps { kitty: true, truecolor: true, nested: Some(Nesting::Tmux) };
+        let with = Caps { kitty: true, truecolor: true, nested: Some(Nesting::Tmux), emoji: true };
         assert!(with.keyboard_notice().is_none(), "kitty present → no notice even inside tmux");
-        let without = Caps { kitty: false, truecolor: true, nested: None };
+        let without = Caps { kitty: false, truecolor: true, nested: None, emoji: true };
         assert_eq!(without.keyboard_notice(), Some(KEYBOARD_NOTICE_GENERIC));
+    }
+
+    #[test]
+    fn emoji_need_a_utf8_locale_off_the_linux_console() {
+        assert!(emoji_from_env(Some("xterm-256color"), Some("en_US.UTF-8")));
+        assert!(emoji_from_env(Some("xterm-ghostty"), Some("en_US.utf8")));
+        assert!(emoji_from_env(Some("tmux-256color"), None), "no locale reads as UTF-8");
+        assert!(emoji_from_env(None, Some("en_US")), "no charset named");
+        assert!(!emoji_from_env(Some("linux"), Some("en_US.UTF-8")), "the Linux console");
+        assert!(!emoji_from_env(Some("vt100"), None));
+        assert!(!emoji_from_env(Some("dumb"), None));
+        assert!(!emoji_from_env(Some("xterm"), Some("C")));
+        assert!(!emoji_from_env(Some("xterm"), Some("POSIX")));
+        assert!(!emoji_from_env(Some("xterm"), Some("en_US.ISO8859-1")));
     }
 
     #[test]
@@ -322,11 +370,11 @@ mod tests {
     #[test]
     fn notice_is_tailored_to_the_outer_multiplexer() {
         // Inside tmux without kitty: the notice names the `extended-keys` fix.
-        let tmux = Caps { kitty: false, truecolor: true, nested: Some(Nesting::Tmux) };
+        let tmux = Caps { kitty: false, truecolor: true, nested: Some(Nesting::Tmux), emoji: true };
         let msg = tmux.keyboard_notice().expect("notice warranted without kitty");
         assert!(msg.contains("extended-keys"), "tmux notice names the fix: {msg}");
         // Inside Screen: a Screen-specific message, with no tmux-only command.
-        let screen = Caps { kitty: false, truecolor: true, nested: Some(Nesting::Screen) };
+        let screen = Caps { kitty: false, truecolor: true, nested: Some(Nesting::Screen), emoji: true };
         let msg = screen.keyboard_notice().expect("notice warranted without kitty");
         assert!(msg.contains("Screen"), "screen notice mentions Screen: {msg}");
         assert!(!msg.contains("extended-keys"), "screen notice omits the tmux-only fix: {msg}");

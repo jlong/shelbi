@@ -232,8 +232,13 @@ pub struct Theme<C = Swatch> {
     /// Text on a saturated fill: the alert band, the Zen band, the palette
     /// cursor, the unread-errors button, the Enable Zen button.
     pub on_color: C,
+    /// A sidebar footer button under the pointer (Settings, Send Feedback):
+    /// the desktop's `background_hover` tint laid over the canvas.
+    pub button_hover: C,
     /// The sidebar's unread-errors button fill.
     pub error_button: C,
+    /// The unread-errors button under the pointer.
+    pub error_button_hover: C,
     /// The error log's unread `●` marker.
     pub error_marker: C,
     /// The one-time notice band (the keyboard-protocol notice).
@@ -298,7 +303,9 @@ impl Theme {
             workflow_badge_bg: Swatch::rgb(0x3a4258),
             workflow_badge_fg: Swatch::rgb(0xdcdfe8),
             on_color: Swatch::ansi(White, 0xffffff),
+            button_hover: Swatch::rgb(0x45474e),
             error_button: Swatch::rgb(0x6e4646),
+            error_button_hover: Swatch::rgb(0x825454),
             error_marker: Swatch::rgb(0xd27878),
             notice: Swatch::rgb(0x5a461e),
             status_bar: Swatch::rgb(0x282832),
@@ -344,7 +351,9 @@ impl Theme {
             workflow_badge_bg: Swatch::rgb(0xd3d8e4),
             workflow_badge_fg: Swatch::rgb(0x2a3142),
             on_color: Swatch::rgb(0xffffff),
+            button_hover: Swatch::rgb(0xe6e8ee),
             error_button: Swatch::rgb(0x6e4646),
+            error_button_hover: Swatch::rgb(0x825454),
             error_marker: Swatch::rgb(0xb54848),
             notice: Swatch::rgb(0x5a461e),
             status_bar: Swatch::rgb(0xe4e4e4),
@@ -428,7 +437,9 @@ impl<C: Copy> Theme<C> {
             workflow_badge_bg,
             workflow_badge_fg,
             on_color,
+            button_hover,
             error_button,
+            error_button_hover,
             error_marker,
             notice,
             status_bar,
@@ -467,7 +478,9 @@ impl<C: Copy> Theme<C> {
             workflow_badge_bg: f(workflow_badge_bg),
             workflow_badge_fg: f(workflow_badge_fg),
             on_color: f(on_color),
+            button_hover: f(button_hover),
             error_button: f(error_button),
+            error_button_hover: f(error_button_hover),
             error_marker: f(error_marker),
             notice: f(notice),
             status_bar: f(status_bar),
@@ -519,7 +532,9 @@ const TOKEN_NAMES: &[&str] = &[
     "workflow_badge_bg",
     "workflow_badge_fg",
     "on_color",
+    "button_hover",
     "error_button",
+    "error_button_hover",
     "error_marker",
     "notice",
     "status_bar",
@@ -700,6 +715,7 @@ mod tests {
             for fg in ["white", "gray", "foreground"] {
                 assert_contrast(&theme, fg, "selection", 4.5);
                 assert_contrast(&theme, fg, "search", 4.5);
+                assert_contrast(&theme, fg, "button_hover", 4.5);
             }
         }
         // Light also lands on the white canvas (the desktop's main area) and
@@ -708,7 +724,7 @@ mod tests {
         for fg in TEXT_TOKENS {
             assert_contrast(&light, fg, "canvas", 4.5);
         }
-        for fill in ["zen", "error_button", "notice", "ansi_red", "ansi_green", "green"] {
+        for fill in ["zen", "error_button", "error_button_hover", "notice", "ansi_red", "ansi_green", "green"] {
             assert_contrast(&light, "on_color", fill, 4.5);
         }
         assert_contrast(&light, "ansi_gray", "status_bar", 4.5);

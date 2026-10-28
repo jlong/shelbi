@@ -1,7 +1,8 @@
 //! Contact Us in the window (`dt-feedback-dialog`): the sidebar footer's
 //! Settings and megaphone in the left corner, the dialog opened from the
-//! megaphone and from Help ▸ Send Feedback…, and a send end to end through a
-//! fake transport (the request body, each error class, validation, no
+//! megaphone and from Help ▸ Send Feedback… (both the registry's Send
+//! Feedback, which the TUI's footer runs too), and a send end to end through
+//! a fake transport (the request body, each error class, validation, no
 //! duplicate sends, the thank-you, the name and email remembered).
 //!
 //! The window is the smoke test's headless one ([`Harness`]); every test
@@ -94,8 +95,15 @@ impl Feedback {
 
     fn open_dialog(&mut self) -> Entity<FeedbackDialog> {
         self.h.click_selector("sidebar-feedback");
-        self.h.draw();
+        self.run_send_feedback("the megaphone");
         self.dialog().expect("Contact Us is open")
+    }
+
+    /// `from` ran the registry's Send Feedback (the tap holds it): run it.
+    fn run_send_feedback(&mut self, from: &str) {
+        let calls = self.h.take_calls();
+        assert_eq!(calls, [HostCall::SendFeedback], "{from} runs the registry's Send Feedback");
+        self.h.perform(calls);
     }
 
     fn read<R>(&self, f: impl FnOnce(&FeedbackDialog) -> R) -> R {
@@ -203,18 +211,20 @@ fn help_send_feedback_opens_it_over_the_palette_and_cmd_w_cancels_it(cx: &mut Te
     f.h.key("ctrl-space");
     assert!(f.h.window.read_with(&f.h.cx, |w, _| w.overlay.is_some()), "the palette is up");
     f.h.cx.dispatch_action(menus::MenuInvoke {
-        target: MenuAction::App(AppCommand::SendFeedback),
+        target: MenuAction::Command("action:send-feedback".into()),
         generation: 0,
     });
     f.h.cx.run_until_parked();
     assert!(f.h.window.read_with(&f.h.cx, |w, _| w.overlay.is_none()), "the palette closed first");
+    f.run_send_feedback("Help ▸ Send Feedback…");
     let first = f.dialog().expect("Help ▸ Send Feedback… opened it");
     // It opens once; the window's chords wait behind it.
     f.h.cx.dispatch_action(menus::MenuInvoke {
-        target: MenuAction::App(AppCommand::SendFeedback),
+        target: MenuAction::Command("action:send-feedback".into()),
         generation: 0,
     });
     f.h.cx.run_until_parked();
+    assert!(f.h.take_calls().is_empty(), "the menus' commands wait behind the dialog");
     assert_eq!(f.dialog(), Some(first));
     f.h.cx.dispatch_action(menus::MenuInvoke {
         target: MenuAction::App(AppCommand::CloseWindow),

@@ -33,6 +33,9 @@ pub enum Effect {
     /// Open Settings in place of the navigation column, on the page last
     /// used (a client-local view change; nothing stops).
     OpenSettings,
+    /// Open Contact Us, the feedback dialog (a client-local dialog; the
+    /// send is the dialog's own).
+    SendFeedback,
     /// Switch the client to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow (the host collects the form, then calls

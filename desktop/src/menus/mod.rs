@@ -159,7 +159,6 @@ pub fn run_app_command(command: AppCommand, cx: &mut App) -> bool {
             TerminalSettings::zoom(FontZoom::ActualSize, cx);
         }
         AppCommand::Settings
-        | AppCommand::SendFeedback
         | AppCommand::CloseWindow
         | AppCommand::Minimize
         | AppCommand::Zoom
