@@ -121,6 +121,20 @@ exact repository and workflow base used for every check and fact, plus the
 reviewed task commit and exact squash candidate. Pass the same six values to
 every later PR command.
 
+The squash candidate (`integration_sha`) is always the base at `base_sha` plus
+the branch's own changes. When the branch already contains the base, that is
+exactly the branch's tree. When it does not (an unrebased or conflicted tip),
+Shelbi builds the real three-way merge instead of taking a branch tree that
+predates the base. `diff_size` measures `base_sha` to `integration_sha`, the
+commit that actually lands, so a candidate that would revert work on the base
+shows it there. When the three-way merge conflicts, `merge_conflict` names the
+files and `integration_sha` is `null`: there is nothing to publish or land.
+
+The probe fails closed (exit 3 with a JSON error naming the reason) instead of
+reporting a candidate it can't vouch for: a branch whose history carries merge
+commits and doesn't rebase cleanly onto the base, or a candidate that would
+drop or rewrite a file present at `base_sha` that the branch never touched.
+
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<TASK_ID>` | string | — | Task id to probe (required). |
@@ -213,8 +227,8 @@ shelbi zen pr-merge <PR_NUMBER> --match-repository <REPOSITORY> --match-reposito
 ```
 
 Land the prebuilt squash candidate after `ci-watch` reports `green`. Shelbi
-verifies that `integration_sha` has sole parent `base_sha` and exactly the tree
-of `head_sha`, then advances only `refs/heads/<base_branch>` from `base_sha` to
+verifies that `integration_sha` has sole parent `base_sha` and exactly the
+three-way integration tree of `head_sha` onto it, then advances only `refs/heads/<base_branch>` from `base_sha` to
 `integration_sha` with Git's compare-and-swap lease. A concurrent same-head PR
 retarget cannot redirect that update. This atomicity applies to the remote ref
 update, not to GitHub PR metadata.
