@@ -52,15 +52,11 @@ Work on a task branch in your assigned workspace. Preserve unrelated changes and
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::super::workflows_state::tests::{Home, PROJECT};
+    use super::super::workflows_state::tests::Home;
     use super::*;
 
-    /// A throwaway home holding the Agents fixture.
-    pub(crate) fn home(tag: &str) -> Home {
-        home_for(tag, PROJECT)
-    }
-
-    /// [`home`] with the fixture project named `project`.
+    /// A throwaway home holding the Agents fixture, its project named
+    /// `project`.
     pub(crate) fn home_for(tag: &str, project: &str) -> Home {
         let home = Home::with_project(&format!("agents-{tag}"), project);
         fixture::write(&home.root.join("projects").join(project), project);

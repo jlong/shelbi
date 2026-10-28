@@ -41,7 +41,7 @@ use shelbi_app::settings::agents::{
 };
 use shelbi_app::settings::{Job, JobState, SettingsPage, Ticket};
 use shelbi_app::text_area::TextArea;
-use shelbi_app::{EditTarget, Effect};
+use shelbi_app::Effect;
 use shelbi_state::agents_config::{AgentSummary, AgentsConfig, Provenance};
 use shelbi_state::keymap::{Key, Keymaps, SidebarAction};
 
@@ -156,6 +156,8 @@ pub(crate) enum Outcome {
     CloseEditor,
     ShowPage(SettingsPage),
     Reload,
+    /// Open agent `.0` in the agent editor.
+    OpenAgent(String),
 }
 
 /// The Agents page for one project. A project switch makes a new one.
@@ -172,6 +174,15 @@ pub(crate) struct AgentsPage {
     /// The new row's name.
     draft: TextArea,
     editor: Option<Editor>,
+    /// Where the focus goes once the next read lands (the agent editor
+    /// closed onto this page).
+    pending_focus: Option<super::AgentBack>,
+    /// An agent just created or duplicated, for Settings to open in the
+    /// agent editor.
+    opened: Option<String>,
+    /// What the agent editor said as it closed (its agent gone from the
+    /// files), until the next edit.
+    note: Option<String>,
 }
 
 impl AgentsPage {
@@ -186,7 +197,40 @@ impl AgentsPage {
             confirm_choice: 0,
             draft: TextArea::default(),
             editor: None,
+            pending_focus: None,
+            opened: None,
+            note: None,
         }
+    }
+
+    /// Put the focus on `back` (an agent's row, or the shared
+    /// instructions) now if it's listed, and again once the next read
+    /// lands (a renamed or new agent shows then).
+    pub(crate) fn select_after_load(&mut self, back: super::AgentBack) {
+        self.apply_focus(&back);
+        self.pending_focus = Some(back);
+    }
+
+    fn apply_focus(&mut self, back: &super::AgentBack) -> bool {
+        let item = match back {
+            super::AgentBack::Agent(name) => Item::Agent(name.clone()),
+            super::AgentBack::Shared => Item::EditShared,
+        };
+        let listed = self.items().contains(&item);
+        if listed {
+            self.focus = item;
+        }
+        listed
+    }
+
+    /// The agent just created or duplicated, once.
+    pub(crate) fn take_opened(&mut self) -> Option<String> {
+        self.opened.take()
+    }
+
+    /// Say `note` over the page (until the next edit).
+    pub(crate) fn set_notice(&mut self, note: String) {
+        self.note = Some(note);
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -246,6 +290,9 @@ impl AgentsPage {
         if result.is_err() || !self.state.saving() {
             self.state.loaded(result);
         }
+        if let Some(back) = self.pending_focus.take() {
+            self.apply_focus(&back);
+        }
         self.settle_focus();
         true
     }
@@ -261,6 +308,7 @@ impl AgentsPage {
 
     fn request(&mut self, edit: Edit) -> Outcome {
         self.menu = None;
+        self.note = None;
         match self.state.request(edit) {
             Some(job) => self.job(job),
             None => Outcome::Stay,
@@ -278,10 +326,11 @@ impl AgentsPage {
             }
         }
         if let Some(name) = created {
-            // The TUI has no agent editor yet to open it in: the new row
-            // takes the focus instead (see `open_agent`).
+            // The new row takes the focus, and Settings opens it in the
+            // agent editor (as the desktop's page does).
             self.draft = TextArea::default();
-            self.focus = Item::Agent(name);
+            self.focus = Item::Agent(name.clone());
+            self.opened = Some(name);
         }
         self.settle_focus();
         next.map(|job| CommitJob {
@@ -409,13 +458,10 @@ impl AgentsPage {
 
     // --- actions --------------------------------------------------------------
 
-    /// Open agent `name` for editing. This is the one hook a row's Edit goes
-    /// through: the TUI's dedicated agent editor once it has one
-    /// (`tui-agent-editor`); until then the agent's `instructions.md` in the
-    /// user's editor, the palette's `edit:agent:<name>` target. The page
-    /// reads the files again when the editor returns.
+    /// Open agent `name` for editing: the one hook a row's Edit goes
+    /// through, into the agent editor (`tui-agent-editor`).
     fn open_agent(&self, name: &str) -> Outcome {
-        Outcome::Run(Effect::OpenEditor { target: EditTarget::Agent(name.to_string()) })
+        Outcome::OpenAgent(name.to_string())
     }
 
     /// Open agent `name`'s `agent.yaml` in the user's editor: Edit YAML, the
@@ -844,7 +890,7 @@ impl AgentsPage {
         if let Some(e) = self.state.error_at(&Target::Page) {
             wrapped(&mut rows, e, width, Style::default().fg(palette().red));
         }
-        if let Some(n) = self.state.notice() {
+        if let Some(n) = self.state.notice().or(self.note.as_deref()) {
             wrapped(&mut rows, n, width, Style::default().fg(palette().yellow));
         }
         if self.state.saving() {
@@ -1441,8 +1487,19 @@ mod tests {
                     Some(SaveStart::Work(..)) => panic!("the Agents page saves through its queue"),
                     None => {}
                 },
+                SettingsAction::AgentWork => self.agent_work(),
                 SettingsAction::Stay => {}
                 other => self.left = Some(other),
+            }
+        }
+
+        /// Run the agent editor's waiting work here, as the shell would off
+        /// the UI thread.
+        fn agent_work(&mut self) {
+            while let Some((ticket, work)) = self.s.take_agent_work() {
+                let done = super::super::run_agent_work(work, &|p: &str| AgentsConfig::load(p).map_err(|e| e.to_string()));
+                let (action, _) = self.s.agent_landed(&ticket, done);
+                self.apply(action);
             }
         }
 
@@ -1613,11 +1670,12 @@ mod tests {
         let mut d = Driver::new(Some(PROJECT));
         d.focus(Item::Agent("developer".into()));
         d.key(KeyCode::Enter);
-        assert_eq!(
-            d.ran,
-            [Effect::OpenEditor { target: EditTarget::Agent("developer".into()) }],
-            "the agent editor hook: instructions.md until the TUI has an agent editor"
-        );
+        assert_eq!(d.s.agent_editor().map(|e| e.name()), Some("developer"), "the agent editor opens");
+        assert!(d.ran.is_empty());
+        // Back (nothing unsaved) lands on the agent's row.
+        d.key(KeyCode::Esc);
+        assert!(d.s.agent_editor().is_none());
+        assert_eq!(*d.page().focus(), Item::Agent("developer".into()));
         d.key(KeyCode::Char('y'));
         assert_eq!(d.edited, [home.agents().join("developer").join("agent.yaml")]);
     }
@@ -1640,8 +1698,10 @@ mod tests {
         d.key(KeyCode::Enter);
         assert!(home.agents().join("docs2/agent.yaml").exists());
         assert!(d.page().state().draft.is_none());
-        assert_eq!(*d.page().focus(), Item::Agent("docs2".into()), "the new row takes the focus");
-        assert!(d.ran.is_empty(), "no editor opens on its own");
+        assert_eq!(d.s.agent_editor().map(|e| e.name()), Some("docs2"), "the new agent opens in the editor");
+        assert!(d.ran.is_empty(), "no external editor opens on its own");
+        d.key(KeyCode::Esc);
+        assert_eq!(*d.page().focus(), Item::Agent("docs2".into()), "Back lands on the new row");
         // Esc drops a new row.
         d.key(KeyCode::Char('n'));
         d.keys("x");
@@ -1662,6 +1722,8 @@ mod tests {
         d.key(KeyCode::Enter);
         let copy = home.agents().join("review-copy");
         assert!(std::fs::read_to_string(copy.join("instructions.md")).unwrap().contains("release notes"));
+        assert_eq!(d.s.agent_editor().map(|e| e.name()), Some("review-copy"));
+        d.key(KeyCode::Esc);
         assert_eq!(*d.page().focus(), Item::Agent("review-copy".into()));
     }
 
@@ -1704,6 +1766,9 @@ mod tests {
         d.key(KeyCode::Char('n'));
         d.keys("docs");
         d.key(KeyCode::Enter);
+        // It opens in the agent editor; Back to the page.
+        assert!(d.s.agent_editor().is_some());
+        d.key(KeyCode::Esc);
         let task = home.workflows().join("task.yaml");
         let text = std::fs::read_to_string(&task).unwrap();
         std::fs::write(&task, text.replace("agent: review", "agent: docs")).unwrap();
@@ -1840,6 +1905,7 @@ mod tests {
         d.key(KeyCode::Char('n'));
         d.keys("docs");
         d.key(KeyCode::Enter);
+        d.key(KeyCode::Esc);
         d.focus(Item::Agent("review".into()));
         d.key(KeyCode::Char('m'));
         d.key(KeyCode::Char('d'));
@@ -1949,7 +2015,8 @@ mod tests {
         d.screen(160, 60);
         let a = d.s.handle_mouse(click(col, row as u16), side, main);
         d.apply(a);
-        assert_eq!(d.ran.len(), 1, "a second opens");
+        assert_eq!(d.s.agent_editor().map(|e| e.name()), Some("developer"), "a second opens");
+        d.key(KeyCode::Esc);
         // The ⋮ at the row's end.
         let text = d.screen(160, 60);
         let line = text.lines().nth(row).unwrap();

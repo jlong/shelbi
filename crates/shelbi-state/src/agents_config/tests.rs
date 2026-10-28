@@ -1003,6 +1003,88 @@ fn import_skill_copies_a_directory_or_a_markdown_file() {
     ));
 }
 
+#[test]
+fn import_skill_refuses_a_missing_path_or_a_manifest_without_a_description() {
+    let home = Home::new();
+    let source = home.root.join("source");
+    fs::create_dir_all(source.join("bare")).unwrap();
+    fs::write(source.join("bare/SKILL.md"), "Just a body.\n").unwrap();
+    fs::create_dir_all(source.join("quiet")).unwrap();
+    fs::write(source.join("quiet/SKILL.md"), "---\nname: quiet\n---\nBody\n").unwrap();
+    fs::write(source.join("broken.md"), "---\ndescription: [unclosed\n---\n").unwrap();
+    fs::write(source.join("open.md"), "---\ndescription: never closed\n").unwrap();
+
+    let cfg = load();
+    let refused = |rel: &str, says: &str| {
+        let err = cfg.import_skill("qa", &source.join(rel)).unwrap_err();
+        assert!(matches!(err, AgentError::File { .. }), "{rel}: {err:?}");
+        assert!(err.to_string().contains(says), "{rel}: {err}");
+    };
+    refused("gone", "doesn't exist");
+    refused("gone.md", "doesn't exist");
+    refused("bare", "no frontmatter");
+    refused("quiet", "no `description:`");
+    refused("broken.md", "isn't valid YAML");
+    refused("open.md", "no closing `---`");
+    // Nothing went into the model.
+    assert!(!cfg.agent("qa").unwrap().skills().iter().any(|s| s.name == "bare"));
+}
+
+#[test]
+fn skill_files_and_text_read_the_draft() {
+    let home = Home::new();
+    let source = home.root.join("source");
+    fs::create_dir_all(source.join("lint/refs/deep")).unwrap();
+    fs::write(source.join("lint/SKILL.md"), "---\ndescription: Lints\n---\nRun it.\n").unwrap();
+    fs::write(source.join("lint/refs/deep/rules.md"), "rules\n").unwrap();
+    let cfg = load()
+        .import_skill("qa", &source.join("lint"))
+        .unwrap()
+        .add_skill("qa", "notes", "Takes notes.", "Write them down.")
+        .unwrap();
+    let qa = cfg.agent("qa").unwrap();
+    assert_eq!(
+        qa.skill_files("lint"),
+        strings(&["skills/lint/SKILL.md", "skills/lint/refs/deep/rules.md"])
+    );
+    assert_eq!(qa.skill_file("lint").as_deref(), Some("skills/lint/SKILL.md"));
+    assert!(qa.skill_text("notes").unwrap().contains("Write them down."));
+    assert!(qa.skill_text("missing").is_none());
+    // A flat legacy skill.
+    home.write("qa/skills/legacy.md", "---\ndescription: Old\n---\n");
+    let qa = load();
+    let qa = qa.agent("qa").unwrap();
+    assert_eq!(qa.skill_file("legacy").as_deref(), Some("skills/legacy.md"));
+    assert_eq!(qa.skill_files("legacy"), strings(&["skills/legacy.md"]));
+}
+
+#[test]
+fn the_project_overrides_read_from_the_project_yaml() {
+    let _home = Home::new();
+    let cfg = load();
+    assert_eq!(cfg.project_runner_pin("developer"), None);
+    assert_eq!(cfg.project_model(RunnerKind::Claude), None);
+    assert_eq!(cfg.project_permissions_ceiling(), None);
+
+    let projects = crate::projects_dir().unwrap();
+    fs::write(
+        projects.join(format!("{PROJECT}.yaml")),
+        format!(
+            "{PROJECT_YAML}agents:\n  developer:\n    runner: codex\n  qa: {{}}\n\
+             runners:\n  codex:\n    command: codex\n    model: gpt-5.5\n    reasoning_effort: high\n\
+             workspace_permissions_mode: acceptEdits\n"
+        ),
+    )
+    .unwrap();
+    let cfg = load();
+    assert_eq!(cfg.project_runner_pin("developer"), Some(RunnerKind::Codex));
+    assert_eq!(cfg.project_runner_pin("qa"), None, "a block without a runner pins none");
+    assert_eq!(cfg.project_model(RunnerKind::Codex), Some("gpt-5.5"));
+    assert_eq!(cfg.project_reasoning_effort(RunnerKind::Codex), Some(ReasoningEffort::High));
+    assert_eq!(cfg.project_model(RunnerKind::Claude), None);
+    assert_eq!(cfg.project_permissions_ceiling(), Some("acceptEdits"));
+}
+
 // ---------------------------------------------------------------------------
 // Reset
 

@@ -151,12 +151,22 @@ paths on every `cargo test`.
 - **Settings ▸ Agents** (`tui-settings-agents`): both clients draw the page
   over one state (`shelbi_app::settings::agents`: the rows, the guards on
   Reset and Delete, the serialized save queue, the confirm copy, the
-  preview), and both edit the shared instructions in place. The desktop's
-  row click and pencil open its agent details editor; the TUI's Enter goes
-  through one hook that opens `instructions.md` in the user's editor until
-  the TUI has a details editor (`tui-agent-editor`). The desktop's ⋮ menu is
-  the TUI's `m` (and the row's `⋮`); its table stacks under 72 columns. See
+  preview), and both edit the shared instructions in place. A row's click
+  or pencil (desktop) and Enter (TUI) open the agent details editor, and a
+  new or duplicated agent opens in it in both. The desktop's ⋮ menu is the
+  TUI's `m` (and the row's `⋮`); its table stacks under 72 columns. See
   [`status/tui-settings-agents.md`](status/tui-settings-agents.md).
+- **Agent details** (`dt-agent-details`, `tui-agent-editor`): both editors
+  run one draft (`shelbi_app::settings::agent_editor`: the changes and
+  their fields, the pickers' choices, Save / Discard, the leave prompt, the
+  rename / delete / reset guards, the conflict flag, what the project sets
+  over the agent) and open the same files in the user's editor
+  (`Leave::Open`: `agent.yaml`, `instructions.md`, a skill's `SKILL.md`).
+  The desktop picks an import with the macOS chooser, the TUI types its
+  path; the TUI also takes a custom model name, inspects a skill in place,
+  confirms a skill's removal and shows each runner setting's value in
+  effect under its picker (the desktop says it in the Runner preferences
+  footnote). See [`status/tui-agent-editor.md`](status/tui-agent-editor.md).
 - **Settings ▸ Workspaces** (`tui-settings-workspaces`): both clients show
   the same rows (`shelbi_app::settings::workspaces`: each workspace's name,
   derived worktree, machine and Local or SSH, own and inherited tags, and

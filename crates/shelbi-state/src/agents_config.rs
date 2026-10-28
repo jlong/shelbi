@@ -37,7 +37,12 @@
 //!   `add_skill` / `import_skill` / `remove_skill`, and
 //!   `reset_to_default` (with [`can_reset`](AgentsConfig::can_reset)).
 //!   [`assignments`](AgentsConfig::assignments) is the read-only "Workflow
-//!   assignments" list.
+//!   assignments" list; [`Agent::skill_files`] / [`Agent::skill_text`]
+//!   inspect a skill as the draft holds it. What the project sets over an
+//!   agent (its runner pin, a model or effort for every agent on a runner,
+//!   the permission ceiling) is read with
+//!   [`project_runner_pin`](AgentsConfig::project_runner_pin) and its
+//!   siblings, so a details view can say what applies.
 //! - **Pickers.** [`runner_options`] (each runner with its model
 //!   suggestions and reasoning efforts) and [`PERMISSION_MODES`]. `None`
 //!   from a getter (and to a setter) is "Use runner default" / "Use project
@@ -88,7 +93,9 @@
 //! - A skill is what the runner mounts from `skills/`: a directory
 //!   `skills/<name>/SKILL.md` (the layout Claude Code loads, and the one
 //!   `add_skill` writes) or a legacy flat `skills/<name>.md`. Its
-//!   description is the frontmatter `description:`.
+//!   description is the frontmatter `description:`, which both Add skill
+//!   and an import require (an import of a missing path, or of a file whose
+//!   frontmatter is absent, broken or has no description, is refused).
 //! - Reset rewrites `instructions.md` and `agent.yaml` (comments included)
 //!   to the shipped text and makes the skills exactly the shipped ones.
 //! - `model` is free text (it's passed to the runner's `--model`), so the
@@ -401,6 +408,29 @@ impl Agent {
         out.into_values().collect()
     }
 
+    /// Skill `skill`'s files (`SKILL.md` and whatever else its directory
+    /// holds, or the flat `.md`), by path relative to the agent's
+    /// directory, as the draft holds them.
+    pub fn skill_files(&self, skill: &str) -> Vec<String> {
+        self.skill_paths(skill)
+    }
+
+    /// Skill `skill`'s `SKILL.md` (or flat `.md`) as the draft holds it.
+    pub fn skill_text(&self, skill: &str) -> Option<String> {
+        let path = self.skill_file(skill)?;
+        self.files.get(&path).map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+
+    /// Where skill `skill`'s `SKILL.md` (or flat `.md`) sits, relative to
+    /// the agent's directory.
+    pub fn skill_file(&self, skill: &str) -> Option<String> {
+        let skill = self.skills().into_iter().find(|s| s.name == skill)?;
+        Some(match skill.layout {
+            SkillLayout::Directory => format!("{SKILLS_DIR}/{}/{SKILL_FILE}", skill.name),
+            SkillLayout::File => format!("{SKILLS_DIR}/{}.md", skill.name),
+        })
+    }
+
     fn skill_paths(&self, skill: &str) -> Vec<String> {
         let dir = format!("skills/{skill}/");
         let flat = format!("skills/{skill}.md");
@@ -457,6 +487,8 @@ struct Disk {
     assignments: BTreeMap<String, Vec<Assignment>>,
     /// Agents the project YAML pins a runner for.
     pinned: Vec<String>,
+    /// What the project YAML sets over every agent's own preferences.
+    overrides: ProjectOverrides,
     /// `deployed_agent_defaults` from the project state: the hash of the
     /// shipped `instructions.md` each agent was deployed with.
     deployed: BTreeMap<String, String>,
@@ -523,6 +555,7 @@ impl AgentsConfig {
             disk: Arc::new(Disk {
                 assignments: load_assignments(project)?,
                 pinned: load_pins(project),
+                overrides: load_overrides(project),
                 dir,
                 agents: loaded,
                 preamble_path,
@@ -628,6 +661,32 @@ impl AgentsConfig {
             }
             _ => false,
         }
+    }
+
+    /// The runner kind the project YAML pins `agent` onto
+    /// (`agents.<name>.runner`): it wins over the agent's preferred runner.
+    pub fn project_runner_pin(&self, agent: &str) -> Option<RunnerKind> {
+        self.disk.overrides.pins.get(agent).copied()
+    }
+
+    /// The model the project YAML sets for every agent on `runner`
+    /// (`runners.<kind>.model`): it wins over the agent's own.
+    pub fn project_model(&self, runner: RunnerKind) -> Option<&str> {
+        self.disk.overrides.runners.get(&runner)?.0.as_deref()
+    }
+
+    /// The reasoning effort the project YAML sets for every agent on
+    /// `runner` (`runners.<kind>.reasoning_effort`): it wins over the
+    /// agent's own.
+    pub fn project_reasoning_effort(&self, runner: RunnerKind) -> Option<ReasoningEffort> {
+        self.disk.overrides.runners.get(&runner)?.1
+    }
+
+    /// The project's permission ceiling (`workspace_permissions_mode`): an
+    /// agent's request above it is lowered to it, and an agent without one
+    /// gets it.
+    pub fn project_permissions_ceiling(&self) -> Option<&str> {
+        self.disk.overrides.permissions_ceiling.as_deref()
     }
 
     /// The shared instructions (`agents/_shared/preamble.md`), empty when
@@ -861,6 +920,9 @@ impl AgentsConfig {
     /// (copied whole) or a `.md` file (copied to `skills/<stem>/SKILL.md`).
     /// The skill is named after the directory or file stem.
     pub fn import_skill(&self, agent: &str, source: &Path) -> Result<Self> {
+        if !source.exists() {
+            return Err(file_err(source, "doesn't exist"));
+        }
         let stem = source
             .file_stem()
             .and_then(|s| s.to_str())
@@ -892,6 +954,14 @@ impl AgentsConfig {
                 format!("isn't a skill (a directory with {SKILL_FILE}, or a .md file)"),
             ));
         };
+        let main = format!("skills/{name}/{SKILL_FILE}");
+        let manifest = files
+            .iter()
+            .find(|(rel, _)| *rel == main)
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default();
+        let manifest_path = if source.is_dir() { source.join(SKILL_FILE) } else { source.to_path_buf() };
+        check_skill_manifest(&manifest).map_err(|why| file_err(&manifest_path, why))?;
         self.insert_skill(agent, name, files)
     }
 
@@ -1397,6 +1467,60 @@ fn load_assignments(project: &str) -> Result<BTreeMap<String, Vec<Assignment>>> 
     Ok(out)
 }
 
+/// What a project YAML sets over its agents' own preferences, as dispatch
+/// resolves them ([`shelbi_core::resolve_agent_launch`]).
+#[derive(Debug, Default)]
+struct ProjectOverrides {
+    /// `agents.<name>.runner`.
+    pins: BTreeMap<String, RunnerKind>,
+    /// `runners.<kind>.model` and `.reasoning_effort`.
+    runners: BTreeMap<RunnerKind, (Option<String>, Option<ReasoningEffort>)>,
+    /// `workspace_permissions_mode`.
+    permissions_ceiling: Option<String>,
+}
+
+/// The project YAML's overrides, read leniently: a value that doesn't
+/// parse is left out (dispatch would refuse the file anyway).
+fn load_overrides(project: &str) -> ProjectOverrides {
+    let mut out = ProjectOverrides::default();
+    let Ok(path) = crate::workflow_config::project_config_file(project) else {
+        return out;
+    };
+    let Ok(Some(text)) = read_optional(&path) else {
+        return out;
+    };
+    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+        return out;
+    };
+    fn parse<T: serde::de::DeserializeOwned>(v: Option<&Value>) -> Option<T> {
+        v.and_then(|v| serde_yaml::from_value(v.clone()).ok())
+    }
+    if let Some(agents) = value.get("agents").and_then(Value::as_mapping) {
+        for (name, config) in agents {
+            if let (Some(name), Some(kind)) = (name.as_str(), parse(config.get("runner"))) {
+                out.pins.insert(name.to_string(), kind);
+            }
+        }
+    }
+    if let Some(runners) = value.get("runners").and_then(Value::as_mapping) {
+        for (kind, config) in runners {
+            let Some(kind) = parse(Some(kind)) else {
+                continue;
+            };
+            let model = config.get("model").and_then(Value::as_str).map(str::to_string);
+            let effort = parse(config.get("reasoning_effort"));
+            if model.is_some() || effort.is_some() {
+                out.runners.insert(kind, (model, effort));
+            }
+        }
+    }
+    out.permissions_ceiling = value
+        .get("workspace_permissions_mode")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    out
+}
+
 /// The agents the project YAML pins a runner for (`agents.<name>:`).
 fn load_pins(project: &str) -> Vec<String> {
     let Ok(path) = crate::workflow_config::project_config_file(project) else {
@@ -1502,6 +1626,26 @@ fn skill_description(text: &str) -> Option<String> {
     let close = rest.find("\n---")?;
     let value: Value = serde_yaml::from_str(&rest[..close]).ok()?;
     Some(value.get("description")?.as_str()?.trim().to_string())
+}
+
+/// Why a skill file's frontmatter won't do, if it won't: the runner reads
+/// its `description:` to decide when to load the skill.
+fn check_skill_manifest(text: &str) -> std::result::Result<(), String> {
+    let Some(rest) = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    else {
+        return Err("has no frontmatter: it must open with `---`, `description: …`, `---`".into());
+    };
+    let Some(close) = rest.find("\n---") else {
+        return Err("has no closing `---` after its frontmatter".into());
+    };
+    let value: Value = serde_yaml::from_str(&rest[..close])
+        .map_err(|e| format!("has frontmatter that isn't valid YAML: {e}"))?;
+    match value.get("description").and_then(Value::as_str) {
+        Some(d) if !d.trim().is_empty() => Ok(()),
+        _ => Err("has no `description:` in its frontmatter: the runner uses it to decide when to load the skill".into()),
+    }
 }
 
 fn file_name(dir: &Path) -> String {
