@@ -96,7 +96,6 @@ use crate::theme::palette;
 mod agent_editor;
 mod agents;
 mod machine_form;
-mod modal_form;
 mod workflow_editor;
 mod workflows;
 pub(crate) mod workspaces;

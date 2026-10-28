@@ -232,6 +232,27 @@ pub struct Theme<C = Swatch> {
     /// A table row under the pointer: lighter than [`Theme::selection`],
     /// which wins when a row is both.
     pub row_hover: C,
+    /// A dialog panel's fill (Contact Us): the desktop dialog's canvas,
+    /// lifted off the terminal's background so its half-block edge shows.
+    pub dialog: C,
+    /// A control's fill at rest on a [`Theme::dialog`]: a text field, the
+    /// segmented control's track, a secondary button. Its focus and refusal
+    /// fills are the text field's ([`Theme::input_focus`],
+    /// [`Theme::input_invalid`]).
+    pub dialog_control: C,
+    /// The selected segment of a segmented control: the desktop's canvas
+    /// chip on its track.
+    pub segment: C,
+    /// A primary button's fill (Send Message): the desktop's
+    /// `primary_fill` tint laid over [`Theme::dialog`].
+    pub primary: C,
+    /// A primary button with the keyboard on it: the tint at the desktop's
+    /// pressed strength.
+    pub primary_focus: C,
+    /// A primary button's label, and the icon on the tinted badge.
+    pub primary_label: C,
+    /// The thank-you's heart badge: magenta tinted over [`Theme::dialog`].
+    pub magenta_tint: C,
     /// `color/divider` (was `DIVIDER_DIM`): the sidebar's right-edge rule at
     /// rest.
     pub divider: C,
@@ -320,6 +341,13 @@ impl Theme {
             input_disabled: Swatch::rgb(0x222222),
             table_rule: Swatch::rgb(0x444444),
             row_hover: Swatch::rgb(0x2d2d2d),
+            dialog: Swatch::rgb(0x232323),
+            dialog_control: Swatch::rgb(0x303030),
+            segment: Swatch::rgb(0x1c1c1c),
+            primary: Swatch::rgb(0x31444b),
+            primary_focus: Swatch::rgb(0x3e6979),
+            primary_label: Swatch::rgb(0xb0e6fb),
+            magenta_tint: Swatch::rgb(0x433742),
             divider: Swatch::rgb(0x414141),
             zen: Swatch::rgb(0x007f00),
 
@@ -374,6 +402,13 @@ impl Theme {
             input_disabled: Swatch::rgb(0xf4f4f4),
             table_rule: Swatch::rgb(0xd6d6d6),
             row_hover: Swatch::rgb(0xececec),
+            dialog: Swatch::rgb(0xf2f2f2),
+            dialog_control: Swatch::rgb(0xe2e2e2),
+            segment: Swatch::rgb(0xffffff),
+            primary: Swatch::rgb(0xe1eef2),
+            primary_focus: Swatch::rgb(0xc4e6f3),
+            primary_label: Swatch::rgb(0x0a6f9e),
+            magenta_tint: Swatch::rgb(0xe8d8ea),
             divider: Swatch::rgb(0xd0d0d0),
             zen: Swatch::rgb(0x007f00),
 
@@ -467,6 +502,13 @@ impl<C: Copy> Theme<C> {
             input_disabled,
             table_rule,
             row_hover,
+            dialog,
+            dialog_control,
+            segment,
+            primary,
+            primary_focus,
+            primary_label,
+            magenta_tint,
             divider,
             zen,
             divider_active,
@@ -514,6 +556,13 @@ impl<C: Copy> Theme<C> {
             input_disabled: f(input_disabled),
             table_rule: f(table_rule),
             row_hover: f(row_hover),
+            dialog: f(dialog),
+            dialog_control: f(dialog_control),
+            segment: f(segment),
+            primary: f(primary),
+            primary_focus: f(primary_focus),
+            primary_label: f(primary_label),
+            magenta_tint: f(magenta_tint),
             divider: f(divider),
             zen: f(zen),
             divider_active: f(divider_active),
@@ -574,6 +623,13 @@ const TOKEN_NAMES: &[&str] = &[
     "input_disabled",
     "table_rule",
     "row_hover",
+    "dialog",
+    "dialog_control",
+    "segment",
+    "primary",
+    "primary_focus",
+    "primary_label",
+    "magenta_tint",
     "divider",
     "zen",
     "divider_active",
@@ -780,6 +836,27 @@ mod tests {
             // A field's placeholder and a read-only field's text.
             assert_contrast(&theme, "muted", "input", 3.0);
             assert_contrast(&theme, "muted", "input_disabled", 3.0);
+            // A dialog's controls: their text on every fill they take, the
+            // placeholder at rest, the fills apart from the panel's.
+            for fg in ["white", "gray", "foreground"] {
+                for fill in ["dialog", "dialog_control", "segment"] {
+                    assert_contrast(&theme, fg, fill, 4.5);
+                }
+            }
+            assert_contrast(&theme, "muted", "dialog_control", 3.0);
+            assert_contrast(&theme, "muted", "dialog", 3.0);
+            assert_contrast(&theme, "primary_label", "primary", 4.5);
+            assert_contrast(&theme, "white", "primary_focus", 4.5);
+            assert_contrast(&theme, "ansi_magenta", "magenta_tint", 3.0);
+            for (a, b) in [
+                ("dialog", "dialog_control"),
+                ("dialog_control", "segment"),
+                ("dialog_control", "input_focus"),
+                ("primary", "primary_focus"),
+                ("primary", "dialog_control"),
+            ] {
+                assert_ne!(token(&theme, a).rgb, token(&theme, b).rgb, "{a} and {b} differ");
+            }
             // Each state's fill reads apart from the others.
             for (a, b) in [("input", "input_focus"), ("input", "input_invalid"), ("input_focus", "input_invalid")] {
                 assert_ne!(token(&theme, a).rgb, token(&theme, b).rgb, "{a} and {b} differ");

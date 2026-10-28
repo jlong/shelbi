@@ -1,8 +1,8 @@
-//! The settings modals' form layout (the workspace and machine forms): each
-//! field its label over its textbox with what's said under it, a blank row
-//! between fields, laid out as lines with each control's click target and
-//! block recorded, so a short terminal scrolls to keep the focused control
-//! (and what's said under it) in view.
+//! The modal forms' layout (Settings' workspace and machine forms, and
+//! Contact Us): each field its label over its textbox with what's said
+//! under it, a blank row between fields, laid out as lines with each
+//! control's click target and block recorded, so a short terminal scrolls
+//! to keep the focused control (and what's said under it) in view.
 
 use ratatui::{
     layout::Rect,
@@ -19,7 +19,7 @@ use crate::textbox::{self, Textbox};
 const PAIR_MIN_W: usize = 56;
 
 /// One field of a [`FormLines::pair`].
-pub(super) struct Field<'a, H> {
+pub(crate) struct Field<'a, H> {
     pub label: &'a str,
     pub textbox: Textbox<'a>,
     pub focused: bool,
@@ -42,7 +42,7 @@ fn field_lines(label: &str, field: Textbox<'_>, focused: bool, disabled: bool, u
 
 /// A control's place in a form's lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Control<H> {
+pub(crate) struct Control<H> {
     /// The lines it and what's said under it span: `first..end`.
     pub first: usize,
     pub end: usize,
@@ -55,7 +55,7 @@ pub(super) struct Control<H> {
 }
 
 /// A form's content as lines `width` columns wide, and its controls.
-pub(super) struct FormLines<H> {
+pub(crate) struct FormLines<H> {
     pub lines: Vec<Line<'static>>,
     pub controls: Vec<Control<H>>,
     pub width: usize,
@@ -65,16 +65,16 @@ pub(super) struct FormLines<H> {
 }
 
 impl<H: Copy + PartialEq> FormLines<H> {
-    pub(super) fn new(width: usize) -> Self {
+    pub(crate) fn new(width: usize) -> Self {
         FormLines { lines: Vec::new(), controls: Vec::new(), width, footer: None }
     }
 
-    pub(super) fn blank(&mut self) {
+    pub(crate) fn blank(&mut self) {
         self.lines.push(Line::raw(""));
     }
 
     /// `text` wrapped to the form's width.
-    pub(super) fn text(&mut self, text: &str, style: Style) {
+    pub(crate) fn text(&mut self, text: &str, style: Style) {
         for l in shelbi_app::overlay::error_log::wrap(text, self.width.max(1)) {
             self.lines.push(Line::from(Span::styled(l, style)));
         }
@@ -82,7 +82,7 @@ impl<H: Copy + PartialEq> FormLines<H> {
 
     /// A field: `label` over `field`'s box, then each of `under` wrapped.
     /// The box (all three of its rows) is `hit`'s click target.
-    pub(super) fn field(&mut self, label: &str, field: Textbox<'_>, focused: bool, disabled: bool, under: &[(&str, Style)], hit: H) {
+    pub(crate) fn field(&mut self, label: &str, field: Textbox<'_>, focused: bool, disabled: bool, under: &[(&str, Style)], hit: H) {
         let first = self.lines.len();
         self.lines.extend(field_lines(label, field, focused, disabled, under, self.width));
         self.controls.push(Control {
@@ -98,7 +98,7 @@ impl<H: Copy + PartialEq> FormLines<H> {
 
     /// Two fields side by side, each half the width (a narrow form stacks
     /// them, a blank row between).
-    pub(super) fn pair(&mut self, left: Field<'_, H>, right: Field<'_, H>) {
+    pub(crate) fn pair(&mut self, left: Field<'_, H>, right: Field<'_, H>) {
         const GAP: usize = 2;
         if self.width < PAIR_MIN_W {
             self.field(left.label, left.textbox, left.focused, left.disabled, &left.under, left.hit);
@@ -128,19 +128,29 @@ impl<H: Copy + PartialEq> FormLines<H> {
 
     /// A one-line control at `x`, `w` wide, on the line about to be pushed
     /// (or pushed last, with `line`); its block runs from `first`.
-    pub(super) fn control(&mut self, first: usize, line: usize, x: usize, w: usize, hit: H) {
+    pub(crate) fn control(&mut self, first: usize, line: usize, x: usize, w: usize, hit: H) {
         self.controls.push(Control { first, end: line + 1, line, x: x as u16, w: w as u16, h: 1, hit });
     }
 
+    /// `lines` (a box, a button, a checkbox), all of them `hit`'s click
+    /// target across the form's width.
+    pub(crate) fn rows(&mut self, lines: impl IntoIterator<Item = Line<'static>>, hit: H) {
+        let first = self.lines.len();
+        self.lines.extend(lines);
+        let end = self.lines.len();
+        let h = (end - first) as u16;
+        self.controls.push(Control { first, end, line: first, x: 0, w: self.width as u16, h, hit });
+    }
+
     /// The lines from here on are the footer.
-    pub(super) fn footer(&mut self) {
+    pub(crate) fn footer(&mut self) {
         self.footer = Some(self.lines.len());
     }
 
     /// The lines to skip so `focus`'s block shows in `height` rows: its end
     /// when it fits, else its start. Focus in a pinned footer shows the
     /// fields' end.
-    pub(super) fn scroll(&self, focus: H, height: usize) -> usize {
+    pub(crate) fn scroll(&self, focus: H, height: usize) -> usize {
         let Some(c) = self.controls.iter().find(|c| c.hit == focus) else {
             return 0;
         };
@@ -159,7 +169,7 @@ impl<H: Copy + PartialEq> FormLines<H> {
     /// Draw the lines into `content`, scrolled to keep `focus` in view (the
     /// footer pinned to the bottom when they don't all fit), and record
     /// each control's (visible) click target in `hits`.
-    pub(super) fn render(mut self, f: &mut Frame, content: Rect, focus: H, hits: &mut Vec<(Rect, H)>) {
+    pub(crate) fn render(mut self, f: &mut Frame, content: Rect, focus: H, hits: &mut Vec<(Rect, H)>) {
         let height = content.height as usize;
         // The footer pins only when the fields keep a few rows of their own.
         let at = self.footer.filter(|at| self.lines.len() > height && self.lines.len() - at + 4 <= height);

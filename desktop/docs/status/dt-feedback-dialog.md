@@ -53,18 +53,20 @@ components draw for an on/off choice.
 
 ## How it works
 
-- `src/platform/feedback.rs`: the request and the answer. `payload` builds
+- `shelbi_app::feedback` (shared with the TUI's dialog since
+  `tui-feedback-dialog`; `src/platform/feedback.rs` re-exports it and adds
+  the `FeedbackGlobal` test seam): the request and the answer. `payload` builds
   the JSON body (`appName` `"Shelbi"`, `email`, `type`, `message`,
   `timestamp` in ISO 8601 UTC; `name` only when given; `appVersion` and
   `macOSVersion` only with system info on). `classify` reads the answer:
   2xx sent; 422 the body's `error`; 429 "Too many submissions. Please try
   again later."; anything else "Server error (HTTP n)", with the body's
   message when it's a short line. `FeedbackService` is the seam: the live
-  one posts through `/usr/bin/curl` (as the update check does), reads
+  one posts through `/usr/bin/curl` (`curl` on the PATH off a Mac) (as the update check does), reads
   `sw_vers` and the clock, and remembers the name and email in
-  `~/.shelbi/desktop-feedback.json`. `SHELBI_DESKTOP_FEEDBACK_URL` posts
+  `~/.shelbi/feedback.json`. `SHELBI_FEEDBACK_URL` posts
   elsewhere.
-- `src/views/feedback_state.rs`: the toolkit-free form. Validation (email,
+- `shelbi_app::feedback::form`: the toolkit-free form and the dialog's words. Validation (email,
   then message, required after trimming; "Please enter your email" / "Please
   enter a message", the keyboard moved to the field), the one send in
   flight (a second press, Esc and Cancel do nothing while it's out), the
@@ -114,7 +116,7 @@ unsent, the payload with and without system info and with the kind picked,
 the keyboard walk, ⌘Return, validation, each failure class shown inline
 with the draft kept and a retry, a double press sending once with
 "Sending…" meanwhile, the thank-you, the name and email remembered and
-prefilled), `views::feedback_state::tests` and `platform::feedback::tests`.
-Every test sets its own `FeedbackService` with a fake transport; one that
+prefilled), and `shelbi_app::feedback`'s own tests (the form's and the payload's).
+Every test sets its own `FeedbackGlobal` with a fake transport; one that
 sets none gets `FeedbackService::offline`, so no test can reach the real
 endpoint.

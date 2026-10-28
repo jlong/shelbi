@@ -105,8 +105,8 @@ once, by the first launch after the change.) Environment:
 `SHELBI_DESKTOP_UPDATE_URL` points it at a fixture (see Update notice). Help ▸ Send
 Feedback… (and the sidebar footer's megaphone) opens Contact Us, which
 posts to the 32pixels.co feedback endpoint; it remembers the name and email
-you gave in `~/.shelbi/desktop-feedback.json`, and
-`SHELBI_DESKTOP_FEEDBACK_URL` posts it somewhere else instead, for testing.
+you gave in `~/.shelbi/feedback.json`, and
+`SHELBI_FEEDBACK_URL` posts it somewhere else instead, for testing.
 
 ## Build and run
 

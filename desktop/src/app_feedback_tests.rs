@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use super::smoke::Harness;
 use super::*;
 use crate::menus::tree::{AppCommand, MenuAction};
-use crate::platform::feedback::{FeedbackService, HttpResponse, Remembered, SystemInfo};
-use crate::views::feedback_state::{Focus, NO_EMAIL, NO_MESSAGE};
+use crate::platform::feedback::form::{Focus, NO_EMAIL, NO_MESSAGE};
+use crate::platform::feedback::{Client, FeedbackGlobal, FeedbackService, HttpResponse, Os, Remembered, SystemInfo};
 
 const NOW: &str = "2026-10-27T12:00:00Z";
 
@@ -60,7 +60,7 @@ fn temp_file(tag: &str) -> PathBuf {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join("desktop-feedback.json")
+    dir.join(crate::platform::feedback::REMEMBERED_FILE)
 }
 
 impl Feedback {
@@ -70,6 +70,7 @@ impl Feedback {
         let remembered = temp_file(tag);
         let fake = endpoint.clone();
         let service = FeedbackService {
+            client: Client::Desktop,
             transport: Arc::new(move |body: &str| {
                 fake.bodies.lock().unwrap().push(serde_json::from_str(body).unwrap());
                 fake.answers.lock().unwrap().pop_front().unwrap_or(Ok(HttpResponse {
@@ -79,12 +80,12 @@ impl Feedback {
             }),
             system: Arc::new(|| SystemInfo {
                 app_version: "9.8.7".into(),
-                macos_version: "15.1.0".into(),
+                os: Os::MacOs("15.1.0".into()),
             }),
             now: Arc::new(|| NOW.to_string()),
             remembered: Some(remembered.clone()),
         };
-        h.cx.update(|_, cx| cx.set_global(service));
+        h.cx.update(|_, cx| cx.set_global(FeedbackGlobal(service)));
         h.focus_window();
         Feedback { h, endpoint, remembered }
     }

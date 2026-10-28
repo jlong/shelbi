@@ -49,7 +49,7 @@ use shelbi_app::settings::workspaces::{MachineStatus, LOCAL_LABEL};
 use shelbi_core::ForwardMode;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
-use super::modal_form::{Field as Field2, FormLines};
+use crate::modal_form::{Field as Field2, FormLines};
 use super::workspaces::button_style;
 use crate::panel;
 use crate::textbox::{self, Textbox};

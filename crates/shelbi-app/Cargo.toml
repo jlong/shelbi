@@ -21,6 +21,8 @@ shelbi-palette = { workspace = true }
 shelbi-proto = { workspace = true }
 shelbi-client = { workspace = true }
 serde = { workspace = true }
+# Contact Us's request body and the remembered name and email.
+serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
