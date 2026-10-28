@@ -48,7 +48,8 @@ use shelbi_state::keymap::{
     format_chord, Action, DisplayStyle, Key, KeyChord, Keymaps, Mods, SidebarAction,
 };
 
-use super::settings::{bleed_rect, hovered, HoverKey};
+use super::settings::{bleed_rect, hovered, section_heading, HoverKey};
+use crate::button::Button;
 use crate::panel;
 use crate::table::{self, Cell, Column, Table};
 use crate::textbox::{self, Textbox};
@@ -63,6 +64,13 @@ pub(crate) enum Stop {
     OpenKeys,
     Row(Action),
 }
+
+/// The context dropdown's width (the longest context, "Command palette",
+/// and its `▾`).
+const CONTEXT_W: usize = 22;
+
+/// The narrowest the search keeps beside the context and Reset all.
+const SEARCH_MIN_W: usize = 24;
 
 /// What a click at a recorded rect hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +330,9 @@ impl KeysPage {
     }
 
     fn stops(&self) -> Vec<Stop> {
-        let mut out = vec![Stop::Search, Stop::Context, Stop::ResetAll, Stop::OpenKeys];
+        // In the order drawn: Open keys.yaml in the header, then the
+        // filter row left to right.
+        let mut out = vec![Stop::OpenKeys, Stop::Search, Stop::Context, Stop::ResetAll];
         out.extend(self.rows().iter().map(|r| Stop::Row(r.action)));
         out
     }
@@ -441,10 +451,6 @@ impl KeysPage {
                 KeysAction::Stay
             }
             Stop::ResetAll => match k.code {
-                KeyCode::Right => {
-                    self.stop = Stop::OpenKeys;
-                    KeysAction::Stay
-                }
                 _ if activate && self.state.any_customized() => {
                     let outcome = self.state.reset_all();
                     self.settle(outcome)
@@ -452,10 +458,6 @@ impl KeysPage {
                 _ => KeysAction::Stay,
             },
             Stop::OpenKeys => match k.code {
-                KeyCode::Left => {
-                    self.stop = Stop::ResetAll;
-                    KeysAction::Stay
-                }
                 _ if activate => KeysAction::OpenFile,
                 _ => KeysAction::Stay,
             },
@@ -706,16 +708,26 @@ impl KeysPage {
     /// Every line of the page at `width`.
     fn lines(&self, width: usize, focused: bool) -> Vec<PageLine> {
         let mut out = Vec::new();
-        out.push(PageLine::text(Line::from(Span::styled(
+        let is = |stop: Stop| focused && self.stop == stop;
+        // The desktop's header: the title with Open keys.yaml at its
+        // right, what the page does under it.
+        let open = Button::secondary("Open keys.yaml").focused(is(Stop::OpenKeys));
+        let heading = section_heading(
             "Keybindings",
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-        ))));
-        wrapped(
-            &mut out,
-            "Pick a shortcut and press ⏎ to change it. Shared with the desktop app.",
+            Some("Pick a shortcut and press ⏎ to change it. Shared with the desktop app."),
+            &[open],
             width,
-            Style::default().fg(palette().muted),
         );
+        for (n, h) in heading.into_iter().enumerate() {
+            let mut line = PageLine::text(h.line);
+            line.hits = h.targets.iter().map(|&(x, w, _)| (x, x + w, Hit::Stop(Stop::OpenKeys))).collect();
+            if !line.hits.is_empty() {
+                // Its rows keep the button in view with its first.
+                line.stop = (n == 0 || !out.iter().any(|l: &PageLine| l.stop.is_some())).then_some(Stop::OpenKeys);
+                line.under_row = line.stop.is_none();
+            }
+            out.push(line);
+        }
         if let Some(e) = &self.error {
             wrapped(&mut out, e, width, Style::default().fg(palette().red));
         }
@@ -727,57 +739,62 @@ impl KeysPage {
         }
         out.push(PageLine::blank());
 
-        let is = |stop: Stop| focused && self.stop == stop;
-        // The search: a field (its three rows the stop's click target),
-        // the caret at its end while it's typed in.
+        // The filters, as the desktop's row: the search, the context
+        // dropdown and Reset all, side by side (the search alone above
+        // the other two when narrow).
         let on = is(Stop::Search) || self.editing;
-        let field = Textbox::new(&self.state.query).placeholder("Search actions or shortcuts").focused(on);
-        let field = if self.editing { field.caret_at_end() } else { field };
-        for (n, line) in field.lines(width.min(textbox::MAX_W)).into_iter().enumerate() {
-            let mut line = PageLine::stop(line, Stop::Search, width);
-            if n > 0 {
-                // Its rows under the first keep it in view with it.
-                line.stop = None;
-                line.under_row = true;
-            }
-            out.push(line);
-        }
-        out.push(PageLine::blank());
-
-        // The context filter.
-        let context = format!("Context  ‹ {} ›", self.state.context_label());
-        out.push(PageLine::stop(
-            Line::from(Span::styled(
-                pad(&panel::truncate_right(&context, width), width),
-                button_style(is(Stop::Context), true),
-            )),
-            Stop::Context,
-            width,
-        ));
-
-        // Reset all and Open keys.yaml, side by side when they fit.
-        let reset = " Reset all ";
-        let open = " Open keys.yaml ";
-        let reset_style = button_style(is(Stop::ResetAll), self.state.any_customized());
-        let open_style = button_style(is(Stop::OpenKeys), true);
-        let reset_w = reset.chars().count() as u16;
-        let open_w = open.chars().count() as u16;
-        if (reset_w + 2 + open_w) as usize <= width {
-            let mut line = PageLine::text(Line::from(vec![
-                Span::styled(reset, reset_style),
-                Span::raw("  "),
-                Span::styled(open, open_style),
-            ]));
-            line.hits = vec![
-                (0, reset_w, Hit::Stop(Stop::ResetAll)),
-                (reset_w + 2, reset_w + 2 + open_w, Hit::Stop(Stop::OpenKeys)),
-            ];
-            // Either button's stop scrolls this line into view.
-            line.stop = Some(if self.stop == Stop::OpenKeys { Stop::OpenKeys } else { Stop::ResetAll });
-            out.push(line);
+        let search = Textbox::new(&self.state.query).placeholder("Search actions or shortcuts").focused(on);
+        let search = if self.editing { search.caret_at_end() } else { search };
+        let label = self.state.context_label();
+        let context_w = CONTEXT_W.max(panel::display_width(label) + 4);
+        let context = Textbox::new(label).focused(is(Stop::Context)).trail("▾");
+        let reset = Button::secondary("Reset all").focused(is(Stop::ResetAll)).enabled(self.state.any_customized());
+        let rest_w = context_w + 1 + reset.width();
+        let mut bands: Vec<Vec<(Vec<Line<'static>>, usize, Stop)>> = Vec::new();
+        if width >= rest_w + 1 + SEARCH_MIN_W {
+            let search_w = (width - rest_w - 1).min(textbox::MAX_W);
+            bands.push(vec![
+                (search.lines(search_w).to_vec(), search_w, Stop::Search),
+                (context.lines(context_w).to_vec(), context_w, Stop::Context),
+                (reset.spans().map(Line::from).to_vec(), reset.width(), Stop::ResetAll),
+            ]);
         } else {
-            out.push(PageLine::stop(Line::from(Span::styled(reset, reset_style)), Stop::ResetAll, width));
-            out.push(PageLine::stop(Line::from(Span::styled(open, open_style)), Stop::OpenKeys, width));
+            let search_w = width.min(textbox::MAX_W);
+            bands.push(vec![(search.lines(search_w).to_vec(), search_w, Stop::Search)]);
+            let context_w = context_w.min(width.saturating_sub(reset.width() + 1).max(8));
+            bands.push(vec![
+                (context.lines(context_w).to_vec(), context_w, Stop::Context),
+                (reset.spans().map(Line::from).to_vec(), reset.width(), Stop::ResetAll),
+            ]);
+        }
+        for (b, band) in bands.into_iter().enumerate() {
+            if b > 0 {
+                out.push(PageLine::blank());
+            }
+            let focus = band.iter().map(|(_, _, s)| *s).find(|s| self.stop == *s).unwrap_or(band[0].2);
+            for row in 0..textbox::BOX_H {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let mut hits = Vec::new();
+                let mut x = 0u16;
+                for (i, (lines, w, stop)) in band.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(" "));
+                        x += 1;
+                    }
+                    spans.extend(lines[row].spans.iter().cloned());
+                    hits.push((x, x + *w as u16, Hit::Stop(*stop)));
+                    x += *w as u16;
+                }
+                let mut line = PageLine::text(Line::from(spans));
+                line.hits = hits;
+                if row == 0 {
+                    line.stop = Some(focus);
+                } else {
+                    // Its rows under the first keep it in view with it.
+                    line.under_row = true;
+                }
+                out.push(line);
+            }
         }
 
         // The groups.
@@ -828,7 +845,7 @@ impl KeysPage {
             Column::new(group.context.title)
                 .min(label_w)
                 .max(label_w)
-                .title_style(Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
             Column::new(group.context.hint)
                 .min(widest.max(6))
                 .max(widest.max(6))
@@ -908,12 +925,7 @@ impl KeysPage {
             if chord_note(chord, self.kitty).is_some() {
                 text.push('⚠');
             }
-            let style = if picked {
-                Style::default().fg(palette().on_color).bg(palette().cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette().cyan)
-            };
-            chips.push((format!(" {text} "), style, Some(Hit::Chord(action, i))));
+            chips.push((format!(" {text} "), keycap(picked, false), Some(Hit::Chord(action, i))));
         }
         if capturing(Slot::New) {
             if !shown.is_empty() {
@@ -922,21 +934,11 @@ impl KeysPage {
             chips.push((" Press keys… ".into(), capture_style(), Some(Hit::Add(action))));
         } else if shown.is_empty() {
             let picked = selected && self.slot == 0;
-            let style = if picked {
-                Style::default().fg(palette().on_color).bg(palette().cyan)
-            } else {
-                Style::default().fg(palette().muted)
-            };
-            chips.push((" None ".into(), style, Some(Hit::Add(action))));
+            chips.push((" None ".into(), keycap(picked, true), Some(Hit::Add(action))));
         } else if selected {
             let picked = self.slot >= shown.len();
-            let style = if picked {
-                Style::default().fg(palette().on_color).bg(palette().cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette().muted)
-            };
             chips.push((" ".into(), Style::default(), None));
-            chips.push((" + ".into(), style, Some(Hit::Add(action))));
+            chips.push((" + ".into(), keycap(picked, true), Some(Hit::Add(action))));
         }
         chips
     }
@@ -1002,13 +1004,21 @@ impl PageLine {
         PageLine::text(Line::raw(""))
     }
 
-    /// A stop's line, the whole width its click target.
-    fn stop(line: Line<'static>, stop: Stop, width: usize) -> Self {
-        PageLine { stop: Some(stop), hits: vec![(0, width as u16, Hit::Stop(stop))], ..PageLine::text(line) }
-    }
-
     fn under(line: Line<'static>) -> Self {
         PageLine { under_row: true, ..PageLine::text(line) }
+    }
+}
+
+/// A chord as the desktop's keycap: a Secondary button's fill, a quiet
+/// one (None, `+`) muted on a field's; picked, the button's focus.
+fn keycap(picked: bool, quiet: bool) -> Style {
+    let p = palette();
+    if picked {
+        Style::default().fg(p.button_focus_text).bg(p.button_focus).add_modifier(Modifier::BOLD)
+    } else {
+        // A quiet one on a field's fill, where muted text reads.
+        let (fg, bg) = if quiet { (p.muted, p.input) } else { (p.white, p.button) };
+        Style::default().fg(fg).bg(bg)
     }
 }
 
@@ -1016,26 +1026,10 @@ fn capture_style() -> Style {
     Style::default().fg(palette().on_color).bg(palette().yellow).add_modifier(Modifier::BOLD)
 }
 
-/// A button's look: filled while focused, muted while it does nothing.
-fn button_style(focused: bool, enabled: bool) -> Style {
-    let base = Style::default().bg(palette().selection);
-    match (focused, enabled) {
-        (true, true) => base.fg(palette().white).add_modifier(Modifier::BOLD),
-        (true, false) => base.fg(palette().muted),
-        (false, true) => Style::default().fg(palette().cyan),
-        (false, false) => Style::default().fg(palette().muted),
-    }
-}
-
 fn wrapped(out: &mut Vec<PageLine>, text: &str, width: usize, style: Style) {
     for line in shelbi_app::overlay::error_log::wrap(text, width.max(1)) {
         out.push(PageLine::text(Line::from(Span::styled(line, style))));
     }
-}
-
-fn pad(text: &str, width: usize) -> String {
-    let w = panel::display_width(text);
-    format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
 #[cfg(test)]

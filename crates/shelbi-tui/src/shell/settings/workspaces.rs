@@ -45,7 +45,6 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
@@ -63,8 +62,9 @@ use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::pool::{MachineChange, PoolError};
 
 use super::machine_form;
+use crate::button::Button;
 use super::HoverKey;
-use crate::modal_form::FormLines;
+use crate::modal_form::{self, Field, FormLines};
 use crate::panel;
 use crate::table::{Cell, Column, Table, TableLine};
 use crate::textbox::Textbox;
@@ -901,16 +901,16 @@ impl WorkspacesPage {
                 rows.push(PageRow::text(Line::from(Span::styled(line, style))));
             }
         };
-        rows.push(PageRow::text(Line::from(Span::styled(
-            "Workspaces",
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-        ))));
-        text(
-            &mut rows,
-            "Where this project’s agents work: each workspace is a worktree on one of its machines. \
-             The Machines view shows them at work; this page is their configuration.",
-            Style::default().fg(palette().muted),
-        );
+        let items = self.items();
+        let sel = |item: Item| focused && items.get(self.cursor) == Some(&item);
+        let at = |item: Item| items.iter().position(|i| *i == item);
+        let loaded = matches!(self.state.as_ref().map(|s| s.load()), Some(Load::Loaded(_)));
+        // The Workspaces section's heading is the page's, as the desktop's.
+        let new = Button::secondary("New workspace").focused(sel(Item::New));
+        let buttons: &[Button] = if loaded { &[new] } else { &[] };
+        for h in super::section_heading("Workspaces", Some(WORKSPACES_HELP), buttons, width) {
+            rows.push(PageRow::heading(h, &[at(Item::New)]));
+        }
         let Some(state) = &self.state else {
             rows.push(PageRow::blank());
             text(&mut rows, "No project is open.", Style::default().fg(palette().foreground));
@@ -924,9 +924,6 @@ impl WorkspacesPage {
             text(&mut rows, error, Style::default().fg(palette().red));
         }
         rows.push(PageRow::blank());
-        let items = self.items();
-        let sel = |item: Item| focused && items.get(self.cursor) == Some(&item);
-        let at = |item: Item| items.iter().position(|i| *i == item);
         match state.load() {
             Load::Loading => {
                 rows.push(PageRow::text(Line::from(Span::styled(
@@ -935,23 +932,27 @@ impl WorkspacesPage {
                 ))));
             }
             Load::Failed(e) => {
-                text(&mut rows, &format!("Couldn't read the workspaces: {e}"), Style::default().fg(palette().red));
-                text(&mut rows, "Press r, or choose Try again.", Style::default().fg(palette().muted));
+                // The desktop's failed-read panel: what failed, then Retry.
+                rows.push(PageRow::text(Line::from(Span::styled(
+                    "Couldn’t read this project’s workspaces",
+                    Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+                ))));
+                text(&mut rows, &e.to_string(), Style::default().fg(palette().red));
+                text(&mut rows, "Press r, or choose Retry.", Style::default().fg(palette().muted));
                 rows.push(PageRow::blank());
-                rows.push(PageRow::item(action_line("Try again", None, sel(Item::Retry), width), at(Item::Retry)));
+                let retry = Button::secondary("Retry").focused(sel(Item::Retry));
+                for h in super::button_lines(&[retry], width, crate::button::Align::Left) {
+                    rows.push(PageRow::heading(h, &[at(Item::Retry)]));
+                }
             }
             Load::Loaded(index) => {
-                rows.push(PageRow::item(
-                    action_line("New workspace…", Some("n"), sel(Item::New), width),
-                    at(Item::New),
-                ));
-                rows.push(PageRow::blank());
                 let selected = (0..index.workspaces.len()).find(|&i| sel(Item::Workspace(i)));
                 for line in workspace_table(&index.workspaces).selected(selected, true).lines(width) {
                     let item = line.row.and_then(|i| at(Item::Workspace(i)));
                     rows.push(PageRow::table(line, WORKSPACES_TABLE, item));
                 }
                 rows.push(PageRow::blank());
+                text(&mut rows, WORKSPACES_FOOTNOTE, Style::default().fg(palette().muted));
                 text(
                     &mut rows,
                     &format!("Slot: {} {}", form::SLOT_HELP, form::SLOT_AUTOMATIC_HELP),
@@ -962,15 +963,11 @@ impl WorkspacesPage {
                     "+tag: inherited from the workspace’s machine.",
                     Style::default().fg(palette().muted),
                 );
-                rows.push(PageRow::blank());
-                rows.push(PageRow::text(Line::from(Span::styled(
-                    "Machines",
-                    Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
-                ))));
-                rows.push(PageRow::item(
-                    action_line("Add machine…", Some("m"), sel(Item::AddMachine), width),
-                    at(Item::AddMachine),
-                ));
+                rows.extend(super::section_rule(width).map(PageRow::text));
+                let add = Button::secondary("Add machine").focused(sel(Item::AddMachine));
+                for h in super::section_heading("Machines", Some(MACHINES_HELP), &[add], width) {
+                    rows.push(PageRow::heading(h, &[at(Item::AddMachine)]));
+                }
                 rows.push(PageRow::blank());
                 let statuses: Vec<MachineStatus> = index.machines.iter().map(|m| state.status(m)).collect();
                 let selected = (0..index.machines.len()).find(|&i| sel(Item::Machine(i)));
@@ -993,6 +990,7 @@ impl WorkspacesPage {
                     }
                 }
                 rows.push(PageRow::blank());
+                text(&mut rows, MACHINES_FOOTNOTE, Style::default().fg(palette().muted));
                 text(
                     &mut rows,
                     "Reachable means SSH answered the status probe: it doesn’t check the Shelbi CLI, Git, or the \
@@ -1057,19 +1055,24 @@ impl WorkspacesPage {
 
         // Lay the content out as lines, each field its label over its box,
         // recording where each control sits for clicks.
-        let mut out: FormLines<Hit> = FormLines::new(inner_w);
-        out.text(&form.description(), muted);
-        out.blank();
+        let mut out: FormLines<Hit> = FormLines::new(inner_w).with_rest(palette().input_well);
+        out.heading(form.title(), &form.description());
         fn error(e: &Option<String>, red: Style) -> Option<(&str, Style)> {
             e.as_deref().map(|e| (e, red))
         }
-        // Name.
+        // Name and Machine side by side, as the desktop's.
         let on = focus == Focus::Name;
         let name = form.name();
         let field = Textbox::new(name).focused(on).invalid(errors.name.is_some()).selected(fresh && on);
         let field = if on && !fresh { field.caret_at_end() } else { field };
-        out.field("Name", field, on, false, &[error(&errors.name, red)].into_iter().flatten().collect::<Vec<_>>(), Hit::Control(Focus::Name));
-        out.blank();
+        let name_field = Field {
+            label: "Name",
+            textbox: field,
+            focused: on,
+            disabled: false,
+            under: [error(&errors.name, red)].into_iter().flatten().collect(),
+            hit: Hit::Control(Focus::Name),
+        };
         // Machine: the picker (its menu under it while open), and what the
         // machine is.
         let on = focus == Focus::Machine;
@@ -1084,22 +1087,28 @@ impl WorkspacesPage {
         if form.menu().is_some() {
             under.clear();
         }
-        out.field("Machine", picker, on, false, &under, Hit::Control(Focus::Machine));
+        let machine_field = Field { label: "Machine", textbox: picker, focused: on, disabled: false, under, hit: Hit::Control(Focus::Machine) };
+        out.pair(name_field, machine_field);
         if let Some(open) = form.menu() {
+            // The menu drops under the picker's column.
+            let (x, w) = modal_form::pair_right(inner_w).unwrap_or((0, inner_w));
             let first = out.lines.len();
             for (i, m) in form.machines().iter().enumerate() {
-                let text = panel::truncate_right(&format!(" {}  {} ", m.name, m.detail()), inner_w);
-                let pad = inner_w.saturating_sub(panel::display_width(&text));
+                let text = panel::truncate_right(&format!(" {}  {} ", m.name, m.detail()), w);
+                let pad = w.saturating_sub(panel::display_width(&text));
                 let style = if i == open {
                     Style::default().fg(palette().white).bg(palette().selection).add_modifier(Modifier::BOLD)
                 } else if matches!(m.status, MachineStatus::Unreachable(_)) {
-                    Style::default().fg(palette().red)
+                    Style::default().fg(palette().red).bg(palette().input_well)
                 } else {
-                    Style::default().fg(palette().gray)
+                    Style::default().fg(palette().gray).bg(palette().input_well)
                 };
                 let line = out.lines.len();
-                out.lines.push(Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style)));
-                out.control(first, line, 0, inner_w, Hit::Option(i));
+                out.lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(x)),
+                    Span::styled(format!("{text}{}", " ".repeat(pad)), style),
+                ]));
+                out.control(first, line, x, w, Hit::Option(i));
             }
             if let Some(e) = &errors.machine {
                 out.text(e, red);
@@ -1134,57 +1143,33 @@ impl WorkspacesPage {
         let mut under = vec![(form::SLOT_HELP, muted), (form::SLOT_AUTOMATIC_HELP, muted)];
         under.extend(error(&errors.slot, red));
         out.field("Slot (optional)", field, on, false, &under, Hit::Control(Focus::Slot));
-        // The footer: a refusal over the buttons, then the key hint.
+        // The footer: a refusal, the rule, the buttons, then the key hint.
         out.footer();
         if let Some(e) = &errors.general {
             out.blank();
             out.text(e, red);
         }
         out.blank();
-        // The buttons: Remove at the left (Edit), Cancel and the default
-        // action at the right.
-        let button_row = out.lines.len();
-        let mut buttons: Vec<(Focus, String, Style)> = Vec::new();
+        out.rule();
+        // Remove at the left (Edit), Cancel and the default action at the
+        // right.
+        let busy = form.busy();
+        let mut left = Vec::new();
         if !form.is_new() {
-            buttons.push((Focus::Remove, " Remove workspace… ".into(), button_style(focus == Focus::Remove, true, false)));
+            left.push((Button::danger("Remove workspace").focused(focus == Focus::Remove).enabled(!busy), Hit::Control(Focus::Remove)));
         }
-        buttons.push((Focus::Cancel, " Cancel ".into(), button_style(focus == Focus::Cancel, !form.busy(), false)));
-        buttons.push((
-            Focus::Submit,
-            format!(" {} ", form.submit_label()),
-            button_style(focus == Focus::Submit, form.can_submit(), true),
-        ));
-        let total: usize = buttons.iter().map(|(_, t, _)| panel::display_width(t) + 1).sum();
-        let mut spans = Vec::new();
-        let mut x = 0usize;
-        for (i, (button, label, style)) in buttons.iter().enumerate() {
-            if i == 0 && *button == Focus::Remove {
-                spans.push(Span::styled(label.clone(), *style));
-                out.control(button_row, button_row, x, panel::display_width(label), Hit::Control(*button));
-                x += panel::display_width(label);
-                let gap = inner_w.saturating_sub(total).max(1);
-                spans.push(Span::raw(" ".repeat(gap)));
-                x += gap;
-                continue;
-            }
-            if i == 0 {
-                let gap = inner_w.saturating_sub(total);
-                spans.push(Span::raw(" ".repeat(gap)));
-                x += gap;
-            }
-            spans.push(Span::styled(label.clone(), *style));
-            out.control(button_row, button_row, x, panel::display_width(label), Hit::Control(*button));
-            x += panel::display_width(label);
-            spans.push(Span::raw(" "));
-            x += 1;
-        }
-        out.lines.push(Line::from(spans));
-        let hint = if form.busy() {
+        let submit = form.submit_label();
+        let right = [
+            (Button::secondary("Cancel").focused(focus == Focus::Cancel).enabled(!busy), Hit::Control(Focus::Cancel)),
+            (Button::primary(submit).focused(focus == Focus::Submit).enabled(form.can_submit()), Hit::Control(Focus::Submit)),
+        ];
+        out.buttons_apart(&left, &right);
+        let hint = if busy {
             "Working… (nothing else runs until this lands)".to_string()
         } else if form.menu().is_some() {
             "↑↓ choose · ⏎ pick · Esc close".to_string()
         } else {
-            format!("Tab next · ⏎ {} · Esc cancel", form.submit_label().to_lowercase())
+            format!("Tab next · ⏎ {} · Esc cancel", submit.to_lowercase())
         };
         out.lines.push(Line::from(Span::styled(panel::truncate_right(&hint, inner_w), muted)));
 
@@ -1195,17 +1180,7 @@ impl WorkspacesPage {
             width,
             height,
         };
-        super::clear_layer(f, rect, main);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette().divider_active))
-            .title(Span::styled(
-                format!(" {} ", form.title()),
-                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let content = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let content = super::overlay_panel(f, rect, main, None);
         // An open menu keeps its highlighted machine in view.
         let focus = match form.menu() {
             Some(open) => Hit::Option(open),
@@ -1215,81 +1190,58 @@ impl WorkspacesPage {
     }
 
     fn render_confirm(&mut self, f: &mut Frame, main: Rect, c: &RemoveConfirm) {
-        let width = 64.min(main.width.saturating_sub(2));
-        if width < 20 || main.height < 5 {
-            return;
-        }
-        let inner_w = width.saturating_sub(4) as usize;
-        let wrap = |s: &str| shelbi_app::overlay::error_log::wrap(s, inner_w.max(1));
-        let mut lines: Vec<Line<'static>> = wrap(&c.body())
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, Style::default().fg(palette().foreground))))
-            .collect();
+        let mut body = vec![(c.body(), Style::default().fg(palette().foreground))];
         if let Some(e) = c.error() {
-            lines.push(Line::raw(""));
-            lines.extend(wrap(e).into_iter().map(|l| Line::from(Span::styled(l, Style::default().fg(palette().red)))));
+            body.push((String::new(), Style::default()));
+            body.push((e.to_string(), Style::default().fg(palette().red)));
         }
-        lines.push(Line::raw(""));
-        let cancel = " Cancel ".to_string();
-        let remove = " Remove workspace ".to_string();
-        let gap = inner_w.saturating_sub(panel::display_width(&cancel) + panel::display_width(&remove) + 1);
-        let button_row = lines.len();
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(gap)),
-            Span::styled(cancel.clone(), button_style(c.focus() == ConfirmFocus::Cancel, !c.busy(), false)),
-            Span::raw(" "),
-            Span::styled(remove.clone(), danger_style(c.focus() == ConfirmFocus::Remove, !c.busy())),
-        ]));
+        let enabled = !c.busy();
+        let buttons = [
+            (Button::secondary("Cancel").focused(c.focus() == ConfirmFocus::Cancel).enabled(enabled), 0),
+            (Button::danger("Remove workspace").focused(c.focus() == ConfirmFocus::Remove).enabled(enabled), 1),
+        ];
         let hint = if c.busy() { "Removing…" } else { "Tab switch · ⏎ press · Esc cancel" };
-        lines.push(Line::from(Span::styled(hint, Style::default().fg(palette().muted))));
-        let height = (lines.len() as u16 + 2).min(main.height);
-        let rect = Rect {
-            x: main.x + (main.width - width) / 2,
-            y: main.y + (main.height - height) / 2,
-            width,
-            height,
-        };
-        super::clear_layer(f, rect, main);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette().red))
-            .title(Span::styled(
-                format!(" {} ", c.title()),
-                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let content = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-        f.render_widget(Paragraph::new(lines), content);
-        // The confirmation sits over the form: its rects come last and win.
-        if (button_row as u16) < content.height {
-            let y = content.y + button_row as u16;
-            let x = content.x + gap as u16;
-            let cw = panel::display_width(&cancel) as u16;
-            self.hits.push((Rect { x, y, width: cw, height: 1 }, Hit::ConfirmCancel));
-            self.hits.push((
-                Rect { x: x + cw + 1, y, width: panel::display_width(&remove) as u16, height: 1 },
-                Hit::ConfirmRemove,
-            ));
+        // The confirmation is modal over the form: its rects come last and win.
+        for (r, i) in super::render_dialog(f, main, 64, &c.title(), &body, &buttons, hint) {
+            self.hits.push((r, if i == 0 { Hit::ConfirmCancel } else { Hit::ConfirmRemove }));
         }
-        // The confirmation is modal over the form: only its buttons answer.
-        self.hits.retain(|(_, h)| matches!(h, Hit::ConfirmCancel | Hit::ConfirmRemove));
     }
 }
 
 /// One rendered row of the page: a line, and the selectable row it belongs
 /// to (a workspace takes two lines).
+/// The Workspaces section's description, as the desktop's.
+const WORKSPACES_HELP: &str = "Give agents their own place to work, on this Mac or another machine.";
+
+/// Under the workspaces table, as the desktop's.
+const WORKSPACES_FOOTNOTE: &str = "Each workspace has its own worktree. Tags help Shelbi route tasks to the right workspace.";
+
+/// The Machines section's description, as the desktop's.
+const MACHINES_HELP: &str = "Choose where this project’s workspaces run.";
+
+/// Under the machines table, as the desktop's.
+const MACHINES_FOOTNOTE: &str = "Remote machines connect over SSH using your existing SSH configuration.";
+
 pub(crate) struct PageRow {
     pub line: Line<'static>,
     pub item: Option<usize>,
     /// A table's line: its row, for the pointer's hover (`Row::table`).
     pub table_row: Option<HoverKey>,
     pub hover: Option<Line<'static>>,
+    /// Buttons on it: `x`, `w`, the item each is.
+    pub targets: Vec<(u16, u16, usize)>,
 }
 
 impl PageRow {
     fn text(line: Line<'static>) -> PageRow {
-        PageRow { line, item: None, table_row: None, hover: None }
+        PageRow { line, item: None, table_row: None, hover: None, targets: Vec::new() }
+    }
+
+    /// A line of a section heading, its buttons each one of `items`.
+    fn heading(h: super::HeadingLine, items: &[Option<usize>]) -> PageRow {
+        let targets: Vec<(u16, u16, usize)> =
+            h.targets.iter().filter_map(|&(x, w, b)| items.get(b).copied().flatten().map(|i| (x, w, i))).collect();
+        PageRow { item: targets.first().map(|t| t.2), targets, ..PageRow::text(h.line) }
     }
 
     /// Table `table`'s line, a line of selectable row `item`.
@@ -1299,6 +1251,7 @@ impl PageRow {
             item,
             table_row: Some((table, l.row.unwrap_or(usize::MAX))),
             hover: l.hover,
+            targets: Vec::new(),
         }
     }
 
@@ -1418,59 +1371,6 @@ fn confirm_key(k: KeyEvent) -> Option<Key> {
         KeyCode::Esc => Some(Key::Esc),
         KeyCode::Char(' ') => Some(Key::Space),
         _ => None,
-    }
-}
-
-/// A button: the selection fill while focused; dim while it can't run.
-pub(super) fn button_style(focused: bool, enabled: bool, primary: bool) -> Style {
-    if !enabled {
-        return Style::default().fg(palette().muted).bg(palette().status_bar);
-    }
-    let style = Style::default().bg(palette().selection);
-    match (focused, primary) {
-        (true, _) => style.fg(palette().white).add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        (false, true) => style.fg(palette().cyan).add_modifier(Modifier::BOLD),
-        (false, false) => style.fg(palette().gray),
-    }
-}
-
-/// The confirmation's destructive button.
-fn danger_style(focused: bool, enabled: bool) -> Style {
-    if !enabled {
-        return Style::default().fg(palette().muted).bg(palette().status_bar);
-    }
-    let style = Style::default().fg(palette().red).bg(palette().selection).add_modifier(Modifier::BOLD);
-    if focused {
-        style.add_modifier(Modifier::REVERSED)
-    } else {
-        style
-    }
-}
-
-/// An action row: `› label   note`, the selection fill when selected.
-fn action_line(label: &str, note: Option<&str>, selected: bool, width: usize) -> Line<'static> {
-    let marker = if selected { "› " } else { "  " };
-    let mut text = format!("{marker}{}", panel::truncate_right(label, width.saturating_sub(2)));
-    if let Some(note) = note {
-        let room = width.saturating_sub(panel::display_width(&text) + 2);
-        if room >= panel::display_width(note) {
-            text.push_str("  ");
-            text.push_str(note);
-        }
-    }
-    fill(text, selected, Style::default().fg(palette().cyan), width)
-}
-
-/// `text` padded across `width` with the selection fill when `selected`.
-fn fill(text: String, selected: bool, style: Style, width: usize) -> Line<'static> {
-    if selected {
-        let pad = width.saturating_sub(panel::display_width(&text));
-        Line::from(Span::styled(
-            format!("{text}{}", " ".repeat(pad)),
-            Style::default().fg(palette().white).bg(palette().selection).add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::from(Span::styled(text, style))
     }
 }
 
@@ -1674,7 +1574,7 @@ mod tests {
         );
         let text = text(&page, 100);
         for want in [
-            "New workspace…",
+            " New workspace ",
             "Workspace ",
             "│ Machine ",
             "│ Tags ",
@@ -1688,7 +1588,7 @@ mod tests {
             "0 auto",
             "from 0, in the order the project declares them",
             "Machines",
-            "Add machine…",
+            "Add machine",
             "⏎ or c on a machine configures it",
             "│ SSH host ",
             "│ Project directory ",
@@ -1782,9 +1682,10 @@ mod tests {
         assert!(page.items().is_empty());
         page.loaded(&t, Err("projects/my-project.yaml: bad indent".into()));
         let shown = text(&page, 80);
-        assert!(shown.contains("Couldn't read the workspaces: projects/my-project.yaml: bad indent"), "{shown}");
+        assert!(shown.contains("Couldn’t read this project’s workspaces"), "{shown}");
+        assert!(shown.contains("projects/my-project.yaml: bad indent") && shown.contains("Retry"), "{shown}");
         assert_eq!(page.items(), [Item::Retry]);
-        assert_eq!(page.activate(0), Ask::Reload, "Try again reads again");
+        assert_eq!(page.activate(0), Ask::Reload, "Retry reads again");
         let t = page.begin_load(Some(PROJECT), true).unwrap();
         assert!(text(&page, 80).contains("Loading…"), "a retry shows it's reading");
         page.loaded(&t, super::super::fixture_pool(PROJECT));
@@ -2162,7 +2063,7 @@ mod tests {
     fn machine_rows_open_the_form_with_the_machines_own_values() {
         let mut page = loaded();
         let text = text(&page, 100);
-        assert!(text.contains("Add machine…  m"), "{text}");
+        assert!(text.contains(" Add machine "), "{text}");
         assert!(!text.contains("in your editor"), "{text}");
         assert_eq!(page.activate(item_at(&page, Item::AddMachine)), Ask::Stay);
         let form = page.machine_form().expect("Add machine opens the form");
@@ -2206,7 +2107,7 @@ mod tests {
         let help = page.machine_form().unwrap().work_dir_help();
         assert!(help.contains("remote’s home"), "{help}");
         let read = prose(&shown);
-        for want in ["Add machine", "Kind", "SSH", "Name", "SSH host", "never asks for a password", "Project directory", &help, "Machine tags", "Connection", "Not checked", "Cancel"] {
+        for want in ["Add machine", "Name", "SSH host", "Your existing SSH keys and settings are observed", "Project directory", &help, "Machine tags", "Connection", "Not checked", "Cancel"] {
             assert!(read.contains(want), "{want:?}:\n{shown}");
         }
         page.layer_key(key(KeyCode::Esc));
@@ -2215,7 +2116,7 @@ mod tests {
         let help = page.machine_form().unwrap().work_dir_help();
         assert!(help.contains("~ is your home"), "{help}");
         let read = prose(&shown);
-        for want in ["Configure machine", &format!("Local ({})", shelbi_app::settings::workspaces::LOCAL_LABEL), "~/Projects/my-project", &help, "Save changes"] {
+        for want in ["Configure machine", "~/Projects/my-project", &help, "Save changes"] {
             assert!(read.contains(want), "{want:?}:\n{shown}");
         }
         for absent in ["SSH host", "Connection", "Not checked"] {
@@ -2505,7 +2406,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         assert_eq!(buf[(rows[0].x, rows[0].y)].symbol(), "▄");
         assert_eq!(buf[(rows[2].x, rows[2].y)].symbol(), "▀");
-        assert_eq!(buf[(rows[1].x + 1, rows[1].y)].bg, palette().input, "at rest");
+        assert_eq!(buf[(rows[1].x + 1, rows[1].y)].bg, palette().input_well, "at rest, a well in the dialog");
         for row in &rows {
             tab_to(&mut page, Focus::Name);
             page.layer_mouse(MouseEvent {

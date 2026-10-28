@@ -31,7 +31,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use shelbi_app::settings::workflows::{
@@ -42,7 +42,8 @@ use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::StatusCategory;
 use shelbi_state::workflow_config::{StatusSummary, UnreadableWorkflow, WorkflowConfig, WorkflowSummary};
 
-use super::{box_rows, heading, selected_style, wrapped, Row, SettingsAction};
+use super::{box_rows, section_heading, selected_style, wrapped, Row, SettingsAction};
+use crate::button::Button;
 use crate::panel;
 use crate::table::{Cell, Column, Table, TableLine};
 use crate::textbox::Textbox;
@@ -275,10 +276,16 @@ impl WorkflowsPage {
         let Some(state) = self.state.as_mut() else {
             return false;
         };
+        let first = state.config().is_none();
         let taken = state.loaded(result);
         if taken {
             self.apply_select();
             self.select_on_load = None;
+            // A first read lands on the first workflow, not the heading's
+            // New workflow button (item 0).
+            if first && self.cursor == 0 {
+                self.cursor = 1;
+            }
         }
         self.clamp_cursor();
         taken
@@ -352,12 +359,13 @@ impl WorkflowsPage {
         let Some(state) = self.state.as_ref().filter(|s| s.config().is_some()) else {
             return Vec::new();
         };
-        let mut out: Vec<Item> = state.workflows().into_iter().map(|w| Item::Workflow(w.name)).collect();
+        // In the order drawn: each section's heading buttons, then its table.
+        let mut out = vec![Item::NewWorkflow];
+        out.extend(state.workflows().into_iter().map(|w| Item::Workflow(w.name)));
         out.extend(state.unreadable().iter().map(|u| Item::Unreadable(u.name.clone())));
-        out.push(Item::NewWorkflow);
-        out.extend(state.statuses().into_iter().map(|s| Item::Status(s.id)));
-        out.push(Item::NewStatus);
         out.push(Item::EditStatuses);
+        out.push(Item::NewStatus);
+        out.extend(state.statuses().into_iter().map(|s| Item::Status(s.id)));
         out
     }
 
@@ -390,7 +398,7 @@ impl WorkflowsPage {
                     out.push(entry("Set as default", "s", Act::SetDefault(name.clone()), false));
                 }
                 let blocked = state.delete_workflow_blocked(name).is_some();
-                out.push(entry("Delete…", "x", Act::DeleteWorkflow(name.clone()), blocked));
+                out.push(entry("Delete", "x", Act::DeleteWorkflow(name.clone()), blocked));
                 out.push(entry("New workflow", "n", Act::NewWorkflow, false));
                 out
             }
@@ -410,13 +418,13 @@ impl WorkflowsPage {
                     out.push(entry("Move down", "⇧↓", Act::MoveStatus(id.clone(), true), false));
                 }
                 let blocked = state.delete_status_blocked(id).is_some();
-                out.push(entry("Delete…", "x", Act::DeleteStatus(id.clone()), blocked));
+                out.push(entry("Delete", "x", Act::DeleteStatus(id.clone()), blocked));
                 out.push(entry("New status", "n", Act::NewStatus, false));
-                out.push(entry("Edit statuses.yaml", "y", Act::StatusesYaml, false));
+                out.push(entry("Edit YAML", "y", Act::StatusesYaml, false));
                 out
             }
             Item::NewStatus => vec![entry("New status", "⏎ n", Act::NewStatus, false)],
-            Item::EditStatuses => vec![entry("Edit statuses.yaml", "⏎ y", Act::StatusesYaml, false)],
+            Item::EditStatuses => vec![entry("Edit YAML", "⏎ y", Act::StatusesYaml, false)],
         }
     }
 
@@ -886,18 +894,27 @@ impl WorkflowsPage {
 
     /// The page's rows at `width`; `focused` when the page has the keys.
     pub(super) fn rows(&self, width: usize, focused: bool, has_project: bool) -> Vec<Row> {
-        let mut rows = vec![Row::text(Line::from(vec![
-            Span::styled("Workflows", Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
-            Span::styled(self.saving_note(), Style::default().fg(palette().muted)),
-        ]))];
         let muted = Style::default().fg(palette().muted);
         let red = Style::default().fg(palette().red);
+        let selected = |i: usize| (i == self.cursor).then_some(focused);
+        // The Workflows section's heading is the page's, as the desktop's;
+        // its New workflow button is item 0 once the workflows read.
+        let loaded = self.state.as_ref().is_some_and(|s| s.config().is_some()) && has_project;
+        let new = Button::secondary("New workflow").focused(selected(0) == Some(true));
+        let buttons: &[Button] = if loaded { &[new] } else { &[] };
+        let mut rows: Vec<Row> = section_heading("Workflows", Some(WORKFLOWS_HELP), buttons, width)
+            .into_iter()
+            .map(|h| Row::heading(h, &[Some(0)]))
+            .collect();
+        let saving = self.saving_note();
+        if !saving.is_empty() {
+            wrapped(&mut rows, saving.trim(), width, muted);
+        }
         let Some(state) = self.state.as_ref().filter(|_| has_project) else {
             rows.push(Row::blank());
             wrapped(&mut rows, "No project is open. Switch to a project to edit its workflows.", width, muted);
             return rows;
         };
-        wrapped(&mut rows, WORKFLOWS_HELP, width, muted);
         if let Some(notice) = state.notice() {
             wrapped(&mut rows, notice, width, Style::default().fg(palette().yellow));
         }
@@ -929,14 +946,14 @@ impl WorkflowsPage {
                 wrapped(&mut rows, e, width, red);
             }
         }
-        let selected = |i: usize| (i == self.cursor).then_some(focused);
         // The cursor's row in a table whose first row is item `base`.
         let picked = |base: usize, len: usize| (self.cursor >= base && self.cursor < base + len).then(|| self.cursor - base);
-        let mut index = 0usize;
+        // Item 0 is New workflow, in the heading.
+        let new_workflow = 0;
+        let mut index = 1usize;
 
         // Workflows.
         rows.push(Row::blank());
-        heading(&mut rows, "Workflows");
         let workflows = state.workflows();
         let unreadable = state.unreadable();
         let table = workflow_table(&workflows, unreadable);
@@ -952,24 +969,30 @@ impl WorkflowsPage {
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Workflow { from })) => {
                 let refused = state.error_at(&Target::NewWorkflow);
-                draft_rows(&mut rows, text, "Workflow name", refused, index, width);
+                draft_rows(&mut rows, text, "Workflow name", refused, new_workflow, width);
                 let help = match from {
                     Some(from) => format!("Duplicate of {from}. Enter to create, Esc to cancel."),
                     None => "Enter to create, Esc to cancel.".to_string(),
                 };
                 wrapped(&mut rows, &help, width, muted);
             }
-            _ => {
-                rows.push(Row::item(add_line("+ New workflow", selected(index), width), index));
-                error_rows(&mut rows, state.error_at(&Target::NewWorkflow), width);
-            }
+            _ => error_rows(&mut rows, state.error_at(&Target::NewWorkflow), width),
         }
-        index += 1;
 
-        // Statuses.
+        // Statuses: Edit YAML and New status in the heading, then the table.
+        rows.extend(super::section_rule(width).map(Row::text));
+        let (edit_yaml, new_status) = (index, index + 1);
+        index += 2;
+        let buttons = [
+            Button::secondary("Edit YAML").focused(selected(edit_yaml) == Some(true)),
+            Button::secondary("New status").focused(selected(new_status) == Some(true)),
+        ];
+        rows.extend(
+            section_heading("Statuses", Some(STATUSES_HELP), &buttons, width)
+                .into_iter()
+                .map(|h| Row::heading(h, &[Some(edit_yaml), Some(new_status)])),
+        );
         rows.push(Row::blank());
-        heading(&mut rows, "Statuses");
-        wrapped(&mut rows, STATUSES_HELP, width, muted);
         let statuses = state.statuses();
         // A status renamed in a field under its row shows selected.
         let renaming = match &self.modal {
@@ -990,11 +1013,10 @@ impl WorkflowsPage {
                 _ => error_rows(rows, refused, width),
             }
         });
-        index += statuses.len();
         match (&self.modal, &state.draft) {
             (Some(Modal::Draft { text }), Some(Draft::Status { category })) => {
                 let refused = state.error_at(&Target::NewStatus);
-                draft_rows(&mut rows, text, "Status name", refused, index, width);
+                draft_rows(&mut rows, text, "Status name", refused, new_status, width);
                 let id = state.new_status_id(&text.text()).unwrap_or_else(|| "…".into());
                 rows.push(Row::text(Line::from(vec![
                     Span::styled("id ", muted),
@@ -1005,18 +1027,17 @@ impl WorkflowsPage {
                 ])));
                 wrapped(&mut rows, "Enter to add, Esc to cancel.", width, muted);
             }
-            _ => {
-                rows.push(Row::item(add_line("+ New status", selected(index), width), index));
-                error_rows(&mut rows, state.error_at(&Target::NewStatus), width);
-            }
+            _ => error_rows(&mut rows, state.error_at(&Target::NewStatus), width),
         }
-        index += 1;
-        rows.push(Row::item(add_line("Edit statuses.yaml in your editor", selected(index), width), index));
+        rows.push(Row::blank());
         wrapped(&mut rows, RENAME_NOTE, width, muted);
 
         // The legend.
         rows.push(Row::blank());
-        heading(&mut rows, "Status categories");
+        rows.push(Row::text(Line::from(Span::styled(
+            "Status categories",
+            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+        ))));
         let label_w = 10.min(width / 3);
         for category in CATEGORIES {
             let label = format!("{:<label_w$}", category_label(category));
@@ -1096,18 +1117,10 @@ impl WorkflowsPage {
     }
 
     pub(super) fn frame(f: &mut Frame, rect: Rect, title: &str) -> Rect {
-        f.render_widget(Clear, rect);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette().divider_active))
-            .style(Style::default().bg(palette().background))
-            .title(Span::styled(
-                title.to_string(),
-                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        inner
+        // The palette's panel; its content keeps the border's column of
+        // inset, as these popups lay out their own.
+        let content = super::overlay_panel(f, rect, rect, Some(title));
+        Rect { x: content.x - 1, width: content.width + 2, ..content }
     }
 
     /// A list popup: each entry's label and its note (a key, or `current`);
@@ -1134,18 +1147,7 @@ impl WorkflowsPage {
                 break;
             }
             let row = Rect { y, height: 1, ..inner };
-            let left = format!(" {label}");
-            let right = format!("{note} ");
-            let gap = w.saturating_sub(panel::display_width(&left) + panel::display_width(&right));
-            let text = panel::truncate_right(&format!("{left}{}{right}", " ".repeat(gap)), w);
-            let style = if i == selected {
-                selected_style(true)
-            } else if *blocked {
-                Style::default().fg(palette().muted).bg(palette().background)
-            } else {
-                Style::default().fg(palette().foreground).bg(palette().background)
-            };
-            f.render_widget(Paragraph::new(Span::styled(text, style)), row);
+            f.render_widget(Paragraph::new(super::menu_line(label, note, w, i == selected, *blocked)), row);
             self.hits.push((row, ModalHit::Entry(i)));
         }
         let first = inner.y + entries.len() as u16 + 1;

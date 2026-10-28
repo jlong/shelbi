@@ -131,7 +131,7 @@ fn the_wide_detail_sets_view_source_beside_the_name_and_the_narrow_one_under_the
     let (_, desc_y) = find(&buf, "Reads every session").unwrap();
     let (bx, by) = find(&buf, "View source").unwrap();
     assert!(by > desc_y, "stacked under the description");
-    assert_eq!(buf[(bx, by)].bg, palette().selection, "the secondary button's fill");
+    assert_eq!(buf[(bx, by)].bg, palette().button, "the secondary button's fill");
     assert_eq!(buf[(bx, by - 1)].symbol(), BLEED_ABOVE);
 }
 
@@ -141,8 +141,9 @@ fn done_is_the_primary_button() {
     let (buf, _) = draw(&mut v, 100, 30);
     let (x, y) = find(&buf, "Done").unwrap();
     assert_eq!(y, 1, "on the title row");
-    assert_eq!(buf[(x, y)].bg, palette().cyan);
-    assert_eq!(buf[(x, y)].fg, palette().on_color);
+    // Settings' Primary button.
+    assert_eq!(buf[(x, y)].bg, palette().button_primary);
+    assert_eq!(buf[(x, y)].fg, palette().button_primary_text);
     assert_eq!(buf[(x, y - 1)].symbol(), BLEED_ABOVE);
     assert_eq!(buf[(x, y + 1)].symbol(), BLEED_BELOW);
 }

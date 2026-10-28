@@ -88,6 +88,8 @@ use shelbi_state::workflow_config::WorkflowConfig;
 use shelbi_state::agents_config::AgentsConfig;
 
 use super::keybindings::{KeysAction, KeysPage};
+use crate::button::{self, Align, Button};
+use crate::modal_form;
 use crate::panel::{self, PAD};
 use crate::table::{self, TableLine};
 use crate::textbox::{self, Textbox};
@@ -301,6 +303,22 @@ pub(crate) type ConfigWriter = Arc<dyn Fn(&Change) -> Result<UserConfig, String>
 /// The prompt's buttons, left to right.
 const PROMPT_BUTTONS: [&str; 3] = ["Save", "Discard", "Cancel"];
 
+/// The leave dialog's key hint.
+pub(crate) const LEAVE_HINT: &str = "←→ choose · ⏎ press · s save · d discard · Esc cancel";
+
+/// The leave dialog's buttons as drawn, Cancel, Discard and Save (Primary)
+/// left to right, each with its index in [`PROMPT_BUTTONS`]; `choice` (an
+/// index there) has the keyboard.
+pub(crate) fn leave_buttons(choice: usize, enabled: bool) -> Vec<(Button<'static>, usize)> {
+    [2usize, 1, 0]
+        .into_iter()
+        .map(|i| {
+            let b = if i == 0 { Button::primary(PROMPT_BUTTONS[i]) } else { Button::secondary(PROMPT_BUTTONS[i]) };
+            (b.focused(enabled && i == choice).enabled(enabled), i)
+        })
+        .collect()
+}
+
 /// The TUI's glyph for a page's row (the sidebar's emoji nav style).
 fn page_glyph(page: SettingsPage) -> &'static str {
     match page {
@@ -381,6 +399,10 @@ pub(crate) struct SettingsShell {
     hover_rects: Vec<(Rect, HoverKey)>,
     /// The table row drawn lit for the pointer at the last draw.
     hover_shown: Option<HoverKey>,
+    /// The buttons the last draw left on screen, and the one it lit under
+    /// the pointer.
+    buttons: Vec<Rect>,
+    button_lit: Option<Rect>,
     /// Whether a project was open at the last draw.
     has_project: bool,
     /// Unsaved edits a test injects (General edits nothing yet): `Some` is
@@ -418,6 +440,8 @@ impl Default for SettingsShell {
             hits: Vec::new(),
             hover_rects: Vec::new(),
             hover_shown: None,
+            buttons: Vec::new(),
+            button_lit: None,
             has_project: false,
             #[cfg(test)]
             test_edits: None,
@@ -1649,11 +1673,12 @@ impl SettingsShell {
             KeyCode::Esc | KeyCode::Char('c') => self.prompt_choose(2),
             KeyCode::Char('s') => self.prompt_choose(0),
             KeyCode::Char('d') => self.prompt_choose(1),
-            KeyCode::Left | KeyCode::BackTab => {
+            // The buttons run Cancel, Discard, Save left to right.
+            KeyCode::Right | KeyCode::Tab => {
                 self.prompt_choice = self.prompt_choice.saturating_sub(1);
                 SettingsAction::Stay
             }
-            KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.prompt_choice = (self.prompt_choice + 1).min(PROMPT_BUTTONS.len() - 1);
                 SettingsAction::Stay
             }
@@ -1814,6 +1839,16 @@ impl SettingsShell {
     /// Draw the settings sidebar into `sidebar` (the sidebar column's content
     /// rect) and the shown page into `main`.
     pub(crate) fn render(&mut self, f: &mut Frame, sidebar: Rect, main: Rect, chrome: &Chrome<'_>) {
+        self.render_layers(f, sidebar, main, chrome);
+        // The button under the pointer lifts, found in what was drawn last
+        // (whatever layer is on top).
+        let x = sidebar.x.min(main.x);
+        let area = Rect { x, width: main.right().saturating_sub(x), ..main };
+        self.buttons = button::drawn(f.buffer_mut(), area);
+        self.button_lit = button::light_hovered(f.buffer_mut(), &self.buttons, chrome.pointer);
+    }
+
+    fn render_layers(&mut self, f: &mut Frame, sidebar: Rect, main: Rect, chrome: &Chrome<'_>) {
         self.hits.clear();
         self.hover_rects.clear();
         self.hover_shown = None;
@@ -1922,16 +1957,20 @@ impl SettingsShell {
                     if y < bottom {
                         let row = Rect { x: inner_x, y, width: inner_w, height: 1 };
                         let selected = self.stop == Stop::Switcher;
-                        let text = format!(" ▾ {project_label}");
-                        let text = panel::truncate_right(&text, inner_w as usize);
+                        // The desktop's switcher: the project's name, its
+                        // chevron at the right (a dropdown's `▾` here).
+                        let w = inner_w as usize;
+                        let name = panel::truncate_right(&format!(" {project_label}"), w.saturating_sub(3));
+                        let pad = w.saturating_sub(panel::display_width(&name) + 2);
+                        let text = format!("{name}{}▾ ", " ".repeat(pad));
                         let line = if selected {
-                            let pad = (inner_w as usize).saturating_sub(panel::display_width(&text));
-                            Line::from(Span::styled(
-                                format!("{text}{}", " ".repeat(pad)),
-                                selected_style(focused),
-                            ))
+                            Line::from(Span::styled(text, selected_style(focused)))
                         } else {
-                            Line::from(Span::styled(text, Style::default().fg(palette().cyan)))
+                            Line::from(vec![
+                                Span::styled(name, Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
+                                Span::raw(" ".repeat(pad)),
+                                Span::styled("▾ ", Style::default().fg(palette().muted)),
+                            ])
                         };
                         f.render_widget(Paragraph::new(line), row);
                         self.hits.push((Rect { x: area.x, width: area.width, ..row }, Hit::Stop(Stop::Switcher)));
@@ -1987,7 +2026,8 @@ impl SettingsShell {
     /// Whether the pointer at `pointer` lights a different table row than
     /// the last draw did (the shell repaints when it does).
     pub(crate) fn hover_moved(&self, pointer: Option<(u16, u16)>) -> bool {
-        hovered(&self.hover_rects, pointer) != self.hover_shown
+        let button = pointer.and_then(|(x, y)| self.buttons.iter().copied().find(|r| panel::in_rect(*r, x, y)));
+        hovered(&self.hover_rects, pointer) != self.hover_shown || button != self.button_lit
     }
 
     fn render_page(&mut self, f: &mut Frame, area: Rect, status: Option<&str>, hints: &str, pointer: Option<(u16, u16)>) {
@@ -2025,12 +2065,6 @@ impl SettingsShell {
         let actions = self.actions();
         self.action = self.action.min(actions.len().saturating_sub(1));
         let rows = self.page_rows(content.width as usize, content.height as usize, &actions);
-        // Workflows, Workspaces and Agents draw their rows whole; General's
-        // action rows are drawn here, with their focus.
-        let draws_own = matches!(
-            self.nav.page(),
-            SettingsPage::Workflows | SettingsPage::Workspaces | SettingsPage::Agents
-        );
         let focus = match self.nav.page() {
             SettingsPage::Workflows => self.workflows.cursor(),
             SettingsPage::Workspaces => self.workspaces.cursor(),
@@ -2084,35 +2118,28 @@ impl SettingsShell {
                 let line = row.hover.as_ref().filter(|_| lit).unwrap_or(&row.line);
                 f.render_widget(Paragraph::new(line.clone()), bleed_rect(rect, area));
             }
-            let line = match row.action {
-                _ if row.table_row.is_some() => None,
-                Some(a) if !draws_own => {
-                    let selected = self.region == Region::Page && a == self.action;
-                    let width = rect.width as usize;
-                    match &actions[a].does {
-                        Does::Theme => {
-                            let (line, segments) = theme_line(self.form.theme(), selected, width);
-                            for (x, w, theme) in segments {
-                                if x + w <= rect.width {
-                                    self.hits.push((Rect { x: rect.x + x, width: w, ..rect }, Hit::Theme(theme)));
-                                }
-                            }
-                            Some(line)
-                        }
-                        // The field's rows come drawn (`general_rows`).
-                        Does::Editor => Some(row.line.clone()),
-                        _ => Some(action_line(&actions[a], selected, width)),
-                    }
-                }
-                _ => Some(row.line.clone()),
-            };
+            // Every row comes drawn, its focus included; a table's line
+            // draws out in the gutter, above.
+            let line = row.table_row.is_none().then(|| row.line.clone());
             if let Some(line) = line {
                 f.render_widget(Paragraph::new(line), rect);
             }
-            if let Some(a) = row.action {
+            if !row.targets.is_empty() {
+                for &(x, w, hit) in &row.targets {
+                    let r = Rect { x: content.x + x, width: w, ..rect }.intersection(content);
+                    self.hits.push((r, hit));
+                    // A segment under the pointer lifts (not the chosen one,
+                    // whose fill is its own).
+                    if let (Hit::Theme(_), Some((px, py))) = (hit, pointer) {
+                        if py == r.y && panel::in_rect(r, px, py) {
+                            lift_segment(f.buffer_mut(), r);
+                        }
+                    }
+                }
+            } else if let Some(a) = row.action {
                 self.hits.push((Rect { x: area.x, width: area.width, ..rect }, Hit::Action(a)));
             }
-            if let Some(hit) = row.hit {
+            if let Some(hit) = row.hit.filter(|_| row.targets.is_empty()) {
                 let full = Rect { x: area.x, width: area.width, ..rect };
                 match row.split {
                     // Two targets on one row: left of `at`, and from it on.
@@ -2144,7 +2171,13 @@ impl SettingsShell {
                 .workspaces
                 .rows(width, self.region == Region::Page)
                 .into_iter()
-                .map(|r| Row { action: r.item, table_row: r.table_row, hover: r.hover, ..Row::text(r.line) })
+                .map(|r| Row {
+                    action: r.item,
+                    table_row: r.table_row,
+                    hover: r.hover,
+                    targets: r.targets.into_iter().map(|(x, w, i)| (x, w, Hit::Action(i))).collect(),
+                    ..Row::text(r.line)
+                })
                 .collect(),
             // Keybindings draws itself.
             SettingsPage::Keybindings => Vec::new(),
@@ -2161,18 +2194,13 @@ impl SettingsShell {
         let text_w = width.saturating_sub(4) as usize;
         let mut lines: Vec<(Line, Option<usize>)> = Vec::new();
         for (i, item) in items.iter().enumerate() {
-            let (label, why, selected) = (&item.label, &item.why, &item.selected);
-            let disabled = why.is_some();
-            let style = match (*selected, disabled) {
-                (true, false) => selected_style(true),
-                (true, true) => Style::default().fg(palette().muted).bg(palette().selection),
-                (false, false) => Style::default().fg(palette().foreground),
-                (false, true) => Style::default().fg(palette().muted),
+            // The label and its key, as the other menus draw them.
+            let (label, key) = match item.label.rsplit_once("  ") {
+                Some((label, key)) => (label.to_string(), key.to_string()),
+                None => (item.label.clone(), String::new()),
             };
-            let text = format!(" {}", panel::truncate_right(label, text_w));
-            let pad = (text_w + 1).saturating_sub(panel::display_width(&text));
-            lines.push((Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style)), Some(i)));
-            if let (true, Some(why)) = (*selected, why) {
+            lines.push((menu_line(&label, &key, text_w + 2, item.selected, item.why.is_some()), Some(i)));
+            if let (true, Some(why)) = (item.selected, &item.why) {
                 for part in shelbi_app::overlay::error_log::wrap(why, text_w.saturating_sub(2).max(1)) {
                     lines.push((Line::from(Span::styled(format!("   {part}"), Style::default().fg(palette().yellow))), None));
                 }
@@ -2188,18 +2216,10 @@ impl SettingsShell {
             width,
             height,
         };
-        clear_layer(f, rect, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette().divider_active))
-            .title(Span::styled(
-                format!(" {} ", panel::truncate_right(&name, text_w)),
-                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
+        let content = overlay_panel(f, rect, area, Some(&name));
+        let inner = Rect { x: content.x - 1, width: content.width + 2, ..content };
         for (n, (line, item)) in lines.into_iter().take(inner.height as usize).enumerate() {
-            let r = Rect { x: inner.x + 1, y: inner.y + n as u16, width: inner.width.saturating_sub(2), height: 1 };
+            let r = Rect { y: inner.y + n as u16, height: 1, ..inner };
             f.render_widget(Paragraph::new(line), r);
             if let Some(i) = item {
                 self.hits.insert(0, (r, Hit::Agents(AgentsHit::MenuItem(i))));
@@ -2208,70 +2228,26 @@ impl SettingsShell {
     }
 
     fn render_prompt(&mut self, f: &mut Frame, area: Rect) {
-        let width = 44.min(area.width);
-        let height = 7.min(area.height);
-        if width < 12 || height < 4 {
-            return;
-        }
-        let rect = Rect {
-            x: area.x + (area.width - width) / 2,
-            y: area.y + (area.height - height) / 2,
-            width,
-            height,
-        };
-        clear_layer(f, rect, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette().divider_active))
-            .title(Span::styled(
-                " Unsaved changes ",
-                Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let text_w = inner.width.saturating_sub(2) as usize;
-        let message = if self.prompt_saving() {
-            "Saving…".to_string()
-        } else if self.guard.prompt() == Some(&Leave::Editor) {
-            "Save your changes to the shared instructions?".to_string()
+        // The desktop's leave dialog: "Save changes to {name}?", what's
+        // unsaved, then Cancel, Discard and Save at the right.
+        let (name, what) = if self.guard.prompt() == Some(&Leave::Editor) {
+            ("the shared instructions".to_string(), "the shared instructions")
         } else if let Some(editor) = self.editor.as_ref() {
-            format!("Save your changes to {} before leaving?", editor.name())
+            (editor.name().to_string(), "this workflow")
         } else if let Some(editor) = self.agent_editor.as_ref() {
-            format!("Save your changes to {} before leaving?", editor.name())
+            (editor.name().to_string(), "this agent")
         } else {
-            format!("Save your changes to {} before leaving?", self.nav.page().label())
+            (self.nav.page().label().to_string(), "this page")
         };
-        let mut lines: Vec<Line> = shelbi_app::overlay::error_log::wrap(&message, text_w.max(1))
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, Style::default().fg(palette().foreground))))
-            .collect();
-        lines.truncate(inner.height.saturating_sub(2) as usize);
-        f.render_widget(
-            Paragraph::new(lines),
-            Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(1), ..inner },
-        );
-        if self.prompt_saving() {
-            return;
-        }
-        // The buttons on the last row, left to right.
-        let y = inner.bottom().saturating_sub(1);
-        let mut x = inner.x + 1;
+        let saving = self.prompt_saving();
+        let body = if saving { "Saving…".to_string() } else { format!("Your edits to {what} haven’t been saved.") };
+        let buttons = leave_buttons(self.prompt_choice, !saving);
+        let hint = if saving { "" } else { LEAVE_HINT };
+        let title = format!("Save changes to {name}?");
+        let at = render_dialog(f, area, 60, &title, &[(body, Style::default().fg(palette().foreground))], &buttons, hint);
         let hits = [Hit::PromptSave, Hit::PromptDiscard, Hit::PromptCancel];
-        for (i, label) in PROMPT_BUTTONS.iter().enumerate() {
-            let text = format!(" {label} ");
-            let w = text.chars().count() as u16;
-            if x + w > inner.right() {
-                break;
-            }
-            let style = if i == self.prompt_choice {
-                selected_style(true)
-            } else {
-                Style::default().fg(palette().gray).bg(palette().selection)
-            };
-            let r = Rect { x, y, width: w, height: 1 };
-            f.render_widget(Paragraph::new(Span::styled(text, style)), r);
+        for (r, i) in at.into_iter().filter(|_| !saving) {
             self.hits.push((r, hits[i]));
-            x += w + 1;
         }
     }
 }
@@ -2308,11 +2284,32 @@ pub(crate) struct Row {
     table_row: Option<HoverKey>,
     /// The table line as drawn while the pointer is on its row.
     hover: Option<Line<'static>>,
+    /// Buttons on the row (`x`, `w`, what a click on each hits) in place of
+    /// the whole row's `action` or `hit` as click targets.
+    targets: Vec<(u16, u16, Hit)>,
 }
 
 impl Row {
     fn text(line: Line<'static>) -> Row {
-        Row { line, action: None, hit: None, focus: false, split: None, table_row: None, hover: None }
+        Row { line, action: None, hit: None, focus: false, split: None, table_row: None, hover: None, targets: Vec::new() }
+    }
+
+    /// A line of a [`section_heading`], its buttons running `actions`
+    /// (indexed as the heading's buttons were); the row holds the focus of
+    /// the first one's action, if any.
+    pub(crate) fn heading(h: HeadingLine, actions: &[Option<usize>]) -> Row {
+        let action = h.targets.iter().find_map(|&(_, _, b)| actions.get(b).copied().flatten());
+        let hits: Vec<Option<Hit>> = actions.iter().map(|a| a.map(Hit::Action)).collect();
+        Row { action, ..Row::buttons(h, &hits, false) }
+    }
+
+    /// A line holding buttons (a [`section_heading`]'s, a row of
+    /// [`button::row`]'s), each hitting `hits[i]`; `focus` when one of them
+    /// holds the page's focus.
+    pub(crate) fn buttons(h: HeadingLine, hits: &[Option<Hit>], focus: bool) -> Row {
+        let targets: Vec<(u16, u16, Hit)> =
+            h.targets.iter().filter_map(|&(x, w, b)| hits.get(b).copied().flatten().map(|hit| (x, w, hit))).collect();
+        Row { targets, focus, ..Row::text(h.line) }
     }
 
     /// Table `table`'s line `l`: drawn out in the gutter, lit with its row.
@@ -2320,11 +2317,6 @@ impl Row {
     pub(crate) fn table(l: TableLine, table: u8) -> Row {
         let key = (table, l.row.unwrap_or(usize::MAX));
         Row { table_row: Some(key), hover: l.hover, ..Row::text(l.line) }
-    }
-
-    /// The page's focusable row `index`.
-    fn item(line: Line<'static>, index: usize) -> Row {
-        Row { action: Some(index), ..Row::text(line) }
     }
 
     /// A row a click hits, drawn focused (or not) by the page.
@@ -2349,7 +2341,6 @@ fn general_rows(
     focus: Option<usize>,
 ) -> Vec<Row> {
     let at = |does: &Does| actions.iter().position(|a| a.does == *does);
-    let action_row = |i: usize| Row::item(Line::raw(""), i);
     let mut rows = vec![Row::text(Line::from(Span::styled(
         "General",
         Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
@@ -2397,9 +2388,17 @@ fn general_rows(
         }
         if let Some(i) = at(&Does::Theme) {
             heading(&mut rows, "Appearance");
-            // The label over its control, as the fields read.
+            // The label over its control, as the fields read: a segmented
+            // control, each segment a click target down its three rows.
             rows.push(Row::text(textbox::label("Theme", focus == Some(i), false, width)));
-            rows.push(action_row(i));
+            let labels: Vec<&str> = general::THEMES.iter().map(|t| general::theme_label(*t)).collect();
+            let chosen = general::THEMES.iter().position(|t| *t == form.theme()).unwrap_or(0);
+            let (lines, at) = button::segmented(&labels, chosen, focus == Some(i), None, width);
+            let targets: Vec<(u16, u16, Hit)> =
+                at.iter().zip(general::THEMES).map(|(&(x, w), t)| (x, w, Hit::Theme(t))).collect();
+            for line in lines {
+                rows.push(Row { action: Some(i), targets: targets.clone(), ..Row::text(line) });
+            }
             wrapped(
                 &mut rows,
                 "Auto is dark here: a terminal doesn't report its appearance. The theme colors Shelbi's lists and panels, never your sessions.",
@@ -2428,7 +2427,8 @@ fn general_rows(
                 field(&mut rows, "Without it", &format!("{fallback} ({})", general::source_label(source)), label_w, width, None);
             }
             if let Some(i) = at(&Does::ClearEditor) {
-                rows.push(action_row(i));
+                rows.push(Row::blank());
+                action_buttons(&mut rows, actions, i..i + 1, focus, width);
             }
             rows.push(Row::blank());
         }
@@ -2453,7 +2453,8 @@ fn general_rows(
         }
         field(&mut rows, "keys.yaml", &keys, label_w, width, keys_color);
         if let Some(i) = actions.iter().position(|a| matches!(a.does, Does::EditFile(_))) {
-            rows.push(action_row(i));
+            rows.push(Row::blank());
+            action_buttons(&mut rows, actions, i..i + 1, focus, width);
         }
         rows.push(Row::blank());
         match &summary.project {
@@ -2493,16 +2494,45 @@ fn general_rows(
             _ => "What you can do",
         };
         heading(&mut rows, title);
-        for i in first..about {
-            rows.push(action_row(i));
-        }
+        rows.push(Row::blank());
+        action_buttons(&mut rows, actions, first..about, focus, width);
     }
     if about < actions.len() {
         rows.push(Row::blank());
         heading(&mut rows, "About");
-        rows.push(action_row(about));
+        rows.push(Row::blank());
+        action_buttons(&mut rows, actions, about..about + 1, focus, width);
     }
     rows
+}
+
+/// Page actions `range` as Secondary buttons flowing left to right, a new
+/// band of three rows when the next won't fit; a lone one has its note
+/// (what it opens, the version) beside it.
+fn action_buttons(rows: &mut Vec<Row>, actions: &[PageAction], range: std::ops::Range<usize>, focus: Option<usize>, width: usize) {
+    let lone = range.len() == 1;
+    let mut band: Vec<(Button, Option<usize>)> = Vec::new();
+    let mut used = 0;
+    for i in range {
+        let b = Button::secondary(&actions[i].label).focused(focus == Some(i));
+        let w = b.width() + if band.is_empty() { 0 } else { button::GAP };
+        if !band.is_empty() && used + w > width {
+            button_rows(rows, &band, width, Align::Left);
+            band.clear();
+            used = 0;
+        }
+        used += b.width() + if band.is_empty() { 0 } else { button::GAP };
+        band.push((b, Some(i)));
+    }
+    let at = rows.len();
+    button_rows(rows, &band, width, Align::Left);
+    if let (true, Some((b, Some(i)))) = (lone, band.first()) {
+        if let (Some(note), Some(row)) = (&actions[*i].note, rows.get_mut(at + 1)) {
+            if b.width() + 2 + panel::display_width(note) <= width {
+                row.line.spans.push(Span::styled(format!("  {note}"), Style::default().fg(palette().muted)));
+            }
+        }
+    }
 }
 
 /// The Terminal page: what the host terminal owns, its sixteen colors as
@@ -2526,7 +2556,11 @@ fn terminal_rows(width: usize) -> Vec<Row> {
         muted,
     );
     rows.push(Row::blank());
-    heading(&mut rows, "Your terminal's colors");
+    // The desktop's ANSI colors section, read-only here: these are the
+    // terminal's own.
+    heading(&mut rows, "ANSI colors");
+    wrapped(&mut rows, "Regular and bold colors used by terminal applications. These are your terminal's own.", width, muted);
+    rows.push(Row::blank());
     swatch_rows(&mut rows, width);
     rows.push(Row::blank());
     heading(&mut rows, "Preview");
@@ -2543,47 +2577,37 @@ fn terminal_rows(width: usize) -> Vec<Row> {
     rows
 }
 
-/// The sixteen ANSI colors, regular over bright, painted as a session's
-/// cells are ([`ansi_swatches`](super::terminal_view::ansi_swatches)): the
-/// host terminal's own palette, what a session's colors look like here. A narrow page
-/// puts each row's label above its swatches and narrows them.
+/// The sixteen ANSI colors as the desktop's table lays them out: a row per
+/// color, its name, then its regular and bold swatches, painted as a
+/// session's cells are ([`ansi_swatches`](super::terminal_view::ansi_swatches)):
+/// the host terminal's own palette, what a session's colors look like here.
 fn swatch_rows(rows: &mut Vec<Row>, width: usize) {
     let colors = super::terminal_view::ansi_swatches();
-    const NAMES: [&str; 8] = ["blk", "red", "grn", "yel", "blu", "mag", "cyn", "wht"];
-    const LABEL: usize = 9;
-    let label_style = Style::default().fg(palette().gray);
-    let inline = width >= LABEL + 8 * 4;
-    let room = if inline { width - LABEL } else { width };
-    // Each swatch and the gap after it.
-    let (swatch, gap) = match room / 8 {
-        n if n >= 4 => (3, 1),
-        n if n >= 2 => (n - 1, 1),
-        _ => (1, 0),
-    };
-    let indent = if inline { " ".repeat(LABEL) } else { String::new() };
-    // Swatches a row holds: all eight unless the page is narrower than that.
-    let per_row = (room / (swatch + gap).max(1)).clamp(1, 8);
-    for (label, colors) in [("Regular", &colors[..8]), ("Bright", &colors[8..])] {
-        if !inline {
-            rows.push(Row::text(Line::from(Span::styled(panel::truncate_right(label, width), label_style))));
+    const NAMES: [&str; 8] = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"];
+    const NAME_W: usize = 10;
+    if width < 3 {
+        // No room for a pair: each swatch on its own row.
+        for color in colors.iter() {
+            rows.push(Row::text(Line::from(Span::styled(" ", Style::default().bg(*color)))));
         }
-        for (i, chunk) in colors.chunks(per_row).enumerate() {
-            let mut spans = Vec::new();
-            if inline && i == 0 {
-                spans.push(Span::styled(format!("{label:<LABEL$}"), label_style));
-            }
-            for (j, color) in chunk.iter().enumerate() {
-                spans.push(Span::styled(" ".repeat(swatch), Style::default().bg(*color)));
-                if j + 1 < chunk.len() {
-                    spans.push(Span::raw(" ".repeat(gap)));
-                }
-            }
-            rows.push(Row::text(Line::from(spans)));
-        }
+        return;
     }
-    if swatch == 3 {
-        let names: String = NAMES.iter().map(|n| format!("{n} ")).collect();
-        rows.push(Row::text(Line::from(Span::styled(format!("{indent}{}", names.trim_end()), Style::default().fg(palette().muted)))));
+    // A narrow page narrows the names, then the swatches.
+    let name_w = NAME_W.min(width - 3);
+    let room = width - name_w;
+    let swatch = ((room - 1) / 2).clamp(1, 6);
+    let gap = (room - 2 * swatch).clamp(1, 4);
+    let head = Style::default().fg(palette().muted).add_modifier(Modifier::BOLD);
+    let column = |text: &str, w: usize| format!("{:<w$}", panel::truncate_right(text, w));
+    let header = format!("{}{}{}", column("Color", name_w), column("Regular", swatch + gap), "Bold");
+    rows.push(Row::text(Line::from(Span::styled(panel::truncate_right(&header, width), head))));
+    for (i, name) in NAMES.iter().enumerate() {
+        rows.push(Row::text(Line::from(vec![
+            Span::styled(column(name, name_w), Style::default().fg(palette().gray)),
+            Span::styled(" ".repeat(swatch), Style::default().bg(colors[i])),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(" ".repeat(swatch), Style::default().bg(colors[i + 8])),
+        ])));
     }
 }
 
@@ -2648,9 +2672,10 @@ fn project_rows(rows: &mut Vec<Row>, p: &ProjectSummary, label_w: usize, width: 
 }
 
 pub(crate) fn heading(rows: &mut Vec<Row>, text: &str) {
+    // The desktop's section title: loud and bold.
     rows.push(Row::text(Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
     ))));
 }
 
@@ -2704,30 +2729,17 @@ fn label_width(width: usize) -> usize {
     17.min(width / 2)
 }
 
-/// The theme's segmented control, under its label: `Auto  Dark  Light`,
-/// the chosen one filled. Returns the line and each segment's column, width
-/// and theme.
-fn theme_line(chosen: ThemePreference, selected: bool, width: usize) -> (Line<'static>, Vec<(u16, u16, ThemePreference)>) {
-    let mut x = 0;
-    let mut spans = Vec::new();
-    let mut segments = Vec::new();
-    for theme in general::THEMES {
-        let text = format!(" {} ", general::theme_label(theme));
-        let w = text.chars().count();
-        if x + w > width {
-            break;
+/// Lift a segmented control's segment in `r` under the pointer: its cells
+/// on the track's fill take the hover fill.
+fn lift_segment(buf: &mut ratatui::buffer::Buffer, r: Rect) {
+    let p = palette();
+    for x in r.left()..r.right() {
+        if let Some(cell) = buf.cell_mut((x, r.y)) {
+            if cell.bg == p.input || cell.bg == p.input_focus {
+                cell.bg = p.button;
+            }
         }
-        let style = if theme == chosen {
-            selected_style(selected)
-        } else {
-            Style::default().fg(palette().gray)
-        };
-        segments.push((x as u16, w as u16, theme));
-        spans.push(Span::styled(text, style));
-        spans.push(Span::raw(" "));
-        x += w + 1;
     }
-    (Line::from(spans), segments)
 }
 
 /// A text field's rows on a page: its label, then `field`'s box (as wide as
@@ -2744,6 +2756,70 @@ pub(crate) fn field_rows(rows: &mut Vec<Row>, label: &str, field: Textbox<'_>, f
 pub(crate) fn box_rows(rows: &mut Vec<Row>, field: Textbox<'_>, action: Option<usize>, width: usize) {
     for (n, line) in field.lines(width.min(textbox::MAX_W)).into_iter().enumerate() {
         rows.push(Row { action, focus: field.typing() && n == 1, ..Row::text(line) });
+    }
+}
+
+/// One field of [`fields_row`].
+pub(crate) struct RowField<'a> {
+    pub label: &'a str,
+    pub textbox: Textbox<'a>,
+    pub focused: bool,
+    pub disabled: bool,
+    pub action: Option<usize>,
+    /// Its width; 0 takes what the others leave.
+    pub width: usize,
+}
+
+/// The narrowest a flexible field of [`fields_row`] gets before the row
+/// stacks.
+const ROW_FLEX_MIN: usize = 24;
+
+/// Fields side by side, as the desktop's identity rows set them (Name,
+/// Description, Initial status): each its label over its box, two columns
+/// apart, each a click target in its own columns. Too narrow for them all,
+/// they stack as [`field_rows`] do, a blank row between.
+pub(crate) fn fields_row(rows: &mut Vec<Row>, fields: &[RowField<'_>], width: usize) {
+    const GAP: usize = 2;
+    let fixed: usize = fields.iter().map(|f| f.width).sum::<usize>() + GAP * fields.len().saturating_sub(1);
+    let flex = fields.iter().filter(|f| f.width == 0).count();
+    let total = width.min(textbox::MAX_W * 2);
+    if total < fixed + flex * ROW_FLEX_MIN {
+        for (i, f) in fields.iter().enumerate() {
+            if i > 0 {
+                rows.push(Row::blank());
+            }
+            field_rows(rows, f.label, f.textbox, f.focused, f.disabled, f.action, width);
+        }
+        return;
+    }
+    let share = (total - fixed) / flex.max(1);
+    let widths: Vec<usize> = fields.iter().map(|f| if f.width == 0 { share } else { f.width }).collect();
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new(); 1 + textbox::BOX_H];
+    let mut targets = Vec::new();
+    let mut x = 0;
+    for (i, (f, w)) in fields.iter().zip(&widths).enumerate() {
+        if i > 0 {
+            for l in lines.iter_mut() {
+                l.push(Span::raw(" ".repeat(GAP)));
+            }
+            x += GAP;
+        }
+        let label = textbox::label(f.label, f.focused, f.disabled, *w);
+        let pad = w.saturating_sub(label.width());
+        lines[0].extend(label.spans);
+        lines[0].push(Span::raw(" ".repeat(pad)));
+        for (l, b) in lines.iter_mut().skip(1).zip(f.textbox.lines(*w)) {
+            l.extend(b.spans);
+        }
+        if let Some(a) = f.action {
+            targets.push((x as u16, *w as u16, Hit::Action(a)));
+        }
+        x += w;
+    }
+    let action = fields.iter().find(|f| f.focused).or(fields.first()).and_then(|f| f.action);
+    let typing = fields.iter().any(|f| f.textbox.typing());
+    for (n, spans) in lines.into_iter().enumerate() {
+        rows.push(Row { action, targets: targets.clone(), focus: typing && n == 2, ..Row::text(Line::from(spans)) });
     }
 }
 
@@ -2788,26 +2864,6 @@ fn editor_rows(rows: &mut Vec<Row>, form: &GeneralForm, selected: bool, i: usize
     .placeholder("Not set")
     .focused(selected);
     field_rows(rows, "Command", field, selected, false, Some(i), width);
-}
-
-/// An action row: `› label   note`, the selection fill when focused.
-fn action_line(action: &PageAction, selected: bool, width: usize) -> Line<'static> {
-    let marker = if selected { "› " } else { "  " };
-    let label = panel::truncate_right(&action.label, width.saturating_sub(2));
-    let mut text = format!("{marker}{label}");
-    if let Some(note) = &action.note {
-        let room = width.saturating_sub(panel::display_width(&text) + 2);
-        if room >= note.chars().count() {
-            text.push_str("  ");
-            text.push_str(note);
-        }
-    }
-    if selected {
-        let pad = width.saturating_sub(panel::display_width(&text));
-        Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), selected_style(true)))
-    } else {
-        Line::from(Span::styled(text, Style::default().fg(palette().cyan)))
-    }
 }
 
 /// A page's sidebar row: glyph, label, and its number key at the right.
@@ -2872,6 +2928,198 @@ pub(crate) fn bleed_rect(rect: Rect, area: Rect) -> Rect {
 pub(crate) fn clear_layer(f: &mut Frame, rect: Rect, within: Rect) {
     let wide = bleed_rect(rect, within);
     f.render_widget(Clear, Rect { y: rect.y, height: rect.height, ..wide });
+}
+
+/// An overlay over a settings page (a dialog, a prompt, a menu), drawn as
+/// the command palette is: cleared (with [`clear_layer`]'s gutter), the
+/// [`Theme::search`] panel fill in a muted single-line border. A menu's
+/// `title` sits in its top border; a dialog says its own heading
+/// ([`modal_form::dialog_heading`]). Returns the content: inset one column inside the
+/// border each side.
+///
+/// [`Theme::search`]: shelbi_app::theme::Theme::search
+pub(crate) fn overlay_panel(f: &mut Frame, rect: Rect, within: Rect, title: Option<&str>) -> Rect {
+    clear_layer(f, rect, within);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette().muted))
+        .style(Style::default().bg(palette().search));
+    if let Some(title) = title {
+        block = block.title(Span::styled(
+            format!(" {} ", title.trim()),
+            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner }
+}
+
+/// A dialog centered over `area`, up to `width` wide, as the desktop's: its
+/// heading, `body` (each paragraph wrapped in its style), a blank row, its
+/// buttons at the right (in the order drawn, each with the index its owner
+/// knows it by), and a muted key `hint` under them. Returns each shown
+/// button's click target and index.
+pub(crate) fn render_dialog(
+    f: &mut Frame,
+    area: Rect,
+    width: u16,
+    title: &str,
+    body: &[(String, Style)],
+    buttons: &[(Button<'_>, usize)],
+    hint: &str,
+) -> Vec<(Rect, usize)> {
+    let width = width.min(area.width);
+    if width < 16 || area.height < 6 {
+        return Vec::new();
+    }
+    let text_w = width.saturating_sub(4) as usize;
+    let mut lines = modal_form::dialog_heading(title, None, text_w);
+    for (text, style) in body {
+        lines.extend(
+            shelbi_app::overlay::error_log::wrap(text, text_w.max(1))
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, *style))),
+        );
+    }
+    lines.push(Line::raw(""));
+    let shown: Vec<Button> = buttons.iter().map(|(b, _)| *b).collect();
+    let mut at = Vec::new();
+    for (band, band_at) in button::bands(&shown, text_w, Align::Right) {
+        let y = lines.len() as u16;
+        lines.extend(band);
+        at.extend(band_at.into_iter().map(|(x, w, i)| (x, y, w, i)));
+    }
+    if !hint.is_empty() {
+        lines.push(Line::from(Span::styled(panel::truncate_right(hint, text_w), Style::default().fg(palette().muted))));
+    }
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let content = overlay_panel(f, rect, area, None);
+    f.render_widget(Paragraph::new(lines), content);
+    at.into_iter()
+        .filter_map(|(x, y, w, b)| {
+            let r = Rect { x: content.x + x, y: content.y + y, width: w, height: 3 }.intersection(content);
+            (!r.is_empty()).then_some((r, buttons[b].1))
+        })
+        .collect()
+}
+
+/// A menu's entry `width` wide on an overlay's panel: `label` at the left,
+/// `note` (its key, `current`) muted at the right; the selected one a pill
+/// on the selection fill between half-block caps (the table's lit row), an
+/// inert one muted.
+pub(crate) fn menu_line(label: &str, note: &str, width: usize, selected: bool, inert: bool) -> Line<'static> {
+    let fill = palette().selection;
+    let room = width.saturating_sub(2);
+    let gap = room.saturating_sub(panel::display_width(label) + panel::display_width(note) + 2);
+    let text = panel::truncate_right(&format!(" {label}{}{note} ", " ".repeat(gap)), room);
+    let pad = room.saturating_sub(panel::display_width(&text));
+    let text = format!("{text}{}", " ".repeat(pad));
+    if selected {
+        let style = if inert { Style::default().fg(palette().muted) } else { selected_style(true) };
+        Line::from(vec![
+            Span::styled("▐", Style::default().fg(fill)),
+            Span::styled(text, style.bg(fill)),
+            Span::styled("▌", Style::default().fg(fill)),
+        ])
+    } else {
+        let fg = if inert { palette().muted } else { palette().foreground };
+        Line::from(vec![Span::raw(" "), Span::styled(text, Style::default().fg(fg)), Span::raw(" ")])
+    }
+}
+
+/// One line of a [`section_heading`]: the line, and the buttons on it
+/// (`x`, `w`, the button's index in the heading's).
+pub(crate) struct HeadingLine {
+    pub line: Line<'static>,
+    pub targets: Vec<(u16, u16, usize)>,
+}
+
+/// The narrowest a heading's text keeps beside its buttons; narrower, the
+/// buttons go under it.
+const HEADING_TEXT_MIN: usize = 24;
+
+/// A section's heading as the desktop draws it: its title (loud and bold)
+/// over its description (muted), the section's buttons at the right level
+/// with them (under them when there's no room beside).
+pub(crate) fn section_heading(title: &str, description: Option<&str>, buttons: &[Button<'_>], width: usize) -> Vec<HeadingLine> {
+    let title_style = Style::default().fg(palette().white).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(palette().muted);
+    let buttons_w = button::row_width(buttons);
+    let beside = !buttons.is_empty() && width >= buttons_w + 2 + HEADING_TEXT_MIN;
+    let text_w = if beside { width - buttons_w - 2 } else { width };
+    let mut text = vec![Line::from(Span::styled(panel::truncate_right(title, text_w), title_style))];
+    if let Some(d) = description {
+        // A wrap can carry the space it broke at to the next line.
+        text.extend(
+            shelbi_app::overlay::error_log::wrap(d, text_w.max(1))
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l.trim_start().to_string(), desc_style))),
+        );
+    }
+    let mut out: Vec<HeadingLine> = Vec::new();
+    if beside {
+        while text.len() < button::BUTTON_H {
+            text.push(Line::raw(""));
+        }
+        let (row, at) = button::row(buttons, buttons_w, Align::Left);
+        let x0 = (width - buttons_w) as u16;
+        let left: [Line<'static>; 3] = [text[0].clone(), text[1].clone(), text[2].clone()];
+        for line in button::beside(left, row, width, buttons_w) {
+            let targets = at.iter().enumerate().map(|(b, &(x, w))| (x0 + x, w, b)).collect();
+            out.push(HeadingLine { line, targets });
+        }
+        out.extend(text.into_iter().skip(button::BUTTON_H).map(|line| HeadingLine { line, targets: Vec::new() }));
+    } else {
+        out.extend(text.into_iter().map(|line| HeadingLine { line, targets: Vec::new() }));
+        if !buttons.is_empty() {
+            out.push(HeadingLine { line: Line::raw(""), targets: Vec::new() });
+            out.extend(button_lines(buttons, width, Align::Left));
+        }
+    }
+    out
+}
+
+/// A row of buttons set to `align` in `width` as three [`HeadingLine`]s.
+pub(crate) fn button_lines(buttons: &[Button<'_>], width: usize, align: Align) -> Vec<HeadingLine> {
+    button::bands(buttons, width, align)
+        .into_iter()
+        .flat_map(|(lines, at)| lines.into_iter().map(move |line| HeadingLine { line, targets: at.clone() }))
+        .collect()
+}
+
+/// A row of buttons among a page's or an editor's rows, set to `align`:
+/// each runs its item (a click lands on its own columns), and the rows
+/// belong to the focused button's item (else the first's), so scrolling
+/// keeps them in view.
+pub(crate) fn button_rows(rows: &mut Vec<Row>, buttons: &[(Button<'_>, Option<usize>)], width: usize, align: Align) {
+    let shown: Vec<Button> = buttons.iter().map(|(b, _)| *b).collect();
+    // Too narrow for one row, they wrap to another.
+    for (lines, at) in button::bands(&shown, width, align) {
+        let band: Vec<&(Button, Option<usize>)> = at.iter().map(|&(_, _, i)| &buttons[i]).collect();
+        let action = band.iter().find(|(b, _)| b.is_focused()).or(band.first()).and_then(|(_, a)| *a);
+        let targets: Vec<(u16, u16, Hit)> =
+            at.iter().filter_map(|&(x, w, i)| buttons[i].1.map(|a| (x, w, Hit::Action(a)))).collect();
+        for line in lines {
+            rows.push(Row { action, targets: targets.clone(), ..Row::text(line) });
+        }
+    }
+}
+
+/// A rule across the page between two sections (the desktop's full-width
+/// divider), with a blank row each side.
+pub(crate) fn section_rule(width: usize) -> [Line<'static>; 3] {
+    [
+        Line::raw(""),
+        Line::from(Span::styled("─".repeat(width), Style::default().fg(palette().table_rule))),
+        Line::raw(""),
+    ]
 }
 
 /// A one-row band of `text`, padded across `area`.
@@ -3198,7 +3446,8 @@ mod tests {
         // The last row opens About Shelbi.
         assert_eq!(s.run_action(s.actions().len() - 1), SettingsAction::Run(Effect::OpenAbout));
         let text = screen(&mut s, 100, 60);
-        assert!(text.contains("About Shelbi  Version "), "{text}");
+        let about = text.lines().find(|l| l.contains("About Shelbi")).unwrap_or_default();
+        assert!(about.contains("  Version "), "the button with its note:\n{text}");
         // No project: switch or add one.
         let t = s.begin_load(None, true).unwrap();
         s.loaded(&t, Ok(fixture_summary(None)));
@@ -3290,7 +3539,7 @@ mod tests {
         broken.project = Some(Err("projects/proj.yaml: bad indent".into()));
         let t = s.begin_load(Some("proj"), true).unwrap();
         s.loaded(&t, Ok(broken));
-        let text = screen(&mut s, 100, 40);
+        let text = screen(&mut s, 100, 60);
         for want in ["Couldn't read this project's settings", "proj.yaml: bad", "Try again", "Edit Project Settings"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
@@ -3522,7 +3771,7 @@ mod tests {
         assert_eq!(s.page(), SettingsPage::Terminal);
         assert!(s.actions().is_empty(), "nothing on it acts");
         let text = screen(&mut s, 110, 50);
-        for want in ["Terminal", "owns how sessions look", "window opacity and blur", "never changes your terminal's colors", "Regular", "Bright", "Preview", "Claude Code", "They don't apply here"] {
+        for want in ["Terminal", "owns how sessions look", "window opacity and blur", "never changes your terminal's colors", "ANSI colors", "Regular", "Bold", "Magenta", "Preview", "Claude Code", "They don't apply here"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
         // No controls for the host's settings.
@@ -3541,12 +3790,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label}"));
             line.spans.iter().filter_map(|s| s.style.bg).filter(|c| *c != Color::Reset).collect()
         };
+        // Each color's row: its regular swatch, then its bold one.
+        let names = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"];
+        let pairs: Vec<Vec<Color>> = names.iter().map(|n| backgrounds(n)).collect();
+        let regular: Vec<Color> = pairs.iter().map(|p| p[0]).collect();
+        let bold: Vec<Color> = pairs.iter().map(|p| p[1]).collect();
+        assert_eq!(regular, [Color::Black, Color::Red, Color::Green, Color::Yellow, Color::Blue, Color::Magenta, Color::Cyan, Color::Gray]);
         assert_eq!(
-            backgrounds("Regular"),
-            [Color::Black, Color::Red, Color::Green, Color::Yellow, Color::Blue, Color::Magenta, Color::Cyan, Color::Gray]
-        );
-        assert_eq!(
-            backgrounds("Bright"),
+            bold,
             [Color::DarkGray, Color::LightRed, Color::LightGreen, Color::LightYellow, Color::LightBlue, Color::LightMagenta, Color::LightCyan, Color::White]
         );
     }
@@ -3587,6 +3838,69 @@ mod tests {
         s.handle_key(key(KeyCode::Char('3')), &keymaps());
         for (w, h) in [(40, 12), (30, 8), (12, 4)] {
             screen(&mut s, w.max(29), h);
+        }
+    }
+
+    fn heading_text(lines: &[HeadingLine]) -> Vec<String> {
+        lines.iter().map(|h| h.line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+    }
+
+    #[test]
+    fn a_section_heading_sets_its_buttons_beside_its_text_or_under_it() {
+        let buttons = [Button::secondary("Edit YAML"), Button::secondary("New status")];
+        let wide = section_heading("Statuses", Some("Work transitions through statuses in workflows."), &buttons, 100);
+        let text = heading_text(&wide);
+        assert!(text[0].starts_with("Statuses") && text[0].trim_end().ends_with('▄'), "{text:#?}");
+        assert!(text[1].ends_with("  Edit YAML     New status  "), "{text:#?}");
+        // Each button's three rows are its click target, at the right edge.
+        assert_eq!(wide[1].targets, vec![(72, 13, 0), (86, 14, 1)]);
+        let narrow = section_heading("Statuses", Some("Work transitions through statuses in workflows."), &buttons, 30);
+        let text = heading_text(&narrow);
+        assert_eq!(text[0], "Statuses");
+        assert!(narrow.iter().filter(|h| !h.targets.is_empty()).count() >= 3, "the buttons under it: {text:#?}");
+    }
+
+    #[test]
+    fn fields_share_a_row_when_they_fit_and_stack_when_they_dont() {
+        let fields = |w: usize| {
+            let mut rows = Vec::new();
+            let f = |label, action, width| RowField { label, textbox: Textbox::new("x"), focused: false, disabled: false, action: Some(action), width };
+            fields_row(&mut rows, &[f("Name", 0, 24), f("Description", 1, 0), f("Initial status", 2, 24)], w);
+            rows
+        };
+        let wide = fields(120);
+        assert_eq!(wide.len(), 4, "a label row and one box");
+        let labels: String = wide[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(labels.starts_with("Name") && labels.contains("Description") && labels.trim_end().ends_with("Initial status"), "{labels}");
+        assert_eq!(wide[1].targets.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(), vec![(0, 24), (26, 68), (96, 24)]);
+        // Narrow: label over box, each, a blank between.
+        let narrow = fields(60);
+        assert_eq!(narrow.len(), 3 * 4 + 2);
+    }
+
+    #[test]
+    fn a_dialog_is_the_palettes_panel_and_keeps_its_buttons_when_narrow() {
+        for width in [80u16, 30] {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+            let mut hits = Vec::new();
+            term.draw(|f| {
+                let buttons = [(Button::secondary("Cancel"), 1), (Button::danger("Remove workspace").focused(true), 0)];
+                let body = [("Shelbi stops alpha's session.".to_string(), Style::default())];
+                hits = render_dialog(f, f.area(), 56, "Remove alpha?", &body, &buttons, "Tab switch");
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            assert_eq!(hits.len(), 2, "{width}: both buttons answer");
+            // The muted border and the panel's fill, as the palette's.
+            let (bx, by) = (0..24u16)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .find(|&(x, y)| buf[(x, y)].symbol() == "┌")
+                .expect("a border");
+            assert_eq!(buf[(bx, by)].fg, palette().muted);
+            assert_eq!(buf[(bx + 2, by + 1)].bg, palette().search);
+            let (r, i) = hits.iter().find(|(_, i)| *i == 0).unwrap();
+            assert_eq!(*i, 0);
+            assert_eq!(buf[(r.x + 1, r.y + 1)].bg, palette().button_danger_focus, "{width}: the focused Danger button");
         }
     }
 

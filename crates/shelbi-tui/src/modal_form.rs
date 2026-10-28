@@ -6,17 +6,30 @@
 
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
+use crate::button::{self, Align, Button};
 use crate::panel;
 use crate::textbox::{self, Textbox};
 
 /// The narrowest form that sets a [`FormLines::pair`] side by side.
-const PAIR_MIN_W: usize = 56;
+pub(crate) const PAIR_MIN_W: usize = 56;
+
+/// The columns between a [`FormLines::pair`]'s fields.
+pub(crate) const PAIR_GAP: usize = 2;
+
+/// Where a [`FormLines::pair`]'s right field starts in a form `width` wide,
+/// and its width (`None`: the pair stacks).
+pub(crate) fn pair_right(width: usize) -> Option<(usize, usize)> {
+    (width >= PAIR_MIN_W).then(|| {
+        let left_w = (width - PAIR_GAP) / 2;
+        (left_w + PAIR_GAP, width - PAIR_GAP - left_w)
+    })
+}
 
 /// One field of a [`FormLines::pair`].
 pub(crate) struct Field<'a, H> {
@@ -28,9 +41,34 @@ pub(crate) struct Field<'a, H> {
     pub hit: H,
 }
 
-/// A field's lines `width` wide: its label, its box, then `under` wrapped.
-fn field_lines(label: &str, field: Textbox<'_>, focused: bool, disabled: bool, under: &[(&str, Style)], width: usize) -> Vec<Line<'static>> {
+/// A dialog's heading as its first lines: the title bold and loud, what it
+/// does wrapped under it in gray, then a blank row (the desktop dialog's
+/// header).
+pub(crate) fn dialog_heading(title: &str, description: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    let palette = crate::theme::palette();
+    let mut lines = vec![Line::from(Span::styled(
+        panel::truncate_right(title, width),
+        Style::default().fg(palette.white).add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(d) = description {
+        lines.extend(
+            shelbi_app::overlay::error_log::wrap(d, width.max(1))
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, Style::default().fg(palette.gray)))),
+        );
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// A field's lines `width` wide: its label, its box (at rest in `rest`,
+/// when the form gives one), then `under` wrapped.
+fn field_lines(label: &str, field: Textbox<'_>, focused: bool, disabled: bool, under: &[(&str, Style)], width: usize, rest: Option<Color>) -> Vec<Line<'static>> {
     let mut lines = vec![textbox::label(label, focused, disabled, width)];
+    let field = match rest {
+        Some(fill) => field.rest(fill),
+        None => field,
+    };
     lines.extend(field.lines(width));
     for (text, style) in under {
         for l in shelbi_app::overlay::error_log::wrap(text, width.max(1)) {
@@ -62,15 +100,37 @@ pub(crate) struct FormLines<H> {
     /// Where the footer (the buttons and the key hint) starts: a form
     /// taller than its room keeps it pinned under the scrolling fields.
     footer: Option<usize>,
+    /// Its fields' fill at rest (a Settings dialog's wells), when not the
+    /// text field's own.
+    rest: Option<Color>,
 }
 
 impl<H: Copy + PartialEq> FormLines<H> {
     pub(crate) fn new(width: usize) -> Self {
-        FormLines { lines: Vec::new(), controls: Vec::new(), width, footer: None }
+        FormLines { lines: Vec::new(), controls: Vec::new(), width, footer: None, rest: None }
+    }
+
+    /// Its fields at rest in `fill` (a Settings dialog's wells on the
+    /// overlay's panel).
+    pub(crate) fn with_rest(mut self, fill: Color) -> Self {
+        self.rest = Some(fill);
+        self
     }
 
     pub(crate) fn blank(&mut self) {
         self.lines.push(Line::raw(""));
+    }
+
+    /// The dialog's heading: its title, what it's for, a blank row.
+    pub(crate) fn heading(&mut self, title: &str, description: &str) {
+        let desc = (!description.is_empty()).then_some(description);
+        self.lines.extend(dialog_heading(title, desc, self.width));
+    }
+
+    /// A rule across the form (above a dialog's buttons).
+    pub(crate) fn rule(&mut self) {
+        let style = Style::default().fg(crate::theme::palette().table_rule);
+        self.lines.push(Line::from(Span::styled("─".repeat(self.width), style)));
     }
 
     /// `text` wrapped to the form's width.
@@ -84,7 +144,7 @@ impl<H: Copy + PartialEq> FormLines<H> {
     /// The box (all three of its rows) is `hit`'s click target.
     pub(crate) fn field(&mut self, label: &str, field: Textbox<'_>, focused: bool, disabled: bool, under: &[(&str, Style)], hit: H) {
         let first = self.lines.len();
-        self.lines.extend(field_lines(label, field, focused, disabled, under, self.width));
+        self.lines.extend(field_lines(label, field, focused, disabled, under, self.width, self.rest));
         self.controls.push(Control {
             first,
             end: self.lines.len(),
@@ -99,7 +159,7 @@ impl<H: Copy + PartialEq> FormLines<H> {
     /// Two fields side by side, each half the width (a narrow form stacks
     /// them, a blank row between).
     pub(crate) fn pair(&mut self, left: Field<'_, H>, right: Field<'_, H>) {
-        const GAP: usize = 2;
+        const GAP: usize = PAIR_GAP;
         if self.width < PAIR_MIN_W {
             self.field(left.label, left.textbox, left.focused, left.disabled, &left.under, left.hit);
             self.blank();
@@ -108,8 +168,8 @@ impl<H: Copy + PartialEq> FormLines<H> {
         }
         let left_w = (self.width - GAP) / 2;
         let right_w = self.width - GAP - left_w;
-        let a = field_lines(left.label, left.textbox, left.focused, left.disabled, &left.under, left_w);
-        let b = field_lines(right.label, right.textbox, right.focused, right.disabled, &right.under, right_w);
+        let a = field_lines(left.label, left.textbox, left.focused, left.disabled, &left.under, left_w, self.rest);
+        let b = field_lines(right.label, right.textbox, right.focused, right.disabled, &right.under, right_w, self.rest);
         let first = self.lines.len();
         for i in 0..a.len().max(b.len()) {
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -140,6 +200,46 @@ impl<H: Copy + PartialEq> FormLines<H> {
         let end = self.lines.len();
         let h = (end - first) as u16;
         self.controls.push(Control { first, end, line: first, x: 0, w: self.width as u16, h, hit });
+    }
+
+    /// A row of buttons (each with its click target) set to `align`.
+    pub(crate) fn buttons(&mut self, buttons: &[(Button<'_>, H)], align: Align) {
+        let shown: Vec<Button> = buttons.iter().map(|(b, _)| *b).collect();
+        // Too narrow for one row, they wrap to another.
+        for (lines, at) in button::bands(&shown, self.width, align) {
+            let first = self.lines.len();
+            self.lines.extend(lines);
+            for (x, w, i) in at {
+                let h = button::BUTTON_H;
+                self.controls.push(Control { first, end: first + h, line: first, x, w, h: h as u16, hit: buttons[i].1 });
+            }
+        }
+    }
+
+    /// Buttons at the left and at the right of one row (a dialog's
+    /// destructive action apart from its Cancel and confirm).
+    pub(crate) fn buttons_apart(&mut self, left: &[(Button<'_>, H)], right: &[(Button<'_>, H)]) {
+        if left.is_empty() {
+            return self.buttons(right, Align::Right);
+        }
+        let l: Vec<Button> = left.iter().map(|(b, _)| *b).collect();
+        let r: Vec<Button> = right.iter().map(|(b, _)| *b).collect();
+        let (lw, rw) = (button::row_width(&l), button::row_width(&r));
+        if lw + rw + 2 > self.width {
+            // No room for both on one row: the right ones first.
+            self.buttons(right, Align::Right);
+            self.blank();
+            return self.buttons(left, Align::Left);
+        }
+        let (left_lines, left_at) = button::row(&l, lw, Align::Left);
+        let (right_lines, right_at) = button::row(&r, rw, Align::Left);
+        let first = self.lines.len();
+        self.lines.extend(button::beside(left_lines, right_lines, self.width, rw));
+        let offset = (self.width - rw) as u16;
+        let at = left_at.into_iter().chain(right_at.into_iter().map(|(x, w)| (x + offset, w)));
+        for ((x, w), (_, hit)) in at.zip(left.iter().chain(right)) {
+            self.controls.push(Control { first, end: first + button::BUTTON_H, line: first, x, w, h: button::BUTTON_H as u16, hit: *hit });
+        }
     }
 
     /// The lines from here on are the footer.

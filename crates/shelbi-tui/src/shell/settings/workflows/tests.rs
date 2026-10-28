@@ -142,13 +142,13 @@ fn the_page_lists_workflows_statuses_and_the_legend() {
         "subtask",
         "Statuses",
         "Transitions",
-        "+ New workflow",
+        "New workflow",
         "● To Do",
         "in-progress",
         "Handoff",
         "task, subtask",
-        "+ New status",
-        "Edit statuses.yaml in your editor",
+        "New status",
+        "Edit YAML",
         "Renaming a status keeps its ID",
         "Status categories",
         "Archived  Closed without shipping",
@@ -163,17 +163,17 @@ fn the_page_lists_workflows_statuses_and_the_legend() {
     assert_eq!(
         page.items(),
         [
+            Item::NewWorkflow,
             Item::Workflow("task".into()),
             Item::Workflow("subtask".into()),
-            Item::NewWorkflow,
+            Item::EditStatuses,
+            Item::NewStatus,
             Item::Status("backlog".into()),
             Item::Status("todo".into()),
             Item::Status("in-progress".into()),
             Item::Status("review".into()),
             Item::Status("done".into()),
             Item::Status("canceled".into()),
-            Item::NewStatus,
-            Item::EditStatuses,
         ]
     );
 }
@@ -187,7 +187,13 @@ fn every_row_is_reachable_by_keys_and_enter_does_its_main_thing() {
     for _ in 0..n + 2 {
         press(&mut page, key(KeyCode::Down));
     }
-    assert_eq!(page.cursor_item(), Some(Item::EditStatuses), "stops at the bottom");
+    assert!(matches!(page.cursor_item(), Some(Item::Status(_))), "stops at the bottom, the last status");
+    // The Statuses heading's Edit YAML button, above its table.
+    let edit = page.items().iter().position(|i| *i == Item::EditStatuses).unwrap();
+    while page.cursor_item() != Some(Item::EditStatuses) {
+        press(&mut page, key(KeyCode::Up));
+    }
+    assert_eq!(page.items()[edit], Item::EditStatuses);
     match press(&mut page, key(KeyCode::Enter)) {
         SettingsAction::EditYaml(file) => {
             assert!(file.path.ends_with("workflows/statuses.yaml"), "{file:?}");
@@ -196,7 +202,9 @@ fn every_row_is_reachable_by_keys_and_enter_does_its_main_thing() {
         }
         other => panic!("{other:?}"),
     }
+    // Home is the New workflow button; the workflows follow it.
     press(&mut page, key(KeyCode::Home));
+    press(&mut page, key(KeyCode::Down));
     press(&mut page, key(KeyCode::Down));
     match press(&mut page, key(KeyCode::Char('y'))) {
         SettingsAction::EditYaml(file) => {
@@ -208,7 +216,7 @@ fn every_row_is_reachable_by_keys_and_enter_does_its_main_thing() {
     }
     assert_eq!(press(&mut page, key(KeyCode::Char('r'))), SettingsAction::Reload);
     press(&mut page, key(KeyCode::End));
-    assert_eq!(page.cursor_item(), Some(Item::EditStatuses));
+    assert_eq!(page.cursor_item(), Some(Item::Status("canceled".into())));
 }
 
 #[test]
@@ -448,7 +456,7 @@ fn the_menu_lists_every_action_with_its_key_and_runs_them() {
     page.select(&Item::Workflow("subtask".into()));
     press(&mut page, key(KeyCode::Char('m')));
     let text = render(&mut page, 100, 40);
-    for want in ["Edit", "Edit YAML", "Duplicate", "Set as default", "Delete…", "New workflow", "⏎ e"] {
+    for want in ["Edit", "Edit YAML", "Duplicate", "Set as default", "Delete", "New workflow", "⏎ e"] {
         assert!(text.contains(want), "{want:?}:\n{text}");
     }
     // Down to Edit YAML, Enter.

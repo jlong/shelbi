@@ -1183,6 +1183,10 @@ struct ShellState {
     /// what is under the pointer: Settings, an overlay or a panel over the
     /// sidebar hides it, and it shows again only where the pointer still is.
     pointer: Option<(u16, u16)>,
+    /// The buttons an overlay drew last frame and the one lit under the
+    /// pointer (an overlay's buttons lift as Settings' do).
+    overlay_buttons: Vec<Rect>,
+    overlay_lit: Option<Rect>,
     /// The main-area size last reported to the live session.
     reported_main: Option<Size>,
     /// When `Some`, the user is typing a scrollback search query.
@@ -1459,6 +1463,8 @@ impl ShellState {
             sidebar_dragging: false,
             divider_hover: false,
             pointer: None,
+            overlay_buttons: Vec::new(),
+            overlay_lit: None,
             reported_main: None,
             search_input: None,
             should_reexec: false,
@@ -1669,6 +1675,13 @@ impl ShellState {
         let under = pointer.filter(|_| self.overlay.is_none());
         if self.settings_open() && self.settings.hover_moved(under) {
             self.dirty = true;
+        }
+        // An overlay's button under the pointer lights; one it left goes back.
+        if self.overlay.is_some() {
+            let on = pointer.and_then(|(x, y)| self.overlay_buttons.iter().copied().find(|r| crate::panel::in_rect(*r, x, y)));
+            if on != self.overlay_lit {
+                self.dirty = true;
+            }
         }
     }
 
@@ -4923,6 +4936,10 @@ fn draw_frame<B: ratatui::backend::Backend>(
     // Where the pointer is, for Settings' table hover: nowhere while an
     // overlay stands over it.
     let pointer = state.pointer.filter(|_| overlay.is_none());
+    // The pointer over an overlay, for its buttons' hover.
+    let overlay_pointer = state.pointer.filter(|_| overlay.is_some());
+    let mut overlay_buttons = Vec::new();
+    let mut overlay_lit = None;
     // Taken out like the overlay so the draw closure can render it with a
     // mutable borrow of the frame; put back after the draw (rt-tui-review).
     let mut review = state.review.take();
@@ -5137,11 +5154,16 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // above and the overlay's own `Clear` covers it where they overlap.
         if let Some(ov) = overlay.as_mut() {
             ov.render(frame, area);
+            // Its buttons lift under the pointer, found in what it drew.
+            overlay_buttons = crate::button::drawn(frame.buffer_mut(), area);
+            overlay_lit = crate::button::light_hovered(frame.buffer_mut(), &overlay_buttons, overlay_pointer);
         } else if let Some((x, y)) = cursor {
             frame.set_cursor_position(Position::new(x, y));
         }
     });
     state.overlay = overlay;
+    state.overlay_buttons = overlay_buttons;
+    state.overlay_lit = overlay_lit;
     state.review = review;
     state.workspace = workspace;
     state.acknowledgements = acknowledgements;
@@ -8952,7 +8974,7 @@ mod tests {
             draw_frame(&mut term, &mut st).unwrap();
             let screen = screen_text(&term);
             // The controls lead; a short terminal scrolls to the summary.
-            let mut wants = vec!["Settings", "Global", "General", "Terminal", "▾ proj", "Appearance", "Theme", "Editor", "Esc back"];
+            let mut wants = vec!["Settings", "Global", "General", "Terminal", " proj ", "Appearance", "Theme", "Editor", "Esc back"];
             if h >= 48 {
                 wants.extend(["This computer", "Settings folder", "PROJ", "Open in editor", "Edit Project Settings"]);
             } else {
@@ -8985,7 +9007,8 @@ mod tests {
         }
         draw_frame(&mut term, &mut st).unwrap();
         let screen = screen_text(&term);
-        assert!(screen.contains("› About Shelbi"), "the last action is on screen and focused:\n{screen}");
+        let (x, y) = find_on_screen(&term, "About Shelbi").expect("the last action is on screen");
+        assert_eq!(term.backend().buffer()[(x, y)].bg, palette().button_focus, "and focused:\n{screen}");
         // A resize mid-visit redraws without panicking, down to a sliver.
         for (w, h) in [(30, 8), (12, 3), (200, 60)] {
             term.backend_mut().resize(w, h);
@@ -9049,6 +9072,28 @@ mod tests {
     }
 
     #[test]
+    fn esc_on_the_leave_prompt_over_a_typed_command_keeps_it_unsaved() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        settle_settings(&mut st);
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        type_key(&mut st, 'x');
+        assert!(st.settings.form().draft().is_some(), "typing");
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "Keybindings").unwrap();
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert!(st.settings.prompting(), "leaving asks");
+        draw_frame(&mut term, &mut st).unwrap();
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.settings.prompting(), "Esc closes the prompt");
+        assert_eq!(st.settings.form().editor(), None, "nothing saved");
+        assert!(st.settings.form().draft().is_some(), "the typed command stays");
+    }
+
+    #[test]
     fn unsaved_edits_ask_before_leaving_and_save_then_leave() {
         let mut st = settings_state();
         st.dispatch_effect(Effect::OpenSettings);
@@ -9058,7 +9103,7 @@ mod tests {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         let screen = screen_text(&term);
-        assert!(screen.contains("Unsaved changes") && screen.contains("Discard"), "{screen}");
+        assert!(screen.contains("Save changes to General?") && screen.contains("Discard"), "{screen}");
         press(&mut st, KeyCode::Esc);
         assert!(!st.settings.prompting() && st.settings_open(), "Esc closes the prompt first");
         // A switch over a dirty page asks too, and Cancel keeps the project.
@@ -9306,7 +9351,7 @@ mod tests {
             let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             draw_frame(&mut term, &mut st).unwrap();
             let screen = screen_text(&term);
-            for want in ["Settings", "▾ proj", "📑", "task  Default", "subtask", "+ New workflow"] {
+            for want in ["Settings", "proj", "📑", "task  Default", "subtask", "New workflow"] {
                 assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
             }
             let (x, y) = find_on_screen(&term, "task  Default").unwrap();
@@ -9314,7 +9359,9 @@ mod tests {
         }
         // Down the page: it scrolls the statuses into view at 80x24.
         press(&mut st, KeyCode::Tab);
-        for _ in 0..8 {
+        // From task: subtask, the Statuses heading's two buttons, then the
+        // statuses down to Canceled.
+        for _ in 0..9 {
             press(&mut st, KeyCode::Down);
         }
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -9330,6 +9377,35 @@ mod tests {
         (0..buf.area.height)
             .filter(|&y| (0..buf.area.width).any(|x| buf[(x, y)].bg == palette().row_hover))
             .collect()
+    }
+
+    /// A Settings button lifts to its hover fill under the pointer (all
+    /// three of its rows), repaints as the pointer comes and goes, and a
+    /// click on it runs it.
+    #[test]
+    fn a_settings_button_lifts_under_the_pointer_and_runs_on_a_click() {
+        let home = WorkflowsHome::new("button-hover");
+        let mut st = workflows_state(&home);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "New workflow").expect("the heading's button");
+        assert_eq!(term.backend().buffer()[(x, y)].bg, palette().button, "at rest");
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(x + 2, y - 1)));
+        assert!(st.dirty, "onto a button repaints");
+        draw_frame(&mut term, &mut st).unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(x, y)].bg, palette().button_lit, "lit");
+        assert_eq!(buf[(x, y - 1)].fg, palette().button_lit, "its cap too");
+        // Off it: back to rest.
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(x, y + 4)));
+        assert!(st.dirty, "off a button repaints");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(x, y)].bg, palette().button);
+        // A click on its bottom cap runs it: the new workflow's name field.
+        st.handle_event(Event::Mouse(left_click(x, y + 1)));
+        assert!(st.settings.workflows().modal_open(), "New workflow opened its draft");
     }
 
     /// A Settings table row lights under the pointer (all its lines, capped
@@ -9553,11 +9629,13 @@ mod tests {
             let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             draw_frame(&mut term, &mut st).unwrap();
             let screen = screen_text(&term);
-            for want in ["← Back", "task default", "Save changes", "Discard", "⋮ Actions", "Workflow", "Name"] {
+            for want in ["←", "task   Default", "Save changes", "⋮", "Workflow", "Name"] {
                 assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
             }
-            assert!(!screen.contains("▾ proj"), "the settings sidebar is hidden:\n{screen}");
-            let (x, _) = find_on_screen(&term, "← Back").unwrap();
+            // Discard changes gives way to the ⋮ menu at 80 columns.
+            assert_eq!(screen.contains("Discard changes"), w > 80, "{w}x{h}:\n{screen}");
+            assert!(!screen.contains("Global"), "the settings sidebar is hidden:\n{screen}");
+            let (x, _) = find_on_screen(&term, "←").unwrap();
             assert!(x < st.main_rect.x, "{w}x{h}: the editor starts in the sidebar's column");
             for line in screen.lines() {
                 assert!(crate::panel::display_width(line) <= w as usize);
@@ -9623,7 +9701,7 @@ mod tests {
         assert_eq!(st.client.project(), Some("proj"));
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
-        assert!(screen_text(&term).contains("Save your changes to subtask"), "{}", screen_text(&term));
+        assert!(screen_text(&term).contains("Save changes to subtask?"), "{}", screen_text(&term));
         // Cancel stays with the edits.
         press(&mut st, KeyCode::Esc);
         assert!(!st.settings.prompting() && st.settings.editor().is_some_and(|e| e.is_dirty()));
@@ -9685,7 +9763,7 @@ mod tests {
         for want in ["Builder", "Form", "◌ Backlog", "○ To Do", "◐ In Progress", "Initial"] {
             assert!(screen.contains(want), "{want}:\n{screen}");
         }
-        assert!(!screen.contains("▾ proj"), "it covers both columns:\n{screen}");
+        assert!(!screen.contains("Global"), "it covers both columns:\n{screen}");
         // Backlog (the keyboard's first node), Add transition, → Canceled.
         press(&mut st, KeyCode::Down);
         type_key(&mut st, 'a');
@@ -9880,7 +9958,7 @@ mod tests {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         let text = screen_text(&term);
-        assert!(text.contains("orchestrator Customized") && text.contains("Agent"), "{text}");
+        assert!(text.contains("orchestrator   Customized") && text.contains("Agent"), "{text}");
 
         // A typed description saves with Ctrl+S, off the UI thread.
         type_agent_description(&mut st, " Edited.");

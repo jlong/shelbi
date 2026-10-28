@@ -60,6 +60,7 @@ use shelbi_app::text_area::TextArea;
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
 use super::centered_rect;
+use crate::button::Button;
 use crate::modal_form::{Control, FormLines};
 use crate::panel;
 use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
@@ -372,22 +373,14 @@ impl FeedbackDialog {
             out.text(error, Style::default().fg(palette().red));
         }
         out.blank();
-        let send = if form.sending() {
-            button(form::SENDING, palette().primary, Style::default().fg(palette().primary_label), width)
-        } else if focus == Focus::Send {
-            button(form::SEND, palette().primary_focus, strong(), width)
-        } else {
-            button(form::SEND, palette().primary, Style::default().fg(palette().primary_label), width)
-        };
-        out.rows(send, Hit::Control(Focus::Send));
-        let cancel = if form.sending() {
-            button(form::CANCEL, rest, Style::default().fg(palette().muted), width)
-        } else if focus == Focus::Cancel {
-            button(form::CANCEL, palette().input_focus, strong(), width)
-        } else {
-            button(form::CANCEL, rest, Style::default().fg(palette().white), width)
-        };
-        out.rows(cancel, Hit::Control(Focus::Cancel));
+        // The desktop's stacked, full-width Send Message (Primary) and
+        // Cancel, as Settings' buttons draw (focus, hover, disabled alike).
+        let sending = form.sending();
+        let label = if sending { form::SENDING } else { form::SEND };
+        let send = Button::primary(label).focused(focus == Focus::Send && !sending).enabled(!sending);
+        out.rows(send.lines_in(width), Hit::Control(Focus::Send));
+        let cancel = Button::secondary(form::CANCEL).focused(focus == Focus::Cancel && !sending).enabled(!sending);
+        out.rows(cancel.lines_in(width), Hit::Control(Focus::Cancel));
     }
 
     /// Bug Report / Feature Request / Other: a track the width of the form
@@ -496,7 +489,8 @@ impl FeedbackDialog {
         }
         out.footer();
         out.blank();
-        out.rows(button(form::CLOSE, palette().input_focus, strong(), width), Hit::Control(Focus::Close));
+        // Close has the keys (the only control): a focused Secondary button.
+        out.rows(Button::secondary(form::CLOSE).focused(true).lines_in(width), Hit::Control(Focus::Close));
     }
 }
 
@@ -523,11 +517,6 @@ fn panel_height(lines: usize, fit: Fit) -> u16 {
 
 /// The title's style: the strongest text, bold.
 fn title_style() -> Style {
-    Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
-}
-
-/// A focused button's label.
-fn strong() -> Style {
     Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
 }
 
@@ -559,12 +548,6 @@ fn badge(glyph: &str, fill: Color, color: Color, width: usize) -> [Line<'static>
         Line::from(vec![Span::raw(left.clone()), Span::styled(face, Style::default().bg(fill).fg(color))]),
         cap(BLEED_BELOW),
     ]
-}
-
-/// A full-width button: `label` centered on `fill`, with the caps.
-fn button(label: &str, fill: Color, style: Style, width: usize) -> [Line<'static>; 3] {
-    let (above, below) = textbox::caps(width, fill);
-    [above, Line::from(Span::styled(center(label, width), style.bg(fill))), below]
 }
 
 #[cfg(test)]
