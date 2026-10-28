@@ -47,7 +47,6 @@ use shelbi_state::keymap::{Key, Keymaps, SidebarAction};
 
 use super::{heading, selected_style, wrapped, Hit, Row, OFFERED};
 use crate::panel;
-use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
 /// Below this page width the table stacks each agent's fields.
@@ -58,8 +57,7 @@ const RUNNER_W: usize = 18;
 const SKILLS_W: usize = 7;
 const MORE_W: usize = 2;
 /// The editor's left rule.
-/// The new agent's name field's widest (the desktop's draft field).
-const DRAFT_W: usize = 40;
+const EDITOR_PREFIX: &str = "│ ";
 
 /// A row the page's keys stop on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -836,7 +834,7 @@ impl AgentsPage {
                 if let Some(editor) = self.editor.as_mut() {
                     editor.focus = EditorFocus::Text;
                     if let Some((line, start)) = editor.rows.get(row).copied() {
-                        let col = (column as usize).saturating_sub(textbox::INSET);
+                        let col = (column as usize).saturating_sub(EDITOR_PREFIX.chars().count());
                         editor.text.move_to(line, start + col);
                     }
                 }
@@ -1053,28 +1051,34 @@ impl AgentsPage {
         }
     }
 
-    /// The new row: the name field (the caret in it), what Enter does, and a
-    /// refusal.
+    /// The new row: the name being typed, what Enter does, and a refusal.
     fn draft_rows(&self, rows: &mut Vec<Row>, from: Option<&str>, width: usize) {
+        let label = "  Name: ";
+        let room = width.saturating_sub(label.len() + 1).max(1);
         let text: String = self.draft.lines()[0].iter().collect();
         let (_, col) = self.draft.cursor();
-        let refused = self.state.error_at(&Target::NewAgent);
-        let field = Textbox::new(&text).placeholder("Agent name").caret(Some(col)).invalid(refused.is_some());
-        rows.push(Row::blank());
-        for (n, line) in field.lines(width.min(DRAFT_W)).into_iter().enumerate() {
-            let mut row = Row::text(line);
-            // The text's row holds the page's focus.
-            row.focus = n == 1;
-            rows.push(row);
-        }
+        // Keep the caret in view when the name is longer than the room.
+        let skip = (col + 1).saturating_sub(room);
+        let shown: Vec<char> = text.chars().skip(skip).take(room).collect();
+        let caret = col - skip;
+        let mut spans = vec![Span::styled(label, Style::default().fg(palette().gray))];
+        let before: String = shown.iter().take(caret).collect();
+        let at: String = shown.get(caret).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
+        let after: String = shown.iter().skip(caret + 1).collect();
+        spans.push(Span::styled(before, Style::default().fg(palette().white)));
+        spans.push(Span::styled(at, Style::default().fg(palette().canvas).bg(palette().white)));
+        spans.push(Span::styled(after, Style::default().fg(palette().white)));
+        let mut row = Row::text(Line::from(spans));
+        row.focus = true;
+        rows.push(row);
         let hint = match from {
             Some(from) => format!("Duplicate of {from}. Enter to create, Esc to cancel."),
             None => "Enter to create, Esc to cancel.".to_string(),
         };
-        if let Some(e) = refused {
-            wrapped(rows, e, width, Style::default().fg(palette().red));
+        wrapped(rows, &format!("  {hint}"), width, Style::default().fg(palette().muted));
+        if let Some(e) = self.state.error_at(&Target::NewAgent) {
+            wrapped(rows, &format!("  {e}"), width, Style::default().fg(palette().red));
         }
-        wrapped(rows, &hint, width, Style::default().fg(palette().muted));
     }
 
     /// The shared instructions' editor: its wrapped lines in a window that
@@ -1084,12 +1088,11 @@ impl AgentsPage {
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
-        let box_w = width.min(textbox::MAX_W);
-        let text_w = textbox::room(box_w).max(1);
+        let text_w = width.saturating_sub(EDITOR_PREFIX.chars().count()).max(1);
         let (wrapped_rows, (caret_row, caret_col)) = editor.text.wrapped(text_w);
         // As tall as the text (and a line to type on), up to what leaves
         // the buttons in view.
-        let most = height.saturating_sub(8).clamp(3, 20);
+        let most = height.saturating_sub(6).clamp(3, 20);
         let window = (wrapped_rows.len() + 1).max(5).min(most);
         editor.height = window;
         if caret_row < editor.top {
@@ -1098,12 +1101,13 @@ impl AgentsPage {
             editor.top = caret_row + 1 - window;
         }
         editor.top = editor.top.min(wrapped_rows.len().saturating_sub(1));
-        let text_style = textbox::area_text(active, false);
+        let rule_style = Style::default().fg(if active { palette().cyan } else { palette().ansi_dark_gray });
+        let text_style = Style::default().fg(palette().foreground);
         let lines = editor.text.lines();
         let caret_on = active && editor.focus == EditorFocus::Text;
-        let mut body = Vec::new();
         for v in editor.top..editor.top + window {
-            let mut spans = Vec::new();
+            let mut spans = vec![Span::styled(EDITOR_PREFIX, rule_style)];
+            let mut focus = false;
             if let Some(&(line, start)) = wrapped_rows.get(v) {
                 let chars: Vec<char> = lines[line]
                     .iter()
@@ -1111,19 +1115,19 @@ impl AgentsPage {
                     .take(text_w)
                     .map(|c| if c.is_control() { ' ' } else { *c })
                     .collect();
-                let caret = (caret_on && v == caret_row).then_some(caret_col);
-                textbox::caret_spans(&mut spans, &chars, caret, text_w, text_style.bg(textbox::fill(active, false, false)));
+                if caret_on && v == caret_row {
+                    focus = true;
+                    let before: String = chars.iter().take(caret_col).collect();
+                    let at: String = chars.get(caret_col).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
+                    let after: String = chars.iter().skip(caret_col + 1).collect();
+                    spans.push(Span::styled(before, text_style));
+                    spans.push(Span::styled(at, Style::default().fg(palette().canvas).bg(palette().white)));
+                    spans.push(Span::styled(after, text_style));
+                } else {
+                    spans.push(Span::styled(chars.into_iter().collect::<String>(), text_style));
+                }
             }
-            body.push(spans);
-        }
-        // The caps and every row a click lands on: the line it's on (a cap,
-        // the nearest text line).
-        let area = textbox::area(body, active, false, false, box_w);
-        let last = area.len() - 1;
-        for (i, line) in area.into_iter().enumerate() {
-            let v = editor.top + i.clamp(1, last - 1) - 1;
-            let focus = caret_on && i > 0 && i < last && v == caret_row;
-            rows.push(Row::hit(line, Hit::Agents(AgentsHit::EditorLine(v)), focus));
+            rows.push(Row::hit(Line::from(spans), Hit::Agents(AgentsHit::EditorLine(v)), focus));
         }
         editor.rows = wrapped_rows;
         let more = editor.rows.len() > editor.top + window;
@@ -1796,9 +1800,7 @@ mod tests {
         assert_eq!(d.page().editor_text().as_deref(), Some(shelbi_app::settings::agents::fixture::PREAMBLE));
         let text = d.screen(140, 44);
         assert!(text.contains("Save ^S") && text.contains("Cancel Esc"), "the buttons show with the text:\n{text}");
-        // The text on the field's fill between its caps, not a `│ ` gutter.
-        assert!(text.contains(&"▄".repeat(60)) && text.contains(&"▀".repeat(60)), "{text}");
-        assert!(text.contains("  You are working on Shelbi") && !text.contains("│ You"), "{text}");
+        assert!(text.contains("│ You are working on Shelbi"), "{text}");
         // Select all by hand: to the end, then paste Markdown after it.
         d.key_with(KeyCode::PageDown, KeyModifiers::NONE);
         d.key(KeyCode::End);

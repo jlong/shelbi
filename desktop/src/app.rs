@@ -500,6 +500,7 @@ pub enum HostCall {
     OpenErrorLog,
     OpenSettings,
     SendFeedback,
+    OpenAbout,
     OpenAddProject,
     LoadReview(String),
     ApproveReview(String),
@@ -547,6 +548,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn send_feedback(&mut self) {
         self.push(HostCall::SendFeedback);
+    }
+    fn open_about(&mut self) {
+        self.push(HostCall::OpenAbout);
     }
     fn open_add_project(&mut self) {
         self.push(HostCall::OpenAddProject);
@@ -2112,6 +2116,9 @@ impl ShelbiWindow {
             HostCall::OpenErrorLog => self.open_error_log(window, cx),
             HostCall::OpenSettings => self.open_settings(None, window, cx),
             HostCall::SendFeedback => self.open_feedback(window, cx),
+            // After this update, so the window's first frame isn't nested in
+            // ours (as New Window).
+            HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
             HostCall::OpenAddProject => self.open_add_project(window, cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
@@ -3915,7 +3922,12 @@ impl ShelbiWindow {
                 MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
                 MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
-                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) | MenuAction::Command(_) => {}
+                // About is its own window: it opens over a modal too; every
+                // other registry command waits.
+                MenuAction::Command(id) => {
+                    menus::run_windowless_command(id, cx);
+                }
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) => {}
                 MenuAction::App(other) => {
                     menus::run_app_command(*other, cx);
                 }
@@ -3929,7 +3941,12 @@ impl ShelbiWindow {
                 MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
                 MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
-                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) | MenuAction::Command(_) => {}
+                // About is its own window: it opens over a modal too; every
+                // other registry command waits.
+                MenuAction::Command(id) => {
+                    menus::run_windowless_command(id, cx);
+                }
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) => {}
                 MenuAction::App(other) => {
                     menus::run_app_command(*other, cx);
                 }

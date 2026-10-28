@@ -1270,6 +1270,10 @@ struct ShellState {
     /// reached without running the effect.
     #[cfg(test)]
     effect_tap: Option<Vec<Effect>>,
+    /// Test seam: the pages [`ShellState::open_url`] was asked to open, in
+    /// order, instead of launching the browser.
+    #[cfg(test)]
+    opened_urls: Vec<String>,
     /// A pending off-UI-thread add-project scaffold. Separate from [`Self::job`]
     /// because on success the shell must switch to the new project on the UI
     /// thread, so the result is typed ([`CreateOutcome`]) rather than a bare
@@ -1464,6 +1468,8 @@ impl ShellState {
             palette_inputs: Arc::new(DiskPaletteInputs),
             #[cfg(test)]
             effect_tap: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             create_job: None,
             should_quit: false,
             dirty: true,
@@ -2938,7 +2944,25 @@ impl ShellState {
             OverlayEvent::AddProjectSubmit { name, root, mode } => {
                 self.submit_add_project(name, root, mode)
             }
+            OverlayEvent::OpenUrl(url) => self.open_url(url),
         }
+    }
+
+    /// Open `url` in the system browser with the platform opener (`open`,
+    /// `xdg-open`), off the UI thread, as the review's Open in browser does.
+    fn open_url(&mut self, url: String) {
+        #[cfg(test)]
+        {
+            self.opened_urls.push(url);
+        }
+        #[cfg(not(test))]
+        self.spawn_job(move || {
+            let (prog, args) = crate::panel::open_url_command(crate::panel::current_os(), &url);
+            match crate::panel::spawn_opener(&prog, &args) {
+                Ok(()) => format!("opened {url}"),
+                Err(e) => format!("open browser failed: {e}"),
+            }
+        });
     }
 
     /// Validate the submitted add-project form. On success, close the form and
@@ -3146,6 +3170,8 @@ impl ShellState {
                     "Contact Us is in the desktop app; or open github.com/jlong/shelbi/issues".to_string(),
                 )
             }
+            // Over whatever is showing, Settings included.
+            Effect::OpenAbout => self.overlay = Some(ActiveOverlay::about(self.caps.truecolor)),
             // A bare switch (the palette's "Switch Project") picks the target in
             // the Projects column; a named one switches.
             Effect::SwitchProject { project } if project.is_empty() => self.open_project_switcher(),
@@ -8238,6 +8264,7 @@ mod tests {
             "action:error-log",
             "action:settings",
             "action:send-feedback",
+            "action:about",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -8342,6 +8369,49 @@ mod tests {
         st.palette_inputs = Arc::new(FixturePaletteInputs);
         st.show(RowTarget::Session(SessionRef::Orchestrator));
         st
+    }
+
+    #[test]
+    fn about_opens_from_the_palette_and_its_links_reach_the_opener() {
+        use shelbi_app::about;
+        let mut st = settings_state();
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        for c in "About".chars() {
+            type_key(&mut st, c);
+        }
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette is open");
+        };
+        assert_eq!(p.results()[p.selected()].0.id, "action:about");
+        press(&mut st, KeyCode::Enter);
+        assert!(matches!(st.overlay, Some(ActiveOverlay::About(_))), "the palette's About opens it");
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains(&about::version_line(crate::overlay::about::VERSION)), "{screen}");
+        // A click opens its page and leaves About up.
+        let (x, y) = find_on_screen(&term, "GitHub").expect("the GitHub link shows");
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert_eq!(st.opened_urls, [about::GITHUB_URL]);
+        assert!(matches!(st.overlay, Some(ActiveOverlay::About(_))));
+        // The keyboard: the clicked link holds focus; Tab, then Enter.
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Enter);
+        assert_eq!(st.opened_urls, [about::GITHUB_URL, about::LICENSE_URL]);
+        press(&mut st, KeyCode::Esc);
+        assert!(st.overlay.is_none(), "Esc closes it");
+
+        // Over Settings (General's About Shelbi row), Settings stays beneath.
+        st.dispatch_effect(Effect::OpenSettings);
+        st.dispatch_effect(Effect::OpenAbout);
+        assert!(st.settings_open());
+        assert!(matches!(st.overlay, Some(ActiveOverlay::About(_))));
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "Close").expect("the Close button shows");
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert!(st.overlay.is_none(), "Close closes it");
+        assert!(st.settings_open(), "back on Settings");
     }
 
     #[test]
@@ -8651,12 +8721,12 @@ mod tests {
         assert!(screen_text(&term).contains("↓ more"), "what's below says so");
         // Tab to the page and walk down to its last action: it scrolls into view.
         press(&mut st, KeyCode::Tab);
-        for _ in 0..5 {
+        for _ in 0..6 {
             press(&mut st, KeyCode::Down);
         }
         draw_frame(&mut term, &mut st).unwrap();
         let screen = screen_text(&term);
-        assert!(screen.contains("› Edit Zen Mode"), "the last action is on screen and focused:\n{screen}");
+        assert!(screen.contains("› About Shelbi"), "the last action is on screen and focused:\n{screen}");
         // A resize mid-visit redraws without panicking, down to a sliver.
         for (w, h) in [(30, 8), (12, 3), (200, 60)] {
             term.backend_mut().resize(w, h);

@@ -20,7 +20,6 @@ mod panel;
 mod review_panel;
 mod shell;
 mod sidebar;
-mod textbox;
 mod workspace_panel;
 pub mod theme;
 

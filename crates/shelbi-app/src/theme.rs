@@ -211,21 +211,9 @@ pub struct Theme<C = Swatch> {
     /// `selection` (was `SELECTION_BG`): the selected / focused row fill
     /// everywhere.
     pub selection: C,
-    /// `color/search` (was `SEARCH_BG`, `PALETTE_BG`): the sidebar search box
-    /// and the command palette panel.
+    /// `color/search` (was `SEARCH_BG`, `PALETTE_BG`): the sidebar search box,
+    /// the command palette panel, and the TUI's About Shelbi panel.
     pub search: C,
-    /// A text field's fill at rest (the TUI's half-block textbox): the
-    /// search box's fill, so every field reads as the search box does.
-    pub input: C,
-    /// A text field's fill while it has the keyboard: a cyan-tinted fill, so
-    /// focus shows without a border.
-    pub input_focus: C,
-    /// A text field's fill while its value is refused (its error said
-    /// under it).
-    pub input_invalid: C,
-    /// A read-only or disabled text field's fill: quieter than
-    /// [`Theme::input`], its text muted.
-    pub input_disabled: C,
     /// `color/divider` (was `DIVIDER_DIM`): the sidebar's right-edge rule at
     /// rest.
     pub divider: C,
@@ -308,10 +296,6 @@ impl Theme {
             yellow: Swatch::rgb(0xdbc300),
             selection: Swatch::rgb(0x3f3f3f),
             search: Swatch::rgb(0x292929),
-            input: Swatch::rgb(0x292929),
-            input_focus: Swatch::rgb(0x213a40),
-            input_invalid: Swatch::rgb(0x402527),
-            input_disabled: Swatch::rgb(0x222222),
             divider: Swatch::rgb(0x414141),
             zen: Swatch::rgb(0x007f00),
 
@@ -360,10 +344,6 @@ impl Theme {
             yellow: Swatch::rgb(0x7a6c00),
             selection: Swatch::rgb(0xdadada),
             search: Swatch::rgb(0xececec),
-            input: Swatch::rgb(0xececec),
-            input_focus: Swatch::rgb(0xd9eef1),
-            input_invalid: Swatch::rgb(0xf9e1e1),
-            input_disabled: Swatch::rgb(0xf4f4f4),
             divider: Swatch::rgb(0xd0d0d0),
             zen: Swatch::rgb(0x007f00),
 
@@ -451,10 +431,6 @@ impl<C: Copy> Theme<C> {
             yellow,
             selection,
             search,
-            input,
-            input_focus,
-            input_invalid,
-            input_disabled,
             divider,
             zen,
             divider_active,
@@ -496,10 +472,6 @@ impl<C: Copy> Theme<C> {
             yellow: f(yellow),
             selection: f(selection),
             search: f(search),
-            input: f(input),
-            input_focus: f(input_focus),
-            input_invalid: f(input_invalid),
-            input_disabled: f(input_disabled),
             divider: f(divider),
             zen: f(zen),
             divider_active: f(divider_active),
@@ -554,10 +526,6 @@ const TOKEN_NAMES: &[&str] = &[
     "yellow",
     "selection",
     "search",
-    "input",
-    "input_focus",
-    "input_invalid",
-    "input_disabled",
     "divider",
     "zen",
     "divider_active",
@@ -748,17 +716,6 @@ mod tests {
                 assert_contrast(&theme, fg, "selection", 4.5);
                 assert_contrast(&theme, fg, "search", 4.5);
                 assert_contrast(&theme, fg, "button_hover", 4.5);
-                // A text field's value, whatever its state.
-                for fill in ["input", "input_focus", "input_invalid", "input_disabled"] {
-                    assert_contrast(&theme, fg, fill, 4.5);
-                }
-            }
-            // A field's placeholder and a read-only field's text.
-            assert_contrast(&theme, "muted", "input", 3.0);
-            assert_contrast(&theme, "muted", "input_disabled", 3.0);
-            // Each state's fill reads apart from the others.
-            for (a, b) in [("input", "input_focus"), ("input", "input_invalid"), ("input_focus", "input_invalid")] {
-                assert_ne!(token(&theme, a).rgb, token(&theme, b).rgb, "{a} and {b} differ");
             }
         }
         // Light also lands on the white canvas (the desktop's main area) and

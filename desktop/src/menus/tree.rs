@@ -73,7 +73,6 @@ pub enum MenuAction {
 /// The client actions the menus offer besides registry commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppCommand {
-    About,
     Settings,
     Hide,
     HideOthers,
@@ -345,6 +344,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::OpenErrorLog => Placement::View,
         CommandKind::OpenSettings => Placement::App,
         CommandKind::SendFeedback => Placement::Help,
+        CommandKind::OpenAbout => Placement::App,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
         CommandKind::NewWindow => Placement::File,
@@ -410,7 +410,8 @@ fn app_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSp
     MenuSpec {
         title: "Shelbi".into(),
         items: vec![
-            app("About Shelbi", AppCommand::About),
+            // The registry's About, as the palette runs it.
+            slot("action:about", "About Shelbi", None),
             MenuEntry::Separator,
             // The registry's Settings, with ⌘, (bound to the window's
             // OpenSettings for good; here it labels the item).
@@ -633,8 +634,6 @@ fn help_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuS
     }
 }
 
-/// The docs the Help menu opens.
-pub const DOCS_URL: &str = "https://shelbi.dev/docs";
 /// Where Help ▸ Report an Issue goes.
 pub const ISSUES_URL: &str = "https://github.com/jlong/shelbi/issues";
 
@@ -666,9 +665,10 @@ fn command(c: &Command, title: &str) -> MenuEntry {
 /// A submenu of `items`, or of one disabled `empty` line when there are none.
 fn submenu(title: &str, items: Vec<MenuEntry>, empty: &str) -> MenuEntry {
     let items = if items.is_empty() {
+        // Disabled, so its action never fires.
         vec![MenuEntry::Item(MenuItemSpec {
             enabled: false,
-            ..app_item(empty, AppCommand::About)
+            ..app_item(empty, AppCommand::Documentation)
         })]
     } else {
         items

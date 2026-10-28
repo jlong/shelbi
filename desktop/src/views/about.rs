@@ -8,6 +8,8 @@
 //! and this build's version, the tagline, the project's links,
 //! Acknowledgements, and the copyright and license. Every link opens in the
 //! browser except Acknowledgements, which opens its window. ⌘W closes it.
+//! The words and links are [`shelbi_app::about`]'s, which the TUI's About
+//! overlay reads too.
 
 use std::sync::{Arc, LazyLock};
 
@@ -17,8 +19,9 @@ use gpui::{
     WindowHandle, WindowOptions,
 };
 
+use shelbi_app::about::{self, AboutLink};
+
 use crate::app::CloseWindow;
-use crate::menus::tree::DOCS_URL;
 use crate::platform::version::APP_VERSION;
 use crate::theme::style::{Type, Typography};
 use crate::theme::{self, Theme};
@@ -29,15 +32,6 @@ use crate::views::sidebar;
 pub const SIZE: (f32, f32) = (400.0, 520.0);
 /// The app icon's size.
 pub const ICON: f32 = 112.0;
-
-pub const WEBSITE_URL: &str = "https://shelbi.dev";
-pub const GITHUB_URL: &str = "https://github.com/jlong/shelbi";
-pub const LICENSE_URL: &str = "https://github.com/jlong/shelbi/blob/main/LICENSE";
-pub const SPONSOR_URL: &str = "https://32pixels.co";
-
-/// The copyright line's year: the year this build was made (the build
-/// script reads `SOURCE_DATE_EPOCH`, else the clock).
-pub const COPYRIGHT_YEAR: &str = env!("SHELBI_BUILD_YEAR");
 
 /// The app icon at twice its 112pt, so it draws sharp on a Retina display:
 /// `assets/icon/shelbi-224.png`, cut from the committed 1024px master (see
@@ -146,9 +140,14 @@ pub fn link(id: impl Into<SharedString>, label: impl Into<SharedString>, color: 
         .child(label.into())
 }
 
-/// A link that opens `url`.
-fn url_link(id: &'static str, label: &'static str, url: &'static str, color: gpui::Hsla, theme: &Theme) -> Stateful<Div> {
-    link(id, label, color, theme).on_click(move |_: &ClickEvent, _, cx| open_url(url, cx))
+/// A link that opens its page.
+fn url_link(id: &'static str, target: AboutLink, color: gpui::Hsla, theme: &Theme) -> Stateful<Div> {
+    let url = target.url();
+    link(id, target.label(), color, theme).on_click(move |_: &ClickEvent, _, cx| {
+        if let Some(url) = url {
+            open_url(url, cx)
+        }
+    })
 }
 
 /// The frames' heading (`Desktop/Heading` as they draw it: 18 / 28,
@@ -183,13 +182,13 @@ impl Render for AboutView {
             .flex_col()
             .items_center()
             .gap(px(4.0))
-            .child(heading_type(div()).text_color(theme.text_loud).child("Shelbi"))
+            .child(heading_type(div()).text_color(theme.text_loud).child(about::NAME))
             .child(
                 div()
                     .debug_selector(|| "about-version".into())
                     .type_style(Type::Small)
                     .text_color(theme.foreground)
-                    .child(format!("Version {APP_VERSION}")),
+                    .child(about::version_line(APP_VERSION)),
             );
         let links = div()
             .flex()
@@ -197,10 +196,10 @@ impl Render for AboutView {
             .justify_center()
             .gap(px(24.0))
             .type_style(Type::SmallMedium)
-            .child(url_link("about-website", "Website", WEBSITE_URL, theme.link, &theme))
-            .child(url_link("about-docs", "Documentation", DOCS_URL, theme.link, &theme))
-            .child(url_link("about-github", "GitHub", GITHUB_URL, theme.link, &theme));
-        let bundled = link("about-bundled", "Acknowledgements", theme.link, &theme)
+            .child(url_link("about-website", AboutLink::Website, theme.link, &theme))
+            .child(url_link("about-docs", AboutLink::Documentation, theme.link, &theme))
+            .child(url_link("about-github", AboutLink::GitHub, theme.link, &theme));
+        let bundled = link("about-bundled", AboutLink::Acknowledgements.label(), theme.link, &theme)
             .type_style(Type::SmallMedium)
             .on_click(|_: &ClickEvent, _, cx| show_bundled_software(cx));
         let credits = div()
@@ -210,16 +209,16 @@ impl Render for AboutView {
             .gap(px(4.0))
             .type_style(Type::XSmall)
             .text_color(theme.muted)
-            .child(format!("© {COPYRIGHT_YEAR} John W. Long"))
+            .child(about::copyright())
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .justify_center()
                     .gap(px(8.0))
-                    .child(url_link("about-license", "MIT License", LICENSE_URL, theme.muted, &theme))
+                    .child(url_link("about-license", AboutLink::License, theme.muted, &theme))
                     .child("·")
-                    .child(url_link("about-sponsor", "Sponsored by 32pixels", SPONSOR_URL, theme.muted, &theme)),
+                    .child(url_link("about-sponsor", AboutLink::Sponsor, theme.muted, &theme)),
             );
         div()
             .id("about")
@@ -246,7 +245,7 @@ impl Render for AboutView {
                     .type_style(Type::Base)
                     .text_color(theme.foreground)
                     .text_center()
-                    .child("An Open Source personal agent orchestrator."),
+                    .child(about::TAGLINE),
             )
             .child(links)
             .child(bundled)
@@ -293,12 +292,6 @@ pub(crate) mod tests {
         assert_eq!(png[25], 6, "RGBA");
     }
 
-    #[test]
-    fn the_copyright_year_is_a_year() {
-        let year: u32 = COPYRIGHT_YEAR.parse().unwrap();
-        assert!((2026..2200).contains(&year));
-    }
-
     #[gpui::test]
     fn about_shows_this_builds_version_and_its_links_open(cx: &mut TestAppContext) {
         init(cx);
@@ -312,7 +305,10 @@ pub(crate) mod tests {
             click(cx, selector);
         }
         let opened = OPENED.with(|o| o.borrow().clone());
-        assert_eq!(opened, [WEBSITE_URL, DOCS_URL, GITHUB_URL, LICENSE_URL, SPONSOR_URL]);
+        assert_eq!(
+            opened,
+            [about::WEBSITE_URL, about::DOCS_URL, about::GITHUB_URL, about::LICENSE_URL, about::SPONSOR_URL]
+        );
     }
 
     #[gpui::test]

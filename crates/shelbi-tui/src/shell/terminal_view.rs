@@ -32,6 +32,8 @@ use shelbi_term::selection;
 use shelbi_term::view::TerminalView;
 use shelbi_term::Size;
 
+use crate::theme::rgb_to_xterm256;
+
 /// What a mouse event over the pane resolved to. The gesture rules (a drag
 /// selects, a click reaches the program, Shift and Alt override) are
 /// `shelbi-term`'s, shared with the desktop app.
@@ -328,55 +330,6 @@ fn conv_color(c: VtColor, truecolor: bool) -> RatColor {
     }
 }
 
-/// Quantize a 24-bit color to the closest xterm-256 palette index, using the
-/// standard 6×6×6 color cube plus the 24-step grayscale ramp and keeping
-/// whichever is nearer.
-pub(crate) fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
-    // 6x6x6 cube: component levels are 0,95,135,175,215,255.
-    fn level(v: u8) -> (u8, u8) {
-        const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-        let mut best = 0usize;
-        let mut best_d = u16::MAX;
-        for (i, &s) in STEPS.iter().enumerate() {
-            let d = (s as i16 - v as i16).unsigned_abs();
-            if d < best_d {
-                best_d = d;
-                best = i;
-            }
-        }
-        (best as u8, STEPS[best])
-    }
-    let (ri, rv) = level(r);
-    let (gi, gv) = level(g);
-    let (bi, bv) = level(b);
-    let cube_idx = 16 + 36 * ri + 6 * gi + bi;
-    let cube_dist = dist2(r, g, b, rv, gv, bv);
-
-    // Grayscale ramp: indices 232..=255 are gray levels 8,18,...,238.
-    let gray = ((r as u16 + g as u16 + b as u16) / 3) as u8;
-    let gi = if gray < 8 {
-        0
-    } else {
-        (((gray as i16 - 8) + 5) / 10).clamp(0, 23) as u8
-    };
-    let gv = 8 + gi * 10;
-    let gray_idx = 232 + gi;
-    let gray_dist = dist2(r, g, b, gv, gv, gv);
-
-    if gray_dist < cube_dist {
-        gray_idx
-    } else {
-        cube_idx
-    }
-}
-
-fn dist2(r: u8, g: u8, b: u8, r2: u8, g2: u8, b2: u8) -> u32 {
-    let d = |a: u8, b: u8| {
-        let x = a as i32 - b as i32;
-        (x * x) as u32
-    };
-    d(r, r2) + d(g, g2) + d(b, b2)
-}
 
 /// The sixteen ANSI colors as a session's cells draw them (regular 0 to 7,
 /// then bright 8 to 15): the host terminal's own palette. Settings ▸

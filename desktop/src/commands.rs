@@ -49,6 +49,8 @@ pub trait CommandHost {
     fn open_settings(&mut self);
     /// Open Contact Us over the window.
     fn send_feedback(&mut self);
+    /// Show the About Shelbi window (or the open one to the front).
+    fn open_about(&mut self);
     /// Open the add-project form.
     fn open_add_project(&mut self);
     /// Open a review task: a queued one asks which slot to load it onto.
@@ -84,6 +86,8 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // The sidebar footer's megaphone, Help ▸ Send Feedback… and the
         // palette's entry: Contact Us.
         CommandKind::SendFeedback => host.send_feedback(),
+        // Shelbi ▸ About Shelbi: its own small window.
+        CommandKind::OpenAbout => host.open_about(),
         // The window switches in place (dt-switch-project-in-window). A bare
         // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
@@ -138,6 +142,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::OpenSettings => false,
         // The dialog's send goes to the feedback endpoint, not the daemon.
         CommandKind::SendFeedback => false,
+        // Only shows this build's version and the project's links.
+        CommandKind::OpenAbout => false,
         // Edits a local file in the user's editor.
         CommandKind::OpenEditor { .. } => false,
         // Only this client lets go.
@@ -244,6 +250,9 @@ mod tests {
         fn send_feedback(&mut self) {
             self.0.push("send-feedback".into());
         }
+        fn open_about(&mut self) {
+            self.0.push("about".into());
+        }
         fn open_add_project(&mut self) {
             self.0.push("add-project".into());
         }
@@ -297,6 +306,7 @@ mod tests {
             (CommandKind::OpenErrorLog, "error-log"),
             (CommandKind::OpenSettings, "settings"),
             (CommandKind::SendFeedback, "send-feedback"),
+            (CommandKind::OpenAbout, "about"),
             (
                 CommandKind::SwitchProject {
                     project: String::new(),
@@ -393,6 +403,7 @@ mod tests {
                 "error-log",
                 "settings",
                 "send-feedback",
+                "about",
                 "new-window",
                 "detach",
                 "editor:edit:project",

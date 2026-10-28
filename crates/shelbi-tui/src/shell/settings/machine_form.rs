@@ -37,7 +37,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 use std::time::Duration;
@@ -49,10 +49,8 @@ use shelbi_app::settings::workspaces::{MachineStatus, LOCAL_LABEL};
 use shelbi_core::ForwardMode;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
-use super::modal_form::{Field as Field2, FormLines};
-use super::workspaces::button_style;
+use super::workspaces::{button_style, field_line, text_box};
 use crate::panel;
-use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
 /// The SSH host field's helper.
@@ -198,66 +196,58 @@ pub(super) fn render(
         return;
     }
     let inner_w = width.saturating_sub(4) as usize;
+    let stacked = inner_w < 40;
+    let label_w = if stacked { 0 } else { 19usize.min(inner_w / 3) };
+    let value_w = inner_w.saturating_sub(label_w).max(1);
+    let wrap = |s: &str, w: usize| shelbi_app::overlay::error_log::wrap(s, w.max(1));
     let muted = Style::default().fg(palette().muted);
     let red = Style::default().fg(palette().red);
-    let gray = Style::default().fg(palette().gray);
-    let wrap = |s: &str, w: usize| shelbi_app::overlay::error_log::wrap(s, w.max(1));
 
-    // Lay the content out as lines, each field its label over its box,
-    // recording each control's block (its own lines and what's said under
-    // it) and where it sits.
-    let mut out: FormLines<Focus> = FormLines::new(inner_w);
-    out.text(&form.description(), muted);
-    out.blank();
+    // Lay the content out as lines, recording which lines each control
+    // spans (its own and what's said under it) and where it sits.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // (first line, last line + 1, line of the control, x, width, focus)
+    let mut controls: Vec<(usize, usize, usize, u16, u16, Focus)> = Vec::new();
+    for l in wrap(&form.description(), inner_w) {
+        lines.push(Line::from(Span::styled(l, muted)));
+    }
+    lines.push(Line::raw(""));
+    let under = |lines: &mut Vec<Line<'static>>, text: &str, style: Style| {
+        for l in wrap(text, value_w) {
+            lines.push(Line::from(vec![Span::raw(" ".repeat(label_w)), Span::styled(l, style)]));
+        }
+    };
+    let labeled = |lines: &mut Vec<Line<'static>>, label: &str, value: Vec<Span<'static>>| {
+        if stacked {
+            lines.push(Line::from(Span::styled(label.to_string(), Style::default().fg(palette().gray))));
+            lines.push(Line::from(value));
+        } else {
+            lines.push(field_line(label, label_w, value));
+        }
+    };
+    let box_w = value_w.saturating_sub(2).clamp(4, 48);
+
     // Kind: read-only.
     let kind = if form.remote() { "SSH".to_string() } else { format!("Local ({LOCAL_LABEL})") };
-    out.lines.push(textbox::label("Kind", false, false, inner_w));
-    out.text(&kind, Style::default().fg(palette().foreground));
-    // What's said under each shown field: its refusal, then its help.
-    let shown = form.fields_shown();
-    let notes: Vec<(Option<String>, Option<String>)> = shown
-        .iter()
-        .map(|f| {
-            let help = match f {
-                Field::Name => None,
-                Field::Host => Some(HOST_HELP.to_string()),
-                Field::WorkDir => Some(form.work_dir_help()),
-                Field::Tags => Some(mform::TAGS_HELP.to_string()),
-            };
-            (form.field_error(*f).map(sentence), help)
-        })
-        .collect();
-    let spec = |field: Field| {
-        let at = shown.iter().position(|f| *f == field).expect("a shown field");
-        let (error, help) = &notes[at];
+    labeled(&mut lines, "Kind", vec![Span::styled(kind, Style::default().fg(palette().foreground))]);
+    for field in form.fields_shown() {
+        let first = lines.len();
         let focused = form.focus() == Focus::Field(field);
-        let (label, placeholder) = match field {
-            Field::Name => ("Name", "Machine name"),
-            Field::Host => ("SSH host", "Hostname or SSH alias"),
-            Field::WorkDir => ("Project directory", "Path on the machine"),
-            Field::Tags => ("Machine tags", "Comma-separated tags"),
+        let (label, help) = match field {
+            Field::Name => ("Name", None),
+            Field::Host => ("SSH host", Some(HOST_HELP.to_string())),
+            Field::WorkDir => ("Project directory", Some(form.work_dir_help())),
+            Field::Tags => ("Machine tags", Some(mform::TAGS_HELP.to_string())),
         };
-        let mut under: Vec<(&str, Style)> = Vec::new();
-        under.extend(error.as_deref().map(|e| (e, red)));
-        under.extend(help.as_deref().map(|h| (h, muted)));
-        let textbox = Textbox::new(form.text(field))
-            .placeholder(placeholder)
-            .focused(focused)
-            .invalid(error.is_some())
-            .caret(focused.then(|| form.text(field).chars().count()));
-        Field2 { label, textbox, focused, disabled: false, under, hit: Focus::Field(field) }
-    };
-    let mut fields = shown.iter().copied().peekable();
-    while let Some(field) = fields.next() {
-        out.blank();
-        // Name and SSH host side by side, as the desktop sets them.
-        if field == Field::Name && fields.peek() == Some(&Field::Host) {
-            fields.next();
-            out.pair(spec(Field::Name), spec(Field::Host));
-            continue;
+        labeled(&mut lines, label, text_box(form.text(field), box_w, focused, false));
+        let at = lines.len() - 1;
+        if let Some(e) = form.field_error(field) {
+            under(&mut lines, &sentence(e), red);
         }
-        let f = spec(field);
-        out.field(f.label, f.textbox, f.focused, f.disabled, &f.under, f.hit);
+        if let Some(help) = help {
+            under(&mut lines, &help, muted);
+        }
+        controls.push((first, lines.len(), at, label_w as u16, box_w as u16 + 2, Focus::Field(field)));
     }
     // Forwarding: the config's, kept as it is.
     if let Some(forward) = form.configured().and_then(|m| m.forward) {
@@ -265,17 +255,19 @@ pub(super) fn render(
             ForwardMode::Unix => "unix",
             ForwardMode::Tcp => "tcp",
         };
-        out.blank();
-        out.lines.push(textbox::label("Forwarding", false, false, inner_w));
-        out.lines.push(Line::from(vec![
-            Span::styled(mode.to_string(), Style::default().fg(palette().foreground)),
-            Span::styled("  from the config, kept as is".to_string(), muted),
-        ]));
+        labeled(
+            &mut lines,
+            "Forwarding",
+            vec![
+                Span::styled(mode.to_string(), Style::default().fg(palette().foreground)),
+                Span::styled("  from the config, kept as is".to_string(), muted),
+            ],
+        );
     }
     // Connection: what the readiness check found, its buttons, and the
     // probe's last word (its own, never readiness).
     if form.remote() {
-        out.blank();
+        lines.push(Line::raw(""));
         let panel = form.panel();
         let (glyph, tone) = match panel.tone {
             Tone::Idle => ("○".to_string(), palette().gray),
@@ -291,9 +283,8 @@ pub(super) fn render(
         if let (Tone::Busy, Some(elapsed)) = (panel.tone, extra.elapsed) {
             title.push(Span::styled(format!("  {}s", elapsed.as_secs()), muted));
         }
-        let first = out.lines.len();
-        out.lines.push(textbox::label("Connection", false, false, inner_w));
-        out.lines.push(Line::from(title));
+        let first = lines.len();
+        labeled(&mut lines, "Connection", title);
         // The stages: what each found (or that it waits).
         let stage_w = form.stages().iter().map(|s| s.kind.label().chars().count()).max().unwrap_or(0) + 1;
         for stage in form.stages() {
@@ -306,23 +297,25 @@ pub(super) fn render(
                 StageState::Skipped => ("–".to_string(), palette().muted),
             };
             let label = format!("{:<stage_w$}", stage.kind.label());
-            let room = inner_w.saturating_sub(2 + stage_w).max(8);
+            let room = value_w.saturating_sub(2 + stage_w).max(8);
             let result_style = match stage.state {
                 StageState::Waiting | StageState::Skipped => muted,
                 _ => Style::default().fg(palette().foreground),
             };
             // A long result (a path) wraps under itself.
             for (i, part) in wrap(&stage.result, room).into_iter().enumerate() {
-                let mut spans = if i == 0 {
+                let lead = if i == 0 {
                     vec![
                         Span::styled(format!("{mark} "), Style::default().fg(color)),
-                        Span::styled(label.clone(), gray),
+                        Span::styled(label.clone(), Style::default().fg(palette().gray)),
                     ]
                 } else {
                     vec![Span::raw(" ".repeat(2 + stage_w))]
                 };
+                let mut spans = vec![Span::raw(" ".repeat(label_w))];
+                spans.extend(lead);
                 spans.push(Span::styled(part, result_style));
-                out.lines.push(Line::from(spans));
+                lines.push(Line::from(spans));
             }
         }
         let detail_style = match panel.tone {
@@ -330,13 +323,13 @@ pub(super) fn render(
             Tone::Warning => Style::default().fg(palette().yellow),
             _ => muted,
         };
-        out.text(&panel.detail, detail_style);
+        under(&mut lines, &panel.detail, detail_style);
         if let Some(aside) = extra.aside {
-            out.text(aside, gray);
+            under(&mut lines, aside, Style::default().fg(palette().gray));
         }
         // Test connection / Test again (Stop check while one runs), and
         // Install CLI when it can help.
-        let row = out.lines.len();
+        let row = lines.len();
         let running = form.running().is_some();
         let mut buttons = vec![(
             Focus::Test,
@@ -350,33 +343,33 @@ pub(super) fn render(
                 button_style(form.focus() == Focus::InstallCli, !form.saving(), true),
             ));
         }
-        let mut x = 0;
-        let mut spans = Vec::new();
+        let mut x = label_w;
+        let mut spans = vec![Span::raw(" ".repeat(label_w))];
         for (focus, label, style) in buttons {
             let w = panel::display_width(&label);
-            out.control(first, row, x, w, focus);
+            controls.push((first, row + 1, row, x as u16, w as u16, focus));
             spans.push(Span::styled(label, style));
             spans.push(Span::raw(" "));
             x += w + 1;
         }
-        out.lines.push(Line::from(spans));
+        lines.push(Line::from(spans));
         if let Some(note) = probe.and_then(|s| form.probe_note(s)) {
             let style = match probe {
                 Some(MachineStatus::Unreachable(_)) => red,
-                _ => gray,
+                _ => Style::default().fg(palette().gray),
             };
-            out.text(&note, style);
+            under(&mut lines, &note, style);
         }
     }
-    // The footer: a refusal over the buttons, then the key hint.
-    out.footer();
     if let Some(e) = form.error() {
-        out.blank();
-        out.text(&sentence(e), red);
+        lines.push(Line::raw(""));
+        for l in wrap(&sentence(e), inner_w) {
+            lines.push(Line::from(Span::styled(l, red)));
+        }
     }
-    out.blank();
+    lines.push(Line::raw(""));
     // The buttons, at the right.
-    let button_row = out.lines.len();
+    let button_row = lines.len();
     let buttons = [
         (Focus::Cancel, " Cancel ".to_string(), button_style(form.focus() == Focus::Cancel, !form.saving(), false)),
         (
@@ -390,12 +383,12 @@ pub(super) fn render(
     let mut spans = vec![Span::raw(" ".repeat(x))];
     for (focus, label, style) in buttons {
         let w = panel::display_width(&label);
-        out.control(button_row, button_row, x, w, focus);
+        controls.push((button_row, button_row + 1, button_row, x as u16, w as u16, focus));
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
         x += w + 1;
     }
-    out.lines.push(Line::from(spans));
+    lines.push(Line::from(spans));
     let hint = if form.saving() {
         "Saving… (nothing else runs until this lands)".to_string()
     } else if form.installing() {
@@ -405,9 +398,9 @@ pub(super) fn render(
     } else {
         format!("Tab next · ⏎ {} · Esc cancel", form.submit_label().to_lowercase())
     };
-    out.lines.push(Line::from(Span::styled(panel::truncate_right(&hint, inner_w), muted)));
+    lines.push(Line::from(Span::styled(panel::truncate_right(&hint, inner_w), muted)));
 
-    let height = (out.lines.len() as u16 + 2).min(main.height);
+    let height = (lines.len() as u16 + 2).min(main.height);
     let rect = Rect {
         x: main.x + (main.width - width) / 2,
         y: main.y + (main.height - height) / 2,
@@ -425,13 +418,38 @@ pub(super) fn render(
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let content = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-    out.render(f, content, form.focus(), hits);
+    let skip = scroll(&controls, form.focus(), content.height as usize);
+    f.render_widget(Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()), content);
+    for (_, _, line, x, w, focus) in controls {
+        let Some(y) = line.checked_sub(skip) else {
+            continue;
+        };
+        if y < content.height as usize {
+            hits.push((Rect { x: content.x + x, y: content.y + y as u16, width: w.max(1), height: 1 }, focus));
+        }
+    }
 }
 
 /// The spinner's frame `elapsed` into a check.
 fn spinner(elapsed: Option<Duration>) -> char {
     let tenths = elapsed.map_or(0, |e| e.as_millis() / 100) as usize;
     SPINNER[tenths % SPINNER.len()]
+}
+
+/// The lines to skip so the focused control's block (its line and what's
+/// said under it) shows in `height` rows: its end when it fits, else its
+/// start.
+fn scroll(controls: &[(usize, usize, usize, u16, u16, Focus)], focus: Focus, height: usize) -> usize {
+    let Some(&(first, end, ..)) = controls.iter().find(|c| c.5 == focus) else {
+        return 0;
+    };
+    if end <= height {
+        0
+    } else if end - first <= height {
+        end - height
+    } else {
+        first
+    }
 }
 
 #[cfg(test)]
@@ -452,5 +470,18 @@ mod tests {
             delete_word(&mut text);
             assert_eq!(text, to, "from {from:?}");
         }
+    }
+
+    #[test]
+    fn scrolling_keeps_the_focused_block_in_view() {
+        let controls = [
+            (0, 3, 0, 0, 1, Focus::Field(Field::Name)),
+            (3, 9, 3, 0, 1, Focus::Field(Field::WorkDir)),
+            (12, 13, 12, 0, 1, Focus::Submit),
+        ];
+        assert_eq!(scroll(&controls, Focus::Field(Field::Name), 5), 0);
+        assert_eq!(scroll(&controls, Focus::Field(Field::WorkDir), 6), 3, "the block's end shows");
+        assert_eq!(scroll(&controls, Focus::Field(Field::WorkDir), 4), 3, "too tall: its start");
+        assert_eq!(scroll(&controls, Focus::Submit, 5), 8);
     }
 }

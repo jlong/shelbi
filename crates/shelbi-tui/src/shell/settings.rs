@@ -89,13 +89,11 @@ use shelbi_state::agents_config::AgentsConfig;
 
 use super::keybindings::{KeysAction, KeysPage};
 use crate::panel::{self, PAD};
-use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
 mod agent_editor;
 mod agents;
 mod machine_form;
-mod modal_form;
 mod workflow_editor;
 mod workflows;
 pub(crate) mod workspaces;
@@ -1329,7 +1327,8 @@ impl SettingsShell {
     }
 
     /// General's rows: the theme and the editor (once `config.yaml` reads),
-    /// Edit config.yaml, then the summary's actions.
+    /// Edit config.yaml, the summary's actions, then About Shelbi (always:
+    /// it reads nothing).
     fn general_actions(&self) -> Vec<PageAction> {
         let mut out = Vec::new();
         if let JobState::Done(summary) = self.general.state() {
@@ -1351,6 +1350,11 @@ impl SettingsShell {
             });
         }
         out.extend(self.summary_actions());
+        out.push(PageAction {
+            label: "About Shelbi".into(),
+            note: Some(shelbi_app::about::version_line(crate::overlay::about::VERSION)),
+            does: Does::Run(Effect::OpenAbout),
+        });
         out
     }
 
@@ -2036,7 +2040,7 @@ impl SettingsShell {
                     let width = rect.width as usize;
                     match &actions[a].does {
                         Does::Theme => {
-                            let (line, segments) = theme_line(self.form.theme(), selected, width);
+                            let (line, segments) = theme_line(self.form.theme(), selected, label_width(width), width);
                             for (x, w, theme) in segments {
                                 if x + w <= rect.width {
                                     self.hits.push((Rect { x: rect.x + x, width: w, ..rect }, Hit::Theme(theme)));
@@ -2044,8 +2048,7 @@ impl SettingsShell {
                             }
                             line
                         }
-                        // The field's rows come drawn (`general_rows`).
-                        Does::Editor => row.line.clone(),
+                        Does::Editor => editor_line(&self.form, selected, label_width(width), width),
                         _ => action_line(&actions[a], selected, width),
                     }
                 }
@@ -2073,10 +2076,7 @@ impl SettingsShell {
     /// The shown page's rows at `width` (`height` rows of content).
     fn page_rows(&mut self, width: usize, height: usize, actions: &[PageAction]) -> Vec<Row> {
         match self.nav.page() {
-            SettingsPage::General => {
-                let focus = (self.region == Region::Page).then_some(self.action);
-                general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions, focus)
-            }
+            SettingsPage::General => general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions),
             SettingsPage::Terminal => terminal_rows(width),
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Agents => {
@@ -2276,7 +2276,6 @@ fn general_rows(
     save_error: Option<&str>,
     width: usize,
     actions: &[PageAction],
-    focus: Option<usize>,
 ) -> Vec<Row> {
     let at = |does: &Does| actions.iter().position(|a| a.does == *does);
     let action_row = |i: usize| Row::item(Line::raw(""), i);
@@ -2327,8 +2326,6 @@ fn general_rows(
         }
         if let Some(i) = at(&Does::Theme) {
             heading(&mut rows, "Appearance");
-            // The label over its control, as the fields read.
-            rows.push(Row::text(textbox::label("Theme", focus == Some(i), false, width)));
             rows.push(action_row(i));
             wrapped(
                 &mut rows,
@@ -2340,7 +2337,7 @@ fn general_rows(
         }
         if let Some(i) = at(&Does::Editor) {
             heading(&mut rows, "Editor");
-            editor_rows(&mut rows, form, focus == Some(i), i, width);
+            rows.push(action_row(i));
             if form.draft().is_some() {
                 wrapped(&mut rows, "⏎ saves · Esc puts it back · blank clears it", width, Style::default().fg(palette().yellow));
             } else {
@@ -2410,21 +2407,27 @@ fn general_rows(
             Some(Ok(p)) => project_rows(&mut rows, p, label_w, width),
         }
     }
-    // The summary's own actions, after everything above.
-    let first = actions
+    // The summary's own actions, after everything above, then About.
+    let about = at(&Does::Run(Effect::OpenAbout)).unwrap_or(actions.len());
+    let first = actions[..about]
         .iter()
         .position(|a| matches!(a.does, Does::Run(_) | Does::Reload))
-        .unwrap_or(actions.len());
-    if first < actions.len() {
+        .unwrap_or(about);
+    if first < about {
         rows.push(Row::blank());
         let title = match job.done().and_then(|s| s.project.as_ref()) {
             Some(Ok(_)) => "Open in editor",
             _ => "What you can do",
         };
         heading(&mut rows, title);
-        for i in first..actions.len() {
+        for i in first..about {
             rows.push(action_row(i));
         }
+    }
+    if about < actions.len() {
+        rows.push(Row::blank());
+        heading(&mut rows, "About");
+        rows.push(action_row(about));
     }
     rows
 }
@@ -2628,12 +2631,29 @@ fn label_width(width: usize) -> usize {
     17.min(width / 2)
 }
 
-/// The theme's segmented control, under its label: `Auto  Dark  Light`,
-/// the chosen one filled. Returns the line and each segment's column, width
-/// and theme.
-fn theme_line(chosen: ThemePreference, selected: bool, width: usize) -> (Line<'static>, Vec<(u16, u16, ThemePreference)>) {
-    let mut x = 0;
-    let mut spans = Vec::new();
+/// The focus marker and, when there is room for it beside the control, the
+/// row's label in its column.
+fn item_label(label: &str, selected: bool, label_w: usize, width: usize) -> String {
+    let marker = if selected { "› " } else { "  " };
+    if width >= 36 {
+        let w = label_w.saturating_sub(2);
+        format!("{marker}{:<w$}", panel::truncate_right(label, w.saturating_sub(1)))
+    } else {
+        marker.to_string()
+    }
+}
+
+/// The theme's segmented control: `› Theme   Auto  Dark  Light`, the chosen
+/// one filled. Returns the line and each segment's column, width and theme.
+fn theme_line(chosen: ThemePreference, selected: bool, label_w: usize, width: usize) -> (Line<'static>, Vec<(u16, u16, ThemePreference)>) {
+    let left = item_label("Theme", selected, label_w, width);
+    let label_style = if selected {
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().gray)
+    };
+    let mut x = panel::display_width(&left);
+    let mut spans = vec![Span::styled(left, label_style)];
     let mut segments = Vec::new();
     for theme in general::THEMES {
         let text = format!(" {} ", general::theme_label(theme));
@@ -2654,64 +2674,45 @@ fn theme_line(chosen: ThemePreference, selected: bool, width: usize) -> (Line<'s
     (Line::from(spans), segments)
 }
 
-/// A text field's rows on a page: its label, then `field`'s box (as wide as
-/// the page, up to [`textbox::MAX_W`]), every row item `action`'s so a click
-/// anywhere on it lands there. The box's text row holds the page's focus
-/// while it's typed in.
-pub(crate) fn field_rows(rows: &mut Vec<Row>, label: &str, field: Textbox<'_>, focused: bool, disabled: bool, action: Option<usize>, width: usize) {
-    rows.push(Row { action, ..Row::text(textbox::label(label, focused, disabled, width)) });
-    box_rows(rows, field, action, width);
-}
-
-/// [`field_rows`] without the label: a box under one label it shares (a
-/// list of commands).
-pub(crate) fn box_rows(rows: &mut Vec<Row>, field: Textbox<'_>, action: Option<usize>, width: usize) {
-    for (n, line) in field.lines(width.min(textbox::MAX_W)).into_iter().enumerate() {
-        rows.push(Row { action, focus: field.typing() && n == 1, ..Row::text(line) });
-    }
-}
-
-/// The scroll that keeps item `action`'s rows in `height` rows from
-/// `scroll`: all of them (a field's label and box), with the lines said
-/// under them when they fit, and at least one line below, since the last
-/// line shows "↓ more" while rows are clipped below.
-pub(crate) fn follow(rows: &[Row], action: usize, scroll: u16, height: u16) -> u16 {
-    let Some(at) = rows.iter().position(|r| r.action == Some(action)) else {
-        return scroll;
-    };
-    let own = rows.iter().skip(at).take_while(|r| r.action == Some(action)).count().max(1);
-    let notes = rows.iter().skip(at + own).take_while(|r| r.action.is_none() && !r.focus).count();
-    let end = (own - 1 + notes.clamp(1, 3)) as u16;
-    let at = at as u16;
-    if at < scroll {
-        at
-    } else if at + end >= scroll + height {
-        (at + end + 1).saturating_sub(height).min(at)
+/// The editor command's row: its value (or "Not set"), or, while it is
+/// typed, the field with its caret, scrolled to keep the caret in view.
+fn editor_line(form: &GeneralForm, selected: bool, label_w: usize, width: usize) -> Line<'static> {
+    let left = item_label("Command", selected, label_w, width);
+    let room = width.saturating_sub(panel::display_width(&left)).max(1);
+    let label_style = if selected {
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD)
     } else {
-        scroll
+        Style::default().fg(palette().gray)
+    };
+    let mut spans = vec![Span::styled(left, label_style)];
+    match form.draft() {
+        Some(field) => {
+            let chars: Vec<char> = field.text().chars().collect();
+            let caret = field.caret();
+            let start = (caret + 1).saturating_sub(room);
+            let shown: String = chars.iter().skip(start).take(room).collect();
+            let at = caret - start;
+            let before: String = shown.chars().take(at).collect();
+            let under: String = shown.chars().nth(at).map_or(" ".to_string(), String::from);
+            let after: String = shown.chars().skip(at + 1).collect();
+            let fill = Style::default().fg(palette().white).bg(palette().selection);
+            spans.push(Span::styled(before, fill));
+            spans.push(Span::styled(under, fill.add_modifier(Modifier::REVERSED)));
+            let used = at + 1 + after.chars().count();
+            spans.push(Span::styled(format!("{after}{}", " ".repeat(room.saturating_sub(used))), fill));
+        }
+        None => match form.editor() {
+            Some(command) => spans.push(Span::styled(
+                panel::truncate_right(command, room),
+                Style::default().fg(if selected { palette().white } else { palette().foreground }),
+            )),
+            None => spans.push(Span::styled(
+                panel::truncate_right("Not set", room),
+                Style::default().fg(palette().muted).add_modifier(Modifier::ITALIC),
+            )),
+        },
     }
-}
-
-/// A picker's rows on a page: its label over a box holding the choice, a
-/// `▾` at its right (a `dim` one can't be changed now).
-pub(crate) fn picker_rows(rows: &mut Vec<Row>, label: &str, value: &str, focused: bool, dim: bool, action: Option<usize>, width: usize) {
-    let field = Textbox::new(value).focused(focused).disabled(dim).trail("▾");
-    field_rows(rows, label, field, focused, dim, action, width);
-}
-
-/// The editor command's field: its label over a textbox holding the
-/// command ("Not set" when there's none), the caret in it while it's typed.
-/// Every row is action `i`'s, so a click anywhere on it lands there.
-fn editor_rows(rows: &mut Vec<Row>, form: &GeneralForm, selected: bool, i: usize, width: usize) {
-    let draft = form.draft();
-    let typed = draft.map(|d| d.text());
-    let field = match (draft, &typed) {
-        (Some(d), Some(text)) => Textbox::new(text).caret(Some(d.caret())),
-        _ => Textbox::new(form.editor().unwrap_or("")),
-    }
-    .placeholder("Not set")
-    .focused(selected);
-    field_rows(rows, "Command", field, selected, false, Some(i), width);
+    Line::from(spans)
 }
 
 /// An action row: `› label   note`, the selection fill when focused.
@@ -3069,12 +3070,16 @@ mod tests {
     #[test]
     fn page_actions_follow_the_loaded_summary() {
         let mut s = SettingsShell::default();
-        assert!(s.actions().is_empty(), "nothing to do while loading");
+        let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
+        assert_eq!(labels, ["About Shelbi"], "only About (it reads nothing) while loading");
         let t = s.begin_load(Some("proj"), false).expect("a first load");
         assert!(s.begin_load(Some("proj"), false).is_none(), "already loading for proj");
         assert!(s.loaded(&t, Ok(fixture_summary(Some("proj")))));
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
-        assert_eq!(labels, ["Theme", "Command", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode"]);
+        assert_eq!(
+            labels,
+            ["Theme", "Command", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode", "About Shelbi"]
+        );
         let km = keymaps();
         s.set_region(Region::Page);
         for _ in 0..4 {
@@ -3087,11 +3092,18 @@ mod tests {
             })
         );
         assert_eq!(s.handle_key(key(KeyCode::Char('r')), &km), SettingsAction::Reload);
+        // The last row opens About Shelbi.
+        assert_eq!(s.run_action(s.actions().len() - 1), SettingsAction::Run(Effect::OpenAbout));
+        let text = screen(&mut s, 100, 60);
+        assert!(text.contains("About Shelbi  Version "), "{text}");
         // No project: switch or add one.
         let t = s.begin_load(None, true).unwrap();
         s.loaded(&t, Ok(fixture_summary(None)));
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
-        assert_eq!(labels, ["Theme", "Command", "Edit config.yaml", "Switch project…", "Add project…"]);
+        assert_eq!(
+            labels,
+            ["Theme", "Command", "Edit config.yaml", "Switch project…", "Add project…", "About Shelbi"]
+        );
         // A failed read offers Try again.
         let t = s.begin_load(Some("proj"), true).unwrap();
         s.loaded(&t, Err("gone".into()));
@@ -3260,31 +3272,6 @@ mod tests {
     }
 
     #[test]
-    fn a_click_anywhere_on_the_command_field_types_in_it() {
-        let mut s = on_general(fixture_summary(Some("proj")));
-        let km = keymaps();
-        let text = screen(&mut s, 100, 30);
-        let label = text.lines().position(|l| l.trim_end().ends_with("  Command")).unwrap_or_else(|| panic!("{text}"));
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[label + 1].contains("▄▄▄▄") && lines[label + 3].contains("▀▀▀▀"), "{text}");
-        let side = Rect::new(0, 0, 28, 30);
-        let main = Rect::new(28, 0, 72, 30);
-        for y in label + 1..=label + 3 {
-            assert!(!s.typing());
-            let click = MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 60,
-                row: y as u16,
-                modifiers: KeyModifiers::NONE,
-            };
-            s.handle_mouse(click, side, main);
-            assert!(s.typing(), "a click on row {y} types in the field");
-            s.handle_key(key(KeyCode::Esc), &km);
-            screen(&mut s, 100, 30);
-        }
-    }
-
-    #[test]
     fn the_editor_takes_every_key_while_typed_and_saves_only_on_enter() {
         let mut s = on_general(fixture_summary(Some("proj")));
         let km = keymaps();
@@ -3362,7 +3349,7 @@ mod tests {
         let mut s = on_general(summary);
         assert_eq!(s.take_theme(), None, "nothing to apply from a file that doesn't read");
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
-        assert_eq!(labels, ["Edit config.yaml", "Edit Project Settings", "Edit Zen Mode"]);
+        assert_eq!(labels, ["Edit config.yaml", "Edit Project Settings", "Edit Zen Mode", "About Shelbi"]);
         let text = screen(&mut s, 100, 30);
         assert!(text.contains("config.yaml doesn't read: did not find expected key"), "{text}");
         assert_eq!(
