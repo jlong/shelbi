@@ -102,6 +102,7 @@ use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::update::{self as update_view, UpdateState};
 use crate::views::workspace_dialog::{Body as DialogBody, WorkspaceDialog, WorkspaceDialogEvent};
+use crate::views::feedback::{FeedbackDialog, FeedbackEvent};
 use shelbi_app::settings::workspaces::Intent;
 use shelbi_state::keymap::{
     DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
@@ -791,6 +792,9 @@ pub struct ShelbiWindow {
     /// The New / Edit workspace dialog or a removal's confirmation, over the
     /// whole window while Settings shows.
     pool_dialog: Option<(Entity<WorkspaceDialog>, Subscription)>,
+    /// Contact Us, over the whole window, with the focus to hand back when
+    /// it closes. It belongs to no project, so a switch keeps it.
+    feedback: Option<(Entity<FeedbackDialog>, Subscription, Option<FocusHandle>)>,
     /// How often a pool change asked the feed for a refresh.
     #[cfg(test)]
     pool_refreshes: usize,
@@ -1002,6 +1006,7 @@ impl ShelbiWindow {
             #[cfg(test)]
             pool_forms: Vec::new(),
             pool_dialog: None,
+            feedback: None,
             #[cfg(test)]
             pool_refreshes: 0,
             drawn_once: false,
@@ -2219,6 +2224,46 @@ impl ShelbiWindow {
     #[cfg(test)]
     pub(crate) fn pool_dialog(&self) -> Option<Entity<WorkspaceDialog>> {
         self.pool_dialog.as_ref().map(|(d, _)| d.clone())
+    }
+
+    /// Open Contact Us (the sidebar footer's megaphone, Help ▸ Send
+    /// Feedback…) over the window, closing an overlay first. It waits while
+    /// another dialog is up, and opens once.
+    pub(crate) fn open_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let machine_form = matches!(&self.route, Route::Settings(view) if view.read(cx).machine_form().is_some());
+        if self.feedback.is_some() || self.pool_dialog.is_some() || machine_form {
+            return;
+        }
+        if self.overlay.is_some() {
+            self.close_overlay(window, cx);
+        }
+        let restore = window.focused(cx);
+        let dialog = cx.new(|cx| FeedbackDialog::new(window, cx));
+        let sub = cx.subscribe_in(&dialog, window, |this, _, event: &FeedbackEvent, window, cx| match event {
+            FeedbackEvent::Closed => this.close_feedback(window, cx),
+        });
+        self.feedback = Some((dialog, sub, restore));
+        cx.notify();
+    }
+
+    /// Contact Us closed: drop it and give the keyboard back to where it was.
+    fn close_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, _, Some(restore))) = self.feedback.take() {
+            window.focus(&restore, cx);
+        }
+        cx.notify();
+    }
+
+    /// The open Contact Us dialog (`--visual-figma`).
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_feedback(&self) -> Option<Entity<FeedbackDialog>> {
+        self.feedback.as_ref().map(|(d, _, _)| d.clone())
+    }
+
+    /// The open Contact Us dialog (tests).
+    #[cfg(test)]
+    pub(crate) fn feedback(&self) -> Option<Entity<FeedbackDialog>> {
+        self.feedback.as_ref().map(|(d, _, _)| d.clone())
     }
 
     /// The project's workspaces or machines changed on disk: read the feed
@@ -3857,6 +3902,21 @@ impl ShelbiWindow {
     /// A menu item: a registry command runs exactly as the palette runs it.
     fn menu_invoke(&mut self, invoke: &menus::MenuInvoke, window: &mut Window, cx: &mut Context<Self>) {
         use menus::tree::{AppCommand, MenuAction};
+        // Contact Us is modal like a workspace dialog: ⌘W cancels it, the
+        // rest wait (Help ▸ Send Feedback… included: it's already open).
+        if let Some((dialog, _, _)) = &self.feedback {
+            match &invoke.target {
+                MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
+                MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
+                MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette | AppCommand::SendFeedback)
+                | MenuAction::Command(_) => {}
+                MenuAction::App(other) => {
+                    menus::run_app_command(*other, cx);
+                }
+            }
+            return;
+        }
         // A workspace dialog is modal: ⌘W closes it (discarding its draft);
         // the menus' commands wait until it's gone.
         if let Some((dialog, _)) = &self.pool_dialog {
@@ -3864,7 +3924,8 @@ impl ShelbiWindow {
                 MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
                 MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
-                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette) | MenuAction::Command(_) => {}
+                MenuAction::App(AppCommand::Settings | AppCommand::CommandPalette | AppCommand::SendFeedback)
+                | MenuAction::Command(_) => {}
                 MenuAction::App(other) => {
                     menus::run_app_command(*other, cx);
                 }
@@ -3885,6 +3946,7 @@ impl ShelbiWindow {
             }
             MenuAction::App(command) => match command {
                 AppCommand::Settings => self.open_settings(None, window, cx),
+                AppCommand::SendFeedback => self.open_feedback(window, cx),
                 AppCommand::CloseWindow => self.close_window(window, cx),
                 AppCommand::Minimize => window.minimize_window(),
                 AppCommand::Zoom => window.zoom_window(),
@@ -3949,7 +4011,7 @@ impl ShelbiWindow {
         }
         // A workspace dialog is modal: it takes its keys ahead of everything
         // (`WorkspaceDialog::key`), and nothing behind it gets any.
-        if self.pool_dialog.is_some() {
+        if self.pool_dialog.is_some() || self.feedback.is_some() {
             return;
         }
         let Some(chord) = chord else {
@@ -4284,6 +4346,7 @@ impl SidebarHost for ShelbiWindow {
             SidebarEvent::ToggleZen => self.run(CommandKind::ToggleZen, window, cx),
             SidebarEvent::OpenErrors => self.run(CommandKind::OpenErrorLog, window, cx),
             SidebarEvent::OpenSettings => self.open_settings(None, window, cx),
+            SidebarEvent::SendFeedback => self.open_feedback(window, cx),
             SidebarEvent::Collapse => self.toggle_sidebar(cx),
             SidebarEvent::LeaveSettings => self.leave_settings(window, cx),
             SidebarEvent::ShowSettingsPage(page) => self.show_settings_page(page, cx),
@@ -4664,6 +4727,8 @@ impl ShelbiWindow {
             dialog.update(cx, |d, _| d.set_inset(inset));
             dialog.clone()
         });
+        // Contact Us, over the whole window.
+        let feedback = self.feedback.as_ref().map(|(dialog, _, _)| dialog.clone());
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
         let layer = self.overlay.as_ref().map(|o| {
@@ -4733,6 +4798,7 @@ impl ShelbiWindow {
             .child(shell.flex_1().min_h_0())
             .children(machine_form)
             .children(pool_dialog)
+            .children(feedback)
             .children(layer)
             .children(probe)
             .into_any_element()
@@ -5010,6 +5076,10 @@ mod sidebar_tests;
 #[cfg(test)]
 #[path = "app_settings_tests.rs"]
 mod settings_tests;
+
+#[cfg(test)]
+#[path = "app_feedback_tests.rs"]
+mod feedback_tests;
 
 #[cfg(test)]
 #[path = "app_fold_tests.rs"]

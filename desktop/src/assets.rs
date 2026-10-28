@@ -352,6 +352,11 @@ heroicons! {
     USER = "user";
     MAGNIFYING_GLASS = "magnifying-glass";
     COG_6_TOOTH = "cog-6-tooth";
+    /// The sidebar footer's Send Feedback and the Contact Us dialog's
+    /// header.
+    MEGAPHONE = "megaphone";
+    /// Contact Us' thank-you.
+    HEART = "heart";
     CHEVRON_UP_DOWN = "chevron-up-down";
     CHECK = "check";
     SIGNAL_SLASH = "signal-slash";

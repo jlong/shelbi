@@ -99,6 +99,8 @@ pub enum AppCommand {
     FontActualSize,
     Documentation,
     ReportIssue,
+    /// Help ▸ Send Feedback…: Contact Us over the key window.
+    SendFeedback,
 }
 
 /// A key equivalent: the gpui keystroke it is bound as and how it reads.
@@ -623,6 +625,7 @@ fn help_menu() -> MenuSpec {
         items: vec![
             app("Shelbi Documentation", AppCommand::Documentation),
             app("Report an Issue", AppCommand::ReportIssue),
+            app("Send Feedback\u{2026}", AppCommand::SendFeedback),
         ],
     }
 }

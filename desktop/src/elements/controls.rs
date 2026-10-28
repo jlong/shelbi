@@ -12,6 +12,7 @@
 //!   `textbox` well (5px corners inside 6), its text Base in `form_text`, or
 //!   `form_hint` for a placeholder; focused, the edge is the
 //!   `focus/default/ring` with the 3px `focus-glow` around it;
+//!   [`textarea_box`] is its multi-line form (Contact Us' Message);
 //! - [`picker`] (`2238:25517`): a textbox with a [`form_button`] after it,
 //!   8px apart, [`CONTROL_W`] wide;
 //! - [`form_button`] and [`form_icon_button`]: the Button component's
@@ -218,6 +219,34 @@ fn edged_textbox(content: impl IntoElement, edge: Hsla, glow_color: Option<Hsla>
                 .child(content),
         )
         .children(glow_color.map(|color| glow(6.0, color)))
+}
+
+/// A multi-line [`textbox`] around `content` (a `Textarea` with its
+/// appearance off): the same 1px edge, `textbox` well and focus glow, as
+/// tall as its content (the caller sets its width).
+pub fn textarea_box(content: impl IntoElement, focused: bool, theme: &Theme) -> Div {
+    let edge = if focused { theme.focus_ring } else { theme.input_border };
+    div()
+        .relative()
+        .flex()
+        .flex_row()
+        .p(px(1.0))
+        .rounded(px(6.0))
+        .bg(edge)
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(5.0))
+                .bg(theme.textbox)
+                .type_style(Type::Base)
+                .text_color(theme.form_text)
+                .child(content),
+        )
+        .children(focused.then(|| glow(6.0, theme.focus_glow)))
 }
 
 /// A picker: `textbox` (it grows) and `button` after it, [`CONTROL_W`]
