@@ -4518,10 +4518,12 @@ fi
 LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
 LOG=.shelbi/messages/$TASK_ID.log
 # A pid file can outlive its tail and the OS may have reused the pid, so only
-# ever signal a pid whose command line is still exactly this task's tail.
+# ever signal a pid whose command line is still this task's tail (either form:
+# `-n 0` is what hooks started before the relay pinned its start offset).
 is_task_tail() {
   case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
   case "$(ps -ww -o command= -p "$1" 2>/dev/null)" in
+    "tail -f -c +"[0-9]*" $LOG"|*/"tail -f -c +"[0-9]*" $LOG") return 0 ;;
     "tail -f -n 0 $LOG"|*/"tail -f -n 0 $LOG") return 0 ;;
   esac
   return 1
@@ -4533,7 +4535,11 @@ if [ -f "$LOCKDIR/pid" ]; then
 fi
 mkdir -p "$LOCKDIR"
 touch "$LOG"
-tail -f -n 0 "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
+# Relay from the log's end as of now, not wherever it is once `tail` gets
+# around to opening the file: on a loaded machine that can be after this hook
+# returns, and a message appended in between would never be relayed.
+START=$(($(wc -c < "$LOG") + 1))
+tail -f -c +$START "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
 TAIL_PID=$!
 echo "$TAIL_PID" > "$LOCKDIR/pid"
 # Watchdog: the tail must not outlive the agent session that started it.
@@ -4740,8 +4746,9 @@ fn deploy_runner_hook_file(host: &Host, worktree: &Path, file: &RunnerHookFile) 
 /// Stops leftover message tails in one worktree. Arguments: `$1` the
 /// worktree, `$2` the task whose lock to leave alone (empty sweeps them all).
 /// One line per lock visited: `<verdict> <pid|-> <task-id>`. A pid is
-/// signalled only while its command line is exactly that task's `tail -f`, the
-/// same check the SessionStart hook makes, so a recycled pid is never hit.
+/// signalled only while its command line is that task's `tail -f` (current
+/// `-c +<offset>` form or the older hooks' `-n 0`), the same check the
+/// SessionStart hook makes, so a recycled pid is never hit.
 const MESSAGE_TAIL_SWEEP_SH: &str = r#"MSGS=$1/.shelbi/messages
 KEEP=$2
 for LOCK in "$MSGS"/*.tail.d; do
@@ -4756,6 +4763,7 @@ for LOCK in "$MSGS"/*.tail.d; do
     *)
       if kill -0 "$PID" 2>/dev/null; then
         case "$(ps -ww -o command= -p "$PID" 2>/dev/null)" in
+          "tail -f -c +"[0-9]*" .shelbi/messages/$ID.log"|*/"tail -f -c +"[0-9]*" .shelbi/messages/$ID.log"|\
           "tail -f -n 0 .shelbi/messages/$ID.log"|*/"tail -f -n 0 .shelbi/messages/$ID.log")
             kill "$PID" 2>/dev/null && VERDICT=stopped ;;
           *) VERDICT=foreign ;;
@@ -10178,7 +10186,7 @@ statuses:
         let read_pid =
             || -> Option<u32> { std::fs::read_to_string(&pid_path).ok()?.trim().parse().ok() };
         assert!(
-            wait_until(10, || read_pid().is_some()),
+            wait_until(30, || read_pid().is_some()),
             "hook never wrote the tail pid"
         );
         let tail_pid = read_pid().unwrap();
@@ -10187,7 +10195,9 @@ statuses:
             "tail should run while its session is alive"
         );
 
-        // The channel still works while the session lives.
+        // The channel still works while the session lives. The hook pinned the
+        // relay's start offset before writing the pid, so this line is relayed
+        // even if `tail` hasn't opened the log yet.
         let mut log = std::fs::OpenOptions::new()
             .append(true)
             .open(worktree.join(".shelbi/messages/feat-x.log"))
@@ -10195,7 +10205,7 @@ statuses:
         std::io::Write::write_all(&mut log, b"{\"msg_id\":\"m-1\"}\n").unwrap();
         let unread = worktree.join(".shelbi/messages/feat-x.unread.log");
         assert!(
-            wait_until(5, || std::fs::read_to_string(&unread)
+            wait_until(30, || std::fs::read_to_string(&unread)
                 .unwrap_or_default()
                 .contains("m-1")),
             "tail should stream new log lines into unread.log"
@@ -10209,13 +10219,76 @@ statuses:
         );
 
         reap(&mut session);
-        let stopped = wait_until(10, || !process_alive(tail_pid) && !lock.exists());
+        let stopped = wait_until(30, || !process_alive(tail_pid) && !lock.exists());
         if !stopped && process_alive(tail_pid) {
             unsafe { libc::kill(tail_pid as libc::pid_t, libc::SIGTERM) };
         }
         assert!(
             stopped,
             "tail {tail_pid} and its lock must go once the session exits"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The race behind the watchdog test's old flake: the hook returns (and
+    /// its pid file appears) before the backgrounded `tail` has opened the log.
+    /// A `tail` that takes a second to start stands in for a loaded machine. A
+    /// line appended in that gap must still be relayed, and a line already in
+    /// the log before the hook ran must not be.
+    #[test]
+    fn session_start_hook_relays_lines_appended_before_tail_starts() {
+        let tmp = agent_test_tmpdir("tail-slow-start");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+        let msgs = worktree.join(".shelbi/messages");
+        std::fs::create_dir_all(&msgs).unwrap();
+        std::fs::write(msgs.join("feat-x.log"), "{\"msg_id\":\"m-0\"}\n").unwrap();
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        let bin = tmp.join("slow-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let slow_tail = bin.join("tail");
+        std::fs::write(
+            &slow_tail,
+            format!("#!/bin/sh\nsleep 1\nPATH='{path}' exec tail \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &slow_tail,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(".shelbi/hooks/session-start.sh")
+            .env("TASK_ID", "feat-x")
+            .env("PATH", format!("{}:{path}", bin.display()))
+            .current_dir(&worktree)
+            .output()
+            .expect("run hook");
+        assert!(out.status.success(), "hook must succeed: {:?}", out.status);
+        let pid: u32 = std::fs::read_to_string(msgs.join("feat-x.tail.d/pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(msgs.join("feat-x.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut log, b"{\"msg_id\":\"m-1\"}\n").unwrap();
+        let unread = || std::fs::read_to_string(msgs.join("feat-x.unread.log")).unwrap_or_default();
+        let relayed = wait_until(30, || unread().contains("m-1"));
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        assert!(relayed, "a line appended before tail started was dropped");
+        assert!(
+            !unread().contains("m-0"),
+            "lines already in the log must not be relayed: {:?}",
+            unread()
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -10257,7 +10330,8 @@ statuses:
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The dispatch sweep stops earlier tasks' tails and clears their locks,
+    /// The dispatch sweep stops earlier tasks' tails (the current hook's
+    /// `-c +<offset>` form and older hooks' `-n 0`) and clears their locks,
     /// keeps the task being started, and never signals a pid whose command
     /// line isn't that task's tail: a recycled pid (a `sleep`) and another
     /// task's tail recorded under the wrong lock both survive.
@@ -10273,7 +10347,7 @@ statuses:
         let tail = |id: &str| format!(".shelbi/messages/{id}.log");
 
         let mut old_a = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("old-a")]);
-        let mut old_b = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("old-b")]);
+        let mut old_b = spawn_quiet(&worktree, &["tail", "-f", "-c", "+1", &tail("old-b")]);
         let mut keep = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("keep-me")]);
         let mut recycled = spawn_quiet(&worktree, &["sleep", "30"]);
         let mut other_tail = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("other")]);
