@@ -10,6 +10,13 @@ The Builder edits the Form's draft (`EditorState`) through the same `Change`s,
 so Save, Discard and the leave prompt are the Form's, and an edit in either
 view shows in the other.
 
+Since `tui-workflow-editor-builder` its toolkit-free halves,
+`workflow_graph` and `workflow_builder_state`, live in
+`shelbi_app::settings::{workflow_graph, workflow_builder}` (the desktop
+re-exports them under their old paths) so the TUI's Builder draws and
+selects the same way; see
+[`tui-workflow-editor-builder.md`](tui-workflow-editor-builder.md).
+
 ## The change
 
 **Where it lives.** `views/workflow_graph.rs` (toolkit-free): the layout,

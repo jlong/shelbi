@@ -26,11 +26,7 @@ pub(crate) mod tests {
     pub(crate) const PROJECT: &str = "my-project";
 
     impl Home {
-        pub(crate) fn new(tag: &str) -> Home {
-            Home::with_project(tag, PROJECT)
-        }
-
-        /// [`Home::new`] with the fixture project named `project`.
+        /// The fixture project, named `project` ([`PROJECT`] for most).
         pub(crate) fn with_project(tag: &str, project: &str) -> Home {
             let lock = crate::test_env::lock();
             let root = PathBuf::from(format!("/tmp/shb-wf-{tag}-{}", std::process::id()));

@@ -202,13 +202,25 @@ paths on every `cargo test`.
   and [`status/tui-settings-machine-readiness.md`](status/tui-settings-machine-readiness.md).
 - **The workflow editor** (`tui-workflow-editor-form`): both clients edit
   one draft (`shelbi_app::settings::workflow_editor`: the changes, the text
-  form, Save, Discard, the leave prompt, the guards). The TUI has the Form
-  only until its Builder lands, reaches a row's cells through its keys or
-  menu (the desktop has a picker per cell and drags), lists Run commands one
-  per row, asks before Delete, asks Reload or Keep editing on an on-disk
-  conflict (the desktop points at Discard), and asks before a project
-  switch. See
+  form, Save, Discard, the leave prompt, the guards). The TUI's Form
+  reaches a row's cells through its keys or menu (the desktop has a picker
+  per cell and drags), lists Run commands one per row, asks before Delete,
+  asks Reload or Keep editing on an on-disk conflict (the desktop points at
+  Discard), and asks before a project switch. See
   [`status/tui-workflow-editor-form.md`](status/tui-workflow-editor-form.md).
+- **The workflow Builder** (`tui-workflow-editor-builder`): both clients
+  draw the same graph (`shelbi_app::settings::workflow_graph`'s columns and
+  rows) and select, draw and step back the same way
+  (`settings::workflow_builder`). The TUI's editor **opens on the Form**
+  (`v` or the header's Builder | Form for the Builder) where the desktop's
+  opens on the Builder: in a terminal the rows are the more usable start.
+  The TUI lays the graph out in cells (no zoom or Fit; Shift+arrows, Home
+  and the wheel scroll), reaches transitions with `]` / `[`, uses Tab for
+  header / canvas / panel (the desktop's Tab walks nodes), edits a
+  transition's Details in its panel too, reorders actions with
+  Shift/Alt+↑↓ (no drag), and puts the panel in the canvas's place below
+  104 columns (← Graph goes back). See
+  [`status/tui-workflow-editor-builder.md`](status/tui-workflow-editor-builder.md).
 - **Editors**: the TUI hands its terminal to the editor and waits; the desktop
   opens a terminal editor in Terminal.app and a GUI editor directly. Both
   open the same path (`shelbi_app::command_model::edit_target_path`) with the

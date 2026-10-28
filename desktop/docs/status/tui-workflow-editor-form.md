@@ -199,9 +199,9 @@ are clickable; the wheel scrolls without moving the focus.
 
 ## Intentional differences from the desktop
 
-- **No Builder yet.** The TUI offers Form only (`workflow_editor::VIEWS`);
-  the Builder | Form control joins the header when the Builder follow-up
-  lands, over the same `EditorState`.
+- **Opens on the Form.** The Builder followed (`tui-workflow-editor-builder`,
+  `v` or the header's Builder | Form), over the same `EditorState`; the
+  desktop opens on the Builder.
 - **Rows instead of a table.** A status's owner, agent and tags, and a
   transition's endpoints, actions and details, are reached through the row's
   keys or menu (the desktop has a picker per cell and drags). Run commands

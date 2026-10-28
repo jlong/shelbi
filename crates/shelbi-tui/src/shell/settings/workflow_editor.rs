@@ -9,8 +9,10 @@
 //! `default` badge, then Save changes (dimmed while there's nothing to save,
 //! `Saving…` while a save runs), Discard (dimmed without unsaved edits) and
 //! the `⋮ Actions` menu (Edit YAML, Duplicate, Set as default, Manage project
-//! statuses, Delete). The desktop's Builder | Form control joins it once the
-//! TUI has a Builder ([`VIEWS`]); both would edit this one draft.
+//! statuses, Delete), with the Builder | Form control ([`VIEWS`]; `v` from
+//! anywhere) between. Both views edit this one draft; the editor opens on
+//! the Form ([`OPENS_ON`]). The Builder is [`builder`]'s
+//! (`tui-workflow-editor-builder`).
 //!
 //! **The Form** scrolls under it, one focusable row per control, in the
 //! desktop's sections: Workflow (Name, Description, Initial status);
@@ -71,10 +73,14 @@ use super::workflows::{add_line, cell, error_rows, pad_selected, plain_line, Edi
 use super::{heading, render_band, selected_style, wrapped, Row, PROMPT_BUTTONS};
 use crate::panel::{self, PAD};
 use crate::theme::palette;
+use builder::state_workflow;
 
-/// The views the TUI's editor offers over the draft. The Builder (its own
-/// task) joins here; with two, the header shows the Builder | Form control.
-pub(crate) const VIEWS: &[Mode] = &[Mode::Form];
+/// The views the TUI's editor offers over the draft, in the header's
+/// Builder | Form control's order (the desktop's). It opens on the Form.
+pub(crate) const VIEWS: &[Mode] = &[Mode::Builder, Mode::Form];
+
+/// The view the editor opens on.
+pub(crate) const OPENS_ON: Mode = Mode::Form;
 
 /// A text field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +107,8 @@ pub(crate) enum Text {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Item {
     Back,
+    /// The Builder | Form control.
+    View,
     Save,
     Discard,
     Actions,
@@ -121,6 +129,33 @@ pub(crate) enum Item {
     ReviewMode,
     Zen,
     Delete,
+    // The Builder's (`builder`): its canvas, then its details panel's rows.
+    Canvas,
+    /// ← back to the status a transition panel came from, or (narrow) to
+    /// the graph.
+    PanelBack,
+    /// The Status panel's status picker (it moves the selection).
+    PanelStatus,
+    Owner(String),
+    Agent(String),
+    SetInitial(String),
+    /// An Outgoing transitions row.
+    Outgoing(usize),
+    /// Add transition from this status.
+    StartTransition(String),
+    RemoveStatus(String),
+    From(usize),
+    To(usize),
+    RemoveTransition(usize),
+    DrawFrom,
+    DrawTo,
+    NewFrom,
+    NewTo,
+    /// The new transition's action at this slot.
+    NewAction(usize),
+    NewAddAction,
+    CancelNew,
+    ConfirmNew,
 }
 
 /// The sections Tab steps through, top to bottom.
@@ -134,12 +169,14 @@ enum Section {
     Review,
     Automation,
     Manage,
+    Canvas,
+    Panel,
 }
 
 impl Item {
     fn section(&self) -> Section {
         match self {
-            Item::Back | Item::Save | Item::Discard | Item::Actions => Section::Header,
+            Item::Back | Item::View | Item::Save | Item::Discard | Item::Actions => Section::Header,
             Item::Text(Text::Name | Text::Description) | Item::InitialStatus => Section::Workflow,
             Item::Text(Text::Tags(_)) | Item::Status(_) | Item::AddStatus | Item::ManageStatuses => Section::Statuses,
             Item::Transition(_)
@@ -153,6 +190,26 @@ impl Item {
             Item::ReviewMode | Item::Text(Text::Review(_)) => Section::Review,
             Item::Zen | Item::Text(Text::Params) => Section::Automation,
             Item::Delete => Section::Manage,
+            Item::Canvas => Section::Canvas,
+            Item::PanelBack
+            | Item::PanelStatus
+            | Item::Owner(_)
+            | Item::Agent(_)
+            | Item::SetInitial(_)
+            | Item::Outgoing(_)
+            | Item::StartTransition(_)
+            | Item::RemoveStatus(_)
+            | Item::From(_)
+            | Item::To(_)
+            | Item::RemoveTransition(_)
+            | Item::DrawFrom
+            | Item::DrawTo
+            | Item::NewFrom
+            | Item::NewTo
+            | Item::NewAction(_)
+            | Item::NewAddAction
+            | Item::CancelNew
+            | Item::ConfirmNew => Section::Panel,
         }
     }
 }
@@ -171,6 +228,14 @@ enum Pick {
     MergeStrategy,
     ReviewMode,
     Zen,
+    // The Builder's panel.
+    PanelStatus,
+    DrawFrom,
+    DrawTo,
+    NewFrom,
+    NewTo,
+    NewSetAction(usize),
+    NewAddAction,
 }
 
 /// One thing a row, a menu entry or a picker's choice does.
@@ -192,6 +257,10 @@ enum Act {
     Save,
     Discard,
     Delete,
+    /// Switch between the Builder and the Form.
+    ToggleView,
+    /// The Builder's own (its selection, a drawing, a new transition).
+    Builder(builder::BAct),
     /// Close the menu (an entry that only explains).
     Nothing,
 }
@@ -228,6 +297,10 @@ enum Hit {
     Item(usize),
     Choice(usize),
     Button(usize),
+    /// A half of the Builder | Form control.
+    View(Mode),
+    /// The Builder panel's close button.
+    PanelClose,
 }
 
 /// What the editor asks of Settings.
@@ -328,6 +401,9 @@ pub(crate) struct WorkflowEditorPage {
     /// Put the cursor on this status once the draft loads (an Agents link).
     focus_status: Option<String>,
     hits: Vec<(Rect, Hit)>,
+    /// The Builder's presentation (its selection, the keyboard's node, the
+    /// canvas's scroll); the draft stays the one above.
+    builder: builder::BuilderView,
 }
 
 impl WorkflowEditorPage {
@@ -355,6 +431,7 @@ impl WorkflowEditorPage {
             follow_cursor: true,
             focus_status,
             hits: Vec::new(),
+            builder: builder::BuilderView::default(),
         };
         if let Some(config) = config.filter(|c| c.workflow(name).is_some()) {
             page.show(EditorState::new(config.clone(), name));
@@ -430,7 +507,7 @@ impl WorkflowEditorPage {
 
     /// Edit `state` from here on: every field shows it.
     fn show(&mut self, mut state: EditorState) {
-        state.mode = VIEWS[0];
+        state.mode = self.state.as_ref().map_or(OPENS_ON, |s| s.mode);
         if let Some(git) = self.state.as_ref().map(|s| s.project_git().clone()) {
             state.set_project_git(git);
         }
@@ -440,6 +517,7 @@ impl WorkflowEditorPage {
         self.typing = None;
         self.modal = None;
         self.load_error = None;
+        self.builder.reconcile(state_workflow(&self.state));
         self.sync(true);
         if let Some(id) = self.focus_status.take() {
             if !self.select_item(&Item::Status(id.clone())) {
@@ -468,6 +546,10 @@ impl WorkflowEditorPage {
         };
         let form = state.text_form(self.details);
         if force {
+            self.builder.reconcile(Some(state.workflow()));
+            if self.details.is_some() && form.details.is_none() {
+                self.details = None;
+            }
             self.run = form.details.as_ref().map(|(_, d)| d.run.lines().map(str::to_string).collect()).unwrap_or_default();
             self.texts = form;
             self.typing = None;
@@ -568,10 +650,14 @@ impl WorkflowEditorPage {
 
     /// The rows the keys stop on, top to bottom (the header's first).
     pub(crate) fn items(&self) -> Vec<Item> {
-        let mut out = vec![Item::Back, Item::Save, Item::Discard, Item::Actions];
+        let mut out = vec![Item::Back, Item::View, Item::Save, Item::Discard, Item::Actions];
         let Some(state) = self.state.as_ref() else {
             return out;
         };
+        if state.mode == Mode::Builder {
+            self.builder_items(&mut out);
+            return out;
+        }
         out.extend([Item::Text(Text::Name), Item::Text(Text::Description), Item::InitialStatus]);
         for s in &state.workflow().statuses {
             out.push(Item::Status(s.id.clone()));
@@ -614,6 +700,7 @@ impl WorkflowEditorPage {
     fn primary(&self, item: &Item) -> Act {
         match item {
             Item::Back => Act::Leave(Leave::Back),
+            Item::View => Act::ToggleView,
             Item::Save => Act::Save,
             Item::Discard => Act::Discard,
             Item::Actions => Act::Actions,
@@ -632,6 +719,7 @@ impl WorkflowEditorPage {
             Item::ReviewMode => Act::Pick(Pick::ReviewMode),
             Item::Zen => Act::Pick(Pick::Zen),
             Item::Delete => Act::Delete,
+            builder => self.builder_primary(builder),
         }
     }
 
@@ -654,15 +742,17 @@ impl WorkflowEditorPage {
             Act::TransitionMenu(i) => self.transition_menu(i),
             Act::Actions => self.actions_menu(),
             Act::ToggleDetails(i) => {
-                self.details = if self.details == Some(i) { None } else { Some(i) };
-                self.texts.details = None;
-                let form = self.state.as_ref().map(|s| s.text_form(self.details));
-                if let Some(form) = form {
-                    self.run = form.details.as_ref().map(|(_, d)| d.run.lines().map(str::to_string).collect()).unwrap_or_default();
-                    self.texts.details = form.details;
-                }
+                self.open_details(if self.details == Some(i) { None } else { Some(i) });
                 self.select_item(&Item::Details(i));
             }
+            Act::ToggleView => {
+                let to = match self.state.as_ref().map(|s| s.mode) {
+                    Some(Mode::Form) => Mode::Builder,
+                    _ => Mode::Form,
+                };
+                self.set_view(to);
+            }
+            Act::Builder(act) => return self.builder_act(act),
             Act::AddRun => {
                 let at = match self.current() {
                     Some(Item::Text(Text::Run(l))) => l + 1,
@@ -721,6 +811,19 @@ impl WorkflowEditorPage {
         EditorAction::Stay
     }
 
+    /// Open transition `details`' Details (`None`: close them), its fields
+    /// filled from the draft.
+    fn open_details(&mut self, details: Option<usize>) {
+        self.details = details;
+        self.texts.details = None;
+        self.run.clear();
+        let form = self.state.as_ref().map(|s| s.text_form(self.details));
+        if let Some(form) = form {
+            self.run = form.details.as_ref().map(|(_, d)| d.run.lines().map(str::to_string).collect()).unwrap_or_default();
+            self.texts.details = form.details;
+        }
+    }
+
     /// Make `change` to the draft (a refusal shows at its row).
     fn change(&mut self, change: Change) {
         // Removing a transition (or a status, with its transitions)
@@ -741,6 +844,15 @@ impl WorkflowEditorPage {
         let made = self.state.as_mut().is_some_and(|s| s.change(change));
         if structural {
             self.sync(false);
+        }
+        self.builder.reconcile(state_workflow(&self.state));
+        if self.state.as_ref().is_some_and(|s| s.mode == Mode::Builder) {
+            if let (true, Some(Item::Status(id))) = (made, &added) {
+                self.builder.state.select_status(id);
+                self.builder.follow = true;
+            }
+            self.builder_synced();
+            return;
         }
         if let (true, Some(item)) = (made, added) {
             self.select_item(&item);
@@ -768,6 +880,12 @@ impl WorkflowEditorPage {
     }
 
     fn open_pick(&mut self, pick: Pick) {
+        if let Some((title, choices)) = self.builder_pick(&pick) {
+            if !choices.is_empty() {
+                self.list(title, choices);
+            }
+            return;
+        }
         let Some(state) = self.state.as_ref() else {
             return;
         };
@@ -879,6 +997,13 @@ impl WorkflowEditorPage {
                 }
                 ("Zen settings".into(), choices)
             }
+            Pick::PanelStatus
+            | Pick::DrawFrom
+            | Pick::DrawTo
+            | Pick::NewFrom
+            | Pick::NewTo
+            | Pick::NewSetAction(_)
+            | Pick::NewAddAction => return,
         };
         if choices.is_empty() {
             return;
@@ -1216,6 +1341,9 @@ impl WorkflowEditorPage {
         if self.typing.is_some() {
             return self.typing_key(k);
         }
+        if self.in_builder() {
+            return self.builder_key(k, nav);
+        }
         let items = self.items();
         let n = items.len();
         let current = items.get(self.cursor).cloned();
@@ -1282,7 +1410,8 @@ impl WorkflowEditorPage {
             }
             (KeyCode::Char('x') | KeyCode::Delete, Item::Text(Text::Run(line))) => Act::RemoveRun(*line),
             (KeyCode::Char('y'), _) => Act::Leave(Leave::EditYaml),
-            (KeyCode::Char('c'), Item::Back | Item::Save | Item::Discard | Item::Actions) => Act::Leave(Leave::Duplicate),
+            (KeyCode::Char('v'), _) => Act::ToggleView,
+            (KeyCode::Char('c'), Item::Back | Item::View | Item::Save | Item::Discard | Item::Actions) => Act::Leave(Leave::Duplicate),
             _ => return EditorAction::Stay,
         };
         self.run(act)
@@ -1290,16 +1419,17 @@ impl WorkflowEditorPage {
 
     fn step_section(&mut self, forward: bool) {
         let items = self.items();
-        let Some(here) = items.get(self.cursor).map(Item::section) else {
+        let section = |it: &Item| self.section_of(it);
+        let Some(here) = items.get(self.cursor).map(section) else {
             return;
         };
         let starts: Vec<usize> = (0..items.len())
-            .filter(|&i| i == 0 || items[i].section() != items[i - 1].section())
+            .filter(|&i| i == 0 || section(&items[i]) != section(&items[i - 1]))
             .collect();
         let at = starts.iter().rposition(|&s| s <= self.cursor).unwrap_or(0);
         let next = if forward {
             starts.get(at + 1).copied()
-        } else if items[starts[at]].section() == here && self.cursor > starts[at] {
+        } else if section(&items[starts[at]]) == here && self.cursor > starts[at] {
             Some(starts[at])
         } else {
             at.checked_sub(1).map(|a| starts[a])
@@ -1453,6 +1583,12 @@ impl WorkflowEditorPage {
     /// does its Enter), answers a menu or a prompt; the wheel scrolls.
     pub(crate) fn handle_mouse(&mut self, m: MouseEvent) -> EditorAction {
         let hit = self.hits.iter().find(|(r, _)| panel::in_rect(*r, m.column, m.row)).map(|(_, h)| *h);
+        let asking = self.modal.is_some() || self.state.as_ref().is_some_and(|s| s.prompt().is_some());
+        if self.in_builder() && !asking {
+            if let Some(action) = self.builder_mouse(m) {
+                return action;
+            }
+        }
         match m.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.modal.is_none() => {
                 let down = matches!(m.kind, MouseEventKind::ScrollDown);
@@ -1478,13 +1614,21 @@ impl WorkflowEditorPage {
                         _ => EditorAction::Stay,
                     };
                 }
+                match hit {
+                    Some(Hit::View(mode)) => {
+                        self.set_view(mode);
+                        return EditorAction::Stay;
+                    }
+                    Some(Hit::PanelClose) => return self.run(Act::Builder(builder::BAct::Close)),
+                    _ => {}
+                }
                 let Some(Hit::Item(i)) = hit else {
                     return EditorAction::Stay;
                 };
                 self.typing = None;
                 let again = self.cursor == i;
                 self.cursor = i;
-                let header = matches!(self.current(), Some(Item::Back | Item::Save | Item::Discard | Item::Actions));
+                let header = matches!(self.current(), Some(Item::Back | Item::View | Item::Save | Item::Discard | Item::Actions));
                 match self.current() {
                     Some(item) if again || header || matches!(item, Item::Text(_)) => {
                         let act = self.primary(&item);
@@ -1513,6 +1657,9 @@ impl WorkflowEditorPage {
         if self.typing.is_some() {
             return "Type · ⏎/Esc done · ↑↓ done and move · ^S save".into();
         }
+        if self.in_builder() {
+            return self.builder_hints(moves);
+        }
         let rest = match self.current() {
             Some(Item::Status(_)) => "⏎ menu · o owner · a agent · t tags · ⇧↑↓ move · x remove · n add",
             Some(Item::Transition(_)) => "⏎ menu · f from · t to · n action · d details · x remove",
@@ -1522,7 +1669,7 @@ impl WorkflowEditorPage {
             Some(Item::Back) => "⏎ back",
             _ => "⏎ choose",
         };
-        format!("{moves} · {rest} · Tab section · m menu · ^S save · Esc back")
+        format!("{moves} · {rest} · Tab section · m menu · v builder · ^S save · Esc back")
     }
 
     /// Draw the editor over `area` (both Settings columns).
@@ -1561,6 +1708,15 @@ impl WorkflowEditorPage {
             ..inner
         };
         if content.height == 0 {
+            return;
+        }
+        if self.in_builder() {
+            self.render_builder(f, content);
+            if self.state.as_ref().is_some_and(|s| s.prompt().is_some()) {
+                self.render_prompt(f, area);
+            } else {
+                self.render_modal(f, area);
+            }
             return;
         }
         let rows = self.rows(content.width as usize);
@@ -1630,7 +1786,24 @@ impl WorkflowEditorPage {
         let save = button(if busy { "Saving…" } else { "Save changes" }, &Item::Save, dirty && !busy);
         let discard = button("Discard", &Item::Discard, dirty && !busy);
         let actions = button("⋮ Actions", &Item::Actions, state.is_some());
-        let right = [save, Span::raw(" "), discard, Span::raw(" "), actions];
+        // Builder | Form: the view shown filled.
+        let mode = state.map(|s| s.mode);
+        let view_focused = selected(&Item::View);
+        let half = |m: Mode| {
+            let label = match m {
+                Mode::Builder => " Builder ",
+                Mode::Form => " Form ",
+            };
+            let style = match (mode == Some(m), view_focused) {
+                (true, true) => selected_style(true),
+                (true, false) => Style::default().fg(palette().white).bg(palette().selection).add_modifier(Modifier::BOLD),
+                (false, true) => Style::default().fg(palette().cyan).add_modifier(Modifier::UNDERLINED),
+                (false, false) => Style::default().fg(palette().gray),
+            };
+            Span::styled(label, style)
+        };
+        let mut right: Vec<Span<'static>> = VIEWS.iter().map(|&m| half(m)).collect();
+        right.extend([Span::raw("  "), save, Span::raw(" "), discard, Span::raw(" "), actions]);
         let left_w: usize = left.iter().map(|s| panel::display_width(&s.content)).sum();
         let right_w: usize = right.iter().map(|s| panel::display_width(&s.content)).sum();
         let width = rect.width as usize;
@@ -1651,6 +1824,14 @@ impl WorkflowEditorPage {
         let targets = [(" ← Back ", Item::Back), (" Save changes ", Item::Save), (" Saving… ", Item::Save), (" Discard ", Item::Discard), (" ⋮ Actions ", Item::Actions)];
         for span in &spans {
             let w = panel::display_width(&span.content) as u16;
+            let view = match span.content.as_ref() {
+                " Builder " => Some(Mode::Builder),
+                " Form " => Some(Mode::Form),
+                _ => None,
+            };
+            if let (Some(mode), true) = (view, x + w <= rect.right()) {
+                self.hits.push((Rect { x, width: w, ..rect }, Hit::View(mode)));
+            }
             if let Some((_, item)) = targets.iter().find(|(t, _)| *t == span.content) {
                 if let Some(i) = items.iter().position(|it| it == item) {
                     if x + w <= rect.right() {
@@ -1998,6 +2179,9 @@ pub(super) fn picker_line(label: &str, value: &str, selected: bool, label_w: usi
         Span::styled(" ▾", Style::default().fg(palette().cyan)),
     ])
 }
+
+mod builder;
+mod canvas;
 
 #[cfg(test)]
 mod tests;

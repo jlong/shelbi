@@ -125,9 +125,9 @@ fn it_opens_after_its_read_with_the_header_and_every_section() {
     assert!(header.contains("← Back") && header.contains("task default"), "{header}");
     assert!(header.contains("Save changes") && header.contains("Discard") && header.contains("⋮ Actions"), "{header}");
     assert_eq!(ed.cursor_item(), Some(Item::Back));
-    // No Builder yet: no Builder | Form control.
-    assert_eq!(VIEWS, &[Mode::Form]);
-    assert!(!header.contains("Builder"));
+    // It opens on the Form, the Builder | Form control in the header.
+    assert_eq!(ed.state().unwrap().mode, Mode::Form);
+    assert!(header.contains("Builder") && header.contains("Form"), "{header}");
     // A workflow that isn't there says so.
     let mut gone = WorkflowEditorPage::open(PROJECT, "nope", None, None);
     drain(&mut gone);
@@ -676,3 +676,5 @@ fn renders_without_panicking_at_tiny_sizes() {
     press(&mut ed, key(KeyCode::Char('m')));
     render(&mut ed, 12, 4);
 }
+
+mod builder;
