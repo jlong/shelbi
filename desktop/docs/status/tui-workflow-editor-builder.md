@@ -115,7 +115,8 @@ The canvas scrolls to keep the keyboard's node (or transition) in view, and
 `→ ↓ more` says when it's clipped.
 
 **The panel** works as the Form's rows (the same pickers, text fields and
-keys: Enter, `x`, `n`, Shift/Alt+↑↓ to reorder):
+keys: Enter, `x`, `n`, Shift/Alt+↑↓ to reorder), and scrolls by the Form's
+rule: the focused row keeps a line under it, so "↓ more" never covers it:
 
 - **Status**: the status picker (it moves the selection), its category,
   Owner, Agent, Workspace tags, Set as initial, its outgoing transitions
@@ -189,7 +190,8 @@ the editor's.
   the Form's message; Form edits in the Builder and Builder removals in the
   Form, with Discard restoring both; the leave prompt; a cyclic workflow
   with a self-loop and lone statuses; resize with the panel open (wide,
-  narrow, ← Graph, back); scrolling; the mouse (select, hover, handles,
+  narrow, ← Graph, back); scrolling, and a clipped panel keeping a line
+  under every focused row; the mouse (select, hover, handles,
   click-click and drag drawing, the wheel); sizes down to 1x1.
 - `crates/shelbi-tui/src/shell/mod.rs`, through the shell's real key and
   mouse path: Add transition by keys at 80x24 then Save off the UI thread,

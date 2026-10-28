@@ -1150,12 +1150,16 @@ impl WorkflowEditorPage {
         let rows = self.panel_rows(width);
         let max = (rows.len() as u16).saturating_sub(body.height);
         if let Some(at) = rows.iter().position(|r| r.action == Some(self.cursor)) {
+            // The Form's rule: its error lines when they fit, and at least
+            // one line under it, since the last line shows "↓ more" while
+            // rows are clipped below.
+            let end = rows.iter().skip(at + 1).take_while(|r| r.action.is_none()).count().clamp(1, 3) as u16;
             let at = at as u16;
             let scroll = &mut self.builder.panel_scroll;
             if at < *scroll {
                 *scroll = at;
-            } else if at >= *scroll + body.height {
-                *scroll = at + 1 - body.height;
+            } else if at + end >= *scroll + body.height {
+                *scroll = (at + end + 1).saturating_sub(body.height).min(at);
             }
         }
         self.builder.panel_scroll = self.builder.panel_scroll.min(max);

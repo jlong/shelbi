@@ -604,3 +604,33 @@ fn the_mouse_selects_hovers_handles_and_draws_with_clicks_alone() {
     assert_eq!(ed.builder.pan.1, before.1 + 2);
 }
 
+
+#[test]
+fn the_panel_keeps_a_line_under_the_focus_when_it_clips() {
+    let _home = Home::new("bld-panel-scroll");
+    let mut ed = builder("task");
+    // In Progress → Review: the longest panel, in the canvas's place, clipped at 80x16.
+    arrow_to(&mut ed, "in-progress");
+    press(&mut ed, key(KeyCode::Char(']')));
+    press(&mut ed, key(KeyCode::Enter));
+    assert_eq!(b(&ed).selected_transition(), Some(0));
+    let first = render(&mut ed, 80, 16);
+    assert!(first.contains("↓ more"), "the panel clips at 80x16:\n{first}");
+    // Walk every row: the focused one is drawn above "↓ more", never covered
+    // by it (the Form's rule).
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        let screen = render(&mut ed, 80, 16);
+        let lines: Vec<&str> = screen.lines().collect();
+        let item = ed.cursor_item().unwrap();
+        if ed.section_of(&item) == Section::Panel && item != Item::PanelBack {
+            let at = lines.iter().position(|l| l.contains('›')).unwrap_or_else(|| panic!("{item:?} in view:\n{screen}"));
+            if let Some(more) = lines.iter().position(|l| l.contains("↓ more")) {
+                assert!(at < more, "{item:?} keeps a line under it:\n{screen}");
+            }
+            seen.push(item);
+        }
+        press(&mut ed, key(KeyCode::Down));
+    }
+    assert!(seen.contains(&Item::Text(Text::Timeout)) && seen.contains(&Item::RemoveTransition(0)), "{seen:?}");
+}

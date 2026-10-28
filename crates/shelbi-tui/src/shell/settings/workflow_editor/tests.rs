@@ -630,7 +630,17 @@ fn it_scrolls_to_keep_the_focus_in_view_at_80x24_and_tab_steps_sections() {
     for _ in 0..n {
         press(&mut ed, key(KeyCode::Down));
         let screen = render(&mut ed, 80, 24);
-        if matches!(ed.cursor_item(), Some(Item::Back | Item::Save | Item::Discard | Item::Actions)) {
+        // The header's controls (Builder | Form among them) stay on its
+        // pinned first line.
+        if let Some(item) = ed.cursor_item().filter(|i| i.section() == Section::Header) {
+            let label = match item {
+                Item::Back => "← Back",
+                Item::View => "Builder",
+                Item::Save => "Save changes",
+                Item::Discard => "Discard",
+                _ => "⋮ Actions",
+            };
+            assert!(screen.lines().next().is_some_and(|l| l.contains(label)), "{item:?} in the header:\n{screen}");
             continue;
         }
         assert!(screen.lines().skip(2).any(|l| l.trim_start().starts_with('›')), "{:?} in view:\n{screen}", ed.cursor_item());
