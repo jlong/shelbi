@@ -10,10 +10,13 @@
 //! nav block with the half-block selection bleed, the machine-grouped
 //! workspace pool with per-state badges, the two review sections rendered as
 //! two-line entries (dim `⎇ branch` line, truncated with `…`), and the footer
-//! (the one-time first-run hint or a status line; the toolbar, mirroring the
-//! desktop's: Settings, Send Feedback, and the unread-errors badge while there
-//! are any, in its bottom-left corner, with the daemon-version line at its
-//! right; and the `ZEN MODE ON` band shown only while Zen is on). The old `^P
+//! (the one-time first-run hint or a status line; a red daemon/CLI version
+//! warning, naming the fix, only while the two disagree; the toolbar,
+//! mirroring the desktop's: Settings, Send Feedback, and the unread-errors
+//! badge while there are any, in its bottom-left corner; and the `ZEN MODE ON`
+//! band shown only while Zen is on). The versions otherwise wait in the
+//! Settings button's hover name, and the board's freshness shows on the Issues
+//! board. The old `^P
 //! palette q quit` / `^G Zen mode` footer hint lines are gone; those actions
 //! stay reachable through the palette and their existing keys.
 //!
@@ -86,9 +89,15 @@ impl FooterButton {
 
     /// The desktop's tooltip for the button, shown beside the toolbar while
     /// the pointer is over it.
-    fn tooltip(self, unread_errors: usize) -> String {
+    /// The button's name beside the toolbar under the pointer. Settings
+    /// carries the daemon/CLI versions as well, as the desktop's tooltip does:
+    /// the footer itself only shows them on a mismatch.
+    fn tooltip(self, unread_errors: usize, versions: Option<&str>) -> String {
         match self {
-            FooterButton::Settings => "Settings".to_string(),
+            FooterButton::Settings => match versions {
+                Some(line) => format!("Settings · {line}"),
+                None => "Settings".to_string(),
+            },
             FooterButton::Feedback => "Send Feedback".to_string(),
             FooterButton::Errors => format!(
                 "{unread_errors} unread error{}",
@@ -191,9 +200,12 @@ pub struct SidebarView {
     rows: Vec<Row>,
     /// Indices into `rows` that are selectable, in order.
     selectable: Vec<usize>,
-    board_banner: Option<String>,
+    /// The daemon/CLI versions, for the Settings button's hover name.
     daemon_version_line: Option<String>,
-    daemon_version_mismatch: bool,
+    /// The version line while the daemon and the CLI disagree (it names the
+    /// fix), painted red above the toolbar. The board's freshness shows on
+    /// the Issues board, not here.
+    version_warning: Option<String>,
     status_line: String,
     /// The status row carries the orchestrator supervisor's failure (painted
     /// red) rather than the launch-time status line.
@@ -217,9 +229,11 @@ impl SidebarView {
             project_label: model.project_label.clone(),
             rows,
             selectable,
-            board_banner: model.board_banner.clone(),
             daemon_version_line: model.daemon_version_line.clone(),
-            daemon_version_mismatch: model.daemon_version_mismatch,
+            version_warning: model
+                .daemon_version_line
+                .clone()
+                .filter(|_| model.daemon_version_mismatch),
             // A dead orchestrator the supervisor couldn't bring back outranks
             // the launch-time hint: it is why the Orchestrator view won't load.
             status_line: model.footer_status(),
@@ -261,14 +275,23 @@ impl SidebarView {
 
     /// Footer height: the status row's height (0 when empty, 2 for the
     /// first-run hint, [`ORCH_STATUS_ROWS`] for an orchestrator supervisor
-    /// failure, else 1), a row for the version line when it doesn't fit beside
-    /// the toolbar's buttons at `width`, and the four fixed rows: the toolbar's
-    /// half-row margin above, the toolbar, its half-row margin below (the
-    /// spacer above the band), and the zen band. The band paints only while Zen
-    /// is on, but its row is always reserved so the toolbar never shifts when
-    /// Zen toggles.
-    fn footer_height(&self, width: u16) -> u16 {
-        self.status_row_height() + u16::from(self.version_needs_own_row(width)) + 4
+    /// failure, else 1), the version warning's rows on a daemon/CLI mismatch,
+    /// and the four fixed rows: the toolbar's half-row margin above, the
+    /// toolbar, its half-row margin below (the spacer above the band), and the
+    /// zen band. The band paints only while Zen is on, but its row is always
+    /// reserved so the toolbar never shifts when Zen toggles.
+    fn footer_height(&self) -> u16 {
+        self.status_row_height() + self.warning_lines().len() as u16 + 4
+    }
+
+    /// The version warning's lines: the mismatch, then the fix it names on a
+    /// line of its own (`daemon 0.10.0 ≠ cli 0.11.0` / `shelbi daemon
+    /// restart`), so neither is cut short on a sidebar too narrow for both.
+    fn warning_lines(&self) -> Vec<&str> {
+        self.version_warning
+            .as_deref()
+            .map(|line| line.split(" — ").collect())
+            .unwrap_or_default()
     }
 
     fn status_row_height(&self) -> u16 {
@@ -320,46 +343,6 @@ impl SidebarView {
             .map_or(row.x + LIST_INDENT.horizontal, |(_, r)| r.right())
     }
 
-    /// The daemon/CLI version segment and the board-freshness banner, as
-    /// styled spans: dim on a match, red on a mismatch; the banner yellow when
-    /// stale. Empty until the first probe.
-    fn version_spans(&self) -> Vec<Span<'static>> {
-        let mut spans: Vec<Span> = Vec::new();
-        if let Some(line) = self.daemon_version_line.clone() {
-            let style = if self.daemon_version_mismatch {
-                Style::default().fg(palette().ansi_red)
-            } else {
-                Style::default().fg(palette().muted)
-            };
-            spans.push(Span::styled(line, style));
-        }
-        if let Some(banner) = &self.board_banner {
-            let stale = banner.contains("stale") || banner.contains("no daemon");
-            let color = if stale { palette().ansi_yellow } else { palette().muted };
-            let prefix = if spans.is_empty() { "" } else { "  " };
-            spans.push(Span::styled(
-                format!("{prefix}{banner}"),
-                Style::default().fg(color),
-            ));
-        }
-        spans
-    }
-
-    /// Whether the version line has to take its own row above the toolbar: it
-    /// sits right-aligned beside the buttons when it fits there whole (two
-    /// columns clear of them, one in from the right edge), never cut short.
-    fn version_needs_own_row(&self, width: u16) -> bool {
-        let version_w: usize = self.version_spans().iter().map(|s| s.width()).sum();
-        if version_w == 0 {
-            return false;
-        }
-        let row = Rect::new(0, 0, width, 1);
-        let room = width
-            .saturating_sub(LIST_INDENT.horizontal)
-            .saturating_sub(self.buttons_end(row) + 2);
-        version_w > room as usize
-    }
-
     /// Split the sidebar `area` into (header, search, nav, rest-list, footer)
     /// rects — the shared geometry the renderer and the click map both derive
     /// from. `search` is `None` when the header is too short to hold the box;
@@ -368,7 +351,7 @@ impl SidebarView {
     fn geometry(&self, area: Rect) -> SidebarGeometry {
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(self.footer_height(area.width))])
+            .constraints([Constraint::Min(1), Constraint::Length(self.footer_height())])
             .split(area);
         let body_region = outer[0];
         let footer = self.footer_rows(outer[1]);
@@ -439,16 +422,13 @@ impl SidebarView {
         let below = take(&mut left, 1);
         let toolbar = take(&mut left, 1);
         let above = take(&mut left, 1);
-        let version = if self.version_needs_own_row(footer.width) {
-            take(&mut left, 1)
-        } else {
-            None
-        };
+        let warning_h = (self.warning_lines().len() as u16).min(left.height);
+        let warning = take(&mut left, warning_h);
         let status_h = self.status_row_height().min(left.height);
         let status = take(&mut left, status_h);
         FooterRows {
             status,
-            version,
+            warning,
             above,
             toolbar,
             below,
@@ -662,10 +642,10 @@ impl SidebarView {
         StatefulWidget::render(list, area, buf, &mut state);
     }
 
-    /// Paint the footer: the status row, the toolbar (Settings, Send Feedback,
-    /// the unread-errors badge) with the version line at its right or on its
-    /// own row above, and the zen band. `hover` is the button under the
-    /// pointer: it takes its hover pill and its name shows beside the toolbar.
+    /// Paint the footer: the status row, the version warning on a daemon/CLI
+    /// mismatch, the toolbar (Settings, Send Feedback, the unread-errors
+    /// badge), and the zen band. `hover` is the button under the pointer: it
+    /// takes its hover pill and its name shows beside the toolbar.
     fn render_footer(&self, buf: &mut Buffer, rows: &FooterRows, hover: Option<FooterButton>) {
         if let Some(status) = rows.status {
             let style = if self.status_is_orchestrator_failure {
@@ -680,15 +660,20 @@ impl SidebarView {
                 .render(status.inner(LIST_INDENT), buf);
         }
 
-        // On its own row the line takes the whole width past the left inset
-        // (it only clips on a sidebar too narrow even for that).
-        if let Some(row) = rows.version {
-            let row = Rect {
-                x: row.x + LIST_INDENT.horizontal,
-                width: row.width.saturating_sub(LIST_INDENT.horizontal),
-                ..row
-            };
-            Paragraph::new(Line::from(self.version_spans())).render(row, buf);
+        // The mismatch in red, a line per part, inside the list inset; a line
+        // too long for a narrow sidebar ends in `…`.
+        if let Some(rows) = rows.warning {
+            let rows = rows.inner(LIST_INDENT);
+            let style = Style::default().fg(palette().ansi_red);
+            for (i, part) in self.warning_lines().into_iter().enumerate().take(rows.height as usize) {
+                let row = Rect {
+                    y: rows.y + i as u16,
+                    height: 1,
+                    ..rows
+                };
+                Paragraph::new(Span::styled(truncate_ellipsis(part, row.width as usize), style))
+                    .render(row, buf);
+            }
         }
 
         if let Some(toolbar) = rows.toolbar {
@@ -705,27 +690,21 @@ impl SidebarView {
                 );
             }
             // Right of the buttons: the hovered button's name (the desktop's
-            // tooltip) left-aligned, else the version line right-aligned when
-            // it has no row of its own.
+            // tooltip), left-aligned. Nothing sits there otherwise.
             let start = self.buttons_end(toolbar) + 2;
             let end = toolbar.right().saturating_sub(LIST_INDENT.horizontal);
-            if start < end {
+            if let (Some(button), true) = (hover, start < end) {
                 let info = Rect {
                     x: start,
                     width: end - start,
                     ..toolbar
                 };
-                if let Some(button) = hover {
-                    Paragraph::new(Span::styled(
-                        truncate_ellipsis(&button.tooltip(self.unread_errors), info.width as usize),
-                        Style::default().fg(palette().gray),
-                    ))
-                    .render(info, buf);
-                } else if !self.version_needs_own_row(toolbar.width) {
-                    Paragraph::new(Line::from(self.version_spans()))
-                        .alignment(ratatui::layout::Alignment::Right)
-                        .render(info, buf);
-                }
+                let name = button.tooltip(self.unread_errors, self.daemon_version_line.as_deref());
+                Paragraph::new(Span::styled(
+                    truncate_ellipsis(&name, info.width as usize),
+                    Style::default().fg(palette().gray),
+                ))
+                .render(info, buf);
             }
         }
 
@@ -736,7 +715,7 @@ impl SidebarView {
 
     /// Zen row: a full-width green band carrying a bold `ZEN MODE ON` only while
     /// Zen is on. Off or paused paints nothing — the row stays blank so the
-    /// version line above keeps its place.
+    /// toolbar above keeps its place.
     fn render_zen_row(&self, buf: &mut Buffer, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -773,12 +752,13 @@ struct SidebarGeometry {
 }
 
 /// The footer's rows (see [`SidebarView::footer_rows`]), top to bottom; each
-/// `None` when a short sidebar squeezed it out (or, for `version`, when the
-/// line fits beside the buttons).
+/// `None` when a short sidebar squeezed it out (or, for `warning`, when the
+/// daemon and the CLI agree).
 #[derive(Debug, Default)]
 struct FooterRows {
     status: Option<Rect>,
-    version: Option<Rect>,
+    /// The version warning's rows (a daemon/CLI mismatch only).
+    warning: Option<Rect>,
     /// The toolbar's half-row margin above: a hovered button's `▄` row.
     above: Option<Rect>,
     toolbar: Option<Rect>,
@@ -2035,32 +2015,73 @@ mod tests {
         assert!(!joined.contains("supervisor gave up"), "got:\n{joined}");
     }
 
-    /// The version row paints the daemon/CLI segment, red on mismatch.
+    /// Matching versions and the board's freshness (warm, stale or cached)
+    /// never show in the footer, at any width: the footer is the bare toolbar
+    /// over the band, the rows the line used to take given back to the list.
     #[test]
-    fn version_row_renders_daemon_cli_segment() {
+    fn footer_shows_neither_versions_nor_the_board_banner() {
+        for banner in ["board 12s", "board 4m stale · quota resets 16:03", "board 4m cached · no daemon"] {
+            let mut model = empty_model();
+            model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+            model.board_banner = Some(banner.into());
+            for w in [20, 24, 28, 36, 44, 60, 120] {
+                let rows = render_rows_with(&model, 0, true, &default_chrome(), w, 20);
+                let joined = rows.join("\n");
+                assert!(!joined.contains("daemon"), "no versions at {w} cols:\n{joined}");
+                assert!(!joined.contains("board"), "no board banner ({banner}) at {w} cols:\n{joined}");
+                let view = SidebarView::build(&model);
+                assert_eq!(view.footer_height(), 4, "toolbar, its margins and the band only");
+                assert_eq!(row_y(&rows, "⚙"), 20 - 3, "the toolbar keeps its row at {w} cols");
+            }
+        }
+    }
+
+    /// A daemon/CLI mismatch still shows, in red above the toolbar, with the
+    /// fix on a line of its own so a narrow sidebar cuts neither short.
+    #[test]
+    fn version_mismatch_warns_in_red_and_names_the_fix() {
         let mut model = empty_model();
-        model.daemon_version_line = Some("daemon 0.10.0 · cli 0.10.0".into());
-        let rows = render_rows_with(&model, 0, true, &default_chrome(), 40, 16);
-        assert!(rows.join("\n").contains("daemon 0.10.0 · cli 0.10.0"));
+        model.daemon_version_line = Some("daemon 0.10.0 ≠ cli 0.11.0 — shelbi daemon restart".into());
+        model.daemon_version_mismatch = true;
+        model.board_banner = Some("board 4m stale".into());
+        let view = SidebarView::build(&model);
+        assert_eq!(view.footer_height(), 6, "two warning rows over the toolbar");
+        let buf = footer_buf(&view, None, 36, 20);
+        let toolbar_y = 20 - 3;
+        let (mismatch, fix) = (buf_row(&buf, toolbar_y - 3), buf_row(&buf, toolbar_y - 2));
+        assert_eq!(mismatch.trim_end(), " daemon 0.10.0 ≠ cli 0.11.0");
+        assert_eq!(fix.trim_end(), " shelbi daemon restart");
+        assert_eq!(buf[(1, toolbar_y - 3)].fg, palette().ansi_red);
+        assert_eq!(buf[(1, toolbar_y - 2)].fg, palette().ansi_red);
+        assert!(buf_row(&buf, toolbar_y).starts_with("  ⚙"), "the toolbar sits below");
+        let joined: String = (0..20).map(|y| buf_row(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(!joined.contains("board"), "still no board banner:\n{joined}");
+
+        // Too narrow for the mismatch: it ends in `…` rather than wrapping
+        // into the toolbar.
+        let buf = footer_buf(&view, None, 20, 20);
+        assert_eq!(buf_row(&buf, toolbar_y - 3).trim_end(), " daemon 0.10.0 ≠ c…");
+        assert_eq!(buf_row(&buf, toolbar_y - 2).trim_end(), " shelbi daemon res…");
+
+        // Fixed (the daemon restarted on the CLI's version): the warning goes.
+        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+        model.daemon_version_mismatch = false;
+        assert_eq!(SidebarView::build(&model).footer_height(), 4);
     }
 
     #[test]
     fn zen_row_renders_full_width_band_when_on() {
         let mut model = empty_model();
-        model.daemon_version_line = Some("daemon 0.9.0 · cli 0.9.0".into());
         model.zen_mode = ZenModeState::On;
         let rows = render_rows_with(&model, 0, true, &default_chrome(), 24, 16);
         let joined = rows.join("\n");
         assert!(joined.contains("ZEN MODE ON"), "expected ZEN MODE ON in:\n{joined}");
         assert!(!joined.contains("┌─") && !joined.contains("└─"), "no border chrome, got:\n{joined}");
         // The band is the bottom row, full width, with one blank spacer row
-        // between it and the toolbar above (the version line, too long to sit
-        // beside the buttons at 24 columns, is above that).
-        let version_y = row_y(&rows, "daemon 0.9.0");
+        // between it and the toolbar above.
         let toolbar_y = row_y(&rows, "⚙");
         let zen_y = row_y(&rows, "ZEN MODE ON");
         assert_eq!(zen_y, toolbar_y + 2, "one blank row between the toolbar and zen, got:\n{joined}");
-        assert!(version_y < toolbar_y, "the version sits above the toolbar, got:\n{joined}");
         assert_eq!(zen_y, rows.len() - 1, "the zen band is the bottom row, got:\n{joined}");
         assert!(
             rows[zen_y - 1].trim().is_empty(),
@@ -2092,19 +2113,22 @@ mod tests {
     }
 
     #[test]
-    fn version_line_stays_put_across_zen_toggle() {
+    fn footer_stays_put_across_zen_toggle() {
         let mut off = empty_model();
-        off.daemon_version_line = Some("daemon 0.9.0 · cli 0.9.0".into());
+        off.daemon_version_line = Some("daemon 0.9.0 ≠ cli 0.11.0 — shelbi daemon restart".into());
+        off.daemon_version_mismatch = true;
         off.zen_mode = ZenModeState::Off;
-        let off_rows = render_rows_with(&off, 0, true, &default_chrome(), 24, 16);
+        let off_rows = render_rows_with(&off, 0, true, &default_chrome(), 30, 16);
         let mut on = off.clone();
         on.zen_mode = ZenModeState::On;
-        let on_rows = render_rows_with(&on, 0, true, &default_chrome(), 24, 16);
-        assert_eq!(
-            row_y(&off_rows, "daemon 0.9.0"),
-            row_y(&on_rows, "daemon 0.9.0"),
-            "version line must not move when toggling Zen"
-        );
+        let on_rows = render_rows_with(&on, 0, true, &default_chrome(), 30, 16);
+        for text in ["daemon 0.9.0", "⚙"] {
+            assert_eq!(
+                row_y(&off_rows, text),
+                row_y(&on_rows, text),
+                "{text:?} must not move when toggling Zen"
+            );
+        }
     }
 
     // --- footer toolbar -------------------------------------------------------
@@ -2204,7 +2228,8 @@ mod tests {
     }
 
     /// The hovered button's name (the desktop's tooltip) shows beside the
-    /// toolbar, in place of the version line while it shows.
+    /// toolbar; Settings's carries the daemon/CLI versions, as the desktop's
+    /// does, which the footer no longer shows at rest.
     #[test]
     fn hover_names_the_button_beside_the_toolbar() {
         let mut model = empty_model();
@@ -2213,16 +2238,18 @@ mod tests {
         let view = SidebarView::build(&model);
         let y = 20 - 3;
         for (hover, want) in [
-            (FooterButton::Settings, "Settings"),
+            (FooterButton::Settings, "Settings · daemon 0.11.0 · cli 0.11.0"),
             (FooterButton::Feedback, "Send Feedback"),
             (FooterButton::Errors, "1 unread error"),
         ] {
-            let row = buf_row(&footer_buf(&view, Some(hover), 44, 20), y);
+            let row = buf_row(&footer_buf(&view, Some(hover), 60, 20), y);
             assert!(row.contains(want), "{hover:?} is named: {row:?}");
-            assert!(!row.contains("daemon"), "the tooltip replaces the version: {row:?}");
         }
-        let row = buf_row(&footer_buf(&view, None, 44, 20), y);
-        assert!(row.contains("daemon 0.11.0 · cli 0.11.0"), "the version is back: {row:?}");
+        let row = buf_row(&footer_buf(&view, None, 60, 20), y);
+        assert_eq!(row.trim_end(), "  ⚙   📣   !", "nothing beside the buttons at rest: {row:?}");
+        // Before the first probe Settings is just named.
+        let row = buf_row(&footer_buf(&SidebarView::build(&empty_model()), Some(FooterButton::Settings), 60, 20), y);
+        assert!(row.trim_end().ends_with("Settings"), "{row:?}");
     }
 
     /// The unread-errors badge follows Send Feedback while there are unread
@@ -2299,41 +2326,15 @@ mod tests {
         assert_eq!(view.footer_button_at(area, 12, y), Some(FooterButton::Feedback));
     }
 
-    /// The version line sits right-aligned beside the buttons when it fits
-    /// whole, one column in from the edge; on a narrow sidebar it takes its own
-    /// row above the toolbar rather than being cut.
-    #[test]
-    fn version_sits_beside_the_buttons_or_on_its_own_row() {
-        let mut model = empty_model();
-        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
-        let view = SidebarView::build(&model);
-
-        let rows = render_rows(&model, 0, 44, 24);
-        let y = 24 - 3;
-        assert_eq!(row_y(&rows, "daemon 0.11.0"), y, "beside the buttons");
-        assert!(rows[y].ends_with("cli 0.11.0 "), "right-aligned, one in: {:?}", rows[y]);
-
-        let rows = render_rows(&model, 0, 30, 24);
-        let y = 24 - 3;
-        assert_eq!(row_y(&rows, "daemon 0.11.0"), y - 2, "its own row, above the toolbar's margin");
-        assert!(rows[y - 2].starts_with(" daemon 0.11.0 · cli 0.11.0"), "whole: {:?}", rows[y - 2]);
-        assert!(rows[y - 1].trim().is_empty(), "the toolbar's margin stays clear");
-        // The click map moves with it: the toolbar is still the third row up.
-        assert_eq!(view.footer_button_at(Rect::new(0, 0, 30, 24), 2, y as u16), Some(FooterButton::Settings));
-        // Its own row runs to the edge: the default sidebar's 27 content
-        // columns hold the whole line.
-        let rows = render_rows(&model, 0, 27, 24);
-        assert_eq!(rows[y - 2], " daemon 0.11.0 · cli 0.11.0", "not cut short");
-    }
-
-    /// The first-run hint, the status line, the toolbar and the band keep
+    /// The first-run hint, the version warning, the toolbar and the band keep
     /// their order at every height down to a sidebar too short for them,
     /// and nothing panics.
     #[test]
     fn footer_keeps_its_order_at_every_height() {
         let mut model = empty_model();
         model.status_line = FIRST_RUN_HINT.into();
-        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+        model.daemon_version_line = Some("daemon 0.11.0 ≠ cli 0.12.0 — shelbi daemon restart".into());
+        model.daemon_version_mismatch = true;
         model.zen_mode = ZenModeState::On;
         model.unread_errors = 1;
         for h in 1..40u16 {
@@ -2341,7 +2342,7 @@ mod tests {
             let find = |needle: &str| rows.iter().position(|r| r.contains(needle));
             let (hint, version, toolbar, zen) =
                 (find("Ctrl+P palette"), find("daemon 0.11"), find("⚙"), find("ZEN MODE ON"));
-            if h >= 24 {
+            if h >= 25 {
                 for (name, at) in [("hint", hint), ("version", version), ("toolbar", toolbar), ("zen", zen)] {
                     assert!(at.is_some(), "h={h}: the {name} shows:\n{}", rows.join("\n"));
                 }
@@ -2353,7 +2354,7 @@ mod tests {
                 assert_eq!(t + 2, z, "h={h}: one spacer between the toolbar and the band");
             }
             if let (Some(v), Some(t)) = (version, toolbar) {
-                assert!(v < t, "h={h}: the version above the toolbar on a narrow sidebar");
+                assert!(v < t, "h={h}: the version warning above the toolbar");
             }
             if let (Some(hi), Some(v)) = (hint, version) {
                 assert!(hi < v, "h={h}: the hint above the version");
@@ -2363,7 +2364,8 @@ mod tests {
 
     /// Every sidebar element (nav selection, workspaces in each badge state,
     /// reviews in each state, the search box, the Zen band, the unread-errors
-    /// button, the status and version lines) is readable on a light terminal.
+    /// button, the status line and the version warning) is readable on a light
+    /// terminal.
     #[test]
     fn renders_readable_in_light() {
         use shelbi_app::theme::Appearance;
@@ -2383,7 +2385,8 @@ mod tests {
         model.zen_mode = ZenModeState::On;
         model.unread_errors = 2;
         model.status_line = "3 open · 1 review".into();
-        model.daemon_version_line = Some("shelbi 0.10.0".into());
+        model.daemon_version_line = Some("daemon 0.10.0 ≠ cli 0.11.0 — shelbi daemon restart".into());
+        model.daemon_version_mismatch = true;
         let view = SidebarView::build(&model);
         crate::theme::with_appearance(Appearance::Light, || {
             let mut term = Terminal::new(TestBackend::new(40, 48)).unwrap();
