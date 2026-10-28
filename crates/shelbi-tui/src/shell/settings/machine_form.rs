@@ -37,7 +37,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear},
+    widgets::{Block, Borders},
     Frame,
 };
 use std::time::Duration;
@@ -414,7 +414,7 @@ pub(super) fn render(
         width,
         height,
     };
-    f.render_widget(Clear, rect);
+    super::clear_layer(f, rect, main);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette().divider_active))

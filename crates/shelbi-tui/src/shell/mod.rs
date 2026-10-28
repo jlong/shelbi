@@ -1634,6 +1634,12 @@ impl ShellState {
         if self.footer_hover() != before {
             self.dirty = true;
         }
+        // A Settings table row under the pointer lights; one it left goes
+        // dark (an overlay over Settings hides the hover).
+        let under = pointer.filter(|_| self.overlay.is_none());
+        if self.settings_open() && self.settings.hover_moved(under) {
+            self.dirty = true;
+        }
     }
 
     fn selection(&self) -> usize {
@@ -4770,6 +4776,9 @@ fn draw_frame<B: ratatui::backend::Backend>(
     // borrow while it holds shared borrows of the rest of `state`; it is put
     // back right after the draw.
     let mut overlay = state.overlay.take();
+    // Where the pointer is, for Settings' table hover: nowhere while an
+    // overlay stands over it.
+    let pointer = state.pointer.filter(|_| overlay.is_none());
     // Taken out like the overlay so the draw closure can render it with a
     // mutable borrow of the frame; put back after the draw (rt-tui-review).
     let mut review = state.review.take();
@@ -4947,6 +4956,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
                 keymaps,
                 style: display_style,
                 has_project,
+                pointer,
             };
             settings.render(frame, content_rect, main_rect, &chrome);
         }
@@ -9047,10 +9057,10 @@ mod tests {
             let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             draw_frame(&mut term, &mut st).unwrap();
             let screen = screen_text(&term);
-            for want in ["Settings", "▾ proj", "📑", "task default", "subtask", "+ New workflow"] {
+            for want in ["Settings", "▾ proj", "📑", "task  Default", "subtask", "+ New workflow"] {
                 assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
             }
-            let (x, y) = find_on_screen(&term, "task default").unwrap();
+            let (x, y) = find_on_screen(&term, "task  Default").unwrap();
             assert!(contains(st.main_rect, x, y), "{w}x{h}: the page is in the main area");
         }
         // Down the page: it scrolls the statuses into view at 80x24.
@@ -9061,8 +9071,101 @@ mod tests {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         let screen = screen_text(&term);
-        assert!(screen.contains("› ● Canceled"), "{screen}");
+        assert!(screen.contains("▐ ● Canceled"), "the selection's pill:\n{screen}");
         assert!(screen.contains("⏎ rename · m actions"), "the hints name the row's keys:\n{screen}");
+    }
+
+    /// The screen rows a table row is lit on for the pointer.
+    fn hover_lit(term: &Terminal<ratatui::backend::TestBackend>) -> Vec<u16> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .filter(|&y| (0..buf.area.width).any(|x| buf[(x, y)].bg == palette().row_hover))
+            .collect()
+    }
+
+    /// A Settings table row lights under the pointer (all its lines, capped
+    /// with half blocks), repaints only when the row changes, and never
+    /// outlives what's under the pointer: off the table, a scroll, a page
+    /// switch and focus loss all leave nothing stale lit.
+    #[test]
+    fn settings_table_hover_follows_the_pointer_and_never_goes_stale() {
+        let home = WorkflowsHome::new("hover");
+        let mut st = workflows_state(&home);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(hover_lit(&term).is_empty(), "nothing lit before any motion");
+        let (x, y) = find_on_screen(&term, "subtask").expect("the subtask row shows");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(x, y)));
+        assert!(st.dirty, "a row under the pointer repaints");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(hover_lit(&term), vec![y, y + 1], "both of the row's lines light");
+        let buf = term.backend().buffer();
+        let cap = (0..buf.area.width).find(|&cx| buf[(cx, y)].symbol() == "▐").expect("a left cap");
+        assert_eq!(buf[(cap, y)].fg, palette().row_hover, "the cap carries the hover fill");
+        assert!(cap < x, "the cap is left of the row's text");
+
+        // The row's second line is the same row: its hover doesn't move.
+        assert!(!st.settings.hover_moved(Some((x + 3, y + 1))), "still on the same row");
+        assert!(st.settings.hover_moved(Some((x, y + 2))), "the next line is another row");
+
+        // The selected row keeps the selection's fill under the pointer.
+        let (tx, ty) = find_on_screen(&term, "task  Default").unwrap();
+        st.handle_event(Event::Mouse(moved(tx, ty)));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(hover_lit(&term).is_empty(), "the selection wins");
+        assert_eq!(term.backend().buffer()[(tx, ty)].bg, palette().selection);
+
+        // Off the table: dark again.
+        st.handle_event(Event::Mouse(moved(x, y)));
+        draw_frame(&mut term, &mut st).unwrap();
+        let (hx, hy) = find_on_screen(&term, "Configure the statuses").unwrap();
+        assert!(st.settings.hover_moved(Some((hx, hy))), "leaving the table moves the hover");
+        st.handle_event(Event::Mouse(moved(hx, hy)));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(hover_lit(&term).is_empty(), "leaving the table clears it");
+
+        // A scroll moves the rows under a still pointer: only the row now
+        // under it lights, never the one it was on.
+        st.handle_event(Event::Mouse(moved(x, y)));
+        draw_frame(&mut term, &mut st).unwrap();
+        for _ in 0..3 {
+            st.handle_event(Event::Mouse(wheel(false, x, y)));
+        }
+        draw_frame(&mut term, &mut st).unwrap();
+        let lit = hover_lit(&term);
+        assert!(lit.is_empty() || lit.contains(&y), "only the row under the pointer: {lit:?}");
+        if let Some((_, sy)) = find_on_screen(&term, "subtask") {
+            assert!(sy == y || !lit.contains(&sy), "subtask scrolled off the pointer and went dark");
+        }
+
+        // Another page under the same pointer: nothing of the last one stays.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)));
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Keybindings);
+        draw_frame(&mut term, &mut st).unwrap();
+        let lit = hover_lit(&term);
+        assert!(lit.iter().all(|&ly| ly == y), "lit only under the pointer: {lit:?}");
+
+        // Focus lost: the pointer may be anywhere.
+        let (kx, ky) = find_on_screen(&term, "Open command palette").expect("the Global table shows");
+        st.handle_event(Event::Mouse(moved(kx, ky)));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(hover_lit(&term), vec![ky], "a keybinding row lights");
+        // An overlay over Settings takes the pointer; closing it lights the
+        // row still under it.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert!(st.overlay.is_some());
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(hover_lit(&term).is_empty(), "nothing lit under the palette");
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(hover_lit(&term), vec![ky], "lit again once it closes");
+        st.dirty = false;
+        st.handle_event(Event::FocusLost);
+        assert!(st.dirty, "losing focus repaints the lit row");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(hover_lit(&term).is_empty(), "nothing lit once focus goes");
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //! footnote, then Shared instructions: a preview of
 //! `agents/_shared/preamble.md` with Edit instructions, which opens an
 //! in-place multi-line editor with Save and Cancel. At a narrow width the
-//! table stacks each agent's fields under its name; every action stays on a
-//! key and in the row's menu.
+//! table drops Skills, then the runner, then the statuses; every action
+//! stays on a key and in the row's menu.
 //!
 //! Keys on the page (the sidebar keymap's up / down / activate, as
 //! elsewhere in Settings): Enter opens the focused row (an agent: its
@@ -47,16 +47,10 @@ use shelbi_state::keymap::{Key, Keymaps, SidebarAction};
 
 use super::{heading, selected_style, wrapped, Hit, Row, OFFERED};
 use crate::panel;
+use crate::table::{Cell, Column, Table};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
-/// Below this page width the table stacks each agent's fields.
-const TABLE_MIN_W: usize = 72;
-/// The table's fixed columns.
-const MARK_W: usize = 2;
-const RUNNER_W: usize = 18;
-const SKILLS_W: usize = 7;
-const MORE_W: usize = 2;
 /// The editor's left rule.
 /// The new agent's name field's widest (the desktop's draft field).
 const DRAFT_W: usize = 40;
@@ -935,34 +929,46 @@ impl AgentsPage {
             config.unreadable().iter().map(|u| (u.name.clone(), u.error.clone())).collect();
         rows.push(self.button_row("+ New agent", Some("n"), index(&Item::New), quiet && self.focus == Item::New, width));
         rows.push(Row::blank());
-        let table = width >= TABLE_MIN_W;
-        if table {
-            rows.push(Row::text(table_header(width)));
-        }
-        rows.push(Row::text(rule(width)));
-        for a in &summaries {
-            let item = Item::Agent(a.name.clone());
-            let i = index(&item);
-            let selected = focused && self.focus == item && self.menu.is_none() && self.state.confirm.is_none();
-            let lines = if table { table_row(a, width, selected) } else { stacked_row(a, width, selected) };
-            push_item(&mut rows, lines, i, selected && self.state.draft.is_none(), width);
-            self.under_row(&mut rows, &a.name, width);
-        }
-        for (name, error) in &unreadable {
-            let item = Item::Agent(name.clone());
-            let i = index(&item);
-            let selected = focused && self.focus == item && self.menu.is_none() && self.state.confirm.is_none();
-            let lines = unreadable_row(name, error, width, selected);
-            push_item(&mut rows, lines, i, selected && self.state.draft.is_none(), width);
-            self.under_row(&mut rows, name, width);
-        }
-        if summaries.is_empty() && unreadable.is_empty() {
-            wrapped(&mut rows, "No agents yet.", width, Style::default().fg(palette().muted));
+        // The table's rows: the agents, then the ones that don't read.
+        let names: Vec<String> =
+            summaries.iter().map(|a| a.name.clone()).chain(unreadable.iter().map(|(n, _)| n.clone())).collect();
+        let lit = |name: &str| {
+            focused && self.focus == Item::Agent(name.to_string()) && self.menu.is_none() && self.state.confirm.is_none()
+        };
+        let selected = names.iter().position(|n| lit(n));
+        let table = agent_table(&summaries, &unreadable, width).selected(selected, true);
+        let more_x = table.column_x(width, MORE_COLUMN);
+        let lines = table.lines(width);
+        let ends: Vec<bool> = (0..lines.len()).map(|n| lines.get(n + 1).map(|l| l.row) != Some(lines[n].row)).collect();
+        let starts: Vec<bool> = (0..lines.len()).map(|n| n == 0 || lines[n - 1].row != lines[n].row).collect();
+        for ((line, ends_row), starts_row) in lines.into_iter().zip(ends).zip(starts) {
+            let r = line.row;
+            let mut row = Row::table(line, AGENTS_TABLE);
+            if let Some(i) = r.and_then(|r| index(&Item::Agent(names[r].clone()))) {
+                // The focused row's first line holds the page's focus; its
+                // `⋮` column (and the gap before it) opens the menu.
+                let focus = r == selected && self.state.draft.is_none() && starts_row;
+                row.hit = Some(Hit::Agents(AgentsHit::Item(i)));
+                row.focus = focus;
+                if let Some(x) = more_x {
+                    row.split = Some((x.saturating_sub(2) as u16, Hit::Agents(AgentsHit::More(i))));
+                }
+            }
+            rows.push(row);
+            if let (Some(r), true) = (r, ends_row) {
+                let name = &names[r];
+                if let Some((_, error)) = unreadable.iter().find(|(n, _)| n == name) {
+                    for line in shelbi_app::overlay::error_log::wrap(&unreadable_message(error), width.saturating_sub(2).max(1)) {
+                        rows.push(Row::text(Line::from(Span::styled(format!("  {line}"), Style::default().fg(palette().red)))));
+                    }
+                }
+                self.under_row(&mut rows, name, width);
+            }
         }
         if let Some(from) = self.state.draft.clone() {
             self.draft_rows(&mut rows, from.as_deref(), width);
         }
-        rows.push(Row::text(rule(width)));
+        rows.push(Row::blank());
         if OFFERED.contains(SettingsPage::Workflows) {
             wrapped(&mut rows, "Assign agents to workflow statuses on the Workflows page. Runner and model preferences can be changed for each role.", width, Style::default().fg(palette().muted));
             rows.push(self.button_row("Workflows", Some(&format!("page {}", SettingsPage::Workflows.shortcut())), index(&Item::Link), quiet && self.focus == Item::Link, width));
@@ -1179,65 +1185,88 @@ impl AgentsPage {
     }
 }
 
-/// Push an item's `lines`, each hitting item `index` (the last column its
-/// `⋮`), the first focused.
-fn push_item(rows: &mut Vec<Row>, lines: Vec<Line<'static>>, index: Option<usize>, focus: bool, width: usize) {
-    for (n, line) in lines.into_iter().enumerate() {
-        let mut row = match index {
-            Some(i) => Row::hit(line, Hit::Agents(AgentsHit::Item(i)), focus && n == 0),
-            None => Row::text(line),
-        };
-        if let (0, Some(i)) = (n, index) {
-            row.split = Some((width.saturating_sub(MORE_W) as u16, Hit::Agents(AgentsHit::More(i))));
+/// The page's one table, for the pointer's hover (`HoverKey`).
+const AGENTS_TABLE: u8 = 0;
+
+/// The table's `⋮` column: a row's actions.
+const MORE_COLUMN: usize = 4;
+
+/// The agents table, as the desktop's: Agent (the Customized badge, the
+/// description under it), Preferred runner (Recommended under it), Workflow
+/// statuses (wrapped to the column), Skills, and a `⋮` for the row's
+/// actions. An agent whose files don't read is a row of its name (the
+/// page says why under it). Skills go first when it's narrow, then the
+/// runner, then the statuses.
+fn agent_table(agents: &[AgentSummary], unreadable: &[(String, String)], width: usize) -> Table {
+    let columns = || {
+        vec![
+            Column::new("Agent").min(16).max(48).fill(),
+            Column::new("Preferred runner").min(11).max(18).drop(2),
+            Column::new("Workflow statuses").min(14).max(32).drop(1),
+            Column::new("Skills").min(6).max(6).drop(3),
+            Column::new("").min(1).max(1),
+        ]
+    };
+    let build = |statuses_w: Option<usize>| {
+        let mut table = Table::new(columns()).empty("No agents yet.");
+        for a in agents {
+            let mut name = vec![Span::styled(a.name.clone(), Style::default().fg(palette().white).add_modifier(Modifier::BOLD))];
+            if a.provenance == Provenance::Customized {
+                name.push(Span::raw(" "));
+                name.push(Span::styled(
+                    " Customized ",
+                    Style::default().fg(palette().workflow_badge_fg).bg(palette().workflow_badge_bg),
+                ));
+            }
+            let mut agent = Cell::spans(name);
+            if let Some(d) = a.description.as_deref().filter(|d| !d.is_empty()) {
+                agent = agent.and(d.to_string(), Style::default().fg(palette().muted));
+            }
+            let runner = a.preferred_runner.map_or(UNSET_RUNNER, runner_label);
+            let mut runner = Cell::text(runner, Style::default().fg(palette().foreground));
+            if a.runner_recommended {
+                runner = runner.and("Recommended", Style::default().fg(palette().muted));
+            }
+            // The chips on one line to size the column, then wrapped to it.
+            let chips = status_chips(a);
+            let mut lines = chip_lines(&chips, statuses_w.unwrap_or(usize::MAX)).into_iter();
+            let mut statuses = Cell::spans(lines.next().unwrap_or_default());
+            for line in lines {
+                statuses = statuses.and_spans(line);
+            }
+            let skills = Cell::text(a.skills.to_string(), Style::default().fg(palette().gray));
+            table.push(vec![agent, runner, statuses, skills, Cell::text("⋮", Style::default().fg(palette().gray))]);
         }
-        rows.push(row);
+        for (name, _) in unreadable {
+            table.push(vec![
+                Cell::text(name.clone(), Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
+                Cell::empty(),
+                Cell::empty(),
+                Cell::empty(),
+                Cell::text("⋮", Style::default().fg(palette().gray)),
+            ]);
+        }
+        table
+    };
+    let statuses_w = build(None).layout(width)[2];
+    match statuses_w {
+        Some(w) => build(Some(w)),
+        None => build(None),
     }
 }
 
-fn rule(width: usize) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(width), Style::default().fg(palette().ansi_dark_gray)))
-}
-
-/// `text` padded or cut to `width` columns.
-fn cell(text: &str, width: usize) -> String {
-    let text = panel::truncate_right(text, width);
-    let pad = width.saturating_sub(panel::display_width(&text));
-    format!("{text}{}", " ".repeat(pad))
-}
-
-/// The table's column widths at `width`: (name, statuses).
-fn columns(width: usize) -> (usize, usize) {
-    let rest = width.saturating_sub(MARK_W + RUNNER_W + SKILLS_W + MORE_W);
-    let statuses = (rest * 2 / 5).clamp(16, 32);
-    (rest.saturating_sub(statuses), statuses)
-}
-
-fn table_header(width: usize) -> Line<'static> {
-    let (name_w, statuses_w) = columns(width);
-    let style = Style::default().fg(palette().gray).add_modifier(Modifier::BOLD);
-    Line::from(vec![
-        Span::raw(" ".repeat(MARK_W)),
-        Span::styled(cell("Agent", name_w), style),
-        Span::styled(cell("Preferred runner", RUNNER_W), style),
-        Span::styled(cell("Workflow statuses", statuses_w), style),
-        Span::styled(cell("Skills", SKILLS_W), style),
-    ])
-}
-
 /// The status chips laid into lines at most `width` wide: `● Name` each,
-/// the dot in its category's color.
+/// the dot in its category's color; Not assigned when there are none.
 fn chip_lines(chips: &[StatusChip], width: usize) -> Vec<Vec<Span<'static>>> {
     if chips.is_empty() {
-        return vec![vec![Span::styled(cell(NOT_ASSIGNED, width), Style::default().fg(palette().muted))]];
+        return vec![vec![Span::styled(NOT_ASSIGNED, Style::default().fg(palette().muted))]];
     }
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut used = 0;
     let mut current: Vec<Span<'static>> = Vec::new();
     for chip in chips {
-        let name = panel::truncate_right(&chip.name, width.saturating_sub(2).max(1));
-        let w = 2 + panel::display_width(&name);
-        let gap = usize::from(!current.is_empty());
-        if !current.is_empty() && used + gap + w > width {
+        let w = 2 + panel::display_width(&chip.name);
+        if !current.is_empty() && used + 1 + w > width {
             lines.push(std::mem::take(&mut current));
             used = 0;
         }
@@ -1247,134 +1276,11 @@ fn chip_lines(chips: &[StatusChip], width: usize) -> Vec<Vec<Span<'static>>> {
         }
         let dot = chip.category.map(crate::kanban::category_color).unwrap_or(palette().muted);
         current.push(Span::styled("● ", Style::default().fg(dot)));
-        current.push(Span::styled(name, Style::default().fg(palette().foreground)));
+        current.push(Span::styled(chip.name.clone(), Style::default().fg(palette().foreground)));
         used += w;
     }
     lines.push(current);
-    // Pad each line to the column.
-    for line in &mut lines {
-        let w: usize = line.iter().map(|s| panel::display_width(&s.content)).sum();
-        line.push(Span::raw(" ".repeat(width.saturating_sub(w))));
-    }
     lines
-}
-
-/// An agent's name, bold, and its Customized badge when there's room.
-fn name_spans(a: &AgentSummary, width: usize) -> Vec<Span<'static>> {
-    const BADGE: &str = " Customized ";
-    let name = panel::truncate_right(&a.name, width);
-    let mut used = panel::display_width(&name);
-    let mut spans = vec![Span::styled(name, Style::default().fg(palette().white).add_modifier(Modifier::BOLD))];
-    if a.provenance == Provenance::Customized && used + 1 + BADGE.len() <= width {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            BADGE,
-            Style::default().fg(palette().workflow_badge_fg).bg(palette().workflow_badge_bg),
-        ));
-        used += 1 + BADGE.len();
-    }
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    spans
-}
-
-/// Fill a selected row's spans with the selection background.
-fn select(mut line: Line<'static>, selected: bool, width: usize) -> Line<'static> {
-    if selected {
-        let w: usize = line.spans.iter().map(|s| panel::display_width(&s.content)).sum();
-        if w < width {
-            line.spans.push(Span::raw(" ".repeat(width - w)));
-        }
-        line = line.patch_style(Style::default().bg(palette().selection));
-    }
-    line
-}
-
-/// An agent's table row: name and badge, runner, statuses, skills, `⋮`;
-/// then its description, Recommended, and the statuses that didn't fit.
-fn table_row(a: &AgentSummary, width: usize, selected: bool) -> Vec<Line<'static>> {
-    let (name_w, statuses_w) = columns(width);
-    let chips = chip_lines(&status_chips(a), statuses_w);
-    let runner = a.preferred_runner.map_or(UNSET_RUNNER, runner_label);
-    let marker = if selected { "› " } else { "  " };
-    let mut first = vec![Span::styled(marker.to_string(), Style::default().fg(palette().cyan))];
-    first.extend(name_spans(a, name_w.saturating_sub(1)));
-    first.push(Span::raw(" "));
-    first.push(Span::styled(cell(runner, RUNNER_W), Style::default().fg(palette().foreground)));
-    first.extend(chips[0].clone());
-    first.push(Span::styled(cell(&a.skills.to_string(), SKILLS_W), Style::default().fg(palette().gray)));
-    first.push(Span::styled("⋮ ", Style::default().fg(palette().gray)));
-    let mut out = vec![select(Line::from(first), selected, width)];
-    let description = a.description.clone().unwrap_or_default();
-    let lines = chips.len().max(2);
-    for n in 1..lines {
-        let mut spans = vec![Span::raw(" ".repeat(MARK_W))];
-        let left = if n == 1 { cell(&description, name_w.saturating_sub(1)) } else { " ".repeat(name_w.saturating_sub(1)) };
-        spans.push(Span::styled(left, Style::default().fg(palette().gray)));
-        spans.push(Span::raw(" "));
-        let rec = if n == 1 && a.runner_recommended { "Recommended" } else { "" };
-        spans.push(Span::styled(cell(rec, RUNNER_W), Style::default().fg(palette().muted)));
-        match chips.get(n) {
-            Some(c) => spans.extend(c.clone()),
-            None => spans.push(Span::raw(" ".repeat(statuses_w))),
-        }
-        out.push(select(Line::from(spans), selected, width));
-    }
-    out
-}
-
-/// An agent at a narrow width: its fields under its name.
-fn stacked_row(a: &AgentSummary, width: usize, selected: bool) -> Vec<Line<'static>> {
-    let marker = if selected { "› " } else { "  " };
-    let inner = width.saturating_sub(MARK_W + MORE_W).max(1);
-    let mut first = vec![Span::styled(marker.to_string(), Style::default().fg(palette().cyan))];
-    first.extend(name_spans(a, inner));
-    first.push(Span::styled("⋮ ", Style::default().fg(palette().gray)));
-    let mut out = vec![select(Line::from(first), selected, width)];
-    let indent = "    ";
-    let text_w = width.saturating_sub(indent.len()).max(1);
-    let mut push = |text: &str, style: Style| {
-        for line in shelbi_app::overlay::error_log::wrap(text, text_w) {
-            out.push(select(Line::from(vec![Span::raw(indent), Span::styled(line, style)]), selected, width));
-        }
-    };
-    if let Some(d) = a.description.as_deref().filter(|d| !d.is_empty()) {
-        push(d, Style::default().fg(palette().gray));
-    }
-    let mut runner = a.preferred_runner.map_or(UNSET_RUNNER, runner_label).to_string();
-    if a.runner_recommended {
-        runner.push_str(" (recommended)");
-    }
-    let skills = shelbi_app::settings::summary::count(a.skills, "skill");
-    push(&format!("{runner} · {skills}"), Style::default().fg(palette().foreground));
-    let chips = status_chips(a);
-    let statuses = if chips.is_empty() {
-        NOT_ASSIGNED.to_string()
-    } else {
-        format!("Statuses: {}", chips.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))
-    };
-    push(&statuses, Style::default().fg(palette().muted));
-    out
-}
-
-/// An agent whose files don't read: its name, the error, and its `⋮` (Edit
-/// YAML only).
-fn unreadable_row(name: &str, error: &str, width: usize, selected: bool) -> Vec<Line<'static>> {
-    let marker = if selected { "› " } else { "  " };
-    let inner = width.saturating_sub(MARK_W + MORE_W).max(1);
-    let first = Line::from(vec![
-        Span::styled(marker.to_string(), Style::default().fg(palette().cyan)),
-        Span::styled(cell(name, inner), Style::default().fg(palette().white).add_modifier(Modifier::BOLD)),
-        Span::styled("⋮ ", Style::default().fg(palette().gray)),
-    ]);
-    let mut out = vec![select(first, selected, width)];
-    for line in shelbi_app::overlay::error_log::wrap(&unreadable_message(error), width.saturating_sub(4).max(1)) {
-        out.push(select(
-            Line::from(vec![Span::raw("    "), Span::styled(line, Style::default().fg(palette().red))]),
-            selected,
-            width,
-        ));
-    }
-    out
 }
 
 /// The shared instructions' preview: the first lines, lightly formatted.
@@ -1559,7 +1465,7 @@ mod tests {
                 let area = f.area();
                 let side = Rect { width: 28.min(area.width / 3), ..area };
                 let main = Rect { x: side.right(), width: area.width - side.width, ..area };
-                let chrome = super::super::Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true };
+                let chrome = super::super::Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true, pointer: None };
                 self.s.render(f, side, main, &chrome);
             })
             .unwrap();
@@ -1605,19 +1511,28 @@ mod tests {
         let line = |name: &str| text.lines().find(|l| l.contains(&format!(" {name} "))).unwrap().to_string();
         assert!(line("orchestrator").contains("Customized"));
         assert!(!line("developer").contains("Customized"));
-        assert!(line("review").trim_end().ends_with("1      ⋮"), "the review agent's one skill:\n{}", line("review"));
+        assert!(line("review").contains("│ 1 ") && line("review").contains("│ ⋮"), "the review agent's one skill:\n{}", line("review"));
         assert_eq!(text.matches("In Progress").count(), 1, "once, though task and subtask both assign it");
     }
 
     #[test]
-    fn a_narrow_page_stacks_each_agents_fields_and_keeps_its_actions() {
+    fn a_narrow_page_drops_columns_and_keeps_its_actions() {
         let _home = home("narrow");
         let mut d = Driver::new(Some(PROJECT));
+        // Cut, every column still there.
         let text = d.screen(96, 60);
-        assert!(!text.contains("Preferred runner"), "no table header:\n{text}");
-        for want in ["orchestrator", "Statuses: Backlog, To Do", "Claude Code (recommended) · 0 skills", "Not assigned"] {
+        for want in ["Agent ", "│ Preferred ru…", "│ Skills", "│ ● Backlog", "│ Not assigned", "│ ⋮"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
+        // Narrower: Skills go, then the runner; the name and its ⋮ stay.
+        let text = d.screen(80, 60);
+        assert!(!text.contains("Skills") && !text.contains("Claude Code"), "{text}");
+        for want in ["Agent ", "orchestrator", "│ ● Backlog", "│ ⋮"] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+        let text = d.screen(56, 30);
+        assert!(!text.contains("● Backlog"), "only the name is left:\n{text}");
+        assert!(text.contains("orchestrator") && text.contains("│ ⋮"), "{text}");
         // The actions are a key away all the same.
         d.focus(Item::Agent("developer".into()));
         d.key(KeyCode::Char('m'));
@@ -1632,7 +1547,7 @@ mod tests {
                 let area = f.area();
                 let side = Rect { width: 20, ..area };
                 let main = Rect { x: 20, width: 44, ..area };
-                let chrome = super::super::Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true };
+                let chrome = super::super::Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true, pointer: None };
                 d.s.render(f, side, main, &chrome);
             })
             .unwrap();
@@ -1652,7 +1567,7 @@ mod tests {
                 let area = f.area();
                 let side = Rect { width: 28, ..area };
                 let main = Rect { x: 28, width: 132, ..area };
-                let chrome = super::super::Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true };
+                let chrome = super::super::Chrome { project_label: "proj", status: None, keymaps: &km, style: DisplayStyle::Mac, has_project: true, pointer: None };
                 d.s.render(f, side, main, &chrome);
             })
             .unwrap();

@@ -91,9 +91,15 @@ fn render(page: &mut WorkflowsPage, w: u16, h: u16) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        let rows = page.rows(area.width as usize, true, true);
+        // As the shell draws a page: inside its gutter, a table's lines out
+        // in it.
+        let pad = crate::panel::PAD.min(area.width / 2);
+        let content = Rect { x: area.x + pad, width: area.width - 2 * pad, ..area };
+        let rows = page.rows(content.width as usize, true, true);
         for (i, row) in rows.iter().take(area.height as usize).enumerate() {
-            f.render_widget(Paragraph::new(row.line.clone()), Rect { y: i as u16, height: 1, ..area });
+            let rect = Rect { y: i as u16, height: 1, ..content };
+            let rect = if row.table_row.is_some() { super::super::bleed_rect(rect, area) } else { rect };
+            f.render_widget(Paragraph::new(row.line.clone()), rect);
         }
         page.render_modal(f, area);
     })
@@ -131,7 +137,7 @@ fn the_page_lists_workflows_statuses_and_the_legend() {
     let text = render(&mut page, 110, 60);
     for want in [
         "Workflows",
-        "task default",
+        "task  Default",
         "Branch work with a review gate.",
         "subtask",
         "Statuses",
@@ -150,8 +156,10 @@ fn the_page_lists_workflows_statuses_and_the_legend() {
         assert!(text.contains(want), "{want:?}:\n{text}");
     }
     // Counts: task has six statuses and four transitions.
-    let task = text.lines().find(|l| l.contains("task default")).unwrap();
-    assert!(task.trim_end().ends_with('4') && task.contains(" 6 "), "{task}");
+    let task = text.lines().find(|l| l.contains("task  Default")).unwrap();
+    assert!(task.contains("│ 6 ") && task.contains("│ 4 "), "{task}");
+    // The cursor's row is the selection's pill, capped each end.
+    assert!(task.starts_with('▐') && task.trim_end().ends_with('▌'), "{task}");
     assert_eq!(
         page.items(),
         [
@@ -257,7 +265,7 @@ fn duplicate_offers_a_free_name_and_set_default_moves_the_badge() {
     drain(&mut page);
     assert_eq!(WorkflowConfig::load(PROJECT).unwrap().default_workflow(), "subtask");
     assert_eq!(page.cursor_item(), Some(Item::Workflow("subtask".into())), "follows it to the top");
-    assert!(render(&mut page, 100, 40).contains("subtask default"));
+    assert!(render(&mut page, 100, 40).contains("subtask  Default"));
 }
 
 #[test]
@@ -527,7 +535,9 @@ fn an_unreadable_workflow_is_listed_with_its_error_and_opens_its_yaml() {
     std::fs::write(home.workflows().join("broken.yaml"), broken).unwrap();
     let mut page = page();
     let text = render(&mut page, 120, 40);
-    assert!(text.contains("⚠ broken  Can’t be edited here:"), "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.contains("⚠ broken")).expect(&text);
+    assert!(lines[at + 1].contains("Can’t be edited here:"), "its error under its name:\n{text}");
     page.select(&Item::Unreadable("broken".into()));
     match press(&mut page, key(KeyCode::Enter)) {
         SettingsAction::EditYaml(file) => assert!(file.path.ends_with("broken.yaml")),
@@ -592,7 +602,7 @@ fn narrow_and_tiny_widths_draw_without_panicking() {
     let _home = Home::new("narrow");
     let mut page = page();
     let text = render(&mut page, 52, 60);
-    assert!(text.contains("task default"), "{text}");
+    assert!(text.contains("task  Default"), "{text}");
     assert!(text.contains("● To Do"), "{text}");
     page.select(&Item::Status("todo".into()));
     press(&mut page, key(KeyCode::Char('m')));
