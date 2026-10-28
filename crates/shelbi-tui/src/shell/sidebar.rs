@@ -10,10 +10,12 @@
 //! nav block with the half-block selection bleed, the machine-grouped
 //! workspace pool with per-state badges, the two review sections rendered as
 //! two-line entries (dim `⎇ branch` line, truncated with `…`), and the footer
-//! (daemon-version row, the `ZEN MODE ON` band shown only while Zen is on, the
-//! one-time first-run hint, and the unread-errors button). The old `^P palette
-//! q quit` / `^G Zen mode` footer hint lines are gone; those actions stay
-//! reachable through the palette and their existing keys.
+//! (the one-time first-run hint or a status line; the toolbar, mirroring the
+//! desktop's: Settings, Send Feedback, and the unread-errors badge while there
+//! are any, in its bottom-left corner, with the daemon-version line at its
+//! right; and the `ZEN MODE ON` band shown only while Zen is on). The old `^P
+//! palette q quit` / `^G Zen mode` footer hint lines are gone; those actions
+//! stay reachable through the palette and their existing keys.
 //!
 //! Selection is a single flat index over the *selectable* rows (section
 //! headers / blanks are skipped), exactly as [`shelbi_app::nav::ClientState`]
@@ -43,12 +45,6 @@ use unicode_width::UnicodeWidthStr;
 /// from the product wording (ported from the former `crate::FIRST_RUN_HINT`).
 pub(crate) const FIRST_RUN_HINT: &str = "Ctrl+P palette · type E to edit settings";
 
-/// The unread-errors button: a solid 5-wide × 3-tall block anchored to the
-/// footer's bottom-left corner, a single bold `!` in its center cell. Its fill
-/// is the theme's `error_button`, a reddish gray muted enough to read as
-/// chrome and warm enough to signal something's wrong.
-const ERROR_BUTTON_W: u16 = 5;
-const ERROR_BUTTON_H: u16 = 3;
 /// Rows the footer status reserves for the orchestrator supervisor's failure.
 const ORCH_STATUS_ROWS: u16 = 3;
 
@@ -65,6 +61,43 @@ pub enum RowTarget {
     Machine(String),
 }
 
+/// A button in the footer's toolbar, left to right in the desktop's order
+/// (Figma Navigation's footer Toolbar): Settings, Send Feedback, then the
+/// unread-errors badge while there are any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterButton {
+    Settings,
+    Feedback,
+    Errors,
+}
+
+impl FooterButton {
+    /// The button's cells: its glyph with a column of padding each side (the
+    /// `📣` is two cells wide), or the word when emoji can't draw.
+    fn face(self, emoji: bool) -> &'static str {
+        match (self, emoji) {
+            (FooterButton::Settings, true) => " ⚙ ",
+            (FooterButton::Feedback, true) => " 📣 ",
+            (FooterButton::Settings, false) => " Settings ",
+            (FooterButton::Feedback, false) => " Feedback ",
+            (FooterButton::Errors, _) => " ! ",
+        }
+    }
+
+    /// The desktop's tooltip for the button, shown beside the toolbar while
+    /// the pointer is over it.
+    fn tooltip(self, unread_errors: usize) -> String {
+        match self {
+            FooterButton::Settings => "Settings".to_string(),
+            FooterButton::Feedback => "Send Feedback".to_string(),
+            FooterButton::Errors => format!(
+                "{unread_errors} unread error{}",
+                if unread_errors == 1 { "" } else { "s" }
+            ),
+        }
+    }
+}
+
 /// Per-frame footer/header input that isn't board state: the resolved
 /// palette-open chord shown in the search box's `⌘K`-style hint. Owned (no
 /// borrow of the shell state) so the draw closure can disjointly borrow the
@@ -73,6 +106,9 @@ pub struct SidebarChrome {
     /// The palette-open chord resolved for the host platform (e.g. `⌃P` on
     /// macOS, `Ctrl+P` elsewhere), or `<unbound>` when no chord is bound.
     palette: String,
+    /// The footer button under the pointer, lit with its hover fill and
+    /// named beside the toolbar (the desktop's tooltip).
+    hover: Option<FooterButton>,
 }
 
 impl SidebarChrome {
@@ -83,7 +119,13 @@ impl SidebarChrome {
                 keymaps.global.first_chord_for(GlobalAction::OpenPalette),
                 display_style,
             ),
+            hover: None,
         }
+    }
+
+    /// The footer button the pointer is over (see [`SidebarView::footer_button_at`]).
+    pub fn with_hover(self, hover: Option<FooterButton>) -> Self {
+        SidebarChrome { hover, ..self }
     }
 
     /// The resolved palette-open chord (e.g. `⌃P`, `Ctrl+Space`), for callers
@@ -158,6 +200,9 @@ pub struct SidebarView {
     status_is_orchestrator_failure: bool,
     zen_mode: ZenModeState,
     unread_errors: usize,
+    /// Emoji draw on this terminal (`Caps::emoji`); else the footer's buttons
+    /// fall back to words.
+    emoji: bool,
 }
 
 impl SidebarView {
@@ -181,7 +226,14 @@ impl SidebarView {
             status_is_orchestrator_failure: model.orchestrator_status.is_some(),
             zen_mode: model.zen_mode,
             unread_errors: model.unread_errors,
+            emoji: true,
         }
+    }
+
+    /// Lay the footer's buttons out for a terminal that can (or can't) draw
+    /// emoji.
+    pub fn with_emoji(self, emoji: bool) -> Self {
+        SidebarView { emoji, ..self }
     }
 
     pub fn selectable_count(&self) -> usize {
@@ -207,13 +259,16 @@ impl SidebarView {
             .count()
     }
 
-    /// Footer height: the three fixed rows (version / blank / zen band) plus the
-    /// status row's height (0 when empty, 2 for the first-run hint,
-    /// [`ORCH_STATUS_ROWS`] for an orchestrator supervisor failure, else 1). The
-    /// zen band paints only while Zen is on, but the row is always reserved so
-    /// the version line never shifts when Zen toggles.
-    fn footer_height(&self) -> u16 {
-        3 + self.status_row_height()
+    /// Footer height: the status row's height (0 when empty, 2 for the
+    /// first-run hint, [`ORCH_STATUS_ROWS`] for an orchestrator supervisor
+    /// failure, else 1), a row for the version line when it doesn't fit beside
+    /// the toolbar's buttons at `width`, and the four fixed rows: the toolbar's
+    /// half-row margin above, the toolbar, its half-row margin below (the
+    /// spacer above the band), and the zen band. The band paints only while Zen
+    /// is on, but its row is always reserved so the toolbar never shifts when
+    /// Zen toggles.
+    fn footer_height(&self, width: u16) -> u16 {
+        self.status_row_height() + u16::from(self.version_needs_own_row(width)) + 4
     }
 
     fn status_row_height(&self) -> u16 {
@@ -230,6 +285,81 @@ impl SidebarView {
         }
     }
 
+    /// The toolbar's buttons, left to right.
+    fn footer_buttons(&self) -> Vec<FooterButton> {
+        let mut buttons = vec![FooterButton::Settings, FooterButton::Feedback];
+        if self.unread_errors > 0 {
+            buttons.push(FooterButton::Errors);
+        }
+        buttons
+    }
+
+    /// Each toolbar button's columns on the toolbar `row`: one column in from
+    /// the left edge, a column between buttons. A button that would reach the
+    /// row's last column is left off.
+    fn button_spans(&self, row: Rect) -> Vec<(FooterButton, Rect)> {
+        let mut out = Vec::new();
+        let mut x = row.x + LIST_INDENT.horizontal;
+        let limit = row.right().saturating_sub(LIST_INDENT.horizontal);
+        for button in self.footer_buttons() {
+            let w = UnicodeWidthStr::width(button.face(self.emoji)) as u16;
+            if x + w > limit {
+                break;
+            }
+            out.push((button, Rect { x, width: w, ..row }));
+            x += w + BUTTON_GAP;
+        }
+        out
+    }
+
+    /// Where the buttons end on a toolbar row starting at `x` (the column just
+    /// past the last one).
+    fn buttons_end(&self, row: Rect) -> u16 {
+        self.button_spans(row)
+            .last()
+            .map_or(row.x + LIST_INDENT.horizontal, |(_, r)| r.right())
+    }
+
+    /// The daemon/CLI version segment and the board-freshness banner, as
+    /// styled spans: dim on a match, red on a mismatch; the banner yellow when
+    /// stale. Empty until the first probe.
+    fn version_spans(&self) -> Vec<Span<'static>> {
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(line) = self.daemon_version_line.clone() {
+            let style = if self.daemon_version_mismatch {
+                Style::default().fg(palette().ansi_red)
+            } else {
+                Style::default().fg(palette().muted)
+            };
+            spans.push(Span::styled(line, style));
+        }
+        if let Some(banner) = &self.board_banner {
+            let stale = banner.contains("stale") || banner.contains("no daemon");
+            let color = if stale { palette().ansi_yellow } else { palette().muted };
+            let prefix = if spans.is_empty() { "" } else { "  " };
+            spans.push(Span::styled(
+                format!("{prefix}{banner}"),
+                Style::default().fg(color),
+            ));
+        }
+        spans
+    }
+
+    /// Whether the version line has to take its own row above the toolbar: it
+    /// sits right-aligned beside the buttons when it fits there whole (two
+    /// columns clear of them, one in from the right edge), never cut short.
+    fn version_needs_own_row(&self, width: u16) -> bool {
+        let version_w: usize = self.version_spans().iter().map(|s| s.width()).sum();
+        if version_w == 0 {
+            return false;
+        }
+        let row = Rect::new(0, 0, width, 1);
+        let room = width
+            .saturating_sub(LIST_INDENT.horizontal)
+            .saturating_sub(self.buttons_end(row) + 2);
+        version_w > room as usize
+    }
+
     /// Split the sidebar `area` into (header, search, nav, rest-list, footer)
     /// rects — the shared geometry the renderer and the click map both derive
     /// from. `search` is `None` when the header is too short to hold the box;
@@ -238,10 +368,10 @@ impl SidebarView {
     fn geometry(&self, area: Rect) -> SidebarGeometry {
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(self.footer_height())])
+            .constraints([Constraint::Min(1), Constraint::Length(self.footer_height(area.width))])
             .split(area);
         let body_region = outer[0];
-        let footer = outer[1];
+        let footer = self.footer_rows(outer[1]);
         // Header holds the project title (row 0), a half-row margin (row 1),
         // the 2-row search box across rows 2–4 (`▄` / label / `▀`), and a
         // half-row margin (row 5); then the body.
@@ -289,6 +419,43 @@ impl SidebarView {
         }
     }
 
+    /// Lay the footer's rows out bottom-up in `footer`, so a footer squeezed
+    /// by a short sidebar keeps the band and the toolbar and drops what sits
+    /// above them first.
+    fn footer_rows(&self, footer: Rect) -> FooterRows {
+        // Peel one `h`-row rect off the bottom of what's left, if it fits.
+        fn take(left: &mut Rect, h: u16) -> Option<Rect> {
+            (h > 0 && left.height >= h).then(|| {
+                left.height -= h;
+                Rect {
+                    y: left.bottom(),
+                    height: h,
+                    ..*left
+                }
+            })
+        }
+        let mut left = footer;
+        let zen = take(&mut left, 1);
+        let below = take(&mut left, 1);
+        let toolbar = take(&mut left, 1);
+        let above = take(&mut left, 1);
+        let version = if self.version_needs_own_row(footer.width) {
+            take(&mut left, 1)
+        } else {
+            None
+        };
+        let status_h = self.status_row_height().min(left.height);
+        let status = take(&mut left, status_h);
+        FooterRows {
+            status,
+            version,
+            above,
+            toolbar,
+            below,
+            zen,
+        }
+    }
+
     /// Whether `(x, y)` lands on the search box — the shell maps a click here to
     /// opening the command palette, the same as pressing the palette chord.
     pub fn search_box_hit(&self, area: Rect, x: u16, y: u16) -> bool {
@@ -300,21 +467,25 @@ impl SidebarView {
             .is_some_and(|s| contains(s, x, y))
     }
 
-    /// Whether `(x, y)` lands on the Settings gear at the end of the title row
-    /// (the shell opens Settings, as the sidebar's `,` does).
-    pub fn settings_hit(&self, area: Rect, x: u16, y: u16) -> bool {
+    /// The footer button at `(x, y)`, if any: its columns across the three
+    /// cell rows its hover pill spans (the `▄` margin, the toolbar row, the `▀`
+    /// margin), like the search box's target. The shell opens Settings, runs
+    /// Send Feedback, or opens the error log.
+    pub fn footer_button_at(&self, area: Rect, x: u16, y: u16) -> Option<FooterButton> {
         if area.width == 0 || area.height == 0 || !contains(area, x, y) {
-            return false;
+            return None;
         }
-        let header = self.geometry(area).header;
-        let gear = settings_gear_rect(header);
-        // A cell either side of the glyph counts, so the target isn't one column.
-        let target = Rect {
-            x: gear.x.saturating_sub(1),
-            width: gear.width + 2,
-            ..gear
-        };
-        header.width > SETTINGS_GEAR_W + 3 && contains(target, x, y)
+        let rows = self.geometry(area).footer;
+        let toolbar = rows.toolbar?;
+        let top = rows.above.map_or(toolbar.y, |r| r.y);
+        let bottom = rows.below.map_or(toolbar.bottom(), |r| r.bottom());
+        if y < top || y >= bottom {
+            return None;
+        }
+        self.button_spans(toolbar)
+            .into_iter()
+            .find(|(_, r)| x >= r.x && x < r.right())
+            .map(|(b, _)| b)
     }
 
     /// Map a click at viewer `(x, y)` to the selection index of the row there,
@@ -401,7 +572,7 @@ impl SidebarView {
         if let Some(rest) = geo.rest {
             self.render_rest(buf, rest, sel_row, focused);
         }
-        self.render_footer(buf, geo.footer);
+        self.render_footer(buf, &geo.footer, chrome.hover);
     }
 
     /// Render the header block: the project title in the accent cyan on the
@@ -418,24 +589,19 @@ impl SidebarView {
             return;
         }
         // The title sits on row 1 (a blank row above it); fall back to row 0 on
-        // a header clamped to a single row.
-        let gear = settings_gear_rect(header);
+        // a header clamped to a single row. Settings lives in the footer's
+        // toolbar, so the title has the row to itself.
         let title_rect = Rect {
-            y: gear.y,
+            y: header.y + if header.height >= 2 { 1 } else { 0 },
             height: 1,
             ..header
         }
         .inner(LIST_INDENT);
-        // The title leaves the row's last two columns to the Settings gear.
-        let gear_room = if title_rect.width > SETTINGS_GEAR_W + 1 { SETTINGS_GEAR_W + 1 } else { 0 };
         Paragraph::new(Line::from(Span::styled(
-            truncate_ellipsis(&self.project_label, title_rect.width.saturating_sub(gear_room) as usize),
+            truncate_ellipsis(&self.project_label, title_rect.width as usize),
             Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
         )))
         .render(title_rect, buf);
-        if gear_room > 0 {
-            Paragraph::new(Span::styled(SETTINGS_GEAR, Style::default().fg(palette().gray))).render(gear, buf);
-        }
 
         if let Some(search) = search {
             render_search_box(buf, search, &chrome.palette);
@@ -496,38 +662,12 @@ impl SidebarView {
         StatefulWidget::render(list, area, buf, &mut state);
     }
 
-    fn render_footer(&self, buf: &mut Buffer, area: Rect) {
-        // Vertical rhythm: [status?] version, blank, zen-band. The blank keeps
-        // the version line put whether or not the band paints, so toggling Zen
-        // never nudges the line above.
-        let has_status = !self.status_line.is_empty();
-        let mut constraints = Vec::with_capacity(if has_status { 4 } else { 3 });
-        if has_status {
-            constraints.push(Constraint::Length(self.status_row_height()));
-        }
-        constraints.extend([Constraint::Length(1); 3]);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
-
-        let first_fixed = if has_status { 1 } else { 0 };
-        let show_button = self.unread_errors > 0
-            && area.width > ERROR_BUTTON_W + 1
-            && rows.len() >= first_fixed + 3;
-        let content_x = area.x + if show_button { ERROR_BUTTON_W + 1 } else { 1 };
-        let content_w = area
-            .width
-            .saturating_sub(content_x - area.x)
-            .saturating_sub(if show_button { 0 } else { 1 });
-        let content_row = |row: Rect| Rect {
-            x: content_x,
-            width: content_w,
-            ..row
-        };
-
-        let mut idx = 0;
-        if has_status {
+    /// Paint the footer: the status row, the toolbar (Settings, Send Feedback,
+    /// the unread-errors badge) with the version line at its right or on its
+    /// own row above, and the zen band. `hover` is the button under the
+    /// pointer: it takes its hover pill and its name shows beside the toolbar.
+    fn render_footer(&self, buf: &mut Buffer, rows: &FooterRows, hover: Option<FooterButton>) {
+        if let Some(status) = rows.status {
             let style = if self.status_is_orchestrator_failure {
                 Style::default().fg(palette().ansi_red)
             } else if self.status_line == FIRST_RUN_HINT {
@@ -537,68 +677,61 @@ impl SidebarView {
             };
             Paragraph::new(Line::from(Span::styled(self.status_line.clone(), style)))
                 .wrap(Wrap { trim: true })
-                .render(
-                    rows[idx].inner(Margin {
-                        horizontal: 1,
-                        vertical: 0,
-                    }),
+                .render(status.inner(LIST_INDENT), buf);
+        }
+
+        // On its own row the line takes the whole width past the left inset
+        // (it only clips on a sidebar too narrow even for that).
+        if let Some(row) = rows.version {
+            let row = Rect {
+                x: row.x + LIST_INDENT.horizontal,
+                width: row.width.saturating_sub(LIST_INDENT.horizontal),
+                ..row
+            };
+            Paragraph::new(Line::from(self.version_spans())).render(row, buf);
+        }
+
+        if let Some(toolbar) = rows.toolbar {
+            let hover = hover.filter(|h| self.footer_buttons().contains(h));
+            for (button, rect) in self.button_spans(toolbar) {
+                render_footer_button(
                     buf,
+                    button,
+                    button.face(self.emoji),
+                    rect,
+                    rows.above,
+                    rows.below,
+                    hover == Some(button),
                 );
-            idx += 1;
+            }
+            // Right of the buttons: the hovered button's name (the desktop's
+            // tooltip) left-aligned, else the version line right-aligned when
+            // it has no row of its own.
+            let start = self.buttons_end(toolbar) + 2;
+            let end = toolbar.right().saturating_sub(LIST_INDENT.horizontal);
+            if start < end {
+                let info = Rect {
+                    x: start,
+                    width: end - start,
+                    ..toolbar
+                };
+                if let Some(button) = hover {
+                    Paragraph::new(Span::styled(
+                        truncate_ellipsis(&button.tooltip(self.unread_errors), info.width as usize),
+                        Style::default().fg(palette().gray),
+                    ))
+                    .render(info, buf);
+                } else if !self.version_needs_own_row(toolbar.width) {
+                    Paragraph::new(Line::from(self.version_spans()))
+                        .alignment(ratatui::layout::Alignment::Right)
+                        .render(info, buf);
+                }
+            }
         }
 
-        self.render_version_row(buf, content_row(rows[idx]));
-        idx += 1;
-
-        // Blank spacer row between the version line and the zen band.
-        idx += 1;
-
-        let zen_area = if show_button {
-            content_row(rows[idx])
-        } else {
-            rows[idx]
-        };
-        self.render_zen_row(buf, zen_area);
-
-        if show_button {
-            let button = Rect {
-                x: area.x,
-                y: rows[first_fixed].y,
-                width: ERROR_BUTTON_W,
-                height: ERROR_BUTTON_H,
-            };
-            render_error_button(buf, button);
+        if let Some(zen) = rows.zen {
+            self.render_zen_row(buf, zen);
         }
-    }
-
-    /// Daemon/CLI version segment: dim on match, red on mismatch; nothing until
-    /// the first probe. Shares the row with the board-freshness banner.
-    fn render_version_row(&self, buf: &mut Buffer, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let mut spans: Vec<Span> = Vec::new();
-        if let Some(line) = self.daemon_version_line.clone() {
-            let style = if self.daemon_version_mismatch {
-                Style::default().fg(palette().ansi_red)
-            } else {
-                Style::default().fg(palette().muted)
-            };
-            spans.push(Span::styled(line, style));
-        }
-        if let Some(banner) = &self.board_banner {
-            let stale = banner.contains("stale") || banner.contains("no daemon");
-            let color = if stale { palette().ansi_yellow } else { palette().muted };
-            let prefix = if spans.is_empty() { "" } else { "  " };
-            spans.push(Span::styled(
-                format!("{prefix}{banner}"),
-                Style::default().fg(color),
-            ));
-        }
-        if spans.is_empty() {
-            return;
-        }
-        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     /// Zen row: a full-width green band carrying a bold `ZEN MODE ON` only while
@@ -636,24 +769,27 @@ struct SidebarGeometry {
     search: Option<Rect>,
     nav: Rect,
     rest: Option<Rect>,
-    footer: Rect,
+    footer: FooterRows,
 }
 
-/// The Settings gear drawn at the end of the title row.
-const SETTINGS_GEAR: &str = "⚙";
-const SETTINGS_GEAR_W: u16 = 1;
-
-/// Where the gear sits in `header`: the title row's last column inside the
-/// 1-col indent.
-fn settings_gear_rect(header: Rect) -> Rect {
-    let y = header.y + if header.height >= 2 { 1 } else { 0 };
-    Rect {
-        x: header.right().saturating_sub(1 + SETTINGS_GEAR_W),
-        y,
-        width: SETTINGS_GEAR_W,
-        height: 1,
-    }
+/// The footer's rows (see [`SidebarView::footer_rows`]), top to bottom; each
+/// `None` when a short sidebar squeezed it out (or, for `version`, when the
+/// line fits beside the buttons).
+#[derive(Debug, Default)]
+struct FooterRows {
+    status: Option<Rect>,
+    version: Option<Rect>,
+    /// The toolbar's half-row margin above: a hovered button's `▄` row.
+    above: Option<Rect>,
+    toolbar: Option<Rect>,
+    /// The toolbar's half-row margin below (`▀`), and the spacer above the band.
+    below: Option<Rect>,
+    zen: Option<Rect>,
 }
+
+/// Columns between two toolbar buttons (the desktop's 4pt gap, rounded up so
+/// two hover pills never touch).
+const BUTTON_GAP: u16 = 1;
 
 /// Height of the header block: a blank row (0), the project title (row 1), a
 /// blank row (2), and the 2-row search box drawn across three cell rows with
@@ -994,27 +1130,50 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     }
 }
 
-/// Draw the unread-errors button: a solid reddish-gray 5×3 block with a bold
-/// white `!` in the center cell.
-fn render_error_button(buf: &mut Buffer, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
+/// Draw one toolbar button over `rect` (its toolbar-row cells). Settings and
+/// Send Feedback are a gray glyph on the terminal's background at rest, like
+/// the desktop's borderless toolbar buttons; under the pointer they take the
+/// hover fill as a half-block pill (the search box's language: `▄` in the row
+/// above, the glyph on a solid fill, `▀` in the row below) and the glyph goes
+/// bright. The unread-errors badge is always a filled pill, a bold `!` on the
+/// reddish-gray `error_button`, a shade lighter under the pointer.
+fn render_footer_button(
+    buf: &mut Buffer,
+    button: FooterButton,
+    face: &str,
+    rect: Rect,
+    above: Option<Rect>,
+    below: Option<Rect>,
+    hovered: bool,
+) {
+    let p = palette();
+    let (fill, fg, modifier) = match (button, hovered) {
+        (FooterButton::Errors, false) => (Some(p.error_button), p.on_color, Modifier::BOLD),
+        (FooterButton::Errors, true) => (Some(p.error_button_hover), p.on_color, Modifier::BOLD),
+        (_, true) => (Some(p.button_hover), p.white, Modifier::empty()),
+        (_, false) => (None, p.gray, Modifier::empty()),
+    };
+    let mut style = Style::default().fg(fg).add_modifier(modifier);
+    if let Some(fill) = fill {
+        style = style.bg(fill);
     }
-    let style = Style::default()
-        .bg(palette().error_button)
-        .fg(palette().on_color)
-        .add_modifier(Modifier::BOLD);
-    let mid_col = (area.width / 2) as usize;
-    let mid_row = area.height / 2;
-    let lines: Vec<Line> = (0..area.height)
-        .map(|r| {
-            let content: String = (0..area.width as usize)
-                .map(|c| if r == mid_row && c == mid_col { '!' } else { ' ' })
-                .collect();
-            Line::from(Span::styled(content, style))
-        })
-        .collect();
-    Paragraph::new(lines).render(area, buf);
+    buf.set_stringn(rect.x, rect.y, face, rect.width as usize, style);
+    let Some(fill) = fill else {
+        return;
+    };
+    // A double-width glyph resets its continuation cell as it is laid down, so
+    // re-fill every cell to keep the row one solid bar (as the search box does).
+    for x in rect.left()..rect.right() {
+        buf[(x, rect.y)].set_bg(fill);
+    }
+    // The bleed rows: the fill as the half-block glyph's foreground on the
+    // terminal's default background, so it reads as half a cell of fill.
+    let bleed = Style::default().fg(fill);
+    for (row, glyph) in [(above, BLEED_ABOVE), (below, BLEED_BELOW)] {
+        if let Some(row) = row {
+            buf.set_stringn(rect.x, row.y, glyph.repeat(rect.width as usize), rect.width as usize, bleed);
+        }
+    }
 }
 
 /// Height in list lines a rest-of-list row occupies at inner `width`. Review
@@ -1354,7 +1513,7 @@ mod tests {
             ws("charlie", "hub", None, None, WorkspaceBadge::Idle),
             ws("delta", "devbox", Some("t-2"), Some("developer"), WorkspaceBadge::Working),
         ];
-        let rows = render_rows(&model, 0, 28, 22);
+        let rows = render_rows(&model, 0, 28, 24);
         let joined = rows.join("\n");
 
         assert!(joined.contains("Workspaces"), "section header, got:\n{joined}");
@@ -1465,7 +1624,7 @@ mod tests {
             review("nav", "Homepage nav fix", "shelbi/homepage-nav-fix", None, ReviewState::Loading),
             review("onboarding", "Rework onboarding copy", "shelbi/rework-onboarding-copy", None, ReviewState::Pending),
         ];
-        let rows = render_rows(&model, 0, 44, 26);
+        let rows = render_rows(&model, 0, 44, 28);
         let joined = rows.join("\n");
 
         assert!(joined.contains("Ready for Review"), "Ready header, got:\n{joined}");
@@ -1592,7 +1751,7 @@ mod tests {
             ws("charlie", "hub", None, None, WorkspaceBadge::Idle),
         ];
         let view = SidebarView::build(&model);
-        let backend = TestBackend::new(30, 20);
+        let backend = TestBackend::new(30, 22);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
             let area = f.area();
@@ -1633,7 +1792,7 @@ mod tests {
         ];
         let view = SidebarView::build(&model);
         let width = 30u16;
-        let backend = TestBackend::new(width, 20);
+        let backend = TestBackend::new(width, 22);
         let mut term = Terminal::new(backend).unwrap();
         // 3 nav items precede the workspaces; ordinal 3 is the first workspace.
         term.draw(|f| {
@@ -1897,10 +2056,13 @@ mod tests {
         assert!(joined.contains("ZEN MODE ON"), "expected ZEN MODE ON in:\n{joined}");
         assert!(!joined.contains("┌─") && !joined.contains("└─"), "no border chrome, got:\n{joined}");
         // The band is the bottom row, full width, with one blank spacer row
-        // between it and the version line above.
+        // between it and the toolbar above (the version line, too long to sit
+        // beside the buttons at 24 columns, is above that).
         let version_y = row_y(&rows, "daemon 0.9.0");
+        let toolbar_y = row_y(&rows, "⚙");
         let zen_y = row_y(&rows, "ZEN MODE ON");
-        assert_eq!(zen_y, version_y + 2, "one blank row between version and zen, got:\n{joined}");
+        assert_eq!(zen_y, toolbar_y + 2, "one blank row between the toolbar and zen, got:\n{joined}");
+        assert!(version_y < toolbar_y, "the version sits above the toolbar, got:\n{joined}");
         assert_eq!(zen_y, rows.len() - 1, "the zen band is the bottom row, got:\n{joined}");
         assert!(
             rows[zen_y - 1].trim().is_empty(),
@@ -1947,47 +2109,258 @@ mod tests {
         );
     }
 
-    /// The unread-errors button: a 5×3 reddish-gray block with a centered `!`
-    /// in the footer's bottom-left, only when there are unread errors.
-    #[test]
-    fn unread_error_button_appears_only_with_unread_errors() {
-        // No unread errors: no button fill in the bottom-left.
-        let model = empty_model();
-        let view = SidebarView::build(&model);
-        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+    // --- footer toolbar -------------------------------------------------------
+
+    /// Render `view` at `w`×`h` with `hover`, returning the buffer.
+    fn footer_buf(view: &SidebarView, hover: Option<FooterButton>, w: u16, h: u16) -> Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let chrome = default_chrome().with_hover(hover);
         term.draw(|f| {
             let area = f.area();
-            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+            view.render(f.buffer_mut(), area, 0, true, &chrome)
         })
         .unwrap();
-        let buf = term.backend().buffer().clone();
-        assert_ne!(buf[(0, 15)].bg, palette().error_button, "no button block without unread errors");
+        term.backend().buffer().clone()
+    }
 
-        // With unread errors: a 5×3 block anchored bottom-left, `!` centered.
+    /// One buffer row as text, a double-width glyph's continuation cell
+    /// skipped (it holds no symbol of its own).
+    fn buf_row(buf: &Buffer, y: u16) -> String {
+        let mut out = String::new();
+        let mut x = 0;
+        while x < buf.area.width {
+            let sym = buf[(x, y)].symbol();
+            out.push_str(sym);
+            x += UnicodeWidthStr::width(sym).max(1) as u16;
+        }
+        out
+    }
+
+    /// Settings then Send Feedback sit in the footer's bottom-left corner, the
+    /// desktop's order, on the row above the spacer and the zen band; the title
+    /// row has no gear any more. At rest they are gray glyphs on the default
+    /// background.
+    #[test]
+    fn footer_toolbar_shows_settings_then_feedback_bottom_left() {
+        let mut model = empty_model();
+        model.project_label = "My project".into();
+        let view = SidebarView::build(&model);
+        let buf = footer_buf(&view, None, 40, 20);
+        let toolbar_y = 20 - 3;
+        let row = buf_row(&buf, toolbar_y);
+        assert!(row.starts_with("  ⚙   📣 "), "Settings then Feedback, bottom-left: {row:?}");
+        assert_eq!(buf[(2, toolbar_y)].symbol(), "⚙");
+        assert_eq!(buf[(6, toolbar_y)].symbol(), "📣");
+        assert_eq!(buf[(2, toolbar_y)].fg, palette().gray, "the desktop's icon gray");
+        for x in 0..12 {
+            assert_eq!(buf[(x, toolbar_y)].bg, Color::Reset, "no fill at rest, col {x}");
+            assert!(buf[(x, toolbar_y - 1)].symbol().trim().is_empty(), "no pill above at rest");
+            assert!(buf[(x, toolbar_y + 1)].symbol().trim().is_empty(), "no pill below at rest");
+        }
+        let title = buf_row(&buf, 1);
+        assert!(!title.contains('⚙'), "the gear left the title row: {title:?}");
+        assert!(title.contains("My project"));
+    }
+
+    /// The title has the whole row now that the gear is gone: a long project
+    /// name only truncates at the row's inset.
+    #[test]
+    fn title_uses_the_whole_row_without_the_gear() {
+        let mut model = empty_model();
+        model.project_label = "abcdefghijklmnopqrstuvwxyz".into();
+        let rows = render_rows(&model, 0, 28, 20);
+        assert_eq!(rows[1].trim_end(), " abcdefghijklmnopqrstuvwxyz");
+    }
+
+    /// Under the pointer a button takes the half-block hover pill: `▄` above,
+    /// the glyph bright on the hover fill, `▀` below, across its own columns
+    /// only. The other button stays at rest.
+    #[test]
+    fn hovered_button_takes_the_half_block_pill() {
+        let view = SidebarView::build(&empty_model());
+        for (button, cols) in [(FooterButton::Settings, 1..4u16), (FooterButton::Feedback, 5..9u16)] {
+            let buf = footer_buf(&view, Some(button), 40, 20);
+            let y = 20 - 3;
+            for x in 0..14u16 {
+                let lit = cols.contains(&x);
+                // The `📣`'s continuation cell (col 7) is never flushed by the
+                // TestBackend; the emoji covers it on a real terminal.
+                if lit && x != 7 {
+                    assert_eq!(buf[(x, y)].bg, palette().button_hover, "{button:?} fills col {x}");
+                }
+                if lit {
+                    assert_eq!(buf[(x, y - 1)].symbol(), "▄", "{button:?} bleeds above, col {x}");
+                    assert_eq!(buf[(x, y - 1)].fg, palette().button_hover);
+                    assert_eq!(buf[(x, y - 1)].bg, Color::Reset, "the bleed keeps the default bg");
+                    assert_eq!(buf[(x, y + 1)].symbol(), "▀", "{button:?} bleeds below, col {x}");
+                    assert_eq!(buf[(x, y + 1)].fg, palette().button_hover);
+                } else {
+                    assert_eq!(buf[(x, y)].bg, Color::Reset, "{button:?} leaves col {x} alone");
+                    assert!(buf[(x, y - 1)].symbol().trim().is_empty(), "{button:?}: col {x} above");
+                    assert!(buf[(x, y + 1)].symbol().trim().is_empty(), "{button:?}: col {x} below");
+                }
+            }
+            let glyph_x = cols.start + 1;
+            assert_eq!(buf[(glyph_x, y)].fg, palette().white, "{button:?}'s glyph goes bright");
+        }
+    }
+
+    /// The hovered button's name (the desktop's tooltip) shows beside the
+    /// toolbar, in place of the version line while it shows.
+    #[test]
+    fn hover_names_the_button_beside_the_toolbar() {
+        let mut model = empty_model();
+        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+        model.unread_errors = 1;
+        let view = SidebarView::build(&model);
+        let y = 20 - 3;
+        for (hover, want) in [
+            (FooterButton::Settings, "Settings"),
+            (FooterButton::Feedback, "Send Feedback"),
+            (FooterButton::Errors, "1 unread error"),
+        ] {
+            let row = buf_row(&footer_buf(&view, Some(hover), 44, 20), y);
+            assert!(row.contains(want), "{hover:?} is named: {row:?}");
+            assert!(!row.contains("daemon"), "the tooltip replaces the version: {row:?}");
+        }
+        let row = buf_row(&footer_buf(&view, None, 44, 20), y);
+        assert!(row.contains("daemon 0.11.0 · cli 0.11.0"), "the version is back: {row:?}");
+    }
+
+    /// The unread-errors badge follows Send Feedback while there are unread
+    /// errors (the desktop's order): always a filled pill with a bold `!`, a
+    /// shade lighter under the pointer.
+    #[test]
+    fn unread_errors_badge_follows_feedback_only_with_unread_errors() {
+        let model = empty_model();
+        let buf = footer_buf(&SidebarView::build(&model), None, 40, 20);
+        let y = 20 - 3;
+        assert!(!buf_row(&buf, y).contains('!'), "no badge without unread errors");
+
         let mut model = empty_model();
         model.unread_errors = 3;
         let view = SidebarView::build(&model);
-        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
-        term.draw(|f| {
-            let area = f.area();
-            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
-        })
-        .unwrap();
-        let buf = term.backend().buffer().clone();
-        // The block occupies the bottom 3 rows, leftmost 5 columns.
-        let top = 16 - ERROR_BUTTON_H;
-        for dy in 0..ERROR_BUTTON_H {
-            for dx in 0..ERROR_BUTTON_W {
-                assert_eq!(
-                    buf[(dx, top + dy)].bg,
-                    palette().error_button,
-                    "button cell ({dx},{dy}) carries the reddish-gray fill"
-                );
+        let buf = footer_buf(&view, None, 40, 20);
+        assert_eq!(buf[(11, y)].symbol(), "!", "the badge sits after Feedback");
+        assert!(buf[(11, y)].modifier.contains(Modifier::BOLD));
+        for x in 10..13u16 {
+            assert_eq!(buf[(x, y)].bg, palette().error_button, "the badge is filled, col {x}");
+            assert_eq!(buf[(x, y - 1)].symbol(), "▄");
+            assert_eq!(buf[(x, y - 1)].fg, palette().error_button);
+            assert_eq!(buf[(x, y + 1)].symbol(), "▀");
+        }
+        let hovered = footer_buf(&view, Some(FooterButton::Errors), 40, 20);
+        assert_eq!(hovered[(11, y)].bg, palette().error_button_hover);
+        // A stale hover on a badge that's gone draws nothing.
+        let buf = footer_buf(&SidebarView::build(&empty_model()), Some(FooterButton::Errors), 40, 20);
+        assert!(!buf_row(&buf, y).contains("unread"), "no tooltip for a missing badge");
+    }
+
+    /// Each button's target spans its columns across the three cell rows its
+    /// pill covers; the gap, the rows past the pill, and the band miss.
+    #[test]
+    fn footer_button_hits_cover_the_pill_rows() {
+        let mut model = empty_model();
+        model.unread_errors = 2;
+        let view = SidebarView::build(&model);
+        let area = Rect::new(0, 0, 40, 20);
+        let y = 20 - 3;
+        for row in [y - 1, y, y + 1] {
+            for x in 1..4 {
+                assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Settings));
+            }
+            for x in 5..9 {
+                assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Feedback));
+            }
+            for x in 10..13 {
+                assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Errors));
+            }
+            for x in [0, 4, 9, 13, 30] {
+                assert_eq!(view.footer_button_at(area, x, row), None, "col {x} row {row} misses");
             }
         }
-        let cx = ERROR_BUTTON_W / 2;
-        let cy = top + ERROR_BUTTON_H / 2;
-        assert_eq!(buf[(cx, cy)].symbol(), "!", "the `!` sits in the center cell");
+        assert_eq!(view.footer_button_at(area, 2, y - 2), None, "above the pill");
+        assert_eq!(view.footer_button_at(area, 2, y + 2), None, "the zen band");
+        // An offset sidebar (the shell's content rect) hits in its own frame.
+        let shifted = Rect::new(0, 3, 40, 20);
+        assert_eq!(view.footer_button_at(shifted, 2, y + 3), Some(FooterButton::Settings));
+    }
+
+    /// Without emoji (the Linux console, a non-UTF-8 locale) the buttons are
+    /// words, and hit-test over the words.
+    #[test]
+    fn without_emoji_the_buttons_are_words() {
+        let view = SidebarView::build(&empty_model()).with_emoji(false);
+        let buf = footer_buf(&view, None, 40, 20);
+        let y = 20 - 3;
+        let row = buf_row(&buf, y);
+        assert!(row.starts_with("  Settings   Feedback "), "{row:?}");
+        assert!(!row.contains('⚙') && !row.contains('📣'));
+        let area = Rect::new(0, 0, 40, 20);
+        assert_eq!(view.footer_button_at(area, 10, y), Some(FooterButton::Settings));
+        assert_eq!(view.footer_button_at(area, 12, y), Some(FooterButton::Feedback));
+    }
+
+    /// The version line sits right-aligned beside the buttons when it fits
+    /// whole, one column in from the edge; on a narrow sidebar it takes its own
+    /// row above the toolbar rather than being cut.
+    #[test]
+    fn version_sits_beside_the_buttons_or_on_its_own_row() {
+        let mut model = empty_model();
+        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+        let view = SidebarView::build(&model);
+
+        let rows = render_rows(&model, 0, 44, 24);
+        let y = 24 - 3;
+        assert_eq!(row_y(&rows, "daemon 0.11.0"), y, "beside the buttons");
+        assert!(rows[y].ends_with("cli 0.11.0 "), "right-aligned, one in: {:?}", rows[y]);
+
+        let rows = render_rows(&model, 0, 30, 24);
+        let y = 24 - 3;
+        assert_eq!(row_y(&rows, "daemon 0.11.0"), y - 2, "its own row, above the toolbar's margin");
+        assert!(rows[y - 2].starts_with(" daemon 0.11.0 · cli 0.11.0"), "whole: {:?}", rows[y - 2]);
+        assert!(rows[y - 1].trim().is_empty(), "the toolbar's margin stays clear");
+        // The click map moves with it: the toolbar is still the third row up.
+        assert_eq!(view.footer_button_at(Rect::new(0, 0, 30, 24), 2, y as u16), Some(FooterButton::Settings));
+        // Its own row runs to the edge: the default sidebar's 27 content
+        // columns hold the whole line.
+        let rows = render_rows(&model, 0, 27, 24);
+        assert_eq!(rows[y - 2], " daemon 0.11.0 · cli 0.11.0", "not cut short");
+    }
+
+    /// The first-run hint, the status line, the toolbar and the band keep
+    /// their order at every height down to a sidebar too short for them,
+    /// and nothing panics.
+    #[test]
+    fn footer_keeps_its_order_at_every_height() {
+        let mut model = empty_model();
+        model.status_line = FIRST_RUN_HINT.into();
+        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+        model.zen_mode = ZenModeState::On;
+        model.unread_errors = 1;
+        for h in 1..40u16 {
+            let rows = render_rows(&model, 0, 30, h);
+            let find = |needle: &str| rows.iter().position(|r| r.contains(needle));
+            let (hint, version, toolbar, zen) =
+                (find("Ctrl+P palette"), find("daemon 0.11"), find("⚙"), find("ZEN MODE ON"));
+            if h >= 24 {
+                for (name, at) in [("hint", hint), ("version", version), ("toolbar", toolbar), ("zen", zen)] {
+                    assert!(at.is_some(), "h={h}: the {name} shows:\n{}", rows.join("\n"));
+                }
+            }
+            if let Some(z) = zen {
+                assert_eq!(z, rows.len() - 1, "h={h}: the band is the bottom row");
+            }
+            if let (Some(t), Some(z)) = (toolbar, zen) {
+                assert_eq!(t + 2, z, "h={h}: one spacer between the toolbar and the band");
+            }
+            if let (Some(v), Some(t)) = (version, toolbar) {
+                assert!(v < t, "h={h}: the version above the toolbar on a narrow sidebar");
+            }
+            if let (Some(hi), Some(v)) = (hint, version) {
+                assert!(hi < v, "h={h}: the hint above the version");
+            }
+        }
     }
 
     /// Every sidebar element (nav selection, workspaces in each badge state,
@@ -2022,6 +2395,10 @@ mod tests {
             })
             .unwrap();
             crate::theme::assert_light_readable("shell-sidebar", term.backend().buffer());
+            for hover in [FooterButton::Settings, FooterButton::Feedback, FooterButton::Errors] {
+                let buf = footer_buf(&view, Some(hover), 40, 48);
+                crate::theme::assert_light_readable("shell-sidebar-footer-hover", &buf);
+            }
         });
     }
 

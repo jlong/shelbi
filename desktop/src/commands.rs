@@ -47,6 +47,8 @@ pub trait CommandHost {
     fn open_error_log(&mut self);
     /// Open Settings (on the page last used), as ⌘, does.
     fn open_settings(&mut self);
+    /// Open Contact Us over the window.
+    fn send_feedback(&mut self);
     /// Open the add-project form.
     fn open_add_project(&mut self);
     /// Open a review task: a queued one asks which slot to load it onto.
@@ -79,6 +81,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::OpenErrorLog => host.open_error_log(),
         // The registry's Settings: the same Settings ⌘, opens.
         CommandKind::OpenSettings => host.open_settings(),
+        // The sidebar footer's megaphone, Help ▸ Send Feedback… and the
+        // palette's entry: Contact Us.
+        CommandKind::SendFeedback => host.send_feedback(),
         // The window switches in place (dt-switch-project-in-window). A bare
         // switch (no target) opens the switcher.
         CommandKind::SwitchProject { project } => {
@@ -131,6 +136,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::OpenErrorLog => false,
         // Settings itself is local; its pages' saves are their own.
         CommandKind::OpenSettings => false,
+        // The dialog's send goes to the feedback endpoint, not the daemon.
+        CommandKind::SendFeedback => false,
         // Edits a local file in the user's editor.
         CommandKind::OpenEditor { .. } => false,
         // Only this client lets go.
@@ -234,6 +241,9 @@ mod tests {
         fn open_settings(&mut self) {
             self.0.push("settings".into());
         }
+        fn send_feedback(&mut self) {
+            self.0.push("send-feedback".into());
+        }
         fn open_add_project(&mut self) {
             self.0.push("add-project".into());
         }
@@ -286,6 +296,7 @@ mod tests {
             (CommandKind::ToggleZen, "toggle-zen"),
             (CommandKind::OpenErrorLog, "error-log"),
             (CommandKind::OpenSettings, "settings"),
+            (CommandKind::SendFeedback, "send-feedback"),
             (
                 CommandKind::SwitchProject {
                     project: String::new(),
@@ -381,6 +392,7 @@ mod tests {
                 "show:orch",
                 "error-log",
                 "settings",
+                "send-feedback",
                 "new-window",
                 "detach",
                 "editor:edit:project",

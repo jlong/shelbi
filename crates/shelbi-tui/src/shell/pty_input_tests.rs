@@ -156,7 +156,7 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
     let mut out: Vec<u8> = Vec::new();
 
     // Drive the shell's real input path against this session.
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st = ShellState::new("tuikeys", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
     wait_for(Duration::from_secs(5), || {
@@ -302,7 +302,7 @@ fn a_copy_chord_with_a_selection_is_not_forwarded_to_the_agent() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st = ShellState::new("tuicopy", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
     wait_for(Duration::from_secs(5), || {
@@ -386,7 +386,7 @@ fn focus_chords_are_not_forwarded_but_backspace_is() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st = ShellState::new("tuifocus", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
     wait_for(Duration::from_secs(5), || {
@@ -532,7 +532,7 @@ fn a_dropped_file_pastes_into_the_main_session_even_with_the_sidebar_focused() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st = ShellState::new("tuipaste", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
     wait_for(Duration::from_secs(5), || {
@@ -574,7 +574,7 @@ fn a_paste_is_bracketed_when_the_program_enabled_bracketed_paste() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st =
         ShellState::new("tuipastebr", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
@@ -624,7 +624,7 @@ fn a_dropped_file_pastes_into_the_open_review_content_session() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st =
         ShellState::new("tuipasterev", Arc::new(DirectConnector { sock: sock.clone() }), caps);
 
@@ -691,7 +691,7 @@ fn a_dropped_file_pastes_into_the_open_workspace_content_session() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st =
         ShellState::new("tuipastews", Arc::new(DirectConnector { sock: sock.clone() }), caps);
 
@@ -756,7 +756,7 @@ fn settings_keys_never_reach_the_agent_and_back_returns_to_the_live_session() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st = ShellState::new("tuisettings", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
     wait_for(Duration::from_secs(5), || {
@@ -822,7 +822,7 @@ fn a_theme_change_in_settings_leaves_the_live_session_running() {
     let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
-    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
     let mut st = ShellState::new("tuitheme", Arc::new(DirectConnector { sock: sock.clone() }), caps);
     st.show(RowTarget::Session(SessionRef::Orchestrator));
     wait_for(Duration::from_secs(5), || {

@@ -207,7 +207,10 @@ impl Executor for Scenario {
                 Performed::Nothing
             }
             Effect::Mutate(m) => Performed::Mutation(m.clone()),
+            // Contact Us is the host's own dialog (the desktop's window modal;
+            // the TUI's overlay): the view, focus and overlay stack stay put.
             Effect::LoadReview { .. }
+            | Effect::SendFeedback
             | Effect::OpenEditor { .. }
             | Effect::Detach
             | Effect::DetachOtherClients
@@ -240,6 +243,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::ToggleZen => "the_zen_toggle_is_a_daemon_mutation_and_relabels",
         CommandKind::OpenErrorLog => "the_error_log_opens_its_overlay",
         CommandKind::OpenSettings => "settings_opens_over_the_view_on_the_last_page",
+        CommandKind::SendFeedback => "send_feedback_reaches_the_host_and_leaves_the_view",
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
         CommandKind::AddProject => "add_project_collects_the_form_then_mutates",
         CommandKind::NewWindow => "new_window_reaches_the_host_on_a_multi_window_client",
@@ -284,6 +288,7 @@ fn every_command_kind_has_a_scenario() {
             "action:reject-review:T-9",
             "action:error-log",
             "action:settings",
+            "action:send-feedback",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -481,6 +486,18 @@ fn settings_opens_over_the_view_on_the_last_page() {
     let mut tui = SettingsNav::new(PageSet::of(&[SettingsPage::General]));
     tui.open(Some(SettingsPage::Terminal));
     assert_eq!(tui.page(), SettingsPage::General);
+}
+
+#[test]
+fn send_feedback_reaches_the_host_and_leaves_the_view() {
+    let mut s = Scenario::new();
+    s.client.set_view(View::Activity);
+    s.client.focus_sidebar();
+    assert_eq!(s.invoke("action:send-feedback"), Effect::SendFeedback);
+    assert_eq!(s.last(), &Performed::Host(Effect::SendFeedback), "the host opens Contact Us");
+    assert_eq!(s.client.view(), &View::Activity, "the view under the dialog stays");
+    assert_eq!(s.client.overlay(), None);
+    assert!(!s.settings_open);
 }
 
 #[test]

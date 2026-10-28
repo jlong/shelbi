@@ -46,6 +46,9 @@ pub enum CommandKind {
     OpenErrorLog,
     /// Open Settings (the desktop app's ⌘,; the TUI's sidebar `,`).
     OpenSettings,
+    /// Send Feedback: open Contact Us (the sidebar footer's megaphone in
+    /// both clients; the desktop's Help ▸ Send Feedback…).
+    SendFeedback,
     /// Switch to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow.
@@ -165,6 +168,7 @@ impl CommandKind {
             CommandKind::ToggleZen => Effect::Mutate(Mutation::ToggleZen { project: p() }),
             CommandKind::OpenErrorLog => Effect::OpenErrorLog { project: p() },
             CommandKind::OpenSettings => Effect::OpenSettings,
+            CommandKind::SendFeedback => Effect::SendFeedback,
             CommandKind::SwitchProject { project } => Effect::SwitchProject {
                 project: project.clone(),
             },
@@ -347,7 +351,7 @@ impl CommandRegistry {
 
     /// Every available command for `model`, in the order the palette lists
     /// them: the nav views, then the Zen toggle, then workspaces, reviews,
-    /// the review decisions (approve / reject), the error-log action, Settings, switch-project targets,
+    /// the review decisions (approve / reject), the error-log action, Settings, Send Feedback, switch-project targets,
     /// add-project, the edit targets, and finally the quit actions.
     ///
     /// "Available" folds in the existence gating the palette did by
@@ -481,6 +485,22 @@ impl CommandRegistry {
                 color: DecorationColor::Default,
             }),
             subtitle: Some("Change how Shelbi looks and works".to_string()),
+            shortcut: None,
+            hidden_until_query: false,
+        });
+
+        // Send Feedback: always offered, like Settings beside it in the
+        // sidebar footer. The host opens Contact Us.
+        out.push(Command {
+            id: "action:send-feedback".to_string(),
+            title: "Send Feedback".to_string(),
+            kind: CommandKind::SendFeedback,
+            entry_kind: EntryKind::Action,
+            decoration: Some(Decoration {
+                glyph: "📣".into(),
+                color: DecorationColor::Default,
+            }),
+            subtitle: Some("Contact Us about a bug, a feature, or anything else".to_string()),
             shortcut: None,
             hidden_until_query: false,
         });
@@ -686,6 +706,7 @@ impl CommandKind {
             "action:toggle-zen" => Some(CommandKind::ToggleZen),
             "action:error-log" => Some(CommandKind::OpenErrorLog),
             "action:settings" => Some(CommandKind::OpenSettings),
+            "action:send-feedback" => Some(CommandKind::SendFeedback),
             "action:switch-project" => Some(CommandKind::SwitchProject {
                 project: String::new(),
             }),
@@ -797,6 +818,7 @@ mod tests {
             "action:reject-review:T-12",
             "action:error-log",
             "action:settings",
+            "action:send-feedback",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -829,6 +851,7 @@ mod tests {
         };
         for (id, want) in [
             ("action:error-log", "📜"),
+            ("action:send-feedback", "📣"),
             ("action:detach", "🛸"),
             ("action:quit-project", "🏁"),
             ("action:quit-shelbi", "🏎️"),
@@ -1040,6 +1063,7 @@ mod tests {
         assert!(!hidden("review:T-12"));
         assert!(!hidden("action:quit-shelbi"));
         assert!(!hidden("action:settings"));
+        assert!(!hidden("action:send-feedback"));
     }
 
     #[test]
@@ -1055,6 +1079,23 @@ mod tests {
         let entries = reg.entries(&model());
         let hits = shelbi_palette::search(&entries, "settings");
         assert_eq!(hits[0].0.id, "action:settings", "it outranks the Edit … Settings openers");
+    }
+
+    #[test]
+    fn send_feedback_is_offered_with_or_without_a_project() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        let cmd = reg.resolve("action:send-feedback", &m).expect("offered");
+        assert_eq!(cmd.title(), "Send Feedback", "the desktop's label");
+        assert_eq!(cmd.kind(), &CommandKind::SendFeedback);
+        assert_eq!(CommandKind::from_id("action:send-feedback"), Some(CommandKind::SendFeedback));
+        assert!(!cmd.is_mutating(), "the dialog sends on its own");
+        assert_eq!(cmd.effect("alpha"), Effect::SendFeedback);
+        m.project = None;
+        assert!(reg.resolve("action:send-feedback", &m).is_some(), "it needs no project");
+        let entries = reg.entries(&model());
+        let hits = shelbi_palette::search(&entries, "feedback");
+        assert_eq!(hits[0].0.id, "action:send-feedback");
     }
 
     #[test]

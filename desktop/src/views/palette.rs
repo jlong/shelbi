@@ -129,6 +129,8 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
         "action:toggle-zen" if entry.label.ends_with(" off") => icons::TOGGLE_ON,
         "action:toggle-zen" => icons::TOGGLE_OFF,
         "action:error-log" => icons::PAGE_CURL,
+        // The sidebar footer's megaphone.
+        "action:send-feedback" => icons::MEGAPHONE,
         "action:quit-project" => icons::X_MARK,
         "action:quit-shelbi" => icons::FLAG_FINISH,
         "action:detach-others" => icons::SIGNAL_SLASH,

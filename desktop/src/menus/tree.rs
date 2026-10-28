@@ -99,8 +99,6 @@ pub enum AppCommand {
     FontActualSize,
     Documentation,
     ReportIssue,
-    /// Help ▸ Send Feedback…: Contact Us over the key window.
-    SendFeedback,
 }
 
 /// A key equivalent: the gpui keystroke it is bound as and how it reads.
@@ -329,6 +327,8 @@ pub enum Placement {
     File,
     /// The app menu: detach and the quit pair.
     App,
+    /// Help: Send Feedback….
+    Help,
     /// Board-only mutations the registry never lists (they act on a card).
     Board,
 }
@@ -344,6 +344,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::ToggleZen => Placement::View,
         CommandKind::OpenErrorLog => Placement::View,
         CommandKind::OpenSettings => Placement::App,
+        CommandKind::SendFeedback => Placement::Help,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
         CommandKind::NewWindow => Placement::File,
@@ -400,7 +401,7 @@ pub fn build(model: &CommandModel, keymaps: &Keymaps, facts: WindowFacts) -> Men
             view_menu(model, keymaps, facts, &slot),
             go_menu(model, &by_place),
             window_menu(),
-            help_menu(),
+            help_menu(&slot),
         ],
     }
 }
@@ -619,13 +620,15 @@ fn window_menu() -> MenuSpec {
     }
 }
 
-fn help_menu() -> MenuSpec {
+fn help_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSpec {
     MenuSpec {
         title: "Help".into(),
         items: vec![
             app("Shelbi Documentation", AppCommand::Documentation),
             app("Report an Issue", AppCommand::ReportIssue),
-            app("Send Feedback\u{2026}", AppCommand::SendFeedback),
+            // The registry's Send Feedback: Contact Us, as the sidebar
+            // footer's megaphone opens it.
+            slot("action:send-feedback", "Send Feedback\u{2026}", None),
         ],
     }
 }

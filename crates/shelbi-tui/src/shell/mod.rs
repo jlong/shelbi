@@ -90,7 +90,7 @@ use shelbi_app::settings::summary::GeneralSummary;
 use shelbi_app::settings::workflows::Committed;
 use shelbi_app::settings::Ticket;
 use shelbi_state::workflow_config::WorkflowConfig;
-use sidebar::{RowTarget, SidebarView};
+use sidebar::{FooterButton, RowTarget, SidebarView};
 use workspace::{WorkspaceAction, WorkspaceInterface};
 
 use std::path::PathBuf;
@@ -1165,6 +1165,12 @@ struct ShellState {
     /// handle's hover highlight; only flipped (and repainted) when the pointer
     /// crosses the column, so idle motion elsewhere stays cheap.
     divider_hover: bool,
+    /// Where the pointer was last seen (any mouse event), or `None` once the
+    /// terminal loses focus. The sidebar footer's hover is derived from it on
+    /// every frame ([`ShellState::footer_hover`]), so a hover can't outlive
+    /// what is under the pointer: Settings, an overlay or a panel over the
+    /// sidebar hides it, and it shows again only where the pointer still is.
+    pointer: Option<(u16, u16)>,
     /// The main-area size last reported to the live session.
     reported_main: Option<Size>,
     /// When `Some`, the user is typing a scrollback search query.
@@ -1422,6 +1428,7 @@ impl ShellState {
             main_rect: Rect::default(),
             sidebar_dragging: false,
             divider_hover: false,
+            pointer: None,
             reported_main: None,
             search_input: None,
             should_reexec: false,
@@ -1584,13 +1591,43 @@ impl ShellState {
     }
 
     fn sidebar_view(&self) -> Option<SidebarView> {
-        self.sidebar_model.as_ref().map(SidebarView::build)
+        self.sidebar_model
+            .as_ref()
+            .map(|m| SidebarView::build(m).with_emoji(self.caps.emoji))
     }
 
-    /// The per-frame sidebar footer inputs (keybind hint + Zen glyph), owned so
-    /// the draw closure holds no borrow of the rest of the shell state.
+    /// The per-frame sidebar inputs (the palette chord, the hovered footer
+    /// button), owned so the draw closure holds no borrow of the rest of the
+    /// shell state.
     fn sidebar_chrome(&self) -> sidebar::SidebarChrome {
         sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style)
+            .with_hover(self.footer_hover())
+    }
+
+    /// The sidebar footer button under the pointer, while the nav sidebar is
+    /// what shows there: never under an overlay, Settings, or a review or
+    /// workspace panel in the sidebar's column.
+    fn footer_hover(&self) -> Option<FooterButton> {
+        let (x, y) = self.pointer?;
+        if self.overlay.is_some()
+            || self.settings_open()
+            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_))
+            || !contains(self.sidebar_rect, x, y)
+        {
+            return None;
+        }
+        self.sidebar_view()?
+            .footer_button_at(self.sidebar_content_rect(), x, y)
+    }
+
+    /// Record where the pointer is (`None`: the terminal lost focus, so it may
+    /// be anywhere), repainting when that moves the footer's hover.
+    fn track_pointer(&mut self, pointer: Option<(u16, u16)>) {
+        let before = self.footer_hover();
+        self.pointer = pointer;
+        if self.footer_hover() != before {
+            self.dirty = true;
+        }
     }
 
     fn selection(&self) -> usize {
@@ -2036,6 +2073,13 @@ impl ShellState {
         if repaint {
             self.full_redraw = true;
             self.dirty = true;
+        }
+        // The pointer, wherever input goes next (an overlay included), so the
+        // footer's hover is right the moment the sidebar shows again.
+        match &ev {
+            Event::Mouse(m) => self.track_pointer(Some((m.column, m.row))),
+            Event::FocusLost => self.track_pointer(None),
+            _ => {}
         }
         // An open overlay captures input: keys and clicks drive it, not the
         // sidebar or the agent beneath it.
@@ -3046,16 +3090,19 @@ impl ShellState {
 
     /// Resolve a palette entry to its command effect and dispatch it.
     fn run_entry(&mut self, entry: &shelbi_palette::Entry) {
+        match CommandKind::from_id(&entry.id) {
+            Some(kind) => self.run_command(kind),
+            None => self.status = Some(format!("unknown command: {}", entry.id)),
+        }
+    }
+
+    /// Run a registry command against the current project (the palette's
+    /// entries and the sidebar footer's buttons).
+    fn run_command(&mut self, kind: CommandKind) {
         let Some(project) = self.client.project().map(str::to_string) else {
             return;
         };
-        match CommandKind::from_id(&entry.id) {
-            Some(kind) => {
-                let effect = kind.effect_with_project(&project);
-                self.dispatch_effect(effect);
-            }
-            None => self.status = Some(format!("unknown command: {}", entry.id)),
-        }
+        self.dispatch_effect(kind.effect_with_project(&project));
     }
 
     /// Carry out a command [`Effect`]. Navigation effects change the main view
@@ -3092,6 +3139,13 @@ impl ShellState {
             }
             Effect::OpenEditor { target } => self.open_editor(&target),
             Effect::OpenSettings => self.open_settings(),
+            // Contact Us is the desktop's dialog so far (`tui-feedback-dialog`
+            // brings it here): say where it is, as New Window does.
+            Effect::SendFeedback => {
+                self.status = Some(
+                    "Contact Us is in the desktop app; or open github.com/jlong/shelbi/issues".to_string(),
+                )
+            }
             // A bare switch (the palette's "Switch Project") picks the target in
             // the Projects column; a named one switches.
             Effect::SwitchProject { project } if project.is_empty() => self.open_project_switcher(),
@@ -4398,10 +4452,25 @@ impl ShellState {
                         self.dirty = true;
                         return;
                     }
-                    // The gear beside the project title opens Settings.
-                    if view.settings_hit(self.sidebar_content_rect(), m.column, m.row) {
-                        self.open_settings();
-                        return;
+                    // The footer's toolbar: Settings (as `,` does), Send
+                    // Feedback and the unread-errors badge run their
+                    // registry commands, as the desktop's do.
+                    match view.footer_button_at(self.sidebar_content_rect(), m.column, m.row) {
+                        Some(FooterButton::Settings) => {
+                            self.open_settings();
+                            return;
+                        }
+                        Some(FooterButton::Feedback) => {
+                            self.run_command(CommandKind::SendFeedback);
+                            self.dirty = true;
+                            return;
+                        }
+                        Some(FooterButton::Errors) => {
+                            self.run_command(CommandKind::OpenErrorLog);
+                            self.dirty = true;
+                            return;
+                        }
+                        None => {}
                     }
                     if let Some(sel) = view.hit(self.sidebar_content_rect(), m.column, m.row) {
                         self.client.clamp_selection(view.selectable_count());
@@ -5464,6 +5533,7 @@ mod tests {
             kitty: true,
             truecolor: true,
             nested: None,
+            emoji: true,
         };
         let mut st = ShellState::new("proj", connector, caps);
         // Keep `switch_project` (and any startup) from touching the hub socket or
@@ -6364,7 +6434,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         shelbi_state::set_sidebar_width(33).unwrap();
-        let caps = Caps { kitty: true, truecolor: true, nested: None };
+        let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
         let st = ShellState::new("proj", Arc::new(NoopConnector), caps);
         assert_eq!(
             st.client.sidebar_width(),
@@ -6916,7 +6986,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let caps = Caps { kitty: true, truecolor: true, nested: None };
+        let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
         let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
         st.main_view = MainView::Native(View::Issues);
         st.client.focus_main();
@@ -7219,6 +7289,7 @@ mod tests {
             kitty: false,
             truecolor: true,
             nested: Some(caps::Nesting::Tmux),
+            emoji: true,
         };
         let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
         // Armed at startup; within the window it paints the tmux-tailored notice.
@@ -7240,6 +7311,7 @@ mod tests {
             kitty: true,
             truecolor: true,
             nested: Some(caps::Nesting::Tmux),
+            emoji: true,
         };
         let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
         assert!(st.notice_text(Instant::now()).is_none(), "kitty present → no notice");
@@ -7282,6 +7354,7 @@ mod tests {
             kitty: true,
             truecolor: true,
             nested: None,
+            emoji: true,
         };
         let mut st = ShellState::new_with(
             "proj",
@@ -7323,6 +7396,7 @@ mod tests {
             kitty: true,
             truecolor: true,
             nested: None,
+            emoji: true,
         };
         let (open_gate, gate) = std::sync::mpsc::channel();
         let started = Arc::new(AtomicBool::new(false));
@@ -7403,6 +7477,7 @@ mod tests {
             kitty: true,
             truecolor: true,
             nested: None,
+            emoji: true,
         };
         let mut st = ShellState::new_with(
             "proj",
@@ -8162,6 +8237,7 @@ mod tests {
             "action:reject-review:T-9",
             "action:error-log",
             "action:settings",
+            "action:send-feedback",
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
@@ -8296,8 +8372,103 @@ mod tests {
         draw_frame(&mut term, &mut st).unwrap();
         let (x, y) = find_on_screen(&term, "⚙").expect("the gear shows in the sidebar");
         assert!(contains(st.sidebar_rect, x, y), "it is in the sidebar column");
+        assert!(y + 5 > st.sidebar_rect.bottom(), "in the footer, not the title row");
         st.handle_event(Event::Mouse(left_click(x, y)));
         assert!(st.settings_open(), "clicking the gear opens Settings");
+    }
+
+    /// The footer's toolbar sits bottom-left in the desktop's order: Settings,
+    /// Send Feedback, then the unread-errors badge. Feedback and the badge run
+    /// their registry commands (the palette's Send Feedback, the error log).
+    #[test]
+    fn footer_buttons_run_send_feedback_and_the_error_log() {
+        let mut st = settings_state();
+        st.sidebar_model.as_mut().unwrap().unread_errors = 2;
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (gx, gy) = find_on_screen(&term, "⚙").expect("Settings shows");
+        let (fx, fy) = find_on_screen(&term, "📣").expect("Send Feedback shows");
+        assert_eq!(gy, fy, "one toolbar row");
+        assert!(gx < fx, "Settings, then Send Feedback");
+        let (ex, ey) = (fx + 5, fy);
+        assert_eq!(term.backend().buffer()[(ex, ey)].symbol(), "!", "then the badge");
+
+        st.effect_tap = Some(Vec::new());
+        st.handle_event(Event::Mouse(left_click(fx, fy)));
+        assert_eq!(st.effect_tap.as_ref().unwrap().last(), Some(&Effect::SendFeedback));
+        // The pill's rows above and below the glyph are on target too.
+        st.handle_event(Event::Mouse(left_click(ex, ey + 1)));
+        assert_eq!(
+            st.effect_tap.as_ref().unwrap().last(),
+            Some(&Effect::OpenErrorLog { project: "proj".into() })
+        );
+        assert!(!st.settings_open(), "neither opens Settings");
+
+        // Until Contact Us comes to the TUI, Send Feedback says where it is.
+        st.effect_tap = None;
+        st.dispatch_effect(Effect::SendFeedback);
+        assert!(st.status.as_deref().is_some_and(|s| s.contains("Contact Us")), "{:?}", st.status);
+    }
+
+    /// The footer's hover follows the pointer, repaints only when it changes,
+    /// and never outlives what is under the pointer: off the button, focus
+    /// lost, an overlay or Settings over the sidebar all clear it.
+    #[test]
+    fn footer_hover_follows_the_pointer_and_never_goes_stale() {
+        let mut st = settings_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (gx, gy) = find_on_screen(&term, "⚙").expect("Settings shows");
+        let (fx, fy) = find_on_screen(&term, "📣").expect("Send Feedback shows");
+        assert_eq!(st.footer_hover(), None, "no hover before any motion");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(gx, gy)));
+        assert_eq!(st.footer_hover(), Some(FooterButton::Settings));
+        assert!(st.dirty, "a hover change repaints");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(gx, gy)].bg, palette().button_hover, "lit");
+        assert!(screen_text(&term).contains("Settings"), "named beside the toolbar");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(gx, gy - 1)));
+        assert!(!st.dirty, "still on the same button: no repaint");
+
+        st.handle_event(Event::Mouse(moved(fx, fy)));
+        assert_eq!(st.footer_hover(), Some(FooterButton::Feedback));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(gx, gy)].bg, Color::Reset, "Settings went back");
+        assert!(screen_text(&term).contains("Send Feedback"));
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(st.main_rect.x + 5, fy)));
+        assert_eq!(st.footer_hover(), None, "off the buttons");
+        assert!(st.dirty);
+
+        st.handle_event(Event::Mouse(moved(gx, gy)));
+        st.handle_event(Event::FocusLost);
+        assert_eq!(st.footer_hover(), None, "the pointer may be anywhere once focus goes");
+
+        // An overlay over the sidebar hides the hover; closing it shows the
+        // hover again only because the pointer is still there.
+        st.handle_event(Event::Mouse(moved(gx, gy)));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert!(st.overlay.is_some());
+        assert_eq!(st.footer_hover(), None, "under the palette");
+        draw_frame(&mut term, &mut st).unwrap();
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(st.overlay.is_none());
+        assert_eq!(st.footer_hover(), Some(FooterButton::Settings));
+        // Motion while the overlay is up still moves the pointer.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        st.handle_event(Event::Mouse(moved(st.main_rect.x + 5, 3)));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(st.footer_hover(), None, "the pointer left while the palette was up");
+
+        // Clicking Settings covers the sidebar: no hover while it shows.
+        st.handle_event(Event::Mouse(left_click(gx, gy)));
+        assert!(st.settings_open());
+        assert_eq!(st.footer_hover(), None, "Settings covers the sidebar");
     }
 
     #[test]

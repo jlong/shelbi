@@ -155,6 +155,20 @@ impl Harness {
         std::mem::take(&mut *self.tap.borrow_mut())
     }
 
+    /// Carry out `calls` as the window's executor would have (the tap only
+    /// records them), for a test that needs what a command opens.
+    pub(super) fn perform(&mut self, calls: Vec<HostCall>) {
+        let window = self.window.clone();
+        self.cx.update(|w, cx| {
+            window.update(cx, |this, cx| {
+                for call in calls {
+                    this.perform(call, w, cx);
+                }
+            })
+        });
+        self.draw();
+    }
+
     fn commands(&self) -> Vec<Command> {
         let model = self.window.read_with(&self.cx, |w, _| w.command_model());
         CommandRegistry::new().commands(&model)
@@ -216,7 +230,7 @@ fn keystrokes_for(text: &str) -> String {
 fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     let commands = h.commands();
-    assert_eq!(commands.len(), 23, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 24, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");
