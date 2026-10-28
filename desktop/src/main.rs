@@ -349,4 +349,9 @@ fn init_logging() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+    // GitHub retry notices are log lines here, not raw stderr prints: a
+    // bundled app has no terminal, and this way they follow the log's filter.
+    shelbi_state::set_retry_notice_sink(std::sync::Arc::new(|n: &shelbi_state::RetryNotice| {
+        tracing::warn!("{}", n.message());
+    }));
 }

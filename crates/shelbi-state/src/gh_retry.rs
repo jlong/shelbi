@@ -11,8 +11,9 @@
 //!   exponential backoff + jitter), or *terminal* (401 / 404 / 422 validation —
 //!   never retry, so a permanent error can't spin), and
 //! * surfaces each wait to the operator through a notifier (the production
-//!   default prints "rate limit hit; resuming in Ns" to stderr) rather than
-//!   appearing hung.
+//!   default prints "rate limit hit; resuming in Ns" to stderr, unless the
+//!   process installed its own sink with [`set_retry_notice_sink`], as the
+//!   full-screen clients do) rather than appearing hung.
 //!
 //! The sleep, jitter, and notify sinks are all injectable so the whole loop is
 //! unit-tested with a fake clock and no real waiting. A GitHub issue creation is
@@ -303,19 +304,59 @@ fn pseudo_rand(bound: u64) -> u64 {
     x % bound
 }
 
-/// The production notifier: print each wait to stderr so a bulk run that stalls
-/// on a rate limit reads as "resuming in Ns", not a hang.
+impl RetryNotice {
+    /// The operator-facing line for this wait, without the `shelbi: ` prefix the
+    /// stderr notifier adds: "transient GitHub error; retrying in 2s (attempt
+    /// 1/2)".
+    pub fn message(&self) -> String {
+        let secs = self.wait.as_secs_f64().round() as u64;
+        let (what, verb) = match self.kind {
+            RetryKind::RateLimited => ("GitHub rate limit hit", "resuming"),
+            RetryKind::Transient => ("transient GitHub error", "retrying"),
+        };
+        format!(
+            "{what}; {verb} in {secs}s (attempt {}/{})",
+            self.attempt, self.max_attempts
+        )
+    }
+}
+
+/// A process-wide notice sink: where the production policies send each wait.
+pub type NoticeSink = Arc<dyn Fn(&RetryNotice) + Send + Sync>;
+
+/// The sink installed for this process, if any. `None` means stderr.
+static NOTICE_SINK: std::sync::RwLock<Option<NoticeSink>> = std::sync::RwLock::new(None);
+
+/// Send every production retry notice in this process to `sink` instead of
+/// stderr. A full-screen client installs one at startup: the TUI draws on the
+/// terminal stderr shares, so a raw line there lands on top of its frame, and
+/// the desktop has no terminal at all. A CLI command installs nothing and keeps
+/// the stderr line. A later call replaces the sink.
+pub fn set_retry_notice_sink(sink: NoticeSink) {
+    *NOTICE_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+}
+
+/// Drop the installed sink, so notices go back to stderr.
+pub fn clear_retry_notice_sink() {
+    *NOTICE_SINK.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Deliver `notice` exactly as the production policies do (the installed
+/// sink, else stderr), so a client's test can prove where a retry lands
+/// without a live `gh` failure. Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn notify_retry_for_test(notice: &RetryNotice) {
+    default_notify(notice)
+}
+
+/// The production notifier: hand each wait to the process's installed sink, or
+/// (none installed: a CLI command) print it to stderr, so a bulk run that
+/// stalls on a rate limit reads as "resuming in Ns", not a hang.
 fn default_notify(n: &RetryNotice) {
-    let secs = n.wait.as_secs_f64().round() as u64;
-    match n.kind {
-        RetryKind::RateLimited => eprintln!(
-            "shelbi: GitHub rate limit hit; resuming in {secs}s (attempt {}/{})",
-            n.attempt, n.max_attempts
-        ),
-        RetryKind::Transient => eprintln!(
-            "shelbi: transient GitHub error; retrying in {secs}s (attempt {}/{})",
-            n.attempt, n.max_attempts
-        ),
+    let sink = NOTICE_SINK.read().unwrap_or_else(|e| e.into_inner()).clone();
+    match sink {
+        Some(sink) => sink(n),
+        None => eprintln!("shelbi: {}", n.message()),
     }
 }
 
@@ -648,6 +689,49 @@ mod tests {
         let sleep: SleepFn = Arc::new(move |d: Duration| rec.lock().unwrap().push(d.as_secs()));
         let notify: NotifyFn = Arc::new(|_| {});
         (RetryPolicy::for_test(max_attempts, sleep, notify), waits)
+    }
+
+    #[test]
+    fn notice_message_names_the_kind_wait_and_attempt() {
+        let notice = |kind| RetryNotice {
+            attempt: 1,
+            max_attempts: 2,
+            wait: Duration::from_millis(1600),
+            kind,
+        };
+        assert_eq!(
+            notice(RetryKind::Transient).message(),
+            "transient GitHub error; retrying in 2s (attempt 1/2)"
+        );
+        assert_eq!(
+            notice(RetryKind::RateLimited).message(),
+            "GitHub rate limit hit; resuming in 2s (attempt 1/2)"
+        );
+    }
+
+    #[test]
+    fn an_installed_sink_takes_the_production_notices_instead_of_stderr() {
+        // A full-screen client's sink receives what the production notifier
+        // would have printed; clearing it restores the stderr default.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        set_retry_notice_sink(Arc::new(move |n: &RetryNotice| {
+            rec.lock().unwrap().push(n.message())
+        }));
+        default_notify(&RetryNotice {
+            attempt: 3,
+            max_attempts: 10,
+            wait: Duration::from_secs(8),
+            kind: RetryKind::RateLimited,
+        });
+        clear_retry_notice_sink();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .contains(&"GitHub rate limit hit; resuming in 8s (attempt 3/10)".to_string()),
+            "{:?}",
+            seen.lock().unwrap()
+        );
     }
 
     #[test]

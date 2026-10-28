@@ -4054,7 +4054,10 @@ impl ShelbiWindow {
                 return;
             }
             Some(GlobalAction::FocusMain) => {
+                // Ctrl+L's redraw half: the TUI clears and repaints its
+                // terminal; here a fresh frame is all it takes.
                 self.focus_main(window, cx);
+                window.refresh();
                 cx.stop_propagation();
                 return;
             }
