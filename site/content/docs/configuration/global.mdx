@@ -22,8 +22,16 @@ partial files fall back to built-in defaults, never an error.
 
 Per-user UI preferences. Distinct from `shelbi.yaml` (the per-project
 `last_launched` index) so a future `shelbi config reset` can wipe UI
-tweaks without touching hub bookkeeping. A missing file, or one that
-omits a block, resolves to defaults.
+tweaks without touching hub bookkeeping. A file that omits a key or a
+block resolves to that setting's default.
+
+A new install starts from a self-documenting `config.yaml` that sets
+`theme: dark` and a translucent desktop window (`desktop.window_opacity: 90`
+and `desktop.window_blur: 40`). Whichever writes the file first (`shelbi
+init`, or a first settings change in either client) writes those values, and
+with no file at all both clients show them. An existing `config.yaml` is
+never rewritten: without these keys it keeps the defaults in the table below
+(`auto`, an opaque window).
 
 **Path:** `~/.shelbi/config.yaml`
 
@@ -65,7 +73,7 @@ Both clients set it in Settings ▸ General. In the TUI a change saves at
 once and repaints every surface on the next frame, with no restart and no
 effect on running sessions. The TUI also reads `config.yaml` again whenever
 its Settings opens, so an edit made in a text editor or in the desktop app
-shows there. A missing key is `auto`. The dark theme follows your terminal's own palette for
+shows there. A missing key is `auto` (a new install's file sets `dark`). The dark theme follows your terminal's own palette for
 its status colors; the light theme pins every color, so it reads the same in
 any light terminal.
 

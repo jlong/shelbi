@@ -286,6 +286,33 @@ fn yes_mode_with_one_runner_initializes_git_while_stdin_is_open() {
         .unwrap();
     assert!(branch.status.success());
     assert_eq!(String::from_utf8(branch.stdout).unwrap().trim(), "develop");
+
+    // A new install's global config: dark, and a translucent desktop window.
+    let text = fs::read_to_string(home.join("config.yaml")).unwrap();
+    let cfg: shelbi_state::UserConfig = serde_yaml::from_str(&text).unwrap();
+    assert_eq!(cfg.theme, shelbi_state::ThemePreference::Dark);
+    assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(90), Some(40)));
+}
+
+#[test]
+fn init_leaves_an_existing_global_config_byte_for_byte() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("kept");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let existing = "keymap:\n  zen_toggle: ctrl-g\neditor: hx\n";
+    fs::write(home.join("config.yaml"), existing).unwrap();
+    let bin = fake_path(&temp.path().join("path"), FakePath::one_runner());
+
+    let result = run_init(&repo, &home, &bin, &["init", "-y"]);
+    assert!(
+        result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    assert_eq!(fs::read_to_string(home.join("config.yaml")).unwrap(), existing);
 }
 
 #[test]

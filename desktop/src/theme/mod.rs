@@ -309,7 +309,8 @@ fn chrome_appearance(preference: ThemePreference) -> Option<WindowAppearance> {
 
 /// Read the `theme:` setting and the window translucency and install the
 /// resolved theme. Call once at startup, before the first window opens. A
-/// missing or unreadable config is `auto`, opaque.
+/// missing config is a new install's (dark, translucent); an unreadable one is
+/// `auto`, opaque.
 pub fn init(cx: &mut App) {
     let cfg = shelbi_state::load_user_config().unwrap_or_default();
     let preference = cfg.theme;
