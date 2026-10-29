@@ -278,9 +278,9 @@ impl SheetContent {
         use crate::theme::style::{ButtonContent, ButtonSize};
         let (left, right) = match (size, self) {
             (ButtonSize::XSmall, _) => (icons::ARROW_LEFT_BUTTON, icons::ARROW_RIGHT_BUTTON),
-            (_, SheetContent::Left("Approve")) => (icons::CHECK, icons::CHEVRON_DOWN),
-            (_, SheetContent::Left("Reject")) => (icons::X_MARK, icons::CHEVRON_DOWN),
-            _ => (icons::PLUS, icons::CHEVRON_DOWN),
+            (_, SheetContent::Left("Approve")) => (icons::CHECK, crate::theme::style::DROPDOWN_CHEVRON),
+            (_, SheetContent::Left("Reject")) => (icons::X_MARK, crate::theme::style::DROPDOWN_CHEVRON),
+            _ => (icons::PLUS, crate::theme::style::DROPDOWN_CHEVRON),
         };
         match self {
             SheetContent::Label(l) => ButtonContent::label(l),

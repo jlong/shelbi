@@ -42,7 +42,6 @@ use shelbi_app::settings::workspace_form::{
 };
 use super::workspaces::WorkspacesPage;
 use shelbi_app::settings::workspaces::{Intent, WorkspacesState};
-use crate::assets::icons;
 use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
@@ -653,7 +652,7 @@ impl WorkspaceDialog {
             .aria_expanded(open.is_some())
             .when_some(form.machine_choice(), |b, m| b.aria_description(m.detail()))
             .child(div().flex_1().min_w_0().truncate().child(label))
-            .child(style::right_icon_slot(icons::CHEVRON_DOWN, ButtonSize::Base, chevron))
+            .child(style::dropdown_slot(ButtonSize::Base, chevron))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.click(Focus::Machine, window, cx)));
         let menu = open.map(|highlight| {
             let items: Vec<AnyElement> = form
