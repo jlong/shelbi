@@ -26,6 +26,9 @@ pub struct StartParams<'a> {
     pub branch: Option<&'a str>,
     pub reason: Option<&'a str>,
     pub force: bool,
+    /// `--take`: claim an issue that isn't the user's on the tracker before
+    /// starting it (see [`shelbi_state::ownership::ensure_owned_for_dispatch`]).
+    pub take: bool,
 }
 
 /// Poll cadence of [`await_launch`].
@@ -43,6 +46,7 @@ pub(crate) fn start(
         branch: branch_arg,
         reason,
         force,
+        take,
     } = *params;
 
     let project_yaml = shelbi_state::load_project(project).map_err(MutateError::backend)?;
@@ -116,6 +120,20 @@ pub(crate) fn start(
     // synchronous for `task start` rather than buried in a worker-thread error.
     crate::migration::ensure_workspace_dispatchable(project, &workspace_name)
         .map_err(MutateError::backend)?;
+
+    // Ownership gate: on a remote tracker, start only an issue assigned to the
+    // user (or claim it first on an explicit `--take`). Checked before the
+    // branch cut so a refused start leaves no trace.
+    let claim = shelbi_state::ownership::ensure_owned_for_dispatch(
+        &project_yaml.issue_tracker,
+        store.as_ref(),
+        &tf,
+        take,
+    )
+    .map_err(MutateError::Backend)?;
+    if let shelbi_state::ownership::Claim::Took { login } = claim {
+        sink.out(&format!("✓ took {id}: assigned to @{login} on the issue tracker"));
+    }
 
     // Cut the branch on the hub if it hasn't been already (depends_on aware). An
     // explicit `--branch` override bypasses the cut and points sync at that ref.

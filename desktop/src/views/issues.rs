@@ -1745,8 +1745,15 @@ fn reorder_target(
 /// dependencies when it has any. The badge is on every card, as Figma draws
 /// it, even on a one-workflow board (where the TUI leaves it off, see
 /// `IssuesModel::show_workflow_badges`). The assignee isn't on the card, as
-/// in Figma: the detail and the workspace filter carry it.
+/// in Figma: the detail and the workspace filter carry it. On a shared remote
+/// tracker a card that isn't the user's leads with whose it is (`@alice`,
+/// `unassigned`), since Shelbi won't start it without an explicit take.
 fn card_meta(card: &IssueCard, theme: &Theme) -> impl IntoElement {
+    let owner = card
+        .tracker_owner
+        .as_ref()
+        .filter(|o| !o.is_mine())
+        .map(|o| o.label());
     let deps = (!card.depends_on.is_empty()).then(|| {
         let list = card
             .depends_on
@@ -1770,6 +1777,7 @@ fn card_meta(card: &IssueCard, theme: &Theme) -> impl IntoElement {
                 .gap_1()
                 .items_center()
                 .overflow_hidden()
+                .when_some(owner, |d, o| d.child(div().flex_none().text_color(theme.text_loud).child(o)))
                 .child(workflow_badge(card.workflow_name.clone(), theme))
                 .when_some(card.branch.clone(), |d, b| d.child(div().min_w_0().truncate().child(b))),
         )

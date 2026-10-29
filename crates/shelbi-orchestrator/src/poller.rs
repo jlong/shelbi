@@ -5017,11 +5017,20 @@ fn maybe_dispatch_parked_active_gates(project: &Project) {
         }
     };
 
+    // The shared ownership gate, index-only so the tick adds no tracker
+    // request: a teammate's card parked in a gate on a shared remote tracker is
+    // skipped quietly here rather than failing (and logging) every tick.
+    let ownership = shelbi_state::ownership::gate_from_index(&project.name, &project.issue_tracker)
+        .unwrap_or(shelbi_state::OwnershipGate::FailClosed);
+
     for tf in board {
         let status_id = tf.task.column.as_str();
         let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
             .unwrap_or_else(|_| default_workflow());
         if !workflow.is_agent_active_gate(status_id) {
+            continue;
+        }
+        if !ownership.allows(&tf.tracker_assignees) {
             continue;
         }
         // An operator-parked task stays down — dispatching it is the churn loop

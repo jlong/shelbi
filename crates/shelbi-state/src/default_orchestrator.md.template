@@ -452,6 +452,16 @@ One bullet per event prefix. React to every matching line.
   mention it in your next user-facing reply so they know nothing is
   stalled by mistake.
 
+  **Only dispatch issues assigned to you on a remote tracker.** Several
+  people can share one GitHub tracker, so a card a teammate moves into
+  `ready` reaches your feed too. On a remote tracker every task line carries
+  `owner=`: dispatch only `owner=me`, and silently skip `owner=other:<login>`
+  (a teammate's) and `owner=unassigned` (`shelbi issue start` refuses them
+  anyway). The user claims such an issue with `shelbi issue start <id>
+  --take` or by assigning it on the tracker; never pass `--take` yourself. A
+  line with no `owner=` is from a filesystem board, where every issue is
+  yours.
+
 - `task=<id> ... to_category=active` **with no `agent=` in the reason** → a
   card entered an `active`-category status that no dispatch spawned a worker
   for. This is a workflow with an intermediate **agent-owned active gate** — a
@@ -608,8 +618,9 @@ One bullet per event prefix. React to every matching line.
   2. **Catch missed dispatches.** For each free workspace, if there's a
      `ready`-category issue — or a card parked in an `owner: agent` active
      gate (e.g. `adversarial-review`) with no live worker assigned — that
-     isn't blocked by `prefers_machine`, dispatch per the normal
-     auto-dispatch contract. (This catches cases where the workspace-free
+     isn't blocked by `prefers_machine` and, on a remote tracker, is
+     assigned to you (`me` in `shelbi issue list`'s owner column), dispatch
+     per the normal auto-dispatch contract. (This catches cases where the workspace-free
      event, or a `to_category=active` gate wake, was swallowed.)
 
   3. **Reconcile in-review CI.** The hub's scoped CI poll normally emits a

@@ -169,6 +169,7 @@ mod tests {
             workflow: None,
             workflow_name: "task".into(),
             assignee: None,
+            tracker_owner: None,
             priority: 1,
             depends_on: Vec::new(),
             status_id: "done".into(),

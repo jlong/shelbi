@@ -628,6 +628,30 @@ pub trait IssueStore {
     /// priority and timestamps). Errors if the id already exists.
     fn add(&self, spec: NewIssue) -> Result<Issue>;
 
+    /// [`IssueStore::add`], also returning the tracker assignees the backend
+    /// recorded on the new issue, so a create can warn when it didn't end up
+    /// assigned to the user (see [`crate::ownership::creation_warning`]). The
+    /// default is an empty list, right for a backend with no assignee concept.
+    fn add_with_assignees(&self, spec: NewIssue) -> Result<(Issue, Vec<String>)> {
+        Ok((self.add(spec)?, Vec::new()))
+    }
+
+    /// The authenticated tracker login, for the ownership gate
+    /// ([`crate::ownership`]). `None` for a backend with no tracker identity
+    /// (the filesystem board), or when it can't be resolved.
+    fn viewer_login(&self) -> Option<String> {
+        None
+    }
+
+    /// Assign issue `id` to the authenticated tracker user (the explicit
+    /// `--take` claim), returning its tracker assignees after the write. A
+    /// backend with no assignee concept refuses.
+    fn claim(&self, id: &str) -> Result<Vec<String>> {
+        Err(shelbi_core::Error::Other(format!(
+            "issue `{id}` can't be claimed: this issue tracker has no assignees"
+        )))
+    }
+
     /// Move an issue to status `to`. Returns `Some(StatusMove)` when the status
     /// actually changed, `None` when the issue was already there. `reason` is
     /// carried for backends that persist it (e.g. a GitHub comment); the
