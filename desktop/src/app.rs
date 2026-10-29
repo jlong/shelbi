@@ -3003,6 +3003,14 @@ impl ShelbiWindow {
         cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default()
     }
 
+    /// [`Self::switcher_projects`] as the switcher and the chooser draw
+    /// them: in the same order, each with its dot (the chooser has no
+    /// current project).
+    fn switcher_rows(&self, cx: &App) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+        let current = if self.chooser { "" } else { self.project.as_str() };
+        cx.try_global::<Catalog>().map(|c| c.rows(current)).unwrap_or_default()
+    }
+
     /// A key while the switcher is open: ↑↓ (and Tab) move its keyboard row,
     /// Enter picks it, Esc closes. `false` for any other key (it goes on as
     /// usual).
@@ -3051,12 +3059,12 @@ impl ShelbiWindow {
     /// The empty-state chooser: no project is open in this window. Every
     /// project (the catalog's), and Add Project.
     fn render_chooser(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let projects = self.switcher_projects(cx);
+        let projects = self.switcher_rows(cx);
         let add_ix = projects.len();
-        let rows = projects.into_iter().enumerate().map(|(ix, p)| {
-            let name = p.name.clone();
-            style::menu_row(format!("chooser-{}", p.name), ix == self.chooser_highlight, theme)
-                .child(style::project_badge(&p.label, 20.0))
+        let rows = projects.iter().enumerate().map(|(ix, p)| {
+            let name = p.slug.clone();
+            style::menu_row(format!("chooser-{}", p.slug), ix == self.chooser_highlight, theme)
+                .child(crate::views::project_menu::dot(p.indicator, theme))
                 .child(p.label.clone())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     let project = name.clone();
@@ -4440,7 +4448,7 @@ impl ShelbiWindow {
         if self.switcher.animating(now, reduce_motion) {
             window.request_animation_frame();
         }
-        let catalog_projects = switcher_phase.map(|_| self.switcher_projects(cx));
+        let catalog_projects = switcher_phase.map(|_| self.switcher_rows(cx));
         // The sidebar's sections and machine groups folding open or closed.
         self.folds.settle(now);
         if self.folds.animating(now) {
@@ -4550,7 +4558,6 @@ impl ShelbiWindow {
                         switcher: catalog_projects.as_deref().zip(switcher_phase).map(
                             |(projects, phase)| sidebar::SwitcherProps {
                                 projects,
-                                current: self.project.as_str(),
                                 highlight: self.switcher.highlight,
                                 phase,
                             },
@@ -4598,7 +4605,6 @@ impl ShelbiWindow {
                         menu: catalog_projects.as_deref().zip(switcher_phase).map(|(projects, phase)| {
                             sidebar::SwitcherProps {
                                 projects,
-                                current: self.project.as_str(),
                                 highlight: self.switcher.highlight,
                                 phase,
                             }

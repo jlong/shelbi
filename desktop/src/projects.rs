@@ -38,6 +38,9 @@ pub struct ProjectEntry {
 #[derive(Default)]
 struct CatalogInner {
     projects: Vec<ProjectEntry>,
+    /// The projects recorded open (running in some window or terminal), as
+    /// of the last refresh.
+    open: std::collections::HashSet<String>,
     skeletons: std::collections::HashMap<String, SidebarModel>,
     views: std::collections::HashMap<String, ProjectViewState>,
     /// Projects whose view state this process has set: a refresh never
@@ -60,6 +63,19 @@ impl Catalog {
     /// refresh lands.
     pub fn projects(&self) -> Vec<ProjectEntry> {
         self.lock().projects.clone()
+    }
+
+    /// The projects as the switcher lists them, in the same order, each with
+    /// its dot: `shelbi_app::command_model::project_rows`, the rule the
+    /// palette's Projects column uses too (`current` is this window's).
+    pub fn rows(&self, current: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+        let inner = self.lock();
+        let projects = inner
+            .projects
+            .iter()
+            .map(|p| (p.name.clone(), p.label.clone()))
+            .collect();
+        shelbi_app::command_model::project_rows(current, projects, &inner.open)
     }
 
     /// The sidebar a window for `project` paints on its first frame, from
@@ -116,6 +132,10 @@ impl Catalog {
     /// thread).
     pub fn reload(&self) {
         let summaries = shelbi_state::list_projects().unwrap_or_default();
+        let open = shelbi_state::list_open_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let projects: Vec<ProjectEntry> = summaries
             .iter()
             .map(|p| ProjectEntry {
@@ -136,12 +156,20 @@ impl Catalog {
             .collect();
         let mut guard = self.lock();
         guard.projects = projects;
+        guard.open = open;
         guard.skeletons = skeletons;
         for (name, view) in views {
             if !guard.remembered.contains(&name) {
                 guard.views.insert(name, view);
             }
         }
+    }
+
+    /// Record `open` as the projects open elsewhere (a test's or a visual
+    /// check's catalog, which never refreshes).
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn set_open(&self, open: &[&str]) {
+        self.lock().open = open.iter().map(|p| p.to_string()).collect();
     }
 
     /// Whether `project` is in the catalog (as of its last refresh).
@@ -272,6 +300,30 @@ mod tests {
         let bare = catalog.first_frame_sidebar("api");
         assert_eq!(bare.project_label, "api");
         assert!(bare.board_loading);
+    }
+
+    #[test]
+    fn rows_keep_the_switchers_order_with_each_projects_dot() {
+        use shelbi_app::overlay::palette::ProjectIndicator;
+        let entry = |name: &str| ProjectEntry {
+            name: name.into(),
+            label: name.to_uppercase(),
+        };
+        let catalog = Catalog::with(vec![entry("web"), entry("api"), entry("shelbi")], Vec::new());
+        catalog.set_open(&["web"]);
+        let rows: Vec<(String, ProjectIndicator)> = catalog
+            .rows("shelbi")
+            .into_iter()
+            .map(|r| (r.label, r.indicator))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("WEB".to_string(), ProjectIndicator::LoadedIdle),
+                ("API".to_string(), ProjectIndicator::Unloaded),
+                ("SHELBI".to_string(), ProjectIndicator::Active),
+            ]
+        );
     }
 
     #[test]
