@@ -80,7 +80,7 @@ async-channel = "2"
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 # The Markdown parser gpui-kit's text view renders with (pinned to the version
-# gpui-base resolves), for the task detail's checklist count and its tests.
+# gpui-base resolves), for the license text's tests.
 markdown = "=1.0.0"
 
 # The activity feed's clock (relative times, day headers): the version the

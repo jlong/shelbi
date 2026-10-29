@@ -114,6 +114,8 @@ It should be WYSIWYG."
   a live session under the pane (`dt-task-pane-session`, #1989, which made
   Tab put the keys in the terminal), the order is one: Status, Workflow,
   Priority, then the terminal; with none, Tab cycles back off the values.
+  (`dt-task-wysiwyg-editor` later put its title and body editors in this
+  order at their reading places: title, the values, body, terminal.)
   `tab_past_the_properties_puts_the_keys_in_the_terminal` replaces #1989's
   `tab_from_the_pane_puts_the_keys_in_the_terminal`.
 - **No new public `view` model fields**: the choices are their own shared

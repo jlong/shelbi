@@ -47,7 +47,7 @@ use gpui::{
     Stateful, Subscription, Task, Window,
 };
 use shelbi_app::board::DropTarget;
-use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::board::{self, BoardRead, ClosedPage};
 use shelbi_app::board_search::SearchWorker;
 use shelbi_app::{
@@ -59,7 +59,9 @@ use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 use super::board_list::{self, ColumnList, Item};
 use super::board_scroll::{self, BoardScroll};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Property, Scroll};
-use shelbi_app::issue_edit::{Field, SaveJob, Splice};
+use shelbi_app::issue_edit::{Field, SaveJob};
+use super::doc_editor::layout::Field as DocField;
+use super::doc_editor::{DocEditor, DocEvent};
 use super::external_edit::{self, EditorEvent};
 use super::pane_session::{MainShows, PaneSession};
 use super::session_view::{SessionDeps, SessionView};
@@ -166,6 +168,14 @@ enum Done {
     Persisted(Result<(), String>),
 }
 
+/// The open task's title and body editors.
+pub(crate) struct PaneEditors {
+    pub id: String,
+    pub title: Entity<DocEditor>,
+    pub body: Entity<DocEditor>,
+    _subs: Vec<Subscription>,
+}
+
 pub struct IssuesView {
     /// The filter controls, measured so their menus open under them.
     workflow_anchor: style::Anchor,
@@ -204,14 +214,9 @@ pub struct IssuesView {
     /// Emptied when a new search starts, so its results start at the top.
     search_lists: HashMap<String, ColumnList>,
     pub(super) detail_scroll: ScrollHandle,
-    /// The in-place body editor: the issue id and its text state. It edits
-    /// the issue's draft (`issue_edit`), which saves itself.
-    pub(super) editor: Option<(String, Entity<TextareaState>)>,
-    _editor_subscriptions: Vec<Subscription>,
-    /// The draft store changed the editor's text (a read merged into it, a
-    /// conflict resolved, the external editor): put it in at the next render
-    /// (that needs the window).
-    sync_editor: bool,
+    /// The open task's title and body editors. They edit the issue's draft
+    /// (`issue_edit`), which saves itself.
+    pub(crate) pane_editors: Option<PaneEditors>,
     /// The saves a test's view sent (a test never reaches the daemon).
     #[cfg(test)]
     sent_saves: Vec<SaveJob>,
@@ -286,9 +291,7 @@ impl IssuesView {
             property_anchor: Default::default(),
             picker_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
-            editor: None,
-            _editor_subscriptions: Vec::new(),
-            sync_editor: false,
+            pane_editors: None,
             #[cfg(test)]
             sent_saves: Vec::new(),
             add_input: None,
@@ -410,7 +413,7 @@ impl IssuesView {
         self.closed_refresher.stop_without_waiting();
         // Send what's typed. The answers land in the project's draft store,
         // which keeps a draft that fails for when the project is back.
-        self.close_editor();
+        self.close_editors();
         for intent in self.state.flush_all_edits() {
             if let Intent::Save(job) = intent {
                 self.spawn_save(job);
@@ -502,8 +505,8 @@ impl IssuesView {
     /// Open task `id`'s detail (from an Activity row). A task the board hasn't
     /// loaded yet fills in when its read lands.
     pub fn open_task(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.editor.as_ref().is_some_and(|(open, _)| open != id) {
-            self.close_editor();
+        if self.pane_editors.as_ref().is_some_and(|e| e.id != id) {
+            self.close_editors();
         }
         self.state.open_detail(id);
         self.needs_focus = true;
@@ -535,7 +538,7 @@ impl IssuesView {
     pub fn land(&mut self, close: bool, cx: &mut Context<Self>) {
         self.floating = false;
         if close {
-            self.close_editor();
+            self.close_editors();
             self.add_input = None;
             self.state.close_pane();
         }
@@ -547,7 +550,7 @@ impl IssuesView {
     /// whose selection, filters and scroll are as they were (over another
     /// screen, the window hands them back to it).
     pub(super) fn close_pane(&mut self, cx: &mut Context<Self>) {
-        self.finish_editor(cx);
+        self.close_editors();
         self.add_input = None;
         self.state.close_pane();
         self.needs_focus = true;
@@ -557,7 +560,8 @@ impl IssuesView {
     /// Wire the task pane's pointer and keys: over another screen the pane is
     /// the view's focus target (the screen around it keeps its own clicks);
     /// on the board a press in it brings the keys back from, say, the search
-    /// field, unless something inside took them (the body editor).
+    /// field or an editor, unless something inside took them (a press in an
+    /// editor puts its caret there).
     pub(super) fn pane_focus(&self, pane: Stateful<gpui::Div>, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         if self.floating {
             return pane
@@ -568,7 +572,7 @@ impl IssuesView {
         pane.on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                if !window.default_prevented() && this.editor.is_none() {
+                if !window.default_prevented() {
                     window.focus(&this.focus, cx);
                 }
             }),
@@ -580,14 +584,11 @@ impl IssuesView {
         self.detail_model().map(|d| (d.id, d.title, d.body))
     }
 
-    /// Whether the detail is open on `id` with its editor up (an assign
-    /// picker opened from it keeps it).
-    fn editing(&self, id: &str) -> bool {
-        match &self.state.mode {
-            Mode::Detail { id: open, editing } => open == id && *editing,
-            Mode::AssignPicker { id: open, .. } => open == id,
-            _ => false,
-        }
+    /// Whether one of the pane's editors has the keys.
+    fn editor_focused(&self, cx: &App) -> bool {
+        self.pane_editors
+            .as_ref()
+            .is_some_and(|e| e.title.read(cx).is_focused() || e.body.read(cx).is_focused())
     }
 
     /// Drain the refreshers and background results; re-read on the cadence.
@@ -647,22 +648,17 @@ impl IssuesView {
         let saves = self.state.poll_saves(Instant::now());
         changed |= !saves.is_empty();
         self.apply_intents_bg(saves, cx);
-        // The editor's text is the draft's: catch it up when the store
-        // changed it (compared, not queued: another window on the project may
-        // have taken the store's updates).
-        let updates = !self.state.take_text_updates().is_empty();
-        if let Some((id, input)) = &self.editor {
-            let draft = self.state.draft_text(id, Field::Body);
-            if draft.is_some_and(|d| d != input.read(cx).value().as_ref()) {
-                self.sync_editor = true;
-                changed = true;
-            }
+        // The editors show the draft (or the read): catch them up when the
+        // store changed it (compared at render, not queued: another window on
+        // the project may have taken the store's updates).
+        changed |= !self.state.take_text_updates().is_empty();
+        if self.pane_editors.as_ref().is_some_and(|e| self.text_behind(e, cx)) {
+            changed = true;
         }
-        changed |= updates;
-        // Leaving the task (closing the detail, opening another card, the
-        // board taking the keys) closes its editor, saving what's typed.
-        if self.editor.as_ref().is_some_and(|(id, _)| !self.editing(id)) {
-            self.close_editor();
+        // Leaving the task (closing the pane, opening another card) closes
+        // its editors, saving what's typed.
+        if self.pane_editors.as_ref().is_some_and(|e| self.state.detail_id() != Some(e.id.as_str())) {
+            self.close_editors();
             changed = true;
         }
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
@@ -920,54 +916,137 @@ impl IssuesView {
             .map(|tf| tf.body)
     }
 
+    /// The Edit command: the body editor takes the keys, the caret at the
+    /// end of the text.
     fn begin_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.as_ref().is_some_and(|(open, _)| open == id) {
-            if let Some((_, state)) = &self.editor {
-                state.update(cx, |s, cx| s.focus(window, cx));
-            }
-            return;
+        self.sync_pane_editors(window, cx);
+        if let Some(e) = self.pane_editors.as_ref().filter(|e| e.id == id) {
+            let body = e.body.clone();
+            body.update(cx, |b, cx| b.focus_at(true, window, cx));
         }
-        self.close_editor();
-        // The draft's text: what was left unsaved last time, if anything.
-        let body = self
-            .state
-            .draft_text(id, Field::Body)
-            .or_else(|| self.body_of(id))
-            .unwrap_or_default();
-        let state = cx.new(|cx| TextareaState::new(window, cx).default_value(body));
-        state.update(cx, |s, cx| s.focus(window, cx));
-        let issue = id.to_string();
-        let sub = cx.subscribe_in(&state, window, move |this, input, ev: &InputEvent, _, cx| {
-            match ev {
-                InputEvent::Change => {
-                    let text = input.read(cx).value().to_string();
-                    this.state.edit_text(&issue, Field::Body, &text, Instant::now());
-                    cx.notify();
+    }
+
+    /// Keep the pane's editors on its task: made when a task shows, dropped
+    /// (saving) when it goes, and showing its draft or, with none, the read.
+    fn sync_pane_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.state.detail_id().map(str::to_string);
+        if self.pane_editors.as_ref().is_some_and(|e| Some(&e.id) != open.as_ref()) {
+            self.close_editors();
+        }
+        let Some(id) = open else {
+            return;
+        };
+        let Some(d) = self.detail_model() else {
+            return;
+        };
+        if self.pane_editors.is_none() {
+            self.pane_editors = Some(self.make_editors(&d, window, cx));
+        }
+        let title = self.state.draft_text(&id, Field::Title).unwrap_or(d.title);
+        let body = self.state.draft_text(&id, Field::Body).unwrap_or(d.body);
+        if let Some(e) = &self.pane_editors {
+            e.title.update(cx, |t, cx| t.set_from_outside(&title, cx));
+            e.body.update(cx, |b, cx| b.set_from_outside(&body, cx));
+        }
+    }
+
+    /// Whether an editor's text trails the draft (or the read).
+    fn text_behind(&self, e: &PaneEditors, cx: &App) -> bool {
+        let read = self.state.input().tasks().into_iter().find(|tf| tf.task.id == e.id);
+        let title = self.state.draft_text(&e.id, Field::Title).or_else(|| read.as_ref().map(|tf| tf.task.title.clone()));
+        let body = self.state.draft_text(&e.id, Field::Body).or_else(|| read.as_ref().map(|tf| tf.body.clone()));
+        title.is_some_and(|t| t != e.title.read(cx).text()) || body.is_some_and(|b| b != e.body.read(cx).text())
+    }
+
+    /// The title and body editors for task `d`.
+    fn make_editors(&mut self, d: &TaskDetailModel, window: &mut Window, cx: &mut Context<Self>) -> PaneEditors {
+        let title_text = self.state.draft_text(&d.id, Field::Title).unwrap_or_else(|| d.title.clone());
+        let body_text = self.state.draft_text(&d.id, Field::Body).unwrap_or_else(|| d.body.clone());
+        let scroll = self.detail_scroll.clone();
+        let s = scroll.clone();
+        let title = cx.new(|cx| DocEditor::new(&title_text, DocField::Title, "Untitled", "Task title", Some(s), window, cx));
+        let body = cx.new(|cx| {
+            DocEditor::new(&body_text, DocField::Body, "Write a description…", "Task description", Some(scroll), window, cx)
+        });
+        let subs = [(title.clone(), Field::Title), (body.clone(), Field::Body)]
+            .into_iter()
+            .map(|(ed, field)| {
+                let id = d.id.clone();
+                cx.subscribe_in(&ed, window, move |this, ed, ev: &DocEvent, window, cx| {
+                    this.doc_event(&id, field, ed, ev, window, cx)
+                })
+            })
+            .collect();
+        PaneEditors {
+            id: d.id.clone(),
+            title,
+            body,
+            _subs: subs,
+        }
+    }
+
+    /// What one of the pane's editors said.
+    fn doc_event(
+        &mut self,
+        id: &str,
+        field: Field,
+        ed: &Entity<DocEditor>,
+        ev: &DocEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let saves = match ev {
+            DocEvent::Changed => {
+                let text = ed.read(cx).text().to_string();
+                self.state.edit_text(id, field, &text, Instant::now());
+                Vec::new()
+            }
+            DocEvent::Focused => {
+                self.state.editor_focused(id);
+                Vec::new()
+            }
+            // The keys going to the other field (Tab, Enter) keep the
+            // pane's editing (its focus can land before this blur does);
+            // either way what's typed saves now.
+            DocEvent::Blurred if self.editor_focused(cx) => self.state.flush_edit(id),
+            DocEvent::Blurred => self.state.editor_blurred(id),
+            DocEvent::Save => self.state.flush_edit(id),
+            DocEvent::Escape => {
+                window.focus(&self.focus, cx);
+                Vec::new()
+            }
+            // Enter in the title goes on to the body.
+            DocEvent::Submit => {
+                match (&self.pane_editors, field) {
+                    (Some(e), Field::Title) => e.body.clone().update(cx, |n, cx| n.focus_at(false, window, cx)),
+                    _ => window.focus(&self.focus, cx),
                 }
-                // Leaving the field saves what's typed (the editor stays).
-                InputEvent::Blur => {
-                    for intent in this.state.flush_edit(&issue) {
-                        if let Intent::Save(job) = intent {
-                            this.spawn_save(job);
-                        }
+                Vec::new()
+            }
+            // The pane's one Tab order, in reading order: the title, Status,
+            // Workflow, Priority, the body, then the session (when it shows
+            // one) or back off the values.
+            DocEvent::Tab { back } => {
+                let to = match (field, back) {
+                    (Field::Title, false) => Some(Property::Status),
+                    (Field::Body, true) => Some(Property::Priority),
+                    _ => None,
+                };
+                let session = (field == Field::Body && !back)
+                    .then(|| self.pane_session_view().cloned())
+                    .flatten();
+                self.state.set_pane_focus(to);
+                match session {
+                    Some(view) => {
+                        let target = view.read(cx).focus_target(cx);
+                        window.focus(&target, cx);
                     }
-                    cx.notify();
+                    None => window.focus(&self.focus, cx),
                 }
-                _ => {}
+                Vec::new()
             }
-        });
-        self._editor_subscriptions = vec![sub];
-        self.sync_editor = false;
-        self.editor = Some((id.to_string(), state));
-    }
-
-    /// Cmd+S: save the in-place editor's text now. Optional (the draft saves
-    /// itself) and the editor stays open.
-    pub(super) fn save_editor(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.editor.as_ref().map(|(id, _)| id.clone()) else {
-            return;
         };
-        for intent in self.state.flush_edit(&id) {
+        for intent in saves {
             if let Intent::Save(job) = intent {
                 self.spawn_save(job);
             }
@@ -975,51 +1054,18 @@ impl IssuesView {
         cx.notify();
     }
 
-    /// Done / Escape / Close: close the in-place editor, saving what's typed
-    /// (an unchanged draft sends nothing; nothing is reverted).
-    pub(super) fn finish_editor(&mut self, cx: &mut Context<Self>) {
-        self.close_editor();
-        self.needs_focus = true;
-        cx.notify();
-    }
-
-    /// Drop the editor widget, flushing its draft. A draft that can't be
-    /// saved stays in the store and comes back with the editor.
-    fn close_editor(&mut self) {
-        let Some((id, _)) = self.editor.take() else {
+    /// Drop the pane's editors (leaving the task), saving what's typed. A
+    /// draft that can't be saved stays in the store and comes back with
+    /// the task.
+    fn close_editors(&mut self) {
+        let Some(e) = self.pane_editors.take() else {
             return;
         };
-        self._editor_subscriptions.clear();
-        self.sync_editor = false;
-        for intent in self.state.end_edit(&id) {
+        for intent in self.state.end_edit(&e.id) {
             if let Intent::Save(job) = intent {
                 self.spawn_save(job);
             }
         }
-    }
-
-    /// Put the text the draft store changed (a read merged into the draft,
-    /// a conflict resolved, the external editor) into the open editor, as
-    /// one splice so the caret and the text around it stay put.
-    fn sync_editor_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_editor = false;
-        let Some((id, state)) = &self.editor else {
-            return;
-        };
-        let Some(draft) = self.state.draft_text(id, Field::Body) else {
-            return;
-        };
-        state.update(cx, |s, cx| {
-            let current = s.value().to_string();
-            let splice = Splice::between(&current, &draft);
-            if splice.is_empty() {
-                return;
-            }
-            let selection = s.selected_range();
-            s.set_selected_range(splice.start..splice.end, cx);
-            s.replace(splice.text.clone(), window, cx);
-            s.set_selected_range(splice.map(selection.start)..splice.map(selection.end), cx);
-        });
     }
 
     fn open_in_editor(&mut self, id: &str) {
@@ -1107,37 +1153,15 @@ impl IssuesView {
         let Some(chord) = chord_from_keystroke(&ev.keystroke) else {
             return;
         };
-        if self.pane_session_key(ev, window, cx) {
+        if self.pane_tab_key(ev, window, cx) || self.pane_session_key(ev, window, cx) {
             cx.stop_propagation();
             return;
-        }
-        // Cmd+S / Cmd+Enter save the in-place editor now (it saves on its
-        // own too) and leave it open; Esc leaves it, saving its draft (it
-        // never closes the pane under it).
-        if self.editor.is_some() {
-            let m = &ev.keystroke.modifiers;
-            if m.platform && (ev.keystroke.key == "s" || ev.keystroke.key == "enter") {
-                self.save_editor(cx);
-                cx.stop_propagation();
-                return;
-            }
-            if ev.keystroke.key == "escape" && !m.modified() {
-                self.finish_editor(cx);
-                cx.stop_propagation();
-                return;
-            }
         }
         let before = (self.state.selected_column, self.state.selected_row);
         let Some(intents) = self.state.handle_key(chord) else {
             return;
         };
         cx.stop_propagation();
-        // Leaving the editor / prompt with Escape drops its widget (the
-        // editor's text is saved, not reverted).
-        if !matches!(self.state.mode, Mode::Detail { editing: true, .. }) && self.editor.is_some() {
-            self.close_editor();
-            self.needs_focus = true;
-        }
         if self.state.mode != Mode::AddPrompt && self.add_input.is_some() {
             self.add_input = None;
             self.needs_focus = true;
@@ -1150,12 +1174,42 @@ impl IssuesView {
         cx.notify();
     }
 
+    /// Tab / Shift+Tab from the pane into its editors, at their places in
+    /// the pane's order (see the `DocEvent::Tab` arm): off the values, Tab
+    /// goes to the title and Shift+Tab to the body; past Priority, Tab goes
+    /// to the body; before Status, Shift+Tab to the title.
+    fn pane_tab_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Mode::Detail { id, editing: false } = &self.state.mode else {
+            return false;
+        };
+        let Some(e) = self.pane_editors.as_ref().filter(|e| &e.id == id) else {
+            return false;
+        };
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        if ks.key != "tab" || m.alt || m.platform || m.control || m.function {
+            return false;
+        }
+        let into = match (self.state.pane_focus(), m.shift) {
+            (None, false) => (e.title.clone(), false),
+            (None, true) => (e.body.clone(), true),
+            (Some(Property::Priority), false) => (e.body.clone(), false),
+            (Some(Property::Status), true) => (e.title.clone(), true),
+            _ => return false,
+        };
+        self.state.clear_pane_focus();
+        let (editor, end) = into;
+        editor.update(cx, |n, cx| n.focus_at(end, window, cx));
+        cx.notify();
+        true
+    }
+
     /// The pane's keys for its session, while it shows one and has the keys
-    /// (no menu or editor over it): ⌥↑ / ⌥↓ resize the split, and Tab past
-    /// the last property (Status, Workflow, Priority, then the session) puts
-    /// the keys in the terminal.
+    /// (no menu or editor over it): ⌥↑ / ⌥↓ resize the split, and, for a
+    /// pane without its editors, Tab past the last property puts the keys in
+    /// the terminal (with them, the body comes first: [`Self::pane_tab_key`]).
     fn pane_session_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.editor.is_some() || !matches!(self.state.mode, Mode::Detail { editing: false, .. }) {
+        if !matches!(self.state.mode, Mode::Detail { editing: false, .. }) {
             return false;
         }
         let Some(view) = self.pane_session_view().cloned() else {
@@ -2021,10 +2075,8 @@ impl IssuesView {
 
 impl Render for IssuesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.sync_editor {
-            self.sync_editor_text(window, cx);
-        }
-        if self.needs_focus && self.editor.is_none() && self.add_input.is_none() {
+        self.sync_pane_editors(window, cx);
+        if self.needs_focus && !self.editor_focused(cx) && self.add_input.is_none() {
             self.needs_focus = false;
             window.focus(&self.focus, cx);
         }
@@ -2283,7 +2335,7 @@ pub(super) fn backdrop(theme: &Theme, cx: &mut Context<IssuesView>) -> gpui::Sta
         .flex_col()
         .bg(dim)
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-            if this.editor.is_none() {
+            if !this.editor_focused(cx) {
                 this.state.close_overlay();
                 this.add_input = None;
                 this.needs_focus = true;
@@ -2309,6 +2361,7 @@ pub(super) fn centered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_app::issue_edit::SaveStatus;
 
     #[test]
     fn a_read_like_the_last_is_not_folded_unless_a_change_is_in_flight() {
@@ -2651,8 +2704,10 @@ mod tests {
         );
         assert!(!drawn(&mut cx, "property-picker"));
         assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Detail { id: "A".into(), editing: false });
-        // The keyboard: Tab to Priority, Enter opens it, End, Enter.
-        cx.simulate_keystrokes("tab tab tab enter");
+        // The keyboard: Tab past the title to Priority, Enter opens it, End,
+        // Enter.
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_keystrokes("tab tab tab tab enter");
         assert!(drawn(&mut cx, "picker-priority-1"));
         cx.simulate_keystrokes("end enter");
         assert_eq!(
@@ -2676,47 +2731,165 @@ mod tests {
         assert!(!drawn(&mut cx, "task-pane"));
     }
 
+    /// The pane's title and body editors, once drawn. The window is made
+    /// active: gpui reports focus moving only in the active window.
+    fn editors(view: &Entity<IssuesView>, cx: &mut gpui::VisualTestContext) -> (Entity<DocEditor>, Entity<DocEditor>) {
+        cx.update(|window, _| window.activate_window());
+        assert!(drawn(cx, "pane-body-editor"));
+        view.read_with(cx, |v, _| {
+            let e = v.pane_editors.as_ref().expect("the pane's editors");
+            (e.title.clone(), e.body.clone())
+        })
+    }
+
+    fn sent(view: &Entity<IssuesView>, cx: &gpui::VisualTestContext) -> Vec<(String, Option<String>, Option<String>)> {
+        view.read_with(cx, |v, _| v.sent_saves.iter().map(|j| (j.id.clone(), j.title.clone(), j.body.clone())).collect())
+    }
+
+    fn mode(view: &Entity<IssuesView>, cx: &gpui::VisualTestContext) -> Mode {
+        view.read_with(cx, |v, _| v.state.mode.clone())
+    }
+
     #[gpui::test]
-    fn esc_in_the_body_editor_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+    fn the_body_is_typed_into_where_it_reads_and_keeps_the_keys(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) =
+            open_board_sized(cx, vec![issue("A", "todo"), issue("B", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        let commands = record(&view, &mut cx);
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        // Reading it opens no draft and sends nothing.
+        assert_eq!(view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body)), None);
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Body of A");
+
+        // A click puts the caret in the text: no edit mode, nothing moves.
+        let before = cx.debug_bounds("pane-body-editor").unwrap();
+        let at = body.read_with(&cx, |b, _| b.point_of("Body of A".len())).unwrap();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        assert_eq!(cx.debug_bounds("pane-body-editor").unwrap(), before, "focusing doesn't move the text");
+        assert_eq!(mode(&view, &cx), Mode::Detail { id: "A".into(), editing: true });
+        let selected = view.read_with(&cx, |v, _| (v.state.selected_column, v.state.selected_row));
+
+        // The board's keys are text here.
+        cx.simulate_input(" s a e h j k l");
+        cx.simulate_keystrokes("left right up down shift-left");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Body of A s a e h j k l");
+        assert_eq!(view.read_with(&cx, |v, _| (v.state.selected_column, v.state.selected_row)), selected);
+        assert!(commands.borrow().is_empty(), "no start, assign or move: {:?}", commands.borrow());
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
+        assert_eq!(
+            view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body)).as_deref(),
+            Some("Body of A s a e h j k l"),
+            "every change goes to the draft"
+        );
+
+        // Undo is the editor's.
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Body of A");
+        cx.simulate_keystrokes("cmd-shift-z");
+
+        // Esc hands the keys back to the pane, saving: nothing is reverted.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(mode(&view, &cx), Mode::Detail { id: "A".into(), editing: false });
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"), "the pane stays");
+        assert_eq!(sent(&view, &cx), vec![("A".into(), None, Some("Body of A s a e h j k l".into()))]);
+        assert!(drawn(&mut cx, "pane-save-status"), "the pane says the save is out");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Body of A s a e h j k l");
+
+        // `e` (Edit) puts the keys back in the body, the caret at the end.
+        cx.simulate_keystrokes("e");
+        assert!(body.read_with(&cx, |b, _| b.is_focused()));
+        cx.simulate_input("!");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Body of A s a e h j k l!");
+
+        // Closing the pane saves what's typed (queued behind the save out).
+        view.update(&mut cx, |v, cx| v.close_pane(cx));
+        assert!(view.read_with(&cx, |v, _| v.pane_editors.is_none()));
+        let draft = view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body));
+        assert_eq!(draft.as_deref(), Some("Body of A s a e h j k l!"));
+    }
+
+    #[gpui::test]
+    fn a_checkbox_is_clicked_checked_without_editing(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut a = issue("A", "todo");
+        a.body = "## Acceptance criteria\n\n- [ ] one\n- [x] two\n".into();
+        let (view, mut cx) = open_board_sized(cx, vec![a], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        let at = body.read_with(&cx, |b, _| b.check_point(1)).expect("the first item's checkbox");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let expected = "## Acceptance criteria\n\n- [x] one\n- [x] two\n";
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), expected);
+        assert_eq!(view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body)).as_deref(), Some(expected));
+        assert!(!body.read_with(&cx, |b, _| b.is_focused()), "a checkbox click doesn't take the keys");
+        let at = body.read_with(&cx, |b, _| b.check_point(2)).unwrap();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        assert_eq!(
+            body.read_with(&cx, |b, _| b.text().to_string()),
+            "## Acceptance criteria\n\n- [x] one\n- [ ] two\n"
+        );
+    }
+
+    #[gpui::test]
+    fn the_title_is_edited_in_place_and_a_blank_one_is_held(cx: &mut gpui::TestAppContext) {
         use crate::views::board_state::tests::issue;
         cx.update(|cx| cx.set_reduce_motion(true));
         let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
-        let sent = |cx: &gpui::VisualTestContext| {
-            view.read_with(cx, |v, _| v.sent_saves.iter().map(|j| (j.id.clone(), j.body.clone())).collect::<Vec<_>>())
-        };
         view.update(&mut cx, |v, cx| v.open_task("A", cx));
-        assert!(drawn(&mut cx, "task-pane"));
-        cx.simulate_keystrokes("e");
-        assert!(view.read_with(&cx, |v, _| v.editor.is_some()), "e opens the body editor");
-        cx.simulate_input("A new draft");
-        // Esc leaves the editor with its draft saved, and the pane up.
-        cx.simulate_keystrokes("escape");
-        assert!(view.read_with(&cx, |v, _| v.editor.is_none()));
-        assert_eq!(sent(&cx), vec![("A".into(), Some("A new draftBody of A".into()))], "the draft is saved, not dropped");
-        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"), "the pane stays");
-        assert!(drawn(&mut cx, "pane-save-status"), "the pane says the save is out");
+        let (title, body) = editors(&view, &mut cx);
+        let at = title.read_with(&cx, |t, _| t.point_of(0)).unwrap();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        assert!(drawn(&mut cx, "pane-title-editor"));
+        cx.simulate_keystrokes("cmd-a backspace");
+        assert_eq!(title.read_with(&cx, |t, _| t.text().to_string()), "");
+        // Enter moves on to the body; the blank title isn't sent, and says so.
+        cx.simulate_keystrokes("enter");
+        assert!(body.read_with(&cx, |b, _| b.is_focused()));
+        assert!(sent(&view, &cx).iter().all(|(_, t, _)| t.is_none()), "{:?}", sent(&view, &cx));
+        assert!(matches!(view.read_with(&cx, |v, _| v.state.save_status("A")), SaveStatus::Invalid { .. }));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Title)).as_deref(), Some(""));
+        // Shift+Tab goes back through Priority, Workflow and Status to the
+        // title; a name makes it valid again.
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), Some(crate::views::board_state::Property::Priority));
+        cx.simulate_keystrokes("shift-tab shift-tab shift-tab");
+        assert!(title.read_with(&cx, |t, _| t.is_focused()));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), None);
+        // (The input method follows the keys at the next frame.)
+        assert!(drawn(&mut cx, "pane-title-editor"));
+        // A pasted line break comes in as a space.
+        cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("Renamed\nin one".into())));
+        cx.simulate_keystrokes("cmd-v");
+        assert!(drawn(&mut cx, "pane-title-editor"));
+        cx.simulate_input(" line");
+        assert_eq!(title.read_with(&cx, |t, _| t.text().to_string()), "Renamed in one line");
+        cx.simulate_keystrokes("cmd-s");
+        assert_eq!(sent(&view, &cx).last().map(|(_, t, _)| t.clone()), Some(Some("Renamed in one line".into())));
+    }
 
-        // Reopened, the editor is on the draft; unchanged, Esc sends nothing
-        // more (the first save is still out).
-        cx.simulate_keystrokes("e");
-        let text = view.read_with(&cx, |v, cx| v.editor.as_ref().map(|(_, s)| s.read(cx).value().to_string()));
-        assert_eq!(text.as_deref(), Some("A new draftBody of A"));
-        cx.simulate_keystrokes("escape");
-        assert!(view.read_with(&cx, |v, _| v.editor.is_none()), "Esc in the editor reaches the pane");
-        assert_eq!(sent(&cx).len(), 1, "nothing more to save");
+    #[gpui::test]
+    fn the_edit_command_focuses_the_body(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.run_issue_command(&CommandKind::EditIssue { id: "A".into() }, window, cx))
+        });
+        let (_, body) = editors(&view, &mut cx);
         assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
-
-        // Close saves a changed draft too, and closes the pane.
-        cx.simulate_keystrokes("e");
-        cx.simulate_input(" again");
+        assert!(body.read_with(&cx, |b, _| b.is_focused()), "Edit puts the caret in the body");
+        assert_eq!(body.read_with(&cx, |b, _| b.model.head()), "Body of A".len());
+        // Focusing and leaving an unchanged task sends nothing.
+        cx.simulate_keystrokes("escape");
+        assert!(!body.read_with(&cx, |b, _| b.is_focused()));
         view.update(&mut cx, |v, cx| v.close_pane(cx));
-        assert!(view.read_with(&cx, |v, _| v.editor.is_none()));
-        assert_eq!(pane_id(&view, &cx), None);
-        // Typing during a save is kept and saved after it lands: still the
-        // one save out, with the newer text queued as the draft.
-        assert_eq!(sent(&cx).len(), 1);
-        let draft = view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body));
-        assert!(draft.as_ref().is_some_and(|d| d.contains(" again") && d.contains("A new draft")), "{draft:?}");
+        assert!(sent(&view, &cx).is_empty(), "{:?}", sent(&view, &cx));
     }
 
     #[test]

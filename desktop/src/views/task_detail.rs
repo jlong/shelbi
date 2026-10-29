@@ -15,9 +15,9 @@
 //! the Header (52pt, `Workflow / id`, More, Close), then a scroll of the
 //! title (Desktop/Title), the Status / Workflow / Priority / Branch
 //! properties (and, when the task has them, its tracker owner, dependencies
-//! and pull request), a divider, the body ([`markdown::body`]), and the
-//! created / updated dates. The task operations the old modal put on its
-//! action row are in More ([`PaneAction`]) and keep their keys.
+//! and pull request), a divider, the Markdown body, and the created /
+//! updated dates. The task operations the old modal put on its action row
+//! are in More ([`PaneAction`]) and keep their keys.
 //!
 //! Status, Workflow and Priority are edited in place, with no edit mode
 //! (`dt-task-inline-properties`): each value is the Button at Small in the
@@ -30,10 +30,13 @@
 //! and a refusal shows under the title. Branch is selectable text, and More
 //! copies it.
 //!
-//! The body's in-place editor (More > Edit description) works on the issue's
-//! draft (`shelbi_app::issue_edit`), which saves itself a moment after typing
-//! stops (Cmd+S saves at once; Done, Esc and Close leave the editor, saving,
-//! never reverting). A quiet line under the title says where the save
+//! The title and the body are edited where they're read, with no edit mode
+//! ([`super::doc_editor`], `dt-task-wysiwyg-editor`): a click puts the caret
+//! in the formatted text. Both work on the issue's draft
+//! (`shelbi_app::issue_edit`), which saves itself a moment after typing
+//! stops (Cmd+S saves at once; leaving the field, Esc and Close save too,
+//! never reverting). More > Edit description (`e`, the palette's Edit) puts
+//! the keys in the body. A quiet line under the title says where the save
 //! stands, with Retry for a failed one and both choices for a change made
 //! elsewhere at the same place.
 //!
@@ -54,7 +57,6 @@ use gpui::{
     Stateful, Window,
 };
 use gpui_kit::base::TextView;
-use gpui_kit::component::input::Textarea;
 use shelbi_app::issue_edit::{Field, Resolution, SaveStatus};
 use shelbi_app::task_session::{TaskSession, TaskSessionState};
 use shelbi_app::TaskDetailModel;
@@ -64,7 +66,6 @@ use shelbi_state::keymap::PopoverAction;
 use super::board_state::{Mode, PaneAction, PaneProperties, Property, PropertyRow};
 use super::column_swap::SLIDE;
 use super::issues::IssuesView;
-use super::markdown;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
@@ -307,12 +308,11 @@ fn state_note(theme: &Theme, title: &'static str, detail: Option<String>) -> Div
 
 /// A loaded task: the scrolling details.
 fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Context<IssuesView>) -> Stateful<Div> {
-    let editing = view.editor.as_ref().is_some_and(|(id, _)| *id == d.id);
     let pending = view.state.pending(&d.id).map(|p| p.label.clone());
     let notice = view.state.notice(&d.id).map(str::to_string);
-    // A draft left unsaved (its save failed, or is still out) shows instead
-    // of the read: that's the text the editor will open on.
-    let shown_body = view.state.draft_text(&d.id, Field::Body).unwrap_or_else(|| d.body.clone());
+    // The title and body are their editors, read and typed into in place
+    // (each shows the draft while there is one).
+    let editors = view.pane_editors.as_ref().filter(|e| e.id == d.id);
 
     let title = div()
         .debug_selector(|| "pane-title".into())
@@ -320,7 +320,10 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
         .min_w_0()
         .type_style(Type::Title)
         .text_color(theme.text_loud)
-        .child(d.title.clone());
+        .map(|t| match editors {
+            Some(e) => t.child(e.title.clone()),
+            None => t.child(d.title.clone()),
+        });
 
     let save_row = save_row(view, &d.id, theme, cx);
     let status_rows = (pending.is_some() || notice.is_some() || save_row.is_some()).then(|| {
@@ -347,41 +350,11 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
 
     let properties = properties(view, d, theme, cx);
 
-    let body = if let (true, Some((_, state))) = (editing, view.editor.as_ref()) {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .w_full()
-            .child(div().h(px(320.0)).w_full().child(Textarea::new(state).h_full()))
-            // No Save: the draft saves itself. Done leaves the editor.
-            .child(
-                div().flex().flex_row().gap_2().child(
-                    action(theme, "pane-done", ButtonContent::label("Done").hotkey("Esc"), ButtonKind::Ghost)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_editor(cx))),
-                ),
-            )
-            .into_any_element()
-    } else if shown_body.trim().is_empty() {
-        div()
-            .debug_selector(|| "pane-empty".into())
-            .type_style(Type::Base)
-            .text_color(theme.muted)
-            .child("No description yet.")
-            .into_any_element()
-    } else {
-        div()
-            .w_full()
-            .min_w_0()
-            .type_style(Type::Base)
-            .text_color(theme.foreground)
-            .child(
-                markdown::body(ElementId::Name(SharedString::from(format!("body-{}", d.id))), shown_body, theme)
-                    .w_full()
-                    .selectable(true),
-            )
-            .into_any_element()
-    };
+    let body = div()
+        .debug_selector(|| "pane-body".into())
+        .w_full()
+        .min_w_0()
+        .children(editors.map(|e| e.body.clone()));
 
     let dates = div()
         .debug_selector(|| "pane-dates".into())
