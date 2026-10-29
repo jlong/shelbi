@@ -147,6 +147,10 @@ the workflow.
    `pr=` back out of that normalized form to render the merge badge. The
    `review -> done` transition squash-merges into `<base_branch>` and deletes
    the branch — this is the only merge. Do **not** run `zen pr-merge` here.
+   Once the move lands, add the Changelog entry the orchestrator instructions'
+   `## Changelog` rule describes: `shelbi changelog add --author orchestrator
+   --title "<what shipped>" --issue <task-id> --pr <pr-number> -d "<what changed
+   and why it matters>"`.
 9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 

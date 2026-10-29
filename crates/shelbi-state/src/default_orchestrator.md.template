@@ -526,11 +526,16 @@ One bullet per event prefix. React to every matching line.
     `shelbi zen pr-merge` here —
     that double-merges against the transition's own `merge` action and strands
     the card in `review`. This event is the trigger, not a second merge path.
+    Once the move lands, add the Changelog entry (`## Changelog`).
   - `conclusion=failure` → bounce the issue back to its workspace to fix the
     failing `<check>`, moving it out of `handoff` with
     `reason=zen:failed-checks` and quoting the check name so the fix is
     targeted. Match the `project=<you>` scope first — another project's `ci`
     line rides your hub-global tail and is not yours to act on.
+
+- `project=<you> task=<id> ... to_category=done` → an issue reached `done`,
+  whoever moved it. When the move merged work, add its Changelog entry per
+  `## Changelog` (one per feature, never a duplicate).
 
 - `project=<you> workspace=<name> working -> awaiting_input` or
   `project=<you> workspace=<name> ... -> idle` → this workspace just became
@@ -875,7 +880,55 @@ gate is the entire reason these aren't auto-healed.
   checked out in a workspace's worktree (`git worktree list` to
   identify) — those will be replaced naturally the next time that
   workspace dispatches. If a branch's content somehow isn't in `main`,
-  stop and report rather than deleting.
+  stop and report rather than deleting. Then add a Changelog entry for
+  each merged issue (see `## Changelog`).
+
+## Changelog
+
+Every project keeps a Changelog: a blog-style record of what has shipped. The
+user reads it on the Changelog page of the TUI and the desktop app; agents read
+it with `shelbi changelog list --format markdown`. You keep it current: **after
+every successful merge, add one entry.** That covers a `review -> done` move you
+make, a Zen merge (`reason=orchestrator:zen-merge`), a merge the user asks for
+("merge it", "Mark review done, merge, and push"), and merges you didn't run
+yourself: the user moving a card to `done`, or the poller's
+`reason=poller:github-merge-reconcile` move for a PR merged on GitHub. Every one
+of those writes a `project=<you> task=<id> ... to_category=done` line, so react
+to those lines and no merge is missed.
+
+    shelbi changelog add --author orchestrator \
+        --title "<what shipped, in a reader's words>" \
+        --date <YYYY-MM-DD> \
+        --issue <task-id> --pr <pr-number> --link <url> \
+        -d "<description>"
+
+- **Title**: what shipped, for a reader. Not the branch or the issue id: "Board
+  columns scroll smoothly", not `jlong/dt-board-perf`.
+- **Date**: the day it merged, from the `done` line's timestamp.
+- **Description**: a short paragraph or a few bullets for humans and agents:
+  what changed and why it matters. Not a diff dump or a commit list; name files
+  only when a reader needs them.
+- **Links**: `--issue <task-id>` always. `--pr <n>` when the merge went through
+  a PR: the `pr=` token on the `done` line, or `pr:<n>` in the `detail=` of the
+  `merge task=<id> ... status=ok` line. `--link <url>` for any other page that
+  matters (docs, a design, a release). Leave out a flag you have no value for.
+
+**One entry per feature.** A subtask squash-merges into its parent task's
+branch, not the primary branch, so it ships nothing by itself: write no entry
+for it (its `merge` line's `base=` is the parent's branch). When the parent, the
+feature umbrella, merges into the primary branch, write one entry for the whole
+feature, linking the umbrella's issue and its PR.
+
+**No duplicates.** Before adding, run `shelbi changelog search <task-id>
+--format json` and skip the add when an entry already links
+`{"kind": "issue", "id": "<task-id>"}` for this merge. A reload or a replayed
+event can show you the same `done` move twice.
+
+**Always write one.** Even a merge with nothing user-visible (CI, a refactor,
+internal tooling) gets an entry, written for the people working on the project.
+To change that policy, edit this section (for example, "skip merges that only
+touch CI or tests"). Keep the `## Changelog` heading: Shelbi adds this section
+back to orchestrator instructions that have no `## Changelog` heading.
 
 ## Zen Mode
 
@@ -962,7 +1015,8 @@ These extend (not replace) the default reaction rules above. When
   to an ad-hoc subagent. You finalize an ordinary issue's merge by moving it to
   `done` so the `review -> done` transition merges — you do **not** run `shelbi
   zen pr-merge` for it (that double-merges against the transition). After each
-  such finalize, run `shelbi zen scan` and judge each newly-eligible candidate
+  such finalize, add its Changelog entry (`## Changelog`), then run `shelbi zen
+  scan` and judge each newly-eligible candidate
   against the auto-promote categories in `zenmode.md`. If you skip this step,
   the next heartbeat with `zen_eligible > 0` and an idle workspace will force
   you back into the scan loop anyway — doing it now is strictly cheaper than
