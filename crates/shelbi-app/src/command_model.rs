@@ -151,7 +151,23 @@ pub fn projects_column_from(
     projects: Vec<(String, String)>,
     open: &std::collections::HashSet<String>,
 ) -> Vec<ProjectEntry> {
-    let mut rows: Vec<ProjectEntry> = projects
+    let mut rows = project_rows(current, projects, open);
+    // The current project leads; the rest keep list order (a stable sort).
+    rows.sort_by_key(|p| p.slug != current);
+    rows
+}
+
+/// Every project's row in list order, with its indicator: the one rule that
+/// decides a project's dot wherever a client lists projects (the palette's
+/// Projects column, the desktop's switcher menu). The current project counts
+/// as open (this window has it), the others are open when `open` (the
+/// recorded open projects) has them.
+pub fn project_rows(
+    current: &str,
+    projects: Vec<(String, String)>,
+    open: &std::collections::HashSet<String>,
+) -> Vec<ProjectEntry> {
+    projects
         .into_iter()
         .map(|(slug, label)| {
             let is_current = slug == current;
@@ -162,10 +178,7 @@ pub fn projects_column_from(
                 slug,
             }
         })
-        .collect();
-    // The current project leads; the rest keep list order (a stable sort).
-    rows.sort_by_key(|p| p.slug != current);
-    rows
+        .collect()
 }
 
 /// The edit targets that exist on disk for `project`, titled like the
@@ -358,6 +371,30 @@ mod tests {
                 ("alpha", ProjectIndicator::Active),
                 ("web", ProjectIndicator::LoadedIdle),
                 ("api", ProjectIndicator::Unloaded),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_rows_keep_list_order() {
+        let open: std::collections::HashSet<String> = ["web".to_string()].into();
+        let rows = project_rows(
+            "alpha",
+            vec![
+                ("web".into(), "Web".into()),
+                ("api".into(), "API".into()),
+                ("alpha".into(), "Alpha".into()),
+            ],
+            &open,
+        );
+        let got: Vec<(&str, ProjectIndicator)> =
+            rows.iter().map(|r| (r.slug.as_str(), r.indicator)).collect();
+        assert_eq!(
+            got,
+            [
+                ("web", ProjectIndicator::LoadedIdle),
+                ("api", ProjectIndicator::Unloaded),
+                ("alpha", ProjectIndicator::Active),
             ]
         );
     }

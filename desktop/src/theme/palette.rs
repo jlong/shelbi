@@ -397,7 +397,7 @@ palette! {
     /// Quiet text: section headers, branches, timestamps, hints, idle
     /// states, placeholders (`text/muted`).
     muted,
-    /// Text on a saturated fill (a project badge's initials,
+    /// Text on a saturated fill (the checked box's mark,
     /// `other/on_color`).
     text_on_color,
     /// The Activity log's titles and its `you` actor (the Activity frame's
@@ -720,31 +720,6 @@ impl Palette {
             Appearance::Light => Self::light(),
         }
     }
-}
-
-/// The project badges' fills (the switcher's initials). Figma draws no
-/// badge, so these stay the hues they were, dark enough for white initials,
-/// picked per project by [`badge_fill`].
-pub const PROJECT_BADGES: [Rgba; 8] = [
-    Rgba::hex(0xdb0a60),
-    Rgba::hex(0x2830f1),
-    Rgba::hex(0x7019c0),
-    Rgba::hex(0x00753d),
-    Rgba::hex(0x0c699c),
-    Rgba::hex(0x9d4100),
-    Rgba::hex(0xaa0101),
-    Rgba::hex(0x856700),
-];
-
-/// The badge fill for a project, chosen from its name (FNV-1a), so a
-/// project keeps its color across launches and machines.
-pub fn badge_fill(name: &str) -> Rgba {
-    let mut hash: u32 = 0x811c_9dc5;
-    for byte in name.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    PROJECT_BADGES[hash as usize % PROJECT_BADGES.len()]
 }
 
 /// Where a Figma value falls short of WCAG where it is drawn. The design
@@ -1089,20 +1064,6 @@ pub(super) mod tests {
             }
         }
         assert!(missing.is_empty(), "docs/theme.md is missing:\n{}", missing.join("\n"));
-    }
-
-    #[test]
-    fn project_badges_carry_white_initials() {
-        for fill in PROJECT_BADGES {
-            let r = ratio(Rgba::hex(0xffffff), fill);
-            assert!(r >= AA, "white on {}: {r:.2}", fill.css());
-        }
-        assert_eq!(badge_fill("shelbi"), badge_fill("shelbi"), "stable");
-        let distinct: std::collections::HashSet<_> = ["shelbi", "contextstore", "taskpage", "demo"]
-            .iter()
-            .map(|n| badge_fill(n))
-            .collect();
-        assert!(distinct.len() >= 3, "names spread over the hues");
     }
 
     #[test]

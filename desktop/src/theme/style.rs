@@ -27,7 +27,6 @@
 //!   textbox, picker, checkbox) are `elements::controls`;
 //! - the sidebar's (the Navigation component's) 6px corners
 //!   ([`NAV_RADIUS`]) and plain-text shortcut hints ([`hotkey`]);
-//! - a project's initials badge ([`project_badge`]);
 //! - every hover and press fades over about 200ms ([`motion::fill_layer`]);
 //! - menus, popovers and the palette raised with a ring and a soft drop
 //!   ([`popover`]);
@@ -45,7 +44,7 @@ use gpui::{
 use shelbi_core::StatusCategory;
 
 use super::motion::fill_layer;
-use super::{hsla, palette, Theme};
+use super::Theme;
 use crate::assets::{heroicon, icons, status_glyph, Icon, StatusGlyph, ICON_SIZE, ICON_SIZE_BUTTON};
 use crate::elements::exact_text::exact_text;
 
@@ -1218,55 +1217,6 @@ pub fn split_chord(chord: &str) -> Vec<String> {
     keys
 }
 
-/// A project's badge: its two-letter initials, bold and white, on a hue
-/// picked from its name ([`palette::badge_fill`]); `size` square with 6px
-/// corners (8px at 32px and up).
-pub fn project_badge(name: &str, size: f32) -> Div {
-    let initials: String = initials(name);
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(size))
-        .rounded(px(if size >= 32.0 { 8.0 } else { 6.0 }))
-        .bg(hsla(palette::badge_fill(name)))
-        .text_color(gpui::white())
-        .text_size(px((size * 0.42).round()))
-        .font_weight(FontWeight::BOLD)
-        .child(initials)
-}
-
-/// A name's initials: the first letters of its first two words (split at
-/// separators and camel case), else its first two letters
-/// (`context-store` and `ContextStore` → `CS`, `shelbi` → `SH`).
-pub fn initials(name: &str) -> String {
-    let mut words: Vec<String> = Vec::new();
-    let mut prev_lower = false;
-    for c in name.chars() {
-        if !c.is_alphanumeric() {
-            prev_lower = false;
-            words.push(String::new());
-            continue;
-        }
-        if c.is_uppercase() && prev_lower {
-            words.push(String::new());
-        }
-        match words.last_mut() {
-            Some(w) => w.push(c),
-            None => words.push(c.to_string()),
-        }
-        prev_lower = c.is_lowercase();
-    }
-    let words: Vec<&str> = words.iter().map(String::as_str).filter(|w| !w.is_empty()).collect();
-    let picked: String = match words.as_slice() {
-        [] => "?".into(),
-        [one] => one.chars().take(2).collect(),
-        [a, b, ..] => a.chars().take(1).chain(b.chars().take(1)).collect(),
-    };
-    picked.to_uppercase()
-}
-
 /// An empty state: a quiet sentence saying why there's nothing here, and
 /// the action that would change it, centered in the space.
 pub fn empty_state(
@@ -1370,16 +1320,6 @@ mod tests {
         assert_eq!(filter_chip_kind(true, true), ButtonKind::Select);
     }
 
-    #[test]
-    fn initials_take_two_words_or_two_letters() {
-        assert_eq!(initials("shelbi"), "SH");
-        assert_eq!(initials("Shelbi"), "SH");
-        assert_eq!(initials("ContextStore"), "CS");
-        assert_eq!(initials("context-store"), "CS");
-        assert_eq!(initials("my cool project"), "MC");
-        assert_eq!(initials("x"), "X");
-        assert_eq!(initials(""), "?");
-    }
 
     fn themes() -> [Theme; 2] {
         use gpui::WindowAppearance;
