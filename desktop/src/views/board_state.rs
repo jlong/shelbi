@@ -47,13 +47,19 @@ use shelbi_state::keymap::{
 };
 use shelbi_state::KanbanColumnOverride;
 
-/// Which overlay owns the keyboard.
+/// Which overlay owns the keyboard. The task pane isn't modal: it stays up
+/// under the board's own menus and pickers ([`BoardState::pane_id`]), and
+/// the keys come back to it when they close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Board,
-    /// The task detail for `id`. `editing` while the in-place body editor is
-    /// open (the editor then owns the keys; see [`BoardState::handle_key`]).
+    /// The task pane for `id` has the keys. `editing` while the in-place
+    /// body editor is open (the editor then owns the keys; see
+    /// [`BoardState::handle_key`]).
     Detail { id: String, editing: bool },
+    /// The pane's More menu, its keyboard row at `cursor`
+    /// ([`BoardState::pane_actions`]).
+    PaneMenu { cursor: usize },
     WorkspaceDropdown { cursor: usize },
     WorkflowDropdown { cursor: usize },
     /// Pick the workspace to assign `id` to.
@@ -91,6 +97,46 @@ pub enum Intent {
     FocusSearch,
     /// The search was cleared from the board (Esc): empty the field to match.
     ClearSearchField,
+}
+
+/// What the task pane's More menu offers: the task operations the old modal
+/// put on its action row, each with the pane key that does the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneAction {
+    MoveLeft,
+    MoveRight,
+    Start,
+    Assign,
+    EditDescription,
+    OpenInEditor,
+    OpenWorkspace,
+}
+
+impl PaneAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneAction::MoveLeft => "Move left",
+            PaneAction::MoveRight => "Move right",
+            PaneAction::Start => "Start",
+            PaneAction::Assign => "Assign…",
+            PaneAction::EditDescription => "Edit description",
+            PaneAction::OpenInEditor => "Open in editor",
+            PaneAction::OpenWorkspace => "Open workspace",
+        }
+    }
+
+    /// A short name for the menu row's test selector (`pane-menu-<slug>`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            PaneAction::MoveLeft => "move-left",
+            PaneAction::MoveRight => "move-right",
+            PaneAction::Start => "start",
+            PaneAction::Assign => "assign",
+            PaneAction::EditDescription => "edit",
+            PaneAction::OpenInEditor => "editor",
+            PaneAction::OpenWorkspace => "workspace",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +267,10 @@ pub struct BoardState {
     pub selected_column: usize,
     pub selected_row: usize,
     pub mode: Mode,
+    /// The task the floating pane shows, while it is up: it stays through
+    /// the board's menus and pickers (the pane isn't modal), and only
+    /// [`BoardState::close_pane`] (or opening another task) changes it.
+    pane: Option<String>,
     pending: BTreeMap<String, Pending>,
     /// A daemon refusal or failure, shown on the card until dismissed or the
     /// card's next action.
@@ -254,6 +304,7 @@ impl BoardState {
             selected_column: 0,
             selected_row: 0,
             mode: Mode::Board,
+            pane: None,
             pending: BTreeMap::new(),
             notices: BTreeMap::new(),
             staged_edits: BTreeMap::new(),
@@ -512,26 +563,124 @@ impl BoardState {
         }
     }
 
-    /// The detail's card, when the detail is open.
+    /// The task pane's card, while the pane is up (whatever has the keys).
     pub fn detail_id(&self) -> Option<&str> {
-        match &self.mode {
-            Mode::Detail { id, .. } => Some(id),
-            _ => None,
-        }
+        self.pane.as_deref()
     }
 
+    /// Show `id` in the task pane, giving it the keys: the one pane, so a
+    /// pane already up switches to `id`. The card is selected where the
+    /// board shows it; the board doesn't scroll or resize for it.
     pub fn open_detail(&mut self, id: &str) {
         if let Some((c, r)) = self.model.position(id) {
             self.select(c, r);
         }
+        self.pane = Some(id.to_string());
         self.mode = Mode::Detail {
             id: id.to_string(),
             editing: false,
         };
     }
 
+    /// Close whatever is on top: a menu, picker or prompt goes back to the
+    /// pane under it (or the board); the pane itself closes last.
     pub fn close_overlay(&mut self) {
+        match self.mode {
+            Mode::Board | Mode::Detail { .. } => self.close_pane(),
+            _ => self.mode = self.rest(),
+        }
+    }
+
+    /// Close the task pane (and anything over it): the board has the keys,
+    /// its selection, filters and scroll as they were.
+    pub fn close_pane(&mut self) {
+        self.pane = None;
         self.mode = Mode::Board;
+    }
+
+    /// The mode a menu, picker or prompt closes back to: the pane while it is
+    /// up, else the board.
+    fn rest(&self) -> Mode {
+        match &self.pane {
+            Some(id) => Mode::Detail {
+                id: id.clone(),
+                editing: false,
+            },
+            None => Mode::Board,
+        }
+    }
+
+    // ---- the pane's More menu --------------------------------------------
+
+    /// What the pane's More menu lists for its task, in order: the moves,
+    /// Start (not for someone else's issue on a remote tracker), Assign, the
+    /// description's editors, and the workspace once one is assigned.
+    pub fn pane_actions(&self) -> Vec<PaneAction> {
+        let Some(card) = self.pane.as_deref().and_then(|id| self.model.card(id)) else {
+            return Vec::new();
+        };
+        let mut out = vec![PaneAction::MoveLeft, PaneAction::MoveRight];
+        if card.start_refusal().is_none() {
+            out.push(PaneAction::Start);
+        }
+        out.extend([PaneAction::Assign, PaneAction::EditDescription, PaneAction::OpenInEditor]);
+        if card.assignee.is_some() {
+            out.push(PaneAction::OpenWorkspace);
+        }
+        out
+    }
+
+    /// Open the More menu, or close it when it is open (its button's click).
+    pub fn toggle_pane_menu(&mut self) {
+        if self.pane.is_none() {
+            return;
+        }
+        self.mode = match self.mode {
+            Mode::PaneMenu { .. } => self.rest(),
+            _ => Mode::PaneMenu { cursor: 0 },
+        };
+    }
+
+    /// Run the More menu's action `ix` (a click, or Enter on its row), back
+    /// on the pane.
+    pub fn choose_pane_action(&mut self, ix: usize) -> Vec<Intent> {
+        let (Some(id), Some(action)) = (self.pane.clone(), self.pane_actions().get(ix).copied()) else {
+            self.mode = self.rest();
+            return Vec::new();
+        };
+        self.mode = self.rest();
+        match action {
+            PaneAction::MoveLeft => self.move_command(&id, false, false),
+            PaneAction::MoveRight => self.move_command(&id, true, false),
+            PaneAction::Start => self.start(&id),
+            PaneAction::Assign => self.begin_assign(&id),
+            PaneAction::EditDescription => self.begin_edit(&id),
+            PaneAction::OpenInEditor => vec![Intent::OpenInEditor(id)],
+            PaneAction::OpenWorkspace => {
+                let ws = self.model.card(&id).and_then(|c| c.assignee.clone());
+                self.open_workspace(ws)
+            }
+        }
+    }
+
+    fn pane_menu_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+        let n = self.pane_actions().len();
+        match chord.code {
+            Key::Esc | Key::Char('q') => self.mode = self.rest(),
+            Key::Up | Key::Char('k') if n > 0 => {
+                self.mode = Mode::PaneMenu {
+                    cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
+                }
+            }
+            Key::Down | Key::Char('j') if n > 0 => {
+                self.mode = Mode::PaneMenu {
+                    cursor: (cursor + 1) % n,
+                }
+            }
+            Key::Enter | Key::Char(' ') => return self.choose_pane_action(cursor),
+            _ => {}
+        }
+        Vec::new()
     }
 
     // ---- moves ------------------------------------------------------------
@@ -568,14 +717,6 @@ impl BoardState {
                 self.status = Some(msg);
                 Vec::new()
             }
-        }
-    }
-
-    /// The detail's move buttons: one clamped step, like its `H` / `L`.
-    pub fn detail_move(&mut self, forward: bool) -> Vec<Intent> {
-        match self.detail_id().map(str::to_string) {
-            Some(id) => self.move_command(&id, forward, false),
-            None => Vec::new(),
         }
     }
 
@@ -762,12 +903,13 @@ impl BoardState {
                 }
                 Some(self.detail_key(&id, chord))
             }
+            Mode::PaneMenu { cursor } => Some(self.pane_menu_key(cursor, chord)),
             Mode::WorkspaceDropdown { cursor } => Some(self.workspace_dropdown_key(cursor, chord)),
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
             Mode::AssignPicker { id, cursor } => Some(self.assign_key(&id, cursor, chord)),
             Mode::AddPrompt => {
                 if chord.code == Key::Esc {
-                    self.mode = Mode::Board;
+                    self.mode = self.rest();
                     return Some(Vec::new());
                 }
                 None
@@ -861,7 +1003,7 @@ impl BoardState {
         if let Some(action) = self.keymaps.popover.dispatch(chord) {
             return match action {
                 PopoverAction::Close => {
-                    self.mode = Mode::Board;
+                    self.close_pane();
                     Vec::new()
                 }
                 PopoverAction::ScrollUp => vec![Intent::ScrollDetail(Scroll::Up)],
@@ -875,7 +1017,7 @@ impl BoardState {
                     let ws = self.model.card(id).and_then(|c| c.assignee.clone());
                     let out = self.open_workspace(ws);
                     if !out.is_empty() {
-                        self.mode = Mode::Board;
+                        self.close_pane();
                     }
                     out
                 }
@@ -893,7 +1035,7 @@ impl BoardState {
     fn workspace_dropdown_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
         let n = self.workspace_options().len();
         match chord.code {
-            Key::Esc | Key::Char('q') | Key::Char('f') => self.mode = Mode::Board,
+            Key::Esc | Key::Char('q') | Key::Char('f') => self.mode = self.rest(),
             Key::Up | Key::Char('k') if n > 0 => {
                 self.mode = Mode::WorkspaceDropdown {
                     cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
@@ -906,7 +1048,7 @@ impl BoardState {
             }
             Key::Enter | Key::Char(' ') => return self.choose_workspace_option(cursor),
             Key::Char('c') => {
-                self.mode = Mode::Board;
+                self.mode = self.rest();
                 return self.set_workspace_filter(None);
             }
             _ => {}
@@ -916,7 +1058,7 @@ impl BoardState {
 
     /// Commit workspace option `ix` (a click or Enter) and close the dropdown.
     pub fn choose_workspace_option(&mut self, ix: usize) -> Vec<Intent> {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         match self.workspace_options().get(ix) {
             Some(opt) => self.set_workspace_filter(opt.filter.clone()),
             None => Vec::new(),
@@ -926,7 +1068,7 @@ impl BoardState {
     fn workflow_dropdown_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
         let n = self.workflow_options().len();
         match chord.code {
-            Key::Esc | Key::Char('q') | Key::Char('w') => self.mode = Mode::Board,
+            Key::Esc | Key::Char('q') | Key::Char('w') => self.mode = self.rest(),
             Key::Up | Key::Char('k') if n > 0 => {
                 self.mode = Mode::WorkflowDropdown {
                     cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
@@ -939,7 +1081,7 @@ impl BoardState {
             }
             Key::Enter | Key::Char(' ') => self.choose_workflow_option(cursor),
             Key::Char('c') => {
-                self.mode = Mode::Board;
+                self.mode = self.rest();
                 self.set_workflow_filter(None);
             }
             _ => {}
@@ -949,7 +1091,7 @@ impl BoardState {
 
     /// Commit workflow option `ix` and close the dropdown.
     pub fn choose_workflow_option(&mut self, ix: usize) {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         if let Some(opt) = self.workflow_options().get(ix) {
             self.set_workflow_filter(opt.filter.clone());
         }
@@ -958,7 +1100,7 @@ impl BoardState {
     fn assign_key(&mut self, id: &str, cursor: usize, chord: KeyChord) -> Vec<Intent> {
         let n = self.input.workspaces.len();
         match chord.code {
-            Key::Esc | Key::Char('q') => self.mode = Mode::Board,
+            Key::Esc | Key::Char('q') => self.mode = self.rest(),
             Key::Up | Key::Char('k') if n > 0 => {
                 self.mode = Mode::AssignPicker {
                     id: id.to_string(),
@@ -979,7 +1121,7 @@ impl BoardState {
 
     /// Assign `id` to declared workspace `ix` (Enter or a click in the picker).
     pub fn choose_assignee(&mut self, id: &str, ix: usize) -> Vec<Intent> {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         match self.input.workspaces.get(ix) {
             Some(ws) => vec![Intent::Command(CommandKind::AssignIssue {
                 id: id.to_string(),
@@ -1077,7 +1219,7 @@ impl BoardState {
     }
 
     pub fn submit_add(&mut self, title: &str) -> Vec<Intent> {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         let title = title.trim();
         if title.is_empty() {
             return Vec::new();
@@ -1809,6 +1951,76 @@ pub(crate) mod tests {
         assert!(b.status.as_deref().unwrap().contains("no column to the right"));
         press(&mut b, "esc");
         assert_eq!(b.mode, Mode::Board);
+    }
+
+    #[test]
+    fn the_pane_stays_up_under_the_boards_menus_and_pickers() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        b.open_detail("A");
+        // The assign picker over it closes back to it, picked or not.
+        press(&mut b, "a");
+        assert!(matches!(b.mode, Mode::AssignPicker { .. }));
+        assert_eq!(b.detail_id(), Some("A"), "the pane is still up under the picker");
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        press(&mut b, "a");
+        let out = press(&mut b, "enter");
+        assert!(matches!(out.as_slice(), [Intent::Command(CommandKind::AssignIssue { .. })]));
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "assigning keeps the pane");
+        // A filter menu too.
+        b.open_workflow_dropdown();
+        assert_eq!(b.detail_id(), Some("A"));
+        b.close_overlay();
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "the menu goes first");
+        b.close_overlay();
+        assert_eq!((b.mode.clone(), b.detail_id()), (Mode::Board, None), "then the pane");
+        // Opening another card while one is up switches the one pane.
+        b.open_detail("A");
+        b.open_detail("B");
+        assert_eq!(b.detail_id(), Some("B"));
+        press(&mut b, "esc");
+        assert_eq!((b.mode.clone(), b.detail_id()), (Mode::Board, None));
+    }
+
+    #[test]
+    fn more_lists_what_the_task_allows_and_runs_it_on_the_pane() {
+        let mut assigned = issue("A", "todo");
+        assigned.task.assigned_to = Some("alpha".into());
+        let mut b = board(vec![assigned, issue("B", "todo")]);
+        assert!(b.pane_actions().is_empty(), "no pane, no menu");
+        b.toggle_pane_menu();
+        assert_eq!(b.mode, Mode::Board, "More needs a pane");
+
+        b.open_detail("B");
+        use PaneAction::*;
+        assert_eq!(
+            b.pane_actions(),
+            vec![MoveLeft, MoveRight, Start, Assign, EditDescription, OpenInEditor],
+            "no workspace to open while unassigned"
+        );
+        b.open_detail("A");
+        assert_eq!(b.pane_actions().last(), Some(&OpenWorkspace));
+
+        b.toggle_pane_menu();
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: 0 });
+        press(&mut b, "k");
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: 6 }, "up wraps to the last row");
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "Esc closes the menu, not the pane");
+
+        b.toggle_pane_menu();
+        press(&mut b, "j");
+        press(&mut b, "j");
+        assert_eq!(press(&mut b, "enter"), vec![Intent::Command(CommandKind::StartIssue { id: "A".into() })]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        b.toggle_pane_menu();
+        b.toggle_pane_menu();
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "its button closes it again");
+
+        // Edit description opens the in-place editor on the pane's task.
+        b.toggle_pane_menu();
+        assert_eq!(b.choose_pane_action(4), vec![Intent::BeginEdit("A".into())]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: true });
     }
 
     #[test]
