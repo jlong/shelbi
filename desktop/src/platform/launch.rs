@@ -3,12 +3,11 @@
 //! opening a local project.
 //!
 //! - [`LaunchServices`] is the [`RemoteConnector`] both run and the recent
-//!   remote sessions they keep, a seam a test (or the `launch-remote-connect`
-//!   work, with the real SSH connector) sets. With none set the app has
-//!   [`Unavailable`], whose every call says connecting isn't in this build
-//!   yet, and the list in the Shelbi home; a test gets the foundation's
-//!   [`shelbi_app::launch::FakeRemote`] and no list, never a real `ssh` or
-//!   the real home.
+//!   remote sessions they keep, a seam a test sets. With none set the app
+//!   reaches other machines over the user's own `ssh`
+//!   ([`shelbi_app::launch::SshRemote`]) and keeps the list in the Shelbi
+//!   home; a test gets the foundation's [`shelbi_app::launch::FakeRemote`]
+//!   and no list, never a real `ssh` or the real home.
 //! - [`BootstrapDaemon`] starts the daemon the way a project window does:
 //!   the app's bootstrap (find the CLI, installing it when there is none,
 //!   start the daemon, connect). Once a window has bootstrapped, the CLI's
@@ -18,13 +17,10 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{App, Global};
-use shelbi_app::launch::{DaemonStarter, RecentRemotes, RemoteConnector, RemoteError, RemoteSession};
+use shelbi_app::launch::{DaemonStarter, RecentRemotes, RemoteConnector};
 
 use super::version::APP_VERSION;
 use super::{Bootstrap, BootstrapEvent, BootstrapState, Ready, SystemPlatform};
-
-/// Why a remote step fails until the real connector is in the build.
-pub const UNAVAILABLE: &str = "Connecting to Shelbi on another machine isn't available in this build yet.";
 
 /// What the launch window and the Connect dialog run.
 #[derive(Clone)]
@@ -47,23 +43,8 @@ pub fn services(cx: &App) -> LaunchServices {
     };
     #[cfg(not(test))]
     LaunchServices {
-        remote: Arc::new(Unavailable),
+        remote: Arc::new(shelbi_app::launch::SshRemote::new()),
         recents: RecentRemotes::live(),
-    }
-}
-
-/// The connector before `launch-remote-connect`: refuses, in words the
-/// dialog shows.
-pub struct Unavailable;
-
-impl RemoteConnector for Unavailable {
-    fn find_sessions(&self, host: &str) -> Result<(String, Vec<RemoteSession>), RemoteError> {
-        shelbi_app::launch::validate_host(host)?;
-        Err(RemoteError::Failed(UNAVAILABLE.into()))
-    }
-
-    fn connect(&self, _: &RemoteSession) -> Result<(), RemoteError> {
-        Err(RemoteError::Failed(UNAVAILABLE.into()))
     }
 }
 
@@ -109,20 +90,5 @@ impl DaemonStarter for BootstrapDaemon {
             }
         }
         Err("Shelbi stopped starting up.".into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_unavailable_connector_says_so_but_still_checks_the_host() {
-        let remote = Unavailable;
-        assert_eq!(
-            remote.find_sessions("devbox").unwrap_err(),
-            RemoteError::Failed(UNAVAILABLE.into())
-        );
-        assert!(matches!(remote.find_sessions("-x"), Err(RemoteError::InvalidHost(_))));
     }
 }

@@ -61,6 +61,9 @@
 //! - the launch window a start with no daemon opens, and the Connect to
 //!   Remote Session dialog: **`launch-desktop`** (`launch`, `connect_remote`,
 //!   over `shelbi_app::launch` and `crate::platform::launch`)
+//! - a remote Shelbi's project in its own window, reconnecting when `ssh`
+//!   drops: **`launch-remote-connect`** (`remote_session`, over
+//!   `shelbi_app::launch::terminal`)
 //!
 //! Views read view models and invoke registry commands through
 //! `crate::commands`; they never hold domain logic of their own.
@@ -102,6 +105,7 @@ pub mod markdown;
 pub mod overlay;
 pub mod palette;
 pub mod project_menu;
+pub mod remote_session;
 pub mod review;
 pub mod task_detail;
 pub mod task_panel;

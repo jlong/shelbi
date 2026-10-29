@@ -10,7 +10,15 @@
 //! [`ConnectFlow::connected`]). While a call runs the flow is busy: it
 //! starts nothing else, and the field and buttons wait.
 //!
+//! A host whose Shelbi isn't running ([`RemoteError::DaemonStopped`]) is
+//! said under the list, and the primary button offers to start it
+//! ([`super::remote::START_DAEMON_LABEL`]): [`ConnectFlow::start`] hands
+//! back the host for the client to run [`RemoteConnector::start_daemon`] on,
+//! and [`ConnectFlow::started`] the session to connect to once it's up.
+//! Nothing starts the far daemon without that press.
+//!
 //! [`RemoteConnector::find_sessions`]: super::RemoteConnector::find_sessions
+//! [`RemoteConnector::start_daemon`]: super::RemoteConnector::start_daemon
 
 use super::remote::{validate_host, RemoteError, RemoteSession};
 use super::LaunchError;
@@ -19,6 +27,8 @@ use super::LaunchError;
 pub const FINDING_LABEL: &str = "Finding Sessions…";
 /// The Choose session step's primary button while the connection is made.
 pub const CONNECTING_LABEL: &str = "Connecting…";
+/// The primary button while the host's Shelbi starts.
+pub const STARTING_LABEL: &str = "Starting Shelbi…";
 
 /// What the dialog says when the host answered with no sessions.
 pub fn no_sessions(host: &str) -> String {
@@ -40,6 +50,8 @@ pub enum Stage {
 pub enum Busy {
     Finding,
     Connecting,
+    /// Starting the host's Shelbi ([`ConnectFlow::start`]).
+    Starting,
 }
 
 /// The host's answer to a search.
@@ -59,6 +71,9 @@ pub struct ConnectFlow {
     selected: usize,
     busy: Option<Busy>,
     error: Option<String>,
+    /// The session a connect found the host's daemon stopped for: the
+    /// primary button offers to start it.
+    stopped: Option<RemoteSession>,
 }
 
 impl Default for ConnectFlow {
@@ -77,6 +92,7 @@ impl ConnectFlow {
             selected: 0,
             busy: None,
             error: None,
+            stopped: None,
         }
     }
 
@@ -144,7 +160,9 @@ impl ConnectFlow {
         match (self.stage, self.busy) {
             (Stage::Host, Some(Busy::Finding)) => FINDING_LABEL,
             (Stage::Host, _) => super::remote::FIND_SESSIONS_LABEL,
+            (_, Some(Busy::Starting)) => STARTING_LABEL,
             (Stage::Choose, Some(Busy::Connecting)) => CONNECTING_LABEL,
+            (Stage::Choose, _) if self.stopped.is_some() => super::remote::START_DAEMON_LABEL,
             (Stage::Choose, _) => super::remote::CONNECT_LABEL,
         }
     }
@@ -198,6 +216,7 @@ impl ConnectFlow {
         }
         self.stage = Stage::Host;
         self.error = None;
+        self.stopped = None;
     }
 
     /// Connect to session `index` (a row's Connect), or the selected one
@@ -223,10 +242,54 @@ impl ConnectFlow {
         }
         self.busy = None;
         match result {
-            Ok(_) => true,
+            Ok(_) => {
+                self.stopped = None;
+                true
+            }
             Err(e) => {
+                if let LaunchError::Remote(RemoteError::DaemonStopped { .. }) = &e {
+                    self.stopped = self.sessions().get(self.selected).cloned();
+                }
                 self.error = Some(e.to_string());
                 false
+            }
+        }
+    }
+
+    /// Whether the primary button starts the host's Shelbi (a connect found
+    /// it stopped) rather than connecting.
+    pub fn offers_start(&self) -> bool {
+        self.stage == Stage::Choose && self.stopped.is_some()
+    }
+
+    /// Start Shelbi: the host to start it on, or `None` (nothing to start, or
+    /// a call is running).
+    pub fn start(&mut self) -> Option<String> {
+        if self.busy.is_some() || !self.offers_start() {
+            return None;
+        }
+        self.error = None;
+        self.busy = Some(Busy::Starting);
+        self.stopped.as_ref().map(|s| s.host.clone())
+    }
+
+    /// The start came back: the session to connect to now (the flow is
+    /// connecting; hand its answer to [`Self::connected`]), or `None` with
+    /// the reason under the list.
+    pub fn started(&mut self, result: Result<(), RemoteError>) -> Option<RemoteSession> {
+        if self.busy != Some(Busy::Starting) {
+            return None;
+        }
+        self.busy = None;
+        match result {
+            Ok(()) => {
+                let session = self.stopped.take()?;
+                self.busy = Some(Busy::Connecting);
+                Some(session)
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                None
             }
         }
     }
@@ -235,7 +298,40 @@ impl ConnectFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch::remote::{choose_intro, HOST_INTRO};
+    use crate::launch::remote::{choose_intro, HOST_INTRO, START_DAEMON_LABEL};
+
+    #[test]
+    fn a_stopped_daemon_offers_to_start_it_then_connects() {
+        let mut flow = on_choose();
+        flow.select(1);
+        let web = flow.connect(None).unwrap();
+        assert!(flow.start().is_none(), "nothing to start yet");
+        flow.connected(Err(LaunchError::Remote(RemoteError::DaemonStopped { host: "devbox".into() })));
+        assert_eq!(flow.error(), Some("Shelbi isn't running on devbox."));
+        assert!(flow.offers_start());
+        assert_eq!(flow.primary_label(), START_DAEMON_LABEL);
+
+        assert_eq!(flow.start().as_deref(), Some("devbox"));
+        assert_eq!(flow.primary_label(), STARTING_LABEL);
+        assert!(flow.connect(None).is_none(), "busy while it starts");
+        assert_eq!(flow.started(Ok(())), Some(web.clone()));
+        assert_eq!(flow.busy(), Some(Busy::Connecting));
+        assert!(flow.connected(Ok(web)));
+        assert!(!flow.offers_start());
+    }
+
+    #[test]
+    fn a_failed_start_says_why_and_keeps_the_offer_off() {
+        let mut flow = on_choose();
+        flow.connect(None).unwrap();
+        flow.connected(Err(LaunchError::Remote(RemoteError::DaemonStopped { host: "devbox".into() })));
+        flow.start().unwrap();
+        assert_eq!(flow.started(Err(RemoteError::Failed("Shelbi couldn't start on devbox: boom".into()))), None);
+        assert_eq!(flow.error(), Some("Shelbi couldn't start on devbox: boom"));
+        // Change Host drops the offer.
+        flow.change_host();
+        assert!(!flow.offers_start());
+    }
 
     fn session(project: &str) -> RemoteSession {
         RemoteSession {

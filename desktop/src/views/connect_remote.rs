@@ -172,6 +172,13 @@ impl ConnectDialog {
                     self.search(host, window, cx);
                 }
             }
+            // A connect found the host's Shelbi stopped: the user asked to
+            // start it.
+            Stage::Choose if row.is_none() && self.flow.offers_start() => {
+                if let Some(host) = self.flow.start() {
+                    self.start(host, window, cx);
+                }
+            }
             Stage::Choose => {
                 if let Some(session) = self.flow.connect(row) {
                     self.connect(session, window, cx);
@@ -180,6 +187,24 @@ impl ConnectDialog {
         }
         self.sync_focus(window, cx);
         cx.notify();
+    }
+
+    /// Start Shelbi on `host` off the UI thread, then connect.
+    fn start(&mut self, host: String, window: &mut Window, cx: &mut Context<Self>) {
+        let remote = self.services.remote.clone();
+        let work = cx.background_executor().spawn(async move { remote.start_daemon(&host) });
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = work.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(session) = this.flow.started(answer) {
+                    this.connect(session, window, cx);
+                }
+                this.sync_focus(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Change host: back to the field, its text kept.
@@ -435,7 +460,7 @@ impl ConnectDialog {
             "connect-connect",
             flow.primary_label(),
             self.primary_enabled(),
-            flow.busy() == Some(Busy::Connecting),
+            matches!(flow.busy(), Some(Busy::Connecting | Busy::Starting)),
             theme,
         )
         .aria_keyshortcuts("Return")

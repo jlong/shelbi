@@ -313,6 +313,41 @@ fn the_dialog_finds_sessions_then_connects_and_remembers(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn a_stopped_remote_daemon_starts_only_on_start_shelbi_then_its_window_opens(cx: &mut TestAppContext) {
+    use crate::views::remote_session::tests::OPENED;
+    OPENED.with(|o| o.borrow_mut().clear());
+    let home = Home::new("stopped", &[]);
+    let recents = home.recents();
+    let remote = FakeRemote::new()
+        .with_host("devbox", "jlong", &[("shelbi", "~/Workspaces/shelbi")])
+        .with_stopped_daemon("devbox");
+    let mut r = rig(cx, Vec::new(), remote, recents.clone(), FakeDaemon::new());
+    r.click("launch-connect-remote");
+    r.type_host("devbox");
+    r.keys("enter");
+    assert_eq!(r.step(), Stage::Choose);
+
+    // Connect finds Shelbi stopped there: said, and Start Shelbi offered.
+    r.click("connect-connect");
+    let dialog = r.dialog();
+    let (error, label) = dialog.read_with(&r.cx, |d, _| {
+        (d.flow().error().map(str::to_string), d.flow().primary_label())
+    });
+    assert_eq!(error.as_deref(), Some("Shelbi isn't running on devbox."));
+    assert_eq!(label, "Start Shelbi");
+    assert!(recents.load().is_empty(), "not connected, so not remembered");
+    assert!(OPENED.with(|o| o.borrow().is_empty()));
+
+    // Start Shelbi starts it (the fake refuses to connect until then) and
+    // connects: the dialog closes and the session's window opens.
+    r.click("connect-connect");
+    assert!(r.read(|v| v.dialog().is_none()), "connected, so closed");
+    assert_eq!(recents.load()[0].session.project, "shelbi");
+    let opened: Vec<String> = OPENED.with(|o| o.borrow().iter().map(|s| s.project.clone()).collect());
+    assert_eq!(opened, ["shelbi"]);
+}
+
+#[gpui::test]
 fn ssh_errors_show_under_the_host_field(cx: &mut TestAppContext) {
     let _home = Home::new("dialog-errors", &[]);
     let remote = FakeRemote::new().with_failing_host("down", RemoteError::NoShelbi { host: "down".into() });

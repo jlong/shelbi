@@ -418,6 +418,13 @@ enum Cmd {
     /// session state. Not for direct use.
     #[command(hide = true)]
     Relay(commands::relay::Args),
+    /// What another machine's Connect to Remote Session dialog reads from
+    /// this one over `ssh`: `shelbi remote list [--json]` prints the user,
+    /// version, daemon state and projects. Read-only.
+    Remote {
+        #[command(subcommand)]
+        cmd: commands::remote::RemoteCmd,
+    },
     /// Inspect and drive the session backend directly: `ls`, `new`, `kill`,
     /// `send`, `snapshot`. A debug surface over `shelbi-client` /
     /// `shelbi-session` (`shelbi attach <workspace>` is the rendered client).
@@ -530,6 +537,7 @@ fn main() -> Result<()> {
         Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
         Some(Cmd::SessionProcess(args)) => commands::session::run(args),
         Some(Cmd::Relay(args)) => commands::relay::run(args),
+        Some(Cmd::Remote { cmd }) => commands::remote::run(cmd),
         Some(Cmd::Session { cmd }) => commands::session_cli::run(cli.project, cmd),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),

@@ -98,15 +98,15 @@ primary button can be pressed.
 
 ## The remote connector
 
-Until `launch-remote-connect` lands, the app's connector is
-`platform::launch::Unavailable`: it still validates the host, then says
-"Connecting to Shelbi on another machine isn't available in this build
-yet." under the field. Tests and `--visual-figma` run the foundation's
-`FakeRemote` (`shelbi-app`'s `test-support` feature, now also enabled by
-`visual-check`). The connector is the `LaunchServices` global
-(`platform::launch`), with the recent list; `launch-remote-connect` sets the
-real one there. Opening a window on a connected remote session is that
-task's too: the launch window only re-reads its list.
+The app's connector is `shelbi_app::launch::SshRemote` (the user's own
+`ssh`; `launch-remote-connect`, see
+[`launch-remote-connect.md`](launch-remote-connect.md)). Tests and
+`--visual-figma` run the foundation's `FakeRemote` (`shelbi-app`'s
+`test-support` feature, now also enabled by `visual-check`). The connector
+is the `LaunchServices` global (`platform::launch`), with the recent list.
+A connection opens the session's own window
+(`views::remote_session::open_remote_session`), and the launch window
+re-reads its list.
 
 ## Design
 

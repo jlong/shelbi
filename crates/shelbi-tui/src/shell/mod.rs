@@ -20,6 +20,7 @@ pub(crate) mod caps;
 mod acknowledgements;
 mod overlays;
 mod refresh;
+pub mod remote_session;
 // The relaunchers moved to `shelbi_app::session::relaunch` (shared with the
 // desktop app).
 use shelbi_app::session::relaunch;
@@ -65,6 +66,8 @@ use shelbi_app::exec::{Effect, Mutation};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
+use shelbi_app::launch::remote::RemoteSession;
+use shelbi_app::launch::SshRemote;
 use shelbi_core::{ConfigMode, IssueTrackerConfig};
 use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
 use shelbi_state::keymap::{
@@ -468,6 +471,21 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             if state.settings_open() {
                 state.load_settings(true);
             }
+            state.dirty = true;
+        }
+
+        // A remote session was opened: hand the terminal to the other
+        // machine's Shelbi until the user quits it, then repaint.
+        if let Some(session) = state.pending_remote.take() {
+            restore_terminal();
+            let remote = state
+                .remote
+                .clone()
+                .unwrap_or_else(|| Arc::new(SshRemote::new()));
+            state.status = Some(remote_session::run(&session, remote.as_ref()));
+            let _ = enter_terminal_modes();
+            let _ = term.clear();
+            state.reported_main = None;
             state.dirty = true;
         }
 
@@ -1300,6 +1318,10 @@ struct ShellState {
     /// after handling input: it hands the terminal to the editor and waits, then
     /// restores the shell (the TUI's half of the palette's `edit:*` commands).
     pending_editor: Option<PathBuf>,
+    /// A remote session to open. The run loop takes it like
+    /// [`Self::pending_editor`]: it hands the terminal to the other machine's
+    /// Shelbi over `ssh` and waits (`remote_session`).
+    pending_remote: Option<RemoteSession>,
     /// Where the palette's on-disk inputs come from (disk in production).
     palette_inputs: Arc<dyn PaletteInputs>,
     /// Test seam: when set, [`ShellState::dispatch_effect`] records each effect
@@ -1524,6 +1546,7 @@ impl ShellState {
             full_redraw: false,
             job: None,
             pending_editor: None,
+            pending_remote: None,
             palette_inputs: Arc::new(DiskPaletteInputs),
             #[cfg(test)]
             effect_tap: None,
@@ -2480,8 +2503,9 @@ impl ShellState {
     }
 
     /// A remote session connected (from the dialog or a recent row): leave
-    /// the launch screen or the dialog and open it, as a local project
-    /// opens ([`crate::launch::open_remote`]).
+    /// the launch screen or the dialog and open it. The run loop hands the
+    /// terminal to that machine's Shelbi until the user quits it
+    /// ([`Self::pending_remote`], `remote_session`), then comes back here.
     fn remote_connected(&mut self, session: &shelbi_app::launch::RemoteSession) {
         self.overlay = None;
         self.client.focus_main();
@@ -2489,10 +2513,7 @@ impl ShellState {
         {
             self.opened_remotes.push(session.clone());
         }
-        #[cfg(not(test))]
-        if let Err(e) = crate::launch::open_remote(session) {
-            self.status = Some(e.to_string());
-        }
+        self.pending_remote = Some(session.clone());
     }
 
     /// Fold in the launch screen's or the Connect dialog's finished call.
