@@ -12,6 +12,10 @@
 //! - [`remote`] is the Connect to Remote Session seam ([`RemoteConnector`]),
 //!   its session type, and the dialog's words.
 //! - [`connect`] is that dialog's two steps ([`ConnectFlow`]).
+//! - [`ssh`] is the real connector ([`ssh::SshRemote`]): the host's own
+//!   `shelbi remote list --json` over the user's `ssh`, and the terminal
+//!   command that opens a remote session ([`ssh::terminal_command`]).
+//! - [`terminal`] runs that terminal and reconnects it when `ssh` drops.
 //! - [`perform`] carries out a [`LaunchAction`]: opening a local project
 //!   starts the daemon first, through the same on-demand start the clients
 //!   use today ([`DaemonStarter`]); Add project hands over to the add-project
@@ -21,6 +25,8 @@ pub mod connect;
 pub mod recent;
 pub mod remote;
 pub mod route;
+pub mod ssh;
+pub mod terminal;
 
 use std::path::Path;
 
@@ -30,6 +36,7 @@ pub use connect::ConnectFlow;
 pub use recent::{RecentRemote, RecentRemotes, MAX_RECENT_REMOTES, RECENT_REMOTES_FILE};
 pub use remote::{validate_host, RemoteConnector, RemoteError, RemoteSession};
 pub use route::{decide, route, Client, DaemonState, LaunchRoute};
+pub use ssh::{RemoteListing, SshRemote};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use remote::FakeRemote;

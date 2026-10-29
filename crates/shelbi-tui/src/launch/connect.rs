@@ -35,6 +35,10 @@
 //! between sessions; Return presses (in the field, Find Sessions; on a
 //! session, its Connect); Esc cancels. A click works on every control, a
 //! session's body picks it and its Connect connects.
+//!
+//! A host whose Shelbi isn't running says so under the list, and the
+//! primary button becomes Start Shelbi: it starts the host's daemon (only
+//! then), and connects once it's up.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -97,6 +101,7 @@ pub enum ConnectStep {
 enum Job {
     Find(String, Receiver<Result<(String, Vec<RemoteSession>), RemoteError>>),
     Connect(Receiver<Result<RemoteSession, LaunchError>>),
+    Start(Receiver<Result<(), RemoteError>>),
 }
 
 /// The open dialog.
@@ -228,6 +233,7 @@ impl ConnectDialog {
                 }
             }
             Focus::Host | Focus::Primary if self.flow.stage() == Stage::Host => self.find(),
+            Focus::Primary if self.flow.offers_start() => self.start(),
             Focus::Primary => self.connect(None),
             Focus::Session(i) => self.connect(Some(i)),
             Focus::Host => {}
@@ -255,6 +261,29 @@ impl ConnectDialog {
         let Some(session) = self.flow.connect(index) else {
             return;
         };
+        self.spawn_connect(session);
+    }
+
+    /// Start Shelbi on the host a connect found it stopped on (the user
+    /// pressed Start Shelbi), then connect.
+    fn start(&mut self) {
+        let Some(host) = self.flow.start() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let remote = self.remote.clone();
+        let spawned = std::thread::Builder::new().name("shelbi-start-remote".into()).spawn(move || {
+            let _ = tx.send(remote.start_daemon(&host));
+        });
+        match spawned {
+            Ok(_) => self.job = Some(Job::Start(rx)),
+            Err(e) => {
+                self.flow.started(Err(RemoteError::Failed(e.to_string())));
+            }
+        }
+    }
+
+    fn spawn_connect(&mut self, session: RemoteSession) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (remote, recents) = (self.remote.clone(), self.recents.clone());
         let spawned = std::thread::Builder::new().name("shelbi-connect".into()).spawn(move || {
@@ -284,6 +313,18 @@ impl ConnectDialog {
                 self.flow.found(&host, result);
                 if self.flow.stage() == Stage::Choose {
                     self.set_focus(Focus::Session(0));
+                }
+                Some(ConnectStep::Stay)
+            }
+            Job::Start(rx) => {
+                let result = match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(TryRecvError::Empty) => return None,
+                    Err(TryRecvError::Disconnected) => Err(RemoteError::Failed(gone())),
+                };
+                self.job = None;
+                if let Some(session) = self.flow.started(result) {
+                    self.spawn_connect(session);
                 }
                 Some(ConnectStep::Stay)
             }

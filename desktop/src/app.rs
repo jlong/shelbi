@@ -2319,6 +2319,7 @@ impl ShelbiWindow {
                 }
                 if let Some(s) = session {
                     this.flash(format!("Connected to {} on {}.", s.display_label(), s.host), cx);
+                    crate::views::remote_session::open_remote_session(s.clone(), cx);
                 }
                 cx.notify();
             }

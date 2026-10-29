@@ -488,6 +488,41 @@ fn the_connect_flow_runs_by_keyboard_and_remembers_the_session() {
 }
 
 #[test]
+fn a_stopped_remote_daemon_is_started_only_when_the_user_asks() {
+    let sandbox = Sandbox::new();
+    let (mut app, _, remote) = app_with(LaunchModel::default(), devbox().with_stopped_daemon("devbox"), sandbox.recents());
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    type_text(&mut app, "devbox");
+    press(&mut app, KeyCode::Enter);
+    settle(&mut app, |a| stage(a) == Some(Stage::Choose));
+
+    // Connect finds Shelbi stopped: said under the list, Start Shelbi offered.
+    press(&mut app, KeyCode::Enter);
+    settle(&mut app, |a| a.connect_dialog().is_some_and(|d| d.flow().busy().is_none()));
+    let flow = app.connect_dialog().unwrap().flow();
+    assert_eq!(flow.error(), Some("Shelbi isn't running on devbox."));
+    assert_eq!(flow.primary_label(), "Start Shelbi");
+    assert!(remote.started().is_empty(), "nothing started unasked");
+    let buf = draw(&mut app, 100, 30);
+    assert!(find(&buf, "Start Shelbi").is_some(), "{}", text(&buf));
+    capture("connect-daemon-stopped", &buf);
+
+    // Start Shelbi starts it, then connects.
+    for _ in 0..6 {
+        if app.connect_dialog().unwrap().focus() == connect::Focus::Primary {
+            break;
+        }
+        press(&mut app, KeyCode::Tab);
+    }
+    assert_eq!(app.connect_dialog().unwrap().focus(), connect::Focus::Primary);
+    press(&mut app, KeyCode::Enter);
+    let exit = settle(&mut app, |_| false);
+    assert_eq!(remote.started(), ["devbox"]);
+    assert_eq!(exit, Some(LaunchExit::OpenRemote(remote.connected()[0].clone())));
+}
+
+#[test]
 fn without_a_connector_connecting_is_not_offered() {
     for (w, h) in SIZES {
         let recents = RecentRemotes::at(std::env::temp_dir().join("shelbi-launch-tests-unused.json"));

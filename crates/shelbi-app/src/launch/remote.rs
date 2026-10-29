@@ -2,8 +2,8 @@
 //! [`RemoteConnector`] seam the launch screen and the Connect to Remote
 //! Session dialog call, and the dialog's words.
 //!
-//! The real connector (over SSH, with the user's own keys and config) is the
-//! `launch-remote-connect` work; [`FakeRemote`] stands in for it in tests.
+//! The real connector, over SSH with the user's own keys and config, is
+//! [`super::ssh::SshRemote`]; [`FakeRemote`] stands in for it in tests.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,9 @@ pub const CANCEL_LABEL: &str = "Cancel";
 pub const CHANGE_HOST_LABEL: &str = "Change host";
 /// The Choose session screen's primary button, and each row's.
 pub const CONNECT_LABEL: &str = "Connect";
+/// The button beside [`RemoteError::DaemonStopped`]: the one way a client
+/// starts Shelbi on another machine ([`RemoteConnector::start_daemon`]).
+pub const START_DAEMON_LABEL: &str = "Start Shelbi";
 
 /// The line under the title on the Choose session screen.
 pub fn choose_intro(host: &str) -> String {
@@ -83,12 +86,31 @@ pub enum RemoteError {
     /// The host field holds something that can't be an SSH destination.
     #[error("{0}")]
     InvalidHost(String),
-    /// SSH couldn't reach or log in to the host.
+    /// SSH couldn't reach the host.
     #[error("Couldn't connect to {host}: {reason}")]
     Unreachable { host: String, reason: String },
+    /// The host answered but wouldn't let us in with the user's SSH keys
+    /// (Shelbi never asks for a password).
+    #[error("Couldn't sign in to {host}: {reason}. Shelbi signs in with your SSH keys and never asks for a password.")]
+    AuthFailed { host: String, reason: String },
+    /// SSH doesn't trust the host's key yet (or it changed). Shelbi never
+    /// accepts a key on the user's behalf.
+    #[error("{host}'s host key isn't trusted. Run `ssh {host}` in a terminal once to check and accept it.")]
+    HostKey { host: String },
     /// The host answered, but has no Shelbi to connect to.
     #[error("Shelbi isn't installed on {host}.")]
     NoShelbi { host: String },
+    /// The host's Shelbi can't talk to this one.
+    #[error("Shelbi on {host} is {remote}, and this machine has {local}. Update them to the same version.")]
+    VersionMismatch {
+        host: String,
+        local: String,
+        remote: String,
+    },
+    /// Shelbi is installed on the host but its daemon isn't running. A
+    /// client offers [`START_DAEMON_LABEL`] rather than starting it unasked.
+    #[error("Shelbi isn't running on {host}.")]
+    DaemonStopped { host: String },
     /// Anything else, already worded for the dialog.
     #[error("{0}")]
     Failed(String),
@@ -117,8 +139,16 @@ pub trait RemoteConnector: Send + Sync {
     /// there, and its projects.
     fn find_sessions(&self, host: &str) -> Result<(String, Vec<RemoteSession>), RemoteError>;
 
-    /// Connect to `session`.
+    /// Check that `session` can be opened right now: the host answers, its
+    /// Shelbi still has the project, and its daemon is running
+    /// ([`RemoteError::DaemonStopped`] otherwise; never started here). The
+    /// client then opens the session's terminal
+    /// ([`super::ssh::terminal_command`]).
     fn connect(&self, session: &RemoteSession) -> Result<(), RemoteError>;
+
+    /// Start Shelbi's daemon on `host`, the way a client there would. Only
+    /// ever on the user's say-so ([`START_DAEMON_LABEL`]).
+    fn start_daemon(&self, host: &str) -> Result<(), RemoteError>;
 }
 
 /// A scripted [`RemoteConnector`] for tests: hosts answer what they were
@@ -128,8 +158,10 @@ pub trait RemoteConnector: Send + Sync {
 pub struct FakeRemote {
     hosts: std::sync::Mutex<std::collections::HashMap<String, FakeHost>>,
     connect_error: std::sync::Mutex<Option<RemoteError>>,
+    stopped: std::sync::Mutex<std::collections::HashSet<String>>,
     searched: std::sync::Mutex<Vec<String>>,
     connected: std::sync::Mutex<Vec<RemoteSession>>,
+    started: std::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -163,6 +195,16 @@ impl FakeRemote {
         self
     }
 
+    /// `host`'s daemon isn't running: connecting there fails with
+    /// [`RemoteError::DaemonStopped`] until [`RemoteConnector::start_daemon`].
+    pub fn with_stopped_daemon(self, host: &str) -> FakeRemote {
+        self.stopped
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(host.to_string());
+        self
+    }
+
     /// Every connect fails with `error`.
     pub fn failing_connect(self, error: RemoteError) -> FakeRemote {
         *self.connect_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
@@ -177,6 +219,11 @@ impl FakeRemote {
     /// The sessions connected to, in order.
     pub fn connected(&self) -> Vec<RemoteSession> {
         self.connected.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The hosts whose daemon was started, in order.
+    pub fn started(&self) -> Vec<String> {
+        self.started.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     fn lock_hosts(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, FakeHost>> {
@@ -204,10 +251,25 @@ impl RemoteConnector for FakeRemote {
         if let Some(error) = self.connect_error.lock().unwrap_or_else(|p| p.into_inner()).clone() {
             return Err(error);
         }
+        if self.stopped.lock().unwrap_or_else(|p| p.into_inner()).contains(&session.host) {
+            return Err(RemoteError::DaemonStopped {
+                host: session.host.clone(),
+            });
+        }
         self.connected
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(session.clone());
+        Ok(())
+    }
+
+    fn start_daemon(&self, host: &str) -> Result<(), RemoteError> {
+        let host = validate_host(host)?;
+        if let Some(Err(error)) = self.lock_hosts().get(&host) {
+            return Err(error.clone());
+        }
+        self.stopped.lock().unwrap_or_else(|p| p.into_inner()).remove(&host);
+        self.started.lock().unwrap_or_else(|p| p.into_inner()).push(host);
         Ok(())
     }
 }
@@ -284,6 +346,45 @@ mod tests {
         let refusing = FakeRemote::new().failing_connect(RemoteError::Failed("no".into()));
         assert!(refusing.connect(&sessions[0]).is_err());
         assert!(refusing.connected().is_empty());
+    }
+
+    #[test]
+    fn the_fake_refuses_a_stopped_daemon_until_asked_to_start_it() {
+        let fake = FakeRemote::new()
+            .with_host("devbox", "jlong", &[("shelbi", "~/Workspaces/shelbi")])
+            .with_stopped_daemon("devbox");
+        let (_, sessions) = fake.find_sessions("devbox").unwrap();
+        assert_eq!(
+            fake.connect(&sessions[0]),
+            Err(RemoteError::DaemonStopped { host: "devbox".into() })
+        );
+        assert!(fake.started().is_empty(), "connecting never starts a daemon");
+        fake.start_daemon("devbox").unwrap();
+        assert_eq!(fake.started(), vec!["devbox"]);
+        fake.connect(&sessions[0]).unwrap();
+        assert_eq!(fake.connected(), sessions);
+    }
+
+    #[test]
+    fn every_error_reads_as_a_sentence_naming_the_host() {
+        let cases = [
+            (
+                RemoteError::AuthFailed { host: "devbox".into(), reason: "Permission denied (publickey)".into() },
+                "Couldn't sign in to devbox: Permission denied (publickey). Shelbi signs in with your SSH keys and never asks for a password.",
+            ),
+            (
+                RemoteError::HostKey { host: "devbox".into() },
+                "devbox's host key isn't trusted. Run `ssh devbox` in a terminal once to check and accept it.",
+            ),
+            (
+                RemoteError::VersionMismatch { host: "devbox".into(), local: "0.42.0".into(), remote: "0.39.1".into() },
+                "Shelbi on devbox is 0.39.1, and this machine has 0.42.0. Update them to the same version.",
+            ),
+            (RemoteError::DaemonStopped { host: "devbox".into() }, "Shelbi isn't running on devbox."),
+        ];
+        for (error, line) in cases {
+            assert_eq!(error.to_string(), line);
+        }
     }
 
     #[test]

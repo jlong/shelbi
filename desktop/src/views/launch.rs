@@ -454,11 +454,12 @@ impl LaunchView {
         cx.notify();
     }
 
-    /// Connected to `session` (remembered): the list re-reads, so it is on
-    /// top. Opening its window is the remote connection's own work
-    /// (`launch-remote-connect`).
+    /// Connected to `session` (remembered): its window opens
+    /// ([`crate::views::remote_session`]), and the list re-reads, so it is
+    /// on top.
     fn connected(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
         tracing::info!(host = %session.host, project = %session.project, "connected to a remote session");
+        crate::views::remote_session::open_remote_session(session, cx);
         self.selected = self.model.projects.len();
         self.reload(cx);
     }

@@ -45,7 +45,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::{backend::CrosstermBackend, widgets::Clear, Frame, Terminal};
-use shelbi_app::launch::{DaemonStarter, LaunchModel, RecentRemotes, RemoteConnector, RemoteSession, SharedDaemon};
+use shelbi_app::launch::{
+    DaemonStarter, LaunchModel, RecentRemotes, RemoteConnector, RemoteSession, SharedDaemon, SshRemote,
+};
 use shelbi_core::IssueTrackerConfig;
 use shelbi_orchestrator::project_create;
 
@@ -65,24 +67,26 @@ pub enum LaunchExit {
     Quit,
 }
 
-/// The connector this build reaches other machines through, `None` while
-/// there's none (connecting isn't offered). The SSH connector
-/// (`launch-remote-connect`) goes here.
+/// The connector this build reaches other machines through: the user's own
+/// `ssh` ([`SshRemote`]). A test gets one that knows no hosts, so nothing it
+/// drives reaches a real machine.
 pub fn remote_connector() -> Option<Arc<dyn RemoteConnector>> {
-    None
+    #[cfg(test)]
+    return Some(Arc::new(shelbi_app::launch::FakeRemote::new()));
+    #[cfg(not(test))]
+    Some(Arc::new(SshRemote::new()))
 }
 
-/// Open `session`, connected to from the launch screen or Connect to Remote
-/// Session, the way a local project opens. The one place the remote
-/// session's opening goes (`launch-remote-connect` fills it in): the
-/// foundation's `RemoteConnector::connect` doesn't hand back anything to
-/// open yet. Unreachable while [`remote_connector`] is `None`.
+/// Open `session`, connected to from the standalone launch screen (the
+/// terminal is back to normal by now): that machine's Shelbi for the project
+/// runs in this terminal until the user quits it, reconnecting when `ssh`
+/// drops ([`crate::shell::remote_session`]). The shell opens one the same
+/// way from its own run loop.
 pub fn open_remote(session: &RemoteSession) -> Result<()> {
-    anyhow::bail!(
-        "opening {} on {} isn't wired up in this build",
-        session.display_label(),
-        session.host
-    )
+    let remote = SshRemote::new();
+    let status = crate::shell::remote_session::run(session, &remote);
+    eprintln!("{status}");
+    Ok(())
 }
 
 /// What's drawn over the launch screen.

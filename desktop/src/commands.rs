@@ -107,10 +107,8 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
             }
         }
         CommandKind::AddProject => host.open_add_project(),
-        // Shelbi ▸ Connect to Remote Session… and the launch screen. Listed
-        // once the window turns on `CommandModel::remote_connect` /
-        // `launch_screen` (the launch-desktop and launch-remote-connect
-        // subtasks, with the dialog and the screen).
+        // Shelbi ▸ Connect to Remote Session… and the launch screen
+        // (`CommandModel::remote_connect` / `launch_screen`).
         CommandKind::ConnectRemote => host.connect_remote(),
         CommandKind::ShowLaunchScreen => host.show_launch_screen(),
         // File ▸ New Window (⌘⇧N): another window, on this project, that
