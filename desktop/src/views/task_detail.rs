@@ -24,19 +24,27 @@
 //! stops (Cmd+S saves at once; Done, Esc and Close leave the editor, saving,
 //! never reverting). A quiet line under the title says where the save
 //! stands, with Retry for a failed one and both choices for a change made
-//! elsewhere at the same place. The live
-//! session (`dt-task-pane-session`) takes the pane's bottom, under the
-//! scroll; an idle task's details fill the pane.
+//! elsewhere at the same place.
+//!
+//! A task an agent is working shows that agent's live session at the
+//! pane's bottom (`dt-task-pane-session`, [`super::pane_session`]): a 17pt
+//! resize handle under the details (a 32 x 4 grip, dragged, or ↑ / ↓ once
+//! it has the keys, ⌥↑ / ⌥↓ from the pane), then the 356pt session area: a
+//! 44pt header with the workspace's state glyph, its name and Open
+//! Workspace, over the terminal itself. The details and the terminal
+//! scroll on their own. An idle task's details fill the pane.
 //!
 //! Loading, a task no longer on the board, and a board that failed to read
 //! show in the same shell.
 
 use gpui::{
-    div, prelude::*, px, Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, Div, ElementId,
-    SharedString, Stateful,
+    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, CursorStyle,
+    Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString, Stateful,
+    Window,
 };
 use gpui_kit::component::input::Textarea;
 use shelbi_app::issue_edit::{Field, Resolution, SaveStatus};
+use shelbi_app::task_session::{TaskSession, TaskSessionState};
 use shelbi_app::TaskDetailModel;
 use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
@@ -45,6 +53,9 @@ use super::board_state::{Mode, PaneAction};
 use super::column_swap::SLIDE;
 use super::issues::IssuesView;
 use super::markdown;
+use super::pane_session::PaneSession;
+use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
+use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::workflow_editor::{dropdown, MENU_W};
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
@@ -87,7 +98,13 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
         _ => format!("Task / {id}"),
     };
     let body: AnyElement = match content {
-        PaneContent::Task(d) => details(view, d, theme, cx).into_any_element(),
+        PaneContent::Task(d) => {
+            let details = details(view, d, theme, cx);
+            match view.pane_session.as_ref().and_then(|p| p.attached().map(|s| (p, s.clone()))) {
+                Some((p, session)) => with_session(details, p, &session, theme, cx),
+                None => details.into_any_element(),
+            }
+        }
         PaneContent::Loading => state_note(theme, "Loading the task…", None).into_any_element(),
         PaneContent::Missing => {
             state_note(theme, "This task is no longer on the board.", Some("It may have been deleted or archived.".into()))
@@ -391,6 +408,185 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
                 .child(body)
                 .child(dates),
         )
+}
+
+/// The details over the task's live session: the details' scroll, the
+/// resize handle, and the session area, in the column under the Header
+/// (measured for the drag and the clamp).
+fn with_session(
+    details: Stateful<Div>,
+    p: &PaneSession,
+    session: &TaskSession,
+    theme: &Theme,
+    cx: &mut Context<IssuesView>,
+) -> AnyElement {
+    let session_h = p.bounds.map_or(SESSION_H, |b| p.split.session_height(b.size.height.as_f32()));
+    let this = cx.entity().downgrade();
+    let stop_drag = |this: &mut IssuesView, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<IssuesView>| {
+        if let Some(p) = this.pane_session.as_mut().filter(|p| p.dragging) {
+            p.dragging = false;
+            cx.notify();
+        }
+    };
+    div()
+        .id("pane-split")
+        .debug_selector(|| "pane-split".into())
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            if let Some(p) = this.pane_session.as_mut() {
+                if let (true, Some(b)) = (p.dragging, p.bounds) {
+                    p.split.drag_to((ev.position.y - b.origin.y).as_f32(), b.size.height.as_f32());
+                    cx.notify();
+                }
+            }
+        }))
+        .on_mouse_up(MouseButton::Left, cx.listener(stop_drag))
+        .on_mouse_up_out(MouseButton::Left, cx.listener(stop_drag))
+        .child(details)
+        .child(split_handle(p, theme, cx))
+        .child(
+            div()
+                .id("pane-session")
+                .debug_selector(|| "pane-session".into())
+                .flex()
+                .flex_col()
+                .flex_none()
+                .h(px(session_h))
+                .w_full()
+                .overflow_hidden()
+                // The terminal's own surface, the pane's canvas at the
+                // default contrast, so the grid's insets match the grid.
+                .bg(theme.terminal_canvas())
+                .child(session_header(session, theme, cx))
+                .child(div().flex().flex_1().min_h_0().w_full().child(p.view().clone())),
+        )
+        // Measures the column for the drag and the clamp; repaints once
+        // when its size first becomes known or changes.
+        .child(
+            canvas(
+                move |bounds, _, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(p) = this.pane_session.as_mut() {
+                            if p.bounds != Some(bounds) {
+                                p.bounds = Some(bounds);
+                                cx.notify();
+                            }
+                        }
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .into_any_element()
+}
+
+/// The resize handle (Figma 2570:10583): a 17pt band with the 1pt divider
+/// at its foot and the 32 x 4 grip centered over it. Drag it, or give it the
+/// keys (a click) and step it with ↑ / ↓.
+fn split_handle(p: &PaneSession, theme: &Theme, cx: &mut Context<IssuesView>) -> Stateful<Div> {
+    let grip = if p.dragging { theme.icon } else { theme.divider };
+    let hover = theme.icon;
+    div()
+        .id("pane-split-handle")
+        .debug_selector(|| "pane-split-handle".into())
+        .group("pane-split-handle")
+        .track_focus(&p.handle_focus)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(HANDLE_H))
+        .w_full()
+        .border_b_1()
+        .border_color(theme.divider)
+        .cursor(CursorStyle::ResizeUpDown)
+        .focus(|s| s.bg(theme.background_hover))
+        .tooltip(style::tooltip("Drag to resize the session (⌥↑ ⌥↓)"))
+        .child(
+            div()
+                .w(px(GRIP_W))
+                .h(px(GRIP_H))
+                .rounded(px(GRIP_RADIUS))
+                .bg(grip)
+                .group_hover("pane-split-handle", move |s| s.bg(hover)),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                if let Some(p) = this.pane_session.as_mut() {
+                    p.dragging = true;
+                    window.focus(&p.handle_focus, cx);
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+            let m = &ev.keystroke.modifiers;
+            if m.platform || m.control || m.shift {
+                return;
+            }
+            let stepped = match ev.keystroke.key.as_str() {
+                "up" => this.step_split(true, cx),
+                "down" => this.step_split(false, cx),
+                _ => false,
+            };
+            if stepped {
+                cx.stop_propagation();
+            }
+        }))
+}
+
+/// The session's header (Figma 2570:10586): 44pt, 12pt in, the workspace's
+/// state glyph and name, then Open Workspace (Small, Default) at the
+/// trailing edge, over a divider.
+fn session_header(session: &TaskSession, theme: &Theme, cx: &mut Context<IssuesView>) -> Div {
+    let glyph = match session.state {
+        TaskSessionState::Workspace(badge) => workspace_glyph(badge, theme),
+        TaskSessionState::Review(state) => review_glyph(state, theme),
+    };
+    let open = style::content_button(
+        "pane-open-workspace",
+        ButtonContent::label("Open Workspace"),
+        ButtonKind::Secondary,
+        ButtonSize::Small,
+        false,
+        theme,
+    )
+    .tooltip(style::tooltip(if session.is_review() { "Open the review" } else { "Open the workspace" }))
+    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_session_workspace(cx)));
+    div()
+        .debug_selector(|| "pane-session-header".into())
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(SESSION_HEADER_H))
+        .w_full()
+        .px(px(12.0))
+        .border_b_1()
+        .border_color(theme.divider)
+        .child(div().flex().flex_none().items_center().child(render_glyph(glyph)))
+        .child(
+            div()
+                .debug_selector(|| "pane-session-name".into())
+                .min_w_0()
+                .truncate()
+                .type_style(Type::BaseMedium)
+                .text_color(theme.text_loud)
+                .child(session.workspace.clone()),
+        )
+        .child(div().flex_1())
+        .child(open)
 }
 
 /// The property table: Status, Workflow, Priority and Branch, then the

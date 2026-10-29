@@ -453,6 +453,9 @@ fn redraw(screen: &Screen, cols: u16, rows: u16) -> Vec<u8> {
 struct Sessions {
     idle: Vec<String>,
     screens: Vec<(String, Screen)>,
+    /// A screen one scene draws in place of the fixture's (the task pane's
+    /// alpha, mid-task).
+    over: Mutex<Vec<(String, Screen)>>,
 }
 
 impl SessionConnector for Sessions {
@@ -465,11 +468,9 @@ impl SessionConnector for Sessions {
                 branch: None,
             }));
         }
-        let screen = self
-            .screens
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, s)| s.clone())
+        let over = self.over.lock().unwrap().iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone());
+        let screen = over
+            .or_else(|| self.screens.iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone()))
             .unwrap_or_else(|| Arc::new(|_, _| String::new()));
         let size = Size::new(120, 40);
         let (tx, rx) = unbounded();
@@ -783,7 +784,33 @@ fn sessions() -> Arc<Sessions> {
             (name("ws/alpha"), Arc::new(workspace_screen)),
             (name("ws/review"), Arc::new(reviewer_screen)),
         ],
+        over: Mutex::new(Vec::new()),
     })
+}
+
+/// The In progress task pane's agent (Figma 2570:10612, 2570:10623): the
+/// request, the tool calls, the running status and the composer, as Claude
+/// Code draws them. The frame's output is an example; this is the fake
+/// session's screen, drawn by the real terminal.
+fn pane_session_screen(_cols: u16, rows: u16) -> String {
+    let body = lines(&[
+        paint(BOLD, "❯ Keep the active workspace when reconnecting."),
+        String::new(),
+        paint(DIM, "● I’ll preserve the session and retry the attachment."),
+        String::new(),
+        paint(BOLD, "● Read(crates/shelbi-app/src/session/reconnect.rs)"),
+        paint(DIM, "  ⎿  Read 148 lines"),
+        paint(BOLD, "● Update(crates/shelbi-app/src/session/reconnect.rs)"),
+        paint(GREEN, "  ⎿  Added 18 lines, removed 4 lines"),
+        String::new(),
+        paint(BOLD, "● Bash(cargo test -p shelbi-app reconnect)"),
+        paint(DIM, "  ⎿  Running…"),
+    ]);
+    let footer = [
+        at_row(rows - 1, &paint("\x1b[91m", "✻ Running tests…  32s  ·  esc to interrupt")),
+        at_row(rows, &paint(DIM, "❯ Send a message…")),
+    ];
+    body + &footer.concat()
 }
 
 // ---- the run --------------------------------------------------------------
@@ -2923,6 +2950,12 @@ impl Run {
     fn task_panes(&mut self) {
         let (title, _) = TASK_PANE;
         save_pane_task(Column::in_progress(), true);
+        // alpha works it, mid-task: the pane's live session.
+        let alpha = format!("{PROJECT}/ws/alpha");
+        *self.sessions.over.lock().unwrap() = vec![(alpha, Arc::new(pane_session_screen) as Screen)];
+        if let Some(row) = self.sidebar.workspaces.iter_mut().find(|w| w.name == "alpha") {
+            row.current_task = Some(IN_PROGRESS[0].0.into());
+        }
         let handle = self.open_pane();
         if let (Some(board), _, _) = self.views(handle) {
             board.update(&mut self.cx, |v, cx| {
@@ -2932,7 +2965,12 @@ impl Run {
         }
         let shown = self.pane_title(handle).as_deref() == Some(title);
         self.expect("task-pane: the pane shows the task", shown);
+        let (board, _, _) = self.views(handle);
+        let live = board.is_some_and(|b| b.read_with(&self.cx, |v, _| v.pane_session_view().is_some()));
+        self.expect("task-pane: the pane shows alpha's live session", live);
         self.save(handle, "task-pane");
+        self.sessions.over.lock().unwrap().clear();
+        self.sidebar = sidebar_model();
 
         save_pane_task(Column::todo(), false);
         let handle = self.open_pane();
@@ -3088,7 +3126,7 @@ fn save_pane_task(column: Column, started: bool) {
     let (id, (title, body)) = (IN_PROGRESS[0].0, TASK_PANE);
     // Ready to start, none of its criteria are met yet.
     let body = if started { body.to_string() } else { body.replace("[x]", "[ ]") };
-    save_task(id, title, &body, column, 2, started.then_some("bravo"));
+    save_task(id, title, &body, column, 2, started.then_some("alpha"));
     if !started {
         let mut file = shelbi_state::load_task(PROJECT, id).expect("the pane's task");
         file.task.branch = None;

@@ -41,6 +41,9 @@
 //!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
 //!   classification, and the per-pane restart controller over
 //!   [`supervision`], the crash-loop core the daemon poller shares.
+//! - [`task_session`] — which running agent session belongs to a task (the
+//!   workspace working it, or the review slot it is loaded onto), for a
+//!   task detail that shows it.
 //! - [`about`] — About Shelbi's words and links (the tagline, the project's
 //!   URLs, the copyright and license), so both clients' About screens read
 //!   the same.
@@ -79,6 +82,7 @@ pub mod review;
 pub mod session;
 pub mod settings;
 pub mod supervision;
+pub mod task_session;
 pub mod text_area;
 pub mod theme;
 pub mod view;

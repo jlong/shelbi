@@ -658,7 +658,7 @@ fn quiet_glyph(theme: &Theme) -> Hsla {
     c
 }
 
-fn render_glyph(g: StateGlyph) -> AnyElement {
+pub fn render_glyph(g: StateGlyph) -> AnyElement {
     match g {
         StateGlyph::Drawn(g, color) => glyph(g).text_color(color).into_any_element(),
         StateGlyph::Question(color) => div()
