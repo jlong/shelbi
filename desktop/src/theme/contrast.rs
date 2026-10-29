@@ -13,8 +13,13 @@
 //! (the tests hold every pairing the desktop draws to that):
 //!
 //! - [`Class::Surface`] (canvas, sidebar, cards, the raised surface, the
-//!   textbox well, keycaps, the workflow badge) mixes toward black in Dark
-//!   (35% at 100) and toward white in Light (50% at 100). White surfaces
+//!   textbox well, keycaps, the workflow badge) darkens in Dark until the
+//!   canvas is black at 100, and mixes toward white in Light (50% at 100).
+//!   The dark surfaces darken as a ladder ([`darkened`]): each keeps its
+//!   contrast ratio to the canvas, so the sidebar and the raised surface
+//!   sit as far above a black canvas as they did above the slate one. The
+//!   surfaces drawn darker than the canvas (cards, the textbox) meet it at
+//!   black, where their edges, which brighten, carry them. White surfaces
 //!   are already as light as they go, so in Light the separation comes
 //!   mostly from the text.
 //! - [`Class::Text`] (body, loud, muted and form text, the log's grays,
@@ -80,8 +85,8 @@ pub enum Class {
     Kept,
 }
 
-/// How far each class moves at 100%.
-const SURFACE_DARK: f32 = 0.35;
+/// How far each class moves at 100% (the dark surfaces go all the way, the
+/// canvas to black: [`darkened`]).
 const SURFACE_LIGHT: f32 = 0.5;
 const TEXT: f32 = 0.5;
 const BORDER: f32 = 0.5;
@@ -130,14 +135,18 @@ impl Palette {
         } else {
             (Rgb::new(0, 0, 0), Rgb::new(255, 255, 255))
         };
-        let surface = if dark { SURFACE_DARK } else { SURFACE_LIGHT };
+        let ladder = Ladder::new(self.canvas.rgb, k);
         let alpha_toward_opaque = |a: u8, t: f32| {
             let a = f32::from(a);
             (a + (255.0 - a) * t).round().min(255.0) as u8
         };
         self.map_named(|role, c| match class(role) {
+            Some(Class::Surface) if dark => Rgba {
+                rgb: darkened(c.rgb, ladder),
+                a: c.a,
+            },
             Some(Class::Surface) => Rgba {
-                rgb: c.rgb.lerp(ground, surface * k),
+                rgb: c.rgb.lerp(ground, SURFACE_LIGHT * k),
                 a: c.a,
             },
             Some(Class::Text) => Rgba {
@@ -155,6 +164,64 @@ impl Palette {
             Some(Class::Kept) | None => c,
         })
     }
+}
+
+/// The WCAG offset: a contrast ratio is `(L1 + 0.05) / (L2 + 0.05)`.
+const FLARE: f64 = 0.05;
+
+/// How far down the dark surfaces go at a setting: every surface's
+/// `L + 0.05` is multiplied by `scale`, which runs from 1 at 0 to whatever
+/// takes the canvas to black at 100. That keeps every ratio between two
+/// surfaces (and so the steps between them), and since the factor is
+/// geometric in the setting, the canvas's contrast with black falls by the
+/// same ratio at every step: the slider reads evenly along its length.
+#[derive(Clone, Copy)]
+struct Ladder {
+    scale: f64,
+}
+
+impl Ladder {
+    fn new(canvas: Rgb, k: f32) -> Self {
+        let to_black = FLARE / (canvas.relative_luminance() + FLARE);
+        Self {
+            scale: to_black.powf(f64::from(k)),
+        }
+    }
+}
+
+/// `c` down the [`Ladder`]: its luminance moved so its contrast ratio to
+/// the canvas holds, its linear channels scaled together so its hue and
+/// saturation do too. A surface darker than the canvas stops at black.
+fn darkened(c: Rgb, ladder: Ladder) -> Rgb {
+    let lum = c.relative_luminance();
+    if lum <= 0.0 {
+        return c;
+    }
+    let target = ((lum + FLARE) * ladder.scale - FLARE).max(0.0);
+    let factor = target / lum;
+    let channel = |v: u8| encode(decode(v) * factor);
+    Rgb::new(channel(c.r), channel(c.g), channel(c.b))
+}
+
+/// An sRGB byte as linear light, 0 to 1.
+fn decode(v: u8) -> f64 {
+    let v = f64::from(v) / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light, 0 to 1, as an sRGB byte.
+fn encode(v: f64) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let v = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (v * 255.0).round() as u8
 }
 
 #[cfg(test)]
@@ -271,6 +338,57 @@ mod tests {
         assert!(lum(l.muted) < lum(light.muted), "light text darker");
         // The fills laid over a surface keep their value.
         assert_eq!((d.background, d.selection, d.check_fill), (dark.background, dark.selection, dark.check_fill));
+    }
+
+    /// At 100 the dark canvas (`Slate/900`) is black, and on the way it
+    /// darkens at every step, evenly: its contrast with black falls by the
+    /// same ratio each step, so no stretch of the slider does most of the
+    /// work.
+    #[test]
+    fn the_dark_canvas_reaches_black_evenly() {
+        let dark = Palette::dark();
+        let most = dark.with_contrast(100);
+        assert!(most.canvas.rgb.relative_luminance() < 0.002, "{:?}", most.canvas.rgb);
+        let black = Rgb::new(0, 0, 0);
+        let to_black = |p: u8| dark.with_contrast(p).canvas.rgb.contrast_ratio(black);
+        let mut was = to_black(0);
+        for step in (10..=100).step_by(10) {
+            let now = to_black(step);
+            assert!(now < was, "darker at {step}%: {was:.3} -> {now:.3}");
+            was = now;
+        }
+        let (start, mid) = (to_black(0), to_black(50));
+        let even = start.sqrt();
+        assert!((mid - even).abs() < 0.02, "half way: {mid:.3}, an even ladder {even:.3}");
+    }
+
+    /// At 100 the dark surface levels stay apart: the sidebar and the
+    /// raised surface over the black canvas, the workflow badge over the
+    /// sidebar, each by the ratio it had at 0 (and well clear of a flat
+    /// black). The surfaces below the canvas meet it, no lower.
+    #[test]
+    fn dark_surface_levels_stay_apart() {
+        /// The least ratio between two adjacent levels at 100.
+        const MIN_STEP: f64 = 1.15;
+        let dark = Palette::dark();
+        for step in [0, 50, 100] {
+            let p = dark.with_contrast(step);
+            let ratio = |a: Rgba, b: Rgba| a.rgb.contrast_ratio(b.rgb);
+            let lum = |c: Rgba| c.rgb.relative_luminance();
+            for (name, lower, upper, was) in [
+                ("sidebar over canvas", p.canvas, p.sidebar, ratio(dark.canvas, dark.sidebar)),
+                ("raised over canvas", p.canvas, p.raised, ratio(dark.canvas, dark.raised)),
+                ("workflow_badge over sidebar", p.sidebar, p.workflow_badge, ratio(dark.sidebar, dark.workflow_badge)),
+            ] {
+                let now = ratio(lower, upper);
+                assert!(lum(upper) > lum(lower), "{name} at {step}%: order");
+                assert!(now >= MIN_STEP, "{name} at {step}%: {now:.3}");
+                assert!((now - was).abs() < 0.03, "{name} at {step}%: {was:.3} -> {now:.3}");
+            }
+            for (name, below) in [("card", p.card), ("textbox", p.textbox)] {
+                assert!(lum(below) <= lum(p.canvas), "{name} at {step}%: no lighter than the canvas");
+            }
+        }
     }
 
     #[test]

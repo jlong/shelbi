@@ -38,7 +38,7 @@ proportion to the setting (`docs/theme.md`, "Contrast", has the table):
 
 | At 100% | Dark | Light |
 |---|---|---|
-| Surfaces (canvas, sidebar, cards, raised, textbox, keycaps, workflow badge) | 35% toward black: canvas `#1e2330` → `#14171f`, sidebar `#2c3140` → `#1d202a` | 50% toward white: sidebar `#f9f9fc` → `#fcfcfe`; white stays white |
+| Surfaces (canvas, sidebar, cards, raised, textbox, keycaps, workflow badge) | 35% toward black: canvas `#1e2330` → `#14171f`, sidebar `#2c3140` → `#1d202a` (since `dt-contrast-black`, down to a black canvas: [`dt-contrast-black.md`](dt-contrast-black.md)) | 50% toward white: sidebar `#f9f9fc` → `#fcfcfe`; white stays white |
 | Text and icons | half toward white, alpha half toward opaque: `foreground` 85% → 93%, `muted` 55% → 78%, `icon` `#acb4cf` → `#d6dae7` | half toward black, alpha half toward opaque: `muted` `#444c65` 50% → `#222633` 75%, `icon` `#7b85a7` → `#3e4354` |
 | Borders and dividers | half toward white, alpha doubled (`divider` 10% → 20%) | half toward black, alpha doubled |
 | Accent and status hues | a fifth toward white (hue kept): accent `#62cdf6` → `#81d7f8` | a fifth toward black (hue kept): accent `#f21478` → `#c21060` |
