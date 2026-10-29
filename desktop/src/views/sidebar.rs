@@ -99,11 +99,10 @@ pub const MENU_GAP: f32 = 6.0;
 
 /// The footer toolbar's and the titlebar's square buttons.
 const TOOLBAR_BUTTON: f32 = 32.0;
-/// The Zen pill's height.
-const ZEN_PILL_H: f32 = 42.0;
-/// The Zen pill's height under a task panel (State=Workspace and
-/// State=Review draw it 32pt).
-pub const PANEL_ZEN_PILL_H: f32 = 32.0;
+/// The Zen pill's height and corner radius, the same in State=Default,
+/// State=Workspace and State=Review.
+const ZEN_PILL_H: f32 = 24.0;
+const ZEN_PILL_RADIUS: f32 = 8.0;
 
 /// The sidebar's displayed width in pixels: the user's chosen `width_cols`,
 /// clamped to the window (at least 24 columns, at most half the window).
@@ -817,14 +816,13 @@ pub fn render<H: SidebarHost>(
                 .track_scroll(&props.scroll)
                 .children(rest),
         )
-        .child(render_footer(props.model, props.link, ZEN_PILL_H, theme, cx))
+        .child(render_footer(props.model, props.link, theme, cx))
         .into_any_element()
 }
 
 /// The leading column with a task panel in the sidebar's place (the
 /// Navigation component's State=Workspace and State=Review): the sidebar's
-/// titlebar and footer around `panel`, the Zen pill at the 32pt those states
-/// draw.
+/// titlebar and footer around `panel`.
 pub fn render_panel_column<H: SidebarHost>(
     panel: impl IntoElement,
     model: &SidebarModel,
@@ -842,7 +840,7 @@ pub fn render_panel_column<H: SidebarHost>(
         .type_style(Type::Base)
         .child(render_titlebar(palette_chord, theme, cx))
         .child(div().flex().flex_col().flex_1().min_h_0().child(panel))
-        .child(render_footer(model, link, PANEL_ZEN_PILL_H, theme, cx))
+        .child(render_footer(model, link, theme, cx))
         .into_any_element()
 }
 
@@ -1514,7 +1512,6 @@ fn render_row<H: SidebarHost>(
 fn render_footer<H: SidebarHost>(
     model: &SidebarModel,
     link: Option<DaemonLink>,
-    pill_h: f32,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
@@ -1627,15 +1624,15 @@ fn render_footer<H: SidebarHost>(
             )
         })
         .child(toolbar)
-        .child(render_zen_pill(model.zen_mode, pill_h, theme, cx))
+        .child(render_zen_pill(model.zen_mode, theme, cx))
 }
 
-/// The Zen pill: full width, fully rounded. On, it is the Success tint over
-/// the canvas with a green "Zen mode on"; off (or paused), the neutral fill
-/// with "Zen mode off". A click toggles Zen.
+/// The Zen pill: the footer's full width, 24pt tall, 8pt corners. On, it is
+/// the Success tint over the canvas with a centered green "Zen mode on"; off
+/// (or paused), which the component doesn't draw, the neutral fill with
+/// "Zen mode off" in the same shape. A click toggles Zen.
 fn render_zen_pill<H: SidebarHost>(
     zen: ZenModeState,
-    height: f32,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
@@ -1650,9 +1647,10 @@ fn render_zen_pill<H: SidebarHost>(
         .items_center()
         .justify_center()
         .w_full()
-        .h(px(height))
+        .h(px(ZEN_PILL_H))
         .px_2()
-        .rounded_full()
+        .py_1()
+        .rounded(px(ZEN_PILL_RADIUS))
         .overflow_hidden()
         .bg(theme.canvas)
         .cursor_pointer();
@@ -1661,7 +1659,7 @@ fn render_zen_pill<H: SidebarHost>(
     } else {
         [theme.background, theme.background_hover, theme.background_active]
     };
-    fill_layer(d, id, px(height / 2.0), fills)
+    fill_layer(d, id, px(ZEN_PILL_RADIUS), fills)
         .when(on, |d| d.child(div().debug_selector(|| "sidebar-zen-band".into()).absolute().size_0()))
         .child(
             div()
@@ -2246,13 +2244,16 @@ mod render_tests {
         // A two-line review row: 42pt; a workspace row: 26pt.
         assert_eq!(b(&mut cx, "sidebar-review-T-9").size.height.as_f32(), 42.0);
         assert_eq!(b(&mut cx, "sidebar-ws-bravo").size.height.as_f32(), 26.0);
-        // The Zen pill: full width inside 8pt, 42pt tall, at the foot.
+        // The Zen pill: full width inside 8pt, 24pt tall, 8pt under the
+        // footer's buttons and 8pt off the foot.
         let zen = b(&mut cx, "sidebar-zen");
         assert_eq!(zen.left().as_f32(), 8.0);
         assert_eq!(zen.size.width.as_f32(), 264.0);
-        assert_eq!(zen.size.height.as_f32(), 42.0);
+        assert_eq!(zen.size.height.as_f32(), 24.0);
         let sidebar = b(&mut cx, "sidebar");
         assert_eq!((sidebar.bottom() - zen.bottom()).as_f32(), 8.0);
+        let settings = b(&mut cx, "sidebar-settings");
+        assert_eq!((zen.top() - settings.bottom()).as_f32(), 8.0);
     }
 
     #[gpui::test]
