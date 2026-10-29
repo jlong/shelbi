@@ -663,6 +663,15 @@ impl BoardState {
         }]
     }
 
+    /// Rename column `col` until the next rebuild: `--visual-figma`'s
+    /// collapsed column under a long status name.
+    #[cfg(feature = "visual-check")]
+    pub fn relabel_column(&mut self, col: usize, label: &str) {
+        if let Some(column) = self.model.columns.get_mut(col) {
+            column.label = label.into();
+        }
+    }
+
     // ---- keys -------------------------------------------------------------
 
     /// Map a key to intents. Returns `None` when the board doesn't handle the
