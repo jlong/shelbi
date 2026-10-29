@@ -393,7 +393,7 @@ The TUI never constructs this struct; its workspace panel reads the same facts f
 | Field | TUI | Desktop |
 |---|---|---|
 | `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, wrapped (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); the id only as the title's fallback |
-| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, only when non-empty, More opening the task detail over the screen (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`; the window draws the board's detail, `app.rs` `open_task_over`) |
+| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, only when non-empty, More opening the task pane over the screen (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`; the window draws the board's pane, `app.rs` `open_task_over`) |
 | `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | the idle page's place line when there is no worktree (`views/workspace.rs` `render_toolbar` via `WorkspaceHeader::location_line`); not in the panel |
 | `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line |
 | `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
@@ -481,23 +481,23 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 ### `TaskDetailModel`
 | Field | TUI | Desktop |
 |---|---|---|
-| `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | "id" field (`views/task_detail.rs` `render`) |
-| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | panel header (`views/task_detail.rs` `render`) |
+| `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | Header's `Workflow / id` (`views/task_detail.rs` `header`) |
+| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title (`views/task_detail.rs` `details`) |
 | `status_id` | not shown (popover keyed by task id) | not shown: not used |
 | `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | not shown: `status_name` instead (the Figma frame spells the status as the workflow does) |
-| `status_name` | not shown: the popover shows the column label (`status_label`) | "status" field (`views/task_detail.rs` `render`) |
-| `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | not shown: not used |
-| `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | "priority N" in status field (`views/task_detail.rs` `render`) |
-| `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | "workspace" field, "unassigned" when none (`views/task_detail.rs` `render`) |
-| `tracker_owner` | equivalent `OwnershipGate::owner(tracker_assignees)`: "owner:" row, `me` or `@login` plus the `--take` hint, remote tracker only; not in the review popover (`kanban.rs` `popover_header`) | "owner" field, `me` or `@login` plus the `--take` hint, remote tracker only; hides Start when not the user's (`views/task_detail.rs` `render`, `TaskDetailModel::startable`) |
-| `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | "branch" field, resolved `card_branch` (`views/task_detail.rs` `render`) |
-| `workflow_name` | not shown | "workflow" field (`views/task_detail.rs` `render`) |
-| `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | deps field with "[status]" (`views/task_detail.rs` `render`) |
-| `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | same label choice (`views/task_detail.rs` `render`) |
-| `pr_link` | not shown | clickable "PR" link (`views/task_detail.rs` `render`) |
-| `created` | "created:" row (`kanban.rs` `popover_header`) | "created" field (`views/task_detail.rs` `render`) |
-| `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "updated" in created field (`views/task_detail.rs` `render`) |
-| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | markdown `TextView`, "_No description._" fallback, checklist count, in-place editor (`views/task_detail.rs` `render`) |
+| `status_name` | not shown: the popover shows the column label (`status_label`) | Status property's value (`views/task_detail.rs` `properties`) |
+| `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | Status property's status glyph (`views/task_detail.rs` `properties`) |
+| `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | Priority property, "N in queue" (`views/task_detail.rs` `properties`) |
+| `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | not a property (the Task pane frames dropped the Workspace row); More offers Open workspace only when set, and the assign picker marks it "(assigned)" (`board_state.rs` `pane_actions`, `issues.rs` `render_assign`) |
+| `tracker_owner` | equivalent `OwnershipGate::owner(tracker_assignees)`: "owner:" row, `me` or `@login` plus the `--take` hint, remote tracker only; not in the review popover (`kanban.rs` `popover_header`) | Owner property, `Me` or `@login` plus the `--take` hint, remote tracker only; leaves Start out of More when not the user's (`views/task_detail.rs` `properties`, `board_state.rs` `pane_actions`) |
+| `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | Branch property in the mono face, resolved `card_branch`; "Created when work starts" when none (`views/task_detail.rs` `properties`) |
+| `workflow_name` | not shown | Header's `Workflow / id` and the Workflow property, capitalized (`views/task_detail.rs` `workflow_label`) |
+| `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | Depends on property with "[status]", when any (`views/task_detail.rs` `properties`) |
+| `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | "Blocked by" vs "Depends on" label (`views/task_detail.rs` `properties`) |
+| `pr_link` | not shown | clickable Pull request property, when recorded (`views/task_detail.rs` `properties`) |
+| `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) |
+| `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) |
+| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | markdown `TextView` in the pane's scroll, "No description yet." fallback, in-place editor from More / `e` (`views/task_detail.rs` `details`) |
 
 ### `MachinesModel`
 | Field | TUI | Desktop |
@@ -563,7 +563,7 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `slot` | not shown: binds the content sessions (`shell/review.rs` `show_chat` / `show_role`) | not shown: binds the content sessions and the user shell (`views/review.rs` `content_target`, `open_shell`) |
 | `title` | bold task-info title (`review_panel.rs` `render_full` via `panel.rs` `render_task_info`); More popover title (`kanban.rs` `render_task_popover_into`) | Base/Medium title (`views/review.rs` `render_panel` via `task_panel::summary`) |
 | `body` | More popover markdown body (`kanban.rs` `render_task_popover_into`) | not shown as markdown: gates More via `has_body` (`views/review.rs` `render_panel`) |
-| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More opening the task detail over the screen (`views/review.rs` `render_panel` via `task_panel::summary`; the window draws the board's detail, `app.rs` `open_task_over`) |
+| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More opening the task pane over the screen (`views/review.rs` `render_panel` via `task_panel::summary`; the window draws the board's pane, `app.rs` `open_task_over`) |
 | `worktree` | left-truncated folder row, always shown (`review_panel.rs` `render_full` via `panel.rs` `render_folder`) | worktree row, its last four components, Open reveals it in Finder, no Open on a remote slot (`views/review.rs` `render_panel` via `task_panel::worktree_row`) |
 | `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | not shown: the panel shows the task's column (REVIEW, the purple glyph) beside the back button, as State=Review draws it (`views/review.rs` `render_panel`) |
 | `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) |
