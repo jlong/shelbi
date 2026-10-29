@@ -128,6 +128,8 @@ use crate::views::activity_reader::ActivityReader;
 use crate::views::column_swap::{self, ColumnSwap, Layer, Motion, Occupant};
 use crate::views::sidebar_reveal::{self, SidebarReveal};
 use crate::views::issues::{IssuesEvent, IssuesView};
+use crate::views::pane_session::MainShows;
+use crate::views::session_view::SessionDeps;
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
@@ -1287,6 +1289,7 @@ impl ShelbiWindow {
                     }
                     self.update_workspace_row(cx);
                     self.update_review_row(window, cx);
+                    self.update_task_rows(cx);
                     self.update_chat_supervisor_status(cx);
                     true
                 }
@@ -2424,10 +2427,23 @@ impl ShelbiWindow {
             return issues.clone();
         }
         let project = self.project.clone();
-        let issues = cx.new(|cx| IssuesView::new(project, cx));
-        let sub = cx.subscribe_in(&issues, window, |this, _, ev: &IssuesEvent, window, cx| {
-            let IssuesEvent::Command(kind) = ev;
-            this.run(kind.clone(), window, cx);
+        let issues = cx.new(|cx| IssuesView::new(project.clone(), cx));
+        // The task pane's live session: attach only, through the same
+        // sessions the Workspace view reaches.
+        let handle = window.window_handle();
+        let sink = self._feed.as_ref().map(|f| f.session_sink());
+        let deps = SessionDeps::live(&project);
+        #[cfg(any(test, feature = "visual-check"))]
+        let deps = self.workspace_deps.as_ref().map(|d| (d.sessions)()).unwrap_or(deps);
+        issues.update(cx, |v, cx| v.host_sessions(handle, deps, sink, cx));
+        let sub = cx.subscribe_in(&issues, window, |this, _, ev: &IssuesEvent, window, cx| match ev {
+            IssuesEvent::Command(kind) => this.run(kind.clone(), window, cx),
+            // A click in the pane's terminal moves the window's focus model
+            // to the main area, so the sidebar stops taking keys.
+            IssuesEvent::Focused => {
+                this.client.focus_main();
+                cx.notify();
+            }
         });
         self._view_subscriptions.push(sub);
         let sub = cx.observe_in(&issues, window, |this, _, window, cx| this.sync_detail_over(window, cx));
@@ -2436,7 +2452,44 @@ impl ShelbiWindow {
             issues.update(cx, |v, cx| v.restore_workflow_filter(Some(filter), cx));
         }
         self.issues = Some(issues.clone());
+        self.update_task_rows(cx);
         issues
+    }
+
+    /// Hand the board the sidebar's workspace and review rows: which agent
+    /// works the task its pane shows.
+    fn update_task_rows(&mut self, cx: &mut Context<Self>) {
+        if let Some(issues) = self.issues.clone() {
+            let (workspaces, reviews) = (self.model.workspaces.clone(), self.model.reviews.clone());
+            issues.update(cx, |v, cx| v.set_task_rows(workspaces, reviews, cx));
+        }
+    }
+
+    /// Tell the board whether the window shows it (or its pane floating
+    /// over another screen), and what that screen shows: a hidden pane
+    /// detaches its session, and a pane over a screen already showing it
+    /// leaves it out.
+    fn sync_issues_shown(&mut self, cx: &mut Context<Self>) {
+        let Some(issues) = self.issues.clone() else {
+            return;
+        };
+        let ready = matches!(self.boot, Boot::Ready(_)) && !self.chooser;
+        let board = ready && matches!(self.route, Route::View) && matches!(self.client.view(), View::Issues);
+        let floating = ready && issues.read(cx).is_floating();
+        let mut main_shows = MainShows::default();
+        if floating {
+            main_shows.workspace = self
+                .workspace
+                .as_ref()
+                .filter(|w| w.read(cx).is_shown())
+                .and_then(|w| w.read(cx).workspace().map(str::to_string));
+            main_shows.review_task = self
+                .review
+                .as_ref()
+                .filter(|r| matches!(self.route, Route::Review) && r.read(cx).is_shown())
+                .and_then(|r| r.read(cx).task_id().map(str::to_string));
+        }
+        issues.update(cx, |v, cx| v.set_shown(board || floating, main_shows, cx));
     }
 
     /// The orchestrator chat for the window's project, created on first use.
@@ -2854,6 +2907,8 @@ impl ShelbiWindow {
                 }
             }
         }
+        // The board's pane attaches its session only while it is on screen.
+        self.sync_issues_shown(cx);
         // The Review view is shown by `open_review`; likewise only hidden
         // here. Hiding detaches its content; the daemon's sessions stay.
         if !matches!(self.route, Route::Review) {
@@ -2879,6 +2934,10 @@ impl ShelbiWindow {
                 .review
                 .as_ref()
                 .is_some_and(|r| r.read(cx).is_shown() && r.read(cx).contains_focus(window, cx))
+            || self
+                .issues
+                .as_ref()
+                .is_some_and(|v| v.read(cx).session_focused(window, cx))
     }
 
     /// Start the Activity feed's reader for the window's project, so its
@@ -3245,6 +3304,9 @@ impl ShelbiWindow {
                 if let Some(review) = &this.review {
                     review.update(cx, |r, cx| r.note_deliberate_close(cx));
                 }
+                if let Some(issues) = &this.issues {
+                    issues.update(cx, |v, cx| v.note_deliberate_close(true, cx));
+                }
             })
             .ok();
             let quit = cx
@@ -3284,6 +3346,9 @@ impl ShelbiWindow {
                     }
                     if let Some(review) = &this.review {
                         review.update(cx, |r, cx| r.clear_deliberate_close(cx));
+                    }
+                    if let Some(issues) = &this.issues {
+                        issues.update(cx, |v, cx| v.note_deliberate_close(false, cx));
                     }
                     this.banner = Some(format!("Couldn't quit the project: {e}").into());
                     cx.notify();

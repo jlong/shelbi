@@ -103,6 +103,8 @@ pub mod machine_form;
 pub mod machine_form_state;
 pub mod markdown;
 pub mod overlay;
+pub mod pane_session;
+pub mod pane_split;
 pub mod palette;
 pub mod project_menu;
 pub mod remote_session;
