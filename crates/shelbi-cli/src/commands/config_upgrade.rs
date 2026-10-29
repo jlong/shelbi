@@ -2162,8 +2162,13 @@ fn sniff_renamed_siblings(entries: &[InventoryEntry], out: &mut Vec<UpgradeFindi
 /// The apply layer materializes the shipped default for this code.
 pub(crate) const PR_TEMPLATE_MISSING: &str = "PR_TEMPLATE_MISSING";
 
+/// The stable code for "the project has no `changelog-template.md`". The apply
+/// layer materializes the shipped default for it.
+pub(crate) const CHANGELOG_TEMPLATE_MISSING: &str = "CHANGELOG_TEMPLATE_MISSING";
+
 /// Flag lifecycle-owned shipped defaults that a project is missing because it
-/// predates their addition — today the per-project `pr-template.md`. Editing
+/// predates their addition — the per-project `pr-template.md` and
+/// `changelog-template.md`. Editing
 /// the shipped default alone reaches only *new* projects; this sniffer plus its
 /// apply-side materializer brings existing projects up to date on boot, the
 /// same self-heal shape the renamed-sibling and settings-refresh healers use.
@@ -2179,6 +2184,16 @@ fn sniff_missing_lifecycle_defaults(entries: &[InventoryEntry], out: &mut Vec<Up
                 PR_TEMPLATE_MISSING,
                 "the project has no `pr-template.md` (added in a newer Shelbi release)",
                 "Materialize the shipped default PR-description template.",
+                Location { line: 1, column: 1 },
+            ));
+        }
+        if entry.logical_id.ends_with(".changelog-template") && !entry.exists {
+            out.push(finding(
+                entry,
+                Classification::AutoHeal,
+                CHANGELOG_TEMPLATE_MISSING,
+                "the project has no `changelog-template.md` (added in a newer Shelbi release)",
+                "Materialize the shipped default changelog template.",
                 Location { line: 1, column: 1 },
             ));
         }
@@ -4722,6 +4737,11 @@ workspaces:
         )
         .unwrap();
         std::fs::write(
+            project_dir.join("changelog-template.md"),
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE,
+        )
+        .unwrap();
+        std::fs::write(
             project_dir.join("agents/_shared/preamble.md"),
             shelbi_state::DEFAULT_SHARED_PREAMBLE,
         )
@@ -5230,6 +5250,46 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
             std::fs::read_to_string(dir.join("pr-template.md")).unwrap(),
             custom
         );
+    }
+
+    #[test]
+    fn missing_changelog_template_is_materialized_and_a_present_one_kept() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), DEMO_YAML).unwrap();
+
+        // A project that predates the template: flagged as an auto-heal...
+        let report = detect(&["demo".to_string()]).unwrap();
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == CHANGELOG_TEMPLATE_MISSING)
+            .expect("missing changelog template not detected");
+        assert_eq!(f.classification, Classification::AutoHeal);
+
+        // ...and seeded with the shipped default on start.
+        let outcome = run_for_project("demo");
+        assert!(
+            outcome.applied.iter().any(|c| c.code == CHANGELOG_TEMPLATE_MISSING),
+            "changelog template not materialized: {:?}",
+            outcome.applied
+        );
+        let path = home.join("projects/demo/changelog-template.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE
+        );
+
+        // A customized one is never touched.
+        let custom = "## {{title}}\n\n{{description}}\n";
+        std::fs::write(&path, custom).unwrap();
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(!report.findings.iter().any(|f| f.code == CHANGELOG_TEMPLATE_MISSING));
+        run_for_project("demo");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
     }
 
     const DEMO_YAML: &str = "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n";

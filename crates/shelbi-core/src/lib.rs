@@ -1,6 +1,7 @@
 pub mod agent_manifest;
 pub mod error;
 pub mod file_limit;
+pub mod github;
 pub mod integration;
 pub mod login_env;
 pub mod model;

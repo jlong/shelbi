@@ -19,11 +19,12 @@ use crate::overlay::palette::{project_indicator, ProjectEntry};
 use crate::view::SidebarModel;
 
 /// The nav glyph for a nav label: the twemoji the sidebar and the palette
-/// show (💬 / 📋 / ⚡ / 🖥), or `•` for a label with none.
+/// show (💬 / 📋 / 📰 / ⚡ / 🖥), or `•` for a label with none.
 pub fn nav_glyph(label: &str) -> &'static str {
     match label {
         "Orchestrator" => "💬",
         "Issues" => "📋",
+        "Changelog" => "📰",
         "Activity" => "⚡",
         "Machines" => "🖥",
         _ => "•",
@@ -84,14 +85,16 @@ pub fn command_model_from(
             decoration: nav_decoration(&n.label),
         })
         .collect();
-    // Machines is palette-only (no sidebar row); add it once.
-    if !views.iter().any(|v| v.view == View::Machines) {
-        views.push(ViewItem {
-            id: format!("view:{}", View::Machines.as_view_id()),
-            title: "Machines".to_string(),
-            view: View::Machines,
-            decoration: nav_decoration("Machines"),
-        });
+    // Activity and Machines are palette-only (no sidebar row); add each once.
+    for (view, title) in [(View::Activity, "Activity"), (View::Machines, "Machines")] {
+        if !views.iter().any(|v| v.view == view) {
+            views.push(ViewItem {
+                id: format!("view:{}", view.as_view_id()),
+                title: title.to_string(),
+                decoration: nav_decoration(title),
+                view,
+            });
+        }
     }
 
     let workspaces = sidebar
@@ -189,6 +192,10 @@ pub fn edit_targets(project: &str) -> Vec<EditItem> {
     }
     targets.push((EditTarget::ZenMode, "Edit Zen Mode".to_string()));
     targets.push((EditTarget::Workflows, "Edit Workflows".to_string()));
+    targets.push((
+        EditTarget::ChangelogTemplate,
+        "Edit Changelog Template".to_string(),
+    ));
     targets
         .into_iter()
         .filter(|(target, _)| {
@@ -214,6 +221,7 @@ pub fn edit_target_path(project: &str, target: &EditTarget) -> Option<PathBuf> {
         ),
         EditTarget::ZenMode => shelbi_state::zenmode_path(project).ok(),
         EditTarget::Workflows => shelbi_state::workflows_dir(project).ok(),
+        EditTarget::ChangelogTemplate => shelbi_state::changelog_template_path(project).ok(),
     }
 }
 
@@ -248,8 +256,8 @@ mod tests {
                 view: View::Issues,
             },
             NavItem {
-                label: "Activity".into(),
-                view: View::Activity,
+                label: "Changelog".into(),
+                view: View::Changelog,
             },
         ];
         s.workspaces = vec![WorkspaceRow {
@@ -279,21 +287,33 @@ mod tests {
         let m = command_model_from("alpha", &sidebar(), false, Vec::new(), Vec::new());
         assert!(m.zen_on);
         let ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
-        assert_eq!(ids, ["view:orch", "view:tasks", "view:activity", "view:machines"]);
+        // Activity and Machines follow the sidebar's nav as palette-only views.
+        assert_eq!(
+            ids,
+            ["view:orch", "view:tasks", "view:changelog", "view:activity", "view:machines"]
+        );
+        assert_eq!(m.views[2].decoration.as_ref().unwrap().glyph, "📰");
+        assert_eq!(m.views[3].title, "Activity");
+        assert_eq!(m.views[3].decoration.as_ref().unwrap().glyph, "⚡");
         assert_eq!(m.views[0].decoration.as_ref().unwrap().glyph, "💬");
         assert_eq!(m.workspaces[0].subtitle.as_deref(), Some("T-1"));
         assert_eq!(m.reviews[0].task_id, "T-9");
     }
 
     #[test]
-    fn machines_is_not_duplicated_when_the_nav_has_it() {
+    fn palette_only_views_are_not_duplicated_when_the_nav_has_them() {
         let mut s = sidebar();
         s.nav.push(NavItem {
             label: "Machines".into(),
             view: View::Machines,
         });
+        s.nav.push(NavItem {
+            label: "Activity".into(),
+            view: View::Activity,
+        });
         let m = command_model_from("alpha", &s, false, Vec::new(), Vec::new());
         assert_eq!(m.views.iter().filter(|v| v.view == View::Machines).count(), 1);
+        assert_eq!(m.views.iter().filter(|v| v.view == View::Activity).count(), 1);
     }
 
     /// The palette's whole default list for a fixture state, in order: the
@@ -319,6 +339,7 @@ mod tests {
             [
                 "view:orch",
                 "view:tasks",
+                "view:changelog",
                 "view:activity",
                 "view:machines",
                 "action:toggle-zen",

@@ -14,8 +14,7 @@
 //! Settings buttons, and the Zen pill.
 //!
 //! Where the desktop departs from the TUI (each a Figma decision): the
-//! section order; "Changelog" for the Activity view (the TUI keeps
-//! "Activity", [`nav_label`]); Heroicons and the component's glyphs instead
+//! section order; Heroicons and the component's glyphs instead
 //! of the TUI's emoji; a numbered chord per row; the issue number on a
 //! review's second line; a review's serving location left to the Review
 //! view.
@@ -371,16 +370,6 @@ pub fn selected_key(entries: &[Entry], ordinal: usize) -> Option<SharedString> {
         .map(|e| row_selector(&e.row).into())
 }
 
-/// The nav label the desktop shows for a view: the Activity view is
-/// "Changelog" here (John's call; the TUI and the shared model keep
-/// "Activity").
-pub fn nav_label(view: &View, label: &str) -> String {
-    match view {
-        View::Activity => "Changelog".into(),
-        _ => label.to_string(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The window's side.
 // ---------------------------------------------------------------------------
@@ -558,7 +547,7 @@ pub fn row_text(row: &SidebarRow, model: &SidebarModel) -> RowText {
         branch: None,
     };
     match row {
-        SidebarRow::Nav { label, view } => plain(nav_label(view, label)),
+        SidebarRow::Nav { label, .. } => plain(label.clone()),
         SidebarRow::Section(label) => plain(
             Section::of_label(label)
                 .map_or_else(|| label.clone(), |s| s.label().to_string()),
@@ -693,7 +682,10 @@ pub fn nav_icon(view: &View) -> Icon {
     match view {
         View::Session(_) => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         View::Issues => icons::RECTANGLE_STACK,
-        View::Activity => icons::BOLT,
+        View::Changelog => icons::BOLT,
+        // Palette-only now (no sidebar row); its own drawing beside
+        // Changelog's there.
+        View::Activity => icons::BARS_2,
         View::Machines => icons::SERVER_STACK,
     }
 }
@@ -1096,7 +1088,7 @@ fn render_nav_row<H: SidebarHost>(
         .text_color(theme.foreground)
         .map(|d| selected_row(d, &row_selector(row), selected, props, theme));
     let hotkey = nav_view_hotkey(view).map(|chord| style::hotkey(&chord, theme).into_any_element());
-    nav_item(painted, nav_icon(view), nav_label(view, label), hotkey, selected, theme)
+    nav_item(painted, nav_icon(view), label.clone(), hotkey, selected, theme)
         .on_click(cx.listener(move |this, _, window, cx| {
             this.sidebar_event(SidebarEvent::Activate(ord), window, cx)
         }))
@@ -1844,7 +1836,7 @@ mod tests {
         let entries = layout(&m, &BTreeSet::new());
         let names = selectors(&entries);
         let at = |s: &str| names.iter().position(|n| n == s).unwrap_or_else(|| panic!("{s}"));
-        assert!(at("sidebar-nav-Activity") < at("sidebar-section-Workspaces"));
+        assert!(at("sidebar-nav-Changelog") < at("sidebar-section-Workspaces"));
         assert!(at("sidebar-section-Workspaces") < at("sidebar-machine-hub"));
         assert!(at("sidebar-ws-echo") < at("sidebar-section-Ready for Review"));
         assert!(at("sidebar-section-Ready for Review") < at("sidebar-review-R-1"));
@@ -1935,12 +1927,10 @@ mod tests {
     }
 
     #[test]
-    fn the_activity_view_is_changelog_here_only() {
-        assert_eq!(nav_label(&View::Activity, "Activity"), "Changelog");
-        assert_eq!(nav_label(&View::Issues, "Issues"), "Issues");
-        // The shared nav (the TUI's) still says Activity.
+    fn the_shared_nav_ends_on_changelog_with_activity_off_it() {
         let shared = shelbi_app::view::default_nav_items();
-        assert!(shared.iter().any(|n| n.view == View::Activity && n.label == "Activity"));
+        assert!(shared.iter().any(|n| n.view == View::Changelog && n.label == "Changelog"));
+        assert!(!shared.iter().any(|n| n.view == View::Activity), "Activity is palette-only");
     }
 
     #[test]
@@ -1980,7 +1970,7 @@ mod tests {
             row_text(&row("sidebar-section-Ready for Review"), &m).label,
             "Ready for review"
         );
-        assert_eq!(row_text(&row("sidebar-nav-Activity"), &m).label, "Changelog");
+        assert_eq!(row_text(&row("sidebar-nav-Changelog"), &m).label, "Changelog");
 
         let collapsed = SidebarRow::MachineGroup {
             name: "devbox".into(),
@@ -2040,7 +2030,8 @@ mod tests {
     fn nav_icons_are_heroicons() {
         assert_eq!(nav_icon(&View::Session("orch".into())), icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS);
         assert_eq!(nav_icon(&View::Issues), icons::RECTANGLE_STACK);
-        assert_eq!(nav_icon(&View::Activity), icons::BOLT);
+        assert_eq!(nav_icon(&View::Changelog), icons::BOLT);
+        assert_eq!(nav_icon(&View::Activity), icons::BARS_2);
     }
 }
 
@@ -2173,7 +2164,7 @@ mod render_tests {
             "sidebar-project-title",
             "sidebar-nav-Orchestrator",
             "sidebar-nav-Issues",
-            "sidebar-nav-Activity",
+            "sidebar-nav-Changelog",
             "sidebar-section-Workspaces",
             "sidebar-machine-hub",
             "sidebar-machine-devbox",
@@ -2207,7 +2198,7 @@ mod render_tests {
         let order = [
             "sidebar-project-title",
             "sidebar-nav-Orchestrator",
-            "sidebar-nav-Activity",
+            "sidebar-nav-Changelog",
             "sidebar-section-Workspaces",
             "sidebar-machine-hub",
             "sidebar-ws-alpha",

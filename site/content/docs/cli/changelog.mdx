@@ -1,0 +1,222 @@
+---
+title: shelbi changelog
+order: 20.5
+summary: Record what has shipped in a project and read it back, as a list, as blog-style markdown, or as JSON.
+---
+
+```text
+shelbi changelog add    --title <TITLE> [--date <DATE>] [--author <NAME>]
+                        [--issue <ID>]... [--pr <N|URL>]... [--link <URL>]...
+                        [-d <DESC> | stdin] [--format text|markdown|json]
+shelbi changelog list   [--limit <N>] [--since <DATE>] [--format text|markdown|json]
+shelbi changelog search <QUERY> [--limit <N>] [--format text|markdown|json]
+shelbi changelog show   <ENTRY-ID> [--format text|markdown|json]
+```
+
+Every project keeps a changelog: a blog-style record of what has shipped, so
+you and your agents can see what recently landed. The orchestrator adds an
+entry each time it merges work, and you can add your own. The Changelog page in
+the sidebar of the TUI and the desktop app shows it, newest first.
+
+## Where entries live
+
+Each entry is one markdown file with YAML frontmatter, in the project's Shelbi
+state directory:
+
+```text
+~/.shelbi/projects/<project>/changelog/2026-10-28-213005-changelog-lands.md
+```
+
+Files are named `<date>-<time>-<slug>.md` from the entry's date in UTC, so they
+sort by date. The file name without `.md` is the entry's id. Entries stay out
+of your repository whatever the project's config mode.
+
+```markdown
+---
+title: Changelog lands in the sidebar
+date: 2026-10-28T14:30:05-07:00
+author: orchestrator
+issues:
+- changelog
+prs:
+- 1953
+links:
+- https://shelbi.dev/docs/cli/changelog
+---
+The sidebar's Activity row becomes Changelog.
+
+- issue:changelog
+- https://github.com/jlong/shelbi/pull/1953
+- https://shelbi.dev/docs/cli/changelog
+```
+
+The frontmatter holds the title, the date (with time and offset), the author
+(`orchestrator`, `user`, or an agent's name) and the links given as flags. The
+body is the description. You can edit an entry by hand; a bare `date:` like
+`2026-10-28` still loads.
+
+Two writers adding at the same moment never clobber each other: each `add`
+claims a new file name, adding `-2`, `-3` and so on when the name is taken.
+
+## Links
+
+An entry can link Shelbi issues, pull requests, and any other URL. Give them as
+flags, or write them in the description:
+
+| Flag | In the description | Links to |
+| --- | --- | --- |
+| `--issue <id>` | `issue:<id>` | A Shelbi issue by id, such as `issue:tui-about`. The TUI and the desktop app open it inside Shelbi. |
+| `--pr <n\|url>` | `#<n>` | A pull request: a number in the project's GitHub repository (`#1942`), or a PR URL. |
+| `--link <url>` | any `http://` or `https://` URL | Any other page. A GitHub pull request URL counts as a PR. |
+
+Code spans and fenced code blocks in the description are not scanned, and a
+link must start a word (`foo#12` is not a PR). A PR number resolves to a URL
+against the project's GitHub issue tracker or, failing that, its repository's
+`origin` remote when it points at github.com. With neither, the PR keeps its
+number and has no URL.
+
+## The template
+
+New entries are written from the project's changelog template:
+
+```text
+~/.shelbi/projects/<project>/changelog-template.md
+```
+
+For an in-repo project it sits in `<repo>/.shelbi/` beside the other project
+config. Every new project gets the default, and Shelbi adds it on start to any
+project that predates it, never overwriting one that exists. Open it from
+Settings, or from the command palette's **Edit Changelog Template**.
+
+`add` fills these placeholders:
+
+| Placeholder | Becomes |
+| --- | --- |
+| `{{title}}` | The entry's title. |
+| `{{date}}` | Its date, `YYYY-MM-DD`. |
+| `{{time}}` | Its time of day, `HH:MM`. |
+| `{{author}}` | Who wrote it. |
+| `{{description}}` | The description from `-d` or stdin. |
+| `{{links}}` | The flag links, one per line as a markdown list. |
+
+The default template is the description followed by the links. A comment at
+the top of the template (`<!-- ... -->`) explains the placeholders and is left
+out of every entry. Blank lines left by an empty placeholder are tidied away.
+
+## add
+
+Adds an entry and prints its id and file.
+
+| Option | Meaning |
+| --- | --- |
+| `--title <TITLE>` | The entry's title, one line. Required. |
+| `--date <DATE>` | When it shipped. Defaults to now. Takes `YYYY-MM-DD` (keeping the current time of day), a local date and time (`2026-10-28 14:30`), or RFC 3339 (`2026-10-28T14:30:00-07:00`). |
+| `--author <NAME>` | `orchestrator`, `user`, or an agent's name. Defaults to `$SHELBI_AGENT` inside an agent's session, else `user`. |
+| `--issue <ID>` | Link a Shelbi issue. Repeatable. |
+| `--pr <N\|URL>` | Link a pull request (`1942`, `#1942`, or a URL). Repeatable. |
+| `--link <URL>` | Link any other URL. Repeatable. |
+| `-d`, `--description <DESC>` | The description, in markdown. Without it, the description is read from stdin when stdin is not a terminal. |
+| `--format <FORMAT>` | How to print the new entry. Default `text`. |
+
+## list
+
+Lists entries, newest first.
+
+| Option | Meaning |
+| --- | --- |
+| `--limit <N>` | Show at most N entries. |
+| `--since <DATE>` | Only entries on or after this date. A bare date means the start of that day. |
+| `--format <FORMAT>` | Default `text`. |
+
+## search
+
+Lists the entries whose title, description, or link targets contain every word
+of the query, ignoring case, newest first. Link targets include issue ids
+(`board-perf`), PR numbers (`#1953`) and URLs (`pull/1953`).
+
+| Option | Meaning |
+| --- | --- |
+| `--limit <N>` | Show at most N entries. |
+| `--format <FORMAT>` | Default `text`. |
+
+## show
+
+Prints one entry. `<ENTRY-ID>` is the id `list` shows, or any prefix of it that
+names one entry (`2026-10-28-2130`). The default format is `markdown`.
+
+## Formats
+
+**text** is a compact list: the date and title, then the id, the author and
+the links.
+
+```text
+2026-10-28 14:30  Changelog lands in the sidebar
+                  2026-10-28-213005-changelog-lands  orchestrator  issue:changelog  #1953
+```
+
+**markdown** reads like the blog, full entries ready to paste or for an agent
+to read: a heading, a line with the date, author and id, the description, and
+any links the description doesn't already show.
+
+**json** is for agents and scripts. `list` and `search` print an object with
+the entries; `show` and `add` print one entry:
+
+```json
+{
+  "schema_version": 1,
+  "project": "shelbi",
+  "query": "sidebar",
+  "entries": [
+    {
+      "id": "2026-10-28-213005-changelog-lands",
+      "title": "Changelog lands in the sidebar",
+      "date": "2026-10-28T14:30:05-07:00",
+      "author": "orchestrator",
+      "description": "The sidebar's Activity row becomes Changelog.\n\n- issue:changelog\n...",
+      "links": [
+        { "kind": "issue", "id": "changelog" },
+        { "kind": "pr", "number": 1953, "url": "https://github.com/jlong/shelbi/pull/1953" },
+        { "kind": "url", "url": "https://shelbi.dev/docs/cli/changelog" }
+      ],
+      "path": "/Users/you/.shelbi/projects/shelbi/changelog/2026-10-28-213005-changelog-lands.md"
+    }
+  ]
+}
+```
+
+- `schema_version` changes only when the shape breaks.
+- `query` appears on `search` only. `show` and `add` print `entry` in place of
+  `entries`.
+- `date` is RFC 3339 with the offset the entry was written in.
+- `description` is the markdown body.
+- `links` holds every link, the flags' first and then the description's, without
+  duplicates. Each has a `kind`: `issue` with an `id`; `pr` with a `number` and
+  a `url`, either of which can be `null` (a `#12` with no known repository has
+  no URL, a non-GitHub PR URL has no number); `url` with a `url`.
+
+## Examples
+
+Record a merge, linking its issue and PR:
+
+```bash
+shelbi changelog add --title "Faster board" --issue dt-board-perf --pr 1900 \
+  -d "Board columns are a virtualized list, so a long column scrolls smoothly."
+```
+
+Take the description from a file on stdin:
+
+```bash
+shelbi changelog add --title "Zen pill redesign" --pr 1951 < notes.md
+```
+
+What landed this week, as an agent would read it:
+
+```bash
+shelbi changelog list --since 2026-10-26 --format markdown
+```
+
+Everything about the board, as JSON:
+
+```bash
+shelbi changelog search board --format json
+```

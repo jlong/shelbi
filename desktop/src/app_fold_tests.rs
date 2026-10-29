@@ -208,7 +208,7 @@ fn the_keys_skip_a_closing_sections_rows(cx: &mut TestAppContext) {
         "Down skips the workspace folding away"
     );
     f.update(|w, cx| w.step_selection(false, cx));
-    assert_eq!(f.selected(), Some(SidebarTarget::View(View::Activity)), "and so does Up");
+    assert_eq!(f.selected(), Some(SidebarTarget::View(View::Changelog)), "and so does Up");
 
     // A click on a row folding away does nothing.
     f.h.take_calls();

@@ -49,7 +49,8 @@ use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
     apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
-    scope_label, Classification, UpgradeFinding, UpgradeReport, PR_TEMPLATE_MISSING,
+    scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
+    PR_TEMPLATE_MISSING,
     REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
@@ -197,6 +198,14 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // `pr-template.md`). Independent of the content healers below.
     if codes.contains(PR_TEMPLATE_MISSING) {
         heal_missing_pr_template(entry, applied);
+    }
+    if codes.contains(CHANGELOG_TEMPLATE_MISSING) {
+        heal_missing_default(
+            entry,
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE,
+            CHANGELOG_TEMPLATE_MISSING,
+            applied,
+        );
     }
     // Same shape for the shared agent preamble that carries the hub-safety
     // rules (`agents/_shared/preamble.md`).

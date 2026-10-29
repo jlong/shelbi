@@ -111,6 +111,10 @@ fn scaffold_assets(config_root: &Path) {
         config_root.join("pr-template.md"),
         "# PR description template\n\nSummary, technical details, QA checklist.\n",
     );
+    write(
+        config_root.join("changelog-template.md"),
+        "{{description}}\n\n{{links}}\n",
+    );
     for agent in [
         "orchestrator",
         "developer",

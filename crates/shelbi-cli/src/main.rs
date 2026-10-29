@@ -141,6 +141,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::issue::IssueCmd,
     },
+    /// Record and read the project's changelog: a blog-style record of what
+    /// has shipped, one entry per merge.
+    #[command(after_long_help = commands::changelog::LINK_HELP)]
+    Changelog {
+        #[command(subcommand)]
+        cmd: commands::changelog::ChangelogCmd,
+    },
     /// Operate on the issue-tracker backend itself (e.g. `migrate` between
     /// `file_system` and `github`).
     IssueStore {
@@ -477,6 +484,7 @@ fn main() -> Result<()> {
             );
             commands::issue::run(cli.project, cmd)
         }
+        Some(Cmd::Changelog { cmd }) => commands::changelog::run(cli.project, cmd),
         Some(Cmd::IssueStore { cmd }) => commands::issue_store::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {

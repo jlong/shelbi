@@ -57,6 +57,7 @@ fn fixture() -> CommandModel {
         views: vec![
             view("view:orch", "Orchestrator", View::Session("orch".into())),
             view("view:tasks", "Issues", View::Issues),
+            view("view:changelog", "Changelog", View::Changelog),
             view("view:activity", "Activity", View::Activity),
             view("view:machines", "Machines", View::Machines),
         ],
@@ -91,6 +92,10 @@ fn fixture() -> CommandModel {
             EditItem {
                 target: EditTarget::Workflows,
                 title: "Edit Workflows".into(),
+            },
+            EditItem {
+                target: EditTarget::ChangelogTemplate,
+                title: "Edit Changelog Template".into(),
             },
         ],
         other_clients_attached: true,
@@ -287,6 +292,7 @@ fn every_command_kind_has_a_scenario() {
         [
             "view:orch",
             "view:tasks",
+            "view:changelog",
             "view:activity",
             "view:machines",
             "action:toggle-zen",
@@ -307,6 +313,7 @@ fn every_command_kind_has_a_scenario() {
             "edit:agent:developer",
             "edit:zenmode",
             "edit:workflows",
+            "edit:changelog-template",
             "action:detach",
             "action:detach-others",
             "action:quit-project",
@@ -319,6 +326,7 @@ fn every_command_kind_has_a_scenario() {
 fn nav_views_show_and_focus_the_main_area() {
     for (id, view) in [
         ("view:tasks", View::Issues),
+        ("view:changelog", View::Changelog),
         ("view:activity", View::Activity),
         ("view:machines", View::Machines),
         ("view:orch", View::Session("orch".into())),
@@ -670,6 +678,11 @@ fn edit_targets_open_their_file_in_the_editor() {
         ),
         ("edit:zenmode", EditTarget::ZenMode, base.join("zenmode.md")),
         ("edit:workflows", EditTarget::Workflows, base.join("workflows")),
+        (
+            "edit:changelog-template",
+            EditTarget::ChangelogTemplate,
+            base.join("changelog-template.md"),
+        ),
     ] {
         let mut s = Scenario::new();
         let effect = s.invoke(id);

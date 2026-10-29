@@ -58,12 +58,14 @@ const PULSE: Duration = Duration::from_millis(1143);
 
 /// The commands the frame lists on an empty query, in its order, with the
 /// desktop's name (`None` keeps the registry's, as the Zen toggle's flips
-/// with its state) and description. The palette calls the Activity view
-/// "Change log", and Quit Project "Close project".
+/// with its state) and description. The palette calls Quit Project "Close
+/// project". Activity, off the sidebar now, is listed after the Changelog so
+/// it stays one keystroke away.
 const DEFAULT_LIST: &[(&str, Option<&str>, &str)] = &[
     ("view:orch", Some("Orchestrator"), "Chat with your Orchestrator agent"),
     ("view:tasks", Some("Issues"), "Manage what Shelbi is working on here"),
-    ("view:activity", Some("Change log"), "Review what your agents have finished"),
+    ("view:changelog", Some("Changelog"), "Review what your agents have finished"),
+    ("view:activity", Some("Activity"), "See what\u{2019}s happened recently"),
     ("view:machines", Some("Machines"), "See the machines running your agents"),
     ("action:toggle-zen", None, "Let Shelbi handle your entire workflow"),
     ("action:error-log", Some("Error log"), "Review recent errors and warnings"),
@@ -123,7 +125,8 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
     let icon = match id {
         "view:orch" => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         "view:tasks" => icons::RECTANGLE_STACK,
-        "view:activity" => icons::BOLT,
+        "view:changelog" => icons::BOLT,
+        "view:activity" => icons::BARS_2,
         // The frame draws Detach with the Machines drawing too.
         "view:machines" | "action:detach" => icons::SERVER_STACK,
         "action:toggle-zen" if entry.label.ends_with(" off") => icons::TOGGLE_ON,
@@ -545,6 +548,7 @@ mod tests {
             views: vec![
                 view("view:orch", "Chat", View::Session("orch".into())),
                 view("view:tasks", "Tasks", View::Issues),
+                view("view:changelog", "Changelog", View::Changelog),
                 view("view:activity", "Activity", View::Activity),
                 view("view:machines", "Machines", View::Machines),
             ],
@@ -579,7 +583,8 @@ mod tests {
         let expected = [
             ("Orchestrator", "Chat with your Orchestrator agent"),
             ("Issues", "Manage what Shelbi is working on here"),
-            ("Change log", "Review what your agents have finished"),
+            ("Changelog", "Review what your agents have finished"),
+            ("Activity", "See what\u{2019}s happened recently"),
             ("Machines", "See the machines running your agents"),
             ("Turn Zen Mode off", "Let Shelbi handle your entire workflow"),
             ("Error log", "Review recent errors and warnings"),
@@ -601,7 +606,7 @@ mod tests {
         assert!(ids("ship").contains(&"review:T-9".to_string()), "the review row");
         assert!(ids("detach other").contains(&"action:detach-others".to_string()));
         assert!(ids("alp").contains(&"workspace:alpha".to_string()));
-        assert_eq!(ids("change").first().map(String::as_str), Some("view:activity"));
+        assert_eq!(ids("change").first().map(String::as_str), Some("view:changelog"));
         assert_eq!(ids("close").first().map(String::as_str), Some("action:quit-project"));
         // Every registry entry is still reachable.
         assert_eq!(entries.len(), CommandRegistry::new().entries(&model()).len());

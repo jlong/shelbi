@@ -14,12 +14,15 @@ use std::collections::HashMap;
 
 /// What the main area is showing.
 ///
-/// `Issues`, `Activity`, and `Machines` are native (in-process) views.
+/// `Issues`, `Changelog`, `Activity`, and `Machines` are native (in-process)
+/// views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
 /// orchestrator chat, a workspace agent, or a review editor/diff session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
     Issues,
+    /// The project's changelog: what has shipped ([`crate::changelog`]).
+    Changelog,
     Activity,
     Machines,
     /// A session rendered in a terminal view, identified by session name.
@@ -40,6 +43,7 @@ impl View {
     pub fn from_view_id(name: &str) -> View {
         match name {
             "tasks" => View::Issues,
+            "changelog" => View::Changelog,
             "activity" => View::Activity,
             "machines" => View::Machines,
             other => View::Session(other.to_string()),
@@ -52,6 +56,7 @@ impl View {
     pub fn as_view_id(&self) -> String {
         match self {
             View::Issues => "tasks".to_string(),
+            View::Changelog => "changelog".to_string(),
             View::Activity => "activity".to_string(),
             View::Machines => "machines".to_string(),
             View::Session(name) => name.clone(),
@@ -433,6 +438,7 @@ mod tests {
     fn view_id_round_trips() {
         for v in [
             View::Issues,
+            View::Changelog,
             View::Activity,
             View::Machines,
             View::Session("orch".into()),
@@ -443,6 +449,7 @@ mod tests {
         // The historical builtin names resolve to the native views.
         assert_eq!(View::from_view_id("tasks"), View::Issues);
         assert_eq!(View::from_view_id("activity"), View::Activity);
+        assert_eq!(View::from_view_id("changelog"), View::Changelog);
         assert_eq!(View::from_view_id("orch"), View::Session("orch".into()));
     }
 

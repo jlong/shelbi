@@ -3437,7 +3437,9 @@ impl ShellState {
     /// "chat" and workspace session views bind a terminal view.
     fn show_view_effect(&mut self, v: View) {
         match v {
-            View::Issues | View::Activity | View::Machines => self.show(RowTarget::Native(v)),
+            View::Issues | View::Changelog | View::Activity | View::Machines => {
+                self.show(RowTarget::Native(v))
+            }
             View::Session(name) if name == "orch" => {
                 self.show(RowTarget::Session(SessionRef::Orchestrator))
             }
@@ -5288,7 +5290,9 @@ fn row_target_to_view(target: &RowTarget) -> Option<View> {
 /// `View::Session` names the session to bind (`orch` is the orchestrator chat).
 fn view_to_row_target(view: &View) -> RowTarget {
     match view {
-        View::Issues | View::Activity | View::Machines => RowTarget::Native(view.clone()),
+        View::Issues | View::Changelog | View::Activity | View::Machines => {
+            RowTarget::Native(view.clone())
+        }
         View::Session(name) if name == ORCH_VIEW => RowTarget::Session(SessionRef::Orchestrator),
         View::Session(name) => RowTarget::Session(SessionRef::Workspace(name.clone())),
     }
@@ -8322,6 +8326,10 @@ mod tests {
                     target: EditTarget::Workflows,
                     title: "Edit Workflows".into(),
                 },
+                EditItem {
+                    target: EditTarget::ChangelogTemplate,
+                    title: "Edit Changelog Template".into(),
+                },
             ]
         }
         fn projects_column(&self, current: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
@@ -8342,6 +8350,8 @@ mod tests {
         st.palette_inputs = Arc::new(FixturePaletteInputs);
         st.other_clients.store(1, Ordering::SeqCst);
         if let Some(model) = st.sidebar_model.as_mut() {
+            // The shipped nav (Changelog in the sidebar, Activity palette-only).
+            model.nav = shelbi_app::view::default_nav_items();
             model.reviews = vec![shelbi_app::view::ReviewRow {
                 task_id: "T-9".into(),
                 title: "Warm the cache".into(),
@@ -8445,6 +8455,7 @@ mod tests {
         for id in [
             "view:orch",
             "view:tasks",
+            "view:changelog",
             "view:activity",
             "view:machines",
             "action:toggle-zen",
@@ -8464,6 +8475,7 @@ mod tests {
             "edit:agent:developer",
             "edit:zenmode",
             "edit:workflows",
+            "edit:changelog-template",
             "action:detach",
             "action:detach-others",
             "action:quit-project",

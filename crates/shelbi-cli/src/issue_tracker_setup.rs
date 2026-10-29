@@ -50,49 +50,7 @@ pub fn github_config(repo: &str) -> Result<IssueTrackerConfig> {
     Ok(cfg)
 }
 
-/// Derive `owner/repo` from an origin remote URL when it points at
-/// github.com, else `None`. Handles the SSH (`git@github.com:owner/repo.git`),
-/// HTTPS (`https://github.com/owner/repo.git`), and `ssh://` forms, strips any
-/// embedded credentials, and trims a trailing `.git`. A non-GitHub host (a
-/// GitLab/Bitbucket/self-hosted remote) returns `None` so the caller offers
-/// File system rather than an `owner/repo` the GitHub backend can't use.
-pub fn detect_github_repo(remote_url: Option<&str>) -> Option<String> {
-    let remote = remote_url?.trim();
-    if remote.is_empty() {
-        return None;
-    }
-
-    // Normalize every supported form down to `host/owner/repo...` and then
-    // require the host to be github.com before taking the first two segments.
-    let host_and_path = if let Some(rest) = remote.strip_prefix("git@") {
-        // scp-like: git@host:owner/repo(.git)
-        rest.split_once(':')
-            .map(|(host, path)| format!("{host}/{path}"))?
-    } else if let Some((_scheme, rest)) = remote.split_once("://") {
-        // scheme://[user[:pw]@]host/owner/repo(.git)
-        let rest = rest.rsplit_once('@').map(|(_, after)| after).unwrap_or(rest);
-        // Drop any query/fragment where tokens hide.
-        rest.split(['?', '#']).next().unwrap_or(rest).to_string()
-    } else {
-        return None;
-    };
-
-    let mut segments = host_and_path
-        .trim_end_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty());
-    let host = segments.next()?;
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let owner = segments.next()?;
-    let repo = segments.next()?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
-}
+pub use shelbi_core::github::detect_github_repo;
 
 /// The raw outcome of one `gh` invocation. The [`GhProbe`] seam returns this so
 /// the classification in [`github_preflight`] stays a pure, testable function.

@@ -84,7 +84,7 @@ pub struct SidebarModel {
     pub orchestrator_status: Option<String>,
 }
 
-/// A fixed nav builtin (Chat / Issues / Activity).
+/// A fixed nav builtin (Chat / Issues / Changelog).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavItem {
     pub label: String,
@@ -361,8 +361,8 @@ impl WorkspaceHeader {
 }
 
 /// The fixed nav builtins, in sidebar order: the orchestrator chat, the issues
-/// board, the activity feed. Machines is reachable from the command palette,
-/// not the sidebar nav.
+/// board, the changelog. Activity and Machines are reachable from the command
+/// palette, not the sidebar nav.
 pub fn default_nav_items() -> Vec<NavItem> {
     vec![
         NavItem {
@@ -374,8 +374,8 @@ pub fn default_nav_items() -> Vec<NavItem> {
             view: View::Issues,
         },
         NavItem {
-            label: "Activity".into(),
-            view: View::Activity,
+            label: "Changelog".into(),
+            view: View::Changelog,
         },
     ]
 }
@@ -1485,15 +1485,17 @@ mod tests {
         assert_eq!(model.project_label, "Alpha");
         assert_eq!(model.zen_mode, ZenModeState::On);
         assert_eq!(model.unread_errors, 4);
-        // Machines moved to the command palette; the nav is Chat / Issues /
-        // Activity only, matching main's sidebar.
+        // Activity and Machines live in the command palette; the nav is
+        // Chat / Issues / Changelog.
         assert_eq!(model.nav.len(), 3);
         assert_eq!(model.nav[1].view, View::Issues);
-        assert_eq!(model.nav[2].view, View::Activity);
-        assert!(
-            !model.nav.iter().any(|n| n.view == View::Machines),
-            "Machines is no longer a sidebar nav entry"
-        );
+        assert_eq!(model.nav[2].view, View::Changelog);
+        for palette_only in [View::Machines, View::Activity] {
+            assert!(
+                !model.nav.iter().any(|n| n.view == palette_only),
+                "{palette_only:?} is not a sidebar nav entry"
+            );
+        }
 
         // One review task.
         assert_eq!(model.reviews.len(), 1);
@@ -1560,7 +1562,7 @@ mod tests {
             [
                 "nav:Orchestrator",
                 "nav:Issues",
-                "nav:Activity",
+                "nav:Changelog",
                 "blank",
                 "section:Workspaces",
                 // Single machine: a flat, unindented list.

@@ -1196,7 +1196,7 @@ impl ShelbiWindow {
             view if is_chat(view) => notify::Showing::Orchestrator,
             View::Session(name) => notify::Showing::Workspace(name.clone()),
             View::Issues => notify::Showing::Board,
-            View::Activity | View::Machines => notify::Showing::Other,
+            View::Changelog | View::Activity | View::Machines => notify::Showing::Other,
         }
     }
 
@@ -2060,6 +2060,9 @@ impl ShelbiWindow {
                     View::Issues => {
                         self.ensure_issues(window, cx);
                     }
+                    // No page entity to build yet: the main area stays
+                    // empty until the Changelog view draws there.
+                    View::Changelog => {}
                     View::Activity => {
                         self.ensure_activity(window, cx);
                     }
@@ -4152,6 +4155,7 @@ impl ShelbiWindow {
                 let view = self.client.view();
                 let content = match view {
                     View::Issues => self.issues.clone().map(|v| v.into_any_element()),
+                    View::Changelog => None,
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
                     View::Session(_) if is_chat(view) => self.chat.clone().map(|v| v.into_any_element()),

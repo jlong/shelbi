@@ -34,8 +34,8 @@ pub(super) fn fixture_model() -> SidebarModel {
             view: View::Issues,
         },
         NavItem {
-            label: "Activity".into(),
-            view: View::Activity,
+            label: "Changelog".into(),
+            view: View::Changelog,
         },
     ];
     m.workspaces = vec![WorkspaceRow {
@@ -74,6 +74,7 @@ fn fixture_inputs() -> PaletteInputs {
             edit(EditTarget::Agent("developer".into()), "Edit developer Settings"),
             edit(EditTarget::ZenMode, "Edit Zen Mode"),
             edit(EditTarget::Workflows, "Edit Workflows"),
+            edit(EditTarget::ChangelogTemplate, "Edit Changelog Template"),
         ],
         projects: Vec::new(),
         others_attached: true,
@@ -230,7 +231,7 @@ fn keystrokes_for(text: &str) -> String {
 fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     let commands = h.commands();
-    assert_eq!(commands.len(), 26, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 28, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");

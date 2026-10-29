@@ -80,6 +80,9 @@ pub enum EditTarget {
     ZenMode,
     /// The project's `workflows/` directory.
     Workflows,
+    /// The project's `changelog-template.md`, the layout new changelog
+    /// entries are written from.
+    ChangelogTemplate,
 }
 
 /// A state mutation routed through the [`Executor`]. These are the

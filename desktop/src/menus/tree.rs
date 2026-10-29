@@ -546,13 +546,12 @@ fn go_menu<'a, I: Iterator<Item = &'a Command>>(
     model: &CommandModel,
     by_place: &impl Fn(Placement) -> I,
 ) -> MenuSpec {
-    // The nav views as the sidebar names them (Activity is "Changelog"
-    // here), with the sidebar's chords (⌘O ⌘I ⌘L; the window takes them
-    // itself, the menu labels them).
+    // The nav views, with the sidebar's chords (⌘O ⌘I ⌘L; the window takes
+    // them itself, the menu labels them).
     let mut items: Vec<MenuEntry> = by_place(Placement::GoView)
         .map(|c| match c.kind() {
             CommandKind::ShowView(view) => {
-                let mut entry = command(c, &crate::views::sidebar::nav_label(view, c.title()));
+                let mut entry = command(c, c.title());
                 if let MenuEntry::Item(item) = &mut entry {
                     item.shortcut = crate::keys::nav_view_chord(view).and_then(|chord| shortcut(&chord));
                 }

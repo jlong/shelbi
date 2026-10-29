@@ -202,6 +202,7 @@ pub fn run_add_project(
 pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
     match view {
         View::Issues => host.show_view(view),
+        View::Changelog => host.show_view(view),
         View::Activity => host.show_view(view),
         View::Machines => host.show_view(view),
         View::Session(_) => host.show_view(view),
@@ -284,6 +285,7 @@ mod tests {
                 EditTarget::Agent(agent) => format!("edit:agent:{agent}"),
                 EditTarget::ZenMode => "edit:zenmode".to_string(),
                 EditTarget::Workflows => "edit:workflows".to_string(),
+                EditTarget::ChangelogTemplate => "edit:changelog-template".to_string(),
             };
             self.0.push(format!("editor:{id}"));
         }
@@ -302,6 +304,7 @@ mod tests {
         let s = |v: &str| v.to_string();
         vec![
             (CommandKind::ShowView(View::Issues), "show:tasks"),
+            (CommandKind::ShowView(View::Changelog), "show:changelog"),
             (CommandKind::ShowView(View::Activity), "show:activity"),
             (CommandKind::ShowView(View::Machines), "show:machines"),
             (CommandKind::ShowView(View::Session(s("orch"))), "show:orch"),
@@ -356,6 +359,12 @@ mod tests {
                 "editor:edit:workflows",
             ),
             (
+                CommandKind::OpenEditor {
+                    target: EditTarget::ChangelogTemplate,
+                },
+                "editor:edit:changelog-template",
+            ),
+            (
                 CommandKind::MoveIssue {
                     id: s("t1"),
                     to_status: s("done"),
@@ -408,6 +417,7 @@ mod tests {
             allowed,
             [
                 "show:tasks",
+                "show:changelog",
                 "show:activity",
                 "show:machines",
                 "show:orch",
@@ -422,6 +432,7 @@ mod tests {
                 "editor:edit:agent:dev",
                 "editor:edit:zenmode",
                 "editor:edit:workflows",
+                "editor:edit:changelog-template",
             ]
         );
     }
@@ -466,6 +477,7 @@ mod tests {
     fn every_view_routes_to_the_main_area() {
         for view in [
             View::Issues,
+            View::Changelog,
             View::Activity,
             View::Machines,
             View::Session("orch".into()),
