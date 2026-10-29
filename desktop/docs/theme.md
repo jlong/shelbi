@@ -254,7 +254,7 @@ what it is for:
 
 | Class | Roles | Dark at 100 | Light at 100 |
 |---|---|---|---|
-| Surface | `canvas`, `sidebar`, `card`, `raised`, `well`, `textbox`, `keycap`, `nav_selected`, `workflow_badge` | 35% toward black (`canvas` `#1e2330` → `#14171f`, `sidebar` `#2c3140` → `#1d202a`) | 50% toward white (`sidebar` `#f9f9fc` → `#fcfcfe`; white stays white) |
+| Surface | `canvas`, `sidebar`, `card`, `raised`, `well`, `textbox`, `keycap`, `nav_selected`, `workflow_badge` | down to a black canvas, each keeping its contrast ratio to the canvas (`canvas` `#1e2330` → `#000000`, `sidebar` `#2c3140` → `#171a24`, `workflow_badge` `#3a4258` → `#292f40`; `card` and `textbox`, darker than the canvas, meet it at black) | 50% toward white (`sidebar` `#f9f9fc` → `#fcfcfe`; white stays white) |
 | Text | `text_loud`, `foreground`, `gray`, `form_text`, `form_hint`, `muted`, `log_text`, `table_text`, `icon`, `button_icon`, `dark_gray`, `workflow_badge_text`, `link_hover` | half toward white, and alpha half toward opaque (`muted` 55% → 78%) | half toward black, alpha half toward opaque (`muted` `#444c65` at 50% → `#222633` at 75%) |
 | Border | `divider`, `divider_strong`, `input_border`, `check_border`, `ring` | half toward white, alpha doubled (`divider` 10% → 20%) | half toward black, alpha doubled |
 | Hue | links, `accent`, the status icons and text, the log hues, focus rings, the colored button labels | a fifth toward white (hue kept) | a fifth toward black (hue kept) |
@@ -262,8 +262,8 @@ what it is for:
 
 The light theme's surfaces are mostly white already, so its separation comes
 mostly from the text, icons and rules. Body text on the canvas goes from
-10.6:1 to 12.5:1 at 50 and 14.7:1 at 100 in Dark, muted text from 5.2:1 to
-7.5:1 and 10.5:1; in Light, body text 8.2:1 to 11.0:1 and 14.8:1, muted
+10.6:1 to 13.3:1 at 50 and 16.8:1 at 100 in Dark, muted text from 5.2:1 to
+7.8:1 and 11.7:1; in Light, body text 8.2:1 to 11.0:1 and 14.8:1, muted
 text 2.5:1 to 3.8:1 and 6.7:1.
 
 The tests hold every pairing the WCAG checks above cover to never losing
