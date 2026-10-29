@@ -17,7 +17,14 @@
 //! properties (and, when the task has them, its tracker owner, dependencies
 //! and pull request), a divider, the body ([`markdown::body`]), and the
 //! created / updated dates. The task operations the old modal put on its
-//! action row are in More ([`PaneAction`]) and keep their keys. The live
+//! action row are in More ([`PaneAction`]) and keep their keys.
+//!
+//! The body's in-place editor (More > Edit description) works on the issue's
+//! draft (`shelbi_app::issue_edit`), which saves itself a moment after typing
+//! stops (Cmd+S saves at once; Done, Esc and Close leave the editor, saving,
+//! never reverting). A quiet line under the title says where the save
+//! stands, with Retry for a failed one and both choices for a change made
+//! elsewhere at the same place. The live
 //! session (`dt-task-pane-session`) takes the pane's bottom, under the
 //! scroll; an idle task's details fill the pane.
 //!
@@ -29,6 +36,7 @@ use gpui::{
     SharedString, Stateful,
 };
 use gpui_kit::component::input::Textarea;
+use shelbi_app::issue_edit::{Field, Resolution, SaveStatus};
 use shelbi_app::TaskDetailModel;
 use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
@@ -273,6 +281,9 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
     let editing = view.editor.as_ref().is_some_and(|(id, _)| *id == d.id);
     let pending = view.state.pending(&d.id).map(|p| p.label.clone());
     let notice = view.state.notice(&d.id).map(str::to_string);
+    // A draft left unsaved (its save failed, or is still out) shows instead
+    // of the read: that's the text the editor will open on.
+    let shown_body = view.state.draft_text(&d.id, Field::Body).unwrap_or_else(|| d.body.clone());
 
     let title = div()
         .debug_selector(|| "pane-title".into())
@@ -282,11 +293,13 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
         .text_color(theme.text_loud)
         .child(d.title.clone());
 
-    let status_rows = (pending.is_some() || notice.is_some()).then(|| {
+    let save_row = save_row(view, &d.id, theme, cx);
+    let status_rows = (pending.is_some() || notice.is_some() || save_row.is_some()).then(|| {
         div()
             .flex()
             .flex_col()
             .gap_1()
+            .children(save_row)
             .when_some(pending, |d, p| d.child(div().type_style(Type::XSmall).text_color(theme.muted).child(p)))
             .when_some(notice, |d, n| {
                 d.child(
@@ -312,22 +325,15 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
             .gap(px(12.0))
             .w_full()
             .child(div().h(px(320.0)).w_full().child(Textarea::new(state).h_full()))
+            // No Save: the draft saves itself. Done leaves the editor.
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        action(theme, "pane-save", ButtonContent::label("Save").hotkey("⌘S"), ButtonKind::Success)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_editor(cx))),
-                    )
-                    .child(
-                        action(theme, "pane-discard", ButtonContent::label("Discard"), ButtonKind::Quiet)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_editor(cx))),
-                    ),
+                div().flex().flex_row().gap_2().child(
+                    action(theme, "pane-done", ButtonContent::label("Done").hotkey("Esc"), ButtonKind::Quiet)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_editor(cx))),
+                ),
             )
             .into_any_element()
-    } else if d.body.trim().is_empty() {
+    } else if shown_body.trim().is_empty() {
         div()
             .debug_selector(|| "pane-empty".into())
             .type_style(Type::Base)
@@ -341,7 +347,7 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
             .type_style(Type::Base)
             .text_color(theme.foreground)
             .child(
-                markdown::body(ElementId::Name(SharedString::from(format!("body-{}", d.id))), d.body.clone(), theme)
+                markdown::body(ElementId::Name(SharedString::from(format!("body-{}", d.id))), shown_body, theme)
                     .w_full()
                     .selectable(true),
             )
@@ -511,6 +517,57 @@ fn value_button(id: &'static str, icon: Option<StatusCategory>, label: impl Into
         .children(icon.map(|cat| style::left_slot(size, style::status_icon_large(cat, theme))))
         .child(div().min_w_0().truncate().child(label.into()))
         .child(style::dropdown_slot(size, c.icon))
+}
+
+/// Where task `id`'s draft save stands (none while nothing is unsaved), with
+/// Retry for a failed save and both choices for a conflicting change.
+fn save_row(view: &IssuesView, id: &str, theme: &Theme, cx: &mut Context<IssuesView>) -> Option<Div> {
+    let save = view.state.save_status(id);
+    let label = save.label()?;
+    let alarm = matches!(save, SaveStatus::Failed(_) | SaveStatus::Invalid { .. } | SaveStatus::Conflict(_));
+    let id = id.to_string();
+    let row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .type_style(Type::XSmall)
+        .text_color(if alarm { theme.error } else { theme.muted })
+        .debug_selector(|| "pane-save-status".into())
+        .child(label)
+        .when(matches!(save, SaveStatus::Failed(_)), |row| {
+            let id = id.clone();
+            row.child(
+                action(theme, "pane-save-retry", ButtonContent::label("Retry"), ButtonKind::Quiet).on_click(
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let intents = this.state.retry_save(&id);
+                        this.apply_intents(intents, window, cx);
+                        cx.notify();
+                    }),
+                ),
+            )
+        })
+        .when(matches!(save, SaveStatus::Conflict(Field::Body | Field::Title)), |row| {
+            let (mine, theirs) = (id.clone(), id.clone());
+            row.child(
+                action(theme, "pane-keep-mine", ButtonContent::label("Keep mine"), ButtonKind::Quiet)
+                    .tooltip(style::tooltip("Save your version over the other change"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.state.resolve_conflict(&mine, Resolution::KeepMine);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                action(theme, "pane-take-theirs", ButtonContent::label("Use theirs"), ButtonKind::Quiet)
+                    .tooltip(style::tooltip("Show the saved version; yours is set aside"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.state.resolve_conflict(&theirs, Resolution::TakeTheirs);
+                        cx.notify();
+                    })),
+            )
+        });
+    Some(row)
 }
 
 /// A compact action under the body editor.

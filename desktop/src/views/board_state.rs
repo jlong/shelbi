@@ -30,6 +30,14 @@
 //! reported it produced ([`Pending::landed`]). A follow-up on the same card
 //! sends that state rather than the read's pre-change one, which the daemon
 //! would refuse as changed elsewhere (`dt-board-stale-after-own-mutation`).
+//!
+//! Editing a card's text is `shelbi_app::issue_edit`'s (`task-inline-edit-
+//! state`): the project's shared [`issue_edit::IssueEdits`] holds the draft, saves it on
+//! a pause in typing or a flush ([`Intent::Save`]), and serializes every
+//! write of an issue. A move, reorder, start or assignment takes the issue's
+//! lane there too; one asked for while a save is out (or with typing not yet
+//! saved, which goes first) is held and sent once the lane frees, never
+//! refused, so a property change and the draft never undo each other.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -39,6 +47,7 @@ use shelbi_app::board::{
     WorkspaceOption,
 };
 use shelbi_app::board_search::{BoardSearch, SearchRequest, SearchWorker};
+use shelbi_app::issue_edit::{self, Field, SaveJob, SaveStatus, SharedEdits, Snapshot};
 use shelbi_app::{
     BoardFilters, CommandKind, Effect, ExecError, ExpectedState, IssueCard, IssuesModel, Mutation,
 };
@@ -87,8 +96,12 @@ pub enum Intent {
     },
     /// Scroll the open detail.
     ScrollDetail(Scroll),
-    /// Open the in-place body editor for `id` (the view seeds it with the body).
+    /// Open the in-place body editor for `id` (the view seeds it with the
+    /// draft's text, [`BoardState::draft_text`]).
     BeginEdit(String),
+    /// Send a save of an issue's draft (`issue_edit`); the view hands the
+    /// answer back to [`BoardState::finish_save`].
+    Save(SaveJob),
     /// Open `id`'s body in the user's configured editor.
     OpenInEditor(String),
     /// Show the new-issue title prompt.
@@ -192,24 +205,14 @@ pub struct MutationJob {
     pub kind: CommandKind,
     /// The state the user was looking at. `None` only for `AddIssue`.
     pub expected: Option<ExpectedState>,
-    /// The new body, for an `EditIssue`.
-    pub body: Option<String>,
 }
 
 impl MutationJob {
     /// The daemon mutation this job sends: the registry's effect for the
-    /// command (`CommandKind::effect_with_project`), with an edit's body
-    /// filled in. `None` for a command that isn't an issue mutation.
+    /// command (`CommandKind::effect_with_project`). `None` for a command
+    /// that isn't one (an edit is a [`SaveJob`]).
     pub fn mutation(&self, project: &str) -> Option<Mutation> {
         match self.kind.effect_with_project(project) {
-            Effect::Mutate(Mutation::EditIssue {
-                project, id, title, ..
-            }) => Some(Mutation::EditIssue {
-                project,
-                id,
-                title,
-                body: self.body.clone(),
-            }),
             Effect::Mutate(m @ (Mutation::MoveIssue { .. }
             | Mutation::StartIssue { .. }
             | Mutation::AssignIssue { .. }
@@ -218,13 +221,6 @@ impl MutationJob {
             _ => None,
         }
     }
-}
-
-/// An edit waiting to be sent: the body, and the card state it was based on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StagedEdit {
-    body: String,
-    expected: Option<ExpectedState>,
 }
 
 /// A letter key outside the keymap: the desktop-only board keys and the TUI's
@@ -275,10 +271,14 @@ pub struct BoardState {
     /// A daemon refusal or failure, shown on the card until dismissed or the
     /// card's next action.
     notices: BTreeMap<String, String>,
-    staged_edits: BTreeMap<String, StagedEdit>,
-    /// The base state of an in-place edit, captured when the editor opened, so
-    /// a save refuses if someone else edited the issue meanwhile.
-    edit_base: BTreeMap<String, ExpectedState>,
+    /// The project's drafts and per-issue write lanes, shared with its other
+    /// windows and with the threads that send its saves.
+    edits: SharedEdits,
+    /// Mutations held for an issue's lane (a save is out, or goes first),
+    /// in the order asked.
+    held: BTreeMap<String, Vec<CommandKind>>,
+    /// The lane each in-flight mutation holds.
+    tickets: BTreeMap<String, issue_edit::WriteTicket>,
     /// The card being dragged, while a drag is on.
     dragging: Option<String>,
     /// One line of feedback under the board.
@@ -290,6 +290,18 @@ pub struct BoardState {
 
 impl BoardState {
     pub fn new(project: impl Into<String>, keymaps: Keymaps) -> Self {
+        let project = project.into();
+        // A test's board keeps its own drafts: tests run in parallel and
+        // share project names.
+        #[cfg(not(test))]
+        let edits = issue_edit::shared(&project);
+        #[cfg(test)]
+        let edits = SharedEdits::default();
+        Self::with_edits(project, keymaps, edits)
+    }
+
+    /// A board over `edits` (a test's own store, not the process's).
+    pub fn with_edits(project: impl Into<String>, keymaps: Keymaps, edits: SharedEdits) -> Self {
         let input = BoardInput::default();
         let filters = BoardFilters::default();
         let model = IssuesModel::build(&input, &filters);
@@ -307,8 +319,9 @@ impl BoardState {
             pane: None,
             pending: BTreeMap::new(),
             notices: BTreeMap::new(),
-            staged_edits: BTreeMap::new(),
-            edit_base: BTreeMap::new(),
+            edits,
+            held: BTreeMap::new(),
+            tickets: BTreeMap::new(),
             dragging: None,
             status: None,
             generation: 0,
@@ -384,6 +397,11 @@ impl BoardState {
             self.input.apply_closed(page);
         }
         self.settle_pending();
+        let mut edits = issue_edit::lock(&self.edits);
+        if edits.watching() {
+            edits.observe(&self.input.tasks());
+        }
+        drop(edits);
         self.rebuild();
     }
 
@@ -896,8 +914,9 @@ impl BoardState {
             Mode::Detail { id, editing } => {
                 if editing {
                     if chord.code == Key::Esc {
-                        self.mode = Mode::Detail { id, editing: false };
-                        return Some(Vec::new());
+                        // Leaving the editor saves what's typed; nothing is
+                        // reverted.
+                        return Some(self.end_edit(&id));
                     }
                     return None;
                 }
@@ -1175,13 +1194,14 @@ impl BoardState {
         vec![Intent::BeginAdd]
     }
 
-    /// Open the in-place editor on `id`'s body, remembering the state it is
-    /// based on.
+    /// Open the in-place editor on `id`'s body. There is no Save: the
+    /// draft saves itself (`issue_edit`), and the editor shows the draft,
+    /// so text left unsaved earlier comes back.
     pub fn begin_edit(&mut self, id: &str) -> Vec<Intent> {
-        let Some(card) = self.model.card(id) else {
+        let Some(snap) = self.snapshot(id) else {
             return Vec::new();
         };
-        self.edit_base.insert(id.to_string(), card.expected());
+        issue_edit::lock(&self.edits).open(&snap);
         self.open_detail(id);
         self.mode = Mode::Detail {
             id: id.to_string(),
@@ -1190,16 +1210,42 @@ impl BoardState {
         vec![Intent::BeginEdit(id.to_string())]
     }
 
-    /// Save an in-place edit: stage the body against the state the editor
-    /// opened on and emit the registry's `EditIssue`.
-    pub fn save_edit(&mut self, id: &str, body: String) -> Vec<Intent> {
-        let expected = self
-            .edit_base
-            .remove(id)
-            .or_else(|| self.model.card(id).map(IssueCard::expected));
-        self.staged_edits
-            .insert(id.to_string(), StagedEdit { body, expected });
-        if let Mode::Detail { id: open, .. } = &self.mode {
+    /// `id` as the board read it, for the draft store.
+    fn snapshot(&self, id: &str) -> Option<Snapshot> {
+        self.input
+            .tasks()
+            .iter()
+            .find(|tf| tf.task.id == id)
+            .map(Snapshot::of)
+    }
+
+    /// The user typed: `field` of `id`'s draft is now `text`. It saves after
+    /// a pause ([`BoardState::poll_saves`]).
+    pub fn edit_text(&mut self, id: &str, field: Field, text: &str, now: std::time::Instant) {
+        issue_edit::lock(&self.edits).edit(id, field, text, now);
+    }
+
+    /// The text the editor shows for `id`'s `field`, while it has a draft.
+    pub fn draft_text(&self, id: &str, field: Field) -> Option<String> {
+        issue_edit::lock(&self.edits).text(id, field).map(str::to_string)
+    }
+
+    /// Where `id`'s edits stand, for the detail's quiet feedback.
+    pub fn save_status(&self, id: &str) -> SaveStatus {
+        issue_edit::lock(&self.edits).status(id)
+    }
+
+    /// Save `id`'s draft now (Cmd+S, the editor losing focus). The editor
+    /// stays open.
+    pub fn flush_edit(&mut self, id: &str) -> Vec<Intent> {
+        let job = issue_edit::lock(&self.edits).flush(id);
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// Close the editor on `id` (Escape, Done, leaving the task): what's
+    /// typed is saved, and a draft that can't be is kept for next time.
+    pub fn end_edit(&mut self, id: &str) -> Vec<Intent> {
+        if let Mode::Detail { id: open, editing: true } = &self.mode {
             if open == id {
                 self.mode = Mode::Detail {
                     id: id.to_string(),
@@ -1207,15 +1253,100 @@ impl BoardState {
                 };
             }
         }
-        vec![Intent::Command(CommandKind::EditIssue { id: id.to_string() })]
+        let job = issue_edit::lock(&self.edits).close(id);
+        job.map(Intent::Save).into_iter().collect()
     }
 
-    /// A save from the external editor: based on what the board shows now.
+    /// Send a failed save of `id` again.
+    pub fn retry_save(&mut self, id: &str) -> Vec<Intent> {
+        let job = issue_edit::lock(&self.edits).retry(id);
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// Settle a conflict in `id`'s draft.
+    pub fn resolve_conflict(&mut self, id: &str, resolution: issue_edit::Resolution) {
+        let mut edits = issue_edit::lock(&self.edits);
+        if let Some(conflict) = edits.conflict(id) {
+            edits.resolve(id, conflict.field, resolution);
+        }
+    }
+
+    /// The saves due now, across the project's drafts.
+    pub fn poll_saves(&mut self, now: std::time::Instant) -> Vec<Intent> {
+        issue_edit::lock(&self.edits)
+            .poll(now)
+            .into_iter()
+            .map(Intent::Save)
+            .collect()
+    }
+
+    /// Flush every draft with unsaved work (the view is going away: a
+    /// project switch). Saves that fail keep their drafts in the project's
+    /// store, which outlives the view.
+    pub fn flush_all_edits(&mut self) -> Vec<Intent> {
+        let mut edits = issue_edit::lock(&self.edits);
+        let ids: Vec<String> = edits.unsaved().into_iter().map(|(id, _)| id).collect();
+        ids.iter().filter_map(|id| edits.flush(id)).map(Intent::Save).collect()
+    }
+
+    /// The text changes the editor must apply (a read changed the stored
+    /// text under the draft).
+    pub fn take_text_updates(&mut self) -> Vec<issue_edit::Update> {
+        issue_edit::lock(&self.edits).take_updates()
+    }
+
+    /// A save's answer, recorded off the UI thread (the store is shared), so
+    /// it lands even when the view that sent it is gone.
+    pub fn record_save(
+        edits: &SharedEdits,
+        job: &SaveJob,
+        result: Result<Option<ExpectedState>, ExecError>,
+    ) {
+        issue_edit::lock(edits).finish(job, result, std::time::Instant::now());
+    }
+
+    /// The store a save's answer goes to ([`BoardState::record_save`]).
+    pub fn edits(&self) -> SharedEdits {
+        self.edits.clone()
+    }
+
+    /// A save of `id` finished: re-read, and send what waited for it.
+    pub fn finish_save(&mut self, id: &str) -> Vec<Intent> {
+        let mut out = vec![Intent::Refresh];
+        out.extend(self.release_held(id));
+        out
+    }
+
+    /// A save from the external editor: the body as the user wrote it there,
+    /// saved at once (and shown in the in-place editor if it's open on it).
     pub fn save_external_edit(&mut self, id: &str, body: String) -> Vec<Intent> {
-        let expected = self.model.card(id).map(IssueCard::expected);
-        self.staged_edits
-            .insert(id.to_string(), StagedEdit { body, expected });
-        vec![Intent::Command(CommandKind::EditIssue { id: id.to_string() })]
+        let snap = self.snapshot(id);
+        let mut edits = issue_edit::lock(&self.edits);
+        let opened_here = !edits.has_draft(id);
+        if opened_here {
+            let Some(snap) = snap else {
+                drop(edits);
+                self.status = Some(format!("{id} is no longer on the board"));
+                return Vec::new();
+            };
+            edits.open(&snap);
+        }
+        edits.edit_from_elsewhere(id, Field::Body, &body, std::time::Instant::now());
+        let job = if opened_here { edits.close(id) } else { edits.flush(id) };
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// The mutations held for `id`'s lane, once it is free.
+    fn release_held(&mut self, id: &str) -> Vec<Intent> {
+        if issue_edit::lock(&self.edits).busy(id) {
+            return Vec::new();
+        }
+        self.held
+            .remove(id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Intent::Command)
+            .collect()
     }
 
     pub fn submit_add(&mut self, title: &str) -> Vec<Intent> {
@@ -1245,10 +1376,12 @@ impl BoardState {
 
     /// Turn an issue command into a job to send, capturing the state the user
     /// is looking at and marking the card pending. One mutation per issue at a
-    /// time: a second one while the first is in flight is refused here.
+    /// time: a second one while the first is in flight is refused here. One
+    /// asked for while the issue's draft is saving, or has typing not yet
+    /// saved (which is sent first), is held and comes back as an
+    /// [`Intent::Command`] once the save lands.
     ///
-    /// An `EditIssue` with no staged body (e.g. from the palette) opens the
-    /// in-place editor instead.
+    /// `EditIssue` (the palette's, `e`) opens the in-place editor.
     pub fn begin_mutation(&mut self, kind: &CommandKind) -> Result<MutationJob, Vec<Intent>> {
         let (id, label, to_status, to_slot) = match kind {
             CommandKind::MoveIssue { id, to_status } => {
@@ -1269,12 +1402,7 @@ impl BoardState {
             CommandKind::AssignIssue { id, workspace } => {
                 (id.clone(), format!("Assigning to @{workspace}…"), None, None)
             }
-            CommandKind::EditIssue { id } => {
-                if !self.staged_edits.contains_key(id) {
-                    return Err(self.begin_edit(id));
-                }
-                (id.clone(), "Saving…".to_string(), None, None)
-            }
+            CommandKind::EditIssue { id } => return Err(self.begin_edit(id)),
             CommandKind::PrioritizeIssue { id, position } => {
                 (id.clone(), "Reordering…".to_string(), None, Some(*position))
             }
@@ -1308,7 +1436,6 @@ impl BoardState {
                     id: ADD_KEY.to_string(),
                     kind: kind.clone(),
                     expected: None,
-                    body: None,
                 });
             }
             _ => return Err(Vec::new()),
@@ -1323,15 +1450,24 @@ impl BoardState {
             self.status = Some(format!("{id}: a change is already in progress"));
             return Err(Vec::new());
         }
-        let staged = match kind {
-            CommandKind::EditIssue { .. } => self.staged_edits.remove(&id),
-            _ => None,
+        // The draft's lane: typing not yet saved goes first, and a save
+        // that's out finishes first; this change waits its turn.
+        let (flushed, busy) = {
+            let mut edits = issue_edit::lock(&self.edits);
+            let flushed = edits.flush(&id);
+            let busy = edits.busy(&id);
+            (flushed, busy)
         };
-        let seen = match &staged {
-            Some(s) => s.expected.clone(),
-            None => self.model.card(&id).map(IssueCard::expected),
-        };
-        let expected = seen.map(|seen| self.own_expected(&id, seen));
+        if busy {
+            self.held.entry(id.clone()).or_default().push(kind.clone());
+            self.status = Some(format!("{id}: waiting for the save in progress"));
+            return Err(flushed.map(Intent::Save).into_iter().collect());
+        }
+        let seen = self.model.card(&id).map(IssueCard::expected);
+        let expected = seen.map(|seen| {
+            let own = self.own_expected(&id, seen);
+            issue_edit::lock(&self.edits).expected(&id, own)
+        });
         let Some(sent_from) = expected.clone() else {
             self.status = Some(format!("{id} is no longer on the board"));
             return Err(vec![Intent::Refresh]);
@@ -1367,6 +1503,9 @@ impl BoardState {
             None => (sent_from.clone(), to_status, to_slot),
         };
         self.notices.remove(&id);
+        if let Some(ticket) = issue_edit::lock(&self.edits).begin_write(&id, &sent_from) {
+            self.tickets.insert(id.clone(), ticket);
+        }
         self.pending.insert(
             id.clone(),
             Pending {
@@ -1386,7 +1525,6 @@ impl BoardState {
             id,
             kind: kind.clone(),
             expected,
-            body: staged.map(|s| s.body),
         })
     }
 
@@ -1402,6 +1540,11 @@ impl BoardState {
         id: &str,
         result: Result<Option<ExpectedState>, ExecError>,
     ) -> Vec<Intent> {
+        if let Some(ticket) = self.tickets.remove(id) {
+            let landed = result.as_ref().ok().cloned().flatten();
+            issue_edit::lock(&self.edits).end_write(&ticket, landed);
+        }
+        let released = self.release_held(id);
         match result {
             Ok(landed) => {
                 if let Some(p) = self.pending.get_mut(id) {
@@ -1441,7 +1584,9 @@ impl BoardState {
                 self.rebuild();
             }
         }
-        vec![Intent::Refresh]
+        let mut out = vec![Intent::Refresh];
+        out.extend(released);
+        out
     }
 
     /// The state a mutation of `id` should expect, given the state the user
@@ -1706,8 +1851,14 @@ pub(crate) mod tests {
         km
     }
 
+    /// A board with its own draft store (the process's is shared across
+    /// tests running at once).
+    fn fresh_board() -> BoardState {
+        BoardState::with_edits("demo", default_keymaps(), Default::default())
+    }
+
     fn board(tasks: Vec<IssueFile>) -> BoardState {
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(read(tasks));
         b.apply_closed(None);
         b
@@ -1793,7 +1944,7 @@ pub(crate) mod tests {
     #[test]
     fn a_github_board_searches_github_and_load_more_pages_the_results() {
         use shelbi_app::board_search::DEBOUNCE;
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         let mut r = read(vec![issue("A", "todo"), issue("B", "todo")]);
         r.project.as_mut().unwrap().remote_search = true;
         b.apply_open(r);
@@ -1866,7 +2017,7 @@ pub(crate) mod tests {
         if let Some(p) = r.project.as_mut() {
             p.ownership = shelbi_state::OwnershipGate::RequireAssignee("octocat".into());
         }
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(r);
         b.apply_closed(None);
 
@@ -2250,44 +2401,179 @@ pub(crate) mod tests {
         assert_eq!(job.expected, Some(at("review", 7)));
         b.finish_mutation("A", Ok(Some(at("in-progress", 8))));
 
-        // An edit staged against the state from before the other client's
-        // change isn't taken for this client's own: it goes as the editor saw
-        // it, and the daemon refuses it.
-        b.save_edit("A", "new body".into());
-        let job = b
-            .begin_mutation(&CommandKind::EditIssue { id: "A".into() })
-            .unwrap();
-        assert_eq!(job.expected, Some(at("todo", 0)));
+        // The editor opened before the other client's change, but its draft
+        // follows the reads (and is guarded by the text it replaces), so its
+        // save is based on that change plus the start this client landed.
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "new body", t0);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.expected, Some(at("in-progress", 8)));
+        assert_eq!(save.expect_body.as_deref(), Some("Body of A"));
+    }
+
+    /// The saves due a second after `t0`, past the typing pause.
+    fn saves_after_pause(b: &mut BoardState, t0: std::time::Instant) -> Vec<SaveJob> {
+        b.poll_saves(t0 + std::time::Duration::from_secs(1))
+            .into_iter()
+            .map(|i| match i {
+                Intent::Save(job) => job,
+                other => panic!("not a save: {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
-    fn edits_stage_the_body_against_the_state_the_editor_opened_on() {
+    fn editing_saves_on_its_own_and_never_leaves_the_editor() {
         let mut b = board(vec![issue("A", "todo")]);
         b.select(1, 0);
         assert_eq!(press(&mut b, "e"), vec![Intent::BeginEdit("A".into())]);
-        assert_eq!(
-            b.mode,
-            Mode::Detail {
-                id: "A".into(),
-                editing: true
-            }
-        );
+        let editing = Mode::Detail { id: "A".into(), editing: true };
+        assert_eq!(b.mode, editing);
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("Body of A"));
         // While editing, plain keys belong to the editor.
         assert!(b.handle_key(key("j")).is_none());
-        let out = b.save_edit("A", "new body".into());
-        assert_eq!(out, vec![Intent::Command(CommandKind::EditIssue { id: "A".into() })]);
-        let job = b.begin_mutation(&CommandKind::EditIssue { id: "A".into() }).unwrap();
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "new body", t0);
+        assert_eq!(b.save_status("A"), SaveStatus::Unsaved);
+        let job = saves_after_pause(&mut b, t0).pop().expect("saved after the pause");
         assert_eq!(job.body.as_deref(), Some("new body"));
-        assert_eq!(job.expected.unwrap().status, "todo");
-        // An EditIssue with nothing staged (from the palette) opens the editor.
-        b.finish_mutation("A", Ok(None));
-        let mut later = issue("A", "todo");
-        later.task.updated_at += chrono::Duration::seconds(1);
-        b.apply_open(read(vec![later]));
+        assert_eq!(job.expect_body.as_deref(), Some("Body of A"));
+        assert_eq!(job.expected.clone().unwrap(), at("todo", 0));
+        assert_eq!(b.mode, editing, "a save doesn't leave the editor");
+        BoardState::record_save(&b.edits(), &job, Ok(Some(at("todo", 3))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh]);
+        assert_eq!(b.save_status("A"), SaveStatus::Saved);
+        // Cmd+S with nothing new sends nothing and stays.
+        assert!(b.flush_edit("A").is_empty());
+        assert_eq!(b.mode, editing);
+        // Escape closes the editor, saving (not reverting) what's typed.
+        b.edit_text("A", Field::Body, "newer body", t0);
+        let out = b.handle_key(key("esc")).unwrap();
+        assert!(matches!(&out[..], [Intent::Save(job)] if job.body.as_deref() == Some("newer body")));
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        // The palette's Edit opens the editor.
         assert_eq!(
             b.begin_mutation(&CommandKind::EditIssue { id: "A".into() }),
             Err(vec![Intent::BeginEdit("A".into())])
         );
+    }
+
+    #[test]
+    fn a_move_asked_for_while_a_save_is_out_waits_and_expects_where_it_landed() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "mine", t0);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        assert_eq!(b.begin_mutation(&mv), Err(Vec::new()), "held, not refused");
+        assert_eq!(b.status.as_deref(), Some("A: waiting for the save in progress"));
+        assert!(b.pending("A").is_none());
+        BoardState::record_save(&b.edits(), &save, Ok(Some(at("todo", 5))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh, Intent::Command(mv.clone())]);
+        // The read still shows rev 0: the move expects the save's revision.
+        let job = b.begin_mutation(&mv).unwrap();
+        assert_eq!(job.expected, Some(at("todo", 5)));
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_move_with_typing_not_yet_saved_sends_the_typing_first() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        b.edit_text("A", Field::Body, "mine", std::time::Instant::now());
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        let out = b.begin_mutation(&mv).unwrap_err();
+        let [Intent::Save(save)] = &out[..] else {
+            panic!("the typing is saved first: {out:?}");
+        };
+        assert_eq!(save.body.as_deref(), Some("mine"));
+        BoardState::record_save(&b.edits(), save, Ok(Some(at("todo", 2))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh, Intent::Command(mv)]);
+    }
+
+    #[test]
+    fn a_save_after_a_move_expects_the_moves_landed_state_and_keeps_the_draft() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        b.begin_mutation(&mv).unwrap();
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "typed during the move", t0);
+        assert!(saves_after_pause(&mut b, t0).is_empty(), "the save waits for the move");
+        assert_eq!(b.finish_mutation("A", Ok(Some(at("review", 4)))), vec![Intent::Refresh]);
+        // The board's read lags: it still has the card in todo at rev 0.
+        b.apply_open(read(vec![issue("A", "todo")]));
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.expected, Some(at("review", 4)));
+        assert_eq!(save.body.as_deref(), Some("typed during the move"));
+    }
+
+    #[test]
+    fn an_agents_change_elsewhere_merges_into_the_open_draft() {
+        let mut a = issue("A", "todo");
+        a.body = "Body of A\n\nmore\n".into();
+        let mut b = board(vec![a]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "Body of A, edited\n\nmore\n", t0);
+        let mut theirs = issue_at("A", "todo", 9);
+        theirs.body = "Body of A\n\nmore\n\n## Agent notes\nfound it\n".into();
+        b.apply_open(read(vec![theirs.clone()]));
+        let merged = "Body of A, edited\n\nmore\n\n## Agent notes\nfound it\n";
+        let updates = b.take_text_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, merged);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.expected, Some(at("todo", 9)));
+        assert_eq!(save.body.as_deref(), Some(merged));
+        assert_eq!(save.expect_body.as_deref(), Some(theirs.body.as_str()));
+        // The same line changed elsewhere too: both kept, nothing saved.
+        BoardState::record_save(&b.edits(), &save, Ok(Some(at("todo", 10))));
+        b.edit_text("A", Field::Body, "Mine\n\nmore\n\n## Agent notes\nfound it\n", t0);
+        let mut again = issue_at("A", "todo", 11);
+        again.body = "Theirs\n\nmore\n\n## Agent notes\nfound it\n".into();
+        b.apply_open(read(vec![again]));
+        assert_eq!(b.save_status("A"), SaveStatus::Conflict(Field::Body));
+        assert!(saves_after_pause(&mut b, t0).is_empty());
+        b.resolve_conflict("A", issue_edit::Resolution::KeepMine);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.body.as_deref(), Some("Mine\n\nmore\n\n## Agent notes\nfound it\n"));
+    }
+
+
+    #[test]
+    fn an_external_editor_save_goes_through_the_draft_store() {
+        let mut b = board(vec![issue("A", "todo")]);
+        let out = b.save_external_edit("A", "from vim".into());
+        let [Intent::Save(job)] = &out[..] else {
+            panic!("saved at once: {out:?}");
+        };
+        assert_eq!(job.body.as_deref(), Some("from vim"));
+        BoardState::record_save(&b.edits(), job, Ok(Some(at("todo", 1))));
+        assert_eq!(b.draft_text("A", Field::Body), None, "nothing kept once it's stored");
+        // With the in-place editor open, it shows the new text.
+        b.begin_edit("A");
+        b.save_external_edit("A", "from vim again".into());
+        assert_eq!(b.take_text_updates().pop().unwrap().text, "from vim again");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_draft_past_closing_the_editor() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        b.edit_text("A", Field::Body, "precious", std::time::Instant::now());
+        let out = b.end_edit("A");
+        let [Intent::Save(job)] = &out[..] else {
+            panic!("closing flushes: {out:?}");
+        };
+        BoardState::record_save(&b.edits(), job, Err(ExecError::Backend("offline".into())));
+        b.close_overlay();
+        assert_eq!(b.save_status("A"), SaveStatus::Failed("offline".into()));
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("precious"));
+        b.begin_edit("A");
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("precious"));
+        assert!(matches!(&b.retry_save("A")[..], [Intent::Save(_)]));
     }
 
     #[test]
@@ -2314,18 +2600,9 @@ pub(crate) mod tests {
     #[test]
     fn jobs_become_the_registrys_daemon_mutations() {
         let mut b = board(vec![issue("A", "todo")]);
-        b.save_edit("A", "edited".into());
-        let job = b.begin_mutation(&CommandKind::EditIssue { id: "A".into() }).unwrap();
-        assert_eq!(
-            job.mutation("demo"),
-            Some(Mutation::EditIssue {
-                project: "demo".into(),
-                id: "A".into(),
-                title: None,
-                body: Some("edited".into()),
-            })
-        );
+        b.begin_mutation(&CommandKind::StartIssue { id: "A".into() }).unwrap();
         b.finish_mutation("A", Err(ExecError::Backend("boom".into())));
+        assert_eq!(b.notice("A"), Some("boom"));
         let job = b
             .begin_mutation(&CommandKind::MoveIssue {
                 id: "A".into(),
@@ -2345,14 +2622,13 @@ pub(crate) mod tests {
             id: "x".into(),
             kind: CommandKind::ToggleZen,
             expected: None,
-            body: None,
         };
         assert_eq!(not_issue.mutation("demo"), None);
     }
 
     #[test]
     fn the_done_column_fills_after_the_open_board() {
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(read(vec![issue("A", "todo")]));
         assert!(b.model().done_loading);
         assert_eq!(b.model().columns[1].cards.len(), 1);
@@ -2376,7 +2652,7 @@ pub(crate) mod tests {
     }
 
     fn shipped_board(tasks: Vec<IssueFile>) -> BoardState {
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(shipped_read(tasks));
         b.apply_closed(None);
         b

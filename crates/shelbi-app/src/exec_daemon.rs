@@ -171,12 +171,18 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
             id,
             title,
             body,
+            workflow,
+            expect_title,
+            expect_body,
         } => (
             project.clone(),
             id.clone(),
             MutationKind::Edit(Box::new(EditSpec {
                 title: title.clone(),
                 body_replace: body.clone(),
+                workflow: workflow.clone(),
+                expect_title: expect_title.clone(),
+                expect_body: expect_body.clone(),
                 ..Default::default()
             })),
         ),

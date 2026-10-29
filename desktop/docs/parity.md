@@ -57,7 +57,7 @@ paths on every `cargo test`.
 | Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column) |
 | Assign | (board) `AssignIssue` | Not on the TUI board (see Known gaps) | `a`: workspace picker; `@dev` written |
 | Start | (board) `StartIssue` | Not on the TUI board | `s`: dispatched to `dev`; the sandbox agent never confirmed, so the daemon rolled it back |
-| Edit | (board) `EditIssue` | Not on the TUI board | `e`: in-place editor; ⌘S saved the body |
+| Edit | (board) `EditIssue` | Not on the TUI board | `e`: in-place editor over the shared draft (`shelbi_app::issue_edit`, `task-inline-edit-state`): saves itself after a pause, ⌘S saves at once, Esc / Done close it saving |
 | New issue | (board) `AddIssue` | Not on the TUI board | `n`: form; the issue was created in `backlog` |
 
 ## Platform differences (by design)

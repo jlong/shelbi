@@ -780,6 +780,9 @@ fn board_mutations_carry_the_project() {
                 id: s("T-1"),
                 title: None,
                 body: None,
+                workflow: None,
+                expect_title: None,
+                expect_body: None,
             },
         ),
         (

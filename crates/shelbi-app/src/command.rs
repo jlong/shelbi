@@ -217,6 +217,9 @@ impl CommandKind {
                 id: id.clone(),
                 title: None,
                 body: None,
+                workflow: None,
+                expect_title: None,
+                expect_body: None,
             }),
             CommandKind::AddIssue { title } => Effect::Mutate(Mutation::AddIssue {
                 project: p(),

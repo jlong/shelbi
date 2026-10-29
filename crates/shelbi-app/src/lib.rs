@@ -67,6 +67,7 @@ pub mod command;
 pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
+pub mod issue_edit;
 pub mod feedback;
 pub mod layout_sub;
 pub mod licenses;

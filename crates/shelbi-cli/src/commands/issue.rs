@@ -1417,6 +1417,8 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
         branch: args.branch,
         prefers_machine,
         reason: args.reason,
+        expect_title: None,
+        expect_body: None,
     };
     mutate_client::run_mutation(project, &args.id, MutationKind::Edit(Box::new(spec)))
 }
