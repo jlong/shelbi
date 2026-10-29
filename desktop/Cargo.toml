@@ -73,6 +73,12 @@ libc = { version = "0.2", optional = true }
 # Bootstrap publishes its states from a std thread to the UI's async task.
 # Already in gpui's tree.
 async-channel = "2"
+# The board's collapsed columns draw their rotated label from glyph
+# outlines (gpui can't rotate text): ttf-parser reads the bundled faces',
+# fontdb finds a system face for a character they lack. Both already in
+# gpui's tree (resvg's).
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 # The Markdown parser gpui-kit's text view renders with (pinned to the version
 # gpui-base resolves), for the task detail's checklist count and its tests.
 markdown = "=1.0.0"

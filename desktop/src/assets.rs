@@ -537,6 +537,21 @@ const GEIST: &[&[u8]] = &[
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Bold.ttf")),
 ];
 
+/// The weights of [`GEIST`]'s faces, in its order.
+const GEIST_WEIGHTS: [f32; 4] = [400.0, 500.0, 600.0, 700.0];
+
+/// The bundled Geist face nearest `weight`: its font file, for code that
+/// reads glyph outlines itself (`elements::rotated_text`).
+pub fn ui_face(weight: gpui::FontWeight) -> &'static [u8] {
+    let nearest = (0..GEIST.len())
+        .min_by(|&a, &b| {
+            let off = |i: usize| (GEIST_WEIGHTS[i] - weight.0).abs();
+            off(a).total_cmp(&off(b))
+        })
+        .unwrap_or(0);
+    GEIST[nearest]
+}
+
 /// Source Code Pro, the terminal typeface (SIL Open Font License 1.1,
 /// vendored with its license under `assets/fonts/source-code-pro/`, from
 /// Adobe's release branch): regular, bold, and their italics, so the
