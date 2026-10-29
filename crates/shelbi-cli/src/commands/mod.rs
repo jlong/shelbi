@@ -27,6 +27,7 @@ pub mod quit;
 pub mod reload;
 pub mod reload_session;
 pub mod relay;
+pub mod remote;
 pub mod review_serve;
 pub mod send;
 pub mod session;

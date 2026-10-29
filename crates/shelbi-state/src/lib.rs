@@ -322,7 +322,14 @@ pub fn shelbi_home() -> Result<PathBuf> {
 }
 
 pub fn projects_dir() -> Result<PathBuf> {
-    Ok(shelbi_home()?.join("projects"))
+    Ok(projects_dir_in(&shelbi_home()?))
+}
+
+/// [`projects_dir`] under an explicit Shelbi `home` instead of the resolved
+/// one, for callers (and fixtures) that hand a home to a child `shelbi`
+/// rather than setting `SHELBI_HOME` in-process.
+pub fn projects_dir_in(home: &Path) -> PathBuf {
+    home.join("projects")
 }
 
 /// Whether `project` already has a discoverable local registration in either

@@ -66,9 +66,9 @@ use shelbi_state::KanbanColumnOverride;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Board,
-    /// The task pane for `id` has the keys. `editing` while the in-place
-    /// body editor is open (the editor then owns the keys; see
-    /// [`BoardState::handle_key`]).
+    /// The task pane for `id` has the keys. `editing` while one of its
+    /// in-place editors (the title, the body) has them: the editor owns the
+    /// keys then (see [`BoardState::handle_key`]).
     Detail { id: String, editing: bool },
     /// The pane's More menu, its keyboard row at `cursor`
     /// ([`BoardState::pane_actions`]).
@@ -103,8 +103,8 @@ pub enum Intent {
     },
     /// Scroll the open detail.
     ScrollDetail(Scroll),
-    /// Open the in-place body editor for `id` (the view seeds it with the
-    /// draft's text, [`BoardState::draft_text`]).
+    /// Put the keys in `id`'s body editor, the caret at the end (the Edit
+    /// command: there is no edit mode to open).
     BeginEdit(String),
     /// Send a save of an issue's draft (`issue_edit`); the view hands the
     /// answer back to [`BoardState::finish_save`].
@@ -813,6 +813,12 @@ impl BoardState {
         self.pane_focus = None;
     }
 
+    /// Put the keyboard on `property` (Tab coming in from the title or the
+    /// body editor), or off the values.
+    pub fn set_pane_focus(&mut self, property: Option<Property>) {
+        self.pane_focus = property;
+    }
+
     /// The pane's property values for `id`, with this client's in-flight
     /// change shown where it is headed.
     pub fn pane_properties(&self, id: &str) -> Option<PaneProperties> {
@@ -1218,7 +1224,7 @@ impl BoardState {
                     if chord.code == Key::Esc {
                         // Leaving the editor saves what's typed; nothing is
                         // reverted.
-                        return Some(self.end_edit(&id));
+                        return Some(self.editor_blurred(&id));
                     }
                     return None;
                 }
@@ -1513,9 +1519,10 @@ impl BoardState {
         vec![Intent::BeginAdd]
     }
 
-    /// Open the in-place editor on `id`'s body. There is no Save: the
-    /// draft saves itself (`issue_edit`), and the editor shows the draft,
-    /// so text left unsaved earlier comes back.
+    /// Edit `id`'s body (`e`, More > Edit description, the palette's Edit):
+    /// the pane shows it and its body editor takes the keys. There is no
+    /// Save: the draft saves itself (`issue_edit`), and the editor shows the
+    /// draft, so text left unsaved earlier comes back.
     pub fn begin_edit(&mut self, id: &str) -> Vec<Intent> {
         let Some(snap) = self.snapshot(id) else {
             return Vec::new();
@@ -1539,9 +1546,47 @@ impl BoardState {
     }
 
     /// The user typed: `field` of `id`'s draft is now `text`. It saves after
-    /// a pause ([`BoardState::poll_saves`]).
+    /// a pause ([`BoardState::poll_saves`]). A field edited without its
+    /// editor having had the keys (a checkbox clicked) starts the draft.
     pub fn edit_text(&mut self, id: &str, field: Field, text: &str, now: std::time::Instant) {
-        issue_edit::lock(&self.edits).edit(id, field, text, now);
+        let snap = self.snapshot(id);
+        let mut edits = issue_edit::lock(&self.edits);
+        if edits.text(id, field).is_none() {
+            if let Some(snap) = &snap {
+                edits.open(snap);
+            }
+        }
+        edits.edit(id, field, text, now);
+    }
+
+    /// One of `id`'s editors took the keys: its draft opens (or picks up
+    /// the one left unsaved), and the board's keys stay out of the way.
+    pub fn editor_focused(&mut self, id: &str) {
+        if let Some(snap) = self.snapshot(id) {
+            issue_edit::lock(&self.edits).open(&snap);
+        }
+        if let Mode::Detail { id: open, .. } = &self.mode {
+            if open == id {
+                self.mode = Mode::Detail {
+                    id: id.to_string(),
+                    editing: true,
+                };
+            }
+        }
+    }
+
+    /// The keys left `id`'s editor: what's typed saves now, and the pane
+    /// has the keys again. The draft stays open while the task does.
+    pub fn editor_blurred(&mut self, id: &str) -> Vec<Intent> {
+        if let Mode::Detail { id: open, editing: true } = &self.mode {
+            if open == id {
+                self.mode = Mode::Detail {
+                    id: id.to_string(),
+                    editing: false,
+                };
+            }
+        }
+        self.flush_edit(id)
     }
 
     /// The text the editor shows for `id`'s `field`, while it has a draft.
@@ -1561,7 +1606,7 @@ impl BoardState {
         job.map(Intent::Save).into_iter().collect()
     }
 
-    /// Close the editor on `id` (Escape, Done, leaving the task): what's
+    /// Leave `id`'s editors (closing the task, opening another): what's
     /// typed is saved, and a draft that can't be is kept for next time.
     pub fn end_edit(&mut self, id: &str) -> Vec<Intent> {
         if let Mode::Detail { id: open, editing: true } = &self.mode {

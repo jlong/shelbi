@@ -46,6 +46,11 @@
 //! README). Its constant ends in `_BUTTON` (`icons::USER_BUTTON`) and
 //! [`heroicon`] draws it at [`ICON_SIZE_BUTTON`].
 //!
+//! The launch window draws its folders at **32pt**: the `@large` list, the
+//! Figma frames' drawings on a 32pt grid under `assets/icons/heroicons-32/`
+//! (see its README), a card's at the outline set's stroke scaled up and the
+//! empty state's thinner. [`heroicon`] draws them at [`ICON_SIZE_LARGE`].
+//!
 //! The project menus (the switcher and the palette's Projects column) draw
 //! their rows' marks at **16pt**: the `@menu` list, John's Figma drawings on
 //! a 16pt grid under `assets/icons/menu/` (see its README): the open and
@@ -86,9 +91,12 @@ pub const ICON_SIZE_BUTTON: Pixels = px(18.0);
 /// A project menu row's marks (the switcher, the palette's Projects column).
 pub const ICON_SIZE_MENU: Pixels = px(16.0);
 
+/// A launch window card's folder, and its empty state's.
+pub const ICON_SIZE_LARGE: Pixels = px(32.0);
+
 /// Every size an icon renders at: the sizes the Figma file uses.
 #[cfg(test)]
-pub const ICON_SIZES: [Pixels; 3] = [ICON_SIZE, ICON_SIZE_SMALL, ICON_SIZE_BUTTON];
+pub const ICON_SIZES: [Pixels; 4] = [ICON_SIZE, ICON_SIZE_SMALL, ICON_SIZE_BUTTON, ICON_SIZE_LARGE];
 
 /// One vendored Heroicon (its outline drawing) and the size it draws at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +126,8 @@ impl Icon {
 
 /// `icon`, outline, at its size ([`ICON_SIZE`], [`ICON_SIZE_SMALL`] for a
 /// small one, [`ICON_SIZE_BUTTON`] for a button's, [`ICON_SIZE_MENU`] for a
-/// project menu's): the only way Shelbi's
-/// views draw an icon.
+/// project menu's, [`ICON_SIZE_LARGE`] for the launch window's): the only way
+/// Shelbi's views draw an icon.
 pub fn heroicon(icon: Icon) -> Svg {
     svg().path(icon.path()).size(icon.size).flex_none()
 }
@@ -224,10 +232,11 @@ macro_rules! heroicons {
         @small { $($sconst:ident = $sfile:literal;)* }
         @button { $($(#[$bmeta:meta])* $bconst:ident = $bfile:literal;)* }
         @menu { $($mconst:ident = $mfile:literal;)* }
+        @large { $($lconst:ident = $lfile:literal;)* }
     ) => {
         /// The vendored icons.
         pub mod icons {
-            use super::{Icon, ICON_SIZE, ICON_SIZE_BUTTON, ICON_SIZE_MENU, ICON_SIZE_SMALL};
+            use super::{Icon, ICON_SIZE, ICON_SIZE_BUTTON, ICON_SIZE_LARGE, ICON_SIZE_MENU, ICON_SIZE_SMALL};
 
             $(
                 $(#[$meta])*
@@ -266,10 +275,17 @@ macro_rules! heroicons {
                     size: ICON_SIZE_MENU,
                 };
             )*
+            $(
+                pub const $lconst: Icon = Icon {
+                    name: $lfile,
+                    path: concat!("icons/heroicons-32/", $lfile, ".svg"),
+                    size: ICON_SIZE_LARGE,
+                };
+            )*
 
             /// Every vendored icon.
             #[cfg(test)]
-            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)* $($sconst,)* $($bconst,)* $($mconst,)*];
+            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)* $($sconst,)* $($bconst,)* $($mconst,)* $($lconst,)*];
         }
 
         /// Every vendored drawing, by asset path.
@@ -316,6 +332,15 @@ macro_rules! heroicons {
                     env!("CARGO_MANIFEST_DIR"),
                     "/assets/icons/menu/",
                     $mfile,
+                    ".svg"
+                )) as &[u8],
+            ),)*
+            $((
+                concat!("icons/heroicons-32/", $lfile, ".svg"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/icons/heroicons-32/",
+                    $lfile,
                     ".svg"
                 )) as &[u8],
             ),)*
@@ -426,6 +451,10 @@ heroicons! {
         CIRCLE_MENU = "circle";
         CHECK_SMALL_HEAVY_MENU = "check-small-heavy";
         PLUS_MENU = "plus";
+    }
+    @large {
+        FOLDER_LARGE = "folder";
+        FOLDER_LARGE_THIN = "folder-thin";
     }
 }
 
@@ -714,6 +743,11 @@ mod tests {
                 );
                 continue;
             }
+            if path == format!("icons/heroicons-32/{}.svg", icon.name()) {
+                assert!(svg.contains(r#"viewBox="0 0 32 32""#), "{path} is on the Figma's 32pt grid");
+                assert!(svg.contains(r#"stroke="currentColor""#), "{path} paints in currentColor");
+                continue;
+            }
             if path == format!("icons/menu/{}.svg", icon.name()) {
                 assert!(svg.contains(r#"viewBox="0 0 16 16""#), "{path} is on the Figma's 16pt grid");
                 assert!(svg.contains("currentColor"), "{path} paints in currentColor");
@@ -792,7 +826,8 @@ mod tests {
             + Assets.list("icons/figma/").unwrap().len()
             + Assets.list("icons/heroicons-14/").unwrap().len()
             + Assets.list("icons/heroicons-18/").unwrap().len()
-            + Assets.list("icons/menu/").unwrap().len();
+            + Assets.list("icons/menu/").unwrap().len()
+            + Assets.list("icons/heroicons-32/").unwrap().len();
         assert_eq!(listed, HEROICONS.len());
         assert_eq!(HEROICONS.len(), icons::ALL.len());
     }
@@ -801,7 +836,7 @@ mod tests {
     fn every_icon_draws_at_a_figma_size() {
         assert_eq!(
             ICON_SIZES,
-            [px(20.0), px(14.0), px(18.0)],
+            [px(20.0), px(14.0), px(18.0), px(32.0)],
             "the sizes the Figma file draws icons at"
         );
         for icon in icons::ALL {
@@ -811,6 +846,8 @@ mod tests {
                 ICON_SIZE_BUTTON
             } else if icon.path().starts_with("icons/menu/") {
                 ICON_SIZE_MENU
+            } else if icon.path().starts_with("icons/heroicons-32/") {
+                ICON_SIZE_LARGE
             } else {
                 ICON_SIZE
             };

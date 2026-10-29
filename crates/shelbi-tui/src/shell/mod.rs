@@ -16,11 +16,12 @@
 //! background refresher); navigation state (selection, focus, sidebar width) is
 //! shelbi-app's [`ClientState`]. This crate adds no model logic.
 
-mod caps;
+pub(crate) mod caps;
 mod acknowledgements;
 mod changelog;
 mod overlays;
 mod refresh;
+pub mod remote_session;
 // The relaunchers moved to `shelbi_app::session::relaunch` (shared with the
 // desktop app).
 use shelbi_app::session::relaunch;
@@ -66,6 +67,8 @@ use shelbi_app::exec::{Effect, Mutation};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
+use shelbi_app::launch::remote::RemoteSession;
+use shelbi_app::launch::SshRemote;
 use shelbi_core::{ConfigMode, IssueTrackerConfig};
 use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
 use shelbi_state::keymap::{
@@ -472,6 +475,21 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
 
+        // A remote session was opened: hand the terminal to the other
+        // machine's Shelbi until the user quits it, then repaint.
+        if let Some(session) = state.pending_remote.take() {
+            restore_terminal();
+            let remote = state
+                .remote
+                .clone()
+                .unwrap_or_else(|| Arc::new(SshRemote::new()));
+            state.status = Some(remote_session::run(&session, remote.as_ref()));
+            let _ = enter_terminal_modes();
+            let _ = term.clear();
+            state.reported_main = None;
+            state.dirty = true;
+        }
+
         // Background sources (all non-blocking). A daemon change notification
         // triggers an immediate refresh; the periodic request is the fallback.
         // These read the current project's worker bundle, which a project switch
@@ -590,6 +608,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_feedback_job() {
             state.dirty = true;
         }
+        if state.poll_launch() {
+            state.dirty = true;
+        }
         if state.poll_startup() {
             state.dirty = true;
         }
@@ -653,6 +674,15 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
 /// Env var carrying the view to restore across a re-exec, so an out-of-date TUI
 /// that re-execs lands back on the view it was showing (per-client state).
 const REEXEC_VIEW_ENV: &str = "SHELBI_REEXEC_VIEW";
+
+/// The palette's command model with the launch screen turned on, and
+/// Connect to Remote Session when there's a connector to connect through
+/// (`remote_connect`).
+fn with_launch(mut model: shelbi_app::CommandModel, remote_connect: bool) -> shelbi_app::CommandModel {
+    model.launch_screen = true;
+    model.remote_connect = remote_connect;
+    model
+}
 
 /// The view a prior re-exec asked to restore, consumed once. `None` on a normal
 /// start.
@@ -1327,6 +1357,10 @@ struct ShellState {
     /// after handling input: it hands the terminal to the editor and waits, then
     /// restores the shell (the TUI's half of the palette's `edit:*` commands).
     pending_editor: Option<PathBuf>,
+    /// A remote session to open. The run loop takes it like
+    /// [`Self::pending_editor`]: it hands the terminal to the other machine's
+    /// Shelbi over `ssh` and waits (`remote_session`).
+    pending_remote: Option<RemoteSession>,
     /// Where the palette's on-disk inputs come from (disk in production).
     palette_inputs: Arc<dyn PaletteInputs>,
     /// Test seam: when set, [`ShellState::dispatch_effect`] records each effect
@@ -1338,6 +1372,9 @@ struct ShellState {
     /// order, instead of launching the browser.
     #[cfg(test)]
     opened_urls: Vec<String>,
+    /// The remote sessions opened, in a test (never opened for real).
+    #[cfg(test)]
+    opened_remotes: Vec<shelbi_app::launch::RemoteSession>,
     /// A pending off-UI-thread add-project scaffold. Separate from [`Self::job`]
     /// because on success the shell must switch to the new project on the UI
     /// thread, so the result is typed ([`CreateOutcome`]) rather than a bare
@@ -1348,6 +1385,12 @@ struct ShellState {
     feedback_service: shelbi_app::feedback::FeedbackService,
     /// The Contact Us send that's out, off the UI thread.
     feedback_job: Option<Receiver<Result<(), shelbi_app::feedback::FeedbackError>>>,
+    /// How the launch screen and Connect to Remote Session reach another
+    /// machine (`None`: connecting isn't offered, so the palette doesn't
+    /// list it), and start the daemon for a project they open: the live
+    /// ones, or a test's fakes.
+    remote: Option<Arc<dyn shelbi_app::launch::RemoteConnector>>,
+    launch_daemon: Arc<dyn shelbi_app::launch::DaemonStarter>,
     should_quit: bool,
     dirty: bool,
 }
@@ -1545,14 +1588,19 @@ impl ShellState {
             full_redraw: false,
             job: None,
             pending_editor: None,
+            pending_remote: None,
             palette_inputs: Arc::new(DiskPaletteInputs),
             #[cfg(test)]
             effect_tap: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
+            #[cfg(test)]
+            opened_remotes: Vec::new(),
             create_job: None,
             feedback_service,
             feedback_job: None,
+            remote: crate::launch::remote_connector(),
+            launch_daemon: Arc::new(shelbi_app::launch::SharedDaemon),
             should_quit: false,
             dirty: true,
         }
@@ -1675,7 +1723,7 @@ impl ShellState {
             self.palette_inputs.other_projects(project),
             self.palette_inputs.edit_targets(project),
         );
-        CommandRegistry::new().entries(&model)
+        CommandRegistry::new().entries(&with_launch(model, self.remote.is_some()))
     }
 
     fn sidebar_view(&self) -> Option<SidebarView> {
@@ -2587,6 +2635,103 @@ impl ShellState {
         }
     }
 
+    // --- Launch screen (launch-screen) --------------------------------------
+
+    /// "Connect to Remote Session…": the Connect dialog
+    /// ([`crate::launch::ConnectDialog`]) over the window, as the launch
+    /// screen's Connect to remote opens it.
+    fn open_connect_remote(&mut self) {
+        // Listed only with a connector (`CommandModel::remote_connect`).
+        let Some(remote) = self.remote.clone() else {
+            self.overlay = None;
+            return;
+        };
+        let recents = shelbi_app::launch::RecentRemotes::live();
+        self.overlay = Some(ActiveOverlay::connect_remote(remote, recents, self.caps.emoji));
+    }
+
+    /// "Show Launch Screen": the launch screen over the whole window. Opening
+    /// a project there switches to it; Add project and Connect to remote open
+    /// their dialogs in its place; Esc goes back.
+    fn show_launch_screen(&mut self) {
+        let recents = shelbi_app::launch::RecentRemotes::live();
+        match shelbi_app::launch::LaunchModel::load(&recents) {
+            Ok(model) => {
+                let screen = crate::launch::LaunchScreen::new(
+                    model,
+                    self.launch_daemon.clone(),
+                    self.remote.clone(),
+                    recents,
+                    self.caps.emoji,
+                );
+                self.overlay = Some(ActiveOverlay::Launch(Box::new(screen)));
+            }
+            Err(e) => self.status = Some(format!("The launch screen couldn't read the projects: {e}")),
+        }
+    }
+
+    /// What the launch screen asked for.
+    fn apply_launch_step(&mut self, step: crate::launch::LaunchStep) {
+        use crate::launch::LaunchStep;
+        match step {
+            LaunchStep::Stay => {}
+            LaunchStep::Quit => {
+                self.overlay = None;
+                self.client.focus_main();
+            }
+            LaunchStep::Open(project) => {
+                self.overlay = None;
+                self.client.focus_main();
+                if self.client.project() != Some(project.as_str()) {
+                    self.switch_project(&project);
+                }
+            }
+            LaunchStep::AddProject => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.overlay = Some(ActiveOverlay::add_project(&cwd));
+            }
+            LaunchStep::ConnectDialog => self.open_connect_remote(),
+            LaunchStep::Connected(session) => self.remote_connected(&session),
+        }
+    }
+
+    /// A remote session connected (from the dialog or a recent row): leave
+    /// the launch screen or the dialog and open it. The run loop hands the
+    /// terminal to that machine's Shelbi until the user quits it
+    /// ([`Self::pending_remote`], `remote_session`), then comes back here.
+    fn remote_connected(&mut self, session: &shelbi_app::launch::RemoteSession) {
+        self.overlay = None;
+        self.client.focus_main();
+        #[cfg(test)]
+        {
+            self.opened_remotes.push(session.clone());
+        }
+        self.pending_remote = Some(session.clone());
+    }
+
+    /// Fold in the launch screen's or the Connect dialog's finished call.
+    /// Returns `true` when one came back (so the caller redraws).
+    fn poll_launch(&mut self) -> bool {
+        match self.overlay.as_mut() {
+            Some(ActiveOverlay::Launch(screen)) => match screen.poll() {
+                Some(step) => {
+                    self.apply_launch_step(step);
+                    true
+                }
+                None => false,
+            },
+            Some(ActiveOverlay::ConnectRemote(dialog)) => match dialog.poll() {
+                Some(step) => {
+                    let event = overlays::connect_event(step);
+                    self.apply_overlay_event(event);
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     // --- Acknowledgements (tui-acknowledgements) ---------------------------
 
     fn acknowledgements_open(&self) -> bool {
@@ -3260,6 +3405,8 @@ impl ShellState {
                 self.overlay = None;
                 self.open_acknowledgements(AckReturn { about: true });
             }
+            OverlayEvent::Launch(step) => self.apply_launch_step(step),
+            OverlayEvent::RemoteConnected(session) => self.remote_connected(&session),
         }
     }
 
@@ -3558,6 +3705,8 @@ impl ShellState {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.overlay = Some(ActiveOverlay::add_project(&cwd));
             }
+            Effect::ConnectRemote => self.open_connect_remote(),
+            Effect::ShowLaunchScreen => self.show_launch_screen(),
             // The registry lists New Window only for a multi-window client
             // (`CommandModel::multi_window`, the desktop app); this terminal
             // is one window, so say where another one comes from.
@@ -5400,7 +5549,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
 /// Dim every cell in `area` (the terminal view behind an open overlay) so the
 /// modal on top reads as focused. The overlay's own `Clear` restores full
 /// brightness within its rect.
-fn dim_area(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+pub(crate) fn dim_area(buf: &mut ratatui::buffer::Buffer, area: Rect) {
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buf.cell_mut((x, y)) {
@@ -5772,7 +5921,7 @@ fn restore_terminal() {
 /// RAII terminal setup: raw mode, alternate screen, mouse/focus/paste capture,
 /// and a best-effort kitty keyboard push so Shift+Enter reaches the agent where
 /// the terminal supports it. Restores everything on drop and on panic.
-struct RawGuard;
+pub(crate) struct RawGuard;
 
 /// Raw mode, the alternate screen, mouse/focus/paste capture and the kitty
 /// keyboard push: what [`RawGuard::enter`] sets up and [`restore_terminal`]
@@ -5821,7 +5970,7 @@ fn run_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, path: &std::pat
 }
 
 impl RawGuard {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         enter_terminal_modes()?;
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -8590,6 +8739,10 @@ mod tests {
             }];
         }
         st.effect_tap = Some(Vec::new());
+        // Connecting is offered, through a fake (the build has no connector yet).
+        st.remote = Some(Arc::new(
+            shelbi_app::launch::FakeRemote::new().with_host("devbox", "jlong", &[("web", "~/web")]),
+        ));
         st
     }
 
@@ -8622,12 +8775,15 @@ mod tests {
     #[test]
     fn every_registry_command_runs_from_the_palette() {
         let mut st = smoke_state();
-        let model = shelbi_app::command_model::command_model_from(
-            "proj",
-            st.sidebar_model.as_ref().unwrap(),
+        let model = with_launch(
+            shelbi_app::command_model::command_model_from(
+                "proj",
+                st.sidebar_model.as_ref().unwrap(),
+                true,
+                FixturePaletteInputs.other_projects("proj"),
+                FixturePaletteInputs.edit_targets("proj"),
+            ),
             true,
-            FixturePaletteInputs.other_projects("proj"),
-            FixturePaletteInputs.edit_targets("proj"),
         );
         let commands = CommandRegistry::new().commands(&model);
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
@@ -8698,6 +8854,8 @@ mod tests {
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
+            "action:connect-remote",
+            "action:launch-screen",
             "edit:project",
             "edit:agent:developer",
             "edit:zenmode",
@@ -8724,6 +8882,122 @@ mod tests {
         };
         assert!(p.projects_focused(), "on the Projects column");
         assert_eq!(st.client.project(), Some("proj"), "nothing switched yet");
+    }
+
+    #[test]
+    fn connect_to_remote_session_opens_the_dialog_over_the_shell() {
+        let mut st = smoke_state();
+        st.effect_tap = None;
+        st.dispatch_effect(Effect::ConnectRemote);
+        assert!(matches!(st.overlay, Some(ActiveOverlay::ConnectRemote(_))));
+        // Typing goes to the host field, not the session underneath.
+        type_key(&mut st, 'd');
+        st.handle_event(Event::Paste("evbox".into()));
+        let Some(ActiveOverlay::ConnectRemote(dialog)) = &st.overlay else {
+            panic!("the dialog stays open while typing");
+        };
+        assert_eq!(dialog.flow().host(), "devbox");
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Connect to Remote Session"));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(st.overlay.is_none(), "Esc cancels");
+    }
+
+    #[test]
+    fn connect_to_remote_session_is_offered_only_with_a_connector() {
+        let mut st = smoke_state();
+        let listed = |st: &ShellState| st.palette_entries_from_model().iter().any(|e| e.id == "action:connect-remote");
+        assert!(listed(&st));
+        st.remote = None;
+        assert!(!listed(&st), "no connector in this build: not in the palette");
+        assert!(st.palette_entries_from_model().iter().any(|e| e.id == "action:launch-screen"));
+        st.effect_tap = None;
+        st.dispatch_effect(Effect::ConnectRemote);
+        assert!(st.overlay.is_none());
+    }
+
+    #[test]
+    fn a_session_connected_from_the_palette_opens() {
+        let mut st = smoke_state();
+        st.effect_tap = None;
+        let home = tempfile::Builder::new().prefix("sl").tempdir_in("/tmp").unwrap();
+        st.dispatch_effect(Effect::ConnectRemote);
+        if let Some(ActiveOverlay::ConnectRemote(_)) = &st.overlay {
+            // Remember into the temp dir, not the real home.
+            let remote = st.remote.clone().unwrap();
+            let recents = shelbi_app::launch::RecentRemotes::at(home.path().join("recent.json"));
+            st.overlay = Some(ActiveOverlay::connect_remote(remote, recents, false));
+        }
+        for c in "devbox".chars() {
+            type_key(&mut st, c);
+        }
+        let enter = || Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        st.handle_event(enter());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let choosing = |st: &ShellState| {
+            matches!(&st.overlay, Some(ActiveOverlay::ConnectRemote(d)) if d.flow().stage() == shelbi_app::launch::connect::Stage::Choose)
+        };
+        while !choosing(&st) && Instant::now() < deadline {
+            st.poll_launch();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        st.handle_event(enter());
+        while st.overlay.is_some() && Instant::now() < deadline {
+            st.poll_launch();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(st.overlay.is_none(), "the dialog closes");
+        assert_eq!(st.opened_remotes.iter().map(|s| s.project.as_str()).collect::<Vec<_>>(), ["web"]);
+    }
+
+    #[test]
+    fn the_launch_screen_opens_over_the_shell_and_switches_to_a_project() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::Builder::new().prefix("sl").tempdir_in("/tmp").unwrap();
+        let saved = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", home.path());
+        let repo = home.path().join("beta");
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            projects.join("beta.yaml"),
+            format!(
+                "name: beta\nrepo: {r}\nmachines:\n  - {{ name: hub, kind: local, work_dir: {r} }}\n\
+                 orchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\n\
+                 workspaces: []\n",
+                r = repo.display()
+            ),
+        )
+        .unwrap();
+
+        let mut st = smoke_state();
+        st.effect_tap = None;
+        let daemon = Arc::new(shelbi_app::launch::FakeDaemon::new());
+        st.launch_daemon = daemon.clone();
+        st.dispatch_effect(Effect::ShowLaunchScreen);
+        assert!(matches!(st.overlay, Some(ActiveOverlay::Launch(_))));
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Welcome to Shelbi") && screen.contains("beta"), "{screen}");
+
+        // Return on the project: it opens, and the shell switches to it.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while st.overlay.is_some() && Instant::now() < deadline {
+            st.poll_launch();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let switched = st.client.project().map(str::to_string);
+        match saved {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        assert!(st.overlay.is_none(), "the launch screen closes");
+        assert_eq!(switched.as_deref(), Some("beta"));
+        assert_eq!(daemon.starts(), 1);
     }
 
     #[test]

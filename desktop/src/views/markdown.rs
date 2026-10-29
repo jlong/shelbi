@@ -1,15 +1,15 @@
-//! Markdown for the task pane.
+//! Markdown for the Changelog page.
 //!
-//! The body renders with gpui-kit's Markdown text view (gpui-base's
-//! `TextView::markdown`), which parses with the `markdown` crate under
-//! GitHub-flavored options, styled after the Figma Task pane frames
-//! ([`body`]): headings in `Desktop/Heading` (h1) and `Desktop/Base/Semibold`
-//! (the rest: "Description", "Acceptance criteria") in the loud text role,
-//! 12pt over what they head; the body in `Desktop/Base/Regular`, 20pt
-//! between blocks; and a task list drawn as Figma's checkbox rows (a custom
-//! block, [`CHECKLIST`]). Its tests pin that the shipped task-body templates
-//! parse into the blocks the view renders (headings, lists, checkboxes,
-//! code, links) rather than plain text.
+//! An entry's description renders with gpui-kit's Markdown text view
+//! (gpui-base's `TextView`), which parses with the `markdown` crate under
+//! GitHub-flavored options, in the styles the Figma Task pane frames set for
+//! a body ([`body_with_state`]): headings in `Desktop/Heading` (h1) and
+//! `Desktop/Base/Semibold` (the rest) in the loud text role, 12pt over what
+//! they head; the body in `Desktop/Base/Regular`, 20pt between blocks; and a
+//! task list drawn as Figma's checkbox rows (a custom block, [`CHECKLIST`]).
+//! (The task pane's body moved to the in-place editor, `doc_editor`.) Its
+//! tests pin that Markdown bodies parse into the blocks the view renders
+//! (headings, lists, checkboxes, code, links) rather than plain text.
 
 use gpui::{
     div, prelude::*, px, rems, Div, ElementId, Entity, HighlightStyle, Hsla,
@@ -41,21 +41,10 @@ const ROW_GAP: f32 = 12.0;
 /// The custom block a task list renders as.
 const CHECKLIST: &str = "shelbi-checklist";
 
-/// The detail body: `text` as Markdown in the Figma Issue detail's styles,
-/// selectable, its task lists as checkbox rows.
-pub fn body(id: impl Into<ElementId>, text: impl Into<SharedString>, theme: &Theme) -> TextView {
-    let style = text_style(theme);
-    let theme = *theme;
-    let items = style.clone();
-    TextView::markdown(id, text)
-        .style(style)
-        .markdown_block_parser(parse_checklist)
-        .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &theme))
-}
-
-/// [`body`] over a [`TextViewState`] the caller keeps, for text it
-/// highlights (the Changelog's search matches,
-/// `TextViewState::set_range_highlights`).
+/// A description as Markdown over a [`TextViewState`] the caller keeps, for
+/// the text it highlights (the Changelog's search matches,
+/// `TextViewState::set_range_highlights`), selectable, its task lists as
+/// checkbox rows.
 pub fn body_with_state(state: &Entity<TextViewState>, theme: &Theme) -> TextView {
     let style = text_style(theme);
     let theme = *theme;

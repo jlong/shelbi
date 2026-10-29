@@ -44,6 +44,9 @@
 //!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
 //!   classification, and the per-pane restart controller over
 //!   [`supervision`], the crash-loop core the daemon poller shares.
+//! - [`launch`] — the launch screen: the startup routing between it and a
+//!   project, its model (local projects, recent remote sessions), the recent
+//!   remote sessions store, and the remote connection seam.
 //! - [`task_session`] — which running agent session belongs to a task (the
 //!   workspace working it, or the review slot it is loaded onto), for a
 //!   task detail that shows it.
@@ -76,8 +79,10 @@ pub mod exec;
 pub mod exec_daemon;
 pub mod issue_edit;
 pub mod feedback;
+pub mod launch;
 pub mod layout_sub;
 pub mod licenses;
+pub mod markdown_edit;
 pub mod nav;
 pub mod overlay;
 pub mod reachability;

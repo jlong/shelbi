@@ -513,7 +513,9 @@ impl ButtonContent {
     }
 
     /// `Show Hotkey`: `key` as written (`E`, `⌘S`, `Esc`). Empty shows
-    /// none.
+    /// none. The Figma sheet draws it; no view does since the task pane's
+    /// Done went with its edit mode.
+    #[cfg_attr(not(any(test, feature = "visual-check")), allow(dead_code))]
     pub fn hotkey(mut self, key: impl Into<SharedString>) -> Self {
         let key = key.into();
         self.hotkey = (!key.is_empty()).then_some(key);
