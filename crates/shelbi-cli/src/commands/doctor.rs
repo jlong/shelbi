@@ -141,7 +141,7 @@ fn report_budget(
     // never the request count that hid this burn.
     let unit = match kind {
         Budget::Graphql => "points",
-        Budget::Rest => "req",
+        Budget::Rest | Budget::Search => "req",
     };
     let points = spend_total(&spent);
     let remaining_str = remaining

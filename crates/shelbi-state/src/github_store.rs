@@ -516,11 +516,17 @@ impl GitHubStore {
         let rest_base = Arc::clone(&base);
         let rest_policy = policy.clone();
         let gh: GhRunner = Arc::new(move |args: &[&str]| {
+            // The issue search reads its own tier, as in `park_aware_read`.
+            let budget = if is_issue_search(args) {
+                crate::gh_budget::Budget::Search
+            } else {
+                crate::gh_budget::Budget::Rest
+            };
             governed_read(
                 &rest_project,
                 &rest_key,
                 &rest_policy,
-                crate::gh_budget::Budget::Rest,
+                budget,
                 args,
                 &|a| rest_base(a),
                 None,
@@ -606,6 +612,157 @@ impl GitHubStore {
         sort_board(&mut out);
         Ok(out)
     }
+
+    /// One page (1-based) of the board's issue search: GitHub's REST issue
+    /// search (`GET search/issues`, `q=repo:<repo> is:issue <query>`, open and
+    /// closed), mapped onto `IssueFile`s exactly as a list read maps them (the
+    /// `shelbi:status/*` label and open/closed state pick the column) with the
+    /// local assignment overlay folded in, in GitHub's best-match order.
+    ///
+    /// Read on the separate **search** budget ([`is_issue_search`]), so it never
+    /// spends or parks the core REST hour or the GraphQL points; a parked search
+    /// tier (or the shared unreachable breaker) fails fast without spawning `gh`.
+    pub fn search_issues(&self, query: &str, page: u32) -> Result<IssueSearchPage> {
+        let q = format!("q={}", issue_search_query(&self.repo, query));
+        let per_page = format!("per_page={ISSUE_SEARCH_PAGE_SIZE}");
+        let page = format!("page={}", page.max(1));
+        let args = [
+            "api", "--include", "-H", GH_REST_API_VERSION_HEADER, "-X", "GET",
+            SEARCH_ISSUES_PATH, "-f", &q, "-f", &per_page, "-f", &page,
+        ];
+        let out = (self.gh)(&args)?;
+        let resp: GhSearchResponse = parse_json_object(http_response_body(&out))?;
+        let assignments = crate::task_assignments(&self.project)?;
+        let issues = resp
+            .items
+            .into_iter()
+            .filter(|gh| !gh.is_pull_request())
+            .map(|gh| {
+                let mut tf = self.to_issue_file(gh);
+                tf.task.assigned_to = assignments.get(&tf.task.id).cloned();
+                tf
+            })
+            .collect();
+        Ok(IssueSearchPage {
+            issues,
+            total_count: resp.total_count,
+            incomplete: resp.incomplete_results,
+        })
+    }
+}
+
+/// The REST issue-search endpoint the board's search reads.
+const SEARCH_ISSUES_PATH: &str = "search/issues";
+
+/// The page size the board's issue search asks for: GitHub's own default
+/// `per_page` for search.
+pub const ISSUE_SEARCH_PAGE_SIZE: u32 = 30;
+
+/// GitHub's ceiling on how many results one search can page through.
+pub const ISSUE_SEARCH_MAX_RESULTS: u64 = 1_000;
+
+/// One page of the board's issue search.
+#[derive(Debug, Clone)]
+pub struct IssueSearchPage {
+    /// This page's matching issues, in GitHub's best-match order.
+    pub issues: Vec<IssueFile>,
+    /// How many issues match in all, as GitHub reports it.
+    pub total_count: u64,
+    /// GitHub's `incomplete_results`: the search timed out and the matches may
+    /// be partial.
+    pub incomplete: bool,
+}
+
+/// Why the board's issue search couldn't run, so the caller can fall back to
+/// filtering the board it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueSearchError {
+    /// The project's tracker isn't GitHub: search the local board.
+    NotGithub,
+    /// The search quota (or a secondary limit) is spent, or parked until reset.
+    RateLimited,
+    /// The GitHub API can't be reached (or the unreachable breaker is parked).
+    Unreachable,
+    /// Anything else (auth, a malformed query, an unparseable response).
+    Failed(String),
+}
+
+impl std::fmt::Display for IssueSearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssueSearchError::NotGithub => f.write_str("the issue tracker isn't GitHub"),
+            IssueSearchError::RateLimited => f.write_str("GitHub search is rate-limited"),
+            IssueSearchError::Unreachable => f.write_str("GitHub is unreachable"),
+            IssueSearchError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Search `project`'s GitHub issues for `query`, page `page` (1-based): the
+/// board search's live read ([`GitHubStore::search_issues`]). Never touches the
+/// process board cache; [`IssueSearchError::NotGithub`] for any other tracker.
+pub fn search_issues(
+    project: &str,
+    query: &str,
+    page: u32,
+) -> std::result::Result<IssueSearchPage, IssueSearchError> {
+    let cfg = crate::load_project(project)
+        .map_err(|e| IssueSearchError::Failed(e.to_string()))?
+        .issue_tracker;
+    if !matches!(cfg.backend, shelbi_core::IssueTrackerBackend::Github) {
+        return Err(IssueSearchError::NotGithub);
+    }
+    let repo = cfg
+        .github
+        .map(|g| g.repo)
+        .ok_or(IssueSearchError::NotGithub)?;
+    GitHubStore::new(project, repo)
+        .search_issues(query, page)
+        .map_err(|e| classify_search_error(&e))
+}
+
+/// Sort a search failure into what the board does about it.
+fn classify_search_error(e: &Error) -> IssueSearchError {
+    if crate::gh_retry::is_rate_limit_error(e) {
+        IssueSearchError::RateLimited
+    } else if crate::gh_retry::is_connection_error(e) {
+        IssueSearchError::Unreachable
+    } else {
+        IssueSearchError::Failed(e.to_string())
+    }
+}
+
+/// The search `q` for `query` scoped to `repo`'s issues: `repo:<repo> is:issue`
+/// then the user's words, minus any qualifier that would widen the scope past
+/// this repo's issues (`repo:`, `org:`, `user:`, `is:pr`, `type:pr`).
+fn issue_search_query(repo: &str, query: &str) -> String {
+    let words: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| {
+            let w = w.to_ascii_lowercase();
+            !["repo:", "org:", "user:"].iter().any(|q| w.starts_with(q))
+                && w != "is:pr"
+                && w != "type:pr"
+        })
+        .collect();
+    let mut q = format!("repo:{repo} is:issue");
+    for w in words {
+        q.push(' ');
+        q.push_str(w);
+    }
+    q
+}
+
+/// The `GET search/issues` envelope: the total, whether GitHub cut the search
+/// short, and the page's items (each the REST issue shape).
+#[derive(Debug, Deserialize)]
+struct GhSearchResponse {
+    #[serde(default)]
+    total_count: u64,
+    #[serde(default)]
+    incomplete_results: bool,
+    #[serde(default)]
+    items: Vec<GhIssue>,
 }
 
 impl IssueStore for GitHubStore {
@@ -3043,7 +3200,23 @@ fn park_aware_read(
     // [`run_gh_with_token`] mapping (a non-zero exit is a real failure there).
     // The two branches differ only in the run closure, so the surrounding park /
     // budget / attribution wiring is shared through [`governed_read`].
-    let result = if is_single_issue_get(args) {
+    let result = if is_issue_search(args) {
+        // The issue search is metered on GitHub's separate search quota, so it
+        // reads and parks the `search` tier. No token is handed over: a hintless
+        // refusal must not probe (and record) the *core* reset for a search
+        // limit; it parks on the search tier's recorded reset or the short
+        // default instead.
+        governed_read(
+            project,
+            &key,
+            read_policy,
+            crate::gh_budget::Budget::Search,
+            args,
+            &|a| run_gh_with_token(&token, a),
+            None,
+            read_park_side_effects_enabled().then_some("issue-search"),
+        )
+    } else if is_single_issue_get(args) {
         governed_read(
             project,
             &key,
@@ -3088,6 +3261,12 @@ fn rest_read_caller(args: &[&str]) -> Option<&'static str> {
     } else {
         Some("rest-read")
     }
+}
+
+/// Whether `args` is the board's issue search, `-X GET search/issues`: read on
+/// the search budget rather than the core REST one.
+fn is_issue_search(args: &[&str]) -> bool {
+    args.windows(2).any(|w| w == ["-X", "GET"]) && args.contains(&SEARCH_ISSUES_PATH)
 }
 
 /// Whether `args` is the single-issue conditional `GET`:
@@ -3201,7 +3380,7 @@ fn governed_read(
     // untouched; an injected runner answering bare JSON (no `HTTP/` prefix) is
     // untouched too.
     match result {
-        Ok(raw) if budget == crate::gh_budget::Budget::Rest => {
+        Ok(raw) if budget != crate::gh_budget::Budget::Graphql => {
             if is_single_issue_get(args) {
                 // The single-issue conditional `GET` returns the *raw* response
                 // unstripped: `GitHubStore::fetch` reads the status line (`304`/
@@ -3213,7 +3392,7 @@ fn governed_read(
                 // A list/comments/labels read: strip the per-page header blocks
                 // and record the token's REST budget from the last one (the
                 // lowest `remaining`) before the caller parses the JSONL.
-                Ok(strip_and_record_rest_read(key, &raw))
+                Ok(strip_and_record_rest_read(key, budget, &raw))
             }
         }
         other => other,
@@ -3248,14 +3427,12 @@ fn record_rest_read_headers(key: &str, raw: &str) {
 /// transform itself is unconditional so parsing always sees clean JSONL. A
 /// response that does not begin with `HTTP/` (a bare-JSON test fixture) is
 /// returned verbatim, the same escape hatch [`record_and_strip_rest`] keeps.
-fn strip_and_record_rest_read(key: &str, raw: &str) -> String {
+fn strip_and_record_rest_read(key: &str, budget: crate::gh_budget::Budget, raw: &str) -> String {
     let (body, last_header) = split_include_pages(raw);
     if let Some(header) = last_header {
         if read_park_side_effects_enabled() {
-            crate::gh_budget::record_rest_headers(
-                key,
-                &crate::gh_budget::parse_rate_limit_headers(&header),
-            );
+            let headers = crate::gh_budget::parse_rate_limit_headers(&header);
+            crate::gh_budget::record(key, budget, headers.remaining, headers.reset_at);
         }
     }
     body
@@ -3487,19 +3664,21 @@ fn record_budget_park(
     let until = DateTime::from_timestamp(decision.until, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default();
-    if let Err(ev) = crate::append_board_rate_limited_event(
-        project,
-        &until,
-        hit.kind.as_str(),
-        hit.remaining,
-        decision.mode.as_str(),
-    ) {
-        tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
+    // The search tier parks the board's issue search alone (the board itself
+    // keeps reading), so it writes no `board rate-limited` line: the search
+    // falls back to local results and says so in the search box.
+    if budget != crate::gh_budget::Budget::Search {
+        if let Err(ev) = crate::append_board_rate_limited_event(
+            project,
+            &until,
+            hit.kind.as_str(),
+            hit.remaining,
+            decision.mode.as_str(),
+        ) {
+            tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
+        }
     }
-    let tier = match budget {
-        crate::gh_budget::Budget::Rest => "rest",
-        crate::gh_budget::Budget::Graphql => "graphql",
-    };
+    let tier = crate::gh_requests::budget_tag(budget);
     tracing::warn!(
         project = %project,
         budget = tier,
@@ -7701,6 +7880,93 @@ mod tests {
         })
     }
 
+    /// A `search/issues` response carrying `items` (REST issue objects).
+    fn search_json(total: u64, items: &[&str]) -> String {
+        format!(
+            r#"{{"total_count":{total},"incomplete_results":false,"items":[{}]}}"#,
+            items.join(",")
+        )
+    }
+
+    #[test]
+    fn issue_search_maps_hits_to_their_columns_and_scopes_the_query() {
+        let _iso = IsolatedHome::new("issue-search");
+        let review = r#"{"number":3,"title":"Change the palette","state":"open","labels":[{"name":"shelbi:id/t-3"},{"name":"shelbi:status/review"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
+        let done = r#"{"number":4,"title":"Change log","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t-4"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
+        let pr = r#"{"number":5,"title":"Change PR","state":"open","labels":[],"pull_request":{},"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
+        let body = search_json(42, &[review, done, pr]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rec = seen.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            Ok(body.clone())
+        });
+
+        let page = store.search_issues("change repo:other/x is:pr", 2).unwrap();
+        assert_eq!(page.total_count, 42);
+        let got: Vec<(&str, &str)> = page
+            .issues
+            .iter()
+            .map(|tf| (tf.task.id.as_str(), tf.task.column.as_str()))
+            .collect();
+        assert_eq!(got, [("t-3", "review"), ("t-4", "done")], "PRs dropped, labels/state map");
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert!(call.contains("-X GET search/issues"), "{call}");
+        assert!(call.contains("q=repo:owner/repo is:issue change"), "{call}");
+        assert!(!call.contains("other/x") && !call.contains("is:pr"), "scope can't widen: {call}");
+        assert!(call.contains("per_page=30") && call.contains("page=2"), "{call}");
+        assert!(!call.contains("--paginate"), "one page per request: {call}");
+    }
+
+    /// A search rate limit parks the **search** tier alone: the core REST and
+    /// GraphQL budgets stay clear, no `board rate-limited` line is written, and
+    /// the next search short-circuits without calling `gh`.
+    #[test]
+    fn a_search_rate_limit_parks_only_the_search_tier() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+        let now = 50_000i64;
+        set_test_now(now);
+
+        let script = vec![rest_403(
+            &format!(
+                "x-ratelimit-resource: search\nx-ratelimit-remaining: 0\nx-ratelimit-reset: {}",
+                now + 40
+            ),
+            "API rate limit exceeded",
+        )];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let store = GitHubStore::with_governed_runner(
+            "owner/repo",
+            "tok-search-park",
+            scripted_runner(script, calls.clone()),
+        );
+        let key = crate::gh_budget::token_key("tok-search-park");
+        let err = store.search_issues("change", 1).unwrap_err();
+        assert_eq!(classify_search_error(&err), IssueSearchError::RateLimited);
+        use crate::gh_budget::{parked_until, Budget};
+        assert_eq!(parked_until(&key, Budget::Search, now), Some(now + 40));
+        assert_eq!(parked_until(&key, Budget::Rest, now), None, "core REST untouched");
+        assert_eq!(parked_until(&key, Budget::Graphql, now), None, "GraphQL untouched");
+        assert!(rate_limited_lines("test-project").is_empty(), "no board rate-limited line");
+
+        let err = store.search_issues("changes", 1).unwrap_err();
+        assert_eq!(classify_search_error(&err), IssueSearchError::RateLimited);
+        assert_eq!(*calls.lock().unwrap(), 1, "a parked search never spawns gh");
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The `board rate-limited` events.log lines for `project`.
     fn rate_limited_lines(project: &str) -> Vec<String> {
         std::fs::read_to_string(crate::events_log_path().unwrap())
@@ -10754,7 +11020,7 @@ mod tests {
                    X-RateLimit-Reset: 1700000000\r\n\r\n{\"n\":1}\n{\"n\":2}\n\n\
                    HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4998\r\n\
                    X-RateLimit-Reset: 1700000000\r\n\r\n{\"n\":3}\n";
-        let body = strip_and_record_rest_read(&key, raw);
+        let body = strip_and_record_rest_read(&key, crate::gh_budget::Budget::Rest, raw);
         assert_eq!(body, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n");
         let state = crate::gh_budget::read_state(&key);
         assert_eq!(

@@ -99,6 +99,12 @@ pub enum Budget {
     Graphql,
     /// The REST requests budget — mutations and the REST fallback list.
     Rest,
+    /// The REST **search** budget (`GET search/issues`): GitHub meters it on its
+    /// own small per-minute quota (`x-ratelimit-resource: search`, about 30
+    /// requests a minute), separate from both the core REST hour and GraphQL
+    /// points, so the board's issue search parks on its own and never spends or
+    /// parks the core budgets.
+    Search,
 }
 
 /// One budget's persisted state (GraphQL *or* REST). Both tiers share this shape
@@ -123,6 +129,14 @@ pub struct BudgetTier {
     /// first successful read ([`clear_read_backoff`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_secs: Option<i64>,
+}
+
+impl BudgetTier {
+    /// Whether nothing has been recorded on this tier (so it needn't be
+    /// written: a budget file from before the search tier reads back the same).
+    pub fn is_empty(&self) -> bool {
+        *self == BudgetTier::default()
+    }
 }
 
 /// A token's connection-level circuit breaker — separate from the two budget
@@ -156,6 +170,9 @@ pub struct RateLimitState {
     /// The REST requests budget.
     #[serde(default)]
     pub rest: BudgetTier,
+    /// The REST search budget (the board's issue search).
+    #[serde(default, skip_serializing_if = "BudgetTier::is_empty")]
+    pub search: BudgetTier,
     /// The connection-level circuit breaker (shared across both budgets).
     #[serde(default)]
     pub unreachable: UnreachableState,
@@ -168,6 +185,7 @@ impl RateLimitState {
         match budget {
             Budget::Graphql => &self.graphql,
             Budget::Rest => &self.rest,
+            Budget::Search => &self.search,
         }
     }
 
@@ -176,6 +194,7 @@ impl RateLimitState {
         match budget {
             Budget::Graphql => &mut self.graphql,
             Budget::Rest => &mut self.rest,
+            Budget::Search => &mut self.search,
         }
     }
 }

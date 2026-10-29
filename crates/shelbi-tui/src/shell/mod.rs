@@ -512,6 +512,11 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         // move resolves within a tick without ever blocking the loop — the same
         // call the standalone `__tasks` loop makes each tick. Keep redrawing while
         // a move is in flight so the settle / rollback shows.
+        // The board's GitHub search: send the one due after a pause in typing
+        // and fold in its answers (off the UI thread; never blocks).
+        if state.kanban.poll_search() {
+            state.dirty = true;
+        }
         let had_moves = state.kanban.has_pending_moves();
         state.kanban.poll_pending_moves();
         if had_moves {

@@ -43,6 +43,13 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
         handle_workflow_dropdown_key(app, key.code);
         return Outcome::Continue;
     }
+    // Typing the search query (`/`): printable keys edit it, Enter keeps it
+    // and hands the keys back to the board, Esc clears it. Modal like the
+    // dropdowns, so a typed `j` or `q` lands in the query.
+    if app.search_editing {
+        handle_search_key(app, key);
+        return Outcome::Continue;
+    }
 
     // Global chords fire next so a remapped Ctrl+C / Alt+Z can't be
     // shadowed by a kanban binding sharing the same chord.
@@ -93,11 +100,42 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
                 // keeping it out of the keymap avoids touching the shipped
                 // `keys.yaml` default (and its config-upgrade surface).
                 KeyCode::Char('m') => app.load_more_done(),
+                // The text search, as the desktop board's `/` and Esc: routed
+                // directly like the keys above, so `keys.yaml` is untouched.
+                KeyCode::Char('/') => app.begin_search(),
+                KeyCode::Esc if app.search.is_active() => app.clear_search(),
                 _ => {}
             }
         }
     }
     Outcome::Continue
+}
+
+/// A key while the search query is being typed.
+fn handle_search_key(app: &mut KanbanApp, key: KeyEvent) {
+    use crossterm::event::KeyModifiers;
+    let mut query = app.search.query().to_string();
+    match key.code {
+        KeyCode::Esc => {
+            app.clear_search();
+            return;
+        }
+        KeyCode::Enter => {
+            app.end_search_editing();
+            return;
+        }
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => query.clear(),
+        KeyCode::Char(c)
+            if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            query.push(c);
+        }
+        _ => return,
+    }
+    app.set_search(&query);
 }
 
 /// Left-click on a card opens its popover — same path as ENTER/SPACE on the
@@ -779,5 +817,47 @@ mod tests {
         );
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn slash_types_a_search_that_narrows_the_board() {
+        let mut app = KanbanApp::new("demo");
+        let mut a = task_file("t-1", Column::from_status_id("todo"));
+        a.task.title = "Restyle the palette".into();
+        let b = task_file("t-2", Column::from_status_id("todo"));
+        app.apply_board_data(shelbi_app::board::BoardRead {
+            project: None,
+            state_snapshot: None,
+            workflows: Ok(vec![shelbi_core::default_workflow()]),
+            project_statuses: Ok(shelbi_core::default_project_statuses()),
+            board: shelbi_app::board::BoardOutcome::Warm {
+                banner: None,
+                base_tasks: vec![a, b],
+            },
+        });
+        let km = Keymaps::default();
+        let press = |app: &mut KanbanApp, code: KeyCode| {
+            handle_kanban_key(app, KeyEvent::from(code), &km);
+        };
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.search_editing);
+        for c in "pal".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let todo = app.all_columns.iter().position(|c| c.status_id == "todo").unwrap();
+        let ids = |app: &KanbanApp| -> Vec<String> {
+            app.column_tasks(todo).iter().map(|tf| tf.task.id.clone()).collect()
+        };
+        assert_eq!(ids(&app), ["t-1"]);
+        // `j` while typing is part of the query, not a board move.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.search.query(), "palj");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.search_editing, "Enter hands the keys back to the board");
+        assert_eq!(ids(&app), ["t-1"], "and keeps the search");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.search.query(), "");
+        assert_eq!(ids(&app), ["t-1", "t-2"]);
     }
 }

@@ -32,11 +32,13 @@
 //! would refuse as changed elsewhere (`dt-board-stale-after-own-mutation`).
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use shelbi_app::board::{
     self, BoardInput, BoardRead, ClosedPage, DropTarget, WorkflowOption, WorkspaceFilter,
     WorkspaceOption,
 };
+use shelbi_app::board_search::{BoardSearch, SearchRequest, SearchWorker};
 use shelbi_app::{
     BoardFilters, CommandKind, Effect, ExecError, ExpectedState, IssueCard, IssuesModel, Mutation,
 };
@@ -209,6 +211,12 @@ pub struct BoardState {
     keymaps: Keymaps,
     input: BoardInput,
     filters: BoardFilters,
+    /// The text search: a GitHub search on a GitHub board, else a local
+    /// filter (`shelbi_app::board_search`).
+    search: BoardSearch,
+    /// The card selected when the search started, put back when it's cleared
+    /// (so the board is as the user left it).
+    pre_search_selection: Option<String>,
     model: IssuesModel,
     pub selected_column: usize,
     pub selected_row: usize,
@@ -240,6 +248,8 @@ impl BoardState {
             keymaps,
             input,
             filters,
+            search: BoardSearch::new(),
+            pre_search_selection: None,
             model,
             selected_column: 0,
             selected_row: 0,
@@ -316,6 +326,8 @@ impl BoardState {
         if let Some(read) = open {
             self.input.apply_open(read);
             self.filters.workspace = self.input.workspace_filter.clone();
+            self.search.set_remote(self.input.remote_search, Instant::now());
+            self.input.set_search_hits(&self.search);
         }
         if let Some(page) = closed {
             self.input.apply_closed(page);
@@ -339,7 +351,7 @@ impl BoardState {
         // exists (a read that reorders cards shouldn't move the selection).
         let selected = self.selected_card().map(|c| c.id.clone());
         self.generation += 1;
-        self.model = IssuesModel::build(&self.input, &self.filters);
+        self.model = IssuesModel::build_searched(&self.input, &self.filters, &self.search);
         self.overlay_pending();
         if let Some(id) = selected {
             if let Some((c, r)) = self.model.position(&id) {
@@ -616,15 +628,74 @@ impl BoardState {
     /// When the selected card drops out, the keyboard moves to the first
     /// card left, so `j`/`k` walk the matches.
     pub fn set_search(&mut self, query: &str) {
+        self.set_search_at(query, Instant::now());
+    }
+
+    /// [`BoardState::set_search`] at `now` (the search's debounce clock).
+    pub fn set_search_at(&mut self, query: &str, now: Instant) {
         if self.filters.search != query {
+            let was_active = self.search.is_active();
+            if !was_active {
+                self.pre_search_selection = self.selected_card().map(|c| c.id.clone());
+            }
             self.filters.search = query.to_string();
-            self.rebuild();
-            if self.selected_card().is_none() {
-                if let Some(ci) = self.model.columns.iter().position(|c| !c.cards.is_empty()) {
-                    self.select(ci, 0);
+            self.search.set_query(query, now);
+            if was_active && !self.search.is_active() {
+                self.input.set_search_hits(&self.search);
+                self.rebuild();
+                if let Some((c, r)) = self
+                    .pre_search_selection
+                    .take()
+                    .and_then(|id| self.model.position(&id))
+                {
+                    self.select(c, r);
                 }
+                return;
+            }
+            self.search_changed();
+        }
+    }
+
+    /// Rebuild after the search's results changed, keeping the keyboard on a
+    /// card: when the selected one dropped out, the first card left, so
+    /// `j`/`k` walk the matches.
+    fn search_changed(&mut self) {
+        self.input.set_search_hits(&self.search);
+        self.rebuild();
+        if self.selected_card().is_none() {
+            if let Some(ci) = self.model.columns.iter().position(|c| !c.cards.is_empty()) {
+                self.select(ci, 0);
             }
         }
+    }
+
+    /// Send the search that's due through `worker` and fold in its answers
+    /// (the view's tick). True when the board changed.
+    pub fn pump_search(&mut self, worker: &SearchWorker, now: Instant) -> bool {
+        let changed = self.search.pump(worker, now);
+        if changed {
+            self.search_changed();
+        }
+        changed
+    }
+
+    /// Whether the search has a request due (so the view needs its worker).
+    pub fn search_due(&self) -> bool {
+        self.search.is_due()
+    }
+
+    /// Whether "load more" pages the search's results rather than history.
+    pub fn search_showing_results(&self) -> bool {
+        self.search.showing_results()
+    }
+
+    /// The next page of the search's results, to send.
+    pub fn search_load_more(&mut self) -> Option<SearchRequest> {
+        let req = self.search.load_more();
+        if req.is_some() {
+            self.rebuild();
+        }
+        req
     }
 
     pub fn set_workflow_filter(&mut self, filter: Option<String>) {
@@ -1017,7 +1088,7 @@ impl BoardState {
     }
 
     fn load_more(&mut self) -> Vec<Intent> {
-        if self.input.closed_next_cursor.is_some() {
+        if self.model.has_more_done {
             vec![Intent::LoadMore]
         } else {
             Vec::new()
@@ -1472,6 +1543,7 @@ pub(crate) mod tests {
                 display_name: Some("Demo".into()),
                 workspaces: vec!["alpha".into(), "bravo".into()],
                 ownership: shelbi_state::OwnershipGate::Unrestricted,
+                remote_search: false,
             }),
             state_snapshot: None,
             workflows: Ok(vec![shelbi_core::default_workflow()]),
@@ -1548,6 +1620,84 @@ pub(crate) mod tests {
         let _ = b.set_workspace_filter(None);
         b.set_workflow_filter(Some("default".into()));
         assert_eq!(visible(&b), ["A", "B", "C"], "and the workflow filter");
+    }
+
+    /// A fake GitHub search: every query finds `found`, 31 in all (two pages).
+    struct FakeSearch {
+        found: Vec<IssueFile>,
+    }
+
+    impl shelbi_app::board_search::SearchClient for FakeSearch {
+        fn search(
+            &self,
+            _project: &str,
+            _query: &str,
+            page: u32,
+        ) -> Result<shelbi_app::board_search::SearchPage, shelbi_app::board_search::SearchFailure> {
+            let issues = if page == 1 { self.found.clone() } else { vec![issue("D-2", "done")] };
+            Ok(shelbi_app::board_search::SearchPage { issues, total: 31 })
+        }
+    }
+
+    /// Wait for the worker's answer and fold it in.
+    fn settle(b: &mut BoardState, worker: &SearchWorker, at: Instant) {
+        let resp = worker
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the search answers");
+        b.search.apply(resp, at);
+        b.search_changed();
+    }
+
+    #[test]
+    fn a_github_board_searches_github_and_load_more_pages_the_results() {
+        use shelbi_app::board_search::DEBOUNCE;
+        let mut b = BoardState::new("demo", default_keymaps());
+        let mut r = read(vec![issue("A", "todo"), issue("B", "todo")]);
+        r.project.as_mut().unwrap().remote_search = true;
+        b.apply_open(r);
+        b.apply_closed(Some(ClosedPage {
+            issues: vec![issue("D-1", "done")],
+            next_cursor: Some("c1".into()),
+        }));
+        b.select(1, 1);
+        let before = b.selected_card().map(|c| c.id.clone());
+        let worker = SearchWorker::spawn(
+            "demo",
+            std::sync::Arc::new(FakeSearch {
+                found: vec![issue("B", "todo"), issue("OLD", "done")],
+            }),
+        );
+        let t0 = Instant::now();
+        b.set_search_at("issue", t0);
+        assert!(b.model().search.as_ref().unwrap().searching);
+        assert!(!b.pump_search(&worker, t0), "nothing goes out before the pause");
+        assert!(b.pump_search(&worker, t0 + DEBOUNCE));
+        settle(&mut b, &worker, t0 + DEBOUNCE);
+        let ids: Vec<String> = b
+            .model()
+            .columns
+            .iter()
+            .flat_map(|c| c.cards.iter().map(|k| k.id.clone()))
+            .collect();
+        assert_eq!(ids, ["B", "OLD"], "GitHub's matches, beyond the loaded done page");
+        assert_eq!(
+            b.model().search.as_ref().unwrap().label().as_deref(),
+            Some("2 of 31 matches")
+        );
+        assert_eq!(press(&mut b, "m"), [Intent::LoadMore]);
+        assert!(b.search_showing_results(), "so load more pages the results");
+        let more = b.search_load_more().expect("page two");
+        assert_eq!(more.page, 2);
+        worker.send(more);
+        settle(&mut b, &worker, t0 + DEBOUNCE);
+        assert!(b.model().card("D-2").is_some());
+
+        // Clearing puts the board back: its cards, history cursor, selection.
+        b.set_search("");
+        assert!(b.model().search.is_none());
+        assert!(b.model().card("OLD").is_none());
+        assert_eq!(b.closed_cursor(), Some("c1"));
+        assert_eq!(b.selected_card().map(|c| c.id.clone()), before);
     }
 
     #[test]
