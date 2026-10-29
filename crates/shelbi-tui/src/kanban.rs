@@ -2851,6 +2851,19 @@ fn workflow_dropdown_row_text(opt: &WorkflowDropdownOption) -> String {
 /// status names fall through to a generic uppercase rendering so a
 /// `Design` status renders as `DESIGN` without the renderer needing a
 /// per-workflow lookup table.
+/// A category's symbol: the workflow builder's canvas and panel, and the
+/// palette's issue rows.
+pub(crate) fn category_glyph(category: StatusCategory) -> &'static str {
+    match category {
+        StatusCategory::Backlog => "◌",
+        StatusCategory::Ready => "○",
+        StatusCategory::Active => "◐",
+        StatusCategory::Handoff => "◑",
+        StatusCategory::Done => "●",
+        StatusCategory::Archived => "⊘",
+    }
+}
+
 /// Header colour for a column. Driven by [`StatusCategory`] so a
 /// renamed Review-step column (e.g. a workflow's `QA` status with
 /// `category: handoff`) still gets the same magenta the canonical

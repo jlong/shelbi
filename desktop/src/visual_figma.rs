@@ -36,7 +36,7 @@
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
-//! collapsed, Zen off, the sidebar hidden), the issue detail's
+//! collapsed, the project switcher open, Zen off, the sidebar hidden), the issue detail's
 //! ([`DETAIL_ACTIONS`] hovered, a long body scrolled) and the task panels'
 //! (`state-review-*`, `state-workspace-*`: More opening the task detail
 //! over the screen, each view's ⌘N, Approve
@@ -144,6 +144,43 @@ pub const SCREENS: [&str; 12] = [
     "settings-terminal",
     "command-palette",
 ];
+
+/// What the palette's search finds for `zen` in the captures: five issues
+/// (so All caps them with a "Show all" row) and two Changelog entries.
+fn palette_search_corpus() -> shelbi_app::overlay::palette_search::SearchCorpus {
+    use shelbi_app::overlay::palette_search::{IssueDoc, SearchCorpus};
+    use shelbi_core::StatusCategory;
+    let issue = |id: &str, title: &str, status: &str, category| IssueDoc::new(id, title, "", status, category);
+    let issues = vec![
+        issue("1931", "Zen Mode skips the review gate", "In Progress", StatusCategory::Active),
+        issue("1944", "Zen intro copy reads like a warning", "Backlog", StatusCategory::Backlog),
+        issue("1950", "Zen checks run on every workspace", "Review", StatusCategory::Handoff),
+        issue("1957", "Show why Zen held a card back", "Todo", StatusCategory::Ready),
+        issue("1960", "Zen auto-promote ignores assignees", "Done", StatusCategory::Done),
+        issue("1962", "Faster board", "Done", StatusCategory::Done),
+    ];
+    let entry = |id: &str, title: &str, pr: u64, date: &str| {
+        shelbi_app::changelog::ChangelogEntryView::new(
+            shelbi_state::changelog::ChangelogEntry {
+                id: id.into(),
+                title: title.into(),
+                date: chrono::DateTime::parse_from_rfc3339(date).unwrap(),
+                author: "orchestrator".into(),
+                issues: vec![],
+                prs: vec![shelbi_state::changelog::PrRef::Number(pr)],
+                urls: vec![],
+                body: String::new(),
+                path: Default::default(),
+            },
+            Some("jlong/shelbi"),
+        )
+    };
+    let changelog = vec![
+        entry("2026-10-28-zen-review-gate", "Zen Mode waits for review", 1958, "2026-10-28T14:30:00-07:00"),
+        entry("2026-10-21-zen-intro", "A first-run Zen intro", 1902, "2026-10-21T09:00:00-07:00"),
+    ];
+    SearchCorpus::new(issues, changelog)
+}
 
 /// The palette states the frame doesn't draw: the keys typed into the open
 /// palette, and the render's name (beside the screens, with no reference).
@@ -1069,6 +1106,34 @@ impl Run {
         }
     }
 
+    /// The palette's search (no Figma frame draws it; checked by eye): `zen`
+    /// typed under each filter, Tab stepping along the filter row, as
+    /// `palette-search-<filter>`. `SHELBI_VISUAL_ONLY=palette-search` renders
+    /// just these.
+    fn palette_search(&mut self) {
+        let orch = View::Session("orch".into());
+        for (tabs, screen) in [
+            (0, "palette-search-all"),
+            (1, "palette-search-issues"),
+            (2, "palette-search-changelog"),
+            (3, "palette-search-commands"),
+        ] {
+            let handle = self.open();
+            self.click(handle, orch.clone());
+            self.settle(handle);
+            handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.offscreen_open_overlay(None, window, cx);
+                    w.offscreen_palette_corpus(palette_search_corpus());
+                })
+                .unwrap();
+            self.settle(handle);
+            let keys = std::iter::once("z e n").chain(std::iter::repeat_n("tab", tabs)).collect::<Vec<_>>().join(" ");
+            self.cx.simulate_keystrokes(handle.into(), &keys);
+            self.save(handle, screen);
+        }
+    }
+
     /// The palette open over `under`, with the frame's Projects column, after
     /// `keys` (gpui keystroke syntax; none for the frame's state), saved as
     /// `screen`.
@@ -1078,7 +1143,8 @@ impl Run {
         self.settle(handle);
         handle
             .update(&mut self.cx, |w, window, cx| {
-                // The frame's Projects column: two open, one not.
+                // The frame's Projects column: two open (Shelbi the current
+                // one, with the check), one not.
                 use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
                 let project = |slug: &str, label: &str, indicator| ProjectEntry {
                     slug: slug.into(),
@@ -1086,7 +1152,7 @@ impl Run {
                     indicator,
                 };
                 w.offscreen_palette_projects(vec![
-                    project("shelbi", "Shelbi", ProjectIndicator::LoadedIdle),
+                    project("shelbi", "Shelbi", ProjectIndicator::Active),
                     project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle),
                     project("32pixels", "32pixels", ProjectIndicator::Unloaded),
                 ]);
@@ -2440,6 +2506,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "palette-search") {
+            self.palette_search();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "cli-setup") {
             self.cli_setup_windows();
             return;
@@ -2768,6 +2839,20 @@ impl Run {
             }
             self.save(handle, &format!("state-sidebar-fold-{name}-settled"));
         }
+
+        // The project switcher open (the `Project switcher` component's open
+        // state, 2186:1692), the frame's projects open but 32pixels.
+        if let Some(catalog) = self.cx.update(|cx| cx.try_global::<crate::projects::Catalog>().cloned()) {
+            catalog.set_open(&["shelbi", "contextstore"]);
+        }
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_switcher(true, cx))
+            .unwrap();
+        // Past its slide in.
+        self.now.set(self.now.get() + Duration::from_millis(400));
+        self.save(handle, "state-sidebar-switcher");
 
         self.sidebar.zen_mode = shelbi_state::ZenModeState::Off;
         let handle = self.open();

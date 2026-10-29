@@ -330,6 +330,9 @@ pub enum Placement {
     Help,
     /// Board-only mutations the registry never lists (they act on a card).
     Board,
+    /// The palette's search results (an issue, a Changelog entry), which the
+    /// registry never lists either.
+    Search,
 }
 
 /// The menu family of `kind`. No wildcard arm: a new kind must be placed.
@@ -360,6 +363,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         | CommandKind::EditIssue { .. }
         | CommandKind::AddIssue { .. }
         | CommandKind::PrioritizeIssue { .. } => Placement::Board,
+        CommandKind::OpenIssue { .. } | CommandKind::OpenChangelogEntry { .. } => Placement::Search,
     }
 }
 
@@ -1079,5 +1083,6 @@ mod tests {
         assert_eq!(place(&CommandKind::NewWindow), Placement::File);
         assert_eq!(place(&CommandKind::ApproveReview { id: s() }), Placement::GoReview);
         assert_eq!(place(&CommandKind::StartIssue { id: s() }), Placement::Board);
+        assert_eq!(place(&CommandKind::OpenIssue { id: s() }), Placement::Search);
     }
 }

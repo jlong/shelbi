@@ -30,6 +30,12 @@ pub enum Effect {
     OpenEditor { target: EditTarget },
     /// Open the per-project error log.
     OpenErrorLog { project: String },
+    /// Open issue `id`'s detail over the main area, as clicking its card on
+    /// the board does (a client-local view).
+    OpenIssue { project: String, id: String },
+    /// Show the Changelog with entry `id` in view (a client-local view
+    /// change).
+    OpenChangelogEntry { project: String, id: String },
     /// Open Settings in place of the navigation column, on the page last
     /// used (a client-local view change; nothing stops).
     OpenSettings,

@@ -86,7 +86,9 @@ use shelbi_app::add_project_wizard::Origin;
 use shelbi_app::command::{EditItem, ProjectItem};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::overlay::error_log::Viewer;
+use shelbi_app::changelog::ChangelogEntryView;
 use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
+use shelbi_app::overlay::palette_search::{issue_docs, IssueDoc, PaletteSearch, SearchCorpus};
 use shelbi_app::overlay::review_confirm::Slot;
 use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
 use shelbi_app::view::{SidebarModel, SidebarTarget};
@@ -161,6 +163,8 @@ const CASCADE: f32 = 28.0;
 const RESIZE_GRAB: f32 = 5.0;
 /// The title of a window with no project (the empty-state chooser).
 const CHOOSER_TITLE: &str = "Shelbi";
+/// How often an open palette takes the search hits that landed.
+const PALETTE_POLL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// App-wide shell state: the open windows (each in its slot), the
 /// attached-client id, the control-socket watcher feeds register with,
@@ -509,6 +513,8 @@ pub enum HostCall {
     AskRejectReason(String),
     RejectReview(String, String),
     OpenEditor(EditTarget),
+    OpenIssue(String),
+    OpenChangelogEntry(String),
 }
 
 impl CommandHost for Vec<HostCall> {
@@ -574,6 +580,12 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_editor(&mut self, target: &EditTarget) {
         self.push(HostCall::OpenEditor(target.clone()));
+    }
+    fn open_issue(&mut self, id: &str) {
+        self.push(HostCall::OpenIssue(id.to_string()));
+    }
+    fn open_changelog_entry(&mut self, id: &str) {
+        self.push(HostCall::OpenChangelogEntry(id.to_string()));
     }
 }
 
@@ -737,6 +749,9 @@ pub struct ShelbiWindow {
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
     overlay: Option<ActiveOverlay>,
     palette_inputs: PaletteInputs,
+    /// Takes the open palette's issue and Changelog search hits as they
+    /// land; ends when the palette closes.
+    _palette_poll: Option<Task<()>>,
     /// Bumped on each transient status, so a flash only clears its own.
     flash_generation: u64,
     /// The Workspace view, created the first time a workspace is shown.
@@ -987,6 +1002,7 @@ impl ShelbiWindow {
             changelog: None,
             overlay: None,
             palette_inputs: PaletteInputs::default(),
+            _palette_poll: None,
             flash_generation: 0,
             workspace: None,
             workspace_return: None,
@@ -2135,6 +2151,8 @@ impl ShelbiWindow {
             HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
             HostCall::OpenAcknowledgements => cx.defer(crate::views::about::show_bundled_software),
             HostCall::OpenAddProject => self.open_add_project(window, cx),
+            HostCall::OpenIssue(id) => self.open_task(&id, window, cx),
+            HostCall::OpenChangelogEntry(id) => self.open_changelog_entry(id, window, cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
                 let m = Mutation::ApproveReview {
@@ -2889,6 +2907,14 @@ impl ShelbiWindow {
         changelog
     }
 
+    /// Show the Changelog with entry `id` in view (the palette's Changelog
+    /// result).
+    fn open_changelog_entry(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(CommandKind::ShowView(View::Changelog), window, cx);
+        let changelog = self.ensure_changelog(window, cx);
+        changelog.update(cx, |v, cx| v.reveal(&id, window, cx));
+    }
+
     /// Show task `id`'s detail: route to the board and open it there.
     fn open_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.run(CommandKind::ShowView(View::Issues), window, cx);
@@ -3036,6 +3062,14 @@ impl ShelbiWindow {
         cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default()
     }
 
+    /// [`Self::switcher_projects`] as the switcher and the chooser draw
+    /// them: in the same order, each with its dot (the chooser has no
+    /// current project).
+    fn switcher_rows(&self, cx: &App) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+        let current = if self.chooser { "" } else { self.project.as_str() };
+        cx.try_global::<Catalog>().map(|c| c.rows(current)).unwrap_or_default()
+    }
+
     /// A key while the switcher is open: ↑↓ (and Tab) move its keyboard row,
     /// Enter picks it, Esc closes. `false` for any other key (it goes on as
     /// usual).
@@ -3084,12 +3118,12 @@ impl ShelbiWindow {
     /// The empty-state chooser: no project is open in this window. Every
     /// project (the catalog's), and Add Project.
     fn render_chooser(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let projects = self.switcher_projects(cx);
+        let projects = self.switcher_rows(cx);
         let add_ix = projects.len();
-        let rows = projects.into_iter().enumerate().map(|(ix, p)| {
-            let name = p.name.clone();
-            style::menu_row(format!("chooser-{}", p.name), ix == self.chooser_highlight, theme)
-                .child(style::project_badge(&p.label, 20.0))
+        let rows = projects.iter().enumerate().map(|(ix, p)| {
+            let name = p.slug.clone();
+            style::menu_row(format!("chooser-{}", p.slug), ix == self.chooser_highlight, theme)
+                .child(crate::views::project_menu::dot(p.indicator, theme))
                 .child(p.label.clone())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     let project = name.clone();
@@ -3488,9 +3522,95 @@ impl ShelbiWindow {
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entries = self.palette_entries();
         let projects = self.palette_inputs.projects.clone();
-        self.open_overlay(ActiveOverlay::palette(entries, projects), window, cx);
+        // Typing searches the board and the Changelog too: what this window
+        // has read, and (for a page it hasn't opened yet) the board index
+        // and the changelog read off the UI thread.
+        let (issues, changelog) = self.palette_corpus_held(cx);
+        let complete = issues.is_some() && changelog.is_some();
+        let corpus = SearchCorpus::new(issues.unwrap_or_default(), changelog.unwrap_or_default());
+        let search = self.palette_search(corpus);
+        self.open_overlay(ActiveOverlay::palette(entries, projects, search), window, cx);
         // Re-read the inputs off the UI thread; the open palette picks them up.
         self.refresh_palette_inputs(cx);
+        if !complete {
+            self.read_palette_corpus(cx);
+        }
+        self.poll_palette_search(cx);
+    }
+
+    /// Where the palette's searches run: their own thread (a test window
+    /// searches inline, so what it draws doesn't wait on a thread).
+    fn palette_search(&self, corpus: SearchCorpus) -> PaletteSearch {
+        #[cfg(any(test, feature = "visual-check"))]
+        if self.tap.is_some() {
+            return PaletteSearch::inline(corpus);
+        }
+        PaletteSearch::background(corpus, None)
+    }
+
+    /// The issues and Changelog entries this window holds, each `None`
+    /// until its page has read them.
+    fn palette_corpus_held(&self, cx: &App) -> (Option<Vec<IssueDoc>>, Option<Vec<ChangelogEntryView>>) {
+        let issues = self.issues.as_ref().and_then(|v| {
+            let board = v.read(cx).board_input();
+            (!board.loading).then(|| issue_docs(&board.tasks(), &board.project_statuses, board.rules()))
+        });
+        let changelog = self.changelog.as_ref().and_then(|v| v.read(cx).entries());
+        (issues, changelog)
+    }
+
+    /// Read the palette's corpus off the UI thread (the board index and the
+    /// changelog, never GitHub) and hand the open palette whatever part this
+    /// window still doesn't hold.
+    fn read_palette_corpus(&mut self, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "visual-check"))]
+        if self.tap.is_some() {
+            return;
+        }
+        let project = self.project.clone();
+        let reading = project.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { shelbi_app::overlay::palette_search::read_corpus(&project) });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            this.update(cx, |this, cx| {
+                if !this.shows(&reading) {
+                    return;
+                }
+                let (issues, changelog) = this.palette_corpus_held(cx);
+                let corpus = SearchCorpus::new(
+                    issues.unwrap_or_else(|| read.issues.to_vec()),
+                    changelog.unwrap_or_else(|| read.changelog.to_vec()),
+                );
+                if let Some(ActiveOverlay::Palette { palette, .. }) = &mut this.overlay {
+                    palette.set_corpus(corpus);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Take the open palette's search hits as they land (the search runs on
+    /// its own thread), redrawing when they change; stops once the palette
+    /// closes.
+    fn poll_palette_search(&mut self, cx: &mut Context<Self>) {
+        self._palette_poll = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(PALETTE_POLL).await;
+            let open = this.update(cx, |this, cx| match &mut this.overlay {
+                Some(ActiveOverlay::Palette { palette, .. }) => {
+                    if palette.poll_search() {
+                        cx.notify();
+                    }
+                    true
+                }
+                _ => false,
+            });
+            if !matches!(open, Ok(true)) {
+                break;
+            }
+        }));
     }
 
     /// A key while an overlay is open: it takes every key except the app's
@@ -4473,7 +4593,7 @@ impl ShelbiWindow {
         if self.switcher.animating(now, reduce_motion) {
             window.request_animation_frame();
         }
-        let catalog_projects = switcher_phase.map(|_| self.switcher_projects(cx));
+        let catalog_projects = switcher_phase.map(|_| self.switcher_rows(cx));
         // The sidebar's sections and machine groups folding open or closed.
         self.folds.settle(now);
         if self.folds.animating(now) {
@@ -4583,7 +4703,6 @@ impl ShelbiWindow {
                         switcher: catalog_projects.as_deref().zip(switcher_phase).map(
                             |(projects, phase)| sidebar::SwitcherProps {
                                 projects,
-                                current: self.project.as_str(),
                                 highlight: self.switcher.highlight,
                                 phase,
                             },
@@ -4631,7 +4750,6 @@ impl ShelbiWindow {
                         menu: catalog_projects.as_deref().zip(switcher_phase).map(|(projects, phase)| {
                             sidebar::SwitcherProps {
                                 projects,
-                                current: self.project.as_str(),
                                 highlight: self.switcher.highlight,
                                 phase,
                             }
@@ -4948,6 +5066,13 @@ impl ShelbiWindow {
     /// doesn't read its inputs).
     pub(crate) fn offscreen_palette_projects(&mut self, projects: Vec<PaletteProject>) {
         self.palette_inputs.projects = projects;
+    }
+
+    /// Stand in for the board and Changelog reads the open palette searches.
+    pub(crate) fn offscreen_palette_corpus(&mut self, corpus: SearchCorpus) {
+        if let Some(ActiveOverlay::Palette { palette, .. }) = &mut self.overlay {
+            palette.set_corpus(corpus);
+        }
     }
 
     pub(crate) fn offscreen_close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {

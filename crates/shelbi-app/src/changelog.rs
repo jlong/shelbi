@@ -175,7 +175,10 @@ impl ChangelogEntryView {
         }
     }
 
-    fn matches(&self, query: &str) -> bool {
+    /// Whether the entry's title, description, or link targets hold every
+    /// word of `query` (case-insensitive): the Changelog page's search, and
+    /// the palette's over the same entries.
+    pub fn matches(&self, query: &str) -> bool {
         let links: Vec<Link> = self.links.iter().map(|l| l.link.clone()).collect();
         changelog::matches_query(&self.title, &self.description, &links, query)
     }

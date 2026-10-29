@@ -54,6 +54,13 @@
 //! 16pt. Its constant ends in `_CLOSE` and [`heroicon`] draws it at
 //! [`ICON_SIZE_CLOSE`].
 //!
+//! The project menus (the switcher and the palette's Projects column) draw
+//! their rows' marks at **16pt**: the `@menu` list, John's Figma drawings on
+//! a 16pt grid under `assets/icons/menu/` (see its README): the open and
+//! closed project dots, the current project's heavy check, and the plus.
+//! Their constants end in `_MENU` and [`heroicon`] draws them at
+//! [`ICON_SIZE_MENU`].
+//!
 //! The other exception is the **status glyphs** ([`status_glyph`]): the Figma
 //! file's own `status-*` drawings (a dashed circle for backlog, an open one
 //! for to do, a circle filling up through in progress and review to a solid
@@ -87,6 +94,9 @@ pub const ICON_SIZE_BUTTON: Pixels = px(18.0);
 /// A modal's close mark (the issue detail's).
 pub const ICON_SIZE_CLOSE: Pixels = px(16.0);
 
+/// A project menu row's marks (the switcher, the palette's Projects column).
+pub const ICON_SIZE_MENU: Pixels = px(16.0);
+
 /// Every size an icon renders at: the sizes the Figma file uses.
 #[cfg(test)]
 pub const ICON_SIZES: [Pixels; 4] = [ICON_SIZE, ICON_SIZE_SMALL, ICON_SIZE_BUTTON, ICON_SIZE_CLOSE];
@@ -119,7 +129,7 @@ impl Icon {
 
 /// `icon`, outline, at its size ([`ICON_SIZE`], [`ICON_SIZE_SMALL`] for a
 /// small one, [`ICON_SIZE_BUTTON`] for a button's, [`ICON_SIZE_CLOSE`] for
-/// a close mark): the only way Shelbi's
+/// a close mark, [`ICON_SIZE_MENU`] for a project menu's): the only way Shelbi's
 /// views draw an icon.
 pub fn heroicon(icon: Icon) -> Svg {
     svg().path(icon.path()).size(icon.size).flex_none()
@@ -225,10 +235,11 @@ macro_rules! heroicons {
         @small { $($sconst:ident = $sfile:literal;)* }
         @button { $($bconst:ident = $bfile:literal;)* }
         @close { $($cconst:ident = $cfile:literal;)* }
+        @menu { $($mconst:ident = $mfile:literal;)* }
     ) => {
         /// The vendored icons.
         pub mod icons {
-            use super::{Icon, ICON_SIZE, ICON_SIZE_BUTTON, ICON_SIZE_CLOSE, ICON_SIZE_SMALL};
+            use super::{Icon, ICON_SIZE, ICON_SIZE_BUTTON, ICON_SIZE_CLOSE, ICON_SIZE_MENU, ICON_SIZE_SMALL};
 
             $(
                 $(#[$meta])*
@@ -266,10 +277,17 @@ macro_rules! heroicons {
                     size: ICON_SIZE_CLOSE,
                 };
             )*
+            $(
+                pub const $mconst: Icon = Icon {
+                    name: $mfile,
+                    path: concat!("icons/menu/", $mfile, ".svg"),
+                    size: ICON_SIZE_MENU,
+                };
+            )*
 
             /// Every vendored icon.
             #[cfg(test)]
-            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)* $($sconst,)* $($bconst,)* $($cconst,)*];
+            pub const ALL: &[Icon] = &[$($const,)* $($fconst,)* $($sconst,)* $($bconst,)* $($cconst,)* $($mconst,)*];
         }
 
         /// Every vendored drawing, by asset path.
@@ -319,12 +337,23 @@ macro_rules! heroicons {
                     ".svg"
                 )) as &[u8],
             ),)*
+            $((
+                concat!("icons/menu/", $mfile, ".svg"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/icons/menu/",
+                    $mfile,
+                    ".svg"
+                )) as &[u8],
+            ),)*
         ];
     };
 }
 
 heroicons! {
     BOLT = "bolt";
+    /// The palette's Detach.
+    BOLT_SLASH = "bolt-slash";
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
     ARROW_LEFT = "arrow-left";
@@ -376,7 +405,9 @@ heroicons! {
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
     VIEW_COLUMNS = "view-columns";
     BARS_2 = "bars-2";
-    /// The Changelog's sidebar row (the Navigation component's drawing).
+    /// The Changelog's sidebar row (the Navigation component's drawing), its
+    /// palette command (the Figma palette's "Change log") and its search
+    /// results.
     ROCKET_LAUNCH = "rocket-launch";
     DOCUMENT_TEXT = "document-text";
     /// The drawing `TRASH_BUTTON` widens; no view draws it at 20pt.
@@ -417,6 +448,12 @@ heroicons! {
     }
     @close {
         X_MARK_CLOSE = "x-mark";
+    }
+    @menu {
+        CIRCLE_SOLID_MENU = "circle-solid";
+        CIRCLE_MENU = "circle";
+        CHECK_SMALL_HEAVY_MENU = "check-small-heavy";
+        PLUS_MENU = "plus";
     }
 }
 
@@ -697,6 +734,11 @@ mod tests {
                 assert!(svg.contains(r#"fill="currentColor""#), "{path} paints in currentColor");
                 continue;
             }
+            if path == format!("icons/menu/{}.svg", icon.name()) {
+                assert!(svg.contains(r#"viewBox="0 0 16 16""#), "{path} is on the Figma's 16pt grid");
+                assert!(svg.contains("currentColor"), "{path} paints in currentColor");
+                continue;
+            }
             if path == format!("icons/heroicons-16/{}.svg", icon.name()) {
                 // The 20pt drawing with only its stroke widened, 1.5pt at 16.
                 let full = Assets
@@ -784,7 +826,8 @@ mod tests {
             + Assets.list("icons/figma/").unwrap().len()
             + Assets.list("icons/heroicons-14/").unwrap().len()
             + Assets.list("icons/heroicons-18/").unwrap().len()
-            + Assets.list("icons/heroicons-16/").unwrap().len();
+            + Assets.list("icons/heroicons-16/").unwrap().len()
+            + Assets.list("icons/menu/").unwrap().len();
         assert_eq!(listed, HEROICONS.len());
         assert_eq!(HEROICONS.len(), icons::ALL.len());
     }
@@ -803,6 +846,8 @@ mod tests {
                 ICON_SIZE_BUTTON
             } else if icon.path().starts_with("icons/heroicons-16/") {
                 ICON_SIZE_CLOSE
+            } else if icon.path().starts_with("icons/menu/") {
+                ICON_SIZE_MENU
             } else {
                 ICON_SIZE
             };

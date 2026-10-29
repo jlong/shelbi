@@ -25,6 +25,9 @@
 //! - command palette and overlays (error log, review load, reject reason,
 //!   Zen intro, add project): **`dt-palette-overlays`** (landed: `palette.rs`
 //!   and `overlay/`, over the shared `shelbi_app::overlay` state machines)
+//! - the project list the switcher's menu and the palette's Projects column
+//!   share, with its open-project dots: **`dt-switcher-palette-icons`**
+//!   (`project_menu`)
 //! - the review panel taking the sidebar's column, with the push between
 //!   them: **`dt-review-replaces-sidebar`** (`column_swap`)
 //! - the Workspace and Review panels drawn to the Navigation component's
@@ -94,6 +97,7 @@ pub mod machine_form_state;
 pub mod markdown;
 pub mod overlay;
 pub mod palette;
+pub mod project_menu;
 pub mod review;
 pub mod task_detail;
 pub mod task_panel;

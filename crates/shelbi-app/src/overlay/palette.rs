@@ -10,10 +10,22 @@
 //! row yields its `action:switch-project:<slug>` entry (the trailing row,
 //! `action:add-project`), so the host runs it through the registry like any
 //! other entry.
+//!
+//! Typing also searches the project's issues and Changelog entries
+//! ([`super::palette_search`]). While the query isn't blank the palette is
+//! *searching*: the Projects column steps aside, a filter row (All / Issues /
+//! Changelog Entries / Commands, each with its count) sits under the input,
+//! and the results are [`Palette::rows`], grouped by kind under All. Tab and
+//! Shift-Tab change the filter then (an empty query keeps Tab's old job), as
+//! do ←/→ once ↑ from the first result has put focus on the filter row.
 
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::{Key, KeyChord, Mods, PaletteAction};
 
+use super::palette_search::{
+    match_count, result_rows, FilterChip, PaletteSearch, ResultItem, ResultRow, SearchCorpus,
+    SearchFilter,
+};
 use super::{is_bare, typed_char};
 
 /// A project row's liveness indicator in the Projects column.
@@ -85,12 +97,18 @@ pub enum PaletteStep {
 #[derive(Debug, Clone)]
 pub struct Palette {
     query: String,
+    /// The selected result: an index into the selectable rows
+    /// ([`Self::rows`] without the headers).
     selected: usize,
     entries: Vec<Entry>,
     projects: Vec<ProjectEntry>,
     focus: PaletteFocus,
     project_selected: usize,
     tab_columns: bool,
+    filter: SearchFilter,
+    /// Whether the filter row has the keys (↑ from the first result).
+    filter_focus: bool,
+    search: PaletteSearch,
 }
 
 impl Palette {
@@ -105,6 +123,143 @@ impl Palette {
             focus: PaletteFocus::Commands,
             project_selected: 0,
             tab_columns: false,
+            filter: SearchFilter::All,
+            filter_focus: false,
+            search: PaletteSearch::default(),
+        }
+    }
+
+    /// Search issues and Changelog entries with `search` as well as the
+    /// commands.
+    pub fn with_search(mut self, search: PaletteSearch) -> Self {
+        self.search = search;
+        self
+    }
+
+    /// Search fresh issues and entries (a read landed while open).
+    pub fn set_corpus(&mut self, corpus: SearchCorpus) {
+        self.search.set_corpus(corpus);
+    }
+
+    /// The search's issues and entries.
+    pub fn corpus(&self) -> &SearchCorpus {
+        self.search.corpus()
+    }
+
+    /// Take search hits that landed off-thread. Returns whether the results
+    /// changed (the host redraws).
+    pub fn poll_search(&mut self) -> bool {
+        self.search.poll()
+    }
+
+    /// Whether the current query's issue and Changelog search hasn't
+    /// landed yet.
+    pub fn search_pending(&self) -> bool {
+        self.searching() && self.search.pending()
+    }
+
+    /// Whether the palette is searching: the query isn't blank. The filter
+    /// row shows, and the Projects column doesn't.
+    pub fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    pub fn filter(&self) -> SearchFilter {
+        self.filter
+    }
+
+    /// Whether the filter row has the keys.
+    pub fn filter_focused(&self) -> bool {
+        self.searching() && self.filter_focus
+    }
+
+    /// Whether the Projects column shows: there are projects and the
+    /// palette isn't searching.
+    pub fn shows_projects(&self) -> bool {
+        !self.projects.is_empty() && !self.searching()
+    }
+
+    /// The filter row's chips, left to right, each with its match count.
+    pub fn chips(&self) -> Vec<FilterChip> {
+        let commands = self.results().len();
+        let hits = self.search.hits();
+        SearchFilter::ROW
+            .iter()
+            .map(|&filter| FilterChip {
+                filter,
+                label: filter.label(),
+                count: match_count(filter, commands, hits),
+                selected: filter == self.filter,
+            })
+            .collect()
+    }
+
+    /// The results band's rows: the commands alone while not searching;
+    /// grouped by kind under All, or one kind under its filter, while
+    /// searching.
+    pub fn rows(&self) -> Vec<ResultRow> {
+        result_rows(&self.results(), self.search.hits(), self.filter, self.searching())
+    }
+
+    fn items(&self) -> Vec<ResultItem> {
+        self.rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                ResultRow::Item(i) => Some(i),
+                ResultRow::Header(_) => None,
+            })
+            .collect()
+    }
+
+    /// The row the selection is on (clamped to the rows there are), or
+    /// `None` when there are none.
+    pub fn selected_row(&self) -> Option<usize> {
+        let rows = self.rows();
+        let count = rows.iter().filter(|r| r.item().is_some()).count();
+        let target = self.selected_in(count);
+        rows.iter()
+            .enumerate()
+            .filter(|(_, r)| r.item().is_some())
+            .nth(target)
+            .map(|(i, _)| i)
+    }
+
+    /// Show `filter`'s results (a chip clicked, a "Show all" row taken), from
+    /// the top.
+    pub fn set_filter(&mut self, filter: SearchFilter) {
+        self.filter = filter;
+        self.selected = 0;
+    }
+
+    /// A click on a filter chip.
+    pub fn click_filter(&mut self, filter: SearchFilter) {
+        self.set_filter(filter);
+        self.filter_focus = false;
+        self.focus = PaletteFocus::Commands;
+    }
+
+    /// A click on the `index`-th row of [`Self::rows`]: select and activate
+    /// it. A header, or a row that's gone, does nothing.
+    pub fn click_row(&mut self, index: usize) -> PaletteStep {
+        let rows = self.rows();
+        if rows.get(index).and_then(ResultRow::item).is_none() {
+            return PaletteStep::Continue;
+        }
+        let item = rows[..index].iter().filter(|r| r.item().is_some()).count();
+        self.click_item(item)
+    }
+
+    /// Activate a result: run its entry, or take a "Show all" row's filter.
+    fn activate(&mut self, item: ResultItem) -> PaletteStep {
+        match item {
+            ResultItem::ShowAll { kind, .. } => {
+                self.set_filter(kind.filter());
+                PaletteStep::Continue
+            }
+            other => match other.entry() {
+                Some(entry) => PaletteStep::Activate(entry),
+                None => PaletteStep::Continue,
+            },
         }
     }
 
@@ -186,7 +341,9 @@ impl Palette {
 
     /// The footer hint. `close` names the close chord (`Ctrl+P`).
     pub fn footer(&self, close: &str) -> String {
-        if self.projects.is_empty() {
+        if self.searching() {
+            format!("↑↓ navigate · Tab filter · Enter open · Esc / {close} close")
+        } else if self.projects.is_empty() {
             format!("↑↓ navigate · Enter activate · Esc / {close} close")
         } else if self.tab_columns {
             format!("↑↓ navigate · Enter activate · Tab projects · Esc / {close} close")
@@ -222,6 +379,22 @@ impl Palette {
     pub fn handle_key(&mut self, chord: KeyChord, action: Option<PaletteAction>) -> PaletteStep {
         // Tab leaves for the sidebar (or crosses to the other column), ahead
         // of the keymap so no binding can shadow it.
+        // While searching, Tab and Shift-Tab change the filter.
+        let back_tab = chord.code == Key::BackTab || (chord.code == Key::Tab && chord.mods == Mods::SHIFT);
+        if self.searching() && (is_bare(&chord, Key::Tab) || back_tab) {
+            let filter = if back_tab { self.filter.prev() } else { self.filter.next() };
+            self.set_filter(filter);
+            return PaletteStep::Continue;
+        }
+        // ←/→ move along the filter row while it has the keys; with no
+        // Projects column beside the results they do nothing else.
+        if self.searching() && (is_bare(&chord, Key::Left) || is_bare(&chord, Key::Right)) {
+            if self.filter_focus {
+                let filter = if chord.code == Key::Left { self.filter.prev() } else { self.filter.next() };
+                self.set_filter(filter);
+            }
+            return PaletteStep::Continue;
+        }
         if is_bare(&chord, Key::Tab) {
             if !self.tab_columns || self.projects.is_empty() {
                 return PaletteStep::FocusSidebar;
@@ -258,14 +431,24 @@ impl Palette {
                 if self.focus == PaletteFocus::Projects {
                     return PaletteStep::Activate(self.project_entry());
                 }
-                match self.results().get(self.selected) {
-                    Some((entry, _)) => PaletteStep::Activate(entry.clone()),
+                // Enter on the filter row hands the keys back to the results.
+                if self.filter_focused() {
+                    self.filter_focus = false;
+                    return PaletteStep::Continue;
+                }
+                let items = self.items();
+                let ix = self.selected_in(items.len());
+                match items.into_iter().nth(ix) {
+                    Some(item) => self.activate(item),
                     None => PaletteStep::Continue,
                 }
             }
             Some(PaletteAction::NavUp) => {
                 if self.focus == PaletteFocus::Projects {
                     self.project_selected = self.project_selected.saturating_sub(1);
+                } else if self.searching() && self.selected == 0 {
+                    // Up from the first result reaches the filter row.
+                    self.filter_focus = true;
                 } else {
                     self.selected = self.selected.saturating_sub(1);
                 }
@@ -277,15 +460,17 @@ impl Palette {
                     if self.project_selected < self.projects.len() {
                         self.project_selected += 1;
                     }
-                } else if self.selected + 1 < self.results().len() {
+                } else if self.filter_focused() {
+                    self.filter_focus = false;
+                    self.selected = 0;
+                } else if self.selected + 1 < self.items().len() {
                     self.selected += 1;
                 }
                 PaletteStep::Continue
             }
             Some(PaletteAction::Backspace) => {
                 self.query.pop();
-                self.selected = 0;
-                self.focus = PaletteFocus::Commands;
+                self.edited();
                 PaletteStep::Continue
             }
             None => {
@@ -297,15 +482,16 @@ impl Palette {
         }
     }
 
-    /// A click on the `index`-th result: select it and activate it. Out of
-    /// range (the list changed under the click) does nothing.
+    /// A click on the `index`-th result (the selectable rows, headers not
+    /// counted): select it and activate it. Out of range (the list changed
+    /// under the click) does nothing.
     pub fn click_item(&mut self, index: usize) -> PaletteStep {
-        let results = self.results();
-        match results.get(index) {
-            Some((entry, _)) => {
+        match self.items().into_iter().nth(index) {
+            Some(item) => {
                 self.selected = index;
                 self.focus = PaletteFocus::Commands;
-                PaletteStep::Activate(entry.clone())
+                self.filter_focus = false;
+                self.activate(item)
             }
             None => PaletteStep::Continue,
         }
@@ -321,8 +507,19 @@ impl Palette {
 
     fn type_char(&mut self, c: char) {
         self.query.push(c);
+        self.edited();
+    }
+
+    /// The query changed: back to the first result, and search again. A
+    /// query cleared to blank leaves the search (and its filter) behind.
+    fn edited(&mut self) {
         self.selected = 0;
         self.focus = PaletteFocus::Commands;
+        self.filter_focus = false;
+        if !self.searching() {
+            self.filter = SearchFilter::All;
+        }
+        self.search.ask(&self.query);
     }
 }
 
@@ -491,6 +688,127 @@ mod tests {
         p.set_selected(1);
         p.set_entries(vec![entry("a", "Alpha")]);
         assert_eq!(p.selected_in(p.results().len()), 0);
+    }
+
+    fn searchable() -> Palette {
+        use crate::overlay::palette_search::{IssueDoc, SearchCorpus};
+        use shelbi_core::StatusCategory;
+        let issues = (0..5)
+            .map(|i| IssueDoc::new(format!("{}", 1930 + i), format!("Login bug {i}"), "", "Backlog", StatusCategory::Backlog))
+            .collect();
+        Palette::new(
+            vec![entry("action:log-out", "Log out of GitHub"), entry("view:tasks", "Issues")],
+            vec![project("web")],
+        )
+        .with_search(PaletteSearch::inline(SearchCorpus::new(issues, vec![])))
+    }
+
+    fn type_query(p: &mut Palette, q: &str) {
+        for c in q.chars() {
+            press(p, ch(c));
+        }
+    }
+
+    #[test]
+    fn searching_groups_results_and_hides_the_projects_column() {
+        let mut p = searchable();
+        assert!(!p.searching() && p.shows_projects());
+        assert_eq!(p.rows().len(), 2, "an empty query lists the commands, as ever");
+        type_query(&mut p, "lo");
+        assert!(p.searching() && !p.shows_projects());
+        use crate::overlay::palette_search::ResultKind;
+        let rows = p.rows();
+        assert_eq!(rows[0], ResultRow::Header(ResultKind::Command), "commands lead");
+        assert_eq!(rows[2], ResultRow::Header(ResultKind::Issue));
+        assert_eq!(p.selected_row(), Some(1), "the selection skips the header");
+        // Type-and-Enter still runs the command.
+        assert_eq!(
+            press(&mut p.clone(), key(Key::Enter)),
+            PaletteStep::Activate(entry("action:log-out", "Log out of GitHub"))
+        );
+        press(&mut p, key(Key::Down));
+        let counts: Vec<(&str, usize, bool)> = p.chips().iter().map(|c| (c.label, c.count, c.selected)).collect();
+        assert_eq!(
+            counts,
+            [("All", 6, true), ("Issues", 5, false), ("Changelog Entries", 0, false), ("Commands", 1, false)]
+        );
+        // Enter on an issue opens it.
+        let PaletteStep::Activate(e) = press(&mut p, key(Key::Enter)) else {
+            panic!("enter on an issue activates it");
+        };
+        assert_eq!(e.id, "action:open-issue:1930");
+        // The capped group's "Show all" row switches to its filter.
+        for _ in 0..3 {
+            press(&mut p, key(Key::Down));
+        }
+        assert!(matches!(p.rows()[p.selected_row().unwrap()], ResultRow::Item(ResultItem::ShowAll { .. })));
+        assert_eq!(press(&mut p, key(Key::Enter)), PaletteStep::Continue);
+        assert_eq!(p.filter(), SearchFilter::Issues);
+        assert_eq!(p.rows().len(), 5);
+        assert_eq!(p.selected(), 0);
+        // Clearing the query leaves the search and its filter behind.
+        press(&mut p, key(Key::Backspace));
+        press(&mut p, key(Key::Backspace));
+        assert_eq!(p.filter(), SearchFilter::All);
+        assert!(p.shows_projects());
+    }
+
+    #[test]
+    fn tab_and_shift_tab_change_the_filter_only_while_searching() {
+        let mut p = searchable();
+        type_query(&mut p, "lo");
+        assert_eq!(press(&mut p, key(Key::Tab)), PaletteStep::Continue);
+        assert_eq!(p.filter(), SearchFilter::Issues);
+        press(&mut p, KeyChord::new(Key::BackTab, Mods::SHIFT));
+        press(&mut p, KeyChord::new(Key::Tab, Mods::SHIFT));
+        assert_eq!(p.filter(), SearchFilter::Commands, "Shift-Tab wraps left");
+        let ids: Vec<String> = p.rows().iter().filter_map(|r| r.item()?.entry()).map(|e| e.id).collect();
+        assert_eq!(ids, ["action:log-out"]);
+        // An empty query keeps Tab's own job.
+        let mut idle = searchable();
+        assert_eq!(press(&mut idle, key(Key::Tab)), PaletteStep::FocusSidebar);
+    }
+
+    #[test]
+    fn up_from_the_first_result_reaches_the_filter_row() {
+        let mut p = searchable();
+        type_query(&mut p, "lo");
+        press(&mut p, key(Key::Up));
+        assert!(p.filter_focused());
+        press(&mut p, key(Key::Right));
+        press(&mut p, key(Key::Right));
+        assert_eq!(p.filter(), SearchFilter::Changelog);
+        press(&mut p, key(Key::Left));
+        assert_eq!(p.filter(), SearchFilter::Issues);
+        // Down (or Enter) hands the keys back to the results.
+        press(&mut p, key(Key::Down));
+        assert!(!p.filter_focused());
+        assert_eq!(p.selected(), 0);
+        // ←/→ outside the filter row do nothing while searching.
+        press(&mut p, key(Key::Right));
+        assert_eq!((p.filter(), p.focus()), (SearchFilter::Issues, PaletteFocus::Commands));
+        press(&mut p, key(Key::Up));
+        assert_eq!(press(&mut p, key(Key::Enter)), PaletteStep::Continue);
+        assert!(!p.filter_focused());
+        // Typing takes the keys back too.
+        press(&mut p, key(Key::Up));
+        press(&mut p, ch('g'));
+        assert!(!p.filter_focused());
+        assert_eq!(p.footer("⌃P"), "↑↓ navigate · Tab filter · Enter open · Esc / ⌃P close");
+    }
+
+    #[test]
+    fn clicks_pick_a_chip_or_a_row() {
+        let mut p = searchable();
+        type_query(&mut p, "lo");
+        assert_eq!(p.click_row(0), PaletteStep::Continue, "a header does nothing");
+        let PaletteStep::Activate(e) = p.click_row(4) else {
+            panic!("a row activates");
+        };
+        assert_eq!(e.id, "action:open-issue:1931");
+        p.click_filter(SearchFilter::Commands);
+        assert_eq!(p.filter(), SearchFilter::Commands);
+        assert_eq!(p.click_row(0), PaletteStep::Activate(entry("action:log-out", "Log out of GitHub")));
     }
 
     #[test]

@@ -118,9 +118,14 @@ pub enum ActiveOverlay {
 
 impl ActiveOverlay {
     /// Open the command palette over `entries`, with `projects` listed in the
-    /// Projects column (empty hides the column).
-    pub fn palette(entries: Vec<Entry>, projects: Vec<ProjectEntry>) -> Self {
-        ActiveOverlay::Palette(overlay::palette::Palette::new(entries, projects))
+    /// Projects column (empty hides the column), searching the issues and
+    /// Changelog entries `search` holds too.
+    pub fn palette(
+        entries: Vec<Entry>,
+        projects: Vec<ProjectEntry>,
+        search: overlay::palette::PaletteSearch,
+    ) -> Self {
+        ActiveOverlay::Palette(overlay::palette::Palette::new(entries, projects).with_search(search))
     }
 
     /// Open the "Load for review" dialog for `task_id` over the given (free)
@@ -576,7 +581,7 @@ mod tests {
             hidden_until_query: false,
         };
         vec![
-            ActiveOverlay::palette(vec![entry], Vec::new()),
+            ActiveOverlay::palette(vec![entry], Vec::new(), Default::default()),
             ActiveOverlay::review_confirm(
                 "T-1",
                 "Fix the thing",
@@ -771,7 +776,7 @@ mod tests {
             decoration: None,
             hidden_until_query: false,
         };
-        let mut ov = ActiveOverlay::palette(vec![entry], Vec::new());
+        let mut ov = ActiveOverlay::palette(vec![entry], Vec::new(), Default::default());
         let (buf, rect) = draw_over_sentinel(&mut ov);
 
         // Find the selected row: the one, inside the palette rect, whose cells
@@ -955,7 +960,7 @@ mod tests {
 
     #[test]
     fn palette_tab_focuses_sidebar_and_esc_closes() {
-        let mut ov = ActiveOverlay::palette(Vec::new(), Vec::new());
+        let mut ov = ActiveOverlay::palette(Vec::new(), Vec::new(), Default::default());
         assert_eq!(
             ov.handle_key(key(KeyCode::Tab), &keymaps()),
             OverlayEvent::FocusSidebar

@@ -171,6 +171,9 @@ pub struct ChangelogView {
     search_input: Option<Entity<InputState>>,
     /// A page load asked for by the row under the entries, not yet run.
     loading_more: bool,
+    /// An entry to bring into view (the palette's Changelog result) once
+    /// it's read.
+    reveal: Option<String>,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -201,6 +204,7 @@ impl ChangelogView {
             bodies: HashMap::new(),
             search_input: None,
             loading_more: false,
+            reveal: None,
             _subscriptions: Vec::new(),
             _poll: poll,
         }
@@ -221,9 +225,47 @@ impl ChangelogView {
     fn tick(&mut self, cx: &mut Context<Self>) {
         if let Some(Some(data)) = self.refresher.latest() {
             self.model.set_data(data);
+            self.apply_reveal(cx);
             cx.notify();
         }
         self.refresher.request();
+    }
+
+    /// Every entry of the last read, newest first, or `None` before the
+    /// first (the palette searches them).
+    pub fn entries(&self) -> Option<Vec<ChangelogEntryView>> {
+        self.model.data().map(|d| d.entries.clone())
+    }
+
+    /// Show entry `id` (the palette's Changelog result): the search
+    /// cleared and the entry at the top of the list. Waits for the first
+    /// read if it hasn't landed.
+    pub fn reveal(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_search(window, cx);
+        self.reveal = Some(id.to_string());
+        self.apply_reveal(cx);
+    }
+
+    fn apply_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.reveal.clone() else {
+            return;
+        };
+        if self.model.entry(&id).is_none() {
+            return;
+        }
+        self.reveal = None;
+        let position = |m: &ChangelogModel| m.visible().position(|e| e.id == id);
+        while position(&self.model).is_none() && self.model.has_more() {
+            self.model.load_more();
+        }
+        if let Some(ix) = position(&self.model) {
+            self.sync_list();
+            self.list.state.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: Pixels::ZERO,
+            });
+        }
+        cx.notify();
     }
 
     /// Fold in a read now (the offscreen checks drive the view by hand: their
@@ -234,7 +276,7 @@ impl ChangelogView {
     }
 
     /// The page's model, for the offscreen checks.
-    #[cfg(feature = "visual-check")]
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn model(&self) -> &ChangelogModel {
         &self.model
     }
@@ -257,7 +299,7 @@ impl ChangelogView {
     }
 
     /// The list's top, for the offscreen checks.
-    #[cfg(feature = "visual-check")]
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn scroll_top(&self) -> ListOffset {
         self.list.state.logical_scroll_top()
     }
@@ -897,6 +939,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    #[gpui::test]
+    fn reveal_clears_the_search_and_brings_the_entry_to_the_top(cx: &mut TestAppContext) {
+        let _env = crate::test_env::lock();
+        let home = std::env::temp_dir().join(format!("shbcl-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        // SAFETY: the env lock is held.
+        unsafe { std::env::set_var("SHELBI_HOME", &home) };
+        let project = "clr";
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            let body = "A paragraph that takes some room.\n\n".repeat(4);
+            let mut new = entry(&format!("Entry {i}"), &[], &body);
+            // Each a minute after the last, so the first is the oldest.
+            new.date -= chrono::Duration::minutes(10 - i);
+            ids.push(add_entry(project, new).unwrap().id);
+        }
+
+        cx.update(|cx| {
+            cx.set_global(Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark));
+            gpui_kit::init(cx);
+        });
+        let handle = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(project.into(), cx)))
+                .unwrap()
+        });
+        let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+        let view = handle.root(&mut vcx).unwrap();
+        // Asked before the first read lands: it waits for it.
+        let oldest = ids[0].clone();
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.search_for("entry 7", window, cx)));
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.reveal(&oldest, window, cx)));
+        assert!(until(&view, &mut vcx, |m| m.total() == 8), "the first read lands");
+        view.update(&mut vcx, |v, cx| v.tick(cx));
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        vcx.run_until_parked();
+        let (query, at, top) = view.read_with(&vcx, |v, _| {
+            let at = v.model().visible().position(|e| e.id == oldest);
+            (v.model().query().to_string(), at, v.scroll_top().item_ix)
+        });
+        assert_eq!(query, "", "the search is cleared");
+        assert_eq!(at, Some(7), "the oldest entry, newest first");
+        assert!(top > 0, "scrolled down to it (the list stops at its end): {top}");
+
+        unsafe { std::env::remove_var("SHELBI_HOME") };
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[gpui::test]

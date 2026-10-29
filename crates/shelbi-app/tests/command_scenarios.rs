@@ -183,6 +183,16 @@ impl Executor for Scenario {
                 self.client.open_overlay(Overlay::ErrorLog);
                 Performed::Nothing
             }
+            // An issue's detail opens over whatever is showing, as a card
+            // click's does over the board: the host draws it, the view stays.
+            Effect::OpenIssue { .. } => Performed::Host(effect.clone()),
+            // The Changelog takes the main area; the host brings the entry
+            // into view.
+            Effect::OpenChangelogEntry { .. } => {
+                self.client.set_view(View::Changelog);
+                self.client.focus_main();
+                Performed::Host(effect.clone())
+            }
             // Settings stands over the view (it isn't one): the client's view
             // is what its Back returns to, so it is left alone.
             Effect::OpenSettings => {
@@ -265,6 +275,8 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::QuitProject => "detach_and_quit_reach_the_host",
         CommandKind::QuitShelbi => "detach_and_quit_reach_the_host",
         CommandKind::OpenEditor { .. } => "edit_targets_open_their_file_in_the_editor",
+        CommandKind::OpenIssue { .. } => "a_searched_issue_opens_its_detail_over_the_view",
+        CommandKind::OpenChangelogEntry { .. } => "a_searched_changelog_entry_opens_the_changelog_at_it",
         CommandKind::ApproveReview { .. } => "approve_is_sent_at_once",
         CommandKind::RejectReview { .. } => "reject_asks_for_a_reason_then_sends_it",
         CommandKind::MoveIssue { .. }
@@ -542,6 +554,53 @@ fn acknowledgements_reach_the_host_with_or_without_a_project() {
     let mut m = fixture();
     m.project = None;
     assert!(CommandRegistry::new().resolve("action:acknowledgements", &m).is_some());
+}
+
+/// The palette's search results: never listed by the registry (they come
+/// from the issue and Changelog search), only resolved from their ids.
+impl Scenario {
+    fn invoke_search_result(&mut self, id: &str) -> Effect {
+        assert!(
+            CommandRegistry::new().resolve(id, &self.model).is_none(),
+            "{id} is a search result, not a listed command"
+        );
+        let kind = CommandKind::from_id(id).unwrap_or_else(|| panic!("{id} resolves"));
+        let effect = kind.effect_with_project(PROJECT);
+        self.run(effect.clone()).expect("the scenario executor never fails");
+        effect
+    }
+}
+
+#[test]
+fn a_searched_issue_opens_its_detail_over_the_view() {
+    let mut s = Scenario::new();
+    s.client.set_view(View::Changelog);
+    let effect = s.invoke_search_result("action:open-issue:1931");
+    assert_eq!(
+        effect,
+        Effect::OpenIssue {
+            project: PROJECT.into(),
+            id: "1931".into()
+        }
+    );
+    assert_eq!(s.last(), &Performed::Host(effect), "nothing reaches the daemon");
+    assert_eq!(s.client.view(), &View::Changelog, "the detail opens over the view");
+}
+
+#[test]
+fn a_searched_changelog_entry_opens_the_changelog_at_it() {
+    let mut s = Scenario::new();
+    let effect = s.invoke_search_result("action:open-changelog-entry:2026-10-28-login");
+    assert_eq!(
+        effect,
+        Effect::OpenChangelogEntry {
+            project: PROJECT.into(),
+            id: "2026-10-28-login".into()
+        }
+    );
+    assert_eq!(s.client.view(), &View::Changelog);
+    assert_eq!(s.client.focus(), Focus::Main);
+    assert_eq!(s.last(), &Performed::Host(effect), "the host brings the entry into view");
 }
 
 #[test]

@@ -493,7 +493,7 @@ fn start_palette_probe(
                     Some(asked) => {
                         let entries = shelbi_app::CommandRegistry::new()
                             .entries(&shelbi_app::command::CommandModel::default());
-                        root.overlay = Some(ActiveOverlay::palette(entries, Vec::new()));
+                        root.overlay = Some(ActiveOverlay::palette(entries, Vec::new(), Default::default()));
                         root.probe.borrow_mut().palette_requested = Some(asked);
                     }
                     None => {

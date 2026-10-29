@@ -90,10 +90,11 @@ fn the_switcher_menu_floats_over_the_sidebar(cx: &mut TestAppContext) {
     let menu = d.bounds("sidebar-switcher").expect("the menu shows");
     assert_eq!(d.bounds("sidebar-search").unwrap(), search, "the search button doesn't move");
     assert_eq!(d.bounds("sidebar-nav-Issues").unwrap(), issues, "the nav doesn't move");
-    assert_eq!(menu.top(), button.bottom() + px(6.0), "6px under the button");
+    assert_eq!(menu.top(), button.bottom() + px(4.0), "the component's 4pt under the button");
     assert!(menu.size.width >= button.size.width, "at least the trigger's width");
     for name in ["sidebar-project-alpha", "sidebar-project-beta", "sidebar-project-gamma", "sidebar-add-project"] {
-        assert!(d.bounds(name).is_some(), "{name} is listed");
+        let row = d.bounds(name).unwrap_or_else(|| panic!("{name} is listed"));
+        assert_eq!(row.size.height, px(26.0), "{name}: the component's 26pt row");
     }
 }
 
@@ -107,9 +108,9 @@ fn the_switcher_slides_in_and_out(cx: &mut TestAppContext) {
     });
     let button = d.bounds("sidebar-project-title").unwrap();
     let opening = d.bounds("sidebar-switcher").expect("drawn from its first frame");
-    assert!(opening.top() > button.bottom() + px(6.0), "starts lower, sliding up");
+    assert!(opening.top() > button.bottom() + px(4.0), "starts lower, sliding up");
     d.advance(Duration::from_millis(400));
-    assert_eq!(d.bounds("sidebar-switcher").unwrap().top(), button.bottom() + px(6.0));
+    assert_eq!(d.bounds("sidebar-switcher").unwrap().top(), button.bottom() + px(4.0));
 
     d.update(|w, _, cx| {
         let now = (w.clock)();

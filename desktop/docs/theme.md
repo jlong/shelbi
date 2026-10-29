@@ -13,7 +13,7 @@ doesn't read them.
 - `src/theme/style.rs`: the Figma text styles (`Type`, applied with
   `.type_style(...)`) and the component shapes every view shares (nav chip,
   buttons, icon buttons, dropdowns, segmented controls, keycaps and the
-  sidebar's plain hotkeys, project badges, popovers, dialogs, chips, the
+  sidebar's plain hotkeys, popovers, dialogs, chips, the
   focus ring and glow, empty states, tooltips).
 - `src/theme/motion.rs`: the motion: the easing curve, the spring the
   selection chip slides on, and the fades every hover and press runs.
@@ -159,8 +159,8 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Component | Shape |
 |---|---|
 | Corners | 8px (`rounded_lg`) on panel rows and surfaces; 12px on the board's cards; 6px (`NAV_RADIUS`) on the sidebar's rows and chip, buttons, dropdowns and segments (Figma's `6`); 8px on the sidebar's 32px toolbar buttons; 12px on the 32px icon buttons; 4px on keycaps and count badges |
-| Project switcher | The Navigation component's trigger: 28px, 8px across, 6px corners, the name (Base medium, `foreground`) and the up-down chevron in the muted color; clear at rest, the hover fill, pressed while open. Its menu is a popover 6px below: rows of badge, name and a check on the current project, a rule, then "Add project…"; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
-| Project badge | Two-letter initials (two words, camel case split), bold white, on a fill picked from the name (`badge_fill`); the switcher's menu rows |
+| Project switcher | The Navigation component's trigger: 28px, 8px across, 6px corners, the name (Base medium, `foreground`) and the up-down chevron in the muted color; clear at rest, the hover fill, pressed while open. Its menu (the component's open state, 2186:1692) floats 4px below: the `search` tint over the sidebar's color, 6px corners, 4px across and 8px down, no drop; the project list below; ↑↓ / Tab move, Enter picks, Esc or a click outside closes |
+| Project list | The switcher's menu and the palette's Projects column (`views/project_menu.rs`): a "Projects" heading (Base medium, `muted`), 26px rows 8px in with 4px gaps (Base, `foreground`): a 16px dot (filled `icon_green` while the project is open, a `gray` ring when it isn't, decided by `shelbi_app::command_model::project_rows`), the name, and a 16px heavy check in `gray` on the current project; an 8px-clear 1px `divider`; then "+ Add project" (a 16px plus in `gray`). No avatars |
 | Toolbar button | The sidebar's titlebar (Search, Toggle sidebar) and footer (Settings): 32px square, 8px corners, the 20px icon in `icon`, the hover fill fading in and a loud icon on hover |
 | Keycaps | The Button component's Hotkey (`button_hotkey`): one cap holding the key as written (`s`, `E`, `⌘S`), X-Small in `gray`, 16px tall, 4px across, 4px corners, on the canvas with a 1px `button_keycap_edge` drop (the issue detail's actions) |
 | Hotkey (sidebar) | The Navigation component's: the chord's keys as plain text (`⌘O`), 2px apart, X-Small in `gray`, 4px either side, no caps |
@@ -342,7 +342,7 @@ until a new role has its row here, with the values the palette really has.
 | `form_text` | `#f2f3f7d9` | `#020303b2` | `text/foreground`, a role of its own: a textbox's value, an unselected segment or checkbox |
 | `form_hint` | `#f2f3f78c` | `#444c6580` | `text/muted`, a role of its own: a labeled control's helper, a textbox's placeholder, the board toolbar's `Filter:` and search placeholder |
 | `muted` | `#f2f3f78c` | `#444c6580` | `text/muted`: section headers, branches, hints, idle, placeholders |
-| `text_on_color` | `#ffffff` | `#ffffff` | `other/on_color`: a project badge's initials, the check mark |
+| `text_on_color` | `#ffffff` | `#ffffff` | `other/on_color`: the check mark |
 | `log_text` | `#7b85a7` | `#7b85a7` | The Activity frame's `text/gray` (not in `03 Desktop`; opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
 | `table_text` | `#7b85a7` | `#7b85a7` | The Machines frame's `text/gray` (the same): a workspace row's runner and task |
 
@@ -481,15 +481,6 @@ the rule the Button component's Success and Danger styles follow.
 | `palette_shadow` | `#00000040` | `#00000040` | The Command palette's drop effect (`0 10 15 -3`): the palette over the scrim |
 | `scrim` | `#02030359` | `#444c65a6` | `surface/overlay`: the backdrop behind the palette and dialogs |
 
-### Project badges
-
-Not roles: the same eight fills in both themes, picked per project by
-`badge_fill` (an FNV-1a hash of the name), each dark enough for white
-initials at 4.5:1: `#db0a60`, `#2830f1`, `#7019c0`, `#00753d`, `#0c699c`,
-`#9d4100`, `#aa0101`, `#856700`. The Figma Navigation component draws the
-project name without a badge, so the switcher's trigger has none; its menu's
-rows keep their initials.
-
 ## Contrast
 
 `src/theme/palette.rs` checks every pairing the desktop draws, in both
@@ -502,7 +493,7 @@ Text is held to WCAG AA (4.5:1). Icons, the focus ring, a text field's edge
 and the selected nav icon are held to 3:1 (WCAG 1.4.11). `src/theme/mod.rs`
 checks the terminal's default foreground at AA and its ANSI hues and dim
 text at 3:1 on the canvas, except Light's dim text: `text/muted` (`#444c65`
-at 50%) over white is 2.46, held to a 2.4 floor. `project_badges_carry_white_initials` checks every badge fill.
+at 50%) over white is 2.46, held to a 2.4 floor.
 
 ### Exceptions
 

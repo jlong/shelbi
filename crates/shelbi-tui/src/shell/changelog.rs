@@ -336,6 +336,9 @@ pub struct ChangelogPage {
     generation: u64,
     doc: Doc,
     last_area: Rect,
+    /// An entry to bring into view (the palette's Changelog result) once
+    /// it's read and the page has been laid out.
+    reveal: Option<String>,
 }
 
 impl Default for ChangelogPage {
@@ -357,6 +360,7 @@ impl ChangelogPage {
             generation: 1,
             doc: Doc::default(),
             last_area: Rect::default(),
+            reveal: None,
         }
     }
 
@@ -369,6 +373,55 @@ impl ChangelogPage {
     #[cfg(test)]
     pub fn searching(&self) -> bool {
         self.searching
+    }
+
+    /// The focused entry's id.
+    #[cfg(test)]
+    pub fn selected_entry(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Document lines scrolled past.
+    #[cfg(test)]
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// Every entry of the last read, newest first (the palette searches
+    /// them).
+    pub fn entries(&self) -> Vec<ChangelogEntryView> {
+        self.model.data().map(|d| d.entries.clone()).unwrap_or_default()
+    }
+
+    /// Show entry `id` (the palette's Changelog result): the search cleared,
+    /// the entry unfolded, focused and at the top of the screen. Waits for
+    /// the read, and for the first layout, if the page has neither yet.
+    pub fn reveal(&mut self, id: &str) {
+        self.searching = false;
+        self.set_query("");
+        self.collapsed.remove(id);
+        self.reveal = Some(id.to_string());
+        self.apply_reveal();
+    }
+
+    fn apply_reveal(&mut self) {
+        let Some(id) = self.reveal.clone() else {
+            return;
+        };
+        if self.model.entry(&id).is_none() {
+            return;
+        }
+        while self.position_of(&id).is_none() && self.model.has_more() {
+            self.model.load_more();
+        }
+        self.relayout_now();
+        if let Some(ix) = self.position_of(&id) {
+            self.jump_to(ix);
+        }
+        // Laid out for a real screen: done (else the first draw does it).
+        if self.last_area.height > 0 {
+            self.reveal = None;
+        }
     }
 
     /// Take a fresh read. Reading in place stays in place: when the reader
@@ -386,6 +439,7 @@ impl ChangelogPage {
             }
         }
         self.keep_selection();
+        self.apply_reveal();
     }
 
     /// Search: narrow to entries holding every word of `query`. Back to the
@@ -811,6 +865,7 @@ impl ChangelogPage {
         }
         let plan = plan(area);
         self.relayout(plan.column.width);
+        self.apply_reveal();
         self.load_ahead();
         self.scroll = self.scroll.min(self.max_scroll());
         if self.selected_ix().is_none() {

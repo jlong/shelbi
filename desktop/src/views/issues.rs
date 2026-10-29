@@ -280,6 +280,11 @@ impl IssuesView {
         self.needs_focus = true;
     }
 
+    /// What the board has read (the palette searches its issues).
+    pub fn board_input(&self) -> &shelbi_app::board::BoardInput {
+        self.state.input()
+    }
+
     /// The board's state, for the offscreen renders.
     #[cfg(feature = "visual-check")]
     pub fn state_mut(&mut self) -> &mut BoardState {

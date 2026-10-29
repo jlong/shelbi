@@ -28,22 +28,23 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Hsla, Pixels,
+    deferred, div, prelude::*, px, AnyElement, Bounds, Context, Hsla, Pixels,
     Div, ScrollHandle, SharedString, Stateful, Svg, Window,
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
+use shelbi_app::overlay::palette::ProjectEntry;
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::ZenModeState;
 
 use super::settings_nav::SettingsPage;
-use crate::assets::{glyph, glyphs, heroicon, icons, Icon, ICON_SIZE};
+use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::keys::{nav_view_hotkey, row_hotkey};
-use crate::projects::ProjectEntry;
 use crate::refresh::DaemonLink;
 use crate::theme::fold::{self, Folds};
 use crate::theme::motion::{self, fill_layer, SharedTrack};
 use crate::theme::style::{self, Type, Typography, LIST_ROW_H, NAV_RADIUS};
 use crate::theme::Theme;
+use crate::views::project_menu;
 
 /// Width of one sidebar column in the window, so the shared nav model's
 /// widths (default 28, minimum 24) and its clamp apply unchanged: the default
@@ -93,8 +94,9 @@ const NAV_ITEM_H: f32 = 34.0;
 pub const SWITCHER_H: f32 = 28.0;
 /// The project block's minimum height.
 const PROJECT_BLOCK_H: f32 = 48.0;
-/// The menu's gap below the trigger.
-pub const MENU_GAP: f32 = 6.0;
+/// The menu's gap below the trigger (the `Project switcher` component's
+/// `4`).
+pub const MENU_GAP: f32 = 4.0;
 
 /// The footer toolbar's and the titlebar's square buttons.
 const TOOLBAR_BUTTON: f32 = 32.0;
@@ -446,10 +448,9 @@ pub struct SidebarProps<'a> {
 
 /// The switcher menu, as one frame draws it.
 pub struct SwitcherProps<'a> {
-    /// Every project, most recently launched first.
+    /// Every project, most recently launched first, with its dot
+    /// ([`crate::projects::Catalog::rows`]; the current one is `Active`).
     pub projects: &'a [ProjectEntry],
-    /// The current project's id.
-    pub current: &'a str,
     /// The keyboard's row: an index into the projects, or `projects.len()`
     /// for "Add project…".
     pub highlight: usize,
@@ -965,8 +966,9 @@ pub fn switcher_trigger<H: SidebarHost>(
 }
 
 /// The switcher's menu floating `top` below its block's top, 8px in and
-/// as wide as a column `width` wide allows: drawn after everything
-/// (`deferred`), so nothing below it moves and nothing paints over it.
+/// as wide as a column `width` wide allows (the component's 236pt in the
+/// 252pt column): drawn after everything (`deferred`), so nothing below it
+/// moves and nothing paints over it.
 pub fn switcher_menu<H: SidebarHost>(
     switcher: &SwitcherProps<'_>,
     button: &Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -987,9 +989,13 @@ pub fn switcher_menu<H: SidebarHost>(
     .with_priority(1)
 }
 
-/// The switcher's menu: a row per project (its badge, its name, a check on
-/// the current one), a rule, then "Add project…". The keyboard's row wears
-/// the selection fill.
+/// The switcher's menu, the Figma `Project switcher`'s open state
+/// (2186:1692): the "Projects" heading, a row per project (its dot, its
+/// name, a check on the current one), a rule, then "+ Add project"
+/// ([`project_menu`], the palette's Projects column too). The keyboard's row
+/// wears the selection fill. Its `search` tint is laid over the sidebar's
+/// color, so it reads as the frame draws it over the sidebar while hiding
+/// the rows below it.
 fn render_switcher<H: SidebarHost>(
     switcher: &SwitcherProps<'_>,
     button: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -997,75 +1003,62 @@ fn render_switcher<H: SidebarHost>(
     cx: &mut Context<H>,
 ) -> impl IntoElement {
     let rows = switcher.projects.iter().enumerate().map(|(ix, p)| {
-        let is_current = p.name == switcher.current;
-        let name = p.name.clone();
-        style::menu_row(
-            SharedString::from(format!("sidebar-project-{}", p.name)),
+        let name = p.slug.clone();
+        project_menu::project_row(
+            SharedString::from(format!("sidebar-project-{}", p.slug)),
+            format!("sidebar-project-{}", p.slug),
+            p,
             switcher.highlight == ix,
             theme,
         )
-        .child(style::project_badge(&p.label, 24.0))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .when(is_current, |d| d.font_weight(FontWeight::MEDIUM).text_color(theme.text_loud))
-                .child(p.label.clone()),
-        )
-        .child(div().w(ICON_SIZE).flex_none().when(is_current, |d| {
-            d.child(heroicon(icons::CHECK).text_color(theme.accent))
-        }))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
         }))
     });
     let add_ix = switcher.projects.len();
-    let add = style::menu_row("sidebar-add-project", switcher.highlight == add_ix, theme)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(24.0))
-                .flex_none()
-                .child(heroicon(icons::PLUS).text_color(theme.icon)),
-        )
-        .child(div().flex_1().child("Add project…"))
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::AddProject, window, cx)
-        }));
-    style::popover(
-        div()
-            .id("sidebar-switcher")
-            .debug_selector(|| "sidebar-switcher".into())
-            .flex()
-            .flex_col()
-            .p_1()
-            .occlude(),
+    let add = project_menu::add_row(
+        "sidebar-add-project",
+        "sidebar-add-project",
+        switcher.highlight == add_ix,
         theme,
     )
-    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-        // A press on the button toggles it closed through its click.
-        if button.get().is_some_and(|b| b.contains(&event.position)) {
-            return;
-        }
-        this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
-    }))
-    .when(switcher.projects.is_empty(), |d| {
-        d.child(
-            div()
-                .px_2()
-                .h(px(LIST_ROW_H))
-                .flex()
-                .items_center()
-                .text_color(theme.muted)
-                .child("Loading projects…"),
-        )
-    })
-    .children(rows)
-    .child(div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
-    .child(add)
+    .on_click(cx.listener(|this, _, window, cx| {
+        this.sidebar_event(SidebarEvent::AddProject, window, cx)
+    }));
+    div()
+        .id("sidebar-switcher")
+        .debug_selector(|| "sidebar-switcher".into())
+        .flex()
+        .flex_col()
+        .px_1()
+        .py_2()
+        .rounded(px(NAV_RADIUS))
+        .bg(theme.raised.blend(theme.search))
+        .text_color(theme.foreground)
+        .occlude()
+        .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+            // A press on the button toggles it closed through its click.
+            if button.get().is_some_and(|b| b.contains(&event.position)) {
+                return;
+            }
+            this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
+        }))
+        .child(project_menu::heading(theme))
+        .when(switcher.projects.is_empty(), |d| {
+            d.child(
+                div()
+                    .px_2()
+                    .h(px(project_menu::ROW_H))
+                    .flex()
+                    .items_center()
+                    .type_style(Type::Base)
+                    .text_color(theme.muted)
+                    .child("Loading projects…"),
+            )
+        })
+        .children(rows)
+        .child(project_menu::divider(theme))
+        .child(add)
 }
 
 

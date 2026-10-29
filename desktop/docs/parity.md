@@ -54,6 +54,8 @@ paths on every `cargo test`.
 | Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
 | Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to another open project, or shows the empty-state chooser; `pb` kept running |
 | Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
+| Open a searched issue | (palette search) `action:open-issue:<id>` | Added after this walk (`changelog-palette-search`): the board's detail popover over the view the palette opened from (read off the UI thread when the issue is past the board's first history page), as a Changelog issue link opens it | The issue's detail on the board, as a Changelog issue chip opens it |
+| Open a searched Changelog entry | (palette search) `action:open-changelog-entry:<id>` | Added after this walk: the Changelog page, its search cleared, the entry unfolded, focused and at the top | The Changelog page, its search cleared, the entry at the top of the list |
 | Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop) |
 | Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column) |
 | Assign | (board) `AssignIssue` | Not on the TUI board (see Known gaps) | `a`: workspace picker; `@dev` written |
