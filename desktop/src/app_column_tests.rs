@@ -778,11 +778,11 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     c.advance(SLIDE);
     assert!(c.drawn("review-panel") && !c.drawn("column-sidebar"));
     // The Navigation component's titlebar and footer stay around the panel,
-    // the Zen pill at State=Review's 32pt.
+    // the Zen pill at the 24pt every state draws.
     for selector in ["sidebar-search", "sidebar-collapse", "sidebar-settings", "sidebar-zen"] {
         assert!(c.drawn(selector), "{selector} is drawn around the panel");
     }
-    assert_eq!(c.bounds("sidebar-zen").unwrap().size.height, gpui::px(32.0));
+    assert_eq!(c.bounds("sidebar-zen").unwrap().size.height, gpui::px(24.0));
     c.h.take_calls();
 
     // ⌘2 is the panel's View Diff, not the hidden sidebar's second row.
