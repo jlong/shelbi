@@ -55,13 +55,16 @@ pub struct SidebarModel {
     /// Machines the user has collapsed in the Workspaces tree (their workspace
     /// rows are hidden, the group header shows a count suffix).
     pub collapsed_machines: BTreeSet<String>,
-    /// Footer freshness banner (shares the version row): `None` for a local or
-    /// not-yet-probed board.
+    /// Board freshness banner: `None` for a local or not-yet-probed board. The
+    /// desktop footer shows its warnings; the TUI sidebar doesn't show it (its
+    /// Issues board does).
     pub board_banner: Option<String>,
-    /// Preformatted daemon/CLI version footer segment. `None` until probed.
+    /// Preformatted daemon/CLI version line. `None` until probed. Both clients
+    /// show it with the Settings button (tooltip / hover name) and, on a
+    /// mismatch, in red in the footer.
     pub daemon_version_line: Option<String>,
-    /// True when the probed daemon version differs from the running binary —
-    /// the renderer paints the version segment red instead of dim.
+    /// True when the probed daemon version differs from the running binary:
+    /// the footer shows the version line, red, naming the fix.
     pub daemon_version_mismatch: bool,
     /// Launch-time sidebar status line (the first-run hint or a startup-warning
     /// count). Empty when there is nothing to surface.

@@ -1993,13 +1993,14 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
             Style::default().fg(palette().ansi_dark_gray),
         ),
     ];
-    // Board freshness banner (Phase 3 §6): a warm board reads plainly dim; a
-    // stale index or a cache fallback reads yellow so a lagging daemon or an
-    // exhausted quota is visible at a glance rather than hidden behind an
-    // unchanging board.
+    // Board freshness banner (Phase 3 §6), the board's status line (the
+    // sidebar footer no longer carries it): a warm board reads muted, as the
+    // desktop's Issues header draws it; a stale index or a cache fallback
+    // reads yellow so a lagging daemon or an exhausted quota is visible at a
+    // glance rather than hidden behind an unchanging board.
     if let Some(banner) = &app.board_banner {
         let stale = banner.contains("stale") || banner.contains("no daemon");
-        let color = if stale { palette().ansi_yellow } else { palette().ansi_dark_gray };
+        let color = if stale { palette().ansi_yellow } else { palette().muted };
         left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
     }
     f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
@@ -5179,6 +5180,39 @@ transitions:
         // fixed point, not a per-frame decrement.
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         assert_eq!(app.popover.as_ref().unwrap().scroll, clamped);
+    }
+
+    /// The board's freshness is the Issues title row's (the sidebar footer no
+    /// longer shows it): muted while warm, yellow when the index is stale or
+    /// served from cache with no daemon, nothing for a local board.
+    #[test]
+    fn title_row_shows_the_board_status_muted_or_yellow() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for (banner, color) in [
+            ("board 12s", palette().muted),
+            ("board 4m stale · quota resets 16:03", palette().ansi_yellow),
+            ("board 4m cached · no daemon", palette().ansi_yellow),
+        ] {
+            let mut app = KanbanApp::new("demo");
+            app.board_banner = Some(banner.into());
+            let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
+            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            let title: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+            let x = title.find(banner).unwrap_or_else(|| panic!("{banner:?} on the title row: {title:?}"));
+            let x = title[..x].chars().count() as u16;
+            assert!(title[..title.find(banner).unwrap()].contains("total"), "after the count: {title:?}");
+            for dx in 0..banner.chars().count() as u16 {
+                assert_eq!(buf[(x + dx, 0)].fg, color, "{banner:?} col {dx}");
+            }
+        }
+        let mut app = KanbanApp::new("demo");
+        app.board_banner = None;
+        let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let title: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(!title.contains("board"), "a local board shows no status: {title:?}");
     }
 
     /// A body shorter than the popover viewport clamps to zero — no
