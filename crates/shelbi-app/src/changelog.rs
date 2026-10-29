@@ -107,7 +107,10 @@ pub struct ChangelogEntryView {
 }
 
 impl ChangelogEntryView {
-    fn new(entry: changelog::ChangelogEntry, repo: Option<&str>) -> Self {
+    /// The view of one stored entry, its PR numbers resolved against `repo`
+    /// (`owner/name`). [`read_changelog`] builds every entry with this; a
+    /// client's tests build fixtures with it.
+    pub fn new(entry: changelog::ChangelogEntry, repo: Option<&str>) -> Self {
         ChangelogEntryView {
             links: entry
                 .links(repo)

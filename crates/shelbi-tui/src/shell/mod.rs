@@ -18,6 +18,7 @@
 
 mod caps;
 mod acknowledgements;
+mod changelog;
 mod overlays;
 mod refresh;
 // The relaunchers moved to `shelbi_app::session::relaunch` (shared with the
@@ -499,6 +500,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.kanban.apply_closed_page(closed);
             state.dirty = true;
         }
+        if state.poll_changelog() {
+            state.dirty = true;
+        }
         // A change arrived for the workspace the main area is showing: if its
         // attach was idle or failed (no session yet), retry so a session that
         // just started shows up without the user re-selecting the row
@@ -948,6 +952,12 @@ struct ProjectWorkers {
     /// split off the core snapshot: the open board, sidebar and machines paint
     /// from their fast local caches and the done column fills in when this lands.
     closed_refresher: refresh::Refresher<Option<ClosedPageRead>>,
+    /// The changelog's own refresher: on each request it checks the
+    /// changelog directory's stamp ([`shelbi_app::changelog::ChangelogWatch`])
+    /// and reads the entries only when it moved, so an entry `shelbi
+    /// changelog add` (or the orchestrator) writes shows within a refresh,
+    /// without a restart. `None` is "unchanged".
+    changelog_refresher: refresh::Refresher<Option<shelbi_app::changelog::ChangelogData>>,
     /// Wakes from the daemon change subscriber, drained each tick.
     change_rx: Receiver<shelbi_app::changes::ChangeWake>,
     /// Pushed layout events from the daemon poller, drained by
@@ -1010,12 +1020,20 @@ fn production_workers(project: &str, activity_cache: Arc<Mutex<ActivityMetaCache
     let proj_closed = project.to_string();
     let closed_refresher =
         refresh::spawn(move |_generation| KanbanApp::read_closed_page(&proj_closed));
+    let watch = Mutex::new(shelbi_app::changelog::ChangelogWatch::new(project));
+    let changelog_refresher = refresh::spawn(move |_generation| {
+        let mut watch = watch.lock().unwrap_or_else(|p| p.into_inner());
+        watch
+            .changed()
+            .then(|| shelbi_app::changelog::read_changelog(watch.project()))
+    });
     let (changes, change_rx) = shelbi_app::changes::spawn(project);
     let (layout_sub, layout_rx) = shelbi_app::layout_sub::spawn(project);
     ProjectWorkers {
         refresher,
         activity_refresher,
         closed_refresher,
+        changelog_refresher,
         change_rx,
         layout_rx,
         _changes: Some(changes),
@@ -1154,6 +1172,12 @@ struct ShellState {
     kanban: KanbanApp,
     activity: ActivityApp,
     machines: MachinesApp,
+    /// The Changelog page (the sidebar's Changelog row), fed by the
+    /// changelog refresher.
+    changelog: changelog::ChangelogPage,
+    /// An issue link's off-thread read (the issue wasn't on the board the
+    /// shell holds): its detail opens when it lands.
+    changelog_issue_rx: Option<Receiver<Result<shelbi_state::IssueFile, String>>>,
     /// The user's keymaps (with this project's overrides), loaded once and
     /// shared by the embedded native-view key handlers, the palette's bindings,
     /// and resolving the palette-open chord.
@@ -1454,6 +1478,8 @@ impl ShellState {
             kanban,
             activity,
             machines,
+            changelog: changelog::ChangelogPage::new(),
+            changelog_issue_rx: None,
             keymaps,
             display_style,
             startup_status,
@@ -1875,6 +1901,7 @@ impl ShellState {
             w.refresher.request();
             w.activity_refresher.request();
             w.closed_refresher.request();
+            w.changelog_refresher.request();
         }
     }
 
@@ -1922,6 +1949,16 @@ impl ShellState {
     /// (`None` when the store couldn't be built or the fetch failed).
     fn latest_closed(&self) -> Option<Option<ClosedPageRead>> {
         self.workers.as_ref().and_then(|w| w.closed_refresher.latest())
+    }
+
+    /// A changelog read that landed since the last tick, if the changelog
+    /// changed (`None` when it didn't, or nothing landed). Like
+    /// [`Self::latest_snapshot`], only ever the current project's.
+    fn latest_changelog(&self) -> Option<shelbi_app::changelog::ChangelogData> {
+        self.workers
+            .as_ref()
+            .and_then(|w| w.changelog_refresher.latest())
+            .flatten()
     }
 
     fn switch_project(&mut self, project: &str) {
@@ -1976,6 +2013,8 @@ impl ShellState {
             std::mem::replace(&mut self.activity, activity),
             std::mem::replace(&mut self.machines, machines),
         );
+        self.changelog = changelog::ChangelogPage::new();
+        self.changelog_issue_rx = None;
         // An open review / workspace interface belongs to the project we left: it
         // renders over the sidebar column and main area regardless of
         // `main_view`, so drop it (detaching its content view) along with any
@@ -2243,8 +2282,98 @@ impl ShellState {
                 }
                 self.dirty = true;
             }
+            // The Changelog's search takes a paste while it's typing.
+            MainView::Native(View::Changelog) => {
+                if self.changelog.paste(text) {
+                    self.dirty = true;
+                }
+            }
             MainView::Native(_) => {}
         }
+    }
+
+    /// Carry out what the Changelog page asked: an issue link opens the
+    /// issue's detail (the board's task popover), a PR or URL the browser.
+    fn apply_changelog_step(&mut self, step: changelog::Step) {
+        match step {
+            changelog::Step::Stay => {}
+            changelog::Step::OpenUrl(url) => self.open_url(url),
+            changelog::Step::OpenIssue(id) => self.open_changelog_issue(id),
+        }
+    }
+
+    /// Open issue `id`'s detail over the main area: from the board the shell
+    /// already holds, or (a closed issue past its first page, say) read off
+    /// the UI thread and opened when it lands
+    /// ([`Self::poll_changelog_issue`]).
+    fn open_changelog_issue(&mut self, id: String) {
+        if let Some(task) = self.kanban.tasks.iter().find(|t| t.task.id == id).cloned() {
+            self.show_issue_detail(task);
+            return;
+        }
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-changelog-issue".into())
+            .spawn(move || {
+                let read = shelbi_state::issue_store_for(&project)
+                    .and_then(|store| store.get(&id))
+                    .map_err(|e| format!("couldn't open {id}: {e}"))
+                    .and_then(|found| found.ok_or_else(|| format!("no issue {id}")));
+                let _ = tx.send(read);
+            });
+        if spawned.is_ok() {
+            self.status = Some("opening issue…".to_string());
+            self.changelog_issue_rx = Some(rx);
+        }
+    }
+
+    /// Fold what the Changelog's background work delivered: a changed
+    /// changelog (an entry added from anywhere, so it shows without a
+    /// restart; the reader keeps their place) and an issue link's read.
+    /// Returns whether anything landed.
+    fn poll_changelog(&mut self) -> bool {
+        let read = self.latest_changelog();
+        let landed = read.is_some();
+        if let Some(data) = read {
+            self.changelog.set_data(data);
+        }
+        self.poll_changelog_issue() || landed
+    }
+
+    /// Open a landed issue read's detail (or say why it couldn't). Returns
+    /// whether one landed.
+    fn poll_changelog_issue(&mut self) -> bool {
+        let read = match self.changelog_issue_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(read)) => read,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => Err("couldn't open the issue".to_string()),
+        };
+        self.changelog_issue_rx = None;
+        match read {
+            Ok(task) => {
+                self.status = None;
+                // Only while the Changelog still shows: a late read never
+                // lands over a view the user moved on to.
+                if matches!(self.main_view, MainView::Native(View::Changelog)) {
+                    self.show_issue_detail(task);
+                }
+            }
+            Err(e) => self.status = Some(e),
+        }
+        true
+    }
+
+    /// The board's task-detail popover over the main area, as the review
+    /// panel's More opens it.
+    fn show_issue_detail(&mut self, task: shelbi_state::IssueFile) {
+        self.overlay = Some(ActiveOverlay::task_description(
+            task,
+            self.keymaps.clone(),
+            self.display_style,
+        ));
     }
 
     fn handle_key(&mut self, k: KeyEvent) {
@@ -4318,6 +4447,12 @@ impl ShellState {
                 self.dirty = true;
                 return;
             }
+            MainView::Native(View::Changelog) => {
+                let step = self.changelog.handle_key(k);
+                self.apply_changelog_step(step);
+                self.dirty = true;
+                return;
+            }
             _ => {}
         }
 
@@ -4719,6 +4854,12 @@ impl ShellState {
                 self.dirty = true;
                 return;
             }
+            MainView::Native(View::Changelog) => {
+                let step = self.changelog.handle_mouse(m, self.main_rect);
+                self.apply_changelog_step(step);
+                self.dirty = true;
+                return;
+            }
             _ => {}
         }
 
@@ -4985,6 +5126,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
     let kanban = &mut state.kanban;
     let activity = &mut state.activity;
     let machines = &mut state.machines;
+    let changelog = &mut state.changelog;
     let sessions = &state.sessions;
 
     let mut cursor: Option<(u16, u16)> = None;
@@ -5063,6 +5205,12 @@ fn draw_frame<B: ratatui::backend::Backend>(
                         }
                     }
                 },
+                MainView::Native(View::Changelog) => {
+                    let cur = changelog.render(buf, main_rect);
+                    if focus_main {
+                        cursor = cur;
+                    }
+                }
                 MainView::Native(_) => {} // drawn above
                 MainView::Review(id) => {
                     // The interface itself renders at the frame level below; this
@@ -5714,6 +5862,7 @@ mod tests {
                 refresher,
                 activity_refresher,
                 closed_refresher,
+                changelog_refresher: refresh::spawn(|_g| None),
                 change_rx,
                 layout_rx,
                 _changes: None,
@@ -7907,6 +8056,7 @@ mod tests {
                 refresher,
                 activity_refresher,
                 closed_refresher,
+                changelog_refresher: refresh::spawn(|_g| None),
                 change_rx,
                 layout_rx,
                 _changes: None,
@@ -8165,6 +8315,7 @@ mod tests {
                     w3();
                     None
                 }),
+                changelog_refresher: refresh::spawn(|_g| None),
                 change_rx,
                 layout_rx,
                 _changes: None,
@@ -10790,4 +10941,204 @@ workspaces:
             }
         }
     }
+
+    // --- Changelog (changelog-tui) -------------------------------------------
+
+    /// The shipped nav with the sample changelog read in, on the Changelog
+    /// page with the keys in the main area.
+    fn changelog_state() -> ShellState {
+        let mut st = smoke_state();
+        // Run effects for real (the smoke state only records them).
+        st.effect_tap = None;
+        st.client.set_sidebar_width(shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH);
+        st.changelog
+            .set_data(changelog::tests::data(changelog::tests::sample()));
+        st.show(RowTarget::Native(View::Changelog));
+        st
+    }
+
+    fn sample_issue(id: &str, title: &str) -> shelbi_state::IssueFile {
+        let ts = chrono::Utc::now();
+        shelbi_state::IssueFile {
+            task: shelbi_core::Issue {
+                id: id.into(),
+                title: title.into(),
+                column: shelbi_core::Column::done(),
+                priority: 2,
+                assigned_to: None,
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: ts,
+                updated_at: ts,
+                params: Default::default(),
+            },
+            body: "Match the desktop's settings.".into(),
+            tracker_assignees: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn changelog_takes_activitys_place_in_the_sidebar_and_draws_the_blog() {
+        let mut st = changelog_state();
+        let nav: Vec<&str> = st
+            .sidebar_model
+            .as_ref()
+            .unwrap()
+            .nav
+            .iter()
+            .map(|n| n.label.as_str())
+            .collect();
+        assert!(nav.contains(&"Changelog") && !nav.contains(&"Activity"), "{nav:?}");
+        assert!(matches!(st.main_view, MainView::Native(View::Changelog)));
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 45)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("4 entries"), "{screen}");
+        assert!(screen.contains("Settings polish pass") && screen.contains("October 28, 2026"));
+        assert!(screen.contains("⧉ tui-settings-polish") && screen.contains("↗ #1942"));
+        assert!(!screen.contains("Activity"), "Activity isn't in the sidebar:\n{screen}");
+
+        // Activity still opens, from the palette's command.
+        st.dispatch_effect(Effect::ShowView(View::Activity));
+        assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+        st.dispatch_effect(Effect::ShowView(View::Changelog));
+        assert!(matches!(st.main_view, MainView::Native(View::Changelog)));
+    }
+
+    #[test]
+    fn changelog_keys_reach_the_page_and_its_search_types() {
+        let mut st = changelog_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        type_key(&mut st, 'n');
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "Contact Us feedback dialog").unwrap();
+        assert_eq!(term.backend().buffer()[(x, y)].bg, palette().selection, "n focused the next entry");
+
+        // `/` searches; `q` types into it rather than quitting.
+        type_key(&mut st, '/');
+        for c in "faster q".chars() {
+            type_key(&mut st, c);
+        }
+        assert!(!st.should_quit);
+        assert_eq!(st.changelog.model().query(), "faster q");
+        press(&mut st, KeyCode::Backspace);
+        press(&mut st, KeyCode::Backspace);
+        press(&mut st, KeyCode::Enter);
+        assert!(!st.changelog.searching());
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("1 of 4") && screen.contains("Faster board"), "{screen}");
+        assert!(!screen.contains("Settings polish pass"), "{screen}");
+        // A paste goes into the search while it types.
+        type_key(&mut st, '/');
+        st.handle_event(Event::Paste(" board".into()));
+        assert_eq!(st.changelog.model().query(), "faster board");
+    }
+
+    #[test]
+    fn changelog_links_open_the_issue_in_shelbi_and_prs_in_the_browser() {
+        let mut st = changelog_state();
+        st.kanban.tasks = vec![sample_issue("tui-settings-polish", "TUI settings polish")];
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+
+        // The keyboard: Tab to the issue chip, Enter opens its detail.
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Enter);
+        match &st.overlay {
+            Some(ActiveOverlay::TaskDescription { task, .. }) => {
+                assert_eq!(task.task.title, "TUI settings polish")
+            }
+            _ => panic!("an issue link opens the task-detail popover"),
+        }
+        press(&mut st, KeyCode::Esc);
+        assert!(st.overlay.is_none());
+
+        // The mouse: a click on the PR chip opens the browser.
+        draw_frame(&mut term, &mut st).unwrap();
+        let (x, y) = find_on_screen(&term, "#1942").unwrap();
+        st.handle_event(Event::Mouse(left_click(x, y)));
+        assert_eq!(st.opened_urls, ["https://github.com/jlong/shelbi/pull/1942"]);
+    }
+
+    #[test]
+    fn an_issue_off_the_board_opens_when_its_read_lands() {
+        let mut st = changelog_state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        st.changelog_issue_rx = Some(rx);
+        assert!(!st.poll_changelog(), "nothing yet");
+        tx.send(Ok(sample_issue("tui-about", "About Shelbi"))).unwrap();
+        assert!(st.poll_changelog());
+        assert!(matches!(st.overlay, Some(ActiveOverlay::TaskDescription { .. })));
+
+        // A read that fails says why; one that lands after the user moved on
+        // opens nothing.
+        st.overlay = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        st.changelog_issue_rx = Some(rx);
+        tx.send(Err("no issue gone-1".into())).unwrap();
+        assert!(st.poll_changelog());
+        assert_eq!(st.status.as_deref(), Some("no issue gone-1"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        st.changelog_issue_rx = Some(rx);
+        st.show(RowTarget::Native(View::Issues));
+        tx.send(Ok(sample_issue("tui-about", "About Shelbi"))).unwrap();
+        assert!(st.poll_changelog());
+        assert!(st.overlay.is_none());
+    }
+
+    #[test]
+    fn a_changed_changelog_folds_in_without_a_restart() {
+        // The changelog refresher hands over a read only when the directory's
+        // stamp moved; the tick folds it into the page.
+        let reads = Arc::new(Mutex::new(vec![
+            changelog::tests::data(changelog::tests::sample()),
+        ]));
+        let factory: WorkersFactory = Arc::new(move |_project: &str| {
+            let reads = reads.clone();
+            let (_ctx, change_rx) = std::sync::mpsc::channel();
+            let (_ltx, layout_rx) = std::sync::mpsc::channel();
+            ProjectWorkers {
+                refresher: refresh::spawn(|_g| ShellSnapshot {
+                    sidebar: None,
+                    board: None,
+                    activity: None,
+                    machines: None,
+                }),
+                activity_refresher: refresh::spawn(|_g| ActivityData::tagged_for_test("x")),
+                closed_refresher: refresh::spawn(|_g| None),
+                changelog_refresher: refresh::spawn(move |_g| reads.lock().unwrap().pop()),
+                change_rx,
+                layout_rx,
+                _changes: None,
+                _layout_sub: None,
+            }
+        });
+        let mut st = test_state();
+        st.make_workers = factory;
+        st.start_project_workers();
+        assert!(st.changelog.model().is_loading());
+        st.request_refresh();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_changelog();
+                !st.changelog.model().is_loading()
+            }),
+            "the first read lands"
+        );
+        assert_eq!(st.changelog.model().total(), 4);
+        // Unchanged since: the next reads hand over nothing, and the page
+        // keeps what it has.
+        st.request_refresh();
+        std::thread::sleep(Duration::from_millis(50));
+        st.poll_changelog();
+        assert_eq!(st.changelog.model().total(), 4);
+    }
+
 }
