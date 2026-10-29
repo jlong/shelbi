@@ -1033,6 +1033,10 @@ impl Run {
             if let Some(v) = machines {
                 v.update(&mut self.cx, |v, cx| v.poll(cx));
             }
+            let changelog = handle.update(&mut self.cx, |w, _, _| w.offscreen_changelog()).unwrap();
+            if let Some(v) = changelog {
+                v.update(&mut self.cx, |v, cx| v.poll(cx));
+            }
             self.now.set(self.now.get() + Duration::from_secs(1));
             self.cx
                 .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
@@ -2431,6 +2435,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "changelog") {
+            self.changelog();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "cli-setup") {
             self.cli_setup_windows();
             return;
@@ -2490,6 +2499,8 @@ impl Run {
             cx.notify();
         });
         self.save(handle, "activity");
+
+        self.changelog();
 
         self.review(&orch, "review", |_, _| {});
         self.workspace(&orch, "workspace", |_, _| {});
@@ -2787,6 +2798,101 @@ impl Run {
 
     /// The board, a card selected, as the Issues frame shows it; the
     /// toolbar's undrawn states; then a card's detail over the board.
+    /// The Changelog (no Figma frame draws the page; checked by eye):
+    /// `changelog-empty` before any entry, then `changelog` once the
+    /// fixture's entries land (live, on the view's own refresh),
+    /// `state-changelog-search` with a query typed, and
+    /// `state-changelog-next` after J twice (K brings it back).
+    /// `SHELBI_VISUAL_ONLY=changelog` renders just these.
+    fn changelog(&mut self) {
+        let dir = shelbi_state::changelog::changelog_dir(PROJECT).expect("the changelog directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        let handle = self.open();
+        self.click(handle, View::Changelog);
+        let page = handle.update(&mut self.cx, |w, _, _| w.offscreen_changelog()).unwrap();
+        let Some(page) = page else {
+            return self.expect("changelog: the page opens", false);
+        };
+        let read = self.wait(handle, Duration::from_secs(10), |cx| {
+            page.read_with(cx, |v, _| !v.model().is_loading())
+        });
+        self.expect("changelog: the first read lands, empty", read && page.read_with(&self.cx, |v, _| v.model().total() == 0));
+        self.capture(handle, "changelog-empty");
+
+        write_changelog_fixtures(pinned_now());
+        let live = self.wait(handle, Duration::from_secs(10), |cx| {
+            page.read_with(cx, |v, _| v.model().total() == CHANGELOG_FIXTURES.len())
+        });
+        self.expect("changelog: added entries appear live", live);
+        let first = page.read_with(&self.cx, |v, _| v.model().visible().next().map(|e| e.title.clone()));
+        self.expect(
+            "changelog: newest first",
+            first.as_deref() == Some(CHANGELOG_FIXTURES[0].0),
+        );
+        self.settle(handle);
+        self.capture(handle, "changelog");
+
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                if let Some(page) = w.offscreen_changelog() {
+                    page.update(cx, |v, cx| v.search_for("board", window, cx));
+                }
+            })
+            .unwrap();
+        self.settle(handle);
+        let matched = page.read_with(&self.cx, |v, _| v.model().match_count());
+        self.expect("changelog: the search narrows to two entries", matched == 2);
+        self.save(handle, "state-changelog-search");
+
+        let handle = self.open();
+        self.click(handle, View::Changelog);
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                if let Some(page) = w.offscreen_changelog() {
+                    page.update(cx, |v, cx| {
+                        v.press(crate::views::changelog::Nav::NextEntry, window, cx);
+                        v.press(crate::views::changelog::Nav::NextEntry, window, cx);
+                    });
+                }
+            })
+            .unwrap();
+        self.settle(handle);
+        let top = handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_changelog().map(|p| p.read(cx).scroll_top()))
+            .unwrap();
+        // Five entries overflow the window by less than the first one's
+        // height, so J stops at the end, inside it.
+        self.expect(
+            "changelog: J moves the view down",
+            top.is_some_and(|t| t.item_ix >= 1 || t.offset_in_item > px(0.0)),
+        );
+        self.capture(handle, "state-changelog-next");
+        handle
+            .update(&mut self.cx, |w, window, cx| {
+                if let Some(page) = w.offscreen_changelog() {
+                    page.update(cx, |v, cx| {
+                        for _ in 0..3 {
+                            v.press(crate::views::changelog::Nav::PreviousEntry, window, cx);
+                        }
+                    });
+                }
+            })
+            .unwrap();
+        self.settle(handle);
+        let top = handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_changelog().map(|p| p.read(cx).scroll_top()))
+            .unwrap();
+        self.expect(
+            "changelog: K comes back to the first entry",
+            top.is_some_and(|t| t.item_ix == 0 && t.offset_in_item == px(0.0)),
+        );
+        self.cx
+            .update_window(handle.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        self.cx.run_until_parked();
+    }
+
     fn issues(&mut self) {
         let handle = self.open();
         self.click(handle, View::Issues);
@@ -3047,6 +3153,77 @@ fn save_task(id: &str, title: &str, body: &str, column: Column, priority: i64, a
         params: Default::default(),
     };
     shelbi_state::save_task(PROJECT, &task, body).expect("save a fixture task");
+}
+
+/// The Changelog fixture's entries, newest first: title, days before the
+/// pinned now, the description, its issues, PRs and other links.
+#[allow(clippy::type_complexity)]
+const CHANGELOG_FIXTURES: &[(&str, i64, &str, &[&str], &[u64], &[&str])] = &[
+    (
+        "Settings polish pass",
+        0,
+        "Every settings page, dialog and editor now matches the desktop: one half-block button, segmented controls, dropdowns, and the same focus ring everywhere.\n\nThe pages that were still on the old form layout moved over:\n\n- **General** and **Terminal**, with live previews\n- **Keybindings**, whose capture now shows the chord as you press it\n- **Workflows**, including the builder's side panel",
+        &["tui-settings-polish"],
+        &[1942],
+        &["https://shelbi.dev/docs/settings"],
+    ),
+    (
+        "Contact Us feedback dialog",
+        0,
+        "Send feedback without leaving Shelbi: **Help \u{25b8} Contact Us** opens a small dialog that sends your note (and, if you like, your email) straight to the team.",
+        &["dt-feedback-dialog"],
+        &[1931],
+        &[],
+    ),
+    (
+        "A Contrast slider in Settings",
+        1,
+        "`Settings \u{25b8} General` has a **Contrast** slider. Moving it right darkens backgrounds and brightens text, for bright rooms and tired eyes; terminals keep their own colors.",
+        &[],
+        &[1953],
+        &[],
+    ),
+    (
+        "A faster board",
+        6,
+        "The Issues board draws only the cards in view, so a board with a thousand done issues opens as fast as a small one, and scrolling it stays smooth.",
+        &["dt-board-perf"],
+        &[1817],
+        &[],
+    ),
+    (
+        "Drag and drop on the board",
+        17,
+        "Drag a card to another column to move it, or within its column to reorder. A column that can't take the card dims and says why.",
+        &["dt-board-dnd"],
+        &[],
+        &["https://shelbi.dev/docs/board"],
+    ),
+];
+
+/// Write [`CHANGELOG_FIXTURES`] into the fixture project's changelog.
+fn write_changelog_fixtures(now: DateTime<Utc>) {
+    use shelbi_state::changelog::{add_entry, NewEntry, PrRef};
+    for (i, (title, days, body, issues, prs, urls)) in CHANGELOG_FIXTURES.iter().enumerate() {
+        // Same-day entries a minute apart, so the order is the fixture's.
+        let at = now - chrono::Duration::days(*days) - chrono::Duration::minutes(i as i64);
+        add_entry(
+            PROJECT,
+            NewEntry {
+                title: title.to_string(),
+                date: at.with_timezone(&Local).fixed_offset(),
+                author: "orchestrator".into(),
+                issues: issues.iter().map(|s| s.to_string()).collect(),
+                prs: prs
+                    .iter()
+                    .map(|n| PrRef::Url(format!("https://github.com/jlong/shelbi/pull/{n}")))
+                    .collect(),
+                urls: urls.iter().map(|s| s.to_string()).collect(),
+                description: body.to_string(),
+            },
+        )
+        .expect("write a changelog fixture entry");
+    }
 }
 
 fn write_fixtures(home: &Path, now: DateTime<Utc>) {

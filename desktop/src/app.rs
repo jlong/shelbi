@@ -128,6 +128,7 @@ use crate::views::column_swap::{self, ColumnSwap, Layer, Motion, Occupant};
 use crate::views::sidebar_reveal::{self, SidebarReveal};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::machines::{MachinesEvent, MachinesView};
+use crate::views::changelog::{ChangelogEvent, ChangelogView};
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
@@ -731,6 +732,8 @@ pub struct ShelbiWindow {
     activity_reader: Option<ActivityReader>,
     prefetch_activity: bool,
     machines: Option<Entity<MachinesView>>,
+    /// The Changelog page, created the first time it is shown.
+    changelog: Option<Entity<ChangelogView>>,
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
     overlay: Option<ActiveOverlay>,
     palette_inputs: PaletteInputs,
@@ -981,6 +984,7 @@ impl ShelbiWindow {
             activity_reader: None,
             prefetch_activity: false,
             machines: None,
+            changelog: None,
             overlay: None,
             palette_inputs: PaletteInputs::default(),
             flash_generation: 0,
@@ -1570,6 +1574,9 @@ impl ShelbiWindow {
         if let Some(machines) = self.machines.take() {
             machines.update(cx, |v, _| v.stop_workers());
         }
+        if let Some(changelog) = self.changelog.take() {
+            changelog.update(cx, |v, _| v.stop_workers());
+        }
         self._view_subscriptions.clear();
         self.set_route(Route::View);
         self.workspace_return = None;
@@ -2060,9 +2067,9 @@ impl ShelbiWindow {
                     View::Issues => {
                         self.ensure_issues(window, cx);
                     }
-                    // No page entity to build yet: the main area stays
-                    // empty until the Changelog view draws there.
-                    View::Changelog => {}
+                    View::Changelog => {
+                        self.ensure_changelog(window, cx);
+                    }
                     View::Activity => {
                         self.ensure_activity(window, cx);
                     }
@@ -2861,6 +2868,27 @@ impl ShelbiWindow {
         machines
     }
 
+    /// The Changelog page for the window's project, created on first use.
+    /// An issue chip opens the issue's detail on the board.
+    fn ensure_changelog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChangelogView> {
+        if let Some(changelog) = &self.changelog {
+            return changelog.clone();
+        }
+        let project = self.project.clone();
+        let changelog = cx.new(|cx| ChangelogView::new(project, cx));
+        let sub = cx.subscribe_in(&changelog, window, |this, _, ev: &ChangelogEvent, window, cx| {
+            let ChangelogEvent::OpenIssue(id) = ev;
+            this.open_task(id, window, cx);
+        });
+        self._view_subscriptions.push(sub);
+        self.changelog = Some(changelog.clone());
+        changelog
+    }
+
     /// Show task `id`'s detail: route to the board and open it there.
     fn open_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.run(CommandKind::ShowView(View::Issues), window, cx);
@@ -2961,6 +2989,11 @@ impl ShelbiWindow {
             View::Machines if self.machines.is_some() => {
                 if let Some(machines) = &self.machines {
                     machines.update(cx, |v, _| v.request_focus());
+                }
+            }
+            View::Changelog if self.changelog.is_some() => {
+                if let Some(changelog) = &self.changelog {
+                    changelog.update(cx, |v, _| v.request_focus());
                 }
             }
             view if is_chat(view) && self.chat.is_some() => {
@@ -4155,7 +4188,7 @@ impl ShelbiWindow {
                 let view = self.client.view();
                 let content = match view {
                     View::Issues => self.issues.clone().map(|v| v.into_any_element()),
-                    View::Changelog => None,
+                    View::Changelog => self.changelog.clone().map(|v| v.into_any_element()),
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
                     View::Session(_) if is_chat(view) => self.chat.clone().map(|v| v.into_any_element()),
@@ -5063,6 +5096,11 @@ impl ShelbiWindow {
     /// The orchestrator chat's terminal, once attached.
     pub(crate) fn offscreen_chat_pane(&self, cx: &App) -> Option<Entity<crate::elements::terminal::TerminalPane>> {
         self.chat.as_ref()?.read(cx).pane().cloned()
+    }
+
+    /// The Changelog page, once shown.
+    pub(crate) fn offscreen_changelog(&self) -> Option<Entity<ChangelogView>> {
+        self.changelog.clone()
     }
 
     /// The native views shown so far.

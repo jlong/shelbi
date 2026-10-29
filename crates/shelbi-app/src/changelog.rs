@@ -140,6 +140,41 @@ impl ChangelogEntryView {
         self.date.format("%H:%M").to_string()
     }
 
+    /// The description for a client that draws every link as a chip under
+    /// it: without the list of bare links the template's `{{links}}` ends it
+    /// with (each item one `issue:<id>`, `#<n>` or URL), which the chips
+    /// show. Any other description is the whole of it.
+    pub fn prose(&self) -> &str {
+        let text = self.description.trim_end();
+        let mut cut = text.len();
+        let mut items = 0;
+        for line in text.lines().rev() {
+            let Some(item) = line.trim().strip_prefix("- ") else {
+                break;
+            };
+            if !is_bare_link(item.trim()) {
+                return text;
+            }
+            items += 1;
+            cut -= line.len();
+            // The newline before it, if any.
+            cut = text[..cut].strip_suffix('\n').map_or(cut, str::len);
+            cut = text[..cut].strip_suffix('\r').map_or(cut, str::len);
+        }
+        if items == 0 {
+            return text;
+        }
+        // The template sets the list apart with a blank line; a list right
+        // under a line of prose is the prose's own.
+        // (`rest` then ends with that blank line's newline).
+        let rest = &text[..cut];
+        if rest.is_empty() || rest.ends_with('\n') {
+            rest.trim_end()
+        } else {
+            text
+        }
+    }
+
     fn matches(&self, query: &str) -> bool {
         let links: Vec<Link> = self.links.iter().map(|l| l.link.clone()).collect();
         changelog::matches_query(&self.title, &self.description, &links, query)
@@ -298,6 +333,66 @@ impl ChangelogModel {
     }
 }
 
+/// Whether `item` is one link and nothing else: `issue:<id>`, `#<n>`, or an
+/// http(s) URL.
+fn is_bare_link(item: &str) -> bool {
+    if item.is_empty() || item.contains(char::is_whitespace) {
+        return false;
+    }
+    let issue = item.strip_prefix("issue:").is_some_and(|id| !id.is_empty());
+    let pr = item
+        .strip_prefix('#')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    issue || pr || item.starts_with("https://") || item.starts_with("http://")
+}
+
+/// Where `query`'s words appear in `text`, for a client to highlight: the
+/// byte ranges of every case-insensitive occurrence of each whitespace-
+/// separated word (as [`ChangelogModel::set_query`] matches them), in order,
+/// overlapping ones merged. Empty for an empty query.
+pub fn match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    // Lowercase `text`, remembering where each lowered byte came from:
+    // lowercasing can change a character's length.
+    let mut lower = String::with_capacity(text.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    for (at, c) in text.char_indices() {
+        for l in c.to_lowercase() {
+            let start = lower.len();
+            lower.push(l);
+            origin.extend(std::iter::repeat_n(at, lower.len() - start));
+        }
+    }
+    origin.push(text.len());
+    // A lowered byte's original character's end, for a match ending there.
+    let end_of = |ix: usize| -> usize {
+        let at = origin[ix - 1];
+        at + text[at..].chars().next().map_or(0, char::len_utf8)
+    };
+    let mut ranges: Vec<std::ops::Range<usize>> = terms
+        .iter()
+        .filter(|t| !t.is_empty())
+        .flat_map(|t| {
+            lower
+                .match_indices(t.as_str())
+                .map(|(ix, m)| origin[ix]..end_of(ix + m.len()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ranges.sort_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
 /// Tells a client when the changelog has changed on disk. Poll
 /// [`ChangelogWatch::changed`] on the client's tick (it only lists one
 /// directory) and re-read when it says so.
@@ -451,6 +546,41 @@ mod tests {
         m.set_query("");
         assert_eq!(m.match_count(), PAGE_SIZE + 6);
         assert_eq!(m.visible().count(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn prose_drops_the_templates_trailing_link_list() {
+        let prose = |body: &str| view("e", "t", body, vec![]).prose().to_string();
+        assert_eq!(
+            prose("Every page matches.\n\n- issue:tui-polish\n- https://github.com/a/b/pull/12\n- #13\n"),
+            "Every page matches."
+        );
+        assert_eq!(prose("Fixed.\r\n\r\n- issue:x\r\n- #4\r\n"), "Fixed.");
+        assert_eq!(prose("- issue:only"), "");
+        // A list with prose in it, or right under a line of prose, stays.
+        let keep = "Changes:\n- https://a.dev\n- #4";
+        assert_eq!(prose(keep), keep);
+        let keep = "Done.\n\n- faster boards\n- https://a.dev";
+        assert_eq!(prose(keep), keep);
+        assert_eq!(prose("No links here.\n"), "No links here.");
+    }
+
+    #[test]
+    fn match_ranges_find_every_word_case_insensitively() {
+        let text = "Faster Board: the board's gpui lists";
+        assert_eq!(match_ranges(text, "board"), [7..12, 18..23]);
+        // Each word on its own, overlaps merged, in order.
+        assert_eq!(match_ranges(text, "LISTS gpui"), [26..30, 31..36]);
+        assert_eq!(match_ranges(text, "boar oard"), [7..12, 18..23]);
+        assert!(match_ranges(text, "  ").is_empty());
+        assert!(match_ranges(text, "nothing").is_empty());
+        // Ranges index the original text where lowercasing changes lengths
+        // (`İ` lowers to two characters).
+        let text = "İstanbul ships";
+        let r = match_ranges(text, "ships");
+        assert_eq!(&text[r[0].clone()], "ships");
+        let r = match_ranges(text, "i̇stan");
+        assert_eq!(&text[r[0].clone()], "İstan");
     }
 
     #[test]

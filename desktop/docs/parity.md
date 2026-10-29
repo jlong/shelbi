@@ -32,7 +32,8 @@ paths on every `cargo test`.
 |---|---|---|---|
 | Orchestrator | `view:orch` | Chat attaches to the orchestrator session | Same (Go ▸ Orchestrator) |
 | Issues | `view:tasks` | Board | Board (Go ▸ Issues) |
-| Activity | `view:activity` | Feed | Feed (Go ▸ Changelog, ⌘L, the sidebar's Changelog; also via the palette) |
+| Changelog | `view:changelog` | Added after this walk: the sidebar's Changelog row (its page is `changelog-tui`'s) | The Changelog page (`changelog-desktop`: Go ▸ Changelog, ⌘L, the sidebar's Changelog; issue chips open the issue's detail, PR and URL chips the browser) |
+| Activity | `view:activity` | Feed, palette-only since the Changelog took its row | Feed, palette-only since the Changelog took its row |
 | Machines | `view:machines` | Machines view, palette-only | Machines view (Go ▸ Machines) |
 | Workspace | `workspace:<name>` | Idle placeholder for an idle workspace; the agent when one runs | Same (Go ▸ Workspaces ▸ dev) |
 | Open review | `review:<id>` | Serving task: the review interface (panel, live server line, reviewer session) | Queued task: the "Load for review" slot dialog (Go ▸ Reviews ▸ … ▸ Open Review); a serving one opens the Review view |
@@ -94,8 +95,8 @@ paths on every `cargo test`.
   Navigation component over the same rows (`SidebarModel::rows`, laid out by
   `views/sidebar.rs` `layout` in the shared order: Workspaces, then the review
   sections, as in the TUI), each section collapsible (remembered per project
-  in `desktop-view.json`), the Activity view labeled "Changelog" (the TUI and
-  the shared model keep "Activity"), fixed chords (⌘O Orchestrator, ⌘I Issues,
+  in `desktop-view.json`), the Changelog where Activity was (Activity is
+  palette-only in both clients), fixed chords (⌘O Orchestrator, ⌘I Issues,
   ⌘L Changelog, ⌘1 to ⌘9 the working workspaces then the reviews, each
   hinted on its row and taken even from a focused terminal), a review's
   tracker number on its second line, the version line only on a mismatch (it
@@ -367,7 +368,7 @@ equivalent datum.
 ### `NavItem`
 | Field | TUI | Desktop |
 |---|---|---|
-| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text, "Changelog" for the Activity view (`views/sidebar.rs` `render_nav_row`, `nav_label`); palette entry title; Go menu item (also through `nav_label`) |
+| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text (`views/sidebar.rs` `render_nav_row`); palette entry title; Go menu item |
 | `view` | not shown: routing only, mapped to a session or native view (`shell/sidebar.rs` `target_from_view`) | picks the nav row's icon (`views/sidebar.rs` `nav_icon`); routing via `SidebarRow::target` |
 
 ### `WorkspaceRow`
