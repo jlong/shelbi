@@ -145,6 +145,43 @@ pub const SCREENS: [&str; 12] = [
     "command-palette",
 ];
 
+/// What the palette's search finds for `zen` in the captures: five issues
+/// (so All caps them with a "Show all" row) and two Changelog entries.
+fn palette_search_corpus() -> shelbi_app::overlay::palette_search::SearchCorpus {
+    use shelbi_app::overlay::palette_search::{IssueDoc, SearchCorpus};
+    use shelbi_core::StatusCategory;
+    let issue = |id: &str, title: &str, status: &str, category| IssueDoc::new(id, title, "", status, category);
+    let issues = vec![
+        issue("1931", "Zen Mode skips the review gate", "In Progress", StatusCategory::Active),
+        issue("1944", "Zen intro copy reads like a warning", "Backlog", StatusCategory::Backlog),
+        issue("1950", "Zen checks run on every workspace", "Review", StatusCategory::Handoff),
+        issue("1957", "Show why Zen held a card back", "Todo", StatusCategory::Ready),
+        issue("1960", "Zen auto-promote ignores assignees", "Done", StatusCategory::Done),
+        issue("1962", "Faster board", "Done", StatusCategory::Done),
+    ];
+    let entry = |id: &str, title: &str, pr: u64, date: &str| {
+        shelbi_app::changelog::ChangelogEntryView::new(
+            shelbi_state::changelog::ChangelogEntry {
+                id: id.into(),
+                title: title.into(),
+                date: chrono::DateTime::parse_from_rfc3339(date).unwrap(),
+                author: "orchestrator".into(),
+                issues: vec![],
+                prs: vec![shelbi_state::changelog::PrRef::Number(pr)],
+                urls: vec![],
+                body: String::new(),
+                path: Default::default(),
+            },
+            Some("jlong/shelbi"),
+        )
+    };
+    let changelog = vec![
+        entry("2026-10-28-zen-review-gate", "Zen Mode waits for review", 1958, "2026-10-28T14:30:00-07:00"),
+        entry("2026-10-21-zen-intro", "A first-run Zen intro", 1902, "2026-10-21T09:00:00-07:00"),
+    ];
+    SearchCorpus::new(issues, changelog)
+}
+
 /// The palette states the frame doesn't draw: the keys typed into the open
 /// palette, and the render's name (beside the screens, with no reference).
 pub const PALETTE_STATES: [(&str, &str); 4] = [
@@ -1066,6 +1103,34 @@ impl Run {
         println!("{}  {name}", if ok { "ok  " } else { "FAIL" });
         if !ok {
             self.failures += 1;
+        }
+    }
+
+    /// The palette's search (no Figma frame draws it; checked by eye): `zen`
+    /// typed under each filter, Tab stepping along the filter row, as
+    /// `palette-search-<filter>`. `SHELBI_VISUAL_ONLY=palette-search` renders
+    /// just these.
+    fn palette_search(&mut self) {
+        let orch = View::Session("orch".into());
+        for (tabs, screen) in [
+            (0, "palette-search-all"),
+            (1, "palette-search-issues"),
+            (2, "palette-search-changelog"),
+            (3, "palette-search-commands"),
+        ] {
+            let handle = self.open();
+            self.click(handle, orch.clone());
+            self.settle(handle);
+            handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.offscreen_open_overlay(None, window, cx);
+                    w.offscreen_palette_corpus(palette_search_corpus());
+                })
+                .unwrap();
+            self.settle(handle);
+            let keys = std::iter::once("z e n").chain(std::iter::repeat_n("tab", tabs)).collect::<Vec<_>>().join(" ");
+            self.cx.simulate_keystrokes(handle.into(), &keys);
+            self.save(handle, screen);
         }
     }
 
@@ -2438,6 +2503,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "changelog") {
             self.changelog();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "palette-search") {
+            self.palette_search();
             return;
         }
 

@@ -194,12 +194,18 @@ impl Harness {
             let Some(ActiveOverlay::Palette { palette, .. }) = &w.overlay else {
                 panic!("the palette is open");
             };
-            let results = palette.results();
-            let at = results
+            // The selectable rows (a search groups them under headings).
+            let items: Vec<Option<String>> = palette
+                .rows()
                 .iter()
-                .position(|(e, _)| e.id == id)
+                .filter_map(|r| r.item())
+                .map(|i| i.entry().map(|e| e.id))
+                .collect();
+            let at = items
+                .iter()
+                .position(|e| e.as_deref() == Some(id))
                 .unwrap_or_else(|| panic!("the palette lists {id}"));
-            (palette.selected_in(results.len()), at)
+            (palette.selected_in(items.len()), at)
         })
     }
 
@@ -365,4 +371,118 @@ fn the_font_zoom_chords_and_menu_items_step_the_terminal_font(cx: &mut TestAppCo
     assert_eq!(writes.lock().unwrap().last(), Some(&None));
     // No registry command ran.
     assert_eq!(h.take_calls(), []);
+}
+
+/// Issues and Changelog entries matching `login`, as the window's board and
+/// Changelog page would hold them.
+pub(super) fn search_corpus() -> SearchCorpus {
+    use shelbi_core::StatusCategory;
+    let issues = vec![
+        IssueDoc::new("1931", "Fix login redirect loop", "", "In Progress", StatusCategory::Active),
+        IssueDoc::new("1944", "Login form validation", "", "Backlog", StatusCategory::Backlog),
+        IssueDoc::new("1950", "Faster board", "", "Done", StatusCategory::Done),
+    ];
+    let entry = ChangelogEntryView::new(
+        shelbi_state::changelog::ChangelogEntry {
+            id: "2026-10-28-login".into(),
+            title: "Login form shipped".into(),
+            date: chrono::DateTime::parse_from_rfc3339("2026-10-28T14:30:00-07:00").unwrap(),
+            author: "orchestrator".into(),
+            issues: vec![],
+            prs: vec![shelbi_state::changelog::PrRef::Number(1902)],
+            urls: vec![],
+            body: "The login form, rebuilt.".into(),
+            path: Default::default(),
+        },
+        Some("jlong/shelbi"),
+    );
+    SearchCorpus::new(issues, vec![entry])
+}
+
+impl Harness {
+    /// Open the palette (the window's chord) over [`search_corpus`].
+    pub(super) fn open_search_palette(&mut self) {
+        self.focus_window();
+        self.key("ctrl-space");
+        self.window.update(&mut self.cx, |w, _| {
+            if let Some(ActiveOverlay::Palette { palette, .. }) = &mut w.overlay {
+                palette.set_corpus(search_corpus());
+            }
+        });
+        self.draw();
+    }
+
+    fn palette<T>(&self, f: impl FnOnce(&shelbi_app::overlay::palette::Palette) -> T) -> T {
+        self.window.read_with(&self.cx, |w, _| {
+            let Some(ActiveOverlay::Palette { palette, .. }) = &w.overlay else {
+                panic!("the palette is open");
+            };
+            f(palette)
+        })
+    }
+
+    fn top_of(&mut self, selector: &'static str) -> f32 {
+        self.cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is drawn"))
+            .origin
+            .y
+            .as_f32()
+    }
+}
+
+#[gpui::test]
+fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppContext) {
+    use shelbi_app::overlay::palette_search::SearchFilter;
+    let mut h = Harness::open(cx);
+    h.window.update(&mut h.cx, |w, _| {
+        w.palette_inputs.projects = vec![PaletteProject {
+            slug: "alpha".into(),
+            label: "Alpha".into(),
+            indicator: shelbi_app::overlay::palette::ProjectIndicator::Active,
+        }];
+    });
+    h.open_search_palette();
+    assert!(h.cx.debug_bounds("palette-filters").is_none(), "no filter row before typing");
+    assert!(h.cx.debug_bounds("palette-projects").is_some(), "the Projects column, as ever");
+
+    h.key("l o g i n");
+    // The filter row, each chip with its count.
+    assert!(h.cx.debug_bounds("palette-filters").is_some());
+    let counts: Vec<(&str, usize)> = h.palette(|p| p.chips().iter().map(|c| (c.label, c.count)).collect());
+    assert_eq!(counts, [("All", 3), ("Issues", 2), ("Changelog Entries", 1), ("Commands", 0)]);
+    assert!(h.cx.debug_bounds("palette-projects").is_none(), "the Projects column steps aside");
+    // Grouped under All, a heading over each kind, best match first.
+    let issues = h.top_of("palette-heading-Issues");
+    let entries = h.top_of("palette-heading-Changelog Entries");
+    assert!(issues < h.top_of("palette-issue-1931"));
+    assert!(h.top_of("palette-issue-1944") < entries);
+    assert!(entries < h.top_of("palette-entry-2026-10-28-login"));
+
+    // Tab picks the next filter; a click on a chip picks that one.
+    h.key("tab");
+    assert_eq!(h.palette(|p| p.filter()), SearchFilter::Issues);
+    assert!(h.cx.debug_bounds("palette-entry-2026-10-28-login").is_none());
+    h.key("shift-tab");
+    assert_eq!(h.palette(|p| p.filter()), SearchFilter::All);
+    h.click_selector("palette-filter-Changelog Entries");
+    assert_eq!(h.palette(|p| p.filter()), SearchFilter::Changelog);
+    // ↑ from the first result reaches the filter row, where ←/→ move.
+    h.key("up");
+    assert!(h.palette(|p| p.filter_focused()));
+    h.key("left");
+    assert_eq!(h.palette(|p| p.filter()), SearchFilter::Issues);
+    h.key("down");
+
+    // Enter on an issue opens its detail on the board.
+    h.key("enter");
+    assert!(!h.overlay_open());
+    assert_eq!(h.take_calls(), [HostCall::OpenIssue("1931".into())]);
+
+    // A click on an entry opens the Changelog at it.
+    h.open_search_palette();
+    h.key("l o g i n");
+    h.click_selector("palette-entry-2026-10-28-login");
+    assert!(!h.overlay_open());
+    assert_eq!(h.take_calls(), [HostCall::OpenChangelogEntry("2026-10-28-login".into())]);
 }

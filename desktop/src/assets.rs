@@ -354,10 +354,6 @@ heroicons! {
     BOLT = "bolt";
     /// The palette's Detach.
     BOLT_SLASH = "bolt-slash";
-    /// The Changelog command's (the Figma palette's "Change log"), vendored
-    /// for the Changelog work; nothing draws it yet.
-    #[allow(dead_code)]
-    ROCKET_LAUNCH = "rocket-launch";
     SERVER_STACK = "server-stack";
     X_MARK = "x-mark";
     ARROW_LEFT = "arrow-left";
@@ -409,7 +405,9 @@ heroicons! {
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
     VIEW_COLUMNS = "view-columns";
     BARS_2 = "bars-2";
-    /// The Changelog's sidebar row (the Navigation component's drawing).
+    /// The Changelog's sidebar row (the Navigation component's drawing), its
+    /// palette command (the Figma palette's "Change log") and its search
+    /// results.
     ROCKET_LAUNCH = "rocket-launch";
     DOCUMENT_TEXT = "document-text";
     /// The drawing `TRASH_BUTTON` widens; no view draws it at 20pt.

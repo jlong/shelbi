@@ -16,13 +16,22 @@
 //! desktop's copy and order ([`present`]), filtered by
 //! `shelbi_palette::search`, through the shared state machine
 //! (`shelbi_app::overlay::palette`); this file only words and paints them.
+//!
+//! Typing searches the project's issues and Changelog entries as well
+//! (`shelbi_app::overlay::palette_search`): while the query isn't blank the
+//! Projects column steps aside, a filter row (the app's segmented control:
+//! All, Issues, Changelog Entries, Commands, each with its count) sits under
+//! the query line, and the results are grouped by kind under All, a muted
+//! heading over each group and a "Show all" row closing a capped one.
 
 use gpui::{div, prelude::*, px, AnyElement, BoxShadow, Context, Hsla, Pixels, ScrollHandle, Size};
 use shelbi_app::overlay::palette::{Palette, PaletteFocus};
+use shelbi_app::overlay::palette_search::{FilterChip, ResultItem, ResultKind, ResultRow, SearchFilter};
 use shelbi_palette::{DecorationColor, Entry};
 use shelbi_state::keymap::{DisplayStyle, Keymaps};
 
 use crate::assets::{heroicon, icons, Icon};
+use crate::elements::controls;
 use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, Type, Typography};
 use crate::theme::Theme;
@@ -37,6 +46,8 @@ const MAX_WIDTH: f32 = 788.0;
 const NAME_W: f32 = 220.0;
 /// A result row's height.
 pub const ROW_H: f32 = 32.0;
+/// A group heading's height while searching.
+const HEADING_H: f32 = 28.0;
 /// The query line's height.
 const QUERY_H: f32 = 44.0;
 /// The Projects column's width, and the narrowest commands column it may
@@ -185,13 +196,20 @@ pub fn render<H: OverlayHost>(
     let width = panel_width(size.width.as_f32());
     let top = palette_top(size.height.as_f32());
     let max_h = (size.height.as_f32() - top - 40.0).max(120.0);
-    let results = palette.results();
-    let selected = palette.selected_in(results.len());
-    let commands_focused = palette.focus() == PaletteFocus::Commands;
+    let rows = palette.rows();
+    let selected = palette.selected_row();
+    let commands_focused = palette.focus() == PaletteFocus::Commands && !palette.filter_focused();
     // The band sits 16pt in from each side.
-    let projects_w = projects_width(width - 32.0, !palette.projects().is_empty());
+    let projects_w = projects_width(width - 32.0, palette.shows_projects());
 
-    let commands = if results.is_empty() {
+    let commands = if rows.is_empty() {
+        let empty = if palette.search_pending() {
+            "Searching\u{2026}"
+        } else if palette.searching() {
+            palette.filter().empty_label()
+        } else {
+            SearchFilter::Commands.empty_label()
+        };
         // In the first row's slot: the column grows to the Projects
         // column's height, and the message stays at its top.
         div().id("palette-results").child(
@@ -203,15 +221,13 @@ pub fn render<H: OverlayHost>(
                 .items_center()
                 .type_style(Type::Base)
                 .text_color(theme.muted)
-                .child("No matching commands"),
+                .child(empty),
         )
     } else {
-        let rows: Vec<AnyElement> = results
+        let rows: Vec<AnyElement> = rows
             .iter()
             .enumerate()
-            .map(|(i, (entry, _))| {
-                render_row(i, entry, commands_focused && i == selected, theme, cx)
-            })
+            .map(|(i, row)| render_result(i, row, commands_focused && selected == Some(i), theme, cx))
             .collect();
         div()
             .id("palette-results")
@@ -248,6 +264,9 @@ pub fn render<H: OverlayHost>(
         .text_color(theme.foreground)
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(query_line(palette.query(), theme))
+        .when(palette.searching(), |panel| {
+            panel.child(filter_row(&palette.chips(), palette.filter_focused(), theme, cx))
+        })
         .child(band)
         .child(
             div()
@@ -298,6 +317,191 @@ fn query_line(query: &str, theme: &Theme) -> gpui::Div {
         .type_style(Type::Base)
         .child(div().flex_none().text_color(theme.foreground).child(PROMPT))
         .child(text)
+}
+
+/// The filter row: the app's segmented control, one segment per filter
+/// with its count, the chosen one on the selected chip. While it has the
+/// keys (↑ from the first result) the track wears the focus ring.
+fn filter_row<H: OverlayHost>(chips: &[FilterChip], focused: bool, theme: &Theme, cx: &mut Context<H>) -> AnyElement {
+    let segments = chips.iter().map(|chip| {
+        let filter = chip.filter;
+        controls::segment(format!("palette-filter-{}", chip.label), chip.label, chip.selected, true, theme)
+            .gap(px(6.0))
+            .child(
+                div()
+                    .type_style(Type::Small)
+                    .text_color(theme.muted)
+                    .child(chip.count.to_string()),
+            )
+            .on_click(cx.listener(move |this: &mut H, _, window, cx| {
+                with_overlay(this, window, cx, |o| match o {
+                    ActiveOverlay::Palette { palette, .. } => {
+                        palette.click_filter(filter);
+                        OverlayEvent::Stay
+                    }
+                    _ => OverlayEvent::Stay,
+                })
+            }))
+    });
+    let track = controls::segmented_track(theme)
+        .gap(px(2.0))
+        .when(focused, |t| t.border_1().border_color(theme.focus_ring))
+        .children(segments);
+    div()
+        .debug_selector(|| "palette-filters".into())
+        .flex()
+        .flex_row()
+        .flex_none()
+        .px_4()
+        .pb_2()
+        .child(track)
+        .into_any_element()
+}
+
+/// One row of the results band: a group's heading, or a result.
+fn render_result<H: OverlayHost>(
+    index: usize,
+    row: &ResultRow,
+    selected: bool,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> AnyElement {
+    match row {
+        ResultRow::Header(kind) => div()
+            .debug_selector(move || format!("palette-heading-{}", kind.heading()))
+            .flex()
+            .flex_none()
+            .items_end()
+            .h(px(HEADING_H))
+            .px(px(ROW_RADIUS))
+            .pb_1()
+            .type_style(Type::SmallMedium)
+            .text_color(theme.muted)
+            .child(kind.heading())
+            .into_any_element(),
+        ResultRow::Item(ResultItem::Command(entry)) => render_row(index, entry, selected, theme, cx),
+        ResultRow::Item(ResultItem::Issue(doc)) => detail_row(
+            index,
+            format!("palette-issue-{}", doc.id),
+            style::status_icon(doc.category, theme).into_any_element(),
+            &doc.title,
+            doc.detail(),
+            selected,
+            theme,
+            cx,
+        ),
+        ResultRow::Item(ResultItem::Changelog(hit)) => detail_row(
+            index,
+            format!("palette-entry-{}", hit.id),
+            heroicon(icons::ROCKET_LAUNCH).text_color(theme.icon).into_any_element(),
+            &hit.title,
+            hit.detail.clone(),
+            selected,
+            theme,
+            cx,
+        ),
+        ResultRow::Item(ResultItem::ShowAll { kind, count }) => show_all_row(index, *kind, *count, selected, theme, cx),
+    }
+}
+
+/// A result row's frame: 32pt, 6pt corners, the selected one on the
+/// overlay fill, a fill fading in under the pointer; a click activates row
+/// `index` of the palette's rows.
+fn row_frame<H: OverlayHost>(
+    index: usize,
+    key: String,
+    selected: bool,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> gpui::Stateful<gpui::Div> {
+    let selector = key.clone();
+    let row = div()
+        .id(("palette-row", index))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_none()
+        .gap(px(6.0))
+        .h(px(ROW_H))
+        .px(px(6.0))
+        .rounded(px(ROW_RADIUS))
+        .cursor_pointer()
+        .type_style(Type::Base);
+    let row = if selected {
+        row.bg(theme.background)
+    } else {
+        let clear = theme.background.opacity(0.0);
+        fill_layer(row, key, px(ROW_RADIUS), [clear, theme.background, theme.background])
+    };
+    row.on_click(cx.listener(move |this: &mut H, _, window, cx| {
+        with_overlay(this, window, cx, |o| match o {
+            ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_row(index)),
+            _ => OverlayEvent::Stay,
+        })
+    }))
+}
+
+/// A result's name: Base medium, loud and semibold when selected.
+fn name(label: &str, selected: bool, theme: &Theme) -> gpui::Div {
+    div()
+        .truncate()
+        .when(selected, |l| {
+            l.debug_selector(|| "palette-selected".into())
+                .type_style(Type::BaseSemibold)
+                .text_color(theme.text_loud)
+        })
+        .when(!selected, |l| l.type_style(Type::BaseMedium).text_color(theme.foreground))
+        .child(label.to_string())
+}
+
+/// An issue's or a Changelog entry's row: its glyph (the issue's status, the
+/// Changelog's rocket), the title, then the detail (`in progress · #1931`,
+/// `Oct 28 · #1902`) at the right.
+#[allow(clippy::too_many_arguments)]
+fn detail_row<H: OverlayHost>(
+    index: usize,
+    key: String,
+    icon: AnyElement,
+    title: &str,
+    detail: String,
+    selected: bool,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> AnyElement {
+    row_frame(index, key, selected, theme, cx)
+        .child(div().flex_none().size(px(20.0)).flex().items_center().justify_center().child(icon))
+        .child(name(title, selected, theme).flex_1().min_w_0())
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(if selected { theme.foreground } else { theme.muted })
+                .child(detail),
+        )
+        .into_any_element()
+}
+
+/// The row closing a capped group: `Show all 12 issues` in the link color,
+/// where the names start.
+fn show_all_row<H: OverlayHost>(
+    index: usize,
+    kind: ResultKind,
+    count: usize,
+    selected: bool,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> AnyElement {
+    row_frame(index, format!("palette-show-all-{}", kind.heading()), selected, theme, cx)
+        .child(heroicon(icons::ARROW_RIGHT).text_color(theme.link))
+        .child(
+            div()
+                .truncate()
+                .type_style(if selected { Type::BaseSemibold } else { Type::BaseMedium })
+                .text_color(theme.link)
+                .child(kind.show_all_label(count)),
+        )
+        .into_any_element()
 }
 
 fn render_row<H: OverlayHost>(
@@ -355,7 +559,7 @@ fn render_row<H: OverlayHost>(
         )
         .on_click(cx.listener(move |this: &mut H, _, window, cx| {
             with_overlay(this, window, cx, |o| match o {
-                ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_item(index)),
+                ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_row(index)),
                 _ => OverlayEvent::Stay,
             })
         }))

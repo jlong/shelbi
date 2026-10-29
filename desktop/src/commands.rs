@@ -66,6 +66,12 @@ pub trait CommandHost {
     /// Open an `edit:*` target (project settings, an agent's instructions,
     /// `zenmode.md`, the workflows directory) in the user's editor.
     fn open_editor(&mut self, target: &EditTarget);
+    /// Open issue `id`'s detail on the board, as clicking its card does (the
+    /// palette's issue result).
+    fn open_issue(&mut self, id: &str);
+    /// Show the Changelog scrolled to entry `id` (the palette's Changelog
+    /// result).
+    fn open_changelog_entry(&mut self, id: &str);
 }
 
 /// Run a command. Every [`CommandKind`] variant has its own arm.
@@ -115,6 +121,10 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // The same path the TUI opens (`edit_target_path`), in the user's
         // editor: a terminal editor in Terminal.app, a GUI one directly.
         CommandKind::OpenEditor { target } => host.open_editor(target),
+        // The palette's search results: the issue's detail on the board (as
+        // a Changelog issue chip opens it), the Changelog at the entry.
+        CommandKind::OpenIssue { id } => host.open_issue(id),
+        CommandKind::OpenChangelogEntry { id } => host.open_changelog_entry(id),
         // The board's issue mutations (dt-issues-board; drag and drop reuses
         // MoveIssue and adds PrioritizeIssue in dt-board-dnd).
         CommandKind::MoveIssue { .. }
@@ -153,6 +163,9 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::OpenAcknowledgements => false,
         // Edits a local file in the user's editor.
         CommandKind::OpenEditor { .. } => false,
+        // Show what is already read.
+        CommandKind::OpenIssue { .. } => false,
+        CommandKind::OpenChangelogEntry { .. } => false,
         // Only this client lets go.
         CommandKind::Detach => false,
         // Another window on a project already open.
@@ -289,6 +302,12 @@ mod tests {
             };
             self.0.push(format!("editor:{id}"));
         }
+        fn open_issue(&mut self, id: &str) {
+            self.0.push(format!("open-issue:{id}"));
+        }
+        fn open_changelog_entry(&mut self, id: &str) {
+            self.0.push(format!("open-changelog-entry:{id}"));
+        }
     }
 
     fn id_for(kind: CommandKind) -> String {
@@ -364,6 +383,8 @@ mod tests {
                 },
                 "editor:edit:changelog-template",
             ),
+            (CommandKind::OpenIssue { id: s("1931") }, "open-issue:1931"),
+            (CommandKind::OpenChangelogEntry { id: s("e1") }, "open-changelog-entry:e1"),
             (
                 CommandKind::MoveIssue {
                     id: s("t1"),
@@ -433,6 +454,8 @@ mod tests {
                 "editor:edit:zenmode",
                 "editor:edit:workflows",
                 "editor:edit:changelog-template",
+                "open-issue:1931",
+                "open-changelog-entry:e1",
             ]
         );
     }

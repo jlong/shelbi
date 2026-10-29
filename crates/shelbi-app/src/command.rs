@@ -72,6 +72,13 @@ pub enum CommandKind {
     QuitShelbi,
     /// Open an editable config/instructions target.
     OpenEditor { target: EditTarget },
+    /// Open an issue's detail, as clicking its card on the board does (the
+    /// palette's issue search results; never listed, only resolved from its
+    /// id).
+    OpenIssue { id: String },
+    /// Show the Changelog scrolled to one entry (the palette's Changelog
+    /// search results; never listed, only resolved from its id).
+    OpenChangelogEntry { id: String },
     // ---- issue mutations (the generic set; not surfaced in the tmux
     // palette today, carried here so the single-process TUI / desktop app
     // bind them from one definition) ------------------------------------
@@ -188,6 +195,14 @@ impl CommandKind {
             CommandKind::QuitShelbi => Effect::QuitShelbi,
             CommandKind::OpenEditor { target } => Effect::OpenEditor {
                 target: target.clone(),
+            },
+            CommandKind::OpenIssue { id } => Effect::OpenIssue {
+                project: p(),
+                id: id.clone(),
+            },
+            CommandKind::OpenChangelogEntry { id } => Effect::OpenChangelogEntry {
+                project: p(),
+                id: id.clone(),
             },
             CommandKind::MoveIssue { id, to_status } => Effect::Mutate(Mutation::MoveIssue {
                 project: p(),
@@ -721,6 +736,16 @@ impl CommandKind {
         if let Some(slug) = id.strip_prefix("action:switch-project:") {
             return Some(CommandKind::SwitchProject {
                 project: slug.to_string(),
+            });
+        }
+        if let Some(issue) = id.strip_prefix("action:open-issue:") {
+            return Some(CommandKind::OpenIssue {
+                id: issue.to_string(),
+            });
+        }
+        if let Some(entry) = id.strip_prefix("action:open-changelog-entry:") {
+            return Some(CommandKind::OpenChangelogEntry {
+                id: entry.to_string(),
             });
         }
         if let Some(task) = id.strip_prefix("action:approve-review:") {

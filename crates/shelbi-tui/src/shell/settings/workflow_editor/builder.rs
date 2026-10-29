@@ -55,7 +55,7 @@ use shelbi_app::settings::workflow_editor::{
 };
 use shelbi_app::settings::workflow_graph::{EdgeKind, Graph, Pt, Side};
 use shelbi_app::settings::workflows::category_label;
-use shelbi_core::{StatusCategory, TransitionAction, Workflow};
+use shelbi_core::{TransitionAction, Workflow};
 
 use super::canvas::{self, Border, Canvas, EdgeIn, Input, Look, NodeLook, Route};
 use super::{Act, Choice, EditorAction, Hit, Item, Pick, Section, Text, WorkflowEditorPage};
@@ -139,17 +139,9 @@ pub(crate) enum BAct {
     Close,
 }
 
-/// A category's symbol on the canvas and in the panel.
-pub(crate) fn category_glyph(category: StatusCategory) -> &'static str {
-    match category {
-        StatusCategory::Backlog => "◌",
-        StatusCategory::Ready => "○",
-        StatusCategory::Active => "◐",
-        StatusCategory::Handoff => "◑",
-        StatusCategory::Done => "●",
-        StatusCategory::Archived => "⊘",
-    }
-}
+// A category's symbol on the canvas and in the panel (the palette's issue
+// rows draw it too).
+pub(crate) use crate::kanban::category_glyph;
 
 /// A draft's workflow, if one's loaded.
 pub(crate) fn state_workflow(state: &Option<EditorState>) -> Option<&Workflow> {

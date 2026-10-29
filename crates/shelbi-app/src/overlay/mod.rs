@@ -16,6 +16,7 @@
 pub mod add_project;
 pub mod error_log;
 pub mod palette;
+pub mod palette_search;
 pub mod review_confirm;
 pub mod review_reject;
 pub mod zen_intro;

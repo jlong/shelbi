@@ -486,8 +486,12 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.request_refresh();
             last_refresh = Instant::now();
         }
+        // Whether a board or Changelog read landed (the open palette then
+        // searches it).
+        let mut corpus_landed = false;
         if let Some(snap) = state.latest_snapshot() {
             state.apply_snapshot(snap);
+            corpus_landed = true;
         }
         if let Some(activity) = state.latest_activity() {
             state.activity.apply_activity_data(activity);
@@ -499,8 +503,16 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if let Some(closed) = state.latest_closed() {
             state.kanban.apply_closed_page(closed);
             state.dirty = true;
+            corpus_landed = true;
         }
         if state.poll_changelog() {
+            state.dirty = true;
+            corpus_landed = true;
+        }
+        if corpus_landed {
+            state.sync_palette_corpus();
+        }
+        if state.poll_palette_search() {
             state.dirty = true;
         }
         // A change arrived for the workspace the main area is showing: if its
@@ -1178,6 +1190,9 @@ struct ShellState {
     /// An issue link's off-thread read (the issue wasn't on the board the
     /// shell holds): its detail opens when it lands.
     changelog_issue_rx: Option<Receiver<Result<shelbi_state::IssueFile, String>>>,
+    /// The main view an off-board issue read was asked from
+    /// ([`ShellState::main_view_key`]): it opens only if that still shows.
+    issue_read_from: Option<String>,
     /// The user's keymaps (with this project's overrides), loaded once and
     /// shared by the embedded native-view key handlers, the palette's bindings,
     /// and resolving the palette-open chord.
@@ -1480,6 +1495,7 @@ impl ShellState {
             machines,
             changelog: changelog::ChangelogPage::new(),
             changelog_issue_rx: None,
+            issue_read_from: None,
             keymaps,
             display_style,
             startup_status,
@@ -2015,6 +2031,7 @@ impl ShellState {
         );
         self.changelog = changelog::ChangelogPage::new();
         self.changelog_issue_rx = None;
+        self.issue_read_from = None;
         // An open review / workspace interface belongs to the project we left: it
         // renders over the sidebar column and main area regardless of
         // `main_view`, so drop it (detaching its content view) along with any
@@ -2298,15 +2315,15 @@ impl ShellState {
         match step {
             changelog::Step::Stay => {}
             changelog::Step::OpenUrl(url) => self.open_url(url),
-            changelog::Step::OpenIssue(id) => self.open_changelog_issue(id),
+            changelog::Step::OpenIssue(id) => self.open_issue(id),
         }
     }
 
-    /// Open issue `id`'s detail over the main area: from the board the shell
-    /// already holds, or (a closed issue past its first page, say) read off
-    /// the UI thread and opened when it lands
-    /// ([`Self::poll_changelog_issue`]).
-    fn open_changelog_issue(&mut self, id: String) {
+    /// Open issue `id`'s detail over the main area (a Changelog link, the
+    /// palette's issue result): from the board the shell already holds, or (a
+    /// closed issue past its first page, say) read off the UI thread and
+    /// opened when it lands ([`Self::poll_changelog_issue`]).
+    fn open_issue(&mut self, id: String) {
         if let Some(task) = self.kanban.tasks.iter().find(|t| t.task.id == id).cloned() {
             self.show_issue_detail(task);
             return;
@@ -2327,6 +2344,7 @@ impl ShellState {
         if spawned.is_ok() {
             self.status = Some("opening issue…".to_string());
             self.changelog_issue_rx = Some(rx);
+            self.issue_read_from = Some(self.main_view_key());
         }
     }
 
@@ -2352,18 +2370,61 @@ impl ShellState {
             Some(Err(TryRecvError::Disconnected)) => Err("couldn't open the issue".to_string()),
         };
         self.changelog_issue_rx = None;
+        let from = self.issue_read_from.take();
         match read {
             Ok(task) => {
                 self.status = None;
-                // Only while the Changelog still shows: a late read never
-                // lands over a view the user moved on to.
-                if matches!(self.main_view, MainView::Native(View::Changelog)) {
+                // Only while the view it was opened from still shows: a late
+                // read never lands over a view the user moved on to.
+                if from.as_deref() == Some(self.main_view_key().as_str()) {
                     self.show_issue_detail(task);
                 }
             }
             Err(e) => self.status = Some(e),
         }
         true
+    }
+
+    /// What the main area shows, as a key to compare later.
+    fn main_view_key(&self) -> String {
+        match &self.main_view {
+            MainView::Session => format!("session:{:?}", self.client.view()),
+            MainView::Native(v) => format!("native:{v:?}"),
+            MainView::Review(id) => format!("review:{id}"),
+            MainView::Workspace(ws) => format!("workspace:{ws}"),
+        }
+    }
+
+    /// The palette's search corpus: the board and the Changelog this shell
+    /// already holds (never a fresh read).
+    fn palette_corpus(&self) -> shelbi_app::overlay::palette_search::SearchCorpus {
+        use shelbi_app::board::BoardRules;
+        use shelbi_app::overlay::palette_search::{issue_docs, SearchCorpus};
+        let k = &self.kanban;
+        let rules = BoardRules {
+            workflows: &k.workflows,
+            default_workflow_name: &k.default_workflow_name,
+        };
+        SearchCorpus::new(issue_docs(&k.tasks, &k.project_statuses, rules), self.changelog.entries())
+    }
+
+    /// Hand the open palette's search what the shell holds now (a board or
+    /// Changelog read landed).
+    fn sync_palette_corpus(&mut self) {
+        if matches!(self.overlay, Some(ActiveOverlay::Palette(_))) {
+            let corpus = self.palette_corpus();
+            if let Some(ActiveOverlay::Palette(p)) = &mut self.overlay {
+                p.set_corpus(corpus);
+            }
+        }
+    }
+
+    /// Take the open palette's search hits that landed; whether to redraw.
+    fn poll_palette_search(&mut self) -> bool {
+        match &mut self.overlay {
+            Some(ActiveOverlay::Palette(p)) => p.poll_search(),
+            _ => false,
+        }
     }
 
     /// The board's task-detail popover over the main area, as the review
@@ -2506,7 +2567,10 @@ impl ShellState {
             .project()
             .map(|p| self.palette_inputs.projects_column(p))
             .unwrap_or_default();
-        self.overlay = Some(ActiveOverlay::palette(entries, projects));
+        // Typing searches the board and the Changelog the shell holds too,
+        // off the UI thread.
+        let search = shelbi_app::overlay::palette_search::PaletteSearch::background(self.palette_corpus(), None);
+        self.overlay = Some(ActiveOverlay::palette(entries, projects, search));
     }
 
     /// The bare "Switch Project": the palette with its Projects column focused,
@@ -3452,6 +3516,13 @@ impl ShellState {
             Effect::LoadReview { task_id, .. } => self.begin_review(task_id),
             Effect::OpenErrorLog { project } => {
                 self.overlay = Some(ActiveOverlay::error_log(project));
+            }
+            // The palette's issue result: its detail, as a card click opens it.
+            Effect::OpenIssue { id, .. } => self.open_issue(id),
+            // The palette's Changelog result: the page, at that entry.
+            Effect::OpenChangelogEntry { id, .. } => {
+                self.show_view_effect(View::Changelog);
+                self.changelog.reveal(&id);
             }
             Effect::OpenEditor { target } => self.open_editor(&target),
             Effect::OpenSettings => self.open_settings(),
@@ -11072,6 +11143,7 @@ workspaces:
         let mut st = changelog_state();
         let (tx, rx) = std::sync::mpsc::channel();
         st.changelog_issue_rx = Some(rx);
+        st.issue_read_from = Some(st.main_view_key());
         assert!(!st.poll_changelog(), "nothing yet");
         tx.send(Ok(sample_issue("tui-about", "About Shelbi"))).unwrap();
         assert!(st.poll_changelog());
@@ -11087,10 +11159,69 @@ workspaces:
         assert_eq!(st.status.as_deref(), Some("no issue gone-1"));
         let (tx, rx) = std::sync::mpsc::channel();
         st.changelog_issue_rx = Some(rx);
+        st.issue_read_from = Some(st.main_view_key());
         st.show(RowTarget::Native(View::Issues));
         tx.send(Ok(sample_issue("tui-about", "About Shelbi"))).unwrap();
         assert!(st.poll_changelog());
         assert!(st.overlay.is_none());
+    }
+
+    /// Type `query` into the open palette and wait for its issue and
+    /// Changelog search to land (it runs on the palette's worker).
+    fn search_palette(st: &mut ShellState, query: &str) {
+        for c in query.chars() {
+            press(st, KeyCode::Char(c));
+        }
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                st.poll_palette_search();
+                matches!(&st.overlay, Some(ActiveOverlay::Palette(p)) if !p.inner().search_pending())
+            }),
+            "the search lands"
+        );
+    }
+
+    #[test]
+    fn the_palette_finds_an_issue_and_opens_its_detail() {
+        let mut st = changelog_state();
+        st.show(RowTarget::Native(View::Issues));
+        st.kanban.tasks = vec![sample_issue("tui-settings-polish", "TUI settings polish")];
+        st.open_palette();
+        search_palette(&mut st, "polish");
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette is open");
+        };
+        let counts: Vec<(&str, usize)> = p.inner().chips().iter().map(|c| (c.label, c.count)).collect();
+        assert_eq!(
+            counts,
+            [("All", 2), ("Issues", 1), ("Changelog Entries", 1), ("Commands", 0)],
+            "the issue and the sample's Settings polish pass entry"
+        );
+        press(&mut st, KeyCode::Enter);
+        let Some(ActiveOverlay::TaskDescription { task, .. }) = &st.overlay else {
+            panic!("Enter on the issue opens its detail");
+        };
+        assert_eq!(task.task.id, "tui-settings-polish");
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)), "over the view it was opened from");
+    }
+
+    #[test]
+    fn the_palette_finds_a_changelog_entry_and_opens_the_page_at_it() {
+        let mut st = changelog_state();
+        st.show(RowTarget::Native(View::Issues));
+        st.open_palette();
+        search_palette(&mut st, "faster board");
+        // Under the Changelog Entries filter (Tab twice), Enter opens it.
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Enter);
+        assert!(st.overlay.is_none());
+        assert!(matches!(st.main_view, MainView::Native(View::Changelog)));
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(st.changelog.selected_entry(), Some("2026-10-26-150000-faster-board"));
+        assert!(st.changelog.scroll() > 0, "scrolled down to the oldest entry");
+        assert!(find_on_screen(&term, "Faster board").is_some());
     }
 
     #[test]

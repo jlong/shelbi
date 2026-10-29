@@ -287,6 +287,19 @@ pub(crate) fn segmented(
     hovered: Option<usize>,
     width: usize,
 ) -> ([Line<'static>; 3], Vec<(u16, u16)>) {
+    segmented_in(labels, chosen, focused, hovered, width, palette().segment)
+}
+
+/// [`segmented`] with the chosen chip in `chosen_fill`: the palette's filter
+/// row draws it in the selection fill.
+pub(crate) fn segmented_in(
+    labels: &[&str],
+    chosen: usize,
+    focused: bool,
+    hovered: Option<usize>,
+    width: usize,
+    chosen_fill: Color,
+) -> ([Line<'static>; 3], Vec<(u16, u16)>) {
     let p = palette();
     let track = textbox::fill(focused, false, false);
     let on_track = Style::default().bg(track);
@@ -301,7 +314,7 @@ pub(crate) fn segmented(
         }
         let style = if i == chosen {
             // The desktop's canvas chip on its track, as Contact Us draws it.
-            let s = Style::default().bg(p.segment).fg(p.white);
+            let s = Style::default().bg(chosen_fill).fg(p.white);
             if focused {
                 s.add_modifier(Modifier::BOLD)
             } else {
