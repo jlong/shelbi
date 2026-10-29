@@ -34,8 +34,12 @@
 //!   featured entries' texts (`crate_text`); and every shipped crate
 //!   (`SHIPPED`), for the tests.
 //!
-//! The nested cargo runs `--offline --locked`: every package it reads has
-//! already been downloaded for the build that runs this script.
+//! The nested cargo runs `--locked`, first `--offline`. `cargo metadata`
+//! resolves the whole graph, dev-dependencies included, and needs every
+//! package in it downloaded, while a build fetches only what it compiles:
+//! on a cargo cache that never fetched the dev-dependencies (a fresh
+//! machine that never ran `cargo test`) the offline run fails, and the
+//! script runs it again online to fetch them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -369,16 +373,32 @@ fn notice(p: &Package, all: &[Package]) -> String {
 /// crate in `manifest_dir`).
 fn shipped(manifest_dir: &Path, target: &str, root: Option<&str>) -> Vec<Package> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let out = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--locked", "--offline", "--filter-platform", target])
-        .current_dir(manifest_dir)
-        .output()
-        .expect("run cargo metadata for the bundled-software list");
-    assert!(
-        out.status.success(),
-        "cargo metadata failed for the bundled-software list:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let metadata = |offline: bool| {
+        let mut args = vec!["metadata", "--format-version", "1", "--locked", "--filter-platform", target];
+        if offline {
+            args.push("--offline");
+        }
+        Command::new(&cargo)
+            .args(args)
+            .current_dir(manifest_dir)
+            .output()
+            .expect("run cargo metadata for the bundled-software list")
+    };
+    let mut out = metadata(true);
+    if !out.status.success() {
+        // A package the build never needed (a dev-dependency) isn't in the
+        // cache yet: fetch it.
+        let offline = out;
+        out = metadata(false);
+        assert!(
+            out.status.success(),
+            "cargo metadata failed for the bundled-software list \
+             (run `cargo fetch` to download every locked package):\n\
+             offline:\n{}\nonline:\n{}",
+            String::from_utf8_lossy(&offline.stderr),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata JSON");
     let packages: HashMap<&str, &Value> = meta["packages"]
         .as_array()

@@ -105,6 +105,12 @@ fi
 echo "==> baking shelbi root: $shelbi_root"
 export SHELBI_DEFAULT_ROOT="$shelbi_root"
 
+# The build scripts that generate the bundled-software list run
+# `cargo metadata`, which needs every locked package (dev-dependencies too)
+# in the cargo cache; a build alone fetches only what it compiles.
+echo "==> fetching dependencies"
+cargo fetch --locked
+
 echo "==> building release"
 cargo build --release
 
