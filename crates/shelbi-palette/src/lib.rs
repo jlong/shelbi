@@ -106,6 +106,28 @@ pub fn score(matcher: &mut Matcher, pattern: &str, label: &str) -> Option<u16> {
     score_pattern(matcher, &parse_pattern(pattern), label)
 }
 
+/// One query, parsed once, scored against many texts: the palette's fuzzy
+/// match for searches beyond the command labels (issue titles and ids,
+/// Changelog titles), so they rank the way the commands do.
+pub struct Scorer {
+    matcher: Matcher,
+    pattern: Pattern,
+}
+
+impl Scorer {
+    pub fn new(query: &str) -> Self {
+        Scorer {
+            matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
+            pattern: parse_pattern(query),
+        }
+    }
+
+    /// `text`'s score against the query. Higher = better. None = no match.
+    pub fn score(&mut self, text: &str) -> Option<u16> {
+        score_pattern(&mut self.matcher, &self.pattern, text)
+    }
+}
+
 /// Filter + sort `entries` against `query`. Best match first.
 ///
 /// Entries flagged [`Entry::hidden_until_query`] are dropped while the

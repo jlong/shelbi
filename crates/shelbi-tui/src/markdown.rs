@@ -1,9 +1,10 @@
 //! Inline-markdown rendering for the note bodies shown in the review and
 //! kanban panes.
 //!
-//! Issue and review notes are stored as plain markdown strings. The one
-//! inline construct we surface visually is backtick `code`, painted with a
-//! subtle background so it reads as code against the surrounding prose.
+//! Issue and review notes are stored as plain markdown strings. The inline
+//! constructs we surface visually are backtick `code`, painted with a
+//! subtle background so it reads as code against the surrounding prose, and
+//! `**bold**`, drawn bold with its asterisks dropped.
 //!
 //! We deliberately do **not** lean on `Paragraph`'s built-in `Wrap` for
 //! this. ratatui word-wraps *after* the spans are styled, and a
@@ -16,7 +17,7 @@
 //! `.wrap()`), so a code span never crosses the boundary and its background
 //! only ever covers characters inside `width`.
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme::palette;
@@ -46,10 +47,28 @@ pub fn render_note(body: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// One styled slice of a word; `code` toggles the highlight.
+/// How a slice of text is marked up: inline code, bold, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Mark {
+    code: bool,
+    bold: bool,
+}
+
+impl Mark {
+    fn style(self) -> Style {
+        let style = if self.code { code_style() } else { Style::default() };
+        if self.bold {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
+}
+
+/// One styled slice of a word; its `mark` picks the style.
 struct Seg {
     text: String,
-    code: bool,
+    mark: Mark,
 }
 
 /// A token in a source line: a run of whitespace (carrying its own code
@@ -61,42 +80,84 @@ enum Tok {
     Word(Vec<Seg>),
 }
 
-/// Split a source line into `(text, is_code)` runs on backtick pairs. An
-/// unclosed trailing backtick is rendered literally so no text is lost.
-fn parse_runs(line: &str) -> Vec<(String, bool)> {
+/// Split a source line into `(text, mark)` runs: inline code on backtick
+/// pairs, then bold on `**` pairs in the text between ([`bold_runs`]). An
+/// unclosed trailing backtick, or an unpaired `**`, is rendered literally
+/// so no text is lost.
+fn parse_runs(line: &str) -> Vec<(String, Mark)> {
     let pieces: Vec<&str> = line.split('`').collect();
     let last = pieces.len().saturating_sub(1);
-    let mut runs: Vec<(String, bool)> = Vec::new();
+    let mut code_runs: Vec<(String, bool)> = Vec::new();
     for (i, piece) in pieces.iter().enumerate() {
         let is_code_slot = i % 2 == 1;
         if is_code_slot && i != last {
             // A closing backtick followed this piece — real inline code.
-            runs.push((piece.to_string(), true));
+            code_runs.push((piece.to_string(), true));
         } else if is_code_slot {
             // Opening backtick with no partner: keep the backtick as text.
-            runs.push((format!("`{piece}"), false));
+            code_runs.push((format!("`{piece}"), false));
         } else {
-            runs.push((piece.to_string(), false));
+            code_runs.push((piece.to_string(), false));
         }
     }
+    let mut runs: Vec<(String, Mark)> = Vec::new();
+    for (text, code) in code_runs {
+        if code {
+            runs.push((text, Mark { code, bold: false }));
+        } else {
+            runs.extend(bold_runs(&text));
+        }
+    }
+    runs.retain(|(text, _)| !text.is_empty());
+    runs
+}
+
+/// Split plain text on `**` pairs, CommonMark-style but simplified: an
+/// opening `**` is followed by a non-space, its closing one comes after a
+/// non-space, and a `**` with no partner (`2 ** 3`) is text.
+fn bold_runs(text: &str) -> Vec<(String, Mark)> {
+    let marks: Vec<usize> = text.match_indices("**").map(|(i, _)| i).collect();
+    let opens = |i: usize| text[i + 2..].chars().next().is_some_and(|c| !c.is_whitespace());
+    let closes = |i: usize| text[..i].chars().next_back().is_some_and(|c| !c.is_whitespace());
+    let mut runs = Vec::new();
+    let mut from = 0;
+    let mut k = 0;
+    while k < marks.len() {
+        let open = marks[k];
+        let close = (open >= from && opens(open))
+            .then(|| marks[k + 1..].iter().position(|&c| c >= open + 3 && closes(c)))
+            .flatten()
+            .map(|p| k + 1 + p);
+        match close {
+            Some(c) => {
+                runs.push((text[from..open].to_string(), Mark::default()));
+                let bold = Mark { code: false, bold: true };
+                runs.push((text[open + 2..marks[c]].to_string(), bold));
+                from = marks[c] + 2;
+                k = c + 1;
+            }
+            None => k += 1,
+        }
+    }
+    runs.push((text[from..].to_string(), Mark::default()));
     runs
 }
 
 /// Break `runs` into whitespace / word tokens, merging adjacent code and
 /// plain slices with no space between them into a single word so they wrap
 /// as one unit (e.g. project-level `` `default_branch` ``).
-fn tokenize(runs: Vec<(String, bool)>) -> Vec<Tok> {
+fn tokenize(runs: Vec<(String, Mark)>) -> Vec<Tok> {
     let mut toks: Vec<Tok> = Vec::new();
     let mut word: Vec<Seg> = Vec::new();
-    for (text, code) in runs {
+    for (text, mark) in runs {
         for (is_space, chunk) in split_ws(&text) {
             if is_space {
                 if !word.is_empty() {
                     toks.push(Tok::Word(std::mem::take(&mut word)));
                 }
-                toks.push(Tok::Space(Seg { text: chunk, code }));
+                toks.push(Tok::Space(Seg { text: chunk, mark }));
             } else {
-                word.push(Seg { text: chunk, code });
+                word.push(Seg { text: chunk, mark });
             }
         }
     }
@@ -139,7 +200,7 @@ fn cell_width(s: &str) -> usize {
 
 /// Greedy word-wrap of one source line's tokens into `out`, always emitting
 /// at least one line (blank lines are preserved).
-fn wrap_runs(runs: Vec<(String, bool)>, width: usize, out: &mut Vec<Line<'static>>) {
+fn wrap_runs(runs: Vec<(String, Mark)>, width: usize, out: &mut Vec<Line<'static>>) {
     let toks = tokenize(runs);
     let start_len = out.len();
 
@@ -212,9 +273,9 @@ fn hard_split(
     cur_w: &mut usize,
     out: &mut Vec<Line<'static>>,
 ) {
-    let chars: Vec<(char, bool)> = segs
+    let chars: Vec<(char, Mark)> = segs
         .iter()
-        .flat_map(|s| s.text.chars().map(move |c| (c, s.code)))
+        .flat_map(|s| s.text.chars().map(move |c| (c, s.mark)))
         .collect();
 
     let mut i = 0;
@@ -227,14 +288,13 @@ fn hard_split(
         let end = (i + avail).min(chars.len());
         let mut j = i;
         while j < end {
-            let code = chars[j].1;
+            let mark = chars[j].1;
             let mut text = String::new();
-            while j < end && chars[j].1 == code {
+            while j < end && chars[j].1 == mark {
                 text.push(chars[j].0);
                 j += 1;
             }
-            let style = if code { code_style() } else { Style::default() };
-            cur.push(Span::styled(text, style));
+            cur.push(Span::styled(text, mark.style()));
         }
         *cur_w += end - i;
         i = end;
@@ -245,12 +305,7 @@ fn push_seg(cur: &mut Vec<Span<'static>>, seg: Seg) {
     if seg.text.is_empty() {
         return;
     }
-    let style = if seg.code {
-        code_style()
-    } else {
-        Style::default()
-    };
-    cur.push(Span::styled(seg.text, style));
+    cur.push(Span::styled(seg.text, seg.mark.style()));
 }
 
 /// Flatten tokens onto a single unwrapped line (the `width == 0` fallback).
@@ -258,25 +313,13 @@ fn toks_to_line(toks: &[Tok]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for tok in toks {
         match tok {
-            Tok::Space(seg) => {
-                let style = if seg.code {
-                    code_style()
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(seg.text.clone(), style));
-            }
+            Tok::Space(seg) => spans.push(Span::styled(seg.text.clone(), seg.mark.style())),
             Tok::Word(segs) => {
                 for seg in segs {
                     if seg.text.is_empty() {
                         continue;
                     }
-                    let style = if seg.code {
-                        code_style()
-                    } else {
-                        Style::default()
-                    };
-                    spans.push(Span::styled(seg.text.clone(), style));
+                    spans.push(Span::styled(seg.text.clone(), seg.mark.style()));
                 }
             }
         }
@@ -386,6 +429,34 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "first");
         assert_eq!(line_text(&lines[1]), "");
         assert_eq!(line_text(&lines[2]), "second");
+    }
+
+    #[test]
+    fn double_asterisks_draw_bold_without_their_markers() {
+        let lines = render_note("The **Changelog** row and `**raw**` code", 80);
+        assert_eq!(line_text(&lines[0]), "The Changelog row and **raw** code");
+        let bold: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, ["Changelog"]);
+        // Bold that spans words wraps like any text, staying bold.
+        let lines = render_note("**one two three**", 8);
+        assert!(lines.iter().all(|l| l
+            .spans
+            .iter()
+            .filter(|s| !s.content.trim().is_empty())
+            .all(|s| s.style.add_modifier.contains(Modifier::BOLD))));
+    }
+
+    #[test]
+    fn an_unpaired_double_asterisk_is_literal() {
+        let lines = render_note("2 ** 3 and **bold** and ** left", 80);
+        assert_eq!(line_text(&lines[0]), "2 ** 3 and bold and ** left");
+        let lines = render_note("an **open one", 80);
+        assert_eq!(line_text(&lines[0]), "an **open one");
     }
 
     #[test]

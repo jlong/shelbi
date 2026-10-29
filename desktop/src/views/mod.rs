@@ -7,9 +7,10 @@
 //!   (landed: `chat.rs`)
 //! - issues board and task detail: **`dt-issues-board`** (landed:
 //!   `issues.rs` draws the board over the toolkit-free `board_state.rs`,
-//!   `task_detail.rs` the detail, `markdown.rs` / `external_edit.rs` its
-//!   body helpers; drag and drop: **`dt-board-dnd`**; which gesture scrolls
-//!   the board and which a column: **`dt-board-scroll-axes`**,
+//!   `task_detail.rs` the detail, `external_edit.rs` its body helper;
+//!   `markdown.rs` renders the Changelog's descriptions; drag and drop:
+//!   **`dt-board-dnd`**; which gesture scrolls the board and which a
+//!   column: **`dt-board-scroll-axes`**,
 //!   `board_scroll.rs`; each column a virtualized list so a board of a
 //!   thousand cards stays at frame rate: **`dt-board-perf`**, `board_list.rs`)
 //! - activity feed and machines: **`dt-activity-machines`** (landed:
@@ -83,6 +84,7 @@ pub mod board_list;
 pub mod board_scroll;
 pub mod bootstrap;
 pub mod bundled_software;
+pub mod changelog;
 pub mod cli_setup;
 pub mod board_state;
 pub mod chat;
@@ -102,6 +104,7 @@ pub mod machines;
 pub mod machines_state;
 pub mod machine_form;
 pub mod machine_form_state;
+pub mod markdown;
 pub mod overlay;
 pub mod pane_session;
 pub mod pane_split;

@@ -23,6 +23,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Hsla, MouseButton, ScrollHa
 use shelbi_app::nav;
 use shelbi_app::overlay::error_log::{ErrorLogOutcome, Viewer};
 use shelbi_app::overlay::palette::{Palette, PaletteStep, ProjectEntry};
+use shelbi_app::overlay::palette_search::PaletteSearch;
 use shelbi_app::overlay::review_confirm::{self as confirm, Dialog, Slot};
 use shelbi_app::overlay::review_reject::{self as reject, RejectPrompt};
 use shelbi_app::overlay::zen_intro::{self as zen, IntroOutcome, IntroState};
@@ -81,11 +82,16 @@ pub enum ActiveOverlay {
 }
 
 impl ActiveOverlay {
-    pub fn palette(entries: Vec<Entry>, projects: Vec<ProjectEntry>) -> Self {
+    /// The palette over `entries` and `projects`, typing searching the
+    /// issues and Changelog entries `search` holds too.
+    pub fn palette(entries: Vec<Entry>, projects: Vec<ProjectEntry>, search: PaletteSearch) -> Self {
         ActiveOverlay::Palette {
             // Tab crosses to the Projects column, as the frame's footer says
-            // (the TUI's Tab still goes to the sidebar).
-            palette: Palette::new(entries, projects).tab_switches_columns(),
+            // (the TUI's Tab still goes to the sidebar). While searching it
+            // changes the filter instead, in both.
+            palette: Palette::new(entries, projects)
+                .tab_switches_columns()
+                .with_search(search),
             scroll: ScrollHandle::new(),
         }
     }
@@ -163,9 +169,8 @@ impl ActiveOverlay {
                 }
                 let action = keymaps.palette.dispatch(chord);
                 let step = palette.handle_key(chord, action);
-                let count = palette.results().len();
-                if count > 0 {
-                    scroll.scroll_to_item(palette.selected_in(count));
+                if let Some(row) = palette.selected_row() {
+                    scroll.scroll_to_item(row);
                 }
                 palette_event(step)
             }
@@ -468,6 +473,7 @@ mod tests {
         let mut o = ActiveOverlay::palette(
             vec![entry("view:tasks", "Issues"), entry("action:error-log", "Open error log")],
             Vec::new(),
+            Default::default(),
         );
         assert_eq!(o.nav(), nav::Overlay::Palette);
         typed(&mut o, "err");
@@ -478,8 +484,13 @@ mod tests {
         for close in ["esc", "ctrl-p", "ctrl-space", "super-k"] {
             assert_eq!(o.handle_key(chord(close), &keymaps()), OverlayEvent::Close, "{close}");
         }
-        // No Projects column: Tab hands focus to the sidebar.
-        assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::FocusSidebar);
+        // While searching, Tab changes the filter.
+        assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::Stay);
+        let ActiveOverlay::Palette { palette, .. } = &o else { unreachable!() };
+        assert_eq!(palette.filter(), shelbi_app::overlay::palette_search::SearchFilter::Issues);
+        // No query, no Projects column: Tab hands focus to the sidebar.
+        let mut idle = ActiveOverlay::palette(vec![entry("view:tasks", "Issues")], Vec::new(), Default::default());
+        assert_eq!(idle.handle_key(chord("tab"), &keymaps()), OverlayEvent::FocusSidebar);
     }
 
     #[test]
@@ -489,7 +500,7 @@ mod tests {
             label: "Web".into(),
             indicator: shelbi_app::overlay::palette::ProjectIndicator::Unloaded,
         };
-        let mut o = ActiveOverlay::palette(vec![entry("view:tasks", "Issues")], vec![project]);
+        let mut o = ActiveOverlay::palette(vec![entry("view:tasks", "Issues")], vec![project], Default::default());
         assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::Stay);
         let ActiveOverlay::Palette { palette, .. } = &o else { unreachable!() };
         assert_eq!(palette.project_selection(), Some(0));
@@ -716,6 +727,7 @@ mod render_tests {
         ActiveOverlay::palette(
             crate::views::palette::present(CommandRegistry::new().entries(&model)),
             projects,
+            Default::default(),
         )
     }
 
@@ -776,13 +788,13 @@ mod render_tests {
             assert_eq!(palette.handle_key(chord, &keymaps), OverlayEvent::Stay);
         }
         let (_, mut cx) = open(cx, palette);
-        let query = cx.debug_bounds("palette-query").unwrap();
+        let filters = cx.debug_bounds("palette-filters").unwrap();
         let message = cx.debug_bounds("palette-no-match").unwrap();
-        // Right under the query line, as the first row would be, though the
-        // Projects column makes the band taller.
-        assert_eq!(message.top(), query.bottom());
+        // Right under the filter row, as the first row would be; the
+        // Projects column steps aside while searching.
+        assert_eq!(message.top(), filters.bottom());
         assert_eq!(message.size.height, px(crate::views::palette::ROW_H));
-        assert!(cx.debug_bounds("palette-project-Add project").unwrap().bottom() > message.bottom());
+        assert!(cx.debug_bounds("palette-projects").is_none());
     }
 
     #[gpui::test]

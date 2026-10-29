@@ -47,11 +47,12 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
+    append_changelog_section, apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
     apply_tracker_ownership_rewrites, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
-    scope_label, Classification, UpgradeFinding, UpgradeReport, PR_TEMPLATE_MISSING,
-    REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
+    PR_TEMPLATE_MISSING,
+    ORCH_CHANGELOG_RULE_MISSING, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -199,6 +200,14 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     if codes.contains(PR_TEMPLATE_MISSING) {
         heal_missing_pr_template(entry, applied);
     }
+    if codes.contains(CHANGELOG_TEMPLATE_MISSING) {
+        heal_missing_default(
+            entry,
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE,
+            CHANGELOG_TEMPLATE_MISSING,
+            applied,
+        );
+    }
     // Same shape for the shared agent preamble that carries the hub-safety
     // rules (`agents/_shared/preamble.md`).
     if codes.contains(SHARED_PREAMBLE_MISSING) {
@@ -228,6 +237,13 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // (an edited one gets a needs-judgment finding instead, never a write).
     if codes.contains(TRACKER_OWNERSHIP_AUTOHEAL_CODE) {
         heal_tracker_ownership(entry, applied);
+    }
+
+    // Append the orchestrator's `## Changelog` rule to instructions that lack
+    // it. Purely additive Markdown, handled independently like the ones above;
+    // it runs after the in-place tracker rewrite and re-reads the file.
+    if codes.contains(ORCH_CHANGELOG_RULE_MISSING) {
+        heal_orchestrator_changelog(entry, applied);
     }
 
     // Add `--no-fail-fast` to fail-fast `cargo test` local checks. A surgical,
@@ -1087,6 +1103,33 @@ fn heal_tracker_ownership(entry: &InventoryEntry, applied: &mut Vec<AppliedChang
     );
 }
 
+/// Append the shipped `## Changelog` section to an orchestrator
+/// `instructions.md` that lacks the rule, via the shared
+/// [`append_changelog_section`]. Additive only: everything the user wrote stays
+/// byte-for-byte, and a copy that gained the rule between detection and apply
+/// is left alone (the no-op write is skipped).
+fn heal_orchestrator_changelog(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = append_changelog_section(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        ORCH_CHANGELOG_RULE_MISSING,
+        path,
+        "append-changelog-section".into(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 
@@ -1724,7 +1767,10 @@ zen:
         let orch_dir = home.join("projects/demo/agents/orchestrator");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let path = orch_dir.join("instructions.md");
-        let edited = "# Orchestrator\n\n## Reporting\n\nLead with my own custom summary line.\n";
+        // Carries a `## Changelog` heading so the Changelog-rule append (its own
+        // tests below) doesn't touch the file this test checks is left intact.
+        let edited = "# Orchestrator\n\n## Reporting\n\nLead with my own custom summary line.\n\n\
+                      ## Changelog\n\nWrite one entry per merge.\n";
         std::fs::write(&path, edited).unwrap();
 
         let report = detect(&["demo".to_string()]).unwrap();
@@ -1742,6 +1788,117 @@ zen:
         assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "file was modified");
     }
 
+    /// A temp `SHELBI_HOME` holding project `demo` whose orchestrator
+    /// `instructions.md` is `text`. Returns the home and the file's path.
+    fn home_with_orchestrator_instructions(guard: &EnvGuard, text: &str) -> (PathBuf, PathBuf) {
+        let home = fresh_home();
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let path = orch_dir.join("instructions.md");
+        std::fs::write(&path, text).unwrap();
+        (home, path)
+    }
+
+    fn has_code(report: &UpgradeReport, code: &str) -> bool {
+        report.findings.iter().any(|f| f.code == code)
+    }
+
+    #[test]
+    fn absent_changelog_rule_is_appended_on_start_idempotently_and_discloses() {
+        // An existing project whose orchestrator instructions predate the
+        // Changelog rule: the boot pass appends the shipped section after the
+        // user's text, discloses it, and a second pass is a no-op.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        let original = "# Orchestrator\n\n## How to decide\n\nMy own house rules.";
+        let (_home, path) = home_with_orchestrator_instructions(&guard, original);
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == ORCH_CHANGELOG_RULE_MISSING
+                && f.classification == Classification::AutoHeal),
+            "expected an ORCH_CHANGELOG_RULE_MISSING auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == ORCH_CHANGELOG_RULE_MISSING),
+            "nothing applied: {applied:?}",
+        );
+
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert!(healed.starts_with(original), "the user's text was rewritten: {healed}");
+        let section = crate::commands::config_upgrade::shipped_changelog_section();
+        assert!(
+            healed.ends_with(&format!("\n\n{section}\n")),
+            "shipped section not appended after a blank line: {healed}",
+        );
+        assert!(section.contains("shelbi changelog add"), "{section}");
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains("config-upgrade"), "no disclosure line: {log}");
+        assert!(log.contains(ORCH_CHANGELOG_RULE_MISSING), "{log}");
+
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !has_code(&report2, ORCH_CHANGELOG_RULE_MISSING),
+            "residual changelog auto-heal: {report2:?}",
+        );
+        let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
+        assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), healed);
+    }
+
+    #[test]
+    fn present_changelog_rule_in_the_shipped_default_is_not_flagged() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        let (_home, path) = home_with_orchestrator_instructions(&guard, shipped);
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !has_code(&report, ORCH_CHANGELOG_RULE_MISSING),
+            "the shipped default already carries the rule: {report:?}",
+        );
+        apply_auto_heal(&["demo".to_string()], &report);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), shipped, "file was modified");
+    }
+
+    #[test]
+    fn edited_changelog_rule_is_left_untouched_and_unflagged() {
+        // The user rewrote the section (kept the heading, changed the policy),
+        // or dropped the heading but still names the command elsewhere: either
+        // way the rule is theirs, so nothing is reported or written.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        for edited in [
+            "# Orchestrator\n\n## Changelog\n\nDon't write changelog entries in this project.\n",
+            "# Orchestrator\n\n## Merging\n\nAfter a merge, run `shelbi changelog add` \
+             only for user-visible changes.\n",
+        ] {
+            let (_home, path) = home_with_orchestrator_instructions(&guard, edited);
+
+            let report = detect(&["demo".to_string()]).unwrap();
+            assert!(
+                !has_code(&report, ORCH_CHANGELOG_RULE_MISSING),
+                "an edited Changelog rule must not auto-heal: {:?}",
+                report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+            );
+            let applied = apply_auto_heal(&["demo".to_string()], &report);
+            assert!(
+                !applied.iter().any(|c| c.code == ORCH_CHANGELOG_RULE_MISSING),
+                "an edited Changelog rule was auto-applied: {applied:?}",
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "file was modified");
+        }
+    }
+
     #[test]
     fn edited_tmux_passage_is_needs_judgment_and_left_untouched() {
         // A forked copy whose tmux passage the user edited away from the shipped
@@ -1757,7 +1914,9 @@ zen:
         let orch_dir = home.join("projects/demo/agents/orchestrator");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let path = orch_dir.join("instructions.md");
-        let edited = "# Orchestrator\n\nSample it with `tmux capture-pane -p -t <my-slot>`.\n";
+        // The `## Changelog` heading keeps the Changelog-rule append out of it.
+        let edited = "# Orchestrator\n\nSample it with `tmux capture-pane -p -t <my-slot>`.\n\n\
+                      ## Changelog\n\nWrite one entry per merge.\n";
         std::fs::write(&path, edited).unwrap();
 
         let report = detect(&["demo".to_string()]).unwrap();

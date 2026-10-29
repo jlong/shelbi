@@ -79,6 +79,13 @@ pub enum CommandKind {
     QuitShelbi,
     /// Open an editable config/instructions target.
     OpenEditor { target: EditTarget },
+    /// Open an issue's detail, as clicking its card on the board does (the
+    /// palette's issue search results; never listed, only resolved from its
+    /// id).
+    OpenIssue { id: String },
+    /// Show the Changelog scrolled to one entry (the palette's Changelog
+    /// search results; never listed, only resolved from its id).
+    OpenChangelogEntry { id: String },
     // ---- issue mutations (the generic set; not surfaced in the tmux
     // palette today, carried here so the single-process TUI / desktop app
     // bind them from one definition) ------------------------------------
@@ -204,6 +211,14 @@ impl CommandKind {
             CommandKind::OpenEditor { target } => Effect::OpenEditor {
                 target: target.clone(),
             },
+            CommandKind::OpenIssue { id } => Effect::OpenIssue {
+                project: p(),
+                id: id.clone(),
+            },
+            CommandKind::OpenChangelogEntry { id } => Effect::OpenChangelogEntry {
+                project: p(),
+                id: id.clone(),
+            },
             CommandKind::MoveIssue { id, to_status } => Effect::Mutate(Mutation::MoveIssue {
                 project: p(),
                 id: id.clone(),
@@ -281,7 +296,8 @@ impl Command {
 // The model the registry enumerates against.
 // ---------------------------------------------------------------------------
 
-/// A sidebar nav builtin (Chat / Tasks / Activity): the view it shows plus
+/// A nav view (Chat / Issues / Changelog, plus the palette-only Activity and
+/// Machines): the view it shows plus
 /// its id, title, and decoration. `id` is kept because the historical
 /// palette ids (`view:orch`, `view:tasks`, `view:activity`) are not
 /// derivable from the [`View`] alone (the orchestrator "chat" is a session
@@ -370,6 +386,7 @@ fn view_description(view: &View) -> Option<&'static str> {
             Some("Talk with the Orchestrator to manage Shelbi")
         }
         View::Issues => Some("Queue up and manage work for Shelbi"),
+        View::Changelog => Some("See what has shipped"),
         View::Activity => Some("See what's happened recently"),
         View::Machines => Some("See the machines running your agents"),
         View::Session(_) => None,
@@ -784,6 +801,16 @@ impl CommandKind {
                 project: slug.to_string(),
             });
         }
+        if let Some(issue) = id.strip_prefix("action:open-issue:") {
+            return Some(CommandKind::OpenIssue {
+                id: issue.to_string(),
+            });
+        }
+        if let Some(entry) = id.strip_prefix("action:open-changelog-entry:") {
+            return Some(CommandKind::OpenChangelogEntry {
+                id: entry.to_string(),
+            });
+        }
         if let Some(task) = id.strip_prefix("action:approve-review:") {
             return Some(CommandKind::ApproveReview {
                 id: task.to_string(),
@@ -827,6 +854,9 @@ impl CommandKind {
             "edit:workflows" => Some(CommandKind::OpenEditor {
                 target: EditTarget::Workflows,
             }),
+            "edit:changelog-template" => Some(CommandKind::OpenEditor {
+                target: EditTarget::ChangelogTemplate,
+            }),
             _ => None,
         }
     }
@@ -839,6 +869,7 @@ fn edit_id(target: &EditTarget) -> String {
         EditTarget::Agent(a) => format!("edit:agent:{a}"),
         EditTarget::ZenMode => "edit:zenmode".to_string(),
         EditTarget::Workflows => "edit:workflows".to_string(),
+        EditTarget::ChangelogTemplate => "edit:changelog-template".to_string(),
     }
 }
 

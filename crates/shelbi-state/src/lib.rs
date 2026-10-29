@@ -22,6 +22,7 @@ use shelbi_core::{
 mod agent_workspaces;
 pub mod board_index;
 pub mod change_bus;
+pub mod changelog;
 mod daemon_lifecycle;
 mod daemon_poller;
 pub mod disk;
@@ -230,6 +231,10 @@ pub use workspace_status::{
     read_review_serve_pgid, review_serve_pgid_path, save_workspace_status, supervision_shutdown_key,
     workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
     EXPECTED_TEARDOWN_MAX_AGE, REVIEW_SERVE_PGID_FILE_ENV,
+};
+pub use changelog::{
+    changelog_template_path, scaffold_changelog_template, ChangelogTemplateOutcome,
+    CHANGELOG_TEMPLATE_FILE, DEFAULT_CHANGELOG_TEMPLATE,
 };
 pub use pr_template::{
     pr_template_path, scaffold_pr_template, PrTemplateOutcome, DEFAULT_PR_TEMPLATE,

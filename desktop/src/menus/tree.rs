@@ -330,6 +330,9 @@ pub enum Placement {
     Help,
     /// Board-only mutations the registry never lists (they act on a card).
     Board,
+    /// The palette's search results (an issue, a Changelog entry), which the
+    /// registry never lists either.
+    Search,
 }
 
 /// The menu family of `kind`. No wildcard arm: a new kind must be placed.
@@ -365,6 +368,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         | CommandKind::AddIssue { .. }
         | CommandKind::PrioritizeIssue { .. }
         | CommandKind::SetIssueWorkflow { .. } => Placement::Board,
+        CommandKind::OpenIssue { .. } | CommandKind::OpenChangelogEntry { .. } => Placement::Search,
     }
 }
 
@@ -556,13 +560,12 @@ fn go_menu<'a, I: Iterator<Item = &'a Command>>(
     model: &CommandModel,
     by_place: &impl Fn(Placement) -> I,
 ) -> MenuSpec {
-    // The nav views as the sidebar names them (Activity is "Changelog"
-    // here), with the sidebar's chords (⌘O ⌘I ⌘L; the window takes them
-    // itself, the menu labels them).
+    // The nav views, with the sidebar's chords (⌘O ⌘I ⌘L; the window takes
+    // them itself, the menu labels them).
     let mut items: Vec<MenuEntry> = by_place(Placement::GoView)
         .map(|c| match c.kind() {
             CommandKind::ShowView(view) => {
-                let mut entry = command(c, &crate::views::sidebar::nav_label(view, c.title()));
+                let mut entry = command(c, c.title());
                 if let MenuEntry::Item(item) = &mut entry {
                     item.shortcut = crate::keys::nav_view_chord(view).and_then(|chord| shortcut(&chord));
                 }
@@ -1094,5 +1097,6 @@ mod tests {
         assert_eq!(place(&CommandKind::NewWindow), Placement::File);
         assert_eq!(place(&CommandKind::ApproveReview { id: s() }), Placement::GoReview);
         assert_eq!(place(&CommandKind::StartIssue { id: s() }), Placement::Board);
+        assert_eq!(place(&CommandKind::OpenIssue { id: s() }), Placement::Search);
     }
 }

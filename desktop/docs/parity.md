@@ -32,7 +32,8 @@ paths on every `cargo test`.
 |---|---|---|---|
 | Orchestrator | `view:orch` | Chat attaches to the orchestrator session | Same (Go ▸ Orchestrator) |
 | Issues | `view:tasks` | Board | Board (Go ▸ Issues) |
-| Activity | `view:activity` | Feed | Feed (Go ▸ Changelog, ⌘L, the sidebar's Changelog; also via the palette) |
+| Changelog | `view:changelog` | Added after this walk: the sidebar's Changelog row (its page is `changelog-tui`'s) | The Changelog page (`changelog-desktop`: Go ▸ Changelog, ⌘L, the sidebar's Changelog; issue chips open the issue's detail, PR and URL chips the browser) |
+| Activity | `view:activity` | Feed, palette-only since the Changelog took its row | Feed, palette-only since the Changelog took its row |
 | Machines | `view:machines` | Machines view, palette-only | Machines view (Go ▸ Machines) |
 | Workspace | `workspace:<name>` | Idle placeholder for an idle workspace; the agent when one runs | Same (Go ▸ Workspaces ▸ dev) |
 | Open review | `review:<id>` | Serving task: the review interface (panel, live server line, reviewer session) | Queued task: the "Load for review" slot dialog (Go ▸ Reviews ▸ … ▸ Open Review); a serving one opens the Review view |
@@ -55,6 +56,8 @@ paths on every `cargo test`.
 | Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
 | Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to another open project, or shows the empty-state chooser; `pb` kept running |
 | Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
+| Open a searched issue | (palette search) `action:open-issue:<id>` | Added after this walk (`changelog-palette-search`): the board's detail popover over the view the palette opened from (read off the UI thread when the issue is past the board's first history page), as a Changelog issue link opens it | The issue's detail on the board, as a Changelog issue chip opens it |
+| Open a searched Changelog entry | (palette search) `action:open-changelog-entry:<id>` | Added after this walk: the Changelog page, its search cleared, the entry unfolded, focused and at the top | The Changelog page, its search cleared, the entry at the top of the list |
 | Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop); the task pane's Status picker (`dt-task-inline-properties`) |
 | Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column); the task pane's Priority picker, a 1-based place sent as its 0-based slot |
 | Change workflow | (board) `SetIssueWorkflow` | Not on the TUI board (see Known gaps); a palette-less effect would reach `dispatch_effect`'s `EditIssue` arm | The task pane's Workflow picker; a workflow without the issue's status is offered disabled with why (`shelbi_app::task_properties`) |
@@ -93,8 +96,8 @@ paths on every `cargo test`.
   Navigation component over the same rows (`SidebarModel::rows`, laid out by
   `views/sidebar.rs` `layout` in the shared order: Workspaces, then the review
   sections, as in the TUI), each section collapsible (remembered per project
-  in `desktop-view.json`), the Activity view labeled "Changelog" (the TUI and
-  the shared model keep "Activity"), fixed chords (⌘O Orchestrator, ⌘I Issues,
+  in `desktop-view.json`), the Changelog where Activity was (Activity is
+  palette-only in both clients), fixed chords (⌘O Orchestrator, ⌘I Issues,
   ⌘L Changelog, ⌘1 to ⌘9 the working workspaces then the reviews, each
   hinted on its row and taken even from a focused terminal), a review's
   tracker number on its second line, the version line only on a mismatch (it
@@ -367,7 +370,7 @@ equivalent datum.
 ### `NavItem`
 | Field | TUI | Desktop |
 |---|---|---|
-| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text, "Changelog" for the Activity view (`views/sidebar.rs` `render_nav_row`, `nav_label`); palette entry title; Go menu item (also through `nav_label`) |
+| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text (`views/sidebar.rs` `render_nav_row`); palette entry title; Go menu item |
 | `view` | not shown: routing only, mapped to a session or native view (`shell/sidebar.rs` `target_from_view`) | picks the nav row's icon (`views/sidebar.rs` `nav_icon`); routing via `SidebarRow::target` |
 
 ### `WorkspaceRow`

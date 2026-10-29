@@ -1,5 +1,6 @@
 pub mod action;
 pub mod agent;
+pub mod changelog;
 pub mod config;
 pub mod doctor;
 mod config_surfaces;

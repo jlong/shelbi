@@ -37,7 +37,7 @@ fn the_nav_chords_open_their_views(cx: &mut TestAppContext) {
     for (keystroke, view) in [
         ("cmd-o", View::Session("orch".into())),
         ("cmd-i", View::Issues),
-        ("cmd-l", View::Activity),
+        ("cmd-l", View::Changelog),
     ] {
         h.key(keystroke);
         assert_eq!(h.take_calls(), calls_of(CommandKind::ShowView(view)), "{keystroke}");

@@ -428,6 +428,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_reporting_subject(entry, &text, out);
         sniff_tracker_ownership_dispatch(entry, &text, out);
+        sniff_orchestrator_changelog(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
@@ -881,6 +882,92 @@ fn sniff_reporting_subject(entry: &InventoryEntry, text: &str, out: &mut Vec<Upg
             locate_line_containing(text, "comma-separated workspace"),
         ));
     }
+}
+
+/// Heading of the orchestrator's Changelog rule (add an entry after every
+/// merge). The sniffer keys on it and the healer appends the shipped section
+/// under it, so the two can never disagree.
+pub(crate) const ORCH_CHANGELOG_SECTION_HEADING: &str = "## Changelog";
+
+/// The stable code for "the orchestrator instructions predate the Changelog
+/// rule". An auto-heal: the shipped section is appended, never interleaved.
+pub(crate) const ORCH_CHANGELOG_RULE_MISSING: &str = "ORCH_CHANGELOG_RULE_MISSING";
+
+/// The command the Changelog rule necessarily names. A copy that mentions it
+/// anywhere already carries the rule in some form (moved, reworded), so it's
+/// left alone even without the heading.
+const ORCH_CHANGELOG_COMMAND_MARKER: &str = "shelbi changelog add";
+
+/// The shipped `## Changelog` section (heading and body), read out of the
+/// default orchestrator template so the appended copy is always the current
+/// shipped wording.
+pub(crate) fn shipped_changelog_section() -> String {
+    let template = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+    let body = markdown_section(template, ORCH_CHANGELOG_SECTION_HEADING)
+        .expect("the shipped orchestrator template carries a `## Changelog` section");
+    format!("{ORCH_CHANGELOG_SECTION_HEADING}\n{}", body.trim_end())
+}
+
+/// Whether an orchestrator `instructions.md` already carries the Changelog rule:
+/// the heading line, or the command anywhere in the file. A user who rewrote
+/// the section (or replaced its body with "don't write entries") keeps the
+/// heading, so their edit is never touched.
+fn has_changelog_rule(text: &str) -> bool {
+    text.lines()
+        .any(|l| l.trim_end() == ORCH_CHANGELOG_SECTION_HEADING)
+        || text.contains(ORCH_CHANGELOG_COMMAND_MARKER)
+}
+
+/// Append the shipped Changelog section to an orchestrator `instructions.md`
+/// that lacks the rule, returning the text unchanged otherwise (and for an
+/// empty file, which the agent self-heal owns). Purely additive: the original
+/// text is a byte prefix of the result. The healer's write-back; it shares
+/// [`has_changelog_rule`] with the sniffer so the two can never diverge.
+pub(crate) fn append_changelog_section(text: &str) -> String {
+    if text.trim().is_empty() || has_changelog_rule(text) {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&shipped_changelog_section());
+    out.push('\n');
+    out
+}
+
+/// Sniff an orchestrator `instructions.md` for the Changelog rule: after every
+/// merge, add an entry with `shelbi changelog add`.
+///
+/// A default change only reaches NEW projects via the shipped template; existing
+/// projects carry their own copy, so this sniffer heals them on next boot (per
+/// the AGENTS.md "Changing shipped defaults" guardrail). An **absence** sniff
+/// routed to [`Classification::AutoHeal`]: the fix appends a self-contained
+/// section at the end of the file and rewrites nothing the user wrote, so it is
+/// deterministic and non-lossy. A copy with the heading or the command anywhere
+/// (including one the user edited) never fires. Idempotent: after the heal the
+/// file carries the heading and a second pass finds nothing.
+fn sniff_orchestrator_changelog(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if text.trim().is_empty() || has_changelog_rule(text) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        ORCH_CHANGELOG_RULE_MISSING,
+        "orchestrator instructions have no `## Changelog` rule, so merged work never reaches \
+         the project's Changelog",
+        "Append the shipped `## Changelog` section: after every merge, run `shelbi changelog \
+         add` with a reader-facing title, the date, a short description, and `--issue` / \
+         `--pr` / `--link` links (one entry per feature, never a duplicate).",
+        Location {
+            line: text.lines().count().max(1),
+            column: 1,
+        },
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -2286,8 +2373,13 @@ fn sniff_renamed_siblings(entries: &[InventoryEntry], out: &mut Vec<UpgradeFindi
 /// The apply layer materializes the shipped default for this code.
 pub(crate) const PR_TEMPLATE_MISSING: &str = "PR_TEMPLATE_MISSING";
 
+/// The stable code for "the project has no `changelog-template.md`". The apply
+/// layer materializes the shipped default for it.
+pub(crate) const CHANGELOG_TEMPLATE_MISSING: &str = "CHANGELOG_TEMPLATE_MISSING";
+
 /// Flag lifecycle-owned shipped defaults that a project is missing because it
-/// predates their addition — today the per-project `pr-template.md`. Editing
+/// predates their addition — the per-project `pr-template.md` and
+/// `changelog-template.md`. Editing
 /// the shipped default alone reaches only *new* projects; this sniffer plus its
 /// apply-side materializer brings existing projects up to date on boot, the
 /// same self-heal shape the renamed-sibling and settings-refresh healers use.
@@ -2303,6 +2395,16 @@ fn sniff_missing_lifecycle_defaults(entries: &[InventoryEntry], out: &mut Vec<Up
                 PR_TEMPLATE_MISSING,
                 "the project has no `pr-template.md` (added in a newer Shelbi release)",
                 "Materialize the shipped default PR-description template.",
+                Location { line: 1, column: 1 },
+            ));
+        }
+        if entry.logical_id.ends_with(".changelog-template") && !entry.exists {
+            out.push(finding(
+                entry,
+                Classification::AutoHeal,
+                CHANGELOG_TEMPLATE_MISSING,
+                "the project has no `changelog-template.md` (added in a newer Shelbi release)",
+                "Materialize the shipped default changelog template.",
                 Location { line: 1, column: 1 },
             ));
         }
@@ -4921,6 +5023,11 @@ workspaces:
         )
         .unwrap();
         std::fs::write(
+            project_dir.join("changelog-template.md"),
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE,
+        )
+        .unwrap();
+        std::fs::write(
             project_dir.join("agents/_shared/preamble.md"),
             shelbi_state::DEFAULT_SHARED_PREAMBLE,
         )
@@ -5429,6 +5536,46 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
             std::fs::read_to_string(dir.join("pr-template.md")).unwrap(),
             custom
         );
+    }
+
+    #[test]
+    fn missing_changelog_template_is_materialized_and_a_present_one_kept() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), DEMO_YAML).unwrap();
+
+        // A project that predates the template: flagged as an auto-heal...
+        let report = detect(&["demo".to_string()]).unwrap();
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == CHANGELOG_TEMPLATE_MISSING)
+            .expect("missing changelog template not detected");
+        assert_eq!(f.classification, Classification::AutoHeal);
+
+        // ...and seeded with the shipped default on start.
+        let outcome = run_for_project("demo");
+        assert!(
+            outcome.applied.iter().any(|c| c.code == CHANGELOG_TEMPLATE_MISSING),
+            "changelog template not materialized: {:?}",
+            outcome.applied
+        );
+        let path = home.join("projects/demo/changelog-template.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE
+        );
+
+        // A customized one is never touched.
+        let custom = "## {{title}}\n\n{{description}}\n";
+        std::fs::write(&path, custom).unwrap();
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(!report.findings.iter().any(|f| f.code == CHANGELOG_TEMPLATE_MISSING));
+        run_for_project("demo");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
     }
 
     const DEMO_YAML: &str = "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n";

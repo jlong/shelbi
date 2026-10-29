@@ -1297,8 +1297,8 @@ mod tests {
                 view: View::Issues,
             },
             NavItem {
-                label: "Activity".into(),
-                view: View::Activity,
+                label: "Changelog".into(),
+                view: View::Changelog,
             },
         ]
     }
@@ -1414,12 +1414,12 @@ mod tests {
     fn nav_separators_keep_labels_from_shifting_across_selection() {
         let model = empty_model();
         let chat = render_rows(&model, 0, 24, 20); // Chat
-        let activity = render_rows(&model, 2, 24, 20); // Activity
+        let changelog = render_rows(&model, 2, 24, 20); // Changelog
 
-        for label in ["Orchestrator", "Issues", "Activity"] {
+        for label in ["Orchestrator", "Issues", "Changelog"] {
             assert_eq!(
                 row_y(&chat, label),
-                row_y(&activity, label),
+                row_y(&changelog, label),
                 "'{label}' must not move when the selection changes"
             );
         }
@@ -2536,7 +2536,7 @@ mod tests {
         assert_eq!(v.selectable_count(), 5);
         assert_eq!(v.target_at(0), Some(RowTarget::Session(SessionRef::Orchestrator)));
         assert_eq!(v.target_at(1), Some(RowTarget::Native(View::Issues)));
-        assert_eq!(v.target_at(2), Some(RowTarget::Native(View::Activity)));
+        assert_eq!(v.target_at(2), Some(RowTarget::Native(View::Changelog)));
         assert_eq!(v.target_at(3), Some(RowTarget::Session(SessionRef::Workspace("alpha".into()))));
         assert_eq!(v.target_at(4), Some(RowTarget::Review("rev-9".into())));
         assert_eq!(v.target_at(5), None);
@@ -2563,8 +2563,8 @@ mod tests {
         let chat_y = row_y(&rows, "Orchestrator") as u16;
         assert_eq!(v.hit(area, 2, chat_y), Some(0), "Chat → ordinal 0");
         assert_eq!(v.hit(area, 2, chat_y - 1), None, "the separator above Chat is inert");
-        let activity_y = row_y(&rows, "Activity") as u16;
-        assert_eq!(v.hit(area, 2, activity_y), Some(2), "Activity → ordinal 2");
+        let changelog_y = row_y(&rows, "Changelog") as u16;
+        assert_eq!(v.hit(area, 2, changelog_y), Some(2), "Changelog → ordinal 2");
 
         // Section headers are inert; the machine group header is selectable.
         let ws_header_y = row_y(&rows, "Workspaces") as u16;

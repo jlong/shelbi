@@ -2721,6 +2721,7 @@ fn edit_note(target: &EditTarget) -> String {
         EditTarget::Agent(_) => "instructions.md".into(),
         EditTarget::ZenMode => "zenmode.md".into(),
         EditTarget::Workflows => "workflows/".into(),
+        EditTarget::ChangelogTemplate => "changelog-template.md".into(),
     }
 }
 

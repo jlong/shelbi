@@ -1,0 +1,98 @@
+---
+title: Changelog
+order: 20
+summary: Every project keeps a blog-style record of what has shipped. The orchestrator adds an entry each time it merges work, so you and your agents can see what recently landed.
+---
+
+A project's **Changelog** is the record of what has shipped: one entry per
+merged piece of work, newest first, each with a reader-facing title, the date,
+a short description, and links to the issue, the pull request, and any other
+page that matters. It answers "what landed this week?" for you on the
+Changelog page of the TUI and the desktop app, and for agents through
+[`shelbi changelog`](/docs/cli/changelog).
+
+Entries are markdown files in the project's Shelbi state directory, outside
+your repository. The [CLI reference](/docs/cli/changelog) covers the file
+format, links, the template, and every command.
+
+## Who writes it
+
+The [orchestrator](/docs/concepts/orchestrator) keeps the Changelog current.
+After every successful merge it runs `shelbi changelog add`:
+
+```bash
+shelbi changelog add --author orchestrator \
+    --title "Board columns scroll smoothly" \
+    --date 2026-10-28 \
+    --issue dt-board-perf --pr 1900 \
+    -d "Long board columns are a virtualized list, so scrolling a busy column stays smooth."
+```
+
+That covers every way work lands:
+
+- a `review -> done` move the orchestrator makes,
+- a [Zen Mode](/docs/concepts/zen-mode) merge,
+- a merge you ask for ("merge it"),
+- a merge the orchestrator didn't run: you moving a card to `done`, or the
+  poller reconciling a pull request someone merged on GitHub.
+
+Each of those writes a `to_category=done` line to the
+[events log](/docs/concepts/events-log), and the orchestrator reacts to those
+lines, so a merge is never missed. Before adding, it searches the Changelog
+for an entry that already links the issue, so a replayed event never writes a
+second one.
+
+You can add entries yourself too. `shelbi changelog add` from your own shell
+records `user` as the author.
+
+## What an entry says
+
+The orchestrator writes each entry for people and agents reading it later:
+
+- **Title**: what shipped, in a reader's words, not the branch name.
+- **Date**: the day it merged.
+- **Description**: what changed and why it matters, in a short paragraph or a
+  few bullets. Not a diff or a list of commits.
+- **Links**: the issue (`--issue`), the pull request (`--pr`) when there is
+  one, and any other relevant page (`--link`).
+
+## Features and subtasks
+
+A feature split into subtasks ships once. Each subtask merges into the
+feature's branch, not your primary branch, so it gets no entry of its own.
+When the feature itself merges, the orchestrator writes one entry for the
+whole feature, linking its issue and pull request.
+
+## Changing the policy
+
+By default the orchestrator writes an entry for every merge, including ones
+with nothing user-visible, such as a CI fix or a refactor. The rule lives in
+the `## Changelog` section of the orchestrator's `instructions.md`, which your
+project owns:
+
+```text
+~/.shelbi/projects/<project>/agents/orchestrator/instructions.md
+```
+
+Edit that section to change what gets an entry, for example "skip merges that
+only touch CI or tests", or to change how entries are written. Keep the
+`## Changelog` heading. Projects created before the Changelog existed get the
+section on their next start: the [config upgrade](/docs/concepts/config-upgrade)
+pass appends it to orchestrator instructions that have no `## Changelog`
+heading and never mention `shelbi changelog add`, without changing anything
+else in the file. Instructions that already carry the rule, edited or not, are
+left alone.
+
+To change how each entry's description is laid out, edit the project's
+[changelog template](/docs/cli/changelog#the-template).
+
+## See also
+
+- [`shelbi changelog`](/docs/cli/changelog): adding, listing, searching and
+  showing entries, and the entry file format.
+- [Orchestrator](/docs/concepts/orchestrator): the agent that writes the
+  entries.
+- [Zen Mode](/docs/concepts/zen-mode): merges the orchestrator makes on its
+  own.
+- [Config upgrade](/docs/concepts/config-upgrade): how existing projects pick
+  up the Changelog rule.

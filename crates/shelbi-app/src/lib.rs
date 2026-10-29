@@ -11,6 +11,9 @@
 //!   palette's string-prefix dispatch. Each command has an id, a title,
 //!   typed arguments, an availability check against the current model, and
 //!   an [`Effect`](exec::Effect) it produces.
+//! - [`changelog`] — the Changelog page: the project's shipped entries with
+//!   their links resolved, search, paging, and a watch that says when to
+//!   read again.
 //! - [`board`] — the issues board's shared semantics (columns, status
 //!   resolution, legal moves, card order, filters) and its background reads.
 //! - [`view`] — plain-data view models for the sidebar, issues board,
@@ -68,6 +71,7 @@ pub mod activity;
 pub mod add_project_wizard;
 pub mod board;
 pub mod board_search;
+pub mod changelog;
 pub mod changes;
 pub mod command;
 pub mod command_model;

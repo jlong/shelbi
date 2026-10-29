@@ -522,6 +522,17 @@ fn collect_project_entries(project: &str, out: &mut Vec<InventoryEntry>) -> Resu
         SurfaceFormat::Markdown,
         true,
     ));
+    // The user-editable changelog template `shelbi changelog add` fills.
+    // Lifecycle-owned the same way: shipped, seeded when missing, never
+    // overwritten.
+    out.push(entry(
+        &format!("project.{project}.changelog-template"),
+        &scope,
+        config_root.join(shelbi_state::CHANGELOG_TEMPLATE_FILE),
+        candidate_root.join(shelbi_state::CHANGELOG_TEMPLATE_FILE),
+        SurfaceFormat::Markdown,
+        true,
+    ));
 
     let workflows = config_root.join("workflows");
     out.push(entry(

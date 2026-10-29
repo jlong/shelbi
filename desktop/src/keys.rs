@@ -53,7 +53,7 @@ pub fn font_zoom(chord: &KeyChord) -> Option<FontZoom> {
 /// shares).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavChord {
-    /// ⌘O, ⌘I, ⌘L: the Orchestrator, Issues and Changelog (Activity) views.
+    /// ⌘O, ⌘I, ⌘L: the Orchestrator, Issues and Changelog views.
     View(View),
     /// ⌘1 to ⌘9: the sidebar row the hint numbers (reviews, then working
     /// workspaces).
@@ -61,7 +61,7 @@ pub enum NavChord {
 }
 
 /// The nav views' chords, as `keys.yaml` chord strings.
-const NAV_VIEW_CHORDS: &[(&str, &str)] = &[("orch", "super-o"), ("tasks", "super-i"), ("activity", "super-l")];
+const NAV_VIEW_CHORDS: &[(&str, &str)] = &[("orch", "super-o"), ("tasks", "super-i"), ("changelog", "super-l")];
 
 /// The chord that opens `view` from anywhere in the window. `None` for a
 /// view without one (Machines).
@@ -362,7 +362,7 @@ mod tests {
         let chord = |spec, typed| chord_from_keystroke(&ks(spec, Some(typed))).unwrap();
         assert_eq!(nav_chord(&chord("cmd-o", "o")), Some(NavChord::View(View::Session("orch".into()))));
         assert_eq!(nav_chord(&chord("cmd-i", "i")), Some(NavChord::View(View::Issues)));
-        assert_eq!(nav_chord(&chord("cmd-l", "l")), Some(NavChord::View(View::Activity)));
+        assert_eq!(nav_chord(&chord("cmd-l", "l")), Some(NavChord::View(View::Changelog)));
         assert_eq!(nav_chord(&chord("cmd-1", "1")), Some(NavChord::Row(1)));
         assert_eq!(nav_chord(&chord("cmd-9", "9")), Some(NavChord::Row(9)));
         assert_eq!(nav_chord(&chord("cmd-0", "0")), None);
@@ -371,7 +371,8 @@ mod tests {
         assert_eq!(nav_chord(&chord("o", "o")), None);
         assert_eq!(nav_view_hotkey(&View::Session("orch".into())).as_deref(), Some("⌘O"));
         assert_eq!(nav_view_hotkey(&View::Issues).as_deref(), Some("⌘I"));
-        assert_eq!(nav_view_hotkey(&View::Activity).as_deref(), Some("⌘L"));
+        assert_eq!(nav_view_hotkey(&View::Changelog).as_deref(), Some("⌘L"));
+        assert_eq!(nav_view_hotkey(&View::Activity), None, "Activity is palette-only");
         assert_eq!(nav_view_hotkey(&View::Machines), None);
         assert_eq!(row_hotkey(4), "⌘4");
     }

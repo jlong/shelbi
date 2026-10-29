@@ -21,6 +21,13 @@
 //! the palette chord) returns to the agent. Project switching and add-project
 //! are driven by activating the matching registry entry, so the shell's
 //! existing [`run_entry`](crate) path carries them out unchanged.
+//!
+//! Typing also searches the project's issues and Changelog entries (the
+//! shared [`shelbi_app::overlay::palette_search`]): while searching, the
+//! Projects column steps aside, the filter row (All / Issues / Changelog
+//! Entries / Commands with their counts, the settings' segmented control)
+//! sits under the search line, and the results are grouped by kind with a
+//! muted header per group.
 
 use std::time::Instant;
 
@@ -41,6 +48,9 @@ pub use shelbi_app::overlay::palette::{
     project_indicator, PaletteFocus as Focus, PaletteStep, ProjectEntry, ProjectIndicator,
 };
 use shelbi_app::overlay::palette as shared;
+pub use shelbi_app::overlay::palette_search::{
+    FilterChip, PaletteSearch, ResultItem, ResultKind, ResultRow, SearchCorpus, SearchFilter,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::palette;
@@ -74,6 +84,10 @@ const PALETTE_MIN_W: u16 = 40;
 /// search line (1), one blank row above and below the band (2), and the footer
 /// (1). Added to the band height to size the whole panel.
 const CHROME_ROWS: u16 = 6;
+/// Rows the filter row adds while searching: the segmented control's three
+/// (its `▄` cap, the chips, its `▀` cap), in place of the blank under the
+/// search line plus two more.
+const FILTER_ROWS: u16 = 2;
 
 // ---------------------------------------------------------------------------
 // Project indicators (Projects column status glyphs)
@@ -122,18 +136,40 @@ pub struct ProjectsColumn {
     pub phase: f32,
 }
 
+/// The filter row while searching: its chips (each with its count) and
+/// whether it has the keys.
+#[derive(Debug, Clone, Copy)]
+pub struct FilterRowView<'a> {
+    pub chips: &'a [FilterChip],
+    pub focused: bool,
+}
+
 /// Everything the shared [`render`] draws, as plain data.
 pub struct PaletteView<'a> {
     pub query: &'a str,
-    pub results: &'a [(Entry, u16)],
-    pub selected: usize,
-    /// Whether the commands column holds focus (dims its selection otherwise).
+    /// The results band's rows ([`shared::Palette::rows`]).
+    pub rows: &'a [ResultRow],
+    /// The selected row, an index into `rows`.
+    pub selected: Option<usize>,
+    /// Whether the results hold focus (dims their selection otherwise).
     pub commands_focused: bool,
     /// The Projects column, or `None` to render a single-column completion list
     /// spanning the whole width.
     pub projects: Option<ProjectsColumn>,
+    /// The filter row, while searching.
+    pub filters: Option<FilterRowView<'a>>,
+    /// What the band says when there are no rows.
+    pub empty: &'a str,
     /// The one-line footer hint.
     pub footer: &'a str,
+}
+
+/// The rows for a list of commands alone (an empty query's list).
+pub fn command_rows(results: &[(Entry, u16)]) -> Vec<ResultRow> {
+    results
+        .iter()
+        .map(|(e, _)| ResultRow::Item(ResultItem::Command(e.clone())))
+        .collect()
 }
 
 /// Paint the palette into `area` (the content-sized overlay rect [`palette_rect`]
@@ -144,50 +180,49 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     // Figma "Terminal border"): the fill paints every gap as one surface.
     super::dialog_frame(f.buffer_mut(), area, Some(palette().search), None);
 
-    let rows = panel_rows(area);
-    if rows.is_empty() || rows[2].width == 0 || rows[2].height == 0 {
+    let Some(rows) = panel_rows(area, view.filters.is_some()) else {
+        return;
+    };
+    if rows.band.width == 0 || rows.band.height == 0 {
         return;
     }
 
-    f.render_widget(Paragraph::new(search_line(view.query)), rows[0]);
+    f.render_widget(Paragraph::new(search_line(view.query)), rows.search);
+
+    if let (Some(chips_area), Some(filters)) = (rows.filters, view.filters) {
+        render_filters(f, chips_area, filters);
+    }
 
     // Results: commands column on the left, an optional Projects column on the
     // right separated by whitespace.
-    let (commands_area, projects_area) = split_results(rows[2], view.projects.is_some());
+    let (commands_area, projects_area) = split_results(rows.band, view.projects.is_some());
 
-    if view.results.is_empty() {
-        // A query that matches no command shows one dim row rather than
+    if view.rows.is_empty() {
+        // A query that matches nothing shows one dim row rather than
         // collapsing the band to nothing, so the panel keeps a legible shape.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No matching commands",
+                view.empty.to_string(),
                 Style::default().fg(palette().muted),
             ))),
             commands_area,
         );
     } else {
-        let commands_focused = projects_area.is_none() || view.commands_focused;
-        let selected = view.selected.min(view.results.len().saturating_sub(1));
-        // Each command row gets a half-row of space above and below (the sidebar
+        let commands_focused = (projects_area.is_none() || view.commands_focused)
+            && !view.filters.is_some_and(|f| f.focused);
+        let selected = view.selected.map(|s| s.min(view.rows.len() - 1));
+        // Each row gets a half-row of space above and below (the sidebar
         // nav's half-block bleed): the selected row's fill bleeds into those
         // half-rows via the `▄`/`▀` glyphs so the highlight reads as a taller
         // pill. The content lines carry the solid fill on the selected row; the
         // shared `bleed_block_lines` interleaves the bleed separators.
-        let content = build_result_lines(
-            view.results,
-            commands_area.width as usize,
-            commands_focused.then_some(selected),
-        );
-        let lines = bleed_block_lines(
-            content,
-            commands_focused.then_some(selected),
-            commands_area.width as usize,
-            palette().selection,
-        );
+        let shown = selected.filter(|_| commands_focused);
+        let content = build_row_lines(view.rows, commands_area.width as usize, shown);
+        let lines = bleed_block_lines(content, shown, commands_area.width as usize, palette().selection);
         // Scroll the band to keep the selected pill visible when the list is
         // taller than the band (the half-block pitch doubles the row count).
         let band_h = commands_area.height as usize;
-        let off = command_scroll_offset(view.results.len(), selected, band_h);
+        let off = command_scroll_offset(view.rows.len(), selected.unwrap_or(0), band_h);
         let visible: Vec<Line> = lines.into_iter().skip(off).take(band_h).collect();
         f.render_widget(Paragraph::new(visible), commands_area);
     }
@@ -201,33 +236,83 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
             view.footer.to_string(),
             Style::default().fg(palette().muted),
         ))),
-        rows[4],
+        rows.footer,
     );
 }
 
-/// The palette panel's content rows within its overlay `area`: the search line,
-/// a blank, the results band, a blank, and the footer. One source of truth so
-/// [`render`] and the mouse hit-test agree on where the band sits. The content
-/// is inset one column inside the border on each side (so `rows[_].x == area.x
-/// + 2`), matching the Figma's padding.
-fn panel_rows(area: Rect) -> std::rc::Rc<[Rect]> {
+/// The filter chips' labels: each filter's name and its count (`Issues 4`).
+fn chip_labels(chips: &[FilterChip]) -> Vec<String> {
+    chips.iter().map(|c| format!("{} {}", c.label, c.count)).collect()
+}
+
+/// The filter row: the settings' segmented control, the chosen filter's chip
+/// in the selection fill (bold while the row has the keys).
+fn render_filters(f: &mut Frame, area: Rect, filters: FilterRowView) {
+    let labels = chip_labels(filters.chips);
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let chosen = filters.chips.iter().position(|c| c.selected).unwrap_or(0);
+    let (lines, _) = crate::button::segmented_in(
+        &labels,
+        chosen,
+        filters.focused,
+        None,
+        area.width as usize,
+        palette().selection,
+    );
+    f.render_widget(Paragraph::new(lines.to_vec()), area);
+}
+
+/// Where each chip of the filter row sits within `area`, for a click:
+/// `(x, width)` per chip that fits, in [`SearchFilter::ROW`] order.
+fn filter_hits(area: Rect, chips: &[FilterChip]) -> Vec<(u16, u16)> {
+    let labels = chip_labels(chips);
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let (_, at) = crate::button::segmented_in(&labels, 0, false, None, area.width as usize, palette().selection);
+    at.into_iter().map(|(x, w)| (area.x + x, w)).collect()
+}
+
+/// The palette panel's content rows within its overlay `area`: the search
+/// line, the filter row (while searching) or a blank, the results band, a
+/// blank, and the footer. One source of truth so [`render`] and the mouse
+/// hit-test agree on where everything sits. The content is inset one column
+/// inside the border on each side (so `x == area.x + 2`), matching the
+/// Figma's padding.
+#[derive(Debug, Clone, Copy)]
+struct PanelRows {
+    search: Rect,
+    filters: Option<Rect>,
+    band: Rect,
+    footer: Rect,
+}
+
+fn panel_rows(area: Rect, searching: bool) -> Option<PanelRows> {
     // The dialogs' content rect: inside the border, one more column of
     // padding each side. Vertically the search line sits just under the top
     // border and the footer just above the bottom one.
     let content = super::dialog_content(area);
-    Layout::default()
+    let under_search = if searching { 1 + FILTER_ROWS } else { 1 };
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // search line
-            Constraint::Length(1), // blank
-            Constraint::Min(1),    // results band
-            Constraint::Length(1), // blank
-            Constraint::Length(1), // footer
+            Constraint::Length(1),            // search line
+            Constraint::Length(under_search), // blank, or the filter row
+            Constraint::Min(1),               // results band
+            Constraint::Length(1),            // blank
+            Constraint::Length(1),            // footer
         ])
-        .split(content)
+        .split(content);
+    if rows.len() < 5 {
+        return None;
+    }
+    Some(PanelRows {
+        search: rows[0],
+        filters: searching.then_some(rows[1]),
+        band: rows[2],
+        footer: rows[4],
+    })
 }
 
-/// Rows the results band needs: the larger of the command list height and the
+/// Rows the results band needs: the larger of the result list height and the
 /// Projects column's rows. The command list uses the half-block bleed pitch —
 /// `nav_lines(n)` (`2n + 1`) rows, a half-row band above and below every item
 /// so the selected row's fill bleeds into a taller pill — except the empty
@@ -269,12 +354,13 @@ fn command_scroll_offset(n: usize, sel: usize, band_h: usize) -> usize {
 /// grows and shrinks as the list filters. Capped to the window, with a matching
 /// top and bottom margin, so a longer list scrolls inside the panel instead of
 /// overflowing.
-pub fn palette_rect(area: Rect, result_count: usize, project_count: Option<usize>) -> Rect {
+pub fn palette_rect(area: Rect, result_count: usize, project_count: Option<usize>, searching: bool) -> Rect {
     let offset_y = (area.height / 10).min(2);
     let width = (area.width.saturating_mul(70) / 100)
         .max(PALETTE_MIN_W)
         .min(area.width);
-    let desired_h = results_band_rows(result_count, project_count).saturating_add(CHROME_ROWS);
+    let chrome = if searching { CHROME_ROWS + FILTER_ROWS } else { CHROME_ROWS };
+    let desired_h = results_band_rows(result_count, project_count).saturating_add(chrome);
     let max_h = area.height.saturating_sub(offset_y.saturating_mul(2));
     let height = desired_h.min(max_h);
     let x = area.x + area.width.saturating_sub(width) / 2;
@@ -347,91 +433,167 @@ fn icon_for(e: &Entry) -> (String, Color) {
     }
 }
 
-/// Build the command-list content lines: a fixed-width icon slot, a fixed-width
-/// label (bold white on the selected row, else foreground), a dim description
-/// aligned to a fixed x and truncated with `…` when it won't fit, and a
-/// right-aligned dim shortcut hint. Each row is padded to `row_width` so the
-/// selection fill spans the whole commands column; on the selected row the
-/// solid `palette().selection` fill is baked into every span (the shared
-/// [`bleed_block_lines`] then bleeds that fill into the half-rows above and
-/// below). `selected` is the highlighted index when the commands column holds
-/// focus.
+/// Build the results band's content lines, one per row: a command, an
+/// issue, a Changelog entry or a "Show all" row, or a group's muted header.
+/// `selected` is the highlighted row when the results hold focus.
+fn build_row_lines(rows: &[ResultRow], row_width: usize, selected: Option<usize>) -> Vec<Line<'static>> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let is_selected = selected == Some(i);
+            let mut line = match row {
+                ResultRow::Header(kind) => header_line(*kind, row_width),
+                ResultRow::Item(ResultItem::Command(e)) => command_line(e, row_width, is_selected),
+                ResultRow::Item(ResultItem::Issue(d)) => detail_line(
+                    crate::kanban::category_glyph(d.category),
+                    crate::kanban::category_color(d.category),
+                    &d.title,
+                    &d.detail(),
+                    row_width,
+                    is_selected,
+                ),
+                ResultRow::Item(ResultItem::Changelog(h)) => detail_line(
+                    shelbi_app::command_model::nav_glyph("Changelog"),
+                    palette().foreground,
+                    &h.title,
+                    &h.detail,
+                    row_width,
+                    is_selected,
+                ),
+                ResultRow::Item(ResultItem::ShowAll { kind, count }) => {
+                    show_all_line(&kind.show_all_label(*count), row_width, is_selected)
+                }
+            };
+            // Bake the solid fill into every span on the selected row so it
+            // reads as one continuous bar (and the bleed half-rows match).
+            if is_selected {
+                for s in &mut line.spans {
+                    s.style = s.style.bg(palette().selection);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// The icon field: a space, the glyph padded to two cells, a space.
+fn icon_field(glyph: &str) -> String {
+    let glyph_w = UnicodeWidthStr::width(glyph);
+    format!(" {glyph}{} ", " ".repeat(2usize.saturating_sub(glyph_w)))
+}
+
+/// A row's label style: bold white when selected, else the foreground.
+fn label_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(palette().ansi_white)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().foreground)
+    }
+}
+
+/// A group's header under All: its name, muted and bold, where a label
+/// would start.
+fn header_line(kind: ResultKind, width: usize) -> Line<'static> {
+    let text = truncate_to_width(&format!(" {}", kind.heading()), width);
+    let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    Line::from(vec![
+        Span::styled(text, Style::default().fg(palette().muted).add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(pad)),
+    ])
+}
+
+/// An issue's or a Changelog entry's row: its glyph, the title (cut with `…`
+/// to leave room), and the dim detail (`in progress · #1931`) at the right.
+fn detail_line(glyph: &str, glyph_color: Color, title: &str, detail: &str, width: usize, selected: bool) -> Line<'static> {
+    let rem = width.saturating_sub(ICON_FIELD_W);
+    let detail_w = UnicodeWidthStr::width(detail).min(rem / 2);
+    let detail = truncate_with_ellipsis(detail, detail_w);
+    let detail_w = UnicodeWidthStr::width(detail.as_str());
+    let title_room = rem.saturating_sub(detail_w + usize::from(detail_w > 0) * 2);
+    let title = truncate_with_ellipsis(title, title_room);
+    let filler = rem.saturating_sub(UnicodeWidthStr::width(title.as_str()) + detail_w);
+    Line::from(vec![
+        Span::styled(icon_field(glyph), Style::default().fg(glyph_color)),
+        Span::styled(title, label_style(selected)),
+        Span::raw(" ".repeat(filler)),
+        Span::styled(detail, Style::default().fg(palette().muted)),
+    ])
+}
+
+/// A capped group's last row: `Show all 12 issues`, in the accent, where a
+/// label would start.
+fn show_all_line(label: &str, width: usize, selected: bool) -> Line<'static> {
+    let label = truncate_with_ellipsis(label, width.saturating_sub(ICON_FIELD_W));
+    let pad = width.saturating_sub(ICON_FIELD_W + UnicodeWidthStr::width(label.as_str()));
+    let style = if selected {
+        label_style(true)
+    } else {
+        Style::default().fg(palette().ansi_cyan)
+    };
+    Line::from(vec![
+        Span::raw(" ".repeat(ICON_FIELD_W)),
+        Span::styled(label, style),
+        Span::raw(" ".repeat(pad)),
+    ])
+}
+
+/// The command list's content lines, as [`build_row_lines`] draws them.
+#[cfg(test)]
 fn build_result_lines(
     results: &[(Entry, u16)],
     row_width: usize,
     selected: Option<usize>,
 ) -> Vec<Line<'static>> {
-    results
-        .iter()
-        .enumerate()
-        .map(|(i, (e, _))| {
-            let is_selected = selected == Some(i);
-            let (glyph, glyph_color) = icon_for(e);
+    build_row_lines(&command_rows(results), row_width, selected)
+}
 
-            // Icon field: a space, the glyph padded to two cells, a space.
-            let glyph_w = UnicodeWidthStr::width(glyph.as_str());
-            let icon_field = format!(" {glyph}{} ", " ".repeat(2usize.saturating_sub(glyph_w)));
+/// One command's row: a fixed-width icon slot, a fixed-width label (bold
+/// white on the selected row, else foreground), a dim description aligned to
+/// a fixed x and truncated with `…` when it won't fit, and a right-aligned dim
+/// shortcut hint, padded to `row_width` so the selection fill spans the whole
+/// commands column ([`build_row_lines`] bakes the fill in; the shared
+/// [`bleed_block_lines`] then bleeds it into the half-rows above and below).
+fn command_line(e: &Entry, row_width: usize, is_selected: bool) -> Line<'static> {
+    let (glyph, glyph_color) = icon_for(e);
 
-            // Label field padded to a fixed display width.
-            let label = truncate_to_width(&e.label, LABEL_W);
-            let label_pad = LABEL_W.saturating_sub(UnicodeWidthStr::width(label.as_str()));
-            let label_style = if is_selected {
-                Style::default()
-                    .fg(palette().ansi_white)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette().foreground)
-            };
+    // Label field padded to a fixed display width.
+    let label = truncate_to_width(&e.label, LABEL_W);
+    let label_pad = LABEL_W.saturating_sub(UnicodeWidthStr::width(label.as_str()));
 
-            let mut spans = vec![
-                Span::styled(icon_field, Style::default().fg(glyph_color)),
-                Span::styled(
-                    format!("{label}{}", " ".repeat(label_pad)),
-                    label_style,
-                ),
-            ];
+    let mut spans = vec![
+        Span::styled(icon_field(&glyph), Style::default().fg(glyph_color)),
+        Span::styled(format!("{label}{}", " ".repeat(label_pad)), label_style(is_selected)),
+    ];
 
-            // Remaining width after the icon slot and label column holds a gap,
-            // the description, filler, and the right-aligned shortcut.
-            let remaining = row_width.saturating_sub(ICON_FIELD_W + LABEL_W);
-            let gap = 1usize.min(remaining);
-            let rem = remaining - gap;
-            let short = e.shortcut.clone().unwrap_or_default();
-            let short_w = UnicodeWidthStr::width(short.as_str());
-            // When a shortcut is present it sits at the right edge with one
-            // space before it.
-            let short_block = if short_w > 0 { short_w + 1 } else { 0 };
-            let desc_avail = rem.saturating_sub(short_block);
-            let desc = truncate_with_ellipsis(e.subtitle.as_deref().unwrap_or(""), desc_avail);
-            let desc_w = UnicodeWidthStr::width(desc.as_str());
-            let filler = rem.saturating_sub(desc_w).saturating_sub(short_block);
+    // Remaining width after the icon slot and label column holds a gap,
+    // the description, filler, and the right-aligned shortcut.
+    let remaining = row_width.saturating_sub(ICON_FIELD_W + LABEL_W);
+    let gap = 1usize.min(remaining);
+    let rem = remaining - gap;
+    let short = e.shortcut.clone().unwrap_or_default();
+    let short_w = UnicodeWidthStr::width(short.as_str());
+    // When a shortcut is present it sits at the right edge with one
+    // space before it.
+    let short_block = if short_w > 0 { short_w + 1 } else { 0 };
+    let desc_avail = rem.saturating_sub(short_block);
+    let desc = truncate_with_ellipsis(e.subtitle.as_deref().unwrap_or(""), desc_avail);
+    let desc_w = UnicodeWidthStr::width(desc.as_str());
+    let filler = rem.saturating_sub(desc_w).saturating_sub(short_block);
 
-            if gap > 0 {
-                spans.push(Span::raw(" ".repeat(gap)));
-            }
-            spans.push(Span::styled(
-                desc,
-                Style::default().fg(palette().muted),
-            ));
-            if short_w > 0 {
-                spans.push(Span::raw(" ".repeat(filler + 1)));
-                spans.push(Span::styled(short, Style::default().fg(palette().muted)));
-            } else if filler > 0 {
-                spans.push(Span::raw(" ".repeat(filler)));
-            }
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.push(Span::styled(desc, Style::default().fg(palette().muted)));
+    if short_w > 0 {
+        spans.push(Span::raw(" ".repeat(filler + 1)));
+        spans.push(Span::styled(short, Style::default().fg(palette().muted)));
+    } else if filler > 0 {
+        spans.push(Span::raw(" ".repeat(filler)));
+    }
 
-            // Bake the solid fill into every span on the selected row so it
-            // reads as one continuous bar (and the bleed half-rows match). The
-            // label keeps its white/bold foreground; the description stays dim.
-            if is_selected {
-                for s in &mut spans {
-                    s.style = s.style.bg(palette().selection);
-                }
-            }
-
-            Line::from(spans)
-        })
-        .collect()
+    Line::from(spans)
 }
 
 /// Render the Projects column into `area`: a dim "Projects" heading, then one
@@ -549,10 +711,31 @@ impl Palette {
         }
     }
 
+    /// Search issues and Changelog entries with `search` too.
+    pub fn with_search(mut self, search: PaletteSearch) -> Self {
+        self.inner = self.inner.with_search(search);
+        self
+    }
+
     /// Replace the entry list (a background refresh landed) without disturbing
     /// the query; the renderer re-clamps the selection.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
         self.inner.set_entries(entries);
+    }
+
+    /// Search fresh issues and entries (a board or Changelog read landed).
+    pub fn set_corpus(&mut self, corpus: SearchCorpus) {
+        self.inner.set_corpus(corpus);
+    }
+
+    /// Take search hits that landed off-thread; whether to redraw.
+    pub fn poll_search(&mut self) -> bool {
+        self.inner.poll_search()
+    }
+
+    /// The shared state machine (the shell's tests read its rows).
+    pub fn inner(&self) -> &shared::Palette {
+        &self.inner
     }
 
     pub fn query(&self) -> &str {
@@ -582,10 +765,10 @@ impl Palette {
     /// [`palette_rect`]. Recomputed every frame so the panel resizes as the
     /// query filters the list.
     pub fn overlay_rect(&self, area: Rect) -> Rect {
-        let result_count = self.results().len();
+        let row_count = self.inner.rows().len();
         let projects = self.inner.projects().len();
-        let project_count = (projects > 0).then_some(projects);
-        palette_rect(area, result_count, project_count)
+        let project_count = (self.inner.shows_projects()).then_some(projects);
+        palette_rect(area, row_count, project_count, self.inner.searching())
     }
 
     /// Feed one key press. `action` is the palette-mode binding the host
@@ -601,24 +784,40 @@ impl Palette {
     }
 
     /// Feed a left-click at terminal cell (`col`, `row`) over the palette panel
-    /// `rect` (the overlay rect [`overlay_rect`] returned). A click anywhere on a
-    /// command item's band — its label row or either half-block bleed row —
-    /// selects that item and activates it. A click outside the commands column
-    /// (the Projects column, the search line, the footer, or the blank area
-    /// below a short list) leaves the palette open unchanged.
+    /// `rect` (the overlay rect [`overlay_rect`] returned). A click on a filter
+    /// chip shows that filter. A click anywhere on a result's band (its label
+    /// row or either half-block bleed row) selects that result and activates
+    /// it; a group's header does nothing. A click outside the results (the
+    /// Projects column, the search line, the footer, or the blank area below a
+    /// short list) leaves the palette open unchanged.
     ///
     /// [`overlay_rect`]: Palette::overlay_rect
     pub fn handle_click(&mut self, rect: Rect, col: u16, row: u16) -> PaletteStep {
-        let n = self.results().len();
+        let Some(panel) = panel_rows(rect, self.inner.searching()) else {
+            return PaletteStep::Continue;
+        };
+        if let Some(chips_area) = panel.filters {
+            // The chips sit on the segmented control's middle row.
+            if row == chips_area.y + 1 {
+                let chips = self.inner.chips();
+                for (chip, (x, w)) in chips.iter().zip(filter_hits(chips_area, &chips)) {
+                    if col >= x && col < x + w {
+                        self.inner.click_filter(chip.filter);
+                        return PaletteStep::Continue;
+                    }
+                }
+            }
+            if row >= chips_area.y && row < chips_area.y + chips_area.height {
+                return PaletteStep::Continue;
+            }
+        }
+        let rows = self.inner.rows();
+        let n = rows.len();
         if n == 0 {
             return PaletteStep::Continue;
         }
-        let rows = panel_rows(rect);
-        if rows.len() < 3 {
-            return PaletteStep::Continue;
-        }
-        let (commands_area, _) = split_results(rows[2], !self.inner.projects().is_empty());
-        // Horizontal + vertical bounds of the commands band.
+        let (commands_area, _) = split_results(panel.band, self.inner.shows_projects());
+        // Horizontal + vertical bounds of the results band.
         if col < commands_area.x
             || col >= commands_area.x.saturating_add(commands_area.width)
             || row < commands_area.y
@@ -627,23 +826,23 @@ impl Palette {
             return PaletteStep::Continue;
         }
         // Map the clicked row back through the scroll offset to a line in the
-        // full `2n + 1`-row bleed block. Each item owns a 2-row band (its
-        // bleed-above and its label row), so `line / 2` resolves the item; the
-        // final trailing bleed row clamps to the last item.
-        let selected = self.inner.selected_in(n);
+        // full `2n + 1`-row bleed block. Each row owns a 2-row band (its
+        // bleed-above and its label row), so `line / 2` resolves the row; the
+        // final trailing bleed row clamps to the last one.
+        let selected = self.inner.selected_row().unwrap_or(0);
         let band_h = commands_area.height as usize;
         let off = command_scroll_offset(n, selected, band_h);
         let line = (row - commands_area.y) as usize + off;
         if line >= nav_lines(n) {
             return PaletteStep::Continue;
         }
-        self.inner.click_item((line / 2).min(n - 1))
+        self.inner.click_row((line / 2).min(n - 1))
     }
 
     /// The Projects column view, or `None` when there are no projects.
     fn projects_view(&self) -> Option<ProjectsColumn> {
         let projects = self.inner.projects();
-        if projects.is_empty() {
+        if !self.inner.shows_projects() {
             return None;
         }
         Some(ProjectsColumn {
@@ -661,14 +860,27 @@ impl Palette {
 
     /// Paint the overlay into `area`.
     pub fn render(&self, f: &mut Frame, area: Rect) {
-        let results = self.results();
+        let rows = self.inner.rows();
+        let chips = self.inner.chips();
         let footer = self.inner.footer("Ctrl+P");
+        let empty = if self.inner.search_pending() {
+            "Searching…"
+        } else if self.inner.searching() {
+            self.inner.filter().empty_label()
+        } else {
+            SearchFilter::Commands.empty_label()
+        };
         let view = PaletteView {
             query: self.inner.query(),
-            results: &results,
-            selected: self.inner.selected(),
+            rows: &rows,
+            selected: self.inner.selected_row(),
             commands_focused: self.inner.focus() == Focus::Commands,
             projects: self.projects_view(),
+            filters: self.inner.searching().then_some(FilterRowView {
+                chips: &chips,
+                focused: self.inner.filter_focused(),
+            }),
+            empty,
             footer: &footer,
         };
         render(f, area, &view);
@@ -899,12 +1111,15 @@ mod tests {
                 ("palette-projects", "", 0, Some(1)),
                 ("palette-add-project", "", 0, Some(3)),
             ] {
+                let rows = command_rows(&results);
                 let view = PaletteView {
                     query,
-                    results: &results,
-                    selected,
+                    rows: &rows,
+                    selected: Some(selected),
                     commands_focused: projects_selected.is_none(),
                     projects: Some(projects(projects_selected)),
+                    filters: None,
+                    empty: "No matching commands",
                     footer: "↑↓ select · → projects · Ctrl+P close",
                 };
                 let mut term = Terminal::new(TestBackend::new(100, 18)).unwrap();
@@ -1008,7 +1223,7 @@ mod tests {
         let text = dump(&term.backend().buffer().clone());
         assert!(text.contains("activ"), "the query echoes in the search line: {text}");
         assert!(text.contains("Activity"), "the matching row renders: {text}");
-        assert!(!text.contains("Issues"), "the non-matching row is filtered out: {text}");
+        assert!(!text.contains("Queue up"), "the non-matching row is filtered out: {text}");
     }
 
     #[test]
@@ -1151,13 +1366,14 @@ mod tests {
     fn draw_projects(col: ProjectsColumn) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        let results: Vec<(Entry, u16)> = Vec::new();
         let view = PaletteView {
             query: "",
-            results: &results,
-            selected: 0,
+            rows: &[],
+            selected: None,
             commands_focused: col.selected.is_none(),
             projects: Some(col),
+            filters: None,
+            empty: "No matching commands",
             footer: "footer",
         };
         let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -1285,7 +1501,7 @@ mod tests {
     fn palette_rect_is_top_aligned_centered_and_content_sized() {
         let area = Rect::new(0, 0, 100, 40);
         // Six results, no projects: band nav_lines(6)=13 + 6 chrome rows = 19.
-        let r = palette_rect(area, 6, None);
+        let r = palette_rect(area, 6, None, false);
         assert_eq!(r.height, 19, "height fits the content");
         // Width is the prior 70%/min-40 rule, horizontally centered.
         assert_eq!(r.width, 70);
@@ -1297,9 +1513,9 @@ mod tests {
     #[test]
     fn palette_rect_shrinks_and_grows_with_the_result_count() {
         let area = Rect::new(0, 0, 100, 40);
-        let full = palette_rect(area, 8, None);
-        let one = palette_rect(area, 1, None);
-        let none = palette_rect(area, 0, None);
+        let full = palette_rect(area, 8, None, false);
+        let one = palette_rect(area, 1, None, false);
+        let none = palette_rect(area, 0, None, false);
         assert!(one.height < full.height, "one result is a shorter panel");
         assert_eq!(one.height, 9, "one result: 3 band rows (2*1+1) + 6 chrome");
         assert_eq!(none.height, 7, "no matches still reserves the one row");
@@ -1310,7 +1526,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 20);
         // 100 results would want 106 rows; cap to the window minus the top and
         // bottom margin (offset 2 each, from 10% of 20).
-        let r = palette_rect(area, 100, None);
+        let r = palette_rect(area, 100, None, false);
         assert_eq!(r.y, 2);
         assert_eq!(r.height, 16, "capped to area.height - 2*offset");
         assert!(r.y + r.height <= area.height, "stays within the window");
@@ -1319,10 +1535,10 @@ mod tests {
     #[test]
     fn palette_rect_offset_is_the_smaller_of_two_rows_and_ten_percent() {
         // Short window: 10% of 15 = 1 row, smaller than 2.
-        let short = palette_rect(Rect::new(0, 0, 80, 15), 3, None);
+        let short = palette_rect(Rect::new(0, 0, 80, 15), 3, None, false);
         assert_eq!(short.y, 1);
         // Tall window: the offset caps at 2 rows.
-        let tall = palette_rect(Rect::new(0, 0, 80, 60), 3, None);
+        let tall = palette_rect(Rect::new(0, 0, 80, 60), 3, None, false);
         assert_eq!(tall.y, 2);
     }
 
@@ -1337,10 +1553,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
         term.draw(|f| p.render(f, f.area())).unwrap();
         let text = dump(&term.backend().buffer().clone());
-        assert!(
-            text.contains("No matching commands"),
-            "the empty state renders one dim row: {text}"
-        );
+        assert!(text.contains("No matches"), "the empty state renders one dim row: {text}");
     }
 
     #[test]
@@ -1349,12 +1562,15 @@ mod tests {
         let results: Vec<(Entry, u16)> = (0..12)
             .map(|i| (entry(&format!("view:v{i}"), &format!("Command{i:02}")), 0u16))
             .collect();
+        let rows = command_rows(&results);
         let view = PaletteView {
             query: "",
-            results: &results,
-            selected: 11,
+            rows: &rows,
+            selected: Some(11),
             commands_focused: true,
             projects: None,
+            filters: None,
+            empty: "No matching commands",
             footer: "footer",
         };
         // Height 11: 6 chrome rows leave a 5-row band for 12 items, so the band
@@ -1483,6 +1699,140 @@ mod tests {
         );
     }
 
+    // -- Searching: the filter row and grouped results ---------------------
+
+    /// A Changelog entry for the search fixtures.
+    pub(crate) fn changelog_entry(id: &str, title: &str, pr: u64) -> shelbi_app::changelog::ChangelogEntryView {
+        shelbi_app::changelog::ChangelogEntryView::new(
+            shelbi_state::changelog::ChangelogEntry {
+                id: id.into(),
+                title: title.into(),
+                date: chrono::DateTime::parse_from_rfc3339("2026-10-28T14:30:00-07:00").unwrap(),
+                author: "orchestrator".into(),
+                issues: vec![],
+                prs: vec![shelbi_state::changelog::PrRef::Number(pr)],
+                urls: vec![],
+                body: "The login form, rebuilt.".into(),
+                path: Default::default(),
+            },
+            Some("jlong/shelbi"),
+        )
+    }
+
+    /// The wireframe's palette: commands, two issues and an entry that match
+    /// `login`, and a Projects column (which steps aside while searching).
+    pub(crate) fn search_palette() -> Palette {
+        use shelbi_app::overlay::palette_search::IssueDoc;
+        use shelbi_core::StatusCategory;
+        let issues = vec![
+            IssueDoc::new("1931", "Fix login redirect loop", "", "In Progress", StatusCategory::Active),
+            IssueDoc::new("1944", "Login form validation", "", "Backlog", StatusCategory::Backlog),
+            IssueDoc::new("1950", "Faster board", "", "Done", StatusCategory::Done),
+        ];
+        let corpus = SearchCorpus::new(issues, vec![changelog_entry("2026-10-28-login", "Login form shipped", 1902)]);
+        Palette::new(
+            vec![
+                entry_full("action:log-in", "Log in to GitHub", "Account", None),
+                entry_full("view:tasks", "Issues", "Queue up and manage work", None),
+            ],
+            vec![project("website", "Website", ProjectIndicator::Active)],
+        )
+        .with_search(PaletteSearch::inline(corpus))
+    }
+
+    fn type_in(p: &mut Palette, q: &str) {
+        for c in q.chars() {
+            p.handle_key(key(KeyCode::Char(c)), None);
+        }
+    }
+
+    fn draw(p: &Palette, w: u16, h: u16) -> (ratatui::buffer::Buffer, Rect) {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let rect = p.overlay_rect(Rect::new(0, 0, w, h));
+        term.draw(|f| p.render(f, rect)).unwrap();
+        (term.backend().buffer().clone(), rect)
+    }
+
+    #[test]
+    fn searching_draws_the_filter_row_and_groups_the_results() {
+        let mut p = search_palette();
+        type_in(&mut p, "login");
+        let (buf, _) = draw(&p, 100, 30);
+        let text = dump(&buf);
+        assert!(
+            text.contains("All 4  Issues 2  Changelog Entries 1  Commands 1"),
+            "the chips with their counts: {text}"
+        );
+        // The chosen chip is in the selection fill.
+        let (x, y) = find_cell(&buf, "All 4").unwrap();
+        assert_eq!(buf[(x, y)].bg, palette().selection, "the chosen chip");
+        let (x, y) = find_cell(&buf, "Issues 2").unwrap();
+        assert_ne!(buf[(x, y)].bg, palette().selection);
+        // Groups in order, commands first, each under its header.
+        let at = |needle: &str| find_row_with(&buf, needle).unwrap_or_else(|| panic!("{needle}: {text}"));
+        assert!(at("Log in to GitHub") < at("Fix login redirect loop"));
+        assert!(at("Fix login redirect loop") < at("Login form shipped"));
+        assert!(at(" Commands  ") < at("Log in to GitHub"));
+        assert!(text.contains("in progress · #1931"), "an issue's status and number: {text}");
+        assert!(text.contains("Oct 28 · #1902"), "an entry's date and PR: {text}");
+        assert!(!text.contains("Projects"), "the Projects column steps aside: {text}");
+        assert!(text.contains("Tab filter"), "the footer names the filter keys: {text}");
+    }
+
+    #[test]
+    fn tab_picks_a_filter_and_a_click_picks_a_chip() {
+        let mut p = search_palette();
+        type_in(&mut p, "login");
+        p.handle_key(key(KeyCode::Tab), None);
+        let (buf, rect) = draw(&p, 100, 30);
+        let text = dump(&buf);
+        let (x, y) = find_cell(&buf, "Issues 2").unwrap();
+        assert_eq!(buf[(x, y)].bg, palette().selection, "Tab chose Issues: {text}");
+        assert!(text.contains("Login form validation"));
+        assert!(!text.contains("Log in to GitHub") && !text.contains("Login form shipped"), "{text}");
+
+        // A click on the Changelog chip shows the entries.
+        let (x, y) = find_cell(&buf, "Changelog Entries 1").unwrap();
+        assert_eq!(p.handle_click(rect, x + 2, y), PaletteStep::Continue);
+        assert_eq!(p.inner().filter(), SearchFilter::Changelog);
+        let (buf, rect) = draw(&p, 100, 30);
+        let (x, y) = find_cell(&buf, "Login form shipped").unwrap();
+        match p.handle_click(rect, x, y) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "action:open-changelog-entry:2026-10-28-login"),
+            other => panic!("a click on the entry opens it, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_click_on_an_issue_opens_it_and_a_header_does_nothing() {
+        let mut p = search_palette();
+        type_in(&mut p, "login");
+        let (buf, rect) = draw(&p, 100, 30);
+        let (x, y) = find_cell(&buf, "Login form validation").unwrap();
+        match p.handle_click(rect, x, y) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "action:open-issue:1944"),
+            other => panic!("a click on the issue opens it, got {other:?}"),
+        }
+        let (buf, rect) = draw(&p, 100, 30);
+        let y = find_row_with(&buf, " Changelog Entries  ").unwrap();
+        assert_eq!(p.handle_click(rect, rect.x + 3, y), PaletteStep::Continue);
+    }
+
+    #[test]
+    fn searching_renders_readable_in_light() {
+        use shelbi_app::theme::Appearance;
+        crate::theme::with_appearance(Appearance::Light, || {
+            let mut p = search_palette();
+            type_in(&mut p, "login");
+            let (buf, _) = draw(&p, 100, 30);
+            crate::theme::assert_light_readable("palette-search", &buf);
+            p.handle_key(key(KeyCode::Up), Some(PaletteAction::NavUp));
+            let (buf, _) = draw(&p, 100, 30);
+            crate::theme::assert_light_readable("palette-search-filters", &buf);
+        });
+    }
+
     #[test]
     fn clicking_a_command_label_or_its_bleed_row_activates_that_item() {
         let mut p = Palette::new(
@@ -1495,8 +1845,8 @@ mod tests {
         );
         let area = Rect::new(0, 0, 80, 24);
         let rect = p.overlay_rect(area);
-        let rows = panel_rows(rect);
-        let (band, _) = split_results(rows[2], false);
+        let rows = panel_rows(rect, false).unwrap();
+        let (band, _) = split_results(rows.band, false);
         let col = band.x + 1;
 
         // Item 1's label row sits at band offset 2*1 + 1 = 3.
@@ -1515,7 +1865,7 @@ mod tests {
 
         // A click on the search line (above the band) leaves the palette open.
         assert_eq!(
-            p.handle_click(rect, col, rows[0].y),
+            p.handle_click(rect, col, rows.search.y),
             PaletteStep::Continue,
             "a click outside the commands band is a no-op"
         );

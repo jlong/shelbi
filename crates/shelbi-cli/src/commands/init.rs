@@ -777,6 +777,12 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         let path = shelbi_state::pr_template_path(&local_alias).map_err(|e| anyhow!(e))?;
         println!("✓ wrote PR template: {}", path.display());
     }
+    if let shelbi_state::ChangelogTemplateOutcome::Created =
+        shelbi_state::scaffold_changelog_template(&local_alias).map_err(|e| anyhow!(e))?
+    {
+        let path = shelbi_state::changelog_template_path(&local_alias).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote changelog template: {}", path.display());
+    }
     if let shelbi_state::SharedPreambleOutcome::Created =
         shelbi_state::scaffold_shared_preamble(&local_alias).map_err(|e| anyhow!(e))?
     {

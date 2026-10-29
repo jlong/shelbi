@@ -1026,6 +1026,12 @@ fn scaffold_workflows(resolved: &ResolvedProjectRoot, out: &mut dyn ScaffoldRepo
         let path = shelbi_state::pr_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
         out.note(&format!("✓ wrote PR template: {}", path.display()));
     }
+    if let shelbi_state::ChangelogTemplateOutcome::Created =
+        shelbi_state::scaffold_changelog_template(&resolved.name).map_err(|e| anyhow!(e))?
+    {
+        let path = shelbi_state::changelog_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
+        out.note(&format!("✓ wrote changelog template: {}", path.display()));
+    }
     if let shelbi_state::SharedPreambleOutcome::Created =
         shelbi_state::scaffold_shared_preamble(&resolved.name).map_err(|e| anyhow!(e))?
     {
@@ -1330,6 +1336,13 @@ mod tests {
         assert!(tail.contains(&&format!("✓ wrote project statuses: {}", statuses.display())));
         assert!(tail.contains(&&format!("✓ wrote Zen policy: {}", zen.display())));
         assert!(tail.contains(&&format!("✓ wrote PR template: {}", pr.display())));
+        let changelog = shelbi_state::changelog_template_path("acme").unwrap();
+        assert!(tail.contains(&&format!("✓ wrote changelog template: {}", changelog.display())));
+        assert_eq!(
+            std::fs::read_to_string(&changelog).unwrap(),
+            shelbi_state::DEFAULT_CHANGELOG_TEMPLATE,
+            "a new project ships the changelog template"
+        );
         let preamble = shelbi_state::agent_shared_preamble_path("acme").unwrap();
         assert!(tail.contains(&&format!(
             "✓ wrote shared agent preamble (hub safety): {}",
