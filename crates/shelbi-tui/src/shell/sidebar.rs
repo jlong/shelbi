@@ -38,7 +38,8 @@ use shelbi_state::ZenModeState;
 
 use super::session::SessionRef;
 use crate::keymap::format_chord_or_unbound;
-use crate::sidebar::{decoration_to_color, nav_lines, BLEED_ABOVE, BLEED_BELOW};
+use crate::panel;
+use crate::sidebar::{decoration_to_color, nav_lines};
 use crate::theme::palette;
 use shelbi_palette::DecorationColor;
 use unicode_width::UnicodeWidthStr;
@@ -75,15 +76,15 @@ pub enum FooterButton {
 }
 
 impl FooterButton {
-    /// The button's cells: its glyph with a column of padding each side (the
-    /// `📣` is two cells wide), or the word when emoji can't draw.
+    /// The glyph centered in the button's square (the `📣` is two cells
+    /// wide), or the word when emoji can't draw.
     fn face(self, emoji: bool) -> &'static str {
         match (self, emoji) {
-            (FooterButton::Settings, true) => " ⚙ ",
-            (FooterButton::Feedback, true) => " 📣 ",
-            (FooterButton::Settings, false) => " Settings ",
-            (FooterButton::Feedback, false) => " Feedback ",
-            (FooterButton::Errors, _) => " ! ",
+            (FooterButton::Settings, true) => "⚙",
+            (FooterButton::Feedback, true) => "📣",
+            (FooterButton::Settings, false) => "Settings",
+            (FooterButton::Feedback, false) => "Feedback",
+            (FooterButton::Errors, _) => "!",
         }
     }
 
@@ -325,7 +326,7 @@ impl SidebarView {
         let mut x = row.x + LIST_INDENT.horizontal;
         let limit = row.right().saturating_sub(LIST_INDENT.horizontal);
         for button in self.footer_buttons() {
-            let w = UnicodeWidthStr::width(button.face(self.emoji)) as u16;
+            let w = panel::square_button_width(button.face(self.emoji)) as u16;
             if x + w > limit {
                 break;
             }
@@ -333,6 +334,29 @@ impl SidebarView {
             x += w + BUTTON_GAP;
         }
         out
+    }
+
+    /// Where the hovered button's `width`-column name goes, its row with a
+    /// column of inset each side: beside the buttons, two columns past the
+    /// last, when it fits whole there; otherwise the full width of the row
+    /// above the squares' `▄` caps when the sidebar has one (cut short with
+    /// `…` only when even that is too narrow); else what is left beside them.
+    fn tooltip_rect(&self, area: Rect, rows: &FooterRows, toolbar: Rect, width: usize) -> Option<Rect> {
+        let inset = LIST_INDENT.horizontal;
+        let start = self.buttons_end(toolbar) + 2 - inset;
+        let beside = (start + inset < toolbar.right().saturating_sub(inset)).then(|| Rect {
+            x: start,
+            width: toolbar.right() - start,
+            ..toolbar
+        });
+        if beside.is_some_and(|r| r.width as usize >= width + 2 * inset as usize) {
+            return beside;
+        }
+        let floating = rows
+            .above
+            .filter(|above| above.y > area.y)
+            .map(|above| Rect { y: above.y - 1, ..toolbar });
+        floating.or(beside)
     }
 
     /// Where the buttons end on a toolbar row starting at `x` (the column just
@@ -448,7 +472,7 @@ impl SidebarView {
     }
 
     /// The footer button at `(x, y)`, if any: its columns across the three
-    /// cell rows its hover pill spans (the `▄` margin, the toolbar row, the `▀`
+    /// cell rows its square spans (the `▄` margin, the toolbar row, the `▀`
     /// margin), like the search box's target. The shell opens Settings, runs
     /// Send Feedback, or opens the error log.
     pub fn footer_button_at(&self, area: Rect, x: u16, y: u16) -> Option<FooterButton> {
@@ -552,7 +576,7 @@ impl SidebarView {
         if let Some(rest) = geo.rest {
             self.render_rest(buf, rest, sel_row, focused);
         }
-        self.render_footer(buf, &geo.footer, chrome.hover);
+        self.render_footer(buf, area, &geo.footer, chrome.hover);
     }
 
     /// Render the header block: the project title in the accent cyan on the
@@ -644,9 +668,11 @@ impl SidebarView {
 
     /// Paint the footer: the status row, the version warning on a daemon/CLI
     /// mismatch, the toolbar (Settings, Send Feedback, the unread-errors
-    /// badge), and the zen band. `hover` is the button under the pointer: it
-    /// takes its hover pill and its name shows beside the toolbar.
-    fn render_footer(&self, buf: &mut Buffer, rows: &FooterRows, hover: Option<FooterButton>) {
+    /// badge), and the zen band. `hover` is the button under the pointer: its
+    /// square lifts and its name shows beside the toolbar, or, when the
+    /// squares leave too little room for the whole name, floats on the row
+    /// above them (over whatever sits there, as the desktop's tooltip does).
+    fn render_footer(&self, buf: &mut Buffer, area: Rect, rows: &FooterRows, hover: Option<FooterButton>) {
         if let Some(status) = rows.status {
             let style = if self.status_is_orchestrator_failure {
                 Style::default().fg(palette().ansi_red)
@@ -691,20 +717,19 @@ impl SidebarView {
             }
             // Right of the buttons: the hovered button's name (the desktop's
             // tooltip), left-aligned. Nothing sits there otherwise.
-            let start = self.buttons_end(toolbar) + 2;
-            let end = toolbar.right().saturating_sub(LIST_INDENT.horizontal);
-            if let (Some(button), true) = (hover, start < end) {
-                let info = Rect {
-                    x: start,
-                    width: end - start,
-                    ..toolbar
-                };
+            if let Some(button) = hover {
                 let name = button.tooltip(self.unread_errors, self.daemon_version_line.as_deref());
-                Paragraph::new(Span::styled(
-                    truncate_ellipsis(&name, info.width as usize),
-                    Style::default().fg(palette().gray),
-                ))
-                .render(info, buf);
+                let info = self.tooltip_rect(area, rows, toolbar, UnicodeWidthStr::width(name.as_str()));
+                if let Some(info) = info {
+                    for x in info.left()..info.right() {
+                        buf[(x, info.y)].reset();
+                    }
+                    Paragraph::new(Span::styled(
+                        truncate_ellipsis(&name, info.inner(LIST_INDENT).width as usize),
+                        Style::default().fg(palette().gray),
+                    ))
+                    .render(info.inner(LIST_INDENT), buf);
+                }
             }
         }
 
@@ -759,7 +784,7 @@ struct FooterRows {
     status: Option<Rect>,
     /// The version warning's rows (a daemon/CLI mismatch only).
     warning: Option<Rect>,
-    /// The toolbar's half-row margin above: a hovered button's `▄` row.
+    /// The toolbar's half-row margin above: the buttons' `▄` row.
     above: Option<Rect>,
     toolbar: Option<Rect>,
     /// The toolbar's half-row margin below (`▀`), and the spacer above the band.
@@ -768,7 +793,7 @@ struct FooterRows {
 }
 
 /// Columns between two toolbar buttons (the desktop's 4pt gap, rounded up so
-/// two hover pills never touch).
+/// two squares never touch).
 const BUTTON_GAP: u16 = 1;
 
 /// Height of the header block: a blank row (0), the project title (row 1), a
@@ -1108,12 +1133,11 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     }
 }
 
-/// Draw one toolbar button over `rect` (its toolbar-row cells). Settings and
-/// Send Feedback are a gray glyph on the terminal's background at rest, like
-/// the desktop's borderless toolbar buttons; under the pointer they take the
-/// hover fill as a half-block pill (the search box's language: `▄` in the row
-/// above, the glyph on a solid fill, `▀` in the row below) and the glyph goes
-/// bright. The unread-errors badge is always a filled pill, a bold `!` on the
+/// Draw one toolbar button over `rect` (its toolbar-row cells) as a square,
+/// the back button's ([`panel::draw_square_button`]): the glyph gray on the
+/// selection fill, `▄` in the row above and `▀` in the row below, the fill
+/// lifting to the lighter `button_hover` under the pointer, as the other
+/// half-block buttons lift. The unread-errors badge is the same square in red, a bold `!` on the
 /// reddish-gray `error_button`, a shade lighter under the pointer.
 fn render_footer_button(
     buf: &mut Buffer,
@@ -1125,33 +1149,25 @@ fn render_footer_button(
     hovered: bool,
 ) {
     let p = palette();
-    let (fill, fg, modifier) = match (button, hovered) {
-        (FooterButton::Errors, false) => (Some(p.error_button), p.on_color, Modifier::BOLD),
-        (FooterButton::Errors, true) => (Some(p.error_button_hover), p.on_color, Modifier::BOLD),
-        (_, true) => (Some(p.button_hover), p.white, Modifier::empty()),
-        (_, false) => (None, p.gray, Modifier::empty()),
+    let (fill, style) = match (button, hovered) {
+        (FooterButton::Errors, lit) => (
+            if lit { p.error_button_hover } else { p.error_button },
+            Style::default().fg(p.on_color).add_modifier(Modifier::BOLD),
+        ),
+        (_, lit) => (
+            if lit { p.button_hover } else { p.selection },
+            panel::square_glyph_style(false),
+        ),
     };
-    let mut style = Style::default().fg(fg).add_modifier(modifier);
-    if let Some(fill) = fill {
-        style = style.bg(fill);
-    }
-    buf.set_stringn(rect.x, rect.y, face, rect.width as usize, style);
-    let Some(fill) = fill else {
-        return;
-    };
-    // A double-width glyph resets its continuation cell as it is laid down, so
-    // re-fill every cell to keep the row one solid bar (as the search box does).
-    for x in rect.left()..rect.right() {
-        buf[(x, rect.y)].set_bg(fill);
-    }
-    // The bleed rows: the fill as the half-block glyph's foreground on the
-    // terminal's default background, so it reads as half a cell of fill.
-    let bleed = Style::default().fg(fill);
-    for (row, glyph) in [(above, BLEED_ABOVE), (below, BLEED_BELOW)] {
-        if let Some(row) = row {
-            buf.set_stringn(rect.x, row.y, glyph.repeat(rect.width as usize), rect.width as usize, bleed);
-        }
-    }
+    panel::draw_square_button(
+        buf,
+        rect.x,
+        [above.map(|r| r.y), Some(rect.y), below.map(|r| r.y)],
+        rect.width,
+        face,
+        fill,
+        style,
+    );
 }
 
 /// Height in list lines a rest-of-list row occupies at inner `width`. Review
@@ -1265,6 +1281,7 @@ pub(crate) fn sidebar_startup_status_line(diagnostics: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
     use ratatui::{backend::TestBackend, Terminal};
     use shelbi_app::view::{NavItem, ReviewRow, WorkspaceRow};
     use shelbi_state::keymap::KeyChord;
@@ -2053,7 +2070,7 @@ mod tests {
         assert_eq!(fix.trim_end(), " shelbi daemon restart");
         assert_eq!(buf[(1, toolbar_y - 3)].fg, palette().ansi_red);
         assert_eq!(buf[(1, toolbar_y - 2)].fg, palette().ansi_red);
-        assert!(buf_row(&buf, toolbar_y).starts_with("  ⚙"), "the toolbar sits below");
+        assert!(buf_row(&buf, toolbar_y).starts_with("   ⚙"), "the toolbar sits below");
         let joined: String = (0..20).map(|y| buf_row(&buf, y)).collect::<Vec<_>>().join("\n");
         assert!(!joined.contains("board"), "still no board banner:\n{joined}");
 
@@ -2077,15 +2094,16 @@ mod tests {
         let joined = rows.join("\n");
         assert!(joined.contains("ZEN MODE ON"), "expected ZEN MODE ON in:\n{joined}");
         assert!(!joined.contains("┌─") && !joined.contains("└─"), "no border chrome, got:\n{joined}");
-        // The band is the bottom row, full width, with one blank spacer row
-        // between it and the toolbar above.
+        // The band is the bottom row, full width, with one spacer row between
+        // it and the toolbar above, holding only the squares' `▀` caps.
         let toolbar_y = row_y(&rows, "⚙");
         let zen_y = row_y(&rows, "ZEN MODE ON");
-        assert_eq!(zen_y, toolbar_y + 2, "one blank row between the toolbar and zen, got:\n{joined}");
+        assert_eq!(zen_y, toolbar_y + 2, "one spacer row between the toolbar and zen, got:\n{joined}");
         assert_eq!(zen_y, rows.len() - 1, "the zen band is the bottom row, got:\n{joined}");
-        assert!(
-            rows[zen_y - 1].trim().is_empty(),
-            "a blank spacer sits above the band, got: {:?}",
+        assert_eq!(
+            rows[zen_y - 1].trim_end(),
+            " ▀▀▀▀▀ ▀▀▀▀▀",
+            "only the caps sit above the band, got: {:?}",
             rows[zen_y - 1]
         );
         assert_eq!(rows[zen_y].chars().count(), 24, "zen row spans full width, got: {:?}", rows[zen_y]);
@@ -2158,10 +2176,26 @@ mod tests {
         out
     }
 
+    /// Assert the square button over `cols` on toolbar row `y` of `buf`: `▄`
+    /// above and `▀` below in `fill` as their foreground on the default
+    /// background, the toolbar row solid `fill`.
+    fn assert_square(buf: &Buffer, cols: std::ops::Range<u16>, y: u16, fill: Color, what: &str) {
+        for x in cols {
+            assert_eq!(buf[(x, y - 1)].symbol(), BLEED_ABOVE, "{what}: cap above, col {x}");
+            assert_eq!(buf[(x, y - 1)].fg, fill, "{what}: cap above carries the fill, col {x}");
+            assert_eq!(buf[(x, y - 1)].bg, Color::Reset, "{what}: the cap keeps the default bg");
+            assert_eq!(buf[(x, y + 1)].symbol(), BLEED_BELOW, "{what}: cap below, col {x}");
+            assert_eq!(buf[(x, y + 1)].fg, fill, "{what}: cap below carries the fill, col {x}");
+            assert_eq!(buf[(x, y + 1)].bg, Color::Reset);
+            assert_eq!(buf[(x, y)].bg, fill, "{what}: solid fill, col {x}");
+        }
+    }
+
     /// Settings then Send Feedback sit in the footer's bottom-left corner, the
     /// desktop's order, on the row above the spacer and the zen band; the title
-    /// row has no gear any more. At rest they are gray glyphs on the default
-    /// background.
+    /// row has no gear any more. Each is a square button at rest, the back
+    /// button's: [`panel::BACK_BTN_WIDTH`] wide on the selection fill, its
+    /// glyph gray and centered (the double-width `📣` too).
     #[test]
     fn footer_toolbar_shows_settings_then_feedback_bottom_left() {
         let mut model = empty_model();
@@ -2170,18 +2204,51 @@ mod tests {
         let buf = footer_buf(&view, None, 40, 20);
         let toolbar_y = 20 - 3;
         let row = buf_row(&buf, toolbar_y);
-        assert!(row.starts_with("  ⚙   📣 "), "Settings then Feedback, bottom-left: {row:?}");
-        assert_eq!(buf[(2, toolbar_y)].symbol(), "⚙");
-        assert_eq!(buf[(6, toolbar_y)].symbol(), "📣");
-        assert_eq!(buf[(2, toolbar_y)].fg, palette().gray, "the desktop's icon gray");
-        for x in 0..12 {
-            assert_eq!(buf[(x, toolbar_y)].bg, Color::Reset, "no fill at rest, col {x}");
-            assert!(buf[(x, toolbar_y - 1)].symbol().trim().is_empty(), "no pill above at rest");
-            assert!(buf[(x, toolbar_y + 1)].symbol().trim().is_empty(), "no pill below at rest");
+        assert!(row.starts_with("   ⚙     📣  "), "Settings then Feedback, bottom-left: {row:?}");
+        assert_eq!(buf[(3, toolbar_y)].symbol(), "⚙");
+        assert_eq!(buf[(9, toolbar_y)].symbol(), "📣");
+        assert_eq!(panel::BACK_BTN_WIDTH, 5);
+        assert_square(&buf, 1..6, toolbar_y, palette().selection, "Settings");
+        // The `📣`'s continuation cell (col 10) is never flushed by the
+        // TestBackend; the emoji covers it on a real terminal.
+        assert_square(&buf, 7..10, toolbar_y, palette().selection, "Feedback");
+        assert_square(&buf, 11..12, toolbar_y, palette().selection, "Feedback");
+        for x in [3, 9] {
+            assert_eq!(buf[(x, toolbar_y)].fg, palette().ansi_gray, "the back button's glyph gray");
+            assert!(!buf[(x, toolbar_y)].modifier.contains(Modifier::BOLD));
+        }
+        for x in [0, 6, 12, 13] {
+            assert_eq!(buf[(x, toolbar_y)].bg, Color::Reset, "a gap, col {x}");
+            assert!(buf[(x, toolbar_y - 1)].symbol().trim().is_empty(), "no cap over col {x}");
+            assert!(buf[(x, toolbar_y + 1)].symbol().trim().is_empty(), "no cap under col {x}");
         }
         let title = buf_row(&buf, 1);
         assert!(!title.contains('⚙'), "the gear left the title row: {title:?}");
         assert!(title.contains("My project"));
+    }
+
+    /// The footer's squares are the back button's own: drawn by the same
+    /// helper, a workspace panel's `←` and the sidebar's `⚙` come out cell for
+    /// cell alike apart from the glyph.
+    #[test]
+    fn footer_squares_match_the_back_button() {
+        let mut term = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        term.draw(|f| panel::render_back_button(f, Rect::new(0, 0, 12, 3), false, "", Style::default()))
+            .unwrap();
+        let back = term.backend().buffer().clone();
+        let footer = footer_buf(&SidebarView::build(&empty_model()), None, 40, 20);
+        let (bx, fx, fy) = (panel::PAD, 1u16, 20 - 3);
+        for i in 0..panel::BACK_BTN_WIDTH as u16 {
+            for dy in 0..3u16 {
+                let (b, f) = (&back[(bx + i, dy)], &footer[(fx + i, fy - 1 + dy)]);
+                assert_eq!((b.fg, b.bg, b.modifier), (f.fg, f.bg, f.modifier), "col {i} row {dy}");
+                if !(dy == 1 && i == 2) {
+                    assert_eq!(b.symbol(), f.symbol(), "col {i} row {dy}");
+                }
+            }
+        }
+        assert_eq!(back[(bx + 2, 1)].symbol(), "\u{2190}");
+        assert_eq!(footer[(fx + 2, fy)].symbol(), "⚙");
     }
 
     /// The title has the whole row now that the gear is gone: a long project
@@ -2194,37 +2261,23 @@ mod tests {
         assert_eq!(rows[1].trim_end(), " abcdefghijklmnopqrstuvwxyz");
     }
 
-    /// Under the pointer a button takes the half-block hover pill: `▄` above,
-    /// the glyph bright on the hover fill, `▀` below, across its own columns
-    /// only. The other button stays at rest.
+    /// Under the pointer a button's square lifts to the lighter
+    /// `button_hover` across its own columns only; its glyph stays
+    /// gray. The other button stays at rest.
     #[test]
-    fn hovered_button_takes_the_half_block_pill() {
+    fn hovered_button_lifts_its_square() {
         let view = SidebarView::build(&empty_model());
-        for (button, cols) in [(FooterButton::Settings, 1..4u16), (FooterButton::Feedback, 5..9u16)] {
+        let y = 20 - 3;
+        for (button, cols, glyph_x) in [(FooterButton::Settings, 1..6u16, 3), (FooterButton::Feedback, 7..12u16, 9)] {
             let buf = footer_buf(&view, Some(button), 40, 20);
-            let y = 20 - 3;
-            for x in 0..14u16 {
-                let lit = cols.contains(&x);
-                // The `📣`'s continuation cell (col 7) is never flushed by the
-                // TestBackend; the emoji covers it on a real terminal.
-                if lit && x != 7 {
-                    assert_eq!(buf[(x, y)].bg, palette().button_hover, "{button:?} fills col {x}");
-                }
-                if lit {
-                    assert_eq!(buf[(x, y - 1)].symbol(), "▄", "{button:?} bleeds above, col {x}");
-                    assert_eq!(buf[(x, y - 1)].fg, palette().button_hover);
-                    assert_eq!(buf[(x, y - 1)].bg, Color::Reset, "the bleed keeps the default bg");
-                    assert_eq!(buf[(x, y + 1)].symbol(), "▀", "{button:?} bleeds below, col {x}");
-                    assert_eq!(buf[(x, y + 1)].fg, palette().button_hover);
-                } else {
-                    assert_eq!(buf[(x, y)].bg, Color::Reset, "{button:?} leaves col {x} alone");
-                    assert!(buf[(x, y - 1)].symbol().trim().is_empty(), "{button:?}: col {x} above");
-                    assert!(buf[(x, y + 1)].symbol().trim().is_empty(), "{button:?}: col {x} below");
-                }
+            for x in cols.clone().filter(|&x| x != 10) {
+                assert_square(&buf, x..x + 1, y, palette().button_hover, &format!("{button:?}"));
             }
-            let glyph_x = cols.start + 1;
-            assert_eq!(buf[(glyph_x, y)].fg, palette().white, "{button:?}'s glyph goes bright");
+            assert_eq!(buf[(glyph_x, y)].fg, palette().ansi_gray, "{button:?}'s glyph");
+            let other = if button == FooterButton::Settings { 7..10 } else { 1..6 };
+            assert_square(&buf, other, y, palette().selection, "the other button");
         }
+        assert_ne!(palette().button_hover, palette().selection, "the lift shows");
     }
 
     /// The hovered button's name (the desktop's tooltip) shows beside the
@@ -2242,18 +2295,53 @@ mod tests {
             (FooterButton::Feedback, "Send Feedback"),
             (FooterButton::Errors, "1 unread error"),
         ] {
-            let row = buf_row(&footer_buf(&view, Some(hover), 60, 20), y);
+            let buf = footer_buf(&view, Some(hover), 60, 20);
+            let row = buf_row(&buf, y);
             assert!(row.contains(want), "{hover:?} is named: {row:?}");
+            assert!(row.starts_with("   ⚙     📣    !  "), "two columns past the squares: {row:?}");
+            assert!(buf_row(&buf, y - 2).trim().is_empty(), "nothing floats when it fits beside");
         }
         let row = buf_row(&footer_buf(&view, None, 60, 20), y);
-        assert_eq!(row.trim_end(), "  ⚙   📣   !", "nothing beside the buttons at rest: {row:?}");
+        assert_eq!(row.trim_end(), "   ⚙     📣    !", "nothing beside the buttons at rest: {row:?}");
         // Before the first probe Settings is just named.
         let row = buf_row(&footer_buf(&SidebarView::build(&empty_model()), Some(FooterButton::Settings), 60, 20), y);
         assert!(row.trim_end().ends_with("Settings"), "{row:?}");
     }
 
+    /// At the default sidebar width the squares leave too little room beside
+    /// them for some names; those float, whole, on the row above the squares'
+    /// caps, over whatever sits there. A name that fits stays beside.
+    #[test]
+    fn a_name_too_long_for_beside_the_squares_floats_above_them() {
+        let mut model = empty_model();
+        model.unread_errors = 2;
+        model.status_line = "3 open · 1 review".into();
+        let view = SidebarView::build(&model);
+        let (w, y) = (27, 20 - 3);
+        let buf = footer_buf(&view, Some(FooterButton::Errors), w, 20);
+        let above = buf_row(&buf, y - 2);
+        assert_eq!(above.trim_end(), " 2 unread errors", "whole, at the inset, over the status: {above:?}");
+        assert_eq!(buf[(1, y - 2)].fg, palette().gray);
+        assert!(buf_row(&buf, y).trim_end().ends_with('!'), "nothing beside: {:?}", buf_row(&buf, y));
+        assert_square(&buf, 13..18, y, palette().error_button_hover, "the caps stay whole");
+        // At rest the status is back.
+        let rest = footer_buf(&view, None, w, 20);
+        assert!(buf_row(&rest, y - 2).contains("3 open"), "{:?}", buf_row(&rest, y - 2));
+
+        // Two buttons leave room for "Settings" beside them.
+        let view = SidebarView::build(&empty_model());
+        let buf = footer_buf(&view, Some(FooterButton::Settings), w, 20);
+        assert!(buf_row(&buf, y).trim_end().ends_with("📣   Settings"), "{:?}", buf_row(&buf, y));
+        // A name longer than the whole row is cut short there.
+        let mut model = empty_model();
+        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
+        let buf = footer_buf(&SidebarView::build(&model), Some(FooterButton::Settings), w, 20);
+        let above = buf_row(&buf, y - 2);
+        assert!(above.starts_with(" Settings · daemon") && above.trim_end().ends_with('…'), "{above:?}");
+    }
+
     /// The unread-errors badge follows Send Feedback while there are unread
-    /// errors (the desktop's order): always a filled pill with a bold `!`, a
+    /// errors (the desktop's order): the same square, red, with a bold `!`, a
     /// shade lighter under the pointer.
     #[test]
     fn unread_errors_badge_follows_feedback_only_with_unread_errors() {
@@ -2261,69 +2349,101 @@ mod tests {
         let buf = footer_buf(&SidebarView::build(&model), None, 40, 20);
         let y = 20 - 3;
         assert!(!buf_row(&buf, y).contains('!'), "no badge without unread errors");
+        assert_eq!(buf[(13, y)].bg, Color::Reset, "no square past Feedback");
 
         let mut model = empty_model();
         model.unread_errors = 3;
         let view = SidebarView::build(&model);
         let buf = footer_buf(&view, None, 40, 20);
-        assert_eq!(buf[(11, y)].symbol(), "!", "the badge sits after Feedback");
-        assert!(buf[(11, y)].modifier.contains(Modifier::BOLD));
-        for x in 10..13u16 {
-            assert_eq!(buf[(x, y)].bg, palette().error_button, "the badge is filled, col {x}");
-            assert_eq!(buf[(x, y - 1)].symbol(), "▄");
-            assert_eq!(buf[(x, y - 1)].fg, palette().error_button);
-            assert_eq!(buf[(x, y + 1)].symbol(), "▀");
-        }
+        assert_eq!(buf[(15, y)].symbol(), "!", "the badge sits after Feedback, centered");
+        assert!(buf[(15, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(15, y)].fg, palette().on_color);
+        assert_square(&buf, 13..18, y, palette().error_button, "the badge");
+        assert_eq!(buf[(18, y)].bg, Color::Reset);
         let hovered = footer_buf(&view, Some(FooterButton::Errors), 40, 20);
-        assert_eq!(hovered[(11, y)].bg, palette().error_button_hover);
+        assert_square(&hovered, 13..18, y, palette().error_button_hover, "the lit badge");
+        assert_square(&hovered, 1..6, y, palette().selection, "Settings at rest");
         // A stale hover on a badge that's gone draws nothing.
         let buf = footer_buf(&SidebarView::build(&empty_model()), Some(FooterButton::Errors), 40, 20);
         assert!(!buf_row(&buf, y).contains("unread"), "no tooltip for a missing badge");
+        assert_square(&buf, 1..6, y, palette().selection, "Settings stays at rest");
+        assert_square(&buf, 7..10, y, palette().selection, "Feedback stays at rest");
     }
 
-    /// Each button's target spans its columns across the three cell rows its
-    /// pill covers; the gap, the rows past the pill, and the band miss.
+    /// Each button's target spans its square: its columns across the `▄`, the
+    /// toolbar and the `▀` rows; the gaps, the rows past the square, and the
+    /// band miss.
     #[test]
-    fn footer_button_hits_cover_the_pill_rows() {
+    fn footer_button_hits_cover_the_square() {
         let mut model = empty_model();
         model.unread_errors = 2;
         let view = SidebarView::build(&model);
         let area = Rect::new(0, 0, 40, 20);
         let y = 20 - 3;
         for row in [y - 1, y, y + 1] {
-            for x in 1..4 {
+            for x in 1..6 {
                 assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Settings));
             }
-            for x in 5..9 {
+            for x in 7..12 {
                 assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Feedback));
             }
-            for x in 10..13 {
+            for x in 13..18 {
                 assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Errors));
             }
-            for x in [0, 4, 9, 13, 30] {
+            for x in [0, 6, 12, 18, 30] {
                 assert_eq!(view.footer_button_at(area, x, row), None, "col {x} row {row} misses");
             }
         }
-        assert_eq!(view.footer_button_at(area, 2, y - 2), None, "above the pill");
-        assert_eq!(view.footer_button_at(area, 2, y + 2), None, "the zen band");
+        assert_eq!(view.footer_button_at(area, 3, y - 2), None, "above the square");
+        assert_eq!(view.footer_button_at(area, 3, y + 2), None, "the zen band");
         // An offset sidebar (the shell's content rect) hits in its own frame.
         let shifted = Rect::new(0, 3, 40, 20);
-        assert_eq!(view.footer_button_at(shifted, 2, y + 3), Some(FooterButton::Settings));
+        assert_eq!(view.footer_button_at(shifted, 3, y + 3), Some(FooterButton::Settings));
     }
 
     /// Without emoji (the Linux console, a non-UTF-8 locale) the buttons are
-    /// words, and hit-test over the words.
+    /// words, each square widened to fit its word with a column either side,
+    /// and hit-test over the squares.
     #[test]
     fn without_emoji_the_buttons_are_words() {
         let view = SidebarView::build(&empty_model()).with_emoji(false);
         let buf = footer_buf(&view, None, 40, 20);
         let y = 20 - 3;
         let row = buf_row(&buf, y);
-        assert!(row.starts_with("  Settings   Feedback "), "{row:?}");
+        assert!(row.starts_with("  Settings   Feedback  "), "{row:?}");
         assert!(!row.contains('⚙') && !row.contains('📣'));
+        assert_square(&buf, 1..11, y, palette().selection, "Settings");
+        assert_square(&buf, 12..22, y, palette().selection, "Feedback");
         let area = Rect::new(0, 0, 40, 20);
         assert_eq!(view.footer_button_at(area, 10, y), Some(FooterButton::Settings));
+        assert_eq!(view.footer_button_at(area, 11, y), None, "the gap");
         assert_eq!(view.footer_button_at(area, 12, y), Some(FooterButton::Feedback));
+    }
+
+    /// A sidebar too narrow for every square leaves off the ones that don't
+    /// fit whole (never a clipped square), down to none at all.
+    #[test]
+    fn narrow_sidebars_drop_whole_squares() {
+        let mut model = empty_model();
+        model.unread_errors = 1;
+        let view = SidebarView::build(&model);
+        let y = 20 - 3;
+        for (w, last) in [
+            (19u16, Some(FooterButton::Errors)),
+            (18, Some(FooterButton::Feedback)),
+            (13, Some(FooterButton::Feedback)),
+            (12, Some(FooterButton::Settings)),
+            (7, Some(FooterButton::Settings)),
+            (6, None),
+        ] {
+            let buf = footer_buf(&view, None, w, 20);
+            let area = Rect::new(0, 0, w, 20);
+            let shown: Vec<_> = (0..w).filter_map(|x| view.footer_button_at(area, x, y)).collect();
+            assert_eq!(shown.last().copied(), last, "w={w}");
+            // The last column is always blank: nothing reaches the edge.
+            assert_eq!(buf[(w - 1, y)].bg, Color::Reset, "w={w}");
+            assert!(buf[(w - 1, y - 1)].symbol().trim().is_empty(), "w={w}");
+        }
     }
 
     /// The first-run hint, the version warning, the toolbar and the band keep

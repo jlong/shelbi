@@ -8741,13 +8741,13 @@ mod tests {
         let (fx, fy) = find_on_screen(&term, "📣").expect("Send Feedback shows");
         assert_eq!(gy, fy, "one toolbar row");
         assert!(gx < fx, "Settings, then Send Feedback");
-        let (ex, ey) = (fx + 5, fy);
+        let (ex, ey) = (fx + 6, fy);
         assert_eq!(term.backend().buffer()[(ex, ey)].symbol(), "!", "then the badge");
 
         st.effect_tap = Some(Vec::new());
         st.handle_event(Event::Mouse(left_click(fx, fy)));
         assert_eq!(st.effect_tap.as_ref().unwrap().last(), Some(&Effect::SendFeedback));
-        // The pill's rows above and below the glyph are on target too.
+        // The square's rows above and below the glyph are on target too.
         st.handle_event(Event::Mouse(left_click(ex, ey + 1)));
         assert_eq!(
             st.effect_tap.as_ref().unwrap().last(),
@@ -8788,7 +8788,7 @@ mod tests {
         st.handle_event(Event::Mouse(moved(fx, fy)));
         assert_eq!(st.footer_hover(), Some(FooterButton::Feedback));
         draw_frame(&mut term, &mut st).unwrap();
-        assert_eq!(term.backend().buffer()[(gx, gy)].bg, Color::Reset, "Settings went back");
+        assert_eq!(term.backend().buffer()[(gx, gy)].bg, palette().selection, "Settings went back");
         assert!(screen_text(&term).contains("Send Feedback"));
 
         st.dirty = false;

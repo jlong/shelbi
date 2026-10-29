@@ -20,6 +20,7 @@
 //! module used by both panels" the workspace-sidebar task asks for.
 
 use ratatui::{
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -28,6 +29,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
 use crate::theme::palette;
 
 /// Outer left padding (in columns) for the header block, task info, worktree,
@@ -227,10 +229,69 @@ pub(crate) fn advance_blank(y: u16, bottom: u16) -> u16 {
     (y + 1).min(bottom)
 }
 
-/// Render the square back button block and a `status` label beside it. The bleed
-/// rows carry the button's fill colour in their *foreground* so the single arrow
-/// row reads as a square (the sidebar nav's half-block trick). The status sits
-/// on the button's own row, two columns to its right, in `status_style`.
+/// Columns a square button holding `glyph` takes: [`BACK_BTN_WIDTH`], or the
+/// glyph with a column each side when that is wider (a word in place of an
+/// emoji the terminal can't draw).
+pub(crate) fn square_button_width(glyph: &str) -> usize {
+    BACK_BTN_WIDTH.max(display_width(glyph) + 2)
+}
+
+/// A square button's glyph style on its fill: gray at rest, white and bold
+/// when selected or focused.
+pub(crate) fn square_glyph_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(palette().ansi_white)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().ansi_gray)
+    }
+}
+
+/// Draw a square button `width` columns wide from column `x`: a `▄` cap on
+/// row `rows[0]`, `glyph` centered on the solid `fill` on row `rows[1]` (the
+/// padding measured in cells, so a double-width emoji stays centered), and a
+/// `▀` cap on row `rows[2]`. The caps carry the fill as their foreground on
+/// the terminal's background, so the one glyph row reads as a square (the
+/// sidebar nav's half-block trick). A row that is `None` (squeezed out) is
+/// left alone. The back button and the sidebar footer's buttons both draw
+/// through here.
+pub(crate) fn draw_square_button(
+    buf: &mut Buffer,
+    x: u16,
+    rows: [Option<u16>; 3],
+    width: u16,
+    glyph: &str,
+    fill: Color,
+    glyph_style: Style,
+) {
+    if width == 0 {
+        return;
+    }
+    let w = width as usize;
+    let cap = Style::default().fg(fill);
+    if let Some(y) = rows[0] {
+        buf.set_stringn(x, y, BLEED_ABOVE.repeat(w), w, cap);
+    }
+    if let Some(y) = rows[1] {
+        let left = w.saturating_sub(display_width(glyph)).div_ceil(2);
+        let face = format!("{}{glyph}", " ".repeat(left));
+        buf.set_stringn(x, y, " ".repeat(w), w, glyph_style.bg(fill));
+        buf.set_stringn(x, y, face, w, glyph_style.bg(fill));
+        // A double-width glyph resets its continuation cell as it is laid
+        // down, so re-fill every cell to keep the row one solid bar.
+        for col in x..x + width {
+            buf[(col, y)].set_bg(fill);
+        }
+    }
+    if let Some(y) = rows[2] {
+        buf.set_stringn(x, y, BLEED_BELOW.repeat(w), w, cap);
+    }
+}
+
+/// Render the square back button block ([`draw_square_button`], a `←` on the
+/// selection fill) and a `status` label beside it: on the button's own row,
+/// two columns to its right, in `status_style`.
 pub(crate) fn render_back_button(
     f: &mut Frame,
     area: Rect,
@@ -241,39 +302,27 @@ pub(crate) fn render_back_button(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let bg = palette().selection;
     let avail = area.width.saturating_sub(PAD) as usize;
-    let btn_w = BACK_BTN_WIDTH.min(avail.max(1)).max(1);
-    let left = (btn_w - 1) / 2;
-    let right = btn_w - 1 - left;
-    let btn_text = format!("{}\u{2190}{}", " ".repeat(left), " ".repeat(right));
-    let arrow_style = if selected {
-        Style::default()
-            .fg(palette().ansi_white)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette().ansi_gray).bg(bg)
-    };
-    let bleed_style = Style::default().fg(bg);
-    let pad = " ".repeat(PAD as usize);
-    let mut lines = vec![Line::from(vec![
-        Span::raw(pad.clone()),
-        Span::styled(crate::sidebar::BLEED_ABOVE.repeat(btn_w), bleed_style),
-    ])];
-    // The button row carries the status label two columns to the right of the
-    // button.
-    lines.push(Line::from(vec![
-        Span::raw(pad.clone()),
-        Span::styled(btn_text, arrow_style),
-        Span::raw("  "),
-        Span::styled(status.to_string(), status_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw(pad),
-        Span::styled(crate::sidebar::BLEED_BELOW.repeat(btn_w), bleed_style),
-    ]));
-    f.render_widget(Paragraph::new(lines), area);
+    let btn_w = BACK_BTN_WIDTH.min(avail.max(1)).max(1) as u16;
+    let x = area.x + PAD.min(area.width - 1);
+    let rows = [0, 1, 2].map(|i| (i < area.height).then(|| area.y + i));
+    let buf = f.buffer_mut();
+    draw_square_button(
+        buf,
+        x,
+        rows,
+        btn_w.min(area.right() - x),
+        "\u{2190}",
+        palette().selection,
+        square_glyph_style(selected),
+    );
+    if let Some(y) = rows[1] {
+        let status_x = x + btn_w + 2;
+        if status_x < area.right() {
+            let room = (area.right() - status_x) as usize;
+            buf.set_stringn(status_x, y, status, room, status_style);
+        }
+    }
 }
 
 /// Render the task-info block (title, description preview, `More`) into `area`,
