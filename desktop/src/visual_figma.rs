@@ -74,6 +74,13 @@
 //! 03 (`add-project-writing-config`, `-creating-agents`,
 //! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
 //! `SHELBI_VISUAL_ONLY=add-project` renders just those.
+//! `launch-projects` and `launch-empty-<theme>.png` are the launch window
+//! (900 × 620, Figma 2539:10949 and 2544:10318), and `connect-host`,
+//! `connect-choose` (580 wide, 2539:10950 and 2539:10951) the Connect to
+//! Remote Session dialog alone, with `connect-host-finding`,
+//! `-host-error`, `connect-choose-error` and `launch-connect` (the dialog
+//! over the launch window) checked by eye; it runs against the foundation's
+//! `FakeRemote`. `SHELBI_VISUAL_ONLY=launch` renders just those.
 //! `cli-check`, `cli-install` and `cli-ready-<theme>.png` are the first
 //! launch's CLI setup screens before them; `SHELBI_VISUAL_ONLY=cli-setup`.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
@@ -1999,6 +2006,140 @@ impl Run {
         }
     }
 
+    /// The launch window and the Connect to Remote Session dialog
+    /// (`launch-desktop`), over the frames' own rows, the dialog against a
+    /// `FakeRemote` (nothing reads the disk or runs `ssh`).
+    fn launch_windows(&mut self) {
+        use crate::platform::launch::LaunchServices;
+        use crate::views::connect_remote::{ConnectDialog, DIALOG_W};
+        use crate::views::launch::{Deps, LaunchView, SIZE};
+        use shelbi_app::launch::{FakeRemote, LaunchModel, LocalProject, RecentRemote, RecentRemotes, RemoteError, RemoteSession};
+
+        let project = |label: &str, folder: &str| LocalProject {
+            slug: folder.to_lowercase(),
+            label: label.into(),
+            path: format!("/Users/jlong/Workspaces/{folder}"),
+            display_path: format!("~/Workspaces/{folder}"),
+        };
+        let remote = |label: &str, folder: &str| RecentRemote {
+            session: RemoteSession {
+                host: "devbox".into(),
+                user: "jlong".into(),
+                project: folder.to_lowercase(),
+                label: Some(label.into()),
+                path: format!("~/Workspaces/{folder}"),
+            },
+            last_connected: chrono::Utc::now(),
+        };
+        let listed = LaunchModel {
+            projects: vec![
+                project("Shelbi", "shelbi"),
+                project("ContextStore", "ContextStore"),
+                project("32pixels", "32pixels"),
+            ],
+            remotes: vec![remote("Shelbi", "shelbi"), remote("ContextStore", "ContextStore")],
+        };
+        let fake = FakeRemote::new()
+            .with_host("build-server", "jlong", &[("Shelbi", "~/Workspaces/shelbi"), ("ContextStore", "~/Workspaces/ContextStore")])
+            .with_failing_host(
+                "devbox",
+                RemoteError::Unreachable {
+                    host: "devbox".into(),
+                    reason: "ssh: Could not resolve hostname devbox".into(),
+                },
+            )
+            .failing_connect(RemoteError::Failed("Shelbi on build-server isn't running.".into()));
+        self.cx.update(|cx| {
+            cx.set_global(LaunchServices {
+                remote: Arc::new(fake),
+                recents: RecentRemotes::none(),
+            })
+        });
+
+        // The window, each state.
+        for (screen, model) in [("launch-projects", listed.clone()), ("launch-empty", LaunchModel::default()), ("launch-connect", listed.clone())] {
+            let deps = Deps {
+                load: Arc::new(move |_| model.clone()),
+                daemon: Rc::new(|_| Arc::new(shelbi_app::launch::SharedDaemon)),
+                open: Rc::new(|_, _| {}),
+                add: Rc::new(|_| {}),
+            };
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| cx.new(|cx| LaunchView::new(deps, window, cx)))
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            if screen == "launch-connect" {
+                self.cx
+                    .update_window(window, |_, window, cx| {
+                        view.update(cx, |v, cx| v.open_connect(window, cx));
+                        if let Some(d) = view.read(cx).dialog() {
+                            d.update(cx, |d, cx| d.type_host("devbox", window, cx));
+                        }
+                    })
+                    .unwrap();
+                self.settle_sheet(window);
+            }
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+
+        // The dialog alone, at each frame's size.
+        enum Then {
+            Nothing,
+            Finding,
+            Find,
+            FindThenConnect,
+        }
+        let states = [
+            ("connect-host", "devbox", 340.0, Then::Nothing),
+            ("connect-host-finding", "devbox", 340.0, Then::Finding),
+            // An error line grows the panel past the frame's height.
+            ("connect-host-error", "devbox", 372.0, Then::Find),
+            ("connect-choose", "build-server", 456.0, Then::Find),
+            ("connect-choose-error", "build-server", 486.0, Then::FindThenConnect),
+        ];
+        for (screen, host, height, then) in states {
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(DIALOG_W), px(height)), |window, cx| cx.new(|cx| ConnectDialog::new(window, cx)))
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |d, cx| d.type_host(host, window, cx)))
+                .unwrap();
+            let enter = |this: &mut Self| {
+                this.cx
+                    .update_window(window, |_, window, cx| {
+                        view.update(cx, |d, cx| {
+                            d.key(shelbi_state::keymap::KeyChord::parse("enter").expect("a chord"), window, cx)
+                        })
+                    })
+                    .unwrap();
+                this.settle_sheet(window);
+            };
+            match then {
+                Then::Nothing => {}
+                Then::Finding => {
+                    self.cx
+                        .update_window(window, |_, _, cx| view.update(cx, |d, cx| d.offscreen_finding(cx)))
+                        .unwrap();
+                }
+                Then::Find => enter(self),
+                Then::FindThenConnect => {
+                    enter(self);
+                    enter(self);
+                }
+            }
+            self.settle_sheet(window);
+            self.write_sized(window, screen, DIALOG_W as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
     /// The Add Project wizard (`dt-add-project-wizard`) in an 800 × 580
     /// window, over a canned folder check (nothing reads the disk): `add-
     /// project-folder` (no folder yet, Figma 2481:8574), `add-project-
@@ -2462,6 +2603,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "launch") {
+            self.launch_windows();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "cli-setup") {
             self.cli_setup_windows();
             return;
@@ -2576,6 +2722,7 @@ impl Run {
         self.add_project_windows();
         self.cli_setup_windows();
         self.feedback_states();
+        self.launch_windows();
 
         let missing: Vec<&str> = SCREENS
             .iter()

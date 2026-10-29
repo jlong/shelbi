@@ -47,6 +47,12 @@ pub enum Effect {
     /// Begin the add-project flow (the host collects the form, then calls
     /// [`Mutation::AddProject`]).
     AddProject,
+    /// Open the Connect to Remote Session dialog (a client-local dialog;
+    /// its searches and connection go through
+    /// [`crate::launch::RemoteConnector`]).
+    ConnectRemote,
+    /// Show the launch screen (a client-local view; nothing stops).
+    ShowLaunchScreen,
     /// Open another window on `project` (a multi-window client only; the
     /// registry never offers it to the TUI).
     NewWindow { project: String },

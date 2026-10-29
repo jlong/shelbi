@@ -15,6 +15,7 @@ mod handlers;
 mod kanban;
 mod licenses;
 mod keymap;
+pub mod launch;
 mod machines;
 mod markdown;
 mod modal_form;
@@ -135,6 +136,8 @@ pub use app::{App, Row, View, WorkspaceBadge, WorkspaceOverview};
 pub use kanban::KanbanApp;
 pub use machines::MachinesApp;
 pub use sidebar::decoration_to_color;
+/// Open a remote session in this terminal (`shelbi remote connect`).
+pub use shell::remote_session::run as run_remote_session;
 // The poller moved out of this crate into `shelbi-orchestrator` (Phase 3,
 // `rt-daemon-poller`) so it can run either here (the sidebar) or in
 // `shelbi daemon`. Re-exported at the old path so existing callers don't churn.

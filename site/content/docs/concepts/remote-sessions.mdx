@@ -1,0 +1,97 @@
+---
+title: Remote sessions
+order: 19
+summary: Connect the desktop app or the TUI on this machine to Shelbi running on another machine, over your own SSH.
+---
+
+A **remote session** is a Shelbi project that lives on another machine (a
+devbox, a build server, a Mac mini in the closet) opened from the Shelbi on
+the machine in front of you. The project, its daemon, its orchestrator and
+its workspaces all keep running over there; you just look in and drive.
+
+This is different from [remote workspaces](/docs/concepts/workspaces), where
+*your* hub dispatches agents to slots on other machines. A remote session
+connects to a whole other Shelbi: its own hub, its own projects.
+
+## Connecting
+
+Open **Connect to Remote Session** from any of these:
+
+- the launch screen's **Connect to remote** button,
+- the **Shelbi** menu, **Connect to Remote Session…** (desktop),
+- the command palette (**Connect to Remote Session…**),
+- a terminal: [`shelbi remote connect <host> [project]`](/docs/cli/remote).
+
+It is the same two-step dialog wherever you start:
+
+1. **SSH host.** Type an SSH alias from your `~/.ssh/config` (`devbox`) or
+   `user@hostname`, then **Find Sessions**.
+2. **Choose session.** Shelbi signs in, shows the user it is **Connected as**,
+   and lists that machine's projects with their folders. Pick one and
+   **Connect**. **Change Host** goes back to step 1.
+
+Every project you connect to lands in **Recent remote sessions** on the launch
+screen, newest first, so next time it is one click. The list keeps the eight
+most recent, one entry per host, user and project.
+
+## What a remote session looks like
+
+Shelbi opens the other machine's own Shelbi for that project, running in a
+terminal over SSH (`ssh -t <host> shelbi --project <project>`). Everything
+you see is the remote Shelbi, so it always matches that machine's version and
+configuration.
+
+- In the **desktop app**, the session opens in its own window, with the host
+  and project in the title bar.
+- In the **TUI**, the remote Shelbi takes over the terminal. Quit it as usual
+  to come back.
+
+## When the connection drops
+
+Sessions on the other machine never depend on your connection: agents keep
+working when your Wi-Fi blinks or your laptop sleeps. If SSH drops, Shelbi
+shows "Reconnecting to *host*… (attempt N)" and tries again, quickly at
+first and then backing off, until the machine answers. You land back where you
+were.
+
+## SSH and credentials
+
+Shelbi uses your existing SSH setup and nothing else:
+
+- It runs your own `ssh`, so your keys, `ssh-agent`, `~/.ssh/config` aliases,
+  jump hosts and Tailscale all apply.
+- It **never asks for a password** and never stores credentials. SSH runs in
+  batch mode; a host that wants a password or an unknown passphrase fails
+  with a clear message instead of a prompt.
+- It never accepts a host key for you. Connect once with plain `ssh <host>`
+  in a terminal to check and accept a new machine's key.
+
+## The other machine's daemon
+
+Shelbi does not start or stop the other machine's daemon on its own. If Shelbi
+is installed there but not running, the dialog says so and offers
+**Start Shelbi**, which starts it the same way a client on that machine
+would. Stopping it is up to you, on that machine.
+
+## Requirements and errors
+
+The other machine needs Shelbi installed and at least one project. The dialog
+explains each thing that can go wrong:
+
+| Message | What to do |
+| --- | --- |
+| Couldn't connect to *host* | Check the name, your network, or VPN. `ssh <host>` in a terminal shows the same failure. |
+| Couldn't sign in to *host* | Load your key (`ssh-add`) or add it to the host's `authorized_keys`. Passwords aren't supported. |
+| *host*'s host key isn't trusted | Run `ssh <host>` once and accept the key. |
+| Shelbi isn't installed on *host* | Install Shelbi there. Shelbi looks on your login shell's `PATH`, then in `~/.shelbi/bin`. |
+| Shelbi on *host* is *X*, and this machine has *Y* | Update one so both share the same major and minor version (patch releases mix fine). |
+| Shelbi isn't running on *host* | Click **Start Shelbi**, or start it there yourself. |
+
+To see what a remote client will find on a machine, run
+[`shelbi remote list`](/docs/cli/remote) on it.
+
+## See also
+
+- [`shelbi remote`](/docs/cli/remote): what a machine reports to remote clients.
+- [Workspaces](/docs/concepts/workspaces): dispatching agents to other machines
+  from your own hub.
