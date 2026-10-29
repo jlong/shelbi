@@ -15,6 +15,7 @@ mod handlers;
 mod kanban;
 mod licenses;
 mod keymap;
+pub mod launch;
 mod machines;
 mod markdown;
 mod modal_form;
