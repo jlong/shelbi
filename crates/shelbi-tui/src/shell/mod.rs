@@ -2413,10 +2413,10 @@ impl ShellState {
         };
         if ret.about {
             let link = crate::overlay::about::Target::Link(shelbi_app::about::AboutLink::Acknowledgements);
-            self.overlay = Some(ActiveOverlay::About(crate::overlay::about::About::focused(
-                self.caps.truecolor,
-                link,
-            )));
+            self.overlay = Some(ActiveOverlay::About(
+                crate::overlay::about::About::focused(self.caps.truecolor, link)
+                    .with_icon(crate::overlay::about::configured_icon()),
+            ));
         }
         self.dirty = true;
     }

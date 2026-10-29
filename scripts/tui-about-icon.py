@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the TUI About screen's half-block app icon.
+"""Generate the TUI About screen's half-block app icons.
 
-Reads the desktop app icon's 1024px master (`desktop/assets/icon/
-shelbi-1024.png`, the only source of the artwork), crops it to the tile
+Reads each desktop app icon as the app draws it (`desktop/assets/icon/`:
+Command Grille's `command-grille-512.png`, rendered from its layered
+source, and Retro's 1024px master `retro-1024.png`), crops it to the tile
 (dropping the macOS padding and the soft shadow, which only waste cells in a
 terminal), box-filters it down to SIZE x SIZE pixels with premultiplied alpha,
-and writes `crates/shelbi-tui/src/overlay/about_icon.rs`: one RGBA value per
-pixel. The TUI draws two pixels per cell with `▀` (top in the foreground,
+and writes `crates/shelbi-tui/src/overlay/about_icon.rs`: a table per icon,
+one RGBA value per pixel. The TUI draws two pixels per cell with `▀` (top in the foreground,
 bottom in the background), so SIZE pixels square is SIZE columns by SIZE / 2
 rows, and blends the alpha over the overlay's fill as it draws.
 
@@ -14,8 +15,9 @@ Standard library only (a small PNG reader), so it runs anywhere:
 
     python3 scripts/tui-about-icon.py
 
-Rerun it whenever the master changes (see desktop/assets/icon/README.md).
-`--preview out.png` also writes the table scaled up, for checking by eye.
+`desktop/scripts/app-icon.sh` runs it after regenerating the icons (see
+desktop/assets/icon/README.md). `--preview out.png` also writes each table
+scaled up (`out-command-grille.png`, `out-retro.png`), for checking by eye.
 """
 
 import argparse
@@ -30,7 +32,12 @@ SIZE = 20
 TILE_ALPHA = 160
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MASTER = os.path.join(ROOT, "desktop", "assets", "icon", "shelbi-1024.png")
+ICONS = os.path.join(ROOT, "desktop", "assets", "icon")
+# (Rust name, preview suffix, source), in `desktop.app_icon`'s order.
+MASTERS = [
+    ("COMMAND_GRILLE", "command-grille", os.path.join(ICONS, "command-grille-512.png")),
+    ("RETRO", "retro", os.path.join(ICONS, "retro-1024.png")),
+]
 OUT = os.path.join(ROOT, "crates", "shelbi-tui", "src", "overlay", "about_icon.rs")
 
 
@@ -133,25 +140,27 @@ def downsample(rows, x0, y0, side, size):
     return out
 
 
-def write_rust(pixels, size):
+def write_rust(tables, size):
     lines = [
-        "//! The app icon as half-block pixel art, for the About screen: generated",
-        "//! by `scripts/tui-about-icon.py` from the desktop app icon's master",
-        "//! (`desktop/assets/icon/shelbi-1024.png`), cropped to the tile and",
-        f"//! box-filtered to {size} x {size}. Regenerate it, never edit it by hand.",
+        "//! The app icons as half-block pixel art, for the About screen: generated",
+        "//! by `scripts/tui-about-icon.py` from the desktop app's icons as it draws",
+        "//! them (`desktop/assets/icon/command-grille-512.png` and",
+        "//! `retro-1024.png`), cropped to the tile and box-filtered to",
+        f"//! {size} x {size}. Regenerate it, never edit it by hand.",
         "",
-        "/// The icon's width and height, in pixels (cells are one pixel wide and",
+        "/// The icons' width and height, in pixels (cells are one pixel wide and",
         "/// two tall).",
         f"pub const SIZE: usize = {size};",
         "",
-        "/// Row-major `[r, g, b, a]`, straight (not premultiplied) alpha.",
-        "#[rustfmt::skip]",
-        f"pub const PIXELS: [[u8; 4]; SIZE * SIZE] = [",
+        "/// An icon: row-major `[r, g, b, a]`, straight (not premultiplied) alpha.",
+        "pub type Pixels = [[u8; 4]; SIZE * SIZE];",
     ]
-    for row in pixels:
-        cells = " ".join(f"[{r},{g},{b},{a}]," for r, g, b, a in row)
-        lines.append(f"    {cells}")
-    lines.append("];")
+    for name, pixels in tables:
+        lines += ["", "#[rustfmt::skip]", f"pub const {name}: Pixels = ["]
+        for row in pixels:
+            cells = " ".join(f"[{r},{g},{b},{a}]," for r, g, b, a in row)
+            lines.append(f"    {cells}")
+        lines.append("];")
     open(OUT, "w").write("\n".join(lines) + "\n")
 
 
@@ -187,14 +196,17 @@ def main():
     args = parser.parse_args()
     if args.size % 2:
         sys.exit("--size must be even: a cell holds two pixels")
-    width, height, rows = read_png(MASTER)
-    x0, y0, side = tile_box(width, height, rows)
-    pixels = downsample(rows, x0, y0, side, args.size)
+    tables = []
+    for name, suffix, master in MASTERS:
+        width, height, rows = read_png(master)
+        x0, y0, side = tile_box(width, height, rows)
+        pixels = downsample(rows, x0, y0, side, args.size)
+        tables.append((name, pixels))
+        if args.preview:
+            stem, ext = os.path.splitext(args.preview)
+            write_preview(f"{stem}-{suffix}{ext or '.png'}", pixels)
     if not args.no_write:
-        write_rust(pixels, args.size)
-    if args.preview:
-        write_preview(args.preview, pixels)
-
+        write_rust(tables, args.size)
 
 if __name__ == "__main__":
     main()

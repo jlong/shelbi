@@ -178,7 +178,7 @@ pub use ssh_control::{
 };
 pub use user_config::{
     editor_display_name, load_user_config, resolve_editor, resolve_editor_source, save_user_config,
-    scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, DesktopConfig,
+    scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, AppIcon, DesktopConfig,
     DesktopNotifications, EditorSource, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };

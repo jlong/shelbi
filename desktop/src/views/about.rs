@@ -4,24 +4,24 @@
 //! asking again brings the open one to the front.
 //!
 //! About is a fixed 400 × 520 window with only the traffic lights (not
-//! resizable, so no zoom, and no minimize): the app icon at 112pt, the name
+//! resizable, so no zoom, and no minimize): the app icon at 112pt (the one
+//! `desktop.app_icon` chooses, following a change while open), the name
 //! and this build's version, the tagline, the project's links,
 //! Acknowledgements, and the copyright and license. Every link opens in the
 //! browser except Acknowledgements, which opens its window. ⌘W closes it.
 //! The words and links are [`shelbi_app::about`]'s, which the TUI's About
 //! overlay reads too.
 
-use std::sync::{Arc, LazyLock};
-
 use gpui::{
     div, img, prelude::*, px, App, Bounds, ClickEvent, Context, FocusHandle, FontWeight, Global,
-    Image, ImageFormat, SharedString, Stateful, Div, Subscription, TitlebarOptions, Window, WindowBounds,
+    SharedString, Stateful, Div, Subscription, TitlebarOptions, Window, WindowBounds,
     WindowHandle, WindowOptions,
 };
 
 use shelbi_app::about::{self, AboutLink};
 
 use crate::app::CloseWindow;
+use crate::app_icon::{self, AppIconSetting};
 use crate::platform::version::APP_VERSION;
 use crate::theme::style::{Type, Typography};
 use crate::theme::{self, Theme};
@@ -30,18 +30,9 @@ use crate::views::sidebar;
 
 /// The window's size (the frame's).
 pub const SIZE: (f32, f32) = (400.0, 520.0);
-/// The app icon's size.
+/// The app icon's size (drawn from a picture twice that, so it stays sharp
+/// on a Retina display: [`app_icon::about_image`]).
 pub const ICON: f32 = 112.0;
-
-/// The app icon at twice its 112pt, so it draws sharp on a Retina display:
-/// `assets/icon/shelbi-224.png`, cut from the committed 1024px master (see
-/// that folder's README).
-static ICON_IMAGE: LazyLock<Arc<Image>> = LazyLock::new(|| {
-    Arc::new(Image::from_bytes(
-        ImageFormat::Png,
-        include_bytes!("../../assets/icon/shelbi-224.png").to_vec(),
-    ))
-});
 
 /// The open About and Acknowledgements windows (a closed one's handle
 /// fails to update, so it opens anew).
@@ -160,6 +151,8 @@ pub fn heading_type<E: Styled>(el: E) -> E {
 pub struct AboutView {
     focus: FocusHandle,
     _appearance: Subscription,
+    /// Settings picked another app icon: show it.
+    _icon: Subscription,
 }
 
 impl AboutView {
@@ -170,6 +163,7 @@ impl AboutView {
         AboutView {
             focus,
             _appearance: theme::follow_system(window, cx),
+            _icon: cx.observe_global::<AppIconSetting>(|_, cx| cx.notify()),
         }
     }
 }
@@ -234,7 +228,7 @@ impl Render for AboutView {
             .bg(theme.canvas)
             .font_family(crate::theme::style::UI_FAMILY)
             .child(
-                img(ICON_IMAGE.clone())
+                img(app_icon::about_image(app_icon::current(cx)))
                     .debug_selector(|| "about-icon".into())
                     .size(px(ICON))
                     .flex_none(),
@@ -279,17 +273,6 @@ pub(crate) mod tests {
     fn click(cx: &mut VisualTestContext, selector: &'static str) {
         let bounds = cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} isn't drawn"));
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
-    }
-
-    /// The rendition is the master at twice the icon's size, with its
-    /// alpha (a PNG's IHDR: width, height, then RGBA's color type 6).
-    #[test]
-    fn the_icon_rendition_is_2x_with_alpha() {
-        let png = include_bytes!("../../assets/icon/shelbi-224.png");
-        let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
-        assert_eq!(&png[12..16], b"IHDR");
-        assert_eq!((be(16), be(20)), (2 * ICON as u32, 2 * ICON as u32));
-        assert_eq!(png[25], 6, "RGBA");
     }
 
     #[gpui::test]

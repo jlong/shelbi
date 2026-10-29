@@ -7,6 +7,7 @@
 //! module.
 
 mod app;
+mod app_icon;
 mod assets;
 #[cfg(feature = "bench")]
 mod bench;
@@ -246,6 +247,8 @@ fn main() {
             // follows it).
             gpui_kit::init(cx);
             theme::init(cx);
+            // `desktop.app_icon` in the Dock from the start.
+            app_icon::init(cx);
             theme::motion::sync_reduce_motion(cx);
             assets::load_fonts(cx);
             elements::terminal::TerminalSettings::init(cx);

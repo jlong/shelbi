@@ -73,6 +73,7 @@ desktop:
   window_opacity: 100                # percent, 30 to 100; below 100 the desktop shows through
   window_blur: 0                     # blur radius in points, 0 to 50, for what shows through
   contrast: 0                        # percent, 0 to 100; darker surfaces and brighter text (the reverse in light)
+  app_icon: command-grille           # or retro: the Dock icon while running, and About's (the TUI's too)
   notifications:                     # every kind is on unless switched off
     workspace_blocked: true          # an agent waits for input or a permission
     review_ready: true               # a task reaches the review column
@@ -92,6 +93,7 @@ desktop:
 | `desktop.window_opacity` | 100 | How opaque the windows' backgrounds are, in percent (30 to 100; lower values clamp to 30, and a fraction like `0.85` reads as 85). Only the surfaces (the main area, the sidebar, terminal backgrounds) go see-through: text, icons, borders, controls, cell colors and overlays stay opaque. Settings ▸ General's Window transparency slider writes it and applies it to every window as it moves. Reduce Transparency (System Settings ▸ Accessibility ▸ Display) keeps the windows opaque. |
 | `desktop.window_blur` | 0 | How much a translucent window blurs what shows through it: the window server's background blur radius in points (0 to 50), as Ghostty's `background-blur`. No effect at 100% opacity. Settings ▸ General's Background blur slider. |
 | `desktop.contrast` | 0 | How far apart the UI's surfaces and their text sit, in percent (0 to 100; higher values clamp to 100, and a fraction like `0.5` reads as 50). Raising it darkens the backgrounds and brightens text, icons and borders in the dark theme, and lightens the backgrounds and darkens text, icons and borders in the light one; accent and status colors keep their hue. Terminal colors don't change. Settings ▸ General's Contrast slider writes it (0 isn't written) and applies it to every window as it moves. See `docs/theme.md`, "Contrast". |
+| `desktop.app_icon` | `command-grille` | The app's icon: `command-grille` (the bundle's own, layered) or `retro`. The running app shows it in the Dock from launch and the moment Settings ▸ General's App icon tiles pick it (the pick is written, either one); About shows it, and so does the TUI's About. Finder, and the Dock before launch, show the bundle's Command Grille whatever it says. Any other value reads as unset. |
 | `desktop.notifications.*` | all on | Which system notifications are posted (only from the bundled app; an unbundled `cargo run` has no bundle id). |
 | `keys.yaml` | built in | Key bindings, shared with the TUI; the menus show them as key equivalents. Settings ▸ Keybindings edits it. |
 
@@ -192,7 +194,8 @@ desktop/
   macos/Info.plist     the unbundled binary's name (no CFBundleIdentifier: see the file)
   macos/Shelbi.app.plist  the .app bundle's Info.plist (bundle.sh fills in the version)
   scripts/bundle.sh    build, bundle, sign, notarize, staple, zip, sha256 (see Packaging)
-  assets/icon/         the app icon: the 1024px PNG master bundle.sh cuts into .icns (its only source; see its README)
+  scripts/app-icon.sh  compile the layered app icon and regenerate every picture cut from the icons (Xcode 26)
+  assets/icon/         the app icons: Command Grille's layered source and compile, Retro's master, their renditions (see its README)
   assets/icons/        vendored Heroicons + their LICENSE
   assets/fonts/        Geist (UI), Source Code Pro (terminal) and Geist Mono (terminal fallback), OFL; Symbols Nerd Font Mono (terminal icons); with licenses
   docs/gpui.md         the gpui channel: what is pinned, why, breakage log, build numbers
@@ -447,14 +450,16 @@ NOTARIZED`, or `UNSIGNED`):
   Credentials that are set but wrong fail the script rather than quietly
   producing an un-notarized build.
 
-`assets/icon/shelbi-1024.png` is the icon and its only source: the finished
-"Command Grille" artwork (raster, finished in Figma with its macOS mask,
-padding and shadow over transparent corners), committed as a 1024 x 1024 RGBA
-PNG. `bundle.sh` cuts it into the 16 to 512pt iconset at 1x and 2x with `sips`
-and compiles `Shelbi.icns` with `iconutil`, both part of macOS, and refuses a
-master that isn't 1024 x 1024 with alpha. Nothing renders or regenerates it.
-To change the icon, replace the PNG with a new 1024px transparent export of
-the Figma component; `assets/icon/README.md` has the source links and steps.
+The bundle's icon is Command Grille, a layered Icon Composer icon:
+`assets/icon/Shelbi.icon` (four SVG layers exported from Figma), compiled by
+`scripts/app-icon.sh` (Xcode 26's actool) into `assets/icon/compiled/`
+(`Assets.car`, the layered icon macOS 26 draws with live glass and the
+flattened renditions macOS 15 uses, and a fallback `Shelbi.icns`), which is
+committed. `bundle.sh` only copies the compiled files, so it needs no Xcode
+26, and refuses to bundle when the source changed since its compile. The
+running app wears the icon `desktop.app_icon` chooses (Settings ▸ General ▸
+App icon: Command Grille or Retro) in the Dock. `assets/icon/README.md` has
+the sources, the Figma links and the steps to change either icon.
 
 The release workflow (`.github/workflows/release.yml`, job `desktop-release`)
 runs the same script on every tag, with the certificate imported from
