@@ -33,6 +33,7 @@ use shelbi_app::board::{
     self as board_rules, card_branch, column_label, columns_from as kanban_columns_from,
     BoardRules,
 };
+use shelbi_app::board_search::{BoardSearch, SearchWorker};
 #[cfg(test)]
 use shelbi_app::board::resolve_task_status;
 use shelbi_core::{
@@ -231,6 +232,17 @@ pub struct KanbanApp {
     /// daemon-backed when `dev.daemon_mutations` is on, keeping the executor the
     /// single entry point for board moves.
     pub(crate) move_persister: Option<Arc<dyn MovePersister>>,
+    /// The board's text search (`/`): a GitHub issue search on a GitHub
+    /// board, a filter over the loaded cards otherwise. Shared with the
+    /// desktop board ([`shelbi_app::board_search`]).
+    pub(crate) search: BoardSearch,
+    /// Runs the GitHub searches off the UI thread; started on the first one.
+    search_worker: Option<SearchWorker>,
+    /// The search query is being typed (`/` until Enter or Esc): printable
+    /// keys edit it instead of driving the board.
+    pub search_editing: bool,
+    /// The card selected when the search started, put back when it's cleared.
+    pre_search_selection: Option<String>,
 }
 
 /// A [`TransitionRunner`] the background persistence threads can share.
@@ -500,6 +512,10 @@ impl KanbanApp {
             pending_moves: HashMap::new(),
             transition_runner: Arc::new(GitTransitionRunner),
             move_persister: None,
+            search: BoardSearch::new(),
+            search_worker: None,
+            search_editing: false,
+            pre_search_selection: None,
         }
     }
 
@@ -738,6 +754,7 @@ impl KanbanApp {
             .iter()
             .filter(|tf| self.task_matches_filter(tf))
             .filter(|tf| self.task_belongs_to(&tf.task, ac))
+            .filter(|tf| self.task_matches_search(tf))
             .collect();
         // Done shows most-recently-completed first; other columns keep their
         // priority order (the natural order of `self.tasks`). Shared rule.
@@ -796,6 +813,17 @@ impl KanbanApp {
             None => true,
             Some(f) => f.matches(tf.task.assigned_to.as_deref()),
         }
+    }
+
+    /// True when `tf` shows under the text search (every card with no query):
+    /// GitHub's matches once they land, else the query over the card's title,
+    /// id and branch ([`BoardSearch::shows`]).
+    fn task_matches_search(&self, tf: &IssueFile) -> bool {
+        if !self.search.is_active() {
+            return true;
+        }
+        let branch = card_branch(&tf.task, &self.workflows, self.task_workflow_name(&tf.task));
+        self.search.shows(&tf.task.title, &tf.task.id, branch.as_deref())
     }
 
     /// Snapshot of every task's column, for the blocked derivation. Built
@@ -859,12 +887,14 @@ impl KanbanApp {
                 self.display_name = p.display_name;
                 self.workspaces = p.workspaces;
                 self.ownership = p.ownership;
+                self.search.set_remote(p.remote_search, Instant::now());
             }
             None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
                 self.display_name = None;
                 self.workspaces = Vec::new();
                 self.ownership = OwnershipGate::Unrestricted;
+                self.search.set_remote(false, Instant::now());
             }
         }
 
@@ -963,20 +993,121 @@ impl KanbanApp {
     /// the first done-history page and any user-paged extras are merged on top.
     /// Deduped by id (open wins) so the local `file_system` backend, whose open
     /// board already returns the full board, is unaffected.
+    ///
+    /// An active search's hits the board hasn't loaded (GitHub matches beyond
+    /// the loaded done page, say) are merged last, the board's copy winning.
     fn rebuild_tasks(&mut self) {
         self.tasks = board_rules::merge_board(
             &self.open_tasks,
             &self.closed_first_page,
             &self.closed_more,
         );
+        let hits = self.search.hits();
+        if !hits.is_empty() {
+            let mut seen: HashSet<String> = self.tasks.iter().map(|tf| tf.task.id.clone()).collect();
+            let extra: Vec<IssueFile> = hits
+                .iter()
+                .filter(|tf| seen.insert(tf.task.id.clone()))
+                .cloned()
+                .collect();
+            self.tasks.extend(extra);
+        }
     }
 
-    /// Whether a "load more" of the terminal history is available — the on-demand
-    /// closed page reported a next cursor. Drives both the rendered "load more"
-    /// row in the done column and whether [`load_more_done`](Self::load_more_done)
+    /// Whether the done column offers "load more": more terminal history (the
+    /// on-demand closed page reported a next cursor), or, while a GitHub
+    /// search's results show, another page of them. Drives both the rendered
+    /// "load more" row and whether [`load_more_done`](Self::load_more_done)
     /// does anything.
     pub fn has_more_done(&self) -> bool {
+        if self.search.showing_results() {
+            return self.search.status().is_some_and(|s| s.has_more);
+        }
         self.closed_next_cursor.is_some()
+    }
+
+    // ---- text search ------------------------------------------------------
+
+    /// Start typing a search query (`/`).
+    pub fn begin_search(&mut self) {
+        self.search_editing = true;
+    }
+
+    /// Stop typing the query, keeping it (Enter): the keys drive the board
+    /// again, over the cards the search left.
+    pub fn end_search_editing(&mut self) {
+        self.search_editing = false;
+    }
+
+    /// Set the search query. The board shows the matches as the query
+    /// changes (a GitHub search goes out after a pause in typing; see
+    /// [`poll_search`](Self::poll_search)). Starting a search remembers the
+    /// selected card and clearing it puts that back; while it's active a
+    /// selection that drops out lands on the first match.
+    pub fn set_search(&mut self, query: &str) {
+        let was_active = self.search.is_active();
+        if !was_active {
+            self.pre_search_selection = self.selected_task().map(|tf| tf.task.id.clone());
+        }
+        if !self.search.set_query(query, Instant::now()) {
+            return;
+        }
+        self.rebuild_tasks();
+        if was_active && !self.search.is_active() {
+            if let Some(id) = self.pre_search_selection.take() {
+                self.select_task(&id);
+            }
+            self.clamp_selection();
+            return;
+        }
+        self.select_first_match();
+    }
+
+    /// Clear the search and stop typing it (Esc).
+    pub fn clear_search(&mut self) {
+        self.search_editing = false;
+        self.set_search("");
+    }
+
+    /// Put the selection on card `id` when it's on the board.
+    fn select_task(&mut self, id: &str) {
+        for col in 0..self.all_columns.len() {
+            if let Some(row) = self.column_tasks(col).iter().position(|tf| tf.task.id == id) {
+                self.selected_column = col;
+                self.selected_row = row;
+                return;
+            }
+        }
+    }
+
+    /// Keep the selection on a card: when the selected one dropped out of
+    /// the search, the first card left.
+    fn select_first_match(&mut self) {
+        self.clamp_selection();
+        if self.selected_task().is_none() {
+            if let Some(col) = (0..self.all_columns.len()).find(|&c| !self.column_tasks(c).is_empty()) {
+                self.selected_column = col;
+                self.selected_row = 0;
+            }
+        }
+    }
+
+    /// Send the GitHub search that's due and fold in the answers: the event
+    /// loop's per-tick call. True when the board changed (redraw). Never
+    /// blocks; a local board never starts the worker.
+    pub fn poll_search(&mut self) -> bool {
+        if self.search.is_due() && self.search_worker.is_none() {
+            self.search_worker = Some(SearchWorker::github(self.project_name.clone()));
+        }
+        let Some(worker) = &self.search_worker else {
+            return false;
+        };
+        if !self.search.pump(worker, Instant::now()) {
+            return false;
+        }
+        self.rebuild_tasks();
+        self.select_first_match();
+        true
     }
 
     /// Fetch the next page of terminal `done`/`canceled` history and append it —
@@ -986,6 +1117,16 @@ impl KanbanApp {
     /// keeps them, then merged into the board immediately. A no-op when no more
     /// history is available.
     pub fn load_more_done(&mut self) {
+        // While a GitHub search's results show, "load more" pages them.
+        if self.search.showing_results() {
+            if let Some(req) = self.search.load_more() {
+                let project = self.project_name.clone();
+                self.search_worker
+                    .get_or_insert_with(|| SearchWorker::github(project))
+                    .send(req);
+            }
+            return;
+        }
         let Some(cursor) = self.closed_next_cursor.clone() else {
             return;
         };
@@ -2010,6 +2151,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let color = if stale { palette().ansi_yellow } else { palette().muted };
         left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
     }
+    left_spans.extend(search_spans(app));
     f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
 
     if let Some(area) = workflow_area {
@@ -2045,6 +2187,37 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     } else {
         app.filter_chip_hit = None;
     }
+}
+
+/// The title row's search: `/query` (with a cursor while it's typed), a
+/// quiet `…` while a GitHub search is on its way, and the match count or the
+/// "showing local results" notice ([`shelbi_app::board_search::SearchStatus`]).
+/// Empty with no search.
+fn search_spans(app: &KanbanApp) -> Vec<Span<'static>> {
+    if !app.search_editing && !app.search.is_active() {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::styled(
+        format!("   /{}", app.search.query()),
+        Style::default()
+            .fg(palette().ansi_cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.search_editing {
+        spans.push(Span::styled("▏", Style::default().fg(palette().ansi_cyan)));
+    }
+    if let Some(status) = app.search.status() {
+        if status.searching {
+            spans.push(Span::styled(" …", Style::default().fg(palette().muted)));
+        }
+        if let Some(label) = status.label() {
+            spans.push(Span::styled(
+                format!("  {label}"),
+                Style::default().fg(palette().muted),
+            ));
+        }
+    }
+    spans
 }
 
 /// Single-line label shown in the right edge of the title bar. Leading
@@ -2563,7 +2736,7 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
     let style = app.display_style();
     let fc = |c| format_chord_or_unbound(c, style);
     let mut text = format!(
-        "  {}/{} col   {}/{} row   {} open   {}/{} move col   {}/{} reorder   {} workflow   f filter   {} refresh",
+        "  {}/{} col   {}/{} row   {} open   {}/{} move col   {}/{} reorder   {} workflow   f filter   / search   {} refresh",
         fc(km.kanban.first_chord_for(KanbanAction::NavLeft)),
         fc(km.kanban.first_chord_for(KanbanAction::NavRight)),
         fc(km.kanban.first_chord_for(KanbanAction::NavDown)),
@@ -3514,6 +3687,63 @@ mod tests {
             .iter()
             .map(|tf| tf.task.id.clone())
             .collect()
+    }
+
+    /// On a GitHub board the search's matches replace the loaded cards, a
+    /// match beyond the loaded done page included; "load more" pages them;
+    /// clearing puts the board back with its history cursor and selection.
+    #[test]
+    fn a_github_search_shows_matches_beyond_the_loaded_board() {
+        use shelbi_app::board_search::{SearchPage, SearchResponse, DEBOUNCE};
+        let mut app = KanbanApp::new("demo");
+        let mut data = warm_board(vec![
+            task_file("a", Column::from_status_id("todo"), 0, "2026-06-20T10:00:00Z"),
+            task_file("b", Column::from_status_id("todo"), 1, "2026-06-20T10:00:00Z"),
+        ]);
+        data.project = Some(shelbi_app::board::BoardProject {
+            default_workflow_name: DEFAULT_WORKFLOW_NAME.into(),
+            display_name: None,
+            workspaces: Vec::new(),
+            ownership: OwnershipGate::Unrestricted,
+            remote_search: true,
+        });
+        app.apply_board_data(data);
+        app.apply_closed_page(Some(closed(
+            vec![task_file("d1", Column::done(), 0, "2026-06-20T10:00:00Z")],
+            Some("PAGE2"),
+        )));
+        let todo = app.all_columns.iter().position(|c| c.status_id == "todo").unwrap();
+        let done = app.all_columns.iter().position(|c| c.status_id == "done").unwrap();
+        app.selected_column = todo;
+        app.selected_row = 1;
+
+        app.set_search("zz");
+        assert!(app.search.status().unwrap().searching);
+        let t0 = Instant::now();
+        let req = app.search.poll(t0 + DEBOUNCE).expect("due after the pause");
+        app.search.apply(
+            SearchResponse {
+                request: req,
+                result: Ok(SearchPage {
+                    issues: vec![
+                        task_file("b", Column::from_status_id("todo"), 1, "2026-06-20T10:00:00Z"),
+                        task_file("old", Column::done(), 0, "2026-01-01T10:00:00Z"),
+                    ],
+                    total: 40,
+                }),
+            },
+            t0 + DEBOUNCE,
+        );
+        app.rebuild_tasks();
+        assert_eq!(ids_in(&app, todo), ["b"]);
+        assert_eq!(ids_in(&app, done), ["old"], "a match beyond the loaded page");
+        assert!(app.has_more_done(), "load more pages the results");
+
+        app.clear_search();
+        assert_eq!(ids_in(&app, todo), ["a", "b"]);
+        assert_eq!(ids_in(&app, done), ["d1"]);
+        assert_eq!(app.closed_next_cursor.as_deref(), Some("PAGE2"));
+        assert_eq!(app.selected_task().map(|tf| tf.task.id.as_str()), Some("b"));
     }
 
     #[test]
@@ -5241,6 +5471,43 @@ transitions:
         assert!(!title.contains("board"), "a local board shows no status: {title:?}");
     }
 
+    /// The title row carries the search: `/query` with a cursor while it's
+    /// typed, and the "showing local results" notice when GitHub's search
+    /// is unavailable.
+    #[test]
+    fn the_title_row_shows_the_search() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_app::board_search::{SearchFailure, SearchResponse, DEBOUNCE};
+        let title = |app: &mut KanbanApp| -> String {
+            let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
+            term.draw(|f| render_full(f, app, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.width).map(|x| buf[(x, 0)].symbol().to_string()).collect()
+        };
+        let mut app = KanbanApp::new("demo");
+        assert!(!title(&mut app).contains('/'));
+        app.begin_search();
+        app.set_search("pal");
+        assert!(title(&mut app).contains("/pal▏"), "{}", title(&mut app));
+
+        let t0 = Instant::now();
+        app.search.set_remote(true, t0);
+        app.set_search("palette");
+        app.end_search_editing();
+        assert!(title(&mut app).contains("/palette …"), "searching: {}", title(&mut app));
+        let later = Instant::now() + DEBOUNCE;
+        let req = app.search.poll(later).unwrap();
+        app.search.apply(
+            SearchResponse {
+                request: req,
+                result: Err(SearchFailure::RateLimited),
+            },
+            later,
+        );
+        let t = title(&mut app);
+        assert!(t.contains("/palette  showing local results"), "{t}");
+    }
+
     /// A body shorter than the popover viewport clamps to zero — no
     /// scrolling into blank space below a short note.
     #[test]
@@ -5310,7 +5577,7 @@ transitions:
         assert!(
             joined.contains(
                 "h/l col   j/k row   Enter open   Shift+h/Shift+l move col   \
-                 Shift+k/Shift+j reorder   Tab workflow   f filter   r refresh"
+                 Shift+k/Shift+j reorder   Tab workflow   f filter   / search   r refresh"
             ),
             "footer mismatch in:\n{joined}"
         );

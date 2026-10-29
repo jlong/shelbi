@@ -22,6 +22,7 @@ use shelbi_state::{
 };
 
 use crate::board::{self, BoardInput, BoardRules, WorkspaceFilter};
+use crate::board_search::{BoardSearch, SearchStatus};
 use crate::nav::View;
 use crate::theme::Tone;
 
@@ -720,8 +721,12 @@ pub struct IssuesModel {
     /// True until the first terminal-history page lands: the done column is
     /// still filling (the open board never waits on it).
     pub done_loading: bool,
-    /// More terminal history is available behind "load more".
+    /// The done column offers "load more": more terminal history, or, while
+    /// a remote search's results show, more of them.
     pub has_more_done: bool,
+    /// The text search's state for the search box (searching, the match
+    /// count, the local-results notice), or `None` with no query.
+    pub search: Option<SearchStatus>,
     /// Whether cards carry their workflow-name badge (more than one workflow
     /// loaded and no workflow filter).
     pub show_workflow_badges: bool,
@@ -838,6 +843,18 @@ impl IssuesModel {
     /// workspace and workflow, in board order (priority, or newest-first in a
     /// done column).
     pub fn build(input: &BoardInput, filters: &BoardFilters) -> IssuesModel {
+        Self::build_searched(input, filters, &BoardSearch::local(&filters.search))
+    }
+
+    /// [`IssuesModel::build`] under a [`BoardSearch`]: which cards show is the
+    /// search's call ([`BoardSearch::shows`]) rather than a local filter of
+    /// `filters.search`. While the tracker's results show, "load more" pages
+    /// them and the done column isn't waiting on history.
+    pub fn build_searched(
+        input: &BoardInput,
+        filters: &BoardFilters,
+        search: &BoardSearch,
+    ) -> IssuesModel {
         let rules = input.rules();
         let tasks = input.tasks();
         let by_id: HashMap<String, Column> = tasks
@@ -870,9 +887,7 @@ impl IssuesModel {
                 let cards: Vec<IssueCard> = members
                     .into_iter()
                     .map(|tf| card_for(tf, &by_id, &rules, &def.status_id, &input.ownership))
-                    .filter(|c| {
-                        board::card_matches_search(&c.title, &c.id, c.branch.as_deref(), &filters.search)
-                    })
+                    .filter(|c| search.shows(&c.title, &c.id, c.branch.as_deref()))
                     .collect();
                 let collapsed = input
                     .expansion(workflow_filter, &def.status_id)
@@ -893,8 +908,12 @@ impl IssuesModel {
             loading: input.loading,
             banner: input.banner.clone(),
             error: input.error.clone(),
-            done_loading: !input.closed_loaded,
-            has_more_done: input.closed_next_cursor.is_some(),
+            done_loading: !input.closed_loaded && !search.showing_results(),
+            has_more_done: match search.status() {
+                Some(status) if search.showing_results() => status.has_more,
+                _ => input.closed_next_cursor.is_some(),
+            },
+            search: search.status(),
             show_workflow_badges: board::show_card_workflow_label(
                 input.workflows.len(),
                 filters.workflow.is_some(),

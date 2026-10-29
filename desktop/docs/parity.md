@@ -67,10 +67,6 @@ paths on every `cargo test`.
 
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
-- **Board search** (`dt-issues-toolbar`): desktop only. The toolbar's
-  Search field (`/` focuses it, Esc clears it) narrows the cards by title,
-  id and branch, on top of the workflow and workspace filters; the TUI board
-  has the two filters only.
 - **Native menus** with `keys.yaml` key equivalents, and **system
   notifications**: desktop only. Every menu item runs a registry command
   through the same dispatch as the palette.
@@ -430,7 +426,8 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `banner` | equivalent `board_banner` in title row, muted while warm, yellow when stale or cached with no daemon (`kanban.rs` `render_title`) | muted text in header (`views/issues.rs` `render_header`) |
 | `error` | equivalent: refresh error written to `status_line` (`kanban.rs` `fail_refresh`), shown in footer (`render_footer`) | footer status when no newer status (`views/issues.rs` `render_footer`) |
 | `done_loading` | not shown: no equivalent; done column shows "(empty)" until the closed page lands | "Loading history…" row in done column (`views/issues.rs` `render_column`) |
-| `has_more_done` | equivalent `has_more_done()`: "↓ load more (m)" row in done column (`kanban.rs` `render_column`) | "Load more (m)" clickable row in done column (`views/issues.rs` `render_column`) |
+| `has_more_done` | equivalent `has_more_done()`: "↓ load more (m)" row in done column, paging GitHub search results while they show (`kanban.rs` `render_column`, `load_more_done`) | "Load more (m)" clickable row in done column, paging GitHub search results while they show (`views/issues.rs` `render_column`, `load_more`) |
+| `search` | equivalent `app.search.status()`: `/query` in the title row, a muted `…` while a GitHub search is on its way, then the match count or "showing local results" (`kanban.rs` `search_spans`) | a spinner glyph in the toolbar's search field while a GitHub search is on its way, and the match count or "showing local results" beside it (`views/issues.rs` `render_search`, `render_header`) |
 | `show_workflow_badges` | equivalent computed locally via `show_card_workflow_label`, gates card badge (`kanban.rs` `render_columns` / `card_meta_line`) | not shown: the desktop card always carries its workflow badge, as the Figma card draws it (`views/issues.rs` `card_meta`) |
 | `workflow_filter_label` | equivalent own text " Workflow: All ▾" chip, cyan when set, hidden unless more than one workflow (`kanban.rs` `workflow_chip_text` / `render_title`) | the workflow chip's label while a workflow filter is set, in the Button's Select style; unfiltered the chip reads `Workflows` (the Figma Header), always shown (`views/issues.rs` `render_header`) |
 | `workspace_filter_label` | equivalent own text " Workspace: All ▾" chip, cyan when set (`kanban.rs` `filter_chip_text` / `render_title`) | the workspace chip's label while a workspace filter is set, in the Select style; unfiltered the chip reads `Workspaces` (`views/issues.rs` `render_header`) |
@@ -482,7 +479,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 |---|---|---|
 | `workflow` | equivalent `app.workflow_filter`: narrows columns/cards, chip text + cyan highlight (`kanban.rs` `task_belongs_to`, `workflow_chip_text`) | narrows model in `IssuesModel::build`; surfaces as chip label and dropdown cursor (`views/board_state.rs`) |
 | `workspace` | equivalent `app.workspace_filter`: filters cards, chip text + cyan highlight (`kanban.rs` `task_matches_filter`, `filter_chip_text`) | filters model in `IssuesModel::build`; chip label, dropdown cursor, persisted (`views/board_state.rs`) |
-| `search` | not shown: the TUI board has no text search (desktop only, see Platform differences) | the toolbar's Search field; narrows cards in `IssuesModel::build` by title, id and branch (`board.rs` `card_matches_search`), `/` focuses it, Esc clears it (`views/issues.rs` `render_search`, `views/board_state.rs` `set_search`) |
+| `search` | equivalent `app.search` (`BoardSearch`): `/` types the query in the title row, Enter keeps it, Esc clears it; a GitHub search on a GitHub board, else a filter by title, id and branch (`kanban.rs` `set_search`, `task_matches_search`; `handlers/kanban.rs` `handle_search_key`) | the toolbar's Search field; the same `BoardSearch` in `IssuesModel::build_searched` (`board_search.rs`), `/` focuses it, Esc clears it (`views/issues.rs` `render_search`, `views/board_state.rs` `set_search`) |
 
 ### `TaskDetailModel`
 | Field | TUI | Desktop |

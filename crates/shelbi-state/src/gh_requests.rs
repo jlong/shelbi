@@ -67,6 +67,7 @@ pub fn budget_tag(budget: Budget) -> &'static str {
     match budget {
         Budget::Graphql => "graphql",
         Budget::Rest => "rest",
+        Budget::Search => "search",
     }
 }
 
@@ -76,6 +77,7 @@ fn parse_budget(tag: &str) -> Option<Budget> {
     match tag {
         "graphql" => Some(Budget::Graphql),
         "rest" => Some(Budget::Rest),
+        "search" => Some(Budget::Search),
         _ => None,
     }
 }
@@ -415,6 +417,7 @@ pub fn summarize(entries: &[RequestEntry], window: Duration) -> Vec<BudgetRate> 
     rates.sort_by_key(|r| match r.budget {
         Budget::Graphql => 0,
         Budget::Rest => 1,
+        Budget::Search => 2,
     });
     rates
 }

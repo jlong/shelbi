@@ -84,6 +84,10 @@ pub use issue_auth::{
     resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
 };
 pub use github_store::GitHubStore;
+pub use github_store::{
+    search_issues, IssueSearchError, IssueSearchPage, ISSUE_SEARCH_MAX_RESULTS,
+    ISSUE_SEARCH_PAGE_SIZE,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use github_store::{clear_test_gh_runner, set_test_gh_runner, set_test_park_side_effects};
 pub use issue_migrate::{
