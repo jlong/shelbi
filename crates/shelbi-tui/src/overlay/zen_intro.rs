@@ -44,24 +44,18 @@ pub fn step_intro(state: &mut IntroState, key: KeyEvent) -> IntroOutcome {
     }
 }
 
-/// Paint the intro dialog. It fills the whole pane it's given — in the tmux
-/// runtime that pane is the palette's `tmux display-popup`, which already draws
-/// its own border; in the single-process TUI the caller gives it a centered
-/// overlay [`Rect`] over the dimmed main area. Either way the widget
-/// deliberately draws *no* border of its own (a second one would double up; see
-/// the task "zen-intro-double-border"). The " Enable Zen Mode? " title is a
-/// plain in-content heading instead of a border title. Buttons render at the
-/// bottom in the same Cancel-left / primary-right order the existing Quit
-/// popovers use.
+/// Paint the intro dialog into `area` (a centered overlay [`Rect`] over the
+/// dimmed app), in the dialogs' shared border ([`super::dialog_frame`]).
+/// The " Enable Zen Mode? " title is a plain in-content heading rather than
+/// a border title. Buttons render at the bottom in the same Cancel-left /
+/// primary-right order the existing Quit popovers use.
 pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
-    // Clear the whole pane so whatever is behind us doesn't bleed through around
-    // the copy, then inset the content (2 cols / 1 row) so the text isn't
-    // jammed against the frame.
+    // Clear the whole pane so whatever is behind us doesn't bleed through
+    // around the copy, then lay the content out inside the border.
     f.render_widget(Clear, area);
+    let content = super::dialog_frame(f.buffer_mut(), area, None, None);
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .horizontal_margin(2)
-        .vertical_margin(1)
         .constraints([
             Constraint::Length(1), // heading (in-content title)
             Constraint::Length(1), // blank
@@ -70,7 +64,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
             Constraint::Length(1), // blank
             Constraint::Length(1), // buttons
         ])
-        .split(area);
+        .split(content);
 
     let heading = Paragraph::new(Line::from(Span::styled(
         shared::HEADING,
@@ -327,13 +321,9 @@ mod tests {
             dumped.contains("[ ] Don't show this again"),
             "default state must render unchecked checkbox:\n{dumped}",
         );
-        for glyph in ['┌', '┐', '└', '┘', '│', '─'] {
-            assert!(
-                !dumped.contains(glyph),
-                "widget drew its own border glyph {glyph:?}; only the surrounding \
-                 popup/overlay frame should frame the dialog:\n{dumped}",
-            );
-        }
+        // The dialogs' shared border frames it, once.
+        crate::overlay::assert_dialog_border(&buf, buf.area).unwrap();
+        assert_eq!(dumped.matches('┌').count(), 1, "one border:\n{dumped}");
     }
 
     #[test]

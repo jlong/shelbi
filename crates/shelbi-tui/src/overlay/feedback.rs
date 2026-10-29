@@ -9,9 +9,8 @@
 //! shell a [`Submission`] to send off the UI thread. The shell hands the
 //! answer back ([`FeedbackDialog::finished`]).
 //!
-//! The panel is a filled box with a `▄` row above and a `▀` row below (the
-//! glyphs in [`Theme::dialog`] over the terminal's background), like the
-//! sidebar's search box at dialog size. Inside, in the desktop's order: the
+//! The panel is filled with [`Theme::dialog`] in the dialogs' muted
+//! single-line border ([`super::dialog_frame`]). Inside, in the desktop's order: the
 //! megaphone on its tinted badge and "Contact Us", centered; Name and Email
 //! (placeholders, no labels, as the desktop's); the kind's segmented control
 //! (Bug Report, Feature Request, Other); Message; the "Include system info"
@@ -19,17 +18,17 @@
 //! swaps in the thank-you: the heart, "Thank you!", its line, and Close.
 //!
 //! ```text
-//!  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-//!                    ▄▄▄▄
-//!                     📣
-//!                    ▀▀▀▀
-//!                 Contact Us
-//!
-//!    ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-//!     Ada
-//!    ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-//!    ...
-//!  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//!  ┌──────────────────────────────────────┐
+//!  │                 ▄▄▄▄                 │
+//!  │                  📣                  │
+//!  │                 ▀▀▀▀                 │
+//!  │              Contact Us              │
+//!  │                                      │
+//!  │ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄ │
+//!  │  Ada                                 │
+//!  │ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀ │
+//!  │ ...                                  │
+//!  └──────────────────────────────────────┘
 //! ```
 //!
 //! A short terminal drops the badge, then the panel's padding rows, and
@@ -50,7 +49,6 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
     Frame,
 };
 use shelbi_app::feedback::form::{self, Action, FeedbackForm, Focus, Key};
@@ -69,8 +67,9 @@ use crate::theme::palette;
 
 /// The panel's width (the desktop's 440pt), less on a narrower terminal.
 pub const PANEL_W: u16 = 56;
-/// The columns between the panel's edge and its content.
-const PAD_X: u16 = 2;
+/// The columns between the panel's edge and its content: the border and
+/// the dialogs' padding inside it.
+const PAD_X: u16 = 1 + super::DIALOG_PAD_X;
 /// The Message field's height in lines: it grows from the first to the
 /// second with its text, then scrolls (the desktop's).
 const MESSAGE_LINES: (usize, usize) = (5, 9);
@@ -297,12 +296,8 @@ impl FeedbackDialog {
         if rect.width < 8 || rect.height < 4 {
             return;
         }
-        let fill = palette().dialog;
-        let cap = |glyph: &str| Paragraph::new(Line::from(Span::styled(glyph.repeat(rect.width as usize), Style::default().fg(fill))));
-        f.render_widget(cap(BLEED_ABOVE), Rect { height: 1, ..rect });
-        f.render_widget(cap(BLEED_BELOW), Rect { y: rect.bottom() - 1, height: 1, ..rect });
+        super::dialog_frame(f.buffer_mut(), rect, Some(palette().dialog), None);
         let body = Rect { y: rect.y + 1, height: rect.height - 2, ..rect };
-        f.render_widget(Block::default().style(Style::default().bg(fill)), body);
         let (fit, _) = self.fit(rect.width, rect.height);
         let pad = fit.pad_y().min(body.height / 2);
         let content = Rect {
@@ -510,7 +505,7 @@ fn content_width(panel_w: u16) -> u16 {
     panel_w.saturating_sub(2 * PAD_X).max(1)
 }
 
-/// The caps, the padding rows, and `lines` of content.
+/// The border's rows, the padding rows, and `lines` of content.
 fn panel_height(lines: usize, fit: Fit) -> u16 {
     (lines as u16).saturating_add(2 + 2 * fit.pad_y())
 }

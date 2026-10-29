@@ -127,7 +127,7 @@ fn button_row(row: Rect) -> (Rect, Rect) {
 
 /// Map a click at `(col, row)` to the button under it, or `None` for dead space.
 fn hit_test(area: Rect, col: u16, row: u16) -> Option<Hit> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = crate::overlay::dialog_content(area);
     let rows = body_rows(inner);
     let (reject, cancel) = button_row(rows[3]);
     if within(reject, col, row) {
@@ -145,12 +145,7 @@ fn within(rect: Rect, col: u16, row: u16) -> bool {
 
 fn render(f: &mut Frame, area: Rect, prompt: &RejectPrompt) {
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_red))
-        .title(format!(" {} ", shared::TITLE));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), area, None, Some(shared::TITLE));
 
     // label / text area (grows to fill) / spacer / buttons / hint.
     let rows = body_rows(inner);
@@ -516,7 +511,7 @@ mod tests {
             width: 60,
             height: 16,
         };
-        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let inner = crate::overlay::dialog_content(area);
         let rows = body_rows(inner);
         let (reject, cancel) = button_row(rows[3]);
 
@@ -542,7 +537,7 @@ mod tests {
             width: 60,
             height: 16,
         };
-        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let inner = crate::overlay::dialog_content(area);
         let rows = body_rows(inner);
         let (reject, cancel) = button_row(rows[3]);
 
@@ -587,7 +582,7 @@ mod tests {
             width: w,
             height: h,
         };
-        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let inner = crate::overlay::dialog_content(area);
         let rows = body_rows(inner);
         let (reject, _cancel) = button_row(rows[3]);
         let drawn: String = (0..reject.width)

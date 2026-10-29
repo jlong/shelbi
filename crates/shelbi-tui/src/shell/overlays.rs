@@ -720,6 +720,45 @@ mod tests {
         }
     }
 
+    /// Every overlay's name, by an exhaustive match: a new variant fails to
+    /// compile here until it's named, and [`every_overlay`] must then carry
+    /// it for the border check below to pass.
+    fn overlay_name(ov: &ActiveOverlay) -> &'static str {
+        match ov {
+            ActiveOverlay::Palette(_) => "palette",
+            ActiveOverlay::ReviewConfirm { .. } => "review-confirm",
+            ActiveOverlay::RejectReason { .. } => "reject-reason",
+            ActiveOverlay::ErrorLog { .. } => "error-log",
+            ActiveOverlay::ZenIntro { .. } => "zen-intro",
+            ActiveOverlay::AddProject { .. } => "add-project",
+            ActiveOverlay::About(_) => "about",
+            ActiveOverlay::Feedback(_) => "feedback",
+            ActiveOverlay::TaskDescription { .. } => "task-description",
+        }
+    }
+
+    /// Every modal wears the dialogs' one border (`overlay::dialog_frame`):
+    /// the muted single line, at the window sizes the dialogs are fitted to.
+    #[test]
+    fn every_overlay_draws_the_shared_dialog_border() {
+        let names: std::collections::BTreeSet<_> = every_overlay().iter().map(overlay_name).collect();
+        assert_eq!(names.len(), 9, "every variant is in every_overlay(): {names:?}");
+        for (w, h) in [(100, 30), (60, 20), (120, 40)] {
+            for mut ov in every_overlay() {
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                let mut rect = Rect::default();
+                term.draw(|f| {
+                    rect = ov.rect(f.area());
+                    ov.render(f, f.area());
+                })
+                .unwrap();
+                let name = overlay_name(&ov);
+                crate::overlay::assert_dialog_border(term.backend().buffer(), rect)
+                    .unwrap_or_else(|e| panic!("{name} at {w}x{h}: {e}"));
+            }
+        }
+    }
+
     #[test]
     fn palette_selected_row_highlight_holds_only_palette_text() {
         use shelbi_palette::{Entry, EntryKind};

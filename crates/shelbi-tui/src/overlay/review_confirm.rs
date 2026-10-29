@@ -23,7 +23,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
 use crate::theme::palette;
@@ -170,7 +170,7 @@ fn button_row(inner: Rect, y: u16) -> (Rect, Rect) {
 /// space. `area` is the whole popup area (the border is drawn on it; geometry is
 /// computed against its inner rect).
 fn hit_test(dialog: &Dialog, area: Rect, col: u16, row: u16) -> Option<Hit> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = crate::overlay::dialog_content(area);
     let l = layout(inner, dialog);
     if within(l.load, col, row) {
         return Some(Hit::Load);
@@ -192,12 +192,7 @@ fn within(rect: Rect, col: u16, row: u16) -> bool {
 
 fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_cyan))
-        .title(format!(" {} ", shared::TITLE));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), area, None, Some(shared::TITLE));
 
     let title_line = Line::from(Span::styled(
         dialog.inner.title().to_string(),
@@ -465,7 +460,7 @@ mod tests {
             width: 60,
             height: 12,
         };
-        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let inner = crate::overlay::dialog_content(area);
         let l = layout(inner, &dialog(2));
 
         // Clicking the second slot row selects it (Continue), so Load loads it.

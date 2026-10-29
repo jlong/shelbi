@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph},
     Frame,
 };
 use shelbi_palette::{Entry, EntryKind};
@@ -140,14 +140,9 @@ pub struct PaletteView<'a> {
 /// computes). The rect is the panel: a solid `palette().search` fill wrapped
 /// in a muted single-line border, content inset one column inside the border.
 pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
-    // A filled panel wrapped in the muted single-line border (the Figma
-    // "Terminal border"): the `Block` paints the PALETTE_BG fill — so every gap
-    // reads as one surface — and draws the border in the same pass.
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().muted))
-        .style(Style::default().bg(palette().search));
-    f.render_widget(block, area);
+    // A filled panel wrapped in the dialogs' muted single-line border (the
+    // Figma "Terminal border"): the fill paints every gap as one surface.
+    super::dialog_frame(f.buffer_mut(), area, Some(palette().search), None);
 
     let rows = panel_rows(area);
     if rows.is_empty() || rows[2].width == 0 || rows[2].height == 0 {
@@ -216,15 +211,10 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
 /// is inset one column inside the border on each side (so `rows[_].x == area.x
 /// + 2`), matching the Figma's padding.
 fn panel_rows(area: Rect) -> std::rc::Rc<[Rect]> {
-    // The block's border inset (Borders::ALL), then one more column of padding
-    // inside it on each side. Vertically the search line sits just under the top
+    // The dialogs' content rect: inside the border, one more column of
+    // padding each side. Vertically the search line sits just under the top
     // border and the footer just above the bottom one.
-    let content = Rect {
-        x: area.x.saturating_add(2),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
-    };
+    let content = super::dialog_content(area);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([

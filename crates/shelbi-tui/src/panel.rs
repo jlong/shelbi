@@ -129,6 +129,19 @@ pub(crate) fn truncate_right(s: &str, width: usize) -> String {
     out
 }
 
+/// `label` with `lead` spaces before it and `trail` after, all in `style`
+/// but its underline: that stays on the label's own cells, so a hovered
+/// link's or a focused label's underline never runs into the padding
+/// around it (a focus fill still does).
+pub(crate) fn padded_label(label: impl Into<String>, lead: usize, trail: usize, style: Style) -> [Span<'static>; 3] {
+    let pad = style.remove_modifier(Modifier::UNDERLINED);
+    [
+        Span::styled(" ".repeat(lead), pad),
+        Span::styled(label.into(), style),
+        Span::styled(" ".repeat(trail), pad),
+    ]
+}
+
 /// Compose the worktree folder row — `"📁 <path>"` — fitting the whole line
 /// within `width` columns. The prefix's display width is reserved *before*
 /// left-truncating the path so the composed line never overruns the row.

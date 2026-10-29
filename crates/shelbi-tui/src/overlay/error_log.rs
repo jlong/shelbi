@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -87,12 +87,7 @@ pub fn build_lines(rows: &[(ErrorLogEntry, bool)], width: usize) -> Vec<Line<'st
 /// runtime, a centered overlay rect in the single-process TUI).
 pub fn render(f: &mut Frame, area: Rect, viewer: &mut Viewer) {
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_yellow))
-        .title(" Error log ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), area, None, Some("Error log"));
 
     // body (grows) + a one-line hint at the bottom.
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
