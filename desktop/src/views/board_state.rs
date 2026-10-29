@@ -48,12 +48,16 @@ use shelbi_app::board::{
 };
 use shelbi_app::board_search::{BoardSearch, SearchRequest, SearchWorker};
 use shelbi_app::issue_edit::{self, Field, SaveJob, SaveStatus, SharedEdits, Snapshot};
+use shelbi_app::task_properties::{
+    self, PriorityChoice, QueuePosition, StatusChoice, WorkflowChoice,
+};
 use shelbi_app::{
     BoardFilters, CommandKind, Effect, ExecError, ExpectedState, IssueCard, IssuesModel, Mutation,
 };
 use shelbi_state::keymap::{
     Key, KanbanAction, KeyChord, Keymaps, Mods, PopoverAction,
 };
+use shelbi_core::StatusCategory;
 use shelbi_state::KanbanColumnOverride;
 
 /// Which overlay owns the keyboard. The task pane isn't modal: it stays up
@@ -69,6 +73,9 @@ pub enum Mode {
     /// The pane's More menu, its keyboard row at `cursor`
     /// ([`BoardState::pane_actions`]).
     PaneMenu { cursor: usize },
+    /// The picker under one of the pane's property values, its keyboard row
+    /// at `cursor` ([`BoardState::property_rows`]).
+    PropertyPicker { property: Property, cursor: usize },
     WorkspaceDropdown { cursor: usize },
     WorkflowDropdown { cursor: usize },
     /// Pick the workspace to assign `id` to.
@@ -110,6 +117,8 @@ pub enum Intent {
     FocusSearch,
     /// The search was cleared from the board (Esc): empty the field to match.
     ClearSearchField,
+    /// Put text on the clipboard (More > Copy branch).
+    Copy(String),
 }
 
 /// What the task pane's More menu offers: the task operations the old modal
@@ -123,6 +132,7 @@ pub enum PaneAction {
     EditDescription,
     OpenInEditor,
     OpenWorkspace,
+    CopyBranch,
 }
 
 impl PaneAction {
@@ -135,6 +145,7 @@ impl PaneAction {
             PaneAction::EditDescription => "Edit description",
             PaneAction::OpenInEditor => "Open in editor",
             PaneAction::OpenWorkspace => "Open workspace",
+            PaneAction::CopyBranch => "Copy branch name",
         }
     }
 
@@ -148,8 +159,78 @@ impl PaneAction {
             PaneAction::EditDescription => "edit",
             PaneAction::OpenInEditor => "editor",
             PaneAction::OpenWorkspace => "workspace",
+            PaneAction::CopyBranch => "copy-branch",
         }
     }
+}
+
+/// A task pane property the user sets in place: its value is a button that
+/// opens a picker of what it can be set to now
+/// (`shelbi_app::task_properties`). No edit mode: a choice is sent at once,
+/// through the same registry commands the board's keys and drags use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Property {
+    Status,
+    Workflow,
+    Priority,
+}
+
+impl Property {
+    /// In the pane's order, which Tab follows.
+    pub const ALL: [Property; 3] = [Property::Status, Property::Workflow, Property::Priority];
+
+    /// A short name for selectors (`pane-<slug>`, `picker-<slug>`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Property::Status => "status",
+            Property::Workflow => "workflow",
+            Property::Priority => "priority",
+        }
+    }
+}
+
+/// One row of a property's picker, as the view draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyRow {
+    Status(StatusChoice),
+    Workflow(WorkflowChoice),
+    Priority(PriorityChoice),
+}
+
+impl PropertyRow {
+    /// The issue's value now (the picker's check).
+    pub fn current(&self) -> bool {
+        match self {
+            PropertyRow::Status(c) => c.current,
+            PropertyRow::Workflow(c) => c.current,
+            PropertyRow::Priority(c) => c.current,
+        }
+    }
+
+    /// Why it can't be chosen, when it can't (drawn disabled, with the
+    /// reason on hover).
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            PropertyRow::Status(c) => c.refusal.as_deref(),
+            PropertyRow::Workflow(c) => c.refusal.as_deref(),
+            PropertyRow::Priority(_) => None,
+        }
+    }
+}
+
+/// What the pane's property values show: the read, with this client's
+/// in-flight change to the property put where it is headed, so a choice
+/// shows at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneProperties {
+    pub status_name: String,
+    pub category: StatusCategory,
+    pub workflow_name: String,
+    /// `None` for a task whose queue can't be reordered (done), or one
+    /// that isn't on the board.
+    pub queue: Option<QueuePosition>,
+    /// The property a change of this client's is still settling.
+    pub pending: Option<Property>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +265,8 @@ pub struct Pending {
     /// For a reorder, the slot the card is headed for in its stored column:
     /// settled once a read has it there.
     pub to_slot: Option<u32>,
+    /// For a workflow change, the workflow it is headed for.
+    pub to_workflow: Option<String>,
     /// The stored column this mutation renumbers (a move's or start's source,
     /// a reorder's column). Every card whose priority shifts gets a new
     /// revision, so the column's other cards wait for this one to land rather
@@ -217,7 +300,8 @@ impl MutationJob {
             | Mutation::StartIssue { .. }
             | Mutation::AssignIssue { .. }
             | Mutation::AddIssue { .. }
-            | Mutation::PrioritizeIssue { .. })) => Some(m),
+            | Mutation::PrioritizeIssue { .. }
+            | Mutation::EditIssue { workflow: Some(_), .. })) => Some(m),
             _ => None,
         }
     }
@@ -267,6 +351,10 @@ pub struct BoardState {
     /// the board's menus and pickers (the pane isn't modal), and only
     /// [`BoardState::close_pane`] (or opening another task) changes it.
     pane: Option<String>,
+    /// The pane property the keyboard is on (Tab walks them), drawn with
+    /// the focus ring; Enter opens its picker, and closing the picker comes
+    /// back to it.
+    pane_focus: Option<Property>,
     pending: BTreeMap<String, Pending>,
     /// A daemon refusal or failure, shown on the card until dismissed or the
     /// card's next action.
@@ -317,6 +405,7 @@ impl BoardState {
             selected_row: 0,
             mode: Mode::Board,
             pane: None,
+            pane_focus: None,
             pending: BTreeMap::new(),
             notices: BTreeMap::new(),
             edits,
@@ -440,6 +529,12 @@ impl BoardState {
         // something to overlay.
         let tasks = if self.pending.is_empty() { Vec::new() } else { self.input.tasks() };
         for (id, p) in &self.pending {
+            // A workflow change shows on the card's badge at once.
+            if let Some(workflow) = &p.to_workflow {
+                if let Some((c, r)) = self.model.position(id) {
+                    self.model.columns[c].cards[r].workflow_name = workflow.clone();
+                }
+            }
             if let Some(to) = &p.to_status {
                 let Some((from, row)) = self.model.position(id) else {
                     continue;
@@ -593,6 +688,9 @@ impl BoardState {
         if let Some((c, r)) = self.model.position(id) {
             self.select(c, r);
         }
+        if self.pane.as_deref() != Some(id) {
+            self.pane_focus = None;
+        }
         self.pane = Some(id.to_string());
         self.mode = Mode::Detail {
             id: id.to_string(),
@@ -613,6 +711,7 @@ impl BoardState {
     /// its selection, filters and scroll as they were.
     pub fn close_pane(&mut self) {
         self.pane = None;
+        self.pane_focus = None;
         self.mode = Mode::Board;
     }
 
@@ -637,13 +736,27 @@ impl BoardState {
         let Some(card) = self.pane.as_deref().and_then(|id| self.model.card(id)) else {
             return Vec::new();
         };
-        let mut out = vec![PaneAction::MoveLeft, PaneAction::MoveRight];
+        let id = card.id.as_str();
+        let mut out = Vec::new();
+        // A step the workflow has (the pane's move clamps at the ends).
+        if self.move_target(id, false, false).is_ok() {
+            out.push(PaneAction::MoveLeft);
+        }
+        if self.move_target(id, true, false).is_ok() {
+            out.push(PaneAction::MoveRight);
+        }
         if card.start_refusal().is_none() {
             out.push(PaneAction::Start);
         }
-        out.extend([PaneAction::Assign, PaneAction::EditDescription, PaneAction::OpenInEditor]);
+        if !self.input.workspaces.is_empty() {
+            out.push(PaneAction::Assign);
+        }
+        out.extend([PaneAction::EditDescription, PaneAction::OpenInEditor]);
         if card.assignee.is_some() {
             out.push(PaneAction::OpenWorkspace);
+        }
+        if card.branch.is_some() {
+            out.push(PaneAction::CopyBranch);
         }
         out
     }
@@ -678,7 +791,196 @@ impl BoardState {
                 let ws = self.model.card(&id).and_then(|c| c.assignee.clone());
                 self.open_workspace(ws)
             }
+            PaneAction::CopyBranch => match self.model.card(&id).and_then(|c| c.branch.clone()) {
+                Some(branch) => {
+                    self.status = Some(format!("copied {branch}"));
+                    vec![Intent::Copy(branch)]
+                }
+                None => Vec::new(),
+            },
         }
+    }
+
+    // ---- the pane's properties -------------------------------------------
+
+    /// The pane property the keyboard is on.
+    pub fn pane_focus(&self) -> Option<Property> {
+        self.pane_focus
+    }
+
+    /// Take the keyboard off the properties (it went to the pane's session).
+    pub fn clear_pane_focus(&mut self) {
+        self.pane_focus = None;
+    }
+
+    /// The pane's property values for `id`, with this client's in-flight
+    /// change shown where it is headed.
+    pub fn pane_properties(&self, id: &str) -> Option<PaneProperties> {
+        let tasks = self.input.tasks();
+        let tf = tasks.iter().find(|tf| tf.task.id == id)?;
+        let rules = self.input.rules();
+        let pending = self.pending.get(id);
+        let pending_status = pending.and_then(|p| p.to_status.clone());
+        let status_id = pending_status.clone().unwrap_or_else(|| rules.resolved_status_id(&tf.task));
+        let status = self.input.project_statuses.statuses.iter().find(|st| st.id == status_id);
+        let status_name = status.map_or_else(|| tf.task.column.default_status_name().to_string(), |st| st.name.clone());
+        let category = status.map_or_else(|| tf.task.column.category(), |st| st.category);
+        let pending_workflow = pending.and_then(|p| p.to_workflow.clone());
+        let workflow_name = pending_workflow
+            .clone()
+            .unwrap_or_else(|| rules.workflow_name(&tf.task).to_string());
+        let pending_slot = pending.and_then(|p| p.to_slot);
+        let queue = if category == StatusCategory::Done {
+            None
+        } else if pending_status.as_deref().is_some_and(|s| s != tf.task.column.as_str()) {
+            // A move lands at the bottom of its new queue.
+            let len = tasks.iter().filter(|o| o.task.column.as_str() == status_id).count() as u32 + 1;
+            Some(QueuePosition { position: len, len })
+        } else {
+            task_properties::queue_position(&tasks, id).map(|q| match pending_slot {
+                Some(slot) => QueuePosition {
+                    position: (slot + 1).min(q.len),
+                    ..q
+                },
+                None => q,
+            })
+        };
+        let pending = pending.and_then(|p| {
+            if p.to_status.is_some() {
+                Some(Property::Status)
+            } else if p.to_workflow.is_some() {
+                Some(Property::Workflow)
+            } else if p.to_slot.is_some() {
+                Some(Property::Priority)
+            } else {
+                None
+            }
+        });
+        Some(PaneProperties {
+            status_name,
+            category,
+            workflow_name,
+            queue,
+            pending,
+        })
+    }
+
+    /// Why the pane's `property` can't be changed now, when it can't (its
+    /// value is drawn disabled): a done task's queue, a task with a change
+    /// still unanswered.
+    pub fn property_refusal(&self, property: Property) -> Option<String> {
+        let id = self.pane.as_deref()?;
+        if self.pending.get(id).is_some_and(|p| !p.acked || p.landed.is_none()) {
+            return Some("a change is already in progress".to_string());
+        }
+        match property {
+            Property::Priority => task_properties::priority_refusal(&self.input, id),
+            Property::Status | Property::Workflow => None,
+        }
+    }
+
+    /// What `property`'s picker lists for the pane's task.
+    pub fn property_rows(&self, property: Property) -> Vec<PropertyRow> {
+        let Some(id) = self.pane.as_deref() else {
+            return Vec::new();
+        };
+        match property {
+            Property::Status => task_properties::status_choices(&self.input, id)
+                .into_iter()
+                .map(PropertyRow::Status)
+                .collect(),
+            Property::Workflow => task_properties::workflow_choices(&self.input, id)
+                .into_iter()
+                .map(PropertyRow::Workflow)
+                .collect(),
+            Property::Priority => task_properties::priority_choices(&self.input.tasks(), id)
+                .into_iter()
+                .map(PropertyRow::Priority)
+                .collect(),
+        }
+    }
+
+    /// Open `property`'s picker on the issue's current value, or close it
+    /// when it is open (its value's click). A property that can't change
+    /// says why instead.
+    pub fn toggle_property(&mut self, property: Property) {
+        if self.pane.is_none() {
+            return;
+        }
+        if matches!(self.mode, Mode::PropertyPicker { property: open, .. } if open == property) {
+            self.mode = self.rest();
+            return;
+        }
+        if let Some(why) = self.property_refusal(property) {
+            self.status = Some(why);
+            return;
+        }
+        let rows = self.property_rows(property);
+        let cursor = rows.iter().position(PropertyRow::current).unwrap_or(0);
+        self.mode = Mode::PropertyPicker { property, cursor };
+    }
+
+    /// Choose `property`'s row `ix` (a click, or Enter on it), back on the
+    /// pane: the command that sets it, or nothing for the current value. A
+    /// refused row says why on the task and changes nothing.
+    pub fn choose_property(&mut self, property: Property, ix: usize) -> Vec<Intent> {
+        self.mode = self.rest();
+        let (Some(id), Some(row)) = (self.pane.clone(), self.property_rows(property).into_iter().nth(ix)) else {
+            return Vec::new();
+        };
+        let command = match &row {
+            PropertyRow::Status(c) => task_properties::status_command(&self.input, &id, &c.status_id),
+            PropertyRow::Workflow(c) => task_properties::workflow_command(&self.input, &id, &c.name),
+            PropertyRow::Priority(c) => task_properties::priority_command(&self.input, &id, c.position),
+        };
+        match command {
+            Ok(Some(kind)) => vec![Intent::Command(kind)],
+            Ok(None) => Vec::new(),
+            Err(why) => {
+                self.status = Some(why.clone());
+                self.notices.insert(id, why);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Tab / Shift+Tab on the pane: the next / previous property, then off
+    /// them (so Tab cycles back to the first).
+    fn step_property_focus(&mut self, forward: bool) {
+        let all = Property::ALL;
+        let at = self.pane_focus.and_then(|p| all.iter().position(|&q| q == p));
+        self.pane_focus = match (at, forward) {
+            (None, true) => Some(all[0]),
+            (None, false) => Some(all[all.len() - 1]),
+            (Some(i), true) => all.get(i + 1).copied(),
+            (Some(0), false) => None,
+            (Some(i), false) => Some(all[i - 1]),
+        };
+    }
+
+    fn property_key(&mut self, property: Property, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+        let rows = self.property_rows(property);
+        let n = rows.len();
+        let open = |ix: usize| rows.get(ix).is_some_and(|r| r.refusal().is_none());
+        // The next choosable row from `cursor` in `step` (wrapping); the
+        // cursor itself when none is.
+        let next = |step: isize| {
+            (1..=n)
+                .map(|k| (cursor as isize + step * k as isize).rem_euclid(n as isize) as usize)
+                .find(|&ix| open(ix))
+                .unwrap_or(cursor)
+        };
+        let at = |cursor| Mode::PropertyPicker { property, cursor };
+        match chord.code {
+            Key::Esc | Key::Char('q') => self.mode = self.rest(),
+            Key::Up | Key::Char('k') if n > 0 => self.mode = at(next(-1)),
+            Key::Down | Key::Char('j') if n > 0 => self.mode = at(next(1)),
+            Key::Home if n > 0 => self.mode = at((0..n).find(|&ix| open(ix)).unwrap_or(cursor)),
+            Key::End if n > 0 => self.mode = at((0..n).rev().find(|&ix| open(ix)).unwrap_or(cursor)),
+            Key::Enter | Key::Char(' ') if open(cursor) => return self.choose_property(property, cursor),
+            _ => {}
+        }
+        Vec::new()
     }
 
     fn pane_menu_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
@@ -923,6 +1225,7 @@ impl BoardState {
                 Some(self.detail_key(&id, chord))
             }
             Mode::PaneMenu { cursor } => Some(self.pane_menu_key(cursor, chord)),
+            Mode::PropertyPicker { property, cursor } => Some(self.property_key(property, cursor, chord)),
             Mode::WorkspaceDropdown { cursor } => Some(self.workspace_dropdown_key(cursor, chord)),
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
             Mode::AssignPicker { id, cursor } => Some(self.assign_key(&id, cursor, chord)),
@@ -1019,6 +1322,22 @@ impl BoardState {
     }
 
     fn detail_key(&mut self, id: &str, chord: KeyChord) -> Vec<Intent> {
+        // The properties' own keys, before the user's popover keys: Tab walks
+        // them, Enter / Space opens the one the keyboard is on.
+        match chord.code {
+            Key::Tab | Key::BackTab => {
+                let back = chord.code == Key::BackTab || chord.mods.contains(Mods::SHIFT);
+                self.step_property_focus(!back);
+                return Vec::new();
+            }
+            Key::Enter | Key::Char(' ') if chord.mods.is_empty() => {
+                if let Some(property) = self.pane_focus {
+                    self.toggle_property(property);
+                    return Vec::new();
+                }
+            }
+            _ => {}
+        }
         if let Some(action) = self.keymaps.popover.dispatch(chord) {
             return match action {
                 PopoverAction::Close => {
@@ -1406,6 +1725,9 @@ impl BoardState {
             CommandKind::PrioritizeIssue { id, position } => {
                 (id.clone(), "Reordering…".to_string(), None, Some(*position))
             }
+            CommandKind::SetIssueWorkflow { id, workflow } => {
+                (id.clone(), format!("Moving to the {workflow} workflow…"), None, None)
+            }
             CommandKind::AddIssue { title } => {
                 if self.pending.contains_key(ADD_KEY) {
                     self.status = Some("an issue is already being added".into());
@@ -1426,6 +1748,7 @@ impl BoardState {
                         landed: None,
                         to_status: None,
                         to_slot: None,
+                        to_workflow: None,
                         renumbers: Vec::new(),
                         acked: false,
                         prev: None,
@@ -1489,7 +1812,12 @@ impl BoardState {
         // A follow-up on this client's own landed change: until the reads
         // catch up, the card still shows where that change put it, its
         // columns still wait, and a failure puts it back.
+        let to_workflow = match kind {
+            CommandKind::SetIssueWorkflow { workflow, .. } => Some(workflow.clone()),
+            _ => None,
+        };
         let prev = self.pending.remove(&id).map(Box::new);
+        let to_workflow = to_workflow.or_else(|| prev.as_ref().and_then(|p| p.to_workflow.clone()));
         let (read_from, to_status, to_slot) = match &prev {
             Some(p) => {
                 for column in &p.renumbers {
@@ -1515,6 +1843,7 @@ impl BoardState {
                 landed: None,
                 to_status,
                 to_slot,
+                to_workflow,
                 renumbers,
                 acked: false,
                 prev,
@@ -2898,5 +3227,193 @@ pub(crate) mod tests {
         .unwrap();
         assert!(!b.model().columns[review].collapsed);
         assert!(b.model().columns[col_of(&b, "todo")].collapsed);
+    }
+
+    // ---- the pane's properties (dt-task-inline-properties) ----------------
+
+    /// The shipped workflow plus a `subtask` one with no Review or Backlog.
+    fn two_workflow_board(tasks: Vec<IssueFile>) -> BoardState {
+        let mut subtask = shelbi_core::default_workflow();
+        subtask.name = "subtask".into();
+        subtask.statuses.retain(|s| s.id != "review" && s.id != "backlog");
+        let mut r = read(tasks);
+        r.workflows = Ok(vec![shelbi_core::default_workflow(), subtask]);
+        let mut b = fresh_board();
+        b.apply_open(r);
+        b.apply_closed(None);
+        b
+    }
+
+    fn picker(b: &BoardState) -> Option<(Property, usize)> {
+        match b.mode {
+            Mode::PropertyPicker { property, cursor } => Some((property, cursor)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_status_click_opens_its_picker_on_the_current_status_and_moves_through_the_registry() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.toggle_property(Property::Status);
+        assert_eq!(b.mode, Mode::Board, "no pane, no picker");
+        b.open_detail("A");
+        b.toggle_property(Property::Status);
+        let rows = b.property_rows(Property::Status);
+        let todo = rows.iter().position(PropertyRow::current).unwrap();
+        assert_eq!(picker(&b), Some((Property::Status, todo)), "opens on the issue's status");
+        press(&mut b, "j");
+        let (_, cursor) = picker(&b).unwrap();
+        let PropertyRow::Status(next) = &rows[cursor] else { panic!() };
+        assert_eq!(
+            press(&mut b, "enter"),
+            vec![Intent::Command(CommandKind::MoveIssue { id: "A".into(), to_status: next.status_id.clone() })]
+        );
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "back on the pane");
+        // Its value's click closes it again; Esc closes it, not the pane.
+        b.toggle_property(Property::Status);
+        b.toggle_property(Property::Status);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        b.toggle_property(Property::Status);
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        assert_eq!(b.detail_id(), Some("A"));
+        // The current status changes nothing.
+        b.toggle_property(Property::Status);
+        assert!(press(&mut b, "enter").is_empty());
+    }
+
+    #[test]
+    fn the_keyboard_skips_statuses_the_workflow_refuses() {
+        let mut t = issue("A", "todo");
+        t.task.workflow = Some("gone".into());
+        let mut b = board(vec![t]);
+        b.open_detail("A");
+        b.toggle_property(Property::Status);
+        let (_, at) = picker(&b).unwrap();
+        // Every other status is refused (its workflow isn't loaded): the
+        // cursor stays, and Enter on a refused row can't be reached.
+        press(&mut b, "j");
+        press(&mut b, "k");
+        assert_eq!(picker(&b), Some((Property::Status, at)));
+        assert_eq!(at, 1, "Todo, after Backlog");
+        assert!(b.choose_property(Property::Status, 0).is_empty());
+        assert!(b.notice("A").unwrap().contains("isn't loaded"), "a refused choice says why on the task");
+    }
+
+    #[test]
+    fn tab_walks_the_properties_and_enter_opens_the_one_it_is_on() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.open_detail("A");
+        assert_eq!(b.pane_focus(), None);
+        press(&mut b, "tab");
+        assert_eq!(b.pane_focus(), Some(Property::Status));
+        press(&mut b, "tab");
+        assert_eq!(b.pane_focus(), Some(Property::Workflow));
+        press(&mut b, "shift-tab");
+        press(&mut b, "shift-tab");
+        assert_eq!(b.pane_focus(), None, "off the properties");
+        press(&mut b, "shift-tab");
+        assert_eq!(b.pane_focus(), Some(Property::Priority), "and round from the end");
+        press(&mut b, "enter");
+        assert_eq!(picker(&b).map(|p| p.0), Some(Property::Priority));
+        press(&mut b, "esc");
+        assert_eq!(b.pane_focus(), Some(Property::Priority), "the keys come back to the value");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        // Another task, or closing, starts the keyboard over.
+        b.open_detail("A");
+        assert_eq!(b.pane_focus(), Some(Property::Priority));
+        b.close_pane();
+        assert_eq!(b.pane_focus(), None);
+    }
+
+    #[test]
+    fn priority_is_the_place_in_queue_and_reorders_at_its_slot() {
+        let mut b = board(vec![prio("A", "todo", 0), prio("B", "todo", 1), prio("C", "todo", 2), prio("D", "done", 0)]);
+        b.open_detail("C");
+        let shown = b.pane_properties("C").unwrap();
+        assert_eq!(shown.queue, Some(QueuePosition { position: 3, len: 3 }));
+        b.toggle_property(Property::Priority);
+        assert_eq!(picker(&b), Some((Property::Priority, 2)));
+        press(&mut b, "home");
+        let out = press(&mut b, "enter");
+        let kind = CommandKind::PrioritizeIssue { id: "C".into(), position: 0 };
+        assert_eq!(out, vec![Intent::Command(kind.clone())], "place 1 is slot 0");
+        b.begin_mutation(&kind).unwrap();
+        // Shown at once where it is headed, while it settles.
+        let shown = b.pane_properties("C").unwrap();
+        assert_eq!(shown.queue, Some(QueuePosition { position: 1, len: 3 }));
+        assert_eq!(shown.pending, Some(Property::Priority));
+        assert_eq!(ids_in(&b, "todo"), ["C", "A", "B"], "and on the board");
+        // A done task has no queue to reorder.
+        b.open_detail("D");
+        assert_eq!(b.pane_properties("D").unwrap().queue, None);
+        assert!(b.property_refusal(Property::Priority).is_some());
+        b.toggle_property(Property::Priority);
+        assert_eq!(picker(&b), None);
+    }
+
+    #[test]
+    fn a_workflow_change_is_the_validated_edit_and_shows_at_once() {
+        let mut b = two_workflow_board(vec![issue("A", "todo"), issue("R", "review")]);
+        b.open_detail("A");
+        b.toggle_property(Property::Workflow);
+        let rows = b.property_rows(Property::Workflow);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0], PropertyRow::Workflow(c) if c.default && c.current));
+        let out = b.choose_property(Property::Workflow, 1);
+        let kind = CommandKind::SetIssueWorkflow { id: "A".into(), workflow: "subtask".into() };
+        assert_eq!(out, vec![Intent::Command(kind.clone())]);
+        let job = b.begin_mutation(&kind).unwrap();
+        assert!(matches!(
+            job.mutation("demo"),
+            Some(Mutation::EditIssue { workflow: Some(w), title: None, body: None, .. }) if w == "subtask"
+        ));
+        assert_eq!(job.expected.as_ref().map(|e| e.status.as_str()), Some("todo"));
+        let shown = b.pane_properties("A").unwrap();
+        assert_eq!((shown.workflow_name.as_str(), shown.pending), ("subtask", Some(Property::Workflow)));
+        assert_eq!(b.model().card("A").unwrap().workflow_name, "subtask", "the card's badge too");
+        // A second change while that one is unanswered is held off.
+        assert!(b.property_refusal(Property::Status).is_some());
+        // A refusal puts it back, with the daemon's reason on the task.
+        b.finish_mutation("A", Err(ExecError::Backend("workflow `subtask` does not exist".into())));
+        assert_eq!(b.pane_properties("A").unwrap().workflow_name, "default");
+        assert!(b.notice("A").unwrap().contains("does not exist"));
+
+        // An issue in Review can't take a workflow without Review.
+        b.open_detail("R");
+        let rows = b.property_rows(Property::Workflow);
+        assert!(rows[1].refusal().unwrap().contains("no Review status"));
+        b.toggle_property(Property::Workflow);
+        press(&mut b, "j");
+        assert_eq!(picker(&b), Some((Property::Workflow, 0)), "the keyboard skips it");
+        assert!(b.choose_property(Property::Workflow, 1).is_empty());
+        assert!(b.notice("R").unwrap().contains("no Review status"));
+    }
+
+    #[test]
+    fn a_property_change_while_the_body_saves_waits_and_keeps_the_draft() {
+        let mut b = two_workflow_board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "mine", t0);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        let kind = CommandKind::SetIssueWorkflow { id: "A".into(), workflow: "subtask".into() };
+        assert_eq!(b.begin_mutation(&kind), Err(Vec::new()), "held, not refused");
+        BoardState::record_save(&b.edits(), &save, Ok(Some(at("todo", 5))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh, Intent::Command(kind.clone())]);
+        let job = b.begin_mutation(&kind).unwrap();
+        assert_eq!(job.expected, Some(at("todo", 5)), "sent against the save's revision");
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn more_copies_the_branch_when_there_is_one() {
+        let mut t = issue("A", "in-progress");
+        t.task.branch = Some("jlong/a".into());
+        let mut b = board(vec![t]);
+        b.open_detail("A");
+        let actions = b.pane_actions();
+        let ix = actions.iter().position(|a| *a == PaneAction::CopyBranch).unwrap();
+        assert_eq!(b.choose_pane_action(ix), vec![Intent::Copy("jlong/a".into())]);
     }
 }

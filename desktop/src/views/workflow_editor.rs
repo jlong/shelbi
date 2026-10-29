@@ -2379,7 +2379,7 @@ impl WorkflowEditor {
     fn render_prompt(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
         let buttons = vec![
-            style::button("workflow-leave-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme)
+            style::button("workflow-leave-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(state) = this.state.as_mut() {
                         state.cancel_prompt();

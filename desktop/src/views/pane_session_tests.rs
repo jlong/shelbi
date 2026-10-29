@@ -352,13 +352,22 @@ fn the_terminal_takes_its_keys_before_the_pane_and_board(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn tab_from_the_pane_puts_the_keys_in_the_terminal(cx: &mut TestAppContext) {
+fn tab_past_the_properties_puts_the_keys_in_the_terminal(cx: &mut TestAppContext) {
+    use crate::views::board_state::Property;
     let mut p = open(cx);
     p.open_task("A");
+    let view = p.view.clone();
+    // The pane's focus order: Status, Workflow, Priority, then the session.
+    for property in Property::ALL {
+        p.cx.simulate_keystrokes("tab");
+        p.draw();
+        assert_eq!(p.view.read_with(&p.cx, |v, _| v.state.pane_focus()), Some(property));
+        assert!(!p.cx.update(|window, cx| view.read(cx).session_focused(window, cx)));
+    }
     p.cx.simulate_keystrokes("tab");
     p.draw();
-    let view = p.view.clone();
     assert!(p.cx.update(|window, cx| view.read(cx).session_focused(window, cx)));
+    assert_eq!(p.view.read_with(&p.cx, |v, _| v.state.pane_focus()), None);
     p.cx.simulate_keystrokes("x");
     p.draw();
     assert_eq!(p.fake.typed(), "x");

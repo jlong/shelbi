@@ -120,7 +120,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::MoveIssue { .. }
         | CommandKind::StartIssue { .. }
         | CommandKind::AssignIssue { .. }
-        | CommandKind::PrioritizeIssue { .. } => host.issue_command(kind),
+        | CommandKind::PrioritizeIssue { .. }
+        // The task pane's Workflow property (dt-task-inline-properties).
+        | CommandKind::SetIssueWorkflow { .. } => host.issue_command(kind),
         // Approve has no confirmation, in either client.
         CommandKind::ApproveReview { id } => host.approve_review(id),
         // The palette's reject carries no reason: ask for one first.
@@ -175,6 +177,7 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::EditIssue { .. } => true,
         CommandKind::AddIssue { .. } => true,
         CommandKind::PrioritizeIssue { .. } => true,
+        CommandKind::SetIssueWorkflow { .. } => true,
     }
 }
 
@@ -394,6 +397,13 @@ mod tests {
                 },
                 "issue:prioritize:t1",
             ),
+            (
+                CommandKind::SetIssueWorkflow {
+                    id: s("t1"),
+                    workflow: s("subtask"),
+                },
+                "issue:workflow:t1",
+            ),
         ]
     }
 
@@ -447,6 +457,7 @@ mod tests {
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
                 | CommandKind::PrioritizeIssue { .. }
+                | CommandKind::SetIssueWorkflow { .. }
         )
     }
 

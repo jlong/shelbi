@@ -58,7 +58,7 @@ use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 
 use super::board_list::{self, ColumnList, Item};
 use super::board_scroll::{self, BoardScroll};
-use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
+use super::board_state::{BoardState, Intent, Mode, MutationJob, Property, Scroll};
 use shelbi_app::issue_edit::{Field, SaveJob, Splice};
 use super::external_edit::{self, EditorEvent};
 use super::pane_session::{MainShows, PaneSession};
@@ -172,6 +172,10 @@ pub struct IssuesView {
     workspace_anchor: style::Anchor,
     /// The task pane's More button, measured so its menu opens under it.
     pub(super) pane_menu_anchor: style::Anchor,
+    /// The open property picker's value, measured so the picker opens
+    /// under it (one picker is open at a time), and the picker's scroll.
+    pub(super) property_anchor: style::Anchor,
+    pub(super) picker_scroll: ScrollHandle,
     pub(super) state: BoardState,
     pub(super) focus: FocusHandle,
     needs_focus: bool,
@@ -279,6 +283,8 @@ impl IssuesView {
             workflow_anchor: Default::default(),
             workspace_anchor: Default::default(),
             pane_menu_anchor: Default::default(),
+            property_anchor: Default::default(),
+            picker_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
             editor: None,
             _editor_subscriptions: Vec::new(),
@@ -830,6 +836,7 @@ impl IssuesView {
                     let input = self.search_field(window, cx);
                     input.update(cx, |s, cx| s.focus(window, cx));
                 }
+                Intent::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
                 Intent::ClearSearchField => {
                     if let Some(input) = &self.search_input {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -1139,12 +1146,14 @@ impl IssuesView {
         if before != (self.state.selected_column, self.state.selected_row) {
             self.scroll_selection_into_view();
         }
+        self.scroll_picker_to_cursor();
         cx.notify();
     }
 
     /// The pane's keys for its session, while it shows one and has the keys
-    /// (no menu or editor over it): ⌥↑ / ⌥↓ resize the split, Tab puts the
-    /// keys in the terminal.
+    /// (no menu or editor over it): ⌥↑ / ⌥↓ resize the split, and Tab past
+    /// the last property (Status, Workflow, Priority, then the session) puts
+    /// the keys in the terminal.
     fn pane_session_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.editor.is_some() || !matches!(self.state.mode, Mode::Detail { editing: false, .. }) {
             return false;
@@ -1156,12 +1165,20 @@ impl IssuesView {
         let m = &ks.modifiers;
         match ks.key.as_str() {
             "up" | "down" if m.alt && !m.platform && !m.control && !m.shift => self.step_split(ks.key == "up", cx),
-            "tab" if !m.modified() => {
+            "tab" if !m.modified() && self.state.pane_focus() == Some(Property::Priority) => {
+                self.state.clear_pane_focus();
                 let target = view.read(cx).focus_target(cx);
                 window.focus(&target, cx);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Keep an open property picker's keyboard row in view.
+    pub(super) fn scroll_picker_to_cursor(&self) {
+        if let Mode::PropertyPicker { cursor, .. } = self.state.mode {
+            self.picker_scroll.scroll_to_item(cursor);
         }
     }
 
@@ -2600,6 +2617,49 @@ mod tests {
         click(&mut cx, "pane-more");
         cx.simulate_keystrokes("down enter");
         assert!(matches!(events.borrow().last(), Some(CommandKind::MoveIssue { .. })));
+    }
+
+    #[gpui::test]
+    fn a_property_value_opens_its_picker_under_it_and_a_choice_is_sent(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo"), issue("B", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        let events = record(&view, &mut cx);
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        for value in ["pane-status", "pane-workflow", "pane-priority"] {
+            assert!(drawn(&mut cx, value), "{value} is a button");
+        }
+        assert!(!drawn(&mut cx, "property-picker"));
+        // No edit mode: one click on the value opens its picker, under it.
+        click(&mut cx, "pane-status");
+        assert!(drawn(&mut cx, "property-picker"));
+        let value = bounds(&mut cx, "pane-status");
+        let menu = bounds(&mut cx, "property-picker");
+        assert!(menu.top() >= value.bottom() && (menu.left() - value.left()).abs() < px(1.0), "{menu:?} under {value:?}");
+        assert!(drawn(&mut cx, "picker-current-1"), "Todo is checked");
+        // A press outside closes it, and the pane stays.
+        let pane = bounds(&mut cx, "task-pane");
+        cx.simulate_click(gpui::point(pane.left() + px(40.0), pane.bottom() - px(40.0)), gpui::Modifiers::none());
+        assert!(!drawn(&mut cx, "property-picker"));
+        assert!(drawn(&mut cx, "task-pane"));
+        // A choice is the registry's command; the picker closes on the pane.
+        click(&mut cx, "pane-status");
+        click(&mut cx, "picker-status-2");
+        assert_eq!(
+            *events.borrow(),
+            vec![CommandKind::MoveIssue { id: "A".into(), to_status: "in-progress".into() }]
+        );
+        assert!(!drawn(&mut cx, "property-picker"));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Detail { id: "A".into(), editing: false });
+        // The keyboard: Tab to Priority, Enter opens it, End, Enter.
+        cx.simulate_keystrokes("tab tab tab enter");
+        assert!(drawn(&mut cx, "picker-priority-1"));
+        cx.simulate_keystrokes("end enter");
+        assert_eq!(
+            events.borrow().last(),
+            Some(&CommandKind::PrioritizeIssue { id: "A".into(), position: 1 })
+        );
+        assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), Some(crate::views::board_state::Property::Priority));
     }
 
     #[gpui::test]

@@ -267,7 +267,8 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         | CommandKind::AssignIssue { .. }
         | CommandKind::EditIssue { .. }
         | CommandKind::AddIssue { .. }
-        | CommandKind::PrioritizeIssue { .. } => "board_mutations_carry_the_project",
+        | CommandKind::PrioritizeIssue { .. }
+        | CommandKind::SetIssueWorkflow { .. } => "board_mutations_carry_the_project",
     }
 }
 
@@ -802,6 +803,23 @@ fn board_mutations_carry_the_project() {
                 project: s(PROJECT),
                 id: s("T-1"),
                 position: 0,
+            },
+        ),
+        // The task pane's Workflow property: the daemon's validated edit,
+        // touching nothing but the workflow.
+        (
+            CommandKind::SetIssueWorkflow {
+                id: s("T-1"),
+                workflow: s("subtask"),
+            },
+            Mutation::EditIssue {
+                project: s(PROJECT),
+                id: s("T-1"),
+                title: None,
+                body: None,
+                workflow: Some(s("subtask")),
+                expect_title: None,
+                expect_body: None,
             },
         ),
     ] {
