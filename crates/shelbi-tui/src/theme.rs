@@ -360,6 +360,101 @@ pub fn project_pulse_color(phase: f32) -> Color {
     Color::Rgb(rgb.r, rgb.g, rgb.b)
 }
 
+/// Write `buf` as an HTML page in the dark theme, the way a dark terminal
+/// shows it (its palette slots in xterm's colors, the half blocks as half
+/// cells), for checking a surface by eye: `<dir>/<name>.html`.
+#[cfg(test)]
+pub(crate) fn dump_dark_html(dir: &std::path::Path, name: &str, buf: &ratatui::buffer::Buffer) {
+    use ratatui::style::Modifier;
+    use std::fmt::Write as _;
+
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0x00, 0x00, 0x00), (0xcd, 0x31, 0x31), (0x0d, 0xbc, 0x79), (0xe5, 0xe5, 0x10),
+        (0x24, 0x72, 0xc8), (0xbc, 0x3f, 0xbc), (0x11, 0xa8, 0xcd), (0xe5, 0xe5, 0xe5),
+        (0x66, 0x66, 0x66), (0xf1, 0x4c, 0x4c), (0x23, 0xd1, 0x8b), (0xf5, 0xf5, 0x43),
+        (0x3b, 0x8e, 0xea), (0xd6, 0x70, 0xd6), (0x29, 0xb8, 0xdb), (0xff, 0xff, 0xff),
+    ];
+    let (canvas, ink) = ((0x1c, 0x1c, 0x1c), (0xcc, 0xcc, 0xcc));
+    let rgb = |c: Color, default: (u8, u8, u8)| -> (u8, u8, u8) {
+        let named = |i: usize| ANSI[i];
+        match c {
+            Color::Reset => default,
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Black => named(0),
+            Color::Red => named(1),
+            Color::Green => named(2),
+            Color::Yellow => named(3),
+            Color::Blue => named(4),
+            Color::Magenta => named(5),
+            Color::Cyan => named(6),
+            Color::Gray => named(7),
+            Color::DarkGray => named(8),
+            Color::LightRed => named(9),
+            Color::LightGreen => named(10),
+            Color::LightYellow => named(11),
+            Color::LightBlue => named(12),
+            Color::LightMagenta => named(13),
+            Color::LightCyan => named(14),
+            Color::White => named(15),
+            Color::Indexed(i) if i < 16 => named(i as usize),
+            Color::Indexed(i) if i >= 232 => {
+                let v = 8 + (i - 232) * 10;
+                (v, v, v)
+            }
+            Color::Indexed(i) => {
+                let i = i - 16;
+                let level = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+                (level(i / 36), level((i / 6) % 6), level(i % 6))
+            }
+        }
+    };
+    let css = |(r, g, b): (u8, u8, u8)| format!("#{r:02x}{g:02x}{b:02x}");
+    let mut html = format!(
+        "<!doctype html><meta charset=utf-8><title>{name}</title><body style=\"margin:0;\
+         padding:16px;background:{bg}\"><pre style=\"font:14px/17px Menlo,monospace;\
+         margin:0;color:{fg}\">",
+        bg = css(canvas),
+        fg = css(ink),
+    );
+    for y in buf.area.top()..buf.area.bottom() {
+        for x in buf.area.left()..buf.area.right() {
+            let cell = &buf[(x, y)];
+            let (fg, bg) = (css(rgb(cell.fg, ink)), css(rgb(cell.bg, canvas)));
+            let symbol = cell.symbol();
+            // Half blocks as half cells, so they don't depend on the font.
+            let half = match symbol {
+                "▄" => Some(format!("linear-gradient({bg} 50%,{fg} 50%)")),
+                "▀" => Some(format!("linear-gradient({fg} 50%,{bg} 50%)")),
+                "▐" => Some(format!("linear-gradient(90deg,{bg} 50%,{fg} 50%)")),
+                "▌" => Some(format!("linear-gradient(90deg,{fg} 50%,{bg} 50%)")),
+                _ => None,
+            };
+            let mut style = match &half {
+                Some(gradient) => format!("background:{gradient}"),
+                None => format!("color:{fg};background:{bg}"),
+            };
+            if cell.modifier.contains(Modifier::BOLD) {
+                style.push_str(";font-weight:bold");
+            }
+            if cell.modifier.contains(Modifier::DIM) {
+                style.push_str(";opacity:.5");
+            }
+            let shown = match (half.is_some(), symbol) {
+                (true, _) => " ",
+                (_, "<") => "&lt;",
+                (_, ">") => "&gt;",
+                (_, "&") => "&amp;",
+                (_, s) => s,
+            };
+            let _ = write!(html, "<span style=\"{style}\">{shown}</span>");
+        }
+        html.push('\n');
+    }
+    html.push_str("</pre>");
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("{name}.html")), html);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

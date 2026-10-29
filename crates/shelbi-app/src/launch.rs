@@ -11,11 +11,13 @@
 //! - [`recent`] keeps the recent remote sessions under the Shelbi home.
 //! - [`remote`] is the Connect to Remote Session seam ([`RemoteConnector`]),
 //!   its session type, and the dialog's words.
+//! - [`connect`] is that dialog's two steps ([`ConnectFlow`]).
 //! - [`perform`] carries out a [`LaunchAction`]: opening a local project
 //!   starts the daemon first, through the same on-demand start the clients
 //!   use today ([`DaemonStarter`]); Add project hands over to the add-project
 //!   wizard; connecting remembers the session.
 
+pub mod connect;
 pub mod recent;
 pub mod remote;
 pub mod route;
@@ -24,6 +26,7 @@ use std::path::Path;
 
 use shelbi_state::ProjectSummary;
 
+pub use connect::ConnectFlow;
 pub use recent::{RecentRemote, RecentRemotes, MAX_RECENT_REMOTES, RECENT_REMOTES_FILE};
 pub use remote::{validate_host, RemoteConnector, RemoteError, RemoteSession};
 pub use route::{decide, route, Client, DaemonState, LaunchRoute};

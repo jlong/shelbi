@@ -610,9 +610,13 @@ where
 ///   onboarding so the user can set up the project locally. We
 ///   deliberately re-derive the project name from the chosen root's
 ///   basename rather than re-using the missing name.
-/// - cwd does not resolve to a registered project → onboarding for this cwd,
-///   even when other projects already exist. The banner appears only when the
-///   Shelbi home itself is new.
+/// - cwd does not resolve to a registered project and no daemon is running
+///   (in a terminal) → the launch screen: this machine's projects, the
+///   recent remote sessions, Add project and Connect to remote. A project
+///   opened there boots its TUI.
+/// - cwd does not resolve to a registered project otherwise → onboarding for
+///   this cwd, even when other projects already exist. The banner appears
+///   only when the Shelbi home itself is new.
 fn default_entry(explicit: Option<String>) -> Result<()> {
     let resolved = resolve_or_onboard(commands::require_project(explicit))?;
     let missing_project = match classify_default_route(resolved, project_registration_exists) {
@@ -621,6 +625,18 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
         }
         DefaultRoute::Onboarding { missing_project } => missing_project,
     };
+    if shows_launch_screen(shelbi_app::launch::route::daemon_state(), is_interactive()) {
+        let note = missing_project
+            .as_ref()
+            .map(|name| format!("There's no local registration for project {name} on this machine."));
+        return match shelbi_tui::launch::run(note).context("showing the launch screen")? {
+            shelbi_tui::launch::LaunchExit::Open(name) => {
+                shelbi_tui::run_main(&name).context("launching shelbi")
+            }
+            shelbi_tui::launch::LaunchExit::OpenRemote(session) => shelbi_tui::launch::open_remote(&session),
+            shelbi_tui::launch::LaunchExit::Quit => Ok(()),
+        };
+    }
     if let Some(name) = missing_project {
         eprintln!(
             "No local registration for project `{name}` on this machine — \
@@ -637,6 +653,19 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
 enum DefaultRoute {
     Dashboard(String),
     Onboarding { missing_project: Option<String> },
+}
+
+/// Whether `shelbi` outside a registered project shows the launch screen:
+/// the shared launch routing's call (no daemon running), in a terminal that
+/// can show it. Otherwise it onboards as before.
+fn shows_launch_screen(daemon: shelbi_app::launch::DaemonState, interactive: bool) -> bool {
+    use shelbi_app::launch::{route, Client, LaunchRoute};
+    interactive && route(Client::Tui, daemon, None) == LaunchRoute::LaunchScreen
+}
+
+fn is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 fn classify_default_route<F>(resolved: Option<String>, is_registered: F) -> DefaultRoute
@@ -1349,6 +1378,14 @@ mod cli_tests {
                 missing_project: Some("missing".to_string())
             }
         );
+    }
+
+    #[test]
+    fn outside_a_project_the_launch_screen_shows_only_without_a_daemon_in_a_terminal() {
+        use shelbi_app::launch::DaemonState::{NotRunning, Running};
+        assert!(shows_launch_screen(NotRunning, true));
+        assert!(!shows_launch_screen(Running, true), "a running daemon onboards as before");
+        assert!(!shows_launch_screen(NotRunning, false), "no terminal to draw it in");
     }
 
     #[test]
