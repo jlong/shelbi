@@ -42,6 +42,7 @@ mod hub_version;
 mod issue_cache;
 pub mod machine_state;
 pub mod migration;
+pub mod ownership;
 pub mod questions;
 pub use migration::{
     all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
@@ -112,6 +113,7 @@ pub use issue_store::{
     resolve_issue_store, BoardRead, BoardState, ClosedPage, Cursor, FileSystemStore, IssueChange,
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
+pub use ownership::{OwnershipGate, TrackerOwner};
 pub use project_paths::ProjectPaths;
 pub use supervision_status::{
     clear_orchestrator_supervision_status, read_orchestrator_supervision_status,

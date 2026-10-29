@@ -64,7 +64,21 @@ pub(crate) fn add(
         params: std::collections::BTreeMap::new(),
         priority: None,
     };
-    let created = store.add(new).map_err(MutateError::backend)?;
+    let (created, tracker_assignees) =
+        store.add_with_assignees(new).map_err(MutateError::backend)?;
+    // On a remote tracker the create assigns the issue to the user; when that
+    // didn't take (an unresolved login, or the tracker dropped the assignee) the
+    // issue still exists, but say so: the orchestrator won't start it.
+    if let Ok(project_yaml) = shelbi_state::load_project(project) {
+        if let Some(warning) = shelbi_state::ownership::creation_warning(
+            &project_yaml.issue_tracker,
+            store.as_ref(),
+            &created.id,
+            &tracker_assignees,
+        ) {
+            sink.warn(&warning);
+        }
+    }
 
     // Wake the orchestrator when a card is created directly into an agent-owned
     // status (not the quiet backlog inbox). Best-effort — the card is already

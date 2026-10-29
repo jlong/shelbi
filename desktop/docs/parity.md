@@ -460,6 +460,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `workflow` | not shown: raw `task.workflow` only feeds workflow-name resolution | not shown: not used anywhere |
 | `workflow_name` | equivalent `task_workflow_name()` badge (`kanban.rs` `card_meta_line`) | workflow badge on every card (`views/issues.rs` `card_meta`, `workflow_badge`) |
 | `assignee` | not shown on card: `assigned_to` drives workspace filter and the footer "workspace" hint (`kanban.rs` `render_footer`) | not shown on card (the Figma card has no assignee): detail's workspace row (`views/task_detail.rs` `render`); assign picker mark |
+| `tracker_owner` | remote tracker only: a card that isn't the user's leads its meta line with `@login` / `unassigned` in yellow (`kanban.rs` `card_meta_line`); the TUI board has no Start to withhold | remote tracker only: a card that isn't the user's leads its meta line with `@login` / `unassigned` (`views/issues.rs` `card_meta`); `s` shows the `--take` hint instead of starting (`views/board_state.rs` `start`, via `IssueCard::start_refusal`) |
 | `priority` | not shown: ordering and reorder slots only | not shown: ordering only (sort in `board.rs`) |
 | `depends_on` | not shown on card (popover only) | "depends on / blocked by ids" meta line (`views/issues.rs` `card_meta`) |
 | `status_id` | n/a (bucketing via `resolved_status_id`) | not shown: written on optimistic move only (`views/board_state.rs` `apply_open`) |
@@ -491,6 +492,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | not shown: not used |
 | `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | "priority N" in status field (`views/task_detail.rs` `render`) |
 | `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | "workspace" field, "unassigned" when none (`views/task_detail.rs` `render`) |
+| `tracker_owner` | equivalent `OwnershipGate::owner(tracker_assignees)`: "owner:" row, `me` or `@login` plus the `--take` hint, remote tracker only; not in the review popover (`kanban.rs` `popover_header`) | "owner" field, `me` or `@login` plus the `--take` hint, remote tracker only; hides Start when not the user's (`views/task_detail.rs` `render`, `TaskDetailModel::startable`) |
 | `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | "branch" field, resolved `card_branch` (`views/task_detail.rs` `render`) |
 | `workflow_name` | not shown | "workflow" field (`views/task_detail.rs` `render`) |
 | `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | deps field with "[status]" (`views/task_detail.rs` `render`) |

@@ -481,6 +481,7 @@ impl ActiveOverlay {
                     f,
                     rect,
                     Some(task.as_ref()),
+                    None,
                     &columns,
                     scroll,
                     keymaps.as_ref(),

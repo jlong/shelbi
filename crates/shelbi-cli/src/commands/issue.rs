@@ -111,6 +111,12 @@ pub enum IssueCmd {
         /// `~/.shelbi/events.log` for auditability.
         #[arg(long)]
         force: bool,
+        /// Claim the issue before starting it. On a remote issue tracker Shelbi
+        /// only starts issues assigned to you; `--take` assigns this one to you
+        /// on the tracker first (for an unassigned issue, or one you are taking
+        /// over from someone else). The orchestrator never passes this itself.
+        #[arg(long)]
+        take: bool,
     },
     /// Relaunch the assigned workspace on the issue it is ALREADY working,
     /// WITHOUT discarding progress. For a stalled or killed worker: recreates
@@ -129,6 +135,10 @@ pub enum IssueCmd {
         /// `user:cli:resume`.
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
+        /// Claim the issue on a remote issue tracker before resuming it (see
+        /// `issue start --take`).
+        #[arg(long)]
+        take: bool,
     },
     /// Re-order an issue within its column.
     Prio(PrioArgs),
@@ -350,6 +360,7 @@ pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
             branch,
             reason,
             force,
+            take,
         } => mutate_client::run_mutation(
             &project,
             &id,
@@ -358,13 +369,15 @@ pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
                 branch,
                 reason,
                 force,
+                take,
             },
         ),
         IssueCmd::Resume {
             id,
             workspace,
             reason,
-        } => resume(&project, &id, workspace.as_deref(), reason.as_deref()),
+            take,
+        } => resume(&project, &id, workspace.as_deref(), reason.as_deref(), take),
         IssueCmd::Prio(args) => prio(&project, args),
         IssueCmd::Edit(args) => edit(&project, args),
         IssueCmd::Rm { id } => rm(&project, &id),
@@ -580,6 +593,21 @@ fn list(
         }
     };
 
+    // On a remote tracker each row carries an Owner column (`me`, `@login`,
+    // `unassigned`) so a shared board shows whose work each issue is; a
+    // filesystem board has no ownership and lists exactly as before. The gate
+    // reads the login from the board index, with no API call.
+    let ownership = project_yaml
+        .as_ref()
+        .and_then(|p| shelbi_state::ownership::gate_from_index(project, &p.issue_tracker).ok())
+        .unwrap_or(shelbi_state::OwnershipGate::Unrestricted);
+    let owner_col = |tf: &shelbi_state::IssueFile| -> String {
+        ownership
+            .owner(&tf.tracker_assignees)
+            .map(|o| format!("{:<16} ", o.label()))
+            .unwrap_or_default()
+    };
+
     if ready {
         let mut ready_tasks = shelbi_state::list_ready(project).map_err(|e| anyhow!(e))?;
         ready_tasks.retain(|tf| matches_workflow(&tf.task));
@@ -594,7 +622,7 @@ fn list(
                 .as_deref()
                 .map(|w| format!("  [{w}]"))
                 .unwrap_or_default();
-            println!("  {:<28} {}{owner}", tf.task.id, tf.task.title);
+            println!("  {:<28} {}{}{owner}", tf.task.id, owner_col(tf), tf.task.title);
         }
         return Ok(());
     }
@@ -666,7 +694,12 @@ fn list(
             } else {
                 ""
             };
-            println!("  {:<28} {}{owner}{badge}", tf.task.id, tf.task.title);
+            println!(
+                "  {:<28} {}{}{owner}{badge}",
+                tf.task.id,
+                owner_col(tf),
+                tf.task.title
+            );
         }
     }
     Ok(())
@@ -684,6 +717,25 @@ fn show(project: &str, id: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
     let text = shelbi_state::render_task_file(&tf).map_err(|e| anyhow!(e))?;
     print!("{text}");
+
+    // Footer: tracker ownership, on a remote tracker only (a filesystem board
+    // has none). Says when the issue isn't the user's and how to claim it.
+    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+    let gate = shelbi_state::ownership::dispatch_gate(&project_yaml.issue_tracker, store.as_ref());
+    if let Some(owner) = gate.owner(&tf.tracker_assignees) {
+        if !text.ends_with('\n') {
+            println!();
+        }
+        if owner.is_mine() {
+            println!("→ owner: me");
+        } else {
+            println!(
+                "→ owner: {} (not yours: Shelbi won't start it; `shelbi issue start {id} --take` \
+                 claims it)",
+                owner.label()
+            );
+        }
+    }
 
     // Footer: resolved depends_on. Done lazily after the frontmatter dump so
     // scripts grepping for frontmatter still get clean output above the line.
@@ -1055,6 +1107,7 @@ fn resume(
     id: &str,
     workspace_arg: Option<&str>,
     reason: Option<&str>,
+    take: bool,
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let tf = load_issue(project, id)?;
@@ -1088,6 +1141,20 @@ fn resume(
     // another would leave two agents racing one worktree.
     ensure_workspace_dispatchable(project, &workspace_name, id)?;
 
+    // The same ownership gate as `start`: on a remote tracker, resume only an
+    // issue assigned to the user (or claim it first on an explicit `--take`).
+    let store = cached_issue_store(project)?;
+    let claim = shelbi_state::ownership::ensure_owned_for_dispatch(
+        &project_yaml.issue_tracker,
+        store.as_ref(),
+        &tf,
+        take,
+    )
+    .map_err(|e| anyhow!(e))?;
+    if let shelbi_state::ownership::Claim::Took { login } = claim {
+        println!("✓ took {id}: assigned to @{login} on the issue tracker");
+    }
+
     // Resolve the branch WITHOUT cutting or resetting it: the branch already
     // exists (the worker created + committed on it). Prefer the issue's recorded
     // branch, falling back through workflow/project/GitHub prefix resolution.
@@ -1109,7 +1176,6 @@ fn resume(
     let original = tf.task.clone();
     let prev_column = tf.task.column.clone();
     let moved_into_progress = prev_column != Column::in_progress();
-    let store = cached_issue_store(project)?;
     if moved_into_progress {
         store
             .move_status(id, &Column::in_progress(), reason.unwrap_or("user:cli"))
@@ -1787,7 +1853,7 @@ statuses:
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
         shelbi_state::save_task("p", &task_in(Column::in_progress(), "orphan"), "").unwrap();
-        let err = resume("p", "orphan", None, None).unwrap_err().to_string();
+        let err = resume("p", "orphan", None, None, false).unwrap_err().to_string();
         assert!(err.contains("no assigned workspace"), "err: {err}");
 
         std::env::remove_var("SHELBI_HOME");
@@ -1806,11 +1872,107 @@ statuses:
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
         shelbi_state::save_task("p", &task_in(Column::in_progress(), "t"), "").unwrap();
-        let err = resume("p", "t", Some("ghost"), None)
+        let err = resume("p", "t", Some("ghost"), None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("workspace `ghost` not declared"), "err: {err}");
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A github-backed project `gr` (one workspace `dev`) whose fake `gh`
+    /// (authenticated as `octocat`) serves one in-progress issue `t` assigned
+    /// to `assignees` on the tracker. Returns the recorded calls.
+    fn github_resume_fixture(assignees: &[&str]) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("gr.yaml"),
+            "name: gr\nrepo: /tmp/gr\ndefault_branch: main\n\
+             issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/gr\n\
+             workspaces:\n  - { name: dev, machine: local, runner: claude }\n",
+        )
+        .unwrap();
+        let logins: Vec<String> =
+            assignees.iter().map(|l| format!(r#"{{"login":"{l}"}}"#)).collect();
+        let logins = logins.join(",");
+        let rest = format!(
+            r#"{{"number":5,"title":"T","body":"","state":"open","assignees":[{logins}],"labels":[{{"name":"shelbi:id/t"}},{{"name":"shelbi:status/in-progress"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        );
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            let joined = args.join(" ");
+            rec.lock().unwrap().push(joined.clone());
+            if args.contains(&"user") && !joined.contains("repos/") {
+                return Ok("octocat\n".to_string());
+            }
+            if args.contains(&"graphql") {
+                return Ok(
+                    r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":5}]}}}"#
+                        .to_string(),
+                );
+            }
+            Ok(rest.clone())
+        });
+        calls
+    }
+
+    #[test]
+    fn resume_refuses_an_issue_assigned_to_someone_else() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let calls = github_resume_fixture(&["alice"]);
+
+        let err = resume("gr", "t", Some("dev"), None, false).unwrap_err().to_string();
+        assert!(err.contains("assigned to @alice"), "err: {err}");
+        assert!(err.contains("--take"), "err: {err}");
+        assert!(
+            !calls.lock().unwrap().iter().any(|c| c.contains("/assignees")),
+            "resume never claims on its own"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resume_refuses_an_unassigned_issue() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        github_resume_fixture(&[]);
+
+        let err = resume("gr", "t", Some("dev"), None, false).unwrap_err().to_string();
+        assert!(err.contains("not assigned to anyone"), "err: {err}");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resume_passes_the_ownership_gate_for_the_users_own_issue() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        github_resume_fixture(&["octocat"]);
+
+        // The relaunch can't run in a unit test; the failure, if any, just
+        // must not be the ownership gate.
+        if let Err(e) = resume("gr", "t", Some("dev"), None, false) {
+            let e = format!("{e:#}");
+            assert!(!e.contains("Shelbi only starts issues assigned to you"), "{e}");
+            assert!(!e.contains("not assigned to anyone"), "{e}");
+        }
+
+        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -14140,45 +14140,12 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
 // rules here are mechanical (and Rust-tested); the rules there are
 // user-tunable (and live in the prompt).
 
-/// Who "the user" is for Zen ownership gating, and hence which backlog issues
-/// are mechanically eligible on an external issue tracker.
-///
-/// On the filesystem backend every issue is the user's — there is no tracker
-/// notion of ownership — so the gate is [`OwnershipGate::Unrestricted`] and
-/// nothing is filtered on this axis. On an external tracker (GitHub) a backlog
-/// issue is eligible only when its [`shelbi_state::IssueFile::tracker_assignees`]
-/// include the authenticated account's login
-/// ([`OwnershipGate::RequireAssignee`]): work an outside contributor filed, or
-/// that is assigned to someone else, is never auto-promoted. When that login
-/// can't be resolved the gate **fails closed** ([`OwnershipGate::FailClosed`]):
-/// nothing is eligible, because promoting an issue we can't prove the user owns
-/// is the one outcome this gate exists to prevent. Never fail open.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnershipGate {
-    /// Filesystem backend (or any backend with no tracker-side ownership): no
-    /// ownership filtering.
-    Unrestricted,
-    /// External tracker with the authenticated login resolved: eligible only
-    /// when the issue's tracker assignees include this login (case-insensitive,
-    /// matching GitHub login semantics).
-    RequireAssignee(String),
-    /// External tracker whose authenticated login could not be resolved: nothing
-    /// is eligible (fail closed).
-    FailClosed,
-}
-
-impl OwnershipGate {
-    /// Whether an issue carrying these tracker assignees passes the gate.
-    fn allows(&self, tracker_assignees: &[String]) -> bool {
-        match self {
-            OwnershipGate::Unrestricted => true,
-            OwnershipGate::RequireAssignee(login) => tracker_assignees
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(login)),
-            OwnershipGate::FailClosed => false,
-        }
-    }
-}
+/// The ownership gate the Zen scan applies: the shared tracker-ownership check
+/// every dispatch path uses ([`shelbi_state::ownership`]). On a remote tracker
+/// only backlog issues assigned to the authenticated user are mechanically
+/// eligible; an unresolved login fails closed; the filesystem board is
+/// unrestricted.
+pub use shelbi_state::OwnershipGate;
 
 /// Backlog task ids that are mechanically eligible for Zen auto-promotion,
 /// sorted by priority (lower number = higher priority). See module docs for
@@ -14200,31 +14167,24 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
 
 /// Build the ownership gate for `project`'s Zen scan.
 ///
-/// Filesystem backends are unrestricted. An external tracker needs the
-/// authenticated user's login, which we read from the daemon-owned board index
-/// (`board-index.json`'s `viewer_login`, captured there with no extra API call
-/// so the heartbeat-cadence scan adds no GitHub request per tick). A remote
-/// backend whose login we can't resolve — a cold/absent index, a token with no
-/// identity — fails closed, so Zen never promotes an issue it can't attribute.
+/// The login comes from the daemon-owned board index with no extra API call
+/// ([`shelbi_state::ownership::gate_from_index`]), so the heartbeat-cadence scan
+/// adds no GitHub request per tick. A remote backend whose login we can't
+/// resolve fails closed, so Zen never promotes an issue it can't attribute.
 fn resolve_ownership_gate(project: &Project) -> Result<OwnershipGate> {
-    if !project.issue_tracker.backend.is_remote() {
-        return Ok(OwnershipGate::Unrestricted);
+    let gate = shelbi_state::ownership::gate_from_index(&project.name, &project.issue_tracker)?;
+    if gate == OwnershipGate::FailClosed {
+        // Say why: the board index carries no authenticated login yet (the
+        // daemon hasn't published one, or the token has no identity), so we
+        // cannot tell which backlog issues the user owns.
+        tracing::warn!(
+            project = %project.name,
+            "zen: external tracker but no authenticated login in the board index; \
+             failing closed (nothing is mechanically eligible until the daemon \
+             republishes the index with a viewer login)"
+        );
     }
-    match shelbi_state::read_board_index_viewer_login(&project.name, &project.issue_tracker)? {
-        Some(login) if !login.is_empty() => Ok(OwnershipGate::RequireAssignee(login)),
-        _ => {
-            // Fail closed and say why: the board index carries no authenticated
-            // login yet (the daemon hasn't published one, or the token has no
-            // identity), so we cannot tell which backlog issues the user owns.
-            tracing::warn!(
-                project = %project.name,
-                "zen: external tracker but no authenticated login in the board index; \
-                 failing closed (nothing is mechanically eligible until the daemon \
-                 republishes the index with a viewer login)"
-            );
-            Ok(OwnershipGate::FailClosed)
-        }
-    }
+    Ok(gate)
 }
 
 /// The whole board — open plus terminal history — assembled from the open index

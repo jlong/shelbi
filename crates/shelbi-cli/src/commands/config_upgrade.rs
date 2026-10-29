@@ -427,6 +427,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_instructions(entry, &text, out);
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_reporting_subject(entry, &text, out);
+        sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
@@ -880,6 +881,129 @@ fn sniff_reporting_subject(entry: &InventoryEntry, text: &str, out: &mut Vec<Upg
             locate_line_containing(text, "comma-separated workspace"),
         ));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator dispatch rules — only dispatch issues assigned to you on a
+// remote tracker
+
+/// Code for the tracker-ownership dispatch rules: an UNEDITED copy is patched
+/// in place (auto-heal); an edited one is handed to the orchestrator with
+/// [`TRACKER_OWNERSHIP_JUDGMENT_CODE`].
+pub(crate) const TRACKER_OWNERSHIP_AUTOHEAL_CODE: &str = "ORCH_TRACKER_OWNERSHIP_DISPATCH_MISSING";
+
+/// Code for an edited orchestrator copy whose dispatch rules predate the
+/// tracker-ownership gate, routed to the orchestrator for judgment.
+pub(crate) const TRACKER_OWNERSHIP_JUDGMENT_CODE: &str = "ORCH_TRACKER_OWNERSHIP_DISPATCH_EDITED";
+
+/// The phrase the healed ready-dispatch rule carries. A copy containing it is
+/// current, so the sniff is idempotent. Kept in sync with the shipped template
+/// by the drift guard in this module's tests.
+pub(crate) const TRACKER_OWNERSHIP_MARKER: &str =
+    "Only dispatch issues assigned to you on a remote tracker.";
+
+/// The exact passages the past shipped orchestrator template carried, each
+/// paired with its tracker-ownership rewrite: the end of the ready-dispatch
+/// reaction rule (gains the "only dispatch `owner=me`" paragraph) and the
+/// heartbeat's missed-dispatch sweep (gains the assigned-to-you condition).
+///
+/// Several people can share one remote tracker, so a card a teammate moves into
+/// `ready` reaches every orchestrator's feed. The daemon now refuses to start
+/// such an issue and each task line carries `owner=`; these rules teach the
+/// orchestrator to skip others' work up front instead of trying (and failing)
+/// to start it. An UNEDITED copy contains both legacy passages verbatim, so
+/// the swap is deterministic and non-lossy (an auto-heal); a copy that edited
+/// either one gets a needs-judgment finding instead, so the user's wording is
+/// never clobbered.
+pub(crate) const TRACKER_OWNERSHIP_REWRITES: [(&str, &str); 2] = [
+    (
+        "  If no eligible free workspace exists, leave the issue in `ready` and\n  \
+         mention it in your next user-facing reply so they know nothing is\n  \
+         stalled by mistake.\n",
+        "  If no eligible free workspace exists, leave the issue in `ready` and\n  \
+         mention it in your next user-facing reply so they know nothing is\n  \
+         stalled by mistake.\n\n  \
+         **Only dispatch issues assigned to you on a remote tracker.** Several\n  \
+         people can share one GitHub tracker, so a card a teammate moves into\n  \
+         `ready` reaches your feed too. On a remote tracker every task line carries\n  \
+         `owner=`: dispatch only `owner=me`, and silently skip `owner=other:<login>`\n  \
+         (a teammate's) and `owner=unassigned` (`shelbi issue start` refuses them\n  \
+         anyway). The user claims such an issue with `shelbi issue start <id>\n  \
+         --take` or by assigning it on the tracker; never pass `--take` yourself. A\n  \
+         line with no `owner=` is from a filesystem board, where every issue is\n  \
+         yours.\n",
+    ),
+    (
+        "     gate (e.g. `adversarial-review`) with no live worker assigned — that\n     \
+         isn't blocked by `prefers_machine`, dispatch per the normal\n     \
+         auto-dispatch contract.",
+        "     gate (e.g. `adversarial-review`) with no live worker assigned — that\n     \
+         isn't blocked by `prefers_machine` and, on a remote tracker, is\n     \
+         assigned to you (`me` in `shelbi issue list`'s owner column), dispatch\n     \
+         per the normal auto-dispatch contract.",
+    ),
+];
+
+/// Apply both tracker-ownership rewrites, but only when the copy carries both
+/// legacy passages verbatim (an unedited copy); otherwise the text is returned
+/// unchanged. Shared by the sniffer and the healer's write-back so the two can
+/// never diverge.
+pub(crate) fn apply_tracker_ownership_rewrites(text: &str) -> String {
+    if text.contains(TRACKER_OWNERSHIP_MARKER)
+        || !TRACKER_OWNERSHIP_REWRITES.iter().all(|(legacy, _)| text.contains(legacy))
+    {
+        return text.to_string();
+    }
+    TRACKER_OWNERSHIP_REWRITES
+        .iter()
+        .fold(text.to_string(), |acc, (legacy, new)| acc.replacen(legacy, new, 1))
+}
+
+/// Sniff an orchestrator `instructions.md` whose dispatch rules predate the
+/// tracker-ownership gate (no "only dispatch issues assigned to you on a remote
+/// tracker" rule).
+///
+/// A default change only reaches NEW projects via the shipped template; existing
+/// projects carry their own copy, so this hands them the change on next boot (per
+/// the AGENTS.md "Changing shipped defaults" guardrail). An unedited copy is
+/// patched in place ([`Classification::AutoHeal`]); one whose dispatch rules the
+/// user edited routes to [`Classification::NeedsJudgment`] so the orchestrator
+/// merges the rule into its customized copy. Only copies that actually carry the
+/// ready-dispatch rule are in scope. Idempotent once the marker is present.
+fn sniff_tracker_ownership_dispatch(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    if text.contains(TRACKER_OWNERSHIP_MARKER) || !text.contains("to_category=ready") {
+        return;
+    }
+    let unedited = apply_tracker_ownership_rewrites(text) != text;
+    out.push(finding(
+        entry,
+        if unedited {
+            Classification::AutoHeal
+        } else {
+            Classification::NeedsJudgment
+        },
+        if unedited {
+            TRACKER_OWNERSHIP_AUTOHEAL_CODE
+        } else {
+            TRACKER_OWNERSHIP_JUDGMENT_CODE
+        },
+        "orchestrator dispatch rules don't limit dispatch to issues assigned to you — on a \
+         shared remote tracker a teammate's card entering `ready` reaches your feed, and the \
+         ready-dispatch and heartbeat missed-dispatch rules would try to start it (Shelbi now \
+         refuses, so the attempt just fails)",
+        "Add to the ready-dispatch reaction rule: \"Only dispatch issues assigned to you on a \
+         remote tracker.\" — dispatch only lines carrying `owner=me`, silently skip \
+         `owner=other:<login>` and `owner=unassigned`, never pass `--take` yourself (the user \
+         claims an issue with `shelbi issue start <id> --take`), and a line with no `owner=` is \
+         a filesystem board where every issue is yours. In the heartbeat's missed-dispatch \
+         sweep, only dispatch an issue that on a remote tracker is assigned to you (`me` in \
+         `shelbi issue list`'s owner column). Mirror the shipped default template.",
+        locate_line_containing(text, "to_category=ready"),
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -4223,6 +4347,81 @@ mod tests {
             "shipped default template trips the Reporting-subject sniffer: {:?}",
             codes(&out),
         );
+    }
+
+    // ---- orchestrator tracker-ownership dispatch rules ------------------
+
+    /// The shipped template as it stood before the tracker-ownership rule: each
+    /// rewrite reversed, so the drift guard and the heal tests start from a real
+    /// unedited legacy copy rather than a hand-written fragment.
+    fn legacy_ownership_template() -> String {
+        TRACKER_OWNERSHIP_REWRITES
+            .iter()
+            .fold(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.to_string(), |acc, (legacy, new)| {
+                acc.replacen(new, legacy, 1)
+            })
+    }
+
+    #[test]
+    fn unedited_legacy_dispatch_rules_auto_heal_to_the_shipped_wording() {
+        let legacy = legacy_ownership_template();
+        assert!(!legacy.contains(TRACKER_OWNERSHIP_MARKER));
+        let mut out = Vec::new();
+        sniff_tracker_ownership_dispatch(&orch_entry(), &legacy, &mut out);
+        assert_eq!(codes(&out), vec![TRACKER_OWNERSHIP_AUTOHEAL_CODE]);
+        assert_eq!(out[0].classification, Classification::AutoHeal);
+
+        // The heal reproduces exactly what Shelbi ships, and is idempotent.
+        let healed = apply_tracker_ownership_rewrites(&legacy);
+        assert_eq!(healed, shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS);
+        let mut again = Vec::new();
+        sniff_tracker_ownership_dispatch(&orch_entry(), &healed, &mut again);
+        assert!(again.is_empty(), "healed text still trips the sniffer: {:?}", codes(&again));
+    }
+
+    #[test]
+    fn edited_dispatch_rules_are_needs_judgment_and_never_rewritten() {
+        // The user reworded the ready-dispatch rule: no exact legacy passage, so
+        // the change goes to the orchestrator for judgment and the shared
+        // rewrite leaves the copy byte-for-byte alone.
+        let edited = legacy_ownership_template().replace(
+            "stalled by mistake.",
+            "stalled by mistake, and ping me on Slack.",
+        );
+        let mut out = Vec::new();
+        sniff_tracker_ownership_dispatch(&orch_entry(), &edited, &mut out);
+        assert_eq!(codes(&out), vec![TRACKER_OWNERSHIP_JUDGMENT_CODE]);
+        assert_eq!(out[0].classification, Classification::NeedsJudgment);
+        assert_eq!(apply_tracker_ownership_rewrites(&edited), edited);
+    }
+
+    #[test]
+    fn a_copy_without_a_ready_dispatch_rule_is_out_of_scope() {
+        let text = "# Orchestrator\n\n## Reporting\n\nSay what changed.\n";
+        let mut out = Vec::new();
+        sniff_tracker_ownership_dispatch(&orch_entry(), text, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
+    }
+
+    /// Drift guard: the shipped template carries the ownership rule and both
+    /// rewritten passages, never a legacy one, so a fresh project never trips
+    /// the sniffer and the rewrite table can't diverge from what Shelbi ships.
+    #[test]
+    fn shipped_default_template_carries_the_tracker_ownership_rule() {
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(shipped.contains(TRACKER_OWNERSHIP_MARKER));
+        for (legacy, new) in TRACKER_OWNERSHIP_REWRITES {
+            assert!(shipped.contains(new), "shipped template lacks: {new}");
+            // The ready-rule rewrite appends to its legacy passage, so look for
+            // the legacy text only outside the new one.
+            assert!(
+                !shipped.replace(new, "").contains(legacy),
+                "shipped template still carries: {legacy}"
+            );
+        }
+        let mut out = Vec::new();
+        sniff_tracker_ownership_dispatch(&orch_entry(), shipped, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
     }
 
     // ---- orchestrator agent-owned active dispatch -----------------------

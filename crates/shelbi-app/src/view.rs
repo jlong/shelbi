@@ -17,7 +17,9 @@ use std::collections::{BTreeSet, HashMap};
 use shelbi_core::{Column, Machine, MachineKind, Reachability, StatusCategory, WorkspaceSpec};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::machine_state::MachineRecord;
-use shelbi_state::{ErrorLogEntry, IssueFile, WorkspaceState, WorkspaceStatus, ZenModeState};
+use shelbi_state::{
+    ErrorLogEntry, IssueFile, TrackerOwner, WorkspaceState, WorkspaceStatus, ZenModeState,
+};
 
 use crate::board::{self, BoardInput, BoardRules, WorkspaceFilter};
 use crate::nav::View;
@@ -768,6 +770,10 @@ pub struct IssueCard {
     pub workflow_name: String,
     /// The workspace the card is assigned to (`assigned_to`, no `@`).
     pub assignee: Option<String>,
+    /// Whose the issue is on a remote tracker, or `None` on a filesystem board
+    /// (no ownership). A card that isn't the user's is marked, and isn't offered
+    /// to start ([`IssueCard::startable`]).
+    pub tracker_owner: Option<TrackerOwner>,
     pub priority: u32,
     /// Dependency badges, in `depends_on` order.
     pub depends_on: Vec<DepBadge>,
@@ -804,6 +810,19 @@ pub struct BoardFilters {
 }
 
 impl IssueCard {
+    /// Whether the board offers to start this card: always on a filesystem
+    /// board, and on a remote tracker only when it's assigned to the user
+    /// (starting someone else's takes the explicit `issue start --take`).
+    pub fn startable(&self) -> bool {
+        start_refusal(&self.id, self.tracker_owner.as_ref()).is_none()
+    }
+
+    /// Why the board won't start this card, for the status line, or `None`
+    /// when it will ([`IssueCard::startable`]).
+    pub fn start_refusal(&self) -> Option<String> {
+        start_refusal(&self.id, self.tracker_owner.as_ref())
+    }
+
     /// The expected state a mutation of this card carries.
     pub fn expected(&self) -> shelbi_proto::control::ExpectedState {
         shelbi_proto::control::ExpectedState {
@@ -850,7 +869,7 @@ impl IssuesModel {
                 board::sort_column_cards(def.category, &mut members);
                 let cards: Vec<IssueCard> = members
                     .into_iter()
-                    .map(|tf| card_for(tf, &by_id, &rules, &def.status_id))
+                    .map(|tf| card_for(tf, &by_id, &rules, &def.status_id, &input.ownership))
                     .filter(|c| {
                         board::card_matches_search(&c.title, &c.id, c.branch.as_deref(), &filters.search)
                     })
@@ -926,6 +945,8 @@ pub struct TaskDetailModel {
     pub category: StatusCategory,
     pub priority: u32,
     pub assignee: Option<String>,
+    /// Whose the issue is on a remote tracker ([`IssueCard::tracker_owner`]).
+    pub tracker_owner: Option<TrackerOwner>,
     pub branch: Option<String>,
     pub workflow_name: String,
     pub depends_on: Vec<DepBadge>,
@@ -939,7 +960,29 @@ pub struct TaskDetailModel {
     pub body: String,
 }
 
+/// Why a board won't start issue `id` with this tracker owner: it is someone
+/// else's, or unassigned, on a remote tracker (starting it takes the explicit
+/// `issue start --take` claim). `None` when it's the user's, or the board has
+/// no ownership (filesystem). Shared by both clients' Start affordances.
+pub fn start_refusal(id: &str, owner: Option<&TrackerOwner>) -> Option<String> {
+    let owner = owner.filter(|o| !o.is_mine())?;
+    let whose = match owner {
+        TrackerOwner::Unassigned => "unassigned on the tracker".to_string(),
+        TrackerOwner::Unknown(_) => "not known to be yours (your tracker login is unresolved)"
+            .to_string(),
+        other => format!("assigned to {}", other.label()),
+    };
+    Some(format!(
+        "{id} is {whose}; run `shelbi issue start {id} --take` to claim and start it"
+    ))
+}
+
 impl TaskDetailModel {
+    /// Whether the detail offers Start ([`IssueCard::startable`]).
+    pub fn startable(&self) -> bool {
+        start_refusal(&self.id, self.tracker_owner.as_ref()).is_none()
+    }
+
     /// The detail of issue `id` on `input`'s board, or `None` when it is no
     /// longer there.
     pub fn build(input: &BoardInput, id: &str) -> Option<TaskDetailModel> {
@@ -951,7 +994,7 @@ impl TaskDetailModel {
             .collect();
         let rules = input.rules();
         let status_id = rules.resolved_status_id(&tf.task);
-        let card = card_for(tf, &by_id, &rules, &status_id);
+        let card = card_for(tf, &by_id, &rules, &status_id, &input.ownership);
         let status = input
             .project_statuses
             .statuses
@@ -970,6 +1013,7 @@ impl TaskDetailModel {
             status_id,
             priority: task.priority,
             assignee: card.assignee,
+            tracker_owner: card.tracker_owner,
             branch: card.branch,
             workflow_name: card.workflow_name,
             depends_on: card.depends_on,
@@ -987,6 +1031,7 @@ fn card_for(
     by_id: &HashMap<String, Column>,
     rules: &BoardRules<'_>,
     status_id: &str,
+    ownership: &shelbi_state::OwnershipGate,
 ) -> IssueCard {
     let task = &tf.task;
     let workflow_name = rules.workflow_name(task).to_string();
@@ -999,6 +1044,7 @@ fn card_for(
         workflow: task.workflow.clone(),
         workflow_name,
         assignee: task.assigned_to.clone(),
+        tracker_owner: ownership.owner(&tf.tracker_assignees),
         priority: task.priority,
         depends_on: task
             .depends_on
@@ -1685,6 +1731,43 @@ mod tests {
         // Empty columns auto-collapse; non-empty ones expand.
         assert!(model.columns[0].collapsed, "empty backlog collapses");
         assert!(!todo.collapsed);
+    }
+
+    #[test]
+    fn remote_board_cards_carry_ownership_and_only_the_users_start() {
+        let mut board = vec![issue("mine", "todo"), issue("theirs", "todo"), issue("nobody", "todo")];
+        board[0].tracker_assignees = vec!["octocat".into()];
+        board[1].tracker_assignees = vec!["alice".into()];
+        let mut input = board_input(board);
+        input.ownership = shelbi_state::OwnershipGate::RequireAssignee("octocat".into());
+        let model = IssuesModel::build(&input, &BoardFilters::default());
+        let card = |id| model.card(id).unwrap();
+        assert_eq!(card("mine").tracker_owner, Some(TrackerOwner::Me));
+        assert!(card("mine").startable());
+        assert_eq!(
+            card("theirs").tracker_owner,
+            Some(TrackerOwner::Other(vec!["alice".into()]))
+        );
+        assert!(!card("theirs").startable());
+        let why = card("theirs").start_refusal().unwrap();
+        assert!(why.contains("assigned to @alice"), "{why}");
+        assert!(why.contains("shelbi issue start theirs --take"), "{why}");
+        assert_eq!(card("nobody").tracker_owner, Some(TrackerOwner::Unassigned));
+        assert!(!card("nobody").startable());
+        // The detail agrees with the card.
+        let detail = TaskDetailModel::build(&input, "theirs").unwrap();
+        assert_eq!(detail.tracker_owner, card("theirs").tracker_owner);
+        assert!(!detail.startable());
+    }
+
+    #[test]
+    fn filesystem_board_cards_have_no_ownership_and_all_start() {
+        let mut board = vec![issue("a", "todo")];
+        board[0].tracker_assignees = vec!["alice".into()];
+        let model = IssuesModel::build(&board_input(board), &BoardFilters::default());
+        let card = model.card("a").unwrap();
+        assert_eq!(card.tracker_owner, None);
+        assert!(card.startable());
     }
 
     fn board_input(open: Vec<IssueFile>) -> BoardInput {

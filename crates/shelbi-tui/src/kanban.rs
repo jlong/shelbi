@@ -43,7 +43,7 @@ use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
 use shelbi_orchestrator::transition::{
     move_issue_with, GitTransitionRunner, MoveError, MoveRequest, MoveWarning, TransitionRunner,
 };
-use shelbi_state::{KanbanColumnOverride, IssueFile};
+use shelbi_state::{KanbanColumnOverride, IssueFile, OwnershipGate, TrackerOwner};
 
 use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
@@ -99,6 +99,10 @@ pub struct KanbanApp {
     /// on every refresh so an edited project file shows up without a
     /// restart. Empty when the project YAML is missing.
     pub workspaces: Vec<String>,
+    /// The tracker-ownership gate cards are marked against
+    /// ([`shelbi_state::ownership`]), reloaded each refresh: unrestricted on a
+    /// filesystem board, so nothing is marked there.
+    pub ownership: OwnershipGate,
     /// Active filter — `None` means "All workspaces".
     /// [`WorkspaceFilter::Unassigned`] keeps only cards with no `assigned_to`.
     /// Mirrored to `state.json::workspace_filter` so the chip survives a
@@ -471,6 +475,7 @@ impl KanbanApp {
             popover: None,
             card_hits: Vec::new(),
             workspaces: Vec::new(),
+            ownership: OwnershipGate::Unrestricted,
             workspace_filter: None,
             workspace_dropdown: None,
             filter_chip_hit: None,
@@ -853,11 +858,13 @@ impl KanbanApp {
                 self.default_workflow_name = p.default_workflow_name;
                 self.display_name = p.display_name;
                 self.workspaces = p.workspaces;
+                self.ownership = p.ownership;
             }
             None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
                 self.display_name = None;
                 self.workspaces = Vec::new();
+                self.ownership = OwnershipGate::Unrestricted;
             }
         }
 
@@ -2459,6 +2466,7 @@ fn render_column(
         // height stays 2 (single-line title) or 3 (wrapped title) rows.
         lines.push(card_meta_line(
             &tf.task,
+            app.ownership.owner(&tf.tracker_assignees).as_ref(),
             &app.workflows,
             app.task_workflow_name(&tf.task),
             show_card_workflow_label,
@@ -2930,6 +2938,7 @@ fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
 /// the card keeps its title+meta shape, it just renders blank.
 fn card_meta_line(
     task: &Issue,
+    owner: Option<&TrackerOwner>,
     workflows: &[Workflow],
     workflow_name: &str,
     show_workflow_name: bool,
@@ -2938,10 +2947,23 @@ fn card_meta_line(
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
 
+    // On a shared remote tracker, a card that isn't the user's leads with
+    // whose it is (`@alice`, `unassigned`), first so truncation never hides
+    // it: Shelbi won't start it without an explicit `issue start --take`.
+    if let Some(owner) = owner.filter(|o| !o.is_mine()) {
+        let mark = truncate(&owner.label(), max_text);
+        used += mark.chars().count();
+        spans.push(Span::styled(mark, Style::default().fg(palette().ansi_yellow)));
+    }
+
     if show_workflow_name {
+        if !spans.is_empty() {
+            used += 1;
+            spans.push(Span::raw(" "));
+        }
         // One space of padding either side so the background reads as a
         // chip rather than butting straight against the glyphs.
-        let badge = truncate(&format!(" {workflow_name} "), max_text);
+        let badge = truncate(&format!(" {workflow_name} "), max_text.saturating_sub(used));
         used += badge.chars().count();
         spans.push(Span::styled(
             badge,
@@ -3084,6 +3106,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .cloned();
     let columns = app.task_columns();
     let style = app.display_style();
+    let owner = tf.as_ref().and_then(|tf| app.ownership.owner(&tf.tracker_assignees));
     let Some(pop) = app.popover.as_mut() else {
         return;
     };
@@ -3091,6 +3114,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         f,
         popover_area,
         tf.as_ref(),
+        owner.as_ref(),
         &columns,
         &mut pop.scroll,
         &app.keymaps,
@@ -3104,12 +3128,15 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 /// [`render_popover`] and the review interface's description popover so both
 /// show the same bordered box (the dialogs' shared frame), metadata header, markdown body, and footer.
 /// `tf` is the task to show (`None` renders the "issue no longer exists" stub);
-/// `columns` resolves dependency labels; `scroll` is clamped against the wrapped
+/// `owner` is its tracker ownership (`None` off a remote tracker, or where the
+/// caller has no gate); `columns` resolves dependency labels; `scroll` is clamped against the wrapped
 /// body height in place.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_task_popover_into(
     f: &mut Frame,
     popover_area: Rect,
     tf: Option<&IssueFile>,
+    owner: Option<&TrackerOwner>,
     columns: &HashMap<String, Column>,
     scroll: &mut u16,
     keymaps: &Keymaps,
@@ -3117,7 +3144,7 @@ pub(crate) fn render_task_popover_into(
 ) {
     let (header_lines, body_text, title) = match tf {
         Some(tf) => (
-            popover_header(tf, columns),
+            popover_header(tf, owner, columns),
             tf.body.clone(),
             tf.task.title.clone(),
         ),
@@ -3200,7 +3227,11 @@ pub(crate) fn render_task_popover_into(
     f.render_widget(Paragraph::new(hint), chunks[3]);
 }
 
-pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) -> Vec<Line<'static>> {
+pub(crate) fn popover_header(
+    tf: &IssueFile,
+    owner: Option<&TrackerOwner>,
+    columns: &HashMap<String, Column>,
+) -> Vec<Line<'static>> {
     let task = &tf.task;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -3220,6 +3251,22 @@ pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) 
         ));
     }
     lines.push(Line::from(col_line));
+
+    // Tracker ownership, on a remote tracker only. An issue that isn't the
+    // user's says so and names the explicit claim.
+    if let Some(owner) = owner {
+        let mut spans = vec![meta_label("owner")];
+        if owner.is_mine() {
+            spans.push(Span::raw("me"));
+        } else {
+            spans.push(Span::styled(owner.label(), Style::default().fg(palette().ansi_yellow)));
+            spans.push(Span::styled(
+                format!("   not yours: `shelbi issue start {} --take` claims it", task.id),
+                Style::default().fg(palette().ansi_dark_gray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
 
     if let Some(branch) = &task.branch {
         lines.push(meta_row("branch", branch));
@@ -6421,18 +6468,34 @@ transitions:
     fn card_meta_line_blank_for_default_only() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow()];
-        let line = card_meta_line(&task, &workflows, "default", false, 40);
+        let line = card_meta_line(&task, None, &workflows, "default", false, 40);
         assert_eq!(line_text(&line), "");
     }
 
     /// Multi-workflow board, default-workflow task → the workflow badge
     /// surfaces (space-padded) so the user can distinguish "default"
     /// cards from cards belonging to other workflows on the same screen.
+    /// On a shared remote tracker a card that isn't the user's leads its meta
+    /// line with whose it is; the user's own card shows no mark.
+    #[test]
+    fn card_meta_line_marks_cards_that_are_not_the_users() {
+        let task = task_with_params("t", None, &[]);
+        let workflows = vec![default_workflow()];
+        let theirs = TrackerOwner::Other(vec!["alice".into()]);
+        let line = card_meta_line(&task, Some(&theirs), &workflows, "default", false, 40);
+        assert_eq!(line_text(&line), "@alice");
+        let line =
+            card_meta_line(&task, Some(&TrackerOwner::Unassigned), &workflows, "default", false, 40);
+        assert_eq!(line_text(&line), "unassigned");
+        let line = card_meta_line(&task, Some(&TrackerOwner::Me), &workflows, "default", false, 40);
+        assert_eq!(line_text(&line), "");
+    }
+
     #[test]
     fn card_meta_line_shows_default_badge_when_multiple_workflows() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow(), workflow_with_git("feature-task", None)];
-        let line = card_meta_line(&task, &workflows, "default", true, 40);
+        let line = card_meta_line(&task, None, &workflows, "default", true, 40);
         assert_eq!(line_text(&line), " default ");
     }
 
@@ -6442,7 +6505,7 @@ transitions:
     fn card_meta_line_shows_workflow_badge_without_git_block() {
         let task = task_with_params("t", Some("design-review"), &[]);
         let workflows = vec![default_workflow(), workflow_with_git("design-review", None)];
-        let line = card_meta_line(&task, &workflows, "design-review", true, 40);
+        let line = card_meta_line(&task, None, &workflows, "design-review", true, 40);
         assert_eq!(line_text(&line), " design-review ");
     }
 
@@ -6457,7 +6520,7 @@ transitions:
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, "feature-task", true, 60);
+        let line = card_meta_line(&task, None, &workflows, "feature-task", true, 60);
         // Two spaces between badge and branch: the badge's own trailing
         // padding (bg-filled) plus a plain separator space.
         assert_eq!(line_text(&line), " feature-task  ⎇ feature/auth-rewrite");
@@ -6474,7 +6537,7 @@ transitions:
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, "feature-task", false, 60);
+        let line = card_meta_line(&task, None, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&line), "⎇ feature/dashboard-v2");
     }
 
@@ -6489,7 +6552,7 @@ transitions:
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, "feature-task", false, 60);
+        let line = card_meta_line(&task, None, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&line), "⎇ shelbi/t");
     }
 
@@ -6501,10 +6564,10 @@ transitions:
         let task = task_with_params("t", Some("feature-release"), &[]);
         let workflows = vec![workflow_with_git("feature-release", Some("main"))];
         // Show badge path: drop the branch, keep the badge.
-        let with_name = card_meta_line(&task, &workflows, "feature-release", true, 60);
+        let with_name = card_meta_line(&task, None, &workflows, "feature-release", true, 60);
         assert_eq!(line_text(&with_name), " feature-release ");
         // No badge path: nothing left worth showing → blank.
-        let without_name = card_meta_line(&task, &workflows, "feature-release", false, 60);
+        let without_name = card_meta_line(&task, None, &workflows, "feature-release", false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
@@ -6521,9 +6584,9 @@ transitions:
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let with_name = card_meta_line(&task, &workflows, "feature-task", true, 60);
+        let with_name = card_meta_line(&task, None, &workflows, "feature-task", true, 60);
         assert_eq!(line_text(&with_name), " feature-task ");
-        let without_name = card_meta_line(&task, &workflows, "feature-task", false, 60);
+        let without_name = card_meta_line(&task, None, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
@@ -6545,7 +6608,7 @@ transitions:
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, "feature-task", true, 20);
+        let line = card_meta_line(&task, None, &workflows, "feature-task", true, 20);
         let text = line_text(&line);
         assert!(text.chars().count() <= 20, "overflows width: {text:?}");
         assert!(text.ends_with('…'), "should end with ellipsis: {text:?}");
@@ -7041,8 +7104,8 @@ transitions:
 
         // Both tasks live in the same project-wide `Todo` status, but
         // each resolves against its OWN workflow's `git:` template.
-        let fe_line = card_meta_line(&fe_task, &workflows, "frontend", true, 60);
-        let be_line = card_meta_line(&be_task, &workflows, "backend", true, 60);
+        let fe_line = card_meta_line(&fe_task, None, &workflows, "frontend", true, 60);
+        let be_line = card_meta_line(&be_task, None, &workflows, "backend", true, 60);
         assert_eq!(line_text(&fe_line), " frontend  ⎇ feature/fe-login");
         assert_eq!(line_text(&be_line), " backend  ⎇ feature/be-login");
     }
