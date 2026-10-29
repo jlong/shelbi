@@ -1533,7 +1533,7 @@ pub fn append_task_event(
     reason: &str,
 ) -> Result<()> {
     let (from_category, to_category) = resolve_move_categories(project, &from, &to);
-    write_task_event_line(&task_event_body(
+    let body = task_event_body(
         project,
         task_id,
         workflow,
@@ -1542,7 +1542,26 @@ pub fn append_task_event(
         reason,
         from_category,
         to_category,
-    ))
+    );
+    write_task_event_line(&with_owner_token(body, project, task_id))
+}
+
+/// Append the issue's tracker ownership to a task event body as a trailing
+/// `owner=me|other:<login>[,<login>]|unassigned|unknown` token
+/// ([`crate::ownership::TrackerOwner::token`]), so the orchestrator's reaction
+/// rules can skip a teammate's work on a shared remote tracker without another
+/// call. Read from the board index with no API call; omitted on a filesystem
+/// board (no ownership) and for an issue the open index doesn't carry.
+fn with_owner_token(body: String, project: &str, task_id: &str) -> String {
+    match crate::ownership::event_owner_token(project, task_id) {
+        // Each login is sanitized on its own so the `,` between co-assignees
+        // survives (`sanitize_field` would fold it to `_`).
+        Some(owner) => format!(
+            "{body} owner={}",
+            owner.split(',').map(sanitize_field).collect::<Vec<_>>().join(",")
+        ),
+        None => body,
+    }
 }
 
 /// The marker token appended to a task-move event line when the move
@@ -1569,7 +1588,7 @@ pub fn append_task_event_actions_skipped(
     let (from_category, to_category) = resolve_move_categories(project, &from, &to);
     let body = format!(
         "{} {ACTIONS_SKIPPED_MARKER}",
-        task_event_body(
+        with_owner_token(task_event_body(
             project,
             task_id,
             workflow,
@@ -1578,7 +1597,7 @@ pub fn append_task_event_actions_skipped(
             reason,
             from_category,
             to_category,
-        )
+        ), project, task_id)
     );
     write_task_event_line(&body)
 }
@@ -1633,7 +1652,7 @@ pub fn append_github_merge_reconcile_event(
         to_category,
     );
     let sha = sanitize_field(merge_sha.unwrap_or("-"));
-    let body = format!("{base} pr={pr} sha={sha}");
+    let body = with_owner_token(format!("{base} pr={pr} sha={sha}"), project, task_id);
     let line = format!("{ts} {body}");
     match append_event_line(&line) {
         Ok(()) => Ok(()),

@@ -954,6 +954,10 @@ impl IssueStore for GitHubStore {
     }
 
     fn add(&self, spec: NewIssue) -> Result<Issue> {
+        Ok(self.add_with_assignees(spec)?.0)
+    }
+
+    fn add_with_assignees(&self, spec: NewIssue) -> Result<(Issue, Vec<String>)> {
         shelbi_core::validate_task_id(&spec.id)?;
         // A card that already exists (same shelbi id) must not be silently
         // duplicated into a second issue — `add` is create-exclusive, matching
@@ -994,7 +998,7 @@ impl IssueStore for GitHubStore {
         // written into the fenced metadata block. If the login can't be resolved
         // (an unauthenticated token, offline), create it unassigned with a warning
         // rather than failing the create; it simply won't be Zen-eligible.
-        let assignee = self.viewer_login();
+        let assignee = self.resolve_viewer_login();
         if assignee.is_none() {
             tracing::warn!(
                 repo = %self.repo,
@@ -1099,10 +1103,49 @@ impl IssueStore for GitHubStore {
             // immediately rather than waiting for the next board refresh.
             tracker_assignees: created.assignees.iter().map(|u| u.login.clone()).collect(),
         };
+        // GitHub silently drops an assignee the account may not assign (no push
+        // access), so the create lands unassigned: say so rather than leaving the
+        // user to wonder why the orchestrator never starts it.
+        if let Some(login) = &assignee {
+            if !tf.tracker_assignees.iter().any(|a| a.eq_ignore_ascii_case(login)) {
+                tracing::warn!(
+                    repo = %self.repo,
+                    id = %tf.task.id,
+                    login = %login,
+                    "GitHub did not record the authenticated user as the new issue's \
+                     assignee; it was created unassigned"
+                );
+            }
+        }
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         self.publish_write(&tf, created.number);
 
-        Ok(issue)
+        Ok((issue, tf.tracker_assignees))
+    }
+
+    fn viewer_login(&self) -> Option<String> {
+        self.resolve_viewer_login()
+    }
+
+    fn claim(&self, id: &str) -> Result<Vec<String>> {
+        let Some(gh) = self.get_raw(id)? else {
+            return Err(Error::Other(format!("issue `{id}` not found in {}", self.repo)));
+        };
+        let login = self.resolve_viewer_login().ok_or_else(|| {
+            Error::Other("could not resolve the authenticated GitHub login".to_string())
+        })?;
+        // Adds the login beside any existing assignees (GitHub's add-assignees
+        // endpoint never removes one), and answers with the whole updated issue.
+        let out = self.api_send(
+            "POST",
+            &format!("repos/{}/issues/{}/assignees", self.repo, gh.number),
+            &[("assignees[]", login)],
+        )?;
+        let after: GhIssue = parse_json_object(&out)?;
+        let mut tf = self.to_issue_file(after);
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        self.publish_write(&tf, gh.number);
+        Ok(tf.tracker_assignees)
     }
 
     fn move_status(&self, id: &str, to: &Column, _reason: &str) -> Result<Option<StatusMove>> {
@@ -2146,7 +2189,7 @@ impl GitHubStore {
     /// offline); the caller then creates the issue unassigned rather than failing
     /// the create. Not on a per-heartbeat path — `add` is a manual/orchestrator
     /// create — so the one live read it may cost is acceptable.
-    fn viewer_login(&self) -> Option<String> {
+    fn resolve_viewer_login(&self) -> Option<String> {
         if let Some(login) = crate::board_index::read_valid_board_index(
             &self.project,
             Some(&self.board_repo_identity()),
@@ -6011,6 +6054,215 @@ mod tests {
             create.contains("assignees[]=octocat"),
             "create POST must assign the authenticated user: {create}"
         );
+    }
+
+    // ---- tracker ownership: the shared dispatch gate over a fake GitHub ----
+
+    /// A `github` tracker config for the ownership tests.
+    fn ownership_cfg() -> shelbi_core::IssueTrackerConfig {
+        shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A fake GitHub serving one issue (`issue`, REST-shaped), authenticated as
+    /// `login` (empty = unresolvable), whose add-assignees POST answers
+    /// `after_claim`. Records every call.
+    fn ownership_store(
+        issue: &'static str,
+        login: &'static str,
+        after_claim: &'static str,
+    ) -> (GitHubStore, Calls) {
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            let joined = args.join(" ");
+            rec.lock().unwrap().push(joined.clone());
+            if args.contains(&"user") && !joined.contains("repos/") {
+                return Ok(format!("{login}\n"));
+            }
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, issue));
+            }
+            if joined.contains("/assignees") {
+                return Ok(after_claim.to_string());
+            }
+            Ok(issue.to_string())
+        });
+        (store, calls)
+    }
+
+    const MINE: &str = r#"{"number":7,"title":"Mine","body":"","state":"open","assignees":[{"login":"octocat"}],"labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+    const THEIRS: &str = r#"{"number":7,"title":"Theirs","body":"","state":"open","assignees":[{"login":"alice"}],"labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+    const NOBODYS: &str = r#"{"number":7,"title":"Nobody's","body":"","state":"open","assignees":[],"labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+    const CLAIMED: &str = r#"{"number":7,"title":"Theirs","body":"","state":"open","assignees":[{"login":"alice"},{"login":"octocat"}],"labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+
+    fn gate_for(issue: &'static str, login: &'static str, take: bool) -> (std::result::Result<crate::ownership::Claim, String>, Vec<String>) {
+        let (store, calls) = ownership_store(issue, login, CLAIMED);
+        let tf = store.get("t").unwrap().expect("issue t");
+        let out = crate::ownership::ensure_owned_for_dispatch(&ownership_cfg(), &store, &tf, take);
+        let calls = calls.lock().unwrap().clone();
+        (out, calls)
+    }
+
+    #[test]
+    fn dispatch_gate_passes_the_users_own_issue() {
+        let _home = HomeGuard::new("own-gate-mine");
+        let (out, calls) = gate_for(MINE, "octocat", false);
+        assert_eq!(out, Ok(crate::ownership::Claim::AlreadyMine));
+        assert!(call_containing(&calls, &["/assignees"]).is_none(), "no claim write: {calls:?}");
+    }
+
+    #[test]
+    fn dispatch_gate_refuses_someone_elses_issue_naming_the_assignee() {
+        let _home = HomeGuard::new("own-gate-theirs");
+        let (out, calls) = gate_for(THEIRS, "octocat", false);
+        let err = out.unwrap_err();
+        assert!(err.contains("assigned to @alice"), "{err}");
+        assert!(err.contains("not to you (@octocat)"), "{err}");
+        assert!(err.contains("shelbi issue start t --take"), "{err}");
+        assert!(call_containing(&calls, &["/assignees"]).is_none(), "never claims unasked: {calls:?}");
+    }
+
+    #[test]
+    fn dispatch_gate_refuses_an_unassigned_issue() {
+        let _home = HomeGuard::new("own-gate-nobody");
+        let err = gate_for(NOBODYS, "octocat", false).0.unwrap_err();
+        assert!(err.contains("not assigned to anyone"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_gate_fails_closed_when_the_login_is_unknown() {
+        let _home = HomeGuard::new("own-gate-nologin");
+        // Even the issue assigned to `octocat` is refused: with no resolvable
+        // login there's no proving it is the user's.
+        let err = gate_for(MINE, "", false).0.unwrap_err();
+        assert!(err.contains("login could not be resolved"), "{err}");
+        // And `--take` can't claim it either.
+        let err = gate_for(NOBODYS, "", true).0.unwrap_err();
+        assert!(err.contains("can't take"), "{err}");
+    }
+
+    #[test]
+    fn take_assigns_the_issue_to_the_user_then_passes() {
+        let _home = HomeGuard::new("own-gate-take");
+        let (out, calls) = gate_for(THEIRS, "octocat", true);
+        assert_eq!(out, Ok(crate::ownership::Claim::Took { login: "octocat".into() }));
+        let claim = call_containing(&calls, &["-X POST", "repos/owner/repo/issues/7/assignees"])
+            .expect("add-assignees POST");
+        assert!(claim.contains("assignees[]=octocat"), "{claim}");
+    }
+
+    #[test]
+    fn take_refused_by_the_tracker_starts_nothing() {
+        let _home = HomeGuard::new("own-gate-take-refused");
+        // GitHub drops an assignee the account may not assign: the POST answers
+        // the issue unchanged, so the take fails instead of starting it.
+        let (store, _calls) = ownership_store(NOBODYS, "octocat", NOBODYS);
+        let tf = store.get("t").unwrap().unwrap();
+        let err =
+            crate::ownership::ensure_owned_for_dispatch(&ownership_cfg(), &store, &tf, true)
+                .unwrap_err();
+        assert!(err.contains("did not assign `t` to @octocat"), "{err}");
+    }
+
+    #[test]
+    fn create_warns_when_the_tracker_drops_the_assignee() {
+        let _home = HomeGuard::new("own-create-dropped");
+        // The create sends `assignees[]=octocat`, but GitHub answers with no
+        // assignee (the account can't assign): the create lands, and the
+        // shared creation check produces a warning naming the claim.
+        let created = r#"{"number":10,"title":"T","body":"","state":"open","labels":[],"assignees":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            let joined = args.join(" ");
+            if args.contains(&"user") && !joined.contains("repos/") {
+                return Ok("octocat\n".to_string());
+            }
+            if args.contains(&"graphql") {
+                return Ok(
+                    r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[]}}}"#.to_string(),
+                );
+            }
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                return Ok(created.to_string());
+            }
+            Ok(String::new())
+        });
+        let (issue, assignees) = store
+            .add_with_assignees(NewIssue::new("do-thing", "T", Column::todo(), "b"))
+            .expect("the create still succeeds");
+        assert!(assignees.is_empty());
+        let warning =
+            crate::ownership::creation_warning(&ownership_cfg(), &store, &issue.id, &assignees)
+                .expect("a warning");
+        assert!(warning.contains("did not assign it to @octocat"), "{warning}");
+        assert!(warning.contains("--take"), "{warning}");
+        // An issue that did land assigned to the user needs no warning.
+        assert!(crate::ownership::creation_warning(
+            &ownership_cfg(),
+            &store,
+            &issue.id,
+            &["octocat".to_string()]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn event_owner_tokens_come_from_the_board_index() {
+        let home = HomeGuard::new("own-event-token");
+        let projects = crate::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("gp.yaml"),
+            "name: gp\nrepo: /tmp/gp\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/gp\n\
+             workspaces:\n  - { name: dev, machine: local, runner: claude }\n\
+             issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n",
+        )
+        .unwrap();
+        let card = |id: &str, assignees: &[&str]| {
+            let mut tf = idx_issue(id, "todo", "2026-01-01T00:00:00Z");
+            tf.tracker_assignees = assignees.iter().map(|s| s.to_string()).collect();
+            tf
+        };
+        let index = crate::BoardIndex {
+            board: vec![card("mine", &["octocat"]), card("theirs", &["alice", "bob"]), card("nobody", &[])],
+            numbers: std::collections::BTreeMap::new(),
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            stale: false,
+            remaining: None,
+            reset: None,
+            rest_fallback: false,
+            interval_secs: None,
+            repo: Some(crate::github_board_repo("owner/repo")),
+            schema_version: crate::BOARD_INDEX_SCHEMA_VERSION,
+            last_cold_read: None,
+            viewer_login: Some("octocat".into()),
+        };
+        crate::write_board_index("gp", &index).unwrap();
+        let token = |id| crate::ownership::event_owner_token("gp", id);
+        assert_eq!(token("mine").as_deref(), Some("me"));
+        assert_eq!(token("theirs").as_deref(), Some("other:alice,bob"));
+        assert_eq!(token("nobody").as_deref(), Some("unassigned"));
+        // An issue the open index doesn't carry gets no token.
+        assert_eq!(token("missing"), None);
+        assert_eq!(
+            crate::ownership::gate_from_index("gp", &ownership_cfg()).unwrap(),
+            crate::OwnershipGate::RequireAssignee("octocat".into())
+        );
+        drop(home);
     }
 
     #[test]

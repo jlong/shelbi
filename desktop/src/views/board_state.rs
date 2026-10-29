@@ -922,6 +922,13 @@ impl BoardState {
     }
 
     pub fn start(&mut self, id: &str) -> Vec<Intent> {
+        // Someone else's (or an unassigned) issue on a shared remote tracker
+        // isn't offered: say why and how to claim it instead of dispatching a
+        // start the daemon would refuse.
+        if let Some(why) = self.model.card(id).and_then(IssueCard::start_refusal) {
+            self.status = Some(why);
+            return Vec::new();
+        }
         vec![Intent::Command(CommandKind::StartIssue { id: id.to_string() })]
     }
 
@@ -1455,6 +1462,7 @@ pub(crate) mod tests {
                 default_workflow_name: "default".into(),
                 display_name: Some("Demo".into()),
                 workspaces: vec!["alpha".into(), "bravo".into()],
+                ownership: shelbi_state::OwnershipGate::Unrestricted,
             }),
             state_snapshot: None,
             workflows: Ok(vec![shelbi_core::default_workflow()]),
@@ -1544,6 +1552,28 @@ pub(crate) mod tests {
         assert_eq!(press(&mut b, "esc"), [Intent::ClearSearchField]);
         assert_eq!(b.search(), "");
         assert_eq!(b.model().columns.iter().map(|c| c.cards.len()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn start_is_withheld_from_a_teammates_card_on_a_remote_tracker() {
+        // A shared remote tracker: `A` is the user's, `B` a teammate's. `s`
+        // starts `A`, but on `B` it shows the `--take` hint instead.
+        let (mut a, mut theirs) = (issue("A", "todo"), issue("B", "todo"));
+        a.tracker_assignees = vec!["octocat".into()];
+        theirs.tracker_assignees = vec!["alice".into()];
+        let mut r = read(vec![a, theirs]);
+        if let Some(p) = r.project.as_mut() {
+            p.ownership = shelbi_state::OwnershipGate::RequireAssignee("octocat".into());
+        }
+        let mut b = BoardState::new("demo", default_keymaps());
+        b.apply_open(r);
+        b.apply_closed(None);
+
+        assert_eq!(b.start("A"), vec![Intent::Command(CommandKind::StartIssue { id: "A".into() })]);
+        assert!(b.start("B").is_empty(), "a teammate's card is not started");
+        let why = b.status.clone().unwrap_or_default();
+        assert!(why.contains("assigned to @alice"), "{why}");
+        assert!(why.contains("--take"), "{why}");
     }
 
     #[test]

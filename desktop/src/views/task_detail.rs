@@ -104,6 +104,21 @@ pub fn render(
         Some(w) => field(theme, "workspace", format!("@{w}")),
         None => row(theme, "workspace").child(div().text_color(theme.muted).child("Unassigned")),
     });
+    // Tracker ownership, on a remote tracker only: whose the issue is, and for
+    // one that isn't the user's, how to claim it (Start isn't offered).
+    if let Some(owner) = &d.tracker_owner {
+        fields = fields.child(if owner.is_mine() {
+            field(theme, "owner", "me".to_string())
+        } else {
+            row(theme, "owner").child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.muted)
+                    .child(format!("{}   not yours: `shelbi issue start {} --take` claims it", owner.label(), d.id)),
+            )
+        });
+    }
     if let Some(b) = &d.branch {
         fields = fields.child(field(theme, "branch", b.clone()));
     }
@@ -166,17 +181,19 @@ pub fn render(
                     cx.notify();
                 })),
         )
-        .child(
-            action(theme, "detail-start", ButtonContent::label("Start").left(icons::PLAY_SOLID_BUTTON).hotkey("s"), ButtonKind::Secondary).on_click(
-                cx.listener(|this, _: &ClickEvent, window, cx| {
-                    if let Some(id) = this.state.detail_id().map(str::to_string) {
-                        let intents = this.state.start(&id);
-                        this.apply_intents(intents, window, cx);
-                        cx.notify();
-                    }
-                }),
-            ),
-        )
+        .when(d.startable(), |row| {
+            row.child(
+                action(theme, "detail-start", ButtonContent::label("Start").left(icons::PLAY_SOLID_BUTTON).hotkey("s"), ButtonKind::Secondary).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if let Some(id) = this.state.detail_id().map(str::to_string) {
+                            let intents = this.state.start(&id);
+                            this.apply_intents(intents, window, cx);
+                            cx.notify();
+                        }
+                    }),
+                ),
+            )
+        })
         .child(
             action(theme, "detail-assign", ButtonContent::label("Assign").left(icons::USER_BUTTON).hotkey("a"), ButtonKind::Secondary).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| {

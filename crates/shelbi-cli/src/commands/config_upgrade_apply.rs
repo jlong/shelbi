@@ -48,6 +48,7 @@ use shelbi_core::StatusCategory;
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
     append_changelog_section, apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
+    apply_tracker_ownership_rewrites, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     PR_TEMPLATE_MISSING,
@@ -232,8 +233,15 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
         heal_reporting_subject(entry, applied);
     }
 
+    // Add the tracker-ownership dispatch rule to an unedited orchestrator copy
+    // (an edited one gets a needs-judgment finding instead, never a write).
+    if codes.contains(TRACKER_OWNERSHIP_AUTOHEAL_CODE) {
+        heal_tracker_ownership(entry, applied);
+    }
+
     // Append the orchestrator's `## Changelog` rule to instructions that lack
-    // it. Purely additive Markdown, handled independently like the two above.
+    // it. Purely additive Markdown, handled independently like the ones above;
+    // it runs after the in-place tracker rewrite and re-reads the file.
     if codes.contains(ORCH_CHANGELOG_RULE_MISSING) {
         heal_orchestrator_changelog(entry, applied);
     }
@@ -1068,6 +1076,33 @@ fn heal_reporting_subject(entry: &InventoryEntry, applied: &mut Vec<AppliedChang
     );
 }
 
+/// Patch the orchestrator's ready-dispatch and heartbeat missed-dispatch rules
+/// with the tracker-ownership condition via the shared
+/// [`apply_tracker_ownership_rewrites`] table (the same one the sniffer keys the
+/// auto-heal on). Only an unedited copy, carrying both shipped passages
+/// verbatim, is rewritten; a no-op write is skipped.
+fn heal_tracker_ownership(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_tracker_ownership_rewrites(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        TRACKER_OWNERSHIP_AUTOHEAL_CODE,
+        path,
+        "dispatch-rules+tracker-ownership".into(),
+    );
+}
+
 /// Append the shipped `## Changelog` section to an orchestrator
 /// `instructions.md` that lacks the rule, via the shared
 /// [`append_changelog_section`]. Additive only: everything the user wrote stays
@@ -1667,6 +1702,54 @@ zen:
         );
         let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
         assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn unedited_dispatch_rules_gain_the_tracker_ownership_rule_on_start() {
+        // An existing project whose orchestrator copy is the pre-ownership shipped
+        // template, unedited: the boot pass patches both dispatch rules, discloses
+        // it, and a second pass is a no-op.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let legacy = crate::commands::config_upgrade::TRACKER_OWNERSHIP_REWRITES.iter().fold(
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.to_string(),
+            |acc, (legacy, new)| acc.replacen(new, legacy, 1),
+        );
+        let path = orch_dir.join("instructions.md");
+        std::fs::write(&path, &legacy).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == TRACKER_OWNERSHIP_AUTOHEAL_CODE
+                && f.classification == Classification::AutoHeal),
+            "expected a tracker-ownership auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == TRACKER_OWNERSHIP_AUTOHEAL_CODE),
+            "nothing applied: {applied:?}",
+        );
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(healed, shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS);
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains(TRACKER_OWNERSHIP_AUTOHEAL_CODE), "{log}");
+
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code == TRACKER_OWNERSHIP_AUTOHEAL_CODE),
+            "residual auto-heal: {report2:?}",
+        );
+        assert!(apply_auto_heal(&["demo".to_string()], &report2).is_empty());
     }
 
     #[test]

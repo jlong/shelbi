@@ -144,6 +144,11 @@ pub enum MutationKind {
         branch: Option<String>,
         reason: Option<String>,
         force: bool,
+        /// The explicit `--take` claim: on a remote tracker, assign an issue
+        /// that isn't the user's to them before starting it. Defaulted so an
+        /// older client's request still parses (and never takes).
+        #[serde(default)]
+        take: bool,
     },
     Assign {
         to: String,

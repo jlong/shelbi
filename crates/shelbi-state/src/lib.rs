@@ -43,6 +43,7 @@ mod hub_version;
 mod issue_cache;
 pub mod machine_state;
 pub mod migration;
+pub mod ownership;
 pub mod questions;
 pub use migration::{
     all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
@@ -113,6 +114,7 @@ pub use issue_store::{
     resolve_issue_store, BoardRead, BoardState, ClosedPage, Cursor, FileSystemStore, IssueChange,
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
+pub use ownership::{OwnershipGate, TrackerOwner};
 pub use project_paths::ProjectPaths;
 pub use supervision_status::{
     clear_orchestrator_supervision_status, read_orchestrator_supervision_status,
@@ -179,7 +181,7 @@ pub use ssh_control::{
 };
 pub use user_config::{
     editor_display_name, load_user_config, resolve_editor, resolve_editor_source, save_user_config,
-    scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, DesktopConfig,
+    scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, AppIcon, DesktopConfig,
     DesktopNotifications, EditorSource, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };

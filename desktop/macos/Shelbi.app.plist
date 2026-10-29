@@ -25,6 +25,11 @@
 	<string>Shelbi</string>
 	<key>CFBundleDisplayName</key>
 	<string>Shelbi</string>
+	<!-- Assets.car's layered icon (macOS 26) and its flattened renditions
+	     (older systems); Shelbi.icns where the catalog isn't read. Both are
+	     compiled from assets/icon/Shelbi.icon (scripts/app-icon.sh). -->
+	<key>CFBundleIconName</key>
+	<string>Shelbi</string>
 	<key>CFBundleIconFile</key>
 	<string>Shelbi</string>
 	<key>CFBundlePackageType</key>

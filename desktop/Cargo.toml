@@ -96,7 +96,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # pasteboard, file promises and image reps, gpui's window via its raw handle.
 # The Reduce Motion setting (`platform::motion`) is NSWorkspace's; the
 # terminals' scrollbar follows NSScroller's preferred style
-# (`platform::scrollers`).
+# (`platform::scrollers`); the Dock icon is NSApplication's
+# (`platform::dock_icon`).
 # All already in gpui's macOS tree, at the versions it resolves.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -120,9 +121,11 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSAccessibility",
+    "NSApplication",
     "NSBitmapImageRep",
     "NSControl",
     "NSFilePromiseReceiver",
+    "NSImage",
     "NSImageRep",
     "NSPasteboard",
     "NSPasteboardItem",

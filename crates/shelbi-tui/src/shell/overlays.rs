@@ -195,10 +195,10 @@ impl ActiveOverlay {
         }
     }
 
-    /// Open About Shelbi. `truecolor` draws the icon in 24-bit color, else in
-    /// the xterm-256 palette.
+    /// Open About Shelbi, drawing `desktop.app_icon`'s icon. `truecolor`
+    /// draws it in 24-bit color, else in the xterm-256 palette.
     pub fn about(truecolor: bool) -> Self {
-        ActiveOverlay::About(overlay::about::About::new(truecolor))
+        ActiveOverlay::About(overlay::about::About::new(truecolor).with_icon(overlay::about::configured_icon()))
     }
 
     /// Open Contact Us from the name and email `remembered`; `emoji`: the
@@ -486,6 +486,7 @@ impl ActiveOverlay {
                     f,
                     rect,
                     Some(task.as_ref()),
+                    None,
                     &columns,
                     scroll,
                     keymaps.as_ref(),

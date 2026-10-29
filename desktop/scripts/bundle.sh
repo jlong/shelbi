@@ -91,24 +91,23 @@ sed "s/@VERSION@/$version/g" "$here/macos/Shelbi.app.plist" >"$app/Contents/Info
 plutil -lint -s "$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 
-# The icon: the committed 1024px master (assets/icon/shelbi-1024.png, the
-# finished raster artwork and the icon's only source; see assets/icon/README.md)
-# cut into an iconset, then compiled.
-master="$here/assets/icon/shelbi-1024.png"
-master_info="$(sips -g pixelWidth -g pixelHeight -g hasAlpha "$master")"
-grep -q 'pixelWidth: 1024$' <<<"$master_info" &&
-  grep -q 'pixelHeight: 1024$' <<<"$master_info" &&
-  grep -q 'hasAlpha: yes$' <<<"$master_info" ||
-  fail "$master must be a 1024x1024 PNG with alpha"
-iconset="$(mktemp -d)/Shelbi.iconset"
-mkdir -p "$iconset"
-for size in 16 32 128 256 512; do
-  sips -s format png -z "$size" "$size" "$master" --out "$iconset/icon_${size}x${size}.png" >/dev/null
-  double=$((size * 2))
-  sips -s format png -z "$double" "$double" "$master" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+# The icon: Command Grille, compiled from its layered Icon Composer source
+# (assets/icon/Shelbi.icon) by scripts/app-icon.sh and committed, so this
+# step needs no Xcode 26: Assets.car (the layered icon macOS 26 draws, and
+# flattened renditions for older systems; the plist's CFBundleIconName) and
+# actool's Shelbi.icns (CFBundleIconFile). A source edited without
+# recompiling would ship the old icon, so that fails here. See
+# assets/icon/README.md.
+icon_dir="$here/assets/icon"
+compiled="$icon_dir/compiled"
+for f in Assets.car Shelbi.icns Shelbi.icon.sha256; do
+  [[ -s "$compiled/$f" ]] || fail "missing $compiled/$f: run desktop/scripts/app-icon.sh"
 done
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/Shelbi.icns"
-rm -rf "$(dirname "$iconset")"
+icon_digest="$(cd "$icon_dir" && find Shelbi.icon -type f ! -name .DS_Store -print0 | LC_ALL=C sort -z |
+  xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-64)"
+[[ "$icon_digest" == "$(cat "$compiled/Shelbi.icon.sha256")" ]] ||
+  fail "assets/icon/Shelbi.icon changed since it was compiled: run desktop/scripts/app-icon.sh and commit the result"
+cp "$compiled/Assets.car" "$compiled/Shelbi.icns" "$app/Contents/Resources/"
 
 # ---- sign -------------------------------------------------------------------
 keychain_args=()

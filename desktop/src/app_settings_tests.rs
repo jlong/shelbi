@@ -848,6 +848,54 @@ fn the_contrast_slider_restyles_the_windows_as_it_moves_and_saves(cx: &mut TestA
     assert_eq!(value(&mut s), 30);
 }
 
+fn app_icon_in_effect(s: &mut Settings) -> shelbi_state::AppIcon {
+    s.h.cx.update(|_, cx| crate::app_icon::current(cx))
+}
+
+fn dock_applied() -> Vec<shelbi_state::AppIcon> {
+    crate::platform::dock_icon::tests::APPLIED.with(|a| a.borrow().clone())
+}
+
+#[gpui::test]
+fn the_app_icon_tiles_pick_the_icon_live_and_save_it(cx: &mut TestAppContext) {
+    use shelbi_state::AppIcon;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+
+    // Unset: Command Grille, shown picked, and nothing written.
+    let view = general_page(&mut s, shelbi_state::UserConfig::default());
+    for selector in ["settings-app-icon-command-grille", "settings-app-icon-retro"] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    assert_eq!(app_icon_in_effect(&mut s), AppIcon::CommandGrille);
+    assert_eq!(s.read(|_, cx| view.read(cx).app_icon()), None);
+    assert_eq!(dock_applied().last(), Some(&AppIcon::CommandGrille), "the Dock follows config.yaml");
+
+    // A click shows it in the Dock at once and saves it.
+    let saved = |s: &mut Settings| s.read(|_, cx| view.read(cx).saved().desktop.app_icon);
+    s.click("settings-app-icon-retro");
+    assert_eq!(app_icon_in_effect(&mut s), AppIcon::Retro);
+    assert_eq!(dock_applied().last(), Some(&AppIcon::Retro));
+    assert_eq!(saved(&mut s), Some(AppIcon::Retro));
+    // Picking the default writes it too: it was chosen.
+    s.click("settings-app-icon-command-grille");
+    assert_eq!(app_icon_in_effect(&mut s), AppIcon::CommandGrille);
+    assert_eq!(dock_applied().last(), Some(&AppIcon::CommandGrille));
+    assert_eq!(saved(&mut s), Some(AppIcon::CommandGrille));
+
+    // Restored from config.yaml.
+    let mut cfg = shelbi_state::UserConfig::default();
+    cfg.desktop.app_icon = Some(AppIcon::Retro);
+    let view = general_page(&mut s, cfg);
+    assert_eq!(app_icon_in_effect(&mut s), AppIcon::Retro);
+    assert_eq!(s.read(|_, cx| view.read(cx).app_icon()), Some(AppIcon::Retro));
+
+    // Picked elsewhere (another window's settings): the tiles follow.
+    s.update(|_, _, cx| crate::app_icon::set(AppIcon::CommandGrille, cx));
+    s.settle();
+    assert_eq!(s.read(|_, cx| view.read(cx).app_icon()), Some(AppIcon::CommandGrille));
+}
+
 #[gpui::test]
 fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut TestAppContext) {
     use crate::theme::window::{self as translucency, Translucency};

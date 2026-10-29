@@ -137,6 +137,7 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
                 branch: None,
                 reason: Some("user:app:start".to_string()),
                 force: false,
+                take: false,
             },
         ),
         Mutation::AssignIssue {
