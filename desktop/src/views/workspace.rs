@@ -1074,7 +1074,7 @@ impl WorkspaceView {
         let open = self.shell_open;
         // The frame's Shell: 8 across, 4 down, 8 between a 14pt icon and the
         // X-Small label (24pt tall).
-        let shell = style::button_base("ws-shell-button", style::ButtonKind::Quiet, style::ButtonSize::XSmall, false, theme)
+        let shell = style::button_base("ws-shell-button", style::ButtonKind::Ghost, style::ButtonSize::XSmall, false, theme)
             .gap_2()
             .when(open, |d| d.bg(theme.background))
             .type_style(Type::XSmall)

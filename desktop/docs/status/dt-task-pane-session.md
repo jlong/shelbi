@@ -59,7 +59,8 @@ pane.
   attach.
 - **Keys.** A click in the terminal gives it the keys (and moves the
   window's focus model to the main area, `IssuesEvent::Focused`); Tab from
-  the pane does too. While it has them the board's and pane's keys are off
+  the pane does too, past its Status, Workflow and Priority values
+  (`dt-task-inline-properties`). While it has them the board's and pane's keys are off
   (`IssuesView::on_key` returns early), so `j`, `l`, `e` and Esc reach the
   agent, and the window's capture phase treats it as a focused terminal for
   the global chords (`chat_focused`). Ctrl+L (focus main) or a click in the

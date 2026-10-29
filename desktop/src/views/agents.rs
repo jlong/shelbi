@@ -703,7 +703,7 @@ impl AgentsPage {
             .pb(px(16.0))
             .child(div().flex_1().min_w_0().type_style(Type::Small).text_color(theme.form_text).child(text))
             .child(
-                style::button("agent-confirm-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme).on_click(cx.listener(
+                style::button("agent-confirm-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Base, false, theme).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         this.state.confirm = None;
                         cx.notify();
@@ -789,7 +789,7 @@ impl AgentsPage {
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_shared(window, cx)))
             };
             vec![
-                style::button("agents-shared-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Small, false, theme)
+                style::button("agents-shared-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Small, false, theme)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_shared(cx)))
                     .into_any_element(),
                 save.into_any_element(),

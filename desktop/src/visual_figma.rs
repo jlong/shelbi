@@ -190,7 +190,7 @@ const BUTTON_SHEET_ROWS: [SheetButton; 10] = {
         SheetButton(Secondary, Base, SheetContent::Label("Button")),
         SheetButton(Danger, Base, SheetContent::Label("Button")),
         SheetButton(Select, Base, SheetContent::Label("Button")),
-        SheetButton(Quiet, Base, SheetContent::Label("Button")),
+        SheetButton(Ghost, Base, SheetContent::Label("Button")),
         SheetButton(Success, Small, SheetContent::Left("Approve")),
         SheetButton(Danger, Small, SheetContent::Left("Reject")),
         SheetButton(Secondary, XSmall, SheetContent::Label("Open")),
@@ -2334,7 +2334,9 @@ impl Run {
                 let x = button_sheet_x(j);
                 let what = format!("{row:?} {state:?}");
                 let fill = match state {
-                    SheetState::Rest | SheetState::Focused => c.fill,
+                    SheetState::Rest => c.fill,
+                    // Ghost's Focus rests on its hover fill.
+                    SheetState::Focused => c.focus_fill,
                     SheetState::FocusedHover => c.hover,
                     SheetState::FocusedActive => c.pressed,
                     SheetState::Disabled => c.fill.opacity(0.4),
@@ -2985,6 +2987,22 @@ impl Run {
             });
         }
         self.save(handle, "state-task-pane-menu");
+
+        // Each property's picker open under its value, then the keyboard
+        // on Workflow (Tab, Tab): the Ghost focus.
+        for property in crate::views::board_state::Property::ALL {
+            let handle = self.open_pane();
+            if let (Some(board), _, _) = self.views(handle) {
+                board.update(&mut self.cx, |v, cx| {
+                    v.state_mut().toggle_property(property);
+                    cx.notify();
+                });
+            }
+            self.save(handle, &format!("state-task-pane-{}-picker", property.slug()));
+        }
+        let handle = self.open_pane();
+        self.cx.simulate_keystrokes(handle.into(), "tab tab");
+        self.save(handle, "state-task-pane-focus");
 
         // Another card picked beside it: the one pane shows it, the board
         // as it was.
