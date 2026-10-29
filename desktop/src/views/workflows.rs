@@ -1180,7 +1180,7 @@ impl WorkflowsPage {
             style::button_base(format!("status-category-{key}"), ButtonKind::Secondary, ButtonSize::Base, false, theme)
                 .w(px(CATEGORY_W))
                 .child(div().flex_1().min_w_0().truncate().child(category_label(category)))
-                .child(style::right_icon_slot(icons::CHEVRON_DOWN, ButtonSize::Base, theme.button_icon))
+                .child(style::dropdown_slot(ButtonSize::Base, theme.button_icon))
                 .when(open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.toggle_menu(Menu::Category(target.clone()), cx)

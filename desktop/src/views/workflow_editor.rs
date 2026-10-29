@@ -1028,7 +1028,7 @@ pub(super) fn picker_button(
     style::button_base(id, ButtonKind::Secondary, size, false, theme)
         .children(icon.map(|c| style::left_slot(size, style::status_icon_large(c, theme))))
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
-        .child(style::right_icon_slot(icons::CHEVRON_DOWN, size, chevron))
+        .child(style::dropdown_slot(size, chevron))
 }
 
 /// A popup menu's panel.
@@ -2015,7 +2015,7 @@ impl WorkflowEditor {
         let last = actions.len() - 1;
         let button = style::content_button(
             format!("workflow-action-{index}-{slot}"),
-            ButtonContent::label(action_label(action)).right(icons::CHEVRON_DOWN),
+            ButtonContent::label(action_label(action)).dropdown(),
             ButtonKind::Secondary,
             ButtonSize::Small,
             false,
