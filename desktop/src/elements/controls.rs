@@ -23,6 +23,13 @@
 //!   corners, stroked 1px outside, as Figma strokes it) edged in
 //!   `check_border` and checked in `check_fill` with Figma's 12pt mark,
 //!   beside its label; the list stacks them 4px apart;
+//! - [`icon_choice`] and [`icon_choices`]: a picture to pick (the App icon
+//!   setting), its label under it. The Components page draws no such
+//!   picker either, so it borrows the drawn controls' tokens: the segmented
+//!   track's `theme.search` well (10px corners), its items' hover and press
+//!   fills, and, picked, the checkbox's `check_fill` as a 2px ring with its
+//!   `check_glow` around it and the label loud and medium, as a selected
+//!   segment's;
 //! - [`Slider`]: a value along a track, its readout after it. The
 //!   Components page draws no slider, so it is built from the tokens the
 //!   drawn controls use: the segmented track's `theme.search` for the rail,
@@ -37,10 +44,11 @@
 use std::cell::Cell;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    canvas, div, prelude::*, px, relative, App, Bounds, Context, DispatchPhase, Div, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    canvas, div, img, prelude::*, px, relative, App, Bounds, Context, DispatchPhase, Div, EventEmitter,
+    FocusHandle, Focusable, Hsla, Image, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, SharedString, Stateful, Window,
 };
 
@@ -369,6 +377,71 @@ pub fn checkbox(
                 .text_color(if selected { theme.text_loud } else { theme.form_text })
                 .child(label.into()),
         )
+}
+
+/// An [`icon_choice`]'s picture, in points.
+pub const CHOICE_IMAGE: f32 = 64.0;
+
+/// A picture to pick: `image` at [`CHOICE_IMAGE`] in a `theme.search` well
+/// 12px around it, `label` (Small) under it. Picked, the well is ringed in
+/// `check_fill` with the glow around it and the label is loud.
+pub fn icon_choice(
+    id: impl Into<SharedString>,
+    image: Arc<Image>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    const RADIUS: f32 = 10.0;
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let well = div()
+        .id(SharedString::from(format!("{id}-well")))
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(12.0))
+        .rounded(px(RADIUS))
+        .bg(theme.search);
+    let clear = theme.background_hover.opacity(0.0);
+    let well = fill_layer(well, id.clone(), px(RADIUS), [clear, theme.background_hover, theme.background_active])
+        .child(img(image).size(px(CHOICE_IMAGE)).flex_none())
+        .when(selected, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .rounded(px(RADIUS))
+                    .border(px(2.0))
+                    .border_color(theme.check_fill),
+            )
+            .child(glow(RADIUS, theme.check_glow))
+        });
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_col()
+        .flex_none()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .child(well)
+        .child(
+            div()
+                .whitespace_nowrap()
+                .when(selected, |d| d.type_style(Type::SmallMedium).text_color(theme.text_loud))
+                .when(!selected, |d| d.type_style(Type::Small).text_color(theme.form_text))
+                .child(label.into()),
+        )
+}
+
+/// A row of [`icon_choice`]s, 16px apart (room for a picked one's glow).
+pub fn icon_choices() -> Div {
+    div().flex().flex_row().flex_none().items_start().gap(px(16.0)).py(px(3.0)).px(px(3.0))
 }
 
 /// A checkbox list: its [`checkbox`]es stacked 4px apart, 4px in from top

@@ -9,8 +9,10 @@
 //!
 //! The panel is a dialog like every other: the search box's fill in the
 //! dialogs' muted single-line border ([`super::dialog_frame`]). The icon is
-//! pixel art from the desktop's icon ([`super::about_icon`]), two pixels to
-//! a cell with `▀`; it is left out when the window is too short for it.
+//! pixel art from the desktop's icons ([`super::about_icon`]), two pixels to
+//! a cell with `▀`: the one `desktop.app_icon` chooses (Command Grille
+//! unless it says Retro), as the desktop's About shows. It is left out when
+//! the window is too short for it.
 //!
 //! Tab (or an arrow) moves focus through the links and Close; Enter or
 //! Space activates it; a click opens a link or closes. A link the pointer is
@@ -25,6 +27,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
 };
 use shelbi_app::about::{self, AboutLink};
+use shelbi_state::AppIcon;
 use unicode_width::UnicodeWidthStr;
 
 use super::about_icon;
@@ -67,29 +70,66 @@ pub enum Step {
     Acknowledgements,
 }
 
+/// `icon`'s pixel art.
+fn pixels(icon: AppIcon) -> &'static about_icon::Pixels {
+    match icon {
+        AppIcon::CommandGrille => &about_icon::COMMAND_GRILLE,
+        AppIcon::Retro => &about_icon::RETRO,
+    }
+}
+
+/// The icon `desktop.app_icon` chooses for About: Command Grille when it is
+/// unset or `config.yaml` can't be read. A test never reads the real
+/// `~/.shelbi`, so it gets Command Grille.
+pub fn configured_icon() -> AppIcon {
+    #[cfg(test)]
+    {
+        AppIcon::default()
+    }
+    #[cfg(not(test))]
+    {
+        shelbi_state::load_user_config()
+            .map(|cfg| AppIcon::from_config(&cfg.desktop))
+            .unwrap_or_default()
+    }
+}
+
 /// The focus order: the links as they read, then Close.
 fn targets() -> Vec<Target> {
     about::LINKS.into_iter().map(Target::Link).chain([Target::Close]).collect()
 }
 
-/// The overlay's state: what has focus, what the pointer is over, and
-/// whether the terminal draws 24-bit color (the icon falls back to the
-/// xterm-256 palette when it doesn't).
+/// The overlay's state: what has focus, what the pointer is over, which
+/// icon it draws, and whether the terminal draws 24-bit color (the icon
+/// falls back to the xterm-256 palette when it doesn't).
 #[derive(Debug, Clone)]
 pub struct About {
     focus: Target,
     hover: Option<Target>,
+    icon: AppIcon,
     truecolor: bool,
 }
 
 impl About {
-    /// Opened with Close focused, so Enter dismisses it.
+    /// Opened with Close focused, so Enter dismisses it, drawing Command
+    /// Grille (see [`About::with_icon`]).
     pub fn new(truecolor: bool) -> Self {
         About {
             focus: Target::Close,
             hover: None,
+            icon: AppIcon::default(),
             truecolor,
         }
+    }
+
+    /// Draw `icon` (`desktop.app_icon`'s choice).
+    pub fn with_icon(self, icon: AppIcon) -> Self {
+        About { icon, ..self }
+    }
+
+    /// The icon it draws.
+    pub fn icon(&self) -> AppIcon {
+        self.icon
     }
 
     /// Opened again with `focus` focused (back from Acknowledgements, on
@@ -213,10 +253,11 @@ impl About {
         if panel.width < size {
             return;
         }
+        let pixels = pixels(self.icon);
         let x0 = panel.x + (panel.width - size) / 2;
         for c in 0..about_icon::SIZE {
-            let top = about_icon::PIXELS[2 * row * about_icon::SIZE + c];
-            let bottom = about_icon::PIXELS[(2 * row + 1) * about_icon::SIZE + c];
+            let top = pixels[2 * row * about_icon::SIZE + c];
+            let bottom = pixels[(2 * row + 1) * about_icon::SIZE + c];
             if top[3] == 0 && bottom[3] == 0 {
                 continue;
             }
@@ -846,16 +887,50 @@ mod tests {
     }
 
     #[test]
-    fn the_icon_table_is_the_desktop_icon_cut_to_the_tile() {
+    fn the_icon_tables_are_the_desktop_icons_cut_to_the_tile() {
         assert_eq!(about_icon::SIZE % 2, 0, "two pixels to a cell");
-        // The tile fills the frame: its middle is opaque, its rounded corners
-        // clear.
-        let px = |x: usize, y: usize| about_icon::PIXELS[y * about_icon::SIZE + x];
+        for icon in AppIcon::ALL {
+            // The tile fills the frame: its middle is opaque, its rounded
+            // corners clear.
+            let px = |x: usize, y: usize| pixels(icon)[y * about_icon::SIZE + x];
+            let mid = about_icon::SIZE / 2;
+            assert!(px(mid, mid)[3] > 250, "{icon:?}");
+            assert_eq!(px(0, 0)[3], 0, "{icon:?}");
+            // The cobalt tile: blue leads in its corner, beside the stripes.
+            let [r, g, b, _] = px(3, 3);
+            assert!(b > r && b > g, "{icon:?} blue: {r},{g},{b}");
+        }
+        assert_ne!(about_icon::COMMAND_GRILLE, about_icon::RETRO);
+    }
+
+    /// About draws the icon it was opened with: Command Grille unless told
+    /// Retro.
+    #[test]
+    fn about_draws_the_chosen_icon() {
+        let (w, h) = (100, 30);
+        let panel = About::new(true).rect(Rect::new(0, 0, w, h));
+        let size = about_icon::SIZE as u16;
+        let x0 = panel.x + (panel.width - size) / 2;
+        // The icon's cells: the first row of the panel that draws `▀`.
+        let icon_cells = |about: &About| {
+            let buf = draw(about, w, h);
+            let y = (panel.y..panel.bottom())
+                .find(|&y| (x0..x0 + size).any(|x| buf[(x, y)].symbol() == BLEED_BELOW))
+                .expect("the icon is drawn");
+            (y..y + ICON_ROWS as u16)
+                .flat_map(|y| (x0..x0 + size).map(move |x| (x, y)))
+                .map(|(x, y)| (buf[(x, y)].fg, buf[(x, y)].bg))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(About::new(true).icon(), AppIcon::CommandGrille);
+        let grille = icon_cells(&About::new(true));
+        assert_eq!(icon_cells(&About::new(true).with_icon(AppIcon::CommandGrille)), grille);
+        let retro = icon_cells(&About::new(true).with_icon(AppIcon::Retro));
+        assert_ne!(retro, grille);
+        // Its middle cell is that table's pixel, drawn in 24-bit color.
         let mid = about_icon::SIZE / 2;
-        assert!(px(mid, mid)[3] > 250);
-        assert_eq!(px(0, 0)[3], 0);
-        // The cobalt tile: blue leads in its corner, beside the stripes.
-        let [r, g, b, _] = px(3, 3);
-        assert!(b > r && b > g, "blue: {r},{g},{b}");
+        let at = (ICON_ROWS / 2) * about_icon::SIZE + mid;
+        let [r, g, b, _] = about_icon::RETRO[(2 * (ICON_ROWS / 2)) * about_icon::SIZE + mid];
+        assert_eq!(retro[at].0, Color::Rgb(r, g, b));
     }
 }
