@@ -102,6 +102,7 @@ use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::update::{self as update_view, UpdateState};
 use crate::views::workspace_dialog::{Body as DialogBody, WorkspaceDialog, WorkspaceDialogEvent};
+use crate::views::connect_remote::{ConnectDialog, ConnectEvent};
 use crate::views::feedback::{FeedbackDialog, FeedbackEvent};
 use shelbi_app::settings::workspaces::Intent;
 use shelbi_state::keymap::{
@@ -299,6 +300,19 @@ pub fn open_new_window(project: &str, cx: &mut App) -> Option<WindowHandle<Shelb
     open_window(project, slot, state, bounds, cx)
 }
 
+/// A project picked on the launch window: the window already showing it
+/// comes up, else a new window opens on it.
+pub fn open_project_window(slug: &str, cx: &mut App) {
+    if let Some(handle) = windows_showing(slug, None, cx).first().copied() {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+        crate::views::launch::project_window_opened(cx);
+        return;
+    }
+    if open_new_window(slug, cx).is_some() {
+        cx.activate(true);
+    }
+}
+
 /// The Add Project wizard created `slug` and the user pressed Okay (the
 /// wizard has re-read the catalog first): it opens on its Orchestrator. A
 /// window already showing it (an earlier Okay got that far) comes up, else
@@ -406,6 +420,8 @@ fn open_window(
         Ok(handle) => {
             cx.global_mut::<Shell>().windows.push(OpenWindow { handle, slot });
             let _ = handle.update(cx, |w, _, cx| w.record_slot(cx));
+            // A project is open: the launch window, if up, is done.
+            crate::views::launch::project_window_opened(cx);
             Some(handle)
         }
         Err(e) => {
@@ -815,6 +831,9 @@ pub struct ShelbiWindow {
     /// Contact Us, over the whole window, with the focus to hand back when
     /// it closes. It belongs to no project, so a switch keeps it.
     feedback: Option<(Entity<FeedbackDialog>, Subscription, Option<FocusHandle>)>,
+    /// Connect to Remote Session, over the whole window, with the focus to
+    /// hand back when it closes. Like Contact Us, a switch keeps it.
+    connect: Option<(Entity<ConnectDialog>, Subscription, Option<FocusHandle>)>,
     /// How often a pool change asked the feed for a refresh.
     #[cfg(test)]
     pool_refreshes: usize,
@@ -1027,6 +1046,7 @@ impl ShelbiWindow {
             pool_forms: Vec::new(),
             pool_dialog: None,
             feedback: None,
+            connect: None,
             #[cfg(test)]
             pool_refreshes: 0,
             drawn_once: false,
@@ -1082,6 +1102,9 @@ impl ShelbiWindow {
         );
         // This client opens windows: File ▸ New Window and the palette's.
         model.multi_window = true;
+        // It has the launch screen and the Connect to Remote Session dialog.
+        model.launch_screen = true;
+        model.remote_connect = true;
         if self.chooser {
             // No project: only what needs none (switch, add, detach, quit
             // Shelbi).
@@ -2133,13 +2156,11 @@ impl ShelbiWindow {
             HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
             HostCall::OpenAcknowledgements => cx.defer(crate::views::about::show_bundled_software),
             HostCall::OpenAddProject => self.open_add_project(window, cx),
-            // The hooks the Connect dialog and the launch screen plug into
-            // (`shelbi_app::launch`). The registry doesn't list either command
-            // until the window turns `remote_connect` / `launch_screen` on.
-            HostCall::ConnectRemote => {
-                self.flash("Connect to Remote Session isn't in this build yet", cx)
-            }
-            HostCall::ShowLaunchScreen => self.flash("The launch screen isn't in this build yet", cx),
+            HostCall::ConnectRemote => self.open_connect(window, cx),
+            // Its own window, after this update (as New Window).
+            HostCall::ShowLaunchScreen => cx.defer(|cx| {
+                crate::views::launch::show(cx);
+            }),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
                 let m = Mutation::ApproveReview {
@@ -2263,7 +2284,7 @@ impl ShelbiWindow {
     /// another dialog is up, and opens once.
     pub(crate) fn open_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let machine_form = matches!(&self.route, Route::Settings(view) if view.read(cx).machine_form().is_some());
-        if self.feedback.is_some() || self.pool_dialog.is_some() || machine_form {
+        if self.modal_open() || machine_form {
             return;
         }
         if self.overlay.is_some() {
@@ -2276,6 +2297,55 @@ impl ShelbiWindow {
         });
         self.feedback = Some((dialog, sub, restore));
         cx.notify();
+    }
+
+    /// Open Connect to Remote Session (Shelbi ▸ Connect to Remote Session…,
+    /// the palette) over the window, closing an overlay first. It waits
+    /// while another dialog is up, and opens once.
+    pub(crate) fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let machine_form = matches!(&self.route, Route::Settings(view) if view.read(cx).machine_form().is_some());
+        if self.modal_open() || machine_form {
+            return;
+        }
+        if self.overlay.is_some() {
+            self.close_overlay(window, cx);
+        }
+        let restore = window.focused(cx);
+        let dialog = cx.new(|cx| ConnectDialog::new(window, cx));
+        let sub = cx.subscribe_in(&dialog, window, |this, _, event: &ConnectEvent, window, cx| match event {
+            ConnectEvent::Closed(session) => {
+                if let Some((_, _, Some(restore))) = this.connect.take() {
+                    window.focus(&restore, cx);
+                }
+                if let Some(s) = session {
+                    this.flash(format!("Connected to {} on {}.", s.display_label(), s.host), cx);
+                }
+                cx.notify();
+            }
+        });
+        self.connect = Some((dialog, sub, restore));
+        cx.notify();
+    }
+
+    /// ⌘W over Contact Us or Connect to Remote Session: cancel it.
+    fn dismiss_dialog(&self, cx: &mut Context<Self>) {
+        if let Some((d, _, _)) = &self.feedback {
+            d.update(cx, |d, cx| d.dismiss(cx));
+        } else if let Some((d, _, _)) = &self.connect {
+            d.update(cx, |d, cx| d.dismiss(cx));
+        }
+    }
+
+    /// A modal dialog is up over the window (Contact Us, Connect to Remote
+    /// Session, a workspace dialog).
+    fn modal_open(&self) -> bool {
+        self.feedback.is_some() || self.connect.is_some() || self.pool_dialog.is_some()
+    }
+
+    /// The open Connect dialog (tests).
+    #[cfg(test)]
+    pub(crate) fn connect_dialog(&self) -> Option<Entity<ConnectDialog>> {
+        self.connect.as_ref().map(|(d, _, _)| d.clone())
     }
 
     /// Contact Us closed: drop it and give the keyboard back to where it was.
@@ -3942,12 +4012,12 @@ impl ShelbiWindow {
     /// A menu item: a registry command runs exactly as the palette runs it.
     fn menu_invoke(&mut self, invoke: &menus::MenuInvoke, window: &mut Window, cx: &mut Context<Self>) {
         use menus::tree::{AppCommand, MenuAction};
-        // Contact Us is modal like a workspace dialog: ⌘W cancels it, the
-        // rest wait (Help ▸ Send Feedback…, a registry command, included:
-        // it's already open).
-        if let Some((dialog, _, _)) = &self.feedback {
+        // Contact Us and Connect to Remote Session are modal like a
+        // workspace dialog: ⌘W cancels them, the rest wait (their own menu
+        // items included: they're already open).
+        if self.feedback.is_some() || self.connect.is_some() {
             match &invoke.target {
-                MenuAction::App(AppCommand::CloseWindow) => dialog.update(cx, |d, cx| d.dismiss(cx)),
+                MenuAction::App(AppCommand::CloseWindow) => self.dismiss_dialog(cx),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
                 MenuAction::App(AppCommand::Zoom) => window.zoom_window(),
                 // About and Acknowledgements are their own windows: they open
@@ -4059,7 +4129,7 @@ impl ShelbiWindow {
         }
         // A workspace dialog is modal: it takes its keys ahead of everything
         // (`WorkspaceDialog::key`), and nothing behind it gets any.
-        if self.pool_dialog.is_some() || self.feedback.is_some() {
+        if self.modal_open() {
             return;
         }
         let Some(chord) = chord else {
@@ -4778,6 +4848,8 @@ impl ShelbiWindow {
         });
         // Contact Us, over the whole window.
         let feedback = self.feedback.as_ref().map(|(dialog, _, _)| dialog.clone());
+        // Connect to Remote Session, over the whole window.
+        let connect = self.connect.as_ref().map(|(dialog, _, _)| dialog.clone());
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
         let layer = self.overlay.as_ref().map(|o| {
@@ -4848,6 +4920,7 @@ impl ShelbiWindow {
             .children(machine_form)
             .children(pool_dialog)
             .children(feedback)
+            .children(connect)
             .children(layer)
             .children(probe)
             .into_any_element()
@@ -5129,6 +5202,10 @@ mod settings_tests;
 #[cfg(test)]
 #[path = "app_feedback_tests.rs"]
 mod feedback_tests;
+
+#[cfg(test)]
+#[path = "app_connect_tests.rs"]
+mod connect_tests;
 
 #[cfg(test)]
 #[path = "app_fold_tests.rs"]

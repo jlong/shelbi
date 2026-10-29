@@ -48,6 +48,7 @@ mod visual_workspace;
 mod window_state;
 
 use gpui::App;
+use shelbi_app::launch::route::{self as launch_route, Client, LaunchRoute};
 
 use crate::app::Shell;
 use crate::feeds::FeedHub;
@@ -230,12 +231,14 @@ fn main() {
     // The windows to open: local reads before any window exists (the spike
     // has none). The window slots, else (the first launch after the
     // upgrade) one window on the launch project with its old frame.
-    let (session, plan) = match mode {
+    // Where the app starts: with no daemon running, the launch window
+    // (`shelbi_app::launch::route`; the probe never starts one).
+    let (session, plan, route) = match mode {
         Mode::App => {
             let (session, plan) = read_launch_plan();
-            (session.unwrap_or_default(), plan)
+            (session.unwrap_or_default(), plan, launch_route())
         }
-        _ => (WindowSession::default(), Vec::new()),
+        _ => (WindowSession::default(), Vec::new(), LaunchRoute::Usual),
     };
 
     gpui_platform::application()
@@ -315,6 +318,13 @@ fn main() {
             // project window shows the notice when there is.
             views::update::spawn_check(cx);
 
+            // No daemon running: the launch window (the projects here, the
+            // recent remote sessions, Add project, Connect to remote).
+            if route == LaunchRoute::LaunchScreen {
+                tracing::info!("no daemon running: the launch window");
+                views::launch::show(cx);
+                return;
+            }
             // No project yet: the first launch checks for the CLI (installing
             // it when there is none), then becomes the Add Project wizard
             // (closing it, the last window, quits).
@@ -341,6 +351,12 @@ pub(crate) fn read_launch_plan() -> (Option<WindowSession>, Vec<window_state::La
         &WindowState::load_legacy,
     );
     (session, plan)
+}
+
+/// The desktop's start ([`launch_route::route`]): the launch window when no
+/// daemon is running, else the usual restore.
+fn launch_route() -> LaunchRoute {
+    launch_route::route(Client::Desktop, launch_route::daemon_state(), None)
 }
 
 /// Log to stderr, `warn` and up by default (`RUST_LOG` overrides), so a

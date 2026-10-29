@@ -58,6 +58,9 @@
 //! - Contact Us, the feedback dialog the sidebar footer's megaphone and
 //!   Help ▸ Send Feedback… open: **`dt-feedback-dialog`** (`feedback`, over
 //!   the shared `shelbi_app::feedback` and `crate::platform::feedback`)
+//! - the launch window a start with no daemon opens, and the Connect to
+//!   Remote Session dialog: **`launch-desktop`** (`launch`, `connect_remote`,
+//!   over `shelbi_app::launch` and `crate::platform::launch`)
 //!
 //! Views read view models and invoke registry commands through
 //! `crate::commands`; they never hold domain logic of their own.
@@ -81,6 +84,7 @@ pub mod cli_setup;
 pub mod board_state;
 pub mod chat;
 pub mod column_swap;
+pub mod connect_remote;
 pub mod session_view;
 pub mod workspace;
 pub mod workspace_layout;
@@ -89,6 +93,7 @@ pub mod feedback;
 pub mod font_picker;
 pub mod issues;
 pub mod keybindings;
+pub mod launch;
 pub mod machines;
 pub mod machines_state;
 pub mod machine_form;

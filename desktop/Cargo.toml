@@ -148,7 +148,7 @@ objc2-app-kit = { version = "0.3", features = [
 # permission needed), drive simulated keys and mouse into a fake session, and
 # save the frames. A developer tool, off by default: it builds gpui with its
 # `test-support` feature.
-visual-check = ["gpui_platform/test-support", "dep:image"]
+visual-check = ["gpui_platform/test-support", "dep:image", "shelbi-app/test-support"]
 # `cargo run --release --features bench -- --bench-term` (or
 # `scripts/bench-term.sh`): measure the terminal element under heavy output in
 # a real window over sandboxed sessions (`src/bench/`). A developer tool, off

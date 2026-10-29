@@ -7,8 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The dialog's title (the Host and Choose session screens share it).
+/// The dialog's name: the command and the menu item (the TUI's heading).
 pub const DIALOG_TITLE: &str = "Connect to Remote Session";
+/// The heading the Host and Choose session frames draw (Figma 2541:10275):
+/// the desktop dialog's.
+pub const DIALOG_HEADING: &str = "Connect to remote";
 /// The line under the title on the Host screen.
 pub const HOST_INTRO: &str = "Connect to Shelbi running on another machine.";
 /// The host field's label.
@@ -21,7 +24,7 @@ pub const FIND_SESSIONS_LABEL: &str = "Find Sessions";
 /// Both screens' secondary button.
 pub const CANCEL_LABEL: &str = "Cancel";
 /// The Choose session screen's button back to the Host screen.
-pub const CHANGE_HOST_LABEL: &str = "Change Host";
+pub const CHANGE_HOST_LABEL: &str = "Change host";
 /// The Choose session screen's primary button, and each row's.
 pub const CONNECT_LABEL: &str = "Connect";
 

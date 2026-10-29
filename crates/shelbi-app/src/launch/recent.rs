@@ -50,6 +50,12 @@ impl RecentRemotes {
         }
     }
 
+    /// No list: nothing loads and nothing is remembered (a client's tests,
+    /// which never touch the real home).
+    pub fn none() -> RecentRemotes {
+        RecentRemotes { path: None }
+    }
+
     /// The list in `path`.
     pub fn at(path: impl Into<PathBuf>) -> RecentRemotes {
         RecentRemotes {

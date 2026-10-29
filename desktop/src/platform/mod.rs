@@ -27,6 +27,7 @@ pub mod env;
 pub mod feedback;
 pub mod font_smoothing;
 pub mod install;
+pub mod launch;
 pub mod motion;
 pub mod print_version;
 pub mod relaunch;
