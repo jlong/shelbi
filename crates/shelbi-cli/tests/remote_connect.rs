@@ -65,10 +65,11 @@ impl Sandbox {
         let shelbi_home = root.join("sh");
         let repo = root.join("repos").join("alpha");
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(shelbi_home.join("projects")).unwrap();
+        let projects = shelbi_state::projects_dir_in(&shelbi_home);
+        std::fs::create_dir_all(&projects).unwrap();
         let repo_s = repo.display();
         std::fs::write(
-            shelbi_home.join("projects").join("alpha.yaml"),
+            projects.join("alpha.yaml"),
             format!(
                 "name: alpha\nrepo: {repo_s}\nmachines:\n  - {{ name: hub, kind: local, work_dir: {repo_s} }}\n\
                  orchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\n\
