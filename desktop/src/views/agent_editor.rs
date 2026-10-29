@@ -1324,7 +1324,7 @@ impl AgentEditor {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let button = select_button(id, label, None, icons::CHEVRON_DOWN, theme);
+        let button = select_button(id, label, None, style::DROPDOWN_CHEVRON, theme);
         if let Some(why) = blocked {
             return div().w_full().child(button.opacity(0.4).cursor_default().tooltip(style::tooltip(why)));
         }
