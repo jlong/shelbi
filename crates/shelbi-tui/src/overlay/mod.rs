@@ -30,7 +30,56 @@ pub mod review_confirm;
 pub mod review_reject;
 pub mod zen_intro;
 
-use ratatui::layout::Rect;
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::Span,
+    widgets::{Block, Borders, Widget},
+};
+
+use crate::theme::palette;
+
+/// The columns between a dialog's border and its content, each side: the
+/// command palette's.
+pub const DIALOG_PAD_X: u16 = 1;
+
+/// The frame every dialog over the app draws, the command palette's: a
+/// muted single-line border around `rect`, the panel filled with `fill`
+/// (`None` keeps the terminal's background), `title` (bold, the strongest
+/// text) in the top border. Every modal goes through here, so their
+/// borders can't drift apart. Returns [`dialog_content`]'s rect.
+pub fn dialog_frame(buf: &mut Buffer, rect: Rect, fill: Option<Color>, title: Option<&str>) -> Rect {
+    let mut style = Style::default();
+    if let Some(fill) = fill {
+        style = style.bg(fill);
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette().muted))
+        .style(style);
+    if let Some(title) = title {
+        block = block.title(Span::styled(
+            format!(" {} ", title.trim()),
+            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+        ));
+    }
+    block.render(rect, buf);
+    dialog_content(rect)
+}
+
+/// A dialog's content within its `rect`: inside the border, and
+/// [`DIALOG_PAD_X`] columns in from it each side. Hit-tests use this, so
+/// they agree with [`dialog_frame`].
+pub fn dialog_content(rect: Rect) -> Rect {
+    let inner = Block::default().borders(Borders::ALL).inner(rect);
+    let pad = DIALOG_PAD_X.min(inner.width / 2);
+    Rect {
+        x: inner.x + pad,
+        width: inner.width - 2 * pad,
+        ..inner
+    }
+}
 
 /// Center a `width`×`height` box inside `area`, clamped so it never exceeds the
 /// available space (and never underflows on a tiny terminal). Every overlay is
@@ -52,9 +101,56 @@ pub fn centered_pct(area: Rect, pct_w: u16, pct_h: u16, min_w: u16, min_h: u16) 
     centered_rect(area, w, h)
 }
 
+/// Test support: whether `rect`'s edges in `buf` are [`dialog_frame`]'s
+/// border (the single-line glyphs, muted). `Err` says the first cell that
+/// isn't.
+#[cfg(test)]
+pub(crate) fn assert_dialog_border(buf: &Buffer, rect: Rect) -> Result<(), String> {
+    let (l, r, t, b) = (rect.left(), rect.right() - 1, rect.top(), rect.bottom() - 1);
+    let mut want = vec![((l, t), "┌"), ((r, t), "┐"), ((l, b), "└"), ((r, b), "┘")];
+    // The top edge may carry a title, so only its corners are checked.
+    want.extend((l + 1..r).map(|x| ((x, b), "─")));
+    want.extend((t + 1..b).flat_map(|y| [((l, y), "│"), ((r, y), "│")]));
+    for ((x, y), glyph) in want {
+        let cell = &buf[(x, y)];
+        if cell.symbol() != glyph || cell.fg != palette().muted {
+            return Err(format!("({x},{y}) is {:?} in {:?}, not the muted {glyph:?}", cell.symbol(), cell.fg));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only [`dialog_frame`] draws a box border, so the dialogs can't drift
+    /// apart again: any other `Borders::` in the crate is a dialog bypassing
+    /// it. The reject prompt's reason field is a text box, not a dialog.
+    #[test]
+    fn only_the_shared_helper_draws_a_border() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let allowed = [("overlay/mod.rs", usize::MAX), ("overlay/review_reject.rs", 1)];
+        let needle = ["Borders", "::"].concat();
+        for file in files {
+            let rel = file.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+            let n = std::fs::read_to_string(&file).unwrap().matches(&needle).count();
+            let limit = allowed.iter().find(|(f, _)| *f == rel).map_or(0, |(_, n)| *n);
+            assert!(n <= limit, "{rel} draws its own border ({n}x); use overlay::dialog_frame");
+        }
+    }
 
     #[test]
     fn centered_rect_is_centered_and_clamped() {

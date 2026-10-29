@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use shelbi_app::board::{
@@ -2611,8 +2611,8 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .map(|d| d.cursor)
         .unwrap_or(0);
 
-    // Width = widest "Workspace name (count)" row + 4 chars of chrome
-    // (border + arrow + padding). Cap so the popover never spans more
+    // Width = widest "Workspace name (count)" row + 6 chars of chrome
+    // (border, padding, arrow). Cap so the popover never spans more
     // than ~⅓ of the screen — narrow lists shouldn't sprawl. The lower
     // bound is sized to fit the " Filter by workspace " title.
     let max_label_w = opts
@@ -2620,7 +2620,7 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .map(|o| dropdown_row_text(o).chars().count())
         .max()
         .unwrap_or(10);
-    let desired_w = (max_label_w + 4).max(24) as u16;
+    let desired_w = (max_label_w + 6).max(24) as u16;
     let popover_w = desired_w.min(area.width).min(area.width / 3 + 8);
     // Anchor right edge to the chip's right edge so the dropdown
     // visually drops out of the chip. Fall back to right-aligned in
@@ -2651,17 +2651,7 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     };
 
     f.render_widget(Clear, popover_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_cyan))
-        .title(Line::from(vec![Span::styled(
-            " Filter by workspace ",
-            Style::default()
-                .fg(palette().ansi_cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-    let inner = block.inner(popover_area);
-    f.render_widget(block, popover_area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), popover_area, None, Some("Filter by workspace"));
 
     // Split inner: option list on top, single-line hint footer on bottom.
     let chunks = Layout::default()
@@ -2762,7 +2752,7 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .map(|o| workflow_dropdown_row_text(o).chars().count())
         .max()
         .unwrap_or(10);
-    let desired_w = (max_label_w + 4).max(22) as u16;
+    let desired_w = (max_label_w + 6).max(22) as u16;
     let popover_w = desired_w.min(area.width).min(area.width / 3 + 8);
     let popover_x = match app.workflow_chip_hit {
         Some(chip) => {
@@ -2785,17 +2775,7 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     };
 
     f.render_widget(Clear, popover_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_cyan))
-        .title(Line::from(vec![Span::styled(
-            " Filter by workflow ",
-            Style::default()
-                .fg(palette().ansi_cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-    let inner = block.inner(popover_area);
-    f.render_widget(block, popover_area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), popover_area, None, Some("Filter by workflow"));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3122,7 +3102,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 /// `popover_area` (the caller owns the [`Clear`] so this can be reused by an
 /// overlay framework that clears its own rect). Shared by the kanban board's
 /// [`render_popover`] and the review interface's description popover so both
-/// show the same cyan-bordered box, metadata header, markdown body, and footer.
+/// show the same bordered box (the dialogs' shared frame), metadata header, markdown body, and footer.
 /// `tf` is the task to show (`None` renders the "issue no longer exists" stub);
 /// `columns` resolves dependency labels; `scroll` is clamped against the wrapped
 /// body height in place.
@@ -3149,21 +3129,7 @@ pub(crate) fn render_task_popover_into(
     };
 
     let title_text = truncate(&title, popover_area.width.saturating_sub(4) as usize);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_cyan))
-        .title(Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                title_text,
-                Style::default()
-                    .fg(palette().ansi_cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ]));
-    let inner = block.inner(popover_area);
-    f.render_widget(block, popover_area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), popover_area, None, Some(&title_text));
 
     // Layout inside the border: header (fixed height) → separator → body
     // (scrollable) → footer (hint line).

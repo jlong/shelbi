@@ -70,7 +70,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 use shelbi_app::settings::general::{self, Change, GeneralForm, SaveStatus};
@@ -2932,27 +2932,15 @@ pub(crate) fn clear_layer(f: &mut Frame, rect: Rect, within: Rect) {
 
 /// An overlay over a settings page (a dialog, a prompt, a menu), drawn as
 /// the command palette is: cleared (with [`clear_layer`]'s gutter), the
-/// [`Theme::search`] panel fill in a muted single-line border. A menu's
-/// `title` sits in its top border; a dialog says its own heading
-/// ([`modal_form::dialog_heading`]). Returns the content: inset one column inside the
-/// border each side.
+/// [`Theme::search`] panel fill in the dialogs' shared muted border
+/// ([`crate::overlay::dialog_frame`]). A menu's `title` sits in its top
+/// border; a dialog says its own heading ([`modal_form::dialog_heading`]).
+/// Returns the content: inset one column inside the border each side.
 ///
 /// [`Theme::search`]: shelbi_app::theme::Theme::search
 pub(crate) fn overlay_panel(f: &mut Frame, rect: Rect, within: Rect, title: Option<&str>) -> Rect {
     clear_layer(f, rect, within);
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().muted))
-        .style(Style::default().bg(palette().search));
-    if let Some(title) = title {
-        block = block.title(Span::styled(
-            format!(" {} ", title.trim()),
-            Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
-        ));
-    }
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner }
+    crate::overlay::dialog_frame(f.buffer_mut(), rect, Some(palette().search), title)
 }
 
 /// A dialog centered over `area`, up to `width` wide, as the desktop's: its
@@ -3896,7 +3884,12 @@ mod tests {
                 .flat_map(|y| (0..width).map(move |x| (x, y)))
                 .find(|&(x, y)| buf[(x, y)].symbol() == "┌")
                 .expect("a border");
-            assert_eq!(buf[(bx, by)].fg, palette().muted);
+            let (ex, ey) = (0..24u16)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .find(|&(x, y)| buf[(x, y)].symbol() == "┘")
+                .expect("its bottom corner");
+            let rect = Rect::new(bx, by, ex + 1 - bx, ey + 1 - by);
+            crate::overlay::assert_dialog_border(buf, rect).unwrap_or_else(|e| panic!("{width}: {e}"));
             assert_eq!(buf[(bx + 2, by + 1)].bg, palette().search);
             let (r, i) = hits.iter().find(|(_, i)| *i == 0).unwrap();
             assert_eq!(*i, 0);

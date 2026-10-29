@@ -72,13 +72,15 @@ fn the_form_lays_out_the_desktops_controls_in_its_order() {
     // The kinds share one row, in the control's order.
     let xs: Vec<(u16, u16)> = ["Bug Report", "Feature Request", "Other"].iter().map(|t| find(&buf, t).unwrap()).collect();
     assert!(xs.iter().all(|(_, y)| *y == xs[0].1) && xs[0].0 < xs[1].0 && xs[1].0 < xs[2].0, "{xs:?}");
-    // Centered, PANEL_W wide, with the half-block caps in the dialog fill.
+    // Centered, PANEL_W wide, in the dialogs' border on the dialog fill.
     assert_eq!(rect.width, PANEL_W);
     assert_eq!(rect.x, (100 - PANEL_W) / 2);
-    assert_eq!(row(&buf, rect.y).trim(), BLEED_ABOVE.repeat(PANEL_W as usize));
-    assert_eq!(row(&buf, rect.bottom() - 1).trim(), BLEED_BELOW.repeat(PANEL_W as usize));
-    assert_eq!(buf[(rect.x, rect.y)].fg, palette().dialog);
-    assert_eq!(buf[(rect.x, rect.y + 1)].bg, palette().dialog, "the panel is filled");
+    crate::overlay::assert_dialog_border(&buf, rect).unwrap();
+    assert_eq!(buf[(rect.x, rect.y)].bg, palette().dialog, "the border's on the fill");
+    assert_eq!(buf[(rect.x + 1, rect.y + 1)].bg, palette().dialog, "the panel is filled");
+    // The content sits a column inside the border, as the palette's does.
+    let (nx, _) = find(&buf, form::NAME).unwrap();
+    assert!(nx >= rect.x + 2, "Name inside the padding");
     // The title's centered over the form.
     let (tx, _) = find(&buf, form::TITLE).unwrap();
     let mid = rect.x + rect.width / 2;

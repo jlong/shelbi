@@ -29,7 +29,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -136,15 +136,7 @@ fn detected_line(detected: Option<Detected>) -> Span<'static> {
 /// always have room and never truncate.
 fn render(f: &mut Frame, area: Rect, form: &Form) {
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette().ansi_cyan))
-        .title(Line::from(Span::styled(
-            format!(" {} ", shared::TITLE),
-            Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
-        )));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), area, None, Some(shared::TITLE));
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
@@ -203,10 +195,8 @@ fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
     } else {
         Style::default().fg(palette().ansi_gray)
     };
-    let mut spans = vec![
-        Span::styled(format!("{label:<11}"), label_style),
-        Span::raw(value.to_string()),
-    ];
+    let mut spans = label_spans(label, label_style).to_vec();
+    spans.push(Span::raw(value.to_string()));
     if focused {
         spans.push(Span::styled("▏", Style::default().fg(palette().ansi_cyan)));
     }
@@ -239,12 +229,19 @@ fn config_line(mode: ConfigMode, focused: bool) -> Line<'static> {
             Style::default().fg(palette().ansi_dark_gray)
         }
     };
-    Line::from(vec![
-        Span::styled(format!("{:<11}", "Config"), label_style),
+    let mut spans = label_spans("Config", label_style).to_vec();
+    spans.extend([
         Span::styled(in_repo.to_string(), opt_style(mode == ConfigMode::InRepo)),
         Span::raw("   "),
         Span::styled(global.to_string(), opt_style(mode == ConfigMode::Global)),
-    ])
+    ]);
+    Line::from(spans)
+}
+
+/// A field's label in its 11-column gutter, the focused one's underline
+/// under the label's own letters only.
+fn label_spans(label: &str, style: Style) -> [Span<'static>; 3] {
+    crate::panel::padded_label(label, 0, 11usize.saturating_sub(label.chars().count()), style)
 }
 
 #[cfg(test)]
@@ -355,6 +352,22 @@ mod tests {
     /// The form (title, labels, the focused field and cursor, the radio,
     /// the detection line, an inline error, the key hints) is readable on a
     /// light terminal with each control focused.
+    #[test]
+    fn a_focused_label_underlines_its_letters_not_its_gutter() {
+        for line in [field_line("Name", "alpha", true), config_line(ConfigMode::InRepo, true)] {
+            let underlined: String = line
+                .spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(["Name", "Config"].contains(&underlined.as_str()), "{underlined:?}");
+            let gutter = &line.spans[2];
+            assert!(gutter.content.trim().is_empty() && !gutter.content.is_empty());
+            assert!(gutter.style.sub_modifier.contains(Modifier::UNDERLINED), "the gutter clears it");
+        }
+    }
+
     #[test]
     fn renders_readable_in_light() {
         use shelbi_app::theme::Appearance;

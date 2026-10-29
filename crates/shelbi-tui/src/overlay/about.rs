@@ -7,16 +7,14 @@
 //! sponsor links. The desktop's window has its traffic lights to close it;
 //! here a Close button sits at the bottom right, and Esc closes too.
 //!
-//! The panel is the half-block language the sidebar's search box draws: a
-//! `▄` row above and a `▀` row below carry the fill as their foreground over
-//! the terminal's own background, so the panel reads as a solid block with
-//! half-row edges. The icon is pixel art from the desktop's icon
-//! ([`super::about_icon`]), two pixels to a cell with `▀`; it is left out
-//! when the window is too short for it.
+//! The panel is a dialog like every other: the search box's fill in the
+//! dialogs' muted single-line border ([`super::dialog_frame`]). The icon is
+//! pixel art from the desktop's icon ([`super::about_icon`]), two pixels to
+//! a cell with `▀`; it is left out when the window is too short for it.
 //!
 //! Tab (or an arrow) moves focus through the links and Close; Enter or
 //! Space activates it; a click opens a link or closes. A link the pointer is
-//! over is underlined. Acknowledgements opens the TUI's list of the bundled
+//! over is underlined, its label only (not the padding its focus fill takes). Acknowledgements opens the TUI's list of the bundled
 //! software (`shell::acknowledgements`) in About's place; its Done brings
 //! About back, focused on the link.
 
@@ -31,7 +29,8 @@ use unicode_width::UnicodeWidthStr;
 
 use super::about_icon;
 use crate::button::Button;
-use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
+use crate::panel;
+use crate::sidebar::BLEED_BELOW;
 use crate::theme::{palette, pixel, tokens};
 
 /// This build's version (the TUI's crate is the workspace's).
@@ -39,8 +38,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The panel's width when the window has room for it.
 const WIDTH: u16 = 56;
-/// Columns between the panel's sides and its content.
-const PAD_X: u16 = 4;
+/// Columns between the panel's sides and its content: the border and the
+/// dialogs' padding inside it.
+const PAD_X: u16 = 1 + super::DIALOG_PAD_X;
 /// The Close button's label, as the TUI's dialogs name it.
 const CLOSE: &str = "Close";
 /// The button's columns: the label with two of fill each side.
@@ -161,21 +161,7 @@ impl About {
         if panel.width == 0 || panel.height == 0 {
             return;
         }
-        let fill = palette().search;
-        // The half-row edges: the fill as the glyphs' foreground over the
-        // terminal's background (the search box's `▄` / `▀`).
-        let edge = Style::default().fg(fill).bg(Color::Reset);
-        for x in panel.left()..panel.right() {
-            buf[(x, panel.top())].set_symbol(BLEED_ABOVE).set_style(edge);
-            if panel.height > 1 {
-                buf[(x, panel.bottom() - 1)].set_symbol(BLEED_BELOW).set_style(edge);
-            }
-        }
-        for y in panel.top() + 1..panel.bottom().saturating_sub(1) {
-            for x in panel.left()..panel.right() {
-                buf[(x, y)].set_symbol(" ").set_style(Style::default().bg(fill));
-            }
-        }
+        super::dialog_frame(buf, panel, Some(palette().search), None);
         for (y, row) in &plan.rows {
             match row {
                 Row::Gap | Row::Pad => {}
@@ -184,8 +170,14 @@ impl About {
                     let mut x = plan.content.x + plan.content.width.saturating_sub(pieces_width(pieces)) / 2;
                     for p in pieces {
                         let style = self.piece_style(p);
-                        buf.set_stringn(x, *y, &p.text, plan.content.right().saturating_sub(x) as usize, style);
-                        x += p.text.width() as u16;
+                        // A link's padding takes its focus fill but not its
+                        // hover underline.
+                        let pad = usize::from(p.target.is_some());
+                        let label = &p.text[pad..p.text.len() - pad];
+                        for span in panel::padded_label(label, pad, pad, style) {
+                            let room = plan.content.right().saturating_sub(x);
+                            x = buf.set_span(x, *y, &span, room).0;
+                        }
                     }
                 }
                 Row::Button(part) => self.render_button_row(buf, plan.button_x(), *y, *part),
@@ -311,7 +303,8 @@ impl Piece {
     }
 
     /// A link, a column of padding each side so its focus fill reads as a
-    /// pill without moving the row when focus moves.
+    /// pill without moving the row when focus moves. (The padding is a
+    /// space each side, which drawing strips back off for the underline.)
     fn link(link: AboutLink, role: Role) -> Self {
         Piece {
             text: format!(" {} ", link.label()),
@@ -445,9 +438,9 @@ impl Layout {
 /// top of the panel.
 fn layout(area: Rect) -> Layout {
     let width = WIDTH.min(area.width);
-    let pad_x = if width >= 2 * PAD_X + 24 { PAD_X } else { 1.min(width / 2) };
+    let pad_x = PAD_X.min(width / 2);
     let content_w = width.saturating_sub(2 * pad_x);
-    // The two edge rows sit outside the rows.
+    // The border's two rows sit outside the rows.
     let fits = |rows: &[Row]| rows.len() as u16 + 2 <= area.height;
     let mut planned = rows(content_w as usize, true);
     if !fits(&planned) || content_w < about_icon::SIZE as u16 {
@@ -482,6 +475,7 @@ fn layout(area: Rect) -> Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::BLEED_ABOVE;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -621,27 +615,30 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_has_half_block_edges_and_a_solid_fill() {
-        let buf = draw(&About::new(true), 100, 30);
-        let about = About::new(true);
-        let panel = about.rect(Rect::new(0, 0, 100, 30));
-        for x in panel.left()..panel.right() {
-            let top = &buf[(x, panel.top())];
-            assert_eq!((top.symbol(), top.fg, top.bg), (BLEED_ABOVE, palette().search, Color::Reset));
-            let bottom = &buf[(x, panel.bottom() - 1)];
-            assert_eq!((bottom.symbol(), bottom.fg, bottom.bg), (BLEED_BELOW, palette().search, Color::Reset));
-        }
-        // Every inner cell sits on the fill, except the icon's and the
-        // button's (and a focused link's).
-        let close_y = row_of(&buf, CLOSE);
-        let icon = icon_rows(&buf);
-        for y in panel.top() + 1..panel.bottom() - 1 {
-            if icon.contains(&y) || (close_y - 1..=close_y + 1).contains(&y) {
-                continue;
+    fn the_panel_has_the_dialog_border_and_a_solid_fill() {
+        for (w, h) in [(100, 30), (60, 20)] {
+            let buf = draw(&About::new(true), w, h);
+            let panel = About::new(true).rect(Rect::new(0, 0, w, h));
+            crate::overlay::assert_dialog_border(&buf, panel).unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+            // No half-block cap row is left above or below the content.
+            for y in [panel.top(), panel.bottom() - 1] {
+                assert!((panel.left()..panel.right()).all(|x| ![BLEED_ABOVE, BLEED_BELOW].contains(&buf[(x, y)].symbol())));
             }
-            for x in panel.left()..panel.right() {
-                assert_eq!(buf[(x, y)].bg, palette().search, "({x},{y})");
+            // Every cell sits on the fill, the border's too, except the
+            // icon's and the button's (and a focused link's).
+            let close_y = row_of(&buf, CLOSE);
+            let icon = icon_rows(&buf);
+            for y in panel.top()..panel.bottom() {
+                if icon.contains(&y) || (close_y - 1..=close_y + 1).contains(&y) {
+                    continue;
+                }
+                for x in panel.left()..panel.right() {
+                    assert_eq!(buf[(x, y)].bg, palette().search, "{w}x{h} ({x},{y})");
+                }
             }
+            // The content stays inside the border.
+            let close = cell_of(&buf, CLOSE);
+            assert!(close.0 + CLOSE.len() as u16 + 2 < panel.right() - 1, "{w}x{h}: Close inside");
         }
     }
 
@@ -777,6 +774,28 @@ mod tests {
         }
         assert_eq!(buf[(wx, wy)].fg, palette().white);
         assert_eq!(buf[(wx + 8, wy)].bg, palette().search, "the gap after it is the panel's");
+    }
+
+    #[test]
+    fn a_hovered_link_underlines_its_label_and_not_its_padding() {
+        let area = Rect::new(0, 0, 100, 30);
+        let labels = ["Website", "Documentation", "GitHub", "Acknowledgements", "MIT License", "Sponsored by 32pixels"];
+        for label in labels {
+            let mut about = About::new(true);
+            let (x, y) = cell_of(&draw(&about, 100, 30), label);
+            about.handle_mouse(mouse(MouseEventKind::Moved, x, y), area);
+            let buf = draw(&about, 100, 30);
+            let underlined = |x: u16| buf[(x, y)].modifier.contains(Modifier::UNDERLINED);
+            let w = label.width() as u16;
+            assert!((x..x + w).all(underlined), "{label}: every cell of the label");
+            assert!(!underlined(x - 1), "{label}: not the cell before it");
+            assert!(!underlined(x + w), "{label}: not the cell after it");
+            // The padding is still the link's: hovering it underlines the label.
+            about.handle_mouse(mouse(MouseEventKind::Moved, x - 1, y), area);
+            let buf = draw(&about, 100, 30);
+            assert!(buf[(x, y)].modifier.contains(Modifier::UNDERLINED), "{label}: hovered from its padding");
+            assert!(!buf[(x - 1, y)].modifier.contains(Modifier::UNDERLINED));
+        }
     }
 
     #[test]
