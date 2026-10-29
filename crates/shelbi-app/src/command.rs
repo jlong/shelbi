@@ -94,6 +94,11 @@ pub enum CommandKind {
     /// computes the slot from the unfiltered column
     /// ([`crate::board::reorder_slot`]).
     PrioritizeIssue { id: String, position: u32 },
+    /// Move an issue to another configured workflow (the task pane's
+    /// Workflow property). The daemon validates the name; the client offers
+    /// only workflows that declare the issue's status
+    /// ([`crate::task_properties::workflow_choices`]).
+    SetIssueWorkflow { id: String, workflow: String },
 }
 
 /// A registry command: metadata + typed arguments. Built by the registry
@@ -144,6 +149,7 @@ impl Command {
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
                 | CommandKind::PrioritizeIssue { .. }
+                | CommandKind::SetIssueWorkflow { .. }
         )
     }
 
@@ -242,6 +248,15 @@ impl CommandKind {
                     position: *position,
                 })
             }
+            CommandKind::SetIssueWorkflow { id, workflow } => Effect::Mutate(Mutation::EditIssue {
+                project: p(),
+                id: id.clone(),
+                title: None,
+                body: None,
+                workflow: Some(workflow.clone()),
+                expect_title: None,
+                expect_body: None,
+            }),
         }
     }
 }

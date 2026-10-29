@@ -15,14 +15,28 @@
 //! the Header (52pt, `Workflow / id`, More, Close), then a scroll of the
 //! title (Desktop/Title), the Status / Workflow / Priority / Branch
 //! properties (and, when the task has them, its tracker owner, dependencies
-//! and pull request), a divider, the body ([`markdown::body`]), and the
-//! created / updated dates. The task operations the old modal put on its
-//! action row are in More ([`PaneAction`]) and keep their keys.
+//! and pull request), a divider, the Markdown body, and the created /
+//! updated dates. The task operations the old modal put on its action row
+//! are in More ([`PaneAction`]) and keep their keys.
 //!
-//! The body's in-place editor (More > Edit description) works on the issue's
-//! draft (`shelbi_app::issue_edit`), which saves itself a moment after typing
-//! stops (Cmd+S saves at once; Done, Esc and Close leave the editor, saving,
-//! never reverting). A quiet line under the title says where the save
+//! Status, Workflow and Priority are edited in place, with no edit mode
+//! (`dt-task-inline-properties`): each value is the Button at Small in the
+//! Ghost style, and a click (or Tab to it, then Enter) opens a picker
+//! anchored under it of what the task can be set to now
+//! (`shelbi_app::task_properties`): the workflow's statuses with their
+//! glyphs, the configured workflows, the places in the status's queue. A
+//! choice is sent at once as the board's own command (a move runs the
+//! workflow's gates), the value shows where it is headed while it settles,
+//! and a refusal shows under the title. Branch is selectable text, and More
+//! copies it.
+//!
+//! The title and the body are edited where they're read, with no edit mode
+//! ([`super::doc_editor`], `dt-task-wysiwyg-editor`): a click puts the caret
+//! in the formatted text. Both work on the issue's draft
+//! (`shelbi_app::issue_edit`), which saves itself a moment after typing
+//! stops (Cmd+S saves at once; leaving the field, Esc and Close save too,
+//! never reverting). More > Edit description (`e`, the palette's Edit) puts
+//! the keys in the body. A quiet line under the title says where the save
 //! stands, with Retry for a failed one and both choices for a change made
 //! elsewhere at the same place.
 //!
@@ -39,20 +53,19 @@
 
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, CursorStyle,
-    Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString, Stateful,
-    Window,
+    Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString,
+    Stateful, Window,
 };
-use gpui_kit::component::input::Textarea;
+use gpui_kit::base::TextView;
 use shelbi_app::issue_edit::{Field, Resolution, SaveStatus};
 use shelbi_app::task_session::{TaskSession, TaskSessionState};
 use shelbi_app::TaskDetailModel;
 use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
 
-use super::board_state::{Mode, PaneAction};
+use super::board_state::{Mode, PaneAction, PaneProperties, Property, PropertyRow};
 use super::column_swap::SLIDE;
 use super::issues::IssuesView;
-use super::markdown;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
@@ -295,12 +308,11 @@ fn state_note(theme: &Theme, title: &'static str, detail: Option<String>) -> Div
 
 /// A loaded task: the scrolling details.
 fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Context<IssuesView>) -> Stateful<Div> {
-    let editing = view.editor.as_ref().is_some_and(|(id, _)| *id == d.id);
     let pending = view.state.pending(&d.id).map(|p| p.label.clone());
     let notice = view.state.notice(&d.id).map(str::to_string);
-    // A draft left unsaved (its save failed, or is still out) shows instead
-    // of the read: that's the text the editor will open on.
-    let shown_body = view.state.draft_text(&d.id, Field::Body).unwrap_or_else(|| d.body.clone());
+    // The title and body are their editors, read and typed into in place
+    // (each shows the draft while there is one).
+    let editors = view.pane_editors.as_ref().filter(|e| e.id == d.id);
 
     let title = div()
         .debug_selector(|| "pane-title".into())
@@ -308,7 +320,10 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
         .min_w_0()
         .type_style(Type::Title)
         .text_color(theme.text_loud)
-        .child(d.title.clone());
+        .map(|t| match editors {
+            Some(e) => t.child(e.title.clone()),
+            None => t.child(d.title.clone()),
+        });
 
     let save_row = save_row(view, &d.id, theme, cx);
     let status_rows = (pending.is_some() || notice.is_some() || save_row.is_some()).then(|| {
@@ -333,43 +348,13 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
             })
     });
 
-    let properties = properties(d, theme);
+    let properties = properties(view, d, theme, cx);
 
-    let body = if let (true, Some((_, state))) = (editing, view.editor.as_ref()) {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .w_full()
-            .child(div().h(px(320.0)).w_full().child(Textarea::new(state).h_full()))
-            // No Save: the draft saves itself. Done leaves the editor.
-            .child(
-                div().flex().flex_row().gap_2().child(
-                    action(theme, "pane-done", ButtonContent::label("Done").hotkey("Esc"), ButtonKind::Quiet)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_editor(cx))),
-                ),
-            )
-            .into_any_element()
-    } else if shown_body.trim().is_empty() {
-        div()
-            .debug_selector(|| "pane-empty".into())
-            .type_style(Type::Base)
-            .text_color(theme.muted)
-            .child("No description yet.")
-            .into_any_element()
-    } else {
-        div()
-            .w_full()
-            .min_w_0()
-            .type_style(Type::Base)
-            .text_color(theme.foreground)
-            .child(
-                markdown::body(ElementId::Name(SharedString::from(format!("body-{}", d.id))), shown_body, theme)
-                    .w_full()
-                    .selectable(true),
-            )
-            .into_any_element()
-    };
+    let body = div()
+        .debug_selector(|| "pane-body".into())
+        .w_full()
+        .min_w_0()
+        .children(editors.map(|e| e.body.clone()));
 
     let dates = div()
         .debug_selector(|| "pane-dates".into())
@@ -591,7 +576,7 @@ fn session_header(session: &TaskSession, theme: &Theme, cx: &mut Context<IssuesV
 
 /// The property table: Status, Workflow, Priority and Branch, then the
 /// task's tracker owner, dependencies and pull request where it has them.
-fn properties(d: &TaskDetailModel, theme: &Theme) -> Div {
+fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Context<IssuesView>) -> Div {
     let mut rows = div()
         .debug_selector(|| "pane-properties".into())
         .flex()
@@ -599,24 +584,39 @@ fn properties(d: &TaskDetailModel, theme: &Theme) -> Div {
         .gap(px(6.0))
         .w_full()
         .min_w_0();
-    rows = rows.child(property(theme, "Status", value_button("pane-status", Some(d.category), d.status_name.clone(), theme)));
-    rows = rows.child(property(
-        theme,
-        "Workflow",
-        value_button("pane-workflow", None, workflow_label(&d.workflow_name), theme),
-    ));
-    rows = rows.child(property(theme, "Priority", value_button("pane-priority", None, format!("{} in queue", d.priority), theme)));
-    rows = rows.child(property(
+    let shown = view.state.pane_properties(&d.id).unwrap_or_else(|| PaneProperties {
+        status_name: d.status_name.clone(),
+        category: d.category,
+        workflow_name: d.workflow_name.clone(),
+        queue: None,
+        pending: None,
+    });
+    let priority = match shown.queue {
+        Some(q) => format!("{} in queue", q.position),
+        None => "Done".to_string(),
+    };
+    let values = [
+        (Property::Status, "Status", Some(shown.category), shown.status_name.clone()),
+        (Property::Workflow, "Workflow", None, workflow_label(&shown.workflow_name)),
+        (Property::Priority, "Priority", None, priority),
+    ];
+    for (property, label, icon, value) in values {
+        let pending = shown.pending == Some(property);
+        rows = rows.child(property_row(theme, label, value_picker(view, property, icon, value, pending, theme, cx)));
+    }
+    rows = rows.child(property_row(
         theme,
         "Branch",
         match &d.branch {
+            // Selectable and copyable (More copies it too); not an editor:
+            // the branch is derived, and made when work starts.
             Some(b) => value_text(theme)
                 .debug_selector(|| "pane-branch".into())
                 .font_family(PRIMARY_FAMILY)
                 .text_size(px(12.0))
                 .line_height(px(18.0))
                 .text_color(theme.foreground)
-                .child(b.clone()),
+                .child(TextView::markdown(ElementId::Name(SharedString::from(format!("branch-{}", d.id))), plain(b)).selectable(true)),
             None => value_text(theme).text_color(theme.muted).child("Created when work starts"),
         },
     ));
@@ -628,16 +628,16 @@ fn properties(d: &TaskDetailModel, theme: &Theme) -> Div {
         } else {
             format!("{}  ·  not yours: `shelbi issue start {} --take` claims it", owner.label(), d.id)
         };
-        rows = rows.child(property(theme, "Owner", value_text(theme).child(text)));
+        rows = rows.child(property_row(theme, "Owner", value_text(theme).child(text)));
     }
     if !d.depends_on.is_empty() {
         let deps = d.depends_on.iter().map(dep_text).collect::<Vec<_>>().join(", ");
         let label = if d.blocked { "Blocked by" } else { "Depends on" };
-        rows = rows.child(property(theme, label, value_text(theme).debug_selector(|| "pane-deps".into()).child(deps)));
+        rows = rows.child(property_row(theme, label, value_text(theme).debug_selector(|| "pane-deps".into()).child(deps)));
     }
     if let Some(url) = d.pr_link.clone() {
         let open = url.clone();
-        rows = rows.child(property(
+        rows = rows.child(property_row(
             theme,
             "Pull request",
             value_text(theme).child(
@@ -660,7 +660,7 @@ fn properties(d: &TaskDetailModel, theme: &Theme) -> Div {
 
 /// A property row: 28pt, the label in its muted column, 12pt before the
 /// value.
-fn property(theme: &Theme, label: &'static str, value: impl IntoElement) -> Div {
+fn property_row(theme: &Theme, label: &'static str, value: impl IntoElement) -> Div {
     div()
         .flex()
         .flex_row()
@@ -690,29 +690,170 @@ fn value_text(theme: &Theme) -> Div {
         .text_color(theme.foreground)
 }
 
-/// A property's value as the frame draws it: the Button at Small in the
-/// Quiet style, an optional status glyph, the value and a chevron. Choosing
-/// a value belongs to the pane's property editors (a later task), so this
-/// is the face only: no hover, no press.
-fn value_button(id: &'static str, icon: Option<StatusCategory>, label: impl Into<SharedString>, theme: &Theme) -> Div {
+/// A property's value as the frames draw it (`2565:13093`): the Button at
+/// Small in the Ghost style, the status glyph for Status, the value and the
+/// chevron, opening its picker under it. It draws Select while the picker is
+/// open, the focus ring while the keyboard is on it, and Disable when the
+/// property can't change now (a change still unanswered, a done queue), with
+/// the reason on hover. `pending` dims the value while a choice settles.
+fn value_picker(
+    view: &IssuesView,
+    property: Property,
+    icon: Option<StatusCategory>,
+    value: String,
+    pending: bool,
+    theme: &Theme,
+    cx: &mut Context<IssuesView>,
+) -> AnyElement {
     let size = ButtonSize::Small;
-    let c = style::button_colors(ButtonKind::Quiet, theme);
-    div()
-        .debug_selector(move || id.into())
+    let id = SharedString::from(format!("pane-{}", property.slug()));
+    let cursor = match view.state.mode {
+        Mode::PropertyPicker { property: open, cursor } if open == property => Some(cursor),
+        _ => None,
+    };
+    let open = cursor.is_some();
+    let refusal = view.state.property_refusal(property).filter(|_| !open);
+    let kind = if open { ButtonKind::Select } else { ButtonKind::Ghost };
+    let c = style::button_colors(kind, theme);
+    let face = |b: Stateful<Div>| {
+        b.min_w_0()
+            .children(icon.map(|cat| style::left_slot(size, style::status_icon_large(cat, theme))))
+            .child(div().min_w_0().truncate().when(pending, |d| d.opacity(0.6)).child(value))
+            .child(style::dropdown_slot(size, c.icon))
+    };
+    if let Some(why) = refusal {
+        return face(style::disabled_button_base(id, kind, size, theme))
+            .tooltip(style::tooltip(why))
+            .into_any_element();
+    }
+    let focused = !open && view.state.pane_focus() == Some(property);
+    let trigger = face(style::button_base(id, kind, size, focused, theme));
+    // The rows, read now (they're built while this view renders).
+    let rows: Vec<(PropertyRow, String, Option<String>)> = if open {
+        view.state
+            .property_rows(property)
+            .into_iter()
+            .map(|row| {
+                let (label, hint) = row_text(&row);
+                (row, label, hint)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let width = match property {
+        Property::Priority => PRIORITY_MENU_W,
+        Property::Status | Property::Workflow => MENU_W,
+    };
+    let scroll = view.picker_scroll.clone();
+    dropdown(
+        open,
+        &view.property_anchor,
+        "property-picker",
+        trigger,
+        move |cx| picker_rows(property, rows, cursor, scroll, cx),
+        width,
+        false,
+        move |this: &mut IssuesView, cx| {
+            this.state.toggle_property(property);
+            this.scroll_picker_to_cursor();
+            cx.notify();
+        },
+        move |this: &mut IssuesView, _| {
+            if matches!(this.state.mode, Mode::PropertyPicker { property: p, .. } if p == property) {
+                this.state.close_overlay();
+            }
+        },
+        cx,
+    )
+    .into_any_element()
+}
+
+/// A picker's widest: the Priority picker names the task at each place.
+const PRIORITY_MENU_W: f32 = 320.0;
+/// The tallest a picker grows before it scrolls (ten rows).
+const PICKER_MAX_H: f32 = 10.0 * 36.0 + 8.0;
+
+/// A picker row's label and its muted hint.
+fn row_text(row: &PropertyRow) -> (String, Option<String>) {
+    match row {
+        PropertyRow::Status(c) => (c.name.clone(), c.merge.then(|| "merges".to_string())),
+        PropertyRow::Workflow(c) => (workflow_label(&c.name), c.default.then(|| "Default".to_string())),
+        PropertyRow::Priority(c) => (c.position.to_string(), Some(c.occupant.clone().unwrap_or_else(|| "this task".to_string()))),
+    }
+}
+
+/// A picker's rows in one scroll: the keyboard's row on the selection fill,
+/// the current value checked, a row that can't be chosen dimmed with why on
+/// hover.
+fn picker_rows(
+    property: Property,
+    rows: Vec<(PropertyRow, String, Option<String>)>,
+    cursor: Option<usize>,
+    scroll: ScrollHandle,
+    cx: &mut Context<IssuesView>,
+) -> Vec<AnyElement> {
+    let theme = cx.global::<Theme>().opaque();
+    let items: Vec<AnyElement> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (row, label, hint))| {
+            let id = format!("picker-{}-{ix}", property.slug());
+            let refusal = row.refusal().map(str::to_string);
+            let base = match &refusal {
+                Some(why) => style::disabled_menu_row(id, &theme).tooltip(style::tooltip(why.clone())),
+                None => style::menu_row(id, cursor == Some(ix), &theme).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        let intents = this.state.choose_property(property, ix);
+                        this.apply_intents(intents, window, cx);
+                        cx.notify();
+                    },
+                )),
+            };
+            let glyph = match &row {
+                PropertyRow::Status(c) => Some(style::status_icon_large(c.category, &theme)),
+                _ => None,
+            };
+            let check = row
+                .current()
+                .then(|| heroicon(icons::CHECK).text_color(theme.accent).debug_selector(move || format!("picker-current-{ix}")));
+            base.children(glyph)
+                .child(div().flex_none().child(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .type_style(Type::XSmall)
+                        .text_color(theme.muted)
+                        .children(hint),
+                )
+                .children(check)
+                .into_any_element()
+        })
+        .collect();
+    vec![div()
+        .id("property-picker-scroll")
         .flex()
-        .flex_row()
-        .flex_none()
-        .min_w_0()
-        .items_center()
-        .h(px(size.height()))
-        .px(px(size.padding()))
-        .gap(px(size.gap()))
-        .rounded(px(6.0))
-        .type_style(size.text())
-        .text_color(c.text)
-        .children(icon.map(|cat| style::left_slot(size, style::status_icon_large(cat, theme))))
-        .child(div().min_w_0().truncate().child(label.into()))
-        .child(style::dropdown_slot(size, c.icon))
+        .flex_col()
+        .max_h(px(PICKER_MAX_H))
+        .overflow_y_scroll()
+        .track_scroll(&scroll)
+        .children(items)
+        .into_any_element()]
+}
+
+/// `text` as Markdown that shows it as typed: every ASCII punctuation mark
+/// escaped (a branch name's `_`, `*` and `#`).
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Where task `id`'s draft save stands (none while nothing is unsaved), with
@@ -735,7 +876,7 @@ fn save_row(view: &IssuesView, id: &str, theme: &Theme, cx: &mut Context<IssuesV
         .when(matches!(save, SaveStatus::Failed(_)), |row| {
             let id = id.clone();
             row.child(
-                action(theme, "pane-save-retry", ButtonContent::label("Retry"), ButtonKind::Quiet).on_click(
+                action(theme, "pane-save-retry", ButtonContent::label("Retry"), ButtonKind::Ghost).on_click(
                     cx.listener(move |this, _: &ClickEvent, window, cx| {
                         let intents = this.state.retry_save(&id);
                         this.apply_intents(intents, window, cx);
@@ -747,7 +888,7 @@ fn save_row(view: &IssuesView, id: &str, theme: &Theme, cx: &mut Context<IssuesV
         .when(matches!(save, SaveStatus::Conflict(Field::Body | Field::Title)), |row| {
             let (mine, theirs) = (id.clone(), id.clone());
             row.child(
-                action(theme, "pane-keep-mine", ButtonContent::label("Keep mine"), ButtonKind::Quiet)
+                action(theme, "pane-keep-mine", ButtonContent::label("Keep mine"), ButtonKind::Ghost)
                     .tooltip(style::tooltip("Save your version over the other change"))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.state.resolve_conflict(&mine, Resolution::KeepMine);
@@ -755,7 +896,7 @@ fn save_row(view: &IssuesView, id: &str, theme: &Theme, cx: &mut Context<IssuesV
                     })),
             )
             .child(
-                action(theme, "pane-take-theirs", ButtonContent::label("Use theirs"), ButtonKind::Quiet)
+                action(theme, "pane-take-theirs", ButtonContent::label("Use theirs"), ButtonKind::Ghost)
                     .tooltip(style::tooltip("Show the saved version; yours is set aside"))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.state.resolve_conflict(&theirs, Resolution::TakeTheirs);
@@ -836,6 +977,7 @@ pub(super) fn action_hint(view: &IssuesView, action: PaneAction) -> String {
         PaneAction::Assign => "a".into(),
         PaneAction::EditDescription => "e".into(),
         PaneAction::OpenInEditor => "⇧E".into(),
+        PaneAction::CopyBranch => String::new(),
     }
 }
 
@@ -855,6 +997,11 @@ mod tests {
     #[test]
     fn this_year_is_a_plausible_year() {
         assert!((2024..2200).contains(&this_year()));
+    }
+
+    #[test]
+    fn a_branch_shows_as_typed() {
+        assert_eq!(plain("jlong/my_task-1"), "jlong\\/my\\_task\\-1");
     }
 
     #[test]

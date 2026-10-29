@@ -352,13 +352,41 @@ fn the_terminal_takes_its_keys_before_the_pane_and_board(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn tab_from_the_pane_puts_the_keys_in_the_terminal(cx: &mut TestAppContext) {
+fn tab_past_the_properties_puts_the_keys_in_the_terminal(cx: &mut TestAppContext) {
+    use crate::views::board_state::Property;
     let mut p = open(cx);
     p.open_task("A");
+    let view = p.view.clone();
+    p.cx.update(|window, _| window.activate_window());
+    let body_focused = |p: &mut Pane| {
+        p.view.read_with(&p.cx, |v, cx| v.pane_editors.as_ref().is_some_and(|e| e.body.read(cx).is_focused()))
+    };
+    // The pane's focus order: the title, Status, Workflow, Priority, the
+    // body, then the session.
     p.cx.simulate_keystrokes("tab");
     p.draw();
-    let view = p.view.clone();
+    assert!(p.view.read_with(&p.cx, |v, cx| v.pane_editors.as_ref().is_some_and(|e| e.title.read(cx).is_focused())));
+    for property in Property::ALL {
+        p.cx.simulate_keystrokes("tab");
+        p.draw();
+        assert_eq!(p.view.read_with(&p.cx, |v, _| v.state.pane_focus()), Some(property));
+        assert!(!p.cx.update(|window, cx| view.read(cx).session_focused(window, cx)));
+    }
+    p.cx.simulate_keystrokes("tab");
+    p.draw();
+    assert!(body_focused(&mut p));
+    assert_eq!(p.view.read_with(&p.cx, |v, _| v.state.pane_focus()), None);
+    // Shift+Tab goes back to Priority, and Tab to the body again.
+    p.cx.simulate_keystrokes("shift-tab");
+    p.draw();
+    assert_eq!(p.view.read_with(&p.cx, |v, _| v.state.pane_focus()), Some(Property::Priority));
+    p.cx.simulate_keystrokes("tab");
+    p.draw();
+    assert!(body_focused(&mut p));
+    p.cx.simulate_keystrokes("tab");
+    p.draw();
     assert!(p.cx.update(|window, cx| view.read(cx).session_focused(window, cx)));
+    assert_eq!(p.view.read_with(&p.cx, |v, _| v.state.pane_focus()), None);
     p.cx.simulate_keystrokes("x");
     p.draw();
     assert_eq!(p.fake.typed(), "x");
@@ -490,8 +518,8 @@ fn output_while_editing_the_description_keeps_the_editor_focused(cx: &mut TestAp
     let editor_focused = |cx: &mut VisualTestContext| {
         cx.update(|window, cx| {
             let v = view.read(cx);
-            let (_, state) = v.editor.as_ref().expect("editing");
-            gpui::Focusable::focus_handle(state.read(cx), cx).is_focused(window)
+            let e = v.pane_editors.as_ref().expect("the pane's editors");
+            gpui::Focusable::focus_handle(e.body.read(cx), cx).is_focused(window)
         })
     };
     assert!(editor_focused(&mut p.cx));

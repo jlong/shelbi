@@ -5390,6 +5390,10 @@ mod tests {
             },
             CommandKind::StartIssue { id: "t1".into() },
             CommandKind::EditIssue { id: "t1".into() },
+            CommandKind::SetIssueWorkflow {
+                id: "t1".into(),
+                workflow: "subtask".into(),
+            },
         ] {
             assert_eq!(calls(kind.clone()), [HostCall::IssueCommand(kind)]);
         }

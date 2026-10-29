@@ -345,6 +345,26 @@ pub fn menu_row(id: impl Into<SharedString>, selected: bool, theme: &Theme) -> S
     }
 }
 
+/// [`menu_row`] that can't be chosen: the row at the disabled opacity, with
+/// no hover, press or pointer.
+pub fn disabled_menu_row(id: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(LIST_ROW_H + 4.0))
+        .px_2()
+        .rounded_lg()
+        .opacity(0.4)
+        .type_style(Type::Base)
+        .text_color(theme.foreground)
+}
+
 /// A section heading: Base medium, loud.
 pub fn heading(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
@@ -368,8 +388,10 @@ pub enum ButtonKind {
     Secondary,
     /// A destructive action: the Danger style (a pink tint).
     Danger,
-    /// A low-key action beside others: no fill until hovered.
-    Quiet,
+    /// A low-key action beside others, and a value that opens a picker
+    /// (the task pane's properties): the Ghost style (`2565:13261`), no fill
+    /// until hovered, a loud label.
+    Ghost,
     /// A set filter: the Select style (a cyan tint, `button/select/text`).
     Select,
 }
@@ -491,7 +513,9 @@ impl ButtonContent {
     }
 
     /// `Show Hotkey`: `key` as written (`E`, `⌘S`, `Esc`). Empty shows
-    /// none.
+    /// none. The Figma sheet draws it; no view does since the task pane's
+    /// Done went with its edit mode.
+    #[cfg_attr(not(any(test, feature = "visual-check")), allow(dead_code))]
     pub fn hotkey(mut self, key: impl Into<SharedString>) -> Self {
         let key = key.into();
         self.hotkey = (!key.is_empty()).then_some(key);
@@ -623,8 +647,16 @@ pub fn button_base(
     let d = button_shell(id.clone(), kind, size, theme).cursor_pointer();
     // Bands, not `focus_shadow`: a gpui shadow is a filled box under the
     // button and its tinted fill is translucent, so the glow would fill it.
-    fill_layer(d, id, px(6.0), [c.fill, c.hover, c.pressed])
+    let rest = if focused { c.focus_fill } else { c.fill };
+    fill_layer(d, id, px(6.0), [rest, c.hover, c.pressed])
         .when(focused, |b| b.children(focus_bands_in(6.0, 0.0, c.focus)))
+}
+
+/// [`button_base`] with Disable on (see [`disabled_content_button`]), for
+/// views that add their own children.
+pub fn disabled_button_base(id: impl Into<SharedString>, kind: ButtonKind, size: ButtonSize, theme: &Theme) -> Stateful<Div> {
+    let c = button_colors(kind, theme);
+    button_shell(id, kind, size, theme).bg(c.fill).opacity(0.4)
 }
 
 /// The geometry and type every state of a size shares.
@@ -711,6 +743,10 @@ pub struct ButtonColors {
     pub hover: Hsla,
     pub pressed: Hsla,
     pub text: Hsla,
+    /// Its fill at rest while focused: the rest fill, but for the Ghost
+    /// style, whose Focus variant (`2565:13282`) rests on its hover fill so
+    /// the ring has something to hold.
+    pub focus_fill: Hsla,
     /// Its icons (`button/<style>/icon`): the Default style's own gray, the
     /// tinted styles' their label's color.
     pub icon: Hsla,
@@ -740,7 +776,8 @@ impl FocusColors {
 /// component's `background`, `background-hover` and `background-active`;
 /// and its focus. The Success and Danger styles have their own
 /// (`focus/success/*`, `focus/danger/*`); the rest wear the default cyan
-/// (Select and Quiet have no Figma focus variant).
+/// (Select has no Figma focus variant; Ghost's is the default ring over
+/// its hover fill).
 pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
     let default_focus = FocusColors::default(theme);
     match kind {
@@ -749,6 +786,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.primary_fill_hover,
             pressed: theme.primary_fill_active,
             text: theme.primary_label,
+            focus_fill: theme.primary_fill,
             icon: theme.primary_label,
             focus: default_focus,
         },
@@ -757,6 +795,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.success_fill_hover,
             pressed: theme.success_fill_active,
             text: theme.success_label,
+            focus_fill: theme.success_fill,
             icon: theme.success_label,
             focus: FocusColors {
                 ring: theme.success_focus_ring,
@@ -768,6 +807,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.background_hover,
             pressed: theme.background_active,
             text: theme.text_loud,
+            focus_fill: theme.background,
             icon: theme.button_icon,
             focus: default_focus,
         },
@@ -776,6 +816,7 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.danger_fill_hover,
             pressed: theme.danger_fill_active,
             text: theme.error,
+            focus_fill: theme.danger_fill,
             icon: theme.error,
             focus: FocusColors {
                 ring: theme.danger_focus_ring,
@@ -787,14 +828,19 @@ pub fn button_colors(kind: ButtonKind, theme: &Theme) -> ButtonColors {
             hover: theme.select_fill_hover,
             pressed: theme.select_fill_active,
             text: theme.select_label,
+            focus_fill: theme.select_fill,
             icon: theme.select_label,
             focus: default_focus,
         },
-        ButtonKind::Quiet => ButtonColors {
+        // Ghost (`2565:13261`..`13298`): Hover on `theme.background`, Active
+        // on `button/default/background-hover`, the label `theme.text_loud`
+        // (`#020303` Light), the Default style's icon gray.
+        ButtonKind::Ghost => ButtonColors {
             fill: theme.background.opacity(0.0),
-            hover: theme.background_hover,
-            pressed: theme.background_active,
-            text: theme.foreground,
+            hover: theme.background,
+            pressed: theme.background_hover,
+            text: theme.text_loud,
+            focus_fill: theme.background,
             icon: theme.button_icon,
             focus: default_focus,
         },
@@ -1376,7 +1422,7 @@ mod tests {
             let f = button_colors(kind, theme).focus;
             [rgba8(f.ring), rgba8(f.glow)]
         };
-        for kind in [ButtonKind::Primary, ButtonKind::Secondary, ButtonKind::Select, ButtonKind::Quiet] {
+        for kind in [ButtonKind::Primary, ButtonKind::Secondary, ButtonKind::Select, ButtonKind::Ghost] {
             assert_eq!(focus(&dark, kind), [0x62cdf6ff, 0x12adff33], "{kind:?} Dark");
             assert_eq!(focus(&light, kind), [0x31ade9ff, 0x12adff33], "{kind:?} Light");
             assert_eq!(button_colors(kind, &dark).focus, FocusColors::default(&dark));
@@ -1399,7 +1445,7 @@ mod tests {
             ButtonKind::Success,
             ButtonKind::Secondary,
             ButtonKind::Danger,
-            ButtonKind::Quiet,
+            ButtonKind::Ghost,
             ButtonKind::Select,
         ];
         for theme in themes() {

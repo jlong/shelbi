@@ -17,8 +17,10 @@
 //! (a card selected), `board-dropdown.png` and `board-workspace-dropdown.png`
 //! (each filter open), `board-empty.png` (columns a filter emptied),
 //! `board-drag.png` (a card dragged over another column, the drop target
-//! lit), `board-detail.png` (a card's detail) and `board-detail-editing.png`
-//! (its body editor open), `board-detail-unsaved.png` (a save that failed);
+//! lit), `board-detail.png` (a card's detail, its body formatted),
+//! `board-detail-editing.png` (the Edit command's caret in the body),
+//! `board-detail-format.png` (the format toolbar over a selection),
+//! `board-detail-unsaved.png` (a save that failed);
 //! then `settings.png`, Settings'
 //! General page, its Keybindings and Terminal pages
 //! (`settings-keybindings.png`, `settings-terminal.png`), Terminal with its
@@ -47,6 +49,10 @@ use crate::theme::style::{Type, Typography};
 
 const PROJECT: &str = "demo";
 /// A task title too long for one line of the feed (how a row wraps it).
+/// `t1`'s body: the task template's sections, for the pane's formatted
+/// body (headings, a link, code, a checklist, a code block).
+const T1_BODY: &str = "## Description\n\nSigning in sends you back to **/login** in a loop. See [the report](https://example.com/bug) and `auth.rs`.\n\n## Acceptance criteria\n\n- [ ] Sign in lands on the board\n- [x] The redirect keeps its `next` param\n- [ ] A retry never loops\n\n## Implementation notes\n\n```rust\nfn redirect(next: &str) -> Url {}\n```\n";
+
 const LONG_TITLE: &str = "Keep the terminal's scroll position anchored while a long-running agent streams output, and follow new output only when the view is already scrolled to the bottom";
 
 pub fn run(out: PathBuf) -> ! {
@@ -220,9 +226,11 @@ pub fn run(out: PathBuf) -> ! {
         v.state_mut().open_detail("t1");
         cx.notify();
     });
+    // Let the pane's slide in finish.
+    wait(&mut cx, window, Duration::from_millis(500), |_| false);
     save(&mut cx, window, &out, "board-detail.png");
-    // The detail's body editor open (nothing typed, so nothing is saved):
-    // Done in place of Save / Cancel.
+    // The Edit command: the caret at the end of the body (nothing typed, so
+    // nothing is saved).
     window
         .update(&mut cx, |_, w, cx| {
             board.update(cx, |v, cx| {
@@ -231,6 +239,17 @@ pub fn run(out: PathBuf) -> ! {
         })
         .unwrap();
     save(&mut cx, window, &out, "board-detail-editing.png");
+    // A selection in the body: the format toolbar over it.
+    board.update(&mut cx, |v, cx| {
+        if let Some(e) = &v.pane_editors {
+            e.body.update(cx, |b, cx| {
+                let at = b.text().find("loop").unwrap_or(0);
+                b.model.select(at, at + 4);
+                cx.notify();
+            });
+        }
+    });
+    save(&mut cx, window, &out, "board-detail-format.png");
     // A save that failed: the draft stays on screen, with why and Retry. The
     // job is answered here, never sent.
     board.update(&mut cx, |v, cx| {
@@ -544,10 +563,12 @@ workspaces:
             updated_at: now,
             params: Default::default(),
         };
+        let mut body = "";
         if id == "t1" {
             t.params.insert("agent".into(), "developer".into());
+            body = T1_BODY;
         }
-        shelbi_state::save_task(PROJECT, &t, "").expect("save a fixture task");
+        shelbi_state::save_task(PROJECT, &t, body).expect("save a fixture task");
     };
     task("t1", "Fix the login redirect loop", Column::in_progress(), Some("alpha"));
     task("r9", "Add the activity feed to the desktop app", Column::review(), Some("review"));

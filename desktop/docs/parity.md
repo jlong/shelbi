@@ -55,11 +55,12 @@ paths on every `cargo test`.
 | Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
 | Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to another open project, or shows the empty-state chooser; `pb` kept running |
 | Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
-| Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop) |
-| Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column) |
+| Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop); the task pane's Status picker (`dt-task-inline-properties`) |
+| Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column); the task pane's Priority picker, a 1-based place sent as its 0-based slot |
+| Change workflow | (board) `SetIssueWorkflow` | Not on the TUI board (see Known gaps); a palette-less effect would reach `dispatch_effect`'s `EditIssue` arm | The task pane's Workflow picker; a workflow without the issue's status is offered disabled with why (`shelbi_app::task_properties`) |
 | Assign | (board) `AssignIssue` | Not on the TUI board (see Known gaps) | `a`: workspace picker; `@dev` written |
 | Start | (board) `StartIssue` | Not on the TUI board | `s`: dispatched to `dev`; the sandbox agent never confirmed, so the daemon rolled it back |
-| Edit | (board) `EditIssue` | Not on the TUI board | `e`: in-place editor over the shared draft (`shelbi_app::issue_edit`, `task-inline-edit-state`): saves itself after a pause, ⌘S saves at once, Esc / Done close it saving |
+| Edit | (board) `EditIssue` | Not on the TUI board | `e`, More > Edit description, the palette: the pane's body editor takes the keys, caret at the end (no edit mode: the title and body are always editable in place, `dt-task-wysiwyg-editor`) over the shared draft (`shelbi_app::issue_edit`): saves itself after a pause, ⌘S saves at once, Esc hands the keys back saving |
 | New issue | (board) `AddIssue` | Not on the TUI board | `n`: form; the issue was created in `backlog` |
 
 ## Platform differences (by design)
@@ -302,8 +303,9 @@ paths on every `cargo test`.
 
 Found by this audit and not closed by it; each is a follow-up.
 
-- **The TUI board has no Start, Assign, Edit, or New issue.** The desktop
-  board does (`s`, `a`, `e`, `n`). The TUI's users do these through the
+- **The TUI board has no Start, Assign, Edit, New issue, or workflow
+  change.** The desktop board does (`s`, `a`, `e`, `n`, the task pane's
+  Workflow picker), and its pane sets Status and Priority in place too. The TUI's users do these through the
   orchestrator or `shelbi issue`. The commands exist in the registry; the TUI
   needs the board UI for them.
 - **The TUI board sends no expected state** with a move or reorder, so it has
@@ -484,22 +486,22 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | Field | TUI | Desktop |
 |---|---|---|
 | `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | Header's `Workflow / id` (`views/task_detail.rs` `header`) |
-| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title (`views/task_detail.rs` `details`) |
+| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title, edited in place (a `DocEditor` on the draft's title; blank is held back with an inline message) (`views/task_detail.rs` `details`, `views/doc_editor`) |
 | `status_id` | not shown (popover keyed by task id) | not shown: not used |
 | `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | not shown: `status_name` instead (the Figma frame spells the status as the workflow does) |
-| `status_name` | not shown: the popover shows the column label (`status_label`) | Status property's value (`views/task_detail.rs` `properties`) |
+| `status_name` | not shown: the popover shows the column label (`status_label`) | the Status picker's value when no change is settling (`views/task_detail.rs` `properties`; `BoardState::pane_properties` shows an in-flight move's target) |
 | `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | Status property's status glyph (`views/task_detail.rs` `properties`) |
-| `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | Priority property, "N in queue" (`views/task_detail.rs` `properties`) |
+| `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | not shown raw: the Priority property shows the task's 1-based place in its stored queue, "N in queue" (`shelbi_app::task_properties::queue_position`, `views/task_detail.rs` `properties`) |
 | `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | not a property (the Task pane frames dropped the Workspace row); More offers Open workspace only when set, and the assign picker marks it "(assigned)" (`board_state.rs` `pane_actions`, `issues.rs` `render_assign`) |
 | `tracker_owner` | equivalent `OwnershipGate::owner(tracker_assignees)`: "owner:" row, `me` or `@login` plus the `--take` hint, remote tracker only; not in the review popover (`kanban.rs` `popover_header`) | Owner property, `Me` or `@login` plus the `--take` hint, remote tracker only; leaves Start out of More when not the user's (`views/task_detail.rs` `properties`, `board_state.rs` `pane_actions`) |
-| `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | Branch property in the mono face, resolved `card_branch`; "Created when work starts" when none (`views/task_detail.rs` `properties`) |
-| `workflow_name` | not shown | Header's `Workflow / id` and the Workflow property, capitalized (`views/task_detail.rs` `workflow_label`) |
+| `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | Branch property in the mono face, resolved `card_branch`, selectable (More copies it); "Created when work starts" when none (`views/task_detail.rs` `properties`) |
+| `workflow_name` | not shown | Header's `Workflow / id`, and the Workflow picker's value when no change is settling, capitalized (`views/task_detail.rs` `workflow_label`) |
 | `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | Depends on property with "[status]", when any (`views/task_detail.rs` `properties`) |
 | `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | "Blocked by" vs "Depends on" label (`views/task_detail.rs` `properties`) |
 | `pr_link` | not shown | clickable Pull request property, when recorded (`views/task_detail.rs` `properties`) |
 | `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) |
 | `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) |
-| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | markdown `TextView` in the pane's scroll, "No description yet." fallback, in-place editor from More / `e` (`views/task_detail.rs` `details`) |
+| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | the formatted body in the pane's scroll, edited in place WYSIWYG (`shelbi_app::markdown_edit` over the source; checkboxes click; "Write a description…" placeholder when empty); More / `e` put the keys in it (`views/task_detail.rs` `details`, `views/doc_editor`) |
 
 ### `MachinesModel`
 | Field | TUI | Desktop |
