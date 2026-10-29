@@ -109,16 +109,7 @@ pub fn cwd_project(cwd: &Path) -> shelbi_core::Result<Option<String>> {
 /// `projects/<name>.yaml` or an in-repo project's `projects/<name>/local.yaml`.
 /// A path-only check, so nothing is loaded or migrated.
 pub fn project_registered(name: &str) -> bool {
-    if shelbi_core::validate_project_name(name).is_err() {
-        return false;
-    }
-    match shelbi_state::projects_dir() {
-        Ok(dir) => {
-            dir.join(format!("{name}.yaml")).is_file()
-                || dir.join(name).join("local.yaml").is_file()
-        }
-        Err(_) => false,
-    }
+    shelbi_state::has_project_registration(name).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -203,10 +194,10 @@ mod tests {
     fn registration_counts_both_config_layouts() {
         let sandbox = Sandbox::new("route-registered");
         sandbox.register_project("flat");
-        let projects = sandbox.home().join("projects");
-        std::fs::create_dir_all(projects.join("split")).unwrap();
-        std::fs::write(projects.join("split/local.yaml"), "repo: /tmp/split\n").unwrap();
-        std::fs::create_dir_all(projects.join("bare")).unwrap();
+        let split = shelbi_state::project_dir("split").unwrap();
+        std::fs::create_dir_all(&split).unwrap();
+        std::fs::write(split.join("local.yaml"), "repo: /tmp/split\n").unwrap();
+        std::fs::create_dir_all(shelbi_state::project_dir("bare").unwrap()).unwrap();
 
         assert!(project_registered("flat"));
         assert!(project_registered("split"));

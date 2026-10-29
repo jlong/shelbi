@@ -364,7 +364,7 @@ pub(crate) mod test_support {
         pub(crate) fn register_project(&self, name: &str) -> PathBuf {
             let repo = self.home.join("repos").join(name);
             std::fs::create_dir_all(&repo).unwrap();
-            let projects = self.home.join("projects");
+            let projects = shelbi_state::projects_dir().unwrap();
             std::fs::create_dir_all(&projects).unwrap();
             let repo_s = repo.display();
             let yaml = format!(

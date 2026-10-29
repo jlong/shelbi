@@ -48,7 +48,10 @@ impl Home {
         let lock = crate::test_env::lock();
         let dir = std::env::temp_dir().join(format!("shb-launch-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        let prev = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &dir);
+        let registry = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
         for p in projects {
             let repo = dir.join("repos").join(p);
             std::fs::create_dir_all(&repo).unwrap();
@@ -56,10 +59,8 @@ impl Home {
                 "name: {p}\nrepo: {r}\nmachines:\n  - {{ name: hub, kind: local, work_dir: {r} }}\norchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\nworkspaces: []\n",
                 r = repo.display()
             );
-            std::fs::write(dir.join("projects").join(format!("{p}.yaml")), yaml).unwrap();
+            std::fs::write(registry.join(format!("{p}.yaml")), yaml).unwrap();
         }
-        let prev = std::env::var_os("SHELBI_HOME");
-        std::env::set_var("SHELBI_HOME", &dir);
         Home { dir, prev, _lock: lock }
     }
 

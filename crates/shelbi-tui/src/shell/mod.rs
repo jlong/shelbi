@@ -8724,10 +8724,11 @@ mod tests {
         let saved = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", home.path());
         let repo = home.path().join("beta");
-        std::fs::create_dir_all(home.path().join("projects")).unwrap();
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(
-            home.path().join("projects/beta.yaml"),
+            projects.join("beta.yaml"),
             format!(
                 "name: beta\nrepo: {r}\nmachines:\n  - {{ name: hub, kind: local, work_dir: {r} }}\n\
                  orchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\n\

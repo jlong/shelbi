@@ -46,14 +46,15 @@ impl Sandbox {
     fn register(&self, name: &str) {
         let repo = self.home.join("repos").join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(self.home.join("projects")).unwrap();
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
         let yaml = format!(
             "name: {name}\nrepo: {repo}\nmachines:\n  - {{ name: hub, kind: local, work_dir: {repo} }}\n\
              orchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\n\
              workspaces: []\n",
             repo = repo.display()
         );
-        std::fs::write(self.home.join("projects").join(format!("{name}.yaml")), yaml).unwrap();
+        std::fs::write(projects.join(format!("{name}.yaml")), yaml).unwrap();
     }
 
     fn recents(&self) -> RecentRemotes {
