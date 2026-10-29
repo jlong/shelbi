@@ -15,10 +15,10 @@
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, rems, Div, ElementId, HighlightStyle, Hsla, Image, ImageFormat,
+    div, img, prelude::*, px, rems, Div, ElementId, Entity, HighlightStyle, Hsla, Image, ImageFormat,
     SharedString, StyleRefinement,
 };
-use gpui_kit::base::text::{MarkdownNode, MarkdownParseContext, TextView, TextViewStyle};
+use gpui_kit::base::text::{MarkdownNode, MarkdownParseContext, TextView, TextViewState, TextViewStyle};
 use markdown::mdast::Node;
 use markdown::ParseOptions;
 use shelbi_app::theme::Appearance;
@@ -46,6 +46,19 @@ pub fn body(id: impl Into<ElementId>, text: impl Into<SharedString>, theme: &The
     let boxes = Checkboxes::new(theme);
     let items = style.clone();
     TextView::markdown(id, text)
+        .style(style)
+        .markdown_block_parser(parse_checklist)
+        .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &boxes))
+}
+
+/// [`body`] over a [`TextViewState`] the caller keeps, for text it
+/// highlights (the Changelog's search matches,
+/// `TextViewState::set_range_highlights`).
+pub fn body_with_state(state: &Entity<TextViewState>, theme: &Theme) -> TextView {
+    let style = text_style(theme);
+    let boxes = Checkboxes::new(theme);
+    let items = style.clone();
+    TextView::new(state)
         .style(style)
         .markdown_block_parser(parse_checklist)
         .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &boxes))

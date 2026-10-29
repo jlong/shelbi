@@ -682,10 +682,10 @@ pub fn nav_icon(view: &View) -> Icon {
     match view {
         View::Session(_) => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         View::Issues => icons::RECTANGLE_STACK,
-        View::Changelog => icons::BOLT,
-        // Palette-only now (no sidebar row); its own drawing beside
-        // Changelog's there.
-        View::Activity => icons::BARS_2,
+        View::Changelog => icons::ROCKET_LAUNCH,
+        // Palette-only now (no sidebar row): the bolt the Figma Activity
+        // frame draws, beside the Changelog's rocket there.
+        View::Activity => icons::BOLT,
         View::Machines => icons::SERVER_STACK,
     }
 }
@@ -2030,8 +2030,8 @@ mod tests {
     fn nav_icons_are_heroicons() {
         assert_eq!(nav_icon(&View::Session("orch".into())), icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS);
         assert_eq!(nav_icon(&View::Issues), icons::RECTANGLE_STACK);
-        assert_eq!(nav_icon(&View::Changelog), icons::BOLT);
-        assert_eq!(nav_icon(&View::Activity), icons::BARS_2);
+        assert_eq!(nav_icon(&View::Changelog), icons::ROCKET_LAUNCH);
+        assert_eq!(nav_icon(&View::Activity), icons::BOLT);
     }
 }
 

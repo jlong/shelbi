@@ -125,8 +125,8 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
     let icon = match id {
         "view:orch" => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         "view:tasks" => icons::RECTANGLE_STACK,
-        "view:changelog" => icons::BOLT,
-        "view:activity" => icons::BARS_2,
+        "view:changelog" => icons::ROCKET_LAUNCH,
+        "view:activity" => icons::BOLT,
         // The frame draws Detach with the Machines drawing too.
         "view:machines" | "action:detach" => icons::SERVER_STACK,
         "action:toggle-zen" if entry.label.ends_with(" off") => icons::TOGGLE_ON,
