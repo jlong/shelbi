@@ -116,6 +116,24 @@ impl LaunchModel {
         ))
     }
 
+    /// The rows the keyboard moves through: the projects, then the recent
+    /// remote sessions.
+    pub fn row_count(&self) -> usize {
+        self.projects.len() + self.remotes.len()
+    }
+
+    /// What row `index` does when picked (a click, Return on it): open the
+    /// project, or reconnect to the remote session.
+    pub fn action_at(&self, index: usize) -> Option<LaunchAction> {
+        match self.projects.get(index) {
+            Some(p) => Some(LaunchAction::OpenProject(p.slug.clone())),
+            None => self
+                .remotes
+                .get(index - self.projects.len())
+                .map(|r| LaunchAction::Reconnect(r.session.clone())),
+        }
+    }
+
     pub fn state(&self) -> LaunchState {
         if self.projects.is_empty() && self.remotes.is_empty() {
             LaunchState::NoProjects
@@ -419,6 +437,23 @@ mod tests {
         );
         assert_eq!(model.projects[1].label, "ops");
         assert_eq!(model.projects[1].display_path, "/srv/ops");
+    }
+
+    #[test]
+    fn rows_run_projects_then_remote_sessions() {
+        let model = LaunchModel::build(
+            vec![summary("a", None, "/a"), summary("b", None, "/b")],
+            vec![RecentRemote {
+                session: remote_session("shelbi"),
+                last_connected: Utc.with_ymd_and_hms(2026, 10, 28, 9, 0, 0).unwrap(),
+            }],
+            None,
+        );
+        assert_eq!(model.row_count(), 3);
+        assert_eq!(model.action_at(1), Some(LaunchAction::OpenProject("b".into())));
+        assert_eq!(model.action_at(2), Some(LaunchAction::Reconnect(remote_session("shelbi"))));
+        assert_eq!(model.action_at(3), None);
+        assert_eq!(LaunchModel::default().action_at(0), None);
     }
 
     #[test]

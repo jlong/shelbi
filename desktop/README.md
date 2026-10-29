@@ -10,7 +10,9 @@ Status: feature parity with the TUI. Every command in the shared registry
 runs in both clients (`docs/parity.md` records the walk), every view renders
 natively, and no not-implemented path is left. On launch the app finds the
 `shelbi` CLI (installing it on a Mac that has none), starts the daemon, and
-checks versions; a window shows one
+checks versions (with no daemon running it opens the launch window first:
+the projects on this Mac, the recent remote sessions, Add project and
+Connect to remote); a window shows one
 project at a time and switches projects in place (File ▸ New Window, ⌘⇧N,
 opens another), with the sidebar, the Orchestrator chat, the Issues board and task
 detail, Activity, Machines, the Workspace view (an agent with a user shell
