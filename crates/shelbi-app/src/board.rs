@@ -638,6 +638,9 @@ pub struct BoardProject {
     /// The tracker-ownership gate cards are marked against
     /// ([`shelbi_state::ownership`]): unrestricted on a filesystem board.
     pub ownership: OwnershipGate,
+    /// The tracker can search its issues remotely (a GitHub board), so the
+    /// board's text search asks it ([`crate::board_search`]).
+    pub remote_search: bool,
 }
 
 /// How the open-board read went.
@@ -686,6 +689,10 @@ pub fn read_open_board(project: &str) -> BoardRead {
             // From the board index, no API call: a render never spends budget.
             ownership: shelbi_state::ownership::gate_from_index(project, &p.issue_tracker)
                 .unwrap_or(OwnershipGate::FailClosed),
+            remote_search: matches!(
+                p.issue_tracker.backend,
+                shelbi_core::IssueTrackerBackend::Github
+            ),
             workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
         });
     let state_snapshot = shelbi_state::read_state(project).ok();
@@ -794,6 +801,12 @@ pub struct BoardInput {
     pub error: Option<String>,
     /// Whose each card is on a remote tracker (see [`BoardProject::ownership`]).
     pub ownership: OwnershipGate,
+    /// See [`BoardProject::remote_search`].
+    pub remote_search: bool,
+    /// Issues the active text search found that the board hasn't loaded
+    /// ([`crate::board_search::BoardSearch::hits`], set by
+    /// [`BoardInput::set_search_hits`]); merged last, so a loaded card wins.
+    pub search_hits: Vec<IssueFile>,
 }
 
 impl Default for BoardInput {
@@ -815,6 +828,8 @@ impl Default for BoardInput {
             banner: None,
             error: None,
             ownership: OwnershipGate::Unrestricted,
+            remote_search: false,
+            search_hits: Vec::new(),
         }
     }
 }
@@ -831,12 +846,14 @@ impl BoardInput {
                 self.display_name = p.display_name;
                 self.workspaces = p.workspaces;
                 self.ownership = p.ownership;
+                self.remote_search = p.remote_search;
             }
             None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
                 self.display_name = None;
                 self.workspaces = Vec::new();
                 self.ownership = OwnershipGate::Unrestricted;
+                self.remote_search = false;
             }
         }
         self.workspace_filter = read
@@ -907,9 +924,26 @@ impl BoardInput {
         }
     }
 
-    /// The merged board (open first, then terminal history).
+    /// The merged board (open first, then terminal history, then any search
+    /// hits the board hasn't loaded).
     pub fn tasks(&self) -> Vec<IssueFile> {
-        merge_board(&self.open, &self.closed_first, &self.closed_more)
+        let mut tasks = merge_board(&self.open, &self.closed_first, &self.closed_more);
+        if !self.search_hits.is_empty() {
+            let mut seen: HashSet<String> = tasks.iter().map(|tf| tf.task.id.clone()).collect();
+            tasks.extend(
+                self.search_hits
+                    .iter()
+                    .filter(|tf| seen.insert(tf.task.id.clone()))
+                    .cloned(),
+            );
+        }
+        tasks
+    }
+
+    /// Take the issues `search` found ([`crate::board_search::BoardSearch::hits`]),
+    /// after the search changed.
+    pub fn set_search_hits(&mut self, search: &crate::board_search::BoardSearch) {
+        self.search_hits = search.hits().to_vec();
     }
 
     pub fn rules(&self) -> BoardRules<'_> {

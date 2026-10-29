@@ -61,6 +61,7 @@ pub mod about;
 pub mod activity;
 pub mod add_project_wizard;
 pub mod board;
+pub mod board_search;
 pub mod changes;
 pub mod command;
 pub mod command_model;

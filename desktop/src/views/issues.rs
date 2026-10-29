@@ -47,6 +47,7 @@ use gpui::{
 use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState, TextareaState};
 use shelbi_app::board::{self, BoardRead, ClosedPage};
+use shelbi_app::board_search::SearchWorker;
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
 };
@@ -178,6 +179,10 @@ pub struct IssuesView {
     /// Each expanded column's virtualized card list, by status id (a column
     /// keeps its scroll position across a filter change or a collapse).
     column_lists: HashMap<String, ColumnList>,
+    /// The column lists a search shows, kept apart so the board's own lists
+    /// (and their scroll) are where the user left them when it's cleared.
+    /// Emptied when a new search starts, so its results start at the top.
+    search_lists: HashMap<String, ColumnList>,
     pub(super) detail_scroll: ScrollHandle,
     /// The in-place body editor: the issue id and its text state.
     pub(super) editor: Option<(String, Entity<TextareaState>)>,
@@ -185,6 +190,9 @@ pub struct IssuesView {
     /// The toolbar's search field, made on first draw (an input needs the
     /// window).
     search_input: Option<Entity<InputState>>,
+    /// Runs the board's GitHub searches off the UI thread, started on the
+    /// first one (a local board never starts it).
+    search_worker: Option<SearchWorker>,
     display_style: DisplayStyle,
     /// Drawn over another screen: the detail alone, no board.
     floating: bool,
@@ -239,12 +247,14 @@ impl IssuesView {
             load_more_in_flight: false,
             board_scroll: BoardScroll::default(),
             column_lists: HashMap::new(),
+            search_lists: HashMap::new(),
             workflow_anchor: Default::default(),
             workspace_anchor: Default::default(),
             detail_scroll: ScrollHandle::new(),
             editor: None,
             add_input: None,
             search_input: None,
+            search_worker: None,
             display_style: DisplayStyle::detect(),
             floating: false,
             _subscriptions: Vec::new(),
@@ -436,6 +446,10 @@ impl IssuesView {
                 }
             }
         }
+        if self.pump_search() {
+            self.scroll_selection_into_view();
+            changed = true;
+        }
         // A drag released off the board (or cancelled) never reaches a drop
         // handler; let go of its column styling.
         if self.state.dragging().is_some() && !cx.has_active_drag() {
@@ -596,7 +610,32 @@ impl IssuesView {
         });
     }
 
+    /// The search's worker, started on first use.
+    fn search_worker(&mut self) -> &SearchWorker {
+        let project = self.state.project.clone();
+        self.search_worker.get_or_insert_with(|| SearchWorker::github(project))
+    }
+
+    /// Send the search that's due and fold in the answers; true when the
+    /// board changed.
+    fn pump_search(&mut self) -> bool {
+        if self.state.search_due() {
+            self.search_worker();
+        }
+        match &self.search_worker {
+            Some(worker) => self.state.pump_search(worker, Instant::now()),
+            None => false,
+        }
+    }
+
     fn load_more(&mut self) {
+        // While the search's results show, "load more" pages them.
+        if self.state.search_showing_results() {
+            if let Some(req) = self.state.search_load_more() {
+                self.search_worker().send(req);
+            }
+            return;
+        }
         let Some(cursor) = self.state.closed_cursor().map(str::to_string) else {
             return;
         };
@@ -791,7 +830,7 @@ impl IssuesView {
         // the row it reveals is the selected card's.
         self.sync_column_lists();
         let column = self.state.model().columns.get(self.state.selected_column);
-        if let Some(list) = column.and_then(|c| self.column_lists.get(&c.status_id)) {
+        if let Some(list) = column.and_then(|c| self.lists().get(&c.status_id)) {
             list.reveal(self.state.selected_row);
         }
     }
@@ -799,17 +838,31 @@ impl IssuesView {
     /// Bring each expanded column's list in line with the model (a no-op for
     /// a column that hasn't changed).
     fn sync_column_lists(&mut self) {
+        let searching = self.state.model().search.is_some();
+        if !searching {
+            self.search_lists.clear();
+        }
         let model = self.state.model();
+        let lists = if searching { &mut self.search_lists } else { &mut self.column_lists };
         for col in model.columns.iter().filter(|c| !c.collapsed) {
             let rows = column_rows(col, model);
-            match self.column_lists.get_mut(&col.status_id) {
+            match lists.get_mut(&col.status_id) {
                 Some(list) => list.sync(col, &rows),
                 None => {
                     let mut list = ColumnList::new();
                     list.sync(col, &rows);
-                    self.column_lists.insert(col.status_id.clone(), list);
+                    lists.insert(col.status_id.clone(), list);
                 }
             }
+        }
+    }
+
+    /// The column lists on screen: the search's while one is active.
+    fn lists(&self) -> &HashMap<String, ColumnList> {
+        if self.state.model().search.is_some() {
+            &self.search_lists
+        } else {
+            &self.column_lists
         }
     }
 
@@ -841,6 +894,9 @@ impl IssuesView {
         };
         let (workflow_set, workspace_set) = (filters.workflow.is_some(), filters.workspace.is_some());
         let banner = model.banner.clone();
+        // The search's note beside its field: the match count, or that the
+        // board shows local results because GitHub's search is unavailable.
+        let search_note = model.search.as_ref().and_then(|s| s.label());
         let search = self.render_search(theme, window, cx);
         div()
             .flex()
@@ -899,6 +955,16 @@ impl IssuesView {
                     heroicon(icons::ARROW_PATH).text_color(theme.icon),
                 )
             })
+            .when_some(search_note, |row, note| {
+                row.child(
+                    div()
+                        .debug_selector(|| "board-search-note".into())
+                        .flex_none()
+                        .type_style(Type::XSmall)
+                        .text_color(theme.muted)
+                        .child(note),
+                )
+            })
             .child(search)
             .child(
                 style::toolbar_button("new-issue", icons::PLUS, "New issue", theme)
@@ -918,6 +984,7 @@ impl IssuesView {
         let input = self.search_field(window, cx);
         let focused = input.read(cx).focus_handle(cx).is_focused(window);
         let empty = self.state.search().is_empty();
+        let searching = self.state.model().search.as_ref().is_some_and(|s| s.searching);
         let field = div()
             .debug_selector(|| "board-search-field".into())
             .relative()
@@ -954,6 +1021,16 @@ impl IssuesView {
         style::search_box("board-search", field, focused, theme)
             .w(px(SEARCH_W))
             .on_click(move |_, window, cx| window.focus(&focus, cx))
+            // A GitHub search on its way: a quiet spinner glyph at the end
+            // of the field.
+            .when(searching, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "board-search-searching".into())
+                        .flex_none()
+                        .child(heroicon(icons::ARROW_PATH).text_color(theme.muted)),
+                )
+            })
             // The clear button keeps the keyboard in the field, for the
             // next search.
             .when(!empty, |d| {
@@ -1128,7 +1205,7 @@ impl IssuesView {
             }));
         // Only the cards in view are built (`board_list.rs`); the list asks
         // for each as it scrolls in.
-        let list_state = self.column_lists[&col.status_id].state.clone();
+        let list_state = self.lists()[&col.status_id].state.clone();
         let cards = gpui::list(
             list_state.clone(),
             cx.processor(move |this, ix: usize, _window, cx| this.render_column_item(ci, ix, cx)),
@@ -1232,7 +1309,9 @@ impl IssuesView {
                         .text_color(theme.link)
                         .hover(|s| s.text_color(theme.link_hover))
                         .cursor_pointer()
-                        .child(if self.load_more_in_flight {
+                        .child(if self.load_more_in_flight
+                            || self.state.model().search.as_ref().is_some_and(|s| s.searching)
+                        {
                             "Loading…".to_string()
                         } else {
                             format!("Load more ({hint})")
