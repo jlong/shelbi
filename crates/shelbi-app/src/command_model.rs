@@ -19,12 +19,12 @@ use crate::overlay::palette::{project_indicator, ProjectEntry};
 use crate::view::SidebarModel;
 
 /// The nav glyph for a nav label: the twemoji the sidebar and the palette
-/// show (💬 / 📋 / 📰 / ⚡ / 🖥), or `•` for a label with none.
+/// show (💬 / 📋 / 🚀 / ⚡ / 🖥), or `•` for a label with none.
 pub fn nav_glyph(label: &str) -> &'static str {
     match label {
         "Orchestrator" => "💬",
         "Issues" => "📋",
-        "Changelog" => "📰",
+        "Changelog" => "🚀",
         "Activity" => "⚡",
         "Machines" => "🖥",
         _ => "•",
@@ -309,7 +309,7 @@ mod tests {
             ids,
             ["view:orch", "view:tasks", "view:changelog", "view:activity", "view:machines"]
         );
-        assert_eq!(m.views[2].decoration.as_ref().unwrap().glyph, "📰");
+        assert_eq!(m.views[2].decoration.as_ref().unwrap().glyph, "🚀");
         assert_eq!(m.views[3].title, "Activity");
         assert_eq!(m.views[3].decoration.as_ref().unwrap().glyph, "⚡");
         assert_eq!(m.views[0].decoration.as_ref().unwrap().glyph, "💬");
@@ -427,6 +427,7 @@ mod tests {
     #[test]
     fn nav_glyphs_match_the_sidebar() {
         assert_eq!(nav_glyph("Issues"), "📋");
+        assert_eq!(nav_glyph("Changelog"), "🚀");
         assert_eq!(nav_glyph("Machines"), "🖥");
         assert_eq!(nav_glyph("Other"), "•");
     }
