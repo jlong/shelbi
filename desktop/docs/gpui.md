@@ -120,16 +120,23 @@ goes quiet. Watch out for `font-kit` if it's ever taken.
   Shelbi's resolved theme (`gpui_kit::component::Theme::change`).
 - `src/assets.rs` falls back to gpui-kit's assets so its components' internal
   glyphs resolve. Shelbi's own icons are Heroicons, not gpui-kit's Lucide set.
-- The Issues board (`dt-issues-board`) uses three gpui-kit widgets: the
-  Markdown `TextView` (task bodies; links open in the browser by default),
-  `Textarea` (the in-place body editor) and `Input` (the new-issue title).
-  All three work without gpui-kit's `Root`; the window is still not wrapped
-  in it. The first subtask that uses a dialog or notification opens the
+- The Issues board (`dt-issues-board`) uses gpui-kit's `Input` (the
+  new-issue title, the task pane's link prompt). The task pane's title and
+  body are Shelbi's own editor (`views/doc_editor`, `dt-task-wysiwyg-editor`):
+  gpui-kit's `TextView` renders but doesn't edit, and its `Textarea` edits
+  only plain text, so neither can be a WYSIWYG Markdown editor. It is a
+  custom element over gpui's text shaping (`shape_text`, `WrappedLine`) and
+  its input handler (`EntityInputHandler`). These work without gpui-kit's
+  `Root`; the window is still not wrapped in it. The first subtask that uses a dialog or notification opens the
   window through `gpui_kit::open_window` (or wraps it in `Root`).
 - The `markdown` crate is a direct dependency pinned to the version
-  gpui-base resolves (`=1.0.0`), so the task detail's checklist count and
-  its tests read the same parse the `TextView` renders. Bump it with
-  gpui-kit.
+  gpui-base resolves (`=1.0.0`), so the license text's tests read the same
+  parse the `TextView` renders. Bump it with gpui-kit.
+- Focus listeners (`on_focus_in` / `on_focus_out`) only see focus paths in
+  the active window: a test that needs them calls
+  `window.activate_window()` first. Two editors trading focus fire the newly
+  focused one's focus-in before the old one's focus-out when the new one was
+  subscribed first.
 
 ## Upgrading
 

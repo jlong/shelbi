@@ -74,6 +74,7 @@ pub mod issue_edit;
 pub mod feedback;
 pub mod layout_sub;
 pub mod licenses;
+pub mod markdown_edit;
 pub mod nav;
 pub mod overlay;
 pub mod reachability;

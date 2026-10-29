@@ -58,7 +58,7 @@ paths on every `cargo test`.
 | Change workflow | (board) `SetIssueWorkflow` | Not on the TUI board (see Known gaps); a palette-less effect would reach `dispatch_effect`'s `EditIssue` arm | The task pane's Workflow picker; a workflow without the issue's status is offered disabled with why (`shelbi_app::task_properties`) |
 | Assign | (board) `AssignIssue` | Not on the TUI board (see Known gaps) | `a`: workspace picker; `@dev` written |
 | Start | (board) `StartIssue` | Not on the TUI board | `s`: dispatched to `dev`; the sandbox agent never confirmed, so the daemon rolled it back |
-| Edit | (board) `EditIssue` | Not on the TUI board | `e`: in-place editor over the shared draft (`shelbi_app::issue_edit`, `task-inline-edit-state`): saves itself after a pause, ⌘S saves at once, Esc / Done close it saving |
+| Edit | (board) `EditIssue` | Not on the TUI board | `e`, More > Edit description, the palette: the pane's body editor takes the keys, caret at the end (no edit mode: the title and body are always editable in place, `dt-task-wysiwyg-editor`) over the shared draft (`shelbi_app::issue_edit`): saves itself after a pause, ⌘S saves at once, Esc hands the keys back saving |
 | New issue | (board) `AddIssue` | Not on the TUI board | `n`: form; the issue was created in `backlog` |
 
 ## Platform differences (by design)
@@ -484,7 +484,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | Field | TUI | Desktop |
 |---|---|---|
 | `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | Header's `Workflow / id` (`views/task_detail.rs` `header`) |
-| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title (`views/task_detail.rs` `details`) |
+| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title, edited in place (a `DocEditor` on the draft's title; blank is held back with an inline message) (`views/task_detail.rs` `details`, `views/doc_editor`) |
 | `status_id` | not shown (popover keyed by task id) | not shown: not used |
 | `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | not shown: `status_name` instead (the Figma frame spells the status as the workflow does) |
 | `status_name` | not shown: the popover shows the column label (`status_label`) | the Status picker's value when no change is settling (`views/task_detail.rs` `properties`; `BoardState::pane_properties` shows an in-flight move's target) |
@@ -499,7 +499,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `pr_link` | not shown | clickable Pull request property, when recorded (`views/task_detail.rs` `properties`) |
 | `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) |
 | `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) |
-| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | markdown `TextView` in the pane's scroll, "No description yet." fallback, in-place editor from More / `e` (`views/task_detail.rs` `details`) |
+| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | the formatted body in the pane's scroll, edited in place WYSIWYG (`shelbi_app::markdown_edit` over the source; checkboxes click; "Write a description…" placeholder when empty); More / `e` put the keys in it (`views/task_detail.rs` `details`, `views/doc_editor`) |
 
 ### `MachinesModel`
 | Field | TUI | Desktop |
