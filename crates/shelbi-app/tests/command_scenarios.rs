@@ -96,6 +96,9 @@ fn fixture() -> CommandModel {
         other_clients_attached: true,
         // The desktop's model: it opens windows, so New Window is listed.
         multi_window: true,
+        // A client with the launch screen and the Connect dialog.
+        launch_screen: true,
+        remote_connect: true,
     }
 }
 
@@ -191,6 +194,9 @@ impl Executor for Scenario {
             // Acknowledgements likewise (the desktop's window, the TUI's
             // full-screen view, Done returning to what was under it).
             Effect::OpenAcknowledgements => Performed::Host(effect.clone()),
+            // The Connect dialog and the launch screen are each client's own
+            // surface too; neither needs (or changes) the current project.
+            Effect::ConnectRemote | Effect::ShowLaunchScreen => Performed::Host(effect.clone()),
             Effect::AddProject => {
                 self.client.open_overlay(Overlay::AddProject);
                 Performed::Nothing
@@ -255,6 +261,9 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
         CommandKind::AddProject => "add_project_collects_the_form_then_mutates",
         CommandKind::NewWindow => "new_window_reaches_the_host_on_a_multi_window_client",
+        CommandKind::ConnectRemote | CommandKind::ShowLaunchScreen => {
+            "launch_commands_reach_the_host_only_on_a_client_that_has_them"
+        }
         CommandKind::Detach => "detach_and_quit_reach_the_host",
         CommandKind::DetachOtherClients => "detach_and_quit_reach_the_host",
         CommandKind::QuitProject => "detach_and_quit_reach_the_host",
@@ -302,6 +311,8 @@ fn every_command_kind_has_a_scenario() {
             "action:switch-project",
             "action:switch-project:beta",
             "action:add-project",
+            "action:connect-remote",
+            "action:launch-screen",
             "action:new-window",
             "edit:project",
             "edit:agent:developer",
@@ -636,6 +647,36 @@ fn new_window_reaches_the_host_on_a_multi_window_client() {
     let mut m = fixture();
     m.multi_window = false;
     assert!(CommandRegistry::new().resolve("action:new-window", &m).is_none());
+}
+
+#[test]
+fn launch_commands_reach_the_host_only_on_a_client_that_has_them() {
+    // Connect to Remote Session… and Show Launch Screen open the client's own
+    // dialog and screen: nothing reaches the daemon and this client's
+    // project, view and overlays stay as they were.
+    for (id, effect) in [
+        ("action:connect-remote", Effect::ConnectRemote),
+        ("action:launch-screen", Effect::ShowLaunchScreen),
+    ] {
+        let mut s = Scenario::new();
+        s.client.set_view(View::Issues);
+        assert_eq!(s.invoke(id), effect, "{id}");
+        assert_eq!(s.last(), &Performed::Host(effect), "{id}");
+        assert_eq!(s.client.project(), Some(PROJECT), "{id}");
+        assert_eq!(s.client.view(), &View::Issues, "{id}");
+        assert_eq!(s.client.overlay(), None, "{id}");
+    }
+    // No project needed (the launch screen has none open).
+    let mut m = fixture();
+    m.project = None;
+    let reg = CommandRegistry::new();
+    assert!(reg.resolve("action:connect-remote", &m).is_some());
+    assert!(reg.resolve("action:launch-screen", &m).is_some());
+    // A client without them lists neither.
+    m.launch_screen = false;
+    m.remote_connect = false;
+    assert!(reg.resolve("action:connect-remote", &m).is_none());
+    assert!(reg.resolve("action:launch-screen", &m).is_none());
 }
 
 /// A scratch Shelbi root shared by the tests in this binary (set once, so

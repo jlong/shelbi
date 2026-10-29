@@ -126,6 +126,10 @@ pub fn command_model_from(
         edit_targets,
         other_clients_attached,
         multi_window: false,
+        // Each client turns these on once it has the launch screen and the
+        // Connect to Remote Session dialog.
+        launch_screen: false,
+        remote_connect: false,
     }
 }
 

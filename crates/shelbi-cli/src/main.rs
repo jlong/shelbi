@@ -664,19 +664,10 @@ fn resolve_or_onboard(resolved: Result<String>) -> Result<Option<String>> {
 
 /// Whether either supported local registration for `name` is on this
 /// machine: the flat global YAML or an in-repo project's split local half.
-/// This stays a path-only check so the configured-repository bypass does not
-/// trigger the migrations performed by `load_project`.
+/// The launch routing's own check (path-only, so the configured-repository
+/// bypass does not trigger the migrations performed by `load_project`).
 fn project_registration_exists(name: &str) -> bool {
-    if shelbi_core::validate_project_name(name).is_err() {
-        return false;
-    }
-    match shelbi_state::projects_dir() {
-        Ok(dir) => {
-            dir.join(format!("{name}.yaml")).is_file()
-                || dir.join(name).join("local.yaml").is_file()
-        }
-        Err(_) => false,
-    }
+    shelbi_app::launch::route::project_registered(name)
 }
 
 /// Onboarding dispatcher when `default_entry` cannot resolve this cwd to a

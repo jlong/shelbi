@@ -2394,6 +2394,23 @@ impl ShellState {
         }
     }
 
+    // --- Launch screen (launch-screen) --------------------------------------
+
+    /// "Connect to Remote Session…": the hook the Connect dialog plugs into
+    /// (`shelbi_app::launch::remote`). The registry doesn't list the command
+    /// for the TUI until that dialog turns `CommandModel::remote_connect` on.
+    fn open_connect_remote(&mut self) {
+        self.status = Some("Connect to Remote Session isn't in this build yet".to_string());
+    }
+
+    /// "Show Launch Screen": the hook the launch screen plugs into
+    /// (`shelbi_app::launch::LaunchModel`). The registry doesn't list the
+    /// command for the TUI until that screen turns
+    /// `CommandModel::launch_screen` on.
+    fn show_launch_screen(&mut self) {
+        self.status = Some("The launch screen isn't in this build yet".to_string());
+    }
+
     // --- Acknowledgements (tui-acknowledgements) ---------------------------
 
     fn acknowledgements_open(&self) -> bool {
@@ -3358,6 +3375,11 @@ impl ShellState {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.overlay = Some(ActiveOverlay::add_project(&cwd));
             }
+            // Listed only once this client turns on `CommandModel::
+            // remote_connect` / `launch_screen` (the launch-tui and
+            // launch-remote-connect subtasks, with the dialog and the screen).
+            Effect::ConnectRemote => self.open_connect_remote(),
+            Effect::ShowLaunchScreen => self.show_launch_screen(),
             // The registry lists New Window only for a multi-window client
             // (`CommandModel::multi_window`, the desktop app); this terminal
             // is one window, so say where another one comes from.

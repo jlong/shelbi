@@ -41,6 +41,9 @@
 //!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
 //!   classification, and the per-pane restart controller over
 //!   [`supervision`], the crash-loop core the daemon poller shares.
+//! - [`launch`] — the launch screen: the startup routing between it and a
+//!   project, its model (local projects, recent remote sessions), the recent
+//!   remote sessions store, and the remote connection seam.
 //! - [`about`] — About Shelbi's words and links (the tagline, the project's
 //!   URLs, the copyright and license), so both clients' About screens read
 //!   the same.
@@ -68,6 +71,7 @@ pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
 pub mod feedback;
+pub mod launch;
 pub mod layout_sub;
 pub mod licenses;
 pub mod nav;

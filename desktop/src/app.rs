@@ -503,6 +503,8 @@ pub enum HostCall {
     OpenAbout,
     OpenAcknowledgements,
     OpenAddProject,
+    ConnectRemote,
+    ShowLaunchScreen,
     LoadReview(String),
     ApproveReview(String),
     AskRejectReason(String),
@@ -558,6 +560,12 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_add_project(&mut self) {
         self.push(HostCall::OpenAddProject);
+    }
+    fn connect_remote(&mut self) {
+        self.push(HostCall::ConnectRemote);
+    }
+    fn show_launch_screen(&mut self) {
+        self.push(HostCall::ShowLaunchScreen);
     }
     fn load_review(&mut self, task_id: &str) {
         self.push(HostCall::LoadReview(task_id.to_string()));
@@ -2125,6 +2133,13 @@ impl ShelbiWindow {
             HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
             HostCall::OpenAcknowledgements => cx.defer(crate::views::about::show_bundled_software),
             HostCall::OpenAddProject => self.open_add_project(window, cx),
+            // The hooks the Connect dialog and the launch screen plug into
+            // (`shelbi_app::launch`). The registry doesn't list either command
+            // until the window turns `remote_connect` / `launch_screen` on.
+            HostCall::ConnectRemote => {
+                self.flash("Connect to Remote Session isn't in this build yet", cx)
+            }
+            HostCall::ShowLaunchScreen => self.flash("The launch screen isn't in this build yet", cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
                 let m = Mutation::ApproveReview {

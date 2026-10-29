@@ -348,6 +348,10 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::OpenAcknowledgements => Placement::Help,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
+        // Shelbi ▸ Connect to Remote Session…, under Settings… (Figma's
+        // application menu).
+        CommandKind::ConnectRemote => Placement::App,
+        CommandKind::ShowLaunchScreen => Placement::File,
         CommandKind::NewWindow => Placement::File,
         CommandKind::OpenEditor { .. } => Placement::File,
         CommandKind::Detach => Placement::App,
@@ -764,6 +768,10 @@ mod tests {
             }],
             other_clients_attached: true,
             multi_window: true,
+            // The desktop doesn't have the launch screen or the Connect
+            // dialog yet, so its model lists neither command.
+            launch_screen: false,
+            remote_connect: false,
         }
     }
 
