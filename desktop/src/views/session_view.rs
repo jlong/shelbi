@@ -33,6 +33,10 @@
 //!   remote, so the view reconnects ("Reconnecting to <machine>… (attempt N)")
 //!   on the shared [`ReconnectController`]'s backoff, and only an attempt that
 //!   reaches the machine and finds the session gone counts as a death.
+//!   A remote Shelbi's terminal (`views::remote_session`) is a local session
+//!   running `ssh -t`, so there the drop arrives as `ssh` exiting
+//!   [`TerminalExit::ConnectionLost`] ([`SessionView::set_ssh_terminal`]),
+//!   and reconnects the same way.
 //! - **Idle.** A declared workspace with no session shows the TUI's idle
 //!   placeholder, and [`SessionView::retry_if_idle`] re-attaches once a session
 //!   appears (`rt-tui-idle-workspace-open`).
@@ -56,6 +60,7 @@ use shelbi_app::session::{
     self as app_session, ConnectFailure, DeathAction, IdleInfo, PersistentRelauncher,
     ReconnectController, ReconnectPolicy, Relauncher, RestartController, RetryPolicy, SessionRef,
 };
+use shelbi_app::launch::ssh::{exit_meaning, TerminalExit};
 use shelbi_term::Size;
 
 use crate::elements::terminal::session::{self as pane_session, Connected};
@@ -228,6 +233,9 @@ pub struct SessionView {
     /// relay): a connection that ends with no exit is then a lost link to
     /// reconnect, not a death.
     remote_machine: Option<String>,
+    /// The session runs `ssh -t` to [`Self::remote_machine`]: its exit with
+    /// [`TerminalExit::ConnectionLost`] is a lost link, not a death.
+    ssh_terminal: bool,
     /// The palette chord the idle placeholder names.
     palette_chord: String,
     /// Whether an idle workspace shows the TUI's dev-slot idle placeholder
@@ -236,6 +244,10 @@ pub struct SessionView {
     /// The terminal grid's inset from the main area's leading and trailing
     /// edges ([`TERMINAL_INSET_X`] unless the host's frame says otherwise).
     inset_x: f32,
+    /// The grid's inset from the top and bottom ([`TERMINAL_INSET_Y`] unless
+    /// the host's frame says otherwise).
+    inset_top: f32,
+    inset_bottom: f32,
     /// The daemon supervisor's reason a dead orchestrator is not coming back
     /// (the sidebar model's `orchestrator_status`); the orchestrator view's
     /// placeholder names it while the session is down.
@@ -287,9 +299,12 @@ impl SessionView {
             deps,
             on_death: OnDeath::Restart,
             remote_machine: None,
+            ssh_terminal: false,
             palette_chord: String::new(),
             idle_placeholder: true,
             inset_x: TERMINAL_INSET_X,
+            inset_top: TERMINAL_INSET_Y,
+            inset_bottom: TERMINAL_INSET_Y,
             supervisor_status: None,
             slot: Slot::Empty,
             restart: RestartController::default(),
@@ -326,6 +341,13 @@ impl SessionView {
         self.remote_machine = machine;
     }
 
+    /// The session is a remote Shelbi's terminal over `ssh -t` to the
+    /// [`Self::set_remote_machine`] machine: `ssh` exiting because the
+    /// connection dropped reconnects (any other exit is a death).
+    pub fn set_ssh_terminal(&mut self, ssh_terminal: bool) {
+        self.ssh_terminal = ssh_terminal;
+    }
+
     /// The palette chord the idle placeholder names.
     pub fn set_palette_chord(&mut self, chord: &str) {
         self.palette_chord = chord.to_string();
@@ -341,6 +363,13 @@ impl SessionView {
     /// whose Figma frame draws another than [`TERMINAL_INSET_X`].
     pub fn set_inset_x(&mut self, inset: f32) {
         self.inset_x = inset;
+    }
+
+    /// The grid's inset from the top and bottom, for a host whose Figma
+    /// frame draws another than [`TERMINAL_INSET_Y`].
+    pub fn set_inset_y(&mut self, top: f32, bottom: f32) {
+        self.inset_top = top;
+        self.inset_bottom = bottom;
     }
 
     /// The daemon supervisor's orchestrator failure, from the sidebar model.
@@ -390,6 +419,11 @@ impl SessionView {
             Slot::Live(pane) => Some(pane),
             _ => None,
         }
+    }
+
+    /// Whether the view is reconnecting to its machine.
+    pub fn is_reconnecting(&self) -> bool {
+        matches!(self.slot, Slot::Reconnecting)
     }
 
     /// The text the main area shows instead of the terminal, worded as the
@@ -699,6 +733,16 @@ impl SessionView {
             PaneEvent::Title(title) => {
                 self.forward(shelbi_client::SessionEvent::Title(title.clone()))
             }
+            // `ssh` gave up on the connection under a remote Shelbi's
+            // terminal: reconnect, as for a relay drop.
+            PaneEvent::Exited(exited)
+                if self.ssh_terminal
+                    && self.remote_machine.is_some()
+                    && exit_meaning(exited.code) == TerminalExit::ConnectionLost =>
+            {
+                self.forward(shelbi_client::SessionEvent::Exited(exited.clone()));
+                self.link_lost(cx);
+            }
             PaneEvent::Exited(exited) => {
                 self.forward(shelbi_client::SessionEvent::Exited(exited.clone()));
                 self.live_pane_died(app_session::exit_line(Some(exited)), cx);
@@ -881,9 +925,9 @@ impl Render for SessionView {
             // 12px from the top and bottom. The scrollbar overlays that
             // padding, against the main area's right edge.
             let padding = scrollbar::Padding {
-                top: TERMINAL_INSET_Y,
+                top: self.inset_top,
                 right: self.inset_x,
-                bottom: TERMINAL_INSET_Y,
+                bottom: self.inset_bottom,
             };
             pane.update(cx, |pane, _| pane.set_scrollbar_padding(padding));
             return root
@@ -892,8 +936,8 @@ impl Render for SessionView {
                 .bg(theme.nested(theme.terminal_canvas()))
                 .pl(gpui::px(self.inset_x))
                 .pr(gpui::px(self.inset_x))
-                .pt(gpui::px(TERMINAL_INSET_Y))
-                .pb(gpui::px(TERMINAL_INSET_Y))
+                .pt(gpui::px(self.inset_top))
+                .pb(gpui::px(self.inset_bottom))
                 .child(pane.clone());
         }
         if let Some(lines) = self.idle_lines() {
@@ -1869,6 +1913,55 @@ mod tests {
         h.session.exit(1);
         h.settle();
         assert_eq!(h.phase(), SessionPhase::Live);
+        assert_eq!(*h.session.relaunches.lock().unwrap(), vec![false]);
+    }
+
+    #[gpui::test]
+    fn an_ssh_terminal_reconnects_when_ssh_loses_the_connection(cx: &mut TestAppContext) {
+        // A remote Shelbi's terminal: `ssh` exits 255 when the connection
+        // drops, the machine is unreachable once, then the terminal is back.
+        let mut h = open(
+            cx,
+            vec![
+                Outcome::Live(Size::new(80, 24)),
+                Outcome::Unreachable,
+                Outcome::Live(Size::new(80, 24)),
+            ],
+        );
+        let ended = record_events(&mut h);
+        h.update(|c, _| {
+            c.set_remote_machine(Some("devbox".into()));
+            c.set_ssh_terminal(true);
+            c.set_on_death(OnDeath::Close);
+        });
+        h.update(|c, cx| c.show(cx));
+        assert_eq!(h.phase(), SessionPhase::Live);
+
+        h.session.exit(255);
+        h.settle();
+        assert_eq!(h.phase(), SessionPhase::Reconnecting(2));
+        assert_eq!(
+            h.chat.read_with(&h.cx, |c, _| c.notice()).as_deref(),
+            Some("Reconnecting to devbox… (attempt 2) `gpu` is unreachable")
+        );
+        h.advance(Duration::from_secs(1));
+        assert_eq!(h.phase(), SessionPhase::Live, "back once the machine answers");
+        assert!(ended.borrow().is_empty(), "a lost link doesn't end the view");
+
+        // Quitting the far Shelbi (exit 0) ends it.
+        h.session.exit(0);
+        h.settle();
+        assert_eq!(*ended.borrow(), vec![SessionViewEvent::Ended]);
+    }
+
+    #[gpui::test]
+    fn an_exit_255_is_a_death_unless_the_session_is_an_ssh_terminal(cx: &mut TestAppContext) {
+        let mut h = open(cx, vec![Outcome::Live(Size::new(80, 24))]);
+        h.update(|c, _| c.set_remote_machine(Some("gpu".into())));
+        h.update(|c, cx| c.show(cx));
+        h.session.exit(255);
+        h.settle();
+        assert_eq!(h.phase(), SessionPhase::Live, "restarted, not reconnecting");
         assert_eq!(*h.session.relaunches.lock().unwrap(), vec![false]);
     }
 

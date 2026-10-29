@@ -142,11 +142,26 @@ pub fn init(cx: &mut App) {
     cx.set_global(MenuBar::default());
 }
 
-/// Run a registry command that needs no window (About Shelbi and
-/// Acknowledgements, each its own window), so it works with no window open or a modal dialog up. Returns
-/// false for any other command (a window runs those).
+/// Run a registry command that needs no project window (About Shelbi and
+/// Acknowledgements, each its own window), so it works with no window open or a modal dialog up. With no
+/// project window to run it (the launch window frontmost, or none open),
+/// Connect to Remote Session… opens over the launch window, and Show Launch
+/// Screen and Add Project open their own. Returns false for any other
+/// command (a window runs those).
 pub fn run_windowless_command(id: &str, cx: &mut App) -> bool {
     match CommandKind::from_id(id) {
+        Some(CommandKind::ConnectRemote) if no_project_window(cx) => {
+            crate::views::launch::connect_remote(cx);
+            true
+        }
+        Some(CommandKind::ShowLaunchScreen) if no_project_window(cx) => {
+            crate::views::launch::show(cx);
+            true
+        }
+        Some(CommandKind::AddProject) if no_project_window(cx) => {
+            crate::views::add_project::show(shelbi_app::add_project_wizard::Origin::Workspace, None, cx);
+            true
+        }
         Some(CommandKind::OpenAbout) => {
             crate::views::about::show_about(cx);
             true
@@ -156,6 +171,15 @@ pub fn run_windowless_command(id: &str, cx: &mut App) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// No project window would take a menu's command: none is open, or the
+/// active window isn't one (the launch window's own menu bar is up).
+fn no_project_window(cx: &App) -> bool {
+    match cx.active_window() {
+        Some(w) => w.downcast::<crate::app::ShelbiWindow>().is_none(),
+        None => true,
     }
 }
 

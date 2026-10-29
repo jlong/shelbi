@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use shelbi_core::{Column, Issue};
-use shelbi_proto::control::{AddSpec, MutationKind, Stream};
+use shelbi_proto::control::{AddSpec, EditSpec, MutationKind, Stream};
 
 use super::*;
 
@@ -806,6 +806,114 @@ fn start_take_claims_someone_elses_issue_before_starting_it() {
         "{:?}",
         sink.lines
     );
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn apply_edit_refuses_when_the_text_it_replaces_changed() {
+    // An app editor's save names the body / title it replaces. One that
+    // differs from what is stored is refused as stale, writing nothing; a
+    // match (trailing whitespace aside, which the store folds) saves only the
+    // fields sent.
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+
+    let mut t = task(Column::backlog(), "t");
+    t.branch = Some("feat/x".into());
+    shelbi_state::save_task("p", &t, "agent's body\n").unwrap();
+    let edit = |title: Option<&str>, expect_title: Option<&str>, body: Option<&str>, expect_body: Option<&str>| {
+        let mut sink = RecordingSink::default();
+        let mut recheck = no_recheck();
+        apply(
+            "p",
+            "t",
+            &MutationKind::Edit(Box::new(EditSpec {
+                title: title.map(str::to_string),
+                body_replace: body.map(str::to_string),
+                expect_title: expect_title.map(str::to_string),
+                expect_body: expect_body.map(str::to_string),
+                ..Default::default()
+            })),
+            &mut sink,
+            &mut recheck,
+        )
+    };
+
+    let err = edit(None, None, Some("mine"), Some("what I read")).unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }), "{err:?}");
+    let err = edit(Some("New"), Some("not the title"), None, None).unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }), "{err:?}");
+    assert_eq!(shelbi_state::load_task("p", "t").unwrap().body, "agent's body\n");
+
+    edit(None, None, Some("mine"), Some("agent's body\n\n")).unwrap();
+    let after = shelbi_state::load_task("p", "t").unwrap();
+    assert_eq!(after.body, "mine\n");
+    assert_eq!(after.task.title, "t", "the title wasn't sent");
+    assert_eq!(after.task.branch.as_deref(), Some("feat/x"), "frontmatter untouched");
+    edit(Some("New"), Some(" t "), None, None).unwrap();
+    assert_eq!(shelbi_state::load_task("p", "t").unwrap().task.title, "New");
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The content guard on a GitHub-backed board, where the revision can't tell
+/// an app editor's save from a change it hasn't seen: a save whose
+/// `expect_body` differs from the issue's body as GitHub has it now is
+/// refused before any write; one that matches PATCHes the issue.
+#[test]
+fn apply_edit_on_github_refuses_a_save_over_a_body_it_hasnt_seen() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let node = r#"{"data":{"rateLimit":{"remaining":4999},"repository":{"issue":{"number":7,"title":"T","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"agent's body","assignees":{"nodes":[]},"labels":{"nodes":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}]}}}}}"#;
+    let rest = r#"{"number":7,"title":"T","body":"agent's body","state":"open","assignees":[],"labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rec = calls.clone();
+    shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+        let joined = args.join(" ");
+        rec.lock().unwrap().push(joined.clone());
+        if args.contains(&"graphql") && joined.contains("IdSearch") {
+            return Ok(
+                r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":7}]}}}"#
+                    .to_string(),
+            );
+        }
+        if args.contains(&"graphql") {
+            return Ok(node.to_string());
+        }
+        Ok(rest.to_string())
+    });
+    let patched = |calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| {
+        calls.lock().unwrap().iter().any(|c| c.contains("PATCH"))
+    };
+    let edit = |expect_body: &str| {
+        let mut sink = RecordingSink::default();
+        let mut recheck = no_recheck();
+        apply(
+            "gh",
+            "t",
+            &MutationKind::Edit(Box::new(EditSpec {
+                body_replace: Some("mine".into()),
+                expect_body: Some(expect_body.into()),
+                ..Default::default()
+            })),
+            &mut sink,
+            &mut recheck,
+        )
+    };
+
+    let err = edit("what the editor read").unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }), "{err:?}");
+    assert!(!patched(&calls), "a refused save writes nothing");
+
+    let _ = edit("agent's body\n");
+    assert!(patched(&calls), "a save over the body it read goes to GitHub");
 
     shelbi_state::clear_test_gh_runner();
     std::env::remove_var("SHELBI_HOME");

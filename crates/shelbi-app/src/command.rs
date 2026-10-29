@@ -59,6 +59,13 @@ pub enum CommandKind {
     SwitchProject { project: String },
     /// Begin the add-project flow.
     AddProject,
+    /// Open the Connect to Remote Session dialog. Offered only by a client
+    /// that has the dialog ([`CommandModel::remote_connect`]).
+    ConnectRemote,
+    /// Show the launch screen: the projects on this machine and the recent
+    /// remote sessions. Offered only by a client that has the screen
+    /// ([`CommandModel::launch_screen`]).
+    ShowLaunchScreen,
     /// Open another window on the current project. Offered only by a client
     /// that has windows to open ([`CommandModel::multi_window`]).
     NewWindow,
@@ -94,6 +101,11 @@ pub enum CommandKind {
     /// computes the slot from the unfiltered column
     /// ([`crate::board::reorder_slot`]).
     PrioritizeIssue { id: String, position: u32 },
+    /// Move an issue to another configured workflow (the task pane's
+    /// Workflow property). The daemon validates the name; the client offers
+    /// only workflows that declare the issue's status
+    /// ([`crate::task_properties::workflow_choices`]).
+    SetIssueWorkflow { id: String, workflow: String },
 }
 
 /// A registry command: metadata + typed arguments. Built by the registry
@@ -144,6 +156,7 @@ impl Command {
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
                 | CommandKind::PrioritizeIssue { .. }
+                | CommandKind::SetIssueWorkflow { .. }
         )
     }
 
@@ -188,6 +201,8 @@ impl CommandKind {
                 project: project.clone(),
             },
             CommandKind::AddProject => Effect::AddProject,
+            CommandKind::ConnectRemote => Effect::ConnectRemote,
+            CommandKind::ShowLaunchScreen => Effect::ShowLaunchScreen,
             CommandKind::NewWindow => Effect::NewWindow { project: p() },
             CommandKind::Detach => Effect::Detach,
             CommandKind::DetachOtherClients => Effect::DetachOtherClients,
@@ -232,6 +247,9 @@ impl CommandKind {
                 id: id.clone(),
                 title: None,
                 body: None,
+                workflow: None,
+                expect_title: None,
+                expect_body: None,
             }),
             CommandKind::AddIssue { title } => Effect::Mutate(Mutation::AddIssue {
                 project: p(),
@@ -245,6 +263,15 @@ impl CommandKind {
                     position: *position,
                 })
             }
+            CommandKind::SetIssueWorkflow { id, workflow } => Effect::Mutate(Mutation::EditIssue {
+                project: p(),
+                id: id.clone(),
+                title: None,
+                body: None,
+                workflow: Some(workflow.clone()),
+                expect_title: None,
+                expect_body: None,
+            }),
         }
     }
 }
@@ -339,6 +366,13 @@ pub struct CommandModel {
     /// Whether this client opens more than one window (the desktop app).
     /// Gates "New Window": the TUI is one terminal, so it never lists it.
     pub multi_window: bool,
+    /// Whether this client has the launch screen. Gates "Show Launch
+    /// Screen"; a client turns it on once its screen is built.
+    pub launch_screen: bool,
+    /// Whether this client has the Connect to Remote Session dialog. Gates
+    /// "Connect to Remote Session…"; a client turns it on once its dialog is
+    /// built.
+    pub remote_connect: bool,
 }
 
 /// The one-line description shown beside a nav view in the command palette's
@@ -598,6 +632,35 @@ impl CommandRegistry {
             hidden_until_query: true,
         });
 
+        // Connect to a remote Shelbi (hidden until query), only for a client
+        // with the dialog. No project needed: the launch screen offers it too.
+        if model.remote_connect {
+            out.push(Command {
+                id: "action:connect-remote".to_string(),
+                title: "Connect to Remote Session…".to_string(),
+                kind: CommandKind::ConnectRemote,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some(crate::launch::remote::HOST_INTRO.to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+        }
+
+        // The launch screen (hidden until query), only for a client with one.
+        if model.launch_screen {
+            out.push(Command {
+                id: "action:launch-screen".to_string(),
+                title: "Show Launch Screen".to_string(),
+                kind: CommandKind::ShowLaunchScreen,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("See your projects and recent remote sessions".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+        }
+
         // New window (hidden until query), only for a client that has them.
         if model.multi_window {
             out.push(Command {
@@ -775,6 +838,8 @@ impl CommandKind {
                 project: String::new(),
             }),
             "action:add-project" => Some(CommandKind::AddProject),
+            "action:connect-remote" => Some(CommandKind::ConnectRemote),
+            "action:launch-screen" => Some(CommandKind::ShowLaunchScreen),
             "action:new-window" => Some(CommandKind::NewWindow),
             "action:detach" => Some(CommandKind::Detach),
             "action:detach-others" => Some(CommandKind::DetachOtherClients),
@@ -868,6 +933,8 @@ mod tests {
             // gating is exercised separately below.
             other_clients_attached: true,
             multi_window: true,
+            launch_screen: true,
+            remote_connect: true,
         }
     }
 
@@ -893,6 +960,8 @@ mod tests {
             "action:switch-project:beta",
             "action:add-project",
             "action:new-window",
+            "action:connect-remote",
+            "action:launch-screen",
             "edit:project",
             "edit:agent:developer",
             "action:detach",
@@ -965,6 +1034,31 @@ mod tests {
         // The TUI is one terminal: it has no window to open.
         m.multi_window = false;
         assert!(reg.resolve("action:new-window", &m).is_none());
+    }
+
+    #[test]
+    fn launch_commands_are_offered_only_by_a_client_that_has_them() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        m.project = None;
+        let connect = reg.resolve("action:connect-remote", &m).expect("offered");
+        assert_eq!(connect.title(), "Connect to Remote Session…");
+        assert!(connect.hidden_until_query());
+        assert_eq!(connect.effect(""), Effect::ConnectRemote);
+        assert!(!connect.is_mutating());
+        let launch = reg.resolve("action:launch-screen", &m).expect("offered");
+        assert_eq!(launch.title(), "Show Launch Screen");
+        assert_eq!(launch.effect(""), Effect::ShowLaunchScreen);
+        assert!(!launch.is_mutating());
+
+        // Off by default, so neither client lists them before its screen and
+        // dialog exist.
+        m.launch_screen = false;
+        m.remote_connect = false;
+        assert!(reg.resolve("action:connect-remote", &m).is_none());
+        assert!(reg.resolve("action:launch-screen", &m).is_none());
+        let fresh = CommandModel::default();
+        assert!(!fresh.launch_screen && !fresh.remote_connect);
     }
 
     #[test]

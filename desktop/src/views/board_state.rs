@@ -30,6 +30,14 @@
 //! reported it produced ([`Pending::landed`]). A follow-up on the same card
 //! sends that state rather than the read's pre-change one, which the daemon
 //! would refuse as changed elsewhere (`dt-board-stale-after-own-mutation`).
+//!
+//! Editing a card's text is `shelbi_app::issue_edit`'s (`task-inline-edit-
+//! state`): the project's shared [`issue_edit::IssueEdits`] holds the draft, saves it on
+//! a pause in typing or a flush ([`Intent::Save`]), and serializes every
+//! write of an issue. A move, reorder, start or assignment takes the issue's
+//! lane there too; one asked for while a save is out (or with typing not yet
+//! saved, which goes first) is held and sent once the lane frees, never
+//! refused, so a property change and the draft never undo each other.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -39,21 +47,35 @@ use shelbi_app::board::{
     WorkspaceOption,
 };
 use shelbi_app::board_search::{BoardSearch, SearchRequest, SearchWorker};
+use shelbi_app::issue_edit::{self, Field, SaveJob, SaveStatus, SharedEdits, Snapshot};
+use shelbi_app::task_properties::{
+    self, PriorityChoice, QueuePosition, StatusChoice, WorkflowChoice,
+};
 use shelbi_app::{
     BoardFilters, CommandKind, Effect, ExecError, ExpectedState, IssueCard, IssuesModel, Mutation,
 };
 use shelbi_state::keymap::{
     Key, KanbanAction, KeyChord, Keymaps, Mods, PopoverAction,
 };
+use shelbi_core::StatusCategory;
 use shelbi_state::KanbanColumnOverride;
 
-/// Which overlay owns the keyboard.
+/// Which overlay owns the keyboard. The task pane isn't modal: it stays up
+/// under the board's own menus and pickers ([`BoardState::pane_id`]), and
+/// the keys come back to it when they close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Board,
-    /// The task detail for `id`. `editing` while the in-place body editor is
-    /// open (the editor then owns the keys; see [`BoardState::handle_key`]).
+    /// The task pane for `id` has the keys. `editing` while one of its
+    /// in-place editors (the title, the body) has them: the editor owns the
+    /// keys then (see [`BoardState::handle_key`]).
     Detail { id: String, editing: bool },
+    /// The pane's More menu, its keyboard row at `cursor`
+    /// ([`BoardState::pane_actions`]).
+    PaneMenu { cursor: usize },
+    /// The picker under one of the pane's property values, its keyboard row
+    /// at `cursor` ([`BoardState::property_rows`]).
+    PropertyPicker { property: Property, cursor: usize },
     WorkspaceDropdown { cursor: usize },
     WorkflowDropdown { cursor: usize },
     /// Pick the workspace to assign `id` to.
@@ -81,8 +103,12 @@ pub enum Intent {
     },
     /// Scroll the open detail.
     ScrollDetail(Scroll),
-    /// Open the in-place body editor for `id` (the view seeds it with the body).
+    /// Put the keys in `id`'s body editor, the caret at the end (the Edit
+    /// command: there is no edit mode to open).
     BeginEdit(String),
+    /// Send a save of an issue's draft (`issue_edit`); the view hands the
+    /// answer back to [`BoardState::finish_save`].
+    Save(SaveJob),
     /// Open `id`'s body in the user's configured editor.
     OpenInEditor(String),
     /// Show the new-issue title prompt.
@@ -91,6 +117,120 @@ pub enum Intent {
     FocusSearch,
     /// The search was cleared from the board (Esc): empty the field to match.
     ClearSearchField,
+    /// Put text on the clipboard (More > Copy branch).
+    Copy(String),
+}
+
+/// What the task pane's More menu offers: the task operations the old modal
+/// put on its action row, each with the pane key that does the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneAction {
+    MoveLeft,
+    MoveRight,
+    Start,
+    Assign,
+    EditDescription,
+    OpenInEditor,
+    OpenWorkspace,
+    CopyBranch,
+}
+
+impl PaneAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneAction::MoveLeft => "Move left",
+            PaneAction::MoveRight => "Move right",
+            PaneAction::Start => "Start",
+            PaneAction::Assign => "Assign…",
+            PaneAction::EditDescription => "Edit description",
+            PaneAction::OpenInEditor => "Open in editor",
+            PaneAction::OpenWorkspace => "Open workspace",
+            PaneAction::CopyBranch => "Copy branch name",
+        }
+    }
+
+    /// A short name for the menu row's test selector (`pane-menu-<slug>`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            PaneAction::MoveLeft => "move-left",
+            PaneAction::MoveRight => "move-right",
+            PaneAction::Start => "start",
+            PaneAction::Assign => "assign",
+            PaneAction::EditDescription => "edit",
+            PaneAction::OpenInEditor => "editor",
+            PaneAction::OpenWorkspace => "workspace",
+            PaneAction::CopyBranch => "copy-branch",
+        }
+    }
+}
+
+/// A task pane property the user sets in place: its value is a button that
+/// opens a picker of what it can be set to now
+/// (`shelbi_app::task_properties`). No edit mode: a choice is sent at once,
+/// through the same registry commands the board's keys and drags use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Property {
+    Status,
+    Workflow,
+    Priority,
+}
+
+impl Property {
+    /// In the pane's order, which Tab follows.
+    pub const ALL: [Property; 3] = [Property::Status, Property::Workflow, Property::Priority];
+
+    /// A short name for selectors (`pane-<slug>`, `picker-<slug>`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Property::Status => "status",
+            Property::Workflow => "workflow",
+            Property::Priority => "priority",
+        }
+    }
+}
+
+/// One row of a property's picker, as the view draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyRow {
+    Status(StatusChoice),
+    Workflow(WorkflowChoice),
+    Priority(PriorityChoice),
+}
+
+impl PropertyRow {
+    /// The issue's value now (the picker's check).
+    pub fn current(&self) -> bool {
+        match self {
+            PropertyRow::Status(c) => c.current,
+            PropertyRow::Workflow(c) => c.current,
+            PropertyRow::Priority(c) => c.current,
+        }
+    }
+
+    /// Why it can't be chosen, when it can't (drawn disabled, with the
+    /// reason on hover).
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            PropertyRow::Status(c) => c.refusal.as_deref(),
+            PropertyRow::Workflow(c) => c.refusal.as_deref(),
+            PropertyRow::Priority(_) => None,
+        }
+    }
+}
+
+/// What the pane's property values show: the read, with this client's
+/// in-flight change to the property put where it is headed, so a choice
+/// shows at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneProperties {
+    pub status_name: String,
+    pub category: StatusCategory,
+    pub workflow_name: String,
+    /// `None` for a task whose queue can't be reordered (done), or one
+    /// that isn't on the board.
+    pub queue: Option<QueuePosition>,
+    /// The property a change of this client's is still settling.
+    pub pending: Option<Property>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +265,8 @@ pub struct Pending {
     /// For a reorder, the slot the card is headed for in its stored column:
     /// settled once a read has it there.
     pub to_slot: Option<u32>,
+    /// For a workflow change, the workflow it is headed for.
+    pub to_workflow: Option<String>,
     /// The stored column this mutation renumbers (a move's or start's source,
     /// a reorder's column). Every card whose priority shifts gets a new
     /// revision, so the column's other cards wait for this one to land rather
@@ -146,39 +288,23 @@ pub struct MutationJob {
     pub kind: CommandKind,
     /// The state the user was looking at. `None` only for `AddIssue`.
     pub expected: Option<ExpectedState>,
-    /// The new body, for an `EditIssue`.
-    pub body: Option<String>,
 }
 
 impl MutationJob {
     /// The daemon mutation this job sends: the registry's effect for the
-    /// command (`CommandKind::effect_with_project`), with an edit's body
-    /// filled in. `None` for a command that isn't an issue mutation.
+    /// command (`CommandKind::effect_with_project`). `None` for a command
+    /// that isn't one (an edit is a [`SaveJob`]).
     pub fn mutation(&self, project: &str) -> Option<Mutation> {
         match self.kind.effect_with_project(project) {
-            Effect::Mutate(Mutation::EditIssue {
-                project, id, title, ..
-            }) => Some(Mutation::EditIssue {
-                project,
-                id,
-                title,
-                body: self.body.clone(),
-            }),
             Effect::Mutate(m @ (Mutation::MoveIssue { .. }
             | Mutation::StartIssue { .. }
             | Mutation::AssignIssue { .. }
             | Mutation::AddIssue { .. }
-            | Mutation::PrioritizeIssue { .. })) => Some(m),
+            | Mutation::PrioritizeIssue { .. }
+            | Mutation::EditIssue { workflow: Some(_), .. })) => Some(m),
             _ => None,
         }
     }
-}
-
-/// An edit waiting to be sent: the body, and the card state it was based on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StagedEdit {
-    body: String,
-    expected: Option<ExpectedState>,
 }
 
 /// A letter key outside the keymap: the desktop-only board keys and the TUI's
@@ -221,14 +347,26 @@ pub struct BoardState {
     pub selected_column: usize,
     pub selected_row: usize,
     pub mode: Mode,
+    /// The task the floating pane shows, while it is up: it stays through
+    /// the board's menus and pickers (the pane isn't modal), and only
+    /// [`BoardState::close_pane`] (or opening another task) changes it.
+    pane: Option<String>,
+    /// The pane property the keyboard is on (Tab walks them), drawn with
+    /// the focus ring; Enter opens its picker, and closing the picker comes
+    /// back to it.
+    pane_focus: Option<Property>,
     pending: BTreeMap<String, Pending>,
     /// A daemon refusal or failure, shown on the card until dismissed or the
     /// card's next action.
     notices: BTreeMap<String, String>,
-    staged_edits: BTreeMap<String, StagedEdit>,
-    /// The base state of an in-place edit, captured when the editor opened, so
-    /// a save refuses if someone else edited the issue meanwhile.
-    edit_base: BTreeMap<String, ExpectedState>,
+    /// The project's drafts and per-issue write lanes, shared with its other
+    /// windows and with the threads that send its saves.
+    edits: SharedEdits,
+    /// Mutations held for an issue's lane (a save is out, or goes first),
+    /// in the order asked.
+    held: BTreeMap<String, Vec<CommandKind>>,
+    /// The lane each in-flight mutation holds.
+    tickets: BTreeMap<String, issue_edit::WriteTicket>,
     /// The card being dragged, while a drag is on.
     dragging: Option<String>,
     /// One line of feedback under the board.
@@ -240,6 +378,18 @@ pub struct BoardState {
 
 impl BoardState {
     pub fn new(project: impl Into<String>, keymaps: Keymaps) -> Self {
+        let project = project.into();
+        // A test's board keeps its own drafts: tests run in parallel and
+        // share project names.
+        #[cfg(not(test))]
+        let edits = issue_edit::shared(&project);
+        #[cfg(test)]
+        let edits = SharedEdits::default();
+        Self::with_edits(project, keymaps, edits)
+    }
+
+    /// A board over `edits` (a test's own store, not the process's).
+    pub fn with_edits(project: impl Into<String>, keymaps: Keymaps, edits: SharedEdits) -> Self {
         let input = BoardInput::default();
         let filters = BoardFilters::default();
         let model = IssuesModel::build(&input, &filters);
@@ -254,10 +404,13 @@ impl BoardState {
             selected_column: 0,
             selected_row: 0,
             mode: Mode::Board,
+            pane: None,
+            pane_focus: None,
             pending: BTreeMap::new(),
             notices: BTreeMap::new(),
-            staged_edits: BTreeMap::new(),
-            edit_base: BTreeMap::new(),
+            edits,
+            held: BTreeMap::new(),
+            tickets: BTreeMap::new(),
             dragging: None,
             status: None,
             generation: 0,
@@ -333,6 +486,11 @@ impl BoardState {
             self.input.apply_closed(page);
         }
         self.settle_pending();
+        let mut edits = issue_edit::lock(&self.edits);
+        if edits.watching() {
+            edits.observe(&self.input.tasks());
+        }
+        drop(edits);
         self.rebuild();
     }
 
@@ -371,6 +529,12 @@ impl BoardState {
         // something to overlay.
         let tasks = if self.pending.is_empty() { Vec::new() } else { self.input.tasks() };
         for (id, p) in &self.pending {
+            // A workflow change shows on the card's badge at once.
+            if let Some(workflow) = &p.to_workflow {
+                if let Some((c, r)) = self.model.position(id) {
+                    self.model.columns[c].cards[r].workflow_name = workflow.clone();
+                }
+            }
             if let Some(to) = &p.to_status {
                 let Some((from, row)) = self.model.position(id) else {
                     continue;
@@ -512,26 +676,337 @@ impl BoardState {
         }
     }
 
-    /// The detail's card, when the detail is open.
+    /// The task pane's card, while the pane is up (whatever has the keys).
     pub fn detail_id(&self) -> Option<&str> {
-        match &self.mode {
-            Mode::Detail { id, .. } => Some(id),
-            _ => None,
-        }
+        self.pane.as_deref()
     }
 
+    /// Show `id` in the task pane, giving it the keys: the one pane, so a
+    /// pane already up switches to `id`. The card is selected where the
+    /// board shows it; the board doesn't scroll or resize for it.
     pub fn open_detail(&mut self, id: &str) {
         if let Some((c, r)) = self.model.position(id) {
             self.select(c, r);
         }
+        if self.pane.as_deref() != Some(id) {
+            self.pane_focus = None;
+        }
+        self.pane = Some(id.to_string());
         self.mode = Mode::Detail {
             id: id.to_string(),
             editing: false,
         };
     }
 
+    /// Close whatever is on top: a menu, picker or prompt goes back to the
+    /// pane under it (or the board); the pane itself closes last.
     pub fn close_overlay(&mut self) {
+        match self.mode {
+            Mode::Board | Mode::Detail { .. } => self.close_pane(),
+            _ => self.mode = self.rest(),
+        }
+    }
+
+    /// Close the task pane (and anything over it): the board has the keys,
+    /// its selection, filters and scroll as they were.
+    pub fn close_pane(&mut self) {
+        self.pane = None;
+        self.pane_focus = None;
         self.mode = Mode::Board;
+    }
+
+    /// The mode a menu, picker or prompt closes back to: the pane while it is
+    /// up, else the board.
+    fn rest(&self) -> Mode {
+        match &self.pane {
+            Some(id) => Mode::Detail {
+                id: id.clone(),
+                editing: false,
+            },
+            None => Mode::Board,
+        }
+    }
+
+    // ---- the pane's More menu --------------------------------------------
+
+    /// What the pane's More menu lists for its task, in order: the moves,
+    /// Start (not for someone else's issue on a remote tracker), Assign, the
+    /// description's editors, and the workspace once one is assigned.
+    pub fn pane_actions(&self) -> Vec<PaneAction> {
+        let Some(card) = self.pane.as_deref().and_then(|id| self.model.card(id)) else {
+            return Vec::new();
+        };
+        let id = card.id.as_str();
+        let mut out = Vec::new();
+        // A step the workflow has (the pane's move clamps at the ends).
+        if self.move_target(id, false, false).is_ok() {
+            out.push(PaneAction::MoveLeft);
+        }
+        if self.move_target(id, true, false).is_ok() {
+            out.push(PaneAction::MoveRight);
+        }
+        if card.start_refusal().is_none() {
+            out.push(PaneAction::Start);
+        }
+        if !self.input.workspaces.is_empty() {
+            out.push(PaneAction::Assign);
+        }
+        out.extend([PaneAction::EditDescription, PaneAction::OpenInEditor]);
+        if card.assignee.is_some() {
+            out.push(PaneAction::OpenWorkspace);
+        }
+        if card.branch.is_some() {
+            out.push(PaneAction::CopyBranch);
+        }
+        out
+    }
+
+    /// Open the More menu, or close it when it is open (its button's click).
+    pub fn toggle_pane_menu(&mut self) {
+        if self.pane.is_none() {
+            return;
+        }
+        self.mode = match self.mode {
+            Mode::PaneMenu { .. } => self.rest(),
+            _ => Mode::PaneMenu { cursor: 0 },
+        };
+    }
+
+    /// Run the More menu's action `ix` (a click, or Enter on its row), back
+    /// on the pane.
+    pub fn choose_pane_action(&mut self, ix: usize) -> Vec<Intent> {
+        let (Some(id), Some(action)) = (self.pane.clone(), self.pane_actions().get(ix).copied()) else {
+            self.mode = self.rest();
+            return Vec::new();
+        };
+        self.mode = self.rest();
+        match action {
+            PaneAction::MoveLeft => self.move_command(&id, false, false),
+            PaneAction::MoveRight => self.move_command(&id, true, false),
+            PaneAction::Start => self.start(&id),
+            PaneAction::Assign => self.begin_assign(&id),
+            PaneAction::EditDescription => self.begin_edit(&id),
+            PaneAction::OpenInEditor => vec![Intent::OpenInEditor(id)],
+            PaneAction::OpenWorkspace => {
+                let ws = self.model.card(&id).and_then(|c| c.assignee.clone());
+                self.open_workspace(ws)
+            }
+            PaneAction::CopyBranch => match self.model.card(&id).and_then(|c| c.branch.clone()) {
+                Some(branch) => {
+                    self.status = Some(format!("copied {branch}"));
+                    vec![Intent::Copy(branch)]
+                }
+                None => Vec::new(),
+            },
+        }
+    }
+
+    // ---- the pane's properties -------------------------------------------
+
+    /// The pane property the keyboard is on.
+    pub fn pane_focus(&self) -> Option<Property> {
+        self.pane_focus
+    }
+
+    /// Take the keyboard off the properties (it went to the pane's session).
+    pub fn clear_pane_focus(&mut self) {
+        self.pane_focus = None;
+    }
+
+    /// Put the keyboard on `property` (Tab coming in from the title or the
+    /// body editor), or off the values.
+    pub fn set_pane_focus(&mut self, property: Option<Property>) {
+        self.pane_focus = property;
+    }
+
+    /// The pane's property values for `id`, with this client's in-flight
+    /// change shown where it is headed.
+    pub fn pane_properties(&self, id: &str) -> Option<PaneProperties> {
+        let tasks = self.input.tasks();
+        let tf = tasks.iter().find(|tf| tf.task.id == id)?;
+        let rules = self.input.rules();
+        let pending = self.pending.get(id);
+        let pending_status = pending.and_then(|p| p.to_status.clone());
+        let status_id = pending_status.clone().unwrap_or_else(|| rules.resolved_status_id(&tf.task));
+        let status = self.input.project_statuses.statuses.iter().find(|st| st.id == status_id);
+        let status_name = status.map_or_else(|| tf.task.column.default_status_name().to_string(), |st| st.name.clone());
+        let category = status.map_or_else(|| tf.task.column.category(), |st| st.category);
+        let pending_workflow = pending.and_then(|p| p.to_workflow.clone());
+        let workflow_name = pending_workflow
+            .clone()
+            .unwrap_or_else(|| rules.workflow_name(&tf.task).to_string());
+        let pending_slot = pending.and_then(|p| p.to_slot);
+        let queue = if category == StatusCategory::Done {
+            None
+        } else if pending_status.as_deref().is_some_and(|s| s != tf.task.column.as_str()) {
+            // A move lands at the bottom of its new queue.
+            let len = tasks.iter().filter(|o| o.task.column.as_str() == status_id).count() as u32 + 1;
+            Some(QueuePosition { position: len, len })
+        } else {
+            task_properties::queue_position(&tasks, id).map(|q| match pending_slot {
+                Some(slot) => QueuePosition {
+                    position: (slot + 1).min(q.len),
+                    ..q
+                },
+                None => q,
+            })
+        };
+        let pending = pending.and_then(|p| {
+            if p.to_status.is_some() {
+                Some(Property::Status)
+            } else if p.to_workflow.is_some() {
+                Some(Property::Workflow)
+            } else if p.to_slot.is_some() {
+                Some(Property::Priority)
+            } else {
+                None
+            }
+        });
+        Some(PaneProperties {
+            status_name,
+            category,
+            workflow_name,
+            queue,
+            pending,
+        })
+    }
+
+    /// Why the pane's `property` can't be changed now, when it can't (its
+    /// value is drawn disabled): a done task's queue, a task with a change
+    /// still unanswered.
+    pub fn property_refusal(&self, property: Property) -> Option<String> {
+        let id = self.pane.as_deref()?;
+        if self.pending.get(id).is_some_and(|p| !p.acked || p.landed.is_none()) {
+            return Some("a change is already in progress".to_string());
+        }
+        match property {
+            Property::Priority => task_properties::priority_refusal(&self.input, id),
+            Property::Status | Property::Workflow => None,
+        }
+    }
+
+    /// What `property`'s picker lists for the pane's task.
+    pub fn property_rows(&self, property: Property) -> Vec<PropertyRow> {
+        let Some(id) = self.pane.as_deref() else {
+            return Vec::new();
+        };
+        match property {
+            Property::Status => task_properties::status_choices(&self.input, id)
+                .into_iter()
+                .map(PropertyRow::Status)
+                .collect(),
+            Property::Workflow => task_properties::workflow_choices(&self.input, id)
+                .into_iter()
+                .map(PropertyRow::Workflow)
+                .collect(),
+            Property::Priority => task_properties::priority_choices(&self.input.tasks(), id)
+                .into_iter()
+                .map(PropertyRow::Priority)
+                .collect(),
+        }
+    }
+
+    /// Open `property`'s picker on the issue's current value, or close it
+    /// when it is open (its value's click). A property that can't change
+    /// says why instead.
+    pub fn toggle_property(&mut self, property: Property) {
+        if self.pane.is_none() {
+            return;
+        }
+        if matches!(self.mode, Mode::PropertyPicker { property: open, .. } if open == property) {
+            self.mode = self.rest();
+            return;
+        }
+        if let Some(why) = self.property_refusal(property) {
+            self.status = Some(why);
+            return;
+        }
+        let rows = self.property_rows(property);
+        let cursor = rows.iter().position(PropertyRow::current).unwrap_or(0);
+        self.mode = Mode::PropertyPicker { property, cursor };
+    }
+
+    /// Choose `property`'s row `ix` (a click, or Enter on it), back on the
+    /// pane: the command that sets it, or nothing for the current value. A
+    /// refused row says why on the task and changes nothing.
+    pub fn choose_property(&mut self, property: Property, ix: usize) -> Vec<Intent> {
+        self.mode = self.rest();
+        let (Some(id), Some(row)) = (self.pane.clone(), self.property_rows(property).into_iter().nth(ix)) else {
+            return Vec::new();
+        };
+        let command = match &row {
+            PropertyRow::Status(c) => task_properties::status_command(&self.input, &id, &c.status_id),
+            PropertyRow::Workflow(c) => task_properties::workflow_command(&self.input, &id, &c.name),
+            PropertyRow::Priority(c) => task_properties::priority_command(&self.input, &id, c.position),
+        };
+        match command {
+            Ok(Some(kind)) => vec![Intent::Command(kind)],
+            Ok(None) => Vec::new(),
+            Err(why) => {
+                self.status = Some(why.clone());
+                self.notices.insert(id, why);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Tab / Shift+Tab on the pane: the next / previous property, then off
+    /// them (so Tab cycles back to the first).
+    fn step_property_focus(&mut self, forward: bool) {
+        let all = Property::ALL;
+        let at = self.pane_focus.and_then(|p| all.iter().position(|&q| q == p));
+        self.pane_focus = match (at, forward) {
+            (None, true) => Some(all[0]),
+            (None, false) => Some(all[all.len() - 1]),
+            (Some(i), true) => all.get(i + 1).copied(),
+            (Some(0), false) => None,
+            (Some(i), false) => Some(all[i - 1]),
+        };
+    }
+
+    fn property_key(&mut self, property: Property, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+        let rows = self.property_rows(property);
+        let n = rows.len();
+        let open = |ix: usize| rows.get(ix).is_some_and(|r| r.refusal().is_none());
+        // The next choosable row from `cursor` in `step` (wrapping); the
+        // cursor itself when none is.
+        let next = |step: isize| {
+            (1..=n)
+                .map(|k| (cursor as isize + step * k as isize).rem_euclid(n as isize) as usize)
+                .find(|&ix| open(ix))
+                .unwrap_or(cursor)
+        };
+        let at = |cursor| Mode::PropertyPicker { property, cursor };
+        match chord.code {
+            Key::Esc | Key::Char('q') => self.mode = self.rest(),
+            Key::Up | Key::Char('k') if n > 0 => self.mode = at(next(-1)),
+            Key::Down | Key::Char('j') if n > 0 => self.mode = at(next(1)),
+            Key::Home if n > 0 => self.mode = at((0..n).find(|&ix| open(ix)).unwrap_or(cursor)),
+            Key::End if n > 0 => self.mode = at((0..n).rev().find(|&ix| open(ix)).unwrap_or(cursor)),
+            Key::Enter | Key::Char(' ') if open(cursor) => return self.choose_property(property, cursor),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn pane_menu_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+        let n = self.pane_actions().len();
+        match chord.code {
+            Key::Esc | Key::Char('q') => self.mode = self.rest(),
+            Key::Up | Key::Char('k') if n > 0 => {
+                self.mode = Mode::PaneMenu {
+                    cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
+                }
+            }
+            Key::Down | Key::Char('j') if n > 0 => {
+                self.mode = Mode::PaneMenu {
+                    cursor: (cursor + 1) % n,
+                }
+            }
+            Key::Enter | Key::Char(' ') => return self.choose_pane_action(cursor),
+            _ => {}
+        }
+        Vec::new()
     }
 
     // ---- moves ------------------------------------------------------------
@@ -568,14 +1043,6 @@ impl BoardState {
                 self.status = Some(msg);
                 Vec::new()
             }
-        }
-    }
-
-    /// The detail's move buttons: one clamped step, like its `H` / `L`.
-    pub fn detail_move(&mut self, forward: bool) -> Vec<Intent> {
-        match self.detail_id().map(str::to_string) {
-            Some(id) => self.move_command(&id, forward, false),
-            None => Vec::new(),
         }
     }
 
@@ -755,19 +1222,22 @@ impl BoardState {
             Mode::Detail { id, editing } => {
                 if editing {
                     if chord.code == Key::Esc {
-                        self.mode = Mode::Detail { id, editing: false };
-                        return Some(Vec::new());
+                        // Leaving the editor saves what's typed; nothing is
+                        // reverted.
+                        return Some(self.editor_blurred(&id));
                     }
                     return None;
                 }
                 Some(self.detail_key(&id, chord))
             }
+            Mode::PaneMenu { cursor } => Some(self.pane_menu_key(cursor, chord)),
+            Mode::PropertyPicker { property, cursor } => Some(self.property_key(property, cursor, chord)),
             Mode::WorkspaceDropdown { cursor } => Some(self.workspace_dropdown_key(cursor, chord)),
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
             Mode::AssignPicker { id, cursor } => Some(self.assign_key(&id, cursor, chord)),
             Mode::AddPrompt => {
                 if chord.code == Key::Esc {
-                    self.mode = Mode::Board;
+                    self.mode = self.rest();
                     return Some(Vec::new());
                 }
                 None
@@ -858,10 +1328,26 @@ impl BoardState {
     }
 
     fn detail_key(&mut self, id: &str, chord: KeyChord) -> Vec<Intent> {
+        // The properties' own keys, before the user's popover keys: Tab walks
+        // them, Enter / Space opens the one the keyboard is on.
+        match chord.code {
+            Key::Tab | Key::BackTab => {
+                let back = chord.code == Key::BackTab || chord.mods.contains(Mods::SHIFT);
+                self.step_property_focus(!back);
+                return Vec::new();
+            }
+            Key::Enter | Key::Char(' ') if chord.mods.is_empty() => {
+                if let Some(property) = self.pane_focus {
+                    self.toggle_property(property);
+                    return Vec::new();
+                }
+            }
+            _ => {}
+        }
         if let Some(action) = self.keymaps.popover.dispatch(chord) {
             return match action {
                 PopoverAction::Close => {
-                    self.mode = Mode::Board;
+                    self.close_pane();
                     Vec::new()
                 }
                 PopoverAction::ScrollUp => vec![Intent::ScrollDetail(Scroll::Up)],
@@ -875,7 +1361,7 @@ impl BoardState {
                     let ws = self.model.card(id).and_then(|c| c.assignee.clone());
                     let out = self.open_workspace(ws);
                     if !out.is_empty() {
-                        self.mode = Mode::Board;
+                        self.close_pane();
                     }
                     out
                 }
@@ -893,7 +1379,7 @@ impl BoardState {
     fn workspace_dropdown_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
         let n = self.workspace_options().len();
         match chord.code {
-            Key::Esc | Key::Char('q') | Key::Char('f') => self.mode = Mode::Board,
+            Key::Esc | Key::Char('q') | Key::Char('f') => self.mode = self.rest(),
             Key::Up | Key::Char('k') if n > 0 => {
                 self.mode = Mode::WorkspaceDropdown {
                     cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
@@ -906,7 +1392,7 @@ impl BoardState {
             }
             Key::Enter | Key::Char(' ') => return self.choose_workspace_option(cursor),
             Key::Char('c') => {
-                self.mode = Mode::Board;
+                self.mode = self.rest();
                 return self.set_workspace_filter(None);
             }
             _ => {}
@@ -916,7 +1402,7 @@ impl BoardState {
 
     /// Commit workspace option `ix` (a click or Enter) and close the dropdown.
     pub fn choose_workspace_option(&mut self, ix: usize) -> Vec<Intent> {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         match self.workspace_options().get(ix) {
             Some(opt) => self.set_workspace_filter(opt.filter.clone()),
             None => Vec::new(),
@@ -926,7 +1412,7 @@ impl BoardState {
     fn workflow_dropdown_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
         let n = self.workflow_options().len();
         match chord.code {
-            Key::Esc | Key::Char('q') | Key::Char('w') => self.mode = Mode::Board,
+            Key::Esc | Key::Char('q') | Key::Char('w') => self.mode = self.rest(),
             Key::Up | Key::Char('k') if n > 0 => {
                 self.mode = Mode::WorkflowDropdown {
                     cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
@@ -939,7 +1425,7 @@ impl BoardState {
             }
             Key::Enter | Key::Char(' ') => self.choose_workflow_option(cursor),
             Key::Char('c') => {
-                self.mode = Mode::Board;
+                self.mode = self.rest();
                 self.set_workflow_filter(None);
             }
             _ => {}
@@ -949,7 +1435,7 @@ impl BoardState {
 
     /// Commit workflow option `ix` and close the dropdown.
     pub fn choose_workflow_option(&mut self, ix: usize) {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         if let Some(opt) = self.workflow_options().get(ix) {
             self.set_workflow_filter(opt.filter.clone());
         }
@@ -958,7 +1444,7 @@ impl BoardState {
     fn assign_key(&mut self, id: &str, cursor: usize, chord: KeyChord) -> Vec<Intent> {
         let n = self.input.workspaces.len();
         match chord.code {
-            Key::Esc | Key::Char('q') => self.mode = Mode::Board,
+            Key::Esc | Key::Char('q') => self.mode = self.rest(),
             Key::Up | Key::Char('k') if n > 0 => {
                 self.mode = Mode::AssignPicker {
                     id: id.to_string(),
@@ -979,7 +1465,7 @@ impl BoardState {
 
     /// Assign `id` to declared workspace `ix` (Enter or a click in the picker).
     pub fn choose_assignee(&mut self, id: &str, ix: usize) -> Vec<Intent> {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         match self.input.workspaces.get(ix) {
             Some(ws) => vec![Intent::Command(CommandKind::AssignIssue {
                 id: id.to_string(),
@@ -1033,13 +1519,15 @@ impl BoardState {
         vec![Intent::BeginAdd]
     }
 
-    /// Open the in-place editor on `id`'s body, remembering the state it is
-    /// based on.
+    /// Edit `id`'s body (`e`, More > Edit description, the palette's Edit):
+    /// the pane shows it and its body editor takes the keys. There is no
+    /// Save: the draft saves itself (`issue_edit`), and the editor shows the
+    /// draft, so text left unsaved earlier comes back.
     pub fn begin_edit(&mut self, id: &str) -> Vec<Intent> {
-        let Some(card) = self.model.card(id) else {
+        let Some(snap) = self.snapshot(id) else {
             return Vec::new();
         };
-        self.edit_base.insert(id.to_string(), card.expected());
+        issue_edit::lock(&self.edits).open(&snap);
         self.open_detail(id);
         self.mode = Mode::Detail {
             id: id.to_string(),
@@ -1048,16 +1536,49 @@ impl BoardState {
         vec![Intent::BeginEdit(id.to_string())]
     }
 
-    /// Save an in-place edit: stage the body against the state the editor
-    /// opened on and emit the registry's `EditIssue`.
-    pub fn save_edit(&mut self, id: &str, body: String) -> Vec<Intent> {
-        let expected = self
-            .edit_base
-            .remove(id)
-            .or_else(|| self.model.card(id).map(IssueCard::expected));
-        self.staged_edits
-            .insert(id.to_string(), StagedEdit { body, expected });
+    /// `id` as the board read it, for the draft store.
+    fn snapshot(&self, id: &str) -> Option<Snapshot> {
+        self.input
+            .tasks()
+            .iter()
+            .find(|tf| tf.task.id == id)
+            .map(Snapshot::of)
+    }
+
+    /// The user typed: `field` of `id`'s draft is now `text`. It saves after
+    /// a pause ([`BoardState::poll_saves`]). A field edited without its
+    /// editor having had the keys (a checkbox clicked) starts the draft.
+    pub fn edit_text(&mut self, id: &str, field: Field, text: &str, now: std::time::Instant) {
+        let snap = self.snapshot(id);
+        let mut edits = issue_edit::lock(&self.edits);
+        if edits.text(id, field).is_none() {
+            if let Some(snap) = &snap {
+                edits.open(snap);
+            }
+        }
+        edits.edit(id, field, text, now);
+    }
+
+    /// One of `id`'s editors took the keys: its draft opens (or picks up
+    /// the one left unsaved), and the board's keys stay out of the way.
+    pub fn editor_focused(&mut self, id: &str) {
+        if let Some(snap) = self.snapshot(id) {
+            issue_edit::lock(&self.edits).open(&snap);
+        }
         if let Mode::Detail { id: open, .. } = &self.mode {
+            if open == id {
+                self.mode = Mode::Detail {
+                    id: id.to_string(),
+                    editing: true,
+                };
+            }
+        }
+    }
+
+    /// The keys left `id`'s editor: what's typed saves now, and the pane
+    /// has the keys again. The draft stays open while the task does.
+    pub fn editor_blurred(&mut self, id: &str) -> Vec<Intent> {
+        if let Mode::Detail { id: open, editing: true } = &self.mode {
             if open == id {
                 self.mode = Mode::Detail {
                     id: id.to_string(),
@@ -1065,19 +1586,135 @@ impl BoardState {
                 };
             }
         }
-        vec![Intent::Command(CommandKind::EditIssue { id: id.to_string() })]
+        self.flush_edit(id)
     }
 
-    /// A save from the external editor: based on what the board shows now.
+    /// The text the editor shows for `id`'s `field`, while it has a draft.
+    pub fn draft_text(&self, id: &str, field: Field) -> Option<String> {
+        issue_edit::lock(&self.edits).text(id, field).map(str::to_string)
+    }
+
+    /// Where `id`'s edits stand, for the detail's quiet feedback.
+    pub fn save_status(&self, id: &str) -> SaveStatus {
+        issue_edit::lock(&self.edits).status(id)
+    }
+
+    /// Save `id`'s draft now (Cmd+S, the editor losing focus). The editor
+    /// stays open.
+    pub fn flush_edit(&mut self, id: &str) -> Vec<Intent> {
+        let job = issue_edit::lock(&self.edits).flush(id);
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// Leave `id`'s editors (closing the task, opening another): what's
+    /// typed is saved, and a draft that can't be is kept for next time.
+    pub fn end_edit(&mut self, id: &str) -> Vec<Intent> {
+        if let Mode::Detail { id: open, editing: true } = &self.mode {
+            if open == id {
+                self.mode = Mode::Detail {
+                    id: id.to_string(),
+                    editing: false,
+                };
+            }
+        }
+        let job = issue_edit::lock(&self.edits).close(id);
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// Send a failed save of `id` again.
+    pub fn retry_save(&mut self, id: &str) -> Vec<Intent> {
+        let job = issue_edit::lock(&self.edits).retry(id);
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// Settle a conflict in `id`'s draft.
+    pub fn resolve_conflict(&mut self, id: &str, resolution: issue_edit::Resolution) {
+        let mut edits = issue_edit::lock(&self.edits);
+        if let Some(conflict) = edits.conflict(id) {
+            edits.resolve(id, conflict.field, resolution);
+        }
+    }
+
+    /// The saves due now, across the project's drafts.
+    pub fn poll_saves(&mut self, now: std::time::Instant) -> Vec<Intent> {
+        issue_edit::lock(&self.edits)
+            .poll(now)
+            .into_iter()
+            .map(Intent::Save)
+            .collect()
+    }
+
+    /// Flush every draft with unsaved work (the view is going away: a
+    /// project switch). Saves that fail keep their drafts in the project's
+    /// store, which outlives the view.
+    pub fn flush_all_edits(&mut self) -> Vec<Intent> {
+        let mut edits = issue_edit::lock(&self.edits);
+        let ids: Vec<String> = edits.unsaved().into_iter().map(|(id, _)| id).collect();
+        ids.iter().filter_map(|id| edits.flush(id)).map(Intent::Save).collect()
+    }
+
+    /// The text changes the editor must apply (a read changed the stored
+    /// text under the draft).
+    pub fn take_text_updates(&mut self) -> Vec<issue_edit::Update> {
+        issue_edit::lock(&self.edits).take_updates()
+    }
+
+    /// A save's answer, recorded off the UI thread (the store is shared), so
+    /// it lands even when the view that sent it is gone.
+    pub fn record_save(
+        edits: &SharedEdits,
+        job: &SaveJob,
+        result: Result<Option<ExpectedState>, ExecError>,
+    ) {
+        issue_edit::lock(edits).finish(job, result, std::time::Instant::now());
+    }
+
+    /// The store a save's answer goes to ([`BoardState::record_save`]).
+    pub fn edits(&self) -> SharedEdits {
+        self.edits.clone()
+    }
+
+    /// A save of `id` finished: re-read, and send what waited for it.
+    pub fn finish_save(&mut self, id: &str) -> Vec<Intent> {
+        let mut out = vec![Intent::Refresh];
+        out.extend(self.release_held(id));
+        out
+    }
+
+    /// A save from the external editor: the body as the user wrote it there,
+    /// saved at once (and shown in the in-place editor if it's open on it).
     pub fn save_external_edit(&mut self, id: &str, body: String) -> Vec<Intent> {
-        let expected = self.model.card(id).map(IssueCard::expected);
-        self.staged_edits
-            .insert(id.to_string(), StagedEdit { body, expected });
-        vec![Intent::Command(CommandKind::EditIssue { id: id.to_string() })]
+        let snap = self.snapshot(id);
+        let mut edits = issue_edit::lock(&self.edits);
+        let opened_here = !edits.has_draft(id);
+        if opened_here {
+            let Some(snap) = snap else {
+                drop(edits);
+                self.status = Some(format!("{id} is no longer on the board"));
+                return Vec::new();
+            };
+            edits.open(&snap);
+        }
+        edits.edit_from_elsewhere(id, Field::Body, &body, std::time::Instant::now());
+        let job = if opened_here { edits.close(id) } else { edits.flush(id) };
+        job.map(Intent::Save).into_iter().collect()
+    }
+
+    /// The mutations held for `id`'s lane, once it is free.
+    fn release_held(&mut self, id: &str) -> Vec<Intent> {
+        if issue_edit::lock(&self.edits).busy(id) {
+            return Vec::new();
+        }
+        self.held
+            .remove(id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Intent::Command)
+            .collect()
     }
 
     pub fn submit_add(&mut self, title: &str) -> Vec<Intent> {
-        self.mode = Mode::Board;
+        self.mode = self.rest();
         let title = title.trim();
         if title.is_empty() {
             return Vec::new();
@@ -1103,10 +1740,12 @@ impl BoardState {
 
     /// Turn an issue command into a job to send, capturing the state the user
     /// is looking at and marking the card pending. One mutation per issue at a
-    /// time: a second one while the first is in flight is refused here.
+    /// time: a second one while the first is in flight is refused here. One
+    /// asked for while the issue's draft is saving, or has typing not yet
+    /// saved (which is sent first), is held and comes back as an
+    /// [`Intent::Command`] once the save lands.
     ///
-    /// An `EditIssue` with no staged body (e.g. from the palette) opens the
-    /// in-place editor instead.
+    /// `EditIssue` (the palette's, `e`) opens the in-place editor.
     pub fn begin_mutation(&mut self, kind: &CommandKind) -> Result<MutationJob, Vec<Intent>> {
         let (id, label, to_status, to_slot) = match kind {
             CommandKind::MoveIssue { id, to_status } => {
@@ -1127,14 +1766,12 @@ impl BoardState {
             CommandKind::AssignIssue { id, workspace } => {
                 (id.clone(), format!("Assigning to @{workspace}…"), None, None)
             }
-            CommandKind::EditIssue { id } => {
-                if !self.staged_edits.contains_key(id) {
-                    return Err(self.begin_edit(id));
-                }
-                (id.clone(), "Saving…".to_string(), None, None)
-            }
+            CommandKind::EditIssue { id } => return Err(self.begin_edit(id)),
             CommandKind::PrioritizeIssue { id, position } => {
                 (id.clone(), "Reordering…".to_string(), None, Some(*position))
+            }
+            CommandKind::SetIssueWorkflow { id, workflow } => {
+                (id.clone(), format!("Moving to the {workflow} workflow…"), None, None)
             }
             CommandKind::AddIssue { title } => {
                 if self.pending.contains_key(ADD_KEY) {
@@ -1156,6 +1793,7 @@ impl BoardState {
                         landed: None,
                         to_status: None,
                         to_slot: None,
+                        to_workflow: None,
                         renumbers: Vec::new(),
                         acked: false,
                         prev: None,
@@ -1166,7 +1804,6 @@ impl BoardState {
                     id: ADD_KEY.to_string(),
                     kind: kind.clone(),
                     expected: None,
-                    body: None,
                 });
             }
             _ => return Err(Vec::new()),
@@ -1181,15 +1818,24 @@ impl BoardState {
             self.status = Some(format!("{id}: a change is already in progress"));
             return Err(Vec::new());
         }
-        let staged = match kind {
-            CommandKind::EditIssue { .. } => self.staged_edits.remove(&id),
-            _ => None,
+        // The draft's lane: typing not yet saved goes first, and a save
+        // that's out finishes first; this change waits its turn.
+        let (flushed, busy) = {
+            let mut edits = issue_edit::lock(&self.edits);
+            let flushed = edits.flush(&id);
+            let busy = edits.busy(&id);
+            (flushed, busy)
         };
-        let seen = match &staged {
-            Some(s) => s.expected.clone(),
-            None => self.model.card(&id).map(IssueCard::expected),
-        };
-        let expected = seen.map(|seen| self.own_expected(&id, seen));
+        if busy {
+            self.held.entry(id.clone()).or_default().push(kind.clone());
+            self.status = Some(format!("{id}: waiting for the save in progress"));
+            return Err(flushed.map(Intent::Save).into_iter().collect());
+        }
+        let seen = self.model.card(&id).map(IssueCard::expected);
+        let expected = seen.map(|seen| {
+            let own = self.own_expected(&id, seen);
+            issue_edit::lock(&self.edits).expected(&id, own)
+        });
         let Some(sent_from) = expected.clone() else {
             self.status = Some(format!("{id} is no longer on the board"));
             return Err(vec![Intent::Refresh]);
@@ -1211,7 +1857,12 @@ impl BoardState {
         // A follow-up on this client's own landed change: until the reads
         // catch up, the card still shows where that change put it, its
         // columns still wait, and a failure puts it back.
+        let to_workflow = match kind {
+            CommandKind::SetIssueWorkflow { workflow, .. } => Some(workflow.clone()),
+            _ => None,
+        };
         let prev = self.pending.remove(&id).map(Box::new);
+        let to_workflow = to_workflow.or_else(|| prev.as_ref().and_then(|p| p.to_workflow.clone()));
         let (read_from, to_status, to_slot) = match &prev {
             Some(p) => {
                 for column in &p.renumbers {
@@ -1225,6 +1876,9 @@ impl BoardState {
             None => (sent_from.clone(), to_status, to_slot),
         };
         self.notices.remove(&id);
+        if let Some(ticket) = issue_edit::lock(&self.edits).begin_write(&id, &sent_from) {
+            self.tickets.insert(id.clone(), ticket);
+        }
         self.pending.insert(
             id.clone(),
             Pending {
@@ -1234,6 +1888,7 @@ impl BoardState {
                 landed: None,
                 to_status,
                 to_slot,
+                to_workflow,
                 renumbers,
                 acked: false,
                 prev,
@@ -1244,7 +1899,6 @@ impl BoardState {
             id,
             kind: kind.clone(),
             expected,
-            body: staged.map(|s| s.body),
         })
     }
 
@@ -1260,6 +1914,11 @@ impl BoardState {
         id: &str,
         result: Result<Option<ExpectedState>, ExecError>,
     ) -> Vec<Intent> {
+        if let Some(ticket) = self.tickets.remove(id) {
+            let landed = result.as_ref().ok().cloned().flatten();
+            issue_edit::lock(&self.edits).end_write(&ticket, landed);
+        }
+        let released = self.release_held(id);
         match result {
             Ok(landed) => {
                 if let Some(p) = self.pending.get_mut(id) {
@@ -1299,7 +1958,9 @@ impl BoardState {
                 self.rebuild();
             }
         }
-        vec![Intent::Refresh]
+        let mut out = vec![Intent::Refresh];
+        out.extend(released);
+        out
     }
 
     /// The state a mutation of `id` should expect, given the state the user
@@ -1564,8 +2225,14 @@ pub(crate) mod tests {
         km
     }
 
+    /// A board with its own draft store (the process's is shared across
+    /// tests running at once).
+    fn fresh_board() -> BoardState {
+        BoardState::with_edits("demo", default_keymaps(), Default::default())
+    }
+
     fn board(tasks: Vec<IssueFile>) -> BoardState {
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(read(tasks));
         b.apply_closed(None);
         b
@@ -1651,7 +2318,7 @@ pub(crate) mod tests {
     #[test]
     fn a_github_board_searches_github_and_load_more_pages_the_results() {
         use shelbi_app::board_search::DEBOUNCE;
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         let mut r = read(vec![issue("A", "todo"), issue("B", "todo")]);
         r.project.as_mut().unwrap().remote_search = true;
         b.apply_open(r);
@@ -1724,7 +2391,7 @@ pub(crate) mod tests {
         if let Some(p) = r.project.as_mut() {
             p.ownership = shelbi_state::OwnershipGate::RequireAssignee("octocat".into());
         }
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(r);
         b.apply_closed(None);
 
@@ -1809,6 +2476,76 @@ pub(crate) mod tests {
         assert!(b.status.as_deref().unwrap().contains("no column to the right"));
         press(&mut b, "esc");
         assert_eq!(b.mode, Mode::Board);
+    }
+
+    #[test]
+    fn the_pane_stays_up_under_the_boards_menus_and_pickers() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        b.open_detail("A");
+        // The assign picker over it closes back to it, picked or not.
+        press(&mut b, "a");
+        assert!(matches!(b.mode, Mode::AssignPicker { .. }));
+        assert_eq!(b.detail_id(), Some("A"), "the pane is still up under the picker");
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        press(&mut b, "a");
+        let out = press(&mut b, "enter");
+        assert!(matches!(out.as_slice(), [Intent::Command(CommandKind::AssignIssue { .. })]));
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "assigning keeps the pane");
+        // A filter menu too.
+        b.open_workflow_dropdown();
+        assert_eq!(b.detail_id(), Some("A"));
+        b.close_overlay();
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "the menu goes first");
+        b.close_overlay();
+        assert_eq!((b.mode.clone(), b.detail_id()), (Mode::Board, None), "then the pane");
+        // Opening another card while one is up switches the one pane.
+        b.open_detail("A");
+        b.open_detail("B");
+        assert_eq!(b.detail_id(), Some("B"));
+        press(&mut b, "esc");
+        assert_eq!((b.mode.clone(), b.detail_id()), (Mode::Board, None));
+    }
+
+    #[test]
+    fn more_lists_what_the_task_allows_and_runs_it_on_the_pane() {
+        let mut assigned = issue("A", "todo");
+        assigned.task.assigned_to = Some("alpha".into());
+        let mut b = board(vec![assigned, issue("B", "todo")]);
+        assert!(b.pane_actions().is_empty(), "no pane, no menu");
+        b.toggle_pane_menu();
+        assert_eq!(b.mode, Mode::Board, "More needs a pane");
+
+        b.open_detail("B");
+        use PaneAction::*;
+        assert_eq!(
+            b.pane_actions(),
+            vec![MoveLeft, MoveRight, Start, Assign, EditDescription, OpenInEditor],
+            "no workspace to open while unassigned"
+        );
+        b.open_detail("A");
+        assert_eq!(b.pane_actions().last(), Some(&OpenWorkspace));
+
+        b.toggle_pane_menu();
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: 0 });
+        press(&mut b, "k");
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: 6 }, "up wraps to the last row");
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "Esc closes the menu, not the pane");
+
+        b.toggle_pane_menu();
+        press(&mut b, "j");
+        press(&mut b, "j");
+        assert_eq!(press(&mut b, "enter"), vec![Intent::Command(CommandKind::StartIssue { id: "A".into() })]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        b.toggle_pane_menu();
+        b.toggle_pane_menu();
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "its button closes it again");
+
+        // Edit description opens the in-place editor on the pane's task.
+        b.toggle_pane_menu();
+        assert_eq!(b.choose_pane_action(4), vec![Intent::BeginEdit("A".into())]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: true });
     }
 
     #[test]
@@ -2038,44 +2775,179 @@ pub(crate) mod tests {
         assert_eq!(job.expected, Some(at("review", 7)));
         b.finish_mutation("A", Ok(Some(at("in-progress", 8))));
 
-        // An edit staged against the state from before the other client's
-        // change isn't taken for this client's own: it goes as the editor saw
-        // it, and the daemon refuses it.
-        b.save_edit("A", "new body".into());
-        let job = b
-            .begin_mutation(&CommandKind::EditIssue { id: "A".into() })
-            .unwrap();
-        assert_eq!(job.expected, Some(at("todo", 0)));
+        // The editor opened before the other client's change, but its draft
+        // follows the reads (and is guarded by the text it replaces), so its
+        // save is based on that change plus the start this client landed.
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "new body", t0);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.expected, Some(at("in-progress", 8)));
+        assert_eq!(save.expect_body.as_deref(), Some("Body of A"));
+    }
+
+    /// The saves due a second after `t0`, past the typing pause.
+    fn saves_after_pause(b: &mut BoardState, t0: std::time::Instant) -> Vec<SaveJob> {
+        b.poll_saves(t0 + std::time::Duration::from_secs(1))
+            .into_iter()
+            .map(|i| match i {
+                Intent::Save(job) => job,
+                other => panic!("not a save: {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
-    fn edits_stage_the_body_against_the_state_the_editor_opened_on() {
+    fn editing_saves_on_its_own_and_never_leaves_the_editor() {
         let mut b = board(vec![issue("A", "todo")]);
         b.select(1, 0);
         assert_eq!(press(&mut b, "e"), vec![Intent::BeginEdit("A".into())]);
-        assert_eq!(
-            b.mode,
-            Mode::Detail {
-                id: "A".into(),
-                editing: true
-            }
-        );
+        let editing = Mode::Detail { id: "A".into(), editing: true };
+        assert_eq!(b.mode, editing);
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("Body of A"));
         // While editing, plain keys belong to the editor.
         assert!(b.handle_key(key("j")).is_none());
-        let out = b.save_edit("A", "new body".into());
-        assert_eq!(out, vec![Intent::Command(CommandKind::EditIssue { id: "A".into() })]);
-        let job = b.begin_mutation(&CommandKind::EditIssue { id: "A".into() }).unwrap();
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "new body", t0);
+        assert_eq!(b.save_status("A"), SaveStatus::Unsaved);
+        let job = saves_after_pause(&mut b, t0).pop().expect("saved after the pause");
         assert_eq!(job.body.as_deref(), Some("new body"));
-        assert_eq!(job.expected.unwrap().status, "todo");
-        // An EditIssue with nothing staged (from the palette) opens the editor.
-        b.finish_mutation("A", Ok(None));
-        let mut later = issue("A", "todo");
-        later.task.updated_at += chrono::Duration::seconds(1);
-        b.apply_open(read(vec![later]));
+        assert_eq!(job.expect_body.as_deref(), Some("Body of A"));
+        assert_eq!(job.expected.clone().unwrap(), at("todo", 0));
+        assert_eq!(b.mode, editing, "a save doesn't leave the editor");
+        BoardState::record_save(&b.edits(), &job, Ok(Some(at("todo", 3))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh]);
+        assert_eq!(b.save_status("A"), SaveStatus::Saved);
+        // Cmd+S with nothing new sends nothing and stays.
+        assert!(b.flush_edit("A").is_empty());
+        assert_eq!(b.mode, editing);
+        // Escape closes the editor, saving (not reverting) what's typed.
+        b.edit_text("A", Field::Body, "newer body", t0);
+        let out = b.handle_key(key("esc")).unwrap();
+        assert!(matches!(&out[..], [Intent::Save(job)] if job.body.as_deref() == Some("newer body")));
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        // The palette's Edit opens the editor.
         assert_eq!(
             b.begin_mutation(&CommandKind::EditIssue { id: "A".into() }),
             Err(vec![Intent::BeginEdit("A".into())])
         );
+    }
+
+    #[test]
+    fn a_move_asked_for_while_a_save_is_out_waits_and_expects_where_it_landed() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "mine", t0);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        assert_eq!(b.begin_mutation(&mv), Err(Vec::new()), "held, not refused");
+        assert_eq!(b.status.as_deref(), Some("A: waiting for the save in progress"));
+        assert!(b.pending("A").is_none());
+        BoardState::record_save(&b.edits(), &save, Ok(Some(at("todo", 5))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh, Intent::Command(mv.clone())]);
+        // The read still shows rev 0: the move expects the save's revision.
+        let job = b.begin_mutation(&mv).unwrap();
+        assert_eq!(job.expected, Some(at("todo", 5)));
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_move_with_typing_not_yet_saved_sends_the_typing_first() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        b.edit_text("A", Field::Body, "mine", std::time::Instant::now());
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        let out = b.begin_mutation(&mv).unwrap_err();
+        let [Intent::Save(save)] = &out[..] else {
+            panic!("the typing is saved first: {out:?}");
+        };
+        assert_eq!(save.body.as_deref(), Some("mine"));
+        BoardState::record_save(&b.edits(), save, Ok(Some(at("todo", 2))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh, Intent::Command(mv)]);
+    }
+
+    #[test]
+    fn a_save_after_a_move_expects_the_moves_landed_state_and_keeps_the_draft() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        b.begin_mutation(&mv).unwrap();
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "typed during the move", t0);
+        assert!(saves_after_pause(&mut b, t0).is_empty(), "the save waits for the move");
+        assert_eq!(b.finish_mutation("A", Ok(Some(at("review", 4)))), vec![Intent::Refresh]);
+        // The board's read lags: it still has the card in todo at rev 0.
+        b.apply_open(read(vec![issue("A", "todo")]));
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.expected, Some(at("review", 4)));
+        assert_eq!(save.body.as_deref(), Some("typed during the move"));
+    }
+
+    #[test]
+    fn an_agents_change_elsewhere_merges_into_the_open_draft() {
+        let mut a = issue("A", "todo");
+        a.body = "Body of A\n\nmore\n".into();
+        let mut b = board(vec![a]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "Body of A, edited\n\nmore\n", t0);
+        let mut theirs = issue_at("A", "todo", 9);
+        theirs.body = "Body of A\n\nmore\n\n## Agent notes\nfound it\n".into();
+        b.apply_open(read(vec![theirs.clone()]));
+        let merged = "Body of A, edited\n\nmore\n\n## Agent notes\nfound it\n";
+        let updates = b.take_text_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, merged);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.expected, Some(at("todo", 9)));
+        assert_eq!(save.body.as_deref(), Some(merged));
+        assert_eq!(save.expect_body.as_deref(), Some(theirs.body.as_str()));
+        // The same line changed elsewhere too: both kept, nothing saved.
+        BoardState::record_save(&b.edits(), &save, Ok(Some(at("todo", 10))));
+        b.edit_text("A", Field::Body, "Mine\n\nmore\n\n## Agent notes\nfound it\n", t0);
+        let mut again = issue_at("A", "todo", 11);
+        again.body = "Theirs\n\nmore\n\n## Agent notes\nfound it\n".into();
+        b.apply_open(read(vec![again]));
+        assert_eq!(b.save_status("A"), SaveStatus::Conflict(Field::Body));
+        assert!(saves_after_pause(&mut b, t0).is_empty());
+        b.resolve_conflict("A", issue_edit::Resolution::KeepMine);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        assert_eq!(save.body.as_deref(), Some("Mine\n\nmore\n\n## Agent notes\nfound it\n"));
+    }
+
+
+    #[test]
+    fn an_external_editor_save_goes_through_the_draft_store() {
+        let mut b = board(vec![issue("A", "todo")]);
+        let out = b.save_external_edit("A", "from vim".into());
+        let [Intent::Save(job)] = &out[..] else {
+            panic!("saved at once: {out:?}");
+        };
+        assert_eq!(job.body.as_deref(), Some("from vim"));
+        BoardState::record_save(&b.edits(), job, Ok(Some(at("todo", 1))));
+        assert_eq!(b.draft_text("A", Field::Body), None, "nothing kept once it's stored");
+        // With the in-place editor open, it shows the new text.
+        b.begin_edit("A");
+        b.save_external_edit("A", "from vim again".into());
+        assert_eq!(b.take_text_updates().pop().unwrap().text, "from vim again");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_draft_past_closing_the_editor() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        b.edit_text("A", Field::Body, "precious", std::time::Instant::now());
+        let out = b.end_edit("A");
+        let [Intent::Save(job)] = &out[..] else {
+            panic!("closing flushes: {out:?}");
+        };
+        BoardState::record_save(&b.edits(), job, Err(ExecError::Backend("offline".into())));
+        b.close_overlay();
+        assert_eq!(b.save_status("A"), SaveStatus::Failed("offline".into()));
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("precious"));
+        b.begin_edit("A");
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("precious"));
+        assert!(matches!(&b.retry_save("A")[..], [Intent::Save(_)]));
     }
 
     #[test]
@@ -2102,18 +2974,9 @@ pub(crate) mod tests {
     #[test]
     fn jobs_become_the_registrys_daemon_mutations() {
         let mut b = board(vec![issue("A", "todo")]);
-        b.save_edit("A", "edited".into());
-        let job = b.begin_mutation(&CommandKind::EditIssue { id: "A".into() }).unwrap();
-        assert_eq!(
-            job.mutation("demo"),
-            Some(Mutation::EditIssue {
-                project: "demo".into(),
-                id: "A".into(),
-                title: None,
-                body: Some("edited".into()),
-            })
-        );
+        b.begin_mutation(&CommandKind::StartIssue { id: "A".into() }).unwrap();
         b.finish_mutation("A", Err(ExecError::Backend("boom".into())));
+        assert_eq!(b.notice("A"), Some("boom"));
         let job = b
             .begin_mutation(&CommandKind::MoveIssue {
                 id: "A".into(),
@@ -2133,14 +2996,13 @@ pub(crate) mod tests {
             id: "x".into(),
             kind: CommandKind::ToggleZen,
             expected: None,
-            body: None,
         };
         assert_eq!(not_issue.mutation("demo"), None);
     }
 
     #[test]
     fn the_done_column_fills_after_the_open_board() {
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(read(vec![issue("A", "todo")]));
         assert!(b.model().done_loading);
         assert_eq!(b.model().columns[1].cards.len(), 1);
@@ -2164,7 +3026,7 @@ pub(crate) mod tests {
     }
 
     fn shipped_board(tasks: Vec<IssueFile>) -> BoardState {
-        let mut b = BoardState::new("demo", default_keymaps());
+        let mut b = fresh_board();
         b.apply_open(shipped_read(tasks));
         b.apply_closed(None);
         b
@@ -2410,5 +3272,193 @@ pub(crate) mod tests {
         .unwrap();
         assert!(!b.model().columns[review].collapsed);
         assert!(b.model().columns[col_of(&b, "todo")].collapsed);
+    }
+
+    // ---- the pane's properties (dt-task-inline-properties) ----------------
+
+    /// The shipped workflow plus a `subtask` one with no Review or Backlog.
+    fn two_workflow_board(tasks: Vec<IssueFile>) -> BoardState {
+        let mut subtask = shelbi_core::default_workflow();
+        subtask.name = "subtask".into();
+        subtask.statuses.retain(|s| s.id != "review" && s.id != "backlog");
+        let mut r = read(tasks);
+        r.workflows = Ok(vec![shelbi_core::default_workflow(), subtask]);
+        let mut b = fresh_board();
+        b.apply_open(r);
+        b.apply_closed(None);
+        b
+    }
+
+    fn picker(b: &BoardState) -> Option<(Property, usize)> {
+        match b.mode {
+            Mode::PropertyPicker { property, cursor } => Some((property, cursor)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_status_click_opens_its_picker_on_the_current_status_and_moves_through_the_registry() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.toggle_property(Property::Status);
+        assert_eq!(b.mode, Mode::Board, "no pane, no picker");
+        b.open_detail("A");
+        b.toggle_property(Property::Status);
+        let rows = b.property_rows(Property::Status);
+        let todo = rows.iter().position(PropertyRow::current).unwrap();
+        assert_eq!(picker(&b), Some((Property::Status, todo)), "opens on the issue's status");
+        press(&mut b, "j");
+        let (_, cursor) = picker(&b).unwrap();
+        let PropertyRow::Status(next) = &rows[cursor] else { panic!() };
+        assert_eq!(
+            press(&mut b, "enter"),
+            vec![Intent::Command(CommandKind::MoveIssue { id: "A".into(), to_status: next.status_id.clone() })]
+        );
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "back on the pane");
+        // Its value's click closes it again; Esc closes it, not the pane.
+        b.toggle_property(Property::Status);
+        b.toggle_property(Property::Status);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        b.toggle_property(Property::Status);
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        assert_eq!(b.detail_id(), Some("A"));
+        // The current status changes nothing.
+        b.toggle_property(Property::Status);
+        assert!(press(&mut b, "enter").is_empty());
+    }
+
+    #[test]
+    fn the_keyboard_skips_statuses_the_workflow_refuses() {
+        let mut t = issue("A", "todo");
+        t.task.workflow = Some("gone".into());
+        let mut b = board(vec![t]);
+        b.open_detail("A");
+        b.toggle_property(Property::Status);
+        let (_, at) = picker(&b).unwrap();
+        // Every other status is refused (its workflow isn't loaded): the
+        // cursor stays, and Enter on a refused row can't be reached.
+        press(&mut b, "j");
+        press(&mut b, "k");
+        assert_eq!(picker(&b), Some((Property::Status, at)));
+        assert_eq!(at, 1, "Todo, after Backlog");
+        assert!(b.choose_property(Property::Status, 0).is_empty());
+        assert!(b.notice("A").unwrap().contains("isn't loaded"), "a refused choice says why on the task");
+    }
+
+    #[test]
+    fn tab_walks_the_properties_and_enter_opens_the_one_it_is_on() {
+        let mut b = board(vec![issue("A", "todo")]);
+        b.open_detail("A");
+        assert_eq!(b.pane_focus(), None);
+        press(&mut b, "tab");
+        assert_eq!(b.pane_focus(), Some(Property::Status));
+        press(&mut b, "tab");
+        assert_eq!(b.pane_focus(), Some(Property::Workflow));
+        press(&mut b, "shift-tab");
+        press(&mut b, "shift-tab");
+        assert_eq!(b.pane_focus(), None, "off the properties");
+        press(&mut b, "shift-tab");
+        assert_eq!(b.pane_focus(), Some(Property::Priority), "and round from the end");
+        press(&mut b, "enter");
+        assert_eq!(picker(&b).map(|p| p.0), Some(Property::Priority));
+        press(&mut b, "esc");
+        assert_eq!(b.pane_focus(), Some(Property::Priority), "the keys come back to the value");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        // Another task, or closing, starts the keyboard over.
+        b.open_detail("A");
+        assert_eq!(b.pane_focus(), Some(Property::Priority));
+        b.close_pane();
+        assert_eq!(b.pane_focus(), None);
+    }
+
+    #[test]
+    fn priority_is_the_place_in_queue_and_reorders_at_its_slot() {
+        let mut b = board(vec![prio("A", "todo", 0), prio("B", "todo", 1), prio("C", "todo", 2), prio("D", "done", 0)]);
+        b.open_detail("C");
+        let shown = b.pane_properties("C").unwrap();
+        assert_eq!(shown.queue, Some(QueuePosition { position: 3, len: 3 }));
+        b.toggle_property(Property::Priority);
+        assert_eq!(picker(&b), Some((Property::Priority, 2)));
+        press(&mut b, "home");
+        let out = press(&mut b, "enter");
+        let kind = CommandKind::PrioritizeIssue { id: "C".into(), position: 0 };
+        assert_eq!(out, vec![Intent::Command(kind.clone())], "place 1 is slot 0");
+        b.begin_mutation(&kind).unwrap();
+        // Shown at once where it is headed, while it settles.
+        let shown = b.pane_properties("C").unwrap();
+        assert_eq!(shown.queue, Some(QueuePosition { position: 1, len: 3 }));
+        assert_eq!(shown.pending, Some(Property::Priority));
+        assert_eq!(ids_in(&b, "todo"), ["C", "A", "B"], "and on the board");
+        // A done task has no queue to reorder.
+        b.open_detail("D");
+        assert_eq!(b.pane_properties("D").unwrap().queue, None);
+        assert!(b.property_refusal(Property::Priority).is_some());
+        b.toggle_property(Property::Priority);
+        assert_eq!(picker(&b), None);
+    }
+
+    #[test]
+    fn a_workflow_change_is_the_validated_edit_and_shows_at_once() {
+        let mut b = two_workflow_board(vec![issue("A", "todo"), issue("R", "review")]);
+        b.open_detail("A");
+        b.toggle_property(Property::Workflow);
+        let rows = b.property_rows(Property::Workflow);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0], PropertyRow::Workflow(c) if c.default && c.current));
+        let out = b.choose_property(Property::Workflow, 1);
+        let kind = CommandKind::SetIssueWorkflow { id: "A".into(), workflow: "subtask".into() };
+        assert_eq!(out, vec![Intent::Command(kind.clone())]);
+        let job = b.begin_mutation(&kind).unwrap();
+        assert!(matches!(
+            job.mutation("demo"),
+            Some(Mutation::EditIssue { workflow: Some(w), title: None, body: None, .. }) if w == "subtask"
+        ));
+        assert_eq!(job.expected.as_ref().map(|e| e.status.as_str()), Some("todo"));
+        let shown = b.pane_properties("A").unwrap();
+        assert_eq!((shown.workflow_name.as_str(), shown.pending), ("subtask", Some(Property::Workflow)));
+        assert_eq!(b.model().card("A").unwrap().workflow_name, "subtask", "the card's badge too");
+        // A second change while that one is unanswered is held off.
+        assert!(b.property_refusal(Property::Status).is_some());
+        // A refusal puts it back, with the daemon's reason on the task.
+        b.finish_mutation("A", Err(ExecError::Backend("workflow `subtask` does not exist".into())));
+        assert_eq!(b.pane_properties("A").unwrap().workflow_name, "default");
+        assert!(b.notice("A").unwrap().contains("does not exist"));
+
+        // An issue in Review can't take a workflow without Review.
+        b.open_detail("R");
+        let rows = b.property_rows(Property::Workflow);
+        assert!(rows[1].refusal().unwrap().contains("no Review status"));
+        b.toggle_property(Property::Workflow);
+        press(&mut b, "j");
+        assert_eq!(picker(&b), Some((Property::Workflow, 0)), "the keyboard skips it");
+        assert!(b.choose_property(Property::Workflow, 1).is_empty());
+        assert!(b.notice("R").unwrap().contains("no Review status"));
+    }
+
+    #[test]
+    fn a_property_change_while_the_body_saves_waits_and_keeps_the_draft() {
+        let mut b = two_workflow_board(vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "mine", t0);
+        let save = saves_after_pause(&mut b, t0).pop().unwrap();
+        let kind = CommandKind::SetIssueWorkflow { id: "A".into(), workflow: "subtask".into() };
+        assert_eq!(b.begin_mutation(&kind), Err(Vec::new()), "held, not refused");
+        BoardState::record_save(&b.edits(), &save, Ok(Some(at("todo", 5))));
+        assert_eq!(b.finish_save("A"), vec![Intent::Refresh, Intent::Command(kind.clone())]);
+        let job = b.begin_mutation(&kind).unwrap();
+        assert_eq!(job.expected, Some(at("todo", 5)), "sent against the save's revision");
+        assert_eq!(b.draft_text("A", Field::Body).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn more_copies_the_branch_when_there_is_one() {
+        let mut t = issue("A", "in-progress");
+        t.task.branch = Some("jlong/a".into());
+        let mut b = board(vec![t]);
+        b.open_detail("A");
+        let actions = b.pane_actions();
+        let ix = actions.iter().position(|a| *a == PaneAction::CopyBranch).unwrap();
+        assert_eq!(b.choose_pane_action(ix), vec![Intent::Copy("jlong/a".into())]);
     }
 }

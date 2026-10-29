@@ -351,6 +351,10 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::OpenAcknowledgements => Placement::Help,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
+        // Shelbi ▸ Connect to Remote Session…, under Settings… (Figma's
+        // application menu).
+        CommandKind::ConnectRemote => Placement::App,
+        CommandKind::ShowLaunchScreen => Placement::File,
         CommandKind::NewWindow => Placement::File,
         CommandKind::OpenEditor { .. } => Placement::File,
         CommandKind::Detach => Placement::App,
@@ -362,7 +366,8 @@ pub fn place(kind: &CommandKind) -> Placement {
         | CommandKind::AssignIssue { .. }
         | CommandKind::EditIssue { .. }
         | CommandKind::AddIssue { .. }
-        | CommandKind::PrioritizeIssue { .. } => Placement::Board,
+        | CommandKind::PrioritizeIssue { .. }
+        | CommandKind::SetIssueWorkflow { .. } => Placement::Board,
         CommandKind::OpenIssue { .. } | CommandKind::OpenChangelogEntry { .. } => Placement::Search,
     }
 }
@@ -421,6 +426,8 @@ fn app_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSp
             // The registry's Settings, with ⌘, (bound to the window's
             // OpenSettings for good; here it labels the item).
             slot("action:settings", "Settings…", fixed_shortcut(AppCommand::Settings)),
+            // Under Settings… (Figma's application menu, 2544:10362).
+            slot("action:connect-remote", "Connect to Remote Session…", None),
             MenuEntry::Separator,
             MenuEntry::Services,
             MenuEntry::Separator,
@@ -473,6 +480,9 @@ fn file_menu<'a, I: Iterator<Item = &'a Command>>(
         title: "File".into(),
         items: vec![
             slot("action:new-window", "New Window", new_window),
+            // The launch window: the projects here and the recent remote
+            // sessions.
+            slot("action:launch-screen", "Show Launch Screen", None),
             MenuEntry::Separator,
             slot("action:add-project", "Add Project…", None),
             slot("action:switch-project", "Switch Project…", None),
@@ -767,6 +777,9 @@ mod tests {
             }],
             other_clients_attached: true,
             multi_window: true,
+            // The desktop has the launch screen and the Connect dialog.
+            launch_screen: true,
+            remote_connect: true,
         }
     }
 
@@ -846,6 +859,7 @@ mod tests {
                 "About Shelbi",
                 "-",
                 "Settings…",
+                "Connect to Remote Session…",
                 "-",
                 "Services ▸",
                 "-",
@@ -920,8 +934,8 @@ mod tests {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
         let file = tree.menu("File").unwrap();
         assert_eq!(
-            titles(&file.items)[..4],
-            ["New Window", "-", "Add Project…", "Switch Project…"]
+            titles(&file.items)[..5],
+            ["New Window", "Show Launch Screen", "-", "Add Project…", "Switch Project…"]
         );
         let item = find(&tree, "New Window");
         assert!(item.enabled);

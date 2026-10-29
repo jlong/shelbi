@@ -55,6 +55,10 @@ pub trait CommandHost {
     fn open_acknowledgements(&mut self);
     /// Open the add-project form.
     fn open_add_project(&mut self);
+    /// Open the Connect to Remote Session dialog.
+    fn connect_remote(&mut self);
+    /// Show the launch screen.
+    fn show_launch_screen(&mut self);
     /// Open a review task: a queued one asks which slot to load it onto.
     fn load_review(&mut self, task_id: &str);
     /// Approve (accept and merge) a review task.
@@ -109,6 +113,10 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
             }
         }
         CommandKind::AddProject => host.open_add_project(),
+        // Shelbi ▸ Connect to Remote Session… and the launch screen
+        // (`CommandModel::remote_connect` / `launch_screen`).
+        CommandKind::ConnectRemote => host.connect_remote(),
+        CommandKind::ShowLaunchScreen => host.show_launch_screen(),
         // File ▸ New Window (⌘⇧N): another window, on this project, that
         // switches on its own.
         CommandKind::NewWindow => host.new_window(),
@@ -130,7 +138,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::MoveIssue { .. }
         | CommandKind::StartIssue { .. }
         | CommandKind::AssignIssue { .. }
-        | CommandKind::PrioritizeIssue { .. } => host.issue_command(kind),
+        | CommandKind::PrioritizeIssue { .. }
+        // The task pane's Workflow property (dt-task-inline-properties).
+        | CommandKind::SetIssueWorkflow { .. } => host.issue_command(kind),
         // Approve has no confirmation, in either client.
         CommandKind::ApproveReview { id } => host.approve_review(id),
         // The palette's reject carries no reason: ask for one first.
@@ -170,6 +180,11 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::Detach => false,
         // Another window on a project already open.
         CommandKind::NewWindow => false,
+        // A dialog whose searches and connection go over SSH, not to this
+        // daemon.
+        CommandKind::ConnectRemote => false,
+        // Only lists the projects and the recent remote sessions.
+        CommandKind::ShowLaunchScreen => false,
         // May launch the workspace's agent.
         CommandKind::FocusWorkspace { .. } => true,
         CommandKind::LoadReview { .. } => true,
@@ -188,6 +203,7 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::EditIssue { .. } => true,
         CommandKind::AddIssue { .. } => true,
         CommandKind::PrioritizeIssue { .. } => true,
+        CommandKind::SetIssueWorkflow { .. } => true,
     }
 }
 
@@ -280,6 +296,12 @@ mod tests {
         fn open_add_project(&mut self) {
             self.0.push("add-project".into());
         }
+        fn connect_remote(&mut self) {
+            self.0.push("connect-remote".into());
+        }
+        fn show_launch_screen(&mut self) {
+            self.0.push("launch-screen".into());
+        }
         fn load_review(&mut self, task_id: &str) {
             self.0.push(format!("load-review:{task_id}"));
         }
@@ -348,6 +370,8 @@ mod tests {
             ),
             (CommandKind::SwitchProject { project: s("web") }, "switch:web"),
             (CommandKind::AddProject, "add-project"),
+            (CommandKind::ConnectRemote, "connect-remote"),
+            (CommandKind::ShowLaunchScreen, "launch-screen"),
             (CommandKind::NewWindow, "new-window"),
             (CommandKind::Detach, "detach"),
             (CommandKind::DetachOtherClients, "detach-others"),
@@ -424,6 +448,13 @@ mod tests {
                 },
                 "issue:prioritize:t1",
             ),
+            (
+                CommandKind::SetIssueWorkflow {
+                    id: s("t1"),
+                    workflow: s("subtask"),
+                },
+                "issue:workflow:t1",
+            ),
         ]
     }
 
@@ -447,6 +478,8 @@ mod tests {
                 "send-feedback",
                 "about",
                 "acknowledgements",
+                "connect-remote",
+                "launch-screen",
                 "new-window",
                 "detach",
                 "editor:edit:project",
@@ -481,6 +514,7 @@ mod tests {
                 | CommandKind::EditIssue { .. }
                 | CommandKind::AddIssue { .. }
                 | CommandKind::PrioritizeIssue { .. }
+                | CommandKind::SetIssueWorkflow { .. }
         )
     }
 

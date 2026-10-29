@@ -53,6 +53,12 @@ pub enum Effect {
     /// Begin the add-project flow (the host collects the form, then calls
     /// [`Mutation::AddProject`]).
     AddProject,
+    /// Open the Connect to Remote Session dialog (a client-local dialog;
+    /// its searches and connection go through
+    /// [`crate::launch::RemoteConnector`]).
+    ConnectRemote,
+    /// Show the launch screen (a client-local view; nothing stops).
+    ShowLaunchScreen,
     /// Open another window on `project` (a multi-window client only; the
     /// registry never offers it to the TUI).
     NewWindow { project: String },
@@ -128,12 +134,20 @@ pub enum Mutation {
         id: String,
         reason: String,
     },
-    /// Edit an issue's fields (title/body/priority/etc.).
+    /// Edit an issue's fields (title/body/workflow). A `None` field is left
+    /// as it is.
     EditIssue {
         project: String,
         id: String,
         title: Option<String>,
         body: Option<String>,
+        /// Move the issue to another workflow (the daemon validates it).
+        workflow: Option<String>,
+        /// The title / body this edit replaces: the daemon refuses the edit
+        /// as changed elsewhere if the stored one differs, so an editor's
+        /// save never overwrites a change it hasn't seen (`issue_edit`).
+        expect_title: Option<String>,
+        expect_body: Option<String>,
     },
     /// Add a new issue.
     AddIssue {

@@ -955,7 +955,7 @@ fn a_view_without_a_row_selects_none(cx: &mut TestAppContext) {
     assert_eq!(c.selected(), orchestrator());
 }
 
-/// The task detail drawn over the main area (the panels' More,
+/// The task pane drawn over the main area (the panels' More,
 /// `dt-more-opens-detail`), and the board entity floating.
 fn detail_over(c: &Column) -> bool {
     c.read(|w, cx| w.detail_over.is_some() && w.issues.as_ref().is_some_and(|v| v.read(cx).is_floating()))
@@ -971,13 +971,22 @@ fn more_opens_the_task_detail_over_the_workspace_and_esc_comes_back(cx: &mut Tes
     let shown = c.read(|w, cx| w.shown(cx));
     let attached = c.ws_sessions.attached();
 
+    c.h.cx.update(|_, cx| cx.set_reduce_motion(true));
     c.h.click_selector("ws-more");
     c.h.draw();
-    assert!(detail_over(&c), "More opens the detail over the screen");
+    assert!(detail_over(&c), "More opens the pane over the screen");
     assert!(c.drawn("issues-over"));
     let main = c.bounds("workspace-view").unwrap();
     let over = c.bounds("issues-over").unwrap();
-    assert_eq!(over.origin.x, main.origin.x, "the detail covers the main area, not the panel");
+    assert_eq!(over.origin.x, main.origin.x, "the pane's layer is the main area, not the panel");
+    // The same floating pane as on the board: 8pt in from the main area's
+    // top, right and bottom.
+    let pane = c.bounds("task-pane").unwrap();
+    assert_eq!(pane.right(), over.right() - gpui::px(8.0));
+    assert_eq!(pane.top(), over.top() + gpui::px(8.0));
+    assert_eq!(pane.bottom(), over.bottom() - gpui::px(8.0));
+    assert!(pane.left() > main.left(), "the workspace shows beside it");
+    assert!(!c.drawn("backdrop"), "no scrim over the workspace");
     assert!(c.drawn("workspace-panel") && c.drawn("workspace-view"), "the workspace stays under it");
     assert_eq!(c.read(|w, cx| w.shown(cx)), shown, "no switch to Issues");
     assert!(
@@ -1005,8 +1014,9 @@ fn more_opens_the_task_detail_over_the_workspace_and_esc_comes_back(cx: &mut Tes
 }
 
 #[gpui::test]
-fn more_opens_the_task_detail_over_the_review_and_the_backdrop_closes_it(cx: &mut TestAppContext) {
+fn more_opens_the_task_pane_over_the_review_and_close_hands_it_back(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);
+    c.h.cx.update(|_, cx| cx.set_reduce_motion(true));
     c.open_review();
     c.advance(SLIDE);
     let review = c.review();
@@ -1017,10 +1027,17 @@ fn more_opens_the_task_detail_over_the_review_and_the_backdrop_closes_it(cx: &mu
     assert!(c.drawn("review-panel"), "the review stays under it");
     assert!(c.read(|w, _| matches!(w.route, Route::Review)));
 
-    // A click on the scrim, beside the modal.
+    // A click beside the pane isn't the pane's: it isn't modal, so it stays
+    // up, and the review under the click keeps working.
     let over = c.bounds("issues-over").unwrap();
-    let at = over.origin + point(gpui::px(8.0), gpui::px(8.0));
+    let at = over.origin + point(gpui::px(8.0), gpui::px(80.0));
     c.h.cx.simulate_click(at, Modifiers::none());
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    assert!(detail_over(&c) && c.drawn("task-pane"), "a click beside the pane leaves it up");
+
+    // Its Close hands the keys back to the review.
+    c.h.click_selector("pane-close");
     c.h.cx.run_until_parked();
     c.h.draw();
     assert!(!detail_over(&c) && !c.drawn("issues-over"));
@@ -1202,4 +1219,53 @@ fn showing_the_sidebar_over_a_collapsed_panel_column_widens_it(cx: &mut TestAppC
     c.advance(REVEAL);
     assert_eq!(c.width("leading-column"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
     assert!(c.read(|w, _| w.collapsed));
+}
+
+/// The board's task pane shows the agent working its task
+/// (`dt-task-pane-session`) only while the board is on screen, and over the
+/// Workspace view already showing that agent it doesn't attach it twice.
+#[gpui::test]
+fn the_task_panes_session_follows_the_screen_and_never_doubles_the_workspaces(cx: &mut TestAppContext) {
+    use crate::views::board_state::tests::{issue, read};
+    // t-1 isn't in review here: the developer working it is its session.
+    let mut c = Column::open_with(cx, |w| w.model.reviews.clear());
+    c.h.cx.update(|_, cx| cx.set_reduce_motion(true));
+    let agent = |c: &Column| c.ws_sessions.live().into_iter().filter(|n| n.ends_with("/ws/alpha-1")).count();
+    c.update(|w, window, cx| {
+        w.perform(HostCall::ShowView(View::Issues), window, cx);
+        let issues = w.ensure_issues(window, cx);
+        // The harness made the board before the fakes were in: host its
+        // pane on them now.
+        let deps = (w.workspace_deps.as_ref().expect("fake sessions").sessions)();
+        let handle = window.window_handle();
+        issues.update(cx, |v, cx| {
+            v.host_sessions(handle, deps, None, cx);
+            v.stop_workers();
+            let mut t = issue("t-1", "in-progress");
+            t.task.assigned_to = Some("alpha-1".into());
+            v.state_for_test().apply_reads(Some(read(vec![t])), Some(None));
+            v.open_task("t-1", cx);
+        });
+        w.update_task_rows(cx);
+        w.sync_issues_shown(cx);
+    });
+    c.h.draw();
+    c.h.draw();
+    assert!(c.drawn("pane-session"), "the pane shows the agent");
+    assert_eq!(agent(&c), 1);
+
+    // The main area moves on: the pane's attach goes, the agent stays up.
+    c.update(|w, window, cx| w.perform(HostCall::ShowView(View::Machines), window, cx));
+    c.h.draw();
+    assert_eq!(agent(&c), 0);
+
+    // The workspace's own screen, then its More: one attach, the screen's.
+    c.open_workspace();
+    c.advance(SLIDE);
+    assert_eq!(agent(&c), 1);
+    c.h.click_selector("ws-more");
+    c.h.draw();
+    assert!(detail_over(&c) && c.drawn("task-pane"));
+    assert!(!c.drawn("pane-session"), "the screen under the pane already shows it");
+    assert_eq!(agent(&c), 1);
 }

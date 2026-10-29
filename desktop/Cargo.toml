@@ -80,7 +80,8 @@ async-channel = "2"
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 # The Markdown parser gpui-kit's text view renders with (pinned to the version
-# gpui-base resolves), for the task detail's checklist count and its tests.
+# gpui-base resolves), for the Changelog renderer's task lists and the license
+# text's tests.
 markdown = "=1.0.0"
 
 # The activity feed's clock (relative times, day headers): the version the
@@ -148,7 +149,7 @@ objc2-app-kit = { version = "0.3", features = [
 # permission needed), drive simulated keys and mouse into a fake session, and
 # save the frames. A developer tool, off by default: it builds gpui with its
 # `test-support` feature.
-visual-check = ["gpui_platform/test-support", "dep:image"]
+visual-check = ["gpui_platform/test-support", "dep:image", "shelbi-app/test-support"]
 # `cargo run --release --features bench -- --bench-term` (or
 # `scripts/bench-term.sh`): measure the terminal element under heavy output in
 # a real window over sandboxed sessions (`src/bench/`). A developer tool, off

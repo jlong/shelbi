@@ -71,6 +71,10 @@ pub enum OverlayEvent {
     /// About Shelbi's Acknowledgements link: the bundled software, in its
     /// place.
     OpenAcknowledgements,
+    /// The launch screen asked for this (open a project, a dialog, leave).
+    Launch(crate::launch::LaunchStep),
+    /// Connect to Remote Session connected to this session.
+    RemoteConnected(shelbi_app::launch::RemoteSession),
 }
 
 /// The overlay currently drawn over the main area, with its runtime state.
@@ -99,6 +103,12 @@ pub enum ActiveOverlay {
     About(overlay::about::About),
     /// Contact Us (boxed: its draft is the largest of the overlays').
     Feedback(Box<overlay::feedback::FeedbackDialog>),
+    /// The launch screen (the palette's "Show Launch Screen"), over the
+    /// whole window.
+    Launch(Box<crate::launch::LaunchScreen>),
+    /// Connect to Remote Session (the palette's, or the launch screen's
+    /// Connect to remote).
+    ConnectRemote(Box<crate::launch::ConnectDialog>),
     /// The full task-description popover, opened from the review panel's `More`
     /// link. Reuses the board's task-detail renderer
     /// ([`crate::kanban::render_task_popover_into`]) so the board and the review
@@ -207,11 +217,22 @@ impl ActiveOverlay {
         ActiveOverlay::Feedback(Box::new(overlay::feedback::FeedbackDialog::new(remembered, emoji)))
     }
 
+    /// Open Connect to Remote Session, connecting through `remote` and
+    /// remembering what connects in `recents`.
+    pub fn connect_remote(
+        remote: std::sync::Arc<dyn shelbi_app::launch::RemoteConnector>,
+        recents: shelbi_app::launch::RecentRemotes,
+        emoji: bool,
+    ) -> Self {
+        ActiveOverlay::ConnectRemote(Box::new(crate::launch::ConnectDialog::new(remote, recents, emoji)))
+    }
+
     /// Bracketed paste into the overlay's text field, if one is being typed
-    /// in. Only Contact Us takes one so far.
+    /// in: Contact Us's and Connect to Remote Session's host.
     pub fn paste(&mut self, text: &str) -> bool {
         match self {
             ActiveOverlay::Feedback(dialog) => dialog.paste(text),
+            ActiveOverlay::ConnectRemote(dialog) => dialog.paste(text),
             _ => false,
         }
     }
@@ -302,6 +323,8 @@ impl ActiveOverlay {
             },
             ActiveOverlay::About(about) => about_event(about.handle_key(ev)),
             ActiveOverlay::Feedback(dialog) => feedback_event(dialog.handle_key(ev)),
+            ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_key(ev)),
+            ActiveOverlay::ConnectRemote(dialog) => connect_event(dialog.handle_key(ev)),
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 // The popover is read-only here: Esc/q close it, j/k and the page
                 // chords scroll the body. The board's move / open-workspace
@@ -406,6 +429,9 @@ impl ActiveOverlay {
                 }
                 OverlayEvent::Stay
             }
+            // Both track the pointer themselves (their rows light under it).
+            ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_mouse(m)),
+            ActiveOverlay::ConnectRemote(dialog) => connect_event(dialog.handle_mouse(m)),
             _ => OverlayEvent::Stay,
         }
     }
@@ -437,6 +463,9 @@ impl ActiveOverlay {
             ActiveOverlay::About(about) => about.rect(area),
             // Centered and as tall as its content (the desktop's dialog).
             ActiveOverlay::Feedback(dialog) => dialog.rect(area),
+            ActiveOverlay::ConnectRemote(dialog) => dialog.rect(area),
+            // The whole window, as the launch screen is the whole terminal.
+            ActiveOverlay::Launch(_) => area,
             // The same 80%×80% centered box the board's task popover uses, so
             // the review and the board show the task at the identical size.
             ActiveOverlay::TaskDescription { .. } => crate::kanban::popover_rect(area),
@@ -470,6 +499,8 @@ impl ActiveOverlay {
             ActiveOverlay::AddProject { form } => form.render(f, rect),
             ActiveOverlay::About(about) => about.render(f.buffer_mut(), area),
             ActiveOverlay::Feedback(dialog) => dialog.render(f, rect),
+            ActiveOverlay::Launch(screen) => screen.render(f.buffer_mut(), rect),
+            ActiveOverlay::ConnectRemote(dialog) => dialog.render(f, rect),
             ActiveOverlay::TaskDescription {
                 task,
                 scroll,
@@ -515,6 +546,15 @@ fn about_event(step: overlay::about::Step) -> OverlayEvent {
         overlay::about::Step::Close => OverlayEvent::Close,
         overlay::about::Step::Open(url) => OverlayEvent::OpenUrl(url.to_string()),
         overlay::about::Step::Acknowledgements => OverlayEvent::OpenAcknowledgements,
+    }
+}
+
+/// Connect to Remote Session's step as the shell's event.
+pub(super) fn connect_event(step: crate::launch::ConnectStep) -> OverlayEvent {
+    match step {
+        crate::launch::ConnectStep::Stay => OverlayEvent::Stay,
+        crate::launch::ConnectStep::Close => OverlayEvent::Close,
+        crate::launch::ConnectStep::Connected(session) => OverlayEvent::RemoteConnected(session),
     }
 }
 
@@ -609,7 +649,39 @@ mod tests {
                 keymaps(),
                 shelbi_state::keymap::DisplayStyle::Linux,
             ),
+            ActiveOverlay::connect_remote(
+                std::sync::Arc::new(shelbi_app::launch::FakeRemote::new()),
+                shelbi_app::launch::RecentRemotes::at("/tmp/shelbi-overlay-tests-recent.json"),
+                false,
+            ),
         ]
+    }
+
+    /// The launch screen: the whole window rather than a dialog, so it isn't
+    /// one of [`every_overlay`]'s.
+    fn launch_overlay() -> ActiveOverlay {
+        let model = shelbi_app::launch::LaunchModel::default();
+        ActiveOverlay::Launch(Box::new(crate::launch::LaunchScreen::new(
+            model,
+            std::sync::Arc::new(shelbi_app::launch::FakeDaemon::new()),
+            None,
+            shelbi_app::launch::RecentRemotes::at("/tmp/shelbi-overlay-tests-recent.json"),
+            false,
+        )))
+    }
+
+    #[test]
+    fn the_launch_screen_covers_the_whole_window() {
+        let mut ov = launch_overlay();
+        assert_eq!(overlay_name(&ov), "launch-screen");
+        let area = Rect::new(0, 0, 120, 40);
+        assert_eq!(ov.rect(area), area);
+        let (buf, rect) = draw_over_sentinel(&mut ov);
+        for y in rect.top()..rect.bottom() {
+            for x in rect.left()..rect.right() {
+                assert_ne!(buf[(x, y)].symbol(), "X", "the view showed through at ({x},{y})");
+            }
+        }
     }
 
     /// A minimal review task for the description-popover overlay tests.
@@ -740,6 +812,8 @@ mod tests {
             ActiveOverlay::About(_) => "about",
             ActiveOverlay::Feedback(_) => "feedback",
             ActiveOverlay::TaskDescription { .. } => "task-description",
+            ActiveOverlay::ConnectRemote(_) => "connect-remote",
+            ActiveOverlay::Launch(_) => "launch-screen",
         }
     }
 
@@ -748,7 +822,8 @@ mod tests {
     #[test]
     fn every_overlay_draws_the_shared_dialog_border() {
         let names: std::collections::BTreeSet<_> = every_overlay().iter().map(overlay_name).collect();
-        assert_eq!(names.len(), 9, "every variant is in every_overlay(): {names:?}");
+        // Every variant but the launch screen ([`launch_overlay`]).
+        assert_eq!(names.len(), 10, "every variant is in every_overlay(): {names:?}");
         for (w, h) in [(100, 30), (60, 20), (120, 40)] {
             for mut ov in every_overlay() {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
