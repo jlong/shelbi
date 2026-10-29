@@ -623,3 +623,113 @@ fn the_daemon_starts_and_ends_a_workspaces_user_shell() {
         .unwrap();
 }
 
+
+/// `task-inline-edit-state`: an editor's draft against a real daemon while the
+/// CLI (an agent) edits the same issue. The draft's save goes out against the
+/// state it was based on and is refused; the next read rebases it (the edits
+/// touch different lines) and the retry lands both. An edit of the same line
+/// is kept on both sides and saves nothing. Frontmatter the editor didn't
+/// touch is unchanged.
+#[test]
+fn an_open_draft_survives_a_cli_edit_and_never_overwrites_it() {
+    use shelbi_app::issue_edit::{Field, IssueEdits, SaveJob, SaveStatus, Snapshot};
+    use shelbi_app::{ExecError, Mutation};
+    use shelbi_proto::control::{EditSpec, MutationError};
+
+    let mut home = Home::new("draft");
+    std::fs::write(
+        home.path.join("projects/p/tasks/t1.md"),
+        format!(
+            "---\nid: t1\ntitle: Fix it\ncolumn: backlog\npriority: 0\nbranch: feat/x\n\
+             created_at: {T0}\nupdated_at: {T0}\n---\n## Plan\nstep one\nstep two\n"
+        ),
+    )
+    .unwrap();
+    home.start_daemon();
+    let read = |home: &Home| {
+        let text = std::fs::read_to_string(home.path.join("projects/p/tasks/t1.md")).unwrap();
+        shelbi_state::parse_task_file(&text).unwrap()
+    };
+    let cli = |home: &Home, args: &[&str]| {
+        let status = Command::new(BIN)
+            .args(["issue", "edit", "t1", "-p", "p"])
+            .args(args)
+            .env("SHELBI_HOME", &home.path)
+            .env("SHELBI_HUB_SOCK", &home.hub)
+            .env("SHELBI_CONTROL_SOCK", &home.control)
+            .env_remove("SHELBI_ROOT")
+            .env("SHELBI_YES", "0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "the CLI edit ran: {args:?}");
+    };
+    // What the desktop's save thread does: the job's daemon edit.
+    let send = |home: &Home, job: &SaveJob| -> Result<Option<ExpectedState>, ExecError> {
+        let Mutation::EditIssue { title, body, workflow, expect_title, expect_body, .. } =
+            job.mutation("p")
+        else {
+            unreachable!()
+        };
+        let req = MutationRequest {
+            request_id: 1,
+            project: "p".into(),
+            id: "t1".into(),
+            expected: job.expected.clone(),
+            kind: MutationKind::Edit(Box::new(EditSpec {
+                title,
+                body_replace: body,
+                workflow,
+                expect_title,
+                expect_body,
+                ..Default::default()
+            })),
+        };
+        connect(&home.control).unwrap().mutate(&req, &mut discard()).map_err(|e| match e {
+            shelbi_client::ClientError::Mutation(MutationError::Stale { .. }) => {
+                ExecError::Conflict("stale".into())
+            }
+            other => ExecError::Backend(other.to_string()),
+        })
+    };
+
+    let mut edits = IssueEdits::new();
+    edits.open(&Snapshot::of(&read(&home)));
+    let t0 = Instant::now();
+    let later = |s: u64| t0 + Duration::from_secs(s);
+    edits.edit("t1", Field::Body, "## Plan\nstep ONE\nstep two\n", t0);
+
+    // The agent appends a note before the pause in typing ends.
+    cli(&home, &["--body", "agent: found it", "--append"]);
+    let job = edits.poll(later(1)).pop().expect("the pause is over");
+    let refused = send(&home, &job);
+    assert!(matches!(refused, Err(ExecError::Conflict(_))), "{refused:?}");
+    edits.finish(&job, refused, later(1));
+    assert_eq!(edits.status("t1"), SaveStatus::Saving, "waiting for the new copy");
+    assert!(read(&home).body.contains("agent: found it"), "nothing overwritten");
+
+    // The board's next read: rebased, sent again at once, and it lands.
+    edits.observe(&[read(&home)]);
+    let job = edits.poll(later(2)).pop().expect("the rebased draft goes again");
+    let landed = send(&home, &job);
+    assert!(landed.is_ok(), "{landed:?}");
+    edits.finish(&job, landed, later(2));
+    assert_eq!(edits.status("t1"), SaveStatus::Saved);
+    let after = read(&home);
+    assert_eq!(after.body, "## Plan\nstep ONE\nstep two\n\nagent: found it\n");
+    assert_eq!(after.task.title, "Fix it");
+    assert_eq!(after.task.branch.as_deref(), Some("feat/x"));
+    assert_eq!(after.task.column.as_str(), "backlog");
+
+    // The same line, both ways: both kept, nothing saved over the agent's.
+    edits.edit("t1", Field::Body, "## Plan\nstep ONE\nstep 2 (mine)\n\nagent: found it\n", later(3));
+    cli(&home, &["--sub", "step two", "step 2 (agent)"]);
+    edits.observe(&[read(&home)]);
+    assert_eq!(edits.status("t1"), SaveStatus::Conflict(Field::Body));
+    assert!(edits.poll(later(9)).is_empty());
+    assert!(read(&home).body.contains("step 2 (agent)"));
+    let conflict = edits.conflict("t1").unwrap();
+    assert!(conflict.mine.contains("step 2 (mine)") && conflict.theirs.contains("step 2 (agent)"));
+}
