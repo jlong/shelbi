@@ -427,6 +427,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_instructions(entry, &text, out);
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_reporting_subject(entry, &text, out);
+        sniff_orchestrator_changelog(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
@@ -880,6 +881,92 @@ fn sniff_reporting_subject(entry: &InventoryEntry, text: &str, out: &mut Vec<Upg
             locate_line_containing(text, "comma-separated workspace"),
         ));
     }
+}
+
+/// Heading of the orchestrator's Changelog rule (add an entry after every
+/// merge). The sniffer keys on it and the healer appends the shipped section
+/// under it, so the two can never disagree.
+pub(crate) const ORCH_CHANGELOG_SECTION_HEADING: &str = "## Changelog";
+
+/// The stable code for "the orchestrator instructions predate the Changelog
+/// rule". An auto-heal: the shipped section is appended, never interleaved.
+pub(crate) const ORCH_CHANGELOG_RULE_MISSING: &str = "ORCH_CHANGELOG_RULE_MISSING";
+
+/// The command the Changelog rule necessarily names. A copy that mentions it
+/// anywhere already carries the rule in some form (moved, reworded), so it's
+/// left alone even without the heading.
+const ORCH_CHANGELOG_COMMAND_MARKER: &str = "shelbi changelog add";
+
+/// The shipped `## Changelog` section (heading and body), read out of the
+/// default orchestrator template so the appended copy is always the current
+/// shipped wording.
+pub(crate) fn shipped_changelog_section() -> String {
+    let template = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+    let body = markdown_section(template, ORCH_CHANGELOG_SECTION_HEADING)
+        .expect("the shipped orchestrator template carries a `## Changelog` section");
+    format!("{ORCH_CHANGELOG_SECTION_HEADING}\n{}", body.trim_end())
+}
+
+/// Whether an orchestrator `instructions.md` already carries the Changelog rule:
+/// the heading line, or the command anywhere in the file. A user who rewrote
+/// the section (or replaced its body with "don't write entries") keeps the
+/// heading, so their edit is never touched.
+fn has_changelog_rule(text: &str) -> bool {
+    text.lines()
+        .any(|l| l.trim_end() == ORCH_CHANGELOG_SECTION_HEADING)
+        || text.contains(ORCH_CHANGELOG_COMMAND_MARKER)
+}
+
+/// Append the shipped Changelog section to an orchestrator `instructions.md`
+/// that lacks the rule, returning the text unchanged otherwise (and for an
+/// empty file, which the agent self-heal owns). Purely additive: the original
+/// text is a byte prefix of the result. The healer's write-back; it shares
+/// [`has_changelog_rule`] with the sniffer so the two can never diverge.
+pub(crate) fn append_changelog_section(text: &str) -> String {
+    if text.trim().is_empty() || has_changelog_rule(text) {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&shipped_changelog_section());
+    out.push('\n');
+    out
+}
+
+/// Sniff an orchestrator `instructions.md` for the Changelog rule: after every
+/// merge, add an entry with `shelbi changelog add`.
+///
+/// A default change only reaches NEW projects via the shipped template; existing
+/// projects carry their own copy, so this sniffer heals them on next boot (per
+/// the AGENTS.md "Changing shipped defaults" guardrail). An **absence** sniff
+/// routed to [`Classification::AutoHeal`]: the fix appends a self-contained
+/// section at the end of the file and rewrites nothing the user wrote, so it is
+/// deterministic and non-lossy. A copy with the heading or the command anywhere
+/// (including one the user edited) never fires. Idempotent: after the heal the
+/// file carries the heading and a second pass finds nothing.
+fn sniff_orchestrator_changelog(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if text.trim().is_empty() || has_changelog_rule(text) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        ORCH_CHANGELOG_RULE_MISSING,
+        "orchestrator instructions have no `## Changelog` rule, so merged work never reaches \
+         the project's Changelog",
+        "Append the shipped `## Changelog` section: after every merge, run `shelbi changelog \
+         add` with a reader-facing title, the date, a short description, and `--issue` / \
+         `--pr` / `--link` links (one entry per feature, never a duplicate).",
+        Location {
+            line: text.lines().count().max(1),
+            column: 1,
+        },
+    ));
 }
 
 // ---------------------------------------------------------------------------
