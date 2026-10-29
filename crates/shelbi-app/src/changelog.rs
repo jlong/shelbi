@@ -127,9 +127,9 @@ impl ChangelogEntryView {
         }
     }
 
-    /// The day it shipped: `Oct 28, 2026`.
+    /// The day it shipped, spelled out like the docs changelog: `October 28, 2026`.
     pub fn date_label(&self) -> String {
-        self.date.format("%b %-d, %Y").to_string()
+        self.date.format("%B %-d, %Y").to_string()
     }
 
     /// The time it shipped, in the offset it was written in: `14:30`.
@@ -465,6 +465,9 @@ mod tests {
                 .collect(),
         ));
         assert_eq!(m.visible().count(), PAGE_SIZE * 2);
+        let first = m.visible().next().unwrap();
+        assert_eq!(first.date_label(), "October 28, 2026");
+        assert_eq!(first.time_label(), "14:30");
         m.set_query("nothing matches");
         m.set_data(data(vec![view("a", "x", "", vec![])]));
         assert_eq!(m.query(), "nothing matches");
