@@ -2026,7 +2026,9 @@ impl Render for TerminalPane {
             .on_action(cx.listener(|this, _: &crate::menus::SelectAll, _, cx| this.select_all(cx)))
             .relative()
             .size_full()
-            .bg(theme.nested(theme.canvas))
+            // The terminal's own background, which the contrast setting
+            // doesn't move (the canvas around it may be darker).
+            .bg(theme.nested(theme.terminal_canvas()))
             .child(TerminalElement::new(cx.entity()))
             .children(search_bar)
             .children(jump)

@@ -17,7 +17,13 @@
 //! The window's translucency ([`window`]) is a resolve-time change too: the
 //! surface roles take the window opacity as their alpha
 //! ([`Theme::with_opacity`]), and nothing else does.
+//!
+//! So is the contrast setting ([`contrast`]): it moves the palette's roles
+//! apart (darker surfaces and brighter text in Dark, the reverse in Light)
+//! before the opacity is applied, and leaves the terminals' colors as they
+//! are ([`Theme::with_contrast`]).
 
+pub mod contrast;
 pub mod fold;
 pub mod motion;
 pub mod palette;
@@ -45,6 +51,9 @@ pub struct Theme {
     pub terminal: TerminalPalette,
     /// The window opacity the surface roles carry, 0 to 1 (1 is opaque).
     opacity: f32,
+    /// The contrast setting the roles were moved by, in percent (0 is the
+    /// palette as designed).
+    contrast: u8,
 }
 
 impl Deref for Theme {
@@ -69,14 +78,44 @@ pub enum Hue {
 impl Theme {
     /// The theme for `preference` in a window whose system appearance is
     /// `system`.
+    #[cfg(test)]
     pub fn resolve(preference: ThemePreference, system: WindowAppearance) -> Self {
-        let palette = Palette::for_appearance(resolve_appearance(preference, Some(is_dark(system))));
+        Self::resolve_with(preference, 0, system)
+    }
+
+    /// The theme for `preference` at `contrast` percent ([`contrast`]), in a
+    /// window whose system appearance is `system`. The terminal palette is
+    /// the standard palette's at every contrast: a session's default colors
+    /// and its ANSI sixteen don't move with the setting.
+    pub fn resolve_with(preference: ThemePreference, contrast: u8, system: WindowAppearance) -> Self {
+        let standard = Palette::for_appearance(resolve_appearance(preference, Some(is_dark(system))));
+        let contrast = contrast.min(*contrast::CONTRAST_RANGE.end());
         Self {
             preference,
-            terminal: TerminalPalette::for_palette(&palette),
-            colors: palette.map(hsla),
+            terminal: TerminalPalette::for_palette(&standard),
+            colors: standard.with_contrast(contrast).map(hsla),
             opacity: 1.0,
+            contrast,
         }
+    }
+
+    /// This theme at `contrast` percent, its opacity kept.
+    pub fn with_contrast(self, contrast: u8) -> Self {
+        let system = if self.is_dark() { WindowAppearance::Dark } else { WindowAppearance::Light };
+        Self::resolve_with(self.preference, contrast, system).with_opacity(self.opacity)
+    }
+
+    /// The contrast setting the roles carry, in percent.
+    pub fn contrast(&self) -> u8 {
+        self.contrast
+    }
+
+    /// The surface a terminal pane sits on: the terminals' own default
+    /// background (`canvas` at contrast 0) at the window's opacity. A view
+    /// hosting a terminal paints it (through [`Theme::nested`]) so the
+    /// grid's insets match the grid whatever the contrast.
+    pub fn terminal_canvas(&self) -> Hsla {
+        rgb_hsla(self.terminal.background).opacity(self.opacity)
     }
 
     /// This theme in a window `opacity` (0 to 1) opaque: the window's
@@ -317,7 +356,11 @@ pub fn init(cx: &mut App) {
     cx.set_window_appearance(chrome_appearance(preference));
     window::init(window::Translucency::from_config(&cfg.desktop), cx);
     let opacity = window::WindowLook::current(cx).effective().alpha();
-    install(Theme::resolve(preference, cx.window_appearance()).with_opacity(opacity), cx);
+    let contrast = contrast::from_config(&cfg.desktop);
+    install(
+        Theme::resolve_with(preference, contrast, cx.window_appearance()).with_opacity(opacity),
+        cx,
+    );
 }
 
 /// Switch to `preference` now (the settings view's theme choice): re-resolve
@@ -325,8 +368,20 @@ pub fn init(cx: &mut App) {
 /// repaint.
 pub fn apply_preference(preference: ThemePreference, window: &Window, cx: &mut App) {
     cx.set_window_appearance(chrome_appearance(preference));
-    let opacity = cx.global::<Theme>().opacity;
-    install(Theme::resolve(preference, window.appearance()).with_opacity(opacity), cx);
+    let current = *cx.global::<Theme>();
+    install(
+        Theme::resolve_with(preference, current.contrast, window.appearance()).with_opacity(current.opacity),
+        cx,
+    );
+}
+
+/// Change the contrast setting now (Settings' slider, as it moves): every
+/// open window repaints with it.
+pub fn set_contrast(contrast: u8, cx: &mut App) {
+    let current = *cx.global::<Theme>();
+    if current.contrast != contrast {
+        install(current.with_contrast(contrast), cx);
+    }
 }
 
 /// Make `theme` current: our global, and gpui-kit's light/dark mode with its
@@ -341,6 +396,7 @@ pub(crate) fn install(theme: Theme, cx: &mut App) {
     tracing::info!(
         preference = ?theme.preference,
         appearance = ?theme.appearance,
+        contrast = theme.contrast,
         "theme resolved"
     );
     cx.set_global(theme);
@@ -401,7 +457,8 @@ pub fn follow_system<V: 'static>(window: &mut Window, cx: &mut Context<V>) -> Su
 
 fn sync(window: &Window, cx: &mut App) {
     let current = *cx.global::<Theme>();
-    let next = Theme::resolve(current.preference, window.appearance()).with_opacity(current.opacity);
+    let next =
+        Theme::resolve_with(current.preference, current.contrast, window.appearance()).with_opacity(current.opacity);
     if next != current {
         install(next, cx);
     }
@@ -463,11 +520,54 @@ mod tests {
     }
 
     #[test]
+    fn contrast_leaves_the_terminals_colors_alone() {
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            let standard = Theme::resolve(ThemePreference::Auto, system);
+            for contrast in [1, 25, 50, 75, 100, 255] {
+                let t = Theme::resolve_with(ThemePreference::Auto, contrast, system);
+                assert_eq!(t.terminal, standard.terminal, "{system:?} at {contrast}%");
+                assert_eq!(t.terminal_canvas(), standard.canvas, "the panes' surface");
+                if contrast >= 25 && system == WindowAppearance::Dark {
+                    assert_ne!(t.canvas, standard.canvas, "the UI's canvas did move");
+                }
+                if contrast >= 25 {
+                    assert_ne!(t.foreground, standard.foreground, "{system:?}: the UI's text did move");
+                }
+                let glass = t.with_opacity(0.8);
+                assert_eq!(glass.terminal, standard.terminal, "translucency doesn't move them either");
+                assert_eq!(glass.terminal_canvas().a, 0.8, "the panes' surface is the window's glass");
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_composes_with_the_window_opacity() {
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            let standard = Theme::resolve(ThemePreference::Auto, system).with_opacity(0.9);
+            let more = standard.with_contrast(60);
+            assert_eq!((more.contrast(), more.opacity()), (60, 0.9), "each keeps the other");
+            assert_eq!(more.canvas.a, 0.9, "still translucent");
+            assert_eq!(more.well.a, 0.0);
+            let opaque_more = Theme::resolve_with(ThemePreference::Auto, 60, system);
+            assert_eq!(Hsla { a: 1.0, ..more.canvas }, opaque_more.canvas, "the adjusted color, at the opacity");
+            assert_eq!(more.opaque(), opaque_more, "an overlay paints the adjusted, opaque theme");
+            assert_eq!(more.with_contrast(0), standard, "back to the palette exactly");
+            let lum = |c: Hsla| c.l;
+            if system == WindowAppearance::Dark {
+                assert!(lum(more.canvas) < lum(standard.canvas) && lum(more.sidebar) < lum(standard.sidebar));
+            } else {
+                assert!(lum(more.sidebar) > lum(standard.sidebar));
+            }
+        }
+    }
+
+    #[test]
     fn body_text_holds_3_to_1_at_the_opacity_floor_over_mid_gray() {
         use shelbi_app::theme::Rgb;
         let floor = *window::OPACITY_RANGE.start() as f32 / 100.0;
         let gray = Rgb::new(128, 128, 128);
-        for palette in [Palette::dark(), Palette::light()] {
+        let palettes = [Palette::dark(), Palette::light()];
+        for palette in palettes.into_iter().chain(palettes.map(|p| p.with_contrast(100))) {
             let surface = gray.lerp(palette.canvas.rgb, floor);
             let text = palette.foreground.over(surface);
             let ratio = text.contrast_ratio(surface);

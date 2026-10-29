@@ -797,6 +797,57 @@ fn the_sliders_apply_to_the_window_as_they_move_and_save(cx: &mut TestAppContext
     assert!(!s.read(|_, cx| cx.global::<Theme>().is_dark()));
 }
 
+fn theme_contrast(s: &mut Settings) -> u8 {
+    s.h.cx.update(|_, cx| cx.global::<Theme>().contrast())
+}
+
+#[gpui::test]
+fn the_contrast_slider_restyles_the_windows_as_it_moves_and_saves(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    assert_eq!(theme_contrast(&mut s), 0, "unset is the palette as designed");
+    let standard = s.read(|_, cx| *cx.global::<Theme>());
+    let mut cfg = shelbi_state::UserConfig::default();
+    (cfg.desktop.contrast, cfg.desktop.window_opacity) = (Some(40), Some(90));
+    let view = general_page(&mut s, cfg);
+    assert!(s.drawn("settings-contrast"));
+    let slider = s.read(|_, cx| view.read(cx).contrast_slider());
+    let value = |s: &mut Settings| s.read(|_, cx| slider.read(cx).value());
+    assert_eq!((value(&mut s), theme_contrast(&mut s)), (40, 40), "restored from config.yaml");
+    let theme = s.read(|_, cx| *cx.global::<Theme>());
+    assert!(theme.canvas.l < standard.canvas.l, "darker surfaces");
+    assert_eq!((theme.canvas.a, theme.opacity()), (0.9, 0.9), "and still translucent");
+    assert_eq!(theme.terminal, standard.terminal, "the terminals keep their colors");
+    // Reduce Transparency makes the window opaque and keeps the contrast.
+    s.update(|_, _, cx| crate::theme::window::set_reduce_transparency(true, cx));
+    s.settle();
+    assert_eq!((theme_opacity(&mut s), theme_contrast(&mut s)), (1.0, 40));
+    s.update(|_, _, cx| crate::theme::window::set_reduce_transparency(false, cx));
+    s.settle();
+    assert_eq!((theme_opacity(&mut s), theme_contrast(&mut s)), (0.9, 40));
+
+    // Each key applies at once; letting go saves.
+    let saved = |s: &mut Settings| s.read(|_, cx| view.read(cx).saved().desktop.contrast);
+    s.click("settings-contrast");
+    assert_eq!(value(&mut s), 50, "the track's middle");
+    assert_eq!((theme_contrast(&mut s), saved(&mut s)), (50, Some(50)));
+    s.key("shift-right");
+    assert_eq!((theme_contrast(&mut s), saved(&mut s)), (60, Some(60)));
+    s.key("end");
+    assert_eq!((theme_contrast(&mut s), saved(&mut s)), (100, Some(100)));
+    // A theme switch keeps the contrast.
+    s.click("settings-theme-Light");
+    assert_eq!(theme_contrast(&mut s), 100);
+    s.click("settings-contrast");
+    s.key("home");
+    assert_eq!((theme_contrast(&mut s), saved(&mut s)), (0, None), "0 isn't written");
+
+    // Moved elsewhere (another window's settings): the slider follows.
+    s.update(|_, _, cx| crate::theme::set_contrast(30, cx));
+    s.settle();
+    assert_eq!(value(&mut s), 30);
+}
+
 #[gpui::test]
 fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut TestAppContext) {
     use crate::theme::window::{self as translucency, Translucency};

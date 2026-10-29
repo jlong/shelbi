@@ -887,6 +887,9 @@ impl Render for SessionView {
             };
             pane.update(cx, |pane, _| pane.set_scrollbar_padding(padding));
             return root
+                // The grid's insets are the terminal's background, not the
+                // canvas the contrast setting moves.
+                .bg(theme.nested(theme.terminal_canvas()))
                 .pl(gpui::px(self.inset_x))
                 .pr(gpui::px(self.inset_x))
                 .pt(gpui::px(TERMINAL_INSET_Y))
