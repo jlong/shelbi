@@ -265,6 +265,7 @@ pub fn apply(
             branch,
             reason,
             force,
+            take,
         } => {
             start::start(
                 &StartParams {
@@ -274,6 +275,7 @@ pub fn apply(
                     branch: branch.as_deref(),
                     reason: reason.as_deref(),
                     force: *force,
+                    take: *take,
                 },
                 sink,
                 recheck,

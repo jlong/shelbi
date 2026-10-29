@@ -444,6 +444,12 @@ impl ButtonSize {
     }
 }
 
+/// The chevron every dropdown trigger draws in its Right Icon slot (a
+/// board filter, a picker, a menu button): Figma's `chevron-down-small`
+/// (2342:37950). New dropdowns take it through [`ButtonContent::dropdown`]
+/// or [`dropdown_slot`] rather than naming an icon.
+pub const DROPDOWN_CHEVRON: Icon = icons::CHEVRON_DOWN_SMALL;
+
 /// A button's height at the Base size: the height of a form's controls
 /// (textboxes, pickers) beside it.
 pub const BUTTON_H: f32 = ButtonSize::Base.height();
@@ -477,6 +483,11 @@ impl ButtonContent {
     pub fn right(mut self, icon: impl Into<Option<Icon>>) -> Self {
         self.right = icon.into();
         self
+    }
+
+    /// The Right Icon as a dropdown's chevron ([`DROPDOWN_CHEVRON`]).
+    pub fn dropdown(self) -> Self {
+        self.right(DROPDOWN_CHEVRON)
     }
 
     /// `Show Hotkey`: `key` as written (`E`, `⌘S`, `Esc`). Empty shows
@@ -646,6 +657,11 @@ pub fn left_icon_slot(icon: Icon, size: ButtonSize, color: Hsla) -> Div {
 /// the glyph hangs past its right edge.
 pub fn right_icon_slot(icon: Icon, size: ButtonSize, color: Hsla) -> Div {
     right_slot(size, button_glyph(icon, size, color))
+}
+
+/// A dropdown trigger's Right Icon slot: [`DROPDOWN_CHEVRON`] in `color`.
+pub fn dropdown_slot(size: ButtonSize, color: Hsla) -> Div {
+    right_icon_slot(DROPDOWN_CHEVRON, size, color)
 }
 
 /// The left Icon slot holding something other than an icon (a picker's
@@ -925,7 +941,7 @@ pub fn filter_chip(
     let d = button_shell(id.clone(), kind, ButtonSize::Small, theme).cursor_pointer();
     fill_layer(d, id.clone(), px(6.0), [c.fill, c.hover, c.pressed])
         .child(div().debug_selector(part("label")).whitespace_nowrap().child(label.into()))
-        .child(right_icon_slot(icons::CHEVRON_DOWN, ButtonSize::Small, c.icon).debug_selector(part("right")))
+        .child(dropdown_slot(ButtonSize::Small, c.icon).debug_selector(part("right")))
 }
 
 /// The style a board filter chip draws in: Select while its filter is set
@@ -1414,7 +1430,7 @@ mod tests {
     fn sheet_content(name: &str, size: ButtonSize) -> ButtonContent {
         let (left, right) = match size {
             ButtonSize::XSmall => (icons::ARROW_LEFT_BUTTON, icons::ARROW_RIGHT_BUTTON),
-            _ => (icons::PLUS, icons::CHEVRON_DOWN),
+            _ => (icons::PLUS, DROPDOWN_CHEVRON),
         };
         let c = ButtonContent::label("Button");
         match name {

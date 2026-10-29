@@ -22,7 +22,10 @@
 //! (`settings-keybindings.png`, `settings-terminal.png`), Terminal with its
 //! font picker open (`settings-font-picker.png`), the other choices
 //! selected with the size stepper at each end (`settings-size-min.png`,
-//! `settings-size-max.png`, `settings-option-right.png`), the bootstrap
+//! `settings-size-max.png`, `settings-option-right.png`), General's App
+//! icon tiles with each icon picked (`settings-app-icon-command-grille.png`,
+//! `settings-app-icon-retro.png`), About with each icon chosen
+//! (`about-command-grille.png`, `about-retro.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
 //! notice bars (`notice-bars.png`: the update and relaunch bars). It prints
 //! one line per check and exits non-zero if any failed.
@@ -275,6 +278,48 @@ pub fn run(out: PathBuf) -> ! {
             wait(&mut cx, window, Duration::from_millis(400), |_| false);
             save(&mut cx, window, &out, name);
         }
+    }
+    // The General page tall enough to show the App icon tiles, each icon
+    // picked in turn.
+    for (name, icon) in [
+        ("settings-app-icon-command-grille.png", shelbi_state::AppIcon::CommandGrille),
+        ("settings-app-icon-retro.png", shelbi_state::AppIcon::Retro),
+    ] {
+        let window: AnyWindowHandle = cx
+            .open_offscreen_window(size(px(1100.0), px(1000.0)), |window, cx| {
+                cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
+            })
+            .expect("open the offscreen window")
+            .into();
+        let settings = window
+            .update(&mut cx, |root, _, _| root.downcast::<crate::views::settings::SettingsView>())
+            .expect("the settings window")
+            .expect("the settings view");
+        wait(&mut cx, window, Duration::from_secs(5), |cx| {
+            settings.read_with(cx, |v, _| v.offscreen_loaded())
+        });
+        settings.update(&mut cx, |v, cx| v.offscreen_show_app_icon(icon, cx));
+        // Reading config.yaml put its look on; paint the run's own theme,
+        // contrast and opacity (`SHELBI_VISUAL_*`) instead.
+        cx.update(crate::visual_check::install_theme);
+        wait(&mut cx, window, Duration::from_millis(300), |_| false);
+        save(&mut cx, window, &out, name);
+    }
+    // About with each icon chosen.
+    for (name, icon) in [
+        ("about-command-grille.png", shelbi_state::AppIcon::CommandGrille),
+        ("about-retro.png", shelbi_state::AppIcon::Retro),
+    ] {
+        cx.update(|cx| crate::app_icon::set(icon, cx));
+        let (w, h) = crate::views::about::SIZE;
+        let window: AnyWindowHandle = cx
+            .open_offscreen_window(size(px(w), px(h)), |window, cx| {
+                cx.new(|cx| crate::views::about::AboutView::new(window, cx))
+            })
+            .expect("open the offscreen window")
+            .into();
+        cx.update(crate::visual_check::install_theme);
+        save(&mut cx, window, &out, name);
     }
     let (_, window) = open(&mut cx, |cx| {
         cx.new(|_| Screen(Box::new(|theme, _| {

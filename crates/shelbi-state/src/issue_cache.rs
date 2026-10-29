@@ -503,6 +503,22 @@ impl IssueStore for CachedIssueStore {
         Ok(out)
     }
 
+    fn add_with_assignees(&self, spec: NewIssue) -> Result<(Issue, Vec<String>)> {
+        let out = self.inner.add_with_assignees(spec)?;
+        self.invalidate();
+        Ok(out)
+    }
+
+    fn viewer_login(&self) -> Option<String> {
+        self.inner.viewer_login()
+    }
+
+    fn claim(&self, id: &str) -> Result<Vec<String>> {
+        let out = self.inner.claim(id)?;
+        self.invalidate();
+        Ok(out)
+    }
+
     fn move_status(&self, id: &str, to: &Column, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status(id, to, reason)?;
         self.invalidate();

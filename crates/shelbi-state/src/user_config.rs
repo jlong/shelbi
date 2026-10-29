@@ -50,7 +50,8 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "ThemePreference::is_auto")]
     pub theme: ThemePreference,
 
-    /// Desktop app settings (`desktop:` block). Ignored by the CLI and TUI.
+    /// Desktop app settings (`desktop:` block). Ignored by the CLI, and by
+    /// the TUI but for `app_icon`, which its About draws.
     #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
     pub desktop: DesktopConfig,
 }
@@ -161,6 +162,16 @@ pub struct DesktopConfig {
         deserialize_with = "lenient_percent"
     )]
     pub contrast: Option<u8>,
+
+    /// Which icon the desktop app wears in the Dock and its About, and the
+    /// TUI's About draws: `command-grille` or `retro`. Unset, or a value it
+    /// doesn't know, means Command Grille (the app bundle's own icon).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_app_icon"
+    )]
+    pub app_icon: Option<AppIcon>,
 }
 
 /// Which Option keys act as Meta in the desktop app's terminals
@@ -248,6 +259,51 @@ fn lenient_scrollbar<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Res
     })
 }
 
+/// The app's icon (`desktop.app_icon`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppIcon {
+    /// The layered blue tile with its racing stripes, glass grille and `>_`
+    /// prompt: the app bundle's icon.
+    #[default]
+    CommandGrille,
+    /// The earlier raster icon: cobalt and chrome, the grille behind an oval
+    /// bezel.
+    Retro,
+}
+
+impl AppIcon {
+    /// Every icon, in the order the settings show them.
+    pub const ALL: [AppIcon; 2] = [AppIcon::CommandGrille, AppIcon::Retro];
+
+    /// The icon `cfg` names (unset is Command Grille).
+    pub fn from_config(cfg: &DesktopConfig) -> AppIcon {
+        cfg.app_icon.unwrap_or_default()
+    }
+
+    /// The icon's name, as the settings label its tile.
+    pub fn label(self) -> &'static str {
+        match self {
+            AppIcon::CommandGrille => "Command Grille",
+            AppIcon::Retro => "Retro",
+        }
+    }
+}
+
+/// `app_icon`: `command-grille` or `retro` (any case, `_` for `-`);
+/// anything else is ignored rather than failing the whole file.
+fn lenient_app_icon<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<AppIcon>, D::Error> {
+    let value = serde_yaml::Value::deserialize(d)?;
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    Ok(match text.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "command-grille" => Some(AppIcon::CommandGrille),
+        "retro" => Some(AppIcon::Retro),
+        _ => None,
+    })
+}
+
 /// `window_opacity` and `contrast`: a whole percentage, or a fraction up
 /// to 1 read as one (`0.85` is 85). Out of range saturates; anything that isn't a number is
 /// ignored rather than failing the whole file.
@@ -279,6 +335,7 @@ impl DesktopConfig {
             && self.window_opacity.is_none()
             && self.window_blur.is_none()
             && self.contrast.is_none()
+            && self.app_icon.is_none()
     }
 }
 
@@ -1276,5 +1333,41 @@ mod tests {
         assert_eq!(read("3"), None);
         assert_eq!(read("~"), None);
         assert!(DesktopConfig::default().terminal_scrollbar.is_none());
+    }
+
+    #[test]
+    fn app_icon_round_trips_reads_leniently_and_defaults_to_command_grille() {
+        for v in AppIcon::ALL {
+            let cfg = UserConfig {
+                desktop: DesktopConfig {
+                    app_icon: Some(v),
+                    ..DesktopConfig::default()
+                },
+                ..UserConfig::default()
+            };
+            let text = serde_yaml::to_string(&cfg).unwrap();
+            let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+            assert_eq!(back, cfg, "{text}");
+        }
+        let text = serde_yaml::to_string(&DesktopConfig {
+            app_icon: Some(AppIcon::CommandGrille),
+            ..DesktopConfig::default()
+        })
+        .unwrap();
+        assert!(text.contains("app_icon: command-grille"), "{text}");
+
+        let read = |v: &str| {
+            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  app_icon: {v}\n")).unwrap();
+            cfg.desktop.app_icon
+        };
+        assert_eq!(read("retro"), Some(AppIcon::Retro));
+        assert_eq!(read("Command_Grille"), Some(AppIcon::CommandGrille));
+        // Unknown values are ignored, not an error that loses the file.
+        assert_eq!(read("roadster"), None);
+        assert_eq!(read("~"), None);
+        // Unset is Command Grille, and isn't written.
+        assert_eq!(AppIcon::from_config(&DesktopConfig::default()), AppIcon::CommandGrille);
+        assert!(DesktopConfig::default().is_empty());
+        assert!(!DesktopConfig { app_icon: Some(AppIcon::Retro), ..DesktopConfig::default() }.is_empty());
     }
 }

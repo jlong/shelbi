@@ -73,6 +73,12 @@ libc = { version = "0.2", optional = true }
 # Bootstrap publishes its states from a std thread to the UI's async task.
 # Already in gpui's tree.
 async-channel = "2"
+# The board's collapsed columns draw their rotated label from glyph
+# outlines (gpui can't rotate text): ttf-parser reads the bundled faces',
+# fontdb finds a system face for a character they lack. Both already in
+# gpui's tree (resvg's).
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 # The Markdown parser gpui-kit's text view renders with (pinned to the version
 # gpui-base resolves), for the task detail's checklist count and its tests.
 markdown = "=1.0.0"
@@ -96,7 +102,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # pasteboard, file promises and image reps, gpui's window via its raw handle.
 # The Reduce Motion setting (`platform::motion`) is NSWorkspace's; the
 # terminals' scrollbar follows NSScroller's preferred style
-# (`platform::scrollers`).
+# (`platform::scrollers`); the Dock icon is NSApplication's
+# (`platform::dock_icon`).
 # All already in gpui's macOS tree, at the versions it resolves.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -120,9 +127,11 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSAccessibility",
+    "NSApplication",
     "NSBitmapImageRep",
     "NSControl",
     "NSFilePromiseReceiver",
+    "NSImage",
     "NSImageRep",
     "NSPasteboard",
     "NSPasteboardItem",

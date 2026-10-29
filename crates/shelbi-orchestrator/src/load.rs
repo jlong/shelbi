@@ -560,8 +560,13 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     // workflow) is left in the review column for a human sidebar load — routing
     // it here would consume a review slot purely for being idle, diverging from
     // the model where loading onto a review workspace is a deliberate action.
+    // Only the user's own issues are auto-loaded: on a shared remote tracker a
+    // teammate's card reaching review is theirs to load, not this hub's (the
+    // shared ownership gate, index-only so the tick adds no tracker request).
+    let ownership = shelbi_state::ownership::gate_from_index(project_name, &project.issue_tracker)?;
     let eligible: Vec<IssueFile> = review_tasks
         .into_iter()
+        .filter(|tf| ownership.allows(&tf.tracker_assignees))
         .filter(|tf| {
             let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
                 .unwrap_or_else(|_| shelbi_core::default_workflow());
@@ -1080,6 +1085,15 @@ pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<Dispatc
             "issue `{task_id}` is not parked in an agent-owned active gate (status `{status_id}`)"
         )));
     }
+    // Ownership gate: on a shared remote tracker a teammate's card can sit in
+    // a gate too; only the user's own issues are dispatched. Never takes.
+    shelbi_state::ownership::ensure_owned_for_dispatch(
+        &project.issue_tracker,
+        store.as_ref(),
+        &tf,
+        false,
+    )
+    .map_err(Error::Other)?;
     let status = workflow.status(status_id);
     let required: BTreeSet<String> = status
         .map(|s| s.tags.iter().cloned().collect())
@@ -2440,6 +2454,102 @@ statuses:
             "the dispatched task's own assignment must be excluded: {busy:?}",
         );
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Save `tagged_project` as a github-backed project, with the gated
+    /// workflow, served by a fake `gh` (authenticated as `octocat`) holding one
+    /// issue `t-gate` parked in the `adversarial-review` gate and assigned to
+    /// `assignees` on the tracker.
+    fn github_gate_fixture(assignees: &[&str]) {
+        let mut project = gate_project();
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        shelbi_state::save_project(&project).unwrap();
+        write_gated_workflow();
+        let logins: Vec<String> =
+            assignees.iter().map(|l| format!(r#"{{"login":"{l}"}}"#)).collect();
+        let logins = logins.join(",");
+        let rest = format!(
+            r#"{{"number":9,"title":"G","body":"","state":"open","assignees":[{logins}],"labels":[{{"name":"shelbi:id/t-gate"}},{{"name":"shelbi:status/adversarial-review"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        );
+        let node = format!(
+            r#"{{"data":{{"rateLimit":{{"remaining":4999}},"repository":{{"issue":{{"number":9,"title":"G","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"","assignees":{{"nodes":[{logins}]}},"labels":{{"nodes":[{{"name":"shelbi:id/t-gate"}},{{"name":"shelbi:status/adversarial-review"}}]}}}}}}}}}}"#
+        );
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            let joined = args.join(" ");
+            if args.contains(&"user") && !joined.contains("repos/") {
+                return Ok("octocat\n".to_string());
+            }
+            if args.contains(&"graphql") && joined.contains("IdSearch") {
+                return Ok(
+                    r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":9}]}}}"#
+                        .to_string(),
+                );
+            }
+            if args.contains(&"graphql") {
+                return Ok(node.clone());
+            }
+            Ok(rest.clone())
+        });
+    }
+
+    #[test]
+    fn dispatch_active_gate_refuses_a_teammates_gate_card() {
+        // Auto-dispatch: on a shared remote tracker a teammate's card can sit in
+        // an agent-owned gate too. The daemon's gate dispatch runs the shared
+        // ownership check and refuses it (it never takes on its own).
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        github_gate_fixture(&["alice"]);
+
+        let err = dispatch_active_gate("demo", "t-gate").unwrap_err().to_string();
+        assert!(err.contains("assigned to @alice"), "{err}");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dispatch_active_gate_refuses_an_unassigned_gate_card() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        github_gate_fixture(&[]);
+
+        let err = dispatch_active_gate("demo", "t-gate").unwrap_err().to_string();
+        assert!(err.contains("not assigned to anyone"), "{err}");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dispatch_active_gate_passes_the_ownership_check_for_the_users_card() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        github_gate_fixture(&["octocat"]);
+
+        // The launch can't run in a unit test; the refusal just must not be
+        // the ownership gate.
+        if let Err(e) = dispatch_active_gate("demo", "t-gate") {
+            let e = e.to_string();
+            assert!(!e.contains("Shelbi only starts issues assigned to you"), "{e}");
+            assert!(!e.contains("not assigned to anyone"), "{e}");
+            assert!(!e.contains("not parked in an agent-owned active gate"), "{e}");
+        }
+
+        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -58,6 +58,7 @@ use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
 use crate::assets::{heroicon, icons};
+use crate::elements::rotated_text::rotated_text;
 use crate::keys::chord_from_keystroke;
 use crate::theme::style;
 use crate::theme::Theme;
@@ -79,8 +80,8 @@ const SUMMARY_WIDTH: f32 = 244.0;
 /// A card's corner radius (the Figma card's: 12px, rounder than a button's
 /// 6px).
 const CARD_RADIUS: f32 = 12.0;
-/// A collapsed column's width.
-const COLLAPSED_WIDTH: f32 = 36.0;
+/// A collapsed column's width (Figma's turned column heading: 24pt).
+const COLLAPSED_WIDTH: f32 = 24.0;
 /// The toolbar's height (Figma: the 52px Header, no rule under it; its band
 /// sets it off from the board).
 const TOOLBAR_H: f32 = 52.0;
@@ -1024,39 +1025,33 @@ impl IssuesView {
         let focused = ci == self.state.selected_column;
         let drop = self.state.dragging().map(|id| self.state.drop_target(id, ci));
         let refused = matches!(drop, Some(DropTarget::Refused(_)));
-        let letters: Vec<_> = col
-            .label
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .map(|c| div().child(c.to_string()))
-            .collect();
         let theme = *theme;
-        // Figma draws no collapsed column: the strip keeps the column header's
-        // pieces (the glyph, the count, the caps label run down the strip) on
-        // the canvas, with a hover fill.
+        // Figma's collapsed column (node 2165:94) is the column heading
+        // turned 90° clockwise down a 24pt strip: the glyph at the top (kept
+        // upright, as the expanded heading draws it), then the caps label
+        // and the count reading down. The label takes the strip's height
+        // and is cut with an ellipsis only where it would run past it; the
+        // count is never cut.
+        let label_color = if focused { theme.text_loud } else { theme.muted };
         div()
             .id(("collapsed", ci))
             .flex()
             .flex_col()
             .items_center()
-            .gap_1()
+            .gap(px(8.0))
             .flex_none()
             .w(px(COLLAPSED_WIDTH))
             .h_full()
             .py(px(4.0))
+            .overflow_hidden()
             .rounded_lg()
-            .type_style(Type::XSmallSemibold)
-            .text_color(if focused { theme.text_loud } else { theme.muted })
             .cursor_pointer()
             .hover(move |s| s.bg(theme.background))
-            .child(div().flex().items_center().h(px(16.0)).child(style::status_icon(col.category, &theme)))
+            .child(div().flex_none().size(px(16.0)).child(style::status_icon(col.category, &theme)))
             .child(
-                div()
-                    .type_style(Type::XSmall)
-                    .text_color(theme.muted)
-                    .child(col.cards.len().to_string()),
+                rotated_text(col.label.to_uppercase(), Type::XSmallSemibold, label_color).truncate(),
             )
-            .children(letters)
+            .child(rotated_text(col.cards.len().to_string(), Type::XSmall, theme.muted))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let intents = this.state.toggle_column(ci);
                 this.apply_intents(intents, window, cx);
@@ -1750,8 +1745,15 @@ fn reorder_target(
 /// dependencies when it has any. The badge is on every card, as Figma draws
 /// it, even on a one-workflow board (where the TUI leaves it off, see
 /// `IssuesModel::show_workflow_badges`). The assignee isn't on the card, as
-/// in Figma: the detail and the workspace filter carry it.
+/// in Figma: the detail and the workspace filter carry it. On a shared remote
+/// tracker a card that isn't the user's leads with whose it is (`@alice`,
+/// `unassigned`), since Shelbi won't start it without an explicit take.
 fn card_meta(card: &IssueCard, theme: &Theme) -> impl IntoElement {
+    let owner = card
+        .tracker_owner
+        .as_ref()
+        .filter(|o| !o.is_mine())
+        .map(|o| o.label());
     let deps = (!card.depends_on.is_empty()).then(|| {
         let list = card
             .depends_on
@@ -1775,6 +1777,7 @@ fn card_meta(card: &IssueCard, theme: &Theme) -> impl IntoElement {
                 .gap_1()
                 .items_center()
                 .overflow_hidden()
+                .when_some(owner, |d, o| d.child(div().flex_none().text_color(theme.text_loud).child(o)))
                 .child(workflow_badge(card.workflow_name.clone(), theme))
                 .when_some(card.branch.clone(), |d, b| d.child(div().min_w_0().truncate().child(b))),
         )

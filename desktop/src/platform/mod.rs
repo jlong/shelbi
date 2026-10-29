@@ -22,6 +22,7 @@ pub mod bootstrap;
 pub mod control;
 pub mod daemon;
 pub mod discovery;
+pub mod dock_icon;
 pub mod env;
 pub mod feedback;
 pub mod font_smoothing;

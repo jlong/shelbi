@@ -29,6 +29,10 @@
 //!   translucency, two sliders under Contrast. A slider applies to every open
 //!   window as it moves ([`crate::theme::window`]) and is saved when it is
 //!   let go; Reduce Transparency forces the windows opaque and disables them.
+//! - `desktop.app_icon`: the app's icon, Command Grille (the default) or
+//!   Retro, picked from a tile of each under Translucency. A pick shows in
+//!   the Dock at once ([`crate::app_icon`]), and in About, and is saved;
+//!   unset stays unset until one is picked.
 //! - `desktop.notifications`: which system notifications the app posts.
 //! - `desktop.terminal_colors`: the ANSI colors the user changed, regular
 //!   and bold for each of the eight, typed as hex. A valid color applies to
@@ -73,7 +77,9 @@ use gpui::{
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use shelbi_app::settings::general::{theme_label, SaveStatus, THEMES};
-use shelbi_state::{DesktopConfig, DesktopNotifications, OptionAsMeta, TerminalScrollbar, ThemePreference, UserConfig};
+use shelbi_state::{
+    AppIcon, DesktopConfig, DesktopNotifications, OptionAsMeta, TerminalScrollbar, ThemePreference, UserConfig,
+};
 use shelbi_term::render::Rgb as TermRgb;
 
 use super::agent_editor::{AgentEditor, AgentEditorEvent};
@@ -89,6 +95,7 @@ use super::workflows::{WorkflowsEvent, WorkflowsPage};
 use shelbi_app::settings::workspace_form::Outcome;
 use super::workspaces::{WorkspacesEvent, WorkspacesPage};
 use shelbi_app::settings::workspaces::Intent;
+use crate::app_icon::{self, AppIconSetting};
 use crate::assets::icons;
 use crate::elements::controls::{self, Slider, SliderEvent};
 use crate::elements::terminal::colors::{self, AnsiOverrides};
@@ -140,6 +147,8 @@ pub struct SettingsValues {
     pub translucency: Translucency,
     /// The contrast setting, in percent.
     pub contrast: u8,
+    /// The app icon picked (`None` until one is: Command Grille, unwritten).
+    pub app_icon: Option<AppIcon>,
 }
 
 /// The notification switches, as the form shows them.
@@ -206,6 +215,7 @@ impl Default for SettingsValues {
             ansi: [None; 16],
             translucency: Translucency::default(),
             contrast: 0,
+            app_icon: None,
         }
     }
 }
@@ -246,6 +256,7 @@ impl SettingsValues {
             ansi: terminal.ansi,
             translucency: Translucency::from_config(&cfg.desktop),
             contrast: contrast::from_config(&cfg.desktop),
+            app_icon: cfg.desktop.app_icon,
         }
     }
 
@@ -276,6 +287,9 @@ impl SettingsValues {
             window_opacity: None,
             window_blur: None,
             contrast: None,
+            // Written once picked, whichever it is, so the choice outlives
+            // a change of default.
+            app_icon: self.app_icon,
         };
         self.translucency.apply(&mut cfg.desktop);
         contrast::apply(self.contrast, &mut cfg.desktop);
@@ -351,6 +365,8 @@ pub struct SettingsView {
     /// The contrast setting, and its slider.
     contrast: u8,
     contrast_slider: Entity<Slider>,
+    /// The app icon picked (`None` shows Command Grille, the default).
+    app_icon: Option<AppIcon>,
     option_as_meta: OptionAsMeta,
     scrollbar: TerminalScrollbar,
     notifications: Switches,
@@ -437,6 +453,8 @@ impl SettingsView {
             // Reduce Transparency changed, or another window's sliders
             // moved: show it.
             cx.observe_global::<WindowLook>(|this, cx| this.follow_window_look(cx)),
+            // Another window's settings picked an app icon: show it.
+            cx.observe_global::<AppIconSetting>(|this, cx| this.follow_app_icon(cx)),
             cx.subscribe(&keybindings, |_, _, event: &KeybindingsEvent, cx| match event {
                 KeybindingsEvent::Saved(keymaps) => cx.emit(SettingsEvent::KeysSaved(keymaps.clone())),
                 KeybindingsEvent::Leave => cx.emit(SettingsEvent::Leave),
@@ -499,6 +517,7 @@ impl SettingsView {
             blur_slider,
             contrast: 0,
             contrast_slider,
+            app_icon: None,
             option_as_meta: OptionAsMeta::Off,
             scrollbar: TerminalScrollbar::Auto,
             notifications: Switches::default(),
@@ -868,6 +887,8 @@ impl SettingsView {
         translucency::set(values.translucency, cx);
         self.show_contrast(values.contrast, cx);
         crate::theme::set_contrast(values.contrast, cx);
+        self.app_icon = values.app_icon;
+        app_icon::set(values.app_icon.unwrap_or_default(), cx);
         self.option_as_meta = values.option_as_meta;
         self.scrollbar = values.scrollbar;
         self.notifications = values.notifications;
@@ -889,7 +910,32 @@ impl SettingsView {
             ansi: self.ansi,
             translucency: self.translucency,
             contrast: self.contrast,
+            app_icon: self.app_icon,
         }
+    }
+
+    /// Pick the app's icon: the Dock and About show it now, and it is saved.
+    fn set_app_icon(&mut self, icon: AppIcon, cx: &mut Context<Self>) {
+        self.app_icon = Some(icon);
+        app_icon::set(icon, cx);
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// The app icon changed (another window's pick): show it, once the
+    /// config is read.
+    fn follow_app_icon(&mut self, cx: &mut Context<Self>) {
+        let current = app_icon::current(cx);
+        if self.loaded && current != self.app_icon.unwrap_or_default() {
+            self.app_icon = Some(current);
+            cx.notify();
+        }
+    }
+
+    /// The app icon the picker shows picked.
+    #[cfg(test)]
+    pub fn app_icon(&self) -> Option<AppIcon> {
+        self.app_icon
     }
 
     /// The contrast slider moved: every window follows at once, and letting
@@ -1253,6 +1299,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Show `icon` picked, without applying or saving it (`--visual-views`'
+    /// App icon frames).
+    pub(crate) fn offscreen_show_app_icon(&mut self, icon: AppIcon, cx: &mut Context<Self>) {
+        self.app_icon = Some(icon);
+        cx.notify();
+    }
+
     /// Whether `config.yaml` has been read into the form.
     pub(crate) fn offscreen_loaded(&self) -> bool {
         self.loaded
@@ -1283,6 +1336,14 @@ fn option_label(value: OptionAsMeta) -> &'static str {
         OptionAsMeta::Both => "Meta",
         OptionAsMeta::Left => "Left is Meta",
         OptionAsMeta::Right => "Right is Meta",
+    }
+}
+
+/// An app icon tile's selector (and element id).
+fn app_icon_selector(icon: AppIcon) -> &'static str {
+    match icon {
+        AppIcon::CommandGrille => "settings-app-icon-command-grille",
+        AppIcon::Retro => "settings-app-icon-retro",
     }
 }
 
@@ -1434,6 +1495,7 @@ impl Render for SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_switch(switch, cx)))
         };
 
+        let shown_icon = self.app_icon.unwrap_or_default();
         let shown = self.page;
         let page = div()
             .id("settings")
@@ -1473,6 +1535,25 @@ impl Render for SettingsView {
                     &theme,
                 ))
                 .child(self.render_translucency(&theme, cx))
+                .child(controls::labeled_control(
+                    "App icon",
+                    controls::icon_choices().children(AppIcon::ALL.map(|icon| {
+                        controls::icon_choice(
+                            app_icon_selector(icon),
+                            app_icon::tile_image(icon),
+                            icon.label(),
+                            icon == shown_icon,
+                            &theme,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_app_icon(icon, cx)))
+                    })),
+                    Some(
+                        "Shown in the Dock while Shelbi runs and in About. Finder, and the Dock before \
+                         launch, show the app's own icon, Command Grille."
+                            .into(),
+                    ),
+                    &theme,
+                ))
                 .child(controls::labeled_control(
                     "Shelbi CLI",
                     cli,
@@ -1861,6 +1942,7 @@ mod tests {
             },
             translucency: Translucency { opacity: 85, blur: 20 },
             contrast: 40,
+            app_icon: Some(AppIcon::Retro),
         };
         let mut cfg = UserConfig {
             editor: Some("hx".into()),
@@ -1881,6 +1963,7 @@ mod tests {
         assert_eq!((ansi.black.bold.as_ref(), ansi.green.regular.as_ref()), (None, None), "only what was changed");
         assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(20)));
         assert_eq!(cfg.desktop.contrast, Some(40));
+        assert_eq!(cfg.desktop.app_icon, Some(AppIcon::Retro));
         assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
         assert_eq!(back, values);
@@ -1903,6 +1986,7 @@ mod tests {
         let shown = SettingsValues::from_config(&UserConfig::default());
         assert_eq!((shown.font_family.as_str(), shown.font_size), ("Source Code Pro", 14));
         assert_eq!(shown, SettingsValues::default());
+        assert_eq!(shown.app_icon, None, "unset shows Command Grille and stays unset");
     }
 
     /// A first launch (no `config.yaml`) shows a new install's look, and the

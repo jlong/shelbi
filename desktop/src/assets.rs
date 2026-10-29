@@ -29,7 +29,7 @@
 //!
 //! One exception: a few drawings John made in the Figma file where
 //! Heroicons has none (the palette's Zen toggle, error log and finish
-//! flag, the sidebar's toggle). They live under `assets/icons/figma/` (see its README), on the
+//! flag, the sidebar's toggle, every dropdown's chevron). They live under `assets/icons/figma/` (see its README), on the
 //! Figma's 20pt grid, and render through the same [`heroicon`] helper.
 //!
 //! Where the Figma file draws an icon at **14pt** (the Activity pickers'
@@ -395,6 +395,8 @@ heroicons! {
     GLOBE_ALT = "globe-alt";
     ARROW_DOWN = "arrow-down";
     CHEVRON_UP = "chevron-up";
+    /// The terminal search bar's newer-match button (a dropdown's chevron
+    /// is `CHEVRON_DOWN_SMALL`).
     CHEVRON_DOWN = "chevron-down";
     /// The agent editor's Workflow assignments rows (they open the
     /// workflow).
@@ -427,6 +429,7 @@ heroicons! {
         FLAG_FINISH = "flag-finish";
         SIDEBAR = "sidebar";
         KEYBOARD_KEY = "keyboard-key";
+        CHEVRON_DOWN_SMALL = "chevron-down-small";
     }
     @small {
         FUNNEL_SMALL = "funnel";
@@ -533,6 +536,21 @@ const GEIST: &[&[u8]] = &[
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-SemiBold.ttf")),
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/geist/Geist-Bold.ttf")),
 ];
+
+/// The weights of [`GEIST`]'s faces, in its order.
+const GEIST_WEIGHTS: [f32; 4] = [400.0, 500.0, 600.0, 700.0];
+
+/// The bundled Geist face nearest `weight`: its font file, for code that
+/// reads glyph outlines itself (`elements::rotated_text`).
+pub fn ui_face(weight: gpui::FontWeight) -> &'static [u8] {
+    let nearest = (0..GEIST.len())
+        .min_by(|&a, &b| {
+            let off = |i: usize| (GEIST_WEIGHTS[i] - weight.0).abs();
+            off(a).total_cmp(&off(b))
+        })
+        .unwrap_or(0);
+    GEIST[nearest]
+}
 
 /// Source Code Pro, the terminal typeface (SIL Open Font License 1.1,
 /// vendored with its license under `assets/fonts/source-code-pro/`, from
@@ -886,6 +904,44 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "draw icons with assets::heroicon(icon) or assets::glyph(g), not svg():\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// A dropdown's chevron is Figma's `chevron-down-small`, drawn as
+    /// exported (2342:37950), and the 20pt Heroicons chevron is left only
+    /// to the terminal search bar's newer-match button, which opens no
+    /// menu.
+    #[test]
+    fn dropdowns_draw_the_small_chevron() {
+        assert_eq!(crate::theme::style::DROPDOWN_CHEVRON, icons::CHEVRON_DOWN_SMALL);
+        let bytes = Assets.load(icons::CHEVRON_DOWN_SMALL.path()).unwrap().unwrap();
+        let svg = std::str::from_utf8(&bytes).unwrap();
+        assert!(svg.contains(r#"d="M5.5968 7.725L10.0001 12.1283L14.4033 7.725""#), "Figma's path");
+        assert!(svg.contains(r#"stroke-width="1.25""#));
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allowed = [src.join("assets.rs"), src.join("elements/terminal/mod.rs")];
+        let mut files = vec![src];
+        let mut offenders = Vec::new();
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || allowed.contains(&path) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains("icons::CHEVRON_DOWN") && !line.contains("icons::CHEVRON_DOWN_SMALL") {
+                    offenders.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a dropdown's chevron is style::DROPDOWN_CHEVRON:\n{}",
             offenders.join("\n")
         );
     }

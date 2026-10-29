@@ -561,7 +561,7 @@ fn picker(id: impl Into<SharedString>, label: impl Into<SharedString>, icon: Opt
         .w_full()
         .children(icon.map(|c| style::left_slot(size, style::status_icon_large(c, theme))))
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
-        .child(style::right_icon_slot(icons::CHEVRON_DOWN, size, theme.button_icon))
+        .child(style::dropdown_slot(size, theme.button_icon))
 }
 
 /// A labeled control in the inspector: Base label, 6pt, the control, the
@@ -715,7 +715,7 @@ impl WorkflowEditor {
             "builder-zoom-menu",
             style::content_button(
                 "builder-zoom",
-                ButtonContent::label(self.builder.viewport.label()).right(icons::CHEVRON_DOWN),
+                ButtonContent::label(self.builder.viewport.label()).dropdown(),
                 ButtonKind::Secondary,
                 ButtonSize::Small,
                 false,

@@ -23,7 +23,7 @@ use shelbi_core::{
     default_project_statuses, default_workflow, Issue, ProjectStatuses, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
-use shelbi_state::{IssueFile, KanbanColumnOverride};
+use shelbi_state::{IssueFile, KanbanColumnOverride, OwnershipGate};
 
 use crate::view::ColumnDef;
 
@@ -635,6 +635,9 @@ pub struct BoardProject {
     pub default_workflow_name: String,
     pub display_name: Option<String>,
     pub workspaces: Vec<String>,
+    /// The tracker-ownership gate cards are marked against
+    /// ([`shelbi_state::ownership`]): unrestricted on a filesystem board.
+    pub ownership: OwnershipGate,
 }
 
 /// How the open-board read went.
@@ -680,6 +683,9 @@ pub fn read_open_board(project: &str) -> BoardRead {
         .map(|p| BoardProject {
             default_workflow_name: p.default_workflow_name().to_string(),
             display_name: p.display_name.clone().or_else(|| p.label.clone()),
+            // From the board index, no API call: a render never spends budget.
+            ownership: shelbi_state::ownership::gate_from_index(project, &p.issue_tracker)
+                .unwrap_or(OwnershipGate::FailClosed),
             workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
         });
     let state_snapshot = shelbi_state::read_state(project).ok();
@@ -786,6 +792,8 @@ pub struct BoardInput {
     pub banner: Option<String>,
     /// The last read error, if the latest read failed.
     pub error: Option<String>,
+    /// Whose each card is on a remote tracker (see [`BoardProject::ownership`]).
+    pub ownership: OwnershipGate,
 }
 
 impl Default for BoardInput {
@@ -806,6 +814,7 @@ impl Default for BoardInput {
             loading: true,
             banner: None,
             error: None,
+            ownership: OwnershipGate::Unrestricted,
         }
     }
 }
@@ -821,11 +830,13 @@ impl BoardInput {
                 self.default_workflow_name = p.default_workflow_name;
                 self.display_name = p.display_name;
                 self.workspaces = p.workspaces;
+                self.ownership = p.ownership;
             }
             None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
                 self.display_name = None;
                 self.workspaces = Vec::new();
+                self.ownership = OwnershipGate::Unrestricted;
             }
         }
         self.workspace_filter = read

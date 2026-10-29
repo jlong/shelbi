@@ -1095,6 +1095,7 @@ mod tests {
             branch: None,
             reason: None,
             force: false,
+            take: false,
         };
         let a = fire(&served.sock, 1, start(), at_todo());
         let b = fire(&served.sock, 2, start(), at_todo());

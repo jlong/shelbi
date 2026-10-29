@@ -653,3 +653,161 @@ fn workspace_busy_with_other_cant_confirm_on_a_stale_board_missing_the_routed_id
     std::env::remove_var("SHELBI_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---- tracker ownership: `start` on a shared remote tracker -------------------
+
+/// A fake GitHub for project `gh` serving one issue `t` (number 7) assigned to
+/// `assignees`, authenticated as `octocat`. The add-assignees POST answers the
+/// issue with `octocat` added. Every call is recorded.
+fn fake_github_issue(assignees: &[&str]) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let issue = |logins: &[String]| {
+        let assignees: Vec<String> =
+            logins.iter().map(|l| format!(r#"{{"login":"{l}"}}"#)).collect();
+        format!(
+            r#"{{"number":7,"title":"T","body":"","state":"open","assignees":[{}],"labels":[{{"name":"shelbi:id/t"}},{{"name":"shelbi:status/todo"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#,
+            assignees.join(",")
+        )
+    };
+    // The same issue as a GraphQL node (the single-issue query `get_raw` uses).
+    let node = |logins: &[String]| {
+        let assignees: Vec<String> =
+            logins.iter().map(|l| format!(r#"{{"login":"{l}"}}"#)).collect();
+        format!(
+            r#"{{"data":{{"rateLimit":{{"remaining":4999}},"repository":{{"issue":{{"number":7,"title":"T","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"","assignees":{{"nodes":[{}]}},"labels":{{"nodes":[{{"name":"shelbi:id/t"}},{{"name":"shelbi:status/todo"}}]}}}}}}}}}}"#,
+            assignees.join(",")
+        )
+    };
+    let before: Vec<String> = assignees.iter().map(|s| s.to_string()).collect();
+    let mut after = before.clone();
+    after.push("octocat".into());
+    let before_node = node(&before);
+    let (before, after) = (issue(&before), issue(&after));
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec = calls.clone();
+    shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+        let joined = args.join(" ");
+        rec.lock().unwrap().push(joined.clone());
+        if args.contains(&"user") && !joined.contains("repos/") {
+            return Ok("octocat\n".to_string());
+        }
+        if args.contains(&"graphql") && joined.contains("IdSearch") {
+            return Ok(
+                r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":7}]}}}"#
+                    .to_string(),
+            );
+        }
+        if args.contains(&"graphql") {
+            return Ok(before_node.clone());
+        }
+        if joined.contains("/assignees") {
+            return Ok(after.clone());
+        }
+        Ok(before.clone())
+    });
+    calls
+}
+
+fn start_t(take: bool) -> (Result<ChangeNote, MutateError>, RecordingSink) {
+    let mut sink = RecordingSink::default();
+    let mut recheck = no_recheck();
+    let out = apply(
+        "gh",
+        "t",
+        &MutationKind::Start {
+            workspace: Some("dev".into()),
+            branch: None,
+            reason: None,
+            force: false,
+            take,
+        },
+        &mut sink,
+        &mut recheck,
+    );
+    (out, sink)
+}
+
+fn claimed(calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> bool {
+    calls.lock().unwrap().iter().any(|c| c.contains("/assignees"))
+}
+
+#[test]
+fn start_refuses_an_issue_assigned_to_someone_else() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let calls = fake_github_issue(&["alice"]);
+
+    let err = start_t(false).0.unwrap_err().to_string();
+    assert!(err.contains("assigned to @alice"), "{err}");
+    assert!(err.contains("--take"), "{err}");
+    assert!(!claimed(&calls), "start never claims on its own");
+    assert!(!events_log().contains("task=t "), "a refused start moves nothing: {}", events_log());
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn start_refuses_an_unassigned_issue() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let calls = fake_github_issue(&[]);
+
+    let err = start_t(false).0.unwrap_err().to_string();
+    assert!(err.contains("not assigned to anyone"), "{err}");
+    assert!(!claimed(&calls));
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn start_passes_the_ownership_gate_for_the_users_own_issue() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let calls = fake_github_issue(&["octocat"]);
+
+    // The launch itself can't run here (no repo, no session), so the start may
+    // still fail later; what matters is that it isn't the ownership gate.
+    if let Err(e) = start_t(false).0 {
+        let e = e.to_string();
+        assert!(!e.contains("Shelbi only starts issues assigned to you"), "{e}");
+        assert!(!e.contains("login could not be resolved"), "{e}");
+    }
+    assert!(!claimed(&calls), "an own issue needs no claim");
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn start_take_claims_someone_elses_issue_before_starting_it() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let calls = fake_github_issue(&["alice"]);
+
+    let (out, sink) = start_t(true);
+    if let Err(e) = &out {
+        assert!(!e.to_string().contains("Shelbi only starts issues assigned to you"), "{e}");
+    }
+    assert!(claimed(&calls), "--take assigns the issue to the user on the tracker: {out:?}");
+    assert!(
+        sink.lines.iter().any(|(_, l)| l == "✓ took t: assigned to @octocat on the issue tracker"),
+        "{:?}",
+        sink.lines
+    );
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
