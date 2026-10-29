@@ -2436,6 +2436,19 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "main") {
+            // The main window's screens alone, for the contrast setting's
+            // captures (`SHELBI_VISUAL_CONTRAST`).
+            let handle = self.open();
+            self.click(handle, orch.clone());
+            self.settle(handle);
+            self.save(handle, "orchestrator");
+            self.workspace(&orch, "workspace", |_, _| {});
+            self.issues();
+            self.settings();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
             self.components();
             self.review_confirm_states(&orch);
@@ -3162,5 +3175,13 @@ workspaces:
 
     // Settings: the frame's Shelbi CLI path. Its font and size predate the
     // Source Code Pro default, so those keep theirs.
-    std::fs::write(home.join("config.yaml"), "desktop:\n  cli_path: /opt/homebrew/bin/shelbi\n").unwrap();
+    // The run's contrast is the saved one too, so Settings shows it (and
+    // reading the file doesn't put the theme back to 0).
+    let contrast = crate::visual_check::theme().contrast();
+    let contrast = if contrast == 0 { String::new() } else { format!("  contrast: {contrast}\n") };
+    std::fs::write(
+        home.join("config.yaml"),
+        format!("desktop:\n  cli_path: /opt/homebrew/bin/shelbi\n{contrast}"),
+    )
+    .unwrap();
 }

@@ -305,6 +305,15 @@ macro_rules! palette {
                 }
             }
 
+            /// Convert every role with `f`, which is told the role's name
+            /// (the contrast setting adjusts a role by what it is for).
+            pub fn map_named<D>(&self, mut f: impl FnMut(&'static str, C) -> D) -> Palette<D> {
+                Palette {
+                    appearance: self.appearance,
+                    $( $role: f(stringify!($role), self.$role), )+
+                }
+            }
+
             /// Every role and its value, in declaration order.
             #[cfg(test)]
             pub fn roles(&self) -> Vec<(&'static str, C)> {
@@ -793,7 +802,7 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
 ];
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const AA: f64 = 4.5;
@@ -818,7 +827,7 @@ mod tests {
     }
 
     /// Every pairing the desktop draws, as `(what on what, ratio, minimum)`.
-    fn pairings(p: &Palette) -> Vec<(String, f64, f64)> {
+    pub(in crate::theme) fn pairings(p: &Palette) -> Vec<(String, f64, f64)> {
         let mut out = Vec::new();
         let mut check = |what: String, fg: Rgba, bg: Rgba, min: f64| {
             assert_eq!(bg.a, 0xff, "{what}: the background must be flattened");

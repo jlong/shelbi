@@ -21,8 +21,12 @@
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
 //!   reads, typed or chosen with Browse.
 //!
+//! - `desktop.contrast`: how far apart the surfaces and their text sit, a
+//!   slider under Theme (0 to 100%, 0 not written). It applies to every
+//!   open window as it moves ([`crate::theme::contrast`]) and is saved when
+//!   it is let go.
 //! - `desktop.window_opacity` / `desktop.window_blur`: the windows'
-//!   translucency, two sliders under Theme. A slider applies to every open
+//!   translucency, two sliders under Contrast. A slider applies to every open
 //!   window as it moves ([`crate::theme::window`]) and is saved when it is
 //!   let go; Reduce Transparency forces the windows opaque and disables them.
 //! - `desktop.notifications`: which system notifications the app posts.
@@ -94,6 +98,7 @@ use crate::elements::terminal::{scrollbar, TerminalPane, TerminalSettings};
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::window::{self as translucency, Translucency, WindowLook, BLUR_RANGE, OPACITY_RANGE};
+use crate::theme::contrast::{self, CONTRAST_RANGE};
 use crate::theme::{rgb_hsla, Theme};
 
 
@@ -133,6 +138,8 @@ pub struct SettingsValues {
     pub ansi: AnsiOverrides,
     /// The windows' opacity and blur.
     pub translucency: Translucency,
+    /// The contrast setting, in percent.
+    pub contrast: u8,
 }
 
 /// The notification switches, as the form shows them.
@@ -198,6 +205,7 @@ impl Default for SettingsValues {
             notifications: Switches::default(),
             ansi: [None; 16],
             translucency: Translucency::default(),
+            contrast: 0,
         }
     }
 }
@@ -237,6 +245,7 @@ impl SettingsValues {
             notifications: Switches::from(&cfg.desktop.notifications),
             ansi: terminal.ansi,
             translucency: Translucency::from_config(&cfg.desktop),
+            contrast: contrast::from_config(&cfg.desktop),
         }
     }
 
@@ -266,8 +275,10 @@ impl SettingsValues {
             terminal_colors: colors::to_config(&self.ansi),
             window_opacity: None,
             window_blur: None,
+            contrast: None,
         };
         self.translucency.apply(&mut cfg.desktop);
+        contrast::apply(self.contrast, &mut cfg.desktop);
         cfg.theme = self.theme;
     }
 }
@@ -337,6 +348,9 @@ pub struct SettingsView {
     translucency: Translucency,
     opacity_slider: Entity<Slider>,
     blur_slider: Entity<Slider>,
+    /// The contrast setting, and its slider.
+    contrast: u8,
+    contrast_slider: Entity<Slider>,
     option_as_meta: OptionAsMeta,
     scrollbar: TerminalScrollbar,
     notifications: Switches,
@@ -410,7 +424,10 @@ impl SettingsView {
         });
         let blur_slider =
             cx.new(|cx| Slider::new("settings-window-blur", initial.blur.into(), range(&BLUR_RANGE), (1, 5), "", cx));
+        let contrast_slider =
+            cx.new(|cx| Slider::new("settings-contrast", 0, range(&CONTRAST_RANGE), (1, 10), "%", cx));
         let mut subscriptions = vec![
+            cx.subscribe(&contrast_slider, |this, _, event: &SliderEvent, cx| this.slide_contrast(*event, cx)),
             cx.subscribe(&opacity_slider, |this, _, event: &SliderEvent, cx| {
                 this.slide(|t, v| t.opacity = v, *event, cx)
             }),
@@ -455,8 +472,11 @@ impl SettingsView {
                 this.follow_terminal_settings(window, cx)
             }),
             // The appearance changed: the colors left to the theme are its
-            // new ones.
-            cx.observe_global_in::<Theme>(window, |this, window, cx| this.show_colors(window, cx)),
+            // new ones. Or the contrast moved in another window: show it.
+            cx.observe_global_in::<Theme>(window, |this, window, cx| {
+                this.show_colors(window, cx);
+                this.follow_contrast(cx);
+            }),
         ];
         for (slot, input) in ansi_inputs.iter().enumerate() {
             subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| {
@@ -477,6 +497,8 @@ impl SettingsView {
             translucency: initial,
             opacity_slider,
             blur_slider,
+            contrast: 0,
+            contrast_slider,
             option_as_meta: OptionAsMeta::Off,
             scrollbar: TerminalScrollbar::Auto,
             notifications: Switches::default(),
@@ -844,6 +866,8 @@ impl SettingsView {
         self.show_translucency(values.translucency, cx);
         // What config.yaml says is what the windows show.
         translucency::set(values.translucency, cx);
+        self.show_contrast(values.contrast, cx);
+        crate::theme::set_contrast(values.contrast, cx);
         self.option_as_meta = values.option_as_meta;
         self.scrollbar = values.scrollbar;
         self.notifications = values.notifications;
@@ -864,7 +888,45 @@ impl SettingsView {
             notifications: self.notifications,
             ansi: self.ansi,
             translucency: self.translucency,
+            contrast: self.contrast,
         }
+    }
+
+    /// The contrast slider moved: every window follows at once, and letting
+    /// go saves it.
+    fn slide_contrast(&mut self, event: SliderEvent, cx: &mut Context<Self>) {
+        let (SliderEvent::Changed(v) | SliderEvent::Committed(v)) = event;
+        let next = contrast::clamped(v);
+        if next != self.contrast {
+            self.contrast = next;
+            crate::theme::set_contrast(next, cx);
+            cx.notify();
+        }
+        if matches!(event, SliderEvent::Committed(_)) {
+            self.save(cx);
+        }
+    }
+
+    /// Show `value` on the contrast slider.
+    fn show_contrast(&mut self, value: u8, cx: &mut Context<Self>) {
+        self.contrast = value;
+        self.contrast_slider.update(cx, |s, cx| s.set_value(value.into(), cx));
+        cx.notify();
+    }
+
+    /// The theme changed: show its contrast (once the config is read), so a
+    /// slider moved in another window shows here too.
+    fn follow_contrast(&mut self, cx: &mut Context<Self>) {
+        let current = cx.global::<Theme>().contrast();
+        if self.loaded && current != self.contrast {
+            self.show_contrast(current, cx);
+        }
+    }
+
+    /// The contrast slider.
+    #[cfg(test)]
+    pub fn contrast_slider(&self) -> Entity<Slider> {
+        self.contrast_slider.clone()
     }
 
     /// A slider moved (`set` writes its value into the setting): every
@@ -1399,6 +1461,17 @@ impl Render for SettingsView {
                     Some("Shared with the TUI, which picks it up when it starts or opens Settings.".into()),
                     &theme,
                 ))
+                .child(controls::labeled_control(
+                    "Contrast",
+                    self.contrast_slider.clone(),
+                    Some(
+                        "Separates text and icons from the backgrounds: darker backgrounds and brighter \
+                         text in Dark, lighter backgrounds and darker text in Light. Terminals keep their \
+                         colors."
+                            .into(),
+                    ),
+                    &theme,
+                ))
                 .child(self.render_translucency(&theme, cx))
                 .child(controls::labeled_control(
                     "Shelbi CLI",
@@ -1787,6 +1860,7 @@ mod tests {
                 ansi
             },
             translucency: Translucency { opacity: 85, blur: 20 },
+            contrast: 40,
         };
         let mut cfg = UserConfig {
             editor: Some("hx".into()),
@@ -1806,6 +1880,7 @@ mod tests {
         assert_eq!((ansi.black.regular.as_deref(), ansi.red.bold.as_deref()), (Some("#000000"), Some("#E69589")));
         assert_eq!((ansi.black.bold.as_ref(), ansi.green.regular.as_ref()), (None, None), "only what was changed");
         assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(20)));
+        assert_eq!(cfg.desktop.contrast, Some(40));
         assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
         assert_eq!(back, values);
@@ -1821,6 +1896,7 @@ mod tests {
         cfg.desktop.terminal_colors.set(3, Some("#dbc300".into()));
         (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(60), Some(10));
         cfg.desktop.terminal_scrollbar = Some(TerminalScrollbar::Always);
+        cfg.desktop.contrast = Some(70);
         SettingsValues::default().apply(&mut cfg);
         assert!(cfg.desktop.is_empty(), "{:?}", cfg.desktop);
 

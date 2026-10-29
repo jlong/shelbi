@@ -242,6 +242,42 @@ the windows see-through. The opacity is applied when the theme resolves
 - **Reduce Transparency** keeps every window opaque, read at launch and each
   time a window comes forward.
 
+## Contrast (`src/theme/contrast.rs`)
+
+`desktop.contrast` (Settings ▸ General's Contrast slider, 0 to 100%) moves
+the surfaces and what is drawn on them apart. Like the opacity it is applied
+when the theme resolves (`Palette::with_contrast`, through
+`Theme::resolve_with`), never as an overlay, and before the opacity, so a
+translucent window's surfaces are the adjusted colors at the window's alpha.
+0 is the palette exactly; every role moves in proportion to the setting, by
+what it is for:
+
+| Class | Roles | Dark at 100 | Light at 100 |
+|---|---|---|---|
+| Surface | `canvas`, `sidebar`, `card`, `raised`, `well`, `textbox`, `keycap`, `nav_selected`, `workflow_badge` | 35% toward black (`canvas` `#1e2330` → `#14171f`, `sidebar` `#2c3140` → `#1d202a`) | 50% toward white (`sidebar` `#f9f9fc` → `#fcfcfe`; white stays white) |
+| Text | `text_loud`, `foreground`, `gray`, `form_text`, `form_hint`, `muted`, `log_text`, `table_text`, `icon`, `button_icon`, `dark_gray`, `workflow_badge_text`, `link_hover` | half toward white, and alpha half toward opaque (`muted` 55% → 78%) | half toward black, alpha half toward opaque (`muted` `#444c65` at 50% → `#222633` at 75%) |
+| Border | `divider`, `divider_strong`, `input_border`, `check_border`, `ring` | half toward white, alpha doubled (`divider` 10% → 20%) | half toward black, alpha doubled |
+| Hue | links, `accent`, the status icons and text, the log hues, focus rings, the colored button labels | a fifth toward white (hue kept) | a fifth toward black (hue kept) |
+| Kept | the translucent fills laid over a surface (rows, chips, button fills and tints, selection, glows, shadows, scrim), `check_fill`, `text_on_color`, `button_keycap_edge` | unchanged: they composite darker over the darker surfaces by themselves, and their rest / hover / pressed steps stay as far apart | unchanged |
+
+The light theme's surfaces are mostly white already, so its separation comes
+mostly from the text, icons and rules. Body text on the canvas goes from
+10.6:1 to 12.5:1 at 50 and 14.7:1 at 100 in Dark, muted text from 5.2:1 to
+7.5:1 and 10.5:1; in Light, body text 8.2:1 to 11.0:1 and 14.8:1, muted
+text 2.5:1 to 3.8:1 and 6.7:1.
+
+The tests hold every pairing the WCAG checks above cover to never losing
+contrast as the setting rises, in both themes, but one: the log's dark gray
+on the selected Machines row's band (1.21:1 at 0), the only text drawn darker
+than its band in Dark, crosses the band near 15% before it clears it, and at
+100 reads better than at 0.
+
+The terminals don't take it: their palette is the contrast-0 palette's at
+every setting (default foreground, background and the ANSI sixteen), and a
+pane hosting a terminal paints that background (`Theme::terminal_canvas`) so
+the grid's insets match it. While the window is translucent a terminal's
+default background is the window's glass, as with the opacity alone.
+
 ## Shared meanings
 
 The shared view models name colors by meaning (the activity feed's `Tone`, a

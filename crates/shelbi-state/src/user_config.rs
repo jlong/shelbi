@@ -147,6 +147,20 @@ pub struct DesktopConfig {
         deserialize_with = "lenient_amount"
     )]
     pub window_blur: Option<u8>,
+
+    /// How far apart the desktop app's surfaces and their text sit, in
+    /// percent: 0 is the palette as designed and 100 the strongest step the
+    /// app makes. Raising it darkens the backgrounds and brightens the text,
+    /// icons and borders in the dark theme, and lightens the backgrounds and
+    /// darkens the text in the light one. Out of range saturates (the app
+    /// clamps to 100), and a fraction (`0.5`) reads as that percentage, as
+    /// `window_opacity` does. Unset means 0, which isn't written.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_percent"
+    )]
+    pub contrast: Option<u8>,
 }
 
 /// Which Option keys act as Meta in the desktop app's terminals
@@ -234,8 +248,8 @@ fn lenient_scrollbar<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Res
     })
 }
 
-/// `window_opacity`: a whole percentage, or a fraction up to 1 read as one
-/// (`0.85` is 85). Out of range saturates; anything that isn't a number is
+/// `window_opacity` and `contrast`: a whole percentage, or a fraction up
+/// to 1 read as one (`0.85` is 85). Out of range saturates; anything that isn't a number is
 /// ignored rather than failing the whole file.
 fn lenient_percent<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u8>, D::Error> {
     let value = serde_yaml::Value::deserialize(d)?;
@@ -264,6 +278,7 @@ impl DesktopConfig {
             && self.terminal_colors.is_empty()
             && self.window_opacity.is_none()
             && self.window_blur.is_none()
+            && self.contrast.is_none()
     }
 }
 
@@ -1180,6 +1195,33 @@ mod tests {
         assert_eq!(read("  window_opacity: 300\n  window_blur: -4"), (Some(255), Some(0)));
         assert_eq!(read("  window_opacity: lots\n  window_blur: 12.4"), (None, Some(12)));
         assert_eq!(read("  window_opacity: ~"), (None, None));
+    }
+
+    #[test]
+    fn contrast_round_trips_and_reads_leniently() {
+        let cfg = UserConfig {
+            desktop: DesktopConfig {
+                contrast: Some(60),
+                ..DesktopConfig::default()
+            },
+            ..UserConfig::default()
+        };
+        let text = serde_yaml::to_string(&cfg).unwrap();
+        assert!(text.contains("contrast: 60"), "{text}");
+        assert_eq!(serde_yaml::from_str::<UserConfig>(&text).unwrap(), cfg);
+        assert!(!cfg.desktop.is_empty());
+        assert!(!serde_yaml::to_string(&UserConfig::default()).unwrap().contains("contrast"));
+
+        let read = |v: &str| {
+            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  contrast: {v}\n")).unwrap();
+            cfg.desktop.contrast
+        };
+        assert_eq!(read("40"), Some(40));
+        assert_eq!(read("0.5"), Some(50), "a fraction");
+        assert_eq!(read("400"), Some(255), "saturates; the app clamps");
+        assert_eq!(read("-3"), Some(0));
+        assert_eq!(read("high"), None, "ignored, not an error that loses the file");
+        assert_eq!(read("~"), None);
     }
 
     #[test]
