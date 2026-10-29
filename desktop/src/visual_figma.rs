@@ -36,7 +36,7 @@
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
-//! collapsed, Zen off, the sidebar hidden), the issue detail's
+//! collapsed, the project switcher open, Zen off, the sidebar hidden), the issue detail's
 //! ([`DETAIL_ACTIONS`] hovered, a long body scrolled) and the task panels'
 //! (`state-review-*`, `state-workspace-*`: More opening the task detail
 //! over the screen, each view's ⌘N, Approve
@@ -1074,7 +1074,8 @@ impl Run {
         self.settle(handle);
         handle
             .update(&mut self.cx, |w, window, cx| {
-                // The frame's Projects column: two open, one not.
+                // The frame's Projects column: two open (Shelbi the current
+                // one, with the check), one not.
                 use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
                 let project = |slug: &str, label: &str, indicator| ProjectEntry {
                     slug: slug.into(),
@@ -1082,7 +1083,7 @@ impl Run {
                     indicator,
                 };
                 w.offscreen_palette_projects(vec![
-                    project("shelbi", "Shelbi", ProjectIndicator::LoadedIdle),
+                    project("shelbi", "Shelbi", ProjectIndicator::Active),
                     project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle),
                     project("32pixels", "32pixels", ProjectIndicator::Unloaded),
                 ]);
@@ -2757,6 +2758,20 @@ impl Run {
             }
             self.save(handle, &format!("state-sidebar-fold-{name}-settled"));
         }
+
+        // The project switcher open (the `Project switcher` component's open
+        // state, 2186:1692), the frame's projects open but 32pixels.
+        if let Some(catalog) = self.cx.update(|cx| cx.try_global::<crate::projects::Catalog>().cloned()) {
+            catalog.set_open(&["shelbi", "contextstore"]);
+        }
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_switcher(true, cx))
+            .unwrap();
+        // Past its slide in.
+        self.now.set(self.now.get() + Duration::from_millis(400));
+        self.save(handle, "state-sidebar-switcher");
 
         self.sidebar.zen_mode = shelbi_state::ZenModeState::Off;
         let handle = self.open();
