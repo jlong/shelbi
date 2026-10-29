@@ -126,6 +126,17 @@ pub struct EditSpec {
     /// `None` leaves it unchanged.
     pub prefers_machine: Option<Option<String>>,
     pub reason: Option<String>,
+    /// The title this edit replaces: the edit is refused as stale if the
+    /// stored title differs (compared trimmed). An app editor's save sends
+    /// the title it was based on, so it never overwrites a change it hasn't
+    /// seen, even where the revision can't tell (a remote tracker bumps it on
+    /// its own). Absent from the CLI, and from an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_title: Option<String>,
+    /// The body this edit replaces, likewise (compared without trailing
+    /// whitespace, which the store folds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_body: Option<String>,
 }
 
 /// The mutation to perform. Carries the full CLI argument surface so the

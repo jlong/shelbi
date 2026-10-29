@@ -1177,10 +1177,10 @@ impl AgentEditor {
     /// Import (an existing skill), Cancel and Add skill.
     fn render_skill_form(&self, form: &SkillForm, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let state = self.state.as_ref().expect("loaded");
-        let import = style::button("agent-skill-import", "Import…", ButtonKind::Quiet, ButtonSize::Small, false, theme)
+        let import = style::button("agent-skill-import", "Import…", ButtonKind::Ghost, ButtonSize::Small, false, theme)
             .tooltip(style::tooltip("Copy a skill folder (with its SKILL.md) or a .md file"))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.import_skill(window, cx)));
-        let cancel = style::button("agent-skill-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Small, false, theme)
+        let cancel = style::button("agent-skill-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Small, false, theme)
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_skill_form(cx)));
         let add = style::button("agent-skill-add", "Add skill", ButtonKind::Primary, ButtonSize::Small, false, theme)
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_skill(window, cx)));
@@ -1416,7 +1416,7 @@ impl AgentEditor {
     fn render_prompt(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
         let buttons = vec![
-            style::button("agent-leave-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme)
+            style::button("agent-leave-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(state) = this.state.as_mut() {
                         state.cancel_prompt();
@@ -1457,7 +1457,7 @@ impl AgentEditor {
     fn render_confirm_delete(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let name = self.state.as_ref().map(|s| s.name().to_string()).unwrap_or_default();
         let buttons = vec![
-            style::button("agent-delete-cancel", "Cancel", ButtonKind::Quiet, ButtonSize::Base, false, theme)
+            style::button("agent-delete-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(state) = this.state.as_mut() {
                         state.cancel_delete();

@@ -18,7 +18,8 @@
 //!
 //! Each screen gets a fresh 1440x1024 window and is saved as
 //! `<screen>-<theme>.png`, named as the reference PNGs are: orchestrator,
-//! issues, issue-detail, activity, review, workspace, workspace-idle,
+//! issues, task-pane (the In progress frame 2172:722) and task-pane-idle
+//! (Ready to start, 2573:10737), activity, review, workspace, workspace-idle,
 //! machines, the four Settings pages (settings-general,
 //! settings-keybindings, settings-terminal, settings-workflows against
 //! `workflows/1-index.png`, settings-workflow-builder{,-status,-drawing,
@@ -36,8 +37,9 @@
 //! palette states the
 //! frame doesn't draw ([`PALETTE_STATES`], no reference: checked by eye),
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
-//! collapsed, the project switcher open, Zen off, the sidebar hidden), the issue detail's
-//! ([`DETAIL_ACTIONS`] hovered, a long body scrolled) and the task panels'
+//! collapsed, the project switcher open, Zen off, the sidebar hidden), the task pane's
+//! (`state-task-pane-*`: its More menu, a long body scrolled, an empty body,
+//! a task no longer on the board, another card picked beside it) and the task panels'
 //! (`state-review-*`, `state-workspace-*`: More opening the task detail
 //! over the screen, each view's ⌘N, Approve
 //! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
@@ -76,7 +78,7 @@
 //! launch's CLI setup screens before them; `SHELBI_VISUAL_ONLY=cli-setup`.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
-//! components; `=issues` just the board, its states and the issue detail.
+//! components; `=issues` just the board, its states and the task pane.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -116,7 +118,7 @@ use crate::views::workspace::{WorkspaceDeps, WorkspaceOps};
 const PROJECT: &str = "my-project";
 /// `SHELBI_VISUAL_ONLY=panels` renders only the Review and Workspace
 /// screens and their panels' states; `=settings` only Settings; `=issues`
-/// only the board and the issue detail.
+/// only the board and the task pane.
 const ONLY_VAR: &str = "SHELBI_VISUAL_ONLY";
 /// The reference PNGs' size, in points.
 const WIDTH: u32 = 1440;
@@ -132,10 +134,11 @@ type EditFn = dyn Fn(
 );
 
 /// Every screen, named as its reference PNG.
-pub const SCREENS: [&str; 12] = [
+pub const SCREENS: [&str; 13] = [
     "orchestrator",
     "issues",
-    "issue-detail",
+    "task-pane",
+    "task-pane-idle",
     "activity",
     "review",
     "workspace",
@@ -193,10 +196,6 @@ pub const PALETTE_STATES: [(&str, &str); 4] = [
     ("tab down", "command-palette-project-selected"),
 ];
 
-/// The issue detail's actions, left to right, by the name of the render
-/// with each one hovered (`issue-detail-hover-<name>`).
-pub const DETAIL_ACTIONS: [&str; 6] = ["move-left", "move-right", "start", "assign", "edit", "editor"];
-
 // ---- the form components ---------------------------------------------------
 
 /// The components page's sheets, named as its PNGs, with their sizes: the
@@ -228,7 +227,7 @@ const BUTTON_SHEET_ROWS: [SheetButton; 10] = {
         SheetButton(Secondary, Base, SheetContent::Label("Button")),
         SheetButton(Danger, Base, SheetContent::Label("Button")),
         SheetButton(Select, Base, SheetContent::Label("Button")),
-        SheetButton(Quiet, Base, SheetContent::Label("Button")),
+        SheetButton(Ghost, Base, SheetContent::Label("Button")),
         SheetButton(Success, Small, SheetContent::Left("Approve")),
         SheetButton(Danger, Small, SheetContent::Left("Reject")),
         SheetButton(Secondary, XSmall, SheetContent::Label("Open")),
@@ -491,6 +490,9 @@ fn redraw(screen: &Screen, cols: u16, rows: u16) -> Vec<u8> {
 struct Sessions {
     idle: Vec<String>,
     screens: Vec<(String, Screen)>,
+    /// A screen one scene draws in place of the fixture's (the task pane's
+    /// alpha, mid-task).
+    over: Mutex<Vec<(String, Screen)>>,
 }
 
 impl SessionConnector for Sessions {
@@ -503,11 +505,9 @@ impl SessionConnector for Sessions {
                 branch: None,
             }));
         }
-        let screen = self
-            .screens
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, s)| s.clone())
+        let over = self.over.lock().unwrap().iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone());
+        let screen = over
+            .or_else(|| self.screens.iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone()))
             .unwrap_or_else(|| Arc::new(|_, _| String::new()));
         let size = Size::new(120, 40);
         let (tx, rx) = unbounded();
@@ -821,7 +821,33 @@ fn sessions() -> Arc<Sessions> {
             (name("ws/alpha"), Arc::new(workspace_screen)),
             (name("ws/review"), Arc::new(reviewer_screen)),
         ],
+        over: Mutex::new(Vec::new()),
     })
+}
+
+/// The In progress task pane's agent (Figma 2570:10612, 2570:10623): the
+/// request, the tool calls, the running status and the composer, as Claude
+/// Code draws them. The frame's output is an example; this is the fake
+/// session's screen, drawn by the real terminal.
+fn pane_session_screen(_cols: u16, rows: u16) -> String {
+    let body = lines(&[
+        paint(BOLD, "❯ Keep the active workspace when reconnecting."),
+        String::new(),
+        paint(DIM, "● I’ll preserve the session and retry the attachment."),
+        String::new(),
+        paint(BOLD, "● Read(crates/shelbi-app/src/session/reconnect.rs)"),
+        paint(DIM, "  ⎿  Read 148 lines"),
+        paint(BOLD, "● Update(crates/shelbi-app/src/session/reconnect.rs)"),
+        paint(GREEN, "  ⎿  Added 18 lines, removed 4 lines"),
+        String::new(),
+        paint(BOLD, "● Bash(cargo test -p shelbi-app reconnect)"),
+        paint(DIM, "  ⎿  Running…"),
+    ]);
+    let footer = [
+        at_row(rows - 1, &paint("\x1b[91m", "✻ Running tests…  32s  ·  esc to interrupt")),
+        at_row(rows, &paint(DIM, "❯ Send a message…")),
+    ];
+    body + &footer.concat()
 }
 
 // ---- the run --------------------------------------------------------------
@@ -2377,7 +2403,9 @@ impl Run {
                 let x = button_sheet_x(j);
                 let what = format!("{row:?} {state:?}");
                 let fill = match state {
-                    SheetState::Rest | SheetState::Focused => c.fill,
+                    SheetState::Rest => c.fill,
+                    // Ghost's Focus rests on its hover fill.
+                    SheetState::Focused => c.focus_fill,
                     SheetState::FocusedHover => c.hover,
                     SheetState::FocusedActive => c.pressed,
                     SheetState::Disabled => c.fill.opacity(0.4),
@@ -3077,16 +3105,8 @@ impl Run {
             .unwrap();
         self.cx.run_until_parked();
 
-        // A card's detail over the board.
-        let handle = self.open();
-        self.click(handle, View::Issues);
-        self.wait_for_board(handle);
-        self.frame_filter(handle);
-        handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
-            .unwrap();
-        self.save(handle, "issue-detail");
-        self.detail_states();
+        // A card's task pane over the board, in progress and ready to start.
+        self.task_panes();
 
     }
 
@@ -3099,58 +3119,124 @@ impl Run {
         self.settle(handle);
     }
 
-    /// The issue detail over the board, as the frame shows it.
-    fn open_detail(&mut self) -> WindowHandle<ShelbiWindow> {
+    /// The task pane over the board, the Task pane frames' task open: in
+    /// progress (2172:722, Backlog collapsed, its branch cut) and ready to
+    /// start (2573:10737, in To Do, no branch yet), each with the frames'
+    /// body. The In progress frame's live session is `dt-task-pane-session`'s,
+    /// so the pane's details fill it here. Then the pane's states no
+    /// frame draws (`state-task-pane-*`, checked by eye).
+    fn task_panes(&mut self) {
+        let (title, _) = TASK_PANE;
+        save_pane_task(Column::in_progress(), true);
+        // alpha works it, mid-task: the pane's live session.
+        let alpha = format!("{PROJECT}/ws/alpha");
+        *self.sessions.over.lock().unwrap() = vec![(alpha, Arc::new(pane_session_screen) as Screen)];
+        if let Some(row) = self.sidebar.workspaces.iter_mut().find(|w| w.name == "alpha") {
+            row.current_task = Some(IN_PROGRESS[0].0.into());
+        }
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().toggle_column(0);
+                cx.notify();
+            });
+        }
+        let shown = self.pane_title(handle).as_deref() == Some(title);
+        self.expect("task-pane: the pane shows the task", shown);
+        let (board, _, _) = self.views(handle);
+        let live = board.is_some_and(|b| b.read_with(&self.cx, |v, _| v.pane_session_view().is_some()));
+        self.expect("task-pane: the pane shows alpha's live session", live);
+        self.save(handle, "task-pane");
+        self.sessions.over.lock().unwrap().clear();
+        self.sidebar = sidebar_model();
+
+        save_pane_task(Column::todo(), false);
+        let handle = self.open_pane();
+        self.save(handle, "task-pane-idle");
+
+        // The More menu open.
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().toggle_pane_menu();
+                cx.notify();
+            });
+        }
+        self.save(handle, "state-task-pane-menu");
+
+        // Each property's picker open under its value, then the keyboard
+        // on Workflow (Tab, Tab): the Ghost focus.
+        for property in crate::views::board_state::Property::ALL {
+            let handle = self.open_pane();
+            if let (Some(board), _, _) = self.views(handle) {
+                board.update(&mut self.cx, |v, cx| {
+                    v.state_mut().toggle_property(property);
+                    cx.notify();
+                });
+            }
+            self.save(handle, &format!("state-task-pane-{}-picker", property.slug()));
+        }
+        let handle = self.open_pane();
+        self.cx.simulate_keystrokes(handle.into(), "tab tab");
+        self.save(handle, "state-task-pane-focus");
+
+        // Another card picked beside it: the one pane shows it, the board
+        // as it was.
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().open_detail("retry-agent");
+                cx.notify();
+            });
+        }
+        let shown = self.pane_title(handle).as_deref() == Some("Retry failed agent starts");
+        self.expect("state-task-pane-switched: the pane follows the card", shown);
+        self.save(handle, "state-task-pane-switched");
+
+        // A body four times the frame's, paged down.
+        let (_, body) = TASK_PANE;
+        save_task_body(&body.repeat(4));
+        let handle = self.open_pane();
+        self.cx.simulate_keystrokes(handle.into(), "pagedown");
+        self.save(handle, "state-task-pane-scrolled");
+
+        // No body at all.
+        save_task_body("");
+        let handle = self.open_pane();
+        self.save(handle, "state-task-pane-empty");
+
+        // A task the board doesn't have (deleted since it was opened).
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().open_detail("deleted-task");
+                cx.notify();
+            });
+        }
+        self.save(handle, "state-task-pane-missing");
+
+        // The fixture's own card back as the other screens draw it.
+        let Card(id, title, body) = &IN_PROGRESS[0];
+        save_task(id, title, body, Column::in_progress(), 1, Some("bravo"));
+    }
+
+    /// The board with the Task pane frames' task open in the pane.
+    fn open_pane(&mut self) -> WindowHandle<ShelbiWindow> {
         let handle = self.open();
         self.click(handle, View::Issues);
         self.wait_for_board(handle);
         self.frame_filter(handle);
         handle
-            .update(&mut self.cx, |w, window, cx| w.offscreen_open_task("desktop-app", window, cx))
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_task(IN_PROGRESS[0].0, window, cx))
             .unwrap();
         self.settle(handle);
         handle
     }
 
-    /// The detail's states the frame doesn't draw (no reference; checked by
-    /// eye): each action hovered ([`DETAIL_ACTIONS`]), then a body too long
-    /// for the modal, paged down.
-    fn detail_states(&mut self) {
-        let handle = self.open_detail();
-        let window: AnyWindowHandle = handle.into();
-        let image = self.cx.capture_screenshot(window).expect("render to image");
-        eprintln!("DEBUG capture {}x{}", image.width(), image.height());
-        let scale = image.width() as f32 / WIDTH as f32;
-        // The action row's top: the modal (85% of the window down, centered)
-        // plus its 1pt edge, the 52pt title row and the 176pt field table.
-        let top = HEIGHT as f32 * 0.075 + 1.0 + 52.0 + 176.0;
-        let buttons = detail_buttons(&image, scale, top + 2.0);
-        self.expect(
-            &format!("detail states: the {} actions found on the row", DETAIL_ACTIONS.len()),
-            buttons.len() == DETAIL_ACTIONS.len(),
-        );
-        for (name, x) in DETAIL_ACTIONS.iter().zip(buttons) {
-            let at = gpui::point(px(x), px(top + 13.0));
-            self.cx.simulate_mouse_move(window, at, None, gpui::Modifiers::none());
-            self.capture(handle, &format!("issue-detail-hover-{name}"));
-        }
-        // Park the pointer off the actions: the next window opens under it.
-        self.cx
-            .simulate_mouse_move(window, gpui::point(px(0.0), px(0.0)), None, gpui::Modifiers::none());
-        self.cx
-            .update_window(window, |_, window, _| window.remove_window())
-            .unwrap();
-
-        // The umbrella's body four times over: more than the modal holds.
-        let long = format!(
-            "{DESKTOP_APP_BODY}{}",
-            DESKTOP_APP_BODY.replace("# Desktop application", "## Desktop application").repeat(3)
-        );
-        save_task("desktop-app", "Desktop application", &long, Column::review(), 1, Some("review"));
-        let handle = self.open_detail();
-        self.cx.simulate_keystrokes(handle.into(), "pagedown");
-        self.save(handle, "issue-detail-scrolled");
-        save_task("desktop-app", "Desktop application", DESKTOP_APP_BODY, Column::review(), 1, Some("review"));
+    /// The title the open pane shows, once its task has loaded.
+    fn pane_title(&mut self, handle: WindowHandle<ShelbiWindow>) -> Option<String> {
+        let (board, _, _) = self.views(handle);
+        board?.update(&mut self.cx, |v, _| v.detail_text()).map(|(_, title, _)| title)
     }
 
     fn wait_for_board(&mut self, handle: WindowHandle<ShelbiWindow>) -> bool {
@@ -3163,34 +3249,6 @@ impl Run {
         }
         false
     }
-}
-
-/// The horizontal centers (in points) of the buttons on the detail's action
-/// row: each run of non-canvas pixels on row `y` with canvas on both sides
-/// (the modal's edge and the scrim beyond it run on to the window's edge or
-/// are wider than any button).
-fn detail_buttons(image: &image::RgbaImage, scale: f32, y: f32) -> Vec<f32> {
-    let row = (y * scale) as u32;
-    // The modal's empty bottom is the canvas.
-    let canvas = *image.get_pixel(image.width() / 2, (HEIGHT as f32 * 0.92 * scale) as u32);
-    let mut out = Vec::new();
-    let mut start: Option<u32> = None;
-    let mut after_canvas = false;
-    for x in 0..image.width() {
-        let is_canvas = *image.get_pixel(x, row) == canvas;
-        if is_canvas {
-            if let Some(s) = start.take() {
-                let width = (x - s) as f32 / scale;
-                if (40.0..=150.0).contains(&width) {
-                    out.push((s + x) as f32 / 2.0 / scale);
-                }
-            }
-        } else if after_canvas {
-            start = Some(x);
-        }
-        after_canvas = is_canvas;
-    }
-    out
 }
 
 // ---- the fixture project --------------------------------------------------
@@ -3240,6 +3298,42 @@ The desktop should expose the same orchestrator, workspaces, issues, review, act
 ## Implementation notes\n\n\
 The desktop is its own Rust workspace. Shared state and orchestration stay in the existing crates; the GPUI \
 client owns presentation and native interaction.\n";
+
+/// The Task pane frames' task: its title and the body the pane shows (the
+/// board's card keeps its own excerpt, as the frames draw it).
+const TASK_PANE: (&str, &str) = (
+    "Handle reconnects after a daemon restart",
+    "## Description\n\nReconnect to running agent sessions after the hub restarts. Keep terminal output and the \
+active workspace intact so work can continue without interruption.\n\n\
+## Acceptance criteria\n\n\
+- [x] Restore the last selected workspace\n\
+- [x] Reconnect without losing terminal output\n\
+- [ ] Offer a retry when the hub is unavailable\n\n\
+## Implementation notes\n\n\
+Reuse the shared reconnect policy. A retry should attach to the existing session instead of starting another agent.\n",
+);
+
+/// Save the Task pane frames' task in `column` with its frame body: second
+/// in its queue either way (the frames' Priority, "2 in queue"), assigned
+/// with its branch once `started`, neither before.
+fn save_pane_task(column: Column, started: bool) {
+    let (id, (title, body)) = (IN_PROGRESS[0].0, TASK_PANE);
+    // Ready to start, none of its criteria are met yet.
+    let body = if started { body.to_string() } else { body.replace("[x]", "[ ]") };
+    save_task(id, title, &body, column, 2, started.then_some("alpha"));
+    if !started {
+        let mut file = shelbi_state::load_task(PROJECT, id).expect("the pane's task");
+        file.task.branch = None;
+        shelbi_state::save_task(PROJECT, &file.task, &file.body).expect("save the pane's task");
+    }
+}
+
+/// Give the pane's task a new body.
+fn save_task_body(body: &str) {
+    let mut file = shelbi_state::load_task(PROJECT, IN_PROGRESS[0].0).expect("the pane's task");
+    file.body = body.to_string();
+    shelbi_state::save_task(PROJECT, &file.task, &file.body).expect("save the pane's task");
+}
 
 fn day(d: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, d, 12, 0, 0).single().expect("a fixture date")

@@ -151,6 +151,27 @@ pub(crate) fn edit(
     // edit that raced an out-of-band move is refused rather than clobbering).
     recheck()?;
 
+    // An app editor's save names the title / body it replaces (`EditSpec::
+    // expect_title` / `expect_body`): refuse it as stale when the stored one
+    // changed since the editor read it, so the save never overwrites an edit
+    // it hasn't seen. The revision can't always tell (a remote tracker's moves
+    // past the same-status gate above), the content can.
+    let title_moved = spec
+        .expect_title
+        .as_deref()
+        .is_some_and(|t| t.trim() != tf.task.title.trim());
+    let body_moved = spec
+        .expect_body
+        .as_deref()
+        .is_some_and(|b| b.trim_end() != tf.body.trim_end());
+    if title_moved || body_moved {
+        let actual = super::state_of(&tf.task);
+        return Err(MutateError::Stale {
+            expected: actual.clone(),
+            actual,
+        });
+    }
+
     // Compute the new body (substitutions OR a whole-body source).
     if !spec.subs.is_empty() {
         let (new_body, report) = apply_substitutions(&tf.body, &spec.subs, spec.allow_no_match)?;

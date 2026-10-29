@@ -236,6 +236,10 @@ pub struct SessionView {
     /// The terminal grid's inset from the main area's leading and trailing
     /// edges ([`TERMINAL_INSET_X`] unless the host's frame says otherwise).
     inset_x: f32,
+    /// The grid's inset from the top and bottom ([`TERMINAL_INSET_Y`] unless
+    /// the host's frame says otherwise).
+    inset_top: f32,
+    inset_bottom: f32,
     /// The daemon supervisor's reason a dead orchestrator is not coming back
     /// (the sidebar model's `orchestrator_status`); the orchestrator view's
     /// placeholder names it while the session is down.
@@ -290,6 +294,8 @@ impl SessionView {
             palette_chord: String::new(),
             idle_placeholder: true,
             inset_x: TERMINAL_INSET_X,
+            inset_top: TERMINAL_INSET_Y,
+            inset_bottom: TERMINAL_INSET_Y,
             supervisor_status: None,
             slot: Slot::Empty,
             restart: RestartController::default(),
@@ -341,6 +347,13 @@ impl SessionView {
     /// whose Figma frame draws another than [`TERMINAL_INSET_X`].
     pub fn set_inset_x(&mut self, inset: f32) {
         self.inset_x = inset;
+    }
+
+    /// The grid's inset from the top and bottom, for a host whose Figma
+    /// frame draws another than [`TERMINAL_INSET_Y`].
+    pub fn set_inset_y(&mut self, top: f32, bottom: f32) {
+        self.inset_top = top;
+        self.inset_bottom = bottom;
     }
 
     /// The daemon supervisor's orchestrator failure, from the sidebar model.
@@ -881,9 +894,9 @@ impl Render for SessionView {
             // 12px from the top and bottom. The scrollbar overlays that
             // padding, against the main area's right edge.
             let padding = scrollbar::Padding {
-                top: TERMINAL_INSET_Y,
+                top: self.inset_top,
                 right: self.inset_x,
-                bottom: TERMINAL_INSET_Y,
+                bottom: self.inset_bottom,
             };
             pane.update(cx, |pane, _| pane.set_scrollbar_padding(padding));
             return root
@@ -892,8 +905,8 @@ impl Render for SessionView {
                 .bg(theme.nested(theme.terminal_canvas()))
                 .pl(gpui::px(self.inset_x))
                 .pr(gpui::px(self.inset_x))
-                .pt(gpui::px(TERMINAL_INSET_Y))
-                .pb(gpui::px(TERMINAL_INSET_Y))
+                .pt(gpui::px(self.inset_top))
+                .pb(gpui::px(self.inset_bottom))
                 .child(pane.clone());
         }
         if let Some(lines) = self.idle_lines() {

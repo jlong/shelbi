@@ -1,40 +1,42 @@
-//! Markdown for the task detail.
+//! Markdown for the task pane.
 //!
 //! The body renders with gpui-kit's Markdown text view (gpui-base's
 //! `TextView::markdown`), which parses with the `markdown` crate under
-//! GitHub-flavored options, styled after the Figma Issue detail frame
-//! ([`body`]): headings in `Desktop/Heading` (h1) and `Desktop/Base/Medium`
-//! (the rest) in the loud text role, the body in `Desktop/Base/Regular`, 16pt
-//! between blocks, and a task list drawn as Figma's checkbox rows (a custom
-//! block, [`CHECKLIST`]). This module also reads the same parse for the one
-//! thing the detail header shows about the body, its checklist progress, and
-//! its tests pin that the shipped task-body templates parse into the blocks
-//! the view renders (headings, lists, checkboxes, code, links) rather than
-//! plain text.
-
-use std::sync::Arc;
+//! GitHub-flavored options, styled after the Figma Task pane frames
+//! ([`body`]): headings in `Desktop/Heading` (h1) and `Desktop/Base/Semibold`
+//! (the rest: "Description", "Acceptance criteria") in the loud text role,
+//! 12pt over what they head; the body in `Desktop/Base/Regular`, 20pt
+//! between blocks; and a task list drawn as Figma's checkbox rows (a custom
+//! block, [`CHECKLIST`]). Its tests pin that the shipped task-body templates
+//! parse into the blocks the view renders (headings, lists, checkboxes,
+//! code, links) rather than plain text.
 
 use gpui::{
-    div, img, prelude::*, px, rems, Div, ElementId, Entity, HighlightStyle, Hsla, Image, ImageFormat,
+    div, prelude::*, px, rems, Div, ElementId, Entity, HighlightStyle, Hsla,
     SharedString, StyleRefinement,
 };
 use gpui_kit::base::text::{MarkdownNode, MarkdownParseContext, TextView, TextViewState, TextViewStyle};
 use markdown::mdast::Node;
-use markdown::ParseOptions;
 use shelbi_app::theme::Appearance;
 
+use crate::elements::controls;
 use crate::theme::style::{Type, Typography};
 use crate::theme::Theme;
 
 /// GitHub-flavored Markdown, as gpui-kit's text view parses it (it adds math,
 /// which task bodies don't use).
-fn options() -> ParseOptions {
-    ParseOptions::gfm()
+#[cfg(test)]
+fn options() -> markdown::ParseOptions {
+    markdown::ParseOptions::gfm()
 }
 
-/// The room between two blocks of the body (the Figma frame's 16pt gap): a
-/// rem, which the desktop leaves at gpui's 16px.
-const BLOCK_GAP: f32 = 16.0;
+/// The room between two blocks of the body (the Task pane's 20pt section
+/// gap), in rems of gpui's 16px.
+const BLOCK_GAP: f32 = 20.0;
+/// The room under a heading, before what it heads.
+const HEADING_GAP: f32 = 12.0;
+/// The room between a task list's rows.
+const ROW_GAP: f32 = 12.0;
 
 /// The custom block a task list renders as.
 const CHECKLIST: &str = "shelbi-checklist";
@@ -43,12 +45,12 @@ const CHECKLIST: &str = "shelbi-checklist";
 /// selectable, its task lists as checkbox rows.
 pub fn body(id: impl Into<ElementId>, text: impl Into<SharedString>, theme: &Theme) -> TextView {
     let style = text_style(theme);
-    let boxes = Checkboxes::new(theme);
+    let theme = *theme;
     let items = style.clone();
     TextView::markdown(id, text)
         .style(style)
         .markdown_block_parser(parse_checklist)
-        .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &boxes))
+        .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &theme))
 }
 
 /// [`body`] over a [`TextViewState`] the caller keeps, for text it
@@ -56,12 +58,12 @@ pub fn body(id: impl Into<ElementId>, text: impl Into<SharedString>, theme: &The
 /// `TextViewState::set_range_highlights`).
 pub fn body_with_state(state: &Entity<TextViewState>, theme: &Theme) -> TextView {
     let style = text_style(theme);
-    let boxes = Checkboxes::new(theme);
+    let theme = *theme;
     let items = style.clone();
     TextView::new(state)
         .style(style)
         .markdown_block_parser(parse_checklist)
-        .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &boxes))
+        .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &theme))
 }
 
 /// The body's text style: foreground body text, loud headings, the palette's
@@ -84,18 +86,17 @@ fn text_style(theme: &Theme) -> TextViewStyle {
         .with_dark(theme.appearance == Appearance::Dark)
 }
 
-/// A heading of `level`: `Desktop/Heading` for the first level (the frame's
-/// "Desktop application"), `Desktop/Base/Medium` below it ("Acceptance
-/// criteria"), in the loud role. The frame spaces every block alike, so a
-/// heading drops the text view's section gaps for the one block gap below it
-/// (the block above already leaves one).
+/// A heading of `level`: `Desktop/Heading` for the first level,
+/// `Desktop/Base/Semibold` below it (the pane's "Acceptance criteria"), in
+/// the loud role. A heading drops the text view's section gaps for the
+/// pane's 12pt under it (the block above already leaves its gap).
 fn heading(level: u8, color: Hsla) -> StyleRefinement {
-    let ty = if level == 1 { Type::Heading } else { Type::BaseMedium };
+    let ty = if level == 1 { Type::Heading } else { Type::BaseSemibold };
     StyleRefinement::default()
         .type_style(ty)
         .text_color(color)
         .pt(px(0.0))
-        .pb(px(BLOCK_GAP))
+        .pb(px(HEADING_GAP))
 }
 
 /// One row of a task list.
@@ -144,45 +145,15 @@ fn checklist_items<'a>(node: &Node, source: impl Fn(&Node) -> Option<&'a str>) -
         .collect()
 }
 
-/// The checkbox's colors, and its tick.
-#[derive(Clone)]
-struct Checkboxes {
-    /// The box's 1px edge (`theme.muted`).
-    edge: Hsla,
-    /// A checked box's fill (`theme.white`, the loud role).
-    fill: Hsla,
-    /// The Figma `Icon / check` (12pt, a 1.5pt stroke) in the canvas color,
-    /// cut out of the fill.
-    tick: Arc<Image>,
-}
-
-impl Checkboxes {
-    fn new(theme: &Theme) -> Self {
-        let c = theme.canvas.to_rgb();
-        let hex = |v: f32| (v * 255.0).round() as u8;
-        let svg = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.25 6.375L5.25 9.375L9.75 2.625" stroke="#{:02x}{:02x}{:02x}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"##,
-            hex(c.r),
-            hex(c.g),
-            hex(c.b),
-        );
-        Self {
-            edge: theme.muted,
-            fill: theme.text_loud,
-            tick: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
-        }
-    }
-}
-
-/// A task list as the frame draws it: one 22pt row per item, a block gap
-/// apart, each a 14pt checkbox and the item's text.
-fn render_checklist(node: &MarkdownNode, style: &TextViewStyle, boxes: &Checkboxes) -> Div {
+/// A task list as the frame draws it: one 18pt row per item, 12pt apart,
+/// each a 14pt checkbox and the item's text.
+fn render_checklist(node: &MarkdownNode, style: &TextViewStyle, theme: &Theme) -> Div {
     let items = node.data::<Vec<ChecklistItem>>().cloned().unwrap_or_default();
     let start = node.source_range().map_or(0, |r| r.start);
     div()
         .flex()
         .flex_col()
-        .gap(px(BLOCK_GAP))
+        .gap(px(ROW_GAP))
         .w_full()
         .children(items.into_iter().enumerate().map(|(ix, item)| {
             div()
@@ -191,9 +162,8 @@ fn render_checklist(node: &MarkdownNode, style: &TextViewStyle, boxes: &Checkbox
                 .items_start()
                 .gap(px(8.0))
                 .w_full()
-                .min_h(px(22.0))
-                .py(px(2.0))
-                .child(checkbox(item.checked, boxes))
+                .min_h(px(Type::Base.line_height()))
+                .child(checkbox(item.checked, theme))
                 .child(
                     div().flex_1().min_w_0().child(
                         TextView::markdown(
@@ -207,25 +177,21 @@ fn render_checklist(node: &MarkdownNode, style: &TextViewStyle, boxes: &Checkbox
         }))
 }
 
-/// A 14pt box with 2pt corners and a 1px muted edge, filled loud with the
-/// tick when checked, centered on the item's first line.
-fn checkbox(checked: bool, boxes: &Checkboxes) -> Div {
-    div().flex().flex_none().items_center().h(px(Type::Base.line_height())).child(
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(14.0))
-            .rounded(px(2.0))
-            .border_1()
-            .border_color(boxes.edge)
-            .when(checked, |b| b.bg(boxes.fill).child(img(boxes.tick.clone()).size(px(12.0)))),
-    )
+/// The Checkbox's check (the design system's, as the Task pane draws an
+/// acceptance criterion), centered on the item's first line.
+fn checkbox(checked: bool, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(Type::Base.line_height()))
+        .child(controls::check(checked, false, theme))
 }
 
 /// `(checked, total)` over the body's task-list items (`- [ ]` / `- [x]`), or
 /// `None` when it has none.
-pub fn checklist(body: &str) -> Option<(usize, usize)> {
+#[cfg(test)]
+fn checklist(body: &str) -> Option<(usize, usize)> {
     let root = markdown::to_mdast(body, &options()).ok()?;
     let mut done = 0;
     let mut total = 0;
@@ -242,6 +208,7 @@ pub fn checklist(body: &str) -> Option<(usize, usize)> {
     (total > 0).then_some((done, total))
 }
 
+#[cfg(test)]
 fn walk(node: &Node, f: &mut impl FnMut(&Node)) {
     f(node);
     if let Some(children) = node.children() {
