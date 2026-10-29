@@ -1220,3 +1220,52 @@ fn showing_the_sidebar_over_a_collapsed_panel_column_widens_it(cx: &mut TestAppC
     assert_eq!(c.width("leading-column"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
     assert!(c.read(|w, _| w.collapsed));
 }
+
+/// The board's task pane shows the agent working its task
+/// (`dt-task-pane-session`) only while the board is on screen, and over the
+/// Workspace view already showing that agent it doesn't attach it twice.
+#[gpui::test]
+fn the_task_panes_session_follows_the_screen_and_never_doubles_the_workspaces(cx: &mut TestAppContext) {
+    use crate::views::board_state::tests::{issue, read};
+    // t-1 isn't in review here: the developer working it is its session.
+    let mut c = Column::open_with(cx, |w| w.model.reviews.clear());
+    c.h.cx.update(|_, cx| cx.set_reduce_motion(true));
+    let agent = |c: &Column| c.ws_sessions.live().into_iter().filter(|n| n.ends_with("/ws/alpha-1")).count();
+    c.update(|w, window, cx| {
+        w.perform(HostCall::ShowView(View::Issues), window, cx);
+        let issues = w.ensure_issues(window, cx);
+        // The harness made the board before the fakes were in: host its
+        // pane on them now.
+        let deps = (w.workspace_deps.as_ref().expect("fake sessions").sessions)();
+        let handle = window.window_handle();
+        issues.update(cx, |v, cx| {
+            v.host_sessions(handle, deps, None, cx);
+            v.stop_workers();
+            let mut t = issue("t-1", "in-progress");
+            t.task.assigned_to = Some("alpha-1".into());
+            v.state_for_test().apply_reads(Some(read(vec![t])), Some(None));
+            v.open_task("t-1", cx);
+        });
+        w.update_task_rows(cx);
+        w.sync_issues_shown(cx);
+    });
+    c.h.draw();
+    c.h.draw();
+    assert!(c.drawn("pane-session"), "the pane shows the agent");
+    assert_eq!(agent(&c), 1);
+
+    // The main area moves on: the pane's attach goes, the agent stays up.
+    c.update(|w, window, cx| w.perform(HostCall::ShowView(View::Machines), window, cx));
+    c.h.draw();
+    assert_eq!(agent(&c), 0);
+
+    // The workspace's own screen, then its More: one attach, the screen's.
+    c.open_workspace();
+    c.advance(SLIDE);
+    assert_eq!(agent(&c), 1);
+    c.h.click_selector("ws-more");
+    c.h.draw();
+    assert!(detail_over(&c) && c.drawn("task-pane"));
+    assert!(!c.drawn("pane-session"), "the screen under the pane already shows it");
+    assert_eq!(agent(&c), 1);
+}

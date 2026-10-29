@@ -42,7 +42,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, App, ClickEvent, Context, Entity, EventEmitter,
+    div, prelude::*, px, relative, AnyElement, AnyWindowHandle, App, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, ScrollHandle, SharedString,
     Stateful, Subscription, Task, Window,
 };
@@ -53,6 +53,7 @@ use shelbi_app::board_search::SearchWorker;
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
 };
+use shelbi_app::view::{ReviewRow, WorkspaceRow};
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 
 use super::board_list::{self, ColumnList, Item};
@@ -60,10 +61,13 @@ use super::board_scroll::{self, BoardScroll};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
 use shelbi_app::issue_edit::{Field, SaveJob, Splice};
 use super::external_edit::{self, EditorEvent};
+use super::pane_session::{MainShows, PaneSession};
+use super::session_view::{SessionDeps, SessionView};
 use super::task_detail;
 use crate::assets::{heroicon, icons};
 use crate::elements::rotated_text::rotated_text;
 use crate::keys::chord_from_keystroke;
+use crate::refresh::SessionSink;
 use crate::theme::style;
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
@@ -104,6 +108,9 @@ const GLOW_ROOM: f32 = 6.0;
 pub enum IssuesEvent {
     /// Run this registry command through `commands::dispatch_command`.
     Command(CommandKind),
+    /// The pane's session terminal took keyboard focus: the window's focus
+    /// model moves to the main area.
+    Focused,
 }
 
 /// The value a card drag carries.
@@ -214,6 +221,9 @@ pub struct IssuesView {
     display_style: DisplayStyle,
     /// Drawn over another screen: the detail alone, no board.
     floating: bool,
+    /// The pane's live session, once the window hosts one
+    /// ([`Self::host_sessions`]; offscreen boards have none).
+    pub(super) pane_session: Option<PaneSession>,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -280,9 +290,95 @@ impl IssuesView {
             search_worker: None,
             display_style: DisplayStyle::detect(),
             floating: false,
+            pane_session: None,
             _subscriptions: Vec::new(),
             _poll: poll,
         }
+    }
+
+    /// Give the pane a live session for the task it shows, in `window`, on
+    /// `deps` (whose relauncher [`PaneSession`] replaces: the pane never
+    /// launches anything).
+    pub fn host_sessions(&mut self, window: AnyWindowHandle, deps: SessionDeps, sink: Option<SessionSink>, cx: &mut Context<Self>) {
+        let project = self.state.project.clone();
+        self.pane_session = Some(PaneSession::new(window, &project, deps, sink, cx));
+    }
+
+    /// The sidebar's refreshed workspace and review rows: which session works
+    /// the pane's task.
+    pub fn set_task_rows(&mut self, workspaces: Vec<WorkspaceRow>, reviews: Vec<ReviewRow>, cx: &mut Context<Self>) {
+        let changed = self.pane_session.as_mut().is_some_and(|p| p.set_rows(workspaces, reviews));
+        if changed {
+            self.sync_session(true, cx);
+            cx.notify();
+        }
+    }
+
+    /// Whether the window shows the board, or this view floating over
+    /// another screen, and what that screen shows. A hidden board's pane
+    /// keeps its task but detaches its session.
+    pub fn set_shown(&mut self, shown: bool, main_shows: MainShows, cx: &mut Context<Self>) {
+        let changed = self.pane_session.as_mut().is_some_and(|p| p.set_shown(shown, main_shows));
+        if changed {
+            self.sync_session(false, cx);
+            cx.notify();
+        }
+    }
+
+    /// The project is being quit (`on`), so the pane session's exit is not
+    /// restarted, or the quit failed (`!on`).
+    pub fn note_deliberate_close(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(p) = &self.pane_session {
+            p.view().update(cx, |v, _| if on { v.note_deliberate_close() } else { v.clear_deliberate_close() });
+        }
+    }
+
+    /// Whether the pane's session terminal holds keyboard focus.
+    pub fn session_focused(&self, window: &Window, cx: &App) -> bool {
+        self.pane_session.as_ref().is_some_and(|p| p.contains_focus(window, cx))
+    }
+
+    /// The pane's session view, while it shows one.
+    pub fn pane_session_view(&self) -> Option<&Entity<SessionView>> {
+        self.pane_session.as_ref().filter(|p| p.attached().is_some()).map(PaneSession::view)
+    }
+
+    /// Attach the pane's session to what its task needs now.
+    fn sync_session(&mut self, rows_changed: bool, cx: &mut Context<Self>) {
+        if self.pane_session.is_none() {
+            return;
+        }
+        // Only a task the board has: a deleted or missing one shows none.
+        let task = self.detail_model().map(|d| d.id);
+        if let Some(p) = self.pane_session.as_mut() {
+            p.sync(task.as_deref(), rows_changed, cx);
+        }
+    }
+
+    /// Open the pane's session in its own screen (the session header's Open
+    /// Workspace): the same workspace or review, through the registry. The
+    /// pane closes; its attach goes with it, the agent stays as it is.
+    pub(super) fn open_session_workspace(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.pane_session.as_ref().and_then(|p| p.attached()).map(|s| s.open_command()) else {
+            return;
+        };
+        self.close_pane(cx);
+        self.sync_session(false, cx);
+        cx.emit(IssuesEvent::Command(command));
+    }
+
+    /// The keyboard's split resize (the handle's ↑ / ↓, the pane's ⌥↑ /
+    /// ⌥↓): `grow` gives the session one step more.
+    pub(super) fn step_split(&mut self, grow: bool, cx: &mut Context<Self>) -> bool {
+        let Some(p) = self.pane_session.as_mut().filter(|p| p.attached().is_some()) else {
+            return false;
+        };
+        let Some(bounds) = p.bounds else {
+            return false;
+        };
+        p.split.step(grow, bounds.size.height.as_f32());
+        cx.notify();
+        true
     }
 
     /// The board's workflow filter (what a project switch saves).
@@ -320,6 +416,12 @@ impl IssuesView {
     /// view is shown).
     pub fn request_focus(&mut self) {
         self.needs_focus = true;
+    }
+
+    /// The board's state, for the window's tests.
+    #[cfg(test)]
+    pub fn state_for_test(&mut self) -> &mut BoardState {
+        &mut self.state
     }
 
     /// The board's state, for the offscreen renders.
@@ -990,13 +1092,18 @@ impl IssuesView {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // The search field owns its keys (its Esc and Enter come in as
-        // actions, caught in `render_search`).
-        if self.search_focused(window, cx) {
+        // actions, caught in `render_search`), and the pane's session its
+        // own: a typed `j` or an Esc there is the agent's, never the board's.
+        if self.search_focused(window, cx) || self.session_focused(window, cx) {
             return;
         }
         let Some(chord) = chord_from_keystroke(&ev.keystroke) else {
             return;
         };
+        if self.pane_session_key(ev, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         // Cmd+S / Cmd+Enter save the in-place editor now (it saves on its
         // own too) and leave it open; Esc leaves it, saving its draft (it
         // never closes the pane under it).
@@ -1033,6 +1140,29 @@ impl IssuesView {
             self.scroll_selection_into_view();
         }
         cx.notify();
+    }
+
+    /// The pane's keys for its session, while it shows one and has the keys
+    /// (no menu or editor over it): ⌥↑ / ⌥↓ resize the split, Tab puts the
+    /// keys in the terminal.
+    fn pane_session_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.editor.is_some() || !matches!(self.state.mode, Mode::Detail { editing: false, .. }) {
+            return false;
+        }
+        let Some(view) = self.pane_session_view().cloned() else {
+            return false;
+        };
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        match ks.key.as_str() {
+            "up" | "down" if m.alt && !m.platform && !m.control && !m.shift => self.step_split(ks.key == "up", cx),
+            "tab" if !m.modified() => {
+                let target = view.read(cx).focus_target(cx);
+                window.focus(&target, cx);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn scroll_selection_into_view(&mut self) {
@@ -1884,6 +2014,9 @@ impl Render for IssuesView {
         if self.state.dragging().is_some() && !cx.has_active_drag() {
             self.state.end_drag();
         }
+        // The pane's session follows its task (opened, switched, closed, or
+        // gone from the board) as the pane draws it.
+        self.sync_session(false, cx);
         let theme = *cx.global::<Theme>();
         let detail = self.render_detail(&theme, cx);
         if self.floating {
@@ -2330,8 +2463,9 @@ mod tests {
         let sink = events.clone();
         cx.update(|_, cx| {
             cx.subscribe(view, move |_, ev: &IssuesEvent, _| {
-                let IssuesEvent::Command(kind) = ev;
-                sink.borrow_mut().push(kind.clone());
+                if let IssuesEvent::Command(kind) = ev {
+                    sink.borrow_mut().push(kind.clone());
+                }
             })
             .detach()
         });
