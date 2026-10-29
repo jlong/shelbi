@@ -58,6 +58,7 @@ use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 use super::board_list::{self, ColumnList, Item};
 use super::board_scroll::{self, BoardScroll};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Scroll};
+use shelbi_app::issue_edit::{Field, SaveJob, Splice};
 use super::external_edit::{self, EditorEvent};
 use super::task_detail;
 use crate::assets::{heroicon, icons};
@@ -150,6 +151,10 @@ enum Done {
         /// The ack carries the issue's post-change state, when reported.
         result: Result<Option<ExpectedState>, ExecError>,
     },
+    /// A save finished (its answer is already in the shared draft store).
+    /// A test's saves are recorded, not run.
+    #[cfg_attr(test, allow(dead_code))]
+    Saved { id: String },
     More(Result<ClosedPage, String>),
     Persisted(Result<(), String>),
 }
@@ -188,8 +193,17 @@ pub struct IssuesView {
     /// Emptied when a new search starts, so its results start at the top.
     search_lists: HashMap<String, ColumnList>,
     pub(super) detail_scroll: ScrollHandle,
-    /// The in-place body editor: the issue id and its text state.
+    /// The in-place body editor: the issue id and its text state. It edits
+    /// the issue's draft (`issue_edit`), which saves itself.
     pub(super) editor: Option<(String, Entity<TextareaState>)>,
+    _editor_subscriptions: Vec<Subscription>,
+    /// The draft store changed the editor's text (a read merged into it, a
+    /// conflict resolved, the external editor): put it in at the next render
+    /// (that needs the window).
+    sync_editor: bool,
+    /// The saves a test's view sent (a test never reaches the daemon).
+    #[cfg(test)]
+    sent_saves: Vec<SaveJob>,
     add_input: Option<Entity<InputState>>,
     /// The toolbar's search field, made on first draw (an input needs the
     /// window).
@@ -257,6 +271,10 @@ impl IssuesView {
             pane_menu_anchor: Default::default(),
             detail_scroll: ScrollHandle::new(),
             editor: None,
+            _editor_subscriptions: Vec::new(),
+            sync_editor: false,
+            #[cfg(test)]
+            sent_saves: Vec::new(),
             add_input: None,
             search_input: None,
             search_worker: None,
@@ -288,6 +306,14 @@ impl IssuesView {
     pub fn stop_workers(&mut self) {
         self.open_refresher.stop_without_waiting();
         self.closed_refresher.stop_without_waiting();
+        // Send what's typed. The answers land in the project's draft store,
+        // which keeps a draft that fails for when the project is back.
+        self.close_editor();
+        for intent in self.state.flush_all_edits() {
+            if let Intent::Save(job) = intent {
+                self.spawn_save(job);
+            }
+        }
     }
 
     /// Take keyboard focus on the next frame (the window calls this when the
@@ -368,6 +394,9 @@ impl IssuesView {
     /// Open task `id`'s detail (from an Activity row). A task the board hasn't
     /// loaded yet fills in when its read lands.
     pub fn open_task(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.editor.as_ref().is_some_and(|(open, _)| open != id) {
+            self.close_editor();
+        }
         self.state.open_detail(id);
         self.needs_focus = true;
         cx.notify();
@@ -398,7 +427,7 @@ impl IssuesView {
     pub fn land(&mut self, close: bool, cx: &mut Context<Self>) {
         self.floating = false;
         if close {
-            self.editor = None;
+            self.close_editor();
             self.add_input = None;
             self.state.close_pane();
         }
@@ -410,25 +439,11 @@ impl IssuesView {
     /// whose selection, filters and scroll are as they were (over another
     /// screen, the window hands them back to it).
     pub(super) fn close_pane(&mut self, cx: &mut Context<Self>) {
-        self.leave_editor(cx);
+        self.finish_editor(cx);
         self.add_input = None;
         self.state.close_pane();
         self.needs_focus = true;
         cx.notify();
-    }
-
-    /// Leave the in-place editor without losing its draft: changes are saved
-    /// through `EditIssue`, an unchanged body just closes it.
-    fn leave_editor(&mut self, cx: &mut Context<Self>) {
-        let Some((id, state)) = &self.editor else {
-            return;
-        };
-        let changed = Some(state.read(cx).value().to_string()) != self.body_of(id);
-        if changed {
-            self.save_editor(cx);
-        } else {
-            self.cancel_editor(cx);
-        }
     }
 
     /// Wire the task pane's pointer and keys: over another screen the pane is
@@ -457,6 +472,16 @@ impl IssuesView {
         self.detail_model().map(|d| (d.id, d.title, d.body))
     }
 
+    /// Whether the detail is open on `id` with its editor up (an assign
+    /// picker opened from it keeps it).
+    fn editing(&self, id: &str) -> bool {
+        match &self.state.mode {
+            Mode::Detail { id: open, editing } => open == id && *editing,
+            Mode::AssignPicker { id: open, .. } => open == id,
+            _ => false,
+        }
+    }
+
     /// Drain the refreshers and background results; re-read on the cadence.
     fn tick(&mut self, cx: &mut Context<Self>) {
         let open = self.open_refresher.latest();
@@ -467,7 +492,11 @@ impl IssuesView {
             match done {
                 Done::Mutation { id, result } => {
                     let intents = self.state.finish_mutation(&id, result);
-                    self.apply_intents_bg(intents);
+                    self.apply_intents_bg(intents, cx);
+                }
+                Done::Saved { id } => {
+                    let intents = self.state.finish_save(&id);
+                    self.apply_intents_bg(intents, cx);
                 }
                 Done::More(page) => {
                     self.load_more_in_flight = false;
@@ -487,11 +516,8 @@ impl IssuesView {
             changed = true;
             match ev {
                 EditorEvent::Saved { id, body } => {
-                    for intent in self.state.save_external_edit(&id, body) {
-                        if let Intent::Command(kind) = intent {
-                            cx.emit(IssuesEvent::Command(kind));
-                        }
-                    }
+                    let intents = self.state.save_external_edit(&id, body);
+                    self.apply_intents_bg(intents, cx);
                 }
                 EditorEvent::Failed { id, error } => {
                     self.state.status = Some(format!("{id}: {error}"));
@@ -506,6 +532,29 @@ impl IssuesView {
         // handler; let go of its column styling.
         if self.state.dragging().is_some() && !cx.has_active_drag() {
             self.state.end_drag();
+            changed = true;
+        }
+        // Saves whose pause in typing is over, and text the store changed
+        // under the editor.
+        let saves = self.state.poll_saves(Instant::now());
+        changed |= !saves.is_empty();
+        self.apply_intents_bg(saves, cx);
+        // The editor's text is the draft's: catch it up when the store
+        // changed it (compared, not queued: another window on the project may
+        // have taken the store's updates).
+        let updates = !self.state.take_text_updates().is_empty();
+        if let Some((id, input)) = &self.editor {
+            let draft = self.state.draft_text(id, Field::Body);
+            if draft.is_some_and(|d| d != input.read(cx).value().as_ref()) {
+                self.sync_editor = true;
+                changed = true;
+            }
+        }
+        changed |= updates;
+        // Leaving the task (closing the detail, opening another card, the
+        // board taking the keys) closes its editor, saving what's typed.
+        if self.editor.as_ref().is_some_and(|(id, _)| !self.editing(id)) {
+            self.close_editor();
             changed = true;
         }
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
@@ -593,11 +642,44 @@ impl IssuesView {
         });
     }
 
-    /// Intents that need no window (from a background result).
-    fn apply_intents_bg(&mut self, intents: Vec<Intent>) {
+    /// Send a draft's save. Its answer goes straight into the project's
+    /// shared draft store (so it lands even if this view is gone by then);
+    /// the view is only told to catch up.
+    fn spawn_save(&mut self, job: SaveJob) {
+        #[cfg(test)]
+        self.sent_saves.push(job);
+        #[cfg(not(test))]
+        self.run_save(job);
+    }
+
+    #[cfg(not(test))]
+    fn run_save(&self, job: SaveJob) {
+        let project = self.state.project.clone();
+        let edits = self.state.edits();
+        let tx = self.done_tx.clone();
+        std::thread::spawn(move || {
+            let result = shelbi_app::execute_mutation_expecting(
+                &job.mutation(&project),
+                job.expected.clone(),
+                &mut |_stream, _line| {},
+            );
+            if let Err(e) = &result {
+                tracing::warn!("saving {}/{} failed: {e}", project, job.id);
+            }
+            BoardState::record_save(&edits, &job, result);
+            let _ = tx.send(Done::Saved { id: job.id });
+        });
+    }
+
+    /// Intents that need no window (from a background result, or the tick).
+    fn apply_intents_bg(&mut self, intents: Vec<Intent>, cx: &mut Context<Self>) {
         for intent in intents {
-            if intent == Intent::Refresh {
-                self.refresh();
+            match intent {
+                Intent::Refresh => self.refresh(),
+                Intent::Save(job) => self.spawn_save(job),
+                // A change held for the issue's lane, now its turn.
+                Intent::Command(kind) => cx.emit(IssuesEvent::Command(kind)),
+                _ => {}
             }
         }
     }
@@ -639,6 +721,7 @@ impl IssuesView {
                 }
                 Intent::ScrollDetail(s) => self.scroll_detail(s),
                 Intent::BeginEdit(id) => self.begin_edit(&id, window, cx),
+                Intent::Save(job) => self.spawn_save(job),
                 Intent::OpenInEditor(id) => self.open_in_editor(&id),
                 Intent::BeginAdd => self.begin_add(window, cx),
                 Intent::FocusSearch => {
@@ -729,37 +812,105 @@ impl IssuesView {
     }
 
     fn begin_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let body = self.body_of(id).unwrap_or_default();
+        if self.editor.as_ref().is_some_and(|(open, _)| open == id) {
+            if let Some((_, state)) = &self.editor {
+                state.update(cx, |s, cx| s.focus(window, cx));
+            }
+            return;
+        }
+        self.close_editor();
+        // The draft's text: what was left unsaved last time, if anything.
+        let body = self
+            .state
+            .draft_text(id, Field::Body)
+            .or_else(|| self.body_of(id))
+            .unwrap_or_default();
         let state = cx.new(|cx| TextareaState::new(window, cx).default_value(body));
         state.update(cx, |s, cx| s.focus(window, cx));
+        let issue = id.to_string();
+        let sub = cx.subscribe_in(&state, window, move |this, input, ev: &InputEvent, _, cx| {
+            match ev {
+                InputEvent::Change => {
+                    let text = input.read(cx).value().to_string();
+                    this.state.edit_text(&issue, Field::Body, &text, Instant::now());
+                    cx.notify();
+                }
+                // Leaving the field saves what's typed (the editor stays).
+                InputEvent::Blur => {
+                    for intent in this.state.flush_edit(&issue) {
+                        if let Intent::Save(job) = intent {
+                            this.spawn_save(job);
+                        }
+                    }
+                    cx.notify();
+                }
+                _ => {}
+            }
+        });
+        self._editor_subscriptions = vec![sub];
+        self.sync_editor = false;
         self.editor = Some((id.to_string(), state));
     }
 
-    /// Save the in-place editor's text through `EditIssue`.
+    /// Cmd+S: save the in-place editor's text now. Optional (the draft saves
+    /// itself) and the editor stays open.
     pub(super) fn save_editor(&mut self, cx: &mut Context<Self>) {
-        let Some((id, state)) = self.editor.take() else {
+        let Some(id) = self.editor.as_ref().map(|(id, _)| id.clone()) else {
             return;
         };
-        let body = state.read(cx).value().to_string();
-        self.needs_focus = true;
-        for intent in self.state.save_edit(&id, body) {
-            if let Intent::Command(kind) = intent {
-                cx.emit(IssuesEvent::Command(kind));
+        for intent in self.state.flush_edit(&id) {
+            if let Intent::Save(job) = intent {
+                self.spawn_save(job);
             }
         }
         cx.notify();
     }
 
-    pub(super) fn cancel_editor(&mut self, cx: &mut Context<Self>) {
-        self.editor = None;
-        if let Mode::Detail { id, .. } = &self.state.mode {
-            self.state.mode = Mode::Detail {
-                id: id.clone(),
-                editing: false,
-            };
-        }
+    /// Done / Escape / Close: close the in-place editor, saving what's typed
+    /// (an unchanged draft sends nothing; nothing is reverted).
+    pub(super) fn finish_editor(&mut self, cx: &mut Context<Self>) {
+        self.close_editor();
         self.needs_focus = true;
         cx.notify();
+    }
+
+    /// Drop the editor widget, flushing its draft. A draft that can't be
+    /// saved stays in the store and comes back with the editor.
+    fn close_editor(&mut self) {
+        let Some((id, _)) = self.editor.take() else {
+            return;
+        };
+        self._editor_subscriptions.clear();
+        self.sync_editor = false;
+        for intent in self.state.end_edit(&id) {
+            if let Intent::Save(job) = intent {
+                self.spawn_save(job);
+            }
+        }
+    }
+
+    /// Put the text the draft store changed (a read merged into the draft,
+    /// a conflict resolved, the external editor) into the open editor, as
+    /// one splice so the caret and the text around it stay put.
+    fn sync_editor_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_editor = false;
+        let Some((id, state)) = &self.editor else {
+            return;
+        };
+        let Some(draft) = self.state.draft_text(id, Field::Body) else {
+            return;
+        };
+        state.update(cx, |s, cx| {
+            let current = s.value().to_string();
+            let splice = Splice::between(&current, &draft);
+            if splice.is_empty() {
+                return;
+            }
+            let selection = s.selected_range();
+            s.set_selected_range(splice.start..splice.end, cx);
+            s.replace(splice.text.clone(), window, cx);
+            s.set_selected_range(splice.map(selection.start)..splice.map(selection.end), cx);
+        });
     }
 
     fn open_in_editor(&mut self, id: &str) {
@@ -846,8 +997,9 @@ impl IssuesView {
         let Some(chord) = chord_from_keystroke(&ev.keystroke) else {
             return;
         };
-        // The in-place editor saves on Cmd+S / Cmd+Enter; Esc leaves it,
-        // keeping its draft (it never closes the pane under it).
+        // Cmd+S / Cmd+Enter save the in-place editor now (it saves on its
+        // own too) and leave it open; Esc leaves it, saving its draft (it
+        // never closes the pane under it).
         if self.editor.is_some() {
             let m = &ev.keystroke.modifiers;
             if m.platform && (ev.keystroke.key == "s" || ev.keystroke.key == "enter") {
@@ -856,7 +1008,7 @@ impl IssuesView {
                 return;
             }
             if ev.keystroke.key == "escape" && !m.modified() {
-                self.leave_editor(cx);
+                self.finish_editor(cx);
                 cx.stop_propagation();
                 return;
             }
@@ -866,9 +1018,10 @@ impl IssuesView {
             return;
         };
         cx.stop_propagation();
-        // Leaving the editor / prompt with Escape drops its widget.
+        // Leaving the editor / prompt with Escape drops its widget (the
+        // editor's text is saved, not reverted).
         if !matches!(self.state.mode, Mode::Detail { editing: true, .. }) && self.editor.is_some() {
-            self.editor = None;
+            self.close_editor();
             self.needs_focus = true;
         }
         if self.state.mode != Mode::AddPrompt && self.add_input.is_some() {
@@ -1721,6 +1874,9 @@ impl IssuesView {
 
 impl Render for IssuesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sync_editor {
+            self.sync_editor_text(window, cx);
+        }
         if self.needs_focus && self.editor.is_none() && self.add_input.is_none() {
             self.needs_focus = false;
             window.focus(&self.focus, cx);
@@ -2331,28 +2487,42 @@ mod tests {
         use crate::views::board_state::tests::issue;
         cx.update(|cx| cx.set_reduce_motion(true));
         let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
-        let events = record(&view, &mut cx);
+        let sent = |cx: &gpui::VisualTestContext| {
+            view.read_with(cx, |v, _| v.sent_saves.iter().map(|j| (j.id.clone(), j.body.clone())).collect::<Vec<_>>())
+        };
         view.update(&mut cx, |v, cx| v.open_task("A", cx));
         assert!(drawn(&mut cx, "task-pane"));
         cx.simulate_keystrokes("e");
         assert!(view.read_with(&cx, |v, _| v.editor.is_some()), "e opens the body editor");
-        view.update_in(&mut cx, |v, window, cx| {
-            let (_, state) = v.editor.clone().unwrap();
-            state.update(cx, |s, cx| s.set_value("A new draft", window, cx));
-        });
+        cx.simulate_input("A new draft");
         // Esc leaves the editor with its draft saved, and the pane up.
         cx.simulate_keystrokes("escape");
         assert!(view.read_with(&cx, |v, _| v.editor.is_none()));
-        assert_eq!(*events.borrow(), vec![CommandKind::EditIssue { id: "A".into() }], "the draft is saved, not dropped");
+        assert_eq!(sent(&cx), vec![("A".into(), Some("A new draftBody of A".into()))], "the draft is saved, not dropped");
         assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"), "the pane stays");
+        assert!(drawn(&mut cx, "pane-save-status"), "the pane says the save is out");
 
-        // An unchanged body just closes the editor (Esc typed into it).
+        // Reopened, the editor is on the draft; unchanged, Esc sends nothing
+        // more (the first save is still out).
         cx.simulate_keystrokes("e");
-        assert!(view.read_with(&cx, |v, _| v.editor.is_some()));
+        let text = view.read_with(&cx, |v, cx| v.editor.as_ref().map(|(_, s)| s.read(cx).value().to_string()));
+        assert_eq!(text.as_deref(), Some("A new draftBody of A"));
         cx.simulate_keystrokes("escape");
         assert!(view.read_with(&cx, |v, _| v.editor.is_none()), "Esc in the editor reaches the pane");
-        assert_eq!(events.borrow().len(), 1, "nothing to save");
+        assert_eq!(sent(&cx).len(), 1, "nothing more to save");
         assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
+
+        // Close saves a changed draft too, and closes the pane.
+        cx.simulate_keystrokes("e");
+        cx.simulate_input(" again");
+        view.update(&mut cx, |v, cx| v.close_pane(cx));
+        assert!(view.read_with(&cx, |v, _| v.editor.is_none()));
+        assert_eq!(pane_id(&view, &cx), None);
+        // Typing during a save is kept and saved after it lands: still the
+        // one save out, with the newer text queued as the draft.
+        assert_eq!(sent(&cx).len(), 1);
+        let draft = view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body));
+        assert!(draft.as_ref().is_some_and(|d| d.contains(" again") && d.contains("A new draft")), "{draft:?}");
     }
 
     #[test]

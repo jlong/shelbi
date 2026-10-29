@@ -86,6 +86,8 @@ mockup and the earlier docked-pane draft.
   `e`) so editing doesn't regress before the WYSIWYG task replaces it. It
   is not a new gate: no pencil, and nothing is read-only until you enter
   it. Its Cancel is now Discard, the one explicit way to drop a draft.
+  (Since `task-inline-edit-state` the draft saves itself, so Save and
+  Discard gave way to Done.)
 - Priority reads `N in queue`, the frames' copy, from `TaskDetailModel.priority`.
 - **The session area** (In progress frame, `dt-task-pane-session`) is not
   here. The scroll is `flex_1` under the Header, so that task adds its

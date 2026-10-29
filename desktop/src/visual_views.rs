@@ -17,7 +17,9 @@
 //! (a card selected), `board-dropdown.png` and `board-workspace-dropdown.png`
 //! (each filter open), `board-empty.png` (columns a filter emptied),
 //! `board-drag.png` (a card dragged over another column, the drop target
-//! lit) and `board-detail.png` (a card's detail); then `settings.png`, Settings'
+//! lit), `board-detail.png` (a card's detail) and `board-detail-editing.png`
+//! (its body editor open), `board-detail-unsaved.png` (a save that failed);
+//! then `settings.png`, Settings'
 //! General page, its Keybindings and Terminal pages
 //! (`settings-keybindings.png`, `settings-terminal.png`), Terminal with its
 //! font picker open (`settings-font-picker.png`), the other choices
@@ -219,6 +221,33 @@ pub fn run(out: PathBuf) -> ! {
         cx.notify();
     });
     save(&mut cx, window, &out, "board-detail.png");
+    // The detail's body editor open (nothing typed, so nothing is saved):
+    // Done in place of Save / Cancel.
+    window
+        .update(&mut cx, |_, w, cx| {
+            board.update(cx, |v, cx| {
+                v.run_issue_command(&shelbi_app::CommandKind::EditIssue { id: "t1".into() }, w, cx)
+            })
+        })
+        .unwrap();
+    save(&mut cx, window, &out, "board-detail-editing.png");
+    // A save that failed: the draft stays on screen, with why and Retry. The
+    // job is answered here, never sent.
+    board.update(&mut cx, |v, cx| {
+        let state = v.state_mut();
+        let typed = Instant::now() - Duration::from_secs(5);
+        let text = "Repro: sign in, get bounced back to /login.\n";
+        state.edit_text("t1", shelbi_app::issue_edit::Field::Body, text, typed);
+        for intent in state.poll_saves(Instant::now()) {
+            if let crate::views::board_state::Intent::Save(job) = intent {
+                let failed = Err(shelbi_app::ExecError::Backend("the hub is unreachable".into()));
+                crate::views::board_state::BoardState::record_save(&state.edits(), &job, failed);
+            }
+        }
+        // The tick puts the draft's text in the editor.
+        v.poll(cx);
+    });
+    save(&mut cx, window, &out, "board-detail-unsaved.png");
 
     // ---- Settings, the bootstrap screens and the notice bars ----
     let window = open_with_window(&mut cx, |window, cx| {
