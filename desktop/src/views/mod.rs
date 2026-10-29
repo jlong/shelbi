@@ -77,6 +77,7 @@ pub mod board_list;
 pub mod board_scroll;
 pub mod bootstrap;
 pub mod bundled_software;
+pub mod changelog;
 pub mod cli_setup;
 pub mod board_state;
 pub mod chat;

@@ -409,6 +409,8 @@ heroicons! {
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
     VIEW_COLUMNS = "view-columns";
     BARS_2 = "bars-2";
+    /// The Changelog's sidebar row (the Navigation component's drawing).
+    ROCKET_LAUNCH = "rocket-launch";
     DOCUMENT_TEXT = "document-text";
     /// The drawing `TRASH_BUTTON` widens; no view draws it at 20pt.
     #[allow(dead_code)]
