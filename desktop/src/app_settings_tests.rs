@@ -1080,6 +1080,59 @@ fn the_contrast_slider_restyles_the_windows_as_it_moves_and_saves(cx: &mut TestA
     assert_eq!(value(&mut s), 30);
 }
 
+#[gpui::test]
+fn a_sliders_track_lines_up_with_its_label_and_the_thumb_overhangs_at_the_ends(cx: &mut TestAppContext) {
+    use crate::elements::controls::THUMB;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let view = general_page(&mut s, shelbi_state::UserConfig::default());
+    let slider = s.read(|_, cx| view.read(cx).contrast_slider());
+    let value = |s: &mut Settings| s.read(|_, cx| slider.read(cx).value());
+    let saved = |s: &mut Settings| s.read(|_, cx| view.read(cx).saved().desktop.contrast);
+    let page = s.bounds("settings").expect("the page is drawn");
+    // The track starts on the page's text edge (its 32pt padding), where
+    // every label and helper starts, as do the other sliders.
+    let track = s.bounds("settings-contrast").expect("the slider is drawn");
+    assert_eq!(track.left(), page.left() + px(32.0), "the track starts on the text edge");
+    for selector in ["settings-window-opacity", "settings-window-blur"] {
+        assert_eq!(s.bounds(selector).map(|b| (b.left(), b.size.width)), Some((track.left(), track.size.width)));
+    }
+    let y = track.center().y;
+    let thumb = |s: &mut Settings| s.bounds("settings-contrast-thumb").expect("the thumb is drawn");
+
+    // At the ends the thumb is centered on the track's, half of it past
+    // (its fill, which the selector marks, sits inside a 1pt edge).
+    let past = px(THUMB / 2.0 - 1.0);
+    s.click("settings-contrast");
+    s.key("home");
+    assert_eq!(value(&mut s), 0);
+    assert_eq!((thumb(&mut s).center().x, thumb(&mut s).left()), (track.left(), track.left() - past));
+    s.key("end");
+    assert_eq!(value(&mut s), 100);
+    assert_eq!((thumb(&mut s).center().x, thumb(&mut s).right()), (track.right(), track.right() + past));
+
+    // Its overhanging half still grabs it: pressed past the track's end it
+    // stays at the end, and a drag carries it across the whole range.
+    s.mouse_down(gpui::point(track.right() + px(6.0), y));
+    assert_eq!(value(&mut s), 100, "pressing the overhang keeps the end");
+    s.mouse_move(gpui::point(track.left() + track.size.width / 4.0, y), true);
+    assert_eq!(value(&mut s), 25, "a quarter along");
+    s.mouse_move(gpui::point(track.left(), y), true);
+    assert_eq!(value(&mut s), 0, "the track's start is the floor");
+    s.mouse_up(gpui::point(track.left(), y));
+    assert_eq!(saved(&mut s), None, "letting go saves it (0 isn't written)");
+    s.mouse_down(gpui::point(track.left() - px(6.0), y));
+    s.mouse_move(gpui::point(track.right(), y), true);
+    assert_eq!(value(&mut s), 100, "from the start's overhang to the end");
+    s.mouse_up(gpui::point(track.right(), y));
+    assert_eq!(saved(&mut s), Some(100));
+
+    // A click on the track lands under the pointer.
+    s.mouse_down(gpui::point(track.left() + track.size.width * 0.75, y));
+    s.mouse_up(gpui::point(track.left() + track.size.width * 0.75, y));
+    assert_eq!((value(&mut s), saved(&mut s)), (75, Some(75)));
+}
+
 fn app_icon_in_effect(s: &mut Settings) -> shelbi_state::AppIcon {
     s.h.cx.update(|_, cx| crate::app_icon::current(cx))
 }
