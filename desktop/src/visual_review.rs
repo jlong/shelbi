@@ -464,6 +464,10 @@ impl Run {
         self.handle
             .update(&mut self.cx, |w, window, cx| w.offscreen_close_overlay(window, cx))
             .unwrap();
+        let wrap = self
+            .handle
+            .update(&mut self.cx, |_, _, cx| crate::views::overlay::review_reject::wrap(cx))
+            .unwrap();
         for (name, overlay) in [
             ("palette.png", None),
             (
@@ -475,7 +479,7 @@ impl Run {
                     2,
                 )),
             ),
-            ("dialog-reject.png", Some(ActiveOverlay::reject_reason("cold-start"))),
+            ("dialog-reject.png", Some(typed_reason(ActiveOverlay::reject_reason("cold-start", Some(wrap))))),
             ("dialog-zen.png", Some(ActiveOverlay::zen_intro("demo"))),
             ("dialog-error-log.png", Some(log)),
         ] {
@@ -489,4 +493,19 @@ impl Run {
                 .unwrap();
         }
     }
+}
+
+/// The reject prompt with a reason typed that runs past the box's width,
+/// so the frame shows it wrapping.
+fn typed_reason(mut overlay: crate::views::overlay::ActiveOverlay) -> crate::views::overlay::ActiveOverlay {
+    use shelbi_state::keymap::{Key, KeyChord, Mods};
+    if let crate::views::overlay::ActiveOverlay::RejectReason { prompt, .. } = &mut overlay {
+        let reason = "Lots of little discrepancies. Logo is bigger than figma. Buttons along the top are wrong. \
+                      Fonts are a weight too heavy.\nThe sidebar is two points too wide.";
+        for c in reason.chars() {
+            let code = if c == '\n' { Key::Enter } else { Key::Char(c) };
+            prompt.handle_key(KeyChord::new(code, Mods::NONE));
+        }
+    }
+    overlay
 }

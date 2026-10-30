@@ -74,9 +74,11 @@ pub enum ActiveOverlay {
         scroll: ScrollHandle,
     },
     ReviewConfirm { task_id: String, dialog: Dialog },
+    /// `text` is where the last draw put the reason's text, for clicks.
     RejectReason {
         task_id: String,
         prompt: RejectPrompt,
+        text: review_reject::TextBounds,
     },
     ZenIntro { project: String, state: IntroState },
 }
@@ -123,10 +125,15 @@ impl ActiveOverlay {
         }
     }
 
-    pub fn reject_reason(task_id: impl Into<String>) -> Self {
+    /// The reject prompt, its text soft-wrapping as `wrap` measures
+    /// ([`review_reject::wrap`]; `None` lays out a row per line).
+    pub fn reject_reason(task_id: impl Into<String>, wrap: Option<reject::Wrap>) -> Self {
+        let mut prompt = RejectPrompt::new();
+        prompt.set_wrap(wrap);
         ActiveOverlay::RejectReason {
             task_id: task_id.into(),
-            prompt: RejectPrompt::new(),
+            prompt,
+            text: Default::default(),
         }
     }
 
@@ -204,7 +211,7 @@ impl ActiveOverlay {
             ActiveOverlay::ReviewConfirm { task_id, dialog } => {
                 confirm_event(task_id, dialog.handle_key(chord))
             }
-            ActiveOverlay::RejectReason { task_id, prompt } => {
+            ActiveOverlay::RejectReason { task_id, prompt, .. } => {
                 let step = prompt.handle_key(chord);
                 reject_event(task_id, prompt, step)
             }
@@ -333,8 +340,8 @@ pub fn render_layer<H: OverlayHost>(
         ActiveOverlay::ReviewConfirm { dialog, .. } => {
             (review_confirm::render(dialog, theme, cx), false)
         }
-        ActiveOverlay::RejectReason { prompt, .. } => {
-            (review_reject::render(prompt, theme, cx), false)
+        ActiveOverlay::RejectReason { prompt, text, .. } => {
+            (review_reject::render(prompt, text, theme, cx), false)
         }
         ActiveOverlay::ZenIntro { state, .. } => (zen_intro::render(state, theme, cx), false),
     };
@@ -575,7 +582,7 @@ mod tests {
 
     #[test]
     fn the_reject_prompt_submits_its_reason() {
-        let mut o = ActiveOverlay::reject_reason("T-2");
+        let mut o = ActiveOverlay::reject_reason("T-2", None);
         assert!(o.takes_newlines());
         typed(&mut o, "fails");
         o.handle_key(chord("enter"), &keymaps());
@@ -815,9 +822,67 @@ mod render_tests {
         vcx.simulate_click(gpui::point(px(5.0), px(790.0)), Modifiers::none());
         assert_eq!(root.read_with(&vcx, |f, _| f.events.clone()), [OverlayEvent::Close]);
 
-        let (root, mut vcx) = open(cx, ActiveOverlay::reject_reason("T-1"));
+        let (root, mut vcx) = open(cx, ActiveOverlay::reject_reason("T-1", None));
         vcx.simulate_click(gpui::point(px(5.0), px(790.0)), Modifiers::none());
         assert!(root.read_with(&vcx, |f, _| f.events.is_empty()), "a stray click keeps the reason");
+    }
+
+    /// The reject prompt's text and caret, read from the fixture.
+    fn reject_text(root: &gpui::Entity<Fixture>, cx: &VisualTestContext) -> (String, (usize, usize), Vec<String>) {
+        root.read_with(cx, |f, _| match &f.overlay {
+            Some(ActiveOverlay::RejectReason { prompt, .. }) => {
+                let t = prompt.text();
+                let rows = t.layout().0.iter().map(|r| t.lines()[r.line][r.start..r.end].iter().collect()).collect();
+                (prompt.reason(), t.cursor(), rows)
+            }
+            _ => panic!("the reject prompt is open"),
+        })
+    }
+
+    #[gpui::test]
+    fn a_long_reason_wraps_and_the_caret_keys_and_clicks_follow_its_rows(cx: &mut TestAppContext) {
+        const LONG: &str = "Lots of little discrepancies. Logo is bigger than figma. Buttons along the top are wrong. \
+            Fonts are off by a weight and the sidebar is two points too wide on every screen I checked.";
+        let wrap = cx.update(|cx| review_reject::wrap(cx));
+        let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
+        let mut overlay = ActiveOverlay::reject_reason("T-1", Some(wrap));
+        for c in LONG.chars() {
+            overlay.handle_key(KeyChord::new(Key::Char(c), shelbi_state::keymap::Mods::NONE), &keymaps);
+        }
+        let (root, mut vcx) = open(cx, overlay);
+        let (reason, _, rows) = reject_text(&root, &vcx);
+        assert_eq!(reason, LONG, "wrapping adds no newline");
+        assert!(rows.len() >= 3, "the line wraps over several rows: {rows:?}");
+        for row in &rows[..rows.len() - 1] {
+            assert!(row.ends_with(' '), "rows break between words: {row:?}");
+        }
+        // Every row is drawn inside the text area, one under the other.
+        let area = vcx.debug_bounds("reject-text").unwrap();
+        let tops: Vec<gpui::Pixels> = (0..rows.len())
+            .map(|v| {
+                let sel: &'static str = Box::leak(format!("reject-line-{v}").into_boxed_str());
+                vcx.debug_bounds(sel).unwrap_or_else(|| panic!("row {v} drawn")).top()
+            })
+            .collect();
+        assert!(tops.windows(2).all(|w| w[1] > w[0]));
+        assert!(*tops.last().unwrap() < area.bottom());
+        // The caret ends the last row; ↑ takes it up one.
+        let caret = vcx.debug_bounds("reject-caret").unwrap();
+        assert_eq!(caret.top(), *tops.last().unwrap());
+        assert!(caret.right() <= area.right(), "the caret shows inside the area");
+        root.update(&mut vcx, |f, cx| {
+            f.overlay.as_mut().unwrap().handle_key(KeyChord::new(Key::Up, shelbi_state::keymap::Mods::NONE), &keymaps);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(vcx.debug_bounds("reject-caret").unwrap().top(), tops[tops.len() - 2]);
+        assert_eq!(reject_text(&root, &vcx).1 .0, 0, "still the one line");
+        // A click on the first row puts the caret there, near the click.
+        let first = vcx.debug_bounds("reject-line-0").unwrap();
+        vcx.simulate_click(gpui::point(first.left() + px(1.0), first.top() + px(4.0)), Modifiers::none());
+        assert_eq!(reject_text(&root, &vcx).1, (0, 0));
+        assert_eq!(vcx.debug_bounds("reject-caret").unwrap().top(), first.top());
+        assert_eq!(reject_text(&root, &vcx).0, LONG);
     }
 
     #[gpui::test]
@@ -850,7 +915,7 @@ mod render_tests {
                 vec!["review-confirm-message", "review-confirm-dismiss"],
             ),
             (
-                ActiveOverlay::reject_reason("T-1"),
+                ActiveOverlay::reject_reason("T-1", None),
                 vec!["review-reject", "reject-text", "reject-caret", "reject-submit", "reject-cancel"],
             ),
             (

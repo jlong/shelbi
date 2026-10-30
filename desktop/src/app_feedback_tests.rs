@@ -409,3 +409,11 @@ fn an_unpicked_kind_takes_no_fill_under_the_pointer_and_send_still_lights(cx: &m
     point_at(&mut f, "feedback-send");
     assert!(crate::theme::motion::is_hovered("feedback-send"), "a button still lights");
 }
+
+#[gpui::test]
+fn the_message_text_area_soft_wraps(cx: &mut TestAppContext) {
+    let mut f = Feedback::open(cx, "wrap");
+    f.open_dialog();
+    let (_, _, message) = f.read(|d| d.inputs());
+    f.h.assert_area_wraps(&message, "Contact Us' message");
+}

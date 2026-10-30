@@ -1691,7 +1691,7 @@ impl AgentEditorPage {
         let at = index(&Item::Area(Area::Instructions));
         let on = selected(&Item::Area(Area::Instructions)) == Some(true);
         let window = if editing { height.saturating_sub(4).clamp(3, 30) } else { PREVIEW_LINES };
-        area_rows(&mut rows, &self.instructions, &mut self.area, editing, on, at, window, width);
+        area_rows(&mut rows, &mut self.instructions, &mut self.area, editing, on, at, window, width);
         if let Some(e) = self.state.as_ref().and_then(|s| s.error_at(&Field::Instructions)) {
             wrapped(&mut rows, e, width, red);
         }
@@ -1750,9 +1750,9 @@ impl AgentEditorPage {
             let on = selected(&Item::Area(Area::SkillBody)) == Some(true);
             rows.push(Row { action: at, ..Row::text(textbox::label("Instructions (SKILL.md body)", on || editing, false, width)) });
             let window = if editing { height.saturating_sub(6).clamp(3, 16) } else { 4 };
-            if let Some(form) = self.skill_form.as_ref() {
+            if let Some(form) = self.skill_form.as_mut() {
                 let mut view = if editing { self.area } else { AreaView::default() };
-                area_rows(&mut rows, &form.body, &mut view, editing, on, at, window, width);
+                area_rows(&mut rows, &mut form.body, &mut view, editing, on, at, window, width);
                 if editing {
                     self.area = view;
                 }
@@ -2026,11 +2026,12 @@ fn with_source(note: &str, source: Option<Source>) -> String {
 /// caps; while `editing`, a `window` of its wrapped lines kept around the
 /// caret (the caret's row marked as the page's focus), otherwise a preview
 /// of its first `window` lines; then how many more there are. Every row is
-/// item `at`'s, so a click on it selects it.
+/// item `at`'s, so a click on it selects it. ↑ / ↓ in `text` move by the
+/// wrapped rows drawn here.
 #[allow(clippy::too_many_arguments)]
 fn area_rows(
     rows: &mut Vec<Row>,
-    text: &TextArea,
+    text: &mut TextArea,
     view: &mut AreaView,
     editing: bool,
     selected: bool,
@@ -2040,7 +2041,9 @@ fn area_rows(
 ) {
     let box_w = width.min(textbox::MAX_W);
     let text_w = textbox::room(box_w).max(1);
-    let (wrapped_rows, (caret_row, caret_col)) = text.wrapped(text_w);
+    let wrap = textbox::wrap(text_w);
+    let (wrapped_rows, (caret_row, caret_col)) = text.wrapped(&wrap);
+    text.set_wrap(Some(wrap));
     let focused = editing || selected;
     let style = textbox::area_text(focused, false).bg(textbox::fill(focused, false, false));
     let lines = text.lines();
@@ -2059,10 +2062,9 @@ fn area_rows(
     let mut caret_at = None;
     for v in top..top + window.max(1) {
         let mut spans = Vec::new();
-        if let Some(&(line, start)) = wrapped_rows.get(v) {
-            let chars: Vec<char> =
-                lines[line].iter().skip(start).take(text_w).map(|c| if c.is_control() { ' ' } else { *c }).collect();
+        if let Some(&row) = wrapped_rows.get(v) {
             let caret = (editing && v == caret_row).then_some(caret_col);
+            let (chars, caret) = textbox::row_chars(lines, row, caret, text_w);
             if caret.is_some() {
                 caret_at = Some(body.len());
             }

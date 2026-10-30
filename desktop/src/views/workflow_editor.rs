@@ -883,6 +883,11 @@ impl WorkflowEditor {
         self.details.as_ref().map(|d| d.timeout.clone())
     }
 
+    /// The open Details' `run` text area.
+    pub fn details_run_field(&self) -> Option<Entity<TextareaState>> {
+        self.details.as_ref().map(|d| d.run.clone())
+    }
+
     pub fn drop_on(&mut self, dragged: &str, onto: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.drop_status(dragged, onto, window, cx);
     }

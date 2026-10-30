@@ -1701,6 +1701,18 @@ fn statuses_and_transitions_edit_from_their_controls(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_details_run_text_area_soft_wraps(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-run-wrap", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+    s.click("workflow-transition-details-0");
+    let run = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).details_run_field().unwrap(),
+        _ => unreachable!(),
+    });
+    s.h.assert_area_wraps(&run, "the Workflow editor's run field");
+}
+
+#[gpui::test]
 fn details_and_lower_sections_show_their_errors_inline(cx: &mut TestAppContext) {
     let _home = Home::with_project("ed-details", "alpha");
     let mut s = Settings::open_editor(cx, "task");
@@ -2761,6 +2773,16 @@ fn edit_instructions_edits_and_saves_the_shared_instructions(cx: &mut TestAppCon
     assert_eq!(AgentsConfig::load("alpha").unwrap().shared_instructions(), "## Ground rules\n\nBe kind.\n");
 }
 
+#[gpui::test]
+fn the_shared_instructions_text_area_soft_wraps(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("page-shared-wrap", "alpha");
+    let mut s = Settings::open_agents(cx);
+    s.click("agents-edit-instructions");
+    let page = s.agents();
+    let input = s.read(|_, cx| page.read(cx).shared_input().unwrap());
+    s.h.assert_area_wraps(&input, "Settings ▸ Agents' shared instructions");
+}
+
 use crate::views::agent_editor::AgentEditor;
 use crate::views::agent_editor_state::{Change as AgentChange, Field as AgentField};
 
@@ -2966,6 +2988,17 @@ fn leaving_the_agent_editor_with_edits_asks_first(cx: &mut TestAppContext) {
     s.click("agent-edit-developer");
     s.click("agent-shared-instructions-link");
     assert!(!s.drawn("agent-editor") && s.drawn("agents-shared-preview"));
+}
+
+#[gpui::test]
+fn the_agent_editors_text_areas_soft_wrap(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-wrap", "alpha");
+    let mut s = Settings::open_agent(cx, "security");
+    let instructions = s.with_agent_editor(|e, _| e.instructions_field());
+    s.h.assert_area_wraps(&instructions, "the agent editor's instructions");
+    s.click("agent-add-skill");
+    let (_, _, body) = s.with_agent_editor(|e, _| e.skill_fields().unwrap());
+    s.h.assert_area_wraps(&body, "a new skill's body");
 }
 
 #[gpui::test]

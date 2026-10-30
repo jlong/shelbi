@@ -253,6 +253,9 @@ impl FeedbackDialog {
         let Some(&(_, hit)) = self.hits.iter().rev().find(|(r, _)| at(r)) else {
             return Step::Stay;
         };
+        if hit == Hit::Control(Focus::Message) {
+            self.click_message(col, row);
+        }
         match hit {
             Hit::Kind(kind) => {
                 self.form.pick(kind);
@@ -268,6 +271,31 @@ impl FeedbackDialog {
                 Step::Stay
             }
         }
+    }
+
+    /// A click on Message's box: the caret to the wrapped row it landed on
+    /// (the caps take the row beside them). The box's rows are the last
+    /// draw's Message hits, a cap above and below its text.
+    fn click_message(&mut self, col: u16, row: u16) {
+        let rects: Vec<Rect> =
+            self.hits.iter().filter(|(_, h)| *h == Hit::Control(Focus::Message)).map(|(r, _)| *r).collect();
+        let (_, n) = self.message_window(self.message_room() + 2 * textbox::INSET);
+        // The text's first row is under the cap; a scrolled-off cap leaves
+        // the rows' order unknown, so only a whole box places the caret.
+        let [top, ..] = rects[..] else {
+            return;
+        };
+        if rects.len() != n + 2 {
+            return;
+        }
+        let v = (row.saturating_sub(top.y + 1) as usize).min(n - 1);
+        let x = col.saturating_sub(top.x + textbox::INSET as u16);
+        self.message.place(self.message_top + v, x as f32);
+    }
+
+    /// Message's text room in the last draw.
+    fn message_room(&self) -> usize {
+        self.message.wrap().map_or(1, |w| w.width() as usize)
     }
 
     /// Where the last draw put the controls that aren't buttons (the
@@ -317,6 +345,8 @@ impl FeedbackDialog {
             width: content_width(rect.width),
             height: body.height - 2 * pad,
         };
+        // ↑ / ↓ in Message move by the rows it's drawn on.
+        self.message.set_wrap(Some(textbox::wrap(textbox::room(content.width as usize).max(1))));
         let out = self.lines(content.width as usize, fit);
         self.message_top = self.message_window(content.width as usize).0;
         let focus = Hit::Control(self.form.focus());
@@ -326,7 +356,7 @@ impl FeedbackDialog {
     /// Message's wrapped lines in view: the first, and how many.
     fn message_window(&self, width: usize) -> (usize, usize) {
         let text_w = textbox::room(width).max(1);
-        let (rows, (caret, _)) = self.message.wrapped(text_w);
+        let (rows, (caret, _)) = self.message.wrapped(&textbox::wrap(text_w));
         let n = rows.len().clamp(MESSAGE_LINES.0, MESSAGE_LINES.1);
         let mut top = self.message_top.min(rows.len().saturating_sub(1));
         if self.form.focus() == Focus::Message {
@@ -432,16 +462,15 @@ impl FeedbackDialog {
         let fill = if focused { palette().input_focus } else { palette().dialog_control };
         let style = textbox::area_text(focused, false).bg(fill);
         let text_w = textbox::room(width).max(1);
-        let (rows, (caret_row, caret_col)) = self.message.wrapped(text_w);
+        let (rows, (caret_row, caret_col)) = self.message.wrapped(&textbox::wrap(text_w));
         let (top, n) = self.message_window(width);
         let lines = self.message.lines();
         let mut body = Vec::new();
         for v in top..top + n {
             let mut spans = Vec::new();
-            if let Some(&(line, start)) = rows.get(v) {
-                let chars: Vec<char> =
-                    lines[line].iter().skip(start).take(text_w).map(|c| if c.is_control() { ' ' } else { *c }).collect();
+            if let Some(&row) = rows.get(v) {
                 let caret = (focused && v == caret_row).then_some(caret_col);
+                let (chars, caret) = textbox::row_chars(lines, row, caret, text_w);
                 let used = textbox::caret_spans(&mut spans, &chars, caret, text_w, style);
                 if v == 0 && self.form.message().is_empty() {
                     let hint = panel::truncate_right(form::MESSAGE, text_w.saturating_sub(used));

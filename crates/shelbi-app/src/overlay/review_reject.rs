@@ -3,7 +3,10 @@
 //! Reviewers write multi-paragraph feedback, so the reason is a real
 //! multi-line editor: Enter inserts a line break, and submitting is its own
 //! action (Ctrl-D from anywhere, or Tab to `[ Reject ]` and Enter / Space).
-//! The arrows, Home / End, Backspace (across lines) and Delete edit. A blank
+//! The arrows, Home / End, Backspace (across lines) and Delete edit. Long
+//! lines soft-wrap at the box's width once the host has said how
+//! ([`RejectPrompt::set_wrap`]): ↑ / ↓ then move by wrapped row and a click
+//! places the caret on one ([`RejectPrompt::click_text_at`]). A blank
 //! reason never submits. On [`Step::Submit`] the host reads
 //! [`RejectPrompt::reason`] and sends `RejectReview { reason }`.
 
@@ -44,7 +47,7 @@ impl RejectFocus {
     }
 }
 
-pub use crate::text_area::TextArea;
+pub use crate::text_area::{TextArea, VisualRow, Wrap};
 
 /// What one key or click resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,11 @@ impl RejectPrompt {
 
     pub fn set_focus(&mut self, focus: RejectFocus) {
         self.focus = focus;
+    }
+
+    /// How the host's text area wraps (see [`TextArea::set_wrap`]).
+    pub fn set_wrap(&mut self, wrap: Option<Wrap>) {
+        self.text.set_wrap(wrap);
     }
 
     /// Feed one key, applying edits and navigation in place.
@@ -168,9 +176,11 @@ impl RejectPrompt {
         Step::Cancel
     }
 
-    /// A click in the text area focuses it.
-    pub fn click_text(&mut self) {
+    /// A click on the text area's wrapped row `row`, `x` across it: focus it
+    /// and put the caret there.
+    pub fn click_text_at(&mut self, row: usize, x: f32) {
         self.focus = RejectFocus::Text;
+        self.text.place(row, x);
     }
 
     fn try_submit(&self) -> Step {
@@ -264,12 +274,29 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_reason_moves_and_clicks_by_row_and_submits_unwrapped() {
+        let mut p = RejectPrompt::new();
+        p.set_wrap(Some(Wrap::cells(12)));
+        typed(&mut p, "Logo is bigger than figma.");
+        let (rows, caret) = p.text().wrapped(&Wrap::cells(12));
+        assert_eq!(rows.len(), 3, "\"Logo is \" \"bigger than \" \"figma.\"");
+        assert_eq!(caret, (2, 6), "the caret ends the last wrapped row");
+        p.handle_key(key(Key::Up));
+        assert_eq!(p.text().cursor(), (0, 14), "up a wrapped row, same column");
+        p.set_focus(RejectFocus::Reject);
+        p.click_text_at(0, 2.0);
+        assert_eq!((p.focus(), p.text().cursor()), (RejectFocus::Text, (0, 2)));
+        assert_eq!(p.handle_key(ctrl('d')), Step::Submit);
+        assert_eq!(p.reason(), "Logo is bigger than figma.", "wrapping adds no newline");
+    }
+
+    #[test]
     fn esc_cancels_and_clicks_resolve() {
         let mut p = RejectPrompt::new();
         assert_eq!(p.handle_key(key(Key::Esc)), Step::Cancel);
         assert_eq!(p.click_reject(), Step::Continue, "blank reason stays open");
         assert_eq!(p.focus(), RejectFocus::Reject);
-        p.click_text();
+        p.click_text_at(0, 0.0);
         typed(&mut p, "x");
         assert_eq!(p.click_reject(), Step::Submit);
         assert_eq!(p.click_cancel(), Step::Cancel);

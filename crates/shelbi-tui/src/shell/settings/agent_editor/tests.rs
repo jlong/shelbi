@@ -716,3 +716,31 @@ fn clicks_select_then_open_and_answer_menus() {
     ed.handle_mouse(wheel);
     assert_eq!(ed.cursor_item(), Some(Item::Runner));
 }
+
+#[test]
+fn instructions_wrap_long_lines_and_move_by_wrapped_row() {
+    let _home = home("wrap");
+    let mut ed = editor("developer");
+    go(&mut ed, Item::Area(Area::Instructions));
+    press(&mut ed, key(KeyCode::Enter));
+    for _ in 0..400 {
+        press(&mut ed, key(KeyCode::PageDown));
+    }
+    press(&mut ed, key(KeyCode::End));
+    press(&mut ed, key(KeyCode::Enter));
+    let long = "Always rebase onto origin main before handing off the branch. ".repeat(3);
+    typed(&mut ed, long.trim_end());
+    let text = page_text(&mut ed);
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains("rebase onto")).collect();
+    assert!(rows.len() >= 2, "the long line shows on several rows:\n{text}");
+    assert!(rows.iter().all(|r| !r.contains("branch.Always")), "breaks fall between words:\n{text}");
+    let (line, end) = ed.instructions.cursor();
+    let wrap = ed.instructions.wrap().cloned().expect("the draw set the wrap");
+    let (_, (caret_row, _)) = ed.instructions.wrapped(&wrap);
+    press(&mut ed, key(KeyCode::Up));
+    let (up_line, up_col) = ed.instructions.cursor();
+    assert_eq!(up_line, line, "one wrapped row up stays in the line");
+    assert!(up_col < end);
+    assert_eq!(ed.instructions.wrapped(&wrap).1 .0, caret_row - 1);
+    assert!(ed.instructions.text().ends_with(long.trim_end()), "no newline added");
+}

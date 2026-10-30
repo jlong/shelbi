@@ -32,6 +32,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use shelbi_app::text_area::{VisualRow, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::panel;
@@ -325,6 +326,24 @@ pub(crate) fn area_in(rows: Vec<Vec<Span<'static>>>, fill: Color, width: usize) 
     }
     lines.push(below);
     lines
+}
+
+/// How a multi-line field's text wraps in `room` columns: at word
+/// boundaries, each char as wide as the terminal draws it.
+pub(crate) fn wrap(room: usize) -> Wrap {
+    Wrap::new(room.max(1) as f32, |c| c.width().unwrap_or(0).max(1) as f32)
+}
+
+/// Wrapped row `row` of `lines` as drawn in `room` columns (a control char
+/// as a space), and `caret` (a column in the row) kept on it: a caret on
+/// spaces hanging past the edge shows in the last column.
+pub(crate) fn row_chars(lines: &[Vec<char>], row: VisualRow, caret: Option<usize>, room: usize) -> (Vec<char>, Option<usize>) {
+    let chars = lines[row.line][row.start..row.end]
+        .iter()
+        .take(room)
+        .map(|c| if c.is_control() { ' ' } else { *c })
+        .collect();
+    (chars, caret.map(|c| c.min(room.saturating_sub(1))))
 }
 
 /// The text room inside a box `width` wide.

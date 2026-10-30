@@ -40,7 +40,7 @@ use shelbi_app::settings::agents::{
     SHARED_FOOTNOTE, SHARED_HELPER, SHARED_TITLE, UNSET_RUNNER,
 };
 use shelbi_app::settings::{Job, JobState, SettingsPage, Ticket};
-use shelbi_app::text_area::TextArea;
+use shelbi_app::text_area::{TextArea, VisualRow};
 use shelbi_app::Effect;
 use shelbi_state::agents_config::{AgentSummary, AgentsConfig, Provenance};
 use shelbi_state::keymap::{Key, Keymaps, SidebarAction};
@@ -102,8 +102,8 @@ struct Editor {
     focus: EditorFocus,
     /// The first wrapped line shown.
     top: usize,
-    /// The wrapped lines from the last draw (`(line, start)`), for clicks.
-    rows: Vec<(usize, usize)>,
+    /// The wrapped lines from the last draw, for clicks.
+    rows: Vec<VisualRow>,
     /// Lines shown at once (Page Up / Page Down move this far).
     height: usize,
 }
@@ -830,9 +830,9 @@ impl AgentsPage {
                 self.focus = Item::Editor;
                 if let Some(editor) = self.editor.as_mut() {
                     editor.focus = EditorFocus::Text;
-                    if let Some((line, start)) = editor.rows.get(row).copied() {
+                    if row < editor.rows.len() {
                         let col = (column as usize).saturating_sub(textbox::INSET);
-                        editor.text.move_to(line, start + col);
+                        editor.text.place(row, col as f32);
                     }
                 }
                 Outcome::Stay
@@ -1101,7 +1101,10 @@ impl AgentsPage {
         };
         let box_w = width.min(textbox::MAX_W);
         let text_w = textbox::room(box_w).max(1);
-        let (wrapped_rows, (caret_row, caret_col)) = editor.text.wrapped(text_w);
+        let wrap = textbox::wrap(text_w);
+        let (wrapped_rows, (caret_row, caret_col)) = editor.text.wrapped(&wrap);
+        // ↑ / ↓ move by the rows drawn here.
+        editor.text.set_wrap(Some(wrap));
         // As tall as the text (and a line to type on), up to what leaves
         // the buttons in view.
         let most = height.saturating_sub(8).clamp(3, 20);
@@ -1119,14 +1122,9 @@ impl AgentsPage {
         let mut body = Vec::new();
         for v in editor.top..editor.top + window {
             let mut spans = Vec::new();
-            if let Some(&(line, start)) = wrapped_rows.get(v) {
-                let chars: Vec<char> = lines[line]
-                    .iter()
-                    .skip(start)
-                    .take(text_w)
-                    .map(|c| if c.is_control() { ' ' } else { *c })
-                    .collect();
+            if let Some(&row) = wrapped_rows.get(v) {
                 let caret = (caret_on && v == caret_row).then_some(caret_col);
+                let (chars, caret) = textbox::row_chars(lines, row, caret, text_w);
                 textbox::caret_spans(&mut spans, &chars, caret, text_w, text_style.bg(textbox::fill(active, false, false)));
             }
             body.push(spans);
@@ -1721,6 +1719,36 @@ mod tests {
         assert!(d.page().editor_text().is_none(), "the editor closes once saved");
         assert_eq!(*d.page().focus(), Item::EditShared);
         assert!(d.screen(140, 60).contains("Notes"), "the preview shows the new text");
+    }
+
+    #[test]
+    fn the_shared_instructions_wrap_long_lines_and_move_by_wrapped_row() {
+        let _home = home("shared-wrap");
+        let mut d = Driver::new(Some(PROJECT));
+        d.focus(Item::EditShared);
+        d.key(KeyCode::Enter);
+        d.screen(140, 44);
+        d.key_with(KeyCode::PageDown, KeyModifiers::NONE);
+        d.key(KeyCode::End);
+        let long = "Every worker rebases onto origin main before it hands off. ".repeat(3);
+        d.s.paste(&format!("\n{}", long.trim_end()));
+        let text = d.screen(140, 44);
+        let rows: Vec<&str> = text.lines().filter(|l| l.contains("rebases onto")).collect();
+        assert!(rows.len() >= 2, "the long line shows on several rows:\n{text}");
+        for r in &rows {
+            assert!(!r.contains("hands offEvery"), "breaks fall between words: {r}");
+        }
+        let editor = |d: &Driver| d.page().editor.as_ref().unwrap().text.clone();
+        let (line, end) = editor(&d).cursor();
+        let wrap = editor(&d).wrap().cloned().expect("the draw set the wrap");
+        let (wrapped, (caret_row, _)) = editor(&d).wrapped(&wrap);
+        assert_eq!(wrapped[caret_row].line, line, "the caret ends the long line's last row");
+        d.key(KeyCode::Up);
+        let (up_line, up_col) = editor(&d).cursor();
+        assert_eq!(up_line, line, "up stays in the line: one wrapped row up");
+        assert!(up_col < end);
+        assert_eq!(editor(&d).wrapped(&wrap).1 .0, caret_row - 1);
+        assert_eq!(d.page().editor_text().unwrap().matches('\n').count(), shelbi_app::settings::agents::fixture::PREAMBLE.matches('\n').count() + 1, "no newline added");
     }
 
     #[test]
