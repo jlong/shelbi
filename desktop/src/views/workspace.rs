@@ -523,6 +523,14 @@ impl WorkspaceView {
         self.panel.sync(&shape);
     }
 
+    /// `editor:` or `diff_tool:` was saved: read the details again, for the
+    /// Edit in … name and which of Edit / View Diff open in an app.
+    pub fn tools_changed(&mut self, cx: &mut Context<Self>) {
+        if self.details.is_some() {
+            self.request_details(cx);
+        }
+    }
+
     /// Read the workspace's details off the UI thread (one read at a time; a
     /// row change while one is in flight is caught by the next refresh).
     fn request_details(&mut self, cx: &mut Context<Self>) {
@@ -1966,6 +1974,25 @@ pub(crate) mod tests {
             h.view.read_with(&h.cx, |v, _| v.status_line.clone()).as_deref(),
             Some("couldn't open the app: Zed isn't installed")
         );
+    }
+
+    #[gpui::test]
+    fn a_tool_saved_in_settings_reaches_the_open_panel(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        // Settings saved Zed (an app) as the editor.
+        let mut details = details_for_t1();
+        details.editor_name = "Zed".into();
+        details.apps = shelbi_state::AppTools { editor: true, diff: false };
+        *h.ops.details.lock().unwrap() = Some(details);
+        h.update(|v, cx| v.tools_changed(cx));
+        assert_eq!(
+            h.view.read_with(&h.cx, |v, _| v.details.as_ref().map(|d| d.editor_name.clone())).as_deref(),
+            Some("Zed")
+        );
+        h.click("ws-switch-editor");
+        assert_eq!(*h.ops.opened_apps.lock().unwrap(), vec![ReviewRole::Editor], "Edit opens the app now");
+        assert_eq!(h.active(), ContentView::Agent);
     }
 
     #[gpui::test]

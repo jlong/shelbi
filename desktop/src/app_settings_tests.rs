@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{px, Bounds, Pixels, TestAppContext};
+use shelbi_app::settings::general::{SaveStatus, ToolSetting};
 use shelbi_app::view::ReviewState;
 
 use super::smoke::Harness;
@@ -456,6 +457,160 @@ fn an_override_from_config_shows_with_reset(cx: &mut TestAppContext) {
     // Reset with nothing found says so rather than showing a blank field.
     s.click("settings-cli-reset");
     assert_eq!(cli_shown(&mut s, &view), crate::views::settings::CLI_NOT_FOUND);
+}
+
+/// The installed tools a test's pickers list: Neovim (CLI) and Zed (an app)
+/// for the editor, Kaleidoscope for the diff.
+fn detected_tools() -> shelbi_state::tools::DetectedTools {
+    use shelbi_state::tools::ToolOption;
+    use shelbi_state::ToolChoice;
+    let option = |name: &str, choice: ToolChoice| ToolOption { name: name.into(), ..ToolOption::custom(&choice) };
+    shelbi_state::tools::DetectedTools {
+        editors: vec![
+            option("Neovim", ToolChoice::Command("nvim".into())),
+            option("Zed", ToolChoice::app("/Applications/Zed.app")),
+        ],
+        diff_tools: vec![option("Kaleidoscope", ToolChoice::app("/Applications/Kaleidoscope.app"))],
+        git_difftool: Some("vimdiff".into()),
+    }
+}
+
+/// General, read as `cfg`, its pickers listing [`detected_tools`].
+fn tools_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
+    let view = general_page(s, cfg);
+    s.update(|_, _, cx| view.update(cx, |v, cx| v.set_detected_tools(detected_tools(), cx)));
+    s.settle();
+    view
+}
+
+/// Open `setting`'s picker (it has the keys then).
+fn open_picker(s: &mut Settings, view: &Entity<SettingsView>, setting: ToolSetting) {
+    s.update(|_, window, cx| {
+        let select = view.read(cx).tool_select(setting);
+        select.update(cx, |p, cx| p.open(window, cx));
+    });
+    s.settle();
+}
+
+fn saved(s: &mut Settings, view: &Entity<SettingsView>) -> shelbi_state::UserConfig {
+    s.h.cx.update(|_, cx| view.read(cx).saved().clone())
+}
+
+#[gpui::test]
+fn the_editor_picker_lists_the_choices_and_a_pick_saves_it(cx: &mut TestAppContext) {
+    use shelbi_state::ToolChoice;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let view = tools_page(&mut s, shelbi_state::UserConfig::default());
+    assert!(s.drawn("settings-editor-button") && s.drawn("settings-diff-tool-button"));
+    let label = |s: &mut Settings, setting| {
+        s.h.cx.update(|_, cx| view.read(cx).tools().picker(setting).current_label())
+    };
+    assert_eq!(label(&mut s, ToolSetting::Editor), "Default ($EDITOR or vim)");
+    assert_eq!(label(&mut s, ToolSetting::DiffTool), "Git's difftool");
+
+    // Default, Neovim, Zed, Browse…, Other command….
+    open_picker(&mut s, &view, ToolSetting::Editor);
+    assert!(s.drawn("settings-editor-menu"));
+    assert!(s.drawn("settings-editor-option-4") && !s.drawn("settings-editor-option-5"));
+    // ↓ ↓ to Zed; Return saves it, and only it.
+    s.key("down");
+    s.key("down");
+    s.key("enter");
+    assert!(!s.drawn("settings-editor-menu"), "a pick closes the menu");
+    let cfg = saved(&mut s, &view);
+    assert_eq!(cfg.editor, Some(ToolChoice::app("/Applications/Zed.app")));
+    assert_eq!(cfg.diff_tool, None);
+    assert_eq!(label(&mut s, ToolSetting::Editor), "Zed");
+
+    // Back to the default clears the key.
+    open_picker(&mut s, &view, ToolSetting::Editor);
+    s.key("up");
+    s.key("up");
+    s.key("enter");
+    assert_eq!(saved(&mut s, &view).editor, None);
+}
+
+#[gpui::test]
+fn a_failed_tool_save_goes_back_and_says_why(cx: &mut TestAppContext) {
+    use shelbi_state::ToolChoice;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let cfg = shelbi_state::UserConfig { diff_tool: Some(ToolChoice::Command("difft".into())), ..Default::default() };
+    let view = tools_page(&mut s, cfg);
+    s.update(|_, _, cx| view.update(cx, |v, _| v.fail_tool_save = Some("Couldn't save config.yaml: disk full".into())));
+    open_picker(&mut s, &view, ToolSetting::DiffTool);
+    // The current setting (difft) is listed as yours; ↑ to Kaleidoscope.
+    s.key("up");
+    s.key("enter");
+    s.h.cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.tools().diff_tool_choice(), Some(&ToolChoice::Command("difft".into())), "a failed save doesn't look saved");
+        assert_eq!(v.tools().status(), &SaveStatus::Failed("Couldn't save config.yaml: disk full".into()));
+    });
+}
+
+#[gpui::test]
+fn other_command_takes_a_typed_command_line(cx: &mut TestAppContext) {
+    use shelbi_state::ToolChoice;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let cfg = shelbi_state::UserConfig { editor: Some(ToolChoice::Command("code --wait".into())), ..Default::default() };
+    let view = tools_page(&mut s, cfg);
+    // A custom command shows as the setting, and Other command… starts from it.
+    assert_eq!(
+        s.h.cx.update(|_, cx| view.read(cx).tools().picker(ToolSetting::Editor).current_label()),
+        "Visual Studio Code"
+    );
+    open_picker(&mut s, &view, ToolSetting::Editor);
+    s.key("down");
+    s.key("down");
+    s.key("enter");
+    assert!(s.drawn("settings-editor-command"), "the field opens under the picker");
+    let typed = s.h.cx.update(|_, cx| view.read(cx).tools().draft().map(|d| d.text()));
+    assert_eq!(typed.as_deref(), Some("code --wait"));
+
+    // Escape cancels, keeping the setting.
+    s.key("escape");
+    assert!(!s.drawn("settings-editor-command"));
+    assert_eq!(saved(&mut s, &view).editor, Some(ToolChoice::Command("code --wait".into())), "nothing written");
+
+    // Typed and committed with Return, it's saved as a command.
+    s.update(|_, window, cx| view.update(cx, |v, cx| v.begin_command(ToolSetting::DiffTool, window, cx)));
+    s.settle();
+    assert!(s.drawn("settings-diff-tool-command"));
+    s.h.cx.simulate_input("ksdiff --wait");
+    s.key("enter");
+    assert!(!s.drawn("settings-diff-tool-command"));
+    assert_eq!(saved(&mut s, &view).diff_tool, Some(ToolChoice::Command("ksdiff --wait".into())));
+}
+
+#[gpui::test]
+fn browse_saves_an_app_and_refuses_what_isnt_a_tool(cx: &mut TestAppContext) {
+    use shelbi_state::ToolChoice;
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let view = tools_page(&mut s, shelbi_state::UserConfig::default());
+    let dir = std::env::temp_dir().join(format!("shelbi-browse-{}", std::process::id()));
+    let app = dir.join("Nova.app");
+    std::fs::create_dir_all(app.join("Contents")).unwrap();
+    std::fs::write(app.join("Contents/Info.plist"), "<plist/>").unwrap();
+
+    s.update(|_, _, cx| view.update(cx, |v, cx| v.browse_picked(ToolSetting::Editor, &app, cx)));
+    assert_eq!(saved(&mut s, &view).editor, Some(ToolChoice::app(&app)));
+    assert_eq!(
+        s.h.cx.update(|_, cx| view.read(cx).tools().picker(ToolSetting::Editor).current_label()),
+        "Nova"
+    );
+
+    let missing = dir.join("Gone.app");
+    s.update(|_, _, cx| view.update(cx, |v, cx| v.browse_picked(ToolSetting::Editor, &missing, cx)));
+    s.h.cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(matches!(v.save_status(), SaveStatus::Failed(e) if e.contains("doesn't exist")));
+        assert_eq!(v.tools().editor_choice(), Some(&ToolChoice::app(&app)), "the setting stays");
+    });
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The Terminal page's view, with `config.yaml` "read" as `cfg`.

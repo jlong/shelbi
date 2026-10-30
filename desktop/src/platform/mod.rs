@@ -17,6 +17,7 @@
 //! notifications (`dt-menus-notifications`) are platform concerns too, but
 //! live where that subtask puts them; the app bundle is `scripts/bundle.sh`.
 
+pub mod app_icons;
 pub mod blur;
 pub mod bootstrap;
 pub mod control;
@@ -29,6 +30,7 @@ pub mod font_smoothing;
 pub mod install;
 pub mod launch;
 pub mod motion;
+pub mod open_panel;
 pub mod print_version;
 pub mod relaunch;
 pub mod scrollers;

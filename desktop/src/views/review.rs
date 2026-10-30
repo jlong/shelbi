@@ -534,6 +534,37 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// `editor:` or `diff_tool:` was saved: re-read the review's Edit in …
+    /// name and which of Edit / View Diff open in an app, and show them.
+    pub fn tools_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = self.review.as_ref().filter(|r| r.resolved).map(|r| r.info.task_id.clone()) else {
+            return;
+        };
+        let ops = self.ops.clone();
+        let project = self.project.clone();
+        let read = cx.background_executor().spawn(async move { ops.resolve(&project, &task) });
+        cx.spawn(async move |this, cx| {
+            let Ok(ReviewTarget::Serving(fresh)) = read.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let Some(r) = this.review.as_mut().filter(|r| r.resolved && r.info.task_id == fresh.task_id) else {
+                    return;
+                };
+                if r.info.editor_name == fresh.editor_name && r.info.apps == fresh.apps {
+                    return;
+                }
+                r.info.editor_name = fresh.editor_name;
+                r.info.apps = fresh.apps;
+                r.model = ReviewPanelModel::build(&r.info, r.row.as_ref());
+                r.panel.sync(&r.model);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The task's sidebar row refreshed: the live server state.
     pub fn update_row(&mut self, row: Option<ReviewRow>, cx: &mut Context<Self>) {
         let Some(r) = self.review.as_mut() else {
@@ -1622,6 +1653,21 @@ pub(crate) mod tests {
             ops,
             events,
         }
+    }
+
+    #[gpui::test]
+    fn a_tool_saved_in_settings_reaches_the_open_review(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        let mut fresh = info();
+        fresh.editor_name = "Zed".into();
+        fresh.apps = shelbi_state::AppTools { editor: true, diff: true };
+        *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(fresh)));
+        h.update(|v, cx| v.tools_changed(cx));
+        let model = h.view.read_with(&h.cx, |v, _| v.model().cloned()).unwrap();
+        assert_eq!(model.editor_name, "Zed");
+        assert_eq!(model.apps, shelbi_state::AppTools { editor: true, diff: true });
+        assert_eq!(model.title, info().title, "the rest of the review is kept");
     }
 
     #[gpui::test]

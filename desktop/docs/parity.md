@@ -120,11 +120,17 @@ paths on every `cargo test`.
   change (`general::Change`) through `update_user_config` and applies the
   theme once the write lands; the desktop applies it at once and writes its
   whole form. Auto follows the system in the desktop and is dark in the TUI
-  (a terminal doesn't report its appearance). The TUI's General also edits
-  `editor:` (Enter commits, clearing restores `$EDITOR` then `vim`) and keeps
-  its summary of where the settings live; the desktop's General has no editor
-  field and instead edits the CLI path, notifications and window effects,
-  which are the desktop's own.
+  (a terminal doesn't report its appearance). Both edit `editor:` and
+  `diff_tool:` (`editor-difftool-desktop`, `editor-difftool-tui`) from the
+  shared `general::ToolPicker`: the default, the detected command-line tools
+  and apps, the current setting, Browse… and Other command… (a typed command
+  line, saved on Return), each pick saving its one key at once with the
+  shared `SaveStatus`. The desktop draws them as Selects with the apps'
+  icons (`views::tool_select`), Browse… opening a native open panel in
+  `/Applications`, and refreshes the open Workspace and Review panels' Edit
+  in … / View Diff when a save lands. The TUI keeps its summary of where the
+  settings live; the desktop's General also edits the CLI path,
+  notifications and window effects, which are the desktop's own.
 - **Settings ▸ Terminal**: the desktop edits its own terminals' font, size,
   Option key, scrollbar and ANSI colors (`desktop:` in `config.yaml`) and
   previews them. In the TUI the host terminal owns all of that, so its
