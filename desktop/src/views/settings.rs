@@ -2037,13 +2037,15 @@ mod tests {
 
         let shown = SettingsValues::from_config(&shelbi_state::load_user_config().unwrap());
         assert_eq!(shown.theme, ThemePreference::Dark);
-        assert_eq!(shown.translucency, Translucency { opacity: 90, blur: 40 });
+        assert_eq!(shown.contrast, 50);
+        assert_eq!(shown.translucency, Translucency { opacity: 85, blur: 30 });
 
         let changed = SettingsValues { font_size: 16, ..shown };
         shelbi_state::update_user_config(|cfg| changed.apply(cfg)).unwrap();
         let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
-        assert!(text.contains("theme: dark") && text.contains("window_opacity: 90"), "{text}");
-        assert!(text.contains("window_blur: 40") && text.contains("terminal_font_size: 16"), "{text}");
+        assert!(text.contains("theme: dark") && text.contains("contrast: 50"), "{text}");
+        assert!(text.contains("window_opacity: 85") && text.contains("window_blur: 30"), "{text}");
+        assert!(text.contains("terminal_font_size: 16"), "{text}");
 
         match previous {
             Some(v) => std::env::set_var("SHELBI_HOME", v),

@@ -457,7 +457,8 @@ pub fn default_statuses_yaml() -> Result<String> {
 /// (absent/partial files fall back to built-in defaults), so the file ships
 /// the knobs with the alternatives documented inline and a pointer to the
 /// sibling `keys.yaml`. The theme and the desktop window's look are seeded
-/// explicitly (dark, 90% opaque, blur 40) rather than by changing what a
+/// explicitly (dark, contrast 50, 85% opaque, blur 30) rather than by
+/// changing what a
 /// missing key means, so an existing file keeps its look.
 pub const CONFIG_YAML: &str = "\
 ## Shelbi global config — full reference: https://shelbi.dev/docs/configuration/global
@@ -480,13 +481,16 @@ keymap:
 ## desktop app and is dark in the TUI.
 theme: dark
 
-## The desktop app's windows. window_opacity is a percentage, 30 to 100 (100
-## is opaque), and window_blur the blur radius in points (0 to 50) behind a
-## translucent window. Without these keys a window is opaque and clear.
-## Reduce Transparency in macOS's Accessibility settings makes it opaque.
+## The desktop app's windows. contrast is a percentage, 0 to 100, of how far
+## apart surfaces and their text sit: 0 is the palette as designed and 100 the
+## strongest step. window_opacity is a percentage, 30 to 100 (100 is opaque),
+## and window_blur the blur radius in points (0 to 50) behind a translucent
+## window. Without these keys the contrast is 0 and a window is opaque and
+## clear. Reduce Transparency in macOS's Accessibility settings makes it opaque.
 desktop:
-  window_opacity: 90
-  window_blur: 40
+  contrast: 50
+  window_opacity: 85
+  window_blur: 30
 
 ## Keybinding overrides live in the sibling file ~/.shelbi/keys.yaml.
 ## See https://shelbi.dev/docs/configuration/global
@@ -714,7 +718,8 @@ agent_runners:
         // The new-install look is seeded as explicit values.
         assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"));
         let desktop = v.get("desktop").expect("desktop block");
-        assert_eq!(desktop.get("window_opacity").and_then(|o| o.as_u64()), Some(90));
-        assert_eq!(desktop.get("window_blur").and_then(|b| b.as_u64()), Some(40));
+        assert_eq!(desktop.get("contrast").and_then(|c| c.as_u64()), Some(50));
+        assert_eq!(desktop.get("window_opacity").and_then(|o| o.as_u64()), Some(85));
+        assert_eq!(desktop.get("window_blur").and_then(|b| b.as_u64()), Some(30));
     }
 }

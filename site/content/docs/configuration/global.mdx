@@ -26,12 +26,12 @@ tweaks without touching hub bookkeeping. A file that omits a key or a
 block resolves to that setting's default.
 
 A new install starts from a self-documenting `config.yaml` that sets
-`theme: dark` and a translucent desktop window (`desktop.window_opacity: 90`
-and `desktop.window_blur: 40`). Whichever writes the file first (`shelbi
-init`, or a first settings change in either client) writes those values, and
-with no file at all both clients show them. An existing `config.yaml` is
-never rewritten: without these keys it keeps the defaults in the table below
-(`auto`, an opaque window).
+`theme: dark`, `desktop.contrast: 50`, and a translucent desktop window
+(`desktop.window_opacity: 85` and `desktop.window_blur: 30`). Whichever
+writes the file first (`shelbi init`, or a first settings change in either
+client) writes those values, and with no file at all both clients show them.
+An existing `config.yaml` is never rewritten: without these keys it keeps the
+defaults in the tables below (`auto`, contrast `0`, an opaque window).
 
 **Path:** `~/.shelbi/config.yaml`
 
@@ -47,8 +47,9 @@ never rewritten: without these keys it keeps the defaults in the table below
 editor: code --wait
 theme: light
 desktop:
-  window_opacity: 90
-  window_blur: 40
+  contrast: 50
+  window_opacity: 85
+  window_blur: 30
 ```
 
 The TUI's Settings ▸ General edits `editor` too: it shows the command Shelbi
@@ -94,9 +95,9 @@ and Settings ▸ Terminal pages write these keys for you; every one is optional.
 | `notifications.review_ready` | bool | `true` | Notify when a task reaches the review column. |
 | `notifications.orchestrator_waiting` | bool | `true` | Notify when the orchestrator waits for an answer or shows a permission dialog. |
 | `terminal_colors.<color>.regular` / `.bold` | `#rrggbb` | theme palette | Terminal ANSI colors you changed, per color (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`). Unset colors follow the app's palette. |
-| `window_opacity` | percent | `100` | Window opacity. Values below the floor of `30` are clamped up; a fraction like `0.85` reads as 85. A new install's file sets `90`. |
-| `window_blur` | `0` to `50` | `0` | Blur radius, in points, for what shows through a translucent window. A new install's file sets `40`. |
-| `contrast` | percent | `0` | How far apart surfaces and their text sit; `100` is the strongest step. |
+| `window_opacity` | percent | `100` | Window opacity. Values below the floor of `30` are clamped up; a fraction like `0.85` reads as 85. A new install's file sets `85`. |
+| `window_blur` | `0` to `50` | `0` | Blur radius, in points, for what shows through a translucent window. A new install's file sets `30`. |
+| `contrast` | percent | `0` | How far apart surfaces and their text sit; `100` is the strongest step. A new install's file sets `50`. |
 | `app_icon` | `command-grille` \| `retro` | `command-grille` | The icon in the Dock and in About. |
 
 ### `zen_toggle` chords
