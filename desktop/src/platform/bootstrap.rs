@@ -66,6 +66,11 @@ impl BootstrapState {
 #[derive(Debug, Clone)]
 pub struct Ready {
     pub cli: CliLocation,
+    /// The `shelbi` discovery finds without a `desktop.cli_path`: `cli`
+    /// itself unless the setting chose it, else what the login `PATH` and
+    /// the known locations give (`None` when they give nothing). Settings
+    /// shows it while no override is set.
+    pub automatic: Option<PathBuf>,
     /// `shelbi --version`, when it answered.
     pub cli_version: Option<String>,
     /// The login environment `shelbi`, `git`, `gh`, and `ssh` run under,
@@ -205,6 +210,15 @@ pub fn run(
             }
         }
     };
+    let automatic = match cli.source {
+        CliSource::Setting => {
+            let home = platform.home_dir();
+            discovery::discover(None, &env::path_dirs(&env), home.as_deref(), |p| platform.is_executable(p))
+                .ok()
+                .map(|found| found.path)
+        }
+        CliSource::LoginPath | CliSource::KnownLocation => Some(cli.path.clone()),
+    };
     // The app's children (the daemon, `shelbi` commands) find the CLI by
     // name even when the login shell doesn't list its directory.
     let env = match cli.path.parent() {
@@ -255,6 +269,7 @@ pub fn run(
         VersionCheck::Match => enter(BootstrapState::Ready(Ready {
             on_login_path: cli.source != CliSource::KnownLocation,
             cli,
+            automatic,
             cli_version,
             env: Arc::new(env),
             control: ControlHandle::new(
@@ -561,6 +576,7 @@ mod tests {
         assert_eq!(env["PATH"], "/usr/bin:/bin:/opt/homebrew/bin");
         assert_eq!(p.installed, 0, "a found CLI is never installed over");
         assert!(!ready.on_login_path, "Homebrew isn't on this login PATH");
+        assert_eq!(ready.automatic.as_ref(), Some(&ready.cli.path), "discovery found it");
     }
 
     #[test]
@@ -592,6 +608,21 @@ mod tests {
         };
         assert_eq!(ready.cli.path, PathBuf::from("/Users/me/dev/shelbi"));
         assert_eq!(ready.cli.source, CliSource::Setting);
+        // What Settings shows once the override is cleared: the search
+        // without it, never the override itself.
+        assert_eq!(ready.automatic, Some(PathBuf::from("/opt/homebrew/bin/shelbi")));
+    }
+
+    #[test]
+    fn an_override_with_nothing_else_installed_has_no_automatic_cli() {
+        let mut p = Scripted::healthy("0.10.0");
+        p.setting = Ok(Some(PathBuf::from("/Users/me/dev/shelbi")));
+        p.executables = vec![PathBuf::from("/Users/me/dev/shelbi")];
+        let (_, end) = run_scripted(&mut p, "0.10.0");
+        let BootstrapState::Ready(ready) = end else {
+            panic!("expected Ready")
+        };
+        assert_eq!(ready.automatic, None);
     }
 
     #[test]

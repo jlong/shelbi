@@ -371,14 +371,91 @@ fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
 fn a_typed_letter_in_a_field_stays_the_fields(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.click("settings-cli-path");
+    s.key("cmd-3");
+    s.click("settings-font-size");
     assert!(!s.window_focused(), "the field has focus");
     s.key("j");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::General),
+        Some(SettingsPage::Terminal),
         "j didn't move the settings selection"
     );
+}
+
+/// The Shelbi CLI field's text, as the General page shows it.
+fn cli_shown(s: &mut Settings, view: &Entity<SettingsView>) -> String {
+    s.h.cx.update(|_, cx| view.read(cx).cli_shown(cx))
+}
+
+/// Bootstrap found `automatic` at launch, as the app's shell keeps it.
+fn launched_with(s: &mut Settings, automatic: Option<&str>) {
+    s.h.cx.update(|_, cx| {
+        cx.set_global(Shell::default());
+        let mut ready = inert_ready();
+        ready.automatic = automatic.map(std::path::PathBuf::from);
+        crate::app::share_ready(ready, cx);
+    });
+}
+
+#[gpui::test]
+fn the_cli_field_is_read_only_and_shows_the_cli_found_at_launch(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    launched_with(&mut s, Some("/opt/homebrew/bin/shelbi"));
+    s.open_settings();
+    let view = general_page(&mut s, shelbi_state::UserConfig::default());
+    assert_eq!(cli_shown(&mut s, &view), "/opt/homebrew/bin/shelbi");
+    assert!(s.drawn("settings-cli-browse") && !s.drawn("settings-cli-reset"), "no override to reset");
+
+    // Nothing in it takes the keys: a click leaves them with the window, and
+    // a typed letter goes there (the settings sidebar's j), not into it.
+    s.click("settings-cli-path");
+    assert!(s.window_focused(), "the field can't be focused");
+    s.key("j");
+    assert_eq!(cli_shown(&mut s, &view), "/opt/homebrew/bin/shelbi");
+
+    // A save that isn't a Browse pick never writes the path it shows.
+    s.click("settings-notify-A task is ready for review");
+    let saved = s.h.cx.update(|_, cx| view.read(cx).saved().clone());
+    assert!(!saved.desktop.notifications.review_ready(), "the switch saved");
+    assert_eq!(saved.desktop.cli_path, None, "discovery stays in effect");
+}
+
+#[gpui::test]
+fn browse_sets_the_override_and_reset_clears_it(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    launched_with(&mut s, Some("/opt/homebrew/bin/shelbi"));
+    s.open_settings();
+    let view = general_page(&mut s, shelbi_state::UserConfig::default());
+
+    // What Browse does with the file the dialog picked.
+    s.update(|_, _, cx| view.update(cx, |v, cx| v.pick_cli(std::path::Path::new("/Users/me/bin/shelbi"), cx)));
+    s.settle();
+    assert_eq!(cli_shown(&mut s, &view), "/Users/me/bin/shelbi");
+    let saved = s.h.cx.update(|_, cx| view.read(cx).saved().desktop.cli_path.clone());
+    assert_eq!(saved, Some("/Users/me/bin/shelbi".into()));
+    assert!(s.drawn("settings-cli-reset"));
+
+    s.click("settings-cli-reset");
+    assert_eq!(cli_shown(&mut s, &view), "/opt/homebrew/bin/shelbi", "back to the found CLI");
+    let saved = s.h.cx.update(|_, cx| view.read(cx).saved().desktop.cli_path.clone());
+    assert_eq!(saved, None, "the key is removed");
+    assert!(!s.drawn("settings-cli-reset"));
+}
+
+#[gpui::test]
+fn an_override_from_config_shows_with_reset(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    launched_with(&mut s, None);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    cfg.desktop.cli_path = Some("~/bin/shelbi".into());
+    let view = general_page(&mut s, cfg);
+    assert_eq!(cli_shown(&mut s, &view), "~/bin/shelbi");
+    assert!(s.drawn("settings-cli-reset"));
+
+    // Reset with nothing found says so rather than showing a blank field.
+    s.click("settings-cli-reset");
+    assert_eq!(cli_shown(&mut s, &view), crate::views::settings::CLI_NOT_FOUND);
 }
 
 /// The Terminal page's view, with `config.yaml` "read" as `cfg`.

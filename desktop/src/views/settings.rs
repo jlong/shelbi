@@ -19,7 +19,9 @@
 //! - `theme:` (`auto | dark | light`), shared with the TUI, which reads it
 //!   when it starts and whenever its Settings opens (and edits it there too);
 //! - `desktop.cli_path`: the `shelbi` CLI override the platform bootstrap
-//!   reads, typed or chosen with Browse.
+//!   reads, chosen with Browse and cleared with Reset. Its field is
+//!   read-only: it shows the override, or with none the CLI discovery found
+//!   at launch ([`crate::app::automatic_cli`]), which is never written.
 //!
 //! - `desktop.contrast`: how far apart the surfaces and their text sit, a
 //!   slider under Theme (0 to 100%, 0 not written). It applies to every
@@ -68,7 +70,7 @@
 //! key this view doesn't own (the zen chord, the review editor, a newer
 //! client's settings). Every read and write runs on the background executor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use gpui::{
@@ -356,7 +358,8 @@ pub struct SettingsView {
     /// The terminal font size, and the field it is typed into.
     font_size: u16,
     font_size_input: Entity<InputState>,
-    cli_path: Entity<InputState>,
+    /// The `desktop.cli_path` override, blank when none is set.
+    cli_path: String,
     theme: ThemePreference,
     /// The windows' translucency, and its two sliders.
     translucency: Translucency,
@@ -414,7 +417,6 @@ impl SettingsView {
     pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let font_family = cx.new(|cx| FontPicker::new(PRIMARY_FAMILY.to_string(), window, cx));
         let font_size_input = cx.new(|cx| InputState::new(window, cx).default_value(size_text(DEFAULT_SIZE)));
-        let cli_path = cx.new(|cx| InputState::new(window, cx).placeholder("Found automatically"));
         let defaults = cx.global::<Theme>().terminal.ansi;
         let ansi_inputs: Vec<_> = (0..16)
             .map(|slot| cx.new(|cx| InputState::new(window, cx).default_value(colors::hex(defaults[slot]))))
@@ -471,11 +473,6 @@ impl SettingsView {
                 WorkspacesEvent::Changed => cx.emit(SettingsEvent::PoolChanged),
                 WorkspacesEvent::Leave => cx.emit(SettingsEvent::Leave),
             }),
-            cx.subscribe_in(&cli_path, window, |this, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    this.save(cx);
-                }
-            }),
             cx.subscribe_in(&font_size_input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                     this.commit_size(window, cx);
@@ -510,7 +507,7 @@ impl SettingsView {
             font_family,
             font_size: DEFAULT_SIZE,
             font_size_input,
-            cli_path,
+            cli_path: String::new(),
             theme: ThemePreference::Auto,
             translucency: initial,
             opacity_slider,
@@ -879,8 +876,7 @@ impl SettingsView {
         self.font_family
             .update(cx, |p, cx| p.set_family(values.font_family, cx));
         self.show_size(values.font_size, window, cx);
-        self.cli_path
-            .update(cx, |s, cx| s.set_value(values.cli_path, window, cx));
+        self.cli_path = values.cli_path;
         self.theme = values.theme;
         self.show_translucency(values.translucency, cx);
         // What config.yaml says is what the windows show.
@@ -902,7 +898,7 @@ impl SettingsView {
         SettingsValues {
             font_family: self.font_family.read(cx).family().to_string(),
             font_size: self.font_size,
-            cli_path: self.cli_path.read(cx).value().to_string(),
+            cli_path: self.cli_path.clone(),
             theme: self.theme,
             option_as_meta: self.option_as_meta,
             scrollbar: self.scrollbar,
@@ -1250,8 +1246,8 @@ impl SettingsView {
         self.scrollbar
     }
 
-    /// Choose the `shelbi` binary in a file dialog; the choice fills the
-    /// field and is saved.
+    /// Choose the `shelbi` binary in a file dialog; the choice is the
+    /// override ([`Self::pick_cli`]).
     fn browse_cli(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -1266,15 +1262,31 @@ impl SettingsView {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            this.update_in(cx, |this, window, cx| {
-                this.cli_path
-                    .update(cx, |s, cx| s.set_value(path.display().to_string(), window, cx));
-                this.save(cx);
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.pick_cli(&path, cx)).ok();
         })
         .detach();
+    }
+
+    /// Make `path` the `desktop.cli_path` override: the field shows it and
+    /// it is saved.
+    pub(crate) fn pick_cli(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.cli_path = path.display().to_string();
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Clear the override: automatic discovery picks the CLI again, and the
+    /// field shows what it found.
+    fn reset_cli(&mut self, cx: &mut Context<Self>) {
+        self.cli_path.clear();
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// What the Shelbi CLI field shows: the override, else the CLI discovery
+    /// found at launch, else [`CLI_NOT_FOUND`].
+    pub(crate) fn cli_shown(&self, cx: &App) -> String {
+        cli_shown(&self.cli_path, crate::app::automatic_cli(cx))
     }
 
 }
@@ -1290,13 +1302,6 @@ impl SettingsView {
     pub(crate) fn offscreen_font_picker_ready(&self, cx: &gpui::App) -> bool {
         let picker = self.font_family.read(cx);
         picker.is_open() && picker.fonts_loaded()
-    }
-
-    /// Focus the Shelbi CLI field (`--visual-figma`'s focused textbox).
-    pub(crate) fn offscreen_focus_cli(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let focus = self.cli_path.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
-        cx.notify();
     }
 
     /// Show `icon` picked, without applying or saving it (`--visual-views`'
@@ -1470,25 +1475,30 @@ impl Render for SettingsView {
             .child(size_field)
             .child(step("settings-font-size-down", icons::MINUS, -1, cx))
             .child(step("settings-font-size-up", icons::PLUS, 1, cx));
-        let cli_focused = self.cli_path.read(cx).focus_handle(cx).is_focused(window);
+        // The disabled Textbox (the Textbox at half opacity, as the
+        // workspace dialog's Worktree location): plain text, nothing to
+        // focus or type in. Browse sets the override, Reset clears it.
         let cli = controls::picker(
-            controls::textbox(
-                div().flex_1().min_w_0().child(
-                    Input::new(&self.cli_path)
-                        .appearance(false)
-                        .h_full()
-                        .px_0()
-                        .type_style(Type::Base)
-                        .text_color(theme.form_text),
-                ),
-                cli_focused,
-                &theme,
-            )
-            .debug_selector(|| "settings-cli-path".into())
-            .flex_1(),
+            div()
+                .id("settings-cli-path")
+                .debug_selector(|| "settings-cli-path".into())
+                .flex_1()
+                .min_w_0()
+                .opacity(0.5)
+                .child(controls::textbox(
+                    div().flex_1().min_w_0().truncate().child(self.cli_shown(cx)),
+                    false,
+                    &theme,
+                )),
             controls::form_button("settings-cli-browse", "Browse", &theme)
                 .on_click(cx.listener(|this, _, window, cx| this.browse_cli(window, cx))),
-        );
+        )
+        .when(!self.cli_path.trim().is_empty(), |d| {
+            d.child(
+                controls::form_button("settings-cli-reset", "Reset", &theme)
+                    .on_click(cx.listener(|this, _, _, cx| this.reset_cli(cx))),
+            )
+        });
         let switches = self.notifications;
         let toggle = |label: &'static str, switch: Switch, cx: &mut Context<Self>| {
             controls::checkbox(format!("settings-notify-{label}"), label, switches.get(switch), false, &theme)
@@ -1868,15 +1878,14 @@ impl SettingsView {
     }
 }
 
-/// The selector of a page's marker (tests find the page shown by it).
 /// The Shelbi CLI field's helper line. `running`: the CLI the app runs and
 /// whether a terminal finds it by name; one it doesn't (an install in
 /// `~/bin` on a shell whose `PATH` lacks it) gets the line that fixes that.
 /// The app never edits shell startup files itself.
 pub fn cli_help(running: Option<(PathBuf, bool)>, home: Option<PathBuf>) -> String {
     let mut help = String::from(
-        "The `shelbi` binary the app runs. Blank finds it on your login PATH, \
-         in Homebrew, ~/.cargo/bin, or ~/bin. Takes effect on the next launch.",
+        "The `shelbi` binary the app runs, found on your login PATH, in Homebrew, \
+         ~/.cargo/bin, or ~/bin unless you pick one. Takes effect on the next launch.",
     );
     if let Some((cli, false)) = running {
         let dir = cli.parent().map(|d| d.to_path_buf()).unwrap_or_default();
@@ -1894,6 +1903,21 @@ pub fn cli_help(running: Option<(PathBuf, bool)>, home: Option<PathBuf>) -> Stri
     help
 }
 
+/// What the Shelbi CLI field shows when there is no override and discovery
+/// found nothing.
+pub const CLI_NOT_FOUND: &str = "Not found";
+
+/// The Shelbi CLI field's text: the `desktop.cli_path` override when one is
+/// set, else the CLI discovery found (`automatic`), else [`CLI_NOT_FOUND`].
+pub fn cli_shown(setting: &str, automatic: Option<PathBuf>) -> String {
+    let setting = setting.trim();
+    if !setting.is_empty() {
+        return setting.to_string();
+    }
+    automatic.map_or_else(|| CLI_NOT_FOUND.to_string(), |p| p.display().to_string())
+}
+
+/// The selector of a page's marker (tests find the page shown by it).
 pub fn page_selector(page: SettingsPage) -> &'static str {
     match page {
         SettingsPage::General => "settings-page-general",
@@ -1916,6 +1940,15 @@ mod tests {
         let off = super::cli_help(Some(("/Users/me/bin/shelbi".into(), false)), home);
         assert!(off.contains("export PATH=\"$HOME/bin:$PATH\""), "{off}");
         assert!(off.contains("/Users/me/bin, so"), "{off}");
+    }
+
+    #[test]
+    fn the_cli_field_shows_the_override_else_the_found_cli_else_not_found() {
+        let found = Some(PathBuf::from("/opt/homebrew/bin/shelbi"));
+        assert_eq!(super::cli_shown("~/bin/shelbi", found.clone()), "~/bin/shelbi");
+        assert_eq!(super::cli_shown("", found.clone()), "/opt/homebrew/bin/shelbi");
+        assert_eq!(super::cli_shown("  ", found), "/opt/homebrew/bin/shelbi", "blank is no override");
+        assert_eq!(super::cli_shown("", None), super::CLI_NOT_FOUND);
     }
 
     use super::*;

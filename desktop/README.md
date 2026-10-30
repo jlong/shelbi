@@ -86,7 +86,7 @@ desktop:
 |---|---|---|
 | `theme` | `auto` | Color theme. `auto` follows the system appearance live (the TUI reads `auto` as dark). |
 | `editor` | `$EDITOR`, then `vim` | The editor for `edit:*` commands, a task's "Open in editor", and Cmd+click on a path. A terminal editor opens in Terminal.app; a GUI editor directly. |
-| `desktop.cli_path` | discovered | The `shelbi` the app runs. A leading `~/` is expanded. |
+| `desktop.cli_path` | discovered | The `shelbi` the app runs. A leading `~/` is expanded. Settings ▸ General's Shelbi CLI field is read-only: it shows this override, or with none the `shelbi` the app found at launch (never written here). Browse sets the override and Reset removes it; either takes effect on the next launch. |
 | `desktop.terminal_font_family` | Source Code Pro | Terminal font. Settings picks it from the bundled faces and the installed monospaced families; one that isn't installed falls back to Source Code Pro. |
 | `desktop.terminal_font_size` | 14 | Terminal font size in points (6 to 72; Settings' stepper and ⌘+ / ⌘− step it by 1 within 8 to 32), on 18pt rows at the default. ⌘+ / ⌘− / ⌘0 write it too. |
 | `desktop.option_as_meta` | `false` | Whether Option is Meta in terminals: `true`, `left`, or `right`. |
