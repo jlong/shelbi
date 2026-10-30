@@ -237,6 +237,95 @@ impl ToolPicker {
     }
 }
 
+/// `~` or `~/…` typed at the start of a path, expanded to the home folder
+/// (as a shell would); anything else as typed.
+pub fn expand_home(text: &str) -> std::path::PathBuf {
+    let home = || std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match text.strip_prefix('~') {
+        Some("") => home().unwrap_or_else(|| text.into()),
+        Some(rest) if rest.starts_with('/') => match home() {
+            Some(home) => home.join(rest.trim_start_matches('/')),
+            None => text.into(),
+        },
+        _ => text.into(),
+    }
+}
+
+/// One entry of the folder a typed path is in that the path's last part
+/// starts (case-insensitively, as macOS names match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMatch {
+    /// The entry's name.
+    pub name: String,
+    /// The field's text with this entry taken: a folder ends in `/` (to go
+    /// on into it), an `.app` doesn't (it is what is picked).
+    pub text: String,
+    /// It is a folder to go into (an `.app` bundle isn't).
+    pub folder: bool,
+}
+
+/// What Tab does to a typed path ([`complete_path`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathCompletion {
+    /// The text completed as far as the matches agree: the one match's text
+    /// when there is one, else their common start.
+    pub text: String,
+    /// The entries that match, sorted by name.
+    pub matches: Vec<PathMatch>,
+}
+
+/// Complete `text`, a path being typed for Browse (an app or a program),
+/// against the disk the way a shell's Tab does: its folder's entries that
+/// its last part starts. Hidden entries only when that part starts with
+/// `.`; a text without a `/` has no folder to look in. Reads the folder.
+pub fn complete_path(text: &str) -> PathCompletion {
+    let Some(slash) = text.rfind('/') else {
+        return PathCompletion { text: text.to_string(), matches: Vec::new() };
+    };
+    let (dir, prefix) = text.split_at(slash + 1);
+    let lower = prefix.to_lowercase();
+    let mut matches: Vec<PathMatch> = std::fs::read_dir(expand_home(dir))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !name.to_lowercase().starts_with(&lower) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                        return None;
+                    }
+                    let app = name.to_lowercase().ends_with(".app");
+                    let folder = !app && std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir());
+                    let text = format!("{dir}{name}{}", if folder { "/" } else { "" });
+                    Some(PathMatch { name, text, folder })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    matches.sort_by_key(|m| m.name.to_lowercase());
+    let text = match matches.as_slice() {
+        [] => text.to_string(),
+        [one] => one.text.clone(),
+        [first, rest @ ..] => {
+            // The names' common start (case-insensitively), as the first
+            // one spells it; never shorter than what was typed.
+            let common = first
+                .name
+                .chars()
+                .enumerate()
+                .take_while(|(i, c)| {
+                    rest.iter().all(|m| m.name.chars().nth(*i).is_some_and(|d| d.to_lowercase().eq(c.to_lowercase())))
+                })
+                .count();
+            if common > prefix.chars().count() {
+                format!("{dir}{}", first.name.chars().take(common).collect::<String>())
+            } else {
+                text.to_string()
+            }
+        }
+    };
+    PathCompletion { text, matches }
+}
+
 /// What a source of the resolved editor is called on the page.
 pub fn source_label(source: EditorSource) -> &'static str {
     match source {
@@ -869,6 +958,43 @@ mod tests {
         f.saved_result(Err("nope".into()));
         assert!(f.browse(ToolSetting::DiffTool, &dir.join("missing")).unwrap_err().contains("doesn't exist"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_typed_path_completes_like_a_shell() {
+        let dir = std::env::temp_dir().join(format!("shelbi-general-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for app in ["Zed.app/Contents", "Zulu.app", "Xcode.app", "Utilities", ".hidden"] {
+            std::fs::create_dir_all(dir.join(app)).unwrap();
+        }
+        std::fs::write(dir.join("zsh-tool"), "").unwrap();
+        let at = |s: &str| format!("{}/{s}", dir.display());
+
+        // One match: taken whole; a folder goes on into it, an app doesn't.
+        let c = complete_path(&at("ut"));
+        assert_eq!(c.text, at("Utilities/"));
+        assert_eq!(complete_path(&at("Xc")).text, at("Xcode.app"));
+        // Several: their common start (case-insensitive), every match listed.
+        let c = complete_path(&at("z"));
+        assert_eq!(c.matches.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["Zed.app", "zsh-tool", "Zulu.app"]);
+        assert_eq!(c.text, at("z"), "no longer than what was typed");
+        assert!(c.matches.iter().all(|m| !m.folder));
+        assert_eq!(complete_path(&at("zE")).text, at("Zed.app"), "spelled as the entry is");
+        // Hidden entries only on a leading dot; no folder, no matches.
+        assert_eq!(complete_path(&at("")).matches.len(), 5);
+        assert_eq!(complete_path(&at(".h")).text, at(".hidden/"));
+        assert_eq!(complete_path("nvim"), PathCompletion { text: "nvim".into(), matches: Vec::new() });
+        assert!(complete_path(&at("nothing/x")).matches.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_expands_only_at_the_start() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/Applications/Zed.app"), home.join("Applications/Zed.app"));
+        assert_eq!(expand_home("/a/~/b"), std::path::PathBuf::from("/a/~/b"));
+        assert_eq!(expand_home("~other/x"), std::path::PathBuf::from("~other/x"));
     }
 
     #[test]
