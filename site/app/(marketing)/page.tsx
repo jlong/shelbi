@@ -1,3 +1,5 @@
+import { ClientVariant } from '@/components/ClientVariant'
+import { DesktopHeroAnimation } from '@/components/desktop/DesktopAnimations'
 import { FeatureGrid } from '@/components/FeatureGrid'
 import { Hero } from '@/components/Hero'
 import { HeroAnimation } from '@/components/HeroAnimation'
@@ -12,7 +14,8 @@ export default function HomePage() {
     <div className="flex min-h-screen flex-col">
       <main className="flex flex-1 flex-col">
         <Hero />
-        <HeroAnimation />
+        {/* Every illustration below follows the hero's TUI | Desktop switch. */}
+        <ClientVariant tui={<HeroAnimation />} desktop={<DesktopHeroAnimation />} />
         <SolutionIntro />
         <ValueProps />
         <FeatureGrid />

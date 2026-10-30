@@ -140,6 +140,11 @@ export type Card = {
   id: string
   workspace?: string
   selected?: boolean
+  /**
+   * The issue's first paragraph. The TUI board doesn't draw it; the desktop
+   * board's cards show it under the title (see `components/desktop`).
+   */
+  summary?: string
 }
 
 /** One kanban column: a category-colored header over its stack of cards. */
@@ -1148,6 +1153,47 @@ function buildClaudeCodeRows(
   // Clamp every row to exactly `width` cells so a long transcript line can't
   // widen the pane past the board — the frame width stays constant across beats.
   return [...visible, ...chrome].map((row) => clampRow(row, width))
+}
+
+/**
+ * A bare Claude-Code session (transcript over the pinned `❯` input box and
+ * footer), `rows` tall and `width` cells wide, with no Shelbi TUI chrome around
+ * it. The desktop mockups draw their Orchestrator and Workspace terminals with
+ * it: Claude Code is the same program in either client's terminal, so its
+ * transcript comes from this one engine, and the desktop recolors it by
+ * redefining the `--tui-*` variables to its terminal palette around the pane.
+ * `style` sets the font metrics (the desktop terminal's size and leading).
+ */
+export function ClaudeCodePane({
+  state,
+  lines,
+  rows,
+  width,
+  style,
+}: {
+  state: AppState
+  lines: ChatLine[]
+  rows: number
+  width: number
+  style?: React.CSSProperties
+}) {
+  return (
+    <pre
+      className="m-0 whitespace-pre font-mono"
+      style={{
+        ...PRE_STYLE,
+        width: `${width}ch`,
+        minWidth: `${width}ch`,
+        maxWidth: `${width}ch`,
+        overflow: "hidden",
+        ...style,
+      }}
+    >
+      {buildClaudeCodeRows(state, lines, rows, width).map((row, i) => (
+        <Row key={i} segs={row} />
+      ))}
+    </pre>
+  )
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
@@ -2636,6 +2682,16 @@ function docToVimLines(blocks: DocBlock[]): VimLine[] {
 }
 
 const REVIEW_INSTRUCTIONS: VimLine[] = docToVimLines(REVIEW_DOC)
+
+/**
+ * The same Adversarial Review instructions as raw markdown source, one string
+ * per paragraph-level block (`#` headings, paragraphs, `- ` bullets, and `""`
+ * for a blank line): what the desktop's agent editor shows in its
+ * Instructions field, where the file is plain text rather than a vim buffer.
+ */
+export const REVIEW_INSTRUCTIONS_SOURCE: string[] = REVIEW_DOC.map((b) =>
+  b.k === "blank" ? "" : b.k === "li" ? `- ${b.t}` : b.t,
+)
 
 /**
  * The buffer rows for a file: a right-aligned line-number gutter beside each

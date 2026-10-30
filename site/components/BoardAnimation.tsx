@@ -1,7 +1,7 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
 import { BoardMockup, type AppState, type Card, type Column, type Machine } from "./KanbanMockup"
+import { useAutoplay } from "./useAutoplay"
 
 /**
  * A looping, autoplaying board that shows work flowing through the pipeline —
@@ -33,24 +33,25 @@ import { BoardMockup, type AppState, type Card, type Column, type Machine } from
 // it up in IN PROGRESS. Long enough that a full lap never shows the same title
 // twice on the board at once (the board holds up to 11 distinct tasks: 3 done +
 // 1 review + 1 in-progress + 6 to-do).
-type Flow = { title: string; id: string; worker: string }
+// `summary` is the issue's first paragraph, drawn only by the desktop board.
+type Flow = { title: string; id: string; worker: string; summary: string }
 const POOL: Flow[] = [
-  { title: "Add API ratelimit", id: "t-007", worker: "alpha" },
-  { title: "Fix mobile nav", id: "t-008", worker: "bravo" },
-  { title: "Paginate search API", id: "t-038", worker: "charlie" },
-  { title: "Cache user sessions", id: "t-040", worker: "alpha" },
-  { title: "Wire webhook retries", id: "t-016", worker: "bravo" },
-  { title: "Split OTel spans", id: "t-021", worker: "charlie" },
-  { title: "Sync i18n strings", id: "t-026", worker: "alpha" },
-  { title: "Add health probes", id: "t-042", worker: "bravo" },
-  { title: "Debounce autosave", id: "t-045", worker: "charlie" },
-  { title: "Harden token refresh", id: "t-025", worker: "alpha" },
-  { title: "Prune stale flags", id: "t-030", worker: "bravo" },
-  { title: "Dedupe error reports", id: "t-031", worker: "charlie" },
+  { title: "Add API ratelimit", id: "t-007", worker: "alpha", summary: "Per-key rate limits on the public API, with clear 429 responses." },
+  { title: "Fix mobile nav", id: "t-008", worker: "bravo", summary: "The menu sheet traps scroll on iOS. Close it on navigation." },
+  { title: "Paginate search API", id: "t-038", worker: "charlie", summary: "Cursor pagination for /search so large result sets stream in pages." },
+  { title: "Cache user sessions", id: "t-040", worker: "alpha", summary: "Keep session lookups in Redis instead of hitting the database per request." },
+  { title: "Wire webhook retries", id: "t-016", worker: "bravo", summary: "Retry failed webhook deliveries with backoff and a dead-letter queue." },
+  { title: "Split OTel spans", id: "t-021", worker: "charlie", summary: "Separate spans for queueing and handling so slow jobs are easy to find." },
+  { title: "Sync i18n strings", id: "t-026", worker: "alpha", summary: "Pull the latest translations and flag any keys missing a locale." },
+  { title: "Add health probes", id: "t-042", worker: "bravo", summary: "Liveness and readiness endpoints for the API and the worker pool." },
+  { title: "Debounce autosave", id: "t-045", worker: "charlie", summary: "Save drafts once typing pauses instead of on every keystroke." },
+  { title: "Harden token refresh", id: "t-025", worker: "alpha", summary: "Refresh tokens rotate on use, and a reused token revokes the session." },
+  { title: "Prune stale flags", id: "t-030", worker: "bravo", summary: "Remove feature flags that have been fully rolled out for a month." },
+  { title: "Dedupe error reports", id: "t-031", worker: "charlie", summary: "Group identical errors by fingerprint so one bug is one report." },
 ]
 const M = POOL.length
 // Four single-card moves per unit of work; one full lap is M of them.
-const BEATS = M * 4
+export const BOARD_BEATS = M * 4
 
 // How full TO DO stays: six cards waiting (five in the beat where the top one has
 // just been pulled and the refill hasn't landed yet).
@@ -79,9 +80,24 @@ const BACKLOG: Card[] = [
 // through the pipeline. Their workers are distinct from the pool's
 // alpha/bravo/charlie so the traveler never collides with a resident.
 const RESIDENT_PROGRESS: Card[] = [
-  { title: "Trim vendor bundle", id: "t-022", workspace: "delta" },
-  { title: "Backfill order index", id: "t-017", workspace: "echo" },
-  { title: "Migrate CI to arm64", id: "t-014", workspace: "foxtrot" },
+  {
+    title: "Trim vendor bundle",
+    id: "t-022",
+    workspace: "delta",
+    summary: "Split the vendor chunk and drop unused locales to cut the first load.",
+  },
+  {
+    title: "Backfill order index",
+    id: "t-017",
+    workspace: "echo",
+    summary: "Backfill the new orders index in batches without locking the table.",
+  },
+  {
+    title: "Migrate CI to arm64",
+    id: "t-014",
+    workspace: "foxtrot",
+    summary: "Move the CI runners to arm64 and keep an x86 job for the release build.",
+  },
 ]
 const RESIDENT_WORKERS = RESIDENT_PROGRESS.map((c) => c.workspace as string)
 
@@ -112,7 +128,9 @@ function at(i: number): Flow {
 
 function toCard(i: number, withWorker = false): Card {
   const f = at(i)
-  return withWorker ? { title: f.title, id: f.id, workspace: f.worker } : { title: f.title, id: f.id }
+  return withWorker
+    ? { title: f.title, id: f.id, summary: f.summary, workspace: f.worker }
+    : { title: f.title, id: f.id, summary: f.summary }
 }
 
 /**
@@ -166,8 +184,12 @@ function columnsAt(b: number): Column[] {
   ]
 }
 
-/** The full board state at beat `b`. */
-function stateAt(b: number): AppState {
+/**
+ * The full board state at beat `b`. Shared with the Desktop variant
+ * (`desktop/DesktopBoardAnimation.tsx`), which plays the same beats on the
+ * desktop app's board.
+ */
+export function boardStateAt(b: number): AppState {
   const p = pipelineAt(b)
   const traveler = p.inprog.length ? at(p.inprog[0]).worker : null
   return {
@@ -189,44 +211,17 @@ function stateAt(b: number): AppState {
 // Dwell per beat: long enough to track a single card jumping one column before
 // the next move.
 const HOLD_MS = 1600
+/** Every beat holds the same; the modulo ring makes the wrap a normal one-card move. */
+export const boardHold = () => HOLD_MS
 
 export function BoardAnimation() {
-  const [beat, setBeat] = useState(0)
-  const [visible, setVisible] = useState(true)
-  const [reduced, setReduced] = useState(false)
-  const containerRef = useRef<HTMLDivElement>(null)
-
-  // Respect prefers-reduced-motion: no autoplay, just a single static beat.
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)")
-    const update = () => setReduced(mq.matches)
-    update()
-    mq.addEventListener("change", update)
-    return () => mq.removeEventListener("change", update)
-  }, [])
-
-  // Pause the loop while the board is scrolled off-screen to save CPU.
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    const obs = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), {
-      threshold: 0.15,
-    })
-    obs.observe(el)
-    return () => obs.disconnect()
-  }, [])
-
-  // Advance one beat after the hold and wrap forever; the modulo ring makes the
-  // wrap a normal one-card move, so there's no seam to hide.
-  useEffect(() => {
-    if (reduced || !visible) return
-    const t = window.setTimeout(() => setBeat((k) => (k + 1) % BEATS), HOLD_MS)
-    return () => window.clearTimeout(t)
-  }, [beat, visible, reduced])
+  // Autoplay with the reduced-motion (a single static beat) and off-screen
+  // pauses (`useAutoplay`).
+  const { index: beat, reduced, ref } = useAutoplay(BOARD_BEATS, boardHold)
 
   return (
-    <div ref={containerRef}>
-      <BoardMockup state={stateAt(reduced ? 0 : beat)} />
+    <div ref={ref}>
+      <BoardMockup state={boardStateAt(reduced ? 0 : beat)} />
     </div>
   )
 }

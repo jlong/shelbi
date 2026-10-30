@@ -1,6 +1,9 @@
 import type { ReactNode } from "react"
 import { BoardAnimation } from "./BoardAnimation"
+import { ClientVariant } from "./ClientVariant"
 import { AgentInstructionsMockup, WorkflowConfigMockup } from "./KanbanMockup"
+import { DesktopBoardAnimation } from "./desktop/DesktopAnimations"
+import { DesktopAgentEditorMockup, DesktopWorkflowBuilderMockup } from "./desktop/DesktopEditors"
 
 /**
  * The value-prop triad: tasks, agents, workflows. Each states the mechanism,
@@ -10,6 +13,11 @@ import { AgentInstructionsMockup, WorkflowConfigMockup } from "./KanbanMockup"
  * and stacking under the copy on mobile. The headings stay H3 — they unpack the
  * solution intro's H2 ("Inbox Zero, for agent work"), so they sit a level below
  * it in the page outline.
+ *
+ * Each mockup has a Desktop counterpart (`desktop` below), swapped in by the
+ * TUI | Desktop switch: the desktop app's Issues board, and the Settings
+ * editors where the desktop edits the same agent instructions and workflow
+ * the TUI opens in vim.
  */
 // `bleed` (the board) sizes to its own natural width and overflows the column.
 // `edge` (the vim editors) is a fluid full-bleed: the panel fills from the
@@ -18,6 +26,7 @@ const triad: {
   title: string
   body: ReactNode
   mockup: ReactNode
+  desktop: ReactNode
   bleed?: boolean
   edge?: "left" | "right"
 }[] = [
@@ -28,6 +37,7 @@ const triad: {
     // it reads as the same live dashboard the hero shows, cropped by the viewport,
     // with work animating rightward through the pipeline.
     mockup: <BoardAnimation />,
+    desktop: <DesktopBoardAnimation />,
     bleed: true,
   },
   {
@@ -35,6 +45,7 @@ const triad: {
     body: "Workers build the code. Reviewers scrutinize it: QA, Security, and Adversarial Review ship in the box, each doing one job well. Tailor any of them with custom instructions and skills, or author your own.",
     // Editor bleeds off the left edge (mockup sits on the left on desktop).
     mockup: <AgentInstructionsMockup />,
+    desktop: <DesktopAgentEditorMockup />,
     edge: "left",
   },
   {
@@ -51,6 +62,7 @@ const triad: {
     ),
     // Editor bleeds off the right edge (mockup sits on the right on desktop).
     mockup: <WorkflowConfigMockup />,
+    desktop: <DesktopWorkflowBuilderMockup />,
     edge: "right",
   },
 ]
@@ -64,6 +76,7 @@ export function ValueProps() {
         // order is always copy-then-mockup, so on mobile (single column) the
         // copy reads first and the mockup stacks beneath it regardless of side.
         const mockupLeft = i % 2 === 1
+        const mockup = <ClientVariant tui={item.mockup} desktop={item.desktop} />
         return (
           <section
             key={item.title}
@@ -88,7 +101,7 @@ export function ValueProps() {
                 // stays put and the section's overflow-x-clip crops the spill at
                 // the viewport edge, so the board hangs off the page.
                 <div className={mockupLeft ? "lg:order-first" : undefined}>
-                  <div className="w-max">{item.mockup}</div>
+                  <div className="w-max">{mockup}</div>
                 </div>
               ) : item.edge ? (
                 // Edge bleed: the panel spans from the page edge to the far side
@@ -107,11 +120,11 @@ export function ValueProps() {
                     .filter(Boolean)
                     .join(" ")}
                 >
-                  {item.mockup}
+                  {mockup}
                 </div>
               ) : (
                 <div className={mockupLeft ? "lg:order-first" : undefined}>
-                  {item.mockup}
+                  {mockup}
                 </div>
               )}
             </div>

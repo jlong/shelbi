@@ -1,4 +1,12 @@
 import type { CSSProperties, ReactNode } from "react"
+import { ClientVariant } from "./ClientVariant"
+import {
+  DesktopAttachVignette,
+  DesktopKanbanVignette,
+  DesktopMachinesVignette,
+  DesktopReviewVignette,
+  DesktopTaskFileVignette,
+} from "./desktop/DesktopVignettes"
 
 /**
  * The home page's closing features area: a Clerk-style masonry of bordered
@@ -37,6 +45,11 @@ import type { CSSProperties, ReactNode } from "react"
  * the prompt cursor) uses `motion-safe:animate-pulse`. Every transform / loop
  * is gated behind `motion-safe:` (or reset with `motion-reduce:`) so
  * `prefers-reduced-motion: reduce` gets a still, legible section.
+ *
+ * Each feature also carries a Desktop vignette (`desktop/DesktopVignettes`):
+ * the same story in the desktop app's UI, shown instead of the terminal one
+ * when the TUI | Desktop switch is on Desktop (`ClientVariant`). The open
+ * source mark isn't an app illustration, so both clients share it.
  */
 
 // ── Palette ───────────────────────────────────────────────────────────
@@ -70,6 +83,11 @@ type Feature = {
   label: string
   body: string
   vignette: ReactNode
+  /** The Desktop client's vignette; omitted, both clients share `vignette`. */
+  desktop?: ReactNode
+  /** Desktop wording, where the TUI copy names the terminal. */
+  desktopLabel?: string
+  desktopBody?: string
   /** Where the vignette sits relative to the copy — staggers the masonry. */
   place: "top" | "bottom"
 }
@@ -468,30 +486,37 @@ const FEATURES: Feature[] = [
     label: "Kanban TUI",
     body: "Every task is a card on a board in your terminal, so status is on screen instead of in your head.",
     vignette: <KanbanVignette />,
+    desktop: <DesktopKanbanVignette />,
+    desktopLabel: "Kanban board",
+    desktopBody: "Every task is a card on a board, so status is on screen instead of in your head.",
     place: "top",
   },
   {
     label: "Workers on any machine",
     body: "Any box you can SSH into can take tasks. If it has git and an agent CLI, it's a worker.",
     vignette: <MachinesVignette />,
+    desktop: <DesktopMachinesVignette />,
     place: "bottom",
   },
   {
     label: "Attach from anywhere",
     body: "Every worker runs in its own Shelbi session. Attach from any terminal to watch an agent work or type to it directly. No terminal multiplexer required.",
     vignette: <AttachVignette />,
+    desktop: <DesktopAttachVignette />,
     place: "top",
   },
   {
     label: "Review flow",
     body: "Finished tasks land in the review column and wait for you. Assign a review agent to any column to hold every task to the same bar.",
     vignette: <ReviewVignette />,
+    desktop: <DesktopReviewVignette />,
     place: "bottom",
   },
   {
     label: "Plain-file state",
     body: "Tasks are markdown and workflows are YAML, stored in your repo. No database, no cloud, just files you can read, grep, and commit.",
     vignette: <FileTreeVignette />,
+    desktop: <DesktopTaskFileVignette />,
     place: "top",
   },
   {
@@ -514,12 +539,17 @@ export function FeatureGrid() {
         </h2>
         <dl className="mt-5 gap-5 columns-1 sm:columns-2 lg:columns-3">
           {FEATURES.map((feature) => {
+            // A per-client string or vignette swaps with the switch; one both
+            // clients share renders once.
+            const pick = (tui: ReactNode, desktop: ReactNode | undefined) =>
+              desktop === undefined ? tui : <ClientVariant tui={tui} desktop={desktop} />
             const copy = (
               <>
-                <dt className="font-semibold text-fg">{feature.label}</dt>
-                <dd className="mt-1 leading-relaxed text-gray-7">{feature.body}</dd>
+                <dt className="font-semibold text-fg">{pick(feature.label, feature.desktopLabel)}</dt>
+                <dd className="mt-1 leading-relaxed text-gray-7">{pick(feature.body, feature.desktopBody)}</dd>
               </>
             )
+            const vignette = pick(feature.vignette, feature.desktop)
             return (
               <div
                 key={feature.label}
@@ -527,13 +557,13 @@ export function FeatureGrid() {
               >
                 {feature.place === "top" ? (
                   <>
-                    <div className="mb-4">{feature.vignette}</div>
+                    <div className="mb-4">{vignette}</div>
                     {copy}
                   </>
                 ) : (
                   <>
                     {copy}
-                    <div className="mt-4">{feature.vignette}</div>
+                    <div className="mt-4">{vignette}</div>
                   </>
                 )}
               </div>
