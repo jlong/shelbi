@@ -14,8 +14,7 @@ Settings ▸ General gets an App icon row under Background blur:
 App icon
 ┌────────┐  ┌────────┐
 │  [CG]  │  │ [Retro]│      the picked tile ringed in check_fill + glow
-└────────┘  └────────┘
-Command Grille  Retro
+└────────┘  └────────┘      (names in tooltips, since dt-icon-picker-no-shift)
 Shown in the Dock while Shelbi runs and in About. Finder, and the Dock
 before launch, show the app's own icon, Command Grille.
 ```

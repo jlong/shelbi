@@ -871,14 +871,28 @@ fn the_app_icon_tiles_pick_the_icon_live_and_save_it(cx: &mut TestAppContext) {
     assert_eq!(s.read(|_, cx| view.read(cx).app_icon()), None);
     assert_eq!(dock_applied().last(), Some(&AppIcon::CommandGrille), "the Dock follows config.yaml");
 
+    // Picking moves only the ring: each tile keeps its bounds whichever is
+    // picked (no label to turn bold and widen it), so nothing reflows.
+    let tiles = |s: &mut Settings| {
+        ["settings-app-icon-command-grille", "settings-app-icon-retro"].map(|selector| s.bounds(selector))
+    };
+    let unpicked_retro = tiles(&mut s);
+    // Each tile is its well alone: the picture 12px in, no label under it.
+    let well = px(crate::elements::controls::CHOICE_IMAGE + 24.0);
+    for tile in unpicked_retro {
+        assert_eq!(tile.expect("the tile is drawn").size, gpui::size(well, well));
+    }
+
     // A click shows it in the Dock at once and saves it.
     let saved = |s: &mut Settings| s.read(|_, cx| view.read(cx).saved().desktop.app_icon);
     s.click("settings-app-icon-retro");
+    assert_eq!(tiles(&mut s), unpicked_retro, "picking Retro moves no tile");
     assert_eq!(app_icon_in_effect(&mut s), AppIcon::Retro);
     assert_eq!(dock_applied().last(), Some(&AppIcon::Retro));
     assert_eq!(saved(&mut s), Some(AppIcon::Retro));
     // Picking the default writes it too: it was chosen.
     s.click("settings-app-icon-command-grille");
+    assert_eq!(tiles(&mut s), unpicked_retro, "picking Command Grille moves no tile");
     assert_eq!(app_icon_in_effect(&mut s), AppIcon::CommandGrille);
     assert_eq!(dock_applied().last(), Some(&AppIcon::CommandGrille));
     assert_eq!(saved(&mut s), Some(AppIcon::CommandGrille));
