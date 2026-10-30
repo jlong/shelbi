@@ -1,4 +1,4 @@
-import { INSTALL_COMMAND } from "@/components/InstallCommand"
+import { DESKTOP_INSTALL_COMMAND, INSTALL_COMMAND } from "@/components/InstallCommand"
 import { getSections, humanizeSection, sortedDocs, type Doc } from "@/lib/docs"
 
 // Canonical origin for absolute links in the agent-facing artifacts. Kept in
@@ -15,7 +15,8 @@ const SITE_TAGLINE =
  * strip the handful of JSX components the docs embed — none of which carry
  * markdown-meaningful text an agent needs:
  *
- * - `<InstallCommand />` → the actual install command as a fenced block.
+ * - `<InstallCommand />` → both install commands (the page shows the one for
+ *   the chosen client), each a fenced block under its client's label.
  * - `<CopyPromptBanner prompt={`…`} … />` → the prompt itself as a fenced
  *   block (the whole point of the AI-prompts page survives the strip).
  * - `<Tui>…</Tui>` / `<Desktop>…</Desktop>` (steps that differ by Shelbi
@@ -56,11 +57,15 @@ export function docToMarkdown(doc: Doc): string {
     },
   )
 
-  // `<InstallCommand />` → the canonical install command, single source of
-  // truth shared with the rendered page.
+  // `<InstallCommand />` → both install commands, labeled like the other
+  // per-client content; single source of truth shared with the rendered page.
   body = body.replace(
     /<InstallCommand\b[^>]*\/>/g,
-    `\`\`\`bash\n${INSTALL_COMMAND}\n\`\`\``,
+    () =>
+      [
+        `**${CLIENT_LABELS.Tui}:**\n\n\`\`\`bash\n${INSTALL_COMMAND}\n\`\`\``,
+        `**${CLIENT_LABELS.Desktop}:**\n\n\`\`\`bash\n${DESKTOP_INSTALL_COMMAND}\n\`\`\``,
+      ].join("\n\n"),
   )
 
   body = labelClientVariants(body)

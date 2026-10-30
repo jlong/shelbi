@@ -9,10 +9,22 @@ summary: Let Shelbi inspect your repo and machine, confirm one setup card, and l
 From the Git repository you want Shelbi to manage, install Shelbi and run
 its detected setup:
 
+<Tui>
+
 ```bash
 brew install jlong/shelbi/shelbi
 shelbi project add
 ```
+
+</Tui>
+<Desktop>
+
+```bash
+brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop
+shelbi project add
+```
+
+</Desktop>
 
 Shelbi runs a preflight, asks where issues should live (and which runner, if
 you have both), then shows one plan card to confirm. It does not write project

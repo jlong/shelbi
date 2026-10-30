@@ -77,19 +77,22 @@ function setSelection(key: string, label: string, persist: boolean) {
 }
 
 /**
- * Returns the active label for a tab set and a setter that fans the choice out
- * to every same-group block. `group` is optional: ungrouped tab sets fall back
- * to a per-instance id so they still switch, but skip cross-block sync and
- * persistence (a random id would never round-trip through `localStorage`).
+ * Returns the label the reader chose for a tab set and a setter that fans the
+ * choice out to every same-group block. `group` is optional: ungrouped tab
+ * sets fall back to a per-instance id so they still switch, but skip
+ * cross-block sync and persistence (a random id would never round-trip
+ * through `localStorage`).
  *
- * `labels` scopes the selection to what this block actually offers — if the
- * persisted label isn't present here, this block shows its first tab without
- * clobbering the shared choice.
+ * The choice is `undefined` while the reader hasn't picked a tab in this group
+ * (and always during SSR and hydration), so the caller picks the default.
+ * `labels` scopes it to what this block actually offers: if the persisted
+ * label isn't present here, it reads as no choice, without clobbering the
+ * shared one.
  */
 export function useCodeTabGroup(
   group: string | undefined,
   labels: string[],
-): [string, (label: string) => void] {
+): [string | undefined, (label: string) => void] {
   const fallbackId = useId()
   const key = group ?? fallbackId
   const persist = group != null
@@ -100,13 +103,12 @@ export function useCodeTabGroup(
     () => undefined,
   )
 
-  const active =
-    selected && labels.includes(selected) ? selected : (labels[0] ?? "")
+  const chosen = selected && labels.includes(selected) ? selected : undefined
 
   const select = useCallback(
     (label: string) => setSelection(key, label, persist),
     [key, persist],
   )
 
-  return [active, select]
+  return [chosen, select]
 }

@@ -6,6 +6,8 @@ summary: Install Shelbi with Homebrew on macOS, APT on Ubuntu, or from source fo
 
 <CopyPromptBanner prompt="Install and start Shelbi on my machine. On macOS, run `brew install jlong/shelbi/shelbi && shelbi`. On Ubuntu amd64, add the Shelbi APT keyring from https://apt.shelbi.dev/shelbi-archive-keyring.gpg, add the `https://apt.shelbi.dev stable main` source list with signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg, then run `sudo apt update && sudo apt install shelbi`, followed by `shelbi`. Make sure one authenticated agent CLI, claude or codex, is available." />
 
+<Tui>
+
 On macOS, install Shelbi and start it in one command:
 
 ```bash
@@ -20,18 +22,38 @@ written until you confirm. See
 [Set up your first project](/docs/guides/getting-started/first-project) for
 both paths.
 
+</Tui>
+<Desktop>
+
+On macOS, install the desktop app with Homebrew. Its cask depends on the CLI
+formula, so the command names both:
+
+```bash
+brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop
+```
+
+Then open **Shelbi** from Applications. On a fresh machine it opens the
+**Welcome to Shelbi** window, whose **Add project** starts the desktop app's
+short Add Project wizard. To get Shelbi's detected setup instead (a preflight
+of your repo, runner, and machine, then one plan card to confirm), run
+`shelbi project add` from inside the repository. See
+[Set up your first project](/docs/guides/getting-started/first-project) for
+both paths.
+
+</Desktop>
+
 Shelbi also publishes a prebuilt Ubuntu package. The full package-manager
 commands are:
 
 <CodeTabs group="install-os">
-  <CodeTab label="macOS">
+  <CodeTab label="macOS" client="tui">
 
   ```bash
   brew install jlong/shelbi/shelbi
   ```
 
   </CodeTab>
-  <CodeTab label="macOS desktop app">
+  <CodeTab label="macOS desktop app" client="desktop">
 
   ```bash
   brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop
