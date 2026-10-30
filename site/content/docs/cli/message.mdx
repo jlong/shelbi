@@ -16,7 +16,11 @@ there is a runtime error.
 `shelbi message` pushes a message to a task's assigned
 [workspace](/docs/concepts/workspaces) through a **file-based message log** at
 `<worktree>/.shelbi/messages/<task-id>.log`. Each call appends one durable JSON
-record. The workspace tails that log and folds the message into what it's doing.
+line (`msg_id`, `ts`, `kind`, an optional `in_response_to`, and `body`) and
+prints `queued <msg-id> → <task> (<kind>)` followed by a note that delivery is
+not yet confirmed. The workspace tails that log and folds the message into what
+it's doing. The `msg-id` (shaped `m-<millis>-<pid>`) is what
+`shelbi message status` takes.
 
 `shelbi message` does not type text or Enter into the session, so the session's
 verified-submit mechanism intentionally does not apply. Runner hooks consume
@@ -35,11 +39,14 @@ To learn the real outcome, either block on it or query it:
 - `--wait[=SECS]` blocks until the worker confirms delivery (default 120s), and
   **exits non-zero** if the window elapses with no confirmation.
 - `shelbi message status <msg-id>` reports the current state (`delivered`,
-  `queued`, or `unconfirmed`) from the durable events stream, exiting 0 only
-  when the worker has acked.
+  `queued`, `unconfirmed`, or an unknown id) from the durable events stream,
+  exiting 0 only when the worker has acked.
 
-A message to a task that is already `done`, or to a workspace with no live
-reader, is reported as undeliverable rather than silently queued.
+A message to a task that is already `done`, or whose workspace has no live
+reader right now, is still written to the log but exits non-zero as
+undeliverable. A task that is unassigned, whose workspace or machine is no
+longer declared, or whose worktree doesn't exist yet is an error, and nothing
+is written.
 
 `<KIND>` classifies the message so the workspace knows how to treat it:
 
@@ -82,14 +89,21 @@ act on the message.
 | `--wait [<SECS>]` | int | 120 when bare | Block until the worker confirms delivery, polling the events stream. Exits non-zero if the window elapses without an `ack=worker`. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. Defaults to `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
 
+A push first checks that the hub daemon runs the same version as this CLI. On a
+mismatch it offers to restart the daemon; with the global `-y` it restarts
+without asking; non-interactively (or while workspaces are busy) it stops and
+tells you to run `shelbi daemon restart`. `message status` skips this check.
+
 ## Subcommands
 
 ### `shelbi message status <MSG_ID>`
 
 Report a pushed message's delivery state from `events.log`, keyed on the
-`msg_id` that `shelbi message` printed. Prints `delivered`, `queued`, or
-`unconfirmed` and exits 0 only when the worker has acked, so a script can gate
-on it.
+`msg_id` that `shelbi message` printed. Prints `delivered` and exits 0 when the
+worker has acked, so a script can gate on it. Otherwise it exits non-zero with
+`queued` (no ack yet), `unconfirmed` (the daemon's ack window passed with no
+ack; a late ack can still land), or `unknown message id` (never pushed, or
+rotated out of `events.log`).
 
 ## Examples
 

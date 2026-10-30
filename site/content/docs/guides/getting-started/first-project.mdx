@@ -4,33 +4,48 @@ order: 12
 summary: Let Shelbi inspect your repo and machine, confirm one setup card, and land on a dashboard that is ready to use.
 ---
 
-<CopyPromptBanner prompt="Set up Shelbi for the Git repository in my current directory. Run `shelbi`, review the preflight and detected setup card with me, and press Enter only after I approve it. If I want to change a detected value, use `c` to Customize. Do not hand-write the generated config." />
+<CopyPromptBanner prompt="Set up Shelbi for the Git repository in my current directory. Run `shelbi project add` in this repository, review the preflight and detected setup card with me, and press Enter only after I approve it. If I want to change a detected value, use `c` to Customize. Do not hand-write the generated config." />
 
-From the Git repository you want Shelbi to manage, install and start it:
+From the Git repository you want Shelbi to manage, install Shelbi and run
+its detected setup:
 
 ```bash
-brew install jlong/shelbi/shelbi && shelbi
+brew install jlong/shelbi/shelbi
+shelbi project add
 ```
 
-On the happy path, Shelbi asks one question: launch the detected plan? It does
-not write project state until you confirm the card.
+Shelbi runs a preflight, asks where issues should live (and which runner, if
+you have both), then shows one plan card to confirm. It does not write project
+state until you confirm the card.
+
+<Callout type="note" title="Plain shelbi opens the launch screen">
+
+On a fresh machine with no hub daemon running, plain `shelbi` opens the
+**Welcome to Shelbi** launch screen instead. Its **Add project** button opens a
+short form (project name, repo path prefilled to the current directory, and
+config location) that creates the project with a file-system board and opens
+it, without the preflight or plan card. The rest of this page follows
+`shelbi project add`. With a daemon already running, plain `shelbi` outside a
+project starts this same setup for the current directory.
+
+</Callout>
 
 ## 1. Watch the preflight
 
-First-run setup prints the Shelbi banner, then checks the environment in front
-of you. A typical preflight looks like this:
+Setup checks the environment in front of you. A typical preflight looks like this:
 
 ```text
   ✓ git repo            ~/code/myapp
   ✓ default branch      main
-  ✓ remote              github.com:you/myapp.git
+  ✓ remote              github.com/you/myapp
   ✓ agent               codex 0.27.0 on PATH
-  ✓ machine             10 cores, recommending 4 workspaces
+  ✓ machine             10 cores
 ```
 
 Shelbi detects the repository root, default branch, origin, supported agent
-runners, and a workspace count suited to the machine. The values appear
-as each check completes.
+runners, and the machine's core count. The values appear as each check
+completes. With both runners installed, the agent row lists both
+(`claude <version> + codex <version> on PATH`).
 
 <Callout type="note" title="If both runners are installed">
 
@@ -52,9 +67,12 @@ Choose one and setup continues.
 Next, Shelbi asks where this project's board should live:
 
 ```text
+Where should this project's issues live?
+  GitHub Issues  cards are GitHub issues your team can see and file (requires `gh` logged in)
+  File system    private markdown files on this machine (no GitHub needed)
 ? Issue tracker:
-> GitHub Issues   cards are GitHub issues your team can see and file
-  File system     private markdown files on this machine
+> GitHub Issues
+  File system
 ```
 
 - **GitHub Issues** stores each card as a GitHub issue. It is pre-selected, with
@@ -79,19 +97,19 @@ metadata block, and how assignees gate Zen Mode), see the
 After preflight, Shelbi summarizes everything it will create:
 
 ```text
-  ┌─ myapp ────────────────────────────────────────┐
-  │                                                          │
-  │  repo        ~/code/myapp (main)                         │
-  │  github      github.com:you/myapp.git                    │
-  │  agent       codex                                       │
-  │  issues      GitHub · you/myapp                          │
-  │  workspaces  created on first boot                       │
-  │  workflows   task (branch → PR → review) · subtask       │
-  │  agents      orchestrator · developer · review           │
-  │              (+ qa, security, adversarial, opt-in)       │
-  │                                                          │
-  │  Everything above is editable later: Ctrl+Space → "Edit" │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ myapp ────────────────────────────────────────────────────┐
+  │                                                            │
+  │  repo        ~/code/myapp (main)                           │
+  │  github      github.com/you/myapp                          │
+  │  agent       codex                                         │
+  │  issues      GitHub · you/myapp                            │
+  │  workspaces  created at first boot (orchestrator interview)│
+  │  workflows   task (branch → PR → review) · subtask         │
+  │  agents      orchestrator · developer · review             │
+  │              (+ qa, security, adversarial, opt-in)         │
+  │                                                            │
+  │  Everything above is editable later: Ctrl+Space → "Edit"   │
+  └────────────────────────────────────────────────────────────┘
 
   Enter launch    c customize    q quit
 ```
@@ -100,10 +118,11 @@ After preflight, Shelbi summarizes everything it will create:
 - Press **`c`** to customize the detected values before creating anything.
 - Press **`q`**, **Esc**, or **Ctrl+C** to quit without writing project state.
 
-The displayed plan includes the local `hub`, the shipped `task` and `subtask`
-workflows, and the default agent roles. Both built-in runner declarations remain
-available in settings, even though the detected runner is the one the
-orchestrator uses for the workspaces it creates. The **workspace pool starts
+On a file-system board the issues row reads `file system (local markdown)`.
+The written plan also declares the local `hub` machine, the shipped `task` and
+`subtask` workflows, and the default agent roles. The detected runner becomes
+the orchestrator's runner; both built-in runner declarations stay in the
+project config, so agents can use either. The **workspace pool starts
 empty**: the orchestrator provisions it on first boot, asking how many
 workspaces and which naming scheme you want and creating each with `shelbi
 workspace add`.
@@ -126,15 +145,18 @@ Customize setup. Press Enter to keep each detected value.
 ```
 
 This is where you can choose a different project name or root, change the
-branch or remote, or use a different runner for the orchestrator. Workspaces
-themselves are sized and named later, in the orchestrator's first-boot
-interview.
+branch or remote, or use a different runner for the orchestrator. Only the
+**Orchestrator runner** answer is saved today; the **Agent runner** answer is
+not written, and each agent resolves its own runner. Workspaces themselves are
+sized and named later, in the orchestrator's first-boot interview.
 
 ## 4. Land on the dashboard
 
 After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI.
-The new board contains one Backlog card named **Welcome to Shelbi** and the
-sidebar briefly shows:
+On a file-system board, the new board contains one Backlog card named
+**Welcome to Shelbi** (a GitHub Issues board shows your repo's issues
+instead). The first time you set up a project on this machine, the sidebar
+also briefly shows:
 
 ```text
 Ctrl+P palette · type E to edit settings
@@ -174,19 +196,18 @@ For example:
 
 ```text
   ✗ agent               claude and codex not found on PATH
+  ✓ machine             10 cores
 
-No supported agent runner was found on PATH. Install and authenticate Claude
-Code or Codex, then start Shelbi again.
+No supported agent runner was found on PATH. Install and authenticate Claude Code (https://docs.claude.com/en/docs/claude-code) or Codex (npm install -g @openai/codex), then start Shelbi again.
 ```
 
-If no supported runner is found, Shelbi points to Claude Code and Codex install
-instructions and asks you to authenticate one before starting Shelbi again.
 No partial project is left behind.
 
 ## Add another project
 
 Run `shelbi project add` from another repository. It uses the same preflight,
-card, Customize path, and dashboard launch as first-run setup.
+card, Customize path, and dashboard launch described above. You can also use
+**Add project** on the launch screen.
 
 ## Next
 

@@ -25,11 +25,13 @@ Each entry is one markdown file with YAML frontmatter, in the project's Shelbi
 state directory:
 
 ```text
-~/.shelbi/projects/<project>/changelog/2026-10-28-213005-changelog-lands.md
+~/.shelbi/projects/<project>/changelog/2026-10-28-213005-changelog-lands-in-the-sidebar.md
 ```
 
 Files are named `<date>-<time>-<slug>.md` from the entry's date in UTC, so they
-sort by date. The file name without `.md` is the entry's id. Entries stay out
+sort by date. The slug is the title in lowercase words joined by `-`, cut at a
+word boundary to at most 48 characters. The file name without `.md` is the
+entry's id. Entries stay out
 of your repository whatever the project's config mode.
 
 ```markdown
@@ -119,6 +121,11 @@ Adds an entry and prints its id and file.
 | `-d`, `--description <DESC>` | The description, in markdown. Without it, the description is read from stdin when stdin is not a terminal. |
 | `--format <FORMAT>` | How to print the new entry. Default `text`. |
 
+`add` refuses an `--issue` that isn't a valid issue id, a `--pr` that isn't a
+number or URL, a `--link` that isn't an `http(s)` URL, an unreadable `--date`,
+and a title or author that is empty or longer than one line. It writes nothing
+when one is refused.
+
 ## list
 
 Lists entries, newest first.
@@ -148,11 +155,13 @@ names one entry (`2026-10-28-2130`). The default format is `markdown`.
 ## Formats
 
 **text** is a compact list: the date and title, then the id, the author and
-the links.
+the links. With nothing to show, it prints `No changelog entries yet.` (or
+``No changelog entries match `<query>`.`` for `search`). An entry file that
+can't be read is skipped with a warning on stderr.
 
 ```text
 2026-10-28 14:30  Changelog lands in the sidebar
-                  2026-10-28-213005-changelog-lands  orchestrator  issue:changelog  #1953
+                  2026-10-28-213005-changelog-lands-in-the-sidebar  orchestrator  issue:changelog  #1953
 ```
 
 **markdown** reads like the blog, full entries ready to paste or for an agent
@@ -169,7 +178,7 @@ the entries; `show` and `add` print one entry:
   "query": "sidebar",
   "entries": [
     {
-      "id": "2026-10-28-213005-changelog-lands",
+      "id": "2026-10-28-213005-changelog-lands-in-the-sidebar",
       "title": "Changelog lands in the sidebar",
       "date": "2026-10-28T14:30:05-07:00",
       "author": "orchestrator",
@@ -179,7 +188,7 @@ the entries; `show` and `add` print one entry:
         { "kind": "pr", "number": 1953, "url": "https://github.com/jlong/shelbi/pull/1953" },
         { "kind": "url", "url": "https://shelbi.dev/docs/cli/changelog" }
       ],
-      "path": "/Users/you/.shelbi/projects/shelbi/changelog/2026-10-28-213005-changelog-lands.md"
+      "path": "/Users/you/.shelbi/projects/shelbi/changelog/2026-10-28-213005-changelog-lands-in-the-sidebar.md"
     }
   ]
 }

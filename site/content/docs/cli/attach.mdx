@@ -18,26 +18,49 @@ at once.
 
 Where [`shelbi open`](/docs/cli/open) ensures a workspace's session is up so the
 TUI can show it, `attach` connects *your* terminal to that session directly,
-from any terminal on the hub or over SSH. No terminal multiplexer is involved:
+from any terminal on the machine where the session runs. `attach` only finds
+sessions on the local machine, so for a workspace on a remote machine, SSH to
+that machine and run `shelbi attach` there. No terminal multiplexer is involved:
 the session is a small Shelbi process that owns the agent's PTY and outlives the
 connection, so detaching leaves the agent running.
 
-Detach with the configured key (default `Ctrl+]`); Shelbi shows the detach hint
-on a one-line bar. Detaching never stops the agent.
+Detach with the configured key (default `Ctrl+]`). Shelbi shows the detach key
+on a one-line hint along the bottom row for a few seconds after you attach.
+Detaching never stops the agent.
 
 ## Arguments
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<WORKSPACE>` | string | — | Name of the workspace (session) to attach to (required). |
+| `<WORKSPACE>` | string | — | Workspace name (or a session name or short id from `shelbi session ls`) to attach to (required). Must be a live session. |
 
 ## Flags
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--detach-key <DETACH_KEY>` | string | `ctrl-]` | Key that detaches from the session. |
+| `--detach-key <DETACH_KEY>` | string | `ctrl-]` | Key that detaches, written as modifiers plus a key joined by `-` or `+`, e.g. `ctrl-]`, `ctrl-b`, `alt-d`, `esc`, `f12`. |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
-| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project used to break ties when several sessions match. |
+
+### How `<WORKSPACE>` is matched
+
+The argument is a session selector, tried in this order, stopping at the first
+unique hit:
+
+1. exact session short id
+2. exact session name
+3. workspace name (the last `/` segment of a session name)
+4. unique short-id prefix
+5. unique substring of a session name
+
+When several sessions match, Shelbi prefers the ones under the current project
+(`-p`), then the single live one. A dead session is refused with a pointer to
+`shelbi session snapshot`, which shows its final screen.
+
+Modifiers for `--detach-key` are `ctrl`, `alt` (or `opt`, `meta`), `shift`, and
+`super` (or `cmd`). The key is a single character or one of `enter`, `esc`,
+`tab`, `space`, `backspace`, `delete`, or a function key such as `f12`. The spec is
+case-insensitive.
 
 ## Examples
 

@@ -13,8 +13,8 @@ partial files fall back to built-in defaults, never an error.
 <Callout type="note" title="Home resolution">
 
 `~/.shelbi/` is the default base. It can be relocated via `--root`, then
-`$SHELBI_ROOT`, then `$SHELBI_HOME`, before falling back to
-`$HOME/.shelbi`. Every path below joins a filename onto that base.
+`$SHELBI_ROOT`, then `$SHELBI_HOME`, then a default baked in at install time
+(if any), before falling back to `$HOME/.shelbi`. Every path below joins a filename onto that base.
 
 </Callout>
 
@@ -37,25 +37,26 @@ never rewritten: without these keys it keeps the defaults in the table below
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. The canonical place to set it is `keys.yaml` (`defaults.global.zen_toggle`). |
+| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Legacy. Set the Zen Mode chord in `keys.yaml` (`defaults.global.zen_toggle`) instead: a non-default value here is moved into `keys.yaml` on the next start and reset here, with a one-time notice. |
 | `theme` | `auto` \| `dark` \| `light` | no | `auto` | Color theme for the TUI and the desktop app. See [Theme](#theme). |
-| `editor` | string | no | `$EDITOR`, else `vim` | Editor the [review interface](/docs/concepts/review-workspaces#the-review-editor)'s "Edit in `<editor>`" view launches in the review worktree. Hub-wide, so it follows you across projects. May be a bare command (`hx`) or one with flags (`code --wait`). Resolution order: this key, then `$EDITOR`, then `vim`. |
+| `desktop` | [Desktop](#desktop) | no | — | Desktop app settings. Ignored by the CLI and the TUI (except `app_icon`, which the TUI's About draws). |
+| `editor` | string | no | `$EDITOR`, else `vim` | Editor Shelbi opens for "Edit in `<editor>`" (in the [review interface](/docs/concepts/review-workspaces#the-review-editor) and the workspace panel) and for the desktop app's external edits (an issue body, a workflow's Edit YAML). Hub-wide, so it follows you across projects. May be a bare command (`hx`) or one with flags (`code --wait`). Resolution order: this key, then `$EDITOR`, then `vim`. |
 
 ```yaml
 # ~/.shelbi/config.yaml
-keymap:
-  zen_toggle: ctrl-g
 editor: code --wait
 theme: light
+desktop:
+  window_opacity: 90
+  window_blur: 40
 ```
 
 The TUI's Settings ▸ General edits `editor` too: it shows the command Shelbi
 runs and where it comes from (this key, `$EDITOR`, or the `vim` default), saves
 what you type when you press Enter, and clearing it brings back the fallback.
 
-The `editor` display label in the switcher is the program's basename with its
-first letter upper-cased — `hx` shows as **Edit in Hx**, `code --wait` as
-**Edit in Code**.
+The `editor` display label is the program's basename with its first letter
+upper-cased: `hx` shows as **Edit in Hx**, `code --wait` as **Edit in Code**.
 
 ### Theme
 
@@ -77,6 +78,27 @@ shows there. A missing key is `auto` (a new install's file sets `dark`). The dar
 its status colors; the light theme pins every color, so it reads the same in
 any light terminal.
 
+### Desktop
+
+The `desktop:` block holds the desktop app's settings. Its Settings ▸ General
+and Settings ▸ Terminal pages write these keys for you; every one is optional.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cli_path` | path | discovered | The `shelbi` CLI the app runs, overriding its discovery (the login-shell `PATH`, then the Homebrew prefixes and `~/.cargo/bin`). A leading `~/` is expanded. |
+| `terminal_font_family` | string | Geist Mono | Font family for the app's terminals. |
+| `terminal_font_size` | integer (points) | app default | Font size for the app's terminals. |
+| `option_as_meta` | `false` \| `true` \| `left` \| `right` | `false` | Whether Option acts as Meta in the terminals (Option+B sends `ESC b`) instead of typing the layout's Option characters. `left` / `right` make only that Option key Meta. |
+| `terminal_scrollbar` | `auto` \| `scrolling` \| `always` | `auto` | When the terminals show a scrollbar: `auto` follows macOS's "Show scroll bars", `scrolling` only while scrolling, `always` whenever there is scrollback. |
+| `notifications.workspace_blocked` | bool | `true` | Notify when a workspace's agent stops for you (waiting for input, or a permission dialog). |
+| `notifications.review_ready` | bool | `true` | Notify when a task reaches the review column. |
+| `notifications.orchestrator_waiting` | bool | `true` | Notify when the orchestrator waits for an answer or shows a permission dialog. |
+| `terminal_colors.<color>.regular` / `.bold` | `#rrggbb` | theme palette | Terminal ANSI colors you changed, per color (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`). Unset colors follow the app's palette. |
+| `window_opacity` | percent | `100` | Window opacity. Values below the floor of `30` are clamped up; a fraction like `0.85` reads as 85. A new install's file sets `90`. |
+| `window_blur` | `0` to `50` | `0` | Blur radius, in points, for what shows through a translucent window. A new install's file sets `40`. |
+| `contrast` | percent | `0` | How far apart surfaces and their text sit; `100` is the strongest step. |
+| `app_icon` | `command-grille` \| `retro` | `command-grille` | The icon in the Dock and in About. |
+
 ### `zen_toggle` chords
 
 The accepted values for the Zen toggle chord:
@@ -91,7 +113,10 @@ The accepted values for the Zen toggle chord:
 
 ## `keys.yaml`
 
-Overrides for the TUI keybindings. Built-in chords apply out of the box;
+Overrides for Shelbi's keybindings, shared by the TUI and the desktop app.
+Both clients edit this file in Settings ▸ Keybindings (in the TUI press `,` in
+the sidebar, then `2`; in the desktop app, ⌘2 while Settings is open). Built-in
+chords apply out of the box;
 this file layers on top of them, either globally (`defaults`) or per
 project (`projects.<name>`). Parse errors never fail the load. A
 mistyped entry is skipped and that action keeps its built-in chord.
@@ -148,6 +173,8 @@ The action names accepted under each mode, with their built-in chords:
 | `global` | `quit` | `ctrl-c` |
 | `global` | `zen_toggle` | `alt-z` |
 | `global` | `open_palette` | `ctrl-p` |
+| `global` | `focus_sidebar` / `focus_main` | `ctrl-h` / `ctrl-l` |
+| `sidebar` | `quit` | `q`,`ctrl-c` |
 | `sidebar` | `nav_up` / `nav_down` | `k`,`up` / `j`,`down` |
 | `sidebar` | `activate` | `enter`,`space` |
 | `sidebar` | `refresh` | `r` |
@@ -158,30 +185,42 @@ The action names accepted under each mode, with their built-in chords:
 | `kanban` | `reorder_up` / `reorder_down` | `K`,`shift-up` / `J`,`shift-down` |
 | `kanban` | `open_popover` | `enter`,`space` |
 | `kanban` | `cycle_workflow_filter` | `tab` |
+| `kanban` | `open_workspace` | `o` |
 | `popover` | `close` | `esc`,`enter`,`space`,`q` |
 | `popover` | `scroll_up` / `scroll_down` | `k`,`up` / `j`,`down` |
 | `popover` | `page_up` / `page_down` | `page-up`,`u` / `page-down`,`d` |
+| `popover` | `move_left` / `move_right` | `H`,`shift-left` / `L`,`shift-right` |
+| `popover` | `open_workspace` | `o` |
 | `activity` | `scroll_up` / `scroll_down` | `k`,`up` / `j`,`down` |
+| `activity` | `scroll_end` | `G`,`end` |
 | `activity` | `reset_filter` | `a` |
 | `activity` | `toggle_zen_filter` | `z` |
 | `activity` | `toggle_workspaces_filter` | `w` |
 | `palette` | `close` | `esc`,`ctrl-c`,`ctrl-p` |
 | `palette` | `activate` | `enter` |
 | `palette` | `nav_up` / `nav_down` | `up` / `down` |
+| `palette` | `backspace` | `backspace` |
 
 Most modes also carry `refresh` (`r`) and scroll-navigation actions
-(`page_up`/`page_down`, `scroll_home`); the table lists the ones you're
-most likely to rebind.
+(`page_up`/`page_down`, `scroll_home`). For the full list with the chords in
+effect after your `keys.yaml`, run
+[`shelbi config list-actions`](/docs/cli/config#list-actions). `shelbi config
+dump-keybindings` prints the whole default keymap as a starting `keys.yaml`, and
+`shelbi config check` validates the file and reports errors and warnings.
+
+A mode binding that reuses a `global` chord is dead in the `sidebar`, `kanban`,
+and `activity` modes: global bindings fire first. `shelbi config check` warns
+about it.
 
 ```yaml
-# rebind the palette opener globally, and vim-swap kanban nav in one project
+# rebind the palette opener globally, and add a second chord in one project
 defaults:
   global:
     open_palette: ctrl-k
 projects:
   myapp:
     kanban:
-      move_card_left: [H, ctrl-h]
+      move_card_left: [H, alt-h]
 ```
 
 ## Sibling files

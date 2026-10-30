@@ -16,8 +16,8 @@ review, and a **review interface** for running the change and accepting or
 rejecting it.
 
 This page covers the review tag, the serve recipe, and the review surfaces in
-the TUI. The generic tag and slot mechanics they build on — effective tags,
-superset routing, and `$SLOT` — live in
+the TUI. The generic tag and slot mechanics they build on (effective tags,
+superset routing, and `$SLOT`) live in
 [Workspaces](/docs/concepts/workspaces#tags-capability-labels).
 
 ## The review tag
@@ -27,31 +27,38 @@ Review routing uses one tag by convention: `review`. A workflow's review
 meant to run review work carries it:
 
 ```yaml
-# workflows/default.yaml — the review status requires the tag
+# workflows/task.yaml: the review status requires the tag
 statuses:
   - { id: review, owner: user, agent: review, tags: [review] }
 ```
 
 ```yaml
-# project.yaml — tag the machine (or individual slots) so its slots carry it
-machines:
-  - name: hub
-    kind: local
-    work_dir: ~/Workspaces/myapp
-    tags: [review]              # every slot on hub inherits `review`
+# project.yaml: tag the review slot itself
+workspaces:
+  - { name: dev,    machine: hub }
+  - { name: review, machine: hub, tags: [review], slot: 3000 }
 ```
 
-When an issue enters the review status, the orchestrator routes it to a free
-workspace whose effective tags are a superset of `{review}` — the same
+Tag individual slots, not the machine: machine tags are inherited, so a
+machine-level `review` tag would turn every slot on that machine into a review
+slot.
+
+When an issue enters the review status, Shelbi's hub loads it onto a free
+workspace whose effective tags are a superset of `{review}`, using the same
 [superset routing](/docs/concepts/workspaces#status-tag-routing) every tag uses.
-Nothing branches on the literal word "review"; it is just the tag this workflow
-happens to require. If no declared workspace carries it, the load fails loudly
-rather than running review work on a general slot.
+If no declared workspace carries it, the load fails loudly rather than running
+review work on a general slot.
+
+Routing itself is that generic superset query, but `review` is also the tag
+Shelbi's review machinery keys on: review-tagged slots refuse direct dev
+dispatch (`shelbi issue start` needs `--force`), sit in the sidebar's review
+sections instead of `— Workspaces —`, don't count toward dev capacity, are fed
+by the review auto-load queue, and receive the workflow's `review:` recipe.
 
 ## Serving the branch: the `review:` block
 
-Routing gets an issue onto a review slot. **Serving** the branch — booting the
-dev server so a human can click through it — is best expressed with the
+Routing gets an issue onto a review slot. **Serving** the branch (booting the
+dev server so a human can click through it) is best expressed with the
 workflow's dedicated [`review:`](/docs/configuration/workflow#review) block.
 This is the recommended way to stand up a review server. Shelbi resolves the
 recipe's `$SLOT` / `$PORT` placeholders against the review slot's port and
@@ -59,8 +66,14 @@ injects the resolved recipe into the [Review agent](/docs/concepts/agents)'s
 dispatch prompt; the agent runs it verbatim, health-checks it, and hands back
 a URL.
 
+The port is the review workspace's explicit `slot:` value (e.g. `slot: 3000`).
+A review slot without `slot:` (like the `review` slot `shelbi init` creates)
+leaves `$SLOT` / `$PORT` unresolved, and the Review agent stops and reports the
+misconfiguration instead of serving. Give every review slot a port-valued
+`slot:`.
+
 ```yaml
-# workflows/default.yaml
+# workflows/task.yaml
 review:
   workdir: site                                # relative to the worktree root
   setup: npm install --no-audit --no-fund      # one-shot; must exit 0 before serving
@@ -69,18 +82,18 @@ review:
   url: http://localhost:$SLOT                  # reviewable URL; gates the "Open Browser" action
 ```
 
-The `review:` block carries exactly these fields — matching the
+The `review:` block carries exactly these fields, matching the
 [`ReviewServe`](/docs/configuration/workflow#review) struct in source:
 
-- **`workdir`** — subdirectory to run the recipe in, relative to the worktree
+- **`workdir`**: subdirectory to run the recipe in, relative to the worktree
   root. Omitted, it runs at the root.
-- **`setup`** — a one-shot install/build command that must exit 0 before
+- **`setup`**: a one-shot install/build command that must exit 0 before
   serving. Omitted, setup is skipped.
-- **`serve`** (required) — the command that starts the dev server, bound to
+- **`serve`** (required): the command that starts the dev server, bound to
   the slot's port.
-- **`ready`** — a readiness probe polled until it exits 0. Omitted, there's
+- **`ready`**: a readiness probe polled until it exits 0. Omitted, there's
   no HTTP probe.
-- **`url`** — the reviewable URL handed to the human once the server is up. It
+- **`url`**: the reviewable URL handed to the human once the server is up. It
   also gates the review interface's **Open Browser** action.
 
 Because the recipe lives on the workflow, a monorepo's `app` / `site` / `docs`
@@ -98,11 +111,12 @@ Both spellings exist, and they are not the same mechanism:
   workspace's numeric slot. You derive a port from it yourself with shell
   arithmetic (`$((3000 + $SLOT))`).
 - In the `review:` block, **`$SLOT` and `$PORT` are interchangeable template
-  placeholders**, both resolved by Shelbi to the review slot's port *before*
-  the recipe reaches the agent. Both the `$X` and `${X}` spellings are
+  placeholders**, both resolved by Shelbi to the review slot's port (its
+  explicit `slot:` value) *before* the recipe reaches the agent. Both the `$X` and `${X}` spellings are
   substituted (see `substitute_review_url` in source); a fixed URL with no
-  placeholder round-trips unchanged. There is no shell arithmetic here — the
-  agent receives the already-substituted string.
+  placeholder round-trips unchanged. There is no shell arithmetic here: the
+  agent receives the already-substituted string. Unlike transition `$SLOT`,
+  there is no fallback to the slot's index.
 
 ## Transition commands: run, ready, teardown
 
@@ -111,38 +125,37 @@ status's **transitions** can also run arbitrary commands, and that's the right
 tool for hub-side side-effects that aren't the review server itself. A
 [transition](/docs/configuration/workflow#run-ready-and-teardown) can carry:
 
-- **`run`** — shell commands executed in order, in the issue's worktree, on the
+- **`run`**: shell commands executed in order, in the issue's worktree, on the
   assigned workspace's machine. They run after the edge's git `actions` and
   share the same short-circuit contract.
-- **`ready`** — a command polled until it exits 0 (bounded by `ready_timeout`,
+- **`ready`**: a command polled until it exits 0 (bounded by `ready_timeout`,
   default 90s), so a launched server can be confirmed up before the human is
   handed the URL.
-- **teardown** — expressed as the `run` of the *exit* transition; there is no
+- **teardown**: expressed as the `run` of the *exit* transition; there is no
   separate teardown hook.
 
 Each command runs synchronously, so a long-lived server must background itself
-(`… &`, `nohup`, a detached pane). The edge is entered the moment the launcher
+(`… &`, `nohup`, a detached session). The edge is entered the moment the launcher
 returns; `ready` is what confirms the server actually answers.
 
 Unlike the `review:` block, a transition `run:` server runs **hub-side and
-declaratively** — Shelbi executes it, not the Review agent — so it can't
+declaratively** (Shelbi executes it, not the Review agent), so it can't
 health-check, summarize a failure, or apply a human's tweak. Prefer `review:`
 for the serve recipe; keep transition `run:` for the side-effects around it.
 
 ## A review column, from these pieces
 
-Here is a complete review column: a tagged machine, a tagged status, a
+Here is a complete review column: a tagged slot, a tagged status, a
 `review:` serve recipe, and an accept edge that merges. Only the routing is
 generic workflow config; the serve recipe and the review interface are the
 review-specific machinery layered on top.
 
 ```yaml
-# project.yaml — tag the machine (or individual slots)
+# project.yaml: tag the review slot (not the machine)
 machines:
   - name: hub
     kind: local
     work_dir: ~/Workspaces/myapp
-    tags: [review]
 
 workspaces:
   - { name: alpha,    machine: hub }                 # dev slot
@@ -151,7 +164,7 @@ workspaces:
 ```
 
 ```yaml
-# workflows/default.yaml — the review status requires the tag, and the
+# workflows/task.yaml: the review status requires the tag, and the
 # review: block tells the Review agent how to boot the branch.
 statuses:
   - { id: in-progress, owner: agent, agent: developer }
@@ -159,7 +172,7 @@ statuses:
   - { id: done,        owner: user }
 
 transitions:
-  - from: review, to: done, actions: [merge, delete_branch]
+  - { from: review, to: done, actions: [merge, delete_branch] }
 
 review:
   setup: npm install --no-audit --no-fund
@@ -179,7 +192,7 @@ Routing does two things when an issue enters the status: it loads the issue onto
 the matching workspace running the status's [`agent`](/docs/configuration/workflow#statuses),
 **and** it hands that agent the resolved `review:` recipe. Shelbi ships a
 built-in `review` agent whose charter is "make the change runnable for a human,
-don't code" — name it here, or point `agent:` at any agent you've authored.
+don't code". Name it here, or point `agent:` at any agent you've authored.
 See [agents](/docs/concepts/agents).
 
 </Callout>
@@ -192,19 +205,23 @@ by whether an issue is loaded on a review slot yet:
 ```text
  — Ready for Review —
  ✓ Polish dark-mode toggle              hub:review-0
-   jlong/dark-mode-toggle-polish
+   ⎇ jlong/dark-mode-toggle-polish
 
  — Queued for Review —
  · Fix cookie domain bug
-   jlong/fix-cookie-domain-bug
+   ⎇ jlong/fix-cookie-domain-bug
 ```
 
-- **Ready for Review** (`✓`, cyan) — the issue's `assigned_to` names a
-  `review`-tagged workspace, so the branch is loaded on a review slot and
-  serving. Each entry is a two-line row: line 1 is the issue title with a
-  right-aligned **location badge** (the `machine:workspace` it's loaded on,
-  e.g. `hub:review-0`); line 2 is the branch, dim.
-- **Queued for Review** (`·`, dim) — every other Review-status issue
+- **Ready for Review**: the issue's `assigned_to` names a `review`-tagged
+  workspace. Each entry is a two-line row: line 1 is the issue title, line 2
+  is the branch (`⎇ <branch>`, dim). The badge shows how far the load got:
+  - **`✓`** (cyan): assigned to a review slot **and** confirmed serving (the
+    `ready:` probe passed, or a review with no URL has its agent session up).
+    Line 1 carries a right-aligned **location badge**, the `machine:workspace`
+    it's loaded on (e.g. `hub:review-0`).
+  - **`▶`** (muted): loaded on a review slot but the server isn't confirmed
+    up yet. No location badge.
+- **Queued for Review** (`·`, dim): every other Review-status issue
   (unassigned, or still pinned to the dev workspace that produced it), waiting
   for a free review slot. No location badge, because nothing is serving yet.
 
@@ -214,12 +231,14 @@ workspaces list under `— Workspaces —` as usual.
 
 The daemon auto-loads queued review-column issues onto idle `review`-tagged
 slots each poller tick (`autoload_review_queue`), so a queued branch normally
-lands on a free slot without any human action. The confirm popup is the
-manual path: selecting a **Queued** row raises a "Load onto a review
-workspace?" prompt and, on confirm, loads the branch onto a free
-`review`-tagged slot (never the dev pane that built it) — useful for loading
-a queued issue while the slots are otherwise busy. Selecting a **Ready** row
-opens its review interface directly.
+lands on a free slot without any human action. Selecting a **Queued** row is
+the manual path: it opens **Load for review**. With one free review slot it
+asks "Load onto review workspace `<name>`?", with several it lets you pick
+one, and if every review slot is busy it says so (it never preempts a slot or
+falls back to the dev workspace that built the branch). Use it for issues
+auto-load skips, such as a teammate's issue or one you unloaded with
+`shelbi workspace stop`. Selecting a **Ready** row opens its review interface
+directly.
 
 <Callout type="note" title="Sidebar collapse persists">
 
@@ -237,37 +256,42 @@ state.
 
 Opening a Ready issue launches the **review interface**, a two-column
 layout: the **review panel** on the left and the swappable review content on
-the right. The panel is the review window's own navigation, so the global nav
-sidebar stays docked in the dashboard. The panel is where you drive the review:
+the right. The panel takes the sidebar's column while the review is open. The
+panel is where you drive the review:
 
-- A square **back button** at the top (a back-arrow glyph) that switches focus
-  back to the dashboard window. It leaves the review interface loaded, so you
-  can return to it from the sidebar.
-- A **header** with the review status (`Ready for review`) and the review
-  worktree's folder (`📂`) — click it to reveal the worktree in your OS file
-  manager.
+- A square **back button** at the top (a back-arrow glyph) that returns to the
+  normal sidebar and your previous view (Esc does the same). It leaves the
+  review loaded, so you can reopen it from the sidebar.
+- A **header** with the review status (`Ready for review`).
+- **Task info**: the issue title, a short description preview, and a **More**
+  link (`m`) that opens the full description.
+- The review worktree's folder (`📁`). Click it to reveal the worktree in your
+  OS file manager.
 - A **view switcher** that swaps the right-hand content pane:
-  - **🤓 Reviewer** (default) — talk to the Review agent.
-  - **🔀 View Diff** — open your system diff tool over the review branch's
+  - **🤓 Reviewer** (default): talk to the Review agent.
+  - **🔀 View Diff**: open your system diff tool over the review branch's
     changes (the same `merge-base(base, HEAD)..HEAD` range `shelbi diff`
     shows) in the main pane. By default it launches git's configured diff tool
     (`diff.tool`, or `diff.guitool` for a GUI tool) in directory-diff mode;
     with none configured the panel reports a short error rather than launching.
     A tool that reviews a revision range instead of two directory trees (such
-    as `skim`) needs a `review.diff_command` override in `project.yaml` — see
-    [Project config](/docs/configuration/project). A diff tool that exits
+    as `skim`) needs a `review.diff_command` override in `project.yaml` (see
+    [Project config](/docs/configuration/project)). A diff tool that exits
     without rendering leaves a short message in the pane rather than only git
     warnings.
-  - **✍️ Edit in `<editor>`** — open the worktree in your configured editor
+  - **✍️ Edit in `<editor>`**: open the worktree in your configured editor
     (see below).
-  - **🌐 Open Browser** — open the resolved review `url` in your system
+  - **🌐 Open Browser**: open the resolved review `url` in your system
     browser. This entry renders **only** when the workflow declares a review
     URL.
+
+  On a remote review slot only **Reviewer** and **Open Browser** are offered
+  (and no worktree folder is shown).
 - An **Actions** group:
-  - **✅ Approve** — move the issue one column forward along the normal accept
+  - **✅ Approve**: move the issue one column forward along the normal accept
     edge (`review → done` in the default workflow), firing that edge's
     `actions` (e.g. `merge`, `delete_branch`), then tear the interface down.
-  - **❌ Reject** — open a type-the-reason dialog; on submit, the reason is
+  - **❌ Reject**: open a type-the-reason dialog; on submit, the reason is
     appended to the issue body and the issue is bounced back to the workflow's
     ready status for another pass. An empty reason can't submit.
 
@@ -284,7 +308,7 @@ Resolution order is:
 3. `vim`.
 
 The switch label is derived from the program's basename, first letter
-upper-cased — `hx` shows as **Edit in Hx**, `code --wait` as **Edit in Code**.
+upper-cased: `hx` shows as **Edit in Hx**, `code --wait` as **Edit in Code**.
 
 ## The load → serve → inspect flow
 
@@ -294,14 +318,14 @@ End to end, a finished issue reaches a human like this:
    poller rebases the branch onto the base branch and moves the issue into the
    review status. The finishing workspace closes its own session and returns
    to idle (see [Workspaces](/docs/concepts/workspaces#how-a-task-completes)).
-2. **The orchestrator routes it.** The review status requires `tags: [review]`,
-   so the issue loads onto a free `review`-tagged workspace and the Review
-   agent boots the branch from the resolved `review:` recipe. Queued review
-   issues are paired with idle review slots in **declaration order** — the dev
-   workspace that built the branch is *not* preferred (it is typically not
+2. **The hub loads it.** The review status requires `tags: [review]`, so the
+   hub's review auto-loader (not the orchestrator) loads the issue onto a free
+   `review`-tagged workspace and the Review agent boots the branch from the
+   resolved `review:` recipe. Queued review issues are paired with idle review
+   slots in **declaration order**. The dev workspace that built the branch is *not* preferred (it is typically not
    review-tagged); the only reuse is resuming a slot the issue is already
    serving on. If every matching slot is busy, the issue sits in **Queued for
-   Review** until one frees — nothing is preempted.
+   Review** until one frees; nothing is preempted.
 3. **A human inspects.** You open the issue's review interface from the sidebar,
    click through the running app at the served URL, and decide: **Approve**
    (move to Done) or **Reject** (bounce back with a reason). Each move fires
@@ -312,24 +336,26 @@ The board's category vocabulary is unchanged: the issue sits in the
 
 ## Review and Zen Mode
 
-Routing an issue to a review workspace is the *human* path — the whole point is
+Routing an issue to a review workspace is the *human* path: the whole point is
 human eyes on the running app. Whether such an issue is eligible for
 [Zen Mode](/docs/concepts/zen-mode)'s auto-merge is governed by the ordinary
 action-based rule: Zen's high-confidence bar fires on any transition whose
 `actions` include `merge`. Keep `merge` off the *enter*-review edge and on the
 *accept* edge (as above) so the orchestrator holds the issue for you rather than
-crossing the accept boundary on its own.
+crossing the accept boundary on its own. On top of that, the shipped Zen policy
+never auto-merges an issue that was routed to a review workspace; it waits for
+a human.
 
 ## See also
 
-- [Workflow config](/docs/configuration/workflow) — the status `tags`, the
+- [Workflow config](/docs/configuration/workflow): the status `tags`, the
   `review:` serve block, and transition `run` / `ready` / `ready_timeout`.
-- [Project config](/docs/configuration/project) — machine and workspace
+- [Project config](/docs/configuration/project): machine and workspace
   `tags`, and workspace `slot`.
-- [Global config](/docs/configuration/global) — the hub-wide `config.yaml`
+- [Global config](/docs/configuration/global): the hub-wide `config.yaml`
   `editor` the review interface's "Edit in `<editor>`" view uses.
-- [Workspaces](/docs/concepts/workspaces) — the pool model these slots extend.
-- [Agents](/docs/concepts/agents) — the role that runs inside a workspace,
+- [Workspaces](/docs/concepts/workspaces): the pool model these slots extend.
+- [Agents](/docs/concepts/agents): the role that runs inside a workspace,
   including the built-in `review` agent.
-- [Set up review workspaces](/docs/guides/getting-started/review-workspaces) —
+- [Set up review workspaces](/docs/guides/getting-started/review-workspaces):
   the step-by-step walkthrough.

@@ -20,8 +20,9 @@ because doing it once teaches the whole author-and-wire mechanism. If you
 only want the reviewer, you already have it: the shipped `adversarial`
 preset (alongside `qa` and `security`) is the same role, materialized and
 ready. Skip to [Add it to a
-workflow](/docs/guides/doing-more-with-agents/add-to-workflow) and name
-`agent: adversarial` on a status to wire the shipped one in one line.
+workflow](/docs/guides/doing-more-with-agents/add-to-workflow) and follow
+it with `agent: adversarial` in place of `adversarial-review`: you still
+declare the status and its transition edges, but there's no agent to write.
 
 </Callout>
 
@@ -83,7 +84,9 @@ Each slots onto a workflow status the same way the Adversarial Review agent
 does. A gate agent owns an `active` status between the work and the human
 and needs a bounce edge declared in the workflow's `transitions`. A
 producer agent owns a status where its output is the deliverable, then hands
-off forward.
+off forward. Outside `in-progress` it does that with the transition marker
+too, naming the next status: the ready marker only moves work out of a
+status whose id is `in-progress`.
 
 ## Where to go next
 

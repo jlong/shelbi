@@ -6,15 +6,19 @@ summary: Install Shelbi with Homebrew on macOS, APT on Ubuntu, or from source fo
 
 <CopyPromptBanner prompt="Install and start Shelbi on my machine. On macOS, run `brew install jlong/shelbi/shelbi && shelbi`. On Ubuntu amd64, add the Shelbi APT keyring from https://apt.shelbi.dev/shelbi-archive-keyring.gpg, add the `https://apt.shelbi.dev stable main` source list with signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg, then run `sudo apt update && sudo apt install shelbi`, followed by `shelbi`. Make sure one authenticated agent CLI, claude or codex, is available." />
 
-On macOS, install Shelbi and start its first-run setup in one command:
+On macOS, install Shelbi and start it in one command:
 
 ```bash
 brew install jlong/shelbi/shelbi && shelbi
 ```
 
-Shelbi checks your prerequisites and current Git checkout before it writes
-anything. See [Set up your first project](/docs/guides/getting-started/first-project)
-for the one-confirmation flow.
+On a fresh machine, `shelbi` opens the **Welcome to Shelbi** launch screen,
+with **Add project** and **Connect to remote**. To get Shelbi's detected setup
+instead (a preflight of your repo, runner, and machine, then one plan card to
+confirm), run `shelbi project add` from inside the repository. Nothing is
+written until you confirm. See
+[Set up your first project](/docs/guides/getting-started/first-project) for
+both paths.
 
 Shelbi also publishes a prebuilt Ubuntu package. The full package-manager
 commands are:
@@ -24,6 +28,13 @@ commands are:
 
   ```bash
   brew install jlong/shelbi/shelbi
+  ```
+
+  </CodeTab>
+  <CodeTab label="macOS desktop app">
+
+  ```bash
+  brew install jlong/shelbi/shelbi jlong/shelbi/shelbi-desktop
   ```
 
   </CodeTab>
@@ -54,9 +65,14 @@ The APT key fingerprint is published at:
 curl -fsSL https://apt.shelbi.dev/shelbi-archive-keyring.fingerprint
 ```
 
-The package installs the `shelbi` binary only. The hub daemon is started on
-demand the first time you open a project and exits when no project is open, so
-there is nothing to install or enable.
+The package installs the `shelbi` binary and its bundled configuration
+plugin. The hub daemon is started on demand the first time you open a project
+and exits when no project is open, so there is no service to install or enable.
+
+The macOS desktop app (`Shelbi.app`, Apple silicon, macOS 15 or later) is a
+second client over the same daemon and sessions as the TUI. Its cask depends on
+the CLI formula, so name both when you install it, as in the
+**macOS desktop app** tab above.
 
 If you're hacking on Shelbi or testing unreleased changes, use the
 [source-build path](#install-from-source-for-development) instead.
@@ -67,8 +83,9 @@ You need two things before you start:
 
 - **An agent CLI.** At least one of `claude`
   ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`,
-  installed and authenticated. Declare more than one later, and the
-  project YAML picks per workspace.
+  installed and authenticated. If you install both, each agent
+  (orchestrator, developer, review, and so on) recommends a runner and the
+  project config can override it; workspaces don't pick one.
 - **Git and SSH.** Shelbi creates git worktrees and can run workspaces on
   remote machines over SSH. The Ubuntu package depends on `git` and
   `openssh-client`; on macOS, install them with Xcode Command Line Tools or
@@ -103,8 +120,10 @@ you.
 shelbi
 ```
 
-With no project configured, this starts the guided setup. To check only the
-installed version, run `shelbi --version`.
+Inside a registered project's directory, this opens that project. Anywhere
+else, with no hub daemon running, it opens the launch screen; with a daemon
+already running, it starts project setup for the current directory. To check
+only the installed version, run `shelbi --version`.
 
 ## Verify release artifacts manually
 
@@ -157,17 +176,23 @@ cd shelbi
 ./scripts/install.sh
 ```
 
-The script runs `cargo build --release` and copies the binary to
-`$HOME/bin/shelbi`. Override the destination with `SHELBI_INSTALL_PATH`:
+The script first asks where Shelbi should keep its global state (the Shelbi
+root, default `~/.shelbi`) and bakes that path into the binary as its default.
+It skips the prompt when `SHELBI_DEFAULT_ROOT` is set or there is no terminal
+(for example under `curl | sh`), using `~/.shelbi` in that case. It then runs
+`cargo fetch --locked` and `cargo build --release`, copies the binary to
+`$HOME/bin/shelbi`, and installs the bundled configuration plugin under
+`<prefix>/share/shelbi/plugins/`. Override the destination with
+`SHELBI_INSTALL_PATH`:
 
 ```bash
 SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
 ```
 
 Re-run it any time you pull updates. One step rebuilds and reinstalls.
-The orchestrator and workspace panes re-shell into `shelbi` on every call,
-so they pick up the new binary automatically; only the sidebar, Issues, and
-Activity views need a manual `shelbi reload` to respawn against the new build.
+If a hub daemon is running, the script restarts it onto the new binary
+(pass `--no-daemon` to leave it alone). Run `shelbi reload`, or restart the
+TUI, so attached clients and the orchestrator pick up the new build.
 
 ### macOS: the codesign step
 

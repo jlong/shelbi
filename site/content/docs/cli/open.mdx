@@ -9,9 +9,17 @@ shelbi open [OPTIONS] <NAME>
 ```
 
 `shelbi open` ensures a [workspace](/docs/concepts/workspaces)'s session is up
-so the TUI can show it. For a workspace mid-task it is a no-op: dispatch already
-owns the agent's session. For an idle workspace it starts a plain interactive
-login shell in the worktree, so there is something to focus.
+so the TUI can show it. For a workspace with an issue assigned to it (in
+`todo`, in progress, or serving a review), it is a no-op: dispatch owns that
+agent's session. If any session is already live for the workspace, it also does
+nothing. For an idle workspace it starts a plain interactive login shell
+(`$SHELL -l`) in the worktree, so there is something to focus. If the worktree
+is missing, the shell starts in the machine's `work_dir`.
+
+That shell marks the workspace as occupied by you, so the orchestrator won't
+dispatch to it while it's open (`shelbi workspace list` shows
+`occupied (user shell)`). It isn't a managed agent session: exit the shell to
+free the slot, and Shelbi won't relaunch it.
 
 It's the single entry point behind the sidebar's click-to-focus: the "is this
 workspace's session up?" check lives here, so callers never have to branch on it

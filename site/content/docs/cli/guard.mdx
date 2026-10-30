@@ -1,0 +1,83 @@
+---
+title: shelbi guard
+order: 12.5
+summary: Install, remove, or check the pre-commit hook that stops Shelbi's agents from committing to the default branch.
+---
+
+```text
+shelbi guard <SUBCOMMAND> [OPTIONS]
+```
+
+`shelbi guard` manages the Shelbi commit guard: a `pre-commit` hook in the
+project's hub checkout (`<repo>/.git/hooks/pre-commit`) that refuses commits to
+the project's default branch (and to `git.base_branch` when that differs).
+
+The hook only applies inside Shelbi-managed agent sessions, which export
+`SHELBI_MANAGED_CONTEXT`. Commits from your own shell are never affected. It
+exists so an orchestrator or worker can't land work directly on `main` before
+cutting a task branch. A detached `HEAD` is always allowed, which is how
+Shelbi's own automated merges commit. To commit to a protected branch from
+inside a managed session on purpose, set
+`SHELBI_ALLOW_DEFAULT_BRANCH_COMMIT=1` (or use `git commit --no-verify`).
+
+[`shelbi init`](/docs/cli/init) and the other project setup paths install the
+guard for you and print a notice the first time they do. Opening a project
+later only refreshes a guard that is already installed; it never creates one
+silently. A `pre-commit` hook you wrote yourself is never overwritten or
+removed: install leaves it alone with a warning, and the guard is not
+installed.
+
+Every subcommand accepts the global `-p, --project <PROJECT>` flag to pick the
+project.
+
+## install
+
+```text
+shelbi guard install
+```
+
+Install the guard, or refresh it if it is already there. A fresh install prints
+what the hook does and how to remove it:
+
+```text
+shelbi: installed a git pre-commit hook at <repo>/.git/hooks/pre-commit.
+shelbi:   It blocks commits to a protected branch ONLY inside Shelbi-managed
+shelbi:   agent panes (marked with SHELBI_MANAGED_CONTEXT); your own commits from
+shelbi:   a normal shell are never affected. Remove it anytime with
+shelbi:   `shelbi guard uninstall`.
+```
+
+Running it again when the guard is already installed rewrites the hook and
+prints `✓ refreshed the Shelbi commit guard at <repo>/.git/hooks/pre-commit`.
+
+## uninstall
+
+```text
+shelbi guard uninstall
+```
+
+Remove the Shelbi-managed hook. Prints
+`✓ removed the Shelbi commit guard from <repo>/.git/hooks/pre-commit`, or a
+note that there was nothing to remove. A user-authored hook is left
+untouched.
+
+## status
+
+```text
+shelbi guard status
+```
+
+Report whether the guard is installed:
+
+```text
+installed: Shelbi commit guard at <repo>/.git/hooks/pre-commit
+```
+
+Otherwise it prints `not installed:` with either the reason that the existing
+hook is user-authored or that there's no guard in the checkout.
+
+## See also
+
+- [`shelbi init`](/docs/cli/init): project setup, which installs the guard.
+- [`shelbi wizard`](/docs/cli/wizard): the interactive setup, which installs it
+  too.

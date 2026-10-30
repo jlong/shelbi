@@ -180,6 +180,7 @@ export const STATUS: Record<Category, { kind: StatusKind; color: string; panelCo
   yellow: { kind: "in-progress", color: C.accent, panelColor: C.cyan, label: "in progress" },
   magenta: { kind: "review", color: C.purple, panelColor: C.purple, label: "review" },
   green: { kind: "done", color: C.green, panelColor: C.green, label: "done" },
+  darkgray: { kind: "canceled", color: C.muted, panelColor: C.muted, label: "canceled" },
 }
 
 // ── Window ────────────────────────────────────────────────────────────

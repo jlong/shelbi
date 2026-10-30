@@ -1,0 +1,61 @@
+---
+title: shelbi quit
+order: 30.7
+summary: Quit the current project, ending its sessions after the orchestrator writes its handoff, or quit Shelbi entirely with --all.
+---
+
+```text
+shelbi quit [OPTIONS]
+```
+
+`shelbi quit` closes the current project. The hub daemon asks the project's
+orchestrator to write its handoff (so the next open resumes with context), ends
+the project's sessions, and marks the project closed. Other projects keep
+running. Worktrees and branches are left intact, so the work picks up again the
+next time you open the project.
+
+Pass `--all` to quit Shelbi entirely: the daemon closes every project, ends all
+sessions, and then stops itself. Nothing restarts it until you open a project
+again.
+
+Quitting is not detaching. [`shelbi detach`](/docs/cli/detach) disconnects
+clients but leaves every session running in the background. Inside the
+dashboard the same two actions are in the command palette as **Quit Project**
+and **Quit Shelbi**.
+
+With no daemon running nothing is open, so `shelbi quit` reports that and exits
+`0`.
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--all` | flag | off | Quit Shelbi entirely (every project and the hub daemon) instead of just the current project. |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to quit. Ignored with `--all`. |
+
+## Examples
+
+Quit the project the current directory belongs to:
+
+```bash
+shelbi quit
+```
+
+Quit a specific project from anywhere:
+
+```bash
+shelbi quit -p myapp
+```
+
+Quit every project and stop the hub daemon:
+
+```bash
+shelbi quit --all
+```
+
+## See also
+
+- [`shelbi detach`](/docs/cli/detach): leave everything running and disconnect
+  your clients instead.
+- [`shelbi daemon`](/docs/cli/daemon): the hub daemon that `--all` stops.

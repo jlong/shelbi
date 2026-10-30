@@ -56,7 +56,7 @@ The manifest is a stable contract:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Inventory format version. A newer staged snapshot is rejected by an older `shelbi` (see [Compatibility](#compatibility)). |
+| `schema_version` | Inventory format version. A snapshot whose `schema_version` differs from the running `shelbi`'s is rejected (see [Compatibility](#compatibility)). |
 | `shelbi_version` | The `shelbi` build that produced the snapshot. |
 | `staged_dir` | Absolute path to the candidate directory. |
 | `entries[]` | One record per configuration surface. |
@@ -92,7 +92,9 @@ that Shelbi itself uses, so a clean lint means the file will load at runtime:
   `local.yaml` for [in-repo config](/docs/concepts/config-modes)), statuses,
   workflows, and the workspace-settings template;
 - per-project Markdown (Zen Mode policy, agent instructions, the shared
-  preamble) and per-agent `settings.json` and skills.
+  preamble, PR and changelog templates), per-agent `agent.yaml`,
+  `settings.json` and skills, and each workspace's
+  `.claude/settings.local.json`.
 
 Diagnostics come back with a stable `code` (for example `CONFIG_UNKNOWN_FIELD`,
 `KEYBINDINGS_COLLISION`, `WORKFLOW_STATUS_REFERENCE_INVALID`,
@@ -146,8 +148,11 @@ shelbi config list-actions
 
 Print every action with its mode, name, description, and the chord(s) bound to
 it **after** the `keys.yaml` merge, so it reflects your overrides, not just the
-built-in defaults. This is the reference for what's bindable and what each
-action currently does.
+built-in defaults. Per-project overrides for the resolved project (`-p`,
+`$SHELBI_PROJECT`, or the current directory) are applied too; outside a project
+it shows the global merge only. The output is a fixed-width table with `MODE`,
+`ACTION`, `DESCRIPTION`, and `CHORDS` columns. This is the reference for what's
+bindable and what each action currently does.
 
 ## dump-keybindings
 
@@ -180,10 +185,12 @@ the keybindings-only view.)
 ## Compatibility
 
 The inventory manifest is versioned by `schema_version`. A staged snapshot is
-only valid for the `shelbi` build that produced it: linting a snapshot whose
-version a newer or older binary does not recognize is refused rather than
-misread. Take a fresh `inventory` with the `shelbi` you are running instead of
-reusing an old `staged_dir`. Unknown fields are reported (`CONFIG_UNKNOWN_FIELD`)
+only valid for a `shelbi` that supports the same `schema_version`: linting a
+snapshot with any other schema version, newer or older, is refused
+(`unsupported staged inventory schema version …`) rather than misread. The
+`shelbi_version` field is informational and isn't checked. When in doubt, take
+a fresh `inventory` with the `shelbi` you are running instead of reusing an old
+`staged_dir`. Unknown fields are reported (`CONFIG_UNKNOWN_FIELD`)
 rather than silently ignored, so a config written for a different Shelbi version
 surfaces as a diagnostic you can act on.
 

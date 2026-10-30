@@ -20,13 +20,24 @@ in the input box, Shelbi retries Enter once. A busy Claude session may keep the
 accepted text visible as queued input until its current turn ends. Every result
 is recorded in `~/.shelbi/events.log` as `status=submitted`, `status=queued`,
 or `status=stuck`; a stuck result also makes the command fail instead of
-silently waiting for a human keypress. Codex and custom runners still receive
-the split text/Enter sequence, but Shelbi does not apply Claude's UI parser to
-them. Their result is explicit `status=unverified`, which preserves delivery
-without claiming runner-specific proof.
+silently waiting for a human keypress. A transport failure is also recorded as
+`status=stuck`. Claude and Codex sessions are both verified this way, each with
+its own parser. A custom runner still receives the split text/Enter sequence,
+but Shelbi has no parser for its screen, so the result is `status=unverified`
+(printed as `sent (unverified)`): delivered, with no runner-specific proof.
+Which parser applies follows the project's baseline runner
+(`orchestrator.runner`).
 
-`ID` is resolved against the project YAML's `workspaces:` block first, then
-falls back to the legacy spawn agent registry.
+On success `send` prints `✓ sent`, `✓ queued`, or `✓ sent (unverified)`, with
+the workspace and session it reached. Sends to the same workspace are
+serialized with dispatch and resume, so two messages never merge into one
+prompt.
+
+`ID` must name a workspace declared in the project YAML's `workspaces:` block.
+An unknown name errors and lists the declared workspaces. The workspace must
+also have a live session: `send` never starts one, so an idle workspace is an
+error. Open it with [`shelbi open`](/docs/cli/open) or dispatch an issue to it
+first.
 
 Because `send` writes input into a live session, the message content is
 **ephemeral**. Shelbi records and verifies the delivery result, but the worker
@@ -38,7 +49,7 @@ message that survives, is logged, and is acked by the workspace, reach for
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Workspace name, resolved against `workspaces:` (then the legacy spawn agent registry) (required). |
+| `<ID>` | string | — | Workspace name from the project's `workspaces:` block (required). |
 | `<MESSAGE>` | string | — | The message to type into the pane (required). |
 
 ## Flags

@@ -17,9 +17,14 @@ stream, at:
 ~/.shelbi/projects/<project>/questions/<task-id>/<question-id>.md
 ```
 
-Each file is markdown with frontmatter (`id`, `task`, `workspace`, `kind`,
-`asked_at`, and `answered_at` once answered) followed by the question text,
-untouched.
+If the hub can't tell which project the worker belongs to, it stores the
+question under `~/.shelbi/questions/<task-id>/` instead of dropping it.
+`shelbi question` lists and shows those alongside the project's own.
+
+Each file is markdown with frontmatter (`id`, `task`, `project`, `workspace`,
+`kind: clarification`, `asked_at`, an optional `context` excerpt the worker sent
+with the question, and `answered_at` plus `answer_msg_id` once answered)
+followed by the question text, untouched.
 
 The `events.log` line for the question only has room for a short preview. It
 carries `question=<id>`, `task=<id>`, and `file=<path>` so a reader can find the
@@ -51,6 +56,17 @@ Prints one question in full, with who asked it, when, whether it has been
 answered, and the command to answer it. `<ID>` is the id from the events line.
 When two tasks used the same id, name the task with `--task <TASK>` or write the
 id as `<task>/<id>`.
+
+| Option | Meaning |
+| --- | --- |
+| `--task <TASK>` | Task that asked it. Needed only when two tasks used the same id. |
+| `--json` | Print the question as a JSON object. |
+
+The plain output names the question and its task, then the workspace, when it
+was asked, whether it's answered (with the reply's `msg_id`) or still open, the
+file path, any context, and the full text. While it's open it ends with the
+`shelbi message <task> reply --in-response-to <id> "<answer>"` command to
+answer it.
 
 ## Answering
 

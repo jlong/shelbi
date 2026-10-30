@@ -20,6 +20,12 @@ Press Enter to create the detected plan and launch the dashboard. Press `c` to
 edit the prefilled project, repository, branch, remote, runner, orchestrator, and
 issue-tracker values. Press `q`, Esc, or Ctrl+C to leave without project state.
 
+Creating the project also installs a Shelbi `pre-commit` hook in the repo and
+prints a one-time disclosure. The hook blocks commits to the default branch only
+from Shelbi's agent sessions, never from your own shell, and it leaves a
+user-authored hook untouched. Remove it with
+[`shelbi guard uninstall`](/docs/cli/guard).
+
 If both Claude Code and Codex are detected, the wizard first asks `Which
 agent?`. If the current directory is not a Git repository, it first asks
 permission to run `git init -b main`. A missing runner prerequisite stops
@@ -34,15 +40,17 @@ enabled, and push access for label creation) before anything is written, and on
 a failure explains the fix and offers to retry or fall back to File system. The
 chosen backend shows on the setup card and is written as an `issue_tracker:`
 block in the project config. See [`shelbi init`](/docs/cli/init#where-your-issues-live)
-for the full behavior and [`shelbi issue-store migrate`](/docs/cli/issue) to move
+for the full behavior and [`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate) to move
 an existing board between backends.
 
 The command is idempotent at the project-registration level. If any project is
-already registered, it completes without creating another one. Use
+already registered, it exits quietly, without creating another one or opening
+the dashboard. Use
 `shelbi project add` to run the shared setup flow for an additional project.
 
-`wizard` accepts the global `--root <PATH>`, `-p / --project <PROJECT>`, and
-`-y / --yes` flags.
+`wizard` honors the global `--root <PATH>` (the Shelbi state directory). The
+global `-p` and `-y` flags parse but have no effect here: the card is always
+interactive. For an unattended setup use [`shelbi init -y`](/docs/cli/init).
 
 ## Examples
 

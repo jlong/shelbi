@@ -1,20 +1,20 @@
 ---
 title: Orchestrator
 order: 14
-summary: One agent in window 1 you talk to — it dispatches issues to workspaces, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
+summary: One agent you talk to. It dispatches issues to workspaces, watches the events log, and reports back. You are the priority-setter; it is the scheduler.
 ---
 
 The orchestrator is the agent you talk to. It runs as the project's
-orchestrator session, shown in the dashboard's main pane, runs whatever
+orchestrator session (the **Orchestrator** view in the sidebar), runs whatever
 runner the project declares (typically `claude`), and treats the
 `shelbi` CLI as its tool surface, the same CLI you use yourself.
 
 It is a [**named agent**](/docs/concepts/agents) like any other
 (`agents/orchestrator/`), with an editable `instructions.md` for its system
-prompt. What makes it special is only *where* it runs: in the dashboard, talking
+prompt. What makes it special is only *where* it runs: in its own session, talking
 to you, rather than in a [workspace](/docs/concepts/workspaces) picking up
-issues. The `developer` agent (and any reviewer roles you author) run inside
-workspaces; the orchestrator runs the board.
+issues. The `developer`, `review`, `qa`, `security`, and `adversarial` agents (and
+any you author) run inside workspaces; the orchestrator runs the board.
 
 The mental model is: **you are the priority-setter and reviewer. It is
 the scheduler.** It does not edit code, it does not accept reviews, it
@@ -25,7 +25,7 @@ back.
 The board it runs is the whole dashboard: the columns cards move through and
 the workspaces it dispatches them to:
 
-<AppMockup terminalTitle="jlong@hub — shelbi" />
+<AppMockup />
 
 ## You-are-the-scheduler
 
@@ -92,8 +92,9 @@ When you boot a project (`shelbi orchestrate` or via the TUI launcher),
    [customizing the prompt](#customizing-the-prompt-per-project) below).
 2. Writes the composed prompt to
    `.claude/agent-instructions.md` in the launch directory.
-3. Launches the orchestrator runner in the right pane of the
-   `dashboard` window, with that path as its working directory.
+3. Starts the orchestrator runner as the project's `shelbi-<name>` session,
+   with the project state directory (`~/.shelbi/projects/<name>/`) as its
+   working directory.
 
 For Claude, Shelbi adds Claude-specific launch wiring:
 `--append-system-prompt "$(cat .claude/agent-instructions.md)"` and an
@@ -101,7 +102,7 @@ initial positional prompt that tells Claude to run the bootstrap sequence.
 Codex, by default, routes through Shelbi's native app-server bridge
 (`shelbi __codex-orchestrator <project>`): the bridge owns the Codex thread
 and attaches the visible TUI to it, so board events are never pasted into
-the pane. A compatibility fallback (`codex_standalone_launch`, for Codex
+the session. A compatibility fallback (`codex_standalone_launch`, for Codex
 binaries without app-server mode) instead launches the configured `command`
 and `flags` with an initial positional prompt containing the project
 identity, worktree path, rendered `.claude/agent-instructions.md` contents,
@@ -113,7 +114,7 @@ The split is: the *source* you edit is `instructions.md`;
 `.claude/agent-instructions.md` is a rendered build artifact, not a file
 you maintain by hand.
 
-Orchestrator window setup lives in
+Orchestrator session setup lives in
 `crates/shelbi-orchestrator/src/lib.rs`. `ensure_dashboard(project)`
 resolves the agent prompt, renders it, and launches the runner in that
 directory.
@@ -132,7 +133,7 @@ agent_runners:
 ```
 
 `orchestrator.runner` must name a declared runner; otherwise project
-validation fails before the dashboard launches. If your Codex CLI needs a
+validation fails before the orchestrator launches. If your Codex CLI needs a
 specific approval mode, sandbox mode, or model flag for unattended work,
 put those arguments in `flags`. Shelbi does not translate Claude's
 `workspace_permissions_mode`, `--permission-mode`, `--continue`, or
@@ -140,7 +141,7 @@ put those arguments in `flags`. Shelbi does not translate Claude's
 
 ## Bootstrap flow on session start
 
-The prompt instructs the orchestrator to do three things on the first
+The prompt instructs the orchestrator to do these things on the first
 reply of a session (or right after `shelbi reload`), before answering
 the user:
 
@@ -151,10 +152,18 @@ the user:
 2. **Read the workspace pool.** `shelbi workspace list` to see which
    workspaces are free (no `active`-category issue assigned), which machine
    each lives on, and which agent each is running.
-3. **Start its live watch.** Launch `shelbi orchestrator events next
-   --follow` in the background — the durable claim/ack feed is the
-   orchestrator's primary watch (`shelbi events tail` is the raw view for
-   humans). Every emitted line is a trigger the orchestrator must consider.
+3. **Start a passive watch.** Run `shelbi events tail --follow --project
+   <name>` in the background. It mirrors the log without claiming events, so
+   it only tells the orchestrator when to look.
+4. **Self-drain on every turn.** Before each reply, on every heartbeat, and
+   whenever the watch shows a line, run `shelbi orchestrator events next
+   --follow --max-lifetime 2s`, react to the batch, then acknowledge it with
+   `shelbi orchestrator events ack <delivery-id>`. This claim/ack drain is the
+   source of truth; every event it returns is a trigger the orchestrator must
+   consider. (The prompt forbids a background `events next --follow`: two
+   consuming readers would race.)
+5. **Read config-upgrade findings.** `shelbi config upgrade --needs-judgment
+   --format json` lists config drift that needs the orchestrator's judgment.
 
 In practice the shipped prompt folds the first two steps into a single
 `shelbi status --full --handoff` snapshot (plus `shelbi zen status` and a
@@ -173,10 +182,10 @@ statuses:
 - `task=<id> ... to_category=handoff reason=workspace:ready-marker` →
   the finishing dev workspace has already closed its session, so it's
   *already free*. Find it the next ready issue. If the handoff status
-  requires [review tags](/docs/concepts/review-workspaces), also route the
-  finished branch onto a matching workspace — firing the status's enter
-  transition to boot a server (or leave it queued when they're all busy) so a
-  human can run the change.
+  requires [review tags](/docs/concepts/review-workspaces), Shelbi's hub
+  loads the finished branch onto a free matching review workspace on its own
+  (or queues it until one frees; you can also load it from the sidebar). The
+  orchestrator doesn't drive review loads.
 - `workspace=<name> working -> awaiting_input` → same idea, the workspace
   just freed up.
 - `workspace=<name> pane_alive=false reason=<short>` → an ordinary crash
@@ -220,18 +229,18 @@ so customizing it is the same as customizing any other agent. Edit a file:
   (repo layout, house style, the test command) in
   `<config-root>/agents/_shared/preamble.md`. It's prepended to
   the orchestrator's prompt (and every other agent's), so you write it once
-  instead of pasting it into four `instructions.md` files.
+  instead of pasting it into every agent's `instructions.md`.
 - **Shipped default:** the bundled orchestrator prompt lives in the
   `shelbi-orchestrator` crate. That's the right place for
   shipped-with-Shelbi changes; edit it and rebuild.
 
 The composed output (preamble + instructions) is rewritten to the launch
 directory's `.claude/agent-instructions.md` on every `ensure_dashboard`
-call, so your edits take effect the next time the dashboard is
-bootstrapped (or `shelbi reload`d).
+call, so your edits take effect the next time the orchestrator starts
+(or on `shelbi reload`).
 
 `shelbi reload` runs the agent self-heal before respawning the orchestrator
-pane. If your customized `agents/orchestrator/instructions.md` is missing a
+session. If your customized `agents/orchestrator/instructions.md` is missing a
 required shipped section, reload appends only that section and reports the
 repair in its output; the rest of your prompt is preserved.
 
@@ -244,13 +253,15 @@ it; your changes are overwritten on the next render.
 
 A few things worth keeping when you fork the default prompt:
 
-- The bootstrap flow. The orchestrator needs the initial `issue list` /
-  `workspace list` snapshot and the tail process to do its job.
-- The polling-only event drain. Codex-backed and other polling-only runners
-  must drain pending project events before each user-facing reply, using
-  `shelbi orchestrator events drain` (the durable cursor is persisted in the
-  project config dir and resumes automatically) or the documented
-  cursor-based `events.log` fallback if that CLI primitive is unavailable.
+- The bootstrap flow. The orchestrator needs the initial board and
+  workspace snapshot and the background watch to do its job.
+- The event drain (the `Polling-only event drain` section). Every
+  orchestrator drains pending events before each user-facing reply with
+  `shelbi orchestrator events next --follow --max-lifetime 2s` and acks each
+  batch with `shelbi orchestrator events ack <delivery-id>` (the durable
+  cursor lives in `~/.shelbi/projects/<name>/event-cursor` and resumes
+  automatically). The legacy `shelbi orchestrator events drain` and a
+  cursor-based `events.log` read remain as fallbacks.
 - The **category-based** reaction-rule matching. Patterns key off
   `to_category=<c>` (`ready`, `handoff`) rather than the literal status
   pair, so the rules survive workflow customization. Hardcoding default-
@@ -283,7 +294,7 @@ What you might *want* to change per project:
   accept signal.
 - **It does not auto-promote `backlog` → `ready`.** Triage belongs to
   the user.
-- **It does not itself restart a workspace whose pane died.** The
+- **It does not itself restart a workspace whose session died.** The
   supervisor auto-restarts an ordinary crash; the orchestrator only
   surfaces the case the supervisor gives up on (a crash loop) and waits
   for direction there.
@@ -302,26 +313,26 @@ autonomy switch. It flips the agent from scheduler to lead: it
 auto-promotes `backlog`-category issues into `ready` when it judges the
 work in scope, and it lands finished branches past a project-defined
 confidence bar without waiting on a human reviewer. The policy that
-decides "in scope" lives in the orchestrator agent's `instructions.md`
-described above. You tune it by editing prose, not code. Whether a given
+decides "in scope", and the merge bar, live in the project's `zenmode.md`
+(`<config-root>/zenmode.md`). You tune it by editing prose, not code.
+Issues routed to a review workspace always wait for a human. Whether a given
 status is automated and which agent handles it is separate, and lives in
 the [workflow YAML](/docs/guides/getting-started/workflows#owners-and-agents).
 
 ## See also
 
-- [Agents](/docs/concepts/agents) — the orchestrator is one; this is how
+- [Agents](/docs/concepts/agents): the orchestrator is one; this is how
   its prompt, skills, and customization work.
-- [Workspaces](/docs/concepts/workspaces) — what the orchestrator
+- [Workspaces](/docs/concepts/workspaces): what the orchestrator
   dispatches issues to.
-- [Review workspaces](/docs/concepts/review-workspaces) — the tag-routed slots
-  the orchestrator loads a finished branch onto on handoff, and the queue it
-  drains as they free.
-- [Workflows](/docs/guides/getting-started/workflows) — the schema behind the board,
+- [Review workspaces](/docs/concepts/review-workspaces): the tag-routed slots
+  the hub loads a finished branch onto on handoff.
+- [Workflows](/docs/guides/getting-started/workflows): the schema behind the board,
   including the full category set and the events-log annotations the
   orchestrator pattern-matches on.
-- [The events log](/docs/concepts/events-log) — the orchestrator's
+- [The events log](/docs/concepts/events-log): the orchestrator's
   live feed.
-- [Zen Mode](/docs/concepts/zen-mode) — flipping the orchestrator
+- [Zen Mode](/docs/concepts/zen-mode): flipping the orchestrator
   from scheduler to lead.
 - [Changelog](/docs/concepts/changelog): the record of what shipped, which
   the orchestrator adds to after every merge.

@@ -16,8 +16,10 @@ Every subcommand accepts the global `--root <PATH>` (override the Shelbi root
 directory, else `$SHELBI_ROOT`, else the install-time default),
 `-p, --project <PROJECT>` (defaults to `$SHELBI_PROJECT` or the registered
 project whose `work_dir` contains the current directory), and `-y, --yes`
-(accept the detected plan without prompts — meaningful for `add`) flags. On
-`migrate-to-in-repo` the project flag's value name renders as `<NAME>`.
+flags. `project add` always shows the interactive setup card, even with `-y`;
+for a prompt-free setup use [`shelbi init -y`](/docs/cli/init).
+`migrate-to-in-repo` has its own long-only `--yes` (no `-y` after the
+subcommand) and renders the project flag's value name as `<NAME>`.
 
 ## Commands
 
@@ -34,8 +36,15 @@ shelbi project add [OPTIONS]
 
 Set up a new project interactively. Shelbi detects the current Git repository,
 runner, and workspace recommendation, then shows the same setup card as
-first-run onboarding. Press Enter to create the project and launch its TUI, or
-press `c` to customize the prefilled values first.
+first-run onboarding. Press Enter to create the project and launch its TUI,
+press `c` to customize the prefilled values first, or press `q` (or Esc) to quit
+without writing anything. If the current directory isn't inside a Git
+repository, the plan initializes one.
+
+The new project is registered at `~/.shelbi/projects/<name>.yaml` (global mode).
+Run `migrate-to-in-repo` afterwards to commit its config to the repo. On a clone
+that already has a committed `.shelbi/project.yaml`, use
+[`shelbi init --pick-up`](/docs/cli/init) instead.
 
 ## migrate-to-in-repo
 
@@ -71,6 +80,14 @@ undo. Run `--dry-run` first if you're unsure.
 | --- | --- | --- | --- |
 | `--dry-run` | flag | off | Print the plan without touching disk — every write, move, and delete the real run would perform, in order, so a reviewer can vet it first. |
 | `--yes` | flag | off | Skip the interactive prompt and auto-append the `.gitignore` snippet. Useful for scripts and headless runs with no TTY. Ignored under `--dry-run`. |
+
+The command prints a header naming the project's repo, state dir, and in-repo
+dir, any `⚠` warnings, then a `Plan:` list of actions. A real run ends with
+`✓ applied N actions` and the shared and local config paths; a dry run ends with
+`(dry-run — no files were written)` and the `.gitignore` snippet. An
+already-migrated project prints `Nothing to do` and still offers the snippet.
+Without a TTY and without `--yes`, the snippet is only printed, not appended.
+Re-run with `--yes` to append it.
 
 ## Examples
 

@@ -9,9 +9,14 @@ other direction: half a dozen workspaces all running in their own
 worktrees, the orchestrator keeping every free slot loaded with the
 next ready card. This page walks the loop end-to-end.
 
-You should already have a project with at least two workspaces declared.
-If you only have one, edit `~/.shelbi/projects/<name>.yaml`, bump the
-pool, and run `shelbi reload` before you start.
+You should already have a project with at least two dev workspaces
+declared. If you only have one, add more with `shelbi workspace add bravo`
+(repeat as needed; pass `--machine <name>` to put one on a remote box), or
+edit the project YAML (`~/.shelbi/projects/<name>.yaml`, or
+`<repo>/.shelbi/project.yaml` in-repo) and run `shelbi reload`. The starter
+`review` slot a new project ships with doesn't count: it never takes dev
+dispatch and only serves finished branches (see
+[review workspaces](/docs/guides/getting-started/review-workspaces)).
 
 ## Confirm the pool
 
@@ -62,12 +67,14 @@ Orchestrator: ✓ added 3 to backlog:
 The CLI does the same thing in a loop if you'd rather script it:
 
 ```bash
-shelbi issue add "Add CSV export to the reports page"
+shelbi issue add "Add CSV export to the reports page" --id add-csv-export-to-reports
 shelbi issue add "Fix cookie-domain bug on Safari SSO"
-shelbi issue add "Tighten the rate-limit error copy"
+shelbi issue add "Tighten the rate-limit error copy" --id tighten-rate-limit-error-copy
 ```
 
-Each lands in `backlog` as its own markdown card under
+Without `--id`, the id is the full slugified title (`Add CSV export to the
+reports page` becomes `add-csv-export-to-the-reports-page`), so the `--id`
+flags keep the ids short and match the commands below. Each lands in `backlog` as its own markdown card under
 `~/.shelbi/projects/<name>/tasks/`. Nothing dispatches yet. The
 backlog is still your triage queue.
 
@@ -104,9 +111,13 @@ shelbi issue add "Update the OpenAPI spec for the new auth module" \
   --depends-on auth-rename
 ```
 
-The dependent card carries a `🔒` badge in the Kanban view and the
-orchestrator skips it during dispatch until every id in its
-`depends_on` list reaches `done`. See
+The dependent card carries a `🔒` badge in the Kanban view until every id
+in its `depends_on` list reaches `done`, and Zen Mode's auto-promote scan
+skips it. The badge itself doesn't gate dispatch: once the dependency is
+in progress, a promoted card is dispatched with its branch stacked on the
+dependency's branch. Starting it is only refused while a dependency hasn't
+started yet (or was canceled). If you want the dependent card to wait for
+the dependency to land, leave it in `backlog`. See
 [dependent issues](/docs/guides/getting-started/workflows#dependent-tasks-with-depends_on)
 for the full state model.
 
@@ -115,16 +126,16 @@ for the full state model.
 Promotion is the start signal. Move all three cards into **todo** in
 the order you want them picked up:
 
-- **From the Kanban view** — `Ctrl+P` → Issues, then `H`/`L` to walk
-  cards into the next column. `K`/`J` to reorder within `todo`. The
+- **From the Kanban view**: open **Issues** in the sidebar, then `H`/`L`
+  to walk cards into the next column. `K`/`J` to reorder within `todo`. The
   orchestrator dispatches from the top.
-- **From the orchestrator** — just ask:
+- **From the orchestrator**: just ask:
 
   ```
   you: promote all three.
   ```
 
-- **From the CLI** — one move per card:
+- **From the CLI**: one move per card:
 
   ```bash
   shelbi issue move add-csv-export-to-reports --to todo
@@ -149,32 +160,43 @@ pinned to, and each busy row shows the agent it's running:
   terminalTitle="you@hub — myapp"
   project="myapp"
   activeView="tasks"
+  workflow="task"
+  zenMode={false}
   columns={[
-    { label: "BACKLOG", category: "gray", cards: [] },
-    { label: "TO DO", category: "blue", cards: [] },
+    { label: "BACKLOG", category: "gray", cards: [], collapsed: true },
+    { label: "TO DO", category: "blue", cards: [], collapsed: true },
     {
       label: "IN PROGRESS",
       category: "yellow",
       cards: [
-        { title: "Add CSV export", id: "add-csv-export", workspace: "alpha" },
-        { title: "Fix SSO cookie bug", id: "fix-cookie", workspace: "bravo" },
         {
-          title: "Tighten rate-limit",
-          id: "tighten-copy",
+          title: "Add CSV export to the reports page",
+          id: "add-csv-export-to-reports",
+          workspace: "alpha",
+        },
+        {
+          title: "Fix cookie-domain bug on Safari SSO",
+          id: "fix-cookie-domain-bug-on-safari-sso",
+          workspace: "bravo",
+        },
+        {
+          title: "Tighten the rate-limit error copy",
+          id: "tighten-rate-limit-error-copy",
           workspace: "charlie",
         },
       ],
     },
-    { label: "REVIEW", category: "magenta", cards: [] },
-    { label: "DONE", category: "green", cards: [] },
+    { label: "REVIEW", category: "magenta", cards: [], collapsed: true },
+    { label: "DONE", category: "green", cards: [], collapsed: true },
+    { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
   ]}
   machines={[
     {
       name: "hub",
       workspaces: [
-        { name: "alpha", state: "working", agent: "Developer" },
-        { name: "bravo", state: "working", agent: "Developer" },
-        { name: "charlie", state: "working", agent: "Developer" },
+        { name: "alpha", state: "working", agent: "developer" },
+        { name: "bravo", state: "working", agent: "developer" },
+        { name: "charlie", state: "working", agent: "developer" },
       ],
     },
     {
@@ -186,7 +208,8 @@ pinned to, and each busy row shows the agent it's running:
       ],
     },
   ]}
-  review={[]}
+  readyReview={[]}
+  queuedReview={[]}
 />
 
 The orchestrator's chat shows the same thing in prose:
@@ -209,16 +232,17 @@ exactly what the orchestrator is reacting to:
 
 ```
 2026-06-22T14:11:02+00:00 project=myapp task=add-csv-export-to-reports workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
-2026-06-22T14:11:02+00:00 project=myapp task=add-csv-export-to-reports workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha from_category=ready to_category=active
+2026-06-22T14:11:02+00:00 project=myapp task=add-csv-export-to-reports workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer from_category=ready to_category=active
 2026-06-22T14:11:03+00:00 project=myapp workspace=alpha none -> working
 2026-06-22T14:11:04+00:00 project=myapp task=fix-cookie-domain-bug-on-safari-sso workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
-2026-06-22T14:11:04+00:00 project=myapp task=fix-cookie-domain-bug-on-safari-sso workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=bravo from_category=ready to_category=active
+2026-06-22T14:11:04+00:00 project=myapp task=fix-cookie-domain-bug-on-safari-sso workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=bravo_agent=developer from_category=ready to_category=active
 …
 ```
 
 Jump between workspace panes any time. `Enter` on `bravo` drops you
 straight into its pane to watch the Safari fix happen live. Pop back
-to the orchestrator with `Ctrl+P` → Chat when you're done.
+to the orchestrator with **Orchestrator** in the sidebar (or `Ctrl+P` →
+Orchestrator) when you're done.
 
 ## Review one branch while the others keep running
 
@@ -226,9 +250,10 @@ Workspaces finish at their own pace. When the first one writes its
 review-ready marker, three things happen at once:
 
 1. The hub poller moves the issue from `in_progress` to `review` and
-   clears the marker.
-2. The workspace's badge drops from `⏵` back to idle (`·`) and a `✓`
-   row appears in the sidebar's **Ready for Review** section.
+   clears the marker. The workflow's `in-progress → review` transition
+   pushes the branch and opens a PR.
+2. The workspace's badge drops from `⏵` back to idle (`·`) and the issue
+   appears in the sidebar under **Queued for Review** (`·`).
 3. The orchestrator, watching the event stream, sees the workspace free
    up and immediately dispatches the next ready `todo` card to that
    slot (if any).
@@ -237,30 +262,30 @@ That last step is the loop. You don't have to ask. The workspace that
 just handed off a finished branch is already on its next issue by the
 time you've clicked into the review pane.
 
-Open the review:
+If the project has a free `review`-tagged workspace (a new project
+ships one), the hub loads the queued issue onto it automatically. The
+**Review agent** checks the branch out in that slot's own worktree and
+serves it, and the row moves to **Ready for Review** with a `✓` and the
+`machine:workspace` it's loaded on:
 
 ```
-✓ add-csv-export   alpha     ← Enter
+✓ Add CSV export to the reports page   hub:review     ← Enter
 ```
 
-Shelbi checks the branch out into the project's working directory on
-the machine that ran the issue and spawns a fresh agent session pointed
-at the diff. Ask it to walk you through the change, run tests, or
-request edits. The workspace that produced the branch is busy on
-something else, but the review pane is its own conversation in the
-same worktree.
+`Enter` on the row opens the review panel, where you can talk to the
+Review agent, view the diff, and (once the workflow has a `review:` serve
+recipe) run the change.
+[Set up review workspaces](/docs/guides/getting-started/review-workspaces)
+covers the review slot and the panel in detail. Without a review slot,
+the card stays queued: read the diff on the PR or locally instead.
 
-Accept when you're ready:
-
-```
-you: merge it.
-```
-
-Then move the card from `review` to `done` (`L` in the kanban view,
-or `shelbi issue move <id> --to done`). The card is yours; the
-orchestrator only takes the `review` → `done` step when you've
-explicitly authorized it as part of [Zen
-Mode](/docs/guides/getting-started/enable-zen-mode).
+Accept when you're ready: press **✅ Approve** in the review panel, or
+move the card to `done` (`L` on the board, or
+`shelbi issue move <id> --to done`). The workflow's `review → done`
+transition merges the branch, so don't also ask an agent to merge it. The
+card is yours; the orchestrator only takes the `review` → `done` step
+itself when [Zen Mode](/docs/guides/getting-started/enable-zen-mode) is on
+and the project has no review workspace.
 
 While you've been reviewing, the orchestrator has been working the
 backlog. By the time you finish accepting one branch, two more may be
@@ -274,18 +299,19 @@ A few things stop the dispatcher from filling a free slot, in
 intentional ways. They're worth recognizing so you don't mistake
 intent for breakage:
 
-- **The card is blocked.** Anything in `depends_on` is not yet `done`.
-  The card renders with `🔒` in the kanban view. Land the dependency
-  first.
+- **The card is waiting on you.** A card still in `backlog` never
+  dispatches, including a `🔒` card you're holding back until its
+  `depends_on` lands. Promote it to `todo` when it's ready.
 - **The card prefers a machine and no workspace on it is free.** The
   orchestrator parks it in `todo` rather than mis-routing. Free a
   workspace on the target machine (kill another issue, or remove the
   preference).
-- **The workspace's pane died.** The orchestrator surfaces it
-  (`workspace=<name> pane_alive=false`) and waits for you. Re-launch with
-  `Enter` on the workspace
-  row, or `shelbi workspace stop <name>` to release the in-flight issue
-  back to `todo`.
+- **A workspace keeps crashing.** Shelbi restarts a crashed pane and
+  re-dispatches its issue on its own (`supervision=restart`). After
+  repeated crashes it gives up (`supervision=gave-up reason=crash-loop`)
+  and the orchestrator tells you. Investigate, or run
+  `shelbi workspace stop <name>` to release the in-flight issue back to
+  `todo`.
 - **The mid-conversation guard.** If you're actively chatting with
   the orchestrator about a specific issue, it holds off on
   back-to-back dispatches that would talk over you. The next event
@@ -303,6 +329,6 @@ The next step is *running* the change: [set up review
 workspaces](/docs/guides/getting-started/review-workspaces) to load a
 finished branch onto a live dev server and click through it before you
 accept. After that, [enable Zen Mode](/docs/guides/getting-started/enable-zen-mode)
-to let the orchestrator auto-promote eligible backlog cards and
-auto-merge finished branches that clear a project-defined confidence
-bar.
+to let the orchestrator auto-promote eligible backlog cards and, in
+projects without a review workspace, auto-merge finished branches that
+clear a project-defined confidence bar.

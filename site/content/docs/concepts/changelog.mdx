@@ -71,8 +71,12 @@ the `## Changelog` section of the orchestrator's `instructions.md`, which your
 project owns:
 
 ```text
-~/.shelbi/projects/<project>/agents/orchestrator/instructions.md
+<config-root>/agents/orchestrator/instructions.md
 ```
+
+The config root is `~/.shelbi/projects/<project>/` in global mode and
+`<repo>/.shelbi/` in [in-repo mode](/docs/concepts/config-modes). Or run
+`shelbi agent edit orchestrator` to open it in `$EDITOR`.
 
 Edit that section to change what gets an entry, for example "skip merges that
 only touch CI or tests", or to change how entries are written. Keep the

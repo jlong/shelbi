@@ -28,7 +28,7 @@ It is the same two-step dialog wherever you start:
    `user@hostname`, then **Find Sessions**.
 2. **Choose session.** Shelbi signs in, shows the user it is **Connected as**,
    and lists that machine's projects with their folders. Pick one and
-   **Connect**. **Change Host** goes back to step 1.
+   **Connect**. **Change host** goes back to step 1.
 
 Every project you connect to lands in **Recent remote sessions** on the launch
 screen, newest first, so next time it is one click. The list keeps the eight
@@ -53,6 +53,11 @@ working when your Wi-Fi blinks or your laptop sleeps. If SSH drops, Shelbi
 shows "Reconnecting to *host*… (attempt N)" and tries again, quickly at
 first and then backing off, until the machine answers. You land back where you
 were.
+
+In the TUI (and with `shelbi remote connect`), press Esc to stop reconnecting.
+A reconnect never starts the other machine's Shelbi: if it has stopped, the
+retries end with "Shelbi isn't running on *host*." and you're offered
+**Start Shelbi** instead.
 
 ## SSH and credentials
 

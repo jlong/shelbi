@@ -9,6 +9,45 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### October 29, 2026
+
+**On `main` since v0.11.0, not yet in a tagged release.**
+
+**A Changelog for every project.** Each project keeps a blog-style record of
+what shipped. The orchestrator adds an entry after every merge, you read them on
+the new Changelog page in both clients, and agents and scripts use
+[`shelbi changelog`](/docs/cli/changelog) (`add`, `list`, `search`, `show`). The
+sidebar nav is now Orchestrator, Issues and Changelog (🚀); Activity moves to the
+command palette beside Machines ([#1962](https://github.com/jlong/shelbi/pull/1962), [#1995](https://github.com/jlong/shelbi/pull/1995)). See
+[Changelog](/docs/concepts/changelog).
+
+**A launch screen.** Run `shelbi` outside a registered project with no hub
+daemon running and the TUI opens **Welcome to Shelbi**: the projects on this
+Mac, your recent remote sessions, and **Add project** and **Connect to remote**
+buttons ([#1985](https://github.com/jlong/shelbi/pull/1985)). `shelbi project add` still runs the detected setup card.
+
+**Settings in the TUI.** The TUI gains the desktop's Settings over the same
+shared models: General and Terminal, Keybindings, Workflows with the Form and
+Builder editors, Agents, and Workspaces with the add and configure machine forms
+and their readiness checks ([#1902](https://github.com/jlong/shelbi/pull/1902), [#1908](https://github.com/jlong/shelbi/pull/1908), [#1909](https://github.com/jlong/shelbi/pull/1909), [#1910](https://github.com/jlong/shelbi/pull/1910),
+[#1911](https://github.com/jlong/shelbi/pull/1911), [#1913](https://github.com/jlong/shelbi/pull/1913), [#1915](https://github.com/jlong/shelbi/pull/1915), [#1916](https://github.com/jlong/shelbi/pull/1916), [#1917](https://github.com/jlong/shelbi/pull/1917), [#1920](https://github.com/jlong/shelbi/pull/1920),
+[#1921](https://github.com/jlong/shelbi/pull/1921)). The sidebar footer gains Settings and Send Feedback buttons, with
+About Shelbi, Acknowledgements and a Contact Us dialog to match the desktop
+([#1933](https://github.com/jlong/shelbi/pull/1933), [#1934](https://github.com/jlong/shelbi/pull/1934), [#1938](https://github.com/jlong/shelbi/pull/1938), [#1940](https://github.com/jlong/shelbi/pull/1940), [#1958](https://github.com/jlong/shelbi/pull/1958)).
+
+**Desktop.** Add Project becomes a wizard with a live creation checklist and a
+workflow summary, after a first-launch check that installs the CLI if it's
+missing ([#1876](https://github.com/jlong/shelbi/pull/1876), [#1898](https://github.com/jlong/shelbi/pull/1898), [#1900](https://github.com/jlong/shelbi/pull/1900), [#1903](https://github.com/jlong/shelbi/pull/1903)). Settings ▸ Workspaces
+lists the pool and its machines, with dialogs to add and configure machines and
+to create, edit and remove workspaces ([#1904](https://github.com/jlong/shelbi/pull/1904), [#1905](https://github.com/jlong/shelbi/pull/1905), [#1906](https://github.com/jlong/shelbi/pull/1906),
+[#1914](https://github.com/jlong/shelbi/pull/1914)). The task detail becomes a floating task pane that shows the agent
+working the task, and a task's title, body, status, workflow and priority edit
+in place ([#1986](https://github.com/jlong/shelbi/pull/1986), [#1989](https://github.com/jlong/shelbi/pull/1989), [#1991](https://github.com/jlong/shelbi/pull/1991), [#1992](https://github.com/jlong/shelbi/pull/1992)).
+
+**Shared boards.** On a GitHub Issues board, board search also asks GitHub
+([#1984](https://github.com/jlong/shelbi/pull/1984)), and on a shared remote tracker Shelbi starts only the issues
+assigned to you ([#1968](https://github.com/jlong/shelbi/pull/1968)).
+
 ### October 23, 2026
 
 **v0.11.0. The native macOS desktop app, plus steadier handoffs and sessions.**
@@ -466,6 +505,13 @@ machine shows up as a notice instead of confusing behavior.
 **"Add project" from the palette.** A new palette flow adds a project through a
 details dialog, without dropping back to the wizard.
 
+**Auto-resume of usage-limit-stalled workers.** A worker parked on an agent
+usage limit now resumes automatically when its quota window resets, rather than
+sitting paused until you nudge it.
+
+**Sturdier under bad remotes.** `list` and `status` bound their per-workspace
+probes so a single wedged SSH host can't hang the whole command.
+
 **Zen merge-safety hardening.** Zen's PR create and merge steps now match on
 exact provenance, so they no longer false-fail on Zen's own push or a rebased
 head, and local checks run under a per-check timeout so a loaded hub fails fast
@@ -479,25 +525,17 @@ one-line summary into the orchestrator on a heartbeat cadence, so the policy
 keeps steering even as the orchestrator's context turns over. See
 [Zen Mode](/docs/concepts/zen-mode).
 
-**`shelbi reload <target>`.** Reload one piece in place, a workflow, an agent's
-instructions, or config, without restarting the whole hub.
+**`shelbi reload <target>`.** Respawn one pane in place (`chat`, `tasks`,
+`activity`, `sidebar`, or `workspace <name>`) without bouncing the whole hub.
 
 **Palette and workspace conveniences.** The command palette gains "Edit …
 Settings" openers, hidden until you query for them, and clicking an idle
 workspace now opens a user shell in its tmux window instead of doing nothing.
 
-**Auto-resume of usage-limit-stalled workers.** A worker parked on an agent
-usage limit now resumes automatically when its quota window resets, rather than
-sitting paused until you nudge it.
+**Branches free to merge after handoff.** A worker's worktree detaches from its
+task branch on handoff, so the branch is free to merge and clean up.
 
-**Sturdier under bad remotes.** `list` and `status` bound their per-workspace
-probes so a single wedged SSH host can't hang the whole command, and a worker's
-worktree detaches from its task branch on handoff so the branch is free to merge
-and clean up.
-
-### July 9, 2026
-
-**v0.3.0. A batteries-included default install.** `shelbi init` now sets up the loop
+**A batteries-included default install.** `shelbi init` now sets up the loop
 most projects want without any YAML editing. Two things landed. First, six
 agent presets materialize on first load instead of three: the
 `orchestrator`, `developer`, and `review` roles that run the core loop, plus
@@ -517,7 +555,19 @@ projects get `default_workflow: task` written in, so the review gate is on out
 of the box. See the [agents concept](/docs/concepts/agents) and the
 [workflows guide](/docs/guides/getting-started/workflows#shipped-workflows-task-and-subtask).
 
-### July 8, 2026
+### July 9, 2026
+
+**v0.3.0. Kanban polish and safer project names.** The kanban card popover
+gains shortcuts to move a task between columns and scrolls with the mouse wheel,
+and each column puts a blank row between cards ([#340](https://github.com/jlong/shelbi/pull/340), [#341](https://github.com/jlong/shelbi/pull/341), [#343](https://github.com/jlong/shelbi/pull/343)).
+`shelbi task add` reads piped stdin as the task body ([#337](https://github.com/jlong/shelbi/pull/337)). Onboarding
+normalizes a project name into the agent-id charset ([#347](https://github.com/jlong/shelbi/pull/347)), and the
+Homebrew install docs gain the `brew trust jlong/shelbi` step ([#346](https://github.com/jlong/shelbi/pull/346)).
+
+**v0.3.1 and v0.3.2.** Same-day patch releases: launch no longer crashes on an
+un-normalized project name already on disk ([#351](https://github.com/jlong/shelbi/pull/351)).
+
+### July 7, 2026
 
 **v0.2.0.** The headline fix: launching a pane on a remote machine whose login
 shell is zsh no longer fails at startup. The tmux targets Shelbi passed over
@@ -533,8 +583,6 @@ task along that edge (merge, branch cleanup) instead of stranding it in
 progress. And the hub checkout is guarded against stray commits: a
 Shelbi-managed pre-commit hook rejects commits made directly on the default
 branch, backed by dispatch-time branch checks.
-
-### July 7, 2026
 
 **v0.1.0, the first versioned release.** Shelbi now ships as prebuilt
 binaries, not just source. Pushing a `v*` tag runs a release workflow that
@@ -600,7 +648,7 @@ persists across reviews and is reaped on completion.
 
 **In-repo project config.** A project's configuration can now live inside the
 repo at `.shelbi/project.yaml` instead of only under `~/.shelbi/`, so it can be
-committed and shared with a team. `shelbi migrate-to-in-repo` converts an
+committed and shared with a team. `shelbi project migrate-to-in-repo` converts an
 existing global project in one step, and resolution is mode-aware about which
 half of the config is user-local versus shared.
 

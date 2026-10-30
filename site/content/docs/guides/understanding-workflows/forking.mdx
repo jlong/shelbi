@@ -10,12 +10,13 @@ request from the fork. The maintainer's job is a *review gate*: triage
 what comes in, run it through checks, and merge only what clears sign-off.
 It's the model most open-source projects run.
 
-Shelbi models the **maintainer's side**. Because the branch lives on
-someone else's fork, Shelbi doesn't cut branches or push here. Each issue
-carries the fork's PR branch in [`branch:`](/docs/guides/getting-started/workflows#the-branch-task-field),
-and the workflow is mostly about the gate: a `handoff` sign-off status
-that's `owner: user` so nothing reaches `main` without a human (or a
-[Zen](/docs/concepts/zen-mode)-authorized reviewer agent) accepting it.
+Shelbi models the **maintainer's side**. Shelbi never fetches from a
+fork, so you bring each contribution into your own checkout as a local
+branch and name it in the issue's
+[`branch:`](/docs/guides/getting-started/workflows#the-branch-task-field)
+field. The workflow is mostly about the gate: a `handoff` sign-off status
+that's `owner: user` so nothing reaches `main` without a human accepting
+it.
 
 ## The board
 
@@ -24,44 +25,47 @@ that's `owner: user` so nothing reaches `main` without a human (or a
     terminalTitle: "you@hub — opensource-lib",
     project: "opensource-lib",
     activeView: "tasks",
+    singleWorkflow: true,
+    zenMode: false,
     columns: [
       {
         label: "INCOMING",
         category: "gray",
         cards: [
-          { title: "PR #402: add retry backoff", id: "t-101" },
-          { title: "PR #404: fix typo in docs", id: "t-102" },
-          { title: "PR #405: Windows path bug", id: "t-103" },
+          { title: "PR #402: add retry backoff", id: "pr-402" },
+          { title: "PR #404: fix typo in docs", id: "pr-404" },
+          { title: "PR #405: Windows path bug", id: "pr-405" },
         ],
       },
       {
         label: "TRIAGE",
         category: "blue",
         cards: [
-          { title: "PR #398: new export format", id: "t-104" },
+          { title: "PR #398: new export format", id: "pr-398" },
         ],
       },
       {
         label: "IN REVIEW",
         category: "yellow",
         cards: [
-          { title: "PR #401: perf: cache regex", id: "t-105", workspace: "bravo", selected: true },
+          { title: "PR #401: perf: cache regex", id: "pr-401", branch: "pr-401", workspace: "bravo", selected: true },
         ],
       },
       {
         label: "SIGN-OFF",
         category: "magenta",
         cards: [
-          { title: "PR #399: async file API", id: "t-106" },
+          { title: "PR #399: async file API", id: "pr-399", branch: "pr-399" },
         ],
       },
       {
         label: "MERGED",
         category: "green",
         cards: [
-          { title: "PR #395: bump deps", id: "t-107" },
+          { title: "PR #395: bump deps", id: "pr-395" },
         ],
       },
+      { label: "DECLINED", category: "darkgray", cards: [], collapsed: true },
     ],
     machines: [
       {
@@ -72,13 +76,7 @@ that's `owner: user` so nothing reaches `main` without a human (or a
         ],
       },
     ],
-    readyReview: [
-      {
-        title: "PR #401: perf: cache regex",
-        branch: "shelbi/pr-401-cache-regex",
-        location: "hub:3000",
-      },
-    ],
+    readyReview: [],
     queuedReview: [],
   }}
 />
@@ -89,20 +87,25 @@ in **Sign-off** for a maintainer to accept before it's **Merged**.
 
 ## The statuses
 
-The forking flow relabels the whole board, so declare its statuses (`id`
-+ `name` + `category`) in the project's
-[status catalog](/docs/guides/getting-started/workflows#schema) first
-(`workflows/statuses.yaml`), then reference them by `id` from the workflow:
+The forking flow relabels the whole board. Do it by renaming the shipped
+statuses in the project's
+[status catalog](/docs/guides/getting-started/workflows#schema)
+(`workflows/statuses.yaml`) rather than replacing their ids. The shipped
+`task` and `subtask` workflows reference these six ids, and a missing one
+stops them from loading (and the whole project too, while `task` is its
+`default_workflow`). The id
+`in-progress` also matters on its own: Shelbi only hands finished work
+forward automatically from a status with that id.
 
 ```yaml
-# workflows/statuses.yaml — the forking project's status catalog.
+# workflows/statuses.yaml — the shipped ids, relabeled for the forking flow.
 statuses:
-  - { id: incoming,  name: Incoming,  category: backlog }
-  - { id: triage,    name: Triage,    category: ready }
-  - { id: in-review, name: In Review, category: active }
-  - { id: sign-off,  name: Sign-off,  category: handoff }
-  - { id: merged,    name: Merged,    category: done }
-  - { id: declined,  name: Declined,  category: archived }
+  - { id: backlog,     name: Incoming,  category: backlog }
+  - { id: todo,        name: Triage,    category: ready }
+  - { id: in-progress, name: In Review, category: active }
+  - { id: review,      name: Sign-off,  category: handoff }
+  - { id: done,        name: Merged,    category: done }
+  - { id: canceled,    name: Declined,  category: archived }
 ```
 
 ## The workflow
@@ -114,45 +117,71 @@ description: Forking flow — review gate for pull requests from forks.
 
 git:
   base_branch: main
-  merge_strategy: squash               # squash external contributions into one commit
 
 statuses:
-  - { id: incoming,  owner: user }
-  - { id: triage,    owner: agent, agent: orchestrator }
-  - { id: in-review, owner: agent, agent: reviewer }
-  - { id: sign-off,  owner: user }
-  - { id: merged,    owner: user }
-  - { id: declined,  owner: user }
+  - { id: backlog,     owner: user }                        # Incoming
+  - { id: todo,        owner: agent, agent: orchestrator }  # Triage
+  - { id: in-progress, owner: agent, agent: reviewer }      # In Review
+  - { id: review,      owner: user }                        # Sign-off
+  - { id: done,        owner: user }                        # Merged
+  - { id: canceled,    owner: user }                        # Declined
 
-initial_status: incoming
+initial_status: backlog
 
 transitions:
-  - from: in-review
-    to: sign-off
-    actions: [push_branch]               # push the fork branch to a review ref; no PR to open
-
-  - from: sign-off
-    to: merged
-    actions: [merge]                     # squash-merge the existing fork PR into main
-
-  - from: in-review
-    to: declined
-    actions: [close_pr]                  # close the PR without merging; the fork keeps its branch
+  - { from: in-progress, to: review, actions: [] }   # no PR to open: the contributor already did
 ```
 
-Two side-effects that the [feature-branch](/docs/guides/understanding-workflows/feature-branch)
-model uses are deliberately *absent* here:
+Set `default_workflow: contribution` in `project.yaml` so new issues use
+it (or put `workflow: contribution` in each issue's frontmatter).
+
+The `transitions:` block is there to switch git side-effects *off*. A
+workflow with no `transitions:` block at all gets the legacy hand-off,
+which opens a PR. With the block, every edge that isn't listed with
+actions is a pure status move. Git work on GitHub stays yours:
 
 - **No `open_pr`.** The contributor already opened the PR from their fork.
-  The issue just tracks it. Pre-fill `branch:` with the PR's head ref so
-  `merge` and `close_pr` act on the right PR.
-- **No `delete_branch`.** Shelbi can't delete a branch it doesn't own. The
-  fork keeps its branch whether the PR merges or is declined.
+  The issue just tracks it.
+- **No `merge` or `close_pr`.** Shelbi looks a PR up by the issue's
+  branch name (`gh pr list --head pr-401`), which doesn't find the
+  contributor's PR: its head is a branch on their fork. Merge or close the
+  contributor's PR on GitHub, then move the card to **Merged** or
+  **Declined**. With no `merge` edge, Zen Mode never merges a contribution
+  either.
+- **No `delete_branch`.** The fork keeps its branch whether the PR merges
+  or is declined.
 
-The `in-review` status names an [`agent: reviewer`](/docs/concepts/agents)
+To bring a PR in, fetch its head into the checkout Shelbi manages and
+point the issue at that branch:
+
+```bash
+git fetch origin pull/401/head:pr-401
+```
+
+```markdown
+---
+id: pr-401
+title: "PR #401: perf: cache regex"
+branch: pr-401
+---
+```
+
+If the branch doesn't exist locally when the issue is dispatched, Shelbi
+cuts a fresh, empty branch of that name off `main`, and the reviewer has
+nothing to review. When the reviewer hands off, Shelbi rebases `pr-401`
+onto `main` and pushes it to `origin` under the same name, as it does for
+every task branch, so the contribution also shows up as a branch in your
+repo.
+
+The `In Review` status names an [`agent: reviewer`](/docs/concepts/agents)
 role, an agent you author to run the untrusted contribution through the
-project's checks and summarize risk before a human ever looks. The
-`sign-off` status stays `owner: user`: the gate is the whole point.
+project's checks and summarize risk before a human ever looks. Create it
+first with `shelbi agent new reviewer`: the workflow won't load until the
+agent exists. Or point the status at a shipped reviewer preset instead,
+`security` or `adversarial`. Because it runs in `in-progress`, the
+reviewer gets the same hand-off instructions as a developer: it writes the
+ready marker when it's done, and Shelbi moves the card to **Sign-off**.
+The `Sign-off` status stays `owner: user`: the gate is the whole point.
 
 ## Orchestrator adjustments
 
@@ -187,7 +216,7 @@ the gate for code that arrived from outside.
 
 - [Agents](/docs/concepts/agents) — how to author the `reviewer` role the
   `InReview` status dispatches to.
-- [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field)
-  — pointing an issue at an existing fork PR branch instead of cutting one.
+- [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field):
+  pointing an issue at an existing local branch instead of cutting one.
 - [Trunk-based](/docs/guides/understanding-workflows/trunk-based) — the opposite end of the
   auto-merge spectrum, for work you trust.

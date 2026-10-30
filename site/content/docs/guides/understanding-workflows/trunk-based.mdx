@@ -1,7 +1,7 @@
 ---
 title: Trunk-based
 order: 31
-summary: Short-lived branches that merge to main fast, with no separate review column. The merge is action-based, so it pairs naturally with Zen Mode auto-merge.
+summary: Short-lived branches that merge to main fast, with no separate review column. With no handoff status, the hub merges each branch as soon as the developer marks it done.
 ---
 
 **Trunk-based development** keeps a single always-releasable trunk
@@ -11,14 +11,14 @@ column. Work goes from *in progress* to *merged* the moment checks pass.
 
 In Shelbi this is the [feature-branch model](/docs/guides/understanding-workflows/feature-branch)
 with the `Review` handoff collapsed: the `merge` action moves onto the
-`InProgress → Done` edge. Because
-[Zen Mode's confidence bar is action-based](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar)
-(it gates *any* transition whose actions include `merge`, regardless of
-which statuses sit on either side), that collapsed edge trips exactly the
-same high-confidence probe the review-gated model does. Trunk-based is
-where Zen [auto-merge](/docs/concepts/zen-mode#the-high-confidence-bar)
-earns its keep: the whole point is to land green work without a manual
-accept step.
+`InProgress → Done` edge. A workflow with no `handoff`-category status
+has nothing to hand finished work to, so when the developer writes its
+ready marker the hub auto-advances the card along that `merge` edge and
+merges the branch right away. This is the same path the shipped
+[`subtask` workflow](/docs/guides/getting-started/workflows#subtask) uses.
+[Zen Mode](/docs/concepts/zen-mode) is not consulted on this path, and
+neither are `zen.checks`: the whole point is to land finished work without
+an accept step.
 
 ## The board
 
@@ -27,6 +27,9 @@ accept step.
     terminalTitle: "you@hub — api",
     project: "api",
     activeView: "tasks",
+    workflow: "trunk",
+    workflowFilter: "trunk",
+    zenMode: false,
     columns: [
       {
         label: "BACKLOG",
@@ -61,13 +64,14 @@ accept step.
           { title: "Cache warm-up on cold start", id: "t-069" },
         ],
       },
+      { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
     ],
     machines: [
       {
         name: "hub",
         workspaces: [
-          { name: "delta", state: "working", agent: "Developer" },
-          { name: "echo", state: "working", agent: "Developer" },
+          { name: "delta", state: "working", agent: "developer" },
+          { name: "echo", state: "working", agent: "developer" },
         ],
       },
     ],
@@ -76,9 +80,9 @@ accept step.
   }}
 />
 
-Four columns, no `Review`. An issue branch is cut off `main` at
+No `Review` column. An issue branch is cut off `main` at
 **In Progress** and squash-merged straight back into `main` at **Done**,
-the moment checks pass and Zen clears the bar.
+the moment the developer marks it done.
 
 ## The workflow
 
@@ -90,11 +94,11 @@ references statuses by `id` and adds only `owner` and `agent:`:
 ```yaml
 # workflows/trunk.yaml — reference-only (identity lives in statuses.yaml)
 name: trunk
-description: Trunk-based — short-lived branches, merge to main on green.
+description: Trunk-based — short-lived branches, merge to main when done.
 
 git:
   base_branch: main
-  merge_strategy: squash               # one squashed commit per issue on trunk
+  branch: '{{github_user}}/{{id}}'     # e.g. you/t-065, same as the shipped task workflow
 
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
@@ -108,47 +112,40 @@ initial_status: backlog
 transitions:
   - from: in-progress
     to: done
-    actions: [push_branch, open_pr, merge, delete_branch]
+    actions: [push_branch, merge, delete_branch]
 
   - from: in-progress
     to: canceled
-    actions: [close_pr, delete_branch]
-
-zen:
-  checks:
-    local:
-      - cargo build --workspace
-      - cargo test --workspace
+    actions: [delete_branch]
 ```
 
-The single `in-progress → done` transition does the whole cycle: push the
-short branch, open a PR into `main`, squash-merge it, and delete the
-branch. There is no `handoff`-category status because there's no separate
-review stage. The [`zen.checks`](/docs/concepts/zen-mode) that run before
-the merge bar *are* the gate.
+The single `in-progress → done` transition does the whole cycle. When the
+developer writes its ready marker, the hub checks the worktree is clean and
+the branch has commits, rebases the branch onto `main`, pushes it, and runs
+`merge` *before* it moves the card to Done, so a failed merge leaves the
+card in In Progress instead of marking unmerged work done. Then the edge's
+remaining actions run (`delete_branch`). No PR is opened: with no open PR
+for the branch, `merge` integrates it hub-side and pushes `main`. There is
+no `handoff`-category status because there's no separate review stage.
+
+The squash comes from the project's `git.merge_strategy` (`squash` by
+default). The `merge` action always uses the project setting, so a
+`merge_strategy` in a workflow's `git:` block has no effect on it.
 
 ## Orchestrator adjustments
 
-Trunk-based only pays off with auto-merge on, so the orchestrator prompt's
-[Zen judgment](/docs/guides/getting-started/custom-workflow#2-tune-zens-judgment-categories-for-this-projects-reality)
-does the accepting a human would otherwise do at a `Review` column. Two
-tweaks are worth encoding:
+None are needed, and none would help: the merge happens in the hub as soon
+as the ready marker lands, so orchestrator rules and Zen merge conditions
+never get a chance to hold the card. The gate is whatever the developer
+does before it marks the work done, so put "run the build and tests, and
+only write the ready marker when they pass" in the
+[developer agent's instructions](/docs/concepts/agents#customizing-an-agent).
 
-```markdown
-## Zen Mode — trunk-based
-
-### Merge conditions
-
-An issue on the `InProgress → Done` edge may auto-merge when **all** hold:
-
-1. The workspace has written its review marker (work is complete).
-2. `shelbi zen probe` reports every local check green.
-3. The diff touches no path in the danger set (migrations, auth, CI).
-
-Otherwise, hold the card in `InProgress` and surface it: "`<issue>` is
-green but touches `<danger-path>` — merge to main?" Trunk stays
-releasable because nothing lands without a green probe.
-```
+If you want a green-checks gate before anything lands on `main`, keep a
+`review` (handoff) status between In Progress and Done, as the
+[feature-branch](/docs/guides/understanding-workflows/feature-branch) model
+does, and turn on [Zen Mode](/docs/concepts/zen-mode) so it can accept
+`review → done` for you once its checks pass.
 
 Keep branches short. If a card sits in `InProgress` long enough to drift
 from `main`, prefer restacking or re-cutting it over a big catch-up merge.
@@ -159,6 +156,6 @@ That's the discipline trunk-based trades the review column for.
 - [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the review-gated
   version of the same branch-per-issue shape.
 - [Zen Mode](/docs/concepts/zen-mode) — the confidence bar and the
-  `zen.checks` that stand in for a review column here.
-- [Workflows: what fires the high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar):
-  why a collapsed `InProgress → Done` merge still trips the probe.
+  `zen.checks` that gate a `review → done` accept when you want one.
+- [Workflows: the subtask workflow](/docs/guides/getting-started/workflows#subtask):
+  the shipped handoff-less workflow that merges the same way.

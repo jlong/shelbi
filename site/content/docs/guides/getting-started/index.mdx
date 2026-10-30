@@ -25,17 +25,20 @@ before you start.
 ## The arc
 
 You'll start by **installing** the binary and **setting up a project**.
-Shelbi checks the repo, runner, and machine, then shows one detected
-plan. Press Enter once to write it and open the dashboard, or press `c` to
-customize the detected values. Then you'll **run your first issue** end to end,
+On a fresh machine, `shelbi` opens a launch screen where you add your first
+project; `shelbi project add`, run inside the repo, walks the full detected
+setup instead. Shelbi checks the repo, runner, and machine, asks where issues
+should live, then shows one detected plan. Press Enter to write it and open
+the dashboard, or press `c` to customize the detected values. Then you'll
+**run your first issue** end to end,
 watch a single card cross the board, and review the branch it produces.
 
 From there the guide opens up: a **multi-workspace dispatch loop** fills
 the whole pool and runs cards in parallel, **review workspaces** load a
 finished branch onto a live dev server so you can click through the change,
 **Zen Mode** hands both ends of that loop to the orchestrator, and
-**authoring a custom workflow** shows how to reshape the board's routing to
-your own conventions.
+**customizing the orchestrator prompt** shows how to encode your own
+routing rules, Zen judgment, and reporting style.
 
 The last page steps back to the model underneath all of it:
 [**Workflows**](/docs/guides/getting-started/workflows), the per-project
@@ -46,8 +49,8 @@ clicks into place.
 
 ## Where to go next
 
-- [Concepts](/docs/concepts/agents) — the reference pages behind the loop:
+- [Concepts](/docs/concepts/agents): the reference pages behind the loop:
   agents, workspaces, the orchestrator, the events log, and Zen Mode.
-- [Understanding Workflows](/docs/guides/understanding-workflows) — deep-dives
+- [Understanding Workflows](/docs/guides/understanding-workflows): deep-dives
   that map trunk-based, git-flow, feature-branch, and forking onto a Shelbi
   Workflow, once you know the [workflow basics](/docs/guides/getting-started/workflows).
