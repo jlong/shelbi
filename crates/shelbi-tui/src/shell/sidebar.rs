@@ -15,9 +15,8 @@
 //! mirroring the desktop's: Settings, Send Feedback, and the unread-errors
 //! badge while there are any, in its bottom-left corner, on the bottom row;
 //! and, only while Zen is on, the `ZEN MODE ON` band under it, which lifts the
-//! toolbar one row while it shows). The versions otherwise wait in the
-//! Settings button's hover name, and the board's freshness shows on the Issues
-//! board. The old `^P
+//! toolbar one row while it shows). Matching versions don't show in the
+//! sidebar, and the board's freshness shows on the Issues board. The old `^P
 //! palette q quit` / `^G Zen mode` footer hint lines are gone; those actions
 //! stay reachable through the palette and their existing keys.
 //!
@@ -89,22 +88,16 @@ impl FooterButton {
         }
     }
 
-    /// The desktop's tooltip for the button, shown beside the toolbar while
-    /// the pointer is over it.
-    /// The button's name beside the toolbar under the pointer. Settings
-    /// carries the daemon/CLI versions as well, as the desktop's tooltip does:
-    /// the footer itself only shows them on a mismatch.
-    fn tooltip(self, unread_errors: usize, versions: Option<&str>) -> String {
+    /// The text shown beside the toolbar while the pointer is over the
+    /// button: only the unread-errors badge has any (its count). Settings and
+    /// Send Feedback just light their hover fill.
+    fn tooltip(self, unread_errors: usize) -> Option<String> {
         match self {
-            FooterButton::Settings => match versions {
-                Some(line) => format!("Settings · {line}"),
-                None => "Settings".to_string(),
-            },
-            FooterButton::Feedback => "Send Feedback".to_string(),
-            FooterButton::Errors => format!(
+            FooterButton::Settings | FooterButton::Feedback => None,
+            FooterButton::Errors => Some(format!(
                 "{unread_errors} unread error{}",
                 if unread_errors == 1 { "" } else { "s" }
-            ),
+            )),
         }
     }
 }
@@ -117,8 +110,8 @@ pub struct SidebarChrome {
     /// The palette-open chord resolved for the host platform (e.g. `⌃P` on
     /// macOS, `Ctrl+P` elsewhere), or `<unbound>` when no chord is bound.
     palette: String,
-    /// The footer button under the pointer, lit with its hover fill and
-    /// named beside the toolbar (the desktop's tooltip).
+    /// The footer button under the pointer, lit with its hover fill (the
+    /// unread-errors badge also shows its count beside the toolbar).
     hover: Option<FooterButton>,
 }
 
@@ -202,8 +195,6 @@ pub struct SidebarView {
     rows: Vec<Row>,
     /// Indices into `rows` that are selectable, in order.
     selectable: Vec<usize>,
-    /// The daemon/CLI versions, for the Settings button's hover name.
-    daemon_version_line: Option<String>,
     /// The version line while the daemon and the CLI disagree (it names the
     /// fix), painted red above the toolbar. The board's freshness shows on
     /// the Issues board, not here.
@@ -231,7 +222,6 @@ impl SidebarView {
             project_label: model.project_label.clone(),
             rows,
             selectable,
-            daemon_version_line: model.daemon_version_line.clone(),
             version_warning: model
                 .daemon_version_line
                 .clone()
@@ -342,7 +332,7 @@ impl SidebarView {
         out
     }
 
-    /// Where the hovered button's `width`-column name goes, its row with a
+    /// Where the hovered button's `width`-column tooltip goes, its row with a
     /// column of inset each side: beside the buttons, two columns past the
     /// last, when it fits whole there; otherwise the full width of the row
     /// above the squares' `▄` caps when the sidebar has one (cut short with
@@ -675,9 +665,10 @@ impl SidebarView {
     /// Paint the footer: the status row, the version warning on a daemon/CLI
     /// mismatch, the toolbar (Settings, Send Feedback, the unread-errors
     /// badge), and the zen band. `hover` is the button under the pointer: its
-    /// square lifts and its name shows beside the toolbar, or, when the
-    /// squares leave too little room for the whole name, floats on the row
-    /// above them (over whatever sits there, as the desktop's tooltip does).
+    /// square lifts, and for the unread-errors badge its count shows beside
+    /// the toolbar, or, when the squares leave too little room for the whole
+    /// count, floats on the row above them (over whatever sits there, as the
+    /// desktop's tooltip does).
     fn render_footer(&self, buf: &mut Buffer, area: Rect, rows: &FooterRows, hover: Option<FooterButton>) {
         if let Some(status) = rows.status {
             let style = if self.status_is_orchestrator_failure {
@@ -721,10 +712,9 @@ impl SidebarView {
                     hover == Some(button),
                 );
             }
-            // Right of the buttons: the hovered button's name (the desktop's
+            // Right of the buttons: the hovered badge's count (the desktop's
             // tooltip), left-aligned. Nothing sits there otherwise.
-            if let Some(button) = hover {
-                let name = button.tooltip(self.unread_errors, self.daemon_version_line.as_deref());
+            if let Some(name) = hover.and_then(|button| button.tooltip(self.unread_errors)) {
                 let info = self.tooltip_rect(area, rows, toolbar, UnicodeWidthStr::width(name.as_str()));
                 if let Some(info) = info {
                     for x in info.left()..info.right() {
@@ -2316,32 +2306,35 @@ mod tests {
         assert_ne!(palette().button_hover, palette().selection, "the lift shows");
     }
 
-    /// The hovered button's name (the desktop's tooltip) shows beside the
-    /// toolbar; Settings's carries the daemon/CLI versions, as the desktop's
-    /// does, which the footer no longer shows at rest.
+    /// Hovering Settings or Send Feedback only lights the square: no name and
+    /// no daemon/CLI versions, beside the toolbar or floating above it. The
+    /// unread-errors badge still shows its count beside the toolbar.
     #[test]
-    fn hover_names_the_button_beside_the_toolbar() {
+    fn hover_shows_text_only_for_the_unread_errors_badge() {
         let mut model = empty_model();
         model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
         model.unread_errors = 1;
         let view = SidebarView::build(&model);
         let y = TOOLBAR_Y;
-        for (hover, want) in [
-            (FooterButton::Settings, "Settings · daemon 0.11.0 · cli 0.11.0"),
-            (FooterButton::Feedback, "Send Feedback"),
-            (FooterButton::Errors, "1 unread error"),
-        ] {
-            let buf = footer_buf(&view, Some(hover), 60, 20);
-            let row = buf_row(&buf, y);
-            assert!(row.contains(want), "{hover:?} is named: {row:?}");
-            assert!(row.starts_with("   ⚙     📣    !  "), "two columns past the squares: {row:?}");
-            assert!(buf_row(&buf, y - 2).trim().is_empty(), "nothing floats when it fits beside");
+        let rest = footer_buf(&view, None, 60, 20);
+        assert_eq!(buf_row(&rest, y).trim_end(), "   ⚙     📣    !", "nothing beside the buttons at rest");
+        for w in [27, 60] {
+            let at_rest = footer_buf(&view, None, w, 20);
+            for hover in [FooterButton::Settings, FooterButton::Feedback] {
+                let buf = footer_buf(&view, Some(hover), w, 20);
+                let joined: String = (0..20).map(|y| buf_row(&buf, y)).collect::<Vec<_>>().join("\n");
+                for text in ["Settings", "Feedback", "daemon", "cli", "0.11.0"] {
+                    assert!(!joined.contains(text), "{hover:?} at {w} cols shows {text:?}:\n{joined}");
+                }
+                for row in 0..20 {
+                    assert_eq!(buf_row(&buf, row), buf_row(&at_rest, row), "{hover:?} at {w} cols, row {row}: the text is the rest's");
+                }
+            }
         }
-        let row = buf_row(&footer_buf(&view, None, 60, 20), y);
-        assert_eq!(row.trim_end(), "   ⚙     📣    !", "nothing beside the buttons at rest: {row:?}");
-        // Before the first probe Settings is just named.
-        let row = buf_row(&footer_buf(&SidebarView::build(&empty_model()), Some(FooterButton::Settings), 60, 20), y);
-        assert!(row.trim_end().ends_with("Settings"), "{row:?}");
+        let buf = footer_buf(&view, Some(FooterButton::Errors), 60, 20);
+        let row = buf_row(&buf, y);
+        assert_eq!(row.trim_end(), "   ⚙     📣    !    1 unread error", "two columns past the squares");
+        assert!(buf_row(&buf, y - 2).trim().is_empty(), "nothing floats when it fits beside");
     }
 
     /// At the default sidebar width the squares leave too little room beside
@@ -2364,16 +2357,11 @@ mod tests {
         let rest = footer_buf(&view, None, w, 20);
         assert!(buf_row(&rest, y - 2).contains("3 open"), "{:?}", buf_row(&rest, y - 2));
 
-        // Two buttons leave room for "Settings" beside them.
-        let view = SidebarView::build(&empty_model());
-        let buf = footer_buf(&view, Some(FooterButton::Settings), w, 20);
-        assert!(buf_row(&buf, y).trim_end().ends_with("📣   Settings"), "{:?}", buf_row(&buf, y));
-        // A name longer than the whole row is cut short there.
+        // A count longer than the whole row is cut short there.
         let mut model = empty_model();
-        model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
-        let buf = footer_buf(&SidebarView::build(&model), Some(FooterButton::Settings), w, 20);
-        let above = buf_row(&buf, y - 2);
-        assert!(above.starts_with(" Settings · daemon") && above.trim_end().ends_with('…'), "{above:?}");
+        model.unread_errors = 1000;
+        let buf = footer_buf(&SidebarView::build(&model), Some(FooterButton::Errors), 19, 20);
+        assert_eq!(buf_row(&buf, y - 2).trim_end(), " 1000 unread erro…");
     }
 
     /// The unread-errors badge follows Send Feedback while there are unread
