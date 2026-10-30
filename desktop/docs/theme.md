@@ -287,6 +287,10 @@ the windows see-through. The opacity is applied when the theme resolves
   ([gpui.md](gpui.md#breakage-log)). The window server's blur
   (`platform::blur`) applies once to everything behind the window's
   translucent pixels, glass and fills alike.
+- **Checking it by eye**: `scripts/glass-walk.sh` captures the board, the
+  task pane and Settings in a real window over a striped backdrop at 85/30,
+  30/50, 30/0 and 100 (`--visual-check`'s blend check covers the alpha
+  math offscreen).
 - **Reduce Transparency** keeps every window opaque, read at launch and each
   time a window comes forward.
 
