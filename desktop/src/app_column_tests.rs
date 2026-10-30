@@ -1046,6 +1046,54 @@ fn more_opens_the_task_pane_over_the_review_and_close_hands_it_back(cx: &mut Tes
     assert!(panel_focused, "the keys are back in the review");
 }
 
+/// Drag the task pane's left edge `dx` from where it's pressed.
+fn drag_pane_edge(c: &mut Column, dx: f32) {
+    let edge = c.bounds("task-pane-resize").expect("the pane's edge").center();
+    let to = point(edge.x + gpui::px(dx), edge.y);
+    c.h.cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::none());
+    c.h.cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+    c.h.cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    c.h.cx.run_until_parked();
+    c.h.draw();
+}
+
+#[gpui::test]
+fn the_task_pane_resizes_over_the_review_and_the_workspace_and_the_window_keeps_it(cx: &mut TestAppContext) {
+    let mut c = Column::open_with(cx, |w| w.window_state.task_pane_width = 700.0);
+    c.h.cx.update(|_, cx| cx.set_reduce_motion(true));
+    c.open_review();
+    c.advance(SLIDE);
+    c.h.click_selector("review-more");
+    c.h.draw();
+    assert!(detail_over(&c));
+    assert_eq!(c.width("task-pane"), 700.0, "the window's saved width");
+
+    // Over the review: wider, and the window keeps it to save.
+    let right = c.bounds("task-pane").unwrap().right();
+    drag_pane_edge(&mut c, -100.0);
+    assert_eq!(c.width("task-pane"), 800.0);
+    assert_eq!(c.bounds("task-pane").unwrap().right(), right, "the right edge stays put");
+    assert_eq!(c.read(|w, _| w.window_state.task_pane_width), 800.0);
+    assert!(detail_over(&c) && c.drawn("review-panel"), "the pane and the review stay up");
+    c.h.click_selector("pane-close");
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    c.back();
+    c.advance(SLIDE);
+
+    // Over the workspace: the same width, and its edge drags the same way.
+    c.open_workspace();
+    c.advance(SLIDE);
+    c.h.click_selector("ws-more");
+    c.h.draw();
+    assert!(detail_over(&c));
+    assert_eq!(c.width("task-pane"), 800.0, "the width outlives the pane");
+    drag_pane_edge(&mut c, 60.0);
+    assert_eq!(c.width("task-pane"), 740.0);
+    assert_eq!(c.read(|w, _| w.window_state.task_pane_width), 740.0);
+    assert!(c.drawn("workspace-view"), "the workspace stays under it");
+}
+
 #[gpui::test]
 fn the_detail_over_a_screen_goes_when_the_main_area_moves_on(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);

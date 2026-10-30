@@ -64,6 +64,7 @@ use super::doc_editor::layout::Field as DocField;
 use super::doc_editor::{DocEditor, DocEvent};
 use super::external_edit::{self, EditorEvent};
 use super::pane_session::{MainShows, PaneSession};
+use super::pane_width::PaneWidth;
 use super::session_view::{SessionDeps, SessionView};
 use super::task_detail;
 use crate::assets::{heroicon, icons};
@@ -113,6 +114,19 @@ pub enum IssuesEvent {
     /// The pane's session terminal took keyboard focus: the window's focus
     /// model moves to the main area.
     Focused,
+    /// A drag of the task pane's left edge ended on this width: the window
+    /// saves it (`WindowState::task_pane_width`).
+    PaneWidth(f32),
+}
+
+/// A drag of the task pane's left edge: the width the pane showed and
+/// where the pointer pressed, and the width chosen before it (what decides
+/// whether there's a new one to save).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PaneResize {
+    from: f32,
+    press_x: f32,
+    before: f32,
 }
 
 /// The value a card drag carries.
@@ -233,6 +247,13 @@ pub struct IssuesView {
     /// The pane's live session, once the window hosts one
     /// ([`Self::host_sessions`]; offscreen boards have none).
     pub(super) pane_session: Option<PaneSession>,
+    /// The task pane's chosen width (`dt-task-pane-resize`).
+    pub(super) pane_width: PaneWidth,
+    /// A drag of the pane's left edge is on.
+    pub(super) pane_resize: Option<PaneResize>,
+    /// The pane's layer (the main area inside its insets), measured for the
+    /// drag.
+    pub(super) pane_layer: Option<gpui::Bounds<gpui::Pixels>>,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -300,6 +321,9 @@ impl IssuesView {
             display_style: DisplayStyle::detect(),
             floating: false,
             pane_session: None,
+            pane_width: PaneWidth::default(),
+            pane_resize: None,
+            pane_layer: None,
             _subscriptions: Vec::new(),
             _poll: poll,
         }
@@ -525,6 +549,52 @@ impl IssuesView {
     pub fn open_task_over(&mut self, id: &str, cx: &mut Context<Self>) {
         self.floating = true;
         self.open_task(id, cx);
+    }
+
+    /// The window's saved task pane width.
+    pub fn set_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = PaneWidth::new(width);
+        if width != self.pane_width {
+            self.pane_width = width;
+            cx.notify();
+        }
+    }
+
+    /// The task pane's chosen width.
+    #[cfg(test)]
+    pub fn pane_width(&self) -> f32 {
+        self.pane_width.wanted()
+    }
+
+    /// A press on the pane's left edge at `x`, in window coordinates, starts
+    /// a drag from the width the pane shows.
+    pub(super) fn start_pane_resize(&mut self, x: f32, cx: &mut Context<Self>) {
+        let wanted = self.pane_width.wanted();
+        let shown = self.pane_layer.map_or(wanted, |l| self.pane_width.shown(l.size.width.as_f32()));
+        self.pane_resize = Some(PaneResize { from: shown, press_x: x, before: wanted });
+        cx.notify();
+    }
+
+    /// Follow a drag of the pane's left edge to `x`, in window coordinates.
+    pub(super) fn drag_pane_edge(&mut self, x: f32, cx: &mut Context<Self>) {
+        let (Some(drag), Some(layer)) = (self.pane_resize, self.pane_layer) else {
+            return;
+        };
+        if self.pane_width.drag(drag.from, x - drag.press_x, layer.size.width.as_f32()) {
+            cx.notify();
+        }
+    }
+
+    /// The drag of the pane's edge ended: a new width goes to the window to
+    /// save.
+    pub(super) fn end_pane_resize(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.pane_resize.take() else {
+            return;
+        };
+        if self.pane_width.wanted() != drag.before {
+            cx.emit(IssuesEvent::PaneWidth(self.pane_width.wanted()));
+        }
+        cx.notify();
     }
 
     /// Whether the view draws over another screen.
@@ -2141,7 +2211,11 @@ impl IssuesView {
     /// The task pane, while it is up: the task, or its loading, missing or
     /// failed state in the same shell.
     fn render_detail(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let id = self.state.detail_id()?.to_string();
+        let Some(id) = self.state.detail_id().map(str::to_string) else {
+            // A pane closed mid-drag (Esc) leaves no drag behind for the next.
+            self.pane_resize = None;
+            return None;
+        };
         let model = self.detail_model();
         let content = match &model {
             Some(d) => task_detail::PaneContent::Task(d),
@@ -2608,6 +2682,148 @@ mod tests {
         let settled = bounds(&mut cx, "task-pane");
         assert_eq!(settled.left(), px(512.0), "and lands 8pt in from the right");
         assert_eq!(settled.top(), first.top(), "sliding, not dropping");
+    }
+
+    // ---- resizing the pane (`dt-task-pane-resize`) -------------------------
+
+    /// Every width the view sent the window to save.
+    fn saved_widths(view: &Entity<IssuesView>, cx: &mut gpui::VisualTestContext) -> std::rc::Rc<std::cell::RefCell<Vec<f32>>> {
+        let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = widths.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(view, move |_, ev: &IssuesEvent, _| {
+                if let IssuesEvent::PaneWidth(w) = ev {
+                    sink.borrow_mut().push(*w);
+                }
+            })
+            .detach()
+        });
+        widths
+    }
+
+    /// Press the pane's left edge, move by each of `dxs` from the press (to
+    /// no further left than the window's edge), and let go at the last.
+    fn drag_edge(cx: &mut gpui::VisualTestContext, dxs: &[f32]) {
+        let edge = bounds(cx, "task-pane-resize").center();
+        let at = |dx: f32| gpui::point((edge.x + px(dx)).max(px(0.0)), edge.y);
+        cx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        for &dx in dxs {
+            cx.simulate_mouse_move(at(dx), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let last = at(*dxs.last().unwrap());
+        cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_panes_left_edge_is_its_resize_handle(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let pane = bounds(&mut cx, "task-pane");
+        let edge = bounds(&mut cx, "task-pane-resize");
+        // The sidebar edge's 5pt grab room, down the pane's whole left edge.
+        assert_eq!(edge, gpui::Bounds::new(pane.origin, gpui::size(px(crate::app::RESIZE_GRAB), pane.size.height)));
+    }
+
+    #[gpui::test]
+    fn dragging_the_edge_resizes_the_pane_live_within_its_limits(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        use crate::views::pane_width::{BOARD_KEEP, MIN_W};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let saved = saved_widths(&view, &mut cx);
+        let right = bounds(&mut cx, "task-pane").right();
+        let title = bounds(&mut cx, "pane-title");
+
+        // Left widens it, live: the pane follows each move, its right edge
+        // fixed, and the text reflows to the new width.
+        let edge = bounds(&mut cx, "task-pane-resize").center();
+        let to = gpui::point(edge.x - px(160.0), edge.y);
+        cx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        let pane = bounds(&mut cx, "task-pane");
+        assert_eq!((pane.size.width, pane.right()), (px(800.0), right), "mid-drag");
+        assert!(bounds(&mut cx, "pane-title").size.width > title.size.width, "the title reflows wider");
+        assert!(drawn(&mut cx, "task-pane-resize"));
+        assert!(saved.borrow().is_empty(), "nothing is saved mid-drag");
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(*saved.borrow(), vec![800.0], "the window saves the width it ended on");
+        assert_eq!(view.read_with(&cx, |v, _| v.pane_width()), 800.0);
+
+        // Right narrows it, as far as the minimum; the pointer past it, over
+        // the pane, changes nothing more.
+        drag_edge(&mut cx, &[300.0, 700.0]);
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(MIN_W));
+
+        // Left, far over the board (out of the pane and its layer), as far
+        // as leaves some of the board.
+        drag_edge(&mut cx, &[-300.0, -2000.0]);
+        let room = 1160.0 - 2.0 * task_detail::EDGE;
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(room - BOARD_KEEP));
+        assert_eq!(*saved.borrow(), vec![800.0, MIN_W, room - BOARD_KEEP]);
+
+        // A press and release in place saves nothing new: the edge never
+        // jumps to the pointer.
+        drag_edge(&mut cx, &[0.0]);
+        assert_eq!(saved.borrow().len(), 3);
+        // Closed mid-drag, the next pane takes no drag over from it.
+        let edge = bounds(&mut cx, "task-pane-resize").center();
+        cx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        view.update(&mut cx, |v, cx| v.close_pane(cx));
+        assert!(!drawn(&mut cx, "task-pane"));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let width = bounds(&mut cx, "task-pane").size.width;
+        cx.simulate_mouse_move(gpui::point(px(100.0), edge.y), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, width, "the pointer moves nothing");
+        assert!(view.read_with(&cx, |v, _| v.pane_resize.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_width_outlives_the_pane_and_a_narrow_window_only_borrows_it(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) =
+            open_board_sized(cx, vec![issue("A", "todo"), issue("B", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| {
+            v.set_pane_width(760.0, cx);
+            v.open_task("A", cx);
+        });
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(760.0), "the window's saved width");
+
+        // Closed and opened again (on another task), it keeps the width.
+        click(&mut cx, "pane-close");
+        assert!(!drawn(&mut cx, "task-pane"));
+        view.update(&mut cx, |v, cx| v.open_task("B", cx));
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(760.0));
+
+        // A window too narrow for it fits the pane inside its insets...
+        cx.simulate_resize(gpui::size(px(600.0), px(500.0)));
+        let pane = bounds(&mut cx, "task-pane");
+        assert_eq!(pane, gpui::Bounds::new(gpui::point(px(8.0), px(8.0)), gpui::size(px(584.0), px(484.0))));
+        assert_eq!(view.read_with(&cx, |v, _| v.pane_width()), 760.0, "without forgetting the width");
+        // ...and the width comes back when the window grows.
+        cx.simulate_resize(gpui::size(px(1160.0), px(1024.0)));
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(760.0));
+    }
+
+    #[gpui::test]
+    fn the_pane_slides_in_from_past_its_chosen_width(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| {
+            v.set_pane_width(900.0, cx);
+            v.open_task("A", cx);
+        });
+        let first = bounds(&mut cx, "task-pane");
+        assert!(first.left() > px(252.0), "it starts to the right of its place: {first:?}");
+        std::thread::sleep(super::super::column_swap::SLIDE + Duration::from_millis(60));
+        let settled = bounds(&mut cx, "task-pane");
+        assert_eq!((settled.left(), settled.size.width), (px(252.0), px(900.0)));
     }
 
     #[gpui::test]

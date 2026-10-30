@@ -3,8 +3,9 @@
 //! 2172:722, Ready to start 2573:10737).
 //!
 //! The pane isn't modal. It sits [`EDGE`] in from the main area's top, right
-//! and bottom ([`PANE_W`] wide at most, narrower in a window that can't fit
-//! it), on an overlay layer over the board, which keeps its width, scroll and
+//! and bottom (the user's chosen width at most, 640pt until they drag its
+//! left edge, narrower in a window that can't fit it; see
+//! [`super::pane_width`]), on an overlay layer over the board, which keeps its width, scroll and
 //! selection under it and stays usable where the pane doesn't cover it: a
 //! click on another card shows that card here. It slides in from the right
 //! as it opens ([`SLIDE`], gpui's animation, so Reduce Motion shows it in
@@ -53,7 +54,7 @@
 
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, CursorStyle,
-    Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString,
+    DispatchPhase, Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString,
     Stateful, Window,
 };
 use gpui_kit::base::TextView;
@@ -70,6 +71,7 @@ use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::workflow_editor::{dropdown, MENU_W};
+use crate::app::RESIZE_GRAB;
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::motion::{ease_out_expo, fill_layer};
@@ -78,8 +80,6 @@ use crate::theme::Theme;
 
 /// The pane's room from the main area's top, right and bottom edges.
 pub const EDGE: f32 = 8.0;
-/// The pane's width where the window has room for it.
-pub const PANE_W: f32 = 640.0;
 /// The pane's corners.
 const RADIUS: f32 = 12.0;
 /// The Header's height.
@@ -127,6 +127,9 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
             state_note(theme, "The board couldn't be read.", Some(e)).into_any_element()
         }
     };
+    // The chosen width; the row it sits in shrinks it in a main area too
+    // narrow for it.
+    let width = view.pane_width.wanted();
     let pane = div()
         .id("task-pane")
         .debug_selector(|| "task-pane".into())
@@ -134,7 +137,7 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
         .flex()
         .flex_col()
         .h_full()
-        .w(px(PANE_W))
+        .w(px(width))
         .min_w_0()
         .overflow_hidden()
         .bg(theme.canvas)
@@ -157,7 +160,8 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
                 .rounded(px(RADIUS))
                 .border_1()
                 .border_color(theme.divider),
-        );
+        )
+        .child(resize_handle(view, theme, cx));
     let pane = view.pane_focus(pane, cx);
     div()
         .absolute()
@@ -172,9 +176,73 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
             "task-pane-in",
             Animation::new(SLIDE).with_easing(ease_out_expo),
             // In from past the window's right edge.
-            |pane, t| pane.left(px((1.0 - t) * (PANE_W + EDGE))),
+            move |pane, t| pane.left(px((1.0 - t) * (width + EDGE))),
         ))
+        .child(resize_probe(view, cx))
         .into_any_element()
+}
+
+/// The pane's left edge: the sidebar edge's grab room and cursor, laid over
+/// the pane's first points. A press starts a drag ([`resize_probe`] follows
+/// it); while it's on, a rule lights the edge between the corners, as the
+/// sidebar's edge lights.
+fn resize_handle(view: &IssuesView, theme: &Theme, cx: &mut Context<IssuesView>) -> Stateful<Div> {
+    div()
+        .id("task-pane-resize")
+        .debug_selector(|| "task-pane-resize".into())
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .w(px(RESIZE_GRAB))
+        .cursor(CursorStyle::ResizeLeftRight)
+        .when(view.pane_resize.is_some(), |d| {
+            d.child(div().absolute().top(px(RADIUS)).bottom(px(RADIUS)).left_0().w(px(1.0)).bg(theme.icon))
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                this.start_pane_resize(ev.position.x.as_f32(), cx);
+                // The keys stay where they were (an editor keeps its caret).
+                window.prevent_default();
+                cx.stop_propagation();
+            }),
+        )
+}
+
+/// Measures the pane's layer for the drag, and while a drag of the pane's
+/// edge is on follows the pointer anywhere in the window until the button
+/// comes up (the pointer leaves the pane, and the layer, as it goes).
+fn resize_probe(view: &IssuesView, cx: &mut Context<IssuesView>) -> impl IntoElement {
+    let measured = cx.entity().downgrade();
+    let weak = cx.entity().downgrade();
+    let resizing = view.pane_resize.is_some();
+    canvas(
+        move |bounds, _, cx| {
+            let _ = measured.update(cx, |this, _| this.pane_layer = Some(bounds));
+        },
+        move |_, _, window, _| {
+            if !resizing {
+                return;
+            }
+            let moved = weak.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble {
+                    let _ = moved.update(cx, |this, cx| this.drag_pane_edge(e.position.x.as_f32(), cx));
+                }
+            });
+            let up = weak.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble {
+                    let _ = up.update(cx, |this, cx| this.end_pane_resize(cx));
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 /// The frame's elevation: a 32pt drop 8pt down, in the shadow role.
