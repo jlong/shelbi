@@ -13,8 +13,9 @@
 //! (the one-time first-run hint or a status line; a red daemon/CLI version
 //! warning, naming the fix, only while the two disagree; the toolbar,
 //! mirroring the desktop's: Settings, Send Feedback, and the unread-errors
-//! badge while there are any, in its bottom-left corner; and the `ZEN MODE ON`
-//! band shown only while Zen is on). The versions otherwise wait in the
+//! badge while there are any, in its bottom-left corner, on the bottom row;
+//! and, only while Zen is on, the `ZEN MODE ON` band under it, which lifts the
+//! toolbar one row while it shows). The versions otherwise wait in the
 //! Settings button's hover name, and the board's freshness shows on the Issues
 //! board. The old `^P
 //! palette q quit` / `^G Zen mode` footer hint lines are gone; those actions
@@ -277,12 +278,17 @@ impl SidebarView {
     /// Footer height: the status row's height (0 when empty, 2 for the
     /// first-run hint, [`ORCH_STATUS_ROWS`] for an orchestrator supervisor
     /// failure, else 1), the version warning's rows on a daemon/CLI mismatch,
-    /// and the four fixed rows: the toolbar's half-row margin above, the
-    /// toolbar, its half-row margin below (the spacer above the band), and the
-    /// zen band. The band paints only while Zen is on, but its row is always
-    /// reserved so the toolbar never shifts when Zen toggles.
+    /// the toolbar's three rows (its half-row margin above, the toolbar, its
+    /// half-row margin below), and, only while Zen is on, the zen band under
+    /// them. Off or paused, no row is held for the band: the toolbar's margin
+    /// is the sidebar's bottom row, and it drops back there when Zen goes off.
     fn footer_height(&self) -> u16 {
-        self.status_row_height() + self.warning_lines().len() as u16 + 4
+        self.status_row_height() + self.warning_lines().len() as u16 + 3 + u16::from(self.zen_on())
+    }
+
+    /// Whether the `ZEN MODE ON` band shows (and takes the bottom row).
+    fn zen_on(&self) -> bool {
+        matches!(self.zen_mode, ZenModeState::On)
     }
 
     /// The version warning's lines: the mismatch, then the fix it names on a
@@ -427,8 +433,8 @@ impl SidebarView {
     }
 
     /// Lay the footer's rows out bottom-up in `footer`, so a footer squeezed
-    /// by a short sidebar keeps the band and the toolbar and drops what sits
-    /// above them first.
+    /// by a short sidebar keeps the band (while Zen is on) and the toolbar and
+    /// drops what sits above them first.
     fn footer_rows(&self, footer: Rect) -> FooterRows {
         // Peel one `h`-row rect off the bottom of what's left, if it fits.
         fn take(left: &mut Rect, h: u16) -> Option<Rect> {
@@ -442,7 +448,7 @@ impl SidebarView {
             })
         }
         let mut left = footer;
-        let zen = take(&mut left, 1);
+        let zen = if self.zen_on() { take(&mut left, 1) } else { None };
         let below = take(&mut left, 1);
         let toolbar = take(&mut left, 1);
         let above = take(&mut left, 1);
@@ -738,14 +744,11 @@ impl SidebarView {
         }
     }
 
-    /// Zen row: a full-width green band carrying a bold `ZEN MODE ON` only while
-    /// Zen is on. Off or paused paints nothing — the row stays blank so the
-    /// toolbar above keeps its place.
+    /// Zen row: a full-width green band carrying a bold `ZEN MODE ON`. The
+    /// geometry only gives it a row while Zen is on; off or paused there is no
+    /// row, and the toolbar sits on the sidebar's bottom edge instead.
     fn render_zen_row(&self, buf: &mut Buffer, area: Rect) {
         if area.width == 0 || area.height == 0 {
-            return;
-        }
-        if !matches!(self.zen_mode, ZenModeState::On) {
             return;
         }
         let style = Style::default()
@@ -787,8 +790,10 @@ struct FooterRows {
     /// The toolbar's half-row margin above: the buttons' `▄` row.
     above: Option<Rect>,
     toolbar: Option<Rect>,
-    /// The toolbar's half-row margin below (`▀`), and the spacer above the band.
+    /// The toolbar's half-row margin below (`▀`): the spacer above the band
+    /// while Zen is on, else the sidebar's bottom row.
     below: Option<Rect>,
+    /// The `ZEN MODE ON` band, only while Zen is on.
     zen: Option<Rect>,
 }
 
@@ -2033,8 +2038,8 @@ mod tests {
     }
 
     /// Matching versions and the board's freshness (warm, stale or cached)
-    /// never show in the footer, at any width: the footer is the bare toolbar
-    /// over the band, the rows the line used to take given back to the list.
+    /// never show in the footer, at any width: the footer is the bare toolbar,
+    /// the rows the line used to take given back to the list.
     #[test]
     fn footer_shows_neither_versions_nor_the_board_banner() {
         for banner in ["board 12s", "board 4m stale · quota resets 16:03", "board 4m cached · no daemon"] {
@@ -2047,8 +2052,8 @@ mod tests {
                 assert!(!joined.contains("daemon"), "no versions at {w} cols:\n{joined}");
                 assert!(!joined.contains("board"), "no board banner ({banner}) at {w} cols:\n{joined}");
                 let view = SidebarView::build(&model);
-                assert_eq!(view.footer_height(), 4, "toolbar, its margins and the band only");
-                assert_eq!(row_y(&rows, "⚙"), 20 - 3, "the toolbar keeps its row at {w} cols");
+                assert_eq!(view.footer_height(), 3, "the toolbar and its margins only");
+                assert_eq!(row_y(&rows, "⚙"), TOOLBAR_Y as usize, "the toolbar keeps its row at {w} cols");
             }
         }
     }
@@ -2062,9 +2067,9 @@ mod tests {
         model.daemon_version_mismatch = true;
         model.board_banner = Some("board 4m stale".into());
         let view = SidebarView::build(&model);
-        assert_eq!(view.footer_height(), 6, "two warning rows over the toolbar");
+        assert_eq!(view.footer_height(), 5, "two warning rows over the toolbar");
         let buf = footer_buf(&view, None, 36, 20);
-        let toolbar_y = 20 - 3;
+        let toolbar_y = TOOLBAR_Y;
         let (mismatch, fix) = (buf_row(&buf, toolbar_y - 3), buf_row(&buf, toolbar_y - 2));
         assert_eq!(mismatch.trim_end(), " daemon 0.10.0 ≠ cli 0.11.0");
         assert_eq!(fix.trim_end(), " shelbi daemon restart");
@@ -2083,7 +2088,7 @@ mod tests {
         // Fixed (the daemon restarted on the CLI's version): the warning goes.
         model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
         model.daemon_version_mismatch = false;
-        assert_eq!(SidebarView::build(&model).footer_height(), 4);
+        assert_eq!(SidebarView::build(&model).footer_height(), 3);
     }
 
     #[test]
@@ -2130,8 +2135,35 @@ mod tests {
         assert!(!joined.contains("Zen mode"), "paused shows no hint, got:\n{joined}");
     }
 
+    /// Off or paused, no row is held for the band: the toolbar's `▀` caps are
+    /// the sidebar's bottom row, with nothing blank beneath them. On, the band
+    /// takes the bottom row and the toolbar sits one row up, right above it.
     #[test]
-    fn footer_stays_put_across_zen_toggle() {
+    fn toolbar_takes_the_bottom_row_unless_zen_is_on() {
+        for zen in [ZenModeState::Off, ZenModeState::Paused] {
+            let mut model = empty_model();
+            model.zen_mode = zen;
+            let view = SidebarView::build(&model);
+            assert_eq!(view.footer_height(), 3, "{zen:?}: no row for the band");
+            let rows = render_rows_with(&model, 0, true, &default_chrome(), 24, 16);
+            let joined = rows.join("\n");
+            assert_eq!(row_y(&rows, "⚙"), rows.len() - 2, "{zen:?}: the toolbar is on the bottom:\n{joined}");
+            let last = rows[rows.len() - 1].trim_end();
+            assert_eq!(last, " ▀▀▀▀▀ ▀▀▀▀▀", "{zen:?}: the caps are the last row:\n{joined}");
+        }
+        let mut model = empty_model();
+        model.zen_mode = ZenModeState::On;
+        assert_eq!(SidebarView::build(&model).footer_height(), 4, "On: the band's row too");
+        let rows = render_rows_with(&model, 0, true, &default_chrome(), 24, 16);
+        assert_eq!(row_y(&rows, "⚙"), rows.len() - 3);
+        assert_eq!(rows[rows.len() - 2].trim_end(), " ▀▀▀▀▀ ▀▀▀▀▀");
+        assert_eq!(row_y(&rows, "ZEN MODE ON"), rows.len() - 1);
+    }
+
+    /// Toggling Zen moves the toolbar, and the version warning above it, by
+    /// the band's one row: down when it goes off, up when it comes on.
+    #[test]
+    fn footer_shifts_one_row_across_zen_toggle() {
         let mut off = empty_model();
         off.daemon_version_line = Some("daemon 0.9.0 ≠ cli 0.11.0 — shelbi daemon restart".into());
         off.daemon_version_mismatch = true;
@@ -2143,13 +2175,17 @@ mod tests {
         for text in ["daemon 0.9.0", "⚙"] {
             assert_eq!(
                 row_y(&off_rows, text),
-                row_y(&on_rows, text),
-                "{text:?} must not move when toggling Zen"
+                row_y(&on_rows, text) + 1,
+                "{text:?} drops one row when Zen goes off"
             );
         }
     }
 
     // --- footer toolbar -------------------------------------------------------
+
+    /// The toolbar's row in a 20-row sidebar with Zen off: the row above its
+    /// `▀` caps, which are the bottom row.
+    const TOOLBAR_Y: u16 = 20 - 2;
 
     /// Render `view` at `w`×`h` with `hover`, returning the buffer.
     fn footer_buf(view: &SidebarView, hover: Option<FooterButton>, w: u16, h: u16) -> Buffer {
@@ -2192,7 +2228,7 @@ mod tests {
     }
 
     /// Settings then Send Feedback sit in the footer's bottom-left corner, the
-    /// desktop's order, on the row above the spacer and the zen band; the title
+    /// desktop's order, their `▀` caps on the bottom row (Zen off); the title
     /// row has no gear any more. Each is a square button at rest, the back
     /// button's: [`panel::BACK_BTN_WIDTH`] wide on the selection fill, its
     /// glyph gray and centered (the double-width `📣` too).
@@ -2202,7 +2238,7 @@ mod tests {
         model.project_label = "My project".into();
         let view = SidebarView::build(&model);
         let buf = footer_buf(&view, None, 40, 20);
-        let toolbar_y = 20 - 3;
+        let toolbar_y = TOOLBAR_Y;
         let row = buf_row(&buf, toolbar_y);
         assert!(row.starts_with("   ⚙     📣  "), "Settings then Feedback, bottom-left: {row:?}");
         assert_eq!(buf[(3, toolbar_y)].symbol(), "⚙");
@@ -2237,7 +2273,7 @@ mod tests {
             .unwrap();
         let back = term.backend().buffer().clone();
         let footer = footer_buf(&SidebarView::build(&empty_model()), None, 40, 20);
-        let (bx, fx, fy) = (panel::PAD, 1u16, 20 - 3);
+        let (bx, fx, fy) = (panel::PAD, 1u16, TOOLBAR_Y);
         for i in 0..panel::BACK_BTN_WIDTH as u16 {
             for dy in 0..3u16 {
                 let (b, f) = (&back[(bx + i, dy)], &footer[(fx + i, fy - 1 + dy)]);
@@ -2267,7 +2303,7 @@ mod tests {
     #[test]
     fn hovered_button_lifts_its_square() {
         let view = SidebarView::build(&empty_model());
-        let y = 20 - 3;
+        let y = TOOLBAR_Y;
         for (button, cols, glyph_x) in [(FooterButton::Settings, 1..6u16, 3), (FooterButton::Feedback, 7..12u16, 9)] {
             let buf = footer_buf(&view, Some(button), 40, 20);
             for x in cols.clone().filter(|&x| x != 10) {
@@ -2289,7 +2325,7 @@ mod tests {
         model.daemon_version_line = Some("daemon 0.11.0 · cli 0.11.0".into());
         model.unread_errors = 1;
         let view = SidebarView::build(&model);
-        let y = 20 - 3;
+        let y = TOOLBAR_Y;
         for (hover, want) in [
             (FooterButton::Settings, "Settings · daemon 0.11.0 · cli 0.11.0"),
             (FooterButton::Feedback, "Send Feedback"),
@@ -2317,7 +2353,7 @@ mod tests {
         model.unread_errors = 2;
         model.status_line = "3 open · 1 review".into();
         let view = SidebarView::build(&model);
-        let (w, y) = (27, 20 - 3);
+        let (w, y) = (27, TOOLBAR_Y);
         let buf = footer_buf(&view, Some(FooterButton::Errors), w, 20);
         let above = buf_row(&buf, y - 2);
         assert_eq!(above.trim_end(), " 2 unread errors", "whole, at the inset, over the status: {above:?}");
@@ -2347,7 +2383,7 @@ mod tests {
     fn unread_errors_badge_follows_feedback_only_with_unread_errors() {
         let model = empty_model();
         let buf = footer_buf(&SidebarView::build(&model), None, 40, 20);
-        let y = 20 - 3;
+        let y = TOOLBAR_Y;
         assert!(!buf_row(&buf, y).contains('!'), "no badge without unread errors");
         assert_eq!(buf[(13, y)].bg, Color::Reset, "no square past Feedback");
 
@@ -2371,34 +2407,41 @@ mod tests {
     }
 
     /// Each button's target spans its square: its columns across the `▄`, the
-    /// toolbar and the `▀` rows; the gaps, the rows past the square, and the
+    /// toolbar and the `▀` rows, wherever Zen puts the toolbar (the bottom
+    /// row off, one row up on); the gaps, the rows past the square, and the
     /// band miss.
     #[test]
     fn footer_button_hits_cover_the_square() {
         let mut model = empty_model();
         model.unread_errors = 2;
-        let view = SidebarView::build(&model);
         let area = Rect::new(0, 0, 40, 20);
-        let y = 20 - 3;
-        for row in [y - 1, y, y + 1] {
-            for x in 1..6 {
-                assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Settings));
+        for (zen, y) in [
+            (ZenModeState::Off, TOOLBAR_Y),
+            (ZenModeState::Paused, TOOLBAR_Y),
+            (ZenModeState::On, TOOLBAR_Y - 1),
+        ] {
+            model.zen_mode = zen;
+            let view = SidebarView::build(&model);
+            for row in [y - 1, y, y + 1] {
+                for x in 1..6 {
+                    assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Settings), "{zen:?}");
+                }
+                for x in 7..12 {
+                    assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Feedback), "{zen:?}");
+                }
+                for x in 13..18 {
+                    assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Errors), "{zen:?}");
+                }
+                for x in [0, 6, 12, 18, 30] {
+                    assert_eq!(view.footer_button_at(area, x, row), None, "{zen:?}: col {x} row {row} misses");
+                }
             }
-            for x in 7..12 {
-                assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Feedback));
-            }
-            for x in 13..18 {
-                assert_eq!(view.footer_button_at(area, x, row), Some(FooterButton::Errors));
-            }
-            for x in [0, 6, 12, 18, 30] {
-                assert_eq!(view.footer_button_at(area, x, row), None, "col {x} row {row} misses");
-            }
+            assert_eq!(view.footer_button_at(area, 3, y - 2), None, "{zen:?}: above the square");
+            // An offset sidebar (the shell's content rect) hits in its own frame.
+            let shifted = Rect::new(0, 3, 40, 20);
+            assert_eq!(view.footer_button_at(shifted, 3, y + 3), Some(FooterButton::Settings), "{zen:?}");
         }
-        assert_eq!(view.footer_button_at(area, 3, y - 2), None, "above the square");
-        assert_eq!(view.footer_button_at(area, 3, y + 2), None, "the zen band");
-        // An offset sidebar (the shell's content rect) hits in its own frame.
-        let shifted = Rect::new(0, 3, 40, 20);
-        assert_eq!(view.footer_button_at(shifted, 3, y + 3), Some(FooterButton::Settings));
+        assert_eq!(SidebarView::build(&model).footer_button_at(area, 3, 19), None, "the zen band");
     }
 
     /// Without emoji (the Linux console, a non-UTF-8 locale) the buttons are
@@ -2408,7 +2451,7 @@ mod tests {
     fn without_emoji_the_buttons_are_words() {
         let view = SidebarView::build(&empty_model()).with_emoji(false);
         let buf = footer_buf(&view, None, 40, 20);
-        let y = 20 - 3;
+        let y = TOOLBAR_Y;
         let row = buf_row(&buf, y);
         assert!(row.starts_with("  Settings   Feedback  "), "{row:?}");
         assert!(!row.contains('⚙') && !row.contains('📣'));
@@ -2427,7 +2470,7 @@ mod tests {
         let mut model = empty_model();
         model.unread_errors = 1;
         let view = SidebarView::build(&model);
-        let y = 20 - 3;
+        let y = TOOLBAR_Y;
         for (w, last) in [
             (19u16, Some(FooterButton::Errors)),
             (18, Some(FooterButton::Feedback)),
