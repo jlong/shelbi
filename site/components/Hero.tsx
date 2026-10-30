@@ -1,5 +1,6 @@
 import Link from "next/link"
 import { ArrowRightIcon } from "@heroicons/react/24/outline"
+import { ClientSwitch } from "./ClientSwitch"
 
 const CTA_BASE =
   "inline-flex items-center justify-center gap-1 rounded-sm px-3 py-2 font-mono text-sm font-medium outline-none transition-colors focus-visible:[outline-style:solid] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fg"
@@ -8,6 +9,8 @@ export function Hero() {
   return (
     <section data-hero className="relative">
       <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 pb-3 pt-6 text-center md:pb-2.5 md:pt-8">
+        {/* Which client the page's illustrations show (shared site-wide). */}
+        <ClientSwitch />
         <h1 className="max-w-4xl text-balance text-4xl font-semibold tracking-tight text-fg sm:text-5xl md:text-7xl">
           Stop babysitting agents.
         </h1>

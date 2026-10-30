@@ -5,6 +5,7 @@ import { Source_Code_Pro } from "next/font/google"
 import { Header } from "@/components/Header"
 import { Footer } from "@/components/Footer"
 import { getSections, humanizeSection } from "@/lib/docs"
+import { CLIENT_BOOT_SCRIPT } from "@/lib/client-preference"
 import "./globals.css"
 
 // Mono family for code, CLI hints, and the hero mockup. Self-hosted via
@@ -71,7 +72,9 @@ export default function RootLayout({
       <head>
         <script
           suppressHydrationWarning
-          dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }}
+          // The theme, then the TUI / Desktop illustration choice
+          // (lib/client-preference.ts), both applied before first paint.
+          dangerouslySetInnerHTML={{ __html: `${THEME_BOOT_SCRIPT};${CLIENT_BOOT_SCRIPT}` }}
         />
       </head>
       <body className="bg-bg text-fg flex min-h-screen flex-col font-sans">

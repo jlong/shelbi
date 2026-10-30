@@ -1,5 +1,11 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
+/* The TUI / Desktop illustration choice (lib/client-preference.ts): the boot
+   script marks `<html data-client="desktop">` before paint, so these variants
+   swap the client-specific mockups with no flash. TUI is the default (no
+   attribute). */
+@custom-variant client-desktop (&:where([data-client="desktop"], [data-client="desktop"] *));
+@custom-variant client-tui (&:where(:root:not([data-client="desktop"]), :root:not([data-client="desktop"]) *));
 
 /* ============================================================
    Mono symbol supplement (box-drawing, arrows, block/geometry)
@@ -204,6 +210,79 @@
 }
 
 /* ============================================================
+   Desktop mockup palette (light defaults)
+   ============================================================
+   The Desktop variants of the home illustrations draw the native
+   desktop app (desktop/src), so they read its own palette: the Figma
+   `03 Desktop` tokens as `desktop/src/theme/palette.rs` resolves them
+   (see `desktop/docs/theme.md`). Translucent tokens keep their straight
+   alpha, as the app paints them. The `--dt-term-*` values are the
+   desktop terminal's colors (the default foreground composited over the
+   canvas, and the light / dark ANSI slots), which the Claude Code panes
+   in the mockups map the shared `--tui-*` engine colors onto. Kept in
+   sync with the `.dark` block below.
+   ============================================================ */
+:root {
+  --dt-canvas: #FFFFFF; /* surface/background */
+  --dt-sidebar: #F9F9FC; /* the Navigation fill */
+  --dt-card: #FFFFFF; /* surface/depth-0: board cards, text wells */
+  --dt-raised: #F9F9FC; /* the palette and menus */
+  --dt-toolbar: rgba(172, 180, 207, 0.08); /* surface/depth-10: the Issues header band */
+  --dt-fill: rgba(172, 180, 207, 0.12); /* button/default/background */
+  --dt-fill-hover: rgba(172, 180, 207, 0.22);
+  --dt-fill-active: rgba(172, 180, 207, 0.32);
+  --dt-selection: rgba(172, 180, 207, 0.40); /* surface/selection */
+  --dt-search: rgba(172, 180, 207, 0.16); /* surface/depth-30 */
+  --dt-divider: rgba(172, 180, 207, 0.10); /* stroke/light */
+  --dt-divider-strong: rgba(172, 180, 207, 0.20); /* stroke/medium */
+  --dt-input-border: rgba(172, 180, 207, 0.50); /* stroke/dark */
+  --dt-fg: rgba(2, 3, 3, 0.70); /* text/foreground */
+  --dt-loud: #020303; /* text/bold */
+  --dt-muted: rgba(68, 76, 101, 0.50); /* text/muted */
+  --dt-icon: rgba(123, 133, 167, 0.90); /* icon/primary */
+  --dt-button-icon: #7B85A7; /* button/default/icon */
+  --dt-accent: #F21478; /* icon/select */
+  --dt-icon-cyan: #31ADE9;
+  --dt-icon-green: #5AC351;
+  --dt-icon-yellow: #FFCA0D;
+  --dt-icon-purple: #B247E7;
+  --dt-success: #00753D; /* text/green: the Zen pill's label */
+  --dt-zen: rgba(90, 195, 81, 0.12); /* button/success/background */
+  --dt-success-label: #00753D;
+  --dt-danger-fill: rgba(242, 20, 120, 0.12);
+  --dt-danger-label: #B40041;
+  --dt-select-fill: rgba(98, 205, 246, 0.12); /* a set filter chip */
+  --dt-select-label: #1989C4;
+  --dt-link: #1989C4;
+  --dt-warning: #8A5F04; /* text/ansi_yellow: a merge in flight */
+  --dt-check-fill: #F21478; /* checkbox/select/background */
+  --dt-focus-ring: #31ADE9;
+  --dt-focus-glow: rgba(18, 173, 255, 0.20);
+  --dt-badge-bg: #D3D8E4; /* a card's workflow badge */
+  --dt-badge-fg: #2A3142;
+  --dt-shadow: rgba(10, 30, 81, 0.02); /* shadow/raised card's drops */
+  --dt-shadow-ring: rgba(10, 30, 81, 0.03);
+  --dt-ring: rgba(10, 30, 81, 0.03);
+  --dt-scrim: rgba(68, 76, 101, 0.65); /* surface/overlay */
+  --dt-window-edge: rgba(0, 0, 0, 0.16);
+  /* The selected nav row: the canvas, lifted with shadow/raised card in Light
+     (the dark chip is flat). */
+  --dt-chip-shadow: 0 4px 2px var(--dt-shadow), 0 11px 0 -8px var(--dt-shadow),
+    0 3px 0 -1px var(--dt-shadow), 0 0 0 1px var(--dt-shadow-ring);
+
+  --dt-term-fg: #4E4F4F; /* text/foreground over white */
+  --dt-term-dim: #A1A5B2; /* text/muted over white */
+  --dt-term-bold: #020303;
+  --dt-term-box: #F4F5F8;
+  --dt-term-red: #C23B3E;
+  --dt-term-green: #367B16;
+  --dt-term-yellow: #8A5F04;
+  --dt-term-blue: #2563C9;
+  --dt-term-magenta: #A21CAF;
+  --dt-term-cyan: #007A83;
+}
+
+/* ============================================================
    Dark mode — redefine the same tokens
    ============================================================ */
 .dark {
@@ -315,6 +394,60 @@
   --tui-task-box-bg: #292929;
   --tui-workflow-badge-bg: #3F3F3F;
   --tui-workflow-badge-fg: #DCDFE8;
+
+  /* Desktop mockup palette — dark (the app's Dark mode). */
+  --dt-canvas: #1E2330;
+  --dt-sidebar: #2C3140;
+  --dt-card: #020303;
+  --dt-raised: #2C3140;
+  --dt-toolbar: rgba(172, 180, 207, 0.10);
+  --dt-fill: rgba(172, 180, 207, 0.18);
+  --dt-fill-hover: rgba(172, 180, 207, 0.28);
+  --dt-fill-active: rgba(172, 180, 207, 0.40);
+  --dt-selection: rgba(172, 180, 207, 0.55);
+  --dt-search: rgba(172, 180, 207, 0.25);
+  --dt-divider: rgba(172, 180, 207, 0.10);
+  --dt-divider-strong: rgba(172, 180, 207, 0.20);
+  --dt-input-border: rgba(172, 180, 207, 0.30);
+  --dt-fg: rgba(242, 243, 247, 0.85);
+  --dt-loud: #F2F3F7;
+  --dt-muted: rgba(242, 243, 247, 0.55);
+  --dt-icon: rgba(172, 180, 207, 0.90);
+  --dt-button-icon: #ACB4CF;
+  --dt-accent: #62CDF6;
+  --dt-icon-cyan: #62CDF6;
+  --dt-icon-green: #31D924;
+  --dt-icon-yellow: #FFDD64;
+  --dt-icon-purple: #E374FF;
+  --dt-success: #31D924;
+  --dt-zen: rgba(90, 195, 81, 0.18);
+  --dt-success-label: #86D580;
+  --dt-danger-fill: rgba(242, 20, 120, 0.18);
+  --dt-danger-label: #FF66AB;
+  --dt-select-fill: rgba(98, 205, 246, 0.18);
+  --dt-select-label: #B0E6FB;
+  --dt-link: #30C6FF;
+  --dt-warning: #DBC300;
+  --dt-check-fill: #31ADE9;
+  --dt-focus-ring: #62CDF6;
+  --dt-focus-glow: rgba(18, 173, 255, 0.20);
+  --dt-badge-bg: #3A4258;
+  --dt-badge-fg: #DCDFE8;
+  --dt-ring: rgba(172, 180, 207, 0.10);
+  --dt-scrim: rgba(2, 3, 3, 0.35);
+  --dt-window-edge: rgba(0, 0, 0, 0.5);
+  --dt-chip-shadow: none;
+
+  --dt-term-fg: #D2D4D9;
+  --dt-term-dim: #92959D;
+  --dt-term-bold: #F2F3F7;
+  --dt-term-box: #2C3140;
+  --dt-term-red: #E04F52;
+  --dt-term-green: #5ACD25;
+  --dt-term-yellow: #DBC300;
+  --dt-term-blue: #5893D6;
+  --dt-term-magenta: #D259D7;
+  --dt-term-cyan: #00A6B2;
 }
 
 /* ============================================================
@@ -399,4 +532,28 @@ html:not(.dark) pre.shiki span {
   100% {
     opacity: 1;
   }
+}
+
+/* The Desktop "Review flow" vignette (components/desktop/DesktopVignettes.tsx)
+   on the same 2.4s timeline: the Approve / Reject row gives way as the
+   "Merging the PR…" line (reviewMerging) fades in. */
+@keyframes desktopApproveLeave {
+  0%,
+  60% {
+    opacity: 1;
+  }
+  72%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* Desktop mockup terminals (components/desktop/DesktopMockup.tsx): the
+   desktop's 18pt rows are taller than Source Code Pro's glyph box, so each
+   run of cells fills its whole row, keeping a colored row (the dispatched
+   task's box) one continuous fill as a terminal paints it. */
+.dt-terminal pre > span {
+  display: inline-block;
+  height: calc(18 * var(--u));
+  vertical-align: top;
 }

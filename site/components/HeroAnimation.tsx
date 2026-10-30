@@ -1,6 +1,5 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
 import {
   AppMockup,
   type AppState,
@@ -10,6 +9,7 @@ import {
   type Machine,
   type PaletteItem,
 } from "./KanbanMockup"
+import { useAutoplay } from "./useAutoplay"
 
 /**
  * The autoplaying hero: a looping story of using Shelbi end to end, told as a
@@ -56,22 +56,52 @@ import {
 // the backlog behind them. The dispatch beat then assigns the first FOUR across
 // both machines — alpha & bravo on the `hub`, echo & foxtrot on the `devbox` —
 // so the sidebar shows multi-machine orchestration; the last two wait in TO DO.
-type Task = { id: string; title: string; worker?: string }
+// Each task also carries the issue's first paragraph (`summary`), which only
+// the desktop board draws (the TUI's cards are title-only).
+type Task = { id: string; title: string; summary: string; worker?: string }
 
 const TASKS: Task[] = [
-  { id: "metrics-api-endpoint", title: "Metrics API endpoint", worker: "alpha" },
-  { id: "chart-components", title: "Chart components (line + bar)", worker: "echo" },
-  { id: "date-range-filter", title: "Date-range filter", worker: "bravo" },
-  { id: "csv-export", title: "CSV export", worker: "foxtrot" },
-  { id: "dashboard-empty-states", title: "Empty + loading states" },
-  { id: "dashboard-tests", title: "Dashboard tests" },
+  {
+    id: "metrics-api-endpoint",
+    title: "Metrics API endpoint",
+    summary: "Signups, active users, and revenue as big-number tiles, backed by a single GET /api/metrics request.",
+    worker: "alpha",
+  },
+  {
+    id: "chart-components",
+    title: "Chart components (line + bar)",
+    summary: "A line chart for the trend and a bar chart for the plan breakdown, both driven by the shared date range.",
+    worker: "echo",
+  },
+  {
+    id: "date-range-filter",
+    title: "Date-range filter",
+    summary: "One date range drives the whole page. Changing it re-queries once and every tile and chart redraws.",
+    worker: "bravo",
+  },
+  {
+    id: "csv-export",
+    title: "CSV export",
+    summary: "Export the raw numbers behind the dashboard as CSV, scoped to the current filter.",
+    worker: "foxtrot",
+  },
+  {
+    id: "dashboard-empty-states",
+    title: "Empty + loading states",
+    summary: "Skeletons while the metrics load and a friendly empty state, so the page never paints blank.",
+  },
+  {
+    id: "dashboard-tests",
+    title: "Dashboard tests",
+    summary: "Cover the metrics endpoint, the date-range filter, and the CSV export end to end.",
+  },
 ]
 
 /** A backlog/board card for a task; `withWorker` attaches its `@workspace`. */
 function card(t: Task, withWorker = false): Card {
   return withWorker && t.worker
-    ? { title: t.title, id: t.id, workspace: t.worker }
-    : { title: t.title, id: t.id }
+    ? { title: t.title, id: t.id, summary: t.summary, workspace: t.worker }
+    : { title: t.title, id: t.id, summary: t.summary }
 }
 
 // ── Resident backdrop ─────────────────────────────────────────────────
@@ -89,22 +119,34 @@ function card(t: Task, withWorker = false): Card {
 // backlog + 2 residents = 8 cards → 24 rows — still fits without resizing the
 // fixed frame.
 const RESIDENT_DONE: Card[] = [
-  { title: "Migrate to PG 16", id: "t-012" },
-  { title: "Ship dark mode", id: "t-013" },
-  { title: "Wire up OAuth", id: "t-034" },
-  { title: "Add audit logging", id: "t-046" },
-  { title: "Redis cache /profile", id: "t-027" },
-  { title: "Fix flaky CI tests", id: "t-048" },
+  { title: "Migrate to PG 16", id: "t-012", summary: "Upgrade the primary database and its replicas with no downtime." },
+  { title: "Ship dark mode", id: "t-013", summary: "A dark theme across the app that follows the system setting." },
+  { title: "Wire up OAuth", id: "t-034", summary: "Sign in with GitHub and Google alongside email and password." },
+  { title: "Add audit logging", id: "t-046", summary: "Record who changed what in the admin tools, searchable by user." },
+  { title: "Redis cache /profile", id: "t-027", summary: "Cache profile reads in Redis and invalidate them on every write." },
+  { title: "Fix flaky CI tests", id: "t-048", summary: "Stabilize the three integration tests that fail one run in ten." },
 ]
 const RESIDENT_PROGRESS: Card[] = [
-  { title: "Trim vendor bundle", id: "t-022", workspace: "charlie" },
-  { title: "Backfill order index", id: "t-017", workspace: "golf" },
+  {
+    title: "Trim vendor bundle",
+    id: "t-022",
+    summary: "Split the vendor chunk and drop unused locales to cut the first load.",
+    workspace: "charlie",
+  },
+  {
+    title: "Backfill order index",
+    id: "t-017",
+    summary: "Backfill the new orders index in batches without locking the table.",
+    workspace: "golf",
+  },
 ]
 const RESIDENT_BACKLOG: Card[] = [
-  { title: "Rework onboarding UX", id: "t-004" },
-  { title: "Audit OSS licenses", id: "t-005" },
+  { title: "Rework onboarding UX", id: "t-004", summary: "Fewer steps to a first project, with sample data to explore." },
+  { title: "Audit OSS licenses", id: "t-005", summary: "List every dependency's license and flag any that need review." },
 ]
-const RESIDENT_TODO: Card[] = [{ title: "Add API ratelimit", id: "t-007" }]
+const RESIDENT_TODO: Card[] = [
+  { title: "Add API ratelimit", id: "t-007", summary: "Per-key rate limits on the public API, with clear 429 responses." },
+]
 
 // The resident IN PROGRESS workers, always busy in the sidebar so the two
 // machines read as an active system before the dashboard tasks dispatch.
@@ -403,7 +445,7 @@ const DISPATCHED: Partial<AppState> = {
 }
 
 /** The reduced-motion representative frame: the board mid-dispatch. */
-const STATIC_STATE: AppState = { ...BASE, ...DISPATCHED }
+export const HERO_STATIC_STATE: AppState = { ...BASE, ...DISPATCHED }
 
 function buildKeyframes(): Keyframe[] {
   const k: Keyframe[] = []
@@ -577,56 +619,31 @@ function buildKeyframes(): Keyframe[] {
   return k
 }
 
-const KEYFRAMES = buildKeyframes()
+/**
+ * The story's timeline, shared with the Desktop variant
+ * (`desktop/DesktopHeroAnimation.tsx`), which plays the same beats in the
+ * desktop app's chrome.
+ */
+export const HERO_KEYFRAMES = buildKeyframes()
+
+/** How long hero frame `i` holds, for `useAutoplay`. */
+export const heroHold = (i: number) => HERO_KEYFRAMES[i].hold
 
 export function HeroAnimation() {
-  const [index, setIndex] = useState(0)
-  const [visible, setVisible] = useState(true)
-  const [reduced, setReduced] = useState(false)
-  const containerRef = useRef<HTMLDivElement>(null)
-
-  // Respect prefers-reduced-motion: no autoplay, just the static frame.
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)")
-    const update = () => setReduced(mq.matches)
-    update()
-    mq.addEventListener("change", update)
-    return () => mq.removeEventListener("change", update)
-  }, [])
-
-  // Pause the loop while the hero is scrolled off-screen to save CPU.
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    const obs = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), {
-      threshold: 0.15,
-    })
-    obs.observe(el)
-    return () => obs.disconnect()
-  }, [])
-
-  // Advance the timeline: schedule the next frame after the current hold, and
-  // wrap forever. Re-runs on visibility/reduced changes so pausing (cleanup
-  // clears the pending timer) and resuming both fall out naturally.
-  useEffect(() => {
-    if (reduced || !visible) return
-    const t = window.setTimeout(() => {
-      setIndex((i) => (i + 1) % KEYFRAMES.length)
-    }, KEYFRAMES[index].hold)
-    return () => window.clearTimeout(t)
-  }, [index, visible, reduced])
+  // Autoplay with the reduced-motion and off-screen pauses (`useAutoplay`).
+  const { index, reduced, ref } = useAutoplay(HERO_KEYFRAMES.length, heroHold)
 
   if (reduced) {
     return (
-      <div ref={containerRef}>
-        <AppMockup state={STATIC_STATE} />
+      <div ref={ref}>
+        <AppMockup state={HERO_STATIC_STATE} />
       </div>
     )
   }
 
-  const kf = KEYFRAMES[index]
+  const kf = HERO_KEYFRAMES[index]
   return (
-    <div ref={containerRef}>
+    <div ref={ref}>
       <AppMockup state={kf.state} contentOpacity={kf.opacity} />
     </div>
   )
