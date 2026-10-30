@@ -97,6 +97,8 @@ const PROJECT_BLOCK_H: f32 = 48.0;
 /// The menu's gap below the trigger (the `Project switcher` component's
 /// `4`).
 pub const MENU_GAP: f32 = 4.0;
+/// The menu's inset from the sidebar's left and right edges.
+pub const MENU_INSET: f32 = 12.0;
 
 /// The footer toolbar's and the titlebar's square buttons.
 const TOOLBAR_BUTTON: f32 = 32.0;
@@ -965,10 +967,10 @@ pub fn switcher_trigger<H: SidebarHost>(
     }))
 }
 
-/// The switcher's menu floating `top` below its block's top, 8px in and
-/// as wide as a column `width` wide allows (the component's 236pt in the
-/// 252pt column): drawn after everything (`deferred`), so nothing below it
-/// moves and nothing paints over it.
+/// The switcher's menu floating `top` below its block's top, [`MENU_INSET`]
+/// in from both edges of a column `width` wide (228pt in the 252pt column),
+/// however long a project's name (it truncates): drawn after everything
+/// (`deferred`), so nothing below it moves and nothing paints over it.
 pub fn switcher_menu<H: SidebarHost>(
     switcher: &SwitcherProps<'_>,
     button: &Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -981,8 +983,8 @@ pub fn switcher_menu<H: SidebarHost>(
         div()
             .absolute()
             .top(px(top + (1.0 - switcher.phase) * motion::SLIDE_PX))
-            .left(px(8.0))
-            .min_w(px((width - 16.0).max(0.0)))
+            .left(px(MENU_INSET))
+            .w(px((width - 2.0 * MENU_INSET).max(0.0)))
             .opacity(switcher.phase)
             .child(render_switcher(switcher, button.clone(), theme, cx)),
     )
