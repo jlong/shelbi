@@ -6548,8 +6548,11 @@ fn sync_worktree(
         return Ok(());
     }
 
-    // Already exists — make sure it's clean and on the right branch.
-    require_clean_worktree(host, &wt_str)?;
+    // Already exists — make sure it's clean and on the right branch. Judge
+    // untracked entries by the ignore rules of the tree being checked out
+    // (and the default branch's), not just the branch the worktree is on.
+    let target = cut_base.as_deref().unwrap_or(branch);
+    require_clean_worktree(host, &wt_str, &[target, default_branch])?;
 
     let current = shelbi_ssh::run_capture(
         host,
@@ -6643,10 +6646,31 @@ fn prune_and_heal_worktree_dir(host: &Host, repo: &str, wt_str: &str) -> Result<
 /// the first dispatch, and an idle worktree whose only untracked entry is our
 /// own scratch would be wrongly rejected as "uncommitted user work". Mirrors
 /// `rebase_workspace_branch_onto_default`.
-fn require_clean_worktree(host: &Host, wt_str: &str) -> Result<()> {
+///
+/// `ignore_refs` are the refs whose ignore rules also apply to untracked
+/// entries: the ref the worktree is about to check out and the project's
+/// default branch. A worktree that last ran a task on a branch without a
+/// `.gitignore` (the orphan `docs/planning` branch) still holds build output
+/// from earlier tasks (`target/`, `site/node_modules/`). Its own branch
+/// doesn't ignore those, so `git status` lists them as `??`, but the branch
+/// we're switching to does, and git treats ignored files as expendable on
+/// checkout. Those entries are not user work. Tracked edits, and untracked
+/// files no listed ref ignores, still block. Nothing is deleted either way.
+fn require_clean_worktree(host: &Host, wt_str: &str, ignore_refs: &[&str]) -> Result<()> {
     let dirty =
         shelbi_ssh::run_capture(host, ["git", "-C", wt_str, "status", "--porcelain", "-z"])?;
-    let user_dirty = user_dirty_porcelain_lines(&dirty);
+    let mut user_dirty: Vec<String> = user_dirty_porcelain_lines(&dirty)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if user_dirty.iter().any(|r| r.starts_with("?? ")) && !ignore_refs.is_empty() {
+        let excludes = ref_exclude_patterns(host, wt_str, ignore_refs);
+        if !excludes.is_empty() {
+            let untracked = untracked_not_ignored(host, wt_str, &excludes)?;
+            user_dirty.retain(|r| !r.starts_with("?? "));
+            user_dirty.extend(untracked.into_iter().map(|p| format!("?? {p}")));
+        }
+    }
     if !user_dirty.is_empty() {
         return Err(Error::Other(format!(
             "workspace worktree at {wt_str} has uncommitted changes — \
@@ -6655,6 +6679,108 @@ fn require_clean_worktree(host: &Host, wt_str: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Every `.gitignore` committed on each of `refs`, rewritten as root-relative
+/// patterns for `git ls-files --exclude` (see [`root_relative_ignore_patterns`]).
+/// Best-effort: a ref that doesn't resolve contributes nothing, which leaves
+/// the caller's check as strict as it was without it.
+fn ref_exclude_patterns(host: &Host, wt_str: &str, refs: &[&str]) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for (i, r) in refs.iter().enumerate() {
+        if refs[..i].contains(r) {
+            continue;
+        }
+        let Ok(tree) = shelbi_ssh::run_capture(
+            host,
+            ["git", "-C", wt_str, "ls-tree", "-r", "--name-only", "-z", r],
+        ) else {
+            continue;
+        };
+        let mut files: Vec<&str> = tree
+            .split('\0')
+            .filter(|p| *p == ".gitignore" || p.ends_with("/.gitignore"))
+            .collect();
+        // Shallower files first: git lets a deeper `.gitignore` override a
+        // shallower one, and among `--exclude` patterns the last match wins.
+        files.sort_by_key(|p| p.matches('/').count());
+        for file in files {
+            let Ok(body) =
+                shelbi_ssh::run_capture(host, ["git", "-C", wt_str, "show", &format!("{r}:{file}")])
+            else {
+                continue;
+            };
+            let dir = file.strip_suffix(".gitignore").unwrap_or("");
+            patterns.extend(root_relative_ignore_patterns(dir, &body));
+        }
+    }
+    patterns
+}
+
+/// Rewrite the body of the `.gitignore` in `dir` (`""` for the root, else
+/// `"site/"`) as patterns relative to the repo root, with gitignore(5)
+/// semantics intact: a pattern with a leading or middle `/` is anchored to
+/// `dir`; one without matches at any depth below it (`dir/**/<pattern>`).
+/// Negation and a trailing `/` (directories only) carry over.
+fn root_relative_ignore_patterns(dir: &str, body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // Trailing spaces are ignored unless escaped with a backslash, which
+        // keeps the one space it escapes.
+        let trimmed = line.trim_end_matches(' ');
+        let line = if trimmed.ends_with('\\') && trimmed.len() < line.len() {
+            &line[..trimmed.len() + 1]
+        } else {
+            trimmed
+        };
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if dir.is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let (neg, pat) = match line.strip_prefix('!') {
+            Some(rest) => ("!", rest),
+            None => ("", line),
+        };
+        let anchored = pat.trim_end_matches('/').contains('/');
+        let rewritten = if anchored {
+            format!("{neg}{dir}{}", pat.strip_prefix('/').unwrap_or(pat))
+        } else {
+            format!("{neg}{dir}**/{pat}")
+        };
+        out.push(rewritten);
+    }
+    out
+}
+
+/// Untracked entries in the worktree that neither its own ignore rules nor
+/// `excludes` ignore, collapsed to the directory the way `git status` shows
+/// them, minus shelbi's own scratch paths.
+fn untracked_not_ignored(host: &Host, wt_str: &str, excludes: &[String]) -> Result<Vec<String>> {
+    let mut argv: Vec<String> = [
+        "git",
+        "-C",
+        wt_str,
+        "ls-files",
+        "--others",
+        "--directory",
+        "--no-empty-directory",
+        "--exclude-standard",
+        "-z",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    argv.extend(excludes.iter().map(|p| format!("--exclude={p}")));
+    let out = shelbi_ssh::run_capture(host, &argv)?;
+    Ok(out
+        .split('\0')
+        .filter(|p| !p.is_empty() && !is_shelbi_scratch_path(p))
+        .map(str::to_string)
+        .collect())
 }
 
 /// The review-slot counterpart of [`sync_worktree`]: put the worktree on the
@@ -6689,11 +6815,11 @@ fn sync_review_worktree(
     let wt_str = worktree.to_string_lossy().into_owned();
 
     let worktree_exists = prune_and_heal_worktree_dir(host, &repo, &wt_str)?;
+    let target = resolve_review_checkout_target(host, &repo, branch, default_branch)?;
     if worktree_exists {
-        require_clean_worktree(host, &wt_str)?;
+        require_clean_worktree(host, &wt_str, &[&target, default_branch])?;
     }
 
-    let target = resolve_review_checkout_target(host, &repo, branch, default_branch)?;
     let sha = shelbi_ssh::run_capture(
         host,
         ["git", "-C", &repo, "rev-parse", "--verify", &format!("{target}^{{commit}}")],
@@ -13962,6 +14088,171 @@ mod sync_worktree_git_tests {
             "worktree must stay on its branch when the release refuses"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A workspace that ran main-based tasks (leaving gitignored build output
+    /// behind), then a task on an orphan branch with no `.gitignore`. Returns
+    /// the repo and the worktree, which sits on the orphan task branch with
+    /// that build output showing as untracked.
+    fn worktree_left_on_orphan_branch(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let repo = init_repo(label);
+        std::fs::create_dir_all(repo.join("site")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(
+            repo.join("site/.gitignore"),
+            "# deps\n/node_modules\nnext-env.d.ts\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("site/page.tsx"), "export {}\n").unwrap();
+        assert!(run_git_in(&repo, &["add", "."]).status.success());
+        assert!(run_git_in(&repo, &["commit", "-q", "-m", "ignores"])
+            .status
+            .success());
+
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        // Build output from the main-based task, ignored on main.
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/shelbi"), "bin\n").unwrap();
+        std::fs::create_dir_all(wt.join("site/node_modules/next")).unwrap();
+        std::fs::write(wt.join("site/node_modules/next/index.js"), "\n").unwrap();
+        std::fs::write(wt.join("site/next-env.d.ts"), "\n").unwrap();
+
+        // The next task runs on an orphan branch (like `docs/planning`): no
+        // tracked files from main and no `.gitignore`.
+        assert!(run_git_in(&wt, &["checkout", "-q", "--orphan", "shelbi/docs"])
+            .status
+            .success());
+        assert!(run_git_in(&wt, &["rm", "-rfq", "."]).status.success());
+        std::fs::write(wt.join("notes.md"), "# notes\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "notes.md"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "docs"])
+            .status
+            .success());
+        let status = run_git_in(&wt, &["status", "--porcelain"]);
+        let status = String::from_utf8_lossy(&status.stdout).into_owned();
+        assert!(
+            status.contains("?? site/") && status.contains("?? target/"),
+            "precondition: build output reads as untracked on the orphan branch, got: {status}"
+        );
+        (repo, wt)
+    }
+
+    #[test]
+    fn orphan_branch_build_output_ignored_on_target_does_not_block() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, wt) = worktree_left_on_orphan_branch("orphan-ignored");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+
+        // A fresh main-based task cuts off main, which ignores all of it.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/y", "main")
+            .expect("build output the target branch ignores must not block dispatch");
+        assert_eq!(head_of(&wt), "shelbi/y");
+        // Nothing was deleted: the build output is still there, now ignored.
+        assert!(wt.join("target/debug/shelbi").exists());
+        assert!(wt.join("site/node_modules/next/index.js").exists());
+        assert!(wt.join("site/next-env.d.ts").exists());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn orphan_branch_existing_target_branch_uses_its_ignores() {
+        // Re-dispatching an existing main-based branch (no cut) judges the
+        // leftovers by that branch's `.gitignore` files.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, wt) = worktree_left_on_orphan_branch("orphan-existing");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main")
+            .expect("ignored build output must not block switching to an existing branch");
+        assert_eq!(head_of(&wt), "shelbi/x");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn orphan_branch_genuine_untracked_work_still_blocks() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, wt) = worktree_left_on_orphan_branch("orphan-userwork");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+
+        // Untracked files main doesn't ignore, one at the root and one in a
+        // directory that also holds ignored build output.
+        std::fs::write(wt.join("draft.md"), "real work\n").unwrap();
+        std::fs::write(wt.join("site/todo.txt"), "real work\n").unwrap();
+
+        let msg = sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/y", "main")
+            .expect_err("untracked files the target doesn't ignore must still block")
+            .to_string();
+        assert!(
+            msg.contains("has uncommitted changes — commit, stash, or discard before assigning a new task"),
+            "same refusal message, got: {msg}"
+        );
+        assert!(msg.contains("?? draft.md"), "names the untracked file, got: {msg}");
+        // `site/` is wholly untracked on the orphan branch, so it collapses
+        // to the directory, exactly as `git status` lists it.
+        assert!(msg.contains("?? site/"), "names the untracked dir, got: {msg}");
+        assert!(
+            !msg.contains("target/") && !msg.contains("node_modules"),
+            "ignored build output isn't listed as user work, got: {msg}"
+        );
+        assert_eq!(head_of(&wt), "shelbi/docs", "a refused sync leaves the worktree alone");
+        assert!(wt.join("draft.md").exists());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn orphan_branch_tracked_edit_still_blocks() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, wt) = worktree_left_on_orphan_branch("orphan-tracked");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+
+        std::fs::write(wt.join("notes.md"), "# notes\nedit\n").unwrap();
+
+        let msg = sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/y", "main")
+            .expect_err("a tracked edit must still block")
+            .to_string();
+        assert!(msg.contains("notes.md"), "names the edited file, got: {msg}");
+        assert_eq!(head_of(&wt), "shelbi/docs");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn root_relative_ignore_patterns_keep_gitignore_semantics() {
+        let body = "# comment\n\ntarget/\n/out\nlogs/*.log\n!keep.log\nescaped\\ \r\ntrail  \n";
+        assert_eq!(
+            root_relative_ignore_patterns("", body),
+            vec!["target/", "/out", "logs/*.log", "!keep.log", "escaped\\ ", "trail"],
+        );
+        assert_eq!(
+            root_relative_ignore_patterns("site/", body),
+            vec![
+                "site/**/target/",
+                "site/out",
+                "site/logs/*.log",
+                "!site/**/keep.log",
+                "site/**/escaped\\ ",
+                "site/**/trail",
+            ],
+        );
     }
 
     #[test]
