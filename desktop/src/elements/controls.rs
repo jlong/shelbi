@@ -38,6 +38,8 @@
 //!   edge and the raised drops; the focus ring and glow around the thumb
 //!   while it has the keyboard. ← / → step it, ⇧← / ⇧→ step it further,
 //!   Home / End go to the ends; a click or a drag on the track sets it.
+//!   The rail spans the control (its ends line up with the label and the
+//!   helper), so at either end the thumb overhangs it by half a thumb.
 //!
 //! [`motion::SlideTrack`]: crate::theme::motion::SlideTrack
 
@@ -497,7 +499,8 @@ pub struct Slider {
     unit: &'static str,
     disabled: bool,
     focus: FocusHandle,
-    /// The track's bounds as last painted (where a click or drag lands).
+    /// The track's bounds as last painted (where a click or drag lands):
+    /// the rail's, which the thumb's center travels end to end.
     track: Rc<Cell<Option<Bounds<Pixels>>>>,
     dragging: bool,
 }
@@ -599,9 +602,7 @@ impl Slider {
     /// The value under window `x` on the track as last painted.
     fn value_at(&self, x: Pixels) -> Option<i32> {
         let b = self.track.get()?;
-        let left = b.left().as_f32() + THUMB / 2.0;
-        let right = b.right().as_f32() - THUMB / 2.0;
-        Some(slider_value_at(x.as_f32(), left, right, &self.range))
+        Some(slider_value_at(x.as_f32(), b.left().as_f32(), b.right().as_f32(), &self.range))
     }
 
     fn press(&mut self, x: Pixels, window: &mut Window, cx: &mut Context<Self>) {
@@ -677,24 +678,30 @@ impl Render for Slider {
             .border_1()
             .border_color(theme.input_border)
             .shadow(shadows)
+            .when(!self.disabled, |d| d.cursor_pointer())
+            // At either end half the thumb hangs past the track, outside
+            // its hitbox: the thumb takes its own presses.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    this.press(e.position.x, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.release(cx)))
             .child(fill_layer(
                 div().id(thumb_id.clone()).debug_selector(move || thumb_id.to_string()).size_full().rounded_full(),
                 format!("{}-thumb", self.id),
                 px(THUMB / 2.0),
                 [theme.background, theme.background_hover, theme.background_active],
             ));
-        let rail = |d: Div| d.absolute().top(px((SLIDER_H - RAIL_H) / 2.0)).h(px(RAIL_H)).rounded(px(RAIL_H / 2.0));
-        // The thumb's center travels the track inset by half a thumb at
-        // each end, so it never overhangs the control.
-        let travel = div()
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left(px(THUMB / 2.0))
-            .right(px(THUMB / 2.0))
-            .child(rail(div()).left_0().right_0().bg(theme.search))
-            .child(rail(div()).left_0().w(relative(fraction)).bg(theme.check_fill))
-            .child(div().absolute().top_0().left(relative(fraction)).child(thumb));
+        let rail =
+            |d: Div| d.absolute().top(px((SLIDER_H - RAIL_H) / 2.0)).left_0().h(px(RAIL_H)).rounded(px(RAIL_H / 2.0));
+        // The rail spans the track, its ends on the label's and helper's
+        // edges, and the thumb's center travels it end to end: at either
+        // end the thumb (with its ring and glow) overhangs the control by
+        // half a thumb, into the page's padding or the readout's gap.
+        let thumb = div().absolute().top_0().left(relative(fraction)).child(thumb);
         let selector = self.id.clone();
         let track = div()
             .id(self.id.clone())
@@ -705,7 +712,9 @@ impl Render for Slider {
             .h(px(SLIDER_H))
             .when(!self.disabled, |d| d.cursor_pointer())
             .child(probe)
-            .child(travel)
+            .child(rail(div()).right_0().bg(theme.search))
+            .child(rail(div()).w(relative(fraction)).bg(theme.check_fill))
+            .child(thumb)
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
                 if this.key(e.keystroke.key.as_str(), e.keystroke.modifiers.shift, cx) {
                     cx.stop_propagation();
