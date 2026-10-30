@@ -34,7 +34,7 @@ use shelbi_app::launch::{self, RemoteSession};
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
 use super::launch::card;
-use super::workflow_editor::text_field;
+use super::workflow_editor::dialog_text_field;
 use crate::assets::{heroicon, icons};
 use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
@@ -345,7 +345,7 @@ fn action(id: &'static str, label: &'static str, enabled: bool, busy: bool, them
 impl ConnectDialog {
     fn render_host(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let flow = &self.flow;
-        let field = text_field(&self.host_input, "connect-host", None, flow.error().is_some(), window, cx).w_full();
+        let field = dialog_text_field(&self.host_input, "connect-host", None, flow.error().is_some(), window, cx).w_full();
         let details = div()
             .flex()
             .flex_col()
@@ -504,7 +504,8 @@ impl ConnectDialog {
 
 impl Render for ConnectDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = *cx.global::<Theme>();
+        // A dialog: opaque over a translucent window, its fields too.
+        let theme = cx.global::<Theme>().opaque();
         let (content, min_h) = match self.flow.stage() {
             Stage::Host => (self.render_host(&theme, window, cx), HOST_H),
             Stage::Choose => (self.render_choose(&theme, cx), CHOOSE_H),

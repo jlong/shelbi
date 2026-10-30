@@ -1639,7 +1639,8 @@ fn render_zen_pill<H: SidebarHost>(
         .py_1()
         .rounded(px(ZEN_PILL_RADIUS))
         .overflow_hidden()
-        .bg(theme.canvas)
+        // The canvas on the sidebar, as the selected nav row's chip.
+        .bg(theme.nav_selected)
         .cursor_pointer();
     let fills = if on {
         [theme.zen, theme.success_fill_hover, theme.success_fill_active]

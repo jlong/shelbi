@@ -193,6 +193,7 @@ impl Check {
         self.alt_screen();
         self.taller_session();
         self.resize();
+        self.translucent_blend();
         self.timing();
     }
 
@@ -1347,6 +1348,51 @@ impl Check {
         self.with_pane(|pane, _, cx| pane.session_resized(want, cx))
             .unwrap();
         self.save("resize-after-echo.png");
+    }
+
+    /// A fill over a translucent window's glass composites with "over",
+    /// alpha included (`platform::metal_blend`): an 18% tint over 85% glass
+    /// leaves 0.18 + 0.85 x 0.82 = 87.7% alpha, so the desktop (and its
+    /// window-server blur) still shows through it. Without the fix gpui
+    /// adds the alphas and the tint reads as solid (alpha 1).
+    fn translucent_blend(&mut self) {
+        struct Glass;
+        impl Render for Glass {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let glass = gpui::hsla(0.6, 0.2, 0.15, 0.85);
+                let tint = gpui::hsla(0.6, 0.2, 0.75, 0.18);
+                div()
+                    .size_full()
+                    .flex()
+                    .bg(glass)
+                    .child(div().w_1_2().h_full())
+                    .child(div().w_1_2().h_full().bg(tint).child(div().size_full().bg(tint)))
+            }
+        }
+        let handle = self
+            .cx
+            .open_offscreen_window(size(px(200.0), px(100.0)), |window, cx| {
+                window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
+                cx.new(|_| Glass)
+            })
+            .expect("open the glass window");
+        let window: AnyWindowHandle = handle.into();
+        self.cx.run_until_parked();
+        let image = self.cx.capture_screenshot(window).expect("render to image");
+        let (w, h) = (image.width(), image.height());
+        let alpha = |x: u32| image.get_pixel(x, h / 2).0[3];
+        let (glass, tint) = (alpha(w / 4), alpha(w * 3 / 4));
+        let near = |got: u8, want: f32| (f32::from(got) - want * 255.0).abs() <= 2.0;
+        self.expect("blend: the glass keeps the window's opacity", near(glass, 0.85), format!("alpha {glass}"));
+        // Two 18% coats over 85% glass: 1 - 0.15 x 0.82 x 0.82.
+        let want = 1.0 - 0.15 * 0.82 * 0.82;
+        self.expect(
+            "blend: tints over the glass composite their alpha with \"over\"",
+            near(tint, want),
+            format!("alpha {tint}, want {:.0} (255 = gpui's additive alpha, solid)", want * 255.0),
+        );
+        let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        self.cx.run_until_parked();
     }
 
     fn timing(&mut self) {

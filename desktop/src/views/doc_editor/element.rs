@@ -67,7 +67,7 @@ impl Element for DocElement {
         let doc = e.model.doc().clone();
         let field = e.field;
         let marked = e.model.marked();
-        let theme = cx.global::<Theme>().opaque();
+        let theme = e.theme(cx);
         let shared: Shared = Rc::new(RefCell::new(None));
         let out = shared.clone();
         let mut style = Style::default();
@@ -134,8 +134,8 @@ impl Element for DocElement {
         let Some(l) = shared.borrow().clone() else {
             return;
         };
-        let theme = cx.global::<Theme>().opaque();
         let editor = self.editor.read(cx);
+        let theme = editor.theme(cx);
         let focused = editor.focus.is_focused(window);
         let doc = editor.model.doc().clone();
         let sel = editor.model.selection();

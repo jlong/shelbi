@@ -13,7 +13,8 @@
 //! `--print-version` ([`print_version`]) is bootstrap's headless check, and
 //! [`update`] the once-a-day new-release check. [`font_smoothing`] turns
 //! macOS stem thickening off for the app at launch, so text draws at the
-//! frames' weight. Native menus and system
+//! frames' weight, and [`metal_blend`] corrects gpui's Metal alpha blending
+//! so a translucent window's fills tint the glass. Native menus and system
 //! notifications (`dt-menus-notifications`) are platform concerns too, but
 //! live where that subtask puts them; the app bundle is `scripts/bundle.sh`.
 
@@ -29,6 +30,7 @@ pub mod feedback;
 pub mod font_smoothing;
 pub mod install;
 pub mod launch;
+pub mod metal_blend;
 pub mod motion;
 pub mod open_panel;
 pub mod print_version;

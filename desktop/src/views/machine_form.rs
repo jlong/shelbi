@@ -50,7 +50,7 @@ use shelbi_orchestrator::pool_admin::{self, MachineChange, PoolError};
 use super::machine_form_state::{
     Action, Check, Field, Focus, MachineForm, ReadinessRequest, SaveRequest, Tone,
 };
-use super::workflow_editor::{footnote, text_field};
+use super::workflow_editor::{dialog_text_field, footnote};
 use crate::assets::{heroicon, icons};
 use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
@@ -511,11 +511,11 @@ fn helper_or_error(selector: &'static str, help: Option<&'static str>, error: Op
 
 impl MachineFormView {
     fn field(&self, field: Field, selector: &'static str, window: &Window, cx: &App) -> Div {
-        text_field(self.input(field), selector, None, self.state.field_error(field).is_some(), window, cx)
+        dialog_text_field(self.input(field), selector, None, self.state.field_error(field).is_some(), window, cx)
     }
 
     fn button(&self, id: &'static str, label: &'static str, focus: Focus, kind: ButtonKind, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.global::<Theme>();
+        let theme = &cx.global::<Theme>().opaque();
         let focused = self.keyboard && self.state.focus() == focus;
         style::button(id, label, kind, ButtonSize::Small, focused, theme)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.click(focus, window, cx)))
@@ -524,7 +524,7 @@ impl MachineFormView {
     /// The connection check region: what's known for the draft's host and
     /// directory, and its buttons.
     fn render_check(&self, cx: &mut Context<Self>) -> Div {
-        let theme = *cx.global::<Theme>();
+        let theme = cx.global::<Theme>().opaque();
         let panel = self.state.panel();
         let warning = |color| {
             heroicon(icons::EXCLAMATION_TRIANGLE)
@@ -597,7 +597,8 @@ impl MachineFormView {
 
 impl Render for MachineFormView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = *cx.global::<Theme>();
+        // A dialog: opaque over a translucent window, its fields too.
+        let theme = cx.global::<Theme>().opaque();
         let remote = self.state.remote();
         let heading = div()
             .flex()

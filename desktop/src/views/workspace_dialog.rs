@@ -35,7 +35,7 @@ use gpui::{
 use gpui_kit::component::input::{InputEvent, InputState};
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
-use super::workflow_editor::{readonly_field, text_field};
+use super::workflow_editor::{dialog_text_field, readonly_field};
 use shelbi_app::settings::workspace_form::{
     Action, ConfirmFocus, Focus, Job, Key, MachineChoice, Outcome, PoolService, RemoveConfirm, WorkspaceForm,
     SLOT_HELP, TAGS_HELP,
@@ -526,7 +526,7 @@ impl WorkspaceDialog {
         let name = field(
             "workspace-dialog-name",
             "Name",
-            text_field(&self.name_input, "workspace-dialog-name-input", None, errors.name.is_some(), window, cx),
+            dialog_text_field(&self.name_input, "workspace-dialog-name-input", None, errors.name.is_some(), window, cx),
             Vec::new(),
             errors.name.as_deref(),
             theme,
@@ -544,7 +544,7 @@ impl WorkspaceDialog {
         let tags = field(
             "workspace-dialog-tags",
             "Tags",
-            text_field(
+            dialog_text_field(
                 &self.tags_input,
                 "workspace-dialog-tags-input",
                 Some("Optional tags".into()),
@@ -564,7 +564,7 @@ impl WorkspaceDialog {
             div()
                 .w_full()
                 .opacity(0.5)
-                .child(readonly_field(&self.location_input, "workspace-dialog-location-input", window, cx)),
+                .child(readonly_field(&self.location_input, "workspace-dialog-location-input", &cx.global::<Theme>().opaque(), window, cx)),
             vec![form.location_help()],
             None,
             theme,
@@ -572,7 +572,7 @@ impl WorkspaceDialog {
         let slot = field(
             "workspace-dialog-slot",
             "Slot (optional)",
-            text_field(
+            dialog_text_field(
                 &self.slot_input,
                 "workspace-dialog-slot-input",
                 Some(form.slot_placeholder().into()),
@@ -768,7 +768,8 @@ fn scrim(id: &'static str, inset: f32, panel: impl IntoElement, theme: &Theme) -
 
 impl Render for WorkspaceDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = *cx.global::<Theme>();
+        // A dialog: opaque over a translucent window, its fields too.
+        let theme = cx.global::<Theme>().opaque();
         let root = div()
             .id("workspace-dialog-layer")
             .track_focus(&self.focus)
