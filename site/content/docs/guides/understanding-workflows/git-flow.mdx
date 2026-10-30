@@ -13,9 +13,10 @@ explicit staging branch where work accumulates before a release.
 Git-flow doesn't fit one board, because a feature and a release are
 different lifecycles. Model it as **two Shelbi Workflows**: a `feature`
 workflow whose issues branch off and merge back into `develop`, and a
-`release` workflow whose issue PRs `develop` into `main`. Hotfixes reuse
-the [feature-branch](/docs/guides/understanding-workflows/feature-branch) default with `main` as
-their base.
+`release` workflow that tracks the PR from `develop` into `main`. Hotfixes
+reuse the shipped `task` workflow (the
+[feature-branch](/docs/guides/understanding-workflows/feature-branch) model) with `main`
+as their base.
 
 ## The board
 
@@ -24,6 +25,9 @@ their base.
     terminalTitle: "you@hub — platform",
     project: "platform",
     activeView: "tasks",
+    workflow: "feature",
+    workflowFilter: "feature",
+    zenMode: false,
     columns: [
       {
         label: "BACKLOG",
@@ -44,16 +48,17 @@ their base.
         label: "IN PROGRESS",
         category: "yellow",
         cards: [
-          { title: "Build billing portal", id: "t-084", workspace: "bravo", selected: true },
+          { title: "Build billing portal", id: "t-084", branch: "feature/t-084", workspace: "bravo", selected: true },
         ],
       },
       {
         label: "REVIEW",
         category: "magenta",
         cards: [
-          { title: "Rework audit log schema", id: "t-085", workspace: "charlie" },
+          { title: "Rework audit log schema", id: "t-085", branch: "feature/t-085", workspace: "review-0" },
         ],
       },
+      { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
       {
         label: "ON DEVELOP",
         category: "green",
@@ -68,7 +73,7 @@ their base.
         name: "hub",
         workspaces: [
           { name: "alpha", state: "idle" },
-          { name: "bravo", state: "working", agent: "Developer" },
+          { name: "bravo", state: "working", agent: "developer" },
           { name: "charlie", state: "idle" },
         ],
       },
@@ -76,8 +81,8 @@ their base.
     readyReview: [
       {
         title: "Rework audit log schema",
-        branch: "shelbi/rework-audit-log",
-        location: "hub:3000",
+        branch: "feature/t-085",
+        location: "hub:review-0",
       },
     ],
     queuedReview: [],
@@ -97,7 +102,10 @@ Status identity lives once in the project's
 don't have: `on-develop`, the done-category landing for feature work
 that's merged into `develop` but not yet released. It also adds `staging`
 and `released` for the release workflow below. Declare them (`id` + `name` +
-`category`) in the catalog first, then reference them by `id`:
+`category`) in the catalog first, then reference them by `id`. Keep all six
+shipped statuses: the shipped `task` and `subtask` workflows reference them,
+and if `task` (the project's `default_workflow`) can't load, the whole
+project fails to load.
 
 ```yaml
 # workflows/statuses.yaml — git-flow statuses alongside the defaults.
@@ -107,6 +115,7 @@ statuses:
   - { id: todo,        name: Todo,        category: ready }
   - { id: in-progress, name: In Progress, category: active }
   - { id: review,      name: Review,      category: handoff }
+  - { id: done,        name: Done,        category: done }
   - { id: canceled,    name: Canceled,    category: archived }
   # git-flow additions
   - { id: on-develop,  name: On Develop,  category: done }
@@ -122,14 +131,14 @@ name: feature
 description: Git-flow feature — branch off develop, merge back into develop.
 
 git:
-  base_branch: develop                 # feature/* branches cut off develop
-  merge_strategy: squash
+  base_branch: develop                 # branches are cut off develop
+  branch: 'feature/{{id}}'             # and named feature/<issue-id>
 
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
   - { id: todo,        owner: agent, agent: orchestrator }
   - { id: in-progress, owner: agent, agent: developer }
-  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: review,      owner: user,  agent: review, tags: [review] }
   - { id: on-develop,  owner: user }
   - { id: canceled,    owner: user }
 
@@ -142,7 +151,7 @@ transitions:
 
   - from: review
     to: on-develop
-    actions: [merge, delete_branch]      # squash into develop
+    actions: [merge, delete_branch]      # merge the PR into develop
 
   - from: in-progress
     to: canceled
@@ -150,39 +159,44 @@ transitions:
 ```
 
 Setting `git.base_branch: develop` is the whole trick: branches are cut
-from `develop` and the `open_pr` action targets `develop` because no
-transition overrides it with a [`target:`](/docs/guides/getting-started/workflows#per-transition-target).
+from `develop`, the developer's hand-off rebases onto `develop`, and the
+`open_pr` action targets `develop` because no transition overrides it with
+a [`target:`](/docs/guides/getting-started/workflows#per-transition-target).
+`git.branch` names the branches `feature/<id>`; without it they'd follow
+the project's naming (`<github-login>/<id>` by default).
+
+The merge strategy is not set here. The `merge` action always uses the
+project's `git.merge_strategy` (`squash` by default), and ignores a
+`merge_strategy` in a workflow's `git:` block.
 
 ## The release workflow
 
-A release issue PRs the accumulated `develop` into `main`. Pre-fill its
-`branch:` so the orchestrator operates on `develop`
-[directly instead of cutting a new branch](/docs/guides/getting-started/workflows#the-branch-task-field):
+A release issue tracks the PR that takes the accumulated `develop` into
+`main`. Keep it human-driven. Shelbi only hands work forward
+automatically from the `in-progress` status, and every git action
+(`push_branch`, `open_pr`) runs in the worktree of the workspace the issue
+is assigned to. A developer dispatched onto `develop` would also get
+`develop` rebased onto `main` at hand-off, rewriting the long-lived branch
+you mean to preserve. So the release workflow is plain status moves:
 
 ```yaml
 # workflows/release.yaml — reference-only; identity lives in statuses.yaml
 name: release
-description: Git-flow release — PR develop into main and tag.
+description: Git-flow release — track the develop-to-main release PR.
 
 git:
   base_branch: main
-  merge_strategy: merge                # a true merge preserves develop's history
 
 statuses:
-  - { id: staging,  owner: agent, agent: developer }
-  - { id: review,   owner: user,  agent: orchestrator }
+  - { id: staging,  owner: user }      # you prepare the release and open the PR
+  - { id: review,   owner: user }      # the PR is open; you merge it on GitHub
   - { id: released, owner: user }
 
 initial_status: staging
 
 transitions:
-  - from: staging
-    to: review
-    actions: [push_branch, open_pr]      # open PR: base main, head develop
-
-  - from: review
-    to: released
-    actions: [merge]                     # merge develop into main; keep develop
+  - { from: staging, to: review,   actions: [] }   # pure status moves: no
+  - { from: review,  to: released, actions: [] }   # branch, push, or merge
 ```
 
 ```markdown
@@ -190,32 +204,40 @@ transitions:
 id: release-2025-07
 title: Release 2025.07
 workflow: release
-branch: develop                        # operate on develop as-is; don't cut a branch
 ---
 ```
 
-Note `merge_strategy: merge` (not `squash`) and the absence of
-`delete_branch`: `develop` is long-lived, so the release preserves its
-history and never deletes it.
+When `develop` is ready, open the release PR yourself
+(`gh pr create --base main --head develop`) and move the card to
+**Review**. Merge the PR on GitHub with a merge commit (not a squash), so
+`main` keeps `develop`'s history and `develop` is never deleted, then move
+the card to **Released**. With no `merge` edge, Zen Mode never merges a
+release for you.
+
+If you'd rather have Shelbi merge it, add `actions: [merge]` to the
+`review → released` edge and set `git.merge_strategy: merge` in
+`project.yaml`. That setting is project-wide, so feature merges into
+`develop` become true merges too, and Zen Mode (which only lands squash
+merges) stops merging for the project.
 
 ## Orchestrator adjustments
 
 Two routing rules keep the three lifecycles from colliding. Encode them in
 the orchestrator prompt (see
-[Author a custom workflow](/docs/guides/getting-started/custom-workflow#1-pin-certain-task-shapes-to-specific-workspaces)):
+[Customize the orchestrator prompt](/docs/guides/getting-started/custom-workflow#1-pin-certain-task-shapes-to-specific-workspaces)):
 
 ```markdown
 ## Routing rules — git-flow
 
 - **Features** default to the `feature` workflow (base `develop`). Ordinary
   work goes here; do not route feature work at `main`.
-- **Hotfixes** — titles prefixed `hotfix:` — use the `default` workflow
-  (base `main`) so the fix branches off the released line. After a hotfix
+- **Hotfixes** (titles prefixed `hotfix:`) use the shipped `task`
+  workflow (base `main`) so the fix branches off the released line. After a hotfix
   merges to `main`, open a follow-up issue to merge `main` back into
   `develop` so the branches don't diverge.
-- **Releases** are created by the user on the `release` workflow with
-  `branch: develop` pre-filled. Never auto-promote a release — cutting one
-  is a human decision about what's ready to ship.
+- **Releases** are created by the user on the `release` workflow. Never
+  dispatch or move a release card: cutting one is a human decision about
+  what's ready to ship.
 ```
 
 The develop-back-merge after a hotfix is the one bit of bookkeeping
@@ -227,7 +249,8 @@ follow-up issue rather than trying to encode it as a transition.
 - [Workflows: parameterization](/docs/guides/getting-started/workflows#parameterization)
   — `{{var}}` in `base_branch` if you run several concurrent integration
   branches instead of one `develop`.
-- [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field)
-  — how a release issue operates on `develop` without cutting a new branch.
+- [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field):
+  how branch names are resolved, and how to point an issue at an
+  existing branch.
 - [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the simpler model
   hotfixes fall back to.

@@ -26,7 +26,7 @@ the other three guides are described as deltas from it.
 
 | Model | Shape | Guide |
 | ----- | ----- | ----- |
-| **Trunk-based** | Short-lived branches, merge to `main` fast. Pairs naturally with Zen auto-merge. | [Trunk-based →](/docs/guides/understanding-workflows/trunk-based) |
+| **Trunk-based** | Short-lived branches, merge to `main` fast. No review column: the hub merges as soon as the developer is done. | [Trunk-based →](/docs/guides/understanding-workflows/trunk-based) |
 | **Git-flow** | Long-lived `develop` integration branch with `feature`/`release`/`hotfix` branches. | [Git-flow →](/docs/guides/understanding-workflows/git-flow) |
 | **Feature-branch** (GitHub-flow) | Branch per issue off `main`, PR, merge. The default Shelbi shape. | [Feature-branch →](/docs/guides/understanding-workflows/feature-branch) |
 | **Forking** | Contributions arrive from forks; a review gate stands between them and `main`. | [Forking →](/docs/guides/understanding-workflows/forking) |
@@ -46,7 +46,7 @@ project-wide status catalog. Each workflow file **references** statuses by
 
 - [Workflows](/docs/guides/getting-started/workflows) — the schema every guide is built
   on: statuses, categories, transitions, `target:`, parameterization.
-- [Author a custom Shelbi workflow](/docs/guides/getting-started/custom-workflow)
+- [Customize the orchestrator prompt](/docs/guides/getting-started/custom-workflow)
   — how to edit the orchestrator prompt each model's routing note asks for.
 - [Zen Mode](/docs/concepts/zen-mode) — the action-based confidence bar
   that gates any transition whose actions include `merge`.

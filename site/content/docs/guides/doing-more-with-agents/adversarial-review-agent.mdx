@@ -5,8 +5,8 @@ summary: Scaffold an adversarial-review agent with shelbi agent new, understand 
 ---
 
 An [agent](/docs/concepts/agents) is a directory under your project's
-Shelbi config with, at minimum, an `instructions.md`: its system prompt.
-That's the whole contract. Authoring the Adversarial Review agent means
+Shelbi config with, at minimum, an `instructions.md`: its role prompt.
+That's the whole required contract. Authoring the Adversarial Review agent means
 scaffolding that directory and writing a prompt that makes the agent a
 genuine skeptic.
 
@@ -22,23 +22,32 @@ shelbi agent new adversarial-review
 ```
 
 This creates
-`~/.shelbi/projects/<project>/agents/adversarial-review/` with a starter
+`~/.shelbi/projects/<project>/agents/adversarial-review/` (or
+`<repo>/.shelbi/agents/adversarial-review/` for an
+[in-repo](/docs/concepts/config-modes) project) with a starter
 `instructions.md` and an empty `skills/`. The starter prompt is a minimal
 role template meant to be replaced. See
 [`shelbi agent new`](/docs/cli/agent#new). The name doubles as the
-identifier you'll reference from a workflow's `agent:` field, so it has to
-be lowercase kebab-case (`a-z`, `0-9`, `-`, `_`).
+identifier you'll reference from a workflow's `agent:` field, so it may use
+only letters, digits, `-`, and `_`, and can't start with `.` or `_`.
+Lowercase kebab-case is the convention.
 
 </Step>
 <Step title="Understand what you're editing">
 
-`instructions.md` **is** the agent's system prompt. There's no wrapper or
-config layer. Two other things share the launch-time prompt with it:
+`instructions.md` is the agent's role prompt. At dispatch, Shelbi also
+sends the agent the issue itself plus a completion section (how to hand
+off, or for a gate like this one, the exact pass and reject commands).
+Three other things shape the agent:
 
 - **`agents/_shared/preamble.md`** is prepended to *every* agent in the
-  project. Your repo layout, house style, and the test command already live
-  there, so the rendered prompt the runner sees is the preamble followed by
-  this agent's `instructions.md`.
+  project, so the rendered prompt the runner sees is the preamble followed
+  by this agent's `instructions.md`. The shipped preamble holds only hub
+  safety rules. Put your repo layout, house style, and test command there.
+- **`agent.yaml`** (optional; `shelbi agent new` doesn't create one) sets
+  the agent's description, preferred runner, per-runner model and
+  reasoning effort, and permission mode. You can also edit these in
+  **Settings ▸ Agents**. The shipped agents each have one to copy from.
 - **`skills/`** is an optional directory of agent-scoped skills the runner
   loads when this agent is active. Reach for it if the reviewer needs a
   repeatable procedure (say, a security checklist) rather than just a role.
@@ -124,14 +133,20 @@ finding.
 off. "No issues found" is a conclusion you have to earn, not a default:
 only sign off clean when you have walked every changed hunk and have a
 specific reason each is sound. Say briefly *why* the change holds up (what
-you checked) so the human reviewer can trust the pass, then hand off
-forward the normal way, by writing the review-ready marker.
+you checked) so the human reviewer can trust the pass, then pass it
+forward by writing the transition marker with the next status, `review`:
+
+    mkdir -p .shelbi && printf '%s\n%s\n' "$TASK_ID" review \
+      > .shelbi/shelbi-transition.tmp && mv .shelbi/shelbi-transition.tmp .shelbi/shelbi-transition
+
+Do not write the review-ready marker: it only moves issues out of
+`in-progress`, so here it would be ignored.
 
 **Blocking findings, bounce it back.** If any finding is a `blocker`, the
 change is not ready for a human. Write up your findings, then send the issue
 back to the developer by writing the transition marker:
 
-    printf '%s\n%s\n' "$TASK_ID" bounce \
+    mkdir -p .shelbi && printf '%s\n%s\n' "$TASK_ID" bounce \
       > .shelbi/shelbi-transition.tmp && mv .shelbi/shelbi-transition.tmp .shelbi/shelbi-transition
 
 The first line is your issue id (`$TASK_ID` in your environment); the second
@@ -150,8 +165,8 @@ first and earns its sign-off.
 
 ## How send-back works
 
-A gate agent bounces an issue by writing one file: the **transition marker**
-at `<worktree>/.shelbi/shelbi-transition`. It's the same kind of plain-file
+A gate agent bounces an issue (or passes it forward) by writing one file:
+the **transition marker** at `<worktree>/.shelbi/shelbi-transition`. It's the same kind of plain-file
 signal as the review-ready marker a finishing agent writes. Workspaces have
 no `shelbi` binary, so the agent just writes the file and the hub poller
 acts on it.
@@ -175,9 +190,11 @@ Write it atomically, temp file then `mv`, so the poller never reads a
 half-written marker:
 
 ```sh
-printf '%s\n%s\n' "$TASK_ID" bounce \
+mkdir -p .shelbi && printf '%s\n%s\n' "$TASK_ID" bounce \
   > .shelbi/shelbi-transition.tmp && mv .shelbi/shelbi-transition.tmp .shelbi/shelbi-transition
 ```
+
+Create `.shelbi/` first (`mkdir -p`), since it may not exist yet.
 
 It lives under `.shelbi/` because that directory is Shelbi's gitignored
 deploy footprint, so the marker never dirties the worktree or trips a

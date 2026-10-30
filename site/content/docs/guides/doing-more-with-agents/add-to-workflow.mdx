@@ -26,7 +26,12 @@ statuses:
   - { id: adversarial-review,  name: Adversarial Review,  category: active }
   - { id: review,              name: Review,              category: handoff }
   - { id: done,                name: Done,                category: done }
+  - { id: canceled,            name: Canceled,            category: archived }
 ```
+
+Keep every shipped status in the list. The shipped `task` and `subtask`
+workflows reference all six, and if `task` (the project's
+`default_workflow`) can't load, the whole project fails to load.
 
 `category` comes from the
 [closed vocabulary](/docs/configuration/statuses#categories):
@@ -38,26 +43,31 @@ is. Declaration order here is the left-to-right column order in the TUI.
 
 ## 2. Reference it from the workflow
 
-In the [workflow file](/docs/configuration/workflow), reference the status
-by `id` between `in-progress` and `review`. Make it agent-owned and point
-it at the agent you authored:
+In the [workflow file](/docs/configuration/workflow) (the shipped
+`workflows/task.yaml` in a new project), reference the status by `id`
+between `in-progress` and `review`. Make it agent-owned and point it at the
+agent you authored:
 
 ```yaml
-# workflows/default.yaml
+# workflows/task.yaml
 statuses:
   - { id: backlog,             owner: user,  agent: orchestrator }
   - { id: todo,                owner: agent, agent: orchestrator }
   - { id: in-progress,         owner: agent, agent: developer }
   - { id: adversarial-review,  owner: agent, agent: adversarial-review }
-  - { id: review,              owner: user,  agent: orchestrator }
+  - { id: review,              owner: user,  agent: review, tags: [review] }
   - { id: done,                owner: user }
+  - { id: canceled,            owner: user }
 ```
 
-`owner: agent` makes the status the orchestrator's to act on, so issues
-that land here are [auto-dispatched](/docs/concepts/orchestrator); the
-`agent: adversarial-review` field names *which* agent runs it. No `name:`
-or `category:` appears here. Those live in `statuses.yaml`, and repeating
-them fails the load.
+`owner: agent` on an `active` status that isn't the workflow's main
+`in-progress` makes it a **gate**: the hub daemon auto-dispatches issues
+that land here to the named agent, and adds the gate's pass and reject
+commands to its prompt. The `agent: adversarial-review` field names
+*which* agent runs it. Leave `review` as shipped: `agent: review` with
+`tags: [review]` is what puts a finished branch on a review workspace for
+you. No `name:` or `category:` appears here. Those live in
+`statuses.yaml`, and repeating them fails the load.
 
 ## 3. Rewire the transitions
 
@@ -76,7 +86,9 @@ transitions:
   - { from: in-progress,        to: adversarial-review, actions: [push_branch, open_pr] }
   - { from: adversarial-review, to: review,             actions: [] }
   - { from: adversarial-review, to: in-progress,        actions: [] }
-  - { from: review,             to: done,               actions: [merge, delete_branch] }
+  - { from: review,             to: done,               actions: [push_branch, merge] }
+  - { from: in-progress,        to: canceled,           actions: [close_pr, delete_branch] }
+  - { from: review,             to: canceled,           actions: [close_pr, delete_branch] }
 ```
 
 What each edge does:
@@ -84,18 +96,25 @@ What each edge does:
 - **`in-progress → adversarial-review`** runs `push_branch` and `open_pr`,
   so the branch is on the remote with a PR open before the reviewer starts.
   The reviewer works against a real diff, and its findings have somewhere to
-  land.
+  land. This edge is also what routes the developer's ready marker into
+  the gate: it must be the only edge from `in-progress` into an
+  agent-owned active status. Without it, the ready marker skips the gate
+  and goes straight to `review`.
 - **`adversarial-review → review`** has no actions: the branch is already
   pushed and PR'd, so promoting a clean pass to human review is a pure
-  status change.
+  status change. The reviewer takes it by writing the transition marker
+  with `review`.
 - **`adversarial-review → in-progress`** is the bounce-back. When the
   skeptic files blockers and writes the
   [transition marker](/docs/guides/doing-more-with-agents/adversarial-review-agent#how-send-back-works),
   the issue drops to the developer with no git side-effects: same branch,
   same PR, another pass. This edge is what makes that bounce legal; drop it
   and the poller refuses the reviewer's send-back.
-- **`review → done`** is the only edge carrying `merge` (and
-  `delete_branch`). That's deliberate.
+- **`review → done`** is the only edge carrying `merge`, as in the
+  shipped workflow (push first, then merge; the merged branch is cleaned
+  up separately). That's deliberate.
+- **`→ canceled`** edges are the shipped ones: close the PR and delete the
+  branch.
 
 The [action primitives](/docs/configuration/workflow#actions) in play are
 `push_branch` (push the issue branch to origin), `open_pr` (open its PR),
@@ -124,7 +143,11 @@ PR.
     terminalTitle: "you@hub — webapp",
     project: "webapp",
     activeView: "tasks",
+    workflow: "task",
+    zenMode: false,
+    boardWidth: 135,
     columns: [
+      { label: "BACKLOG", category: "gray", cards: [], collapsed: true },
       {
         label: "TO DO",
         category: "blue",
@@ -160,6 +183,7 @@ PR.
           { title: "Ship dark-mode toggle", id: "t-047" },
         ],
       },
+      { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
     ],
     machines: [
       {
@@ -172,7 +196,9 @@ PR.
       },
     ],
     readyReview: [],
-    queuedReview: [],
+    queuedReview: [
+      { title: "Add CSV export", branch: "you/t-044" },
+    ],
   }}
 />
 
@@ -182,5 +208,5 @@ PR.
   reference for `statuses`, `transitions`, and their actions.
 - [Statuses](/docs/configuration/statuses) — the `statuses.yaml` catalog
   and the closed category vocabulary.
-- [Orchestrator](/docs/concepts/orchestrator) — how agent-owned statuses
-  get auto-dispatched and handed off.
+- [Orchestrator](/docs/concepts/orchestrator): how issues get
+  dispatched and handed off.
