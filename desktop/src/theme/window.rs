@@ -4,10 +4,11 @@
 //! `background-blur`.
 //!
 //! The opacity is a [`Theme`] resolve-time change, not an opacity layer: the
-//! window's surface roles (`canvas`, `sidebar`) take it as their alpha, and
-//! the terminals' default background follows them, while text, icons,
-//! borders, controls and overlays keep their own colors ([`Theme::opaque`]
-//! for an overlay), so content stays as readable as it is opaque. Below
+//! window's surface roles (`canvas`, `sidebar`) take it as their alpha, the
+//! terminals' default background follows them, and the opaque fills on them
+//! become tints of the glass ([`super::glass`]), while text, icons, borders
+//! and overlays keep their own colors ([`Theme::opaque`] for an overlay), so
+//! content stays as readable as it is opaque. Below
 //! 100% the window's background is [`WindowBackgroundAppearance::Transparent`],
 //! and the blur is the window server's own background blur at the chosen
 //! radius ([`crate::platform::blur`]).

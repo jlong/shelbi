@@ -781,7 +781,7 @@ impl WorkflowEditor {
             .rounded(px(6.0))
             .border_1()
             .border_color(theme.divider)
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .cursor_default()
             .child(style::anchor_probe(&self.canvas_anchor))
             .child(frame)

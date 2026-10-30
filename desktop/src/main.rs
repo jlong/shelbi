@@ -178,6 +178,8 @@ fn main() {
     }
     // Before any window (or offscreen render) draws text.
     platform::font_smoothing::apply();
+    // Before any window (or offscreen render) builds its Metal pipelines.
+    platform::metal_blend::install();
     #[cfg(feature = "visual-check")]
     if let Mode::VisualCheck(dir) = mode {
         visual_check::run(visual_check::out_dir(dir));

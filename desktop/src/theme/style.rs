@@ -862,6 +862,14 @@ pub fn focus_shadow(theme: &Theme) -> Vec<BoxShadow> {
     vec![around(theme.focus_ring, 1.0), around(theme.focus_glow, 4.0)]
 }
 
+/// [`focus_shadow`] painted inside a fill that is a tint of the glass (a
+/// board card in a translucent window): a drop shadow is a filled box under
+/// the element, and the ring's would show through the tint, so the ring and
+/// the glow step inside the edge instead.
+pub fn focus_shadow_inset(theme: &Theme) -> Vec<BoxShadow> {
+    focus_shadow(theme).into_iter().map(|s| BoxShadow { inset: true, ..s }).collect()
+}
+
 /// An icon button's square.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconButtonSize {

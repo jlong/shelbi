@@ -143,7 +143,8 @@ pub struct CardGhost {
 
 impl Render for CardGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = *cx.global::<Theme>();
+        // Opaque: it floats over the board with a drop shadow.
+        let theme = cx.global::<Theme>().opaque();
         div()
             .w(px(COLUMN_WIDTH))
             .flex()
@@ -1022,6 +1023,11 @@ impl IssuesView {
         if let Some(e) = &self.pane_editors {
             e.title.update(cx, |t, cx| t.set_from_outside(&title, cx));
             e.body.update(cx, |b, cx| b.set_from_outside(&body, cx));
+            // Over the board the pane is on the glass; over another screen
+            // it is an opaque overlay (`task_detail::render`).
+            let glass = !self.floating;
+            e.title.update(cx, |t, cx| t.set_on_glass(glass, cx));
+            e.body.update(cx, |b, cx| b.set_on_glass(glass, cx));
         }
     }
 
@@ -1858,6 +1864,8 @@ impl IssuesView {
             // the card and would show through its dimmed fill.
             .shadow(if dragged {
                 Vec::new()
+            } else if selected && theme.translucent() {
+                style::focus_shadow_inset(theme)
             } else if selected {
                 style::focus_shadow(theme)
             } else {
@@ -2182,6 +2190,30 @@ impl Render for IssuesView {
                 .into_any_element();
         }
         let board = self.render_board(&theme, cx);
+        // The board's layers, clipped short of the task pane while the window
+        // is translucent so nothing draws under the pane but the glass. The
+        // inner box keeps the full width either way, so nothing reflows.
+        let cover = task_detail::board_cover(self, &theme).unwrap_or(0.0);
+        let content = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .right(px(cover))
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right(px(-cover))
+                    .flex()
+                    .flex_col()
+                    .child(self.render_header(&theme, window, cx))
+                    .child(board)
+                    .child(self.render_footer(&theme)),
+            );
         div()
             .id("issues")
             .track_focus(&self.focus)
@@ -2196,9 +2228,7 @@ impl Render for IssuesView {
             .bg(theme.nested(theme.canvas))
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(self.render_header(&theme, window, cx))
-            .child(board)
-            .child(self.render_footer(&theme))
+            .child(content)
             .children(detail)
             .children(self.render_dropdown(&theme, cx))
             .children(self.render_assign(&theme, cx))
@@ -2345,13 +2375,14 @@ fn card_meta(card: &IssueCard, theme: &Theme) -> impl IntoElement {
 }
 
 /// Figma's Workflow badge: the workflow's name, X-Small, on
-/// `theme.workflow_badge_bg` with 2px corners.
+/// `theme.workflow_badge_bg` with 2px corners. It sits on a card, so on the
+/// glass it is the badge's tint over the card's ([`Theme::fill_on`]).
 fn workflow_badge(name: String, theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
         .px_1()
         .rounded(px(2.0))
-        .bg(theme.workflow_badge)
+        .bg(theme.fill_on(theme.workflow_badge, theme.card))
         .text_color(theme.workflow_badge_text)
         .child(name)
 }

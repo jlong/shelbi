@@ -35,7 +35,7 @@ use gpui_kit::base::input::Textarea;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
-use super::workflow_editor::text_field;
+use super::workflow_editor::dialog_text_field;
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::{controls, spinner};
 use crate::keys::chord_from_keystroke;
@@ -362,9 +362,9 @@ impl FeedbackDialog {
             .gap(px(12.0))
             .child(badge(icons::MEGAPHONE, theme.primary_fill, theme.primary_label))
             .child(title(form::TITLE, theme));
-        let name = text_field(&self.name_input, "feedback-name", Some(form::NAME.into()), false, window, cx);
+        let name = dialog_text_field(&self.name_input, "feedback-name", Some(form::NAME.into()), false, window, cx);
         let email_invalid = form.error() == Some(form::NO_EMAIL);
-        let email = text_field(&self.email_input, "feedback-email", Some(form::EMAIL.into()), email_invalid, window, cx);
+        let email = dialog_text_field(&self.email_input, "feedback-email", Some(form::EMAIL.into()), email_invalid, window, cx);
         let kind = self.render_kinds(theme, window, cx);
         let message_focused = self.message_input.read(cx).focus_handle(cx).is_focused(window);
         let message = controls::textarea_box(
@@ -533,7 +533,8 @@ fn panel(id: &'static str, label: &'static str, theme: &Theme) -> Stateful<Div> 
 
 impl Render for FeedbackDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = *cx.global::<Theme>();
+        // A dialog: opaque over a translucent window, its fields too.
+        let theme = cx.global::<Theme>().opaque();
         self.follow_focus(window, cx);
         let panel = if self.form.sent() {
             self.render_thanks(&theme, window, cx)

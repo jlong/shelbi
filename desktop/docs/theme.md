@@ -235,11 +235,58 @@ the windows see-through. The opacity is applied when the theme resolves
   paints `theme.nested(role)`, the role while opaque (where it still hides
   what slides under it) and nothing while translucent. `well` is the glass
   inside its divider.
-- **Everything else keeps its color**: text, icons, borders, fills,
-  `card`, `raised`, `keycap`, `nav_selected`. Overlays (the dialogs, the
-  task pane, the palette, menus) paint from `theme.opaque()`, as do the
-  fills a drop shadow sits under (the selected segment, the focused back
+- **Opaque fills on a surface become tints of the glass** (`src/theme/glass.rs`,
+  `glass::on_glass` names each role's treatment). For each one the theme
+  solves the tint that, laid over the opaque surface it sits on, paints its
+  solid color exactly (`glass::unblend`: per channel the alpha that reaches
+  it with the tint at 0 or 1, the largest of the three), then scales that
+  alpha by the window opacity. At 100% nothing changes; below it the
+  blurred desktop shows through the fill as it does through the glass.
+
+  | Role | On the glass |
+  |---|---|
+  | `canvas`, `sidebar` | the window opacity as alpha |
+  | `well` | clear (the glass inside its divider) |
+  | `card`, `textbox`, `workflow_badge` | tint over `canvas` |
+  | `nav_selected` (also the Zen pill's chip) | tint over `sidebar` |
+  | `keycap` | itself at the window opacity (it sits on any button's fill) |
+  | every other role | kept |
+
+  Kept: the fills that are already tints (`background*`, `select_fill*`,
+  `selection`, `search`, `toolbar`, `row_selected`, the chip tints, the
+  `primary` / `success` / `danger` fills, `zen`, `notice`, the search and
+  selection highlights), which let the glass through by themselves; text,
+  icons, borders, focus rings and glows, shadows and the scrim, which stay as
+  readable as opaque; and `raised`, the surface menus, popovers and the
+  palette draw on. Contrast resolves first, so a tint is of the adjusted
+  color.
+- **A fill on another fill** is tinted over that fill, not the canvas: the
+  board's workflow badge on a card is `theme.fill_on(theme.workflow_badge,
+  theme.card)`, so the stack paints what the opaque stack does. A textbox's
+  edge is a fill under its well while opaque; on the glass it is a 1px
+  border around the well instead (`controls::edged`), so the edge doesn't
+  show through the tinted well. The board's selected card wears its focus
+  ring inside its edge (`focus_shadow_inset`): a drop shadow is a filled box
+  under the card and would show through it.
+- **Overlays stay opaque**: the dialogs (Feedback, workspace, Connect to
+  Remote, the machine form, their text fields through
+  `dialog_text_field`), the palette, menus, popovers and tooltips paint from
+  `theme.opaque()`, as do the fills a drop shadow sits under (the selected
+  segment, a slider's thumb, the board's drag ghost, the focused back
   button) and the terminal's notice band.
+- **The task pane over the board is glass.** It paints no surface of its
+  own (`nested(canvas)`) and its fills are tints; the board clips its header,
+  columns and footer short of the pane (`task_detail::board_cover`, the
+  pane's final place, anchored to the right so nothing reflows), so only the
+  glass is under it. Over Review and Workspace (More) the pane covers a live
+  session, so there it is an opaque overlay, its title and body editors too
+  (`DocEditor::set_on_glass`).
+- **Alpha blends with "over"**: gpui-pre 0.3.9's Metal pipelines add each
+  primitive's alpha to the framebuffer's, which saturates any fill over the
+  glass to opaque; `platform::metal_blend` corrects that at pipeline creation
+  ([gpui.md](gpui.md#breakage-log)). The window server's blur
+  (`platform::blur`) applies once to everything behind the window's
+  translucent pixels, glass and fills alike.
 - **Reduce Transparency** keeps every window opaque, read at launch and each
   time a window comes forward.
 

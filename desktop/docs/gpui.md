@@ -153,6 +153,7 @@ goes quiet. Watch out for `font-kit` if it's ever taken.
 |---|---|---|---|---|
 | 2026-10-14 | | `gpui-pre 0.3.9`, `gpui-kit 0.7.3` | Initial pin. | |
 | 2026-10-14 | `gpui-pre 0.3.9` | (no upgrade) Zed git @`93d7456`, evaluated in a scratch copy | No text rendered: `gpui_macos` without `font-kit`. `gpui-kit` can't coexist with a git gpui. | `features = ["font-kit"]` on `gpui_platform`; drop `gpui-kit` (6 lines). Not switched. |
+| 2026-10-30 | | `gpui-pre 0.3.9` (no upgrade) | Fills over a translucent window read solid: `gpui_apple::metal_renderer` builds its pipelines with the destination alpha factor `One`, so alphas add (18% over 85% glass = 1.03, clamped to opaque). | `platform::metal_blend` wraps the Metal device's `newRenderPipelineStateWithDescriptor:error:` and sets `OneMinusSourceAlpha` on gpui's labeled pipelines (`quads`, `shadows`, `underlines`, `monochrome_sprites`, `polychrome_sprites`, `surfaces`, `path_sprites`); no fork, color factors untouched, opaque windows unchanged. Coupled to those labels: `--visual-check`'s blend check fails if an upgrade renames them. |
 
 ### Tests
 

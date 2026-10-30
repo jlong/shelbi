@@ -15,8 +15,9 @@
 //! `light` pin the theme and the window chrome with it.
 //!
 //! The window's translucency ([`window`]) is a resolve-time change too: the
-//! surface roles take the window opacity as their alpha
-//! ([`Theme::with_opacity`]), and nothing else does.
+//! surface roles take the window opacity as their alpha, and the opaque
+//! fills that sit on them become tints of the glass ([`glass`],
+//! [`Theme::with_opacity`]); text, icons, borders and overlays keep theirs.
 //!
 //! So is the contrast setting ([`contrast`]): it moves the palette's roles
 //! apart (darker surfaces and brighter text in Dark, the reverse in Light)
@@ -25,6 +26,7 @@
 
 pub mod contrast;
 pub mod fold;
+pub mod glass;
 pub mod motion;
 pub mod palette;
 pub mod style;
@@ -121,17 +123,47 @@ impl Theme {
     /// This theme in a window `opacity` (0 to 1) opaque: the window's
     /// surfaces, the main area (`canvas`) and the leading column
     /// (`sidebar`), take it as their alpha, and the terminals' default
-    /// background follows them (`TerminalElement`). Every other role keeps
-    /// its color, so text, icons, borders and controls stay as they are.
-    /// The command well, the canvas inside a divider, is the glass itself
-    /// while translucent (a second coat would thicken it).
-    pub fn with_opacity(mut self, opacity: f32) -> Self {
+    /// background follows them (`TerminalElement`). The opaque fills laid on
+    /// them (a card, a textbox's well, the workflow badge, the selected nav
+    /// row, a keycap) become tints that paint their solid color over the
+    /// opaque surface, their alpha scaled by the opacity, so the glass shows
+    /// through them too ([`glass`]). Every other role keeps its color: text,
+    /// icons and borders stay as they are, and the fills that are already
+    /// tints let the glass through by themselves. The command well, the
+    /// canvas inside a divider, is the glass itself while translucent (a
+    /// second coat would thicken it). At 1 this is the palette exactly.
+    pub fn with_opacity(self, opacity: f32) -> Self {
         let opacity = opacity.clamp(0.0, 1.0);
-        self.opacity = opacity;
-        self.colors.canvas.a = opacity;
-        self.colors.sidebar.a = opacity;
-        self.colors.well = self.nested(self.colors.canvas);
-        self
+        let mut theme = self.solid();
+        theme.opacity = opacity;
+        if opacity < 1.0 {
+            theme.colors = glass::glass(&theme.colors, opacity);
+        }
+        theme
+    }
+
+    /// This theme in an opaque window: the palette at its contrast.
+    fn solid(&self) -> Self {
+        if !self.translucent() {
+            return *self;
+        }
+        let system = if self.is_dark() { WindowAppearance::Dark } else { WindowAppearance::Light };
+        Self::resolve_with(self.preference, self.contrast, system)
+    }
+
+    /// The tint for the fill role `fill` laid on the fill role `base`
+    /// rather than on the canvas (the board's workflow badge on a card): the
+    /// tint that paints `fill`'s solid color over `base`'s, at the window
+    /// opacity. Both must be roles this theme tints over the canvas
+    /// ([`glass::OnGlass::TintOverCanvas`]). The role itself while opaque.
+    pub fn fill_on(&self, fill: Hsla, base: Hsla) -> Hsla {
+        if !self.translucent() {
+            return fill;
+        }
+        let canvas = Hsla { a: 1.0, ..self.colors.canvas };
+        let solid = |c: Hsla| glass::over(Hsla { a: c.a / self.opacity, ..c }, canvas);
+        let tint = glass::unblend(solid(fill), solid(base));
+        Hsla { a: tint.a * self.opacity, ..tint }
     }
 
     /// The window opacity the surfaces carry (1 is opaque).
@@ -144,11 +176,12 @@ impl Theme {
         self.opacity < 1.0
     }
 
-    /// This theme with opaque surfaces: an overlay (the task detail, a
-    /// dialog) paints from it, so it stays readable over a translucent
-    /// window, as does a fill whose drop shadow would show through it.
+    /// This theme with opaque surfaces and fills: an overlay (a dialog,
+    /// the task pane over another screen) paints from it, so it stays
+    /// readable over a translucent window, as does a fill whose drop shadow
+    /// would show through it.
     pub fn opaque(&self) -> Self {
-        self.with_opacity(1.0)
+        self.solid()
     }
 
     /// `surface` for a layer that sits on that same surface (a view in the
@@ -493,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn the_window_opacity_reaches_the_surfaces_only() {
+    fn the_window_opacity_reaches_the_surfaces_and_their_fills_only() {
         for system in [WindowAppearance::Dark, WindowAppearance::Light] {
             let opaque = Theme::resolve(ThemePreference::Auto, system);
             assert!(!opaque.translucent());
@@ -507,8 +540,10 @@ mod tests {
             assert_eq!(glass.well.a, 0.0, "the well is the glass inside its divider");
             assert_eq!(glass.nested(glass.canvas).a, 0.0, "no second coat");
             for ((name, want), (_, got)) in opaque.roles().into_iter().zip(glass.roles()) {
-                if !["canvas", "sidebar", "well"].contains(&name) {
+                if glass::on_glass(name) == glass::OnGlass::Kept {
                     assert_eq!(got, want, "{name} keeps its color");
+                } else {
+                    assert!(got.a < 1.0, "{name} lets the glass through");
                 }
             }
             // Same hue: only the alpha moved.

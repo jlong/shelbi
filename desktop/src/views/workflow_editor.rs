@@ -1233,24 +1233,46 @@ pub(super) fn text_field(
     window: &Window,
     cx: &App,
 ) -> Div {
-    field(input, selector, placeholder, invalid, false, window, cx)
+    field(input, selector, placeholder, invalid, false, cx.global::<Theme>(), window, cx)
+}
+
+/// [`text_field`] in a dialog: drawn from the opaque theme, as the dialog
+/// is ([`Theme::opaque`]), so its well isn't a tint of the glass.
+pub(super) fn dialog_text_field(
+    input: &Entity<InputState>,
+    selector: impl Into<SharedString>,
+    placeholder: Option<SharedString>,
+    invalid: bool,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    field(input, selector, placeholder, invalid, false, &cx.global::<Theme>().opaque(), window, cx)
 }
 
 /// [`text_field`] whose text can be selected and copied but not changed.
-pub(super) fn readonly_field(input: &Entity<InputState>, selector: impl Into<SharedString>, window: &Window, cx: &App) -> Div {
-    field(input, selector, None, false, true, window, cx)
+/// `theme` is the one the field's surface paints from (a dialog's opaque
+/// one, [`dialog_text_field`]).
+pub(super) fn readonly_field(
+    input: &Entity<InputState>,
+    selector: impl Into<SharedString>,
+    theme: &Theme,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    field(input, selector, None, false, true, theme, window, cx)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn field(
     input: &Entity<InputState>,
     selector: impl Into<SharedString>,
     placeholder: Option<SharedString>,
     invalid: bool,
     readonly: bool,
+    theme: &Theme,
     window: &Window,
     cx: &App,
 ) -> Div {
-    let theme = cx.global::<Theme>();
     let focused = input.read(cx).focus_handle(cx).is_focused(window);
     let empty = input.read(cx).value().is_empty();
     let content = div()

@@ -1017,7 +1017,7 @@ impl AgentEditor {
             Some(why) => div()
                 .id("agent-name-locked")
                 .tooltip(style::tooltip(why))
-                .child(readonly_field(&self.name, "agent-name", window, cx))
+                .child(readonly_field(&self.name, "agent-name", cx.global::<Theme>(), window, cx))
                 .into_any_element(),
             None => text_field(&self.name, "agent-name", None, name_error.is_some(), window, cx).into_any_element(),
         };

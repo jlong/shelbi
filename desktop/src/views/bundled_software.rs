@@ -298,7 +298,7 @@ impl BundledSoftwareView {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(theme.canvas);
+            .bg(theme.nested(theme.canvas));
         let Some(ix) = self.browser.selected() else {
             return pane
                 .items_center()

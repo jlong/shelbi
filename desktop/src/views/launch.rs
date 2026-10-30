@@ -762,8 +762,10 @@ impl Render for LaunchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let right = match self.model.state() {
-            LaunchState::Projects => self.render_lists(&theme, cx).into_any_element(),
-            LaunchState::NoProjects => self.render_empty(&theme).into_any_element(),
+            // Each column paints its own surface: one coat of the glass each
+            // while the window is translucent.
+            LaunchState::Projects => self.render_lists(&theme, cx).bg(theme.canvas).into_any_element(),
+            LaunchState::NoProjects => self.render_empty(&theme).bg(theme.canvas).into_any_element(),
         };
         div()
             .id("launch")
@@ -778,7 +780,7 @@ impl Render for LaunchView {
             .relative()
             .flex()
             .size_full()
-            .bg(theme.canvas)
+            .bg(theme.nested(theme.canvas))
             .text_color(theme.foreground)
             .font_family(style::UI_FAMILY)
             .child(self.render_welcome(&theme, cx))

@@ -197,17 +197,7 @@ pub fn invalid_textbox(content: impl IntoElement, focused: bool, theme: &Theme) 
 }
 
 fn edged_textbox(content: impl IntoElement, edge: Hsla, glow_color: Option<Hsla>, theme: &Theme) -> Div {
-    // The edge is the box's fill, showing 1px around the well, so the well's
-    // 5px corners sit inside the box's 6px as Figma nests them.
-    div()
-        .relative()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .h(px(BUTTON_H))
-        .p(px(1.0))
-        .rounded(px(6.0))
-        .bg(edge)
+    edged(div().relative().flex().flex_row().flex_none().h(px(BUTTON_H)), edge, theme)
         .child(
             div()
                 .flex()
@@ -227,18 +217,26 @@ fn edged_textbox(content: impl IntoElement, edge: Hsla, glow_color: Option<Hsla>
         .children(glow_color.map(|color| glow(6.0, color)))
 }
 
+/// A textbox's 1px `edge` around its well. Opaque, the edge is the box's
+/// fill, showing 1px around the well, so the well's 5px corners sit inside
+/// the box's 6px as Figma nests them. Translucent, the well is a tint of the
+/// glass ([`crate::theme::glass`]) and a fill under it would show through,
+/// so the edge is a 1px border around it instead (the same box).
+fn edged(el: Div, edge: Hsla, theme: &Theme) -> Div {
+    let el = el.rounded(px(6.0));
+    if theme.translucent() {
+        el.border_1().border_color(edge)
+    } else {
+        el.p(px(1.0)).bg(edge)
+    }
+}
+
 /// A multi-line [`textbox`] around `content` (a `Textarea` with its
 /// appearance off): the same 1px edge, `textbox` well and focus glow, as
 /// tall as its content (the caller sets its width).
 pub fn textarea_box(content: impl IntoElement, focused: bool, theme: &Theme) -> Div {
     let edge = if focused { theme.focus_ring } else { theme.input_border };
-    div()
-        .relative()
-        .flex()
-        .flex_row()
-        .p(px(1.0))
-        .rounded(px(6.0))
-        .bg(edge)
+    edged(div().relative().flex().flex_row(), edge, theme)
         .child(
             div()
                 .relative()
