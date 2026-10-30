@@ -410,6 +410,7 @@ fn a_launch_reopens_the_open_windows_and_a_close_forgets_one(cx: &mut TestAppCon
             project: "beta".into(),
             state: WindowState {
                 sidebar_width: 33,
+                task_pane_width: 820.0,
                 ..WindowState::default()
             },
         },
@@ -421,12 +422,14 @@ fn a_launch_reopens_the_open_windows_and_a_close_forgets_one(cx: &mut TestAppCon
     assert_eq!(windows(cx), [("alpha".to_string(), 0), ("beta".to_string(), 2)]);
     let beta = cx.update(|cx| cx.global::<Shell>().windows[1].handle);
     assert_eq!(read(cx, beta, |w, _| w.client.sidebar_width()), 33, "its slot's sidebar");
+    assert_eq!(read(cx, beta, |w, _| w.window_state.task_pane_width), 820.0, "and its task pane");
     // Closing one of two: its slot isn't reopened next launch.
     update(cx, beta, |_, window, _| window.remove_window());
     assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
     let slots = cx.update(|cx| cx.global::<Shell>().session.slots.clone());
     assert!(slots[0].open);
     assert!(!slots[2].open);
+    assert_eq!(slots[2].state.task_pane_width, 820.0, "a closed slot keeps its pane width");
     // Closing the last (the app quits): it stays open, to come back.
     let alpha = cx.update(|cx| cx.global::<Shell>().windows[0].handle);
     update(cx, alpha, |_, window, _| window.remove_window());

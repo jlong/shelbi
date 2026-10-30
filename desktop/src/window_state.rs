@@ -1,6 +1,7 @@
 //! What the desktop app's windows remember, in three parts:
 //!
-//! - [`WindowState`]: one window's frame and sidebar (width, collapse).
+//! - [`WindowState`]: one window's frame, sidebar (width, collapse) and task
+//!   pane width.
 //! - [`WindowSession`]: the app's window slots, in
 //!   `~/.shelbi/desktop-windows.json`. Each slot keeps its window's
 //!   [`WindowState`] and the project it last showed, and whether it was open
@@ -24,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH;
+
+use crate::views::pane_width::DEFAULT_W;
 
 /// The pre-slot per-project window file, read only to migrate it.
 pub const LEGACY_FILE_NAME: &str = "desktop-window.json";
@@ -54,6 +57,9 @@ pub struct WindowState {
     pub sidebar_width: u16,
     /// Whether the sidebar is collapsed.
     pub sidebar_collapsed: bool,
+    /// The user's chosen task pane width, in points. Saved as chosen, so a
+    /// window too narrow to honor it narrows the pane for display only.
+    pub task_pane_width: f32,
 }
 
 impl Default for WindowState {
@@ -62,6 +68,7 @@ impl Default for WindowState {
             frame: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
+            task_pane_width: DEFAULT_W,
         }
     }
 }
@@ -330,6 +337,7 @@ mod tests {
             }),
             sidebar_width: 33,
             sidebar_collapsed: true,
+            task_pane_width: 812.0,
         };
         state.save_to(&path).unwrap();
         assert_eq!(WindowState::load_from(&path), state);
@@ -358,6 +366,7 @@ mod tests {
         assert_eq!(partial.sidebar_width, 30);
         assert_eq!(partial.frame, None);
         assert!(!partial.sidebar_collapsed);
+        assert_eq!(partial.task_pane_width, DEFAULT_W, "a file from before the pane resized");
     }
 
     fn state(x: f32) -> WindowState {
@@ -370,6 +379,7 @@ mod tests {
             }),
             sidebar_width: 30,
             sidebar_collapsed: false,
+            task_pane_width: DEFAULT_W,
         }
     }
 
@@ -496,5 +506,6 @@ mod tests {
     #[test]
     fn default_width_is_the_shared_nav_default() {
         assert_eq!(WindowState::default().sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!(WindowState::default().task_pane_width, 640.0);
     }
 }

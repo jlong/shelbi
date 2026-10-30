@@ -108,6 +108,7 @@ pub mod markdown;
 pub mod overlay;
 pub mod pane_session;
 pub mod pane_split;
+pub mod pane_width;
 pub mod palette;
 pub mod project_menu;
 pub mod remote_session;

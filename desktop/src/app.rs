@@ -162,8 +162,9 @@ const STARTUP_STATUS: &str = "Starting the orchestrator…";
 /// How far a new window sits off the one it was opened from.
 const CASCADE: f32 = 28.0;
 /// How wide the column edge's grab room is: the column's last five points
-/// (the Review rule's own point and the column's last four).
-const RESIZE_GRAB: f32 = 5.0;
+/// (the Review rule's own point and the column's last four). The task pane's
+/// left edge takes the same room.
+pub(crate) const RESIZE_GRAB: f32 = 5.0;
 /// The title of a window with no project (the empty-state chooser).
 const CHOOSER_TITLE: &str = "Shelbi";
 /// How often an open palette takes the search hits that landed.
@@ -298,6 +299,7 @@ pub fn open_new_window(project: &str, cx: &mut App) -> Option<WindowHandle<Shelb
         let _ = from.update(cx, |w, window, _| {
             state.sidebar_width = w.window_state.sidebar_width;
             state.sidebar_collapsed = w.window_state.sidebar_collapsed;
+            state.task_pane_width = w.window_state.task_pane_width;
             cascade = Some(window.window_bounds().get_bounds());
         });
     }
@@ -2471,6 +2473,8 @@ impl ShelbiWindow {
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.workspace_deps.as_ref().map(|d| (d.sessions)()).unwrap_or(deps);
         issues.update(cx, |v, cx| v.host_sessions(handle, deps, sink, cx));
+        let pane_width = self.window_state.task_pane_width;
+        issues.update(cx, |v, cx| v.set_pane_width(pane_width, cx));
         let sub = cx.subscribe_in(&issues, window, |this, _, ev: &IssuesEvent, window, cx| match ev {
             IssuesEvent::Command(kind) => this.run(kind.clone(), window, cx),
             // A click in the pane's terminal moves the window's focus model
@@ -2478,6 +2482,12 @@ impl ShelbiWindow {
             IssuesEvent::Focused => {
                 this.client.focus_main();
                 cx.notify();
+            }
+            // A drag of the task pane's edge ended: the window keeps the
+            // width, like the sidebar's.
+            IssuesEvent::PaneWidth(width) => {
+                this.window_state.task_pane_width = *width;
+                this.schedule_save(cx);
             }
         });
         self._view_subscriptions.push(sub);

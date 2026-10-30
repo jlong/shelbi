@@ -226,7 +226,7 @@ impl Pane {
             .iter()
             .filter_map(|e| match e {
                 IssuesEvent::Command(k) => Some(k.clone()),
-                IssuesEvent::Focused => None,
+                IssuesEvent::Focused | IssuesEvent::PaneWidth(_) => None,
             })
             .collect()
     }
