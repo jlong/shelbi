@@ -24,12 +24,12 @@
 //!   `check_border` and checked in `check_fill` with Figma's 12pt mark,
 //!   beside its label; the list stacks them 4px apart;
 //! - [`icon_choice`] and [`icon_choices`]: a picture to pick (the App icon
-//!   setting), its label under it. The Components page draws no such
+//!   setting), its name in a tooltip. The Components page draws no such
 //!   picker either, so it borrows the drawn controls' tokens: the segmented
 //!   track's `theme.search` well (10px corners), its items' hover and press
 //!   fills, and, picked, the checkbox's `check_fill` as a 2px ring with its
-//!   `check_glow` around it and the label loud and medium, as a selected
-//!   segment's;
+//!   `check_glow` around it, both laid over the well so picking moves
+//!   nothing;
 //! - [`Slider`]: a value along a track, its readout after it. The
 //!   Components page draws no slider, so it is built from the tokens the
 //!   drawn controls use: the segmented track's `theme.search` for the rail,
@@ -54,7 +54,9 @@ use gpui::{
 
 use crate::assets::{check_mark, heroicon, Icon};
 use crate::theme::motion::fill_layer;
-use crate::theme::style::{button, focus_shadow, raised_drops, ButtonKind, ButtonSize, Type, Typography, BUTTON_H};
+use crate::theme::style::{
+    button, focus_shadow, raised_drops, tooltip, ButtonKind, ButtonSize, Type, Typography, BUTTON_H,
+};
 use crate::theme::Theme;
 
 /// A labeled control's widest: its helper wraps at this.
@@ -383,12 +385,14 @@ pub fn checkbox(
 pub const CHOICE_IMAGE: f32 = 64.0;
 
 /// A picture to pick: `image` at [`CHOICE_IMAGE`] in a `theme.search` well
-/// 12px around it, `label` (Small) under it. Picked, the well is ringed in
-/// `check_fill` with the glow around it and the label is loud.
+/// 12px around it, `name` in its tooltip (no label under it: a picked
+/// label's heavier weight would widen the tile). Picked, the well is ringed
+/// in `check_fill` with the glow around it, both laid over it, so a picked
+/// tile and an unpicked one have the same bounds.
 pub fn icon_choice(
     id: impl Into<SharedString>,
     image: Arc<Image>,
-    label: impl Into<SharedString>,
+    name: impl Into<SharedString>,
     selected: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
@@ -424,19 +428,10 @@ pub fn icon_choice(
         .id(id)
         .debug_selector(move || selector.to_string())
         .flex()
-        .flex_col()
         .flex_none()
-        .items_center()
-        .gap(px(8.0))
         .cursor_pointer()
+        .tooltip(tooltip(name))
         .child(well)
-        .child(
-            div()
-                .whitespace_nowrap()
-                .when(selected, |d| d.type_style(Type::SmallMedium).text_color(theme.text_loud))
-                .when(!selected, |d| d.type_style(Type::Small).text_color(theme.form_text))
-                .child(label.into()),
-        )
 }
 
 /// A row of [`icon_choice`]s, 16px apart (room for a picked one's glow).
