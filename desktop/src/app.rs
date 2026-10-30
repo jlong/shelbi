@@ -237,6 +237,13 @@ pub fn running_cli(cx: &App) -> Option<(std::path::PathBuf, bool)> {
     Some((ready.cli.path.clone(), ready.on_login_path))
 }
 
+/// The `shelbi` discovery finds with no `desktop.cli_path`, as bootstrap
+/// found it at launch (`Ready::automatic`): `None` before bootstrap is
+/// ready, or when nothing was found.
+pub fn automatic_cli(cx: &App) -> Option<std::path::PathBuf> {
+    cx.try_global::<Shell>()?.ready.as_ref()?.automatic.clone()
+}
+
 /// The shared bootstrap result, once one is (tests).
 #[cfg(test)]
 pub fn shared_ready(cx: &App) -> Option<Ready> {
@@ -5156,6 +5163,7 @@ pub(crate) fn inert_ready() -> Ready {
             path: "/nonexistent/shelbi".into(),
             source: CliSource::Setting,
         },
+        automatic: None,
         cli_version: None,
         env: Arc::new(Default::default()),
         on_login_path: true,

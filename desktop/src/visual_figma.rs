@@ -44,8 +44,7 @@
 //! over the screen, each view's ⌘N, Approve
 //! and Reject hovered and pressed), and Machines' (`machines-unreachable`:
 //! the remote down, its row selected; `machines-idle-selected`,
-//! `machines-review-selected`), Settings' (`state-settings-cli-focused`:
-//! a focused textbox; `state-keybindings-*`: the bindings editor's capture,
+//! `machines-review-selected`), Settings' (`state-keybindings-*`: the bindings editor's capture,
 //! conflict, search, picker and customized states; `state-workflow-form-*`:
 //! the workflow editor edited, its leave prompt, and its form's foot;
 //! `state-agents-*`: an agent's ⋮ menu, a reset waiting to be confirmed,
@@ -1282,19 +1281,8 @@ impl Run {
                 .unwrap();
             self.save(handle, screen);
         }
-
-        // The Shelbi CLI field focused: the textbox's ring and glow, the
-        // caret in the ring's color.
-        let handle = self.open();
-        handle
-            .update(&mut self.cx, |w, window, cx| {
-                w.offscreen_open_settings(SettingsPage::General, window, cx);
-                if let Some(settings) = w.offscreen_settings() {
-                    settings.update(cx, |v, cx| v.offscreen_focus_cli(window, cx));
-                }
-            })
-            .unwrap();
-        self.save(handle, "state-settings-cli-focused");
+        // The Shelbi CLI field is read-only (`dt-cli-path-readonly`): there
+        // is no focused state to draw.
         self.settings_workflows();
         self.settings_agents();
         self.settings_workspaces();
@@ -3715,7 +3703,8 @@ workspaces:
     ];
     std::fs::write(home.join("events.log"), events.join("\n") + "\n").unwrap();
 
-    // Settings: the frame's Shelbi CLI path. Its font and size predate the
+    // Settings: the frame's Shelbi CLI path, as an override (the window has
+    // no discovery to show, so it draws with Reset). Its font and size predate the
     // Source Code Pro default, so those keep theirs.
     // The run's contrast is the saved one too, so Settings shows it (and
     // reading the file doesn't put the theme back to 0).
