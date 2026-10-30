@@ -67,7 +67,7 @@ use shelbi_app::review::{
 };
 use shelbi_app::session::{ReviewRelauncher, SessionRef};
 use shelbi_app::view::{ReviewRow, ReviewState};
-use shelbi_app::{CommandKind, ReviewSessionOp, WorkspaceSessionOp};
+use shelbi_app::{CommandKind, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 use shelbi_core::{Column, StatusCategory};
 
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X};
@@ -97,6 +97,11 @@ pub trait ReviewOps: Send + Sync {
     /// Start or stop the user shell in review slot `slot`'s worktree (the
     /// workspace's `EnsureShell` / `CloseShell`: a slot is a workspace).
     fn shell_op(&self, project: &str, slot: &str, op: WorkspaceSessionOp) -> Result<(), String>;
+    /// Open `task`'s review worktree (the editor) or its diff in the app the
+    /// settings chose for `role`.
+    fn open_in_app(&self, _project: &str, _task: &str, _role: ReviewRole) -> Result<(), String> {
+        Err("apps can't be opened here".into())
+    }
 }
 
 /// The real thing: the orchestrator's review state, the daemon's control
@@ -120,6 +125,7 @@ impl ReviewOps for LiveOps {
                     body,
                     worktree: info.worktree,
                     editor_name: info.editor_name,
+                    apps: info.apps,
                     review_url: info.review_url,
                     has_health_check: info.has_health_check,
                     remote_machine: info.remote_machine,
@@ -146,6 +152,12 @@ impl ReviewOps for LiveOps {
 
     fn session_op(&self, project: &str, task: &str, op: ReviewSessionOp) -> Result<(), String> {
         shelbi_app::review_session(project, task, op, &mut |_, _| {})
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn open_in_app(&self, project: &str, task: &str, role: ReviewRole) -> Result<(), String> {
+        shelbi_orchestrator::review_session::open_in_app(project, task, role.into())
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -395,6 +407,7 @@ impl ReviewView {
             body: String::new(),
             worktree: String::new(),
             editor_name: String::new(),
+            apps: Default::default(),
             review_url: None,
             has_health_check: false,
             remote_machine: None,
@@ -748,6 +761,12 @@ impl ReviewView {
             PanelEffect::ShowEditor => {
                 self.set_status(None, cx);
                 self.select_view(ActiveView::Editor, cx);
+            }
+            // The app opens; the content view stays as it is.
+            PanelEffect::OpenApp(role) => {
+                self.set_status(None, cx);
+                let project = self.project.clone();
+                self.run_opener("open the app", move |ops| ops.open_in_app(&project, &task, role), cx);
             }
             // Inert until the slot's server is serving (the row says so).
             PanelEffect::OpenBrowser => {
@@ -1525,6 +1544,7 @@ pub(crate) mod tests {
             body: "## Summary\n\nWarm the cache at boot.".into(),
             worktree: "/w/review-1".into(),
             editor_name: "Vim".into(),
+            apps: Default::default(),
             review_url: Some("http://localhost:4101".into()),
             has_health_check: true,
             remote_machine: None,

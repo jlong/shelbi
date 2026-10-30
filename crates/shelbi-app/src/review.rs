@@ -14,6 +14,7 @@
 //! results back in.
 
 use shelbi_state::keymap::{Key, KeyChord, Mods};
+use shelbi_state::AppTools;
 
 use crate::view::{ReviewRow, ReviewState};
 use crate::ReviewRole;
@@ -42,6 +43,8 @@ pub struct ReviewInfo {
     pub worktree: String,
     /// Display name of the resolved editor (`Vim`, `Helix`, …).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane.
+    pub apps: AppTools,
     /// The review URL (the workflow's `review:` template with `$PORT` /
     /// `$SLOT` substituted), when the workflow declares one.
     pub review_url: Option<String>,
@@ -149,6 +152,8 @@ pub struct ReviewPanelModel {
     pub worktree: String,
     pub status_label: String,
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane.
+    pub apps: AppTools,
     pub review_url: Option<String>,
     pub remote_machine: Option<String>,
     /// The view-switcher nav items, in order.
@@ -183,6 +188,7 @@ impl ReviewPanelModel {
             worktree: info.worktree.clone(),
             status_label: READY_FOR_REVIEW.to_string(),
             editor_name: info.editor_name.clone(),
+            apps: info.apps,
             review_url: info.review_url.clone(),
             remote_machine: info.remote_machine.clone(),
             switch_items,
@@ -327,6 +333,9 @@ pub enum PanelEffect {
     ShowChat,
     ShowDiff,
     ShowEditor,
+    /// Open the worktree (the editor) or the diff in the app chosen for
+    /// that role; the content view stays as it is.
+    OpenApp(ReviewRole),
     OpenBrowser,
     RevealFolder,
     ShowDescription,
@@ -390,13 +399,16 @@ pub fn step_selection(selected: usize, len: usize, delta: i32) -> usize {
 
 /// What activating `row` does, and the content view it makes active. While a
 /// gated merge is in flight Approve and Reject are declined, so a replayed or
-/// double press never starts a second one.
-pub fn activate_row(row: PanelRow, has_body: bool, merging: bool) -> (PanelEffect, Option<ActiveView>) {
+/// double press never starts a second one. Edit and View Diff with an app
+/// chosen (`apps`) launch it and leave the content view as it is.
+pub fn activate_row(row: PanelRow, has_body: bool, merging: bool, apps: AppTools) -> (PanelEffect, Option<ActiveView>) {
     match row {
         PanelRow::Back => (PanelEffect::Back, None),
         PanelRow::More => (description_effect(has_body), None),
         PanelRow::Folder => (PanelEffect::RevealFolder, None),
         PanelRow::Switch(ReviewSwitch::Chat) => (PanelEffect::ShowChat, Some(ActiveView::Chat)),
+        PanelRow::Switch(ReviewSwitch::Diff) if apps.diff => (PanelEffect::OpenApp(ReviewRole::Diff), None),
+        PanelRow::Switch(ReviewSwitch::Editor) if apps.editor => (PanelEffect::OpenApp(ReviewRole::Editor), None),
         PanelRow::Switch(ReviewSwitch::Diff) => (PanelEffect::ShowDiff, Some(ActiveView::Diff)),
         PanelRow::Switch(ReviewSwitch::Editor) => {
             (PanelEffect::ShowEditor, Some(ActiveView::Editor))
@@ -432,6 +444,7 @@ pub struct ReviewPanelState {
     status_line: Option<String>,
     /// The user-shell row is offered (the desktop's).
     shell: bool,
+    apps: AppTools,
 }
 
 impl ReviewPanelState {
@@ -456,6 +469,7 @@ impl ReviewPanelState {
             merging: false,
             status_line: None,
             shell,
+            apps: model.apps,
         }
     }
 
@@ -469,6 +483,7 @@ impl ReviewPanelState {
         let current = self.selected_row();
         self.rows = Self::rows_for(model, self.shell);
         self.has_body = model.has_body();
+        self.apps = model.apps;
         self.selected = current
             .and_then(|row| self.rows.iter().position(|r| *r == row))
             .unwrap_or_else(|| self.selected.min(self.rows.len().saturating_sub(1)));
@@ -545,7 +560,7 @@ impl ReviewPanelState {
             return PanelEffect::None;
         }
         self.selected = idx;
-        let (effect, view) = activate_row(row, self.has_body, self.merging);
+        let (effect, view) = activate_row(row, self.has_body, self.merging, self.apps);
         if let Some(view) = view {
             self.active = view;
         }
@@ -786,6 +801,7 @@ mod tests {
             body: "## Summary\n\n- Warm the `cache` at boot.\n> quoted snake_case".into(),
             worktree: "/Users/j/proj/.shelbi/wt/review-1".into(),
             editor_name: "Vim".into(),
+            apps: AppTools::default(),
             review_url: url.then(|| "http://localhost:4101".to_string()),
             has_health_check: true,
             remote_machine: remote.then(|| "gpu".to_string()),
@@ -991,13 +1007,13 @@ mod tests {
     #[test]
     fn the_pure_activation_declines_only_a_second_decision_while_merging() {
         // The TUI's panel keeps this exact table.
-        assert_eq!(activate_row(PanelRow::Approve, true, true).0, PanelEffect::None);
-        assert_eq!(activate_row(PanelRow::Reject, true, true).0, PanelEffect::None);
+        assert_eq!(activate_row(PanelRow::Approve, true, true, AppTools::default()).0, PanelEffect::None);
+        assert_eq!(activate_row(PanelRow::Reject, true, true, AppTools::default()).0, PanelEffect::None);
         assert_eq!(
-            activate_row(PanelRow::Switch(ReviewSwitch::Chat), true, true),
+            activate_row(PanelRow::Switch(ReviewSwitch::Chat), true, true, AppTools::default()),
             (PanelEffect::ShowChat, Some(ActiveView::Chat))
         );
-        assert_eq!(activate_row(PanelRow::More, false, false).0, PanelEffect::None);
+        assert_eq!(activate_row(PanelRow::More, false, false, AppTools::default()).0, PanelEffect::None);
         assert_eq!(step_selection(0, 0, 1), 0);
         assert_eq!(step_selection(9, 3, 1), 0, "a stale index clamps first");
     }
@@ -1164,6 +1180,24 @@ mod tests {
         l.open("t-2");
         l.cancel("t-1");
         assert!(matches!(l.resolved("t-2", serving()), LoadStep::Open(_)));
+    }
+
+    #[test]
+    fn an_app_editor_or_diff_launches_and_keeps_the_content_view() {
+        let mut i = info(false, false);
+        i.editor_name = "Zed".into();
+        i.apps = AppTools { editor: true, diff: true };
+        let model = ReviewPanelModel::build(&i, None);
+        assert_eq!(model.switch_items.iter().map(|s| s.label(&model.editor_name)).collect::<Vec<_>>(), ["Reviewer", "View Diff", "Edit in Zed"]);
+        let mut p = ReviewPanelState::new(&model);
+        assert_eq!(p.click(PanelRow::Switch(ReviewSwitch::Editor)), PanelEffect::OpenApp(ReviewRole::Editor));
+        assert_eq!(p.click(PanelRow::Switch(ReviewSwitch::Diff)), PanelEffect::OpenApp(ReviewRole::Diff));
+        assert_eq!(p.active(), ActiveView::Chat, "the chat stays shown");
+        assert_eq!(
+            activate_row(PanelRow::Switch(ReviewSwitch::Editor), false, false, AppTools::default()),
+            (PanelEffect::ShowEditor, Some(ActiveView::Editor)),
+            "a CLI editor is a pane"
+        );
     }
 
     #[test]

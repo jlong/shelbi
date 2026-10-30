@@ -69,6 +69,7 @@ pub mod session_lost;
 mod ssh_control;
 pub mod supervision_relaunch;
 pub mod supervision_status;
+pub mod tools;
 mod user_config;
 mod workflows;
 mod workspace_status;
@@ -183,8 +184,10 @@ pub use ssh_control::{
     CmCleanupOutcome, DaemonPidRecord, HostForward, HubEndpoint, TCP_FORWARD_BIND_ADDR,
     TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_SPAN,
 };
+pub use tools::{AppTools, ToolChoice, ToolKind};
 pub use user_config::{
-    editor_display_name, load_user_config, resolve_editor, resolve_editor_source, save_user_config,
+    editor_display_name, load_user_config, resolve_diff_tool, resolve_editor, resolve_editor_choice,
+    resolve_editor_choice_from, resolve_editor_source, resolved_editor_name, save_user_config,
     scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, AppIcon, DesktopConfig,
     DesktopNotifications, EditorSource, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,

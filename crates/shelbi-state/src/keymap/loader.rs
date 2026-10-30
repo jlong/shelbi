@@ -2481,7 +2481,7 @@ editor: hx
         assert!(out.contains("## Editor comment."), "editor comment lost: {out}");
         // The unrelated `editor` key survives the round-trip.
         let cfg = load_user_config().unwrap();
-        assert_eq!(cfg.editor.as_deref(), Some("hx"));
+        assert_eq!(cfg.editor.as_ref().and_then(crate::ToolChoice::command), Some("hx"));
         std::env::remove_var("SHELBI_HOME");
     }
 

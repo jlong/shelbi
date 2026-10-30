@@ -56,6 +56,9 @@ pub struct ReviewPanel {
     pub worktree: String,
     /// Display name of the resolved editor (`Vim`, `Helix`, …).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane: those
+    /// launch it ([`PanelEffect::OpenApp`]) and leave the view as it is.
+    pub apps: shelbi_state::AppTools,
     /// Whether the workflow declares a review URL — gates the Browser entry.
     pub has_review_url: bool,
     /// The reviewed task's title — shown bold white in the task-info block.
@@ -94,6 +97,7 @@ impl ReviewPanel {
         let mut panel = Self {
             worktree: worktree.into(),
             editor_name: editor_name.into(),
+            apps: shelbi_state::AppTools::default(),
             has_review_url,
             title: title.into(),
             description: description.into(),
@@ -170,7 +174,7 @@ impl ReviewPanel {
     /// double press (Enter *or* click) is dropped.
     fn activate_row(&mut self, row: PanelRow) -> PanelEffect {
         let has_body = !self.description.trim().is_empty();
-        let (effect, view) = shelbi_app::review::activate_row(row, has_body, self.merging);
+        let (effect, view) = shelbi_app::review::activate_row(row, has_body, self.merging, self.apps);
         if let Some(view) = view {
             self.active_view = view;
         }
@@ -861,6 +865,17 @@ mod tests {
             .position(|r| matches!(r, PanelRow::Switch(i) if *i == item))
             .unwrap();
         app.selected = idx;
+    }
+
+    #[test]
+    fn an_app_editor_or_diff_launches_and_keeps_the_view() {
+        let mut app = panel(true);
+        app.apps = shelbi_state::AppTools { editor: true, diff: true };
+        select_switch(&mut app, SwitchItem::Editor);
+        assert_eq!(app.activate(), PanelEffect::OpenApp(shelbi_app::ReviewRole::Editor));
+        select_switch(&mut app, SwitchItem::Diff);
+        assert_eq!(app.activate(), PanelEffect::OpenApp(shelbi_app::ReviewRole::Diff));
+        assert_eq!(app.active_view, ActiveView::Chat, "the chat stays shown");
     }
 
     #[test]

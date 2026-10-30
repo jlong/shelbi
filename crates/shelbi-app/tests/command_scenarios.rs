@@ -388,6 +388,7 @@ fn review_info() -> ReviewInfo {
         body: String::new(),
         worktree: "/w/review-1".into(),
         editor_name: "Vim".into(),
+        apps: Default::default(),
         review_url: None,
         has_health_check: false,
         remote_machine: None,

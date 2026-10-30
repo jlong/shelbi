@@ -115,6 +115,7 @@ impl WorkspaceOps for Ops {
                 branch: Some("main".into()),
                 worktree: "/Users/me/src/demo/.shelbi/wt/bravo".into(),
                 editor_name: "Vim".into(),
+                apps: Default::default(),
                 ..WorkspaceDetailsInfo::default()
             }
         } else {
@@ -127,6 +128,7 @@ impl WorkspaceOps for Ops {
                 branch: Some("jlong/cold-start".into()),
                 worktree: "/Users/me/src/demo/.shelbi/wt/alpha".into(),
                 editor_name: "Vim".into(),
+                apps: Default::default(),
             }
         })
     }

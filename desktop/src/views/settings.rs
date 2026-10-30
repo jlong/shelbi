@@ -1997,7 +1997,7 @@ mod tests {
         assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(20)));
         assert_eq!(cfg.desktop.contrast, Some(40));
         assert_eq!(cfg.desktop.app_icon, Some(AppIcon::Retro));
-        assert_eq!(cfg.editor.as_deref(), Some("hx"), "other keys are untouched");
+        assert_eq!(cfg.editor.as_ref().and_then(shelbi_state::ToolChoice::command), Some("hx"), "other keys are untouched");
         let back = SettingsValues::from_config(&cfg);
         assert_eq!(back, values);
         assert_eq!(cfg.desktop.notifications.review_ready, Some(false));

@@ -589,12 +589,14 @@ impl WorkspaceOps for Ops {
                 branch: Some("jlong/desktop-app".into()),
                 worktree: worktree(workspace),
                 editor_name: "Vi".into(),
+                apps: Default::default(),
             }
         } else {
             WorkspaceDetailsInfo {
                 branch: Some("main".into()),
                 worktree: worktree(workspace),
                 editor_name: "Vi".into(),
+                apps: Default::default(),
                 ..WorkspaceDetailsInfo::default()
             }
         })
@@ -615,6 +617,7 @@ fn review_info() -> ReviewInfo {
         body: UMBRELLA_BODY.into(),
         worktree: worktree("review"),
         editor_name: "Vi".into(),
+        apps: Default::default(),
         review_url: Some("http://localhost:4101".into()),
         has_health_check: true,
         remote_machine: None,

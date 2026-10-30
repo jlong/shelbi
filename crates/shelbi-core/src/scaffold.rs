@@ -471,10 +471,17 @@ keymap:
   ## ctrl-g, ctrl-shift-z, none.
   zen_toggle: alt-z
 
-## Editor the review interface's \"Edit in <editor>\" view opens in the review
-## worktree. Falls back to $EDITOR, then vim. May carry flags (e.g. code --wait).
-## The sidebar label reflects the resolved editor name (Edit in Vim, Edit in Helix).
+## Editor \"Edit in <editor>\" opens on a workspace or review worktree. A
+## command (it may carry flags, e.g. code --wait) runs in a pane; an app opens
+## the worktree in the app: editor: { app: /Applications/Zed.app }. Falls back
+## to $EDITOR, then vim. The label is the editor's name (Edit in Neovim).
 # editor: vim
+
+## Diff tool View Diff runs over a branch's changes: a command in a pane
+## (difft, nvim -d) or an app: diff_tool: { app: /Applications/Kaleidoscope.app }.
+## Unset runs git's configured difftool (diff.tool / diff.guitool). A project's
+## review.diff_command takes precedence.
+# diff_tool: difft
 
 ## Color theme for the TUI and the desktop app: auto, dark, light. auto (what
 ## a config without this key gets) follows the system appearance in the

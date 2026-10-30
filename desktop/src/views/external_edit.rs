@@ -12,7 +12,8 @@
 //!
 //! A window app has no terminal, so a terminal editor (vim, nvim, hx, ...)
 //! runs in a new Terminal.app window via `osascript`; anything else (`code
-//! --wait`, `zed`, `subl`) is spawned directly. The watcher stops when a
+//! --wait`, `zed`, `subl`) is spawned directly, and an app `editor:`
+//! (`{ app: /Applications/Zed.app }`) opens the file with `open -a`. The watcher stops when a
 //! directly spawned editor exits (after one last check), or after
 //! [`WATCH_LIMIT`] for a Terminal-hosted one, whose exit it can't observe.
 
@@ -40,12 +41,21 @@ pub enum Launch {
     Direct { program: String, args: Vec<String> },
     /// Run this shell command line in a new Terminal.app window.
     Terminal { command: String },
+    /// Open the file in this app (`open -a <app> <file>`).
+    App { app: PathBuf, file: PathBuf },
 }
 
-/// Decide how to run `editor` (a command line, possibly with flags) on
-/// `file`.
-pub fn launch_for(editor: &str, file: &Path) -> Launch {
-    launch_at(editor, file, None, None)
+/// Decide how to open `file` in the editor `choice` (an `editor:` setting):
+/// an app with `open -a` (no line: an app has no common syntax for one), a
+/// command as [`launch_at`] does.
+pub fn launch_choice(choice: &shelbi_state::ToolChoice, file: &Path, line: Option<u32>, column: Option<u32>) -> Launch {
+    match choice {
+        shelbi_state::ToolChoice::App { app } => Launch::App {
+            app: app.clone(),
+            file: file.to_path_buf(),
+        },
+        shelbi_state::ToolChoice::Command(editor) => launch_at(editor, file, line, column),
+    }
 }
 
 /// Decide how to run `editor` on `file`, at `line` (and `column`) when given,
@@ -113,9 +123,23 @@ pub fn launch_at(editor: &str, file: &Path, line: Option<u32>, column: Option<u3
 
 /// Start `launch`: a GUI editor as a child process (returned, so a caller
 /// can watch for its exit), a terminal editor in a new Terminal.app window
-/// (`None`: its exit can't be observed).
+/// or a file in an app (`None`: its exit can't be observed).
 pub fn spawn(launch: &Launch) -> Result<Option<std::process::Child>, String> {
     match launch {
+        Launch::App { app, file } => {
+            let status = std::process::Command::new("open")
+                .arg("-a")
+                .arg(app)
+                .arg(file)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("opening {}: {e}", app.display()))?;
+            if status.success() {
+                Ok(None)
+            } else {
+                Err(format!("{} couldn't open {} ({status})", shelbi_state::tools::app_display_name(app), file.display()))
+            }
+        }
         Launch::Direct { program, args } => std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
@@ -141,7 +165,7 @@ pub fn spawn(launch: &Launch) -> Result<Option<std::process::Child>, String> {
     }
 }
 
-/// Open `path` in the user's editor ([`shelbi_state::resolve_editor`]),
+/// Open `path` in the user's editor ([`shelbi_state::resolve_editor_choice`]),
 /// the launch every Edit YAML and `edit:*` share. Hands back the editor's
 /// name. A test opens nothing: it records the path ([`tests::opened`]).
 pub fn open_file(path: &Path) -> Result<String, String> {
@@ -152,9 +176,9 @@ pub fn open_file(path: &Path) -> Result<String, String> {
     }
     #[cfg(not(test))]
     {
-        let editor = shelbi_state::resolve_editor();
-        spawn(&launch_for(&editor, path))?;
-        Ok(shelbi_state::editor_display_name(&editor))
+        let (editor, _) = shelbi_state::resolve_editor_choice();
+        spawn(&launch_choice(&editor, path, None, None))?;
+        Ok(editor.display_name())
     }
 }
 
@@ -202,8 +226,8 @@ fn run(path: &Path, id: &str, body: &str, tx: &Sender<EditorEvent>) -> Result<()
         std::fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     }
     std::fs::write(path, body).map_err(|e| format!("can't write {}: {e}", path.display()))?;
-    let editor = shelbi_state::resolve_editor();
-    let mut child = spawn(&launch_for(&editor, path))?;
+    let (editor, _) = shelbi_state::resolve_editor_choice();
+    let mut child = spawn(&launch_choice(&editor, path, None, None))?;
 
     let mut last = modified(path);
     let mut last_body = body.to_string();
@@ -259,20 +283,20 @@ pub(crate) mod tests {
     fn gui_editors_spawn_directly_and_terminal_editors_get_a_terminal() {
         let file = Path::new("/tmp/x y.md");
         assert_eq!(
-            launch_for("code --wait", file),
+            launch_at("code --wait", file, None, None),
             Launch::Direct {
                 program: "code".into(),
                 args: vec!["--wait".into(), "/tmp/x y.md".into()]
             }
         );
-        match launch_for("/opt/homebrew/bin/nvim -u NONE", file) {
+        match launch_at("/opt/homebrew/bin/nvim -u NONE", file, None, None) {
             Launch::Terminal { command } => {
                 assert!(command.starts_with("/opt/homebrew/bin/nvim -u NONE "), "{command}");
                 assert!(command.contains("'/tmp/x y.md'"), "the path is quoted: {command}");
             }
             other => panic!("nvim needs a terminal: {other:?}"),
         }
-        assert!(matches!(launch_for("vim", file), Launch::Terminal { .. }));
+        assert!(matches!(launch_at("vim", file, None, None), Launch::Terminal { .. }));
     }
 
     #[test]
@@ -284,6 +308,20 @@ pub(crate) mod tests {
     #[test]
     fn applescript_strings_escape_quotes_and_backslashes() {
         assert_eq!(applescript_string(r#"vim "a\b""#), r#""vim \"a\\b\"""#);
+    }
+
+    #[test]
+    fn an_app_editor_opens_the_file_with_open_a() {
+        let file = Path::new("/w/notes.md");
+        let zed = shelbi_state::ToolChoice::app("/Applications/Zed.app");
+        assert_eq!(
+            launch_choice(&zed, file, Some(3), None),
+            Launch::App {
+                app: "/Applications/Zed.app".into(),
+                file: file.into()
+            }
+        );
+        assert_eq!(launch_choice(&"vim".into(), file, None, None), launch_at("vim", file, None, None));
     }
 
     #[test]

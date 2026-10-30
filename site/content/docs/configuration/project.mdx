@@ -452,7 +452,7 @@ Behavior of the [review interface](/docs/concepts/review-workspaces#the-review-i
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `diff_command` | string | no | none | Command **View Diff** runs instead of the default `git difftool -d -y <base> HEAD`. Set it when your diff tool reviews a **revision range** rather than git's directory-diff pair. See below. |
+| `diff_command` | string | no | none | Command **View Diff** runs for this project instead of your [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) or the default `git difftool -d -y <base> HEAD`. Set it when your diff tool reviews a **revision range** rather than git's directory-diff pair. See below. |
 
 By default **View Diff** runs `git difftool -d -y <base> HEAD` — git's
 directory-diff mode, which invokes your `diff.tool` with **two directory

@@ -1147,10 +1147,10 @@ impl IssuesView {
         let Some(body) = self.body_of(id) else {
             return;
         };
-        let editor = shelbi_state::resolve_editor();
+        let (editor, _) = shelbi_state::resolve_editor_choice();
         self.state.status = Some(format!(
             "editing {id} in {}; saves are sent as you write",
-            shelbi_state::editor_display_name(&editor)
+            editor.display_name()
         ));
         external_edit::open(&self.state.project, id, &body, self.editor_tx.clone());
     }

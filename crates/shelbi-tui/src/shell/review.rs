@@ -61,6 +61,9 @@ pub enum ReviewAction {
     Approve,
     /// Open the reject-reason overlay.
     Reject,
+    /// Open the review worktree (the editor) or its diff in the app chosen
+    /// for the role; the content view stays as it is.
+    OpenApp(ReviewRole),
     /// Open the configured review URL in the system browser.
     OpenBrowser,
     /// Reveal the review worktree folder in the OS file manager.
@@ -204,6 +207,13 @@ impl ReviewInterface {
     }
 
     /// Put a message on the panel's status line (effect failures, notes).
+    /// Edit and View Diff open these in their apps (`editor:` /
+    /// `diff_tool:` apps) instead of a pane.
+    pub fn with_apps(mut self, apps: shelbi_state::AppTools) -> Self {
+        self.panel.apps = apps;
+        self
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.panel.status_line = msg.into();
     }
@@ -489,6 +499,7 @@ fn map_effect(effect: PanelEffect) -> ReviewAction {
         PanelEffect::ShowChat => ReviewAction::ShowContent(None),
         PanelEffect::ShowDiff => ReviewAction::ShowContent(Some(ReviewRole::Diff)),
         PanelEffect::ShowEditor => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
+        PanelEffect::OpenApp(role) => ReviewAction::OpenApp(role),
         PanelEffect::OpenBrowser => ReviewAction::OpenBrowser,
         PanelEffect::RevealFolder => ReviewAction::RevealFolder,
         PanelEffect::ShowDescription => ReviewAction::ShowDescription,

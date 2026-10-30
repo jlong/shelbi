@@ -271,6 +271,8 @@ pub struct WorkspaceDetailsInfo {
     pub worktree: String,
     /// The resolved editor's display name (`Vim`, ...).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane.
+    pub apps: shelbi_state::AppTools,
 }
 
 /// The header above a workspace's agent: which task it is working (id and

@@ -1371,7 +1371,7 @@ impl SettingsShell {
             if self.form.saved().is_some() {
                 out.push(PageAction { label: "Theme".into(), note: None, does: Does::Theme });
                 out.push(PageAction { label: "Command".into(), note: None, does: Does::Editor });
-                if self.form.editor().is_some() {
+                if self.form.editor_choice().is_some() {
                     out.push(PageAction {
                         label: "Clear the editor setting".into(),
                         note: Some(format!("use {}", self.form.fallback_editor().0)),
@@ -3534,7 +3534,7 @@ mod tests {
     fn written(theme: ThemePreference, editor: Option<&str>) -> UserConfig {
         UserConfig {
             theme,
-            editor: editor.map(str::to_string),
+            editor: editor.map(shelbi_state::ToolChoice::from),
             ..UserConfig::default()
         }
     }
@@ -3680,7 +3680,7 @@ mod tests {
         assert_eq!(s.handle_key(key(KeyCode::Char('s')), &km), SettingsAction::Save);
         let Some(SaveStart::Work(ticket, work)) = s.begin_save(Some("proj"), &writer()) else { panic!("the typed command saves") };
         let result = work();
-        assert_eq!(result.as_ref().unwrap().as_ref().unwrap().editor.as_deref(), Some("hx"));
+        assert_eq!(result.as_ref().unwrap().as_ref().unwrap().editor.as_ref().and_then(shelbi_state::ToolChoice::command), Some("hx"));
         assert_eq!(s.saved(&ticket, result), SettingsAction::Leave);
         assert_eq!(s.form().editor(), Some("hx"));
     }
@@ -3712,6 +3712,7 @@ mod tests {
             summary.global.preferences = Ok(general::Preferences {
                 theme: ThemePreference::Light,
                 editor: Some("code --wait".into()),
+                diff_tool: None,
             });
             let mut s = on_general(summary);
             let km = keymaps();

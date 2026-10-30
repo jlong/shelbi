@@ -210,16 +210,19 @@ From the review panel you can:
 <Tui>
 
 - **🤓 Reviewer**: talk to the Review agent (the default view).
-- **🔀 View Diff**: open your system diff tool over the review branch's
-  changes in the main pane. By default this uses git's configured diff tool
-  (`diff.tool`, or `diff.guitool` for a GUI tool) in directory-diff mode; if
-  none is configured the panel shows a short error instead of launching. A
+- **🔀 View Diff**: open your diff tool over the review branch's changes:
+  your [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) setting,
+  in the main pane for a command or in the app for an app. Unset, it uses git's
+  configured diff tool (`diff.tool`, or `diff.guitool` for a GUI tool) in
+  directory-diff mode; if none is configured the panel shows a short error
+  instead of launching. A
   diff tool that reviews a **revision range** rather than two directory trees
   (such as `skim`) cannot read the directory pair directory-diff mode hands
   it, so set `review.diff_command` in `project.yaml` to run it directly
   instead. See [Review diff command](#review-diff-command) below.
 - **✍️ Edit in `<editor>`**: open the review worktree in your
-  [configured editor](/docs/configuration/global#configyaml).
+  [configured editor](/docs/configuration/global#editor-and-diff-tool): in
+  the main pane for a command, in the app for an app.
 - **🌐 Open Browser**: open the served `url` in your system browser. This
   action only appears when the workflow declares a review URL.
 
@@ -233,14 +236,17 @@ The views are numbered, so `⌘1`, `⌘2`, and so on switch between them while
 the review is open.
 
 - **Reviewer**: talk to the Review agent (the default view).
-- **View Diff**: run your diff tool over the review branch's changes in the
-  main area. By default this uses git's configured diff tool (`diff.tool`, or
-  `diff.guitool` for a GUI tool) in directory-diff mode; if none is configured
-  the view shows a short error instead. A diff tool that reviews a **revision
+- **View Diff**: run your diff tool over the review branch's changes: your
+  [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) setting, in
+  the main area for a command or in the app for an app. Unset, it uses git's
+  configured diff tool (`diff.tool`, or `diff.guitool` for a GUI tool) in
+  directory-diff mode; if none is configured the view shows a short error
+  instead. A diff tool that reviews a **revision
   range** (such as `skim`) needs `review.diff_command` in `project.yaml`; see
   [Review diff command](#review-diff-command) below.
 - **Edit in `<editor>`**: open the review worktree in your
-  [configured editor](/docs/configuration/global#configyaml), inside the app.
+  [configured editor](/docs/configuration/global#editor-and-diff-tool):
+  inside Shelbi for a command, in the editor app for an app.
 - **Web Browser**: open the served `url` in your browser. It reads
   "loading…" until the server is up, and only appears when the workflow
   declares a review URL.
@@ -278,7 +284,8 @@ any.
 
 ## Review diff command
 
-**View Diff** defaults to `git difftool -d -y <base> HEAD`, git's
+With no [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) set,
+**View Diff** runs `git difftool -d -y <base> HEAD`, git's
 directory-diff mode, which builds two temp trees and hands your `diff.tool`
 **two directory paths**. Most terminal and GUI diff tools understand that.
 Some tools instead review a **revision range** (`skim <base> <head>`,

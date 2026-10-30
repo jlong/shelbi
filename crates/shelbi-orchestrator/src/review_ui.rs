@@ -150,7 +150,8 @@ fn resolve_difftool_gui(worktree: &std::path::Path) -> Result<bool> {
         return Ok(false);
     }
     Err(Error::Other(
-        "no diff tool configured — set git `diff.tool` (or `diff.guitool`) to your preferred diff tool"
+        "no diff tool configured: pick one in Settings ▸ General (`diff_tool:` in ~/.shelbi/config.yaml), \
+or set git `diff.tool` (or `diff.guitool`)"
             .into(),
     ))
 }
@@ -167,29 +168,31 @@ fn resolve_difftool_gui(worktree: &std::path::Path) -> Result<bool> {
 ///   — `-d` opens the whole changeset, `-y` skips the per-file prompt, `-g`
 ///   selects the GUI tool when [`resolve_difftool_gui`] chose it.
 ///
-/// Either invocation is wrapped so a **non-zero exit** leaves a readable
-/// message in the pane and holds it (a `read`) instead of leaving only git's
-/// warnings behind — the "tool exited without rendering" case an incompatible
-/// tool produces. A clean exit (the reviewer quit the tool) returns 0, the
-/// shell falls through, and the pane dies as before, so the panel's
-/// [`mid_content_pane_dead`] recovery swaps chat back in.
+/// [`diff_pane_command_for`] wraps any other invocation (a `diff_tool:`
+/// command's) the same way.
+#[cfg(test)]
 fn diff_pane_command(
     worktree: &std::path::Path,
     base: &str,
     override_cmd: Option<&str>,
     use_gui: bool,
 ) -> String {
-    let wt = shelbi_core::shell_escape(&worktree.to_string_lossy());
     let invocation = match override_cmd {
         Some(template) => render_diff_command(template, worktree, base),
-        None => {
-            let gui = if use_gui { "-g " } else { "" };
-            format!(
-                "git difftool -d -y {gui}{base} HEAD",
-                base = shelbi_core::shell_escape(base),
-            )
-        }
+        None => crate::tools::diff_invocation(&shelbi_state::tools::DiffLaunch::GitConfigured, worktree, base, use_gui),
     };
+    diff_pane_command_for(worktree, &invocation)
+}
+
+/// Wrap a diff `invocation` for the diff pane: run in `worktree`, and on a
+/// **non-zero exit** leave a readable message in the pane and hold it (a
+/// `read`) instead of leaving only git's warnings behind — the "tool exited
+/// without rendering" case an incompatible tool produces. A clean exit (the
+/// reviewer quit the tool) returns 0, the shell falls through, and the pane
+/// dies as before, so the panel's [`mid_content_pane_dead`] recovery swaps
+/// chat back in.
+fn diff_pane_command_for(worktree: &std::path::Path, invocation: &str) -> String {
+    let wt = shelbi_core::shell_escape(&worktree.to_string_lossy());
     // `{ …; }` groups the invocation so `$?` is the tool's own exit status; on
     // a non-zero exit we print a plain-language explanation and `read` to keep
     // the pane up so the message is legible (rather than the pane collapsing
@@ -198,7 +201,7 @@ fn diff_pane_command(
         "cd {wt} && {{ {invocation}; }}; __st=$?; \
 if [ \"$__st\" -ne 0 ]; then \
 printf '\\n[shelbi] diff tool exited without rendering a diff (status %s).\\n' \"$__st\"; \
-printf 'The configured diff tool may not accept this diff mode; set review.diff_command in project.yaml to a revision-range command (e.g. skim {{base}} {{head}}).\\n'; \
+printf 'The configured diff tool may not accept this diff mode; pick another in Settings (diff_tool: in ~/.shelbi/config.yaml), or set review.diff_command in project.yaml to a revision-range command (e.g. skim {{base}} {{head}}).\\n'; \
 printf 'Press Enter to return to chat.'; read -r __; fi"
     )
 }
@@ -257,13 +260,14 @@ fn git_config_value(worktree: &std::path::Path, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Build the `sh -c` command for a review **editor** content session: `$EDITOR`
+/// Build the `sh -c` command for a review **editor** content session: the
+/// editor command ([`shelbi_state::resolve_editor`]: a command `editor:`,
+/// else `$EDITOR`, else vim; an app `editor:` opens in the app, never here)
 /// opened on the review worktree. Shared with the single-process TUI
 /// (`rt-tui-review`), which spawns this as a `<project>/review/<slot>/editor`
-/// session process instead of a tmux pane; the tmux path builds the identical
-/// line inline in [`ensure_editor_pane`]. `exec` so the session ends when the
-/// editor quits; the worktree is shell-escaped, the editor command is not (it
-/// may carry flags, e.g. `code --wait`).
+/// session process. `exec` so the session ends when the editor quits; the
+/// worktree is shell-escaped, the editor command is not (it may carry flags,
+/// e.g. `code --wait`).
 pub(crate) fn editor_session_command(worktree: &std::path::Path) -> String {
     format!(
         "cd {} && exec {}",
@@ -272,39 +276,45 @@ pub(crate) fn editor_session_command(worktree: &std::path::Path) -> String {
     )
 }
 
-/// Build the `sh -c` command for a review **diff** content session — the same
-/// `git difftool` (or `review.diff_command` override) invocation
-/// [`ensure_diff_pane`] runs, over `merge-base(base, HEAD)..HEAD`. Shared with
-/// the single-process TUI, which spawns it as a `<project>/review/<slot>/diff`
-/// session. On the default path the tool is resolved first so an unconfigured
-/// `diff.tool` surfaces as an `Err` (a status-line warning) rather than a
-/// session that dies on launch.
+/// `merge-base(base_branch, HEAD)` in `worktree`: the base every diff of a
+/// branch's changes compares against, the range `shelbi diff` reports.
+pub(crate) fn merge_base(worktree: &std::path::Path, base_branch: &str) -> Result<String> {
+    git_capture(worktree, &["merge-base", base_branch, "HEAD"])
+}
+
+/// Build the `sh -c` command for a review **diff** content session over
+/// `merge-base(base, HEAD)..HEAD`, by precedence: the project's
+/// `review.diff_command`, then a command `diff_tool:` (`difft`, `nvim -d`),
+/// then git's configured difftool (also what an app `diff_tool:` gets here: a
+/// pane can't show an app, which opens through
+/// [`crate::tools::open_in_app`] instead). Shared with the single-process
+/// TUI, which spawns it as a `<project>/review/<slot>/diff` session. On git's
+/// path the tool is resolved first so an unconfigured `diff.tool` surfaces
+/// as an `Err` (a status-line warning) rather than a session that dies on
+/// launch.
 pub(crate) fn diff_session_command(
     project: &shelbi_core::Project,
     worktree: &std::path::Path,
 ) -> Result<String> {
-    let override_cmd = project.review_diff_command();
-    let use_gui = match override_cmd {
-        Some(_) => false,
-        None => resolve_difftool_gui(worktree)?,
+    let invocation: Box<dyn FnOnce(&str) -> String> = match project.review_diff_command() {
+        Some(template) => Box::new(move |base| render_diff_command(template, worktree, base)),
+        None => {
+            let diff_tool = shelbi_state::resolve_diff_tool();
+            let path_dirs = match &diff_tool {
+                Some(c) if !c.is_app() => shelbi_state::tools::login_path_dirs(),
+                _ => Vec::new(),
+            };
+            let launch = crate::tools::pane_diff_launch(diff_tool.as_ref(), &path_dirs)?;
+            let use_gui = match launch {
+                shelbi_state::tools::DiffLaunch::GitConfigured => resolve_difftool_gui(worktree)?,
+                _ => false,
+            };
+            Box::new(move |base| crate::tools::diff_invocation(&launch, worktree, base, use_gui))
+        }
     };
-    let base = git_capture(worktree, &["merge-base", project.base_branch(), "HEAD"])?;
-    Ok(diff_pane_command(worktree, &base, override_cmd, use_gui))
+    let base = merge_base(worktree, project.base_branch())?;
+    Ok(diff_pane_command_for(worktree, &invocation(&base)))
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Approve / Reject transitions
