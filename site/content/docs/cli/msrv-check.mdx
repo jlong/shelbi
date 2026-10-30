@@ -1,0 +1,63 @@
+---
+title: shelbi msrv-check
+order: 28.6
+summary: Build a Rust workspace on its declared minimum Rust version, as a zen.checks.local entry that catches MSRV breaks before handoff.
+---
+
+```text
+shelbi msrv-check [OPTIONS]
+```
+
+`shelbi msrv-check` builds the Rust workspace in the current directory on the
+minimum Rust version it declares (the `rust-version` in `Cargo.toml`), the way a
+typical CI `msrv` job does:
+
+```bash
+cargo +<rust-version> check --workspace --all-targets --locked
+```
+
+It's meant as a [`zen.checks.local`](/docs/configuration/project#zen) entry on Rust
+projects. A stable-toolchain build won't notice a lockfile change that pulls in
+a dependency needing a newer Rust than the declared minimum; this catches it
+before handoff instead of only in CI.
+
+It reads `rust-version` from the nearest `Cargo.toml` at or above the current
+directory. If the toolchain isn't installed it installs it once with `rustup`.
+It never fails for reasons unrelated to the code:
+
+- no `rust-version` found, `rustup` missing, or a toolchain that can't be
+  installed (offline, for example) prints a warning on stderr and exits `0`
+  (a skip);
+- a real MSRV break (the check ran and `cargo` failed) exits with `cargo`'s
+  non-zero status.
+
+| Variable | Effect |
+| --- | --- |
+| `SHELBI_SKIP_MSRV_CHECK=1` | Skip the check entirely (exit `0`). For a host that intentionally doesn't provision the MSRV toolchain. |
+| `SHELBI_MSRV_NO_INSTALL=1` | Never install a missing toolchain; skip instead. The check still runs where the toolchain is already installed. |
+
+`msrv-check` has no flags of its own beyond the global `--root` and
+`-p, --project`, which it doesn't use.
+
+## Examples
+
+Add it to a project's local Zen checks:
+
+```yaml
+zen:
+  checks:
+    local:
+      - shelbi msrv-check
+```
+
+Run it by hand from the repository root:
+
+```bash
+shelbi msrv-check
+```
+
+## See also
+
+- [Project configuration](/docs/configuration/project#zen): where `zen.checks.local`
+  is set.
+- [Zen Mode](/docs/concepts/zen-mode): when local checks run.

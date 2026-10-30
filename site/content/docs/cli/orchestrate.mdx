@@ -1,0 +1,46 @@
+---
+title: shelbi orchestrate
+order: 26
+summary: Make sure the project's orchestrator session is running, starting it if needed.
+---
+
+```text
+shelbi orchestrate [OPTIONS]
+```
+
+`shelbi orchestrate` makes sure the current project's
+[orchestrator](/docs/concepts/orchestrator) is running as the project's
+orchestrator session. It starts the hub daemon on demand if it isn't up yet,
+then starts the orchestrator agent if it isn't already running. It prints
+`✓ orchestrator started (…)` or `orchestrator already running (…)`, followed by
+a reminder to open the project with `shelbi` to see it.
+
+You rarely need it: opening a project with `shelbi` starts the orchestrator,
+and the daemon relaunches it if it dies while the project is open. It is
+useful from a script or a plain shell when you want the orchestrator up
+without opening a client.
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--status` | flag | off | Reserved. It currently behaves exactly like a plain `shelbi orchestrate`: it still starts the orchestrator if it isn't running, and prints the same lines. |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project whose orchestrator to start. |
+
+## Examples
+
+Start the orchestrator for the project in the current directory:
+
+```bash
+shelbi orchestrate
+```
+
+## See also
+
+- [Orchestrator](/docs/concepts/orchestrator): what the orchestrator does and
+  how it is supervised.
+- [`shelbi reload`](/docs/cli/reload): relaunch the orchestrator (and the rest
+  of the project) on a freshly installed binary.
+- [`shelbi orchestrator events`](/docs/cli/orchestrator): the event queue the
+  orchestrator drains.

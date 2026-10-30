@@ -9,13 +9,12 @@ shelbi detach [OPTIONS] [CLIENT_ID]
 ```
 
 Shelbi runs a single long-lived session that the daemon owns, and more than one
-client can attach to it at once: two terminal windows today, and later the
-desktop app attaching to a running CLI session or a client attaching to a remote
-one. `shelbi detach` disconnects clients from that session without stopping any
+client can attach to it at once: terminal windows and the desktop app today,
+and later a client attaching to a remote session. `shelbi detach` disconnects clients from that session without stopping any
 work. Each detached client stops rendering and drops its connections, while every
 session and agent keeps running in the background.
 
-Detaching is not quitting. [`shelbi quit`](/docs/cli/open) ends a project's
+Detaching is not quitting. [`shelbi quit`](/docs/cli/quit) ends a project's
 sessions (and `shelbi quit --all` stops the whole hub); detach leaves all of it
 running so you can come back to it. Inside the dashboard the same actions live in
 the command palette as **Detach** (leave Shelbi running in the background),
@@ -24,9 +23,10 @@ session), **Quit Project**, and **Quit Shelbi**.
 
 ## Reattaching
 
-There is no `shelbi attach` for this. Plain `shelbi` reattaches to the running
+Plain `shelbi` reattaches to the running
 session (and starts one if none is running), so after a detach you simply run
-`shelbi` again to pick up where you left off.
+`shelbi` again to pick up where you left off. ([`shelbi attach`](/docs/cli/attach)
+is a different command: it puts your terminal on one workspace's session.)
 
 ## Arguments
 
@@ -40,10 +40,13 @@ session (and starts one if none is running), so after a detach you simply run
 | --- | --- | --- | --- |
 | `--list` | bool | `false` | List the attached clients (id, kind, host, project, attach time) without detaching any. |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
-| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Accepted as a global flag but ignored: detach is hub-wide, not per-project. |
 
-`shelbi detach` always exits `0`, whether or not any client was attached (with
-no running session it reports `No clients attached.`).
+`shelbi detach` exits `0` whether or not any client was attached. With no
+running session it reports `No clients attached.`, and an id that isn't attached
+reports `No client '<id>' attached.`. It exits non-zero only if it can't reach the
+running daemon's control socket. The `--list` table shows `-` in the PROJECT
+column for a client with no project, such as the desktop app.
 
 ## Examples
 

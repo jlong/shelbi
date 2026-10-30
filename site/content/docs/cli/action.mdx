@@ -1,0 +1,138 @@
+---
+title: shelbi action
+order: 28.3
+summary: Run one of the single-purpose git and GitHub primitives that a workflow's transitions sequence, by hand.
+---
+
+```text
+shelbi action <SUBCOMMAND> [OPTIONS] <TASK_ID>
+```
+
+`shelbi action` runs the hub-side primitives behind a workflow's
+[`transitions:` actions](/docs/configuration/workflow#actions). When an issue
+moves across an edge that declares actions, Shelbi runs them for you; these
+subcommands run one by hand, for recovery or scripting.
+
+Each primitive does one thing, is idempotent, and quietly succeeds when there's
+nothing to do. Each one prints a short machine-readable result on stdout. They
+change git, PR, or issue state, so they first check that the running hub daemon
+matches this `shelbi` binary.
+
+`<TASK_ID>` is the issue id. Every subcommand accepts the global
+`-p, --project <PROJECT>` flag, omitted from the tables below.
+
+## push-branch
+
+```text
+shelbi action push-branch <TASK_ID>
+```
+
+Push the issue's branch from its assigned workspace's worktree to `origin`.
+Pushing an up-to-date branch succeeds. Prints `pushed`.
+
+## open-pr
+
+```text
+shelbi action open-pr [--target <TARGET>] <TASK_ID>
+```
+
+Open a PR for the issue's branch and print its number. If an open PR for the
+branch already exists, prints that PR's number instead. The PR base is
+`--target` if given, else the branch of the first not-done `depends_on` parent,
+else the project's base branch.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--target <TARGET>` | string | resolved as above | Override the PR base branch. Mirrors a transition's `target:` field. |
+
+## close-pr
+
+```text
+shelbi action close-pr <TASK_ID>
+```
+
+Close any open PR for the issue's branch without merging. Prints the closed PR
+number, or `none` if there was nothing to close.
+
+## merge
+
+```text
+shelbi action merge [--target <TARGET>] <TASK_ID>
+```
+
+Integrate the issue's branch into the target branch using the project's
+`git.merge_strategy` (`squash` or `merge`; `rebase` isn't supported yet and
+errors). A workflow's own `merge_strategy` isn't consulted. If a PR is open for
+the branch, Shelbi merges it through GitHub into the PR's own base. Otherwise the hub fetches the branch from `origin`, merges it locally, and
+pushes the result.
+
+The first line says which path ran:
+
+- `pr:<n>:<sha>` for a PR merge (`sha-pending` when GitHub hasn't reported the
+  merge commit yet),
+- `hub:<target>:<sha>` for a hub-side merge,
+- `already-merged:…` or `already-integrated:<target>` when the work had already
+  landed.
+
+`merge` doesn't delete the branch (pair it with `delete-branch`). It does
+restack every not-done issue that lists this one in its `depends_on`, printing
+one more line per child (`restacked:…` or `skipped:…`).
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--target <TARGET>` | string | workflow `git.base_branch`, else the project's base branch | Override the merge target. Mirrors a transition's `target:` field. |
+
+## delete-branch
+
+```text
+shelbi action delete-branch <TASK_ID>
+```
+
+Delete the issue's branch from `origin` and from the hub's local refs. Skipped
+while a workspace still has the branch checked out. Prints `deleted`,
+`skipped:<reason>`, or `not-present`.
+
+## restack
+
+```text
+shelbi action restack --from <FROM> [--onto <ONTO>] <TASK_ID>
+```
+
+Rebase a child issue's branch onto a new base (usually the target its parent
+just merged into) and retarget its open PR. It runs in a detached worktree on
+the hub, so the hub checkout keeps whatever branch you have checked out. Prints
+`restacked:<id>:<branch>:<new-base>:<sha>`, or
+`skipped:<id>:already-restacked` when the branch is already on the new base.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--from <FROM>` | string | none | The branch the child is currently based on, usually the parent's branch (required). |
+| `--onto <ONTO>` | string | the project's base branch | The new base. |
+
+## apply-transition
+
+```text
+shelbi action apply-transition --from <FROM> --to <TO> <TASK_ID>
+```
+
+Run every action the issue's workflow declares for the `from -> to` edge, in
+order, stopping at the first failure. The transition's `target:` is resolved
+with `{{var}}` placeholders filled from the issue's frontmatter. Prints one
+`<action><TAB><result>` line per action that ran. An undeclared edge, or one
+with no actions, prints nothing and exits `0`.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--from <FROM>` | string | none | Status id the issue is moving out of (required). |
+| `--to <TO>` | string | none | Status id the issue is moving into (required). |
+
+This runs the actions only. It doesn't move the card; use
+[`shelbi issue move`](/docs/cli/issue#move) for that.
+
+## See also
+
+- [Workflow configuration](/docs/configuration/workflow#transitions): declaring
+  the `transitions:` that sequence these actions.
+- [`shelbi issue move`](/docs/cli/issue#move): moving a card, which runs its
+  edge's actions (or skips them with `--skip-transition-actions`).
+- [`shelbi zen`](/docs/cli/zen): the Zen Mode merge primitives.

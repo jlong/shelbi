@@ -39,7 +39,10 @@ A board mid-flight, with one issue promoted to `TO DO`, one dispatched to a
 workspace, and one already `DONE`:
 
 <AppMockup
+  terminalTitle="you@hub — shelbi"
   project="shelbi"
+  workflow="task"
+  zenMode={false}
   columns={[
     { label: "BACKLOG", category: "gray", cards: [
       { title: "Audit third-party licenses", id: "t-005" },
@@ -51,10 +54,11 @@ workspace, and one already `DONE`:
     { label: "IN PROGRESS", category: "yellow", cards: [
       { title: "Write changelog page", id: "t-013", workspace: "delta" },
     ] },
-    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "REVIEW", category: "magenta", cards: [], collapsed: true },
     { label: "DONE", category: "green", cards: [
       { title: "Getting-started section", id: "t-004" },
     ] },
+    { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
   ]}
   machines={[
     { name: "hub", workspaces: [
@@ -62,10 +66,11 @@ workspace, and one already `DONE`:
       { name: "bravo", state: "idle" },
     ] },
     { name: "devbox", workspaces: [
-      { name: "delta", state: "working", agent: "Developer" },
+      { name: "delta", state: "working", agent: "developer" },
     ] },
   ]}
-  review={[]}
+  readyReview={[]}
+  queuedReview={[]}
 />
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag: it targets
@@ -87,7 +92,7 @@ Pass `--status todo` to skip triage when you're already sure.
 | `<TITLE>` | string | — | Human-readable title (positional, required). |
 | `--id <ID>` | string | slug of title | Override the auto-generated id. |
 | `--status <STATUS>` | string | `backlog` | Initial status. |
-| `-d, --description <DESCRIPTION>` | string | the title | Issue body. When omitted, the body defaults to the title; use `shelbi issue edit` to fill it in later. |
+| `-d, --description <DESCRIPTION>` | string | the title | Issue body. May instead be piped on stdin (`shelbi issue add "Title" <<EOF … EOF`); passing both is an error. When neither is given, the body defaults to the title; use `shelbi issue edit` to fill it in later. |
 | `--depends-on <ID>` | string (repeatable) | — | Block this issue on another. Repeat for multiple deps. |
 | `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this issue to a workspace on a specific machine. |
 | `--workflow <NAME>` | string | project default | Workflow this issue runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
@@ -143,17 +148,25 @@ shelbi issue move --to <STATUS> [OPTIONS] <ID>
 Move an issue between statuses. Promoting to `todo` is the orchestrator's start
 signal. It picks a free workspace and runs `issue start` itself.
 
-The destination is validated against the issue's workflow. A status the workflow
-doesn't declare (or a custom status with no backing column) errors with the
-list of reachable statuses, and the issue stays put. Matching is case- and
-punctuation-insensitive (`InProgress` matches `in_progress`); an issue pinned to a
-workflow with no YAML on disk falls back to the built-in `default`, so
-projects keep moving while the workflows directory is empty.
+The destination is validated against the issue's workflow. A status the
+workflow doesn't declare errors with the list of statuses it does declare, and
+the issue stays put. The core statuses accept friendly spellings in any case
+(`InProgress`, `wip`, `to-do`, `cancelled`, `completed`, …); a custom status id
+must match exactly. An issue pinned to a workflow with no YAML on disk falls
+back to the built-in `default` (with a warning), so projects keep moving while
+the workflows directory is empty.
+
+Moving across an edge that declares
+[transition actions](/docs/configuration/workflow#actions) runs them. A `merge`
+action is gated: the branch is merged before the card moves, and a failed merge
+leaves the issue where it was. A move into `in_progress` also cuts the issue's
+branch on the hub first.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--to <STATUS>` | string | — | Destination status (required). Must be a status declared by the issue's workflow. |
 | `--reason <REASON>` | string | `user:cli` | Reason tag recorded in `~/.shelbi/events.log`. The orchestrator parses this to tell auto-dispatches apart from user actions. |
+| `--skip-transition-actions` | flag | off | Recovery escape hatch: advance the card without running the destination transition's actions (`merge`, `push_branch`, `open_pr`, …). Use only when the git work already happened out of band, such as a PR merged by hand. The move is stamped `actions=skipped` in the event log. |
 
 ## assign
 
@@ -163,11 +176,13 @@ shelbi issue assign --to <WORKSPACE> <ID>
 
 Set the issue's `assigned_to` field without launching the workspace. Use
 this when you want to pre-allocate before promoting to `todo`. The
-workspace must be declared in the project YAML.
+workspace must be declared in the project YAML. A workspace already running a
+different `in_progress` issue is refused.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--to <WORKSPACE>` | string | — | Workspace name (required). |
+| `--force` | flag | off | Assign onto a `review`-tagged workspace anyway (refused by default; review slots load handed-off branches through the review queue). The override is recorded in `~/.shelbi/events.log`. |
 
 ## unassign
 
@@ -187,7 +202,7 @@ Launch the assigned workspace on this issue. Three things happen in one shot:
 
 1. The workspace's worktree is checked out to the issue's branch (generated
    from workflow config, project config, or your GitHub username when unset).
-2. Any existing pane for that workspace is killed. Context is wiped clean.
+2. Any existing session for that workspace is ended. Context is wiped clean.
 3. The runner relaunches with the issue prompt and the column transitions
    into `in_progress`.
 
@@ -199,6 +214,8 @@ the orchestrator runs when an issue hits `todo`.
 | `--workspace <WORKSPACE>` | string | issue's `assigned_to` | Assign and launch in one call. |
 | `--branch <BRANCH>` | string | generated | Override the default branch name. |
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
+| `--force` | flag | off | Launch on a `review`-tagged workspace anyway (refused by default). Recorded in `~/.shelbi/events.log`. |
+| `--take` | flag | off | On a remote issue tracker (e.g. GitHub), assign the issue to you on the tracker before starting. Needed for an unassigned issue or one you're taking over; Shelbi only starts issues assigned to you there. The orchestrator never passes it. |
 
 ## resume
 
@@ -212,7 +229,7 @@ throwing away progress. Use it when a worker stalls or its session dies
 want it going again on the same issue with its work intact.
 
 `resume` is the recovery counterpart to [`start`](#start). `start` wipes
-the agent's context (kills the pane and re-checks-out a clean branch): right
+the agent's context (ends the session and re-checks-out a clean branch): right
 for a fresh dispatch, wrong for recovery. `resume` instead preserves the
 in-flight state:
 
@@ -220,10 +237,10 @@ in-flight state:
    uncommitted changes stay exactly where the worker left them. The branch is
    never reset or re-checked-out. (If the worktree was torn down entirely, it's
    recreated on the issue's existing branch.)
-2. The runner pane is recreated or reclaimed: a killed session is stood back
+2. The runner session is recreated or reclaimed: a killed session is stood back
    up, and a stale or wedged one (the duplicate-session case) is torn down
-   before the fresh pane comes up.
-3. For a **claude** runner the pane relaunches with `--continue`, so the worker
+   before the fresh session comes up.
+3. For a **claude** runner the session relaunches with `--continue`, so the worker
    reloads its prior conversation and picks up mid-thought with full context.
    Other runners fall back to re-injecting the issue prompt. The agent continues
    by reading its own prior work in the worktree. Either way the prompt is
@@ -236,6 +253,7 @@ someone moved back), `resume` restores it.
 | --- | --- | --- | --- |
 | `--workspace <WORKSPACE>` | string | issue's `assigned_to` | Workspace whose worktree holds the in-flight work. |
 | `--reason <REASON>` | string | `user:cli:resume` | Reason tag recorded in `~/.shelbi/events.log` if the resume has to move the card back into `in_progress`. |
+| `--take` | flag | off | Claim the issue on a remote issue tracker before resuming it (see `start --take`). |
 
 ## prio
 
@@ -254,6 +272,8 @@ opening the TUI.
 | `--top` | flag | — | Move to the top of the column. |
 | `--bottom` | flag | — | Move to the bottom of the column. |
 | `--set <N>` | integer | — | Move to a specific 0-based slot. |
+
+Pass exactly one of these flags.
 
 ## edit
 
@@ -311,13 +331,15 @@ EOF
 shelbi issue rm <ID>
 ```
 
-Delete an issue file.
+Delete an issue. On the `file_system` backend this removes its markdown file;
+on a `github` board it closes the GitHub issue as *not planned* (GitHub can't
+delete issues). Either way the column's priorities are renumbered.
 
 <Callout type="warning" title="Irreversible">
 
-`shelbi issue rm` deletes the issue's markdown file outright. There's no
-trash and no undo. To take a card off the board without destroying its
-history, move it back to `backlog` instead.
+On the file system backend `shelbi issue rm` deletes the markdown file
+outright. There's no trash and no undo. To take a card off the board without
+destroying its history, move it to `canceled` instead.
 
 </Callout>
 

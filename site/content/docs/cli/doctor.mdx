@@ -1,0 +1,69 @@
+---
+title: shelbi doctor
+order: 31.5
+summary: Runtime health checks for a project, mainly its GitHub API budget, with a warning when a budget would run out within 30 minutes.
+---
+
+```text
+shelbi doctor [OPTIONS]
+```
+
+`shelbi doctor` prints a runtime health report for the current project. It is
+read-only and always exits `0`: it's a report, not a gate, so the warnings are
+the signal.
+
+It checks:
+
+- **macOS login session.** Whether the daemon has lost its GUI login session
+  (the state that makes agents silently lose DNS, SSH, and user lookups). It
+  prints `macOS login session: ok`, or `LOST` with when and why it was
+  detected.
+- **GitHub API budget.** For a project whose board lives on
+  [GitHub Issues](/docs/concepts/github-issues), the observed request rate over
+  the last hour for the GraphQL and REST budgets, the remaining budget, and the
+  projected time until it runs out. GraphQL is measured in points, REST in
+  requests. Requests that GitHub answered with `304 Not Modified` spend no
+  budget and are counted on their own line, and failed attempts are reported
+  separately so a dead network never reads as a high spend rate.
+
+When a budget would run out within 30 minutes at the observed rate, `doctor`
+prints a `WARNING` line under it naming the top callers, so you know which
+reader to throttle. It also flags a parked connection circuit breaker
+(`network: UNREACHABLE`) and the daemon's last board-refresh failure when the
+board isn't refreshing.
+
+A project on the local `file_system` board has no API budget, so only the
+session check runs:
+
+```text
+macOS login session: ok
+
+doctor: project `repo` uses a local (file_system) issue backend — no API budget to check
+```
+
+On a GitHub-backed project:
+
+```text
+macOS login session: ok
+
+GitHub API budget health for `shelbi`:
+  graphql: ~321 points/hr (205 requests, 321 points) · 4411 remaining · exhausts in ~13h
+  rest: ~295 req/hr (295 requests, 295 req) · 4163 remaining · exhausts in ~14h
+    127 not-modified (304) read(s), no budget spent
+```
+
+## Flags
+
+`doctor` has no flags of its own.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to check. |
+
+## See also
+
+- [GitHub Issues backend](/docs/concepts/github-issues): how Shelbi reads and
+  writes a GitHub board, and why it watches the API budget.
+- [`shelbi config lint`](/docs/cli/config#lint): static checks of the
+  configuration files, as opposed to these runtime checks.

@@ -17,13 +17,24 @@ shelbi init [OPTIONS]
 The `-y` path performs the full prerequisite and project validation before it
 writes anything. It uses the current directory by default, detects the Git
 root, branch, origin, and runner, then creates the same project and
-Welcome card as Enter on the interactive setup card.
+Welcome card as Enter on the interactive setup card. If the directory isn't a
+Git repository yet, `-y` initializes one with `git init -b main` first
+(interactive setup asks before doing so). Running `init -y` again in a directory
+that already belongs to a project prints `✓ Project <name> is already
+configured.` and changes nothing.
 
-The project is created with an **empty workspace pool**. `shelbi init` no longer
-provisions workspaces; the orchestrator sets them up on first boot by asking how
-many workspaces and which naming scheme you want, then creating each one with
+The `-y` path creates the project with an **empty workspace pool**; the
+orchestrator sets the pool up on first boot by asking how many workspaces and
+which naming scheme you want, then creating each one with
 [`shelbi workspace add`](/docs/cli/workspace). Run `shelbi` interactively for that
-first-boot interview.
+first-boot interview. The config-location path (without `-y`) instead writes a
+starter pool of two hub workspaces: `dev` and a `review`-tagged `review` slot.
+
+Every setup path also installs a `pre-commit` hook in the repository that blocks
+commits to the default branch from inside Shelbi's agent sessions only; your own
+shell is unaffected. Shelbi prints a notice the first time it installs the hook,
+and an existing hook of your own is left untouched (with a warning). Manage or
+remove it with [`shelbi guard`](/docs/cli/guard).
 
 ## Where your issues live
 
@@ -39,13 +50,14 @@ Interactive setup asks where the project's board should live:
   never written. On success, Shelbi creates `shelbi:id/*` and `shelbi:status/*`
   labels on first use and stores a small metadata block in each issue's body.
 - **File system** keeps the board as private markdown files on this machine
-  under `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. This is the
-  default.
+  under `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. It's
+  pre-selected when the origin isn't on GitHub, and it's what `-y` uses unless
+  you pass `--issue-tracker github`.
 
 The choice is written as an `issue_tracker:` block in the project config: the
 shared `project.yaml` for in-repo mode, or `~/.shelbi/projects/<name>.yaml` for
 global mode. To move an existing board between backends later, use
-[`shelbi issue-store migrate`](/docs/cli/issue). Setup never switches the backend
+[`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate). Setup never switches the backend
 of a project that already has issues without pointing you there first.
 
 ## Automation
@@ -86,8 +98,8 @@ Pass `--runner claude` or `--runner codex` to make automation deterministic.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `-y, --yes` | flag | off | Accept the detected plan without prompts. This is a global flag and may appear before or after `init`. |
-| `--project <PROJECT>` | string | project-root basename | Override the generated project name. |
-| `--root <ROOT>` | path | current directory with `-y` | Repository Shelbi will manage. |
+| `--project <PROJECT>` | string | project-root basename | Override the generated project name. Shelbi lowercases it and replaces characters a project id can't hold with `-`, and tells you when it does (`Using project name 'my_thing' (normalized from 'My_Thing')`). |
+| `--root <ROOT>` | path | current directory with `-y` | Repository Shelbi will manage. Put it after `init`: `shelbi --root PATH init` sets the Shelbi state directory instead. A relative path is resolved against the current directory and must exist. |
 | `--runner <RUNNER>` | `claude` \| `codex` | the only detected runner | Runner for the workspaces the orchestrator creates on first boot. Required when both supported runners are installed. |
 | `--default-branch <BRANCH>` | string | detected branch, then `main` | Override the detected default branch. `--branch` is an alias. |
 | `--github-url <URL>` | string | detected origin | Override the detected origin URL. `--remote` is an alias; pass an empty value to omit it. |
@@ -95,7 +107,10 @@ Pass `--runner claude` or `--runner codex` to make automation deterministic.
 | `--issue-tracker <BACKEND>` | `github` \| `file_system` | `file_system` | Where the board lives. `github` is preflighted before anything is written; a failure is a hard error naming the fix (no silent fall-back). Omit to keep `file_system`. |
 | `--github-repo <OWNER/REPO>` | string | detected origin repo | The repo for `--issue-tracker github`. Required when the origin remote is not a GitHub repo. |
 
-Detected-plan overrides require `-y`. The `-y` path cannot be combined with
+`--runner`, `--default-branch`, `--github-url`, `--orchestrator-runner`,
+`--issue-tracker`, and `--github-repo` require `-y`; without it they fail with a
+`detected-plan overrides require shelbi init -y` error. `--project` and `--root`
+work on both paths. The `-y` path cannot be combined with
 `--mode` or `--pick-up`. Without `--issue-tracker`, `-y` keeps the `file_system`
 default so existing scripted setups are unchanged. The chosen backend is printed
 in the plan summary.
@@ -113,6 +128,7 @@ Without `-y`, `shelbi init` uses the explicit config-mode workflow:
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Choose committed in-repo config or per-user global config. Required for this path when stdin is not a TTY. |
+| `--root <ROOT>` | path | asked interactively | Project root. Skips the "Project root?" prompt; required when stdin is not a TTY. |
 | `--pick-up` | flag | off | Register an existing committed `<repo>/.shelbi/project.yaml` after cloning a teammate's project. |
 
 Register an existing in-repo project like this:
@@ -131,3 +147,5 @@ and migration path.
   the visible preflight and one-confirmation experience.
 - [`shelbi wizard`](/docs/cli/wizard) for the explicit interactive entry point.
 - [`shelbi project`](/docs/cli/project) for adding or migrating projects.
+- [`shelbi guard`](/docs/cli/guard) for the default-branch commit guard setup
+  installs.

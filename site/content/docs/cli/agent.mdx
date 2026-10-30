@@ -19,10 +19,17 @@ Agents live under the project's `agents/` directory:
 `~/.shelbi/projects/<project>/agents/<name>/` in the default
 [global mode](/docs/concepts/config-modes) or
 `<repo>/.shelbi/agents/<name>/` in in-repo mode. Each has an
-`instructions.md` (its prompt) and an optional `skills/` directory. The
-shared `agents/_shared/preamble.md` is prepended to every agent's prompt at
-launch time. The defaults are seeded on first load and never clobbered on
-upgrade. See [customizing an agent](/docs/concepts/agents#customizing-an-agent).
+`instructions.md` (its prompt) and an optional `skills/` directory. Shipped
+agents also carry `agent.yaml` (which runner and model the agent uses) and a
+`settings.json` for Claude Code hooks; `agent new` scaffolds only
+`instructions.md` and `skills/`. The shared `agents/_shared/preamble.md` is
+prepended to every agent's prompt at launch time.
+
+Shelbi writes the defaults when it creates the project. On `shelbi init` and
+`shelbi reload` it updates any default you haven't edited to the current
+release's version and leaves edited ones alone (except that runner-required
+orchestrator sections are appended if missing). See
+[customizing an agent](/docs/concepts/agents#customizing-an-agent).
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
 from the per-subcommand tables below.
@@ -33,29 +40,32 @@ from the per-subcommand tables below.
 shelbi agent list
 ```
 
-Print a table of every agent in the project: its name, the workflow
-statuses that reference it via the
-[`agent:` field](/docs/guides/getting-started/workflows#owners-and-agents), the count of
-skill files under its `skills/` dir, and whether its `instructions.md`
-has been customized away from the bundled default.
+Print a table of every agent in the project, sorted by name: its name, the
+workflow status ids that reference it via the
+[`agent:` field](/docs/guides/getting-started/workflows#owners-and-agents), the
+number of `*.md` files directly in its `skills/` dir (directory-style skills
+such as `skills/<name>/SKILL.md` aren't counted), and whether its
+`instructions.md` has been customized away from the bundled default. On a fresh
+project:
 
 ```text
 AGENT          STATUSES                   SKILLS  CUSTOMIZED
-orchestrator   -                          0       no
-developer      InProgress, Todo           0       no
-review         Review                     1       no
-qa             -                          0       no
-security       -                          0       no
 adversarial    -                          0       no
+developer      in-progress                0       no
+orchestrator   backlog, todo              0       no
+qa             -                          0       no
+review         review                     0       no
+security       -                          0       no
 ```
 
 The `CUSTOMIZED` column reads:
 
-- `no` — shipped default whose `instructions.md` matches the bundled body
-  byte-for-byte.
-- `yes` — shipped default that's been edited (or whose file is missing on
+- `no`: shipped default whose `instructions.md` still matches a bundled
+  default (the current one, or an older release's that the next self-heal
+  will update).
+- `yes`: shipped default that's been edited (or whose file is missing on
   disk and would re-materialize on the next `shelbi reload`).
-- `-` — an agent you authored; there's no bundled body to compare against.
+- `-`: an agent you authored; there's no bundled body to compare against.
 
 ## show
 
@@ -64,13 +74,17 @@ shelbi agent show <NAME>
 ```
 
 Print the agent's `instructions.md` to stdout, followed by a `Skills:`
-section listing each `skills/*.md` file with the `description` from its
-frontmatter. Errors if the agent doesn't exist.
+section listing each `*.md` file directly in `skills/` with the
+`description` from its frontmatter (or `(no description)`).
+Directory-style skills (`skills/<name>/SKILL.md`) aren't listed, so the shipped
+`review` agent shows `(none)`. Errors if the agent doesn't exist.
 
 This shows you what *one* agent's file holds in isolation. It does **not**
 prepend `agents/_shared/preamble.md`. That composition happens at launch
-time, not at `show` time. To see the shared preamble, `cat
-~/.shelbi/projects/<name>/agents/_shared/preamble.md`.
+time, not at `show` time. To see the shared preamble, `cat` the project's
+`agents/_shared/preamble.md`
+(`~/.shelbi/projects/<project>/agents/_shared/preamble.md` in global mode,
+`<repo>/.shelbi/agents/_shared/preamble.md` in in-repo mode).
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -87,7 +101,8 @@ Scaffold a new agent directory under `agents/<NAME>/` with a starter
 role template, not a copy of `developer`. It's there to be replaced.
 
 Errors if an agent with that name already exists. Names must be non-empty,
-must not start with `.` or `_`, and may only contain `a-z`, `0-9`, `-`, `_`.
+must not start with `.` or `_`, and may only contain ASCII letters, digits,
+`-`, and `_`.
 The name doubles as the identifier referenced from workflow `agent:`
 fields, so the validator is stricter than POSIX.
 
@@ -101,8 +116,9 @@ fields, so the validator is stricter than POSIX.
 shelbi agent edit <NAME>
 ```
 
-Open the agent's `instructions.md` in `$EDITOR` (falling back to `$VISUAL`,
-then `vim`). Errors if the agent doesn't exist. Run `shelbi agent new
+Open the agent's `instructions.md` in `$VISUAL`, falling back to `$EDITOR`,
+then `vi`. A blank variable is skipped, and a value with arguments (such as
+`code -w`) is split on whitespace. Errors if the agent doesn't exist. Run `shelbi agent new
 <NAME>` first, or `shelbi reload` to materialize the shipped defaults if
 this is the first time the project's been opened.
 

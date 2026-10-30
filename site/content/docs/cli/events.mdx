@@ -1,25 +1,32 @@
 ---
 title: shelbi events
 order: 25
-summary: Inspect the hub-global workspace-state transition log — the same feed the orchestrator reacts to.
+summary: Inspect the hub-global events log of task transitions, workspace state changes, heartbeats, and hub operations.
 ---
 
 ```text
 shelbi events <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi events` exposes `~/.shelbi/events.log`, the append-only log of every
-column transition and workspace state change across the hub. The orchestrator
-follows it as its trigger stream. To see what the orchestrator is seeing, run
-`events tail --follow` in another pane.
+`shelbi events` exposes `~/.shelbi/events.log`, the append-only log of task
+transitions, workspace state changes, heartbeats, and hub operations (dispatch,
+merge, forward health) across the hub. The orchestrator mirrors it with
+`events tail --follow --project <name>` as a low-latency wake-up; its
+authoritative feed is the durable
+[`shelbi orchestrator events`](/docs/cli/orchestrator) queue. To see what the
+orchestrator is seeing, run `events tail --follow --project <name>` in another
+terminal.
 
 The most common line shapes are:
 
 ```text
-<ts> project=<p> task=<id> workflow=<name> <from> -> <to> reason=<r> from_category=<c> to_category=<c>
+<ts> project=<p> task=<id> workflow=<name> <from> -> <to> reason=<r> from_category=<c> to_category=<c> [owner=<who>]
 <ts> project=<p> workspace=<name> <prev> -> <new>
-<ts> project=<name> heartbeat
+<ts> project=<name> heartbeat zen=<on|off> zen_eligible=<n> idle_workspaces=<n>
 ```
+
+Hub operations add their own shapes, such as `dispatch project=<p> task=<id>
+…`, `merge task=<id> …`, and `ssh reverse-forward host=<h> …`.
 
 The token is `workspace=`, not `worker=` (a retired pre-rename alias). On the
 first workspace transition `<prev>` is `none`.
@@ -32,7 +39,9 @@ interval `60s`, backing off toward a `5m` cap). See
 [the events log](/docs/concepts/events-log#heartbeats) for the full
 shape catalog.
 
-Every subcommand accepts the global `-p / --project <PROJECT>` flag.
+`events tail` is hub-global by default. Pass `--project <name>` (long form
+only; `-p` isn't accepted here, and `$SHELBI_PROJECT` is ignored) to scope it to
+one project.
 
 ## tail
 
@@ -41,16 +50,17 @@ shelbi events tail [OPTIONS]
 ```
 
 Print recent transitions, and optionally stream new ones as they're
-appended. Useful for live debugging, for orchestrator bootstrap (`--follow`
-in the background and watch with `Monitor`), and for post-hoc forensics
-(`--since 1h` to scope to a window).
+appended. Useful for live debugging, as the orchestrator's low-latency
+wake-up (`--follow --project <name>` in the background, watched with
+`Monitor`), and for post-hoc forensics (`--since 1h` to scope to a window).
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `-n, --lines <LINES>` | integer | `20` | Number of trailing lines to print before following (or before exiting if `--follow` is not set). |
-| `--since <SINCE>` | duration (e.g. `10m`, `2h`, `1d`) | — | Only show events newer than this. When set, `-n` is ignored and *all* matching lines print. |
+| `--since <SINCE>` | duration: `<n>s`, `<n>m`, `<n>h`, `<n>d`, or bare seconds | — | Only show events newer than this. When set, `-n` is ignored and *all* matching lines print. Lines whose timestamp doesn't parse are kept. |
+| `--project <PROJECT>` | string | all projects | Only show lines with `project=<PROJECT>`. Lines without a `project=` token (such as `merge task=…` and `ssh reverse-forward …`) are dropped. `-n` and `--since` count the project's own lines. Non-consuming: safe to run alongside `shelbi orchestrator events next`. |
 | `-f, --follow` | flag | off | Stream new transitions as they're appended. Exit on Ctrl-C. |
-| `--format <FORMAT>` | `raw`, `envelope` | `raw` | Print historical log lines, or a normalized JSON envelope with `kind`, `project`, `timestamp`, and the original `line`. Push-capable harness callbacks use this same envelope. |
+| `--format <FORMAT>` | `raw`, `envelope` | `raw` | Print historical log lines, or a normalized JSON envelope (`version`, `transport`, `kind`, `project`, `timestamp`, and the original `line`). Push-capable harness callbacks use this same envelope. |
 
 Shelbi only transports events. Whether a harness wakes the orchestrator through
 Claude-style `Monitor` output, a callback socket, or the pre-turn drain path, the
@@ -64,10 +74,11 @@ See the last twenty transitions:
 shelbi events tail
 ```
 
-Follow the log live, the same thing the orchestrator does on bootstrap:
+Follow one project's lines live, the same accelerator the orchestrator starts
+on bootstrap:
 
 ```bash
-shelbi events tail --follow
+shelbi events tail --follow --project myapp
 ```
 
 Print everything from the last two hours, no live tail:
@@ -88,3 +99,5 @@ shelbi events tail --lines 100 --follow
   kinds and which reason tags the orchestrator recognizes.
 - [Orchestrator](/docs/concepts/orchestrator) — how the scheduler turns
   events into dispatch decisions.
+- [`shelbi orchestrator events`](/docs/cli/orchestrator): the durable,
+  consuming event queue the orchestrator drains and acks.

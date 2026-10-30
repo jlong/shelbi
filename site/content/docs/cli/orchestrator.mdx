@@ -1,0 +1,94 @@
+---
+title: shelbi orchestrator
+order: 26.5
+summary: Orchestrator plumbing. The durable, project-scoped event queue the orchestrator agent drains and acknowledges.
+---
+
+```text
+shelbi orchestrator events <SUBCOMMAND> [OPTIONS]
+```
+
+<Callout type="warning" title="Orchestrator plumbing">
+
+These are machine-readable transport primitives for the orchestrator agent, not
+everyday commands. The orchestrator runs them itself. Running `drain` or `ack`
+by hand advances the project's durable cursor, so the
+orchestrator never sees the events you consumed. To watch events yourself, use
+[`shelbi events tail`](/docs/cli/events), which never consumes anything.
+
+</Callout>
+
+`shelbi orchestrator events` reads the project's lines from
+[`~/.shelbi/events.log`](/docs/concepts/events-log) as normalized JSON batches,
+starting from a cursor. The project keeps a durable cursor in its config
+directory, so the orchestrator's authoritative feed survives restarts: a batch
+is only consumed once it is acknowledged, and an unacknowledged batch is
+delivered again (at-least-once). The orchestrator pairs this queue with a
+passive `shelbi events tail --follow --project <name>` as a low-latency
+wake-up.
+
+These commands only read events and move the cursor. They never dispatch work
+or change the board.
+
+## drain
+
+```text
+shelbi orchestrator events drain [--cursor <CURSOR>]
+```
+
+Print every pending project event since the cursor. It starts from the durable
+cursor (or `--cursor`) and always writes the position it reached back to the
+durable cursor.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cursor <CURSOR>` | string | durable cursor | Start from this cursor instead of the durable one. `0` replays the whole log from the start. |
+
+## next
+
+```text
+shelbi orchestrator events next --timeout <TIMEOUT> [--cursor <CURSOR>]
+shelbi orchestrator events next --follow [--max-lifetime <DURATION>]
+```
+
+Without `--follow`, wait up to `--timeout` for the next non-empty batch after
+`--cursor`. This form doesn't touch the durable cursor.
+
+With `--follow`, stream batches continuously from the durable cursor. Each batch
+carries a stable `shelbi-event/<project>/<from>-<through>` delivery id. Reading
+does not advance the cursor; `ack` does. The hub writes at least a heartbeat on
+its idle cadence, so a consumer that sees no line for longer than the heartbeat
+interval can treat the follower as dead and restart it. A batch left unacked
+is redelivered after a bounded visibility timeout rather than wedging the
+feed. On SIGTERM, SIGHUP, SIGINT, or when `--max-lifetime` expires, the feed
+prints a final `{"feed":"expired"|"terminated", ...}` notice and exits `0`.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cursor <CURSOR>` | string | `0` | Cursor to read after. Ignored with `--follow`, which always resumes from the durable cursor. |
+| `--timeout <TIMEOUT>` | duration (`10s`, `2m`, `1h`) | none | Maximum wait. Required unless `--follow` is set; ignored when it is. |
+| `--follow` | flag | off | Stream batches continuously with delivery ids (claim/ack). |
+| `--max-lifetime <MAX_LIFETIME>` | duration (e.g. `4h`) | none | Exit cleanly with a `feed=expired` notice after this long. Ignored without `--follow`. |
+
+## ack
+
+```text
+shelbi orchestrator events ack <DELIVERY_ID>
+```
+
+Advance the durable cursor past a batch printed by `next --follow`, so it isn't
+delivered again. Idempotent: a duplicate ack never rewinds the stream.
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<DELIVERY_ID>` | string | none | The `shelbi-event/<project>/<from>-<through>` id from `next --follow` (required). |
+
+Every subcommand accepts the global `-p, --project <PROJECT>` and
+`--root <PATH>` flags.
+
+## See also
+
+- [`shelbi events`](/docs/cli/events): the non-consuming tail of the same log.
+- [Events log](/docs/concepts/events-log): the line shapes inside each batch.
+- [Orchestrator](/docs/concepts/orchestrator): how the orchestrator reacts to
+  events.

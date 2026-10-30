@@ -1,7 +1,7 @@
 ---
 title: shelbi daemon
 order: 35
-summary: Run the hub-side daemon that ingests worker messages and appends them to the events log.
+summary: Run the on-demand hub daemon that ingests worker messages, serves client mutations, and polls each open project's workspaces.
 ---
 
 ```text
@@ -11,9 +11,14 @@ shelbi daemon [OPTIONS] [COMMAND]
 `shelbi daemon` runs the hub-side daemon that listens on `~/.shelbi/hub.sock`
 (overridable via `$SHELBI_HUB_SOCK`) for worker messages and appends
 `event`-verb payloads to [`~/.shelbi/events.log`](/docs/concepts/events-log).
+The same process also listens on `~/.shelbi/control.sock` (overridable via
+`$SHELBI_CONTROL_SOCK`) for the board and issue mutations clients send, and for
+each open project it runs the workspace poller and the board-index refresh.
 
 The daemon is **started on demand**: the first time you open a project it is
-launched if it isn't already running, and it exits once no project is open.
+launched if it isn't already running, and it exits shortly after no project is
+open (it stays up at least 15 seconds after starting, then checks every 5
+seconds).
 There is no service to install. If a daemon crashes while no UI is attached, a
 session process restarts it. You rarely run any of these subcommands by hand.
 
@@ -44,8 +49,16 @@ root's** `shelbi.pid` (`--root`, `$SHELBI_ROOT`, or `$SHELBI_HOME`). They refuse
 signalling nothing, when that record no longer names the same process (a stale
 or recycled pid) or when the hub socket answers as a different pid than the
 record (for example a temp `SHELBI_ROOT` with `$SHELBI_HUB_SOCK` still pointing
-at the live hub). To exercise daemon start/stop code without touching the live
-hub, use a fresh temp root and unset the hub sockets:
+at the live hub). A refusal exits non-zero with `not stopping the hub daemon:
+<reason>` (or `not restarting the hub daemon: <reason>`). A `stop` with nothing
+running prints `shelbi daemon: not running under <root>` and succeeds. On
+success `stop` prints `✓ stopped the hub daemon (pid N, from <root>/shelbi.pid)`;
+`restart` first retires any leftover launchd or systemd unit from older
+releases, waits up to 10 seconds for the new daemon, then prints `✓ hub daemon
+restarted on the current binary`.
+
+To exercise daemon start/stop code without touching the live hub, use a fresh
+temp root and unset the hub sockets:
 
 ```bash
 env -u SHELBI_HUB_SOCK -u SHELBI_CONTROL_SOCK SHELBI_ROOT="$(mktemp -d /tmp/shb.XXXX)" \
@@ -63,13 +76,14 @@ Every subcommand accepts the same options:
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
-| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Accepted as a global flag but ignored: the daemon is hub-wide and serves every open project. |
 
 ## Reverse-forward health and tuning
 
 Every shelbi-routed `ssh` invocation carries a reverse forward so remote workers
-can write to the hub's events log over the multiplexed channel. The TUI poller
-rechecks that forward on a slow cadence and repairs it if it has gone stale.
+can write to the hub's events log over the multiplexed channel. The daemon's
+per-project workspace poller rechecks that forward every 120 seconds and repairs
+it if it has gone stale.
 
 Two failure modes are transient (direct SSH stays healthy) but can be noisy in the
 events log, so the recheck handles them explicitly:
@@ -77,10 +91,10 @@ events log, so the recheck handles them explicitly:
 - A flaky `master_open` is retried with exponential backoff before it is
   reported. A blip that self-heals is logged once as
   `detail=master_open_recovered attempts=N status=established`; only an outage
-  that survives the whole retry budget logs `detail=master_open_failed
-  attempts=N status=failed`.
+  that survives the whole retry budget logs `status=failed
+  detail=master_open_failed attempts=N`.
 - Loopback-port exhaustion on a TCP-fallback host is surfaced distinctly as
-  `detail=loopback_port_exhausted band=<lo>-<hi>`, so it reads apart from a
+  `detail=loopback_port_exhausted band=<lo>-<hi> tried=<n>`, so it reads apart from a
   master-open blip. Before allocating, the recheck reclaims the port its own
   prior master was holding, then sweeps the configured band.
 
@@ -94,13 +108,29 @@ apply):
 | `SHELBI_TCP_FORWARD_PORT_BASE` | `47100` | First loopback port for a TCP-fallback forward. |
 | `SHELBI_TCP_FORWARD_PORT_SPAN` | `64` | Width of the loopback band swept on a bind collision. Widen this if you see `loopback_port_exhausted`. |
 
+These are read by the daemon process, which inherits the environment of
+whichever client started it. Export them, then run `shelbi daemon restart` from
+that shell for them to take effect.
+
 ## Examples
 
 Check whether the daemon is running:
 
 ```bash
 shelbi daemon status
+# shelbi daemon: running
+#   lock held:  yes
+#   listening:  yes
+#   version:    0.11.0
+#   protocol:   1
+#   pid:        64129
+#   pid record: 0.11.0
+#   open:       myapp
 ```
+
+With no daemon it prints `shelbi daemon: not running` and `(started on demand
+when you open a project)`. Both cases exit `0`. A running daemon with no open
+project shows `open:       (no open projects — will exit when idle)`.
 
 Pick up a freshly installed binary (stop the running daemon and start a fresh
 one on the current binary):
