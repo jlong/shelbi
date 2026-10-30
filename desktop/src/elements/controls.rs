@@ -125,7 +125,7 @@ pub fn selected_segment<E: Styled>(el: E, theme: &Theme) -> E {
 /// One item of a [`segmented_track`]: 24px, 12px across, Base in
 /// `form_text`; selected, Base medium and loud on the [`selected_segment`]
 /// (unless `chip_inline` is false while a sliding chip stands in).
-/// Unselected, a fill fades in on hover.
+/// Unselected, no fill: the pointer changes only the cursor.
 pub fn segment(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -136,7 +136,7 @@ pub fn segment(
     let id: SharedString = id.into();
     let selector = id.clone();
     let d = div()
-        .id(id.clone())
+        .id(id)
         .debug_selector(move || selector.to_string())
         .relative()
         .flex()
@@ -155,13 +155,7 @@ pub fn segment(
             d
         }
     } else {
-        let clear = theme.background_hover.opacity(0.0);
-        fill_layer(
-            d.type_style(Type::Base).text_color(theme.form_text),
-            id,
-            px(6.0),
-            [clear, theme.background_hover, theme.background_active],
-        )
+        d.type_style(Type::Base).text_color(theme.form_text)
     };
     d.child(label.into())
 }

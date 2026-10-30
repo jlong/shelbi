@@ -2128,13 +2128,6 @@ impl SettingsShell {
                 for &(x, w, hit) in &row.targets {
                     let r = Rect { x: content.x + x, width: w, ..rect }.intersection(content);
                     self.hits.push((r, hit));
-                    // A segment under the pointer lifts (not the chosen one,
-                    // whose fill is its own).
-                    if let (Hit::Theme(_), Some((px, py))) = (hit, pointer) {
-                        if py == r.y && panel::in_rect(r, px, py) {
-                            lift_segment(f.buffer_mut(), r);
-                        }
-                    }
                 }
             } else if let Some(a) = row.action {
                 self.hits.push((Rect { x: area.x, width: area.width, ..rect }, Hit::Action(a)));
@@ -2393,7 +2386,7 @@ fn general_rows(
             rows.push(Row::text(textbox::label("Theme", focus == Some(i), false, width)));
             let labels: Vec<&str> = general::THEMES.iter().map(|t| general::theme_label(*t)).collect();
             let chosen = general::THEMES.iter().position(|t| *t == form.theme()).unwrap_or(0);
-            let (lines, at) = button::segmented(&labels, chosen, focus == Some(i), None, width);
+            let (lines, at) = button::segmented(&labels, chosen, focus == Some(i), width);
             let targets: Vec<(u16, u16, Hit)> =
                 at.iter().zip(general::THEMES).map(|(&(x, w), t)| (x, w, Hit::Theme(t))).collect();
             for line in lines {
@@ -2728,19 +2721,6 @@ fn edit_note(target: &EditTarget) -> String {
 /// The label column's width on a page `width` wide.
 fn label_width(width: usize) -> usize {
     17.min(width / 2)
-}
-
-/// Lift a segmented control's segment in `r` under the pointer: its cells
-/// on the track's fill take the hover fill.
-fn lift_segment(buf: &mut ratatui::buffer::Buffer, r: Rect) {
-    let p = palette();
-    for x in r.left()..r.right() {
-        if let Some(cell) = buf.cell_mut((x, r.y)) {
-            if cell.bg == p.input || cell.bg == p.input_focus {
-                cell.bg = p.button;
-            }
-        }
-    }
 }
 
 /// A text field's rows on a page: its label, then `field`'s box (as wide as

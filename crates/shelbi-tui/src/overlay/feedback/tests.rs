@@ -362,3 +362,25 @@ fn both_themes_paint_the_dialog_from_their_tokens() {
         });
     }
 }
+
+#[test]
+fn the_pointer_lifts_the_buttons_and_never_a_kind_or_a_field() {
+    // In light the fields and the kind's track share a button's fill.
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        crate::theme::with_appearance(appearance, || {
+            let mut d = FeedbackDialog::new(Remembered::default(), true);
+            let (mut buf, _) = render(&mut d, 100, 45);
+            let not_buttons = d.not_buttons();
+            let mut buttons = crate::button::drawn(&buf, buf.area);
+            buttons.retain(|b| !not_buttons.iter().any(|r| r.intersects(*b)));
+            let (sx, sy) = find(&buf, form::SEND).unwrap();
+            let (cx, cy) = find(&buf, form::CANCEL).unwrap();
+            assert_eq!(buttons.len(), 2, "{appearance:?}: Send and Cancel only");
+            assert!(crate::panel::in_rect(buttons[0], sx, sy) && crate::panel::in_rect(buttons[1], cx, cy));
+            let (fx, fy) = find(&buf, "Feature Request").unwrap();
+            let before = buf[(fx, fy)].bg;
+            assert_eq!(crate::button::light_hovered(&mut buf, &buttons, Some((fx, fy))), None, "{appearance:?}");
+            assert_eq!(buf[(fx, fy)].bg, before, "{appearance:?}: an unpicked kind keeps the track's fill");
+        });
+    }
+}

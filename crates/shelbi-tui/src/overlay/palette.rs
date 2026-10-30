@@ -255,7 +255,6 @@ fn render_filters(f: &mut Frame, area: Rect, filters: FilterRowView) {
         &labels,
         chosen,
         filters.focused,
-        None,
         area.width as usize,
         palette().selection,
     );
@@ -267,7 +266,7 @@ fn render_filters(f: &mut Frame, area: Rect, filters: FilterRowView) {
 fn filter_hits(area: Rect, chips: &[FilterChip]) -> Vec<(u16, u16)> {
     let labels = chip_labels(chips);
     let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let (_, at) = crate::button::segmented_in(&labels, 0, false, None, area.width as usize, palette().selection);
+    let (_, at) = crate::button::segmented_in(&labels, 0, false, area.width as usize, palette().selection);
     at.into_iter().map(|(x, w)| (area.x + x, w)).collect()
 }
 

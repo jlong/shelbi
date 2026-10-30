@@ -390,3 +390,22 @@ fn a_double_press_sends_once_and_shows_sending_meanwhile(cx: &mut TestAppContext
     f.h.draw();
     assert!(f.h.cx.debug_bounds("feedback-thanks").is_some());
 }
+
+#[gpui::test]
+fn an_unpicked_kind_takes_no_fill_under_the_pointer_and_send_still_lights(cx: &mut TestAppContext) {
+    let mut f = Feedback::open(cx, "hover");
+    f.open_dialog();
+    f.fill("Ada", "ada@example.com", "Hover");
+    let point_at = |f: &mut Feedback, selector: &'static str| {
+        f.h.draw();
+        let at = f.h.cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
+        f.h.cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        // A hover found while painting shows in the next frame.
+        f.h.draw();
+        f.h.draw();
+    };
+    point_at(&mut f, "feedback-kind-feature");
+    assert!(!crate::theme::motion::is_hovered("feedback-kind-feature"), "an unpicked segment has no hover fill");
+    point_at(&mut f, "feedback-send");
+    assert!(crate::theme::motion::is_hovered("feedback-send"), "a button still lights");
+}

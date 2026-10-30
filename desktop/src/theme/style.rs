@@ -1178,7 +1178,8 @@ pub fn filter_track() -> Div {
 
 /// One kind filter: X-Small, 8px in, 24px tall; muted at rest, loud on the
 /// selected chip ([`segment_chip`], unless `chip_inline` is false while a
-/// sliding chip stands in). Unselected, a fill fades in on hover.
+/// sliding chip stands in). Unselected, no fill: the pointer changes only
+/// the cursor.
 pub fn filter_segment(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -1189,7 +1190,7 @@ pub fn filter_segment(
     let id: SharedString = id.into();
     let selector = id.clone();
     let d = div()
-        .id(id.clone())
+        .id(id)
         .debug_selector(move || selector.to_string())
         .relative()
         .flex()
@@ -1209,13 +1210,7 @@ pub fn filter_segment(
             d
         }
     } else {
-        let clear = theme.background_hover.opacity(0.0);
-        fill_layer(
-            d.text_color(theme.muted),
-            id,
-            px(6.0),
-            [clear, theme.background_hover, theme.background_active],
-        )
+        d.text_color(theme.muted)
     };
     d.child(label.into())
 }
