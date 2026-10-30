@@ -12,7 +12,7 @@ name = "shelbi-desktop"
 # A version can't be inherited across workspaces, so this is a literal kept
 # equal to the root `[workspace.package] version`.
 # `scripts/release/check-version.sh` enforces that (and that it equals the tag).
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/jlong/shelbi"
