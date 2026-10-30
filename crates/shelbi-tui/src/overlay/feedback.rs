@@ -270,6 +270,17 @@ impl FeedbackDialog {
         }
     }
 
+    /// Where the last draw put the controls that aren't buttons (the
+    /// fields, the kind's segmented control). In light their fill is a
+    /// button's, so the shell's hover must not take them for buttons.
+    pub fn not_buttons(&self) -> Vec<Rect> {
+        self.hits
+            .iter()
+            .filter(|(_, hit)| !matches!(hit, Hit::Control(Focus::Send | Focus::Cancel | Focus::Close)))
+            .map(|(r, _)| *r)
+            .collect()
+    }
+
     /// The panel's rect in `area` (the whole window): centered, as tall as
     /// its content, never taller than `area`.
     pub fn rect(&self, area: Rect) -> Rect {

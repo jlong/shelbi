@@ -472,6 +472,16 @@ impl ActiveOverlay {
         }
     }
 
+    /// Where the last draw put controls that aren't buttons but may share a
+    /// button's fill (the feedback dialog's fields and kind in light): the
+    /// pointer lifts none of them.
+    pub fn not_buttons(&self) -> Vec<Rect> {
+        match self {
+            ActiveOverlay::Feedback(dialog) => dialog.not_buttons(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Draw the overlay over `area`. Takes `&mut self` because the error-log
     /// viewer clamps its scroll offset against the rendered line count at draw
     /// time.

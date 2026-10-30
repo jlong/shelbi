@@ -21,7 +21,8 @@
 //!
 //! The segmented control ([`segmented`]) is a field's box holding its
 //! choices, the chosen one a chip in [`Theme::segment`] (the desktop's
-//! canvas chip, as Contact Us's), the others lifting under the pointer.
+//! canvas chip, as Contact Us's), the others on the track alone: the
+//! pointer lifts no segment.
 //!
 //! [`Theme::segment`]: shelbi_app::theme::Theme::segment
 
@@ -278,16 +279,10 @@ pub(crate) fn beside(left: [Line<'static>; 3], right: [Line<'static>; 3], width:
 
 /// A segmented control in `width` columns: a field's box holding `labels`,
 /// `chosen` a chip in the segment fill (bold and strong while the control has
-/// the keyboard), `hovered` lifting. Returns its three lines and each
-/// segment's column and width.
-pub(crate) fn segmented(
-    labels: &[&str],
-    chosen: usize,
-    focused: bool,
-    hovered: Option<usize>,
-    width: usize,
-) -> ([Line<'static>; 3], Vec<(u16, u16)>) {
-    segmented_in(labels, chosen, focused, hovered, width, palette().segment)
+/// the keyboard), the others on the track (the pointer lifts none). Returns
+/// its three lines and each segment's column and width.
+pub(crate) fn segmented(labels: &[&str], chosen: usize, focused: bool, width: usize) -> ([Line<'static>; 3], Vec<(u16, u16)>) {
+    segmented_in(labels, chosen, focused, width, palette().segment)
 }
 
 /// [`segmented`] with the chosen chip in `chosen_fill`: the palette's filter
@@ -296,7 +291,6 @@ pub(crate) fn segmented_in(
     labels: &[&str],
     chosen: usize,
     focused: bool,
-    hovered: Option<usize>,
     width: usize,
     chosen_fill: Color,
 ) -> ([Line<'static>; 3], Vec<(u16, u16)>) {
@@ -320,8 +314,6 @@ pub(crate) fn segmented_in(
             } else {
                 s
             }
-        } else if hovered == Some(i) {
-            Style::default().bg(p.button).fg(p.white)
         } else {
             on_track.fg(p.foreground)
         };
@@ -378,7 +370,7 @@ impl Piece {
 
     /// A segmented control, each segment tagged `tags[i]`.
     pub(crate) fn segmented(labels: &[&str], chosen: usize, focused: bool, tags: &[usize], drop: u8) -> Piece {
-        let (lines, at) = segmented(labels, chosen, focused, None, usize::MAX);
+        let (lines, at) = segmented(labels, chosen, focused, usize::MAX);
         let width = lines[0].width();
         let hits = at.into_iter().zip(tags).map(|((x, w), t)| (x, w, *t)).collect();
         Piece { rows: lines.map(|l| l.spans), width, hits, drop, shrink: None }
@@ -593,20 +585,20 @@ mod tests {
 
     #[test]
     fn a_segmented_control_fills_the_chosen_segment() {
-        let (lines, at) = segmented(&["Auto", "Dark", "Light"], 1, false, Some(2), 40);
+        let (lines, at) = segmented(&["Auto", "Dark", "Light"], 1, false, 40);
         let buf = draw(lines.to_vec(), 40);
         assert_eq!(text(&buf, 1), "  Auto  Dark  Light");
         assert_eq!(at, vec![(1, 6), (7, 6), (13, 7)]);
         let p = palette();
         assert_eq!(buf[(8, 1)].bg, p.segment, "the chosen");
         assert_eq!(buf[(2, 1)].bg, p.input, "the track");
-        assert_eq!(buf[(14, 1)].bg, p.button, "the hovered");
+        assert_eq!(buf[(14, 1)].bg, p.input, "an unchosen segment is the track's");
         assert_eq!(text(&buf, 0), "▄".repeat(21));
-        let (lines, _) = segmented(&["Auto", "Dark", "Light"], 0, true, None, 40);
+        let (lines, _) = segmented(&["Auto", "Dark", "Light"], 0, true, 40);
         let buf = draw(lines.to_vec(), 40);
         assert_eq!(buf[(0, 1)].bg, p.input_focus, "focus tints the track");
         // Too narrow for every segment: the ones that fit.
-        let (_, at) = segmented(&["Auto", "Dark", "Light"], 0, false, None, 14);
+        let (_, at) = segmented(&["Auto", "Dark", "Light"], 0, false, 14);
         assert_eq!(at.len(), 2);
     }
 

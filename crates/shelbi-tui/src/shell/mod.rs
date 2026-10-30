@@ -5529,8 +5529,11 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // above and the overlay's own `Clear` covers it where they overlap.
         if let Some(ov) = overlay.as_mut() {
             ov.render(frame, area);
-            // Its buttons lift under the pointer, found in what it drew.
+            // Its buttons lift under the pointer, found in what it drew (not
+            // a control in a button's fill that isn't one).
+            let not_buttons = ov.not_buttons();
             overlay_buttons = crate::button::drawn(frame.buffer_mut(), area);
+            overlay_buttons.retain(|b| !not_buttons.iter().any(|r| r.intersects(*b)));
             overlay_lit = crate::button::light_hovered(frame.buffer_mut(), &overlay_buttons, overlay_pointer);
         } else if let Some((x, y)) = cursor {
             frame.set_cursor_position(Position::new(x, y));
