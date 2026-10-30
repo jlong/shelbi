@@ -36,8 +36,9 @@
 //! narrower than [`WIDE`], with ← Graph back to the same selection): a
 //! status (the status picker, its category, Owner, Agent, Workspace tags,
 //! Set as initial, its outgoing transitions, Add transition, Remove), a
-//! transition (From, To, its ordered actions, its Details: Target branch,
-//! Run, Ready check, Ready timeout, URL; Delete), one being drawn (From, To,
+//! transition (From, To, its ordered actions with its Run script last, Add
+//! action, the Run script editor while open, its Details: Target branch,
+//! URL; Delete), one being drawn (From, To,
 //! Cancel) and a new one (From, To, its actions, Cancel, Add transition).
 //! The rows work as the Form's: the same pickers, text fields and keys.
 
@@ -51,7 +52,7 @@ use ratatui::{
 };
 use shelbi_app::settings::workflow_builder::{move_action, BuilderState, Removal, Selection};
 use shelbi_app::settings::workflow_editor::{
-    action_label, owner_label, Change, EditorState, Field, Mode, ACTIONS, TAGS_PLACEHOLDER,
+    action_label, owner_label, Change, EditorState, Field, Mode, ACTIONS, RUN_SCRIPT, TAGS_PLACEHOLDER,
 };
 use shelbi_app::settings::workflow_graph::{EdgeKind, Graph, Pt, Side};
 use shelbi_app::settings::workflows::category_label;
@@ -226,14 +227,9 @@ impl WorkflowEditorPage {
                     return;
                 };
                 out.extend([Item::From(index), Item::To(index)]);
-                out.extend((0..t.actions.len()).map(|slot| Item::Action(index, slot)));
-                if t.actions.len() < ACTIONS.len() {
-                    out.push(Item::AddAction(index));
-                }
+                self.action_items(out, index, t.actions.len());
                 if self.details == Some(index) {
-                    out.push(Item::Text(Text::Target));
-                    out.extend((0..self.run.len()).map(|l| Item::Text(Text::Run(l))));
-                    out.extend([Item::AddRun, Item::Text(Text::Ready), Item::Text(Text::Timeout), Item::Text(Text::Url)]);
+                    out.extend([Item::Text(Text::Target), Item::Text(Text::Url)]);
                 }
                 out.push(Item::RemoveTransition(index));
             }
@@ -349,7 +345,7 @@ impl WorkflowEditorPage {
                 let b = &mut self.builder;
                 match here {
                     Some(Item::Status(id) | Item::Text(Text::Tags(id))) => b.state.select_status(&id),
-                    Some(Item::Transition(i) | Item::Action(i, _) | Item::AddAction(i) | Item::Details(i)) => {
+                    Some(Item::Transition(i) | Item::Action(i, _) | Item::AddAction(i) | Item::Script(i) | Item::Details(i)) => {
                         let from = self.state.as_ref().and_then(|s| s.transitions().get(i)).map(|t| t.from.clone());
                         b.state.select_transition(i);
                         b.state.focus = from;
@@ -401,10 +397,15 @@ impl WorkflowEditorPage {
     /// After the selection changed: a transition's Details open, and the
     /// cursor lands on a row that exists.
     pub(super) fn builder_synced(&mut self) {
-        if let Some(i) = self.builder.state.selected_transition() {
+        let selected = self.builder.state.selected_transition();
+        if let Some(i) = selected {
             if self.details != Some(i) {
                 self.open_details(Some(i));
             }
+        }
+        // Another transition's Run script editor closes.
+        if self.script.is_some() && self.script != selected {
+            self.open_script(None);
         }
         if self.builder.state.selection.is_none() {
             self.builder.panel_open = false;
@@ -720,6 +721,7 @@ impl WorkflowEditorPage {
             KeyCode::Char('x') | KeyCode::Delete => {
                 let act = match item {
                     Item::Action(i, slot) => Act::Change(Change::RemoveAction { index: i, slot }),
+                    Item::Script(i) => Act::Change(Change::RemoveScript(i)),
                     Item::NewAction(slot) => Act::Builder(BAct::NewRemoveAction(slot)),
                     Item::Text(Text::Run(line)) => Act::RemoveRun(line),
                     Item::RemoveStatus(id) => Act::Builder(BAct::RemoveStatus(id)),
@@ -730,7 +732,7 @@ impl WorkflowEditorPage {
             }
             KeyCode::Char('n') => {
                 let act = match item {
-                    Item::Action(i, _) | Item::AddAction(i) | Item::From(i) | Item::To(i) => Act::Pick(Pick::AddAction(i)),
+                    Item::Action(i, _) | Item::AddAction(i) | Item::Script(i) | Item::From(i) | Item::To(i) => Act::Pick(Pick::AddAction(i)),
                     Item::Text(Text::Run(_)) | Item::AddRun => Act::AddRun,
                     Item::NewAction(_) | Item::NewAddAction | Item::NewFrom | Item::NewTo => Act::Pick(Pick::NewAddAction),
                     _ => return EditorAction::Stay,
@@ -866,6 +868,7 @@ impl WorkflowEditorPage {
             }
             Some(item) if self.section_of(&item) == Section::Header => format!("←→ choose · ⏎ press · Tab canvas · v {} · ^S save · Esc back", if self.in_builder() { "form" } else { "builder" }),
             Some(Item::Action(..) | Item::NewAction(_)) => format!("{moves} · ⏎ change · ⇧↑↓ move · x remove · n add · Esc back"),
+            Some(Item::Script(_)) => format!("{moves} · ⏎ menu · x remove · n add · Esc back"),
             Some(Item::Text(Text::Run(_))) => format!("{moves} · ⏎ edit · ⇧↑↓ move · x remove · n add · Esc back"),
             Some(Item::Text(_)) => format!("{moves} · ⏎ edit · Tab section · ^S save · Esc back"),
             _ => format!("{moves} · ⏎ choose · Tab section · ^S save · Esc back"),
@@ -1206,16 +1209,20 @@ impl WorkflowEditorPage {
             button(&mut rows, Item::PanelBack, &text, Style::default().fg(palette().cyan));
         }
         let name = |id: &str| self.status_name(id);
-        let action_rows = |rows: &mut Vec<Row>, actions: &[TransitionAction], item: &dyn Fn(usize) -> Item, add: Option<Item>, from: &str, to: &str| {
+        // `script`: the transition's Run script row, after its actions.
+        let action_rows = |rows: &mut Vec<Row>, actions: &[TransitionAction], item: &dyn Fn(usize) -> Item, script: Option<(Item, Line<'static>)>, add: Option<Item>, from: &str, to: &str| {
             rows.push(Row::blank());
             heading(rows, "Actions");
             wrapped(rows, &format!("Run in this order when a task moves from {from} to {to}."), width, muted);
-            if actions.is_empty() {
+            if actions.is_empty() && script.is_none() {
                 wrapped(rows, "  No actions", width, muted);
             }
             for (slot, a) in actions.iter().enumerate() {
                 let it = item(slot);
                 let line = plain_line(&format!("{}. {}", slot + 1, action_label(*a)), selected(&it), width, Style::default().fg(palette().foreground));
+                row(rows, it, line);
+            }
+            if let Some((it, line)) = script {
                 row(rows, it, line);
             }
             if let Some(add) = add {
@@ -1276,8 +1283,14 @@ impl WorkflowEditorPage {
                 picker(&mut rows, "From", &name(&t.from), Item::From(i));
                 picker(&mut rows, "To", &name(&t.to), Item::To(i));
                 error_rows(&mut rows, state.error_at(&Field::Transition(i)), width);
-                let add = (t.actions.len() < ACTIONS.len()).then_some(Item::AddAction(i));
-                action_rows(&mut rows, &t.actions, &|slot| Item::Action(i, slot), add, &name(&t.from), &name(&t.to));
+                let add = index(&Item::AddAction(i)).map(|_| Item::AddAction(i));
+                let script = self.script_line(i, t.actions.len(), "", selected(&Item::Script(i)), width).map(|line| (Item::Script(i), line));
+                action_rows(&mut rows, &t.actions, &|slot| Item::Action(i, slot), script, add, &name(&t.from), &name(&t.to));
+                if self.script == Some(i) {
+                    rows.push(Row::blank());
+                    heading(&mut rows, RUN_SCRIPT);
+                    self.script_rows(&mut rows, width);
+                }
                 if self.details == Some(i) {
                     rows.push(Row::blank());
                     heading(&mut rows, "Details");
@@ -1303,7 +1316,7 @@ impl WorkflowEditorPage {
                 picker(&mut rows, "From", &name(&n.from), Item::NewFrom);
                 picker(&mut rows, "To", &name(&n.to), Item::NewTo);
                 let add = (n.actions.len() < ACTIONS.len()).then_some(Item::NewAddAction);
-                action_rows(&mut rows, &n.actions, &Item::NewAction, add, &name(&n.from), &name(&n.to));
+                action_rows(&mut rows, &n.actions, &Item::NewAction, None, add, &name(&n.from), &name(&n.to));
                 rows.push(Row::blank());
                 error_rows(&mut rows, state.error_at(&Field::Transitions), width);
                 buttons(

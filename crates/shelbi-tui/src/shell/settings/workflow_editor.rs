@@ -18,9 +18,11 @@
 //! desktop's sections: Workflow (Name, Description, Initial status);
 //! Statuses (each status with its owner, agent and workspace tags; Add
 //! status; Manage project statuses); Transitions (each `from → to`, its
-//! actions in order, Add action, Details and, open, the Details fields:
-//! Target branch, the Run commands one per row, Ready check, Ready timeout,
-//! URL; Add transition); Git (Base branch, Branch name, Merge strategy);
+//! actions in order, its Run script last when it has one, Add action (the
+//! git actions it lacks, and Run script), the Run script editor while open
+//! (its commands one per row, Add command, Ready check, Ready timeout,
+//! Done), Details and, open, the Details fields: Target branch, URL; Add
+//! transition); Git (Base branch, Branch name, Merge strategy);
 //! Review (Review mode, and the recipe's fields when it runs the branch);
 //! Automation (Zen settings, Required task fields); Delete workflow.
 //!
@@ -31,9 +33,10 @@
 //! Enter, Esc or ↑↓ stop typing), a picker opens, a status or a transition
 //! opens its menu. `m` opens the row's menu (else the workflow's actions),
 //! every menu entry has its own key: `o` owner, `a` agent, `t` tags (a
-//! status), `f` / `t` from / to, `d` details (a transition), `n` adds in the
-//! section (a status, an action or a command, a transition), `x` / Delete
-//! removes, Shift/Alt+↑↓ reorders a status, an action or a command. Ctrl+S
+//! status), `f` / `t` from / to, `d` details (a transition), `e` edits a
+//! Run script, `n` adds in the section (a status, an action or a command, a
+//! transition), `x` / Delete removes, Shift/Alt+↑↓ reorders a status, an
+//! action or a command (Run script stays last: it runs after the actions). Ctrl+S
 //! saves. Esc goes Back.
 //!
 //! Every control edits the shared draft through `shelbi_state`'s
@@ -60,9 +63,9 @@ use ratatui::{
 use shelbi_app::settings::workflow_editor::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, zen_custom_help, Change,
     EditorState, Field, GitForm, Leave, Mode, ProjectGit, ReviewMode, SaveJob, SaveOutcome, TextForm,
-    ACTIONS, ALL_STATUSES_ADDED, DESCRIPTION_PLACEHOLDER, DETAILS_READY, DETAILS_TARGET, DETAILS_TIMEOUT,
-    DETAILS_URL, GIT_HELP, PARAMS_HELP, REVIEW_FIELDS, RUN_HELP, STRATEGIES, TAGS_PLACEHOLDER, TRANSITIONS_HELP,
-    ZEN_PROJECT_HELP,
+    ACTIONS, ADD_COMMAND, ALL_STATUSES_ADDED, DESCRIPTION_PLACEHOLDER, DETAILS_TARGET, DETAILS_URL,
+    GIT_HELP, PARAMS_HELP, REVIEW_FIELDS, RUN_HELP, RUN_PLACEHOLDER, RUN_SCRIPT, SCRIPT_READY, SCRIPT_TIMEOUT,
+    STRATEGIES, TAGS_PLACEHOLDER, TRANSITIONS_HELP, ZEN_PROJECT_HELP,
 };
 use shelbi_app::settings::workflows::Target;
 use shelbi_app::settings::{Job, Ticket};
@@ -105,11 +108,12 @@ pub(crate) enum Text {
     Params,
     /// The open Details panel's fields.
     Target,
-    /// Its Run command at this line.
+    Url,
+    /// The open Run script editor's command at this row, its Ready check
+    /// and Ready timeout.
     Run(usize),
     Ready,
     Timeout,
-    Url,
 }
 
 /// A row the keys stop on.
@@ -130,9 +134,13 @@ pub(crate) enum Item {
     /// Transition `.0`'s action at slot `.1`.
     Action(usize, usize),
     AddAction(usize),
-    Details(usize),
-    /// Add a Run command to the open Details.
+    /// Transition `.0`'s Run script (after its actions).
+    Script(usize),
+    /// Add a command to the open Run script.
     AddRun,
+    /// The open Run script's Done.
+    CloseScript,
+    Details(usize),
     AddTransition,
     MergeStrategy,
     ReviewMode,
@@ -191,8 +199,10 @@ impl Item {
             Item::Transition(_)
             | Item::Action(..)
             | Item::AddAction(_)
-            | Item::Details(_)
+            | Item::Script(_)
             | Item::AddRun
+            | Item::CloseScript
+            | Item::Details(_)
             | Item::AddTransition
             | Item::Text(Text::Target | Text::Run(_) | Text::Ready | Text::Timeout | Text::Url) => Section::Transitions,
             Item::Text(Text::BaseBranch | Text::Branch) | Item::MergeStrategy => Section::Git,
@@ -257,6 +267,14 @@ enum Act {
     TransitionMenu(usize),
     Actions,
     ToggleDetails(usize),
+    /// Run script's menu: Edit, Remove.
+    ScriptMenu(usize),
+    /// Open (or close) transition `.0`'s Run script editor.
+    ToggleScript(usize),
+    /// The add menu's Run script: the editor, on an empty command when the
+    /// transition has none.
+    AddScript(usize),
+    CloseScript,
     AddRun,
     RemoveRun(usize),
     MoveRun(usize, bool),
@@ -393,11 +411,12 @@ pub(crate) struct WorkflowEditorPage {
     load: Job<()>,
     job: Job<()>,
     pending: Option<(Ticket, EditorWork)>,
-    /// What the text fields hold (possibly refused text) and the open
-    /// Details' Run commands, one per line.
+    /// What the text fields hold (possibly refused text), the open Run
+    /// script's commands among them.
     texts: TextForm,
-    run: Vec<String>,
     details: Option<usize>,
+    /// The transition whose Run script editor is open.
+    script: Option<usize>,
     /// The field being typed.
     typing: Option<(Text, LineEdit)>,
     modal: Option<Modal>,
@@ -430,8 +449,8 @@ impl WorkflowEditorPage {
             job: Job::default(),
             pending: None,
             texts: TextForm::default(),
-            run: Vec::new(),
             details: None,
+            script: None,
             typing: None,
             modal: None,
             prompt_choice: 0,
@@ -523,6 +542,7 @@ impl WorkflowEditorPage {
         self.name = state.name().to_string();
         self.state = Some(state);
         self.details = None;
+        self.script = None;
         self.typing = None;
         self.modal = None;
         self.load_error = None;
@@ -553,13 +573,15 @@ impl WorkflowEditorPage {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let form = state.text_form(self.details);
+        let form = state.text_form(self.details, self.script);
         if force {
             self.builder.reconcile(Some(state.workflow()));
             if self.details.is_some() && form.details.is_none() {
                 self.details = None;
             }
-            self.run = form.details.as_ref().map(|(_, d)| d.run.lines().map(str::to_string).collect()).unwrap_or_default();
+            if self.script.is_some() && form.script.is_none() {
+                self.script = None;
+            }
             self.texts = form;
             self.typing = None;
             return;
@@ -575,22 +597,25 @@ impl WorkflowEditorPage {
         self.texts.tags = tags;
         if self.details.is_none() {
             self.texts.details = None;
-            self.run.clear();
+        }
+        if self.script.is_none() {
+            self.texts.script = None;
         }
     }
 
-    /// The fields as a form: the open Details' Run commands joined.
-    fn form(&self) -> TextForm {
-        let mut form = self.texts.clone();
-        if let Some((_, details)) = form.details.as_mut() {
-            details.run = self.run.join("\n");
-        }
-        form
+    /// The open Run script's commands.
+    fn commands(&self) -> &[String] {
+        self.texts.script.as_ref().map_or(&[], |(_, s)| s.run.as_slice())
+    }
+
+    fn commands_mut(&mut self) -> Option<&mut Vec<String>> {
+        self.texts.script.as_mut().map(|(_, s)| &mut s.run)
     }
 
     fn text(&self, text: &Text) -> String {
         let t = &self.texts;
         let details = t.details.as_ref().map(|(_, d)| d);
+        let script = t.script.as_ref().map(|(_, s)| s);
         match text {
             Text::Name => self.state.as_ref().map(|s| s.typed_name().to_string()).unwrap_or_default(),
             Text::Description => t.description.clone(),
@@ -600,10 +625,10 @@ impl WorkflowEditorPage {
             Text::Review(i) => t.review.field(*i).to_string(),
             Text::Params => t.params.clone(),
             Text::Target => details.map(|d| d.target.clone()).unwrap_or_default(),
-            Text::Run(line) => self.run.get(*line).cloned().unwrap_or_default(),
-            Text::Ready => details.map(|d| d.ready.clone()).unwrap_or_default(),
-            Text::Timeout => details.map(|d| d.ready_timeout.clone()).unwrap_or_default(),
             Text::Url => details.map(|d| d.url.clone()).unwrap_or_default(),
+            Text::Run(line) => self.commands().get(*line).cloned().unwrap_or_default(),
+            Text::Ready => script.map(|s| s.ready.clone()).unwrap_or_default(),
+            Text::Timeout => script.map(|s| s.ready_timeout.clone()).unwrap_or_default(),
         }
     }
 
@@ -628,19 +653,18 @@ impl WorkflowEditorPage {
             Text::Review(i) => *t.review.field_mut(*i) = value,
             Text::Params => t.params = value,
             Text::Run(line) => {
-                if let Some(l) = self.run.get_mut(*line) {
+                if let Some(l) = self.commands_mut().and_then(|run| run.get_mut(*line)) {
                     *l = value;
                 }
             }
-            Text::Target | Text::Ready | Text::Timeout | Text::Url => {
+            Text::Target | Text::Url => {
                 if let Some((_, d)) = t.details.as_mut() {
-                    let slot = match text {
-                        Text::Target => &mut d.target,
-                        Text::Ready => &mut d.ready,
-                        Text::Timeout => &mut d.ready_timeout,
-                        _ => &mut d.url,
-                    };
-                    *slot = value;
+                    *(if *text == Text::Target { &mut d.target } else { &mut d.url }) = value;
+                }
+            }
+            Text::Ready | Text::Timeout => {
+                if let Some((_, s)) = t.script.as_mut() {
+                    *(if *text == Text::Ready { &mut s.ready } else { &mut s.ready_timeout }) = value;
                 }
             }
         }
@@ -649,7 +673,7 @@ impl WorkflowEditorPage {
 
     /// A text field changed: the draft takes each field that differs.
     fn typed(&mut self) {
-        let form = self.form();
+        let form = self.texts.clone();
         if let Some(state) = self.state.as_mut() {
             state.type_texts(&form);
         }
@@ -674,15 +698,10 @@ impl WorkflowEditorPage {
         out.extend([Item::AddStatus, Item::ManageStatuses]);
         for (i, t) in state.transitions().iter().enumerate() {
             out.push(Item::Transition(i));
-            out.extend((0..t.actions.len()).map(|slot| Item::Action(i, slot)));
-            if t.actions.len() < ACTIONS.len() {
-                out.push(Item::AddAction(i));
-            }
+            self.action_items(&mut out, i, t.actions.len());
             out.push(Item::Details(i));
             if self.details == Some(i) {
-                out.push(Item::Text(Text::Target));
-                out.extend((0..self.run.len()).map(|l| Item::Text(Text::Run(l))));
-                out.extend([Item::AddRun, Item::Text(Text::Ready), Item::Text(Text::Timeout), Item::Text(Text::Url)]);
+                out.extend([Item::Text(Text::Target), Item::Text(Text::Url)]);
             }
         }
         out.push(Item::AddTransition);
@@ -692,6 +711,29 @@ impl WorkflowEditorPage {
         }
         out.extend([Item::Zen, Item::Text(Text::Params), Item::Delete]);
         out
+    }
+
+    /// Transition `i`'s action rows (`actions` of them), its Run script, Add
+    /// action, and the Run script editor while open: the Form's and the
+    /// Builder's panel's.
+    pub(super) fn action_items(&self, out: &mut Vec<Item>, i: usize, actions: usize) {
+        out.extend((0..actions).map(|slot| Item::Action(i, slot)));
+        if self.shows_script(i) {
+            out.push(Item::Script(i));
+        }
+        if actions < ACTIONS.len() || !self.shows_script(i) {
+            out.push(Item::AddAction(i));
+        }
+        if self.script == Some(i) {
+            out.extend((0..self.commands().len()).map(|l| Item::Text(Text::Run(l))));
+            out.extend([Item::AddRun, Item::Text(Text::Ready), Item::Text(Text::Timeout), Item::CloseScript]);
+        }
+    }
+
+    /// Whether transition `i`'s row shows Run script: it has one, or its
+    /// editor is open (on a script not typed yet).
+    fn shows_script(&self, i: usize) -> bool {
+        self.script == Some(i) || self.state.as_ref().is_some_and(|s| s.has_script(i))
     }
 
     fn clamp(&mut self) {
@@ -722,7 +764,9 @@ impl WorkflowEditorPage {
             Item::Action(i, slot) => Act::Pick(Pick::SetAction(*i, *slot)),
             Item::AddAction(i) => Act::Pick(Pick::AddAction(*i)),
             Item::Details(i) => Act::ToggleDetails(*i),
+            Item::Script(i) => Act::ScriptMenu(*i),
             Item::AddRun => Act::AddRun,
+            Item::CloseScript => Act::CloseScript,
             Item::AddTransition => Act::Change(Change::AddTransition),
             Item::MergeStrategy => Act::Pick(Pick::MergeStrategy),
             Item::ReviewMode => Act::Pick(Pick::ReviewMode),
@@ -762,26 +806,49 @@ impl WorkflowEditorPage {
                 self.set_view(to);
             }
             Act::Builder(act) => return self.builder_act(act),
+            Act::ScriptMenu(i) => self.script_menu(i),
+            Act::ToggleScript(i) => {
+                self.open_script(if self.script == Some(i) { None } else { Some(i) });
+                self.select_item(&Item::Script(i));
+            }
+            Act::AddScript(i) => {
+                self.open_script(Some(i));
+                if self.commands().is_empty() {
+                    return self.run(Act::AddRun);
+                }
+                self.select_item(&Item::Text(Text::Run(0)));
+            }
+            Act::CloseScript => {
+                if let Some(i) = self.script {
+                    self.open_script(None);
+                    if !self.select_item(&Item::Script(i)) {
+                        self.select_item(&Item::AddAction(i));
+                    }
+                }
+            }
             Act::AddRun => {
                 let at = match self.current() {
                     Some(Item::Text(Text::Run(l))) => l + 1,
-                    _ => self.run.len(),
+                    _ => self.commands().len(),
                 };
-                self.run.insert(at, String::new());
+                let Some(run) = self.commands_mut() else {
+                    return EditorAction::Stay;
+                };
+                run.insert(at, String::new());
                 self.select_item(&Item::Text(Text::Run(at)));
                 self.typing = Some((Text::Run(at), LineEdit::new("")));
             }
             Act::RemoveRun(line) => {
-                if line < self.run.len() {
-                    self.run.remove(line);
+                if let Some(run) = self.commands_mut().filter(|run| line < run.len()) {
+                    run.remove(line);
                     self.typed();
                     self.clamp();
                 }
             }
             Act::MoveRun(line, down) => {
                 let to = if down { line + 1 } else { line.wrapping_sub(1) };
-                if to < self.run.len() && line < self.run.len() {
-                    self.run.swap(line, to);
+                if let Some(run) = self.commands_mut().filter(|run| to < run.len() && line < run.len()) {
+                    run.swap(line, to);
                     self.typed();
                     self.select_item(&Item::Text(Text::Run(to)));
                 }
@@ -824,13 +891,17 @@ impl WorkflowEditorPage {
     /// filled from the draft.
     fn open_details(&mut self, details: Option<usize>) {
         self.details = details;
-        self.texts.details = None;
-        self.run.clear();
-        let form = self.state.as_ref().map(|s| s.text_form(self.details));
-        if let Some(form) = form {
-            self.run = form.details.as_ref().map(|(_, d)| d.run.lines().map(str::to_string).collect()).unwrap_or_default();
-            self.texts.details = form.details;
+        self.texts.details = self.state.as_ref().and_then(|s| s.text_form(details, None).details);
+    }
+
+    /// Open transition `script`'s Run script editor (`None`: close it), its
+    /// fields filled from the draft.
+    pub(super) fn open_script(&mut self, script: Option<usize>) {
+        if self.typing.as_ref().is_some_and(|(t, _)| matches!(t, Text::Run(_) | Text::Ready | Text::Timeout)) {
+            self.typing = None;
         }
+        self.script = script;
+        self.texts.script = self.state.as_ref().and_then(|s| s.text_form(None, script).script);
     }
 
     /// Make `change` to the draft (a refusal shows at its row).
@@ -839,6 +910,14 @@ impl WorkflowEditorPage {
         // renumbers the rest: the open Details would be another's.
         if matches!(change, Change::RemoveTransition(_) | Change::RemoveStatus(_)) {
             self.details = None;
+            self.open_script(None);
+        }
+        // Run script's editor goes with it.
+        if let Change::RemoveScript(i) = &change {
+            let i = *i;
+            if self.script == Some(i) {
+                self.open_script(None);
+            }
         }
         let structural = matches!(change, Change::AddStatus(_) | Change::RemoveStatus(_) | Change::RemoveTransition(_));
         let added = match &change {
@@ -965,11 +1044,14 @@ impl WorkflowEditorPage {
             }
             Pick::AddAction(i) => {
                 let t = state.transitions().get(*i);
-                let choices = ACTIONS
+                let mut choices: Vec<Choice> = ACTIONS
                     .iter()
                     .filter(|a| !t.is_some_and(|t| t.actions.contains(a)))
                     .map(|a| Self::choice(action_label(*a), "", Act::Change(Change::AddAction { index: *i, action: *a })))
                     .collect();
+                if !self.shows_script(*i) {
+                    choices.push(Choice { help: Some(RUN_HELP.into()), ..Self::choice(RUN_SCRIPT, "", Act::AddScript(*i)) });
+                }
                 ("Add action".into(), choices)
             }
             Pick::MergeStrategy => {
@@ -1052,14 +1134,29 @@ impl WorkflowEditorPage {
             Self::choice("From…", "f", Act::Pick(Pick::From(i))),
             Self::choice("To…", "t", Act::Pick(Pick::To(i))),
         ];
-        if t.actions.len() < ACTIONS.len() {
+        if t.actions.len() < ACTIONS.len() || !self.shows_script(i) {
             choices.push(Self::choice("Add action…", "n", Act::Pick(Pick::AddAction(i))));
+        }
+        if self.shows_script(i) {
+            let edit = if self.script == Some(i) { "Close Run script" } else { "Edit Run script" };
+            choices.push(Self::choice(edit, "e", Act::ToggleScript(i)));
         }
         choices.push(Self::choice(details, "d", Act::ToggleDetails(i)));
         choices.push(Self::choice("Remove transition", "x", Act::Change(Change::RemoveTransition(i))));
         choices.push(Self::choice("Add transition", "", Act::Change(Change::AddTransition)));
         let title = format!("{} → {}", self.catalog_name(&t.from), self.catalog_name(&t.to));
         self.modal = Some(Modal::List { title, choices, selected: 0 });
+    }
+
+    /// Run script's menu (the desktop chip's): Edit (or Done while its
+    /// editor is open), Remove.
+    fn script_menu(&mut self, i: usize) {
+        let edit = if self.script == Some(i) { "Done" } else { "Edit" };
+        let choices = vec![
+            Self::choice(edit, "e", Act::ToggleScript(i)),
+            Self::choice("Remove", "x", Act::Change(Change::RemoveScript(i))),
+        ];
+        self.modal = Some(Modal::List { title: RUN_SCRIPT.into(), choices, selected: 0 });
     }
 
     /// The header's ⋮: Save, Discard, Edit YAML, Duplicate, Set as default,
@@ -1098,7 +1195,7 @@ impl WorkflowEditorPage {
     fn save(&mut self) -> EditorAction {
         self.typing = None;
         let changes = match self.state.as_ref() {
-            Some(state) => state.text_changes(&self.form()),
+            Some(state) => state.text_changes(&self.texts),
             None => return EditorAction::Stay,
         };
         let job = self.state.as_mut().and_then(|s| s.begin_save(changes));
@@ -1400,13 +1497,15 @@ impl WorkflowEditorPage {
             (KeyCode::Char('t'), Item::Status(id)) => Act::Type(Text::Tags(id.clone())),
             (KeyCode::Char('f'), Item::Transition(i)) => Act::Pick(Pick::From(*i)),
             (KeyCode::Char('t'), Item::Transition(i)) => Act::Pick(Pick::To(*i)),
-            (KeyCode::Char('d'), Item::Transition(i) | Item::Action(i, _) | Item::AddAction(i) | Item::Details(i)) => {
+            (KeyCode::Char('d'), Item::Transition(i) | Item::Action(i, _) | Item::AddAction(i) | Item::Script(i) | Item::Details(i)) => {
                 Act::ToggleDetails(*i)
             }
+            (KeyCode::Char('e'), Item::Script(i)) => Act::ToggleScript(*i),
+            (KeyCode::Char('e'), Item::Transition(i)) if self.shows_script(*i) => Act::ToggleScript(*i),
             (KeyCode::Char('n'), it) => match it.section() {
                 Section::Statuses => Act::Pick(Pick::AddStatus),
                 Section::Transitions => match it {
-                    Item::Transition(i) | Item::Action(i, _) | Item::AddAction(i) => Act::Pick(Pick::AddAction(*i)),
+                    Item::Transition(i) | Item::Action(i, _) | Item::AddAction(i) | Item::Script(i) => Act::Pick(Pick::AddAction(*i)),
                     Item::Text(Text::Run(_)) | Item::AddRun => Act::AddRun,
                     _ => Act::Change(Change::AddTransition),
                 },
@@ -1417,6 +1516,7 @@ impl WorkflowEditorPage {
             (KeyCode::Char('x') | KeyCode::Delete, Item::Action(i, slot)) => {
                 Act::Change(Change::RemoveAction { index: *i, slot: *slot })
             }
+            (KeyCode::Char('x') | KeyCode::Delete, Item::Script(i)) => Act::Change(Change::RemoveScript(*i)),
             (KeyCode::Char('x') | KeyCode::Delete, Item::Text(Text::Run(line))) => Act::RemoveRun(*line),
             (KeyCode::Char('y'), _) => Act::Leave(Leave::EditYaml),
             (KeyCode::Char('v'), _) => Act::ToggleView,
@@ -1566,7 +1666,7 @@ impl WorkflowEditorPage {
         match choice {
             0 => {
                 let changes = match self.state.as_ref() {
-                    Some(state) => state.text_changes(&self.form()),
+                    Some(state) => state.text_changes(&self.texts),
                     None => return EditorAction::Stay,
                 };
                 let job = self.state.as_mut().and_then(|s| s.save_and_leave(changes));
@@ -1676,6 +1776,7 @@ impl WorkflowEditorPage {
             Some(Item::Status(_)) => "⏎ menu · o owner · a agent · t tags · ⇧↑↓ move · x remove · n add",
             Some(Item::Transition(_)) => "⏎ menu · f from · t to · n action · d details · x remove",
             Some(Item::Action(..)) => "⏎ change · ⇧↑↓ move · x remove · n add",
+            Some(Item::Script(_)) => "⏎ menu · e edit · x remove · n add · d details",
             Some(Item::Text(Text::Run(_))) => "⏎ edit · ⇧↑↓ move · x remove · n add",
             Some(Item::Text(_)) => "⏎ edit",
             Some(Item::Back) => "⏎ back",
@@ -1946,11 +2047,17 @@ impl WorkflowEditorPage {
                 let line = plain_line(&text, selected(&item), width, Style::default().fg(palette().foreground));
                 rows.push(Row { action: index(&item), ..Row::text(line) });
             }
-            if t.actions.is_empty() {
+            if let Some(line) = self.script_line(i, t.actions.len(), "    ", selected(&Item::Script(i)), width) {
+                rows.push(Row { action: index(&Item::Script(i)), ..Row::text(line) });
+            } else if t.actions.is_empty() {
                 wrapped(&mut rows, "      No actions", width, muted);
             }
             if index(&Item::AddAction(i)).is_some() {
                 rows.push(Row { action: index(&Item::AddAction(i)), ..Row::text(add_line("    + Add action", selected(&Item::AddAction(i)), width)) });
+            }
+            if self.script == Some(i) {
+                self.script_rows(&mut rows, width);
+                rows.push(Row::blank());
             }
             let open = self.details == Some(i);
             let set = if state.has_details(i) { " (set)" } else { "" };
@@ -2044,8 +2151,59 @@ impl WorkflowEditorPage {
         }
     }
 
-    /// The open transition's Details: Target, the Run commands under one
-    /// label (a box each), Ready, Timeout and URL.
+    /// Transition `i`'s Run script row (numbered after its `actions`), or
+    /// `None` without one: its name and how many commands it runs.
+    pub(super) fn script_line(&self, i: usize, actions: usize, indent: &str, selected: Option<bool>, width: usize) -> Option<Line<'static>> {
+        if !self.shows_script(i) {
+            return None;
+        }
+        let n = match &self.texts.script {
+            Some((at, s)) if *at == i => s.run.iter().filter(|l| !l.trim().is_empty()).count(),
+            _ => self.state.as_ref().map_or(0, |s| s.script_form(i).run.len()),
+        };
+        let count = match n {
+            0 => String::new(),
+            1 => " · 1 command".into(),
+            n => format!(" · {n} commands"),
+        };
+        let open = if self.script == Some(i) { "▾" } else { "▸" };
+        let text = format!("{indent}{}. {RUN_SCRIPT}{count} {open}", actions + 1);
+        Some(plain_line(&text, selected, width, Style::default().fg(palette().foreground)))
+    }
+
+    /// The open Run script's editor: its help, its commands (a box each),
+    /// Add command, Ready check, Ready timeout, Done.
+    pub(super) fn script_rows(&self, rows: &mut Vec<Row>, width: usize) {
+        let items = self.items();
+        let index = |item: &Item| items.iter().position(|it| it == item);
+        let on = |item: &Item| index(item) == Some(self.cursor);
+        let muted = Style::default().fg(palette().muted);
+        rows.push(Row::blank());
+        wrapped(rows, RUN_HELP, width, muted);
+        rows.push(Row::blank());
+        let commands = self.commands();
+        let typing = (0..commands.len()).any(|l| on(&Item::Text(Text::Run(l))));
+        rows.push(Row::text(textbox::label("Commands", typing, false, width)));
+        for line in 0..commands.len() {
+            let text = Text::Run(line);
+            let item = Item::Text(text.clone());
+            let (value, caret) = self.field_text(&text);
+            let field = Textbox::new(&value).caret(caret).placeholder(RUN_PLACEHOLDER).focused(on(&item));
+            box_rows(rows, field, index(&item), width);
+        }
+        let add = format!("+ {ADD_COMMAND}");
+        rows.push(Row { action: index(&Item::AddRun), ..Row::text(add_line(&add, on(&Item::AddRun).then_some(true), width)) });
+        for ((label, placeholder), text) in [(SCRIPT_READY, Text::Ready), (SCRIPT_TIMEOUT, Text::Timeout)] {
+            let item = Item::Text(text.clone());
+            rows.push(Row::blank());
+            self.field(rows, label, &text, placeholder, on(&item), false, index(&item), width);
+        }
+        rows.push(Row::blank());
+        let done = Button::secondary("Done").focused(on(&Item::CloseScript));
+        button_rows(rows, &[(done, index(&Item::CloseScript))], width, Align::Left);
+    }
+
+    /// The open transition's Details: Target branch and URL.
     pub(super) fn details_rows(&self, rows: &mut Vec<Row>, width: usize) {
         let items = self.items();
         let index = |item: &Item| items.iter().position(|it| it == item);
@@ -2056,19 +2214,6 @@ impl WorkflowEditorPage {
             self.field(rows, label, &text, placeholder, on(&item), false, index(&item), width);
         };
         field(rows, DETAILS_TARGET, Text::Target);
-        rows.push(Row::blank());
-        let running = (0..self.run.len()).any(|l| on(&Item::Text(Text::Run(l))));
-        rows.push(Row::text(textbox::label("Run", running, false, width)));
-        for line in 0..self.run.len() {
-            let text = Text::Run(line);
-            let item = Item::Text(text.clone());
-            let (value, caret) = self.field_text(&text);
-            box_rows(rows, Textbox::new(&value).caret(caret).focused(on(&item)), index(&item), width);
-        }
-        rows.push(Row { action: index(&Item::AddRun), ..Row::text(add_line("+ Add command", on(&Item::AddRun).then_some(true), width)) });
-        wrapped(rows, RUN_HELP, width, Style::default().fg(palette().muted));
-        field(rows, DETAILS_READY, Text::Ready);
-        field(rows, DETAILS_TIMEOUT, Text::Timeout);
         field(rows, DETAILS_URL, Text::Url);
     }
 

@@ -193,28 +193,74 @@ fn the_builders_new_transition_goes_in_whole_and_a_duplicate_is_refused() {
 }
 
 #[test]
-fn details_write_the_transitions_other_keys() {
+fn details_write_the_target_and_url() {
     let _home = Home::new("ed-details");
     let mut state = editor("task");
     assert!(!state.has_details(0));
-    let form = DetailsForm {
-        target: "develop".into(),
-        run: "npm ci\n\nnpm run dev -- -p $SLOT &\n".into(),
-        ready: "curl -sf localhost:$SLOT".into(),
-        ready_timeout: "soon".into(),
-        url: "http://localhost:$SLOT".into(),
-    };
-    assert!(!state.change(Change::Details { index: 0, form: form.clone() }));
-    assert!(state.error_at(&Field::Transition(0)).unwrap().contains("whole number of seconds"));
-    let form = DetailsForm { ready_timeout: "120".into(), ..form };
+    let form = DetailsForm { target: "develop".into(), url: "http://localhost:$SLOT".into() };
     assert!(state.change(Change::Details { index: 0, form }));
     assert!(state.has_details(0));
+    assert!(!state.has_script(0), "Details set no Run script");
     save(&mut state, vec![]);
     let t = on_disk("task").transitions.unwrap()[0].clone();
     assert_eq!(t.target.as_deref(), Some("develop"));
-    assert_eq!(t.run, ["npm ci", "npm run dev -- -p $SLOT &"]);
-    assert_eq!(t.ready_timeout, Some(Duration::from_secs(120)));
     assert_eq!(t.url.as_deref(), Some("http://localhost:$SLOT"));
+    assert!(t.run.is_empty() && t.ready.is_none() && t.ready_timeout.is_none());
+}
+
+#[test]
+fn run_script_writes_run_ready_and_timeout_and_remove_clears_them() {
+    let home = Home::new("ed-script");
+    let mut state = editor("task");
+    assert!(!state.has_script(0));
+    assert_eq!(state.script_form(0), ScriptForm::default());
+    let form = ScriptForm {
+        run: vec!["npm ci".into(), "  ".into(), " npm run dev -- -p $SLOT & ".into()],
+        ready: "curl -sf localhost:$SLOT".into(),
+        ready_timeout: "soon".into(),
+    };
+    assert!(!state.change(Change::Script { index: 0, form: form.clone() }));
+    assert!(state.error_at(&Field::Transition(0)).unwrap().contains("whole number of seconds"));
+    assert!(!state.has_script(0), "a refused script leaves the draft as it was");
+    let form = ScriptForm { ready_timeout: "120".into(), ..form };
+    assert!(state.change(Change::Script { index: 0, form }));
+    assert!(state.has_script(0) && !state.has_details(0));
+    save(&mut state, vec![]);
+    let t = on_disk("task").transitions.unwrap()[0].clone();
+    assert_eq!(t.run, ["npm ci", "npm run dev -- -p $SLOT &"], "in order, blank rows dropped");
+    assert_eq!(t.ready.as_deref(), Some("curl -sf localhost:$SLOT"));
+    assert_eq!(t.ready_timeout, Some(Duration::from_secs(120)));
+
+    // Opened again: the chip and its commands, and an unedited save writes
+    // the same keys.
+    let mut state = editor("task");
+    assert!(state.has_script(0));
+    let script = state.script_form(0);
+    assert_eq!(script.run, ["npm ci", "npm run dev -- -p $SLOT &"]);
+    assert_eq!((script.ready.as_str(), script.ready_timeout.as_str()), ("curl -sf localhost:$SLOT", "120"));
+    let before = home.read("task.yaml");
+    let form = state.text_form(None, Some(0));
+    state.type_texts(&form);
+    assert!(!state.is_dirty(), "the editor as filled changes nothing");
+    assert_eq!(home.read("task.yaml"), before);
+
+    // A row typed blank changes nothing either (it's dropped).
+    let mut typed = form.clone();
+    typed.script.as_mut().unwrap().1.run.push(String::new());
+    state.type_texts(&typed);
+    assert!(!state.is_dirty());
+
+    // Reordered, then removed: Remove clears all three keys.
+    typed.script.as_mut().unwrap().1.run.swap(0, 1);
+    state.type_texts(&typed);
+    assert_eq!(state.transitions()[0].run, ["npm run dev -- -p $SLOT &", "npm ci"]);
+    assert!(state.change(Change::RemoveScript(0)));
+    assert!(!state.has_script(0));
+    save(&mut state, vec![]);
+    let t = on_disk("task").transitions.unwrap()[0].clone();
+    assert!(t.run.is_empty() && t.ready.is_none() && t.ready_timeout.is_none());
+    let saved = home.read("task.yaml");
+    assert!(!saved.contains("run:") && !saved.contains("ready"), "{saved}");
 }
 
 #[test]
@@ -346,8 +392,8 @@ fn a_refused_text_field_holds_the_save_back() {
     let before = home.read("task.yaml");
     let mut state = editor("task");
     state.change(Change::Description("New words.".into()));
-    let detail = DetailsForm { ready_timeout: "x".into(), ..DetailsForm::default() };
-    assert!(state.begin_save(vec![Change::Details { index: 1, form: detail }]).is_none());
+    let script = ScriptForm { ready_timeout: "x".into(), ..ScriptForm::default() };
+    assert!(state.begin_save(vec![Change::Script { index: 1, form: script }]).is_none());
     assert!(state.error_at(&Field::Transition(1)).is_some());
     assert_eq!(home.read("task.yaml"), before, "nothing written");
     assert!(state.is_dirty(), "the description is still to save");
@@ -435,13 +481,15 @@ fn save_issue(id: &str, workflow: &str, column: shelbi_core::Column) {
 fn the_text_form_round_trips_the_draft_and_keeps_refused_text_out_of_it() {
     let _home = Home::new("ed-texts");
     let mut state = editor("task");
-    let form = state.text_form(Some(0));
+    let form = state.text_form(Some(0), Some(0));
     assert_eq!(form.description, "Branch work with a review gate.");
     assert_eq!((form.base_branch.as_str(), form.branch.as_str()), ("main", "{{github_user}}/{{id}}"));
     assert_eq!(form.tags.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["backlog", "todo", "in-progress", "review", "done", "canceled"]);
     assert_eq!(form.tags[3].1, "review");
     assert_eq!(form.details.as_ref().map(|(i, _)| *i), Some(0));
-    assert!(state.text_form(Some(99)).details.is_none(), "no such transition");
+    assert_eq!(form.script.as_ref().map(|(i, _)| *i), Some(0));
+    let gone = state.text_form(Some(99), Some(99));
+    assert!(gone.details.is_none() && gone.script.is_none(), "no such transition");
 
     // The fields as filled change nothing.
     state.type_texts(&form);
@@ -452,7 +500,7 @@ fn the_text_form_round_trips_the_draft_and_keeps_refused_text_out_of_it() {
     let mut typed = form.clone();
     typed.description = "Typed.".into();
     typed.tags[0].1 = "gpu mac".into();
-    typed.details.as_mut().unwrap().1.ready_timeout = "soon".into();
+    typed.script.as_mut().unwrap().1.ready_timeout = "soon".into();
     state.type_texts(&typed);
     assert_eq!(state.workflow().description.as_deref(), Some("Typed."));
     assert_eq!(state.status("backlog").unwrap().tags, ["gpu", "mac"]);
@@ -460,7 +508,7 @@ fn the_text_form_round_trips_the_draft_and_keeps_refused_text_out_of_it() {
     assert_eq!(state.transitions()[0].ready_timeout, None);
     // Save refuses while the text is wrong, and takes it once corrected.
     assert!(state.begin_save(state.text_changes(&typed)).is_none());
-    typed.details.as_mut().unwrap().1.ready_timeout = "90".into();
+    typed.script.as_mut().unwrap().1.ready_timeout = "90".into();
     let job = state.begin_save(state.text_changes(&typed)).expect("a save");
     assert_eq!(state.saved(run_save(job)), None);
     assert!(!state.has_errors());
@@ -479,7 +527,7 @@ fn an_unchanged_legacy_prefix_survives_an_unrelated_save() {
     let text = home.read("task.yaml").replace("  branch: '{{github_user}}/{{id}}'\n", "  branch_prefix: team\n");
     std::fs::write(home.workflows().join("task.yaml"), text).unwrap();
     let mut state = editor("task");
-    let form = state.text_form(None);
+    let form = state.text_form(None, None);
     assert_eq!(form.branch, "team/{{id}}");
     let mut typed = form.clone();
     typed.description = "Something else.".into();
@@ -542,7 +590,7 @@ fn rename_and_delete_are_refused_while_open_issues_use_the_workflow() {
 fn a_field_refused_for_want_of_another_goes_in_once_that_one_does() {
     let _home = Home::new("ed-depends");
     let mut state = editor("task");
-    let mut form = state.text_form(None);
+    let mut form = state.text_form(None, None);
     form.base_branch = "feature/{{feature}}".into();
     state.type_texts(&form);
     assert!(state.error_at(&Field::Git).unwrap().contains("required task field"));

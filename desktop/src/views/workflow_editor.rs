@@ -21,6 +21,15 @@
 //! **The Builder** (`workflow_builder`, `dt-wf-editor-builder`) draws the
 //! same draft as a graph; the editor opens on it.
 //!
+//! **Run script** is an action of the editor's over a transition's `run`,
+//! `ready` and `ready_timeout` (not a git action, so not in its YAML
+//! `actions`): its chip sits last in the row, since the commands run after
+//! the git actions, and the + menu offers it while the transition has none.
+//! Its editor opens under the row (Edit in the chip's menu, or picking it
+//! from +): the commands one field each, dragged by their handles to
+//! reorder, Add command, Ready check and Ready timeout, Done. Remove clears
+//! all three keys.
+//!
 //! Every field edits a draft ([`EditorState`]) through
 //! `shelbi_state::workflow_config`; nothing is written until Save. Pickers
 //! apply when picked, text fields as typed (Name at Save, since a rename
@@ -35,9 +44,8 @@
 //! it overwrite the hand edit (the model's check for files changed on disk).
 //!
 //! A transition's **Details** open under its row on every row, empty or
-//! not: the keys the row can't show (`target`, `run`, `ready`,
-//! `ready_timeout`, `url`). The button takes the Select style when the
-//! transition sets any of them.
+//! not: the keys the row can't show (`target`, `url`). The button takes the
+//! Select style when the transition sets either.
 
 use std::collections::HashMap;
 
@@ -45,16 +53,18 @@ use gpui::{
     deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Stateful, Subscription, Window,
 };
-use gpui_kit::base::input::{Textarea, TextareaState};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use shelbi_core::{Owner, StatusCategory, TransitionAction};
 use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflow_editor_state::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, Change, DetailsForm, EditorState,
-    Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, TextForm, ACTIONS, STRATEGIES,
+    Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ScriptForm, TextForm, ACTIONS,
+    ADD_COMMAND, DETAILS_TARGET, DETAILS_URL, RUN_HELP, RUN_PLACEHOLDER, RUN_SCRIPT, SCRIPT_READY, SCRIPT_TIMEOUT,
+    STRATEGIES,
 };
 use super::sidebar;
+use super::workflow_builder::ActionGhost;
 use super::workflow_builder_state::BuilderState;
 use super::workflow_graph::Pt;
 use super::workflows_state::category_label;
@@ -117,6 +127,8 @@ pub(super) enum Menu {
     To(usize),
     /// Transition `.0`'s action chip at `.1`.
     Action(usize, usize),
+    /// Transition `.0`'s Run script chip.
+    Script(usize),
     AddAction(usize),
     MergeStrategy,
     ReviewMode,
@@ -172,11 +184,25 @@ impl Render for DragGhost {
 struct Details {
     index: usize,
     target: Entity<InputState>,
-    run: Entity<TextareaState>,
-    ready: Entity<InputState>,
-    timeout: Entity<InputState>,
     url: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The open Run script editor's fields: a command each, in order, then
+/// Ready check and Ready timeout.
+pub(super) struct Script {
+    pub(super) index: usize,
+    commands: Vec<(Entity<InputState>, Subscription)>,
+    ready: Entity<InputState>,
+    timeout: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// A Run script command being dragged by its handle.
+#[derive(Debug, Clone)]
+pub struct CommandDrag {
+    slot: usize,
+    label: SharedString,
 }
 
 /// The Run the branch fields, in [`ReviewForm`]'s order.
@@ -204,6 +230,7 @@ pub struct WorkflowEditor {
     /// Builder's inspector share it).
     pub(super) tags: HashMap<String, (Entity<InputState>, Subscription)>,
     details: Option<Details>,
+    pub(super) script: Option<Script>,
     pub(super) menu: Option<Menu>,
     /// Where the open menu's button last painted (its own click toggles it).
     menu_anchor: style::Anchor,
@@ -287,6 +314,7 @@ impl WorkflowEditor {
             review,
             tags: HashMap::new(),
             details: None,
+            script: None,
             menu: None,
             menu_anchor: Default::default(),
             scroll: ScrollHandle::new(),
@@ -354,6 +382,7 @@ impl WorkflowEditor {
             state.set_project_git(git);
         }
         self.details = None;
+        self.script = None;
         self.menu = None;
         self.tags.clear();
         self.builder = BuilderState::default();
@@ -368,7 +397,7 @@ impl WorkflowEditor {
         };
         // The draft's text, through the shared form both clients fill their
         // fields from.
-        let form = state.text_form(self.details.as_ref().map(|d| d.index));
+        let form = state.text_form(self.details.as_ref().map(|d| d.index), None);
         let review = form.review.clone();
         let mut values = vec![
             (self.name.clone(), state.typed_name().to_string()),
@@ -405,20 +434,33 @@ impl WorkflowEditor {
         }
         if let Some(details) = &self.details {
             let form = state.details_form(details.index);
-            let fields = [
-                (details.target.clone(), form.target),
-                (details.ready.clone(), form.ready),
-                (details.timeout.clone(), form.ready_timeout),
-                (details.url.clone(), form.url),
-            ];
-            for (input, value) in fields {
+            for (input, value) in [(details.target.clone(), form.target), (details.url.clone(), form.url)] {
                 if input.read(cx).value() != value.as_str() {
                     input.update(cx, |s, cx| s.set_value(value, window, cx));
                 }
             }
-            if details.run.read(cx).value() != form.run.as_str() {
-                details.run.update(cx, |s, cx| s.set_value(form.run, window, cx));
-            }
+        }
+        self.sync_script(window, cx);
+    }
+
+    /// The open Run script's fields take the draft's script when it differs
+    /// from theirs (a blank command row isn't a difference); it closes when
+    /// its transition is gone.
+    fn sync_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(state), Some(script)) = (self.state.as_ref(), self.script.as_ref()) else {
+            return;
+        };
+        let index = script.index;
+        if index >= state.transitions().len() {
+            self.script = None;
+            return;
+        }
+        let draft = state.script_form(index);
+        let mut fields = self.script_form(script, cx);
+        fields.run.retain(|l| !l.trim().is_empty());
+        fields.run.iter_mut().for_each(|l| *l = l.trim().to_string());
+        if fields != draft {
+            self.open_script(index, false, window, cx);
         }
     }
 
@@ -435,6 +477,7 @@ impl WorkflowEditor {
             review: self.review_form(cx),
             tags,
             details: self.details.as_ref().map(|d| (d.index, self.details_form(d, cx))),
+            script: self.script.as_ref().map(|s| (s.index, self.script_form(s, cx))),
         }
     }
 
@@ -460,12 +503,15 @@ impl WorkflowEditor {
 
     fn details_form(&self, details: &Details, cx: &App) -> DetailsForm {
         let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
-        DetailsForm {
-            target: value(&details.target),
-            run: details.run.read(cx).value().to_string(),
-            ready: value(&details.ready),
-            ready_timeout: value(&details.timeout),
-            url: value(&details.url),
+        DetailsForm { target: value(&details.target), url: value(&details.url) }
+    }
+
+    fn script_form(&self, script: &Script, cx: &App) -> ScriptForm {
+        let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        ScriptForm {
+            run: script.commands.iter().map(|(input, _)| value(input)).collect(),
+            ready: value(&script.ready),
+            ready_timeout: value(&script.timeout),
         }
     }
 
@@ -486,6 +532,10 @@ impl WorkflowEditor {
         // renumbers the rest: the open Details would be another's.
         if matches!(change, Change::RemoveTransition(_) | Change::RemoveStatus(_)) {
             self.details = None;
+            self.script = None;
+        }
+        if matches!(change, Change::RemoveScript(i) if self.script.as_ref().is_some_and(|s| s.index == i)) {
+            self.script = None;
         }
         let structural = matches!(change, Change::AddStatus(_) | Change::RemoveStatus(_));
         if let Some(state) = self.state.as_mut() {
@@ -745,35 +795,98 @@ impl WorkflowEditor {
             return;
         };
         let form = state.details_form(index);
-        let mut input = |value: String, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).default_value(value));
-        let target = input(form.target, cx);
-        let ready = input(form.ready, cx);
-        let timeout = input(form.ready_timeout, cx);
-        let url = input(form.url, cx);
-        let run = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8).default_value(form.run));
-        let mut subscriptions = Vec::new();
-        for field in [&target, &ready, &timeout, &url] {
-            subscriptions.push(cx.subscribe_in(field, window, |this, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.typed(cx);
-                }
-            }));
-        }
-        subscriptions.push(cx.subscribe_in(&run, window, |this, _, event: &InputEvent, _, cx| {
+        let target = self.typed_field(form.target, window, cx);
+        let url = self.typed_field(form.url, window, cx);
+        self.details = Some(Details {
+            index,
+            target: target.0,
+            url: url.0,
+            _subscriptions: vec![target.1, url.1],
+        });
+        cx.notify();
+    }
+
+    /// A field holding `value` whose edits go to the draft as typed.
+    fn typed_field(&self, value: String, window: &mut Window, cx: &mut Context<Self>) -> (Entity<InputState>, Subscription) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
+        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 this.typed(cx);
             }
-        }));
-        self.details = Some(Details {
-            index,
-            target,
-            run,
-            ready,
-            timeout,
-            url,
-            _subscriptions: subscriptions,
         });
+        (input, sub)
+    }
+
+    /// Open transition `index`'s Run script editor, its fields filled from
+    /// the draft; `blank` (the + menu's Run script) starts a transition
+    /// without one on an empty command, focused.
+    pub(super) fn open_script(&mut self, index: usize, blank: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let mut form = state.script_form(index);
+        if blank && form.run.is_empty() {
+            form.run = ScriptForm::blank().run;
+        }
+        let commands: Vec<_> = form.run.into_iter().map(|c| self.typed_field(c, window, cx)).collect();
+        let ready = self.typed_field(form.ready, window, cx);
+        let timeout = self.typed_field(form.ready_timeout, window, cx);
+        if blank {
+            if let Some((input, _)) = commands.last() {
+                input.update(cx, |s, cx| s.focus(window, cx));
+            }
+        }
+        self.script = Some(Script { index, commands, ready: ready.0, timeout: timeout.0, _subscriptions: vec![ready.1, timeout.1] });
         cx.notify();
+    }
+
+    /// Edit (or, open, Done) in Run script's chip menu.
+    pub(super) fn toggle_script(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script.as_ref().is_some_and(|s| s.index == index) {
+            self.close_script(cx);
+        } else {
+            self.open_script(index, false, window, cx);
+        }
+    }
+
+    pub(super) fn close_script(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.script = None;
+        cx.notify();
+    }
+
+    /// Whether transition `index`'s row shows Run script: it has one, or
+    /// its editor is open on one not typed yet.
+    pub(super) fn shows_script(&self, index: usize) -> bool {
+        self.script.as_ref().is_some_and(|s| s.index == index) || self.state.as_ref().is_some_and(|s| s.has_script(index))
+    }
+
+    /// Add command: an empty field after the others, focused.
+    fn add_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = self.typed_field(String::new(), window, cx);
+        field.0.update(cx, |s, cx| s.focus(window, cx));
+        if let Some(script) = self.script.as_mut() {
+            script.commands.push(field);
+        }
+        cx.notify();
+    }
+
+    fn remove_command(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if let Some(script) = self.script.as_mut().filter(|s| slot < s.commands.len()) {
+            // Its subscription goes with it.
+            drop(script.commands.remove(slot));
+        }
+        self.typed(cx);
+    }
+
+    /// Drop command `from` on command `to`'s row: it takes that row's place.
+    fn move_command(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if let Some(script) = self.script.as_mut().filter(|s| from < s.commands.len() && to < s.commands.len() && from != to) {
+            let c = script.commands.remove(from);
+            script.commands.insert(to, c);
+        }
+        self.typed(cx);
     }
 
     /// Drop status `dragged` on status `onto`'s row: it takes that row's
@@ -878,14 +991,14 @@ impl WorkflowEditor {
         self.base_branch.clone()
     }
 
-    /// The open Details' ready timeout field.
-    pub fn details_timeout_field(&self) -> Option<Entity<InputState>> {
-        self.details.as_ref().map(|d| d.timeout.clone())
+    /// The open Run script's ready timeout field.
+    pub fn script_timeout_field(&self) -> Option<Entity<InputState>> {
+        self.script.as_ref().map(|s| s.timeout.clone())
     }
 
-    /// The open Details' `run` text area.
-    pub fn details_run_field(&self) -> Option<Entity<TextareaState>> {
-        self.details.as_ref().map(|d| d.run.clone())
+    /// The open Run script's command fields, in order.
+    pub fn script_command_fields(&self) -> Vec<Entity<InputState>> {
+        self.script.as_ref().map(|s| s.commands.iter().map(|(input, _)| input.clone()).collect()).unwrap_or_default()
     }
 
     pub fn drop_on(&mut self, dragged: &str, onto: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1932,8 +2045,11 @@ impl WorkflowEditor {
             .enumerate()
             .map(|(slot, &action)| self.action_chip(index, slot, action, &t.actions, theme, cx).into_any_element())
             .collect();
+        let script = self.shows_script(index).then(|| self.script_chip(index, theme, cx));
         let missing: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| !t.actions.contains(a)).collect();
-        let add_action = (!missing.is_empty()).then(|| {
+        // Run script, while the transition has none, after the git actions.
+        let add_script = !self.shows_script(index);
+        let add_action = (!missing.is_empty() || add_script).then(|| {
             self.dropdown(
                 Menu::AddAction(index),
                 "workflow-add-action-menu",
@@ -1941,7 +2057,7 @@ impl WorkflowEditor {
                     .tooltip(style::tooltip("Add an action")),
                 move |cx| {
                     let theme = *cx.global::<Theme>();
-                    missing
+                    let mut items: Vec<AnyElement> = missing
                         .iter()
                         .map(|&action| {
                             menu_item(format!("workflow-add-action-{index}-{action}"), action_label(action), false, &theme)
@@ -1950,7 +2066,15 @@ impl WorkflowEditor {
                                 }))
                                 .into_any_element()
                         })
-                        .collect()
+                        .collect();
+                    if add_script {
+                        items.push(
+                            menu_item(format!("workflow-add-action-{index}-run-script"), RUN_SCRIPT, false, &theme)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_script(index, true, window, cx)))
+                                .into_any_element(),
+                        );
+                    }
+                    items
                 },
                 MENU_W,
                 cx,
@@ -1990,6 +2114,7 @@ impl WorkflowEditor {
                     .items_center()
                     .gap(px(8.0))
                     .children(chips)
+                    .children(script)
                     .children(add_action),
             )
             .child(details)
@@ -1997,12 +2122,148 @@ impl WorkflowEditor {
         let error = state
             .error_at(&Field::Transition(index))
             .map(|e| error_line(format!("workflow-transition-error-{index}"), e, theme).px(px(12.0)).pb(px(10.0)));
+        let script = self
+            .script
+            .as_ref()
+            .filter(|s| s.index == index)
+            .map(|s| self.render_script(s, false, theme, window, cx).mx(px(12.0)).mb(px(12.0)));
         let panel = self
             .details
             .as_ref()
             .filter(|d| d.index == index)
             .map(|d| self.render_details(d, theme, window, cx));
-        div().flex().flex_col().child(row).children(error).children(panel).into_any_element()
+        div().flex().flex_col().child(row).children(error).children(script).children(panel).into_any_element()
+    }
+
+    /// Run script's chip, after the actions: its menu edits or removes it.
+    fn script_chip(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let open = self.script.as_ref().is_some_and(|s| s.index == index);
+        let button = style::content_button(
+            format!("workflow-script-{index}"),
+            ButtonContent::label(RUN_SCRIPT).dropdown(),
+            if open { ButtonKind::Select } else { ButtonKind::Secondary },
+            ButtonSize::Small,
+            false,
+            theme,
+        )
+        .whitespace_nowrap();
+        self.dropdown(
+            Menu::Script(index),
+            "workflow-script-menu",
+            button,
+            move |cx| {
+                let theme = *cx.global::<Theme>();
+                vec![
+                    menu_item(format!("workflow-script-{index}-edit"), if open { "Done" } else { "Edit" }, false, &theme)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.toggle_script(index, window, cx)))
+                        .into_any_element(),
+                    menu_rule(&theme).into_any_element(),
+                    menu_item(format!("workflow-script-{index}-remove"), "Remove", false, &theme)
+                        .text_color(theme.error)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.change(Change::RemoveScript(index), window, cx)))
+                        .into_any_element(),
+                ]
+            },
+            MENU_W,
+            cx,
+        )
+    }
+
+    /// The open Run script's editor (under its Form row, or in the
+    /// Builder's inspector, `narrow`): what it does, its commands (a drag
+    /// handle, the command, remove), Add command, Ready check and Ready
+    /// timeout, Done.
+    pub(super) fn render_script(&self, script: &Script, narrow: bool, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let rows: Vec<AnyElement> = script
+            .commands
+            .iter()
+            .enumerate()
+            .map(|(slot, (input, _))| {
+                let id = |part: &str| -> SharedString { format!("workflow-script-command-{slot}-{part}").into() };
+                let label: SharedString = match input.read(cx).value().trim() {
+                    "" => RUN_PLACEHOLDER.into(),
+                    text => text.to_string().into(),
+                };
+                let handle_id = id("handle");
+                let handle = div()
+                    .id(handle_id.clone())
+                    .debug_selector(move || handle_id.to_string())
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(ROW_BUTTON))
+                    .cursor_grab()
+                    .child(heroicon(icons::BARS_2).text_color(theme.icon))
+                    .on_drag(CommandDrag { slot, label }, |drag: &CommandDrag, _, _, cx: &mut App| {
+                        let label = drag.label.clone();
+                        cx.new(|_| ActionGhost { label })
+                    });
+                let remove = row_button(id("remove"), icons::X_MARK_BUTTON, false, theme)
+                    .tooltip(style::tooltip("Remove command"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.remove_command(slot, cx)));
+                let row_id = id("row");
+                let hover = *theme;
+                div()
+                    .id(row_id.clone())
+                    .debug_selector(move || row_id.to_string())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .w_full()
+                    .rounded(px(6.0))
+                    .drag_over::<CommandDrag>(move |st, _, _, _| st.bg(hover.background))
+                    .on_drop(cx.listener(move |this, drag: &CommandDrag, _, cx| this.move_command(drag.slot, slot, cx)))
+                    .child(handle)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(16.0))
+                            .type_style(Type::Small)
+                            .text_color(theme.form_hint)
+                            .child(format!("{}", slot + 1)),
+                    )
+                    .child(self.text_field(input, id("field"), Some(RUN_PLACEHOLDER.into()), false, window, cx).flex_1().min_w_0())
+                    .child(remove)
+                    .into_any_element()
+            })
+            .collect();
+        let add = header_button("workflow-script-add", Some(icons::PLUS), ADD_COMMAND, theme)
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_command(window, cx)));
+        let commands = div().flex().flex_col().gap(px(8.0)).w_full().children(rows).child(div().flex().flex_row().child(add));
+        let (ready_label, ready_hint) = SCRIPT_READY;
+        let (timeout_label, timeout_hint) = SCRIPT_TIMEOUT;
+        let ready = labeled(ready_label, self.text_field(&script.ready, "workflow-script-ready", Some(ready_hint.into()), false, window, cx), None, theme);
+        let timeout =
+            labeled(timeout_label, self.text_field(&script.timeout, "workflow-script-timeout", Some(timeout_hint.into()), false, window, cx), None, theme);
+        let readiness = if narrow {
+            div().flex().flex_col().gap(px(12.0)).child(ready).child(timeout)
+        } else {
+            div().flex().flex_row().gap(px(FIELD_GAP)).child(ready.flex_1().min_w_0()).child(timeout.w(px(FIELD_W)))
+        };
+        let done = style::button("workflow-script-done", "Done", ButtonKind::Secondary, ButtonSize::Small, false, theme)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_script(cx)));
+        div()
+            .debug_selector(|| "workflow-script".into())
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .p(px(if narrow { 12.0 } else { 16.0 }))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.input_border)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(RUN_SCRIPT))
+                    .child(footnote(RUN_HELP, theme)),
+            )
+            .child(commands)
+            .child(readiness)
+            .child(div().flex().flex_row().justify_end().child(done))
     }
 
     /// An action's chip: its name over a chevron, its menu swapping it for
@@ -2077,43 +2338,8 @@ impl WorkflowEditor {
         )
     }
 
-    /// A transition's Details, under its row: its target branch, the
-    /// commands it runs, and its readiness check.
+    /// A transition's Details, under its row: its target branch and URL.
     fn render_details(&self, d: &Details, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let run_focused = d.run.read(cx).focus_handle(cx).is_focused(window);
-        let run_empty = d.run.read(cx).value().is_empty();
-        let run = div()
-            .debug_selector(|| "workflow-details-run".into())
-            .relative()
-            .flex()
-            .w_full()
-            .min_h(px(56.0))
-            .p(px(1.0))
-            .rounded(px(6.0))
-            .bg(if run_focused { theme.focus_ring } else { theme.input_border })
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .px(px(8.0))
-                    .py(px(6.0))
-                    .rounded(px(5.0))
-                    .bg(theme.textbox)
-                    .type_style(Type::Base)
-                    .text_color(theme.form_text)
-                    .child(Textarea::new(&d.run))
-                    .when(run_empty, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .left(px(8.0))
-                                .top(px(6.0))
-                                .text_color(theme.form_hint)
-                                .child("One command per line"),
-                        )
-                    }),
-            );
         let field = |label: &'static str, input: &Entity<InputState>, selector: &'static str, placeholder: &'static str, cx: &App| {
             labeled(label, self.text_field(input, selector, Some(placeholder.into()), false, window, cx), None, theme)
         };
@@ -2133,22 +2359,8 @@ impl WorkflowEditor {
                     .flex()
                     .flex_row()
                     .gap(px(FIELD_GAP))
-                    .child(field("Target branch", &d.target, "workflow-details-target", "The workflow’s base branch", cx).w(px(WIDE_PICKER_W)))
-                    .child(field("URL", &d.url, "workflow-details-url", "http://localhost:$PORT", cx).flex_1().min_w_0()),
-            )
-            .child(labeled(
-                "Run",
-                run,
-                Some("Commands run in order, in the task’s worktree, after the actions.".into()),
-                theme,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(FIELD_GAP))
-                    .child(field("Ready check", &d.ready, "workflow-details-ready", "Polled until it exits 0", cx).flex_1().min_w_0())
-                    .child(field("Ready timeout (seconds)", &d.timeout, "workflow-details-timeout", "90", cx).w(px(FIELD_W))),
+                    .child(field(DETAILS_TARGET.0, &d.target, "workflow-details-target", DETAILS_TARGET.1, cx).w(px(WIDE_PICKER_W)))
+                    .child(field(DETAILS_URL.0, &d.url, "workflow-details-url", DETAILS_URL.1, cx).flex_1().min_w_0()),
             )
     }
 

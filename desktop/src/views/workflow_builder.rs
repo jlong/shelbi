@@ -48,7 +48,7 @@ use shelbi_core::{Owner, StatusCategory, TransitionAction, WorkflowStatus};
 use super::task_panel;
 use super::workflow_builder_state::{action_drop, action_step, move_action, ActionList, Removal, Selection};
 use super::workflow_editor::{Menu, WorkflowEditor};
-use super::workflow_editor_state::{action_label, owner_label, Change, EditorState, Field, ACTIONS};
+use super::workflow_editor_state::{action_label, owner_label, Change, EditorState, Field, ACTIONS, RUN_SCRIPT};
 use super::workflow_graph::{
     route_to_pointer, Edge, EdgeKind, Graph, Label, LabelAt, Pt, Rect, Side, HANDLE_D, HANDLE_HIT, HANDLE_HOT_D, LABEL_LINE_H, LABEL_PAD,
     ZOOMS,
@@ -94,8 +94,8 @@ pub struct ActionDrag {
 }
 
 /// The row that follows the pointer during a drag.
-struct ActionGhost {
-    label: SharedString,
+pub(super) struct ActionGhost {
+    pub(super) label: SharedString,
 }
 
 impl Render for ActionGhost {
@@ -1463,7 +1463,7 @@ impl WorkflowEditor {
         );
         let rows = self.action_rows(ActionList::New, &n.actions, theme, window, cx);
         let missing: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| !n.actions.contains(a)).collect();
-        let add_action = self.add_action_menu(Menu::NewAddAction, "builder-new-add-action", missing, |this, a, _, cx| this.edit_new(cx, |actions| actions.push(a)), theme, cx);
+        let add_action = self.add_action_menu(Menu::NewAddAction, "builder-new-add-action", missing, None, |this, a, _, cx| this.edit_new(cx, |actions| actions.push(a)), theme, cx);
         let cancel = base_button("builder-new-cancel", None, "Cancel", ButtonKind::Secondary, theme)
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_new(cx)));
         let add = base_button("builder-new-add", None, "Add transition", ButtonKind::Select, theme)
@@ -1595,18 +1595,21 @@ impl WorkflowEditor {
             .into_any_element()
     }
 
-    /// Add action and its menu of the actions not yet on the transition.
+    /// Add action and its menu of the actions not yet on the transition,
+    /// then Run script when `script` names a transition without one.
+    #[allow(clippy::too_many_arguments)]
     fn add_action_menu(
         &self,
         menu: Menu,
         id: &'static str,
         missing: Vec<TransitionAction>,
+        script: Option<usize>,
         add: impl Fn(&mut Self, TransitionAction, &mut Window, &mut Context<Self>) + Clone + 'static,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
         let button = small_button(id, Some(icons::PLUS), "Add action", ButtonKind::Secondary, theme);
-        if missing.is_empty() {
+        if missing.is_empty() && script.is_none() {
             return div().child(button.opacity(0.4).cursor_default().tooltip(style::tooltip("Every action is already here")));
         }
         self.dropdown(
@@ -1615,7 +1618,7 @@ impl WorkflowEditor {
             button,
             move |cx| {
                 let theme = *cx.global::<Theme>();
-                missing
+                let mut items: Vec<AnyElement> = missing
                     .iter()
                     .map(|&a| {
                         let add = add.clone();
@@ -1628,11 +1631,52 @@ impl WorkflowEditor {
                             }))
                             .into_any_element()
                     })
-                    .collect()
+                    .collect();
+                if let Some(index) = script {
+                    items.push(
+                        style::menu_row(format!("{id}-run-script"), false, &theme)
+                            .child(RUN_SCRIPT)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_script(index, true, window, cx)))
+                            .into_any_element(),
+                    );
+                }
+                items
             },
             200.0,
             cx,
         )
+    }
+
+    /// Transition `index`'s Run script row, after its actions: no handle (it
+    /// always runs last), its button opening the editor, remove.
+    fn script_row(&self, index: usize, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.script.as_ref().is_some_and(|s| s.index == index);
+        let edit = style::content_button(
+            "builder-script",
+            ButtonContent::label(RUN_SCRIPT).dropdown(),
+            if open { ButtonKind::Select } else { ButtonKind::Secondary },
+            ButtonSize::Small,
+            false,
+            theme,
+        )
+        .flex_1()
+        .min_w_0()
+        .tooltip(style::tooltip(if open { "Close the editor" } else { "Edit commands" }))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.toggle_script(index, window, cx)));
+        let trash = square_button("builder-script-remove", icons::TRASH, TRASH_BUTTON, theme)
+            .tooltip(style::tooltip("Remove Run script"))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.change(Change::RemoveScript(index), window, cx)));
+        div()
+            .debug_selector(|| "builder-script-row".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .w_full()
+            .child(div().flex_none().size(px(ACTION_HANDLE)))
+            .child(edit)
+            .child(trash)
+            .into_any_element()
     }
 
     /// A transition: From, To, its ordered actions, Add action, the note
@@ -1658,12 +1702,16 @@ impl WorkflowEditor {
             theme,
             cx,
         );
-        let rows = self.action_rows(ActionList::Transition(index), &t.actions, theme, window, cx);
+        let mut rows = self.action_rows(ActionList::Transition(index), &t.actions, theme, window, cx);
+        if self.shows_script(index) {
+            rows.push(self.script_row(index, theme, cx));
+        }
         let missing: Vec<TransitionAction> = ACTIONS.into_iter().filter(|a| !t.actions.contains(a)).collect();
         let add_action = self.add_action_menu(
             Menu::AddAction(index),
             "builder-add-action",
             missing,
+            (!self.shows_script(index)).then_some(index),
             move |this, a, window, cx| this.change(Change::AddAction { index, action: a }, window, cx),
             theme,
             cx,
@@ -1678,6 +1726,9 @@ impl WorkflowEditor {
         out.extend(error);
         out.push(rule(theme).into_any_element());
         out.push(self.actions_block(&status_name(state, &t.from), &status_name(state, &t.to), rows, add_action, theme));
+        if let Some(script) = self.script.as_ref().filter(|s| s.index == index) {
+            out.push(self.render_script(script, true, theme, window, cx).into_any_element());
+        }
         if added {
             out.push(rule(theme).into_any_element());
             out.push(

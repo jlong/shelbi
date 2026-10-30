@@ -212,10 +212,20 @@ paths on every `cargo test`.
   one draft (`shelbi_app::settings::workflow_editor`: the changes, the text
   form, Save, Discard, the leave prompt, the guards). The TUI's Form
   reaches a row's cells through its keys or menu (the desktop has a picker
-  per cell and drags), lists Run commands one per row, asks before Delete,
+  per cell and drags), asks before Delete,
   asks Reload or Keep editing on an on-disk conflict (the desktop points at
   Discard), and asks before a project switch. See
   [`status/tui-workflow-editor-form.md`](status/tui-workflow-editor-form.md).
+- **Run script** (`workflow-run-script-action`): both clients show a
+  transition's `run` / `ready` / `ready_timeout` as a Run script action
+  last in its Actions (the desktop's chip, the TUI's numbered row), offer it
+  in Add action while the transition has none, and edit it in an editor
+  under the row (and in the Builder's transition panel): a command per row,
+  Add command, Ready check, Ready timeout, Done. The desktop's chip menu has
+  Edit / Remove and its commands reorder by drag handle; the TUI's row opens
+  the same menu on Enter (`e` edits, `x` removes) and its commands reorder
+  with Shift/Alt+↑↓. Details hold only Target branch and URL in both. See
+  [`status/workflow-run-script-action.md`](status/workflow-run-script-action.md).
 - **The workflow Builder** (`tui-workflow-editor-builder`): both clients
   draw the same graph (`shelbi_app::settings::workflow_graph`'s columns and
   rows) and select, draw and step back the same way
@@ -225,7 +235,8 @@ paths on every `cargo test`.
   The TUI lays the graph out in cells (no zoom or Fit; Shift+arrows, Home
   and the wheel scroll), reaches transitions with `]` / `[`, uses Tab for
   header / canvas / panel (the desktop's Tab walks nodes), edits a
-  transition's Details in its panel too, reorders actions with
+  transition's Details in its panel too (the desktop's panel has Run script
+  but no Details), reorders actions with
   Shift/Alt+↑↓ (no drag), and puts the panel in the canvas's place below
   104 columns (← Graph goes back). See
   [`status/tui-workflow-editor-builder.md`](status/tui-workflow-editor-builder.md).
