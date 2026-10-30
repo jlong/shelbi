@@ -18,6 +18,8 @@ Shelbi runs a preflight, asks where issues should live (and which runner, if
 you have both), then shows one plan card to confirm. It does not write project
 state until you confirm the card.
 
+<Tui>
+
 <Callout type="note" title="Plain shelbi opens the launch screen">
 
 On a fresh machine with no hub daemon running, plain `shelbi` opens the
@@ -29,6 +31,29 @@ it, without the preflight or plan card. The rest of this page follows
 project starts this same setup for the current directory.
 
 </Callout>
+
+</Tui>
+<Desktop>
+
+<Callout type="note" title="The desktop app's Add Project wizard">
+
+The desktop app adds a project with its own short wizard instead: **Add
+project** on the **Welcome to Shelbi** window, **+ Add project** in the
+project switcher (click the project name at the top of the sidebar), or
+**File ▸ Add Project…**. It asks for the **Project folder** (Browse, or type a
+path), then **Where should settings live?** (**In the project** or **Outside
+the project**), and **Create Project** writes the config, agents, and
+workflows. **Okay** on **You're all set!** opens the project on its
+Orchestrator.
+
+The wizard creates a file-system board, without the preflight, the runner and
+issue-tracker questions, or the plan card. For those, run
+`shelbi project add` in the repo as below; the project then shows up in the
+desktop app too, since both clients share one daemon.
+
+</Callout>
+
+</Desktop>
 
 ## 1. Watch the preflight
 
@@ -152,6 +177,8 @@ sized and named later, in the orchestrator's first-boot interview.
 
 ## 4. Land on the dashboard
 
+<Tui>
+
 After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI.
 On a file-system board, the new board contains one Backlog card named
 **Welcome to Shelbi** (a GitHub Issues board shows your repo's issues
@@ -172,6 +199,31 @@ the generated project files directly and run `shelbi reload`. See
 [Project configuration](/docs/configuration/project) for the full schema and
 [Config modes](/docs/concepts/config-modes) if you want to share config through
 the repository.
+
+</Tui>
+<Desktop>
+
+After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI in
+that terminal. The desktop app is a second client over the same daemon, so open
+**Shelbi.app** and pick the project under **Projects on this Mac**, or from the
+project switcher at the top of the sidebar if the app is already open.
+
+On a file-system board, the new board contains one Backlog card named
+**Welcome to Shelbi** (a GitHub Issues board shows your repo's issues
+instead). The Welcome card is the first hands-on tour: drag it from Backlog to
+To Do and watch Shelbi dispatch it to an available workspace in the sidebar.
+The card is only a guide and is safe to delete.
+
+To change settings later, open **Settings** (`⌘,`, or the gear at the bottom of
+the sidebar): its project section has **Workspaces**, **Workflows**, and
+**Agents** pages. The command palette (`⌘K`) also lists **Edit Project
+Settings** and the other config files once you type "Edit", and **File ▸ Edit
+Configuration** does the same; they open the file in your editor. See
+[Project configuration](/docs/configuration/project) for the full schema and
+[Config modes](/docs/concepts/config-modes) if you want to share config through
+the repository.
+
+</Desktop>
 
 ## Edge cases before the card
 
@@ -207,7 +259,7 @@ No partial project is left behind.
 
 Run `shelbi project add` from another repository. It uses the same preflight,
 card, Customize path, and dashboard launch described above. You can also use
-**Add project** on the launch screen.
+<Tui>**Add project** on the launch screen</Tui><Desktop>the desktop app's Add Project wizard (**File ▸ Add Project…**)</Desktop>.
 
 ## Next
 

@@ -5,7 +5,7 @@ summary: One agent you talk to. It dispatches issues to workspaces, watches the 
 ---
 
 The orchestrator is the agent you talk to. It runs as the project's
-orchestrator session (the **Orchestrator** view in the sidebar), runs whatever
+orchestrator session (the **Orchestrator** view in the sidebar<Desktop>, `⌘O`</Desktop>), runs whatever
 runner the project declares (typically `claude`), and treats the
 `shelbi` CLI as its tool surface, the same CLI you use yourself.
 
@@ -25,7 +25,7 @@ back.
 The board it runs is the whole dashboard: the columns cards move through and
 the workspaces it dispatches them to:
 
-<AppMockup />
+<ClientMockup />
 
 ## You-are-the-scheduler
 
@@ -84,7 +84,8 @@ the orchestrator agent's `instructions.md`. Like every
 `agents/orchestrator/instructions.md`. The orchestrator is the configured
 runner with that prompt staged in its launch directory.
 
-When you boot a project (`shelbi orchestrate` or via the TUI launcher),
+When you boot a project (`shelbi orchestrate`, or by opening it in the TUI or
+the desktop app),
 `ensure_dashboard()` does the following:
 
 1. Resolves the orchestrator agent's prompt: `_shared/preamble.md`

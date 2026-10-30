@@ -114,24 +114,25 @@ isn't on it, add it under `extend`.
 Any of these works:
 
 - **CLI**: `shelbi zen on`
-- **TUI**: `Alt+Z` from anywhere in the TUI
-- **Palette**: `Ctrl+P` → **Turn Zen Mode on**
-- **Desktop**: View ▸ **Turn Zen Mode On** (`⌥Z`)
 
-The first time you turn Zen on from the app, an **Enable Zen Mode?** intro
+<Tui>
+
+- **Palette**: `Ctrl+P` → **Turn Zen Mode on**
+- **Hotkey**: `Alt+Z` (the `global.zen_toggle` binding) while the Activity
+  view has focus
+
+The first time you turn Zen on from the TUI, an **Enable Zen Mode?** intro
 explains what it does (tick "Don't show this again" to skip it next time).
 
 **Rebinding**: if your terminal swallows `Alt` (macOS Terminal.app does), set
 `defaults.global.zen_toggle` in `~/.shelbi/keys.yaml` to another chord,
-such as `ctrl-g`, `ctrl-shift-z`, or `'ctrl-\'` (quoted). See
-[`keys.yaml`](/docs/configuration/global#keysyaml).
+such as `ctrl-g`, `ctrl-shift-z`, or `'ctrl-\'` (quoted), or rebind it in
+**Settings ▸ Keybindings**. See [`keys.yaml`](/docs/configuration/global#keysyaml).
 
 You'll know it's on by the full-width green **ZEN MODE ON** band along
 the bottom edge of the sidebar, under the toolbar. That band is the
 at-a-glance "the agent is in lead mode" signal. When Zen is off or
-paused, the band is simply absent. The desktop app's sidebar footer has
-a Zen pill instead, reading "Zen mode on" or "Zen mode off"; clicking it
-toggles Zen.
+paused, the band is simply absent.
 
 ```
  Orchestrator
@@ -147,6 +148,27 @@ toggles Zen.
  ZEN MODE ON
 ```
 
+</Tui>
+<Desktop>
+
+- **Sidebar**: click the Zen pill at the bottom of the sidebar
+- **Shortcut**: `⌥Z`, or **View ▸ Turn Zen Mode On**
+- **Palette**: `⌘K` → **Turn Zen Mode on**
+
+The first time you turn Zen on from the app, an **Enable Zen Mode?** intro
+explains what it does (tick "Don't show this again" to skip it next time).
+
+You'll know it's on by the pill at the bottom of the sidebar: it turns green
+and reads **Zen mode on**. That pill is the at-a-glance "the agent is in lead
+mode" signal. When Zen is off or paused, it reads **Zen mode off**.
+
+To use a different shortcut, rebind **Toggle Zen mode** in **Settings ▸
+Keybindings** (`⌘,`), or set `defaults.global.zen_toggle` in
+[`keys.yaml`](/docs/configuration/global#keysyaml); the bindings are shared
+with the TUI.
+
+</Desktop>
+
 ## Watch one issue land end to end
 
 Drop a small, clearly-in-scope issue into the backlog:
@@ -160,14 +182,14 @@ promote it. With Zen on, the orchestrator scans backlog when a
 workspace frees up, runs the **judgment categories** from your
 project's `zenmode.md` against each mechanically-eligible card, and
 promotes the ones at least one category applies to. You'll see a Zen
-row in the Activity view (`Ctrl+P` → Activity):
+row in the Activity view (<Tui>`Ctrl+P` → Activity</Tui><Desktop>`⌘K` → Activity, or **Go ▸ Activity**</Desktop>):
 
 ```
 promoted Tighten the rate-limit error copy   backlog → todo
 ```
 
 The dispatch and run that follow look exactly like the manual loop:
-the card moves to `in_progress`, the workspace badge flips to `⏵`, and
+the card moves to `in_progress`, the workspace badge flips to working, and
 the agent works the prompt.
 
 <Callout type="warning" title="Zen only auto-merges without a review workspace">
@@ -210,7 +232,7 @@ would merge twice.)
 
 The `review → done` move merges the branch, and the card lands in **Done**:
 
-<AppMockup
+<ClientMockup
   terminalTitle="you@hub — myapp"
   project="myapp"
   activeView="tasks"
@@ -263,8 +285,8 @@ it to `done`) or push new commits that clear the bar on the next attempt.
 
 ## The activity feed
 
-Zen-driven moves show up in the **Activity** view (`Ctrl+P` → Activity).
-Press `z` (or click the **Zen** pill) to filter the feed down to them,
+Zen-driven moves show up in the **Activity** view (<Tui>`Ctrl+P` → Activity</Tui><Desktop>`⌘K` → Activity, or **Go ▸ Activity**</Desktop>).
+Press `z` (or click the **Zen** <Tui>pill</Tui><Desktop>filter</Desktop>) to filter the feed down to them,
 so machine-initiated actions are easy to separate from anything you
 did. The most common reason strings:
 
@@ -287,7 +309,7 @@ Three flavors of "stop", in increasing severity:
   Zen issues already mid-flight keep applying the bar. Use this when
   you want to triage incoming work yourself for a bit without
   aborting in-flight merges.
-- **`shelbi zen off`** (or the `Alt+Z` toggle): hard off. New
+- **`shelbi zen off`** (or the Zen toggle in the app): hard off. New
   auto-promotions stop and the orchestrator stops initiating the
   merge bar on review handoffs. Anything already in the bar runs to
   completion on its current trajectory.

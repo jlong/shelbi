@@ -97,6 +97,8 @@ to launch it from one.
 
 ### Selecting and copying text
 
+<Tui>
+
 Inside the dashboard, drag with the left mouse button to select text in any
 agent pane, then press Cmd+C (or Ctrl+Shift+C) to copy it. Hold Option while you
 drag if you need the drag to reach a full-screen program instead of selecting.
@@ -108,6 +110,16 @@ own selection when it has one and otherwise passes through to Shelbi:
 ```
 keybind = performable:super+c=copy_to_clipboard
 ```
+
+</Tui>
+<Desktop>
+
+In the desktop app, drag with the left mouse button to select text in any
+terminal pane (the orchestrator, a workspace's agent, a review), then press
+`⌘C` (**Edit ▸ Copy**) to copy it. No terminal configuration is involved: the
+app draws its terminals itself.
+
+</Desktop>
 
 Remote workspaces need a compatible `shelbi` binary and the agent CLI on the
 machine they run on, plus an `ssh` host you can reach without a password prompt.

@@ -11,6 +11,21 @@ page that matters. It answers "what landed this week?" for you on the
 Changelog page of the TUI and the desktop app, and for agents through
 [`shelbi changelog`](/docs/cli/changelog).
 
+<Tui>
+
+Open it with **Changelog** in the sidebar (or the palette). `n` / `p` step to
+the next and previous entry, `/` searches, and `Tab` steps through an entry's
+links; `Enter` follows one.
+
+</Tui>
+<Desktop>
+
+Open it with **Changelog** in the sidebar (`⌘L`). `j` / `k` step to the next and
+previous entry, `⌘F` or `/` searches, and each entry's link chips open the
+issue on the board or the pull request in your browser.
+
+</Desktop>
+
 Entries are markdown files in the project's Shelbi state directory, outside
 your repository. The [CLI reference](/docs/cli/changelog) covers the file
 format, links, the template, and every command.

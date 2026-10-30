@@ -18,8 +18,12 @@ const SITE_TAGLINE =
  * - `<InstallCommand />` → the actual install command as a fenced block.
  * - `<CopyPromptBanner prompt={`…`} … />` → the prompt itself as a fenced
  *   block (the whole point of the AI-prompts page survives the strip).
- * - any other self-closing PascalCase component (e.g. `<AppMockup … />`) is a
- *   purely-visual mockup and is dropped.
+ * - `<Tui>…</Tui>` / `<Desktop>…</Desktop>` (steps that differ by Shelbi
+ *   client, which the page swaps with its TUI | Desktop switch) → both
+ *   variants, labeled, so an agent reading the export sees each client's
+ *   instructions. See {@link labelClientVariants}.
+ * - any other self-closing PascalCase component (e.g. `<AppMockup … />`,
+ *   `<ClientMockup … />`) is a purely-visual mockup and is dropped.
  *
  * All-caps placeholder tokens like `<ID>` or `<NAME>` live inside code fences
  * and are *not* JSX; the component patterns below require a lowercase letter
@@ -59,6 +63,8 @@ export function docToMarkdown(doc: Doc): string {
     `\`\`\`bash\n${INSTALL_COMMAND}\n\`\`\``,
   )
 
+  body = labelClientVariants(body)
+
   // Any remaining self-closing PascalCase component on its own line (the tag
   // name must contain a lowercase letter, which excludes all-caps code
   // placeholders like `<ID>`). These are visual-only, so drop the line.
@@ -71,6 +77,34 @@ export function docToMarkdown(doc: Doc): string {
   body = body.replace(/\n{3,}/g, "\n\n").trim()
 
   return `# ${doc.title}\n\n${doc.summary}\n\n${body}\n`
+}
+
+const CLIENT_LABELS = { Tui: "TUI", Desktop: "Desktop app" } as const
+
+/**
+ * Print the docs' per-client content with both variants kept and labeled.
+ *
+ * - A block (the tag alone on its line, around paragraphs or lists) gets a
+ *   bold lead line: `**TUI:**` / `**Desktop app:**`, then its content.
+ * - Inline variants inside a sentence (which may wrap across source lines;
+ *   blocks are converted first, so what's left is inline) become
+ *   `X (TUI) / Y (Desktop app)` for an adjacent pair, or `X (TUI)` alone.
+ */
+export function labelClientVariants(body: string): string {
+  for (const [tag, label] of Object.entries(CLIENT_LABELS)) {
+    body = body.replace(
+      new RegExp(`^([ \\t]*)<${tag}>[ \\t]*\\n([\\s\\S]*?)\\n[ \\t]*</${tag}>[ \\t]*$`, "gm"),
+      (_match, indent: string, content: string) => `${indent}**${label}:**\n${content}`,
+    )
+  }
+  body = body.replace(
+    /<Tui>([\s\S]*?)<\/Tui>[ \t]*<Desktop>([\s\S]*?)<\/Desktop>/g,
+    `$1 (${CLIENT_LABELS.Tui}) / $2 (${CLIENT_LABELS.Desktop})`,
+  )
+  return body.replace(
+    /<(Tui|Desktop)>([\s\S]*?)<\/\1>/g,
+    (_match, tag: keyof typeof CLIENT_LABELS, content: string) => `${content} (${CLIENT_LABELS[tag]})`,
+  )
 }
 
 /**

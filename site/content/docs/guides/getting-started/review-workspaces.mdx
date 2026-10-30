@@ -129,8 +129,9 @@ pushes the branch and opens a PR.
 Because that status requires `tags: [review]`, the hub automatically loads the
 issue onto the first free `review`-tagged slot (the orchestrator never does
 this) and the Review agent boots the server from the `review:` recipe. You can
-also load it yourself with `Enter` on its **Queued for Review** row or from the
-palette. If every review slot is busy the issue waits under **Queued for
+also load it yourself <Tui>with `Enter` on its **Queued for Review** row or from the
+palette</Tui><Desktop>by clicking its **Queued for review** row, from the palette, or
+from **Go ▸ Reviews**</Desktop>. If every review slot is busy the issue waits under **Queued for
 Review** until one frees; nothing is preempted.
 
 The finishing dev workspace closes its own session and returns to `idle`. Its
@@ -139,6 +140,8 @@ work is now waiting to be *run*, not edited.
 </Step>
 <Step title="Open the review interface and click through">
 
+<Tui>
+
 The issue appears in the sidebar under **Ready for Review** (`✓`) with a
 `machine:workspace` badge showing the slot it's loaded on. Select it (or press
 `Enter` on its row) to open the **review interface**: a two-column layout with
@@ -146,7 +149,18 @@ the **review panel** on the left (its own navigation, with a back button at the
 top that returns you to the dashboard) and the swappable review content on the
 right.
 
-<AppMockup
+</Tui>
+<Desktop>
+
+The issue appears in the sidebar under **Ready for review** with a cyan check.
+Click it (or press its `⌘1`–`⌘9` shortcut) to open the **review view**: the **review
+panel** takes the sidebar's column (a back button at the top returns you to
+the board, and `Esc` does the same) and the swappable review content fills the
+main area.
+
+</Desktop>
+
+<ClientMockup
   terminalTitle="you@hub — myapp"
   project="myapp"
   activeView="tasks"
@@ -193,6 +207,8 @@ right.
 
 From the review panel you can:
 
+<Tui>
+
 - **🤓 Reviewer**: talk to the Review agent (the default view).
 - **🔀 View Diff**: open your system diff tool over the review branch's
   changes in the main pane. By default this uses git's configured diff tool
@@ -210,6 +226,32 @@ From the review panel you can:
 On a remote review slot, View Diff and Edit are hidden: they only work on a
 local slot.
 
+</Tui>
+<Desktop>
+
+The views are numbered, so `⌘1`, `⌘2`, and so on switch between them while
+the review is open.
+
+- **Reviewer**: talk to the Review agent (the default view).
+- **View Diff**: run your diff tool over the review branch's changes in the
+  main area. By default this uses git's configured diff tool (`diff.tool`, or
+  `diff.guitool` for a GUI tool) in directory-diff mode; if none is configured
+  the view shows a short error instead. A diff tool that reviews a **revision
+  range** (such as `skim`) needs `review.diff_command` in `project.yaml`; see
+  [Review diff command](#review-diff-command) below.
+- **Edit in `<editor>`**: open the review worktree in your
+  [configured editor](/docs/configuration/global#configyaml), inside the app.
+- **Web Browser**: open the served `url` in your browser. It reads
+  "loading…" until the server is up, and only appears when the workflow
+  declares a review URL.
+- **Shell**: a shell in the review worktree, beside the content.
+
+The worktree's folder sits above the views; **Open** reveals it in Finder. On
+a remote review slot, View Diff and Edit are hidden: they only work on a local
+slot.
+
+</Desktop>
+
 The built-in `review` agent's charter is narrow: **load and serve, don't
 code.** It won't modify the branch or move the card. Point `agent:` at an agent
 you've authored to change what runs there.
@@ -217,13 +259,14 @@ you've authored to change what runs there.
 </Step>
 <Step title="Approve or reject">
 
-You own the decision, and you make it from the **✅ Approve / ❌ Reject** row at
-the bottom of the review panel:
+You own the decision, and you make it from the <Tui>**✅ Approve / ❌ Reject** row at
+the bottom of the review panel</Tui><Desktop>**Approve** and **Reject** buttons
+under **Actions** in the review panel (or the issue's submenu under **Go ▸ Reviews**)</Desktop>:
 
-- **✅ Approve**: moves the card one column forward (`review → done`), firing
+- **Approve**: moves the card one column forward (`review → done`), firing
   that edge's `actions`: per the workflow above, it pushes and merges the
   branch. The interface tears down and focus returns to the dashboard.
-- **❌ Reject**: opens a type-the-reason dialog. On submit, the reason is
+- **Reject**: opens a type-the-reason dialog (`Ctrl-D` submits). On submit, the reason is
   appended to the issue body and the card bounces back to the ready status for
   another pass. An empty reason can't submit.
 

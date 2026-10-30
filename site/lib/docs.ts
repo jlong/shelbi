@@ -223,6 +223,16 @@ export function humanizeSection(section: string): string {
 export type Heading = { depth: 2 | 3; text: string; id: string }
 
 /**
+ * Whether a doc's content differs by Shelbi client: it uses the docs' `<Tui>` /
+ * `<Desktop>` blocks or a `<ClientMockup>`. Those pages carry the TUI | Desktop
+ * switch in their header; pages the same for both clients (the CLI reference,
+ * the config schemas) don't, so the switch never shows as a no-op.
+ */
+export function hasClientVariants(doc: Doc): boolean {
+  return /<(Tui|Desktop|ClientMockup)\b/.test(doc.body.raw)
+}
+
+/**
  * Extract H2/H3 headings from a doc's raw MDX. IDs are generated with the
  * same `github-slugger` that backs `rehype-slug`, so they match the IDs
  * stamped onto the rendered headings — anchor links and scroll-spy stay
