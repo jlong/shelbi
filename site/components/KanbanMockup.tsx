@@ -16,28 +16,29 @@ import { useState } from "react"
  * varies — the rendering (segment model, alignment, palette, frame) is
  * fixed so every mockup reads as the same real terminal capture and can't
  * drift from the running TUI. `KanbanMockup` is a thin preset that renders
- * `defaultAppState`, preserving the marketing landing page verbatim.
+ * `defaultAppState`.
  *
- * Colors match what `crates/shelbi-tui/src/sidebar.rs` and
- * `crates/shelbi-tui/src/kanban.rs` emit via ratatui's named
+ * Colors match what the TUI emits via ratatui's named
  * `Color::Gray | DarkGray | Blue | Yellow | Magenta | Green | Cyan`
  * palette, resolved to the hex values a modern dark terminal (macOS
  * Terminal / iTerm2 defaults) renders them as. Kanban column-header hue
  * is driven by `StatusCategory` in the crate — Backlog=Gray, Ready=Blue,
- * Active=Yellow, Handoff=Magenta, Done=Green (`category_color()` in
- * `crates/shelbi-tui/src/kanban.rs`). Sidebar decorations mirror
- * `WorkspaceBadge::decoration_color()` and `Row::decoration()` in
- * `crates/shelbi-tui/src/app.rs` — the same rules the palette / sidebar
- * / kanban share so this mockup can't drift from the running TUI.
+ * Active=Yellow, Handoff=Magenta, Done=Green, Archived=DarkGray
+ * (`category_color()` in `crates/shelbi-tui/src/kanban.rs`). The sidebar
+ * mirrors `crates/shelbi-tui/src/shell/sidebar.rs` over the shared
+ * `SidebarModel` in `crates/shelbi-app/src/view.rs` (nav items, workspace
+ * badges, review rows), so this mockup can't drift from the running TUI.
  *
  * The sidebar nav is interactive: clicking (or Enter/Space on) a nav row
- * swaps the right pane between the Tasks board, the Activity feed, and the
- * Chat transcript. `AppMockup` owns the live `activeView` in local state,
- * seeded from the scenario so first paint matches the preset exactly; the
- * Activity and Chat panes are built through the same Segment/Row monospace
- * engine as the board so they read as captures of the same terminal, not an
- * HTML re-implementation. On small viewports the sidebar hides so the board
- * doesn't force horizontal scroll on phones.
+ * swaps the right pane between the Orchestrator session, the Issues board,
+ * and the Changelog, the TUI's three nav items (`default_nav_items`). The
+ * Activity feed is reachable in the TUI only from the palette, so here it is
+ * a scenario's `activeView` with no nav row. `AppMockup` owns the live
+ * `activeView` in local state, seeded from the scenario so first paint matches
+ * the preset exactly; every pane is built through the same Segment/Row
+ * monospace engine as the board so they read as captures of the same
+ * terminal, not an HTML re-implementation. On small viewports the sidebar
+ * hides so the board doesn't force horizontal scroll on phones.
  */
 
 // ── Palette ───────────────────────────────────────────────────────────
@@ -96,34 +97,88 @@ const TASK_BOX_BG = "var(--tui-task-box-bg)"
 // selection gray), with contrasting text.
 const WORKFLOW_BADGE_BG = "var(--tui-workflow-badge-bg)" // neutral gray, same as SEL_BG
 const WORKFLOW_BADGE_FG = "var(--tui-workflow-badge-fg)"
+// The sidebar search box's fill, `theme.search` (#292929 dark / #ececec light),
+// the same two values as the task-body callout fill above.
+const SEARCH_BG = TASK_BOX_BG
+
+/**
+ * A half-cell fill: the `▄` / `▀` half-block bleed the TUI draws above and below
+ * a filled row (the nav selection, the search box, the toolbar squares) so it
+ * reads as half a row taller. Drawn as a two-stop gradient behind blank cells
+ * rather than as the block glyphs, which the mono font lacks (its fallback
+ * glyphs don't sit flush with the row). `top` / `bottom` are the fills of the
+ * row's upper and lower halves (`undefined` = the terminal background).
+ */
+function halfFill(top: string | undefined, bottom: string | undefined): string | undefined {
+  if (!top && !bottom) return undefined
+  const t = top ?? "transparent"
+  const b = bottom ?? "transparent"
+  return `linear-gradient(to bottom, ${t} 50%, ${b} 50%)`
+}
 
 // ── Layout constants ─────────────────────────────────────────────────
-// Kanban columns are fixed at 22 monospace cells (20 for card text + a
+// Kanban columns are at least 22 monospace cells (20 for card text + a
 // 2-cell right gutter) — the same shape the TUI uses at 5-column
-// widths. Total board width = 1 leading pad + 5 × 22 = 111 cells.
-// Sidebar content width is 28 (matches the TUI's 30-col sidebar minus
-// its 1-col horizontal padding on each side).
+// widths. A full five-column board = 1 leading pad + 5 × 22 = 111 cells.
+// The sidebar is 30 cells by default (the TUI's sidebar is user-resizable;
+// its 1-col inset on each side leaves 28 for content).
 const COL_W = 22
-const TEXT_W = 20
-// A collapsed column folds down to this narrow strip (category caret, the label
-// spelled vertically, and the hidden-card count) so it sits as a thin gutter
-// beside the active columns instead of a full 22-cell column.
+// A collapsed column folds down to this narrow strip (the label spelled
+// vertically over the hidden-card count) so it sits as a thin gutter beside the
+// expanded columns instead of a full column.
 const COLLAPSED_W = 6
 const SIDEBAR_W = 30
-/** A single column's rendered width in monospace cells — collapsed or full. */
+// The board width `AppMockup` lays a scenario out at: the canonical five-column
+// width. Like the TUI, expanded columns share what the collapsed strips leave, so
+// a board with folded columns still fills the pane instead of shrinking.
+const DEFAULT_BOARD_W = 111
+/** A single column's natural width in monospace cells — collapsed or full. */
 function colWidth(col: Column): number {
   return col.collapsed ? COLLAPSED_W : COL_W
 }
 /**
- * The board content width for a scenario, in monospace cells: 1 leading pad plus
- * each column's own width (`COL_W`, or `COLLAPSED_W` for a folded column). A full
- * five-column board is `1 + 5 * 22 = 111`, the canonical dashboard width the TUI
- * draws. This is the width every view within a single mockup pins to — the Chat
- * and Activity panes size to it so switching nav rows never changes the frame
- * width, even for boards with a collapsed column or a different column count.
+ * Each column's rendered width for a scenario. Collapsed columns keep their
+ * narrow strip; expanded ones take at least `COL_W` and share any width the
+ * scenario's `boardWidth` leaves over (extra cells go to the leftmost columns),
+ * the way the TUI splits its board area.
  */
-function contentWidth(columns: Column[]): number {
-  return 1 + columns.reduce((w, c) => w + colWidth(c), 0)
+function columnWidths(state: AppState): number[] {
+  const natural = state.columns.map(colWidth)
+  const naturalTotal = 1 + natural.reduce((a, b) => a + b, 0)
+  const target = Math.max(naturalTotal, state.boardWidth ?? 0)
+  const expanded = state.columns.filter((c) => !c.collapsed).length
+  if (target === naturalTotal || expanded === 0) return natural
+  const collapsed = state.columns.length - expanded
+  const spare = target - 1 - collapsed * COLLAPSED_W
+  const each = Math.floor(spare / expanded)
+  let extra = spare - each * expanded
+  return state.columns.map((c) => {
+    if (c.collapsed) return COLLAPSED_W
+    const w = each + (extra > 0 ? 1 : 0)
+    if (extra > 0) extra -= 1
+    return w
+  })
+}
+/**
+ * The board content width for a scenario, in monospace cells: 1 leading pad plus
+ * each column's width (see `columnWidths`). A full five-column board is
+ * `1 + 5 * 22 = 111`, the canonical dashboard width the TUI draws. This is the
+ * width every view within a single mockup pins to — the Orchestrator, Activity
+ * and Changelog panes size to it so switching views never changes the frame
+ * width.
+ */
+function contentWidth(state: AppState): number {
+  return 1 + columnWidths(state).reduce((w, c) => w + c, 0)
+}
+
+/** The GitHub login branches are named after: the `user@` of the window title. */
+function branchUser(state: AppState): string {
+  return /^([^@\s]+)@/.exec(state.terminalTitle)?.[1] ?? "you"
+}
+
+/** `developer` → `Developer`: the sidebar's agent label (`title_case` in view.rs). */
+function titleCase(s: string): string {
+  return s ? s[0].toUpperCase() + s.slice(1) : s
 }
 
 // ── Scenario model ────────────────────────────────────────────────────
@@ -132,14 +187,25 @@ function contentWidth(columns: Column[]): number {
 // specific interface state, and `AppMockup` renders it through the fixed
 // engine below.
 
-export type Category = "gray" | "blue" | "yellow" | "magenta" | "green"
+/**
+ * A status category's header color: backlog=gray, ready=blue, active=yellow,
+ * handoff=magenta, done=green, archived (Canceled, Declined…)=darkgray.
+ */
+export type Category = "gray" | "blue" | "yellow" | "magenta" | "green" | "darkgray"
 
 /** One kanban card. `selected` draws the focused-card gray highlight. */
 export type Card = {
   title: string
   id: string
+  /** The workspace the card is assigned to (adds `o workspace` to the hints when selected). */
   workspace?: string
   selected?: boolean
+  /**
+   * The card's git branch. Omitted, a card in an active or handoff column shows
+   * the shipped `{{github_user}}/{{id}}` branch (`<user>/<id>`, the user taken
+   * from the window title); other columns show none.
+   */
+  branch?: string
   /**
    * The issue's first paragraph. The TUI board doesn't draw it; the desktop
    * board's cards show it under the title (see `components/desktop`).
@@ -162,41 +228,49 @@ export type Column = {
   collapsed?: boolean
 }
 
-/** A workspace row in the sidebar, grouped under its machine. */
+/**
+ * A dev workspace row in the sidebar. Review-tagged workspaces never appear
+ * here: the TUI lists them only through the review sections.
+ */
 export type Workspace = {
   name: string
   state: "idle" | "working"
+  /** The agent's name (`developer`, `qa`…); the row shows it title-cased. */
   agent?: string
 }
 
-/** A machine group in the sidebar (`▾ <name>` + its workspaces). */
+/**
+ * A machine and its workspaces. With more than one machine the sidebar groups
+ * rows under `▾ <name>` headers; a single-machine project is a flat list.
+ */
 export type Machine = {
   name: string
   workspaces: Workspace[]
 }
 
 /**
- * One entry in a sidebar review section, mirroring `ReviewEntry` /
- * `Row::Review` in the crate. Rendered as two lines: line 1 is the badge +
- * title (Ready adds the `machine:port` served URL right-aligned); line 2 is
- * the `branch`, dim. `location` is set only for a Ready (serving) entry — a
- * Queued one has no slot yet, so no URL.
+ * One entry in a sidebar review section, mirroring `SidebarRow::Review` in
+ * the crate. Rendered as two lines: line 1 is the badge + title (Ready adds
+ * the `machine:workspace` review slot right-aligned, when the title leaves
+ * room for it); line 2 is `⎇ <branch>`, dim. `location` is set only for a
+ * Ready (serving) entry — a Queued one has no slot yet.
  */
 export type ReviewEntry = {
   title: string
-  /** Branch shown dim on line 2, e.g. `shelbi/<id>`. */
+  /** Branch shown dim on line 2, e.g. `you/<id>`. */
   branch: string
-  /** `machine:port` served URL — present for Ready, omitted for Queued. */
+  /** `machine:workspace` review slot, e.g. `hub:review-0` — Ready only. */
   location?: string
 }
 
 /**
- * Which right-pane view is active — also drives the title-bar label. The
- * first three map to the sidebar nav rows; `workspace` is the focused-worker
- * pane (a Claude-Code session for one workspace), reached by selecting a
- * workspace rather than a nav row, so it carries no nav entry of its own.
+ * Which right-pane view is active. `chat` (Orchestrator), `tasks` (Issues) and
+ * `changelog` are the sidebar nav rows; `activity` is the Activity feed, which
+ * the TUI opens from the palette (no nav row); `workspace` is the
+ * focused-worker pane (a Claude-Code session for one workspace), reached by
+ * selecting a workspace rather than a nav row.
  */
-export type NavView = "chat" | "tasks" | "activity" | "workspace"
+export type NavView = "chat" | "tasks" | "changelog" | "activity" | "workspace"
 
 /**
  * One row in the ⌃P command palette: a left icon, a command label the fuzzy
@@ -232,33 +306,60 @@ export type PaletteState = {
  * `starterAppState`) and override only what your scenario changes.
  */
 export type AppState = {
-  /** macOS window-chrome title, e.g. `jlong@hub — shelbi`. */
+  /**
+   * macOS window-chrome title, e.g. `you@hub — myapp`. Its `user@` also names
+   * the cards' default branches (`<user>/<id>`).
+   */
   terminalTitle: string
-  /** Project name — Cyan-bold in the sidebar header and the title bar. */
+  /** Project name — Cyan-bold in the sidebar header and the board title. */
   project: string
-  /** Highlighted nav row; also selects the title-bar label (Chat/Tasks/Activity). */
+  /** The open view; the matching nav row (if it has one) is highlighted. */
   activeView: NavView
-  /** Kanban columns rendered in the main board (5-column layout). */
+  /**
+   * Board columns, one per status in `statuses.yaml` order (the shipped catalog
+   * draws six: BACKLOG, TO DO, IN PROGRESS, REVIEW, DONE and a darkgray
+   * CANCELED). Mark an empty column `collapsed`: the TUI folds empty columns to
+   * a narrow strip.
+   */
   columns: Column[]
   /**
-   * Workflow name shown as the small badge on each card's meta line. When set,
-   * every card renders ` <workflow> ` as a bluish-gray chip (followed by the
-   * branch once one is cut); omit it to suppress the badge.
+   * Board width in cells (`AppMockup` defaults it to 111). Expanded columns
+   * share what the collapsed strips leave; a board whose columns need more than
+   * this is drawn at its natural width.
+   */
+  boardWidth?: number
+  /**
+   * Workflow name shown as the small badge on each card's meta line (` task `
+   * on a shipped project). The TUI draws it only while more than one workflow
+   * is loaded and the board isn't filtered to one; omit it to suppress the badge.
    */
   workflow?: string
-  /** Sidebar machine groups and their workspaces. */
+  /**
+   * The workflow the board is filtered to (`⇥` cycles it): the title's
+   * `Workflow:` chip reads it in cyan and the cards drop their badge. Omitted,
+   * the chip reads `All`.
+   */
+  workflowFilter?: string
+  /**
+   * The project loads a single workflow, so the board draws no `Workflow:`
+   * chip (the TUI shows it only when there's more than one to filter by).
+   */
+  singleWorkflow?: boolean
+  /** Sidebar machines and their dev workspaces. */
   machines: Machine[]
   /**
-   * Sidebar "Ready for Review" entries — tasks loaded on a review workspace
-   * and serving (cyan ✓, with a `machine:port` location). Empty hides the
-   * section.
+   * Sidebar "Ready for Review" entries — Review-status issues loaded on a
+   * `review`-tagged workspace and serving (cyan ✓, with a `machine:workspace`
+   * location). Empty hides the section.
    */
   readyReview: ReviewEntry[]
   /**
-   * Sidebar "Queued for Review" entries — Review-status tasks waiting for a
-   * free review workspace (blue ·, no location yet). Empty hides the section.
+   * Sidebar "Queued for Review" entries — Review-status issues waiting for a
+   * free review workspace (dim ·, no location yet). Empty hides the section.
    */
   queuedReview: ReviewEntry[]
+  /** Sidebar width in cells (default 30). The TUI's sidebar is resizable. */
+  sidebarWidth?: number
   /**
    * Whether the sidebar shows the full-width green "ZEN MODE ON" band. Opt-in
    * and defaults to off (undefined/false) — only the hero and docs pages that
@@ -318,14 +419,16 @@ const CATEGORY_COLOR: Record<Category, string> = {
   yellow: TUI_YELLOW,
   magenta: TUI_MAGENTA,
   green: TUI_GREEN,
+  darkgray: TUI_DARK_GRAY,
 }
 
-// Sidebar nav rows, in display order. `label` doubles as the title-bar
-// label for the matching `activeView`.
+// Sidebar nav rows, in display order: `default_nav_items` in
+// `crates/shelbi-app/src/view.rs`, with the glyphs `nav_glyph` gives them.
+// Activity and Machines are palette-only, so they have no row here.
 const NAV_ITEMS: { view: NavView; glyph: string; label: string }[] = [
-  { view: "chat", glyph: "💬", label: "Chat" },
-  { view: "tasks", glyph: "📋", label: "Tasks" },
-  { view: "activity", glyph: "⚡", label: "Activity" },
+  { view: "chat", glyph: "💬", label: "Orchestrator" },
+  { view: "tasks", glyph: "📋", label: "Issues" },
+  { view: "changelog", glyph: "🚀", label: "Changelog" },
 ]
 
 // ── Segment model ─────────────────────────────────────────────────────
@@ -364,12 +467,15 @@ function clampRow(segs: Segment[], width: number): Segment[] {
   let used = 0
   for (const seg of segs) {
     if (used >= width) break
-    const chars = [...seg.text]
-    if (used + chars.length <= width) {
+    const w = segW(seg)
+    if (used + w <= width) {
       out.push(seg)
-      used += chars.length
+      used += w
+    } else if (seg.cells !== undefined) {
+      // A pinned glyph that doesn't fit drops whole.
+      break
     } else {
-      out.push({ ...seg, text: chars.slice(0, width - used).join("") })
+      out.push({ ...seg, text: [...seg.text].slice(0, width - used).join("") })
       used = width
       break
     }
@@ -377,7 +483,15 @@ function clampRow(segs: Segment[], width: number): Segment[] {
   if (used < width) out.push({ text: " ".repeat(width - used) })
   return out
 }
-const SIDEBAR_BLANK_ROW: Segment[] = [{ text: " ".repeat(SIDEBAR_W) }]
+/** A segment's width in cells: its pinned `cells`, else one per character. */
+function segW(seg: Segment): number {
+  return seg.cells ?? [...seg.text].length
+}
+
+/** A row's width in cells. */
+function rowW(segs: Segment[]): number {
+  return segs.reduce((n, s) => n + segW(s), 0)
+}
 
 /**
  * Truncate `text` to fit inside `width` monospace cells, using the same
@@ -387,19 +501,8 @@ const SIDEBAR_BLANK_ROW: Segment[] = [{ text: " ".repeat(SIDEBAR_W) }]
 function truncate(text: string, width: number): string {
   const chars = [...text]
   if (chars.length <= width) return text
+  if (width <= 0) return ""
   return chars.slice(0, width - 1).join("") + "…"
-}
-
-/**
- * Kebab-case a title into the slug the working branch is named after — Shelbi
- * cuts `shelbi/<task-id>` and the id is the slugged title, so this reproduces
- * the branch a card's meta line surfaces.
- */
-function slugify(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
 }
 
 /**
@@ -436,112 +539,129 @@ function padTo(text: string, width: number): string {
   return len >= width ? text : text + " ".repeat(width - len)
 }
 
-/** Blank column cell — 22 spaces of padding, no color. */
-function blankColRow(): Segment[] {
-  return [{ text: " ".repeat(COL_W) }]
+/** A blank column cell `width` spaces wide, no color. */
+function blankColRow(width: number): Segment[] {
+  return [{ text: " ".repeat(width) }]
 }
 
 /**
- * A collapsed column's rows: the label spelled one letter per row in the
- * category color, then the hidden-card count in parens — a thin folded strip
- * pinned to `COLLAPSED_W` cells. Each row is centered within the strip so the
- * stacked letters sit centered over the `(N)` count beneath them; the first
- * letter is on row 0 so the strip lines up with the full columns' header row,
- * and the count reads as "N cards folded away here".
+ * A collapsed column's rows, mirroring `render_collapsed_column`: the label
+ * spelled one bold letter per row in the category color (a space in the name is
+ * a blank row), then one blank row and the hidden-card count in parens — a thin
+ * folded strip pinned to `COLLAPSED_W` cells. Each row is centered within the
+ * strip, and the first letter is on row 0 so it lines up with the full columns'
+ * header row.
  */
 function collapsedColumnRows(col: Column): Segment[][] {
   const cat = CATEGORY_COLOR[col.category]
   const center = (segs: Segment[]): Segment[] => {
-    const used = segs.reduce((n, s) => n + [...s.text].length, 0)
+    const used = rowW(segs)
     const total = Math.max(0, COLLAPSED_W - used)
     const left = Math.floor(total / 2)
     return [{ text: " ".repeat(left) }, ...segs, { text: " ".repeat(total - left) }]
   }
   const rows: Segment[][] = []
   for (const ch of col.label) {
-    rows.push(ch === " " ? center([]) : center([{ text: ch, color: cat }]))
+    rows.push(ch === " " ? center([]) : center([{ text: ch, color: cat, bold: true }]))
   }
+  rows.push(center([]))
   rows.push(center([{ text: `(${col.cards.length})`, color: TUI_DARK_GRAY }]))
   return rows
 }
 
+/** What a column's cards need from the scenario to draw their meta line. */
+type CardMeta = {
+  /** The workflow badge text, when cards carry one. */
+  badge?: string
+  /** The GitHub login default branches are named after. */
+  user: string
+}
+
 /**
- * Build the visible rows for a single column: header row followed by
- * one entry per card (title on one or two lines + a branch meta row) with a
- * blank row between cards. A collapsed column folds to its narrow strip instead.
+ * Build the visible rows for a single column `width` cells wide: header row
+ * followed by one entry per card (title on one or two lines + a meta row) with
+ * a blank row between cards. A collapsed column folds to its narrow strip
+ * instead.
  */
-function columnRows(col: Column, workflow?: string): Segment[][] {
+function columnRows(col: Column, width: number, meta: CardMeta): Segment[][] {
   if (col.collapsed) return collapsedColumnRows(col)
   const rows: Segment[][] = []
+  const textW = width - 2
 
   // Header row: `LABEL (N)` in the category color, count in DarkGray,
-  // padded to COL_W. Total = "LABEL" + " (N)" — no leading pad because
-  // the caller adds the board-level " " before column 1.
-  const headerText = `${col.label} (${col.cards.length})`
-  const padCount = COL_W - [...headerText].length
+  // padded to the column width — no leading pad because the caller adds the
+  // board-level " " before column 1.
+  // The label truncates (`…`) before it would run into the 2-cell gutter.
+  const count = ` (${col.cards.length})`
+  const label = truncate(col.label, textW - [...count].length)
+  const padCount = width - [...label].length - [...count].length
   const catColor = CATEGORY_COLOR[col.category]
   rows.push([
-    { text: col.label, color: catColor, bold: true },
-    { text: ` (${col.cards.length})`, color: TUI_DARK_GRAY },
+    { text: label, color: catColor, bold: true },
+    { text: count, color: TUI_DARK_GRAY },
     { text: " ".repeat(Math.max(0, padCount)) },
   ])
 
   col.cards.forEach((card, idx) => {
-    if (idx > 0) rows.push(blankColRow())
+    if (idx > 0) rows.push(blankColRow(width))
 
-    // Title rows — wrapped to at most two lines within TEXT_W (the way the TUI
-    // wraps card titles), each bold and right-padded with the 2-cell gutter that
-    // lives inside the column's cell. A title that fits is one row; a longer one
-    // wraps to two, with the overflow `…`-truncated on line 2.
-    const [titleLine1, titleLine2] = wrapTitleTwoLines(card.title, TEXT_W)
+    // Title rows — wrapped to at most two lines within the card's text width
+    // (the way the TUI wraps card titles), each bold and right-padded with the
+    // 2-cell gutter that lives inside the column's cell.
+    const [titleLine1, titleLine2] = wrapTitleTwoLines(card.title, textW)
     for (const tline of titleLine2 === null ? [titleLine1] : [titleLine1, titleLine2]) {
       if (card.selected) {
-        rows.push([{ text: padTo(tline, COL_W), color: SEL_FG, bg: SEL_BG, bold: true }])
+        rows.push([{ text: padTo(tline, width), color: SEL_FG, bg: SEL_BG, bold: true }])
       } else {
         rows.push([
           { text: tline, color: TUI_FG, bold: true },
-          { text: " ".repeat(Math.max(0, COL_W - [...tline].length)) },
+          { text: " ".repeat(Math.max(0, width - [...tline].length)) },
         ])
       }
     }
 
-    // Meta row — the workflow name as a bluish-gray badge chip, followed by the
-    // task's git branch (`⎇ …`, dim) once one has been cut. Mirrors
-    // `card_meta_line` in crates/shelbi-tui/src/kanban.rs: a branch only exists
-    // after the task is dispatched into IN PROGRESS or handed off to REVIEW, so
-    // BACKLOG / TO DO and merged DONE cards show just the badge. When the board
-    // carries no workflow name the badge is suppressed (blank meta row).
+    // Meta row — the workflow name as a gray badge chip, followed by the
+    // issue's git branch (`⎇ …`, dim) once one has been cut. Mirrors
+    // `card_meta_line` in crates/shelbi-tui/src/kanban.rs. Dispatch cuts the
+    // branch (`{{github_user}}/{{id}}` in the shipped workflows), so a card in
+    // an active or handoff column shows one; BACKLOG / TO DO cards show just
+    // the badge. A card's own `branch` overrides the default.
     const hasBranch = col.category === "yellow" || col.category === "magenta"
-    const branch = hasBranch ? `⎇ shelbi/${slugify(card.title)}` : ""
-    const meta: Segment[] = []
+    const branchName = card.branch ?? (hasBranch ? `${meta.user}/${card.id}` : undefined)
+    const branch = branchName ? `⎇ ${branchName}` : ""
+    const segs: Segment[] = []
     let metaUsed = 0
-    if (workflow) {
-      const badge = ` ${workflow} `
-      meta.push({ text: badge, bg: WORKFLOW_BADGE_BG, color: WORKFLOW_BADGE_FG })
+    if (meta.badge) {
+      const badge = truncate(` ${meta.badge} `, textW)
+      segs.push({ text: badge, bg: WORKFLOW_BADGE_BG, color: WORKFLOW_BADGE_FG })
       metaUsed += [...badge].length
     }
     if (branch) {
-      const sep = meta.length ? 1 : 0
-      const remaining = COL_W - metaUsed - sep
+      const sep = segs.length ? 1 : 0
+      const remaining = textW - metaUsed - sep
       if (remaining > 0) {
-        if (sep) meta.push({ text: " " })
+        if (sep) segs.push({ text: " " })
         const b = truncate(branch, remaining)
-        meta.push({ text: b, color: TUI_DARK_GRAY })
+        // Pin `⎇ ` (the mono font lacks the glyph) to its two cells so the
+        // fallback glyph can't push the columns to its right off the grid.
+        const head = [...b].slice(0, 2).join("")
+        segs.push({ text: head, color: TUI_DARK_GRAY, cells: [...head].length })
+        segs.push({ text: [...b].slice(2).join(""), color: TUI_DARK_GRAY })
         metaUsed += sep + [...b].length
       }
     }
-    if (metaUsed < COL_W) meta.push({ text: " ".repeat(COL_W - metaUsed) })
+    if (metaUsed < width) segs.push({ text: " ".repeat(width - metaUsed) })
     if (card.selected) {
       // The whole row takes the selection gray, but the badge keeps its own
       // fill (its bg is distinct from the selection gray on purpose) so it
       // stays visible — matching `theme::WORKFLOW_BADGE_BG`.
       rows.push(
-        meta.map((s) =>
+        segs.map((s) =>
           s.bg === WORKFLOW_BADGE_BG ? { ...s, color: SEL_FG } : { ...s, bg: SEL_BG, color: SEL_FG },
         ),
       )
     } else {
-      rows.push(meta)
+      rows.push(segs)
     }
   })
 
@@ -552,9 +672,13 @@ function columnRows(col: Column, workflow?: string): Segment[][] {
  * Zip all columns row-by-row into a single board grid. Shorter columns
  * are padded down with blank rows so the grid stays rectangular.
  */
-function buildBoardRows(columns: Column[], workflow?: string): Segment[][] {
-  const perCol = columns.map((c) => columnRows(c, workflow))
-  const maxRows = Math.max(...perCol.map((r) => r.length))
+function buildBoardRows(state: AppState): Segment[][] {
+  const widths = columnWidths(state)
+  const badge =
+    state.workflow && !state.workflowFilter && !state.singleWorkflow ? state.workflow : undefined
+  const meta: CardMeta = { badge, user: branchUser(state) }
+  const perCol = state.columns.map((c, i) => columnRows(c, widths[i], meta))
+  const maxRows = Math.max(0, ...perCol.map((r) => r.length))
   const grid: Segment[][] = []
 
   for (let r = 0; r < maxRows; r += 1) {
@@ -562,7 +686,7 @@ function buildBoardRows(columns: Column[], workflow?: string): Segment[][] {
     for (let c = 0; c < perCol.length; c += 1) {
       // Pad short columns with a blank cell of that column's own width, so a
       // collapsed column's narrow strip stays narrow on its empty rows too.
-      const cellRow = perCol[c][r] ?? [{ text: " ".repeat(colWidth(columns[c])) }]
+      const cellRow = perCol[c][r] ?? blankColRow(widths[c])
       rowSegs.push(...cellRow)
     }
     grid.push(rowSegs)
@@ -570,76 +694,78 @@ function buildBoardRows(columns: Column[], workflow?: string): Segment[][] {
   return grid
 }
 
-/** Title bar row: "<View> · <project>  N total" + right-aligned chips. */
+/**
+ * The Issues board's title row (`render_title` in kanban.rs):
+ * `Issues · <project>   N total` on the left, the ` Workflow: All ▾` (only
+ * while more than one workflow is loaded) and ` Workspace: All ▾` filter chips
+ * flush right. A filtered chip reads its value in bold cyan. The chips drop
+ * when the row is too narrow for them, as the TUI's do.
+ */
 function titleRow(state: AppState): Segment[] {
-  const { columns, project, activeView } = state
-  const width = contentWidth(columns)
+  const { columns, project } = state
+  const width = contentWidth(state)
   const total = columns.reduce((n, c) => n + c.cards.length, 0)
-  // The focused-worker pane has no nav row, so its label is the workspace name
-  // (e.g. `alpha · my-project`); the nav views use their nav label.
-  const label =
-    activeView === "workspace"
-      ? (state.focusedWorkspace ?? "workspace")
-      : (NAV_ITEMS.find((n) => n.view === activeView)?.label ?? "Tasks")
-  const leftText = ` ${label} · ${project}   ${total} total`
-  const workflow = "Workflow: All ▾"
-  const workspace = "Workspace: All ▾ "
-  const leftLen = [...leftText].length
-  const rightLen = [...workflow].length + 2 + [...workspace].length
-  const midPad = Math.max(1, width - leftLen - rightLen)
-  return [
-    { text: ` ${label} · `, color: TUI_DARK_GRAY },
+  const left: Segment[] = [
+    { text: " Issues · ", color: TUI_DARK_GRAY },
     { text: project, color: TUI_CYAN, bold: true },
     { text: `   ${total} total`, color: TUI_DARK_GRAY },
-    { text: " ".repeat(midPad) },
-    { text: workflow, color: TUI_DARK_GRAY },
-    { text: "  " },
-    { text: workspace, color: TUI_DARK_GRAY },
   ]
+  const chips: Segment[] = []
+  if (!state.singleWorkflow) {
+    chips.push({ text: " Workflow: ", color: TUI_DARK_GRAY })
+    chips.push(
+      state.workflowFilter
+        ? { text: `${state.workflowFilter} ▾`, color: TUI_CYAN, bold: true }
+        : { text: "All ▾", color: TUI_DARK_GRAY },
+    )
+  }
+  chips.push({ text: " Workspace: All ▾", color: TUI_DARK_GRAY })
+  const leftW = rowW(left)
+  const chipsW = rowW(chips)
+  // One trailing cell mirrors the board's one leading cell.
+  if (leftW + 1 + chipsW + 1 > width) return bodyRow(left, width)
+  return [...left, { text: " ".repeat(width - leftW - chipsW - 1) }, ...chips, { text: " " }]
 }
 
 /**
- * Footer keybinding hints — matches `render_footer` in the crate, whose hints
- * are per-view. Each view keeps the same key-in-fg / hint-in-dg pattern and
- * pads to the board `width` so the footer (and the frame) is identical across
- * views. The Claude panes (chat + worker) render no footer at all, so this only
- * covers the activity and board views.
+ * The Issues board's key-hint line (`render_footer` in kanban.rs), all dim,
+ * with the default bindings in the macOS display style (`⏎`, `⇥`, `⇧h`).
+ * `o workspace` joins only while the selected card is assigned to a workspace.
+ * Hints that don't fit the board width drop whole from the end rather than
+ * mid-word.
  */
-function footerRow(activeView: NavView, width: number): Segment[] {
-  const segs: Segment[] = []
-  const push = (t: string, color = TUI_DARK_GRAY) => segs.push({ text: t, color })
-  const key = (t: string) => push(t, TUI_FG)
-  // [key, hint] pairs per view.
-  const hints: [string, string][] =
-    activeView === "activity"
-      ? [["j/k", " scroll   "], ["r", " refresh   "], ["esc", " tasks"]]
-      : [
-          ["h/l", " col   "],
-          ["j/k", " row   "],
-          ["⏎", " open   "],
-          ["n", " new   "],
-          ["f", " filter   "],
-          ["r", " refresh"],
-        ]
-  push("  ")
-  for (const [k, hint] of hints) {
-    key(k)
-    push(hint)
+function boardFooterRow(state: AppState, width: number): Segment[] {
+  const hints = [
+    "h/l col",
+    "j/k row",
+    "⏎ open",
+    "⇧h/⇧l move col",
+    "⇧k/⇧j reorder",
+    "⇥ workflow",
+    "f filter",
+    "/ search",
+    "r refresh",
+  ]
+  const selected = state.columns.flatMap((c) => c.cards).find((c) => c.selected)
+  if (selected?.workspace) hints.push("o workspace")
+  let text = "  " + hints[0]
+  for (const hint of hints.slice(1)) {
+    const next = `${text}   ${hint}`
+    if ([...next].length + 1 > width) break
+    text = next
   }
-  const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
-  if (used < width) segs.push({ text: " ".repeat(width - used) })
-  return segs
+  return bodyRow([{ text, color: TUI_DARK_GRAY }], width)
 }
 
-// ── Activity & Chat panes ─────────────────────────────────────────────
-// Two alternate right-pane views, built as `Segment[][]` through the same
-// engine as the board so they read as captures of the real TUI's Activity
-// (`crates/shelbi-tui/src/activity.rs`) and Chat (Orchestrator transcript)
-// views — same palette, same monospace grid, same character alignment.
+// ── Activity, Changelog & Orchestrator panes ──────────────────────────
+// The alternate right-pane views, built as `Segment[][]` through the same
+// engine as the board so they read as captures of the real TUI's Activity,
+// Changelog and Orchestrator (Claude Code session) views — same palette, same
+// monospace grid, same character alignment.
 
 /** Pad a run of segments to the board content width so a view fills the pane. */
 function bodyRow(segs: Segment[], width: number): Segment[] {
-  const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
+  const used = rowW(segs)
   if (used >= width) return segs
   return [...segs, { text: " ".repeat(width - used) }]
 }
@@ -650,8 +776,8 @@ function bodyRow(segs: Segment[], width: number): Segment[] {
  * Activity timestamps so they right-align at the board edge (never beyond it).
  */
 function bodyRightAlignRow(left: Segment[], right: Segment[], width: number): Segment[] {
-  const leftW = left.reduce((acc, s) => acc + [...s.text].length, 0)
-  const rightW = right.reduce((acc, s) => acc + [...s.text].length, 0)
+  const leftW = rowW(left)
+  const rightW = rowW(right)
   const pad = Math.max(1, width - leftW - rightW - 1)
   return [...left, { text: " ".repeat(pad) }, ...right, { text: " " }]
 }
@@ -682,239 +808,288 @@ function padBodyTo(rows: Segment[][], target: number, width: number): Segment[][
   return out
 }
 
-// ── Activity avatars ──────────────────────────────────────────────────
-// The exact half-block "face" glyph arrays + per-workspace tints from
-// `crates/shelbi-tui/src/activity.rs` (`ALPHA_AVATAR` … `FOXTROT_AVATAR`,
-// `avatar_for`). Each face is `AVATAR_H` rows of `AVATAR_W` cells; reusing the
-// crate's exact arrays means the mockup can't drift from the running TUI.
-const AVATAR_W = 4 // activity.rs `AVATAR_W`
-const AVATAR_GAP = 2 // activity.rs `AVATAR_GAP` — cells between avatar and text
-const ACT_LEAD = 1 // leading pad; the crate uses `horizontal_margin(2)`, but the
-// mockup matches the board's 1-col left pad so the pane aligns with the title row.
-
-type Avatar = { rows: [string, string, string]; color: string }
-
-const AVATARS: Record<string, Avatar> = {
-  alpha: { rows: ["▄▀▀▄", "█▄▄█", " ▀▀ "], color: TUI_CYAN },
-  bravo: { rows: ["▄██▄", "█▄▄█", "▀  ▀"], color: TUI_MAGENTA },
-  charlie: { rows: ["▄▀▀▄", "▌▄▄▐", "▀  ▀"], color: TUI_GREEN },
-  delta: { rows: ["▄▄▄▄", "▌▄▄▐", "▐  ▌"], color: TUI_YELLOW },
-  echo: { rows: ["▄▀▀▄", "█  █", "▀▀▀▀"], color: TUI_BLUE },
-  foxtrot: { rows: ["▄  ▄", "█▀▀█", "▐▄▄▌"], color: TUI_LIGHT_RED },
-}
-
-// One Activity feed row, mirroring the event kinds `render_task_event` /
-// `render_workspace_event` paint. `started`/`finished` are workspace-attributed
-// (a face avatar + the crate's white-bold name); `waiting` is a muted
-// workspace-state row (events.log has no literal "idle" — the nearest state is
-// AwaitingInput, rendered dim); `promoted`/`accepted` are task-only rows drawn
-// with a single glyph in the avatar column (★ / ✓) the way `AvatarSlot::Glyph`
-// does. `detail` is the dim secondary line; `when` is the right-aligned
-// relative timestamp.
-type ActivityEvent =
-  | { kind: "started"; ws: string; agent?: string; title: string; detail: string; when: string }
-  | { kind: "finished"; ws: string; title: string; detail: string; when: string }
-  | { kind: "waiting"; ws: string; verb: string; detail?: string; when: string }
-  | { kind: "promoted"; title: string; detail: string; when: string }
-  | { kind: "accepted"; title: string; detail: string; when: string }
-
-// Representative `Today` feed for the sample project — same workspaces
-// (alpha/bravo/charlie/echo) and task titles as the board, newest first. Titles
-// are wrapped in the curly quotes the crate's `title_quoted` uses.
-const ACTIVITY_EVENTS: ActivityEvent[] = [
-  {
-    kind: "finished",
-    ws: "charlie",
-    title: "Cold-start cache",
-    detail: "took 12m · branch: shelbi/cold-start-cache",
-    when: "12m ago",
-  },
-  {
-    kind: "started",
-    ws: "alpha",
-    agent: "Developer",
-    title: "Deploy staging env",
-    detail: "branch: shelbi/deploy-staging-env · #2",
-    when: "18m ago",
-  },
-  { kind: "waiting", ws: "bravo", verb: "is waiting for input", when: "25m ago" },
-  {
-    kind: "started",
-    ws: "echo",
-    agent: "Developer",
-    title: "Backfill order index",
-    detail: "branch: shelbi/backfill-order-index · #3",
-    when: "40m ago",
-  },
-  { kind: "accepted", title: "Ship dark mode", detail: "moved to done", when: "1h ago" },
-]
-
 /**
- * Line 1 of an event row: `[lead][avatar cell][gap][…primary]` with the dim
- * relative timestamp right-aligned, mirroring `paint_row`'s first line. The
- * avatar cell is one row of a face (4 cells) or a glyph padded to 4 cells.
+ * A full-pane view: its scrolling rows (padded to fill the pane) and the rows
+ * pinned to the pane's bottom edge.
  */
-function actPrimaryLine(
-  cell: string,
-  cellColor: string,
-  primary: Segment[],
-  when: string,
-  width: number,
-): Segment[] {
-  const left: Segment[] = [
-    { text: " ".repeat(ACT_LEAD) },
-    { text: cell, color: cellColor },
-    { text: " ".repeat(AVATAR_GAP) },
-    ...primary,
-  ]
-  return bodyRightAlignRow(left, [{ text: when, color: TUI_DARK_GRAY }], width)
-}
+type Pane = { top: Segment[][]; footer: Segment[][] }
 
-/**
- * A secondary/avatar-only continuation line: `[lead][avatar cell][gap][detail]`,
- * padded to the pane width. `cell` is the next avatar row (faces) or blank
- * spaces (glyph rows), `detail` the dim secondary text (omitted for the third
- * avatar row).
- */
-function actContinuationLine(
-  cell: string,
-  cellColor: string,
-  width: number,
-  detail?: string,
-): Segment[] {
-  const segs: Segment[] = [
-    { text: " ".repeat(ACT_LEAD) },
-    { text: cell, color: cellColor },
-  ]
-  if (detail !== undefined) {
-    segs.push({ text: " ".repeat(AVATAR_GAP) })
-    segs.push({ text: detail, color: TUI_DARK_GRAY })
+/** Fit a pane's rows to exactly `rows` tall: pad (or clip) the top, keep the footer. */
+function fitPane(pane: Pane, rows: number, width: number): Pane {
+  const topRows = Math.max(0, rows - pane.footer.length)
+  return {
+    top: padBodyTo(pane.top, topRows, width).map((r) => clampRow(r, width)),
+    footer: pane.footer.map((r) => clampRow(r, width)),
   }
-  return bodyRow(segs, width)
 }
 
-/** Curly-quote a title the way the crate's `title_quoted` does. */
+// ── Activity ──────────────────────────────────────────────────────────
+// The Activity feed (`crates/shelbi-tui/src/activity.rs` over the shared
+// `crates/shelbi-app/src/activity.rs` rows), opened from the palette: a
+// `Activity   <project>` title, the `All · Zen · Workspaces` filter pills, a
+// date-bucketed feed, and the key hints, inside a 2-cell margin. Each feed row
+// reads as a sentence: a tinted `[name]` chip, a dim verb, the bright title,
+// and the outcome pill + relative time pinned right, over a dim second line.
+
+const ACT_MARGIN = 2 // `horizontal_margin(2)` in `render_full`
+const ACT_CHIP_W = 9 // `CHIP_W`: the chip column's minimum width
+const ACT_VERB_GAP = 2 // `VERB_GAP`
+
+/** Per-workspace chip tint (`agent_tone` in shelbi-app's activity.rs). */
+const AGENT_TONE: Record<string, string> = {
+  alpha: TUI_CYAN,
+  bravo: TUI_MAGENTA,
+  charlie: TUI_GREEN,
+  delta: TUI_YELLOW,
+  echo: TUI_BLUE,
+  foxtrot: TUI_LIGHT_RED,
+}
+
+/** One feed row (a `FeedRow`): chip, verb, title, pill, time, second line. */
+type ActivityRow = {
+  /** `[name]`: a workspace in its tint (bold), or a dim system label (`you`). */
+  chip: { label: string; color: string; bold: boolean }
+  verb: string
+  verbColor?: string
+  title?: string
+  pill?: { text: string; color: string }
+  time: string
+  /** The dim second line: `⎇ <branch>` or a detail. */
+  secondary?: string
+}
+
+/**
+ * A representative `Today` feed for the busy default board, newest first:
+ * the same workspaces, issues and `<user>/<id>` branches the board shows.
+ */
+function activityRows(user: string): ActivityRow[] {
+  const agent = (ws: string) => ({ label: ws, color: AGENT_TONE[ws] ?? TUI_GRAY, bold: true })
+  const system = (label: string) => ({ label, color: TUI_DARK_GRAY, bold: false })
+  return [
+    {
+      chip: agent("charlie"),
+      verb: "finished",
+      title: "Cold-start cache",
+      pill: { text: "ready for review", color: TUI_MAGENTA },
+      time: "took 12m · 12m",
+      secondary: `⎇ ${user}/t-011`,
+    },
+    {
+      chip: agent("alpha"),
+      verb: "is building",
+      title: "Deploy staging env",
+      pill: { text: "in progress", color: TUI_YELLOW },
+      time: "18m",
+      secondary: `⎇ ${user}/t-009`,
+    },
+    { chip: system("bravo"), verb: "awaiting input", verbColor: TUI_BLUE, time: "25m" },
+    {
+      chip: agent("echo"),
+      verb: "is building",
+      title: "Backfill order index",
+      pill: { text: "in progress", color: TUI_YELLOW },
+      time: "40m",
+      secondary: `⎇ ${user}/t-017`,
+    },
+    {
+      chip: system("you"),
+      verb: "merged",
+      title: "Ship dark mode",
+      pill: { text: "done", color: TUI_GREEN },
+      time: "1h",
+      secondary: "moved to done",
+    },
+  ]
+}
+
+/** Lay one feed row out at `width` (`paint_row`): one line plus its second line. */
+function activityRowLines(row: ActivityRow, width: number): Segment[][] {
+  const chip = `[${row.chip.label}]`
+  const chipW = [...chip].length
+  const msgX = chipW < ACT_CHIP_W ? ACT_CHIP_W : chipW + 1
+  const titleX = row.verb ? msgX + [...row.verb].length + ACT_VERB_GAP : msgX
+  const left: Segment[] = [
+    { text: chip, color: row.chip.color, bold: row.chip.bold },
+    { text: " ".repeat(msgX - chipW) },
+    { text: row.verb, color: row.verbColor ?? TUI_GRAY },
+  ]
+  if (row.title) {
+    left.push({ text: " ".repeat(ACT_VERB_GAP) })
+    left.push({ text: row.title, color: SEL_FG })
+  }
+  const right: Segment[] = []
+  if (row.pill) right.push({ text: `[${row.pill.text}]`, color: row.pill.color, bold: true })
+  if (row.time) {
+    if (right.length) right.push({ text: "  " })
+    right.push({ text: row.time, color: TUI_DARK_GRAY })
+  }
+  const pad = Math.max(1, width - rowW(left) - rowW(right))
+  const lines: Segment[][] = [[...left, { text: " ".repeat(pad) }, ...right]]
+  if (row.secondary) {
+    lines.push([
+      { text: " ".repeat(titleX) },
+      { text: truncate(row.secondary, width - titleX), color: TUI_DARK_GRAY },
+    ])
+  }
+  return lines
+}
+
+/** The Activity view: title, filter pills, the feed, and the key hints. */
+function buildActivityPane(state: AppState, width: number): Pane {
+  const inner = width - 2 * ACT_MARGIN
+  const margin = (segs: Segment[]): Segment[] => [{ text: " ".repeat(ACT_MARGIN) }, ...segs]
+  const top: Segment[][] = []
+  top.push(
+    margin([
+      { text: "Activity", color: TUI_CYAN, bold: true },
+      { text: `   ${state.project}`, color: TUI_DARK_GRAY },
+    ]),
+  )
+  top.push(
+    margin([
+      { text: "All", color: TUI_CYAN, bold: true },
+      { text: "  ·  ", color: TUI_DARK_GRAY },
+      { text: "Zen", color: TUI_DARK_GRAY },
+      { text: "  ·  ", color: TUI_DARK_GRAY },
+      { text: "Workspaces", color: TUI_DARK_GRAY },
+    ]),
+  )
+  top.push([])
+  // The `── Today ───…` date-bucket header, dim (`date_header`), then the rows,
+  // each followed by a blank line.
+  const head = "── Today "
+  top.push(margin([{ text: head + "─".repeat(Math.max(0, inner - [...head].length)), color: TUI_DARK_GRAY }]))
+  top.push([])
+  for (const row of activityRows(branchUser(state))) {
+    for (const line of activityRowLines(row, inner)) top.push(margin(line))
+    top.push([])
+  }
+  const hints = "j/k scroll · ⇞/⇟ page · g top · ⇧g bottom · r refresh · a/z/w filter"
+  return {
+    top: top.map((r) => bodyRow(r, width)),
+    footer: [bodyRow(margin([{ text: hints, color: TUI_DARK_GRAY }]), width)],
+  }
+}
+
+/** Curly-quote a title (the crate's `title_quoted`). */
 function quoted(title: string): string {
   return `\u{201C}${title}\u{201D}`
 }
 
-/**
- * Render one event into its terminal lines. Face events emit 3 rows (avatar art
- * on all three, primary on row 1, secondary on row 2); glyph events emit 1
- * avatar row (primary) + a blank-avatar secondary — matching `paint_row`'s
- * per-slot line counts.
- */
-function activityEventRows(ev: ActivityEvent, width: number): Segment[][] {
-  const rows: Segment[][] = []
-  const blankCell = " ".repeat(AVATAR_W)
+// ── Changelog ─────────────────────────────────────────────────────────
+// The Changelog page (`crates/shelbi-tui/src/shell/changelog.rs`), the
+// sidebar's third nav row: the project's shipped work as a blog in a centered
+// reading column. The title row reads `Changelog` and the entry count beside
+// the half-block search box; each entry is its bold title with the date at the
+// right, a rule, the description, and a row of link chips (`⧉` an issue, `↗` a
+// PR). The key hints sit along the bottom.
 
-  const faceRows = (av: Avatar, primary: Segment[], detail: string | undefined, when: string) => {
-    rows.push(actPrimaryLine(av.rows[0], av.color, primary, when, width))
-    rows.push(actContinuationLine(av.rows[1], av.color, width, detail))
-    rows.push(actContinuationLine(av.rows[2], av.color, width))
-  }
-  const glyphRows = (
-    glyph: string,
-    glyphColor: string,
-    primary: Segment[],
-    detail: string,
-    when: string,
-  ) => {
-    rows.push(actPrimaryLine(padTo(glyph, AVATAR_W), glyphColor, primary, when, width))
-    rows.push(actContinuationLine(blankCell, TUI_DARK_GRAY, width, detail))
-  }
-
-  switch (ev.kind) {
-    case "started": {
-      // White-bold workspace name + optional dim [agent], `started`, curly title.
-      const primary: Segment[] = [{ text: ev.ws, color: SEL_FG, bold: true }]
-      if (ev.agent) primary.push({ text: ` [${ev.agent}]`, color: TUI_DARK_GRAY })
-      primary.push({ text: "  started  ", color: TUI_GRAY })
-      primary.push({ text: quoted(ev.title), color: TUI_FG })
-      faceRows(AVATARS[ev.ws], primary, ev.detail, ev.when)
-      break
-    }
-    case "finished": {
-      faceRows(
-        AVATARS[ev.ws],
-        [
-          { text: ev.ws, color: SEL_FG, bold: true },
-          { text: "  finished  ", color: TUI_GRAY },
-          { text: quoted(ev.title), color: TUI_FG },
-          { text: " — ready for review", color: TUI_CYAN },
-        ],
-        ev.detail,
-        ev.when,
-      )
-      break
-    }
-    case "waiting": {
-      // Muted workspace-state row — dim bold name + dim verb, face still shown.
-      faceRows(
-        AVATARS[ev.ws],
-        [
-          { text: ev.ws, color: TUI_DARK_GRAY, bold: true },
-          { text: ` ${ev.verb}`, color: TUI_DARK_GRAY },
-        ],
-        ev.detail,
-        ev.when,
-      )
-      break
-    }
-    case "promoted": {
-      glyphRows(
-        "★",
-        TUI_CYAN,
-        [
-          { text: "Promoted", color: TUI_GRAY, bold: true },
-          { text: "  ", color: TUI_GRAY },
-          { text: quoted(ev.title), color: TUI_FG },
-        ],
-        ev.detail,
-        ev.when,
-      )
-      break
-    }
-    case "accepted": {
-      glyphRows(
-        "✓",
-        TUI_CYAN,
-        [
-          { text: quoted(ev.title), color: TUI_FG },
-          { text: " accepted", color: TUI_GRAY },
-        ],
-        ev.detail,
-        ev.when,
-      )
-      break
-    }
-  }
-  return rows
+type ChangelogEntry = {
+  title: string
+  date: string
+  body: string
+  links: { glyph: "⧉" | "↗"; label: string }[]
 }
 
-/** The full-width `── Today ───…` date-bucket header, dim (activity.rs `date_header`). */
-function activityDateHeader(label: string, width: number): Segment[] {
-  const head = ` ── ${label} `
-  const trail = "─".repeat(Math.max(0, width - [...head].length))
-  return [{ text: head + trail, color: TUI_DARK_GRAY }]
-}
+const CHANGELOG_ENTRIES: ChangelogEntry[] = [
+  {
+    title: "Dark mode",
+    date: "October 27, 2026",
+    body: "The dashboard follows the system theme, and Settings has a toggle to pin light or dark.",
+    links: [
+      { glyph: "⧉", label: "t-013" },
+      { glyph: "↗", label: "#412" },
+    ],
+  },
+  {
+    title: "Postgres 16",
+    date: "October 24, 2026",
+    body: "The primary database runs on Postgres 16, moved over with no downtime. Order lookups are about 30% faster.",
+    links: [
+      { glyph: "⧉", label: "t-012" },
+      { glyph: "↗", label: "#398" },
+    ],
+  },
+  {
+    title: "Dead-letter retries",
+    date: "October 21, 2026",
+    body: "Failed webhook deliveries retry with backoff before they land in the dead-letter queue.",
+    links: [
+      { glyph: "⧉", label: "t-019" },
+      { glyph: "↗", label: "#377" },
+    ],
+  },
+]
 
-function buildActivityRows(state: AppState): Segment[][] {
-  const width = contentWidth(state.columns)
-  const rows: Segment[][] = []
+const CHANGELOG_MEASURE = 100 // `MAX_MEASURE`
+const CHANGELOG_SEARCH_W = 34 // `SEARCH_MAX`
+const CHANGELOG_HINTS = "j/k scroll · n/p entry · g/G ends · / search · Tab links · ↵ open"
 
-  // Date-bucketed, reverse-chronological feed — one `Today` bucket here.
-  rows.push(activityDateHeader("Today", width))
-  rows.push(blankRow(width))
+/** The Changelog view, `rows` tall, laid out as `plan` / `Doc::build` do. */
+function buildChangelogPane(width: number, rows: number): Pane {
+  const measure = Math.min(width - 4, CHANGELOG_MEASURE)
+  const x0 = Math.floor((width - measure) / 2)
+  const at = (x: number, segs: Segment[]): Segment[] => [{ text: " ".repeat(x) }, ...segs]
+  const top: Segment[][] = []
 
-  for (const ev of ACTIVITY_EVENTS) {
-    rows.push(...activityEventRows(ev, width))
-    rows.push(blankRow(width))
+  // Header: the 3-row search box at the column's right edge, the title row on
+  // its middle row.
+  const searchW = Math.min(CHANGELOG_SEARCH_W, Math.floor(measure / 2))
+  const searchX = x0 + measure + 1 - searchW
+  const cap = (upper: string | undefined, lower: string | undefined): Segment[] =>
+    at(searchX, [{ text: " ".repeat(searchW), bg: halfFill(upper, lower) }])
+  const count = `${CHANGELOG_ENTRIES.length} entries`
+  const title: Segment[] = [
+    { text: "Changelog", color: SEL_FG, bold: true },
+    { text: `  ${count}`, color: TUI_DARK_GRAY },
+  ]
+  const label: Segment[] = [
+    { text: " ", bg: SEARCH_BG },
+    { text: "🔍", cells: 2, bg: SEARCH_BG },
+    { text: " Search", color: TUI_GRAY, bg: SEARCH_BG },
+  ]
+  label.push({ text: " ".repeat(Math.max(0, searchW - rowW(label) - 2)), bg: SEARCH_BG })
+  label.push({ text: "/", color: TUI_GRAY, bg: SEARCH_BG })
+  label.push({ text: " ", bg: SEARCH_BG })
+  top.push(cap(undefined, SEARCH_BG))
+  top.push([
+    ...at(x0, title),
+    { text: " ".repeat(Math.max(1, searchX - x0 - rowW(title))) },
+    ...label,
+  ])
+  top.push(cap(SEARCH_BG, undefined))
+
+  // Entries: a gap row, the title with its date at the right, a rule, the
+  // description, then a blank row and the link chips.
+  for (const e of CHANGELOG_ENTRIES) {
+    top.push([])
+    const pad = Math.max(2, measure - [...e.title].length - [...e.date].length)
+    top.push(
+      at(x0, [
+        { text: e.title, color: SEL_FG, bold: true },
+        { text: " ".repeat(pad) },
+        { text: e.date, color: TUI_DARK_GRAY },
+      ]),
+    )
+    top.push(at(x0, [{ text: "─".repeat(measure), color: TUI_DIVIDER }]))
+    for (const line of wrapText(e.body, measure)) top.push(at(x0, [{ text: line, color: TUI_FG }]))
+    top.push([])
+    const chips: Segment[] = []
+    e.links.forEach((l, i) => {
+      if (i > 0) chips.push({ text: " " })
+      chips.push({ text: " " })
+      chips.push({ text: l.glyph, color: TUI_CYAN, cells: 1 })
+      chips.push({ text: ` ${l.label} `, color: TUI_CYAN })
+    })
+    top.push(at(x0 - 1, chips))
   }
 
-  // Left unpadded — `TerminalBody` pads every view to a common target height so
-  // the frame stays fixed across nav switches (and any `minBodyRows` pin).
-  return rows
+  // The hints show from 14 rows up, with a blank row above them.
+  const footer = rows >= 14 ? [at(x0, [{ text: CHANGELOG_HINTS, color: TUI_DARK_GRAY }])] : []
+  return {
+    top: top.map((r) => bodyRow(r, width)),
+    footer: footer.map((r) => bodyRow(r, width)),
+  }
 }
 
 // One line of the Claude Code session the Chat pane hosts — the orchestrator
@@ -947,26 +1122,27 @@ export type ChatLine =
   | { kind: "task"; body: string }
 
 // A believable orchestration session over the sample project: the human asks
-// for two pieces of work, the orchestrator adds + dispatches tasks to free
-// workspaces (alpha/bravo) via `shelbi` CLI calls, then summarizes. Matches the
-// board's task titles and workspaces so Chat and Tasks read as one system.
+// for two pieces of work, the orchestrator adds + dispatches issues to free
+// workspaces (alpha/bravo) via `shelbi issue` CLI calls (their real output),
+// then summarizes. Matches the board's issue titles, ids and workspaces so the
+// Orchestrator and Issues views read as one system.
 const CHAT_LINES: ChatLine[] = [
   { kind: "user", text: "Deploy the staging environment and wire up OAuth." },
   { kind: "blank" },
-  { kind: "prose", text: "I'll create both tasks and dispatch them to free workspaces." },
+  { kind: "prose", text: "I'll add both issues and start them on free workspaces." },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: 'shelbi task add "Deploy staging env"' },
-  { kind: "result", text: "✓ deploy-staging-env created in backlog" },
+  { kind: "tool", name: "Bash", args: 'shelbi issue add "Deploy staging env" --id t-009' },
+  { kind: "result", text: "✓ t-009 created in backlog (priority 1)" },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: "shelbi task start deploy-staging-env --workspace alpha" },
-  { kind: "result", text: "✓ deploy-staging-env → in_progress on alpha", more: 2 },
+  { kind: "tool", name: "Bash", args: "shelbi issue start t-009 --workspace alpha" },
+  { kind: "result", text: "→ launching alpha on t-009 (branch: you/t-009, agent: developer)", more: 1 },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: "shelbi task start wire-up-oauth-flow --workspace bravo" },
-  { kind: "result", text: "✓ wire-up-oauth-flow → in_progress on bravo" },
+  { kind: "tool", name: "Bash", args: "shelbi issue start t-010 --workspace bravo" },
+  { kind: "result", text: "→ launching bravo on t-010 (branch: you/t-010, agent: developer)", more: 1 },
   { kind: "blank" },
   {
     kind: "prose",
-    text: "Both are running now — alpha on staging, bravo on OAuth. I'll merge each as it hands off for review.",
+    text: "Both are running: alpha on staging, bravo on OAuth. Each one opens a PR when it reaches Review.",
   },
   { kind: "blank" },
   { kind: "working", text: "Working… (8s · ↓ 431 tokens)" },
@@ -1197,45 +1373,49 @@ export function ClaudeCodePane({
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
-// Mirrors `crates/shelbi-tui/src/sidebar.rs::render_list` + the row
-// composition in `app.rs::rows()`. One row = one line; each row is a
-// list of segments the pre element joins into a monospace grid, same as
-// the board.
+// Mirrors `crates/shelbi-tui/src/shell/sidebar.rs` over `SidebarModel::rows`
+// (`crates/shelbi-app/src/view.rs`): a header (the project title and the
+// filled `🔍 Search  ⌃P` box that opens the palette), the nav block, the
+// Workspaces section, the two review sections, and the footer toolbar (⚙
+// Settings, 📣 Send Feedback) with the `ZEN MODE ON` band under it while Zen
+// is on. Everything sits inside a 1-col inset on each side (`LIST_INDENT`).
+// One row = one line; each row is a list of segments the pre element joins
+// into a monospace grid, same as the board.
 
-/** Pad segments to the sidebar's fixed row width so background fills reach the edge. */
-function padSidebarRow(segs: Segment[]): Segment[] {
-  const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
-  if (used >= SIDEBAR_W) return segs
-  return [...segs, { text: " ".repeat(SIDEBAR_W - used) }]
+/**
+ * A row inside the 1-col inset: a blank gutter cell, `segs` padded to the inner
+ * width (with `bg` behind the padding), and the right gutter cell.
+ */
+function insetRow(segs: Segment[], w: number, bg?: string): Segment[] {
+  const inner = w - 2
+  const used = rowW(segs)
+  const row: Segment[] = [{ text: " " }, ...segs]
+  if (used < inner) row.push({ text: " ".repeat(inner - used), bg })
+  row.push({ text: " " })
+  return row
 }
 
 /**
- * Right-align a `right` label at column `SIDEBAR_W - 1` (1-col trailing
- * pad matches `sidebar.rs`'s `Margin::horizontal: 1`). Returns a full
- * SIDEBAR_W-wide row. If the two runs together exceed the row's width,
- * the right label is dropped rather than pushing the left off-screen —
- * same fallback `right_align` uses in `sidebar.rs`.
+ * An inset row with `right` right-aligned at the inset's edge, or just `left`
+ * when there isn't room for both plus a one-cell gap: the TUI drops the right
+ * column rather than push the left off-screen (`right_align` in sidebar.rs).
  */
-function sidebarRightAlignRow(
+function insetRightAlignRow(
   left: Segment[],
   right: string,
   rightColor: string,
+  w: number,
   bg?: string,
 ): Segment[] {
-  const leftW = left.reduce((acc, s) => acc + [...s.text].length, 0)
+  const inner = w - 2
+  const leftW = rowW(left)
   const rightW = [...right].length
-  const trailing = 1 // matches sidebar's 1-col horizontal margin
-  if (right && leftW + rightW + 1 + trailing <= SIDEBAR_W) {
-    const pad = SIDEBAR_W - leftW - rightW - trailing
-    const row = [
-      ...left,
-      { text: " ".repeat(pad), bg },
-      { text: right, color: rightColor, bg },
-      { text: " ".repeat(trailing), bg },
-    ]
-    return row
-  }
-  return padSidebarRow(left)
+  if (!right || leftW + rightW + 1 > inner) return insetRow(left, w, bg)
+  return insetRow(
+    [...left, { text: " ".repeat(inner - leftW - rightW), bg }, { text: right, color: rightColor, bg }],
+    w,
+    bg,
+  )
 }
 
 // One sidebar nav item, resolved from `NAV_ITEMS`.
@@ -1244,164 +1424,187 @@ type NavItem = (typeof NAV_ITEMS)[number]
 /**
  * A rendered sidebar row. Most rows are plain `Segment[]` lines; nav rows are
  * emitted as a tagged descriptor instead so `Sidebar` can render them through
- * the interactive `<NavRow>` (which owns hover state and the click/keyboard
- * handlers) while every other row still flows through the static `<Row>`.
- * Plain rows stay `Segment[]` so the many `rows.push(...)` sites are unchanged
- * and the two kinds are told apart with `Array.isArray`.
+ * the interactive `<NavRow>` (which owns the click/keyboard handlers) while
+ * every other row still flows through the static `<Row>`. Plain rows stay
+ * `Segment[]` so the many `rows.push(...)` sites are unchanged and the two
+ * kinds are told apart with `Array.isArray`.
  */
-type SidebarRow = Segment[] | { nav: NavItem; selected: boolean }
+type SidebarRow = Segment[] | { nav: NavItem; segs: Segment[] }
 
 /**
- * Segments for one nav row (💬 Chat / 📋 Tasks / ⚡ Activity). `filled` paints
- * the full-row `SIDEBAR_SEL_BG` the TUI's `render_list` gives the selected row;
- * we reuse it for the active row (always) and for hover (affordance). Active
- * text is white-bold like the real selection; a hover-only fill keeps the gray
- * label (the "subtle version") so the active row stays distinguishable.
+ * Segments for one nav row: ` 💬 Orchestrator` inside the inset. `fill` paints
+ * the inset-wide pill the TUI gives the selected row (and, here, the hovered
+ * one); selected text is white-bold like the real selection, a hover-only fill
+ * keeps the gray label so the active row stays distinguishable.
  */
-function navRowSegs(glyph: string, label: string, selected: boolean, filled: boolean): Segment[] {
-  const bg = filled ? SIDEBAR_SEL_BG : undefined
-  const inner: Segment[] = [
-    { text: " ", bg },
-    {
-      text: `${glyph} ${label}`,
-      color: selected ? SEL_FG : TUI_GRAY,
-      bg,
-      bold: selected,
-    },
+function navRowSegs(nav: NavItem, selected: boolean, fill: string | undefined, w: number): Segment[] {
+  const color = selected ? SEL_FG : TUI_GRAY
+  return insetRow(
+    [
+      { text: " ", bg: fill },
+      { text: nav.glyph, color, bg: fill, cells: 2 },
+      { text: ` ${nav.label}`, color, bg: fill, bold: selected },
+    ],
+    w,
+    fill,
+  )
+}
+
+/** The 3-row search box (`render_search_box`): `▄` caps, the label row, `▀` caps. */
+function searchBoxRows(w: number): Segment[][] {
+  const inner = w - 2
+  const chord = "⌃P"
+  const label: Segment[] = [
+    { text: " ", bg: SEARCH_BG },
+    { text: "🔍", cells: 2, bg: SEARCH_BG },
+    { text: " Search", color: TUI_GRAY, bg: SEARCH_BG },
   ]
-  const used = inner.reduce((acc, s) => acc + [...s.text].length, 0)
-  if (used < SIDEBAR_W) {
-    inner.push({ text: " ".repeat(SIDEBAR_W - used), bg })
+  const pad = inner - rowW(label) - [...chord].length - 1
+  if (pad > 0) {
+    label.push({ text: " ".repeat(pad), bg: SEARCH_BG })
+    label.push({ text: chord, color: TUI_GRAY, bg: SEARCH_BG })
   }
-  return inner
+  return [
+    insetRow([], w, halfFill(undefined, SEARCH_BG)),
+    insetRow(label, w, SEARCH_BG),
+    insetRow([], w, halfFill(SEARCH_BG, undefined)),
+  ]
 }
 
 /**
- * The sidebar split into the scrollable body (project header, nav, workspace
- * and review sections) and the footer that stays pinned to the bottom of the
- * sidebar — the `^P palette  q quit` keybind line plus, when Zen Mode is on,
- * the full-width green band. The `Sidebar` component renders `body` at the top
- * and `footer` flush against the bottom edge so the footer always sits at the
- * bottom of the window regardless of how many workspace/review rows precede it.
+ * The footer toolbar (`render_footer_button`): the ⚙ Settings and 📣 Send
+ * Feedback squares, each 5 cells wide with one cell between them, the glyph
+ * gray on the selection fill, over a `▄` cap row and under a `▀` one.
  */
-function buildSidebarRows(state: AppState): { body: SidebarRow[]; footer: SidebarRow[] } {
+function toolbarRows(w: number): Segment[][] {
+  const squares: { glyph: string; cells: number }[] = [
+    { glyph: "⚙", cells: 1 },
+    { glyph: "📣", cells: 2 },
+  ]
+  const SQUARE_W = 5
+  const caps = (upper: string | undefined, lower: string | undefined): Segment[] => {
+    const segs: Segment[] = []
+    squares.forEach((_, i) => {
+      if (i > 0) segs.push({ text: " " })
+      segs.push({ text: " ".repeat(SQUARE_W), bg: halfFill(upper, lower) })
+    })
+    return insetRow(segs, w)
+  }
+  const faces: Segment[] = []
+  squares.forEach((s, i) => {
+    if (i > 0) faces.push({ text: " " })
+    const left = Math.ceil((SQUARE_W - s.cells) / 2)
+    faces.push({ text: " ".repeat(left), bg: SEL_BG })
+    faces.push({ text: s.glyph, color: TUI_GRAY, bg: SEL_BG, cells: s.cells })
+    faces.push({ text: " ".repeat(SQUARE_W - left - s.cells), bg: SEL_BG })
+  })
+  return [caps(undefined, SEL_BG), insetRow(faces, w), caps(SEL_BG, undefined)]
+}
+
+/**
+ * The sidebar split into the scrollable body (header, nav, workspace and
+ * review sections) and the footer that stays pinned to the bottom of the
+ * sidebar — the toolbar plus, when Zen Mode is on, the full-width green band
+ * under it. The `Sidebar` component renders `body` at the top and `footer`
+ * flush against the bottom edge, as the TUI lays its footer out bottom-up.
+ * `hover` is the nav row under the pointer: it takes a fill too.
+ */
+function buildSidebarRows(
+  state: AppState,
+  hover?: NavView,
+): { body: SidebarRow[]; footer: SidebarRow[] } {
+  const w = state.sidebarWidth ?? SIDEBAR_W
+  const blank: Segment[] = [{ text: " ".repeat(w) }]
   const rows: SidebarRow[] = []
 
-  // Project header — same Cyan Bold `app.project_name` renders at.
-  rows.push(
-    padSidebarRow([
-      { text: " " },
-      { text: state.project, color: TUI_CYAN, bold: true },
-    ]),
-  )
-  rows.push(SIDEBAR_BLANK_ROW)
+  // Header — a blank row, the project title in bold cyan, a blank row, then
+  // the search box.
+  rows.push(blank)
+  rows.push(insetRow([{ text: truncate(state.project, w - 2), color: TUI_CYAN, bold: true }], w))
+  rows.push(blank)
+  rows.push(...searchBoxRows(w))
 
-  // Nav rows — 💬 Chat / 📋 Tasks / ⚡ Activity. Emitted as tagged descriptors
-  // so `Sidebar` renders them through the interactive `<NavRow>`; the active
-  // view's row gets the full-row fill + white-bold text `sidebar.rs::render_list`
-  // applies to the selected row, and `<NavRow>` adds the hover fill on top.
-  for (const nav of NAV_ITEMS) {
-    rows.push({ nav, selected: nav.view === state.activeView })
-  }
-  rows.push(SIDEBAR_BLANK_ROW)
+  // Nav block — the items with a separator row before, between and after
+  // them; a filled item's separators carry the half-row bleed of its fill.
+  const fillOf = (nav: NavItem | undefined): string | undefined =>
+    nav && (nav.view === state.activeView || nav.view === hover) ? SIDEBAR_SEL_BG : undefined
+  NAV_ITEMS.forEach((nav, i) => {
+    rows.push(insetRow([], w, halfFill(fillOf(NAV_ITEMS[i - 1]), fillOf(nav))))
+    rows.push({ nav, segs: navRowSegs(nav, nav.view === state.activeView, fillOf(nav), w) })
+  })
+  rows.push(insetRow([], w, halfFill(fillOf(NAV_ITEMS[NAV_ITEMS.length - 1]), undefined)))
 
-  // — Workspaces — section header (DarkGray).
-  rows.push(
-    padSidebarRow([
-      { text: " " },
-      { text: "— Workspaces —", color: TUI_DARK_GRAY },
-    ]),
-  )
-
-  // Per-machine group header + indented workspace rows, matching the
-  // `▾ <machine>` / `  <badge> <name>   <right-label>` shape from
-  // `sidebar.rs`.
-  for (const m of state.machines) {
-    rows.push(
-      padSidebarRow([
-        { text: " " },
-        { text: `▾ ${m.name}`, color: TUI_DARK_GRAY },
-      ]),
-    )
-    for (const w of m.workspaces) {
-      const badgeGlyph = w.state === "working" ? "⏵" : "·"
-      const badgeColor = w.state === "working" ? TUI_GREEN : TUI_DARK_GRAY
-      const rightLabel = w.agent ?? "idle"
-      // The focused-worker pane selects a workspace (rather than a nav row), so
-      // that workspace reads as the active/selected row in the sidebar — the same
-      // full-row `SIDEBAR_SEL_BG` fill + white-bold treatment the nav selection
-      // uses. Only the currently-focused workspace on the `workspace` view lights
-      // up; every other view leaves the list unselected.
-      const selected = state.activeView === "workspace" && w.name === state.focusedWorkspace
-      const bg = selected ? SIDEBAR_SEL_BG : undefined
-      rows.push(
-        sidebarRightAlignRow(
-          [
-            { text: " ", bg },
-            { text: "  ", bg }, // machine-group indent
-            { text: `${badgeGlyph} `, color: badgeColor, bg },
-            { text: w.name, color: selected ? SEL_FG : TUI_GRAY, bg, bold: selected },
-          ],
-          rightLabel,
-          selected ? SEL_FG : TUI_DARK_GRAY,
-          bg,
-        ),
-      )
+  // — Workspaces — section header (muted).
+  const workspaces = state.machines.flatMap((m) => m.workspaces)
+  if (workspaces.length > 0) {
+    rows.push(blank)
+    rows.push(insetRow([{ text: "— Workspaces —", color: TUI_DARK_GRAY }], w))
+    // More than one machine: a `▾ <machine>` header over each machine's
+    // indented rows. A single-machine project is a flat list.
+    const grouped = state.machines.filter((m) => m.workspaces.length > 0).length > 1
+    for (const m of state.machines) {
+      if (grouped) rows.push(insetRow([{ text: `▾ ${m.name}`, color: TUI_GRAY }], w))
+      for (const ws of m.workspaces) {
+        const badgeGlyph = ws.state === "working" ? "⏵" : "·"
+        const badgeColor = ws.state === "working" ? TUI_GREEN : TUI_DARK_GRAY
+        // The focused-worker pane selects a workspace (rather than a nav row):
+        // that row takes the selection fill across the inset, its text keeping
+        // its color as the TUI's does.
+        const selected = state.activeView === "workspace" && ws.name === state.focusedWorkspace
+        const bg = selected ? SIDEBAR_SEL_BG : undefined
+        rows.push(
+          insetRightAlignRow(
+            [
+              { text: grouped ? "  " : "", bg },
+              { text: badgeGlyph, color: badgeColor, bg, cells: 1 },
+              { text: " ", bg },
+              { text: ws.name, color: TUI_GRAY, bg },
+            ],
+            ws.agent ? titleCase(ws.agent) : "idle",
+            TUI_DARK_GRAY,
+            w,
+            bg,
+          ),
+        )
+      }
     }
   }
 
-  // The Review state splits into two sidebar sections, matching `app.rs::rows`:
-  // "Ready for Review" (loaded on a review workspace, serving) then "Queued
-  // for Review" (waiting for a free slot). Each is omitted when empty.
+  // The Review state splits into two sidebar sections, matching
+  // `SidebarModel::rows`: "Ready for Review" (loaded on a review workspace,
+  // serving) then "Queued for Review" (waiting for a free slot). Each is
+  // omitted when empty.
   const pushReviewSection = (label: string, entries: ReviewEntry[], ready: boolean) => {
     if (entries.length === 0) return
-    rows.push(SIDEBAR_BLANK_ROW)
-    rows.push(
-      padSidebarRow([
-        { text: " " },
-        { text: `— ${label} —`, color: TUI_DARK_GRAY },
-      ]),
-    )
+    rows.push(blank)
+    rows.push(insetRow([{ text: `— ${label} —`, color: TUI_DARK_GRAY }], w))
     for (const entry of entries) {
-      rows.push(...reviewEntryRows(entry, ready))
+      rows.push(...reviewEntryRows(entry, ready, w))
     }
   }
   pushReviewSection("Ready for Review", state.readyReview, true)
   pushReviewSection("Queued for Review", state.queuedReview, false)
 
-  // Footer, anchored to the bottom of the sidebar like `render_footer` /
-  // `render_zen_row` in `sidebar.rs`: the dim `^P palette  q quit` keybind
-  // line, then — only when the scenario opts into Zen Mode — a blank row and
-  // the full-width green "ZEN MODE ON" band the TUI paints while Zen is on.
-  // The band bypasses the 1-col horizontal margin so its green fill reaches
-  // both sidebar edges, matching the crate. It's opt-in (default off) so it
-  // shows only on the hero and Zen-describing docs, not every mockup. Returned
-  // separately so `Sidebar` can pin it to the bottom edge — the flex gap above
-  // it replaces the leading blank row the inline layout used for spacing.
-  const footer: SidebarRow[] = [
-    padSidebarRow([
-      { text: " " },
-      { text: "^P palette  q quit", color: TUI_DARK_GRAY },
-    ]),
-  ]
-  if (state.zenMode) {
-    footer.push(SIDEBAR_BLANK_ROW)
-    footer.push(zenBandRow())
-  }
+  // Footer, laid out bottom-up like `footer_rows`: the toolbar (its `▄` row,
+  // the squares, its `▀` row) and, only while Zen is on, the full-width green
+  // "ZEN MODE ON" band on the bottom row. Returned separately so `Sidebar` can
+  // pin it to the bottom edge.
+  const footer: SidebarRow[] = [...toolbarRows(w)]
+  if (state.zenMode) footer.push(zenBandRow(w))
 
   return { body: rows, footer }
 }
 
 /**
  * The full-width "ZEN MODE ON" band, mirroring `render_zen_row` in
- * `sidebar.rs`: a single edge-to-edge green row (`bg(Rgb(0,127,0))`) with
- * white-bold text, the label left-aligned behind one leading space and the
- * rest of the row filled to the sidebar edge. One green segment so the fill
- * is continuous across the whole width.
+ * `sidebar.rs`: a single edge-to-edge green row with white-bold text, the
+ * label left-aligned behind one leading space and the rest of the row filled
+ * to the sidebar edge. One green segment so the fill is continuous across the
+ * whole width.
  */
-function zenBandRow(): Segment[] {
+function zenBandRow(w: number): Segment[] {
   const label = " ZEN MODE ON"
-  const pad = Math.max(0, SIDEBAR_W - [...label].length)
+  const pad = Math.max(0, w - [...label].length)
   return [
     {
       text: label + " ".repeat(pad),
@@ -1414,39 +1617,34 @@ function zenBandRow(): Segment[] {
 
 /**
  * The two rows for one review entry, mirroring `Row::Review` in `sidebar.rs`.
- * Line 1: the decoration badge + title, with the `machine:port` served URL
- * right-aligned when the task is Ready (loaded on a review worktree). Line 2:
- * the branch, dim. Ready uses a cyan `✓` and carries a location; Queued uses a
- * blue `·` and has none yet. Titles/branches truncate the same way the TUI
- * clips them against the pane width, so alignment stays character-perfect.
+ * Line 1: the badge + title (truncated to the inset), with the
+ * `machine:workspace` slot right-aligned when the task is Ready and the title
+ * leaves room for it (otherwise the slot drops, as in the TUI). Line 2:
+ * `⎇ <branch>`, dim. Ready uses a bold cyan `✓`; Queued a dim `·`.
  */
-function reviewEntryRows(entry: ReviewEntry, ready: boolean): Segment[][] {
-  const glyph = ready ? "✓" : "·"
-  const glyphColor = ready ? TUI_CYAN : TUI_BLUE
+function reviewEntryRows(entry: ReviewEntry, ready: boolean, w: number): Segment[][] {
+  const inner = w - 2
+  const glyph: Segment = ready
+    ? { text: "✓", color: TUI_CYAN, bold: true, cells: 1 }
+    : { text: "·", color: TUI_DARK_GRAY, cells: 1 }
+  const left: Segment[] = [glyph, { text: " " }, { text: truncate(entry.title, inner - 2), color: TUI_GRAY }]
   const location = ready ? entry.location : undefined
-
-  // Reserve columns for the 1-col sidebar pad, the 2-col badge, a 1-col gap,
-  // the 1-col trailing margin, and the right-aligned location, so the title
-  // truncates instead of forcing `sidebarRightAlignRow` to drop the URL.
-  const titleWidth = location
-    ? SIDEBAR_W - 5 - [...location].length
-    : SIDEBAR_W - 3
-  const left: Segment[] = [
-    { text: " " },
-    { text: `${glyph} `, color: glyphColor },
-    { text: truncate(entry.title, Math.max(1, titleWidth)), color: TUI_GRAY },
-  ]
-  const line1 = location
-    ? sidebarRightAlignRow(left, location, TUI_DARK_GRAY)
-    : padSidebarRow(left)
-
-  // Branch under the title, indented past the badge column, dim in both
-  // states — clipped to the sidebar width like the TUI does.
-  const line2 = padSidebarRow([
-    { text: " " },
-    { text: `  ${truncate(entry.branch, SIDEBAR_W - 3)}`, color: TUI_DARK_GRAY },
-  ])
+  const line1 = location ? insetRightAlignRow(left, location, TUI_DARK_GRAY, w) : insetRow(left, w)
+  const line2 = insetRow(
+    [
+      { text: "  " },
+      { text: "⎇ ", color: TUI_DARK_GRAY, cells: 2 },
+      { text: truncate(entry.branch, inner - 4), color: TUI_DARK_GRAY },
+    ],
+    w,
+  )
   return [line1, line2]
+}
+
+/** How many rows the sidebar draws for a scenario (body plus footer). */
+function sidebarRowCount(state: AppState): number {
+  const { body, footer } = buildSidebarRows(state)
+  return body.length + footer.length
 }
 
 // ── Command palette ───────────────────────────────────────────────────
@@ -1646,11 +1844,19 @@ function SegSpans({ segs }: { segs: Segment[] }) {
         if (seg.color) style.color = seg.color
         if (seg.bg) style.background = seg.bg
         if (seg.bold) style.fontWeight = 700
+        if (seg.bg || seg.cells !== undefined) {
+          // A filled run is a full-line-height box, so stacked fills (a
+          // two-line selected card, the nav pill and its half-row bleed, the
+          // search box) meet with no seam: an inline span's background only
+          // covers the font's content box, a little shorter than the line.
+          style.display = "inline-block"
+          style.height = LINE_H
+          style.verticalAlign = "top"
+        }
         if (seg.cells !== undefined) {
           // Fixed-width cell: pin the layout advance to `cells` ch so a
           // wider-than-mono glyph (palette emoji) can't shift the columns after
           // it; the glyph bleeds harmlessly into the following blank gap.
-          style.display = "inline-block"
           style.width = `${seg.cells}ch`
         }
         return (
@@ -1676,21 +1882,24 @@ function Row({ segs }: { segs: Segment[] }) {
  * An interactive sidebar nav row. Renders through the same segment spans as a
  * static `Row` (so the monospace grid is untouched) but wraps them in a
  * focusable `role="button"` span: click or Enter/Space selects the view, and
- * hover/focus paints the `SIDEBAR_SEL_BG` fill as a discoverability affordance.
- * The trailing newline stays outside the button so the button's box hugs the
- * row content.
+ * hover/focus reports up to `Sidebar`, which paints the `SIDEBAR_SEL_BG` pill
+ * (and its half-row bleed on the separator rows) as a discoverability
+ * affordance. The trailing newline stays outside the button so the button's
+ * box hugs the row content.
  */
 function NavRow({
   nav,
+  segs,
   selected,
   onSelect,
+  onHover,
 }: {
   nav: NavItem
+  segs: Segment[]
   selected: boolean
   onSelect: (view: NavView) => void
+  onHover: (view: NavView | undefined) => void
 }) {
-  const [hover, setHover] = useState(false)
-  const segs = navRowSegs(nav.glyph, nav.label, selected, selected || hover)
   return (
     <>
       <span
@@ -1706,10 +1915,10 @@ function NavRow({
             onSelect(nav.view)
           }
         }}
-        onMouseEnter={() => setHover(true)}
-        onMouseLeave={() => setHover(false)}
-        onFocus={() => setHover(true)}
-        onBlur={() => setHover(false)}
+        onMouseEnter={() => onHover(nav.view)}
+        onMouseLeave={() => onHover(undefined)}
+        onFocus={() => onHover(nav.view)}
+        onBlur={() => onHover(undefined)}
       >
         <SegSpans segs={segs} />
       </span>
@@ -1717,6 +1926,9 @@ function NavRow({
     </>
   )
 }
+
+// One terminal row's height; filled runs size their boxes to it (`SegSpans`).
+const LINE_H = "17px"
 
 const PRE_STYLE: React.CSSProperties = {
   background: TUI_BG,
@@ -1731,7 +1943,7 @@ const PRE_STYLE: React.CSSProperties = {
   // 295) / 1000 em ≈ 16.9px at this 13px size, so 17px makes adjacent rows'
   // backgrounds overlap ~0.1px — connected past sub-pixel rounding — while
   // line-height ~1.31 keeps the text readable and the character grid uncramped.
-  lineHeight: "17px",
+  lineHeight: LINE_H,
   minWidth: "max-content",
 }
 
@@ -1756,61 +1968,59 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
   // target height so the terminal frame stays a fixed size when switching views
   // (and, for the hero animation, across every beat as content grows/shrinks):
   // the natural board height, floored by any `minBodyRows` pin.
-  const width = contentWidth(state.columns)
-  const boardRows = buildBoardRows(state.columns, state.workflow)
+  const width = contentWidth(state)
+  const boardRows = buildBoardRows(state)
   const target = Math.max(boardRows.length, state.minBodyRows ?? 0)
-  // The board and Activity feed carry the `<label> · <project>  N total …` header
-  // bar and a footer keybinding hint bar. The Chat and worker panes are full
-  // Claude-Code sessions and drop both, so the session fills the pane flush the
-  // way the real CLI does — no `<label> · <project>` header, no
-  // `⏎ send · ↑/↓ scroll · esc tasks` hint bar. Header and footer are two rows
-  // each (title + blank, blank + hints), so a headerless, footerless pane
-  // reclaims all four rows into its body — keeping every view the same total
-  // height (target + 4 chrome rows) so the frame never resizes as the story
-  // swaps panes.
-  const showHeader = state.activeView === "tasks" || state.activeView === "activity"
-  const isClaudePane = state.activeView === "chat" || state.activeView === "workspace"
-  const bodyTarget = target + (isClaudePane ? 4 : 0)
-  const raw: Segment[][] = isClaudePane
-    ? buildClaudeCodeRows(
-        state,
-        (state.activeView === "chat" ? state.chatLines : state.workspaceLines) ?? CHAT_LINES,
-        bodyTarget,
-        width,
-      )
-    : state.activeView === "activity"
-      ? buildActivityRows(state)
-      : boardRows
-  const body = padBodyTo(raw, bodyTarget, width)
-  // Split the scrolling body (header + content) from the pinned footer so the
-  // hint bar can be pushed to the bottom edge of the pane (`mt-auto` below) —
-  // the same treatment `Sidebar` gives its `^P palette  q quit` line. The Claude
-  // panes carry no footer at all, so `footerRows` is empty for them and their
-  // body reclaims the space.
-  const bodyRows: Segment[][] = [
-    ...(showHeader ? [titleRow(state), blankRow(width)] : []),
-    ...body,
-  ]
-  // A blank spacer above the footer keeps it off the content/chrome even when
-  // the pane isn't stretched; when it is, `mt-auto` absorbs the extra slack.
-  const footerRows: Segment[][] = isClaudePane
-    ? []
-    : [blankRow(width), footerRow(state.activeView, width)]
+  // The Issues board carries a two-row header (title + blank) and a two-row
+  // footer (blank + key hints) around its columns: `target + 4` rows in all.
+  // Every other view is a full pane laid out to the same height, so the frame
+  // never resizes as views swap — or to the sidebar's height when that's
+  // taller, so a pane's own bottom chrome (the Claude Code input box, the key
+  // hints) sits on the frame's bottom edge.
+  let bodyRows: Segment[][]
+  let footerRows: Segment[][]
+  if (state.activeView === "tasks") {
+    bodyRows = [titleRow(state), blankRow(width), ...padBodyTo(boardRows, target, width)]
+    footerRows = [blankRow(width), boardFooterRow(state, width)]
+  } else {
+    const rows = Math.max(target + 4, sidebarRowCount(state))
+    const pane: Pane =
+      state.activeView === "activity"
+        ? buildActivityPane(state, width)
+        : state.activeView === "changelog"
+          ? buildChangelogPane(width, rows)
+          : {
+              // The Orchestrator and worker panes are full Claude Code
+              // sessions: no Shelbi header or hint bar, the session fills the
+              // pane flush the way the real CLI does.
+              top: buildClaudeCodeRows(
+                state,
+                (state.activeView === "chat" ? state.chatLines : state.workspaceLines) ?? CHAT_LINES,
+                rows,
+                width,
+              ),
+              footer: [],
+            }
+    const fitted = fitPane(pane, rows, width)
+    bodyRows = fitted.top
+    footerRows = fitted.footer
+  }
 
   return (
     <pre
       // `flex flex-col` so the footer group can be pinned to the bottom edge
-      // (`mt-auto` below), the same way `Sidebar` pins its `^P palette  q quit`
-      // line — the hint bar stays at the bottom of the pane rather than floating
-      // right under the content/chrome when the pane is taller than its content.
+      // (`mt-auto` below), the same way `Sidebar` pins its toolbar — the hint
+      // bar stays at the bottom of the pane rather than floating right under
+      // the content when the pane is taller than its content.
       className="m-0 flex flex-col whitespace-pre font-mono"
       // Pin the pane to exactly `width` cells (`ch` == the monospace advance) so
       // the frame width is identical across every view. `minWidth: max-content`
-      // would otherwise size the pane to its widest *rendered* line, and the Chat
-      // and worker panes contain glyphs the mono font lacks (the `𖠰` footer badge,
-      // `⏺`/`❯`/`✽` tool bullets) that fall back to a wider face — making those
-      // panes render wider than the pure-ASCII board. Clipping any such overflow
-      // (`overflow: hidden`) only ever trims trailing padding, never content.
+      // would otherwise size the pane to its widest *rendered* line, and the
+      // Claude Code panes contain glyphs the mono font lacks (the `𖠰` footer
+      // badge, `⏺`/`❯`/`✽` tool bullets) that fall back to a wider face — making
+      // those panes render wider than the pure-ASCII board. Clipping any such
+      // overflow (`overflow: hidden`) only ever trims trailing padding, never
+      // content.
       style={{
         ...PRE_STYLE,
         width: `${width}ch`,
@@ -1845,12 +2055,21 @@ function Sidebar({
   onSelectView: (view: NavView) => void
   contentOpacity?: number
 }) {
-  const { body, footer } = buildSidebarRows(state)
+  const [hover, setHover] = useState<NavView | undefined>(undefined)
+  const { body, footer } = buildSidebarRows(state, hover)
+  const w = state.sidebarWidth ?? SIDEBAR_W
   const renderRow = (row: SidebarRow, i: number) =>
     Array.isArray(row) ? (
       <Row key={i} segs={row} />
     ) : (
-      <NavRow key={i} nav={row.nav} selected={row.selected} onSelect={onSelectView} />
+      <NavRow
+        key={i}
+        nav={row.nav}
+        segs={row.segs}
+        selected={row.nav.view === state.activeView}
+        onSelect={onSelectView}
+        onHover={setHover}
+      />
     )
   return (
     <pre
@@ -1871,9 +2090,9 @@ function Sidebar({
         // to wider glyphs than the mono cell, so `max-content` would let a beat
         // with working workspaces render a hair wider than an all-idle one.
         // Clipping only trims trailing padding, never a label.
-        width: `${SIDEBAR_W}ch`,
-        minWidth: `${SIDEBAR_W}ch`,
-        maxWidth: `${SIDEBAR_W}ch`,
+        width: `${w}ch`,
+        minWidth: `${w}ch`,
+        maxWidth: `${w}ch`,
         overflow: "hidden",
         ...contentFadeStyle(contentOpacity),
       }}
@@ -2042,7 +2261,12 @@ export function TerminalFrame({
  * `state` wins when given; otherwise the named `preset` (default:
  * "default") is the base. Any extra `AppState` fields passed alongside are
  * shallow-merged on top — the ergonomic path for MDX docs, which can't
- * import the preset objects but can drop a tag and override a field.
+ * import the preset objects but can drop a tag and override a field. Every
+ * field you don't pass comes from the base, so a scenario that replaces the
+ * columns should also set `readyReview`, `queuedReview`, `zenMode` and
+ * `workflow` to match them. Props that aren't `AppState` fields (an old
+ * `review={[]}`, say) are ignored. The board lays out at `DEFAULT_BOARD_W`
+ * cells unless the scenario sets `boardWidth`.
  */
 export function AppMockup({
   state,
@@ -2062,7 +2286,7 @@ export function AppMockup({
   contentOpacity?: number
 } & Partial<AppState>) {
   const base = state ?? PRESETS[preset]
-  const merged: AppState = { ...base, ...overrides }
+  const merged: AppState = { boardWidth: DEFAULT_BOARD_W, ...base, ...overrides }
   return (
     <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
       {/* w-fit hugs the board's natural width; max-w-full keeps the
@@ -2154,20 +2378,21 @@ export function BoardMockup({
 // rather than a hand-built one. Add more as docs need them.
 
 /**
- * The full five-column dashboard the marketing landing page has always
- * shown: a busy board with a selected review card, two machines of
- * workspaces, and both review sections populated — tasks Ready for Review
- * (served on a review workspace) and Queued for Review (waiting for a free
- * slot). `KanbanMockup` renders this verbatim.
+ * A busy project on the shipped `task` workflow: the six-column board (the
+ * empty CANCELED column folded to a strip) with a selected review card, two
+ * machines of dev workspaces, and both review sections populated — issues
+ * Ready for Review (served on a `review`-tagged workspace, which the sidebar
+ * lists only there) and Queued for Review (waiting for a free slot). The docs'
+ * default preset; `KanbanMockup` renders it verbatim.
  */
 export const defaultAppState: AppState = {
-  terminalTitle: "jlong@hub — my-project",
+  terminalTitle: "you@hub — my-project",
   project: "my-project",
   activeView: "tasks",
-  workflow: "app",
-  // The hero showcases a busy, autonomous system — Zen Mode on, so the
-  // full-width green band is part of the landing-page capture.
-  zenMode: true,
+  // A fresh project ships two workflows (`task` and `subtask`), so cards carry
+  // the workflow badge and the board shows the `Workflow:` chip.
+  workflow: "task",
+  zenMode: false,
   columns: [
     {
       label: "BACKLOG",
@@ -2219,9 +2444,9 @@ export const defaultAppState: AppState = {
       category: "magenta",
       cards: [
         // Served on a review workspace (→ Ready for Review in the sidebar).
-        { title: "Cold-start cache", id: "t-011", workspace: "charlie", selected: true },
-        { title: "CSV import fix", id: "t-018", workspace: "golf" },
-        { title: "Nightly report", id: "t-024", workspace: "hotel" },
+        { title: "Cold-start cache", id: "t-011", workspace: "review-0", selected: true },
+        { title: "CSV import fix", id: "t-018", workspace: "review-1" },
+        { title: "Nightly report", id: "t-024", workspace: "review-2" },
         // No review workspace free yet (→ Queued for Review in the sidebar).
         { title: "Validate webhook payloads", id: "t-023" },
         { title: "Harden token refresh", id: "t-025" },
@@ -2239,73 +2464,76 @@ export const defaultAppState: AppState = {
         { title: "Fix flaky CI tests", id: "t-048" },
       ],
     },
+    { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
   ],
-  // Sidebar mirrors the board: every workspace shown on an IN PROGRESS or
-  // REVIEW card is `working` here (in-progress → Developer, review →
-  // Reviewer), leaving only two idle workspaces so the system reads busy.
+  // The sidebar's dev workspaces: the four on an IN PROGRESS card are working
+  // (Developer); the rest are idle. The three review slots (`review-0..2`) are
+  // `review`-tagged, so they show only through the review sections below.
   machines: [
     {
       name: "hub",
       workspaces: [
-        { name: "alpha", state: "working", agent: "Developer" },
-        { name: "bravo", state: "working", agent: "Developer" },
-        { name: "charlie", state: "working", agent: "Reviewer" },
+        { name: "alpha", state: "working", agent: "developer" },
+        { name: "bravo", state: "working", agent: "developer" },
+        { name: "charlie", state: "idle" },
         { name: "delta", state: "idle" },
       ],
     },
     {
       name: "devbox",
       workspaces: [
-        { name: "echo", state: "working", agent: "Developer" },
-        { name: "foxtrot", state: "working", agent: "Developer" },
-        { name: "golf", state: "working", agent: "Reviewer" },
-        { name: "hotel", state: "working", agent: "Reviewer" },
-        { name: "india", state: "idle" },
+        { name: "echo", state: "working", agent: "developer" },
+        { name: "foxtrot", state: "working", agent: "developer" },
+        { name: "golf", state: "idle" },
       ],
     },
   ],
   // Ready = the three served REVIEW cards, each loaded on a review workspace
-  // and serving at its `machine:port`. Queued = the two Review-status cards
-  // still waiting, because all three review workspaces are busy.
+  // (its `machine:workspace` drops beside a title too long to leave room).
+  // Queued = the two Review cards still waiting, because all three review
+  // workspaces are busy.
   readyReview: [
-    { title: "Cold-start cache", branch: "shelbi/cold-start-cache", location: "hub:3000" },
-    { title: "CSV import fix", branch: "shelbi/csv-import-fix", location: "devbox:3000" },
-    { title: "Nightly report", branch: "shelbi/nightly-report", location: "devbox:3001" },
+    { title: "Cold-start cache", branch: "you/t-011", location: "hub:review-0" },
+    { title: "CSV import fix", branch: "you/t-018", location: "devbox:review-1" },
+    { title: "Nightly report", branch: "you/t-024", location: "devbox:review-2" },
   ],
   queuedReview: [
-    { title: "Validate webhook payloads", branch: "shelbi/validate-webhook-payloads" },
-    { title: "Harden token refresh", branch: "shelbi/harden-token-refresh" },
+    { title: "Validate webhook payloads", branch: "you/t-023" },
+    { title: "Harden token refresh", branch: "you/t-025" },
   ],
 }
 
 /**
- * A freshly-initialized project: one machine, one idle workspace, a couple
- * of backlog cards and nothing else moving yet — the shape a
- * getting-started doc wants when it walks through the first task. Spread
- * and tweak it (`{ ...starterAppState, activeView: "chat" }`) to show a
- * specific early-onboarding state.
+ * A freshly-initialized project: the hub machine, one idle workspace, a couple
+ * of backlog cards and nothing else moving yet — the shape a getting-started
+ * doc wants when it walks through the first task. The empty columns fold to
+ * strips, as they do in the TUI. Spread and tweak it
+ * (`{ ...starterAppState, activeView: "chat" }`) to show a specific
+ * early-onboarding state.
  */
 export const starterAppState: AppState = {
-  terminalTitle: "you@laptop — myproject",
+  terminalTitle: "you@hub — myproject",
   project: "myproject",
   activeView: "tasks",
+  workflow: "task",
   columns: [
     {
       label: "BACKLOG",
       category: "gray",
       cards: [
-        { title: "Add a health check", id: "t-001" },
-        { title: "Write the README", id: "t-002" },
+        { title: "Add a health check", id: "add-a-health-check" },
+        { title: "Write the README", id: "write-the-readme" },
       ],
     },
-    { label: "TO DO", category: "blue", cards: [] },
-    { label: "IN PROGRESS", category: "yellow", cards: [] },
-    { label: "REVIEW", category: "magenta", cards: [] },
-    { label: "DONE", category: "green", cards: [] },
+    { label: "TO DO", category: "blue", cards: [], collapsed: true },
+    { label: "IN PROGRESS", category: "yellow", cards: [], collapsed: true },
+    { label: "REVIEW", category: "magenta", cards: [], collapsed: true },
+    { label: "DONE", category: "green", cards: [], collapsed: true },
+    { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
   ],
   machines: [
     {
-      name: "local",
+      name: "hub",
       workspaces: [{ name: "alpha", state: "idle" }],
     },
   ],
