@@ -117,6 +117,25 @@ impl WorkspaceInterface {
         self
     }
 
+    /// The panel's Edit entry, as drawn.
+    #[cfg(test)]
+    pub fn editor_label(&self) -> String {
+        format!("Edit in {}", self.panel.editor_name)
+    }
+
+    /// Which of Edit / View Diff open an app.
+    #[cfg(test)]
+    pub fn apps(&self) -> shelbi_state::AppTools {
+        self.panel.apps
+    }
+
+    /// The editor and diff settings changed: "Edit in <name>" and which of
+    /// Edit / View Diff open an app follow them.
+    pub fn set_tools(&mut self, editor_name: String, apps: shelbi_state::AppTools) {
+        self.panel.editor_name = editor_name;
+        self.panel.apps = apps;
+    }
+
     pub fn workspace(&self) -> &str {
         &self.workspace
     }

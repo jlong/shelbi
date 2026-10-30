@@ -120,10 +120,13 @@ another machine, and neither can a pane Shelbi starts on the hub.
 `code --wait` or the app, and the bundle's name for any other app. A command
 Shelbi doesn't know shows its program name with the first letter upper-cased.
 
-**Settings.** The TUI's Settings ▸ General edits `editor` too: it shows what
-Shelbi runs and where it comes from (this key, `$EDITOR`, or the `vim` default),
-saves a command you type when you press Enter, and clearing it brings back the
-fallback.
+**Settings.** Settings ▸ General has an Editor picker and a Diff tool picker
+in both clients. Each lists the default (no setting, so the fallback applies),
+the command-line tools and the apps Shelbi finds installed, Browse… (an app or
+a program on disk), and Other command… (a command line with its flags, saved
+when you press Enter). A pick saves at once, and the page shows what Shelbi
+runs and where it comes from (this key, `$EDITOR`, or the `vim` default). In
+the TUI, Browse asks for a path, with Tab completion.
 
 ### Theme
 

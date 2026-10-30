@@ -11,12 +11,14 @@
 //! join the set as they land:
 //!
 //! - General (`tui-settings-general`): the appearance (Auto / Dark / Light)
-//!   and the external editor command, over the shared
+//!   and the Editor and Diff tool pickers (`editor-difftool-tui`,
+//!   [`tool_picker`]), over the shared
 //!   [`GeneralForm`](shelbi_app::settings::general::GeneralForm), then a
-//!   summary of where the settings live with the Open in editor paths. Both
+//!   summary of where the settings live with the Open in editor paths. The
 //!   controls save at once, as the desktop app's do: a theme when it is
 //!   picked (it repaints every surface on the next frame once the write
-//!   lands), the editor when Enter commits what was typed. A save shows as
+//!   lands), a tool when it is picked from its list or browsed to, an
+//!   "Other command…" when Enter commits what was typed. A save shows as
 //!   pending until it lands, and a failed one puts the control back.
 //! - Terminal: what the host terminal owns (the font, its ANSI palette,
 //!   window effects), its sixteen colors as sessions draw them here, and a
@@ -73,7 +75,7 @@ use ratatui::{
     widgets::{Clear, Paragraph},
     Frame,
 };
-use shelbi_app::settings::general::{self, Change, GeneralForm, SaveStatus};
+use shelbi_app::settings::general::{self, Change, GeneralForm, SaveStatus, ToolSetting};
 use shelbi_app::settings::keybindings::Change as KeysChange;
 use shelbi_app::settings::summary::{self, FileState, GeneralSummary, ProjectSummary};
 use shelbi_app::settings::terminal_preview;
@@ -83,7 +85,7 @@ use shelbi_app::settings::{
 use shelbi_app::settings::workflows::{Committed, Edit, Target};
 use shelbi_app::{EditTarget, Effect};
 use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
-use shelbi_state::{EditorSource, ThemePreference, UserConfig};
+use shelbi_state::{ThemePreference, UserConfig};
 use shelbi_state::workflow_config::WorkflowConfig;
 use shelbi_state::agents_config::AgentsConfig;
 
@@ -98,6 +100,7 @@ use crate::theme::palette;
 mod agent_editor;
 mod agents;
 mod machine_form;
+mod tool_picker;
 mod workflow_editor;
 mod workflows;
 pub(crate) mod workspaces;
@@ -106,6 +109,7 @@ pub(crate) use agent_editor::{run_work as run_agent_work, AgentDone, AgentWork};
 use agent_editor::{AgentEditorPage, Back as AgentBack, EditorAction as AgentAction, Landed as AgentLanded};
 pub(crate) use agents::CommitJob;
 use agents::{AgentsHit, AgentsPage, Outcome};
+use tool_picker::ToolLayer;
 pub(crate) use workflow_editor::{run_work, EditorDone, EditorWork};
 use workflow_editor::{EditorAction, Landed, WorkflowEditorPage};
 pub(crate) use workflows::EditFile;
@@ -263,10 +267,8 @@ enum Does {
     Reload,
     /// The theme's segmented control (←/→, or Enter for the next one).
     Theme,
-    /// The editor command's field (Enter types, Enter again saves).
-    Editor,
-    /// Clear the editor override, back to the fallback.
-    ClearEditor,
+    /// A tool's picker (Editor, Diff tool): Enter opens its list.
+    Tool(ToolSetting),
     /// Open a file in the editor.
     EditFile(PathBuf),
 }
@@ -355,8 +357,10 @@ pub(crate) struct SettingsShell {
     stop: Stop,
     /// The General page's summary, loaded per project.
     general: Job<GeneralSummary>,
-    /// The General page's appearance and editor controls.
+    /// The General page's appearance and tool controls.
     form: GeneralForm,
+    /// The tool pickers' list or Browse prompt, over the General page.
+    tools: ToolLayer,
     /// A theme loaded or saved that the shell hasn't applied yet.
     theme_out: Option<ThemePreference>,
     /// The Workflows page.
@@ -420,6 +424,7 @@ impl Default for SettingsShell {
             region: Region::Sidebar,
             general: Job::default(),
             form: GeneralForm::default(),
+            tools: ToolLayer::default(),
             theme_out: None,
             workflows: WorkflowsPage::default(),
             keys: KeysPage::new(None),
@@ -546,6 +551,7 @@ impl SettingsShell {
         self.save_error = None;
         self.form.cancel_edit();
         self.form.clear_status();
+        self.tools.close();
         self.workflows.close_modal();
         self.keys.blur();
         if self.nav.page() == SettingsPage::Workspaces {
@@ -938,6 +944,19 @@ impl SettingsShell {
         }
     }
 
+    /// The installed editors and diff tools were detected (off the UI
+    /// thread): the pickers list them.
+    pub(crate) fn tools_detected(&mut self, detected: shelbi_state::tools::DetectedTools) {
+        self.form.set_detected(detected);
+        self.tools.detected(&self.form);
+    }
+
+    /// The tool pickers' layer (the shell's tests read it).
+    #[cfg(test)]
+    pub(crate) fn tool_layer(&self) -> &ToolLayer {
+        &self.tools
+    }
+
     /// The theme `config.yaml` now holds, once, when a load or a save brought
     /// it in: the shell applies it to every surface.
     pub(crate) fn take_theme(&mut self) -> Option<ThemePreference> {
@@ -965,6 +984,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Workspaces {
             return self.workspaces.paste(text);
+        }
+        if self.tools.paste(text) {
+            return true;
         }
         match self.form.draft_mut() {
             Some(field) if self.region == Region::Page => {
@@ -1370,13 +1392,8 @@ impl SettingsShell {
         if let JobState::Done(summary) = self.general.state() {
             if self.form.saved().is_some() {
                 out.push(PageAction { label: "Theme".into(), note: None, does: Does::Theme });
-                out.push(PageAction { label: "Command".into(), note: None, does: Does::Editor });
-                if self.form.editor_choice().is_some() {
-                    out.push(PageAction {
-                        label: "Clear the editor setting".into(),
-                        note: Some(format!("use {}", self.form.fallback_editor().0)),
-                        does: Does::ClearEditor,
-                    });
+                for setting in [ToolSetting::Editor, ToolSetting::DiffTool] {
+                    out.push(PageAction { label: setting.label().into(), note: None, does: Does::Tool(setting) });
                 }
             }
             out.push(PageAction {
@@ -1455,11 +1472,11 @@ impl SettingsShell {
             Does::Run(effect) => SettingsAction::Run(effect),
             Does::Reload => SettingsAction::Reload,
             Does::Theme => write(self.form.step_theme(1)),
-            Does::Editor => {
-                self.form.begin_edit();
+            Does::Tool(setting) => {
+                self.form.cancel_edit();
+                self.tools.open(&self.form, setting);
                 SettingsAction::Stay
             }
-            Does::ClearEditor => write(self.form.clear_editor()),
             Does::EditFile(path) => SettingsAction::EditFile(path),
         }
     }
@@ -1528,6 +1545,12 @@ impl SettingsShell {
         // A capture or the search holds every key (Esc, Tab, digits too).
         if self.keys_focused() && self.keys.holds_keys() {
             return self.keys_key(k, keymaps);
+        }
+        if self.nav.page() == SettingsPage::General && self.tools.is_open() {
+            // A tool's list or the Browse prompt holds every key.
+            self.region = Region::Page;
+            let change = self.tools.key(&mut self.form, k, nav_for(k, keymaps));
+            return write(change);
         }
         if self.typing() {
             return self.field_key(k);
@@ -1755,6 +1778,11 @@ impl SettingsShell {
                 return SettingsAction::Stay;
             }
         }
+        if self.nav.page() == SettingsPage::General && self.tools.is_open() && self.guard.prompt().is_none() {
+            // A tool's list or the Browse prompt is modal.
+            let change = self.tools.mouse(&mut self.form, m);
+            return write(change);
+        }
         if self.guard.prompt().is_some() {
             // The prompt is modal: only its buttons answer.
             return match (m.kind, hit) {
@@ -1881,6 +1909,8 @@ impl SettingsShell {
             self.workflows.hints(&moves)
         } else if self.region == Region::Page && self.nav.page() == SettingsPage::Agents {
             self.agents.hints(&moves)
+        } else if self.nav.page() == SettingsPage::General && self.tools.is_open() {
+            self.tools.hints(&moves)
         } else {
             hints(self.region, self.nav.page(), self.typing(), &moves)
         };
@@ -1893,6 +1923,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Agents {
             self.render_agents_menu(f, main);
+        }
+        if self.nav.page() == SettingsPage::General {
+            self.tools.render(&self.form, f, main);
         }
         if self.nav.page() == SettingsPage::Workspaces {
             self.workspaces.render_layer(f, main);
@@ -2019,6 +2052,7 @@ impl SettingsShell {
                 SettingsPage::Workflows => self.workflows.modal_open(),
                 SettingsPage::Agents => self.agents.menu_open(),
                 SettingsPage::Workspaces => self.workspaces.modal(),
+                SettingsPage::General => self.tools.is_open(),
                 _ => false,
             }
     }
@@ -2338,7 +2372,7 @@ fn general_rows(
         "General",
         Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
     )))];
-    wrapped(&mut rows, "Your appearance and editor, saved to config.yaml as you change them.", width, Style::default().fg(palette().muted));
+    wrapped(&mut rows, "Your appearance, editor and diff tool, saved to config.yaml as you change them.", width, Style::default().fg(palette().muted));
     if let Some(e) = save_error {
         wrapped(&mut rows, &format!("Couldn't save: {e}"), width, Style::default().fg(palette().red));
     }
@@ -2369,7 +2403,7 @@ fn general_rows(
     };
     if let Some(summary) = summary {
         if let Some(e) = form.unreadable() {
-            heading(&mut rows, "Appearance and editor");
+            heading(&mut rows, "Appearance and tools");
             wrapped(&mut rows, &format!("config.yaml doesn't read: {e}"), width, Style::default().fg(palette().red));
             wrapped(
                 &mut rows,
@@ -2400,30 +2434,14 @@ fn general_rows(
             );
             rows.push(Row::blank());
         }
-        if let Some(i) = at(&Does::Editor) {
-            heading(&mut rows, "Editor");
-            editor_rows(&mut rows, form, focus == Some(i), i, width);
-            if form.draft().is_some() {
-                wrapped(&mut rows, "⏎ saves · Esc puts it back · blank clears it", width, Style::default().fg(palette().yellow));
-            } else {
-                wrapped(
-                    &mut rows,
-                    "What Open in editor and a review's Edit view run. Arguments are kept (code --wait).",
-                    width,
-                    Style::default().fg(palette().muted),
-                );
+        if at(&Does::Tool(ToolSetting::Editor)).is_some() {
+            heading(&mut rows, "Editor and diff tool");
+            for setting in [ToolSetting::Editor, ToolSetting::DiffTool] {
+                if let Some(i) = at(&Does::Tool(setting)) {
+                    tool_rows(&mut rows, form, setting, focus == Some(i), i, label_w, width);
+                    rows.push(Row::blank());
+                }
             }
-            let (runs, source) = form.effective_editor();
-            field(&mut rows, "Shelbi runs", &format!("{runs} ({})", general::source_label(source)), label_w, width, None);
-            if source == EditorSource::Config {
-                let (fallback, source) = form.fallback_editor();
-                field(&mut rows, "Without it", &format!("{fallback} ({})", general::source_label(source)), label_w, width, None);
-            }
-            if let Some(i) = at(&Does::ClearEditor) {
-                rows.push(Row::blank());
-                action_buttons(&mut rows, actions, i..i + 1, focus, width);
-            }
-            rows.push(Row::blank());
         }
         heading(&mut rows, "This computer");
         let g = &summary.global;
@@ -2832,19 +2850,39 @@ pub(crate) fn picker_rows(rows: &mut Vec<Row>, label: &str, value: &str, focused
     field_rows(rows, label, field, focused, dim, action, width);
 }
 
-/// The editor command's field: its label over a textbox holding the
-/// command ("Not set" when there's none), the caret in it while it's typed.
-/// Every row is action `i`'s, so a click anywhere on it lands there.
-fn editor_rows(rows: &mut Vec<Row>, form: &GeneralForm, selected: bool, i: usize, width: usize) {
-    let draft = form.draft();
-    let typed = draft.map(|d| d.text());
-    let field = match (draft, &typed) {
-        (Some(d), Some(text)) => Textbox::new(text).caret(Some(d.caret())),
-        _ => Textbox::new(form.editor().unwrap_or("")),
+/// A tool setting's rows: its picker (the current choice), the command
+/// field under it while "Other command…" is typed, what it is for, and
+/// what Shelbi runs for it. Every row of the picker and the field is action
+/// `i`'s, so a click anywhere on them lands there.
+fn tool_rows(rows: &mut Vec<Row>, form: &GeneralForm, setting: ToolSetting, selected: bool, i: usize, label_w: usize, width: usize) {
+    let picker = form.picker(setting);
+    let typing = form.draft_setting() == Some(setting);
+    let current = match picker.entries().get(picker.selected()) {
+        Some(general::PickerEntry::Tool(t)) => tool_picker::tool_label(t),
+        _ => picker.current_label(),
+    };
+    picker_rows(rows, setting.label(), &current, selected && !typing, !form.editable(), Some(i), width);
+    let muted = Style::default().fg(palette().muted);
+    if let (true, Some(draft)) = (typing, form.draft()) {
+        let text = draft.text();
+        let field = Textbox::new(&text).caret(Some(draft.caret())).placeholder("code --wait").focused(true);
+        box_rows(rows, field, Some(i), width);
+        wrapped(rows, "⏎ saves · Esc puts it back · blank clears it", width, Style::default().fg(palette().yellow));
+    } else {
+        let what = match setting {
+            ToolSetting::Editor => "Used by Edit in … for workspaces and reviews.",
+            ToolSetting::DiffTool => "Used by View Diff for workspaces and reviews.",
+        };
+        wrapped(rows, what, width, muted);
     }
-    .placeholder("Not set")
-    .focused(selected);
-    field_rows(rows, "Command", field, selected, false, Some(i), width);
+    let runs = match setting {
+        ToolSetting::Editor => {
+            let (runs, source) = form.effective_editor();
+            format!("{runs} ({})", general::source_label(source))
+        }
+        ToolSetting::DiffTool => form.effective_diff_tool(),
+    };
+    field(rows, "Shelbi runs", &runs, label_w, width, None);
 }
 
 /// A page's sidebar row: glyph, label, and its number key at the right.
@@ -3144,6 +3182,30 @@ fn hints(region: Region, page: SettingsPage, typing: bool, moves: &str) -> Strin
     }
 }
 
+/// The installed tools the shell's tests detect in place of the disk.
+#[cfg(test)]
+pub(crate) fn fixture_detected() -> shelbi_state::tools::DetectedTools {
+    use shelbi_state::tools::ToolOption;
+    use shelbi_state::{ToolChoice, ToolKind};
+    let cli = |name: &str, command: &str| ToolOption { name: name.into(), kind: ToolKind::Cli, choice: command.into(), app_path: None };
+    let app = |name: &str, path: &str| ToolOption {
+        name: name.into(),
+        kind: ToolKind::App,
+        choice: ToolChoice::app(path),
+        app_path: Some(path.into()),
+    };
+    shelbi_state::tools::DetectedTools {
+        editors: vec![
+            cli("Neovim", "nvim"),
+            cli("Helix", "hx"),
+            app("Visual Studio Code", "/Applications/Visual Studio Code.app"),
+            app("Zed", "/Applications/Zed.app"),
+        ],
+        diff_tools: vec![cli("Difftastic", "difft"), app("Kaleidoscope", "/Applications/Kaleidoscope.app")],
+        git_difftool: Some("vimdiff".into()),
+    }
+}
+
 /// A General summary for `project` with no disk read: what the shell's tests
 /// read instead of `~/.shelbi`.
 #[cfg(test)]
@@ -3398,11 +3460,11 @@ mod tests {
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
         assert_eq!(
             labels,
-            ["Theme", "Command", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode", "About Shelbi"]
+            ["Theme", "Editor", "Diff tool", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode", "About Shelbi"]
         );
         let km = keymaps();
         s.set_region(Region::Page);
-        for _ in 0..4 {
+        for _ in 0..5 {
             s.handle_key(key(KeyCode::Char('j')), &km);
         }
         assert_eq!(
@@ -3423,7 +3485,7 @@ mod tests {
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
         assert_eq!(
             labels,
-            ["Theme", "Command", "Edit config.yaml", "Switch project…", "Add project…", "About Shelbi"]
+            ["Theme", "Editor", "Diff tool", "Edit config.yaml", "Switch project…", "Add project…", "About Shelbi"]
         );
         // A failed read offers Try again.
         let t = s.begin_load(Some("proj"), true).unwrap();
@@ -3500,7 +3562,7 @@ mod tests {
         let mut s = SettingsShell::default();
         let t = s.begin_load(None, false).unwrap();
         s.loaded(&t, Ok(fixture_summary(None)));
-        let text = screen(&mut s, 100, 40);
+        let text = screen(&mut s, 100, 50);
         for want in ["No project is open.", "Switch project…", "Add project…", "This computer"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
@@ -3508,7 +3570,7 @@ mod tests {
         broken.project = Some(Err("projects/proj.yaml: bad indent".into()));
         let t = s.begin_load(Some("proj"), true).unwrap();
         s.loaded(&t, Ok(broken));
-        let text = screen(&mut s, 100, 60);
+        let text = screen(&mut s, 100, 70);
         for want in ["Couldn't read this project's settings", "proj.yaml: bad", "Try again", "Edit Project Settings"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
@@ -3593,38 +3655,115 @@ mod tests {
         );
     }
 
+    /// [`on_general`] with the fixture's installed tools detected.
+    fn with_tools(summary: GeneralSummary) -> SettingsShell {
+        let mut s = on_general(summary);
+        s.tools_detected(fixture_detected());
+        s
+    }
+
     #[test]
-    fn a_click_anywhere_on_the_command_field_types_in_it() {
-        let mut s = on_general(fixture_summary(Some("proj")));
+    fn a_click_anywhere_on_a_picker_opens_its_list() {
+        let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
-        let text = screen(&mut s, 100, 30);
-        let label = text.lines().position(|l| l.trim_end().ends_with("  Command")).unwrap_or_else(|| panic!("{text}"));
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[label + 1].contains("▄▄▄▄") && lines[label + 3].contains("▀▀▀▀"), "{text}");
         let side = Rect::new(0, 0, 28, 30);
         let main = Rect::new(28, 0, 72, 30);
-        for y in label + 1..=label + 3 {
-            assert!(!s.typing());
-            let click = MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 60,
-                row: y as u16,
-                modifiers: KeyModifiers::NONE,
-            };
-            s.handle_mouse(click, side, main);
-            assert!(s.typing(), "a click on row {y} types in the field");
-            s.handle_key(key(KeyCode::Esc), &km);
-            screen(&mut s, 100, 30);
+        for (label, setting) in [("Editor", ToolSetting::Editor), ("Diff tool", ToolSetting::DiffTool)] {
+            let text = screen(&mut s, 100, 30);
+            let at = text.lines().position(|l| l.trim_end().ends_with(&format!("  {label}"))).unwrap_or_else(|| panic!("{text}"));
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(lines[at + 1].contains("▄▄▄▄") && lines[at + 2].contains("▾") && lines[at + 3].contains("▀▀▀▀"), "{text}");
+            for y in at + 1..=at + 3 {
+                assert!(!s.tool_layer().is_open());
+                let click = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 60,
+                    row: y as u16,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert_eq!(s.handle_mouse(click, side, main), SettingsAction::Stay);
+                assert_eq!(s.tool_layer().setting(), Some(setting), "a click on row {y} opens the list");
+                assert_eq!(s.handle_key(key(KeyCode::Esc), &km), SettingsAction::Stay);
+                assert_eq!(s.page(), SettingsPage::General, "Esc closed the list, not Settings");
+                screen(&mut s, 100, 30);
+            }
         }
     }
 
     #[test]
-    fn the_editor_takes_every_key_while_typed_and_saves_only_on_enter() {
-        let mut s = on_general(fixture_summary(Some("proj")));
+    fn the_list_draws_the_choices_and_a_click_picks_an_app() {
+        let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Stay, "Enter starts typing");
-        assert!(s.typing());
+        s.handle_key(key(KeyCode::Enter), &km);
+        let text = screen(&mut s, 100, 40);
+        for want in [
+            " Editor ",
+            "Default ($EDITOR or vim)",
+            "Command line",
+            "Neovim (nvim)",
+            "Applications",
+            "Visual Studio Code",
+            "Zed",
+            "Browse…",
+            "Other command…",
+            "No setting: runs vim, the default.",
+            "⏎ pick · Esc close",
+        ] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+        let (x, y) = text
+            .lines()
+            .enumerate()
+            .find_map(|(y, l)| l.find("  Zed ").map(|x| (l[..x].chars().count() + 3, y)))
+            .unwrap_or_else(|| panic!("{text}"));
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE };
+        let zed = shelbi_state::ToolChoice::app("/Applications/Zed.app");
+        assert_eq!(
+            s.handle_mouse(click, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40)),
+            SettingsAction::Write(Change::Editor(Some(zed.clone())))
+        );
+        assert!(!s.tool_layer().is_open());
+        // Pending until the write lands, then saved.
+        assert!(screen(&mut s, 100, 40).contains("Saving…"));
+        s.config_written(Ok(UserConfig { editor: Some(zed), ..UserConfig::default() }));
+        let text = screen(&mut s, 100, 40);
+        for want in ["Saved to ~/.shelbi/config.yaml", " Zed ", "Shelbi runs      Zed (your setting)"] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_failed_pick_goes_back_and_says_why() {
+        let mut s = with_tools(fixture_summary(Some("proj")));
+        let km = keymaps();
+        for _ in 0..2 {
+            s.handle_key(key(KeyCode::Down), &km);
+        }
+        s.handle_key(key(KeyCode::Enter), &km);
+        assert_eq!(s.tool_layer().setting(), Some(ToolSetting::DiffTool));
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &km),
+            SettingsAction::Write(Change::DiffTool(Some("difft".into())))
+        );
+        assert!(screen(&mut s, 100, 40).contains("Difftastic (difft)"), "pending shows the pick");
+        s.config_written(Err("Couldn't save config.yaml: read-only".into()));
+        let text = screen(&mut s, 100, 40);
+        assert!(text.contains("read-only") && text.contains("Git's difftool"), "{text}");
+        assert!(text.contains("Shelbi runs      Git's difftool (vimdiff)"), "{text}");
+    }
+
+    #[test]
+    fn other_command_takes_every_key_while_typed_and_saves_only_on_enter() {
+        let mut s = with_tools(fixture_summary(Some("proj")));
+        let km = keymaps();
+        s.handle_key(key(KeyCode::Down), &km);
+        // The list's last entry: Other command…, which types under the picker.
+        s.handle_key(key(KeyCode::Enter), &km);
+        s.handle_key(key(KeyCode::End), &km);
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Stay);
+        assert!(s.typing() && !s.tool_layer().is_open());
         // Letters, digits, `r`, `q`, the nav keys: all typed, nothing acts.
         for c in "code -w1rqjk".chars() {
             assert_eq!(s.handle_key(key(KeyCode::Char(c)), &km), SettingsAction::Stay);
@@ -3639,6 +3778,8 @@ mod tests {
         assert!(s.region() == Region::Page, "Esc closed the field, not Settings");
 
         s.handle_key(key(KeyCode::Enter), &km);
+        s.handle_key(key(KeyCode::End), &km);
+        s.handle_key(key(KeyCode::Enter), &km);
         assert!(s.paste("code --wait"), "a paste types into the field");
         assert_eq!(
             s.handle_key(key(KeyCode::Enter), &km),
@@ -3646,16 +3787,42 @@ mod tests {
         );
         s.config_written(Ok(written(ThemePreference::Auto, Some("code --wait"))));
         let text = screen(&mut s, 100, 40);
-        for want in ["code --wait", "Shelbi runs      code --wait (your setting)", "Without it       vim (the default)", "Clear the editor setting"] {
+        for want in ["Visual Studio Code (code --wait)", "Shelbi runs      code --wait (your setting)"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
-        // Clearing restores the fallback.
-        s.handle_key(key(KeyCode::Down), &km);
+        // Default clears it: the fallback again.
+        s.handle_key(key(KeyCode::Enter), &km);
+        s.handle_key(key(KeyCode::Home), &km);
         assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Write(Change::Editor(None)));
         s.config_written(Ok(written(ThemePreference::Auto, None)));
         let text = screen(&mut s, 100, 40);
-        assert!(text.contains("Not set") && text.contains("vim (the default)"), "{text}");
-        assert!(!text.contains("Clear the editor setting"), "{text}");
+        assert!(text.contains("Default ($EDITOR or vim)") && text.contains("vim (the default)"), "{text}");
+    }
+
+    #[test]
+    fn browse_opens_a_path_prompt_over_the_page() {
+        let mut s = with_tools(fixture_summary(Some("proj")));
+        let km = keymaps();
+        s.handle_key(key(KeyCode::Down), &km);
+        s.handle_key(key(KeyCode::Enter), &km);
+        s.handle_key(key(KeyCode::End), &km);
+        s.handle_key(key(KeyCode::Up), &km);
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Stay);
+        assert!(s.tool_layer().browsing());
+        let text = screen(&mut s, 100, 40);
+        for want in [" Browse for an editor ", "/Applications/", "Tab completes", "Cancel", "Choose", "Tab complete"] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+        // Keys type into the prompt, never the page; a refused path says why.
+        s.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &km);
+        assert!(s.paste("/nonexistent/shelbi-tool"));
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Stay);
+        let (text, error) = s.tool_layer().browse_text().unwrap();
+        assert_eq!(text, "/nonexistent/shelbi-tool");
+        assert!(error.unwrap().contains("doesn't exist"));
+        assert!(screen(&mut s, 100, 40).contains("doesn't exist"));
+        assert_eq!(s.handle_key(key(KeyCode::Esc), &km), SettingsAction::Stay);
+        assert!(!s.tool_layer().is_open() && s.page() == SettingsPage::General);
     }
 
     #[test]
@@ -3671,6 +3838,8 @@ mod tests {
         let mut s = on_general(fixture_summary(Some("proj")));
         let km = keymaps();
         s.handle_key(key(KeyCode::Down), &km);
+        s.handle_key(key(KeyCode::Enter), &km);
+        s.handle_key(key(KeyCode::End), &km);
         s.handle_key(key(KeyCode::Enter), &km);
         s.paste("hx");
         // Back from the sidebar (a click, or Ctrl+H then Enter).

@@ -206,7 +206,6 @@ impl ReviewInterface {
         true
     }
 
-    /// Put a message on the panel's status line (effect failures, notes).
     /// Edit and View Diff open these in their apps (`editor:` /
     /// `diff_tool:` apps) instead of a pane.
     pub fn with_apps(mut self, apps: shelbi_state::AppTools) -> Self {
@@ -214,6 +213,14 @@ impl ReviewInterface {
         self
     }
 
+    /// The editor and diff settings changed: "Edit in <name>" and which of
+    /// Edit / View Diff open an app follow them.
+    pub fn set_tools(&mut self, editor_name: String, apps: shelbi_state::AppTools) {
+        self.panel.editor_name = editor_name;
+        self.panel.apps = apps;
+    }
+
+    /// Put a message on the panel's status line (effect failures, notes).
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.panel.status_line = msg.into();
     }

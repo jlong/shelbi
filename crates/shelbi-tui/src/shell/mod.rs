@@ -122,8 +122,11 @@ struct AckReturn {
 enum SettingsMsg {
     Loaded(Ticket, Box<GeneralSummary>),
     Saved(Ticket, Result<Option<shelbi_state::UserConfig>, String>),
-    /// An immediate-save preference write landed (General's theme or editor).
-    Written(Result<shelbi_state::UserConfig, String>),
+    /// An immediate-save preference write landed (General's theme, editor
+    /// or diff tool), with what the open panels' Edit / View Diff now are.
+    Written(Result<shelbi_state::UserConfig, String>, Option<PanelTools>),
+    /// The installed editors and diff tools, for General's pickers.
+    ToolsDetected(shelbi_state::tools::DetectedTools),
     /// The Workflows page's read of its project's workflow config.
     WorkflowsLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
     /// One Workflows edit, applied and saved.
@@ -160,6 +163,22 @@ type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
 /// Reads a project's workflow config for Settings ▸ Workflows (blocking; run
 /// off the UI thread).
 type WorkflowsReader = Arc<dyn Fn(&str) -> Result<WorkflowConfig, String> + Send + Sync>;
+
+/// Detects the installed editors and diff tools (blocking; run off the UI
+/// thread). `true` scans again rather than taking the cached scan.
+type ToolsReader = Arc<dyn Fn(bool) -> shelbi_state::tools::DetectedTools + Send + Sync>;
+
+/// What an open workspace or review panel's Edit and View Diff are under a
+/// config: the editor's name ("Edit in Zed") and which open an app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelTools {
+    editor_name: String,
+    apps: shelbi_state::AppTools,
+}
+
+/// [`PanelTools`] for `project` under `cfg` (blocking: reads the project, for
+/// its `review.diff_command`, which View Diff runs before `diff_tool:`).
+type PanelToolsReader = Arc<dyn Fn(&str, &shelbi_state::UserConfig) -> PanelTools + Send + Sync>;
 
 /// `keys.yaml` for the Keybindings page: the file on disk in production, an
 /// in-memory one under test (no test touches the real `~/.shelbi`). Every
@@ -1320,6 +1339,11 @@ struct ShellState {
     /// Reads Settings ▸ Workflows' config (disk in production; in tests a
     /// refusal unless a test points it at its own `SHELBI_HOME`).
     workflows_reader: WorkflowsReader,
+    /// Detects General's installed tools (disk in production; a fixture in
+    /// tests).
+    tools_reader: ToolsReader,
+    /// What the open panels' Edit / View Diff become after a General save.
+    panel_tools: PanelToolsReader,
     /// `keys.yaml` for the Keybindings page (disk in production).
     keys_store: Arc<dyn KeysStore>,
     /// Reads Settings ▸ Agents' model (disk; in tests only a test's own
@@ -1486,6 +1510,26 @@ impl ShellState {
         let workflows_reader: WorkflowsReader = Arc::new(shelbi_app::settings::workflows::load);
         #[cfg(test)]
         let workflows_reader: WorkflowsReader = Arc::new(|_: &str| Err("tests read no ~/.shelbi".to_string()));
+        #[cfg(not(test))]
+        let tools_reader: ToolsReader = Arc::new(|rescan| {
+            if rescan {
+                shelbi_state::tools::refresh_detected_tools()
+            } else {
+                shelbi_state::tools::detected_tools()
+            }
+        });
+        #[cfg(test)]
+        let tools_reader: ToolsReader = Arc::new(|_| settings::fixture_detected());
+        let panel_tools: PanelToolsReader = Arc::new(|project: &str, cfg: &shelbi_state::UserConfig| {
+            // Tests never read a project from the real `~/.shelbi`.
+            let diff_command = !cfg!(test)
+                && shelbi_state::load_project(project).is_ok_and(|p| p.review_diff_command().is_some());
+            let env = std::env::var("EDITOR").ok();
+            PanelTools {
+                editor_name: shelbi_state::resolve_editor_choice_from(cfg.editor.as_ref(), env.as_deref()).0.display_name(),
+                apps: shelbi_orchestrator::tools::app_tools_for(cfg, diff_command),
+            }
+        });
         // The Agents page reads (and its saves write) a project's files; a
         // test that lands on it without its own `SHELBI_HOME` reads nothing.
         let agents_reader: AgentsReader = Arc::new(|project: &str| {
@@ -1579,6 +1623,8 @@ impl ShellState {
             #[cfg(test)]
             settings_store,
             workflows_reader,
+            tools_reader,
+            panel_tools,
             keys_store,
             agents_reader,
             pool_reader,
@@ -2843,11 +2889,15 @@ impl ShellState {
         let spawned = match load.clone() {
             settings::Load::General(sent) => {
                 let reader = self.settings_reader.clone();
+                let tools = self.tools_reader.clone();
                 std::thread::Builder::new()
                     .name("shelbi-shell-settings".into())
                     .spawn(move || {
                         let summary = reader(project.as_deref());
                         let _ = tx.send(SettingsMsg::Loaded(sent, Box::new(summary)));
+                        // The pickers' tools after the page (the first scan
+                        // captures the login PATH); a reload scans again.
+                        let _ = tx.send(SettingsMsg::ToolsDetected(tools(force)));
                     })
             }
             settings::Load::Keys(sent) => {
@@ -3245,7 +3295,13 @@ impl ShellState {
                     let action = self.settings.saved(&ticket, result);
                     self.apply_settings_action(action);
                 }
-                SettingsMsg::Written(result) => self.settings.config_written(result),
+                SettingsMsg::Written(result, tools) => {
+                    self.settings.config_written(result);
+                    if let Some(tools) = tools {
+                        self.apply_panel_tools(tools);
+                    }
+                }
+                SettingsMsg::ToolsDetected(detected) => self.settings.tools_detected(detected),
                 SettingsMsg::WorkflowsLoaded(ticket, config) => {
                     self.settings.workflows_loaded(&ticket, *config);
                 }
@@ -3310,15 +3366,34 @@ impl ShellState {
     /// controls). The form shows it pending until the result lands.
     fn write_setting(&mut self, change: shelbi_app::settings::general::Change) {
         let writer = self.settings_writer.clone();
+        let panel_tools = self.panel_tools.clone();
+        // An open panel's Edit / View Diff follow the new setting.
+        let project = self.client.project().map(str::to_string).filter(|_| self.review.is_some() || self.workspace.is_some());
         let tx = self.settings_tx.clone();
         let spawned = std::thread::Builder::new()
             .name("shelbi-shell-settings-write".into())
             .spawn(move || {
-                let _ = tx.send(SettingsMsg::Written(writer(&change)));
+                let written = writer(&change);
+                let tools = match (&written, project) {
+                    (Ok(cfg), Some(project)) => Some(panel_tools(&project, cfg)),
+                    _ => None,
+                };
+                let _ = tx.send(SettingsMsg::Written(written, tools));
             });
         if let Err(e) = spawned {
             self.settings
                 .config_written(Err(format!("Couldn't start the save: {e}")));
+        }
+    }
+
+    /// The open workspace and review panels take the editor's name and
+    /// which of Edit / View Diff open an app, after a General save.
+    fn apply_panel_tools(&mut self, tools: PanelTools) {
+        if let Some(r) = self.review.as_mut() {
+            r.set_tools(tools.editor_name.clone(), tools.apps);
+        }
+        if let Some(w) = self.workspace.as_mut() {
+            w.set_tools(tools.editor_name, tools.apps);
         }
     }
 
@@ -9664,9 +9739,9 @@ mod tests {
         settle_settings(&mut st);
         st.effect_tap = Some(Vec::new());
         press(&mut st, KeyCode::Tab);
-        // Past the theme, the editor command and Edit config.yaml, then
-        // Edit Project Settings, to Edit Zen Mode.
-        for _ in 0..4 {
+        // Past the theme, the Editor and Diff tool pickers and Edit
+        // config.yaml, then Edit Project Settings, to Edit Zen Mode.
+        for _ in 0..5 {
             press(&mut st, KeyCode::Char('j'));
         }
         press(&mut st, KeyCode::Enter);
@@ -9686,7 +9761,7 @@ mod tests {
         settle_settings(&mut st);
         st.effect_tap = Some(Vec::new());
         // Tall enough that the summary's actions show under the controls.
-        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 48)).unwrap();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 60)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         let (x, y) = find_on_screen(&term, "Edit Project Settings").unwrap();
         st.handle_event(Event::Mouse(left_click(x, y)));
@@ -9716,7 +9791,10 @@ mod tests {
         st.dispatch_effect(Effect::OpenSettings);
         settle_settings(&mut st);
         press(&mut st, KeyCode::Tab);
+        // Editor ▸ Other command….
         press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::End);
         press(&mut st, KeyCode::Enter);
         type_key(&mut st, 'x');
         assert!(st.settings.form().draft().is_some(), "typing");
@@ -9900,7 +9978,10 @@ mod tests {
     fn the_editor_command_saves_with_its_arguments_and_clears_to_the_fallback() {
         let mut st = settings_state();
         on_general_page(&mut st);
+        // The Editor picker's list, its last entry: Other command….
         press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::End);
         press(&mut st, KeyCode::Enter);
         for c in "code --wait".chars() {
             press(&mut st, KeyCode::Char(c));
@@ -9912,14 +9993,45 @@ mod tests {
             st.settings_store.lock().unwrap().config.as_ref().unwrap().editor.as_ref().and_then(shelbi_state::ToolChoice::command),
             Some("code --wait")
         );
-        // Clear the editor setting: the row under the command.
-        press(&mut st, KeyCode::Down);
+        // Default clears the editor setting: the list's first entry.
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::Home);
         press(&mut st, KeyCode::Enter);
         settle_until(&mut st, "the clear lands", |st| !st.settings.form().saving());
         assert_eq!(st.settings_store.lock().unwrap().config.as_ref().unwrap().editor, None);
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         draw_frame(&mut term, &mut st).unwrap();
         assert!(screen_text(&term).contains("vim (the default)"), "{}", screen_text(&term));
+    }
+
+    #[test]
+    fn the_pickers_list_the_detected_tools_and_an_app_pick_reaches_the_open_panel() {
+        let mut st = settings_state();
+        st.workspace = Some(WorkspaceInterface::new(
+            "proj",
+            st.connector.clone(),
+            "alpha",
+            "/wt/alpha",
+            "Vim",
+            "Developer",
+            default_ws_status(),
+            None,
+        ));
+        on_general_page(&mut st);
+        settle_until(&mut st, "the tools are detected", |st| !st.settings.form().detected().editors.is_empty());
+        // Editor ▸ Zed (Default, Neovim, Helix, Visual Studio Code, Zed).
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        for _ in 0..4 {
+            press(&mut st, KeyCode::Down);
+        }
+        press(&mut st, KeyCode::Enter);
+        settle_until(&mut st, "the pick lands", |st| !st.settings.form().saving());
+        let zed = shelbi_state::ToolChoice::app("/Applications/Zed.app");
+        assert_eq!(st.settings_store.lock().unwrap().config.as_ref().unwrap().editor, Some(zed));
+        let w = st.workspace.as_ref().unwrap();
+        assert_eq!(w.editor_label(), "Edit in Zed", "the open panel follows the setting");
+        assert_eq!(w.apps(), shelbi_state::AppTools { editor: true, diff: false });
     }
 
     // --- Settings ▸ Workflows (tui-settings-workflows), through the shell ---
