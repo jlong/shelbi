@@ -1349,10 +1349,10 @@ struct ShellState {
     /// resize, focus regained. Recovers the screen from anything written over
     /// it outside ratatui.
     full_redraw: bool,
-    /// A pending off-UI-thread job; its `String` is the status to show when it
-    /// finishes. Blocking commands (e.g. the Zen toggle) run here so they never
-    /// freeze the one event loop.
-    job: Option<Receiver<String>>,
+    /// A pending off-UI-thread job; its `Some` is the status to show when it
+    /// finishes (`None`: show nothing). Blocking commands (e.g. the Zen toggle)
+    /// run here so they never freeze the one event loop.
+    job: Option<Receiver<Option<String>>>,
     /// A file (or directory) to open in the user's editor. The run loop takes it
     /// after handling input: it hands the terminal to the editor and waits, then
     /// restores the shell (the TUI's half of the palette's `edit:*` commands).
@@ -3809,9 +3809,8 @@ impl ShellState {
             self.overlay = Some(ActiveOverlay::zen_intro(project));
             return;
         }
-        self.spawn_job(move || match toggle_zen_blocking(&project) {
-            Ok(msg) => msg,
-            Err(e) => format!("Zen toggle failed: {e}"),
+        self.spawn_quiet_job(move || {
+            shelbi_app::zen::report(&project, shelbi_app::zen::toggle(&project))
         });
     }
 
@@ -3819,17 +3818,9 @@ impl ShellState {
     /// again" flag, and toggle Zen on confirm. Mirrors the tmux palette's
     /// `apply_zen_intro_result`.
     fn apply_zen_intro(&mut self, project: String, confirmed: bool, dont_show_again: bool) {
-        self.spawn_job(move || {
-            if dont_show_again {
-                let _ = shelbi_state::mark_zen_intro_seen();
-            }
-            if !confirmed {
-                return "Zen Mode: cancelled".to_string();
-            }
-            match toggle_zen_blocking(&project) {
-                Ok(msg) => msg,
-                Err(e) => format!("Zen toggle failed: {e}"),
-            }
+        self.spawn_quiet_job(move || {
+            let result = shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again);
+            shelbi_app::zen::report(&project, result)
         });
     }
 
@@ -3837,32 +3828,52 @@ impl ShellState {
     /// when it finishes. Blocking commands run here so they never freeze the one
     /// event loop (plan: "commands that can block run off the UI thread").
     fn spawn_job(&mut self, f: impl FnOnce() -> String + Send + 'static) {
+        if self.start_job(move || Some(f())) {
+            self.status = Some("working…".to_string());
+        }
+    }
+
+    /// [`Self::spawn_job`] for a job whose success shows nothing (the Zen
+    /// toggle: the sidebar's Zen band is its indicator). No "working…" line
+    /// while it runs; a `Some` result still becomes the status line.
+    fn spawn_quiet_job(&mut self, f: impl FnOnce() -> Option<String> + Send + 'static) {
+        self.start_job(f);
+    }
+
+    /// Run `f` on a worker thread as the pending job. `false` when the thread
+    /// couldn't start.
+    fn start_job(&mut self, f: impl FnOnce() -> Option<String> + Send + 'static) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
-        if std::thread::Builder::new()
+        let started = std::thread::Builder::new()
             .name("shelbi-shell-job".into())
             .spawn(move || {
                 let _ = tx.send(f());
             })
-            .is_ok()
-        {
-            self.status = Some("working…".to_string());
+            .is_ok();
+        if started {
             self.job = Some(rx);
         }
+        started
     }
 
     /// Poll a pending off-thread job without blocking. Returns `true` when it
-    /// finished (so the caller redraws the status line).
+    /// finished (so the caller redraws the status line). A quiet job's `None`
+    /// leaves the status line alone and refreshes the sidebar so what the job
+    /// changed (the Zen band, the error badge) shows now.
     fn poll_job(&mut self) -> bool {
         let done = match &self.job {
             Some(rx) => match rx.try_recv() {
                 Ok(msg) => msg,
                 Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => "job stopped unexpectedly".to_string(),
+                Err(TryRecvError::Disconnected) => Some("job stopped unexpectedly".to_string()),
             },
             None => return false,
         };
         self.job = None;
-        self.status = Some(done);
+        match done {
+            Some(msg) => self.status = Some(msg),
+            None => self.request_refresh(),
+        }
         true
     }
 
@@ -5131,21 +5142,6 @@ fn p_page() -> usize {
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.left() && x < area.right() && y >= area.top() && y < area.bottom()
-}
-
-/// Toggle Zen Mode for `project` (a blocking call: it reconciles the daemon
-/// version first). Returns a status string; errors are stringified so the
-/// worker closure stays self-contained.
-fn toggle_zen_blocking(project: &str) -> Result<String, String> {
-    shelbi_state::ensure_daemon_matches_for_mutation().map_err(|e| e.to_string())?;
-    let state =
-        shelbi_state::toggle_zen_mode(project, "user:palette").map_err(|e| e.to_string())?;
-    let word = if matches!(state, shelbi_state::ZenModeState::Off) {
-        "disabled"
-    } else {
-        "enabled"
-    };
-    Ok(format!("Zen Mode {word}"))
 }
 
 /// Run an approve/reject review mutation through the daemon control socket
@@ -6654,6 +6650,94 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         home
+    }
+
+    /// Run `body` in a temp `SHELBI_HOME` with the Zen intro already seen and
+    /// the hub socket pointed into that home (no test probes the real hub).
+    fn in_zen_home(tag: &str, body: impl FnOnce(&std::path::Path)) {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_home(tag);
+        let saved_sock = std::env::var_os("SHELBI_HUB_SOCK");
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::set_var("SHELBI_HUB_SOCK", home.join("hub.sock"));
+        shelbi_state::mark_zen_intro_seen().unwrap();
+        body(&home);
+        match saved_sock {
+            Some(v) => std::env::set_var("SHELBI_HUB_SOCK", v),
+            None => std::env::remove_var("SHELBI_HUB_SOCK"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Wait for the pending off-thread job to land.
+    fn land_job(st: &mut ShellState) {
+        for _ in 0..400 {
+            if st.poll_job() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the job never came back");
+    }
+
+    fn zen_mode(project: &str) -> shelbi_state::ZenModeState {
+        shelbi_state::read_state(project).unwrap().zen_mode
+    }
+
+    #[test]
+    fn toggling_zen_from_the_palette_prints_no_status_line() {
+        // The sidebar's ZEN MODE ON band is the indicator: neither direction
+        // leaves a line under the session, nor a "working…" one while it runs,
+        // and the sidebar refreshes so the band follows at once.
+        in_zen_home("zen-toggle", |_| {
+            let mut st = test_state();
+            st.status = None;
+            for want in [shelbi_state::ZenModeState::On, shelbi_state::ZenModeState::Off] {
+                let refreshes = st.refresh_requests.get();
+                st.run_command(CommandKind::ToggleZen);
+                assert_eq!(st.status_text(), None, "no line while the toggle runs");
+                land_job(&mut st);
+                assert_eq!(zen_mode("proj"), want);
+                assert_eq!(st.status_text(), None, "no line after the toggle");
+                assert!(st.refresh_requests.get() > refreshes, "the sidebar refreshes");
+            }
+        });
+    }
+
+    #[test]
+    fn the_zen_intro_prints_no_status_line_confirmed_or_cancelled() {
+        in_zen_home("zen-intro", |_| {
+            let mut st = test_state();
+            st.status = None;
+            st.apply_zen_intro("proj".into(), false, false);
+            land_job(&mut st);
+            assert_eq!(zen_mode("proj"), shelbi_state::ZenModeState::Off, "cancel toggles nothing");
+            assert_eq!(st.status_text(), None, "cancel prints nothing");
+
+            st.apply_zen_intro("proj".into(), true, false);
+            land_job(&mut st);
+            assert_eq!(zen_mode("proj"), shelbi_state::ZenModeState::On);
+            assert_eq!(st.status_text(), None, "enable prints nothing");
+        });
+    }
+
+    #[test]
+    fn a_failed_zen_toggle_goes_to_the_error_log_not_the_status_line() {
+        in_zen_home("zen-fail", |_| {
+            // A directory where state.json belongs: the toggle can't read it.
+            std::fs::create_dir_all(shelbi_state::state_path("proj").unwrap()).unwrap();
+            let mut st = test_state();
+            st.status = None;
+            st.run_command(CommandKind::ToggleZen);
+            land_job(&mut st);
+            assert_eq!(st.status_text(), None);
+            let errors = shelbi_state::read_errors("proj").unwrap();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].message.starts_with("Zen toggle failed: "), "{errors:?}");
+        });
     }
 
     #[test]

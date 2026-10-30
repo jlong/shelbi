@@ -43,7 +43,7 @@ use shelbi_app::activity::{
 };
 use shelbi_app::theme::Tone;
 use shelbi_state::keymap::{load_keymaps, ActivityAction, DisplayStyle, Keymaps};
-use shelbi_state::{events_log_path, ZenModeState};
+use shelbi_state::events_log_path;
 
 use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
@@ -179,20 +179,11 @@ impl ActivityApp {
     /// [`shelbi_state::toggle_zen_mode`] path — same read/write/log
     /// dance the sidebar and palette use, tagged `user:hotkey` so the
     /// events log can tell the chord apart from the CLI / palette
-    /// sources.
+    /// sources. Success leaves the status line alone: the sidebar's Zen band is the
+    /// indicator.
     pub fn toggle_zen_mode(&mut self) {
-        match shelbi_state::toggle_zen_mode(&self.project_name, "user:hotkey") {
-            Ok(target) => {
-                let label = match target {
-                    ZenModeState::On => "on",
-                    ZenModeState::Off => "off",
-                    ZenModeState::Paused => "pause",
-                };
-                self.status_line = format!("zen {label}");
-            }
-            Err(e) => {
-                self.fail_status(format!("zen toggle failed: {e}"));
-            }
+        if let Err(e) = shelbi_state::toggle_zen_mode(&self.project_name, "user:hotkey") {
+            self.fail_status(format!("zen toggle failed: {e}"));
         }
     }
 

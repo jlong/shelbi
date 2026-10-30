@@ -1094,21 +1094,12 @@ impl App {
     /// `shelbi zen on|off`, just with `reason=user:hotkey` so the
     /// activity feed can tell the chord apart from the palette
     /// (`user:palette`) and the CLI (`user:cli`). Paused collapses to
-    /// On because this hotkey is intentionally a two-state hop.
+    /// On because this hotkey is intentionally a two-state hop. Success
+    /// leaves the status line alone: the Zen band is the indicator.
     pub fn toggle_zen_mode(&mut self) {
         match shelbi_state::toggle_zen_mode(&self.project_name, "user:hotkey") {
-            Ok(target) => {
-                self.zen_mode = target;
-                let action = match target {
-                    ZenModeState::On => "on",
-                    ZenModeState::Off => "off",
-                    ZenModeState::Paused => "pause",
-                };
-                self.status_line = format!("zen {action}");
-            }
-            Err(e) => {
-                self.log_error("zen toggle failed", e);
-            }
+            Ok(target) => self.zen_mode = target,
+            Err(e) => self.log_error("zen toggle failed", e),
         }
     }
 
@@ -4218,12 +4209,15 @@ mod tests {
 
         app.toggle_zen_mode();
         assert_eq!(app.zen_mode, shelbi_state::ZenModeState::On);
+        // The Zen band is the indicator; the toggle prints nothing.
+        assert_eq!(app.status_line, "");
         // Persisted to state.json — a re-read sees the toggle.
         let state = shelbi_state::read_state("demo").unwrap();
         assert_eq!(state.zen_mode, shelbi_state::ZenModeState::On);
         // Toggle again returns to Off — Paused is not in the binary path.
         app.toggle_zen_mode();
         assert_eq!(app.zen_mode, shelbi_state::ZenModeState::Off);
+        assert_eq!(app.status_line, "");
 
         // Events log got both transitions in the canonical mode=zen shape
         // tagged with `user:hotkey` so the orchestrator's tail and the
