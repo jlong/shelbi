@@ -190,7 +190,7 @@ fn brackets_reach_a_transition_and_its_panel_edits_actions_and_details() {
     press(&mut ed, key(KeyCode::Enter));
     assert_eq!(b(&ed).selected_transition(), Some(0));
     let screen = render(&mut ed, 120, 60);
-    for want in ["Transition", "From", "In Progress", "To", "Review", "Actions", "1. Push branch", "2. Open PR", "+ Add action", "Details", "Target branch", "Ready timeout", "Delete transition"] {
+    for want in ["Transition", "From", "In Progress", "To", "Review", "Actions", "1. Push branch", "2. Open PR", "+ Add action", "Details", "Target branch", "URL", "Delete transition"] {
         assert!(screen.contains(want), "{want}:\n{screen}");
     }
     // Reorder: Open PR first (Shift+↑ on it), then add Merge, remove Push branch.
@@ -207,7 +207,18 @@ fn brackets_reach_a_transition_and_its_panel_edits_actions_and_details() {
     press(&mut ed, key(KeyCode::Enter));
     pick(&mut ed, "Done");
     assert_eq!(transitions(&ed)[0].1, "done");
-    // A Details field: refused text stays with its error, then corrected.
+    assert!(!screen.contains("Ready timeout"), "Run script's, not Details':\n{screen}");
+    // Run script, from Add action: last in the list, its editor in the
+    // panel. A refused field stays with its error, then corrected.
+    go(&mut ed, Item::AddAction(0));
+    press(&mut ed, key(KeyCode::Enter));
+    pick(&mut ed, "Run script");
+    typed(&mut ed, "make serve &");
+    press(&mut ed, key(KeyCode::Enter));
+    let screen = render(&mut ed, 120, 60);
+    for want in ["3. Run script · 1 command", "Commands", "make serve &", "+ Add command", "Ready check", "Ready timeout", "Done"] {
+        assert!(screen.contains(want), "{want}:\n{screen}");
+    }
     go(&mut ed, Item::Text(Text::Timeout));
     press(&mut ed, key(KeyCode::Enter));
     typed(&mut ed, "soon");
@@ -219,6 +230,12 @@ fn brackets_reach_a_transition_and_its_panel_edits_actions_and_details() {
     retype(&mut ed, "45");
     press(&mut ed, key(KeyCode::Enter));
     assert_eq!(ed.state().unwrap().transitions()[0].ready_timeout, Some(std::time::Duration::from_secs(45)));
+    assert_eq!(ed.state().unwrap().transitions()[0].run, ["make serve &"]);
+    // x on its row removes it.
+    go(&mut ed, Item::Script(0));
+    press(&mut ed, key(KeyCode::Char('x')));
+    assert!(!ed.state().unwrap().has_script(0) && !ed.items().contains(&Item::Script(0)));
+    assert_eq!(ed.state().unwrap().transitions()[0].ready_timeout, None, "Remove clears all three");
     // The Form shows all of it.
     press(&mut ed, key(KeyCode::Esc));
     press(&mut ed, key(KeyCode::Char('v')));
@@ -636,5 +653,5 @@ fn the_panel_keeps_a_line_under_the_focus_when_it_clips() {
         }
         press(&mut ed, key(KeyCode::Down));
     }
-    assert!(seen.contains(&Item::Text(Text::Timeout)) && seen.contains(&Item::RemoveTransition(0)), "{seen:?}");
+    assert!(seen.contains(&Item::Text(Text::Url)) && seen.contains(&Item::RemoveTransition(0)), "{seen:?}");
 }

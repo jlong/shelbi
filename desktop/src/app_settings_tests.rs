@@ -1701,27 +1701,23 @@ fn statuses_and_transitions_edit_from_their_controls(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_details_run_text_area_soft_wraps(cx: &mut TestAppContext) {
-    let _home = Home::with_project("ed-run-wrap", "alpha");
-    let mut s = Settings::open_editor(cx, "task");
-    s.click("workflow-transition-details-0");
-    let run = s.read(|w, cx| match &w.route {
-        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).details_run_field().unwrap(),
-        _ => unreachable!(),
-    });
-    s.h.assert_area_wraps(&run, "the Workflow editor's run field");
-}
-
-#[gpui::test]
 fn details_and_lower_sections_show_their_errors_inline(cx: &mut TestAppContext) {
     let _home = Home::with_project("ed-details", "alpha");
     let mut s = Settings::open_editor(cx, "task");
 
-    // Details open under the row; a bad timeout shows there.
+    // Details open under the row: Target branch and URL, no Run fields.
     s.click("workflow-transition-details-0");
-    assert!(s.drawn("workflow-details"));
+    assert!(s.drawn("workflow-details") && s.drawn("workflow-details-target") && s.drawn("workflow-details-url"));
+    assert!(!s.drawn("workflow-script-timeout"), "Run script holds those");
+    s.click("workflow-transition-details-0");
+    assert!(!s.drawn("workflow-details"), "the button closes them");
+
+    // Run script's editor under the row; a bad timeout shows there.
+    s.click("workflow-add-action-0");
+    s.click("workflow-add-action-0-run-script");
+    assert!(s.drawn("workflow-script"));
     let timeout = s.read(|w, cx| match &w.route {
-        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).details_timeout_field().unwrap(),
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).script_timeout_field().unwrap(),
         _ => unreachable!(),
     });
     s.type_into(timeout.clone(), "soon");
@@ -1729,8 +1725,12 @@ fn details_and_lower_sections_show_their_errors_inline(cx: &mut TestAppContext) 
     assert!(s.drawn("workflow-transition-error-0"));
     s.type_into(timeout, "120");
     assert_eq!(s.error_at(Field::Transition(0)), None);
-    s.click("workflow-transition-details-0");
-    assert!(!s.drawn("workflow-details"), "the button closes them");
+    s.click("workflow-script-done");
+    assert!(!s.drawn("workflow-script"), "Done closes it");
+    assert!(s.drawn("workflow-script-0"), "a timeout alone is a Run script");
+    s.click("workflow-script-0");
+    s.click("workflow-script-0-remove");
+    assert!(!s.drawn("workflow-script-0"));
 
     // Git: a templated base branch needs a required field.
     let base = s.read(|w, cx| match &w.route {
@@ -2365,6 +2365,94 @@ impl Settings {
             edge.label.as_ref().map(|l| l.lines.clone()).unwrap_or_default()
         })
     }
+}
+
+#[gpui::test]
+fn run_script_is_an_action_whose_commands_save_to_run(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-run-script", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+    let fields = |s: &Settings| {
+        s.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).script_command_fields(),
+            _ => unreachable!(),
+        })
+    };
+    // In Progress → Review has none: + offers it after the git actions.
+    assert!(!s.drawn("workflow-script-0"));
+    s.click("workflow-add-action-0");
+    s.click("workflow-add-action-0-run-script");
+    assert!(s.drawn("workflow-script") && s.drawn("workflow-script-0"), "the editor, and its chip while open");
+    assert_eq!(fields(&s).len(), 1, "on an empty command");
+    let first = fields(&s)[0].clone();
+    s.type_into(first, "npm install");
+    s.click("workflow-script-add");
+    let second = fields(&s)[1].clone();
+    s.type_into(second, "npm run dev -- --port $((3000 + $SLOT)) &");
+    s.click("workflow-script-add");
+    let third = fields(&s)[2].clone();
+    s.type_into(third, "echo third");
+    assert_eq!(s.draft().transitions.unwrap()[0].run, ["npm install", "npm run dev -- --port $((3000 + $SLOT)) &", "echo third"]);
+    // Reordered by a handle, one removed.
+    s.drag_action("workflow-script-command", 2, 0);
+    s.click("workflow-script-command-2-remove");
+    assert_eq!(s.draft().transitions.unwrap()[0].run, ["echo third", "npm install"]);
+    let ready = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).script_timeout_field().unwrap(),
+        _ => unreachable!(),
+    });
+    s.type_into(ready, "45");
+
+    // The chip sits after the git actions, and + no longer offers another.
+    let x = |s: &mut Settings, selector: &'static str| s.bounds(selector).unwrap().origin.x;
+    assert!(x(&mut s, "workflow-script-0") > x(&mut s, "workflow-action-0-1"));
+    s.click("workflow-add-action-0");
+    assert!(!s.drawn("workflow-add-action-0-run-script"), "one per transition");
+    s.click("workflow-add-action-0");
+
+    s.click("workflow-editor-save");
+    s.saved();
+    let t = on_disk("task").transitions.unwrap()[0].clone();
+    assert_eq!(t.run, ["echo third", "npm install"]);
+    assert_eq!(t.ready_timeout, Some(std::time::Duration::from_secs(45)));
+    use shelbi_core::TransitionAction::*;
+    assert_eq!(t.actions, [PushBranch, OpenPr], "no YAML action for it");
+
+    // Opened again: the chip with its commands; Remove clears all three.
+    s.click("workflow-script-done");
+    s.click("workflow-script-0");
+    s.click("workflow-script-0-edit");
+    let open = fields(&s);
+    let values: Vec<String> = s.read(|_, cx| open.iter().map(|f| f.read(cx).value().to_string()).collect());
+    assert_eq!(values, ["echo third", "npm install"]);
+    s.click("workflow-script-0");
+    s.click("workflow-script-0-remove");
+    assert!(!s.drawn("workflow-script") && !s.drawn("workflow-script-0"));
+    s.click("workflow-editor-save");
+    s.saved();
+    let t = on_disk("task").transitions.unwrap()[0].clone();
+    assert!(t.run.is_empty() && t.ready.is_none() && t.ready_timeout.is_none());
+}
+
+#[gpui::test]
+fn the_builders_transition_panel_has_run_script_last(cx: &mut TestAppContext) {
+    let _home = Home::with_project("bu-run-script", "alpha");
+    let mut s = Settings::open_builder(cx, "task");
+    s.click("builder-edge-label-1");
+    assert!(!s.drawn("builder-script-row"));
+    s.click("builder-add-action");
+    s.click("builder-add-action-run-script");
+    assert!(s.drawn("builder-script-row") && s.drawn("workflow-script"));
+    let first = s.read(|w, cx| match &w.route {
+        Route::Settings(view) => view.read(cx).editor().unwrap().read(cx).script_command_fields()[0].clone(),
+        _ => unreachable!(),
+    });
+    s.type_into(first, "make serve &");
+    assert_eq!(s.draft().transitions.unwrap()[1].run, ["make serve &"]);
+    let y = |s: &mut Settings, selector: &'static str| s.bounds(selector).unwrap().origin.y;
+    assert!(y(&mut s, "builder-script-row") > y(&mut s, "builder-action-1-1-row"), "after the actions");
+    s.click("builder-script-remove");
+    assert!(!s.drawn("builder-script-row"));
+    assert!(s.draft().transitions.unwrap()[1].run.is_empty());
 }
 
 #[gpui::test]

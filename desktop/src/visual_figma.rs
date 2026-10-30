@@ -1715,7 +1715,7 @@ impl Run {
     /// transition's Details open with a refused timeout, the leave prompt,
     /// and the form's foot with Review running the branch.
     fn workflow_form(&mut self) {
-        use crate::views::workflow_editor_state::{Change, DetailsForm};
+        use crate::views::workflow_editor_state::{Change, ScriptForm};
         self.height = FORM_HEIGHT;
         let open = |run: &mut Run| {
             let handle = run.open_workflow_editor("task");
@@ -1735,9 +1735,9 @@ impl Run {
         edit(self, handle, &|e, window, cx| {
             e.make(Change::Owner { id: "backlog".into(), owner: shelbi_core::Owner::Agent }, window, cx);
             e.make(
-                Change::Details {
+                Change::Script {
                     index: 0,
-                    form: DetailsForm { ready_timeout: "soon".into(), ..DetailsForm::default() },
+                    form: ScriptForm { ready_timeout: "soon".into(), ..ScriptForm::default() },
                 },
                 window,
                 cx,

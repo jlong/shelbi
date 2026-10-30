@@ -39,7 +39,11 @@ project's workflows and its [status catalog](/docs/configuration/statuses).
 From there you can create, duplicate, rename, and delete a workflow, pick the
 project's default, and open one in an editor: a form plus a graph builder for
 its statuses (owner, agent, tags), `initial_status`, transitions (actions,
-`target`, `run`, `ready`, `url`), `git`, `required_params`, and `review:`.
+`target`, `url`), `git`, `required_params`, and `review:`. A transition's
+[`run`, `ready`, and `ready_timeout`](#run-ready-and-teardown) show as a
+**Run script** action, always last in its Actions since it runs after the git
+actions: pick it from Add action to enter its commands one per row, in order,
+with an optional ready check and timeout. Removing it removes all three keys.
 Saves go through a patch that keeps comments and unknown keys, and Edit YAML
 opens the file itself. If a file changed on disk since the page read it,
 nothing is written.

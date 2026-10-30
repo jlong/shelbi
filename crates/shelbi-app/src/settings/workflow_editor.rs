@@ -35,8 +35,12 @@
 //!   checks, CI timeout and danger paths stay in the YAML); choosing Use
 //!   project settings removes it.
 //! - **Required task fields** is `required_params:`, and a transition's
-//!   **Details** are its `target`, `run`, `ready`, `ready_timeout` and
-//!   `url`.
+//!   **Details** are its `target` and `url`.
+//! - **Run script** is a transition's `run`, `ready` and `ready_timeout`:
+//!   not a `TransitionAction` but an action of the editor's, drawn last in
+//!   the Actions row (`run` runs after the git actions). The row shows it
+//!   while the transition sets any of the three ([`EditorState::has_script`]),
+//!   the add menu offers it otherwise; Remove clears all three.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,7 +61,15 @@ pub const ALL_STATUSES_ADDED: &str =
 pub const TAGS_PLACEHOLDER: &str = "Any workspace";
 pub const TRANSITIONS_HELP: &str =
     "Run these actions in order when a task moves between statuses. Other moves have no actions.";
-pub const RUN_HELP: &str = "Commands run in order, in the task’s worktree, after the actions.";
+/// Run script: its name in the Actions row and the add menu, its help, a
+/// command's placeholder, and its Ready fields' labels and placeholders.
+pub const RUN_SCRIPT: &str = "Run script";
+pub const RUN_HELP: &str = "Commands run in order, in the task’s worktree, after the other actions. \
+     The task must be assigned to a workspace: on an unassigned task the move fails.";
+pub const RUN_PLACEHOLDER: &str = "A shell command";
+pub const ADD_COMMAND: &str = "Add command";
+pub const SCRIPT_READY: (&str, &str) = ("Ready check", "Polled until it exits 0");
+pub const SCRIPT_TIMEOUT: (&str, &str) = ("Ready timeout (seconds)", "90");
 pub const GIT_HELP: &str = "Use these settings when creating and merging branches for this workflow.";
 pub const PARAMS_HELP: &str = "Require these fields before a task can use this workflow.";
 pub const ZEN_PROJECT_HELP: &str = "Inherit checks, CI timeout, and protected paths from this project.";
@@ -68,11 +80,8 @@ pub fn zen_custom_help(what: &str) -> String {
     format!("This workflow sets its own {what} in its YAML file.")
 }
 
-/// A Details field's label and placeholder, in the panel's order (Run, its
-/// own list, sits between Target branch and Ready check).
+/// A Details field's label and placeholder, in the panel's order.
 pub const DETAILS_TARGET: (&str, &str) = ("Target branch", "The workflow’s base branch");
-pub const DETAILS_READY: (&str, &str) = ("Ready check", "Polled until it exits 0");
-pub const DETAILS_TIMEOUT: (&str, &str) = ("Ready timeout (seconds)", "90");
 pub const DETAILS_URL: (&str, &str) = ("URL", "http://localhost:$PORT");
 
 /// The Run the branch fields' labels and placeholders, in [`ReviewForm`]'s
@@ -237,14 +246,10 @@ impl ReviewForm {
     }
 }
 
-/// A transition's Details, as typed: its `run` commands one per line, its
-/// `ready_timeout` in seconds.
+/// A transition's Details, as typed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetailsForm {
     pub target: String,
-    pub run: String,
-    pub ready: String,
-    pub ready_timeout: String,
     pub url: String,
 }
 
@@ -252,14 +257,45 @@ impl DetailsForm {
     pub fn of(t: &Transition) -> DetailsForm {
         DetailsForm {
             target: t.target.clone().unwrap_or_default(),
-            run: t.run.join("\n"),
-            ready: t.ready.clone().unwrap_or_default(),
-            ready_timeout: t.ready_timeout.map(|d| d.as_secs().to_string()).unwrap_or_default(),
             url: t.url.clone().unwrap_or_default(),
         }
     }
 
     /// `t` with these details.
+    fn apply(&self, t: &Transition) -> Transition {
+        Transition {
+            target: non_empty(&self.target),
+            url: non_empty(&self.url),
+            ..t.clone()
+        }
+    }
+}
+
+/// A transition's Run script, as typed: its `run` commands, one per row in
+/// order (a blank row is dropped), and its `ready_timeout` in seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptForm {
+    pub run: Vec<String>,
+    pub ready: String,
+    pub ready_timeout: String,
+}
+
+impl ScriptForm {
+    pub fn of(t: &Transition) -> ScriptForm {
+        ScriptForm {
+            run: t.run.clone(),
+            ready: t.ready.clone().unwrap_or_default(),
+            ready_timeout: t.ready_timeout.map(|d| d.as_secs().to_string()).unwrap_or_default(),
+        }
+    }
+
+    /// What Run script opens on when the add menu picks it: one empty
+    /// command to type.
+    pub fn blank() -> ScriptForm {
+        ScriptForm { run: vec![String::new()], ..ScriptForm::default() }
+    }
+
+    /// `t` with this script.
     fn apply(&self, t: &Transition) -> Result<Transition, String> {
         let ready_timeout = match self.ready_timeout.trim() {
             "" => None,
@@ -269,11 +305,9 @@ impl DetailsForm {
             )),
         };
         Ok(Transition {
-            target: non_empty(&self.target),
-            run: self.run.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+            run: self.run.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).map(str::to_string).collect(),
             ready: non_empty(&self.ready),
             ready_timeout,
-            url: non_empty(&self.url),
             ..t.clone()
         })
     }
@@ -297,6 +331,8 @@ pub struct TextForm {
     pub tags: Vec<(String, String)>,
     /// The open Details panel: its transition and its fields.
     pub details: Option<(usize, DetailsForm)>,
+    /// The open Run script editor: its transition and its fields.
+    pub script: Option<(usize, ScriptForm)>,
 }
 
 /// The Git fields, as typed.
@@ -380,6 +416,10 @@ pub enum Change {
     /// Move transition `index`'s action at `slot` to `to`.
     MoveAction { index: usize, slot: usize, to: usize },
     Details { index: usize, form: DetailsForm },
+    /// Transition `index`'s Run script (`run`, `ready`, `ready_timeout`).
+    Script { index: usize, form: ScriptForm },
+    /// Remove transition `index`'s Run script: all three keys.
+    RemoveScript(usize),
     Git(GitForm),
     ReviewMode(ReviewMode),
     Review(ReviewForm),
@@ -410,7 +450,9 @@ impl Change {
             | Change::SetAction { index, .. }
             | Change::RemoveAction { index, .. }
             | Change::MoveAction { index, .. }
-            | Change::Details { index, .. } => Field::Transition(*index),
+            | Change::Details { index, .. }
+            | Change::Script { index, .. }
+            | Change::RemoveScript(index) => Field::Transition(*index),
             Change::Git(_) => Field::Git,
             Change::ReviewMode(_) | Change::Review(_) => Field::Review,
             Change::RequiredParams(_) => Field::RequiredParams,
@@ -696,6 +738,16 @@ impl EditorState {
         self.transitions().get(index).is_some_and(|t| DetailsForm::of(t) != DetailsForm::default())
     }
 
+    pub fn script_form(&self, index: usize) -> ScriptForm {
+        self.transitions().get(index).map(ScriptForm::of).unwrap_or_default()
+    }
+
+    /// Whether transition `index` has a Run script: its Actions row shows
+    /// one (last), and the add menu doesn't offer another.
+    pub fn has_script(&self, index: usize) -> bool {
+        self.transitions().get(index).is_some_and(|t| ScriptForm::of(t) != ScriptForm::default())
+    }
+
     /// The Zen settings picker's choice: `None` inherits the project's,
     /// else what the workflow's `zen:` overrides.
     pub fn zen_override(&self) -> Option<String> {
@@ -808,8 +860,19 @@ impl EditorState {
             }
             Change::Details { index, form } => {
                 let t = self.transitions().get(*index).ok_or("No such transition.")?;
+                c.update_transition(w, *index, form.apply(t))
+            }
+            Change::Script { index, form } => {
+                let t = self.transitions().get(*index).ok_or("No such transition.")?;
                 let t = form.apply(t)?;
                 c.update_transition(w, *index, t)
+            }
+            Change::RemoveScript(index) => {
+                return self.edit_transition(*index, |t| {
+                    t.run.clear();
+                    t.ready = None;
+                    t.ready_timeout = None;
+                })
             }
             Change::Git(form) => c.set_git(w, self.git_from(form)),
             Change::ReviewMode(_) | Change::Review(_) => {
@@ -917,9 +980,10 @@ impl EditorState {
     }
 
     /// The text fields' values from the draft, with transition `details`'s
-    /// Details open: what a client puts in its fields when it shows the
-    /// draft (and again after a save, a discard or a reload).
-    pub fn text_form(&self, details: Option<usize>) -> TextForm {
+    /// Details and transition `script`'s Run script open: what a client puts
+    /// in its fields when it shows the draft (and again after a save, a
+    /// discard or a reload).
+    pub fn text_form(&self, details: Option<usize>, script: Option<usize>) -> TextForm {
         let w = self.workflow();
         let git = self.git_form();
         TextForm {
@@ -930,6 +994,7 @@ impl EditorState {
             review: self.review_form.clone(),
             tags: w.statuses.iter().map(|s| (s.id.clone(), self.tags_text(&s.id))).collect(),
             details: details.filter(|i| *i < self.transitions().len()).map(|i| (i, self.details_form(i))),
+            script: script.filter(|i| *i < self.transitions().len()).map(|i| (i, self.script_form(i))),
         }
     }
 
@@ -954,6 +1019,9 @@ impl EditorState {
         }
         if let Some((index, details)) = &form.details {
             out.push(Change::Details { index: *index, form: details.clone() });
+        }
+        if let Some((index, script)) = &form.script {
+            out.push(Change::Script { index: *index, form: script.clone() });
         }
         out
     }
@@ -981,7 +1049,9 @@ impl EditorState {
         match change {
             Change::Description(text) => w.description.as_deref().unwrap_or("") != text.trim(),
             Change::Tags { id, text } => self.status(id).is_some_and(|s| s.tags != split_list(text)),
-            Change::Details { index, form } => self.transitions().get(*index).map(DetailsForm::of).as_ref() != Some(form),
+            Change::Details { index, form } => self.transitions().get(*index).is_some_and(|t| form.apply(t) != *t),
+            // A refused script differs: making it shows why.
+            Change::Script { index, form } => self.transitions().get(*index).is_some_and(|t| form.apply(t).as_ref() != Ok(t)),
             Change::Git(form) => self.git_form() != *form,
             Change::Review(form) => self.review_form != *form,
             Change::RequiredParams(text) => w.required_params != split_list(text),

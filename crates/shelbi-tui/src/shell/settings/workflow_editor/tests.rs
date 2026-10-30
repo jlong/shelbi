@@ -216,18 +216,40 @@ fn an_edit_in_every_section_by_keys_alone_waits_for_save() {
     press(&mut ed, key(KeyCode::Enter));
     typed(&mut ed, "develop");
     press(&mut ed, key(KeyCode::Down));
-    assert_eq!(ed.cursor_item(), Some(Item::AddRun), "↓ stops typing and moves");
+    assert_eq!(ed.cursor_item(), Some(Item::Text(Text::Url)), "↓ stops typing and moves");
+    // Its Run script: the add menu offers it after the git actions, and
+    // opens its editor typing a first command.
+    assert!(!ed.items().contains(&Item::Script(0)));
+    go(&mut ed, Item::AddAction(0));
     press(&mut ed, key(KeyCode::Enter));
+    pick(&mut ed, "Run script");
+    assert_eq!(ed.cursor_item(), Some(Item::Text(Text::Run(0))));
     typed(&mut ed, "npm ci");
     press(&mut ed, key(KeyCode::Enter));
     press(&mut ed, key(KeyCode::Char('n')));
     typed(&mut ed, "npm test");
     press(&mut ed, key(KeyCode::Enter));
     press(&mut ed, shift(KeyCode::Up));
+    assert_eq!(ed.cursor_item(), Some(Item::Text(Text::Run(0))), "the cursor follows the command");
     go(&mut ed, Item::Text(Text::Timeout));
     press(&mut ed, key(KeyCode::Enter));
     typed(&mut ed, "45");
     press(&mut ed, key(KeyCode::Enter));
+    go(&mut ed, Item::CloseScript);
+    press(&mut ed, key(KeyCode::Enter));
+    assert_eq!(ed.cursor_item(), Some(Item::Script(0)), "Done lands on the Run script row");
+    let items = ed.items();
+    let at = |it: &Item| items.iter().position(|i| i == it).unwrap();
+    assert!(at(&Item::Action(0, 0)) < at(&Item::Script(0)), "after the git actions");
+    // Its menu: Edit and Remove; the add menu no longer offers a second.
+    press(&mut ed, key(KeyCode::Enter));
+    assert_eq!(ed.modal_title().as_deref(), Some("Run script"));
+    press(&mut ed, key(KeyCode::Esc));
+    go(&mut ed, Item::AddAction(0));
+    press(&mut ed, key(KeyCode::Enter));
+    let Some(Modal::List { choices, .. }) = ed.modal.clone() else { panic!("no add menu") };
+    assert!(choices.iter().all(|c| c.label != "Run script"), "one per transition");
+    press(&mut ed, key(KeyCode::Esc));
 
     // Git: the base branch and the strategy.
     go(&mut ed, Item::Text(Text::BaseBranch));
@@ -289,8 +311,10 @@ fn refused_text_stays_in_view_with_its_error_until_corrected() {
     let home = Home::new("ed-refused");
     let before = home.read("task.yaml");
     let mut ed = editor("task");
-    go(&mut ed, Item::Details(1));
+    go(&mut ed, Item::AddAction(1));
     press(&mut ed, key(KeyCode::Enter));
+    pick(&mut ed, "Run script");
+    press(&mut ed, key(KeyCode::Esc));
     go(&mut ed, Item::Text(Text::Timeout));
     press(&mut ed, key(KeyCode::Enter));
     typed(&mut ed, "soon");
