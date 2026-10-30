@@ -16,42 +16,47 @@ only thing that changes is who initiates.
 
 ## Turning it on
 
-Three ways to flip the switch:
+Ways to flip the switch:
 
 - **CLI**: `shelbi zen on`, `shelbi zen off`, `shelbi zen pause`.
-- **TUI**: `Alt+Z` toggles between On and Off from any sidebar focus.
+- **Hotkey**: `Alt+Z` in the TUI (⌥Z in the desktop app) toggles between
+  On and Off.
+- **Palette / menu**: **Turn Zen Mode on** in the command palette, or the
+  desktop app's **Turn Zen Mode On** menu item.
 - **Status check**: `shelbi zen status` prints the current mode,
-  configured local checks, resolved danger paths, the last crash
-  timestamp (if any), and the count of in-flight Zen issues.
+  configured local checks, resolved danger paths, the last orchestrator
+  crash (if any), and the count of in-flight Zen issues.
 
-When Zen is **on**, the sidebar shows a green **ZEN ON** pill anchored
-to the bottom of the workspaces column. That pill is the at-a-glance
-"the agent is in lead mode" signal. If it's not there, Zen is off or
-paused.
+The first time you turn Zen on from the TUI or the desktop app, Shelbi
+shows an **Enable Zen Mode?** dialog explaining what Zen does (Cancel /
+Enable, with a "Don't show this again" box).
 
-### First-run hotkey probe
+When Zen is **on**, the sidebar shows a green **ZEN MODE ON** band on its
+bottom row, below the toolbar (desktop: a green "Zen mode on" band). That
+band is the at-a-glance "the agent is in lead mode" signal. If it's not
+there, Zen is off or paused.
 
-Some terminals (notably macOS Terminal.app, where Option/Alt types
-accented characters) swallow `Alt+Z`. The first time you launch the
-sidebar, Shelbi runs a tiny probe: it shows a centered overlay and
-waits a few seconds for `Alt+Z`. If it arrives, the binding is saved
-and you never see the prompt again. If it doesn't, a chooser pops up
-with three fallback chords:
+### Rebinding the hotkey
 
-- `Ctrl+\`
-- `Ctrl+G`
-- `Ctrl+Shift+Z`
+The toggle is the ordinary keybinding `global.zen_toggle`, bound to
+`Alt+Z` by default. Some terminals (notably macOS Terminal.app, where
+Option/Alt types accented characters) swallow `Alt+Z`. If yours does,
+rebind it in Settings ▸ Keybindings, or set
+`defaults.global.zen_toggle` in `~/.shelbi/keys.yaml`:
 
-…plus a "skip" option that leaves the toggle unbound (use the CLI
-instead). Your pick is persisted to `~/.shelbi/config.yaml` (a later
-one-shot migration copies it into `~/.shelbi/keys.yaml`); this is a
-different file from `~/.shelbi/shelbi.yaml`, the hub project index.
+```yaml
+defaults:
+  global:
+    zen_toggle: ctrl-g
+```
+
+You can always use `shelbi zen on|off` or the palette instead.
 
 ## Turning it off
 
 Three levels of "stop":
 
-- **`shelbi zen off`** (or `Alt+Z` toggle): hard off. No new
+- **`shelbi zen off`** (or the `Alt+Z` toggle): hard off. No new
   auto-promotions, and the orchestrator stops initiating the merge
   bar on any `merge`-action transition. Anything already mid-flight
   in the conditions flow runs to completion on its current trajectory.
@@ -65,21 +70,19 @@ Three levels of "stop":
 
 ### Crash recovery
 
-<Callout type="warning" title="A crash disables Zen — on purpose">
+<Callout type="warning" title="A crash does not turn Zen off">
 
-If the orchestrator pane dies mid-session (kill signal, SIGHUP,
-machine power loss), Zen Mode auto-disables on the next orchestrator
-start. The wrapper script around the orchestrator runner writes a
-heartbeat every 60s; if the previous run ended without a graceful
-exit and Zen was on, the next start flips it off, writes a
-`zen=off reason=crash-recovery` event line, and prints a stderr
-warning so you see it immediately.
+Zen Mode is not currently auto-disabled when the orchestrator crashes.
+The daemon relaunches a crashed orchestrator session and Zen stays in
+its current mode. Run `shelbi zen off` if you want it off while you
+review in-flight work.
 
 </Callout>
 
-Re-enable manually with `shelbi zen on` once you've reviewed any
-in-flight work. The orchestrator's bootstrap also scans recent event
-lines for this pattern and calls it out in its first reply.
+The orchestrator's bootstrap still scans recent event lines for a
+`zen=off reason=crash-recovery` line and calls it out in its first reply,
+but current versions of Shelbi no longer write that line; you'll only see
+it in logs from older releases.
 
 ## The `zenmode.md` file
 
@@ -159,8 +162,13 @@ leaves handoffs for you.
 
 The mechanical eligibility scan (`shelbi zen scan`) hands the orchestrator
 `backlog`-category issue ids that are safe from a state-machine standpoint: not
-blocked, not opt-out, no file overlap with anything in flight. From that list,
-**only auto-promote** a candidate if **at least one** of these is true:
+blocked, not opt-out, no file overlap with anything in flight. On an external
+issue tracker (e.g. `github`) the scan **also already excludes any issue not
+assigned to you** (the account Shelbi is authenticated as), so an outside
+contributor's bug report or someone else's issue never reaches this list, and if
+that login can't be resolved the scan returns nothing rather than guessing. You
+don't need to re-check ownership; trust the list. From it, **only auto-promote**
+a candidate if **at least one** of these is true:
 
 1. **It's the kind of work the user generally trusts you with.** Look at the
    `done`-category column. Does the user routinely accept issues of this shape
@@ -268,10 +276,16 @@ the workflow.
    Any identity movement fails closed; never recompute or substitute a probe
    field after CI begins.
 8. If green, finalize by moving the issue to `done` — the transition merges:
-   `shelbi issue move <task-id> --to done --reason "orchestrator:zen-merge
-   ci-green(<pr-number>)"`. The `review -> done` transition squash-merges into
-   `<base_branch>` and deletes the branch — this is the only merge. Do **not**
-   run `zen pr-merge` here.
+   `shelbi issue move <task-id> --to done --reason "orchestrator:zen-merge pr=<pr-number>"`.
+   Keep the reason on one line and use the `pr=<pr-number>` kv token exactly —
+   the event log folds spaces into underscores, and the activity feed reads
+   `pr=` back out of that normalized form to render the merge badge. The
+   `review -> done` transition squash-merges into `<base_branch>` and deletes
+   the branch — this is the only merge. Do **not** run `zen pr-merge` here.
+   Once the move lands, add the Changelog entry the orchestrator instructions'
+   `## Changelog` rule describes: `shelbi changelog add --author orchestrator
+   --title "<what shipped>" --issue <task-id> --pr <pr-number> -d "<what changed
+   and why it matters>"`.
 9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 
@@ -352,7 +366,7 @@ Give the status `owner: agent` and `agent: qa` (or `adversarial-review`), with
 a pass edge forward and a plain bounce edge back to `in-progress`:
 
 ```yaml
-# workflows/default.yaml
+# workflows/task.yaml
 statuses:
   - { id: in-progress,   owner: agent, agent: developer }
   - { id: qa-review,     owner: agent, agent: qa }        # the gate
@@ -435,12 +449,11 @@ Zen Mode does exactly two things the default scheduler doesn't:
 2. **Auto-promote**: when a workspace frees up, Zen scans the backlog
    for issues that are *mechanically eligible* (see
    [`shelbi zen scan`](/docs/cli/zen#scan)) and then applies the
-   **judgment categories** from the orchestrator's prompt to decide
-   which ones to promote into todo.
+   **judgment categories** in `zenmode.md` to decide which ones to
+   promote into todo.
 
-The mechanical layer is in Rust. The judgment layer is in the
-orchestrator's prompt, which means **you own it** and can tune it
-per project. That's the most important point on this page.
+The mechanical layer is in Rust. The judgment layer is in
+`zenmode.md`, which means **you own it** and can tune it per project. That's the most important point on this page.
 
 ## The high-confidence bar
 
@@ -477,13 +490,15 @@ The conditions, in order:
    workflow's resolved `base_branch`, or a per-transition `target:` if
    one is set).
 3. **Diff size within bounds**: by default `files ≤ 30` and
-   `lines_added + lines_removed ≤ 2000`. Tunable in the prompt.
+   `lines_added + lines_removed ≤ 2000`. Tunable in `zenmode.md`.
 4. **No danger-path matches**: anything matching the resolved
    danger-paths list (built-ins + detected shape + project
    `zen.danger_paths.extend` + the active workflow's `zen.danger_paths`
    override, if any) bails out.
 5. **PR opens cleanly** via
-   `shelbi zen pr-create <id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`. All six values are copied directly from the probe report. The PR is returned
+   `shelbi zen pr-create <id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`. All six values are copied directly from the probe report.
+   When the probe rebased the branch, also pass
+   `--match-published-head-commit <published_head_sha>`. The PR is returned
    only after its remote identity matches the exact repository, resolved
    workflow base name and commit, issue branch, reviewed head, and prebuilt
    integration commit. The PR head is the integration commit so CI runs on
@@ -497,7 +512,8 @@ The conditions, in order:
    check, while an optional failed check does not override passing required
    checks. The
    `--task` flag resolves the timeout against the issue's workflow
-   (`zen.ci_timeout` override, then project default of `15m`); plain
+   (`zen.ci_timeout` override, then the project's `zen.ci_timeout`, default
+   900 seconds); plain
    `--timeout <duration>` still overrides explicitly. Anything red or
    a timeout bails. Each poll compares against the frozen probe identity
    and grades only that atomic snapshot, so persistent movement and a brief
@@ -505,9 +521,10 @@ The conditions, in order:
    that would require pagination also fails closed.
 7. **Landing.** With CI green, the orchestrator finalizes by moving the issue
    to the transition's `to` status (`shelbi issue move <id> --to done`). That
-   move runs the transition's own `merge` action — a squash into the resolved
-   `base_branch`, via `gh pr merge` when a PR is open — which is the single
-   merge. The exact-provenance `shelbi zen pr-merge` primitive (sole parent
+   move runs the transition's own `merge` action (a squash into the resolved
+   `base_branch`, via `gh pr merge` when a PR is open), which is the single
+   merge. The default policy then adds a changelog entry with
+   `shelbi changelog add`. The exact-provenance `shelbi zen pr-merge` primitive (sole parent
    `base_sha`, exact `head_sha` tree, a `--force-with-lease` advance of
    `refs/heads/<base_branch>` that fails closed on protected branches, forks,
    merge queues, and non-squash strategies) is reserved for release PRs (version
@@ -522,7 +539,7 @@ that identity continuously. A
 workflow, origin, base, or head change requires a fresh probe and a new flow.
 
 Each step uses a single-purpose CLI primitive. The Rust side does
-mechanical I/O; the orchestrator's prompt holds the policy. That
+mechanical I/O; `zenmode.md` holds the policy. That
 separation is what lets you raise/lower the bar by editing prose
 instead of recompiling.
 
@@ -535,7 +552,7 @@ zen:
     local:
       - 'cargo test --workspace'
       - 'cargo clippy --workspace --all-targets -- -D warnings'
-  ci_timeout: 15m
+  ci_timeout: 900   # seconds (15m)
   danger_paths:
     extend:
       - 'site/public/install.sh'
@@ -553,7 +570,7 @@ checks without restating the rest.
 ```yaml
 # ~/.shelbi/projects/<project>/workflows/research.yaml
 name: research
-description: Long-running investigations — no code-style checks, longer CI.
+description: Long-running investigations, no code-style checks, longer CI.
 
 # References statuses by id from statuses.yaml (drafting is declared there
 # with name: Drafting, category: active).
@@ -566,7 +583,7 @@ zen:
   checks:
     local:
       - 'pytest -k research'
-  ci_timeout: 3600           # seconds — 1h, vs the project's 15m
+  ci_timeout: 3600           # seconds: 1h, vs the project's 15m
   danger_paths:
     override:
       - 'fixtures/**'
@@ -575,7 +592,7 @@ zen:
 Why this exists: a `research:` workflow doesn't want the project's
 `cargo clippy -D warnings` gate, and an integration-test-heavy
 workflow may legitimately need an hour of CI. Pinning those to the
-*workflow* rather than the project lets one project's `default`
+*workflow* rather than the project lets one project's `task`
 workflow stay strict while another workflow in the same project runs
 on relaxed rules.
 
@@ -606,11 +623,13 @@ orchestrator should promote on its own in the first place.
 The Rust side (`shelbi zen scan`) gives the orchestrator a list of
 backlog ids that are *mechanically* safe: not blocked on
 dependencies, not explicitly opted out, no file overlap with anything
-currently in flight. That list is intentionally generous. It doesn't
+currently in flight, and, on a remote tracker such as GitHub, assigned to
+you (the authenticated account); an unresolved login yields an empty list.
+That list is intentionally generous. It doesn't
 know what the user wants.
 
-The orchestrator's prompt then applies three judgment categories
-that ship as the default. A candidate gets promoted only if **at
+The orchestrator then applies the judgment categories in `zenmode.md`.
+Three ship as the default. A candidate gets promoted only if **at
 least one** is true:
 
 1. **It's the kind of work the user generally trusts you with.**
@@ -631,9 +650,9 @@ activity feed shows what was considered and why.
 ## Per-status automation is declarative
 
 Zen's *judgment* (which backlog items are in scope, where the confidence
-bar sits) is prompt prose, covered below. But the more basic question of
+bar sits) is prose in `zenmode.md`, covered above. But the more basic question of
 **which statuses the orchestrator is allowed to act on, and which agent it
-uses**, is not prompt prose at all. It's the
+uses**, is not prose at all. It's the
 [`owner` and `agent` fields](/docs/guides/getting-started/workflows#owners-and-agents) on
 each workflow status.
 
@@ -649,9 +668,9 @@ Two examples:
   the final accept. Which agent reviews is data, not a prompt instruction.
 
 Flipping Zen on/off still gates whether the orchestrator *exercises* this
-autonomy at all. But once Zen is on, the workflow YAML (not the prompt)
+autonomy at all. But once Zen is on, the workflow YAML (not `zenmode.md`)
 decides per status whether the orchestrator acts and which agent it loads.
-The prompt holds only the genuinely judgment-shaped policy: scope
+`zenmode.md` holds only the genuinely judgment-shaped policy: scope
 and the confidence bar. See
 [owners and agents](/docs/guides/getting-started/workflows#owners-and-agents) for the
 field semantics and the four validation rules.
@@ -701,8 +720,9 @@ zen:
 Resolution rules:
 
 - `enabled: false` keeps the issue on the manual-review path even
-  with Zen on; `enabled: true` opts an issue in even when Zen is off
-  (rare but supported).
+  with Zen on. (`enabled: true` is accepted but only affects the
+  in-flight count in `shelbi zen status`; it does not make the
+  orchestrator act on the issue while Zen is off.)
 - `checks_only` takes precedence over `checks_additional`. If both
   are set, `checks_only` wins and `checks_additional` is ignored.
 - `checks_additional` extends whichever list the workflow layer
@@ -729,15 +749,14 @@ zen:
       - 'cargo test --workspace'
       - 'cargo clippy --workspace --all-targets'
 
-  # How long to wait for required GitHub checks. Accepts seconds as
-  # a bare integer, or a string like `30s`, `5m`, `2h`, `1d`.
-  # Default: 15m.
-  ci_timeout: 15m
+  # How long to wait for required GitHub checks, in seconds (a bare
+  # integer; strings like `15m` are rejected). Default: 900 (15m).
+  ci_timeout: 900
 
   # Glob patterns considered too sensitive to auto-merge. Choose
   # one of `extend:` (keep built-ins + detected-shape paths and add
   # yours) or `override:` (replace everything with your list).
-  # Default: an empty `extend:` — built-ins + detected shape only.
+  # Default: an empty `extend:` (built-ins + detected shape only).
   danger_paths:
     extend:
       - 'site/public/install.sh'
@@ -775,19 +794,22 @@ with the resolved per-workflow values printed underneath.
 
 ## The activity feed
 
-Zen-driven events get distinct visual treatment in the sidebar's
-activity feed: a small **ZEN** avatar badge in the same column the
-per-workspace avatars use, and a subtle dark-tinted row background so
-machine-driven actions are visually separable from user actions in
-the same stream.
+Zen-driven events in the Activity feed show a dim `[zen]` chip in the
+identity column (where workspace chips like `[alpha]` go), so
+machine-driven actions are visually separable from user actions in the
+same stream.
 
-The reason strings the feed recognizes (most render with their own
-specific phrasing; the exception is called out below):
+The Zen reason strings the orchestrator writes are below. On disk, the
+event log folds spaces in a reason into `_` (for example
+`orchestrator:zen-promote_category=2`). The feed gives
+`orchestrator:zen-merge` its own merge phrasing (reading the PR from
+`pr=<n>`); the other reasons currently render as a generic move with the
+`[zen]` chip.
 
 | Reason | Meaning |
 | --- | --- |
 | `orchestrator:zen-promote category=<n>` | Promoted a backlog issue to todo under judgment category `<n>`. |
-| `orchestrator:zen-decline reason-text=<short>` | Considered a candidate, decided not to promote. Still gets the ZEN badge and tinted row, but has no dedicated phrasing: it renders generically as a move and does not surface `reason-text`. |
+| `orchestrator:zen-decline reason-text=<short>` | Considered a candidate, decided not to promote. |
 | `orchestrator:zen-merge pr=<n>` | Auto-merged a reviewed issue to `main`. |
 | `zen:failed-checks cmd=<…> exit=<…>` | Local check failed; issue stays in review. |
 | `zen:diff-too-large files=<…> lines=<…>` | Diff exceeded the size threshold. |
@@ -809,21 +831,21 @@ board is quiescent).
 
 ## See also
 
-- [Project config](/docs/configuration/project#zen) — the `zen:` block's
+- [Project config](/docs/configuration/project#zen): the `zen:` block's
   field reference (`checks.local`, `ci_timeout`, `danger_paths`).
-- [`shelbi zen`](/docs/cli/zen) — CLI reference for every Zen
+- [`shelbi zen`](/docs/cli/zen): CLI reference for every Zen
   subcommand.
-- [Workflows](/docs/guides/getting-started/workflows) — how a workflow's
+- [Workflows](/docs/guides/getting-started/workflows): how a workflow's
   `transitions:` declares which edges fire the merge bar, and where
   the per-workflow `zen:` override block lives.
-- [Orchestrator](/docs/concepts/orchestrator) — how the
+- [Orchestrator](/docs/concepts/orchestrator): how the
   underlying scheduler is wired and where the prompt template lives.
-- [The events log](/docs/concepts/events-log) — the canonical
+- [The events log](/docs/concepts/events-log): the canonical
   format of the `mode=zen` and `orchestrator:zen-*` lines Zen emits.
 - [GitHub Issues backend](/docs/concepts/github-issues#github-assignees-and-zen-mode):
   on a GitHub-backed board, Zen only auto-promotes backlog issues assigned to
   the authenticated user; assign yourself to make an outside issue eligible.
-- [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
-  — what `Review` and `Done` mean in the default flow Zen accelerates,
+- [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses):
+  what `Review` and `Done` mean in the default flow Zen accelerates,
   and how custom workflows declare their own `handoff` and `done`
   statuses.

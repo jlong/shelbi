@@ -25,14 +25,14 @@ five concurrent slots, no more, no less.
 The pool lives in the sidebar, grouped by machine. Busy slots show the agent
 they're running; idle ones wait for work:
 
-<AppMockup terminalTitle="jlong@hub — shelbi" />
+<AppMockup />
 
 ## Workspace vs. agent: capacity vs. role
 
 The single most important distinction on this page: a workspace is **where**
 work runs; an [agent](/docs/concepts/agents) is **who** does it.
 
-- A **workspace** is a machine + pane + worktree. It's interchangeable
+- A **workspace** is a machine + Shelbi session + worktree. It's interchangeable
   capacity. `bravo` is just as good as `alpha` for any issue that fits its
   machine.
 - An **agent** is a system prompt + skill set: the `developer`, `qa`, or
@@ -68,11 +68,12 @@ slots* the orchestrator routes work to. That gives you:
   the parallelism cap; the orchestrator can't accidentally outrun your RAM
   by spawning more.
 
-The wizard sizes the pool from total RAM (~10 GB per local workspace, ~12 GB
-when spread across machines, clamped to `[1, 16]`). Add or remove workspaces
-later by editing the YAML and running `shelbi reload`.
+A new project starts with two workspaces on `hub`: `dev` and `review` (tagged
+`review`). Add or remove workspaces later with `shelbi workspace add <name>` /
+`shelbi workspace rm <name>`, or in Settings ▸ Workspaces. (`rm` refuses a
+workspace with an active issue or unpushed work unless you pass `--force`.)
 
-A slot can also carry `tags` — capability labels a workflow status can
+A slot can also carry `tags`: capability labels a workflow status can
 require, so an issue routes to a matching workspace. That routing is generic:
 [review workspaces](/docs/concepts/review-workspaces) are just the canonical
 use of it (a slot tagged `review` that a review status routes to), but the same
@@ -82,20 +83,25 @@ mechanism pins any capability to any pool.
 
 Every machine and every workspace can carry a free-form `tags` list. A
 workspace's **effective tags** are its own tags **unioned** with its
-machine's tags — a tag declared once on a machine applies to all of its
+machine's tags, so a tag declared once on a machine applies to all of its
 slots without repeating it per workspace.
 
 ```yaml
 machines:
-  - name: hub
-    kind: local
+  - name: devbox
+    kind: ssh
+    host: devbox
     work_dir: ~/Workspaces/myapp
-    tags: [review]              # every slot on hub inherits `review`
+    tags: [gpu]                 # every slot on devbox inherits `gpu`
 
 workspaces:
-  - { name: alpha, machine: hub }                 # effective: {review}
-  - { name: bravo, machine: hub, tags: [gpu] }    # effective: {review, gpu}
+  - { name: alpha, machine: devbox }                    # effective: {gpu}
+  - { name: bravo, machine: devbox, tags: [review] }    # effective: {gpu, review}
 ```
+
+Because machine tags are inherited, put `review` on individual slots, not on
+a machine: a machine-level `review` tag makes every slot on that machine a
+review slot.
 
 Both fields accept a scalar `tag:` alias and a bare string as shorthand for a
 one-element list (`tags: review` ≡ `tags: [review]`). Both are elided from the
@@ -113,11 +119,15 @@ statuses:
 
 When an issue enters that status, the orchestrator routes it to a **free
 workspace whose effective tags are a superset of the status's required set**
-(set-AND). Empty required tags — the default — match any free workspace, so
+(set-AND). Empty required tags (the default) match any free workspace, so
 any idle slot qualifies. `tags: [review]` on the status plus `tags: [review]`
-on a machine is all it takes to pin that work to matching slots. Nothing in the
-routing branches on a literal tag name — it's the same superset query every tag
-uses.
+on a workspace is all it takes to pin that work to matching slots.
+
+The routing query itself is generic. The `review` tag also carries built-in
+meaning: review-tagged slots refuse direct dev dispatch, are hidden from the
+sidebar's Workspaces section, are fed by the review auto-load queue, and
+receive the workflow's `review:` recipe. See
+[Review workspaces](/docs/concepts/review-workspaces#the-review-tag).
 
 If no declared workspace matches the required tags, the load fails loudly
 rather than silently running the work on a general slot.
@@ -131,34 +141,37 @@ workspaces on one machine avoid colliding on a port:
 
 ```yaml
 workspaces:
-  - { name: review-0, machine: hub, tags: [review], slot: 0 }
-  - { name: review-1, machine: hub, tags: [review], slot: 1 }
+  - { name: alpha, machine: hub, slot: 0 }
+  - { name: bravo, machine: hub, slot: 1 }
 ```
 
 Alongside `$SLOT`, every transition command also gets `$SHELBI_TASK`,
 `$SHELBI_BRANCH`, `$SHELBI_WORKTREE`, and `$SHELBI_MACHINE`.
 
+For a workflow's `review:` recipe the slot value *is* the port, and there is
+no index fallback: review slots need an explicit port-valued `slot:` (e.g.
+`slot: 3000`). See
+[Review workspaces](/docs/concepts/review-workspaces#serving-the-branch-the-review-block).
+
 ## The sidebar: grouped by machine
 
 Workspaces render in the sidebar grouped under the machine they're pinned to,
 so the layout mirrors where your compute actually lives. Each row shows the
-workspace's state badge, its name, the agent currently loaded (if any), and
-the issue it's on:
+state badge, the name, and the loaded agent (or `idle`):
 
 ```text
- — hub —
- ⏵ alpha      developer   add-csv-export-to-reports
- 💬 bravo     developer   fix-cookie-domain-bug
- · charlie
-
- — devbox —
- ⏵ delta      qa          review:auth-rewrite
- · echo
- · foxtrot
+ — Workspaces —
+ ▾ hub
+   ⏵ alpha                Developer
+   ? bravo                Developer
+   · charlie                   idle
+ ▾ devbox
+   ⏵ delta                       Qa
+   · echo                      idle
 ```
 
-Idle slots (`·`) carry no agent or issue. They're capacity waiting to be
-filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
+Machine headers only appear when the pool spans more than one machine. Idle
+slots (`·`) carry no agent. They're capacity waiting to be filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
 running, which is how you tell at a glance that `delta` is doing a QA pass,
 not writing code.
 
@@ -166,8 +179,8 @@ Each machine group can be collapsed (Space / Enter on its header). The set of
 collapsed machine names persists to `~/.shelbi/state.json` under
 `sidebar.collapsed_machines` (the `SidebarPrefs` struct), so the choice
 survives a sidebar respawn and follows you across projects that share a machine
-name. A collapsed machine keeps its `(total, active)` count on the header so
-capacity stays visible at a glance.
+name. A collapsed machine shows a `(total, N active)` count on its header
+(e.g. `▸ hub   (4, 2 active)`) so capacity stays visible at a glance.
 
 [Review](/docs/concepts/review-workspaces)-tagged slots are the exception:
 they never render here. Their capacity surfaces under the sidebar's
@@ -182,12 +195,12 @@ shelbi issue add "Re-encode the marketing video assets" \
   --prefers-machine devbox
 ```
 
-The orchestrator honors the hint when at least one workspace on that machine
-is free. If `devbox` is fully busy when the issue becomes ready, the card
-stays in its `ready`-category status rather than getting routed to the wrong
-host. Shelbi never silently re-routes RAM-heavy or latency-sensitive work to
-the hub. The hint rides along in the issue's frontmatter as `prefers_machine`
-and is surfaced on the kanban card.
+The orchestrator agent is instructed to honor the hint: it considers only
+workspaces on that machine, and if `devbox` is fully busy when the issue
+becomes ready, it leaves the card in its `ready`-category status rather than
+routing it to the wrong host. This is orchestrator prompt policy, not a hard
+rule enforced by Shelbi's code. The hint is stored as `prefers_machine`;
+clear it with `shelbi issue edit --no-prefers-machine`.
 
 ## Workspace states
 
@@ -198,10 +211,12 @@ The hub polls each workspace's session every few seconds (see
 | Badge | Persisted state    | Meaning                                                                  |
 |-------|--------------------|--------------------------------------------------------------------------|
 | `⏵`   | `working`          | agent is mid-turn: actively typing, calling tools, running shells.       |
-| `💬`  | `awaiting_input`   | agent finished a turn and is sitting at the prompt.                      |
+| `?`   | `awaiting_input`   | agent finished a turn and is sitting at the prompt.                      |
 | `⚠`   | `blocked`          | agent paused on a permission dialog or other interactive gate.           |
 | `⏸`   | `paused`           | the workspace stalled on a usage limit and is waiting to resume.         |
+| `⏵`   | `serving`          | a review slot whose branch passed the `review:` ready probe.             |
 | `·`   | (no in-flight issue) | the slot is idle and ready to be assigned.                              |
+| `…`   | (not read yet)     | the workspace's status hasn't been read yet (e.g. right after a project switch). |
 
 A workspace that *finishes* an issue doesn't get its own "done" badge. The
 moment it writes the review-ready marker and the poller promotes the issue,
@@ -227,9 +242,9 @@ See [the events log](/docs/concepts/events-log).
 
 ## Switching issues clears context
 
-When a workspace picks up a new issue its pane is **killed and re-created**
-from scratch. The branch switch happens first, while the old pane is still
-intact; the pane is torn down and rebuilt only after the worktree and
+When a workspace picks up a new issue its session is **ended and re-created**
+from scratch. The branch switch happens first, while the old session is still
+intact; the session is ended and restarted only after the worktree and
 settings are in place:
 
 1. The worktree is switched to the issue's branch, creating the branch off
@@ -237,15 +252,16 @@ settings are in place:
    present, otherwise `default_branch`, and a workflow can override it
    further) if it doesn't exist, and refusing to switch if there are
    uncommitted changes.
-2. `.claude/settings.local.json` is re-wired under the worktree — an
+2. `.claude/settings.local.json` is re-wired under the worktree: an
    additive, self-healing merge, not a clobber (Shelbi no longer
    overwrites the committed `settings.json` on every dispatch).
-3. The pane (window for hub workspaces, session for remote ones) is torn
-   down.
-4. A new pane is created and the agent CLI is launched in it, loaded with
-   the [agent](/docs/concepts/agents) the issue's status calls for.
-5. Once the agent's input box is ready (`shift+tab to cycle` footer
-   detected), the initial prompt is typed.
+3. The workspace's agent session is ended.
+4. A new Shelbi session is started (on the remote machine, for remote
+   workspaces) and the agent CLI is launched in it, loaded with the
+   [agent](/docs/concepts/agents) the issue's status calls for.
+5. The startup prompt (the agent's charter plus the issue context) is passed
+   to the agent at launch. Shelbi then confirms the agent went busy, falling
+   back to typing the prompt once the input box is ready (Claude only).
 
 This is *intentional*. The previous issue's conversation history, scratchpad
 files, and any agent-local state are gone. Each issue starts the agent with a
@@ -278,21 +294,24 @@ The hub poller `cat`s this file on each tick (locally or over SSH), and when
 it finds a non-empty value:
 
 1. Confirms the named issue is in-progress and assigned to this workspace.
-2. Moves the issue to the next `handoff` status (`review` in the default
-   workflow).
+2. Rebases the branch onto the base branch, pushes it, and moves the issue
+   forward: to an agent-owned gate status if the workflow declares one,
+   otherwise to the first `handoff` status (`review` in the default workflow),
+   firing that edge's actions (in the default workflow, opening the PR).
 3. Clears the marker.
 4. Appends the issue transition to the events log, e.g.
    `project=<name> task=<id> workflow=<name> in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff`.
 
-The agent never runs `shelbi` itself. The marker file is the *entire*
-on-workspace protocol. A remote workspace needs only a compatible `shelbi`
-binary, `git`, and the agent CLI on its machine.
+Completion is signalled only by the marker file; the agent doesn't call
+`shelbi` to finish. (Agents also report state through Claude hooks and can
+ask for clarification through the hub socket.) A remote workspace needs only
+a compatible `shelbi` binary, `git`, and the agent CLI on its machine.
 
 Once the issue is safely promoted, the finishing dev workspace **closes its
 own session** and frees its slot for the next issue. No lingering "done"
-pane. If the project declares [review workspaces](/docs/concepts/review-workspaces),
-the orchestrator then loads the promoted branch onto one so a human can *run*
-the change, not just read the diff.
+session. If the project declares [review workspaces](/docs/concepts/review-workspaces),
+the hub's review auto-loader then loads the promoted branch onto one so a
+human can *run* the change, not just read the diff.
 
 ## Local vs. remote workspaces
 
@@ -318,17 +337,17 @@ makes sure a compatible `shelbi` binary is there to run them.
 
 ## See also
 
-- [Project config](/docs/configuration/project#workspaces) — the
+- [Project config](/docs/configuration/project#workspaces): the
   `workspaces:`, `machines:`, and `agent_runners:` field reference.
-- [Review workspaces](/docs/concepts/review-workspaces) — the tag-routed slot
+- [Review workspaces](/docs/concepts/review-workspaces): the tag-routed slot
   that loads and *serves* a finished branch for human review.
-- [Agents](/docs/concepts/agents) — the role that runs *inside* a
+- [Agents](/docs/concepts/agents): the role that runs *inside* a
   workspace, and the role/slot split.
-- [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
-  — what the default workflow's statuses mean, and where workspaces fit in
+- [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses):
+  what the default workflow's statuses mean, and where workspaces fit in
   the issue lifecycle.
-- [The events log](/docs/concepts/events-log) — the shape of every
+- [The events log](/docs/concepts/events-log): the shape of every
   workspace transition line.
-- [Orchestrator](/docs/concepts/orchestrator) — how it picks which
+- [Orchestrator](/docs/concepts/orchestrator): how it picks which
   workspace to dispatch an issue to.
-- [`shelbi workspace`](/docs/cli/workspace) — list and stop workspaces.
+- [`shelbi workspace`](/docs/cli/workspace): add, remove, list, inspect, and stop workspaces.
