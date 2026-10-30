@@ -1,7 +1,7 @@
 ---
 title: The events log
 order: 15
-summary: An append-only file at ~/.shelbi/events.log — every workspace state change and issue status move, in one stream the orchestrator tails.
+summary: An append-only file at ~/.shelbi/events.log that records every workspace state change and issue status move, in one stream the orchestrator consumes.
 ---
 
 Every state change Shelbi observes is appended to one file:
@@ -10,14 +10,18 @@ Every state change Shelbi observes is appended to one file:
 ~/.shelbi/events.log
 ```
 
-(or `$SHELBI_HOME/events.log` if you've set it). It's the live wire
+(or `<root>/events.log` when you've overridden the Shelbi root with
+`--root` / `$SHELBI_ROOT`). It's the live wire
 the orchestrator listens on to decide what to do next, and the audit
 trail you grep when something looks wrong.
 
 The log is **hub-global**, not per-project: lines for all projects
-running against this hub interleave in the same file. Filtering by
-project (or workspace, or issue) is the orchestrator's job. At the
-filesystem layer, it's one stream.
+running against this hub interleave in the same file. At the filesystem
+layer, it's one stream; per-project views are layered on top. The
+orchestrator consumes its project's events through a durable, acknowledged
+cursor (`shelbi orchestrator events next` / `ack`), and mirrors the log with
+`shelbi events tail --follow --project <name>`, which filters to one
+project's lines.
 
 Defined in `crates/shelbi-state/src/event_log.rs` (`events_log_path`,
 `append_workspace_event`, `append_task_event`).
@@ -43,8 +47,12 @@ carries:
   hub-global and workspace names are only unique *within* a project, so
   each orchestrator filters to `project=<its-own-name>`.
 - `<prev-state>` is `none` on the first observation of that workspace.
-- States: `working`, `awaiting_input`, `blocked`, `paused`. See
+- States: `working`, `awaiting_input`, `blocked`, `paused`, and `serving`
+  (a review slot whose server is up). See
   [workspace states](/docs/concepts/workspaces#workspace-states).
+- Blocking-dialog and usage-limit transitions append a reason:
+  `reason=dialog:<kind>` (and `reason=dialog:<kind>:cleared` when it goes
+  away), or `reason=usage-limit` with an optional `reset=<hint>`.
 - The `workspace=` token names the [workspace](/docs/concepts/workspaces) whose state changed.
 - Written by the hub-side poller every time it observes a state change
   (not on every tick, only on actual transitions).
@@ -52,12 +60,12 @@ carries:
 ### Task transitions
 
 ```
-<rfc3339-timestamp> project=<name> task=<id> workflow=<name> <from-column> -> <to-column> reason=<short> from_category=<cat> to_category=<cat>
+<rfc3339-timestamp> project=<name> task=<id> workflow=<name> <from-column> -> <to-column> reason=<short> from_category=<cat> to_category=<cat> [owner=…] [actions=skipped] [pr=<n> sha=<oid>]
 ```
 
 ```
 2026-06-22T14:24:03+00:00 project=myapp task=fix-login workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
-2026-06-22T14:24:11+00:00 project=myapp task=fix-login workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha from_category=ready to_category=active
+2026-06-22T14:24:11+00:00 project=myapp task=fix-login workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer from_category=ready to_category=active
 2026-06-22T14:31:52+00:00 project=myapp task=fix-login workflow=task in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff
 ```
 
@@ -65,16 +73,23 @@ carries:
   workspace lines.
 - `workflow=<name>` is the workflow the issue runs under (from its
   frontmatter); an empty value is treated as the default workflow.
-- `<from-column>` and `<to-column>` are the snake_case status names
-  from the issue's workflow (default workflow: `backlog`, `todo`,
-  `in_progress`, `review`, `done`). See
+- `<from-column>` and `<to-column>` are the workflow's status ids,
+  written as-is, except that the stock `in-progress` is written
+  `in_progress` (a legacy wire form). The shipped workflows use
+  `backlog`, `todo`, `in_progress`, `review`, `done`, and `canceled`; a
+  custom id like `review-app` keeps its hyphen. See
   [workflows](/docs/guides/getting-started/workflows).
 - `from_category=<cat>` and `to_category=<cat>` are the
   [status categories](/docs/concepts/orchestrator) of those columns,
   derived from the workflow so reaction rules can match semantically
   without re-reading the workflow YAML.
 - `reason=<short>` is a single token (whitespace is folded to
-  underscores) describing who triggered the move.
+  underscores) describing who triggered the move. Dispatches append the
+  agent they loaded, e.g. `reason=user:cli:start_agent=developer`.
+- Optional trailing tokens: `owner=me|other:<login>|unassigned|unknown`
+  (issue ownership on [GitHub-backed boards](/docs/concepts/github-issues)),
+  `actions=skipped` (the move ran with `--skip-transition-actions`), and
+  `pr=<n> sha=<oid>` on `poller:github-merge-reconcile` lines.
 
 ### Heartbeats
 
@@ -88,7 +103,11 @@ carries:
 
 - The line always carries `zen_eligible=` (how many issues Zen could act
   on) and `idle_workspaces=`. When Zen Mode is On a `zen=on` marker is
-  inserted right after `heartbeat`, and a trailing reminder may follow.
+  inserted right after `heartbeat`. While Zen is on, every third
+  heartbeat ends with ` — <first line of zenmode.md>`, and about once an
+  hour with ` — re-read zenmode.md now to refresh Zen policy`.
+- When free disk space under the hub's `work_dir` runs low, the line also
+  carries `disk_free_gib=<n> disk_low=true`.
 - Emitted by the hub-side poller on the cadence set by the
   [`heartbeat`](/docs/configuration/project#heartbeat) key in
   `project.yaml`. Set to `"off"` to disable.
@@ -103,10 +122,11 @@ carries:
   exactly what catches it.
 - Resets on any real event: the poller compares `events.log`'s mtime
   against a baseline it advances on each seed/emit/reset, so any genuine
-  line (an issue move, a workspace transition, a dispatch) both skips
-  that tick's emission (the event already woke the orchestrator) and
-  snaps the cadence back to the standard `interval`. An active board
-  never sees padding lines.
+  line (an issue move, a workspace transition, a dispatch) skips that
+  tick's emission (the event already woke the orchestrator) and snaps
+  the cadence back to the standard `interval`, but only within the
+  current window: a heartbeat still lands at least once per `interval`,
+  even on a continuously active board.
 - Crash-safe: a poller restart waits one full interval before its first
   attempt, rather than firing the slot it missed.
 - Paused while offline: each due tick TCP-probes `1.1.1.1:443` with a
@@ -115,11 +135,12 @@ carries:
   motivation is that the orchestrator can't act on a heartbeat during a
   network drop, so the line would only fill the feed with noise.
 
-Heartbeats exist for the orchestrator's `events tail --follow` watch.
-When nothing's happening on the board, the watch sits idle for as long
-as it takes for *something* to happen, which can be hours, or never if
-a marker-emitting code path silently regresses. The recurring line is
-the orchestrator's fallback trigger to wake up and check active issues.
+Heartbeats are the orchestrator's fallback wake-up and the stream's
+liveness signal. When nothing's happening on the board, the
+orchestrator's watch sits idle for as long as it takes for *something*
+to happen, which can be hours, or never if a marker-emitting code path
+silently regresses. The recurring line is the orchestrator's fallback
+trigger to wake up and check active issues.
 
 The TUI activity feed filters heartbeats out by design. They'd
 produce one "nothing happened" row every few minutes. Use
@@ -128,7 +149,7 @@ produce one "nothing happened" row every few minutes. Use
 The feed lives behind the **Activity** view in the dashboard: the same events
 this log records, rendered for a human instead of grepped:
 
-<AppMockup terminalTitle="jlong@hub — shelbi" activeView="activity" />
+<AppMockup activeView="activity" />
 
 The orchestrator distinguishes the line kinds by which marker tokens the
 body contains (`EventKind::from_body` matches on `contains`, not a fixed
@@ -138,6 +159,32 @@ position). Because every state line now leads with the `project=` scope,
 and more. New line shapes get added over time; consumers that only
 recognize `task=` and `workspace=` should fall through gracefully on the
 rest.
+
+### Zen and CI lines
+
+```
+<rfc3339-timestamp> project=<name> mode=zen <prev> -> <new> reason=<source>
+<rfc3339-timestamp> zen-dryrun task=<id> action=<action> detail=<detail>
+<rfc3339-timestamp> project=<name> task=<id> ci pr=<n> check=<check> conclusion=<conclusion> head_sha=<sha>
+```
+
+```
+2026-06-22T14:40:26+00:00 project=myapp mode=zen off -> on reason=user:palette
+2026-06-22T14:52:55+00:00 project=myapp task=fix-login ci pr=42 check=all conclusion=success head_sha=8d3554bd…
+```
+
+- `mode=zen` records a [Zen Mode](/docs/concepts/zen-mode) toggle. The
+  modes are `off`, `paused`, and `on`; the source is `user:cli` or
+  `user:palette` (older logs also show `user:hotkey`). Older logs may also
+  carry a legacy `project=<name> zen=off reason=crash-recovery` line.
+- `zen-dryrun` lines come from `shelbi zen dry-run`: one per decision Zen
+  would have made. They carry no `project=` scope.
+- `ci` lines record a PR's terminal CI verdict for an issue, as Zen's CI
+  watch sees it: `check=all conclusion=success` when everything passed, or
+  the failing check's name with `conclusion=failure`, plus the commit it
+  graded.
+- Zen's own board moves are ordinary task lines whose reasons start with
+  `orchestrator:zen-` (see [Reason strings](#reason-strings)).
 
 ## Atomicity
 
@@ -163,11 +210,15 @@ shelbi events tail -n 100        # last 100 lines, exit
 shelbi events tail --follow      # last 20 lines, then stream
 shelbi events tail --since 10m   # everything in the last 10 minutes
 shelbi events tail --since 2h --follow
+shelbi events tail -f --project myapp   # only this project's lines (what the orchestrator watches)
+shelbi events tail --format envelope    # normalized JSON envelopes instead of raw lines
 ```
 
 `--since` accepts `<n>s|m|h|d` (e.g. `30s`, `5m`, `2h`, `1d`); a bare
 integer is seconds. When `--since` is set, `-n` is ignored and every
-matching line is printed.
+matching line is printed. With `--project`, `-n` and `--since` count
+within that project's lines. `tail` reads only the live `events.log`,
+never the rotated `events.log.1` (see [below](#reading-the-log-from-code)).
 
 The follow loop polls the file every 250ms, holding back the final
 fragment until its newline arrives so you never see a half-written event.
@@ -177,7 +228,7 @@ content.
 
 ```text
 2026-06-22T14:24:03+00:00 project=myapp task=fix-login workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
-2026-06-22T14:24:11+00:00 project=myapp task=fix-login workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha from_category=ready to_category=active
+2026-06-22T14:24:11+00:00 project=myapp task=fix-login workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer from_category=ready to_category=active
 2026-06-22T14:24:11+00:00 project=myapp workspace=alpha awaiting_input -> working
 2026-06-22T14:31:50+00:00 project=myapp workspace=alpha working -> awaiting_input
 2026-06-22T14:31:52+00:00 project=myapp task=fix-login workflow=task in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff
@@ -199,11 +250,19 @@ consistent set:
 | Reason                                             | Source                                   | Meaning                                                                            |
 |----------------------------------------------------|------------------------------------------|------------------------------------------------------------------------------------|
 | `user:cli`                                         | `shelbi issue move`                       | You moved the card from the CLI with no explicit reason.                           |
-| `user:cli:start`                                   | `shelbi issue start`                      | You launched a workspace on an issue from the CLI.                                   |
-| `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
+| `user:cli:start_agent=<agent>`                     | `shelbi issue start`                      | You launched a workspace on an issue from the CLI.                                 |
+| `user:tui`                                         | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
+| `user:app`                                         | the desktop app's board                  | You moved the card in the desktop app.                                             |
+| `user:review` / `user:review-reject`               | the review panel                         | You accepted or rejected a change from the review panel.                           |
+| `user:cli:add`                                     | `shelbi issue add`                        | You created the card from the CLI.                                                 |
+| `user:cli:resume`                                  | `shelbi issue resume`                     | You resumed an issue onto a workspace from the CLI.                                |
 | `user:promote`                                     | a `--reason` you passed                  | Free-form: anything starting with `user:` reads as "the human chose this."         |
-| `orchestrator:auto-dispatch workspace=<name>`         | the orchestrator's `shelbi issue start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
+| `orchestrator:auto-dispatch_workspace=<name>_agent=<agent>` | the orchestrator's `shelbi issue start` | The orchestrator picked a free workspace and dispatched per its routing rules. |
+| `orchestrator:zen-promote_category=<n>`            | the orchestrator, in Zen Mode            | Zen auto-promoted a backlog issue (`<n>` is the judgment category).                |
+| `orchestrator:zen-merge_pr=<n>`                    | the orchestrator, in Zen Mode            | Zen merged the issue's PR.                                                         |
 | `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the issue to review. |
+| `poller:issue-reconcile` / `poller:issue-adopt`    | the hub poller                           | Someone moved, closed, or relabeled the issue on the tracker itself (e.g. github.com), or a new tracker issue first appeared in a non-`backlog` status. |
+| `poller:github-merge-reconcile`                    | the hub poller                           | The issue's PR was merged on GitHub out of band; the poller advanced the card.     |
 
 These aren't enforced by code. They're a convention the orchestrator
 parses to decide whether *it* triggered an event (and shouldn't react)
@@ -225,8 +284,10 @@ parseable on a single token. Newlines and tabs get the same treatment.
 If you're building something that consumes the log directly, the
 contract is:
 
-- Append-only. Never truncate; if you need to rotate, do it atomically
-  via rename.
+- Append-only. Shelbi rotates the file itself at 8 MiB to
+  `events.log.1` (one older generation kept) and tracks offsets in
+  `events.log.index.json`. Don't truncate or rotate it yourself; read
+  `events.log.1` too if you need older history.
 - One line per event, RFC3339 timestamp first, ASCII fields separated
   by single spaces.
 - Every state line leads with a `project=<name>` scope; match on the
@@ -242,12 +303,12 @@ The full grammar lives in the `append_*_event` family in
 
 ## See also
 
-- [Workspaces](/docs/concepts/workspaces#workspace-states) — what each
+- [Workspaces](/docs/concepts/workspaces#workspace-states): what each
   workspace state actually means.
-- [Workflows](/docs/guides/getting-started/workflows) — what each `from -> to`
+- [Workflows](/docs/guides/getting-started/workflows): what each `from -> to`
   transition means, including the per-workflow status schema and the
   default workflow's lifecycle.
-- [Orchestrator](/docs/concepts/orchestrator) — what the
+- [Orchestrator](/docs/concepts/orchestrator): what the
   orchestrator does with each line it reads.
 - [GitHub Issues backend](/docs/concepts/github-issues#comments-and-moving-cards-from-either-side):
   where the `poller:github-merge-reconcile` line comes from when a card's PR is

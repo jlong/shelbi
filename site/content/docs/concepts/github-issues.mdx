@@ -159,10 +159,11 @@ state alone:
 | `done` | closed, `state_reason: completed` |
 | `canceled` | closed, `state_reason: not_planned` |
 
-The mapping is enforced in both directions. A **closed** issue always reads as a
-terminal card (`done`, or `canceled` when its reason is `not_planned`), so
-closing an issue on github.com lands it in a terminal column regardless of a
-stale status label. Symmetrically, an **open** issue never reads as terminal: an
+The mapping is enforced in both directions. A **closed** issue always reads as
+terminal: its terminal status label if it has one, otherwise `done` (or
+`canceled` when GitHub's reason is `not_planned`), so closing an issue on
+github.com lands it in a terminal column regardless of a stale non-terminal
+status label. Symmetrically, an **open** issue never reads as terminal: an
 open issue still carrying a stale `shelbi:status/done` or `shelbi:status/canceled`
 label (the shape you get by reopening a done issue to comment) reads as `backlog`
 for re-triage, and the stale label is repaired by the next Shelbi-initiated move.
@@ -175,7 +176,8 @@ An issue someone files on github.com without Shelbi's labels is still handled:
   un-migrated repo still renders and every write, move, and comment path can act
   on the issue by its number.
 - **No `shelbi:status/*` label:** the card enters at its workflow's declared
-  **initial** status (`backlog` for the shipped `app` and `default` workflows),
+  **initial** status (`backlog` for the shipped `task` and `subtask` workflows,
+  and the fallback `default` workflow),
   never a hardcoded `todo`. Landing an externally-filed issue straight in the
   ready lane would skip your triage step, so it waits in the entry column
   instead.
@@ -187,8 +189,10 @@ issue, but Shelbi never returns one as a card on any read, search, or poll path.
 
 Shelbi creates its labels on first use. Before any write applies a
 `shelbi:id/*` or `shelbi:status/*` label, it ensures the label exists, creating
-any that are missing with the description `Managed by shelbi` (status labels get
-distinct colors; everything else gets GitHub's default grey). Creation is
+any that are missing with the description `Managed by shelbi`. The six stock
+status labels get distinct colors; custom status labels and id labels get
+GitHub's default grey. The first write also creates the full stock
+`shelbi:status/*` set, so every stock column has its label. Creation is
 idempotent: a label that already exists, or that races into existence, is left
 untouched. There is no separate provisioning step.
 
@@ -204,8 +208,8 @@ even though GitHub stores nothing about it. Because assignment never touches the
 issue, assigning a workspace does not bump the issue's timestamp or `ETag`.
 
 This is distinct from GitHub's own **assignees** (the people assigned to the
-issue), which Shelbi *does* read, as a signal that gates Zen Mode. See the next
-section.
+issue), which Shelbi *does* read, as the signal that gates which issues it may
+start. See the next section.
 
 ## GitHub assignees and Zen Mode
 
@@ -220,6 +224,13 @@ your repo, Shelbi uses the issue's **assignees** to decide what
   unauthenticated token or an offline machine, the issue is created unassigned
   with a warning rather than failing the create; it simply will not be
   Zen-eligible.)
+- **Shelbi only starts issues assigned to you.** On a GitHub board,
+  `shelbi issue start` and `shelbi issue resume` refuse an issue whose
+  assignees don't include you, and so does every automatic start: the
+  orchestrator's dispatch, the daemon's active-gate dispatch, and the review
+  auto-load. Claim an issue with `shelbi issue start <id> --take` (it assigns
+  the issue to you on GitHub, then starts it) or by assigning yourself on
+  github.com. The orchestrator never passes `--take` on its own.
 - **Zen only auto-promotes backlog issues assigned to you.** Under Zen, a backlog
   issue is mechanically eligible only when its GitHub assignees include the
   authenticated account's login. Work an outside contributor filed, or that is
@@ -229,7 +240,10 @@ your repo, Shelbi uses the issue's **assignees** to decide what
 
 The authenticated login comes from the daemon's board index (captured on the same
 GraphQL read that refreshes the board, at no extra API cost), so the gate costs
-nothing per tick.
+nothing per tick. `shelbi issue list` shows each card's owner (`me`, another
+login, or unassigned), and task lines on the
+[events log](/docs/concepts/events-log#task-transitions) carry the same
+information as an `owner=` token.
 
 **To make an outside issue eligible, assign yourself to it on GitHub.** Adding
 your account to the issue's assignees is exactly what lets it pass the ownership
@@ -304,15 +318,20 @@ Conditional-GET `304` reads show as `(N not-modified)` and failed attempts as
 
 A budget governor scales the refresh down as the GraphQL budget tightens: above
 2,000 points it runs at the configured cadence; between 500 and 2,000 it slows to
-a 120s cadence; between 100 and 500 the index refresh pauses until the quota
-resets (while user-initiated single fetches still run); below 100, reads are
-served from cache with a warning. A separate REST reserve (100 requests) refuses
+a 120s cadence; at 500 or below the index refresh pauses until the quota resets,
+then resumes. An actual 403/429 parks it until the reset regardless. Single-issue
+fetches are REST conditional GETs and aren't governed by this GraphQL budget. A
+separate REST reserve (100 requests) refuses
 a mutating call up front rather than failing deep inside a transition:
 
 ```text
 shelbi: refusing to write to owner/repo: only 98 GitHub REST requests remain
 (reserve floor 100); the limit resets at 2026-10-02T13:36:00+00:00. Not sending the request.
 ```
+
+`shelbi doctor` adds the observed request rate, a projected time to run out,
+and a warning naming the top callers when a budget would run out within 30
+minutes at the current rate.
 
 ### When the budget runs out or auth fails
 
@@ -378,7 +397,8 @@ shelbi issue-store migrate --to file_system
 The migration matches on the stable Shelbi id, so a re-run never duplicates an
 already-migrated card. A `--to github` run paces its creates (default 7.5s
 between issues) to stay under GitHub's secondary content-creation limit; switch
-the project's `issue_tracker.backend` once the migration completes.
+the project's `issue_tracker.backend` once the migration completes. Comments are
+not migrated, and workspace assignments are dropped.
 
 ## See also
 

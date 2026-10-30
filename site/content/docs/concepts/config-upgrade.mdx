@@ -28,7 +28,10 @@ Each run is **detect, classify, apply, re-detect, emit**:
 
 1. **Detect.** Sniffers run over every Shelbi-owned config surface (project
    registration YAML, `statuses.yaml`, workflows, the global `config.yaml`,
-   per-agent `settings.json`, and the Zen and instructions Markdown), looking for
+   per-agent `settings.json`, the Zen and instructions Markdown, agent
+   manifests (`agent.yaml`), the workspace-settings template and
+   per-workspace `settings.local.json`, the shared agent preamble, and
+   legacy-named sibling files), looking for
    known legacy forms. Detection never uses a version number, only the file's
    content, so it works for a config written by any past release.
 2. **Classify.** Every finding is sorted into one of two buckets:
@@ -37,10 +40,12 @@ Each run is **detect, classify, apply, re-detect, emit**:
      (`tag: x` becomes `tags: [x]`), a moved keybinding, a legacy status-id
      spelling, or a lifecycle-owned default a project is missing because it
      predates the file (today the per-project
-     [`pr-template.md`](/docs/configuration/project#the-pr-body-template-pr-templatemd)).
+     [`pr-template.md`](/docs/configuration/project#the-pr-body-template-pr-templatemd),
+     `changelog-template.md`, and `agents/_shared/preamble.md`).
    - **`needs_judgment`**: ambiguous, potentially lossy, or the correct target
      is not mechanically determinable. Examples: an unknown top-level key that
-     could be a typo or real data, a `display_name:` that disagrees with `name:`,
+     could be a typo or real data, a `display_name:` that disagrees with both
+     `name:` and the project id,
      a `zen.danger_paths` that sets both `extend:` and `override:`, or a prose
      refresh in instructions a user may have customized. When a sniffer is
      unsure, a finding lands here rather than risk a lossy auto-heal.
@@ -52,17 +57,27 @@ Each run is **detect, classify, apply, re-detect, emit**:
 
 ## What you see
 
-**On `events.log`.** Each affected project gets one line:
+**On `events.log`.** Each applied auto-heal is disclosed on its own line:
+
+```
+project=<id> config-upgrade code=<CODE> surface=<surface> file=<path> change=<old->new>
+```
+
+When findings remain after healing, each scope (a project id, or `global` for
+the shared global surfaces) also gets a summary line:
 
 ```
 project=<id> config-upgrade auto_heal=<M> needs_judgment=<N>
 ```
 
-`auto_heal=<M>` is informational: those `M` fixes are already applied. Only
-`needs_judgment=<N>` with `N > 0` needs attention.
+Both counts describe the residual: `M` counts auto-heals that could *not* be
+applied this run, and `N` counts findings awaiting a decision. Only
+`needs_judgment=<N>` with `N > 0` needs your attention. A fully clean scope
+gets no summary line.
 
-**The findings file.** The residual is written for the orchestrator to ingest at
-boot, as a single hub-global JSON file:
+**The findings file.** The residual is also recorded as a single hub-global
+JSON file (a snapshot of the boot pass; the orchestrator reads the live
+`--needs-judgment` channel instead):
 
 ```
 ~/.shelbi/config-upgrade-findings.json
@@ -84,8 +99,13 @@ The `needs_judgment` findings are the channel the
 --needs-judgment`) and folds the findings into its next reply: the surface, the
 legacy form, the proposed fix, and the rationale, then asks how you want to
 proceed. It never applies a needs-judgment finding you
-have not approved. Once you approve one, it applies exactly that finding by its
-`id`, reusing the same atomic write-back the auto-heal pass uses.
+have not approved. Where an approved finding has a mechanical resolution
+(today only the `danger_paths` extend-plus-override conflict,
+`ZEN_DANGER_PATHS_CONFLICT`), it applies exactly that finding by its `id` with
+`shelbi config upgrade --apply-finding <id>`, reusing the same atomic
+write-back the auto-heal pass uses. For any other finding that command
+refuses, and the orchestrator edits the file directly and tells you what
+changed.
 
 ## Inspecting it yourself
 
@@ -93,7 +113,8 @@ The same detector is exposed through
 [`shelbi config upgrade`](/docs/cli/config#upgrade): run it read-only to preview
 what the boot pass would act on, `--needs-judgment` to read just the human-
 decision channel, `--apply` to perform the auto-heals on demand, or
-`--apply-finding <id>` to resolve a single approved finding.
+`--apply-finding <id>` to resolve a single approved finding that has a
+mechanical resolution.
 
 Both the bare report and `--needs-judgment` detect live against the files on
 disk, so they always agree for the same on-disk state. Neither replays the
