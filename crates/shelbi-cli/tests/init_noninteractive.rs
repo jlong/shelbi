@@ -291,7 +291,8 @@ fn yes_mode_with_one_runner_initializes_git_while_stdin_is_open() {
     let text = fs::read_to_string(home.join("config.yaml")).unwrap();
     let cfg: shelbi_state::UserConfig = serde_yaml::from_str(&text).unwrap();
     assert_eq!(cfg.theme, shelbi_state::ThemePreference::Dark);
-    assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(90), Some(40)));
+    assert_eq!(cfg.desktop.contrast, Some(50));
+    assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(30)));
 }
 
 #[test]

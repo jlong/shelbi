@@ -5,11 +5,11 @@
 //! Holds the Zen Mode toggle chord chosen by the first-run probe, the review
 //! editor, the color theme, and the desktop app's own settings (`desktop:`).
 //! Missing file → a new install's settings ([`UserConfig::new_install`]: the
-//! `shelbi init` scaffold, theme dark and a translucent desktop window), and
-//! the first write of the file starts from that scaffold. In an existing
-//! file a missing key keeps its built-in default (`zen_toggle = AltZ`,
-//! `theme = auto`, an opaque window), so older partial files keep loading
-//! and keep their look.
+//! `shelbi init` scaffold, theme dark, contrast 50 and a translucent desktop
+//! window), and the first write of the file starts from that scaffold. In an
+//! existing file a missing key keeps its built-in default (`zen_toggle =
+//! AltZ`, `theme = auto`, contrast 0, an opaque window), so older partial
+//! files keep loading and keep their look.
 
 use std::fs;
 use std::path::PathBuf;
@@ -587,7 +587,8 @@ impl ZenToggleChord {
 impl UserConfig {
     /// The settings a new install starts with: the `shelbi init` scaffold
     /// ([`shelbi_core::scaffold::CONFIG_YAML`]) as read, which seeds theme
-    /// dark and a 90% opaque, blur-40 desktop window over the defaults.
+    /// dark, contrast 50 and an 85% opaque, blur-30 desktop window over the
+    /// defaults.
     /// [`UserConfig::default`] stays what an existing file's missing keys
     /// mean.
     pub fn new_install() -> UserConfig {
@@ -863,7 +864,7 @@ mod tests {
         let original = format!(
             "{}future_key:\n  nested: 1\n",
             shelbi_core::scaffold::CONFIG_YAML.replace(
-                "window_opacity: 90\n",
+                "window_opacity: 85\n",
                 "window_opacity: 0.85 # Ghostty's shape\n  future_desktop_key: [a, b]\n",
             )
         );
@@ -1021,10 +1022,11 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    /// Theme dark and a 90% opaque, blur-40 desktop window.
+    /// Theme dark, contrast 50 and an 85% opaque, blur-30 desktop window.
     fn assert_new_install_look(cfg: &UserConfig) {
         assert_eq!(cfg.theme, ThemePreference::Dark);
-        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(90), Some(40)));
+        assert_eq!(cfg.desktop.contrast, Some(50));
+        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(30)));
     }
 
     #[test]
@@ -1055,7 +1057,7 @@ mod tests {
         .unwrap();
         let cfg = load_user_config().unwrap();
         assert_eq!(cfg.theme, ThemePreference::Auto);
-        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (None, Some(40)));
+        assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (None, Some(30)));
 
         // A load-modify-save from no file (the legacy zen_toggle migration's
         // shape) writes the seeded look too.
