@@ -9285,6 +9285,7 @@ mod tests {
         let (gx, gy) = find_on_screen(&term, "⚙").expect("Settings shows");
         let (fx, fy) = find_on_screen(&term, "📣").expect("Send Feedback shows");
         assert_eq!(st.footer_hover(), None, "no hover before any motion");
+        let at_rest = screen_text(&term);
 
         st.dirty = false;
         st.handle_event(Event::Mouse(moved(gx, gy)));
@@ -9292,7 +9293,7 @@ mod tests {
         assert!(st.dirty, "a hover change repaints");
         draw_frame(&mut term, &mut st).unwrap();
         assert_eq!(term.backend().buffer()[(gx, gy)].bg, palette().button_hover, "lit");
-        assert!(screen_text(&term).contains("Settings"), "named beside the toolbar");
+        assert_eq!(screen_text(&term), at_rest, "lit, but no name and no versions");
 
         st.dirty = false;
         st.handle_event(Event::Mouse(moved(gx, gy - 1)));
@@ -9302,7 +9303,8 @@ mod tests {
         assert_eq!(st.footer_hover(), Some(FooterButton::Feedback));
         draw_frame(&mut term, &mut st).unwrap();
         assert_eq!(term.backend().buffer()[(gx, gy)].bg, palette().selection, "Settings went back");
-        assert!(screen_text(&term).contains("Send Feedback"));
+        assert_eq!(term.backend().buffer()[(fx, fy)].bg, palette().button_hover, "Send Feedback lit");
+        assert_eq!(screen_text(&term), at_rest, "no name for Send Feedback either");
 
         st.dirty = false;
         st.handle_event(Event::Mouse(moved(st.main_rect.x + 5, fy)));
