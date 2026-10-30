@@ -69,8 +69,17 @@ impl RejectPrompt {
 
     /// Feed a left-click at `(col, row)` within the popup `area`. A click on
     /// `[ Reject ]` submits (a blank reason is still rejected); `[ Cancel ]`
-    /// cancels. Focus follows the click so the highlight tracks what was pressed.
+    /// cancels; one in the text area puts the caret on the wrapped row it
+    /// landed on. Focus follows the click so the highlight tracks what was
+    /// pressed.
     pub fn handle_click(&mut self, area: Rect, col: u16, row: u16) -> Step {
+        let text = text_rect(area);
+        if text.contains(ratatui::layout::Position { x: col, y: row }) {
+            let (_, scroll) = textarea_lines(self, text, true);
+            let at = scroll + (row - text.y) as usize;
+            self.inner.click_text_at(at, (col - text.x) as f32);
+            return Step::Continue;
+        }
         match hit_test(area, col, row) {
             Some(Hit::Reject) => self.inner.click_reject(),
             Some(Hit::Cancel) => self.inner.click_cancel(),
@@ -79,8 +88,11 @@ impl RejectPrompt {
     }
 
     /// Paint the prompt into `area` (the whole popup pane in the tmux runtime, a
-    /// centered overlay rect in the single-process TUI).
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    /// centered overlay rect in the single-process TUI). The text area's
+    /// width is what ↑ / ↓ wrap by from here on.
+    pub fn render(&mut self, f: &mut Frame, area: Rect) {
+        let room = text_rect(area).width.max(1) as usize;
+        self.inner.set_wrap(Some(crate::textbox::wrap(room)));
         render(f, area, self)
     }
 }
@@ -186,48 +198,57 @@ fn render(f: &mut Frame, area: Rect, prompt: &RejectPrompt) {
 }
 
 /// The bordered, multi-line reason area. Its border brightens to cyan when
-/// focused, and a reverse-video block cursor marks the caret. When the caret
-/// scrolls past the visible height the content scrolls to keep it in view.
+/// focused, and a reverse-video block cursor marks the caret. Long lines
+/// soft-wrap at the area's width; when the caret's wrapped row scrolls past
+/// the visible height the content scrolls to keep it in view.
 fn render_textarea(f: &mut Frame, prompt: &RejectPrompt, area: Rect) {
     let focused = prompt.focus() == Focus::Text;
     let border = if focused { palette().ansi_cyan } else { palette().ansi_dark_gray };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
+    let block = text_block().border_style(Style::default().fg(border));
     let text_area = block.inner(area);
     f.render_widget(block, area);
-
-    let visible = text_area.height.max(1) as usize;
-    let (row, _) = prompt.inner.text().cursor();
-    let scroll = row.saturating_sub(visible.saturating_sub(1));
-
-    let lines = textarea_lines(prompt, focused);
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
-        text_area,
-    );
+    let (lines, _) = textarea_lines(prompt, text_area, focused);
+    f.render_widget(Paragraph::new(Text::from(lines)), text_area);
 }
 
-/// Render each buffer line to a styled `Line`. On the caret's line (when
-/// focused) the char under the caret — or a trailing space at end-of-line — is
-/// drawn reverse-video so the caret is visible mid-line and at the end.
-fn textarea_lines(prompt: &RejectPrompt, focused: bool) -> Vec<Line<'static>> {
+/// The text area's bordered box.
+fn text_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL)
+}
+
+/// The text area's inner rect (inside its border) in the popup `area`.
+fn text_rect(area: Rect) -> Rect {
+    let rows = body_rows(crate::overlay::dialog_content(area));
+    text_block().inner(rows[1])
+}
+
+/// The wrapped rows in view in `text_area`, and the first one's index. On
+/// the caret's row (when focused) the char under the caret, or a space at
+/// the line's end, is drawn reverse-video so the caret shows mid-line and
+/// at the end.
+fn textarea_lines(prompt: &RejectPrompt, text_area: Rect, focused: bool) -> (Vec<Line<'static>>, usize) {
     let ta = prompt.inner.text();
-    let (row, col) = ta.cursor();
+    let room = text_area.width.max(1) as usize;
+    let (rows, (caret_row, caret_col)) = ta.wrapped(&crate::textbox::wrap(room));
+    let visible = text_area.height.max(1) as usize;
+    let scroll = caret_row.saturating_sub(visible - 1);
     let cursor = Style::default().add_modifier(Modifier::REVERSED);
     let plain = Style::default().fg(palette().ansi_white);
-    ta.lines()
+    let lines = rows
         .iter()
         .enumerate()
-        .map(|(i, line)| {
-            if !(focused && i == row) {
-                return Line::from(Span::styled(line.iter().collect::<String>(), plain));
-            }
-            let before: String = line[..col].iter().collect();
-            let (under, after): (String, String) = if col < line.len() {
-                (line[col].to_string(), line[col + 1..].iter().collect())
-            } else {
-                (" ".to_string(), String::new())
+        .skip(scroll)
+        .take(visible)
+        .map(|(v, &row)| {
+            let caret = (focused && v == caret_row).then_some(caret_col);
+            let (chars, caret) = crate::textbox::row_chars(ta.lines(), row, caret, room);
+            let Some(col) = caret else {
+                return Line::from(Span::styled(chars.iter().collect::<String>(), plain));
+            };
+            let before: String = chars[..col.min(chars.len())].iter().collect();
+            let (under, after): (String, String) = match chars.get(col) {
+                Some(c) => (c.to_string(), chars[col + 1..].iter().collect()),
+                None => (" ".to_string(), String::new()),
             };
             Line::from(vec![
                 Span::styled(before, plain),
@@ -235,7 +256,8 @@ fn textarea_lines(prompt: &RejectPrompt, focused: bool) -> Vec<Line<'static>> {
                 Span::styled(after, plain),
             ])
         })
-        .collect()
+        .collect();
+    (lines, scroll)
 }
 
 /// A button span. The focused button is reverse-video + bold; an unfocused
@@ -589,6 +611,86 @@ mod tests {
             .map(|dx| buf[(reject.x + dx, reject.y)].symbol().to_string())
             .collect();
         assert_eq!(drawn, REJECT_LABEL, "reject label sits on its hit rect");
+    }
+
+    /// The text area's rows as drawn, trimmed.
+    fn text_rows(prompt: &mut RejectPrompt, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| prompt.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text = text_rect(Rect { x: 0, y: 0, width: w, height: h });
+        (text.y..text.y + text.height)
+            .map(|y| (text.x..text.x + text.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|r| r.trim_end().to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+
+    /// Where the reverse-video caret is drawn, as `(column, row)` in the
+    /// text area.
+    fn caret_cell(prompt: &mut RejectPrompt, w: u16, h: u16) -> (u16, u16) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| prompt.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text = text_rect(Rect { x: 0, y: 0, width: w, height: h });
+        for y in text.y..text.y + text.height {
+            for x in text.x..text.x + text.width {
+                if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                    return (x - text.x, y - text.y);
+                }
+            }
+        }
+        panic!("no caret drawn");
+    }
+
+    const LONG: &str = "Lots of little discrepancies. Logo is bigger than figma. Buttons along the top are wrong.";
+
+    #[test]
+    fn a_long_line_wraps_at_word_boundaries_and_the_caret_follows() {
+        let mut prompt = text_prompt(LONG);
+        let rows = text_rows(&mut prompt, 40, 16);
+        assert!(rows.len() >= 3, "wrapped over several rows: {rows:?}");
+        let room = text_rect(Rect { x: 0, y: 0, width: 40, height: 16 }).width as usize;
+        for r in &rows {
+            assert!(r.chars().count() <= room, "row fits the box: {r:?}");
+            assert!(LONG.contains(r.trim()), "no word is split: {r:?}");
+        }
+        assert_eq!(rows.join(" ").split_whitespace().collect::<Vec<_>>(), LONG.split_whitespace().collect::<Vec<_>>());
+        let last = rows.len() as u16 - 1;
+        assert_eq!(caret_cell(&mut prompt, 40, 16), (rows.last().unwrap().chars().count() as u16, last), "caret ends the last row");
+        assert_eq!(prompt.reason(), LONG, "wrapping adds no newline");
+    }
+
+    #[test]
+    fn up_and_down_move_by_wrapped_row() {
+        let mut prompt = text_prompt(LONG);
+        text_rows(&mut prompt, 40, 16);
+        let (_, row) = caret_cell(&mut prompt, 40, 16);
+        press(&mut prompt, KeyCode::Up);
+        assert_eq!(caret_cell(&mut prompt, 40, 16).1, row - 1, "up one wrapped row");
+        assert_eq!(prompt.inner.text().cursor().0, 0, "still the one line");
+        press(&mut prompt, KeyCode::Down);
+        assert_eq!(caret_cell(&mut prompt, 40, 16).1, row);
+    }
+
+    #[test]
+    fn a_click_in_the_text_area_places_the_caret_on_its_wrapped_row() {
+        let area = Rect { x: 0, y: 0, width: 40, height: 16 };
+        let mut prompt = text_prompt(LONG);
+        prompt.inner.set_focus(Focus::Reject);
+        text_rows(&mut prompt, 40, 16);
+        let text = text_rect(area);
+        assert_eq!(prompt.handle_click(area, text.x + 3, text.y + 1), Step::Continue);
+        assert_eq!(prompt.focus(), Focus::Text);
+        assert_eq!(caret_cell(&mut prompt, 40, 16), (3, 1));
+    }
+
+    #[test]
+    fn a_tall_reason_scrolls_to_keep_the_caret_row_in_view() {
+        let mut prompt = text_prompt(&[LONG; 4].join(" "));
+        let text = text_rect(Rect { x: 0, y: 0, width: 40, height: 12 });
+        let (_, row) = caret_cell(&mut prompt, 40, 12);
+        assert_eq!(row, text.height - 1, "the caret's row is the last shown");
     }
 
     #[test]

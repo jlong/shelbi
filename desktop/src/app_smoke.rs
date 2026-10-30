@@ -126,6 +126,29 @@ impl Harness {
         self.cx.run_until_parked();
     }
 
+    /// Put a line far wider than `input`'s box in it and check it
+    /// soft-wraps there: its last char drawn on a row below its first and
+    /// inside the box, and no newline added to the value.
+    pub(super) fn assert_area_wraps(&mut self, input: &gpui::Entity<gpui_kit::component::input::TextareaState>, what: &str) {
+        let long = "Wrap me at the edge of the box, please. ".repeat(10).trim_end().to_string();
+        let value = long.clone();
+        self.cx.update(|window, cx| input.update(cx, |s, cx| s.set_value(value, window, cx)));
+        // The wrap follows the box's laid-out width.
+        self.draw();
+        self.draw();
+        let (first, last, bounds, text) = self.cx.read(|cx| {
+            let s = input.read(cx);
+            (s.range_to_bounds(&(0..1)), s.range_to_bounds(&(long.len() - 1..long.len())), s.input_bounds(), s.value().to_string())
+        });
+        let (first, last) = (first.unwrap_or_else(|| panic!("{what} is laid out")), last.unwrap());
+        assert!(last.top() > first.top(), "{what}: the long line wraps onto more rows ({first:?}, {last:?})");
+        assert!(
+            last.right() <= bounds.right() + gpui::px(1.0),
+            "{what}: the wrapped text stays in the box ({last:?} in {bounds:?})"
+        );
+        assert_eq!(text, long, "{what}: wrapping adds no newline");
+    }
+
     pub(super) fn key(&mut self, keystroke: &str) {
         self.cx.simulate_keystrokes(keystroke);
         self.cx.run_until_parked();

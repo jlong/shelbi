@@ -384,3 +384,39 @@ fn the_pointer_lifts_the_buttons_and_never_a_kind_or_a_field() {
         });
     }
 }
+
+/// Where Message's caret (the block in the strong text color) is drawn.
+fn caret_at(buf: &Buffer) -> (u16, u16) {
+    (0..buf.area.height)
+        .find_map(|y| (0..buf.area.width).find(|&x| buf[(x, y)].bg == palette().white).map(|x| (x, y)))
+        .expect("a caret")
+}
+
+#[test]
+fn a_long_message_wraps_at_words_and_the_caret_moves_by_wrapped_row() {
+    let mut d = FeedbackDialog::new(remembered("Ada", "ada@example.com"), true);
+    let long = "It froze when I dragged a card. ".repeat(4);
+    let long = long.trim_end();
+    typed(&mut d, long);
+    let (buf, _) = render(&mut d, 100, 45);
+    let (first_x, first_y) = find(&buf, "It froze when").unwrap();
+    let rows: Vec<String> = (first_y..first_y + 3).map(|y| row(&buf, y)).collect();
+    assert!(rows.iter().all(|r| r.contains("froze") || r.contains("card")), "over several rows: {rows:#?}");
+    // Each row breaks at a word: its text, read on from the box's left
+    // edge, is whole words of the message.
+    for r in &rows {
+        let text: String = r.chars().skip(first_x as usize).collect::<String>();
+        let text = text.trim().trim_end_matches(['▌', '▐', '│']).trim();
+        assert!(long.contains(text), "{text:?} is a whole run of the message");
+    }
+    assert_eq!(d.form().message(), long, "wrapping adds no newline");
+    let (_, caret_y) = caret_at(&buf);
+    assert!(caret_y > first_y, "the caret ends the last wrapped row");
+    d.key(key(Code::Up));
+    let (buf, _) = render(&mut d, 100, 45);
+    assert_eq!(caret_at(&buf).1, caret_y - 1, "up one wrapped row");
+    // A click on the first row puts the caret there.
+    d.handle_click(first_x + 3, first_y);
+    let (buf, _) = render(&mut d, 100, 45);
+    assert_eq!(caret_at(&buf), (first_x + 3, first_y));
+}

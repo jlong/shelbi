@@ -2221,7 +2221,8 @@ impl ShelbiWindow {
                 self.run_review_mutation(id, m, Decision::APPROVE, window, cx);
             }
             HostCall::AskRejectReason(id) => {
-                self.open_overlay(ActiveOverlay::reject_reason(id), window, cx)
+                let wrap = crate::views::overlay::review_reject::wrap(cx);
+                self.open_overlay(ActiveOverlay::reject_reason(id, Some(wrap)), window, cx)
             }
             HostCall::RejectReview(id, reason) => self.reject(id, reason, window, cx),
             HostCall::OpenEditor(target) => self.open_editor(target, cx),

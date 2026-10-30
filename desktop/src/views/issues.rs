@@ -3113,6 +3113,32 @@ mod tests {
         assert!(sent(&view, &cx).is_empty(), "{:?}", sent(&view, &cx));
     }
 
+    #[gpui::test]
+    fn a_long_body_line_wraps_and_up_moves_by_wrapped_row(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut a = issue("A", "todo");
+        a.body = "Lots of little discrepancies with the design. ".repeat(8).trim_end().to_string();
+        let len = a.body.len();
+        let (view, mut cx) = open_board_sized(cx, vec![a.clone()], Some(gpui::size(px(1160.0), px(1024.0))));
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.run_issue_command(&CommandKind::EditIssue { id: "A".into() }, window, cx))
+        });
+        let (_, body) = editors(&view, &mut cx);
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let first = body.read_with(&cx, |b, _| b.point_of(0)).unwrap();
+        let end = body.read_with(&cx, |b, _| b.point_of(len)).unwrap();
+        assert!(end.y > first.y, "the one line wraps onto more rows");
+        assert_eq!(body.read_with(&cx, |b, _| b.model.head()), len);
+        cx.simulate_keystrokes("up");
+        let head = body.read_with(&cx, |b, _| b.model.head());
+        assert!(head > 0 && head < len, "up one wrapped row, not out of the line: {head}");
+        let up = body.read_with(&cx, |b, _| b.point_of(head)).unwrap();
+        assert!(up.y < end.y && up.y > first.y - px(1.0));
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), a.body, "wrapping adds no newline");
+    }
+
     #[test]
     fn a_fingerprint_tells_reads_apart() {
         let read = |title: &str| vec![("id-1", title.to_string()), ("id-2", "Other".to_string())];
