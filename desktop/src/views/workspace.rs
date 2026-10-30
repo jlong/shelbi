@@ -68,7 +68,7 @@ use gpui::{
 use shelbi_app::session::{SessionRef, WorkspaceContentRelauncher};
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceHeader, WorkspaceRow};
 use shelbi_app::workspace_panel::{WorkspacePanelState, WsEffect, WsPanelShape, WsRow};
-use shelbi_app::WorkspaceSessionOp;
+use shelbi_app::{ReviewRole, WorkspaceSessionOp};
 use shelbi_core::{Column, StatusCategory};
 
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent};
@@ -102,6 +102,11 @@ pub trait WorkspaceOps: Send + Sync {
     fn session_op(&self, project: &str, workspace: &str, op: WorkspaceSessionOp) -> Result<(), String>;
     /// Show `path` in Finder.
     fn reveal(&self, path: &str) -> Result<(), String>;
+    /// Open the workspace's worktree (the editor) or its diff in the app the
+    /// settings chose for `role`. Hands back the status line.
+    fn open_in_app(&self, _project: &str, _workspace: &str, _role: ReviewRole) -> Result<String, String> {
+        Err("apps can't be opened here".into())
+    }
 }
 
 /// The real thing: the orchestrator's details reader, the daemon's control
@@ -118,7 +123,12 @@ impl WorkspaceOps for LiveOps {
             branch: d.branch,
             worktree: d.worktree,
             editor_name: d.editor_name,
+            apps: d.apps,
         })
+    }
+
+    fn open_in_app(&self, project: &str, workspace: &str, role: ReviewRole) -> Result<String, String> {
+        shelbi_orchestrator::workspace_session::open_in_app(project, workspace, role.into()).map_err(|e| e.to_string())
     }
 
     fn session_op(&self, project: &str, workspace: &str, op: WorkspaceSessionOp) -> Result<(), String> {
@@ -504,7 +514,8 @@ impl WorkspaceView {
     /// The panel's rows for what the workspace is doing now.
     fn panel_shape(&self) -> WsPanelShape {
         let has_body = self.current_details().is_some_and(|d| !d.body.trim().is_empty());
-        WsPanelShape::for_workspace(self.has_task(), has_body, !self.is_remote(), true)
+        let apps = self.details.as_ref().map(|d| d.apps).unwrap_or_default();
+        WsPanelShape::for_workspace(self.has_task(), has_body, !self.is_remote(), true).with_apps(apps)
     }
 
     fn sync_panel(&mut self) {
@@ -592,6 +603,7 @@ impl WorkspaceView {
             WsEffect::ShowAgent => self.select_view(ContentView::Agent, cx),
             WsEffect::ShowDiff => self.select_view(ContentView::Diff, cx),
             WsEffect::ShowEditor => self.select_view(ContentView::Editor, cx),
+            WsEffect::OpenApp(role) => self.open_in_app(role, cx),
             // More opens the task's detail over the screen.
             WsEffect::ShowDescription => {
                 if let Some(task) = self.row.as_ref().and_then(|r| r.current_task.clone()) {
@@ -813,6 +825,30 @@ impl WorkspaceView {
         }
         cx.notify();
         was
+    }
+
+    /// Open the worktree or its diff in the app chosen for `role`, off the
+    /// UI thread. The view stays as it is; a failure lands on the status line.
+    fn open_in_app(&mut self, role: ReviewRole, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        self.status_line = None;
+        let ops = self.ops.clone();
+        let project = self.project.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { ops.open_in_app(&project, &workspace, role) });
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = work.await {
+                this.update(cx, |this, cx| {
+                    this.status_line = Some(format!("couldn't open the app: {e}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn reveal_folder(&mut self, cx: &mut Context<Self>) {
@@ -1308,6 +1344,7 @@ pub(crate) mod tests {
         ops: Mutex<Vec<WorkspaceSessionOp>>,
         fail_ops: Mutex<bool>,
         revealed: Mutex<Vec<String>>,
+        opened_apps: Mutex<Vec<ReviewRole>>,
     }
 
     impl WorkspaceOps for FakeOps {
@@ -1325,6 +1362,14 @@ pub(crate) mod tests {
         fn reveal(&self, path: &str) -> Result<(), String> {
             self.revealed.lock().unwrap().push(path.to_string());
             Ok(())
+        }
+        fn open_in_app(&self, _project: &str, _workspace: &str, role: ReviewRole) -> Result<String, String> {
+            self.opened_apps.lock().unwrap().push(role);
+            if *self.fail_ops.lock().unwrap() {
+                Err("Zed isn't installed".into())
+            } else {
+                Ok("Opened the worktree in Zed".into())
+            }
         }
     }
 
@@ -1464,6 +1509,7 @@ pub(crate) mod tests {
             branch: Some("jlong/t-1".into()),
             worktree: "/w/alpha".into(),
             editor_name: "Vim".into(),
+            apps: Default::default(),
         }
     }
 
@@ -1893,6 +1939,33 @@ pub(crate) mod tests {
         assert!(h.events().is_empty(), "the × stays in the workspace");
         assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::Close));
         assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/alpha"));
+    }
+
+    #[gpui::test]
+    fn an_app_editor_opens_in_the_app_and_the_agent_stays(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        let mut details = details_for_t1();
+        details.editor_name = "Zed".into();
+        details.apps = shelbi_state::AppTools { editor: true, diff: false };
+        *h.ops.details.lock().unwrap() = Some(details);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.click("ws-switch-editor");
+        assert_eq!(*h.ops.opened_apps.lock().unwrap(), vec![ReviewRole::Editor]);
+        assert_eq!(h.active(), ContentView::Agent, "no editor pane: the agent stays");
+        assert!(h.ops().is_empty(), "the daemon spawns no editor session");
+        assert_eq!(h.sessions.attached(), vec!["demo/ws/alpha"]);
+
+        // The diff is still a pane.
+        h.click("ws-switch-diff");
+        assert_eq!(h.active(), ContentView::Diff);
+
+        // A launch that fails says why.
+        *h.ops.fail_ops.lock().unwrap() = true;
+        h.click("ws-switch-editor");
+        assert_eq!(
+            h.view.read_with(&h.cx, |v, _| v.status_line.clone()).as_deref(),
+            Some("couldn't open the app: Zed isn't installed")
+        );
     }
 
     #[gpui::test]

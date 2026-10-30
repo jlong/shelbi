@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use shelbi_core::Result;
 
 use crate::keymap::KeyChord;
+use crate::tools::{command_display_name, ToolChoice};
 use crate::{atomic_write, ensure_dir, shelbi_home};
 
 /// Path to `~/.shelbi/config.yaml` (or `$SHELBI_HOME/config.yaml`).
@@ -32,15 +33,23 @@ pub struct UserConfig {
     #[serde(default)]
     pub keymap: Keymap,
 
-    /// Editor command the review interface's "Edit in <editor>" view
-    /// launches in the task's review worktree. Hub-wide (not per-project)
-    /// so a reviewer's editor choice follows them across every project.
-    /// Resolution order is [`resolve_editor`]: this setting, then
-    /// `$EDITOR`, then `vim`. May be a bare command (`hx`) or a command
-    /// with flags (`code --wait`); the display label is derived from the
-    /// program name (see [`editor_display_name`]).
+    /// The editor the Workspace and Review views' "Edit in <editor>" opens
+    /// on the worktree. Hub-wide (not per-project) so the choice follows the
+    /// user across every project. A command line (`hx`, `code --wait`) runs
+    /// in a pane; an app (`{ app: /Applications/Zed.app }`) opens the
+    /// worktree in the app ([`ToolChoice`]). Unset falls back to `$EDITOR`,
+    /// then `vim` ([`resolve_editor_choice`]). The label is the tool's name
+    /// ([`ToolChoice::display_name`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub editor: Option<String>,
+    pub editor: Option<ToolChoice>,
+
+    /// The diff tool View Diff runs over a branch's changes: a command line
+    /// in a pane (`difft`, `nvim -d`) or an app (`{ app:
+    /// /Applications/Kaleidoscope.app }`). A project's `review.diff_command`
+    /// takes precedence; unset runs git's configured difftool (`diff.tool` /
+    /// `diff.guitool`). See [`crate::tools::diff_launch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_tool: Option<ToolChoice>,
 
     /// Color theme for the TUI and the desktop app (`theme: auto | dark |
     /// light`). A missing key is [`ThemePreference::Auto`] (a new install's
@@ -611,20 +620,56 @@ pub fn load_user_config() -> Result<UserConfig> {
 /// Fallback editor when neither the config nor `$EDITOR` names one.
 pub const DEFAULT_EDITOR: &str = "vim";
 
-/// Resolve the editor command the review interface's "Edit in <editor>"
-/// view launches, in precedence order:
+/// Resolve the editor command a **pane** runs (the review and workspace
+/// editor sessions, a foreground edit), in precedence order:
 ///
-/// 1. `~/.shelbi/config.yaml::editor` (hub-wide reviewer preference),
+/// 1. `~/.shelbi/config.yaml::editor` when it is a command (hub-wide),
 /// 2. the `$EDITOR` environment variable,
 /// 3. `vim` ([`DEFAULT_EDITOR`]).
 ///
-/// A blank/whitespace value at either layer is skipped rather than
-/// launching an empty command. The returned string is the full command
-/// (it may carry flags, e.g. `code --wait`); split it before exec.
+/// An `editor:` app can't run in a pane, so a pane falls back past it to
+/// `$EDITOR`, then vim; [`resolve_editor_choice`] is the setting as the
+/// user chose it. A blank value at either layer is skipped rather than
+/// launching an empty command. The returned string is the full command (it
+/// may carry flags, e.g. `code --wait`); split it before exec.
 pub fn resolve_editor() -> String {
     let from_config = load_user_config().ok().and_then(|c| c.editor);
     let from_env = std::env::var("EDITOR").ok();
-    resolve_editor_from(from_config, from_env)
+    resolve_editor_from(from_config.as_ref().and_then(ToolChoice::command).map(str::to_string), from_env)
+}
+
+/// The editor as chosen: `editor:` (a command or an app), else the
+/// `$EDITOR` / vim command, with the layer that named it.
+pub fn resolve_editor_choice() -> (ToolChoice, EditorSource) {
+    let from_config = load_user_config().ok().and_then(|c| c.editor);
+    let from_env = std::env::var("EDITOR").ok();
+    resolve_editor_choice_from(from_config.as_ref(), from_env.as_deref())
+}
+
+/// [`resolve_editor_choice`]'s precedence over given values: a non-blank
+/// `config` choice, then `env`, then vim.
+pub fn resolve_editor_choice_from(config: Option<&ToolChoice>, env: Option<&str>) -> (ToolChoice, EditorSource) {
+    match config.cloned().and_then(ToolChoice::normalized) {
+        Some(choice) => (choice, EditorSource::Config),
+        None => {
+            let (command, source) = resolve_editor_source(None, env);
+            (ToolChoice::Command(command), source)
+        }
+    }
+}
+
+/// The display name of the editor "Edit in <name>" opens (`Vim`, `Neovim`,
+/// `Zed`), from the user config and `$EDITOR`.
+pub fn resolved_editor_name() -> String {
+    resolve_editor_choice().0.display_name()
+}
+
+/// The `diff_tool:` setting, when one is set.
+pub fn resolve_diff_tool() -> Option<ToolChoice> {
+    load_user_config()
+        .ok()
+        .and_then(|c| c.diff_tool)
+        .and_then(ToolChoice::normalized)
 }
 
 /// Pure precedence core of [`resolve_editor`]: config editor, then `$EDITOR`,
@@ -659,22 +704,12 @@ pub fn resolve_editor_source(config: Option<&str>, env: Option<&str>) -> (String
 }
 
 /// Human-facing name of an editor command for the "Edit in <name>"
-/// sidebar label — the program's basename, first letter upper-cased
-/// (`vim` → `Vim`, `/usr/bin/hx` → `Hx`, `code --wait` → `Code`). Flags
-/// and directory components are dropped. Empty input yields an empty
-/// string so callers can guard.
+/// sidebar label: a known tool's name (`nvim` → `Neovim`, `hx` → `Helix`),
+/// else the program's basename, first letter upper-cased (`vim` → `Vim`,
+/// `/opt/bin/foo -x` → `Foo`). Flags and directory components are dropped.
+/// Empty input yields an empty string so callers can guard.
 pub fn editor_display_name(command: &str) -> String {
-    let program = command.split_whitespace().next().unwrap_or("");
-    let base = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .trim();
-    let mut chars = base.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
+    command_display_name(command)
 }
 
 /// Atomically write the user config to `~/.shelbi/config.yaml`.
@@ -835,7 +870,7 @@ mod tests {
         // What another client (the TUI) reads on its next start.
         let back = load_user_config().unwrap();
         assert_eq!(back.keymap.zen_toggle, ZenToggleChord::CtrlG);
-        assert_eq!(back.editor.as_deref(), Some("hx"));
+        assert_eq!(back.editor.as_ref().and_then(crate::ToolChoice::command), Some("hx"));
         assert_eq!(back.theme, ThemePreference::Dark);
         assert_eq!(back.desktop.terminal_font_size, Some(13));
         let text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
@@ -871,7 +906,7 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
 
         let written = update_user_config(|c| c.editor = Some("code --wait".into())).unwrap();
-        assert_eq!(written.editor.as_deref(), Some("code --wait"));
+        assert_eq!(written.editor.as_ref().and_then(crate::ToolChoice::command), Some("code --wait"));
         let text = std::fs::read_to_string(&path).unwrap();
         for kept in [
             "## Color theme for the TUI and the desktop app",
@@ -884,7 +919,7 @@ mod tests {
             assert!(text.contains(kept), "{kept:?} survives:\n{text}");
         }
         let back = load_user_config().unwrap();
-        assert_eq!(back.editor.as_deref(), Some("code --wait"), "arguments kept");
+        assert_eq!(back.editor.as_ref().and_then(crate::ToolChoice::command), Some("code --wait"), "arguments kept");
         assert_eq!(back.desktop.window_opacity, Some(85));
 
         update_user_config(|c| c.theme = ThemePreference::Light).unwrap();
@@ -1127,13 +1162,82 @@ mod tests {
     }
 
     #[test]
-    fn editor_display_name_titlecases_the_basename() {
+    fn editor_display_name_names_known_tools_and_titlecases_the_rest() {
         assert_eq!(editor_display_name("vim"), "Vim");
-        assert_eq!(editor_display_name("hx"), "Hx");
-        assert_eq!(editor_display_name("/usr/local/bin/nvim"), "Nvim");
+        assert_eq!(editor_display_name("hx"), "Helix");
+        assert_eq!(editor_display_name("/usr/local/bin/nvim"), "Neovim");
         // Flags are dropped; only the program name drives the label.
-        assert_eq!(editor_display_name("code --wait"), "Code");
+        assert_eq!(editor_display_name("code --wait"), "Visual Studio Code");
+        assert_eq!(editor_display_name("ed -p"), "Ed");
         assert_eq!(editor_display_name(""), "");
+    }
+
+    #[test]
+    fn an_app_editor_is_the_choice_but_a_pane_falls_back_past_it() {
+        let zed = ToolChoice::app("/Applications/Zed.app");
+        assert_eq!(
+            resolve_editor_choice_from(Some(&zed), Some("nvim")),
+            (zed.clone(), EditorSource::Config)
+        );
+        assert_eq!(
+            resolve_editor_choice_from(Some(&"  ".into()), Some("nvim")),
+            (ToolChoice::from("nvim"), EditorSource::Env)
+        );
+        assert_eq!(resolve_editor_choice_from(None, None), (ToolChoice::from("vim"), EditorSource::Default));
+        // A pane can't run an app: it takes $EDITOR, then vim.
+        assert_eq!(resolve_editor_from(zed.command().map(str::to_string), Some("nano".into())), "nano");
+    }
+
+    #[test]
+    fn old_and_new_tool_settings_load_and_round_trip() {
+        // The old string form loads unchanged; the app form is a mapping.
+        let cfg: UserConfig = serde_yaml::from_str(
+            "editor: code --wait\ndiff_tool:\n  app: /Applications/Kaleidoscope.app\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.editor, Some(ToolChoice::from("code --wait")));
+        assert_eq!(cfg.diff_tool, Some(ToolChoice::app("/Applications/Kaleidoscope.app")));
+        let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+
+        let cfg: UserConfig = serde_yaml::from_str("editor: { app: /Applications/Zed.app }\ndiff_tool: difft\n").unwrap();
+        assert_eq!(cfg.editor, Some(ToolChoice::app("/Applications/Zed.app")));
+        assert_eq!(cfg.diff_tool, Some(ToolChoice::from("difft")));
+
+        // Unset is omitted on save.
+        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        assert!(!yaml.contains("diff_tool") && !yaml.contains("editor"), "{yaml}");
+    }
+
+    #[test]
+    fn an_app_setting_patches_over_a_command_and_back() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = home.join("config.yaml");
+        std::fs::write(&path, "# mine\neditor: hx\ntheme: light\n").unwrap();
+
+        update_user_config(|c| {
+            c.editor = Some(ToolChoice::app("/Applications/Zed.app"));
+            c.diff_tool = Some("difft".into());
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine\n") && text.contains("theme: light"), "{text}");
+        let back = load_user_config().unwrap();
+        assert_eq!(back.editor, Some(ToolChoice::app("/Applications/Zed.app")), "{text}");
+        assert_eq!(back.diff_tool, Some(ToolChoice::from("difft")), "{text}");
+
+        update_user_config(|c| {
+            c.editor = Some("nvim".into());
+            c.diff_tool = None;
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = load_user_config().unwrap();
+        assert_eq!((back.editor, back.diff_tool), (Some(ToolChoice::from("nvim")), None), "{text}");
+        assert!(!text.contains("app:") && !text.contains("diff_tool"), "{text}");
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
@@ -1192,7 +1296,7 @@ mod tests {
         };
         save_user_config(&cfg).unwrap();
         let back = load_user_config().unwrap();
-        assert_eq!(back.editor.as_deref(), Some("hx"));
+        assert_eq!(back.editor.as_ref().and_then(crate::ToolChoice::command), Some("hx"));
 
         // A default config omits the key entirely (lean on-disk form).
         let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();

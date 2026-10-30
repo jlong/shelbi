@@ -50,6 +50,9 @@ pub enum WorkspaceAction {
     /// Show a content view. `None` is the agent session (already live);
     /// `Some(role)` asks the daemon to ensure that session, then binds it.
     ShowContent(Option<ReviewRole>),
+    /// Open the worktree (the editor) or its diff in the app chosen for the
+    /// role; the content view stays as it is.
+    OpenApp(ReviewRole),
     /// Reveal the workspace worktree folder in the OS file manager.
     RevealFolder,
     /// Open the full task-description popover over the main area.
@@ -105,6 +108,13 @@ impl WorkspaceInterface {
             focus: WsFocus::Panel,
             task,
         }
+    }
+
+    /// Edit and View Diff open these in their apps (`editor:` /
+    /// `diff_tool:` apps) instead of a pane.
+    pub fn with_apps(mut self, apps: shelbi_state::AppTools) -> Self {
+        self.panel.apps = apps;
+        self
     }
 
     pub fn workspace(&self) -> &str {
@@ -384,6 +394,7 @@ fn map_effect(effect: WsEffect) -> WorkspaceAction {
         WsEffect::ShowAgent => WorkspaceAction::ShowContent(None),
         WsEffect::ShowDiff => WorkspaceAction::ShowContent(Some(ReviewRole::Diff)),
         WsEffect::ShowEditor => WorkspaceAction::ShowContent(Some(ReviewRole::Editor)),
+        WsEffect::OpenApp(role) => WorkspaceAction::OpenApp(role),
         WsEffect::ShowDescription => WorkspaceAction::ShowDescription,
         WsEffect::Close => WorkspaceAction::Close,
         // The TUI's panel has no user-shell row (the desktop's), so this

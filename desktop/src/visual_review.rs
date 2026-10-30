@@ -132,6 +132,7 @@ fn info() -> ReviewInfo {
             .into(),
         worktree: "/Users/me/src/demo/.shelbi/wt/review-1".into(),
         editor_name: "Vim".into(),
+        apps: Default::default(),
         review_url: Some("http://localhost:4101".into()),
         has_health_check: true,
         remote_machine: None,

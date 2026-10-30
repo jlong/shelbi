@@ -40,6 +40,15 @@ pub enum ReviewContentRole {
     Diff,
 }
 
+impl From<shelbi_proto::control::ReviewRole> for ReviewContentRole {
+    fn from(role: shelbi_proto::control::ReviewRole) -> Self {
+        match role {
+            shelbi_proto::control::ReviewRole::Editor => ReviewContentRole::Editor,
+            shelbi_proto::control::ReviewRole::Diff => ReviewContentRole::Diff,
+        }
+    }
+}
+
 impl ReviewContentRole {
     /// The `<role>` component of the session name.
     pub fn as_str(&self) -> &'static str {
@@ -100,8 +109,11 @@ pub struct ReviewOpenInfo {
     pub slot: String,
     /// Absolute review worktree path (shown truncated, revealed on click).
     pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, …).
+    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane
+    /// ([`crate::tools::app_tools`]).
+    pub apps: shelbi_state::AppTools,
     /// Whether the workflow declares a review URL (gates the Browser entry).
     pub has_review_url: bool,
     /// The review URL itself (the workflow's `review:` template with the
@@ -151,7 +163,8 @@ fn review_open_info_for_slot(
     let worktree = crate::workspace::workspace_worktree(machine, ws)
         .to_string_lossy()
         .to_string();
-    let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
+    let editor_name = shelbi_state::resolved_editor_name();
+    let apps = crate::tools::app_tools(project);
     // Read the task once, for both the review-URL gate and the panel's task
     // info (title / description preview / popover).
     let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
@@ -171,6 +184,7 @@ fn review_open_info_for_slot(
         slot: slot.to_string(),
         worktree,
         editor_name,
+        apps,
         has_review_url: review_url.is_some(),
         review_url,
         has_health_check,
@@ -306,6 +320,29 @@ pub fn ensure_content_session(
     };
     backend.spawn_session(spec)?;
     Ok(())
+}
+
+/// Open `task_id`'s review worktree (the editor) or its branch diff in the
+/// app chosen for `role` (`editor:` / `diff_tool:`), returning the status
+/// line to show. A remote slot is refused with the reason (an app opens
+/// local worktrees only). Blocking (config, board, and a short watch of the
+/// launch), so call it off the UI thread.
+pub fn open_in_app(project_name: &str, task_id: &str, role: ReviewContentRole) -> Result<String> {
+    let project = shelbi_state::load_project(project_name)?;
+    let slot = resolve_review_slot(project_name, &project, task_id)?
+        .ok_or_else(|| Error::Other(format!("`{task_id}` is not loaded on a review slot")))?;
+    let ws = project
+        .workspace(&slot)
+        .ok_or_else(|| Error::Other(format!("unknown review slot `{slot}`")))?;
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    if machine.host() != Host::Local {
+        let cfg = shelbi_state::load_user_config().unwrap_or_default();
+        return Err(Error::Other(crate::tools::remote_refusal(role, &cfg, &ws.machine)));
+    }
+    let worktree = crate::workspace::workspace_worktree(machine, ws);
+    crate::tools::open_in_app(role, &worktree, project.base_branch())
 }
 
 /// Tear the review interface for `task_id` down: end its editor and diff

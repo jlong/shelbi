@@ -2,7 +2,7 @@
 //! user's editor at the line it names.
 //!
 //! The editor is the one the review panel's "Edit in" uses
-//! (`shelbi_state::resolve_editor`: the hub config's `editor`, then
+//! (`shelbi_state::resolve_editor_choice`: the hub config's `editor`, then
 //! `$EDITOR`, then `vim`), launched through `views::external_edit` with the
 //! line in that editor's syntax. A relative path resolves against the
 //! session's working directory (`shelbi_term::links::path_candidates`); the
@@ -35,7 +35,7 @@ pub fn open(target: &LinkTarget, cwd: Option<PathBuf>, cx: &mut App) {
 
 fn open_path(path: &str, line: Option<u32>, column: Option<u32>, cwd: Option<PathBuf>) -> Result<(), String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let editor = shelbi_state::resolve_editor();
+    let (editor, _) = shelbi_state::resolve_editor_choice();
     if let Some(mut child) = open_path_with(&editor, path, line, column, cwd, home)? {
         // Reap the editor when it exits, so it doesn't linger as a zombie.
         std::thread::spawn(move || {
@@ -48,7 +48,7 @@ fn open_path(path: &str, line: Option<u32>, column: Option<u32>, cwd: Option<Pat
 /// Open `path` in `editor`: the first candidate that exists, at `line` and
 /// `column`. A directory opens in Finder. Returns a GUI editor's child.
 fn open_path_with(
-    editor: &str,
+    editor: &shelbi_state::ToolChoice,
     path: &str,
     line: Option<u32>,
     column: Option<u32>,
@@ -66,7 +66,7 @@ fn open_path_with(
             .map(|_| None)
             .map_err(|e| e.to_string());
     }
-    external_edit::spawn(&external_edit::launch_at(editor, &file, line, column))
+    external_edit::spawn(&external_edit::launch_choice(editor, &file, line, column))
 }
 
 #[cfg(test)]
@@ -88,7 +88,7 @@ mod tests {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let cwd = Some(dir.join("w"));
-        let mut child = open_path_with(&editor.to_string_lossy(), "src/main.rs", Some(42), Some(5), cwd.clone(), None)
+        let mut child = open_path_with(&editor.to_string_lossy().as_ref().into(), "src/main.rs", Some(42), Some(5), cwd.clone(), None)
             .unwrap()
             .expect("a GUI editor runs as a child");
         assert!(child.wait().unwrap().success());
@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(argv.trim(), format!("--goto {}:42:5", file.display()));
 
         // A path that doesn't exist opens nothing.
-        let err = open_path_with(&editor.to_string_lossy(), "src/nope.rs", Some(1), None, cwd, None).unwrap_err();
+        let err = open_path_with(&editor.to_string_lossy().as_ref().into(), "src/nope.rs", Some(1), None, cwd, None).unwrap_err();
         assert!(err.contains("no such file"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

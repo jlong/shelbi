@@ -49,8 +49,10 @@ pub fn content_session_name(project_name: &str, workspace: &str, role: ReviewCon
 pub struct WorkspaceOpenInfo {
     /// Absolute workspace worktree path (shown truncated, revealed on click).
     pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, …).
+    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane.
+    pub apps: shelbi_state::AppTools,
     /// The in-progress task on this workspace, for the panel's status / title /
     /// description preview and the full-description popover. `None` when the
     /// workspace has no in-progress task (the caller keeps the regular sidebar).
@@ -97,8 +99,11 @@ pub struct WorkspaceDetails {
     pub is_remote: bool,
     /// Absolute workspace worktree path (on the workspace's machine).
     pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, …).
+    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane
+    /// ([`crate::tools::app_tools`]).
+    pub apps: shelbi_state::AppTools,
     /// The branch the workspace is on: its in-progress task's branch, else (a
     /// local workspace) the worktree's checked-out branch. `None` when unknown.
     pub branch: Option<String>,
@@ -120,7 +125,8 @@ pub fn workspace_details(project_name: &str, workspace: &str) -> Result<Workspac
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let host = machine.host();
     let worktree = crate::workspace::workspace_worktree(machine, ws);
-    let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
+    let editor_name = shelbi_state::resolved_editor_name();
+    let apps = crate::tools::app_tools(&project);
     let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)?;
     let branch = task
         .as_ref()
@@ -135,6 +141,7 @@ pub fn workspace_details(project_name: &str, workspace: &str) -> Result<Workspac
         is_remote: !host.is_local(),
         worktree: worktree.to_string_lossy().to_string(),
         editor_name,
+        apps,
         branch,
         task: task.map(Box::new),
     })
@@ -152,6 +159,7 @@ pub fn workspace_open_info(project_name: &str, workspace: &str) -> Result<Worksp
     Ok(WorkspaceOpenInfo {
         worktree: details.worktree,
         editor_name: details.editor_name,
+        apps: details.apps,
         task: details.task,
     })
 }
@@ -214,6 +222,26 @@ pub fn ensure_content_session(
     };
     backend.spawn_session(spec)?;
     Ok(())
+}
+
+/// Open `workspace`'s worktree (the editor) or its branch diff in the app
+/// chosen for `role` (`editor:` / `diff_tool:`), returning the status line
+/// to show. A remote workspace is refused with the reason (an app opens
+/// local worktrees only). Blocking, so call it off the UI thread.
+pub fn open_in_app(project_name: &str, workspace: &str, role: ReviewContentRole) -> Result<String> {
+    let project = shelbi_state::load_project(project_name)?;
+    let ws = project
+        .workspace(workspace)
+        .ok_or_else(|| Error::Other(format!("unknown workspace `{workspace}`")))?;
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    if machine.host() != Host::Local {
+        let cfg = shelbi_state::load_user_config().unwrap_or_default();
+        return Err(Error::Other(crate::tools::remote_refusal(role, &cfg, &ws.machine)));
+    }
+    let worktree = crate::workspace::workspace_worktree(machine, ws);
+    crate::tools::open_in_app(role, &worktree, project.base_branch())
 }
 
 /// End `workspace`'s editor and diff content sessions. Idempotent and

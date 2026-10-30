@@ -205,6 +205,8 @@ struct ReviewOpenParams {
     slot: String,
     worktree: String,
     editor_name: String,
+    /// Which of Edit and View Diff open an app.
+    apps: shelbi_state::AppTools,
     has_review_url: bool,
     /// The reviewed task, for the panel's title / description preview and the
     /// full-description popover (`None` when the store couldn't produce it).
@@ -255,6 +257,7 @@ impl ReviewBackend for DaemonReviewBackend {
                 slot: info.slot,
                 worktree: info.worktree,
                 editor_name: info.editor_name,
+                apps: info.apps,
                 has_review_url: info.has_review_url,
                 task: info.task,
             })),
@@ -841,6 +844,8 @@ struct WorkspaceOpenParams {
     workspace: String,
     worktree: String,
     editor_name: String,
+    /// Which of Edit and View Diff open an app.
+    apps: shelbi_state::AppTools,
     /// The in-progress task on the workspace, when resolvable.
     task: Option<Box<shelbi_state::IssueFile>>,
 }
@@ -3949,7 +3954,8 @@ impl ShellState {
             p.editor_name,
             p.has_review_url,
             p.task.map(|b| *b),
-        ));
+        )
+        .with_apps(p.apps));
         self.reported_main = None; // re-report size for the content view
         self.status = None;
         self.review_open_pending = None;
@@ -4146,6 +4152,15 @@ impl ShellState {
                         self.display_style,
                     ));
                 }
+            }
+            ReviewAction::OpenApp(role) => {
+                // The app launches off the UI thread; the content view stays.
+                self.spawn_job(move || {
+                    match shelbi_orchestrator::review_session::open_in_app(&project, &task, role.into()) {
+                        Ok(note) => note,
+                        Err(e) => format!("couldn't open the app: {e}"),
+                    }
+                });
             }
             ReviewAction::OpenBrowser | ReviewAction::RevealFolder => {
                 // Openers run inline (spawn+detach); failures land on the status.
@@ -4426,6 +4441,7 @@ impl ShellState {
                     workspace: name.clone(),
                     worktree: info.worktree,
                     editor_name: info.editor_name,
+                    apps: info.apps,
                     task: info.task,
                 })
                 .map_err(|e| e.to_string());
@@ -4507,7 +4523,8 @@ impl ShellState {
             agent_name,
             status,
             task,
-        ));
+        )
+        .with_apps(p.apps));
         self.reported_main = None;
         self.status = None;
         self.dirty = true;
@@ -4545,6 +4562,15 @@ impl ShellState {
                         let _ = tx.send(WorkspaceJobMsg::ContentReady(role, res));
                     })
                     .ok();
+            }
+            WorkspaceAction::OpenApp(role) => {
+                // The app launches off the UI thread; the content view stays.
+                self.spawn_job(move || {
+                    match shelbi_orchestrator::workspace_session::open_in_app(&project, &name, role.into()) {
+                        Ok(note) => note,
+                        Err(e) => format!("couldn't open the app: {e}"),
+                    }
+                });
             }
             WorkspaceAction::RevealFolder => {
                 if let Some(w) = self.workspace.as_mut() {
@@ -5949,8 +5975,18 @@ fn enter_terminal_modes() -> io::Result<()> {
 /// `editor`, then `$EDITOR`, then vim) on `path` in the foreground: leave the
 /// shell's terminal modes, wait for the editor, restore them, and force a full
 /// repaint. Returns the status line to show. The loop's input reader is on
-/// this thread, so nothing competes with the editor for keys.
+/// this thread, so nothing competes with the editor for keys. An app
+/// `editor:` opens the file in the app instead (`open -a`), leaving the
+/// screen as it is.
 fn run_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, path: &std::path::Path) -> String {
+    if let (shelbi_state::ToolChoice::App { app }, _) = shelbi_state::resolve_editor_choice() {
+        let name = shelbi_state::tools::app_display_name(&app);
+        return match std::process::Command::new("open").arg("-a").arg(&app).arg(path).status() {
+            Ok(status) if status.success() => format!("opened {} in {name}", path.display()),
+            Ok(status) => format!("open -a {name} exited with {status}"),
+            Err(e) => format!("couldn't open {name}: {e}"),
+        };
+    }
     let editor = shelbi_state::resolve_editor();
     let mut parts = editor.split_whitespace();
     let program = parts.next().unwrap_or("vim").to_string();
@@ -7917,6 +7953,7 @@ mod tests {
             slot: "review-1".into(),
             worktree: "/wt".into(),
             editor_name: "Vim".into(),
+            apps: Default::default(),
             has_review_url: false,
             task: None,
         })));
@@ -9872,7 +9909,7 @@ mod tests {
         press(&mut st, KeyCode::Enter);
         settle_until(&mut st, "the editor's write lands", |st| !st.settings.form().saving());
         assert_eq!(
-            st.settings_store.lock().unwrap().config.as_ref().unwrap().editor.as_deref(),
+            st.settings_store.lock().unwrap().config.as_ref().unwrap().editor.as_ref().and_then(shelbi_state::ToolChoice::command),
             Some("code --wait")
         );
         // Clear the editor setting: the row under the command.

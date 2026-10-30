@@ -1,10 +1,17 @@
 //! The General page's shared preferences (`tui-settings-general`): the
-//! appearance (`theme:`) and the external editor (`editor:`) in
-//! `~/.shelbi/config.yaml`, and where a save of them stands.
+//! appearance (`theme:`), the editor (`editor:`) and the diff tool
+//! (`diff_tool:`) in `~/.shelbi/config.yaml`, and where a save of them
+//! stands.
 //!
-//! Both are immediate-save controls, as the desktop app's are: picking a
-//! theme saves it, and the editor's text is saved when the user commits it
-//! (Enter), never per keystroke. A save is one narrow [`Change`] a client
+//! All are immediate-save controls, as the desktop app's are: picking a
+//! theme or a tool saves it, and an "Other command…" is saved when the user
+//! commits it (Enter), never per keystroke. A tool is picked from a
+//! [`ToolPicker`]: the default (the fallback), the installed tools Shelbi
+//! detected (CLI tools, then apps; [`shelbi_state::tools::detected_tools`],
+//! fed in with [`GeneralForm::set_detected`]), the current setting when it
+//! is none of those, Browse (a picked `.app` or executable,
+//! [`GeneralForm::browse`]) and "Other command…" (a typed command line with
+//! flags, `code --wait`). A save is one narrow [`Change`] a client
 //! writes off its UI thread through [`shelbi_state::update_user_config`],
 //! which reads the file fresh and patches only that key. Until the write
 //! lands the control shows the new value as pending ([`SaveStatus::Saving`]);
@@ -14,7 +21,10 @@
 //! Toolkit-free: the TUI's General page draws [`GeneralForm`]; the desktop
 //! app's Settings shares [`SaveStatus`], [`THEMES`] and [`theme_label`].
 
-use shelbi_state::{EditorSource, ThemePreference, UserConfig};
+use std::path::Path;
+
+use shelbi_state::tools::{DetectedTools, ToolOption};
+use shelbi_state::{EditorSource, ThemePreference, ToolChoice, ToolKind, UserConfig};
 
 /// The theme choices, in the order a segmented control shows them.
 pub const THEMES: [ThemePreference; 3] = [ThemePreference::Auto, ThemePreference::Dark, ThemePreference::Light];
@@ -58,8 +68,10 @@ impl SaveStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preferences {
     pub theme: ThemePreference,
-    /// The `editor:` override, as written (it may carry arguments).
-    pub editor: Option<String>,
+    /// The `editor:` setting, as written (a command may carry arguments).
+    pub editor: Option<ToolChoice>,
+    /// The `diff_tool:` setting.
+    pub diff_tool: Option<ToolChoice>,
 }
 
 impl Preferences {
@@ -67,25 +79,73 @@ impl Preferences {
         Preferences {
             theme: cfg.theme,
             editor: cfg.editor.clone(),
+            diff_tool: cfg.diff_tool.clone(),
         }
     }
 }
+
+/// One of the tool settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolSetting {
+    /// `editor:`, what "Edit in <name>" opens.
+    Editor,
+    /// `diff_tool:`, what View Diff runs.
+    DiffTool,
+}
+
+impl ToolSetting {
+    /// The setting's label on the page.
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolSetting::Editor => "Editor",
+            ToolSetting::DiffTool => "Diff tool",
+        }
+    }
+
+    /// The picker's default entry: no setting, so the fallback applies.
+    pub fn default_label(self) -> &'static str {
+        match self {
+            ToolSetting::Editor => DEFAULT_EDITOR_LABEL,
+            ToolSetting::DiffTool => GIT_DIFFTOOL_LABEL,
+        }
+    }
+}
+
+/// The editor picker's default entry (`editor:` unset).
+pub const DEFAULT_EDITOR_LABEL: &str = "Default ($EDITOR or vim)";
+/// The diff tool picker's default entry (`diff_tool:` unset).
+pub const GIT_DIFFTOOL_LABEL: &str = "Git's difftool";
+/// The picker entry that picks an app or a program from disk.
+pub const BROWSE_LABEL: &str = "Browse…";
+/// The picker entry that takes a typed command line.
+pub const OTHER_COMMAND_LABEL: &str = "Other command…";
 
 /// One setting to save: applied to the config as it is on disk, touching
 /// nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Theme(ThemePreference),
-    /// The editor override; `None` clears it, so the fallback applies.
-    Editor(Option<String>),
+    /// The editor; `None` clears it, so the fallback applies.
+    Editor(Option<ToolChoice>),
+    /// The diff tool; `None` clears it, so git's difftool applies.
+    DiffTool(Option<ToolChoice>),
 }
 
 impl Change {
+    /// The change that sets `setting` to `choice`.
+    pub fn tool(setting: ToolSetting, choice: Option<ToolChoice>) -> Change {
+        match setting {
+            ToolSetting::Editor => Change::Editor(choice),
+            ToolSetting::DiffTool => Change::DiffTool(choice),
+        }
+    }
+
     /// Apply this change, and only it, to `cfg`.
     pub fn apply(&self, cfg: &mut UserConfig) {
         match self {
             Change::Theme(theme) => cfg.theme = *theme,
             Change::Editor(editor) => cfg.editor = editor.clone(),
+            Change::DiffTool(diff_tool) => cfg.diff_tool = diff_tool.clone(),
         }
     }
 
@@ -101,6 +161,80 @@ impl Change {
 pub fn normalize_editor(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One entry of a [`ToolPicker`], in the order [`ToolPicker::entries`]
+/// lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerEntry {
+    /// No setting: the fallback ([`ToolSetting::default_label`]).
+    Default,
+    /// An installed tool, or the current setting when it is none of them.
+    Tool(ToolOption),
+    /// Pick an `.app` or an executable from disk ([`GeneralForm::browse`]).
+    Browse,
+    /// Type a command line ([`GeneralForm::begin_edit_tool`]).
+    OtherCommand,
+}
+
+impl PickerEntry {
+    /// The entry's label, for `setting`'s picker.
+    pub fn label(&self, setting: ToolSetting) -> String {
+        match self {
+            PickerEntry::Default => setting.default_label().to_string(),
+            PickerEntry::Tool(t) => t.name.clone(),
+            PickerEntry::Browse => BROWSE_LABEL.to_string(),
+            PickerEntry::OtherCommand => OTHER_COMMAND_LABEL.to_string(),
+        }
+    }
+}
+
+/// A tool setting's choices: the default, the installed tools grouped CLI
+/// and Apps, the current setting when it is none of those, Browse and Other
+/// command, with which one is current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPicker {
+    pub setting: ToolSetting,
+    /// What the default runs now, in words (`nvim, from $EDITOR`, `vimdiff,
+    /// from git`), when known.
+    pub default_detail: Option<String>,
+    /// Installed CLI tools (opened in a pane).
+    pub cli: Vec<ToolOption>,
+    /// Installed apps (opened in the app).
+    pub apps: Vec<ToolOption>,
+    /// The current setting when no installed entry is it: a typed command
+    /// (`code --wait`) or a browsed app.
+    pub custom: Option<ToolOption>,
+    /// The current setting; `None` is the default.
+    pub current: Option<ToolChoice>,
+}
+
+impl ToolPicker {
+    /// Every entry, top to bottom: Default, the CLI tools, the apps, the
+    /// custom setting, Browse, Other command.
+    pub fn entries(&self) -> Vec<PickerEntry> {
+        let mut entries = vec![PickerEntry::Default];
+        entries.extend(self.cli.iter().chain(&self.apps).chain(&self.custom).cloned().map(PickerEntry::Tool));
+        entries.push(PickerEntry::Browse);
+        entries.push(PickerEntry::OtherCommand);
+        entries
+    }
+
+    /// The index in [`Self::entries`] of the current setting.
+    pub fn selected(&self) -> usize {
+        let Some(current) = &self.current else {
+            return 0;
+        };
+        self.entries()
+            .iter()
+            .position(|e| matches!(e, PickerEntry::Tool(t) if &t.choice == current))
+            .unwrap_or(0)
+    }
+
+    /// The label of the current setting (the closed picker's text).
+    pub fn current_label(&self) -> String {
+        self.entries()[self.selected()].label(self.setting)
+    }
 }
 
 /// What a source of the resolved editor is called on the page.
@@ -196,11 +330,15 @@ pub struct GeneralForm {
     unreadable: Option<String>,
     /// `$EDITOR`, for the fallback.
     env_editor: Option<String>,
+    /// The installed tools the pickers offer.
+    detected: DetectedTools,
     /// The change being written.
     pending: Option<Change>,
     status: SaveStatus,
-    /// The editor command while it is being typed.
+    /// A command line while it is being typed ("Other command…").
     draft: Option<LineInput>,
+    /// The setting the draft is for.
+    draft_setting: Option<ToolSetting>,
 }
 
 impl GeneralForm {
@@ -257,18 +395,127 @@ impl GeneralForm {
         }
     }
 
-    /// The editor override the field shows: the one being saved, else the
-    /// file's.
-    pub fn editor(&self) -> Option<&str> {
-        match &self.pending {
-            Some(Change::Editor(e)) => e.as_deref(),
-            _ => self.saved.as_ref().and_then(|p| p.editor.as_deref()),
+    /// The installed tools arrived (detected off the UI thread).
+    pub fn set_detected(&mut self, detected: DetectedTools) {
+        self.detected = detected;
+    }
+
+    pub fn detected(&self) -> &DetectedTools {
+        &self.detected
+    }
+
+    /// A tool setting as shown: the one being saved, else the file's.
+    pub fn tool(&self, setting: ToolSetting) -> Option<&ToolChoice> {
+        match (&self.pending, setting) {
+            (Some(Change::Editor(e)), ToolSetting::Editor) => e.as_ref(),
+            (Some(Change::DiffTool(d)), ToolSetting::DiffTool) => d.as_ref(),
+            _ => self.saved.as_ref().and_then(|p| match setting {
+                ToolSetting::Editor => p.editor.as_ref(),
+                ToolSetting::DiffTool => p.diff_tool.as_ref(),
+            }),
         }
     }
 
-    /// What Shelbi runs, and which layer named it.
+    /// The editor setting as shown (a command or an app).
+    pub fn editor_choice(&self) -> Option<&ToolChoice> {
+        self.tool(ToolSetting::Editor)
+    }
+
+    /// The diff tool setting as shown.
+    pub fn diff_tool_choice(&self) -> Option<&ToolChoice> {
+        self.tool(ToolSetting::DiffTool)
+    }
+
+    /// The editor setting's command line, as an "Other command" field shows
+    /// it: `None` when unset or an app.
+    pub fn editor(&self) -> Option<&str> {
+        self.editor_choice().and_then(ToolChoice::command)
+    }
+
+    /// What Shelbi runs (a command line, or an app's name), and which layer
+    /// named it.
     pub fn effective_editor(&self) -> (String, EditorSource) {
-        shelbi_state::resolve_editor_source(self.editor(), self.env_editor.as_deref())
+        let (choice, source) = shelbi_state::resolve_editor_choice_from(self.editor_choice(), self.env_editor.as_deref());
+        (choice.summary(), source)
+    }
+
+    /// What View Diff runs, in words: the setting (a command line or an
+    /// app's name), else git's difftool and the tool git names.
+    pub fn effective_diff_tool(&self) -> String {
+        match self.diff_tool_choice() {
+            Some(choice) => choice.summary(),
+            None => self.git_difftool_detail(),
+        }
+    }
+
+    fn git_difftool_detail(&self) -> String {
+        match &self.detected.git_difftool {
+            Some(tool) => format!("{GIT_DIFFTOOL_LABEL} ({tool})"),
+            None => format!("{GIT_DIFFTOOL_LABEL} (none configured)"),
+        }
+    }
+
+    /// `setting`'s picker: its entries and the current one.
+    pub fn picker(&self, setting: ToolSetting) -> ToolPicker {
+        let detected = match setting {
+            ToolSetting::Editor => &self.detected.editors,
+            ToolSetting::DiffTool => &self.detected.diff_tools,
+        };
+        let of_kind = |kind| detected.iter().filter(|t| t.kind == kind).cloned().collect::<Vec<_>>();
+        let current = self.tool(setting).cloned().and_then(ToolChoice::normalized);
+        let custom = current
+            .as_ref()
+            .filter(|c| !detected.iter().any(|t| &t.choice == *c))
+            .map(ToolOption::custom);
+        let default_detail = match setting {
+            ToolSetting::Editor => {
+                let (command, source) = self.fallback_editor();
+                Some(format!("{command}, {}", source_label(source)))
+            }
+            ToolSetting::DiffTool => self.detected.git_difftool.as_ref().map(|t| format!("{t}, from git")),
+        };
+        ToolPicker {
+            setting,
+            default_detail,
+            cli: of_kind(ToolKind::Cli),
+            apps: of_kind(ToolKind::App),
+            custom,
+            current,
+        }
+    }
+
+    /// Pick `choice` for `setting` (`None`: the default): the change to
+    /// write, or `None` when it is already the setting or the form can't
+    /// save. A blank command is the default.
+    pub fn choose_tool(&mut self, setting: ToolSetting, choice: Option<ToolChoice>) -> Option<Change> {
+        let choice = choice.and_then(ToolChoice::normalized);
+        if !self.editable() || self.tool(setting) == choice.as_ref() {
+            return None;
+        }
+        self.draft = None;
+        self.draft_setting = None;
+        self.begin(Change::tool(setting, choice))
+    }
+
+    /// Pick a picker entry: Default and a tool save at once; Browse and
+    /// Other command need more from the user, so they change nothing here
+    /// (the client opens its file dialog, or [`Self::begin_edit_tool`]).
+    pub fn choose_entry(&mut self, setting: ToolSetting, entry: &PickerEntry) -> Option<Change> {
+        match entry {
+            PickerEntry::Default => self.choose_tool(setting, None),
+            PickerEntry::Tool(t) => self.choose_tool(setting, Some(t.choice.clone())),
+            PickerEntry::Browse | PickerEntry::OtherCommand => None,
+        }
+    }
+
+    /// Browse picked `path` for `setting`: an `.app` bundle becomes an app,
+    /// an executable a command. `Err` says why the path can't be a tool (it
+    /// doesn't exist, isn't executable, isn't a real bundle); `Ok(None)`
+    /// when it is already the setting or the form can't save. Reads the
+    /// file's metadata.
+    pub fn browse(&mut self, setting: ToolSetting, path: &Path) -> Result<Option<Change>, String> {
+        let choice = shelbi_state::tools::choice_from_path(path)?;
+        Ok(self.choose_tool(setting, Some(choice)))
     }
 
     /// What Shelbi runs without the override.
@@ -295,11 +542,24 @@ impl GeneralForm {
 
     /// Start typing the editor command, from the shown override.
     pub fn begin_edit(&mut self) -> bool {
+        self.begin_edit_tool(ToolSetting::Editor)
+    }
+
+    /// Start typing a command line for `setting` ("Other command…"), from
+    /// its command (empty for an app or the default).
+    pub fn begin_edit_tool(&mut self, setting: ToolSetting) -> bool {
         if !self.editable() {
             return false;
         }
-        self.draft = Some(LineInput::new(self.editor().unwrap_or("")));
+        let text = self.tool(setting).and_then(ToolChoice::command).unwrap_or("");
+        self.draft = Some(LineInput::new(text));
+        self.draft_setting = Some(setting);
         true
+    }
+
+    /// The setting the field being typed is for.
+    pub fn draft_setting(&self) -> Option<ToolSetting> {
+        self.draft.as_ref().and(self.draft_setting)
     }
 
     /// The field being typed, if it is.
@@ -311,37 +571,49 @@ impl GeneralForm {
         self.draft.as_mut()
     }
 
-    /// Whether the typed command differs from the saved one (unsaved).
+    /// The typed command as a choice, for the draft's setting.
+    fn typed(&self) -> Option<(ToolSetting, Option<ToolChoice>)> {
+        let draft = self.draft.as_ref()?;
+        let setting = self.draft_setting.unwrap_or(ToolSetting::Editor);
+        Some((setting, normalize_editor(&draft.text()).map(ToolChoice::Command)))
+    }
+
+    /// Whether the typed command differs from the saved setting (unsaved).
     pub fn dirty(&self) -> bool {
-        self.draft
-            .as_ref()
-            .is_some_and(|d| normalize_editor(&d.text()).as_deref() != self.editor())
+        self.typed()
+            .is_some_and(|(setting, typed)| typed.as_ref() != self.tool(setting))
     }
 
     /// Stop typing and keep the saved command.
     pub fn cancel_edit(&mut self) {
         self.draft = None;
+        self.draft_setting = None;
     }
 
     /// Commit what was typed: the change to write, or `None` when it equals
-    /// the saved command (typing stops either way). A blank command clears
-    /// the override.
+    /// the saved setting (typing stops either way). A blank command clears
+    /// the setting.
     pub fn commit_edit(&mut self) -> Option<Change> {
-        let draft = self.draft.take()?;
-        let editor = normalize_editor(&draft.text());
-        if !self.editable() || editor.as_deref() == self.editor() {
+        let (setting, typed) = self.typed()?;
+        self.cancel_edit();
+        if !self.editable() || typed.as_ref() == self.tool(setting) {
             return None;
         }
-        self.begin(Change::Editor(editor))
+        self.begin(Change::tool(setting, typed))
     }
 
-    /// Clear the override, so the fallback applies.
+    /// Clear the editor setting, so the fallback applies.
     pub fn clear_editor(&mut self) -> Option<Change> {
-        self.draft = None;
-        if !self.editable() || self.editor().is_none() {
+        self.clear_tool(ToolSetting::Editor)
+    }
+
+    /// Clear `setting`, so its fallback applies.
+    pub fn clear_tool(&mut self, setting: ToolSetting) -> Option<Change> {
+        self.cancel_edit();
+        if !self.editable() || self.tool(setting).is_none() {
             return None;
         }
-        self.begin(Change::Editor(None))
+        self.begin(Change::tool(setting, None))
     }
 
     fn begin(&mut self, change: Change) -> Option<Change> {
@@ -387,7 +659,8 @@ mod tests {
         f.load(
             Ok(Preferences {
                 theme,
-                editor: editor.map(str::to_string),
+                editor: editor.map(ToolChoice::from),
+                diff_tool: None,
             }),
             env.map(str::to_string),
         );
@@ -397,7 +670,7 @@ mod tests {
     fn written(theme: ThemePreference, editor: Option<&str>) -> UserConfig {
         UserConfig {
             theme,
-            editor: editor.map(str::to_string),
+            editor: editor.map(ToolChoice::from),
             ..UserConfig::default()
         }
     }
@@ -470,7 +743,7 @@ mod tests {
         assert_eq!(f.theme(), ThemePreference::Dark);
         f.saved_result(Ok(written(ThemePreference::Dark, None)));
         // An external edit read later is taken.
-        f.load(Ok(Preferences { theme: ThemePreference::Light, editor: Some("zed".into()) }), None);
+        f.load(Ok(Preferences { theme: ThemePreference::Light, editor: Some("zed".into()), diff_tool: None }), None);
         assert_eq!((f.theme(), f.editor()), (ThemePreference::Light, Some("zed")));
     }
 
@@ -482,10 +755,120 @@ mod tests {
         };
         cfg.desktop.terminal_font_size = Some(15);
         Change::Theme(ThemePreference::Light).apply(&mut cfg);
-        assert_eq!((cfg.theme, cfg.editor.as_deref()), (ThemePreference::Light, Some("hx")));
+        assert_eq!((cfg.theme, cfg.editor.as_ref()), (ThemePreference::Light, Some(&"hx".into())));
         Change::Editor(None).apply(&mut cfg);
-        assert_eq!((cfg.theme, cfg.editor), (ThemePreference::Light, None));
+        assert_eq!((cfg.theme, cfg.editor.as_ref()), (ThemePreference::Light, None));
+        Change::DiffTool(Some("difft".into())).apply(&mut cfg);
+        assert_eq!((cfg.editor.as_ref(), cfg.diff_tool.as_ref()), (None, Some(&"difft".into())));
         assert_eq!(cfg.desktop.terminal_font_size, Some(15));
+    }
+
+    fn detected() -> DetectedTools {
+        let cli = |name: &str, command: &str| ToolOption {
+            name: name.into(),
+            kind: ToolKind::Cli,
+            choice: command.into(),
+            app_path: None,
+        };
+        let app = |name: &str, path: &str| ToolOption {
+            name: name.into(),
+            kind: ToolKind::App,
+            choice: ToolChoice::app(path),
+            app_path: Some(path.into()),
+        };
+        DetectedTools {
+            editors: vec![cli("Neovim", "nvim"), cli("Helix", "hx"), app("Zed", "/Applications/Zed.app")],
+            diff_tools: vec![cli("Difftastic", "difft"), app("Kaleidoscope", "/Applications/Kaleidoscope.app")],
+            git_difftool: Some("vimdiff".into()),
+        }
+    }
+
+    fn entry_labels(p: &ToolPicker) -> Vec<String> {
+        p.entries().iter().map(|e| e.label(p.setting)).collect()
+    }
+
+    #[test]
+    fn a_picker_groups_the_installed_tools_and_marks_the_current_one() {
+        let mut f = loaded(ThemePreference::Dark, None, Some("nvim"));
+        f.set_detected(detected());
+        let p = f.picker(ToolSetting::Editor);
+        assert_eq!(
+            entry_labels(&p),
+            ["Default ($EDITOR or vim)", "Neovim", "Helix", "Zed", "Browse…", "Other command…"]
+        );
+        assert_eq!((p.cli.len(), p.apps.len(), p.custom.as_ref()), (2, 1, None));
+        assert_eq!((p.selected(), p.current_label().as_str()), (0, "Default ($EDITOR or vim)"));
+        assert_eq!(p.default_detail.as_deref(), Some("nvim, $EDITOR"));
+
+        // Picking an app saves it at once and the picker shows it.
+        let zed = p.entries()[3].clone();
+        assert_eq!(f.choose_entry(ToolSetting::Editor, &zed), Some(Change::Editor(Some(ToolChoice::app("/Applications/Zed.app")))));
+        assert_eq!(f.picker(ToolSetting::Editor).current_label(), "Zed", "pending shows the pick");
+        f.saved_result(Ok(UserConfig { editor: Some(ToolChoice::app("/Applications/Zed.app")), ..UserConfig::default() }));
+        assert_eq!(f.effective_editor(), ("Zed".to_string(), EditorSource::Config));
+        assert_eq!(f.editor(), None, "an app has no command to type");
+        assert_eq!(f.choose_entry(ToolSetting::Editor, &zed), None, "already the setting");
+        assert_eq!(f.choose_entry(ToolSetting::Editor, &PickerEntry::Browse), None, "Browse asks for a path first");
+
+        // A command the detection doesn't list is the custom entry.
+        f.load(Ok(Preferences { editor: Some("code --wait".into()), ..Preferences::default() }), None);
+        let p = f.picker(ToolSetting::Editor);
+        assert_eq!(p.custom.as_ref().map(|c| c.name.as_str()), Some("Visual Studio Code"));
+        assert_eq!(p.selected(), 4);
+        assert_eq!(f.choose_entry(ToolSetting::Editor, &PickerEntry::Default), Some(Change::Editor(None)));
+    }
+
+    #[test]
+    fn the_diff_tool_saves_like_the_editor_and_defaults_to_git() {
+        let mut f = loaded(ThemePreference::Dark, Some("hx"), None);
+        f.set_detected(detected());
+        assert_eq!(f.effective_diff_tool(), "Git's difftool (vimdiff)");
+        let p = f.picker(ToolSetting::DiffTool);
+        assert_eq!(entry_labels(&p), ["Git's difftool", "Difftastic", "Kaleidoscope", "Browse…", "Other command…"]);
+        assert_eq!(p.default_detail.as_deref(), Some("vimdiff, from git"));
+
+        assert_eq!(f.choose_tool(ToolSetting::DiffTool, Some("difft".into())), Some(Change::DiffTool(Some("difft".into()))));
+        assert_eq!(f.editor(), Some("hx"), "the editor is untouched");
+        assert_eq!(f.choose_tool(ToolSetting::DiffTool, None), None, "one save at a time");
+        f.saved_result(Err("read-only".into()));
+        assert_eq!(f.diff_tool_choice(), None, "the failed save didn't happen");
+
+        // Other command…: typed with flags, committed on purpose.
+        assert!(f.begin_edit_tool(ToolSetting::DiffTool));
+        assert_eq!(f.draft_setting(), Some(ToolSetting::DiffTool));
+        f.draft_mut().unwrap().paste("nvim -d -R");
+        assert!(f.dirty());
+        assert_eq!(f.commit_edit(), Some(Change::DiffTool(Some("nvim -d -R".into()))));
+        assert_eq!(f.draft_setting(), None);
+        f.saved_result(Ok(UserConfig { diff_tool: Some("nvim -d -R".into()), ..UserConfig::default() }));
+        assert_eq!(f.effective_diff_tool(), "nvim -d -R");
+        assert_eq!(f.clear_tool(ToolSetting::DiffTool), Some(Change::DiffTool(None)));
+    }
+
+    #[test]
+    fn browse_picks_an_app_or_a_program_and_says_why_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("shelbi-general-browse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = dir.join("Fancy.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), "").unwrap();
+        let exe = dir.join("mydiff");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut f = loaded(ThemePreference::Dark, None, None);
+        assert_eq!(
+            f.browse(ToolSetting::Editor, &app),
+            Ok(Some(Change::Editor(Some(ToolChoice::app(&app)))))
+        );
+        f.saved_result(Ok(UserConfig { editor: Some(ToolChoice::app(&app)), ..UserConfig::default() }));
+        assert_eq!(f.picker(ToolSetting::Editor).current_label(), "Fancy");
+        let exe_choice = ToolChoice::Command(exe.to_string_lossy().into_owned());
+        assert_eq!(f.browse(ToolSetting::DiffTool, &exe), Ok(Some(Change::DiffTool(Some(exe_choice)))));
+        f.saved_result(Err("nope".into()));
+        assert!(f.browse(ToolSetting::DiffTool, &dir.join("missing")).unwrap_err().contains("doesn't exist"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

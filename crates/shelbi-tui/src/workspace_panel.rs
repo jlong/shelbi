@@ -87,6 +87,9 @@ pub struct WorkspacePanel {
     pub worktree: String,
     /// Display name of the resolved editor (`Vim`, `Helix`, …).
     pub editor_name: String,
+    /// Which of Edit and View Diff open an app instead of a pane: those
+    /// launch it ([`WsEffect::OpenApp`]) and leave the view as it is.
+    pub apps: shelbi_state::AppTools,
     /// Display name of the workspace's agent (`Developer`, …) — the Agent
     /// switch's label.
     pub agent_name: String,
@@ -119,6 +122,7 @@ impl WorkspacePanel {
         let mut panel = Self {
             worktree: worktree.into(),
             editor_name: editor_name.into(),
+            apps: shelbi_state::AppTools::default(),
             agent_name: agent_name.into(),
             title: title.into(),
             description: description.into(),
@@ -147,6 +151,7 @@ impl WorkspacePanel {
             folder: true,
             switches: vec![SwitchItem::Agent, SwitchItem::Diff, SwitchItem::Editor],
             shell: false,
+            apps: self.apps,
         })
     }
 
@@ -187,7 +192,7 @@ impl WorkspacePanel {
     }
 
     fn activate_row(&mut self, row: PanelRow) -> WsEffect {
-        let (effect, view) = activate_row(row, !self.description.trim().is_empty());
+        let (effect, view) = activate_row(row, !self.description.trim().is_empty(), self.apps);
         if let Some(view) = view {
             self.active_view = view;
         }

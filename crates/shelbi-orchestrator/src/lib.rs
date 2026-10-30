@@ -41,6 +41,7 @@ pub mod ready;
 pub mod remote_session;
 pub mod review_session;
 pub mod review_ui;
+pub mod tools;
 pub mod session_backend;
 pub mod session_connect;
 pub mod session_guard;

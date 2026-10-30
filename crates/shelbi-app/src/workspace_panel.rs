@@ -13,9 +13,12 @@
 //! have (it opens the panel only for a workspace with a task).
 //!
 //! Nothing here does IO: activating a row returns a [`WsEffect`] the host
-//! carries out.
+//! carries out. Edit and View Diff open a pane, or with an app chosen for
+//! them (`editor:` / `diff_tool:`, [`AppTools`]) launch the app
+//! ([`WsEffect::OpenApp`]) and leave the main area as it was.
 
 use shelbi_state::keymap::{Key, KeyChord, Mods};
+use shelbi_state::AppTools;
 
 use crate::review::step_selection;
 use crate::ReviewRole;
@@ -82,6 +85,9 @@ pub enum WsEffect {
     ShowAgent,
     ShowDiff,
     ShowEditor,
+    /// Open the worktree (the editor) or its diff in the app chosen for
+    /// that role. The main area keeps what it shows.
+    OpenApp(ReviewRole),
     ShowDescription,
     /// Open or close the user shell beside the agent.
     ToggleShell,
@@ -98,6 +104,8 @@ pub struct WsPanelShape {
     pub switches: Vec<WsSwitch>,
     /// The user-shell toggle is offered.
     pub shell: bool,
+    /// Which of Edit and View Diff open an app.
+    pub apps: AppTools,
 }
 
 impl WsPanelShape {
@@ -116,7 +124,14 @@ impl WsPanelShape {
             folder: local,
             switches,
             shell: has_task && shell,
+            apps: AppTools::default(),
         }
+    }
+
+    /// The shape with Edit and View Diff opening `apps`.
+    pub fn with_apps(mut self, apps: AppTools) -> Self {
+        self.apps = apps;
+        self
     }
 }
 
@@ -136,14 +151,18 @@ pub fn panel_rows(shape: &WsPanelShape) -> Vec<WsRow> {
     rows
 }
 
-/// What activating `row` does, and the switch entry it makes active.
-pub fn activate_row(row: WsRow, has_body: bool) -> (WsEffect, Option<WsSwitch>) {
+/// What activating `row` does, and the switch entry it makes active. Edit
+/// and View Diff with an app chosen (`apps`) launch it and make nothing
+/// active: the main area keeps its view.
+pub fn activate_row(row: WsRow, has_body: bool, apps: AppTools) -> (WsEffect, Option<WsSwitch>) {
     match row {
         WsRow::Back => (WsEffect::Back, None),
         WsRow::More => (description_effect(has_body), None),
         WsRow::Folder => (WsEffect::RevealFolder, None),
         WsRow::Switch(WsSwitch::Agent) => (WsEffect::ShowAgent, Some(WsSwitch::Agent)),
+        WsRow::Switch(WsSwitch::Diff) if apps.diff => (WsEffect::OpenApp(ReviewRole::Diff), None),
         WsRow::Switch(WsSwitch::Diff) => (WsEffect::ShowDiff, Some(WsSwitch::Diff)),
+        WsRow::Switch(WsSwitch::Editor) if apps.editor => (WsEffect::OpenApp(ReviewRole::Editor), None),
         WsRow::Switch(WsSwitch::Editor) => (WsEffect::ShowEditor, Some(WsSwitch::Editor)),
         WsRow::Shell => (WsEffect::ToggleShell, None),
     }
@@ -166,6 +185,7 @@ pub struct WorkspacePanelState {
     selected: usize,
     active: WsSwitch,
     has_body: bool,
+    apps: AppTools,
 }
 
 impl WorkspacePanelState {
@@ -182,6 +202,7 @@ impl WorkspacePanelState {
             selected,
             active: WsSwitch::Agent,
             has_body: shape.has_body,
+            apps: shape.apps,
         }
     }
 
@@ -190,6 +211,7 @@ impl WorkspacePanelState {
     /// that appears (a task started) takes the selection, as in a new panel.
     pub fn sync(&mut self, shape: &WsPanelShape) {
         let current = self.selected_row();
+        self.apps = shape.apps;
         let rows = panel_rows(shape);
         if rows == self.rows && shape.has_body == self.has_body {
             return;
@@ -250,7 +272,7 @@ impl WorkspacePanelState {
 
     fn activate_index(&mut self, idx: usize, row: WsRow) -> WsEffect {
         self.selected = idx;
-        let (effect, switch) = activate_row(row, self.has_body);
+        let (effect, switch) = activate_row(row, self.has_body, self.apps);
         if let Some(switch) = switch {
             self.active = switch;
         }
@@ -387,6 +409,24 @@ mod tests {
         // A new task: the agent takes the selection again.
         panel.sync(&WsPanelShape::for_workspace(true, false, true, true));
         assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Agent)));
+    }
+
+    #[test]
+    fn an_app_editor_or_diff_launches_and_keeps_the_view() {
+        let apps = AppTools { editor: true, diff: false };
+        let shape = WsPanelShape::for_workspace(true, true, true, false).with_apps(apps);
+        let mut panel = WorkspacePanelState::new(&shape);
+        assert_eq!(panel.click(WsRow::Switch(WsSwitch::Editor)), WsEffect::OpenApp(ReviewRole::Editor));
+        assert_eq!(panel.active(), WsSwitch::Agent, "the agent stays shown");
+        assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Editor)));
+        assert_eq!(panel.click(WsRow::Switch(WsSwitch::Diff)), WsEffect::ShowDiff, "the diff is still a pane");
+        assert_eq!(panel.active(), WsSwitch::Diff);
+
+        // The setting changed: a synced shape takes it.
+        panel.sync(&shape.clone().with_apps(AppTools { editor: false, diff: true }));
+        assert_eq!(panel.click(WsRow::Switch(WsSwitch::Diff)), WsEffect::OpenApp(ReviewRole::Diff));
+        assert_eq!(panel.active(), WsSwitch::Diff, "still the pane it showed");
+        assert_eq!(panel.click(WsRow::Switch(WsSwitch::Editor)), WsEffect::ShowEditor);
     }
 
     #[test]

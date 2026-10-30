@@ -40,7 +40,8 @@ defaults in the tables below (`auto`, contrast `0`, an opaque window).
 | `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Legacy. Set the Zen Mode chord in `keys.yaml` (`defaults.global.zen_toggle`) instead: a non-default value here is moved into `keys.yaml` on the next start and reset here, with a one-time notice. |
 | `theme` | `auto` \| `dark` \| `light` | no | `auto` | Color theme for the TUI and the desktop app. See [Theme](#theme). |
 | `desktop` | [Desktop](#desktop) | no | — | Desktop app settings. Ignored by the CLI and the TUI (except `app_icon`, which the TUI's About draws). |
-| `editor` | string | no | `$EDITOR`, else `vim` | Editor Shelbi opens for "Edit in `<editor>`" (in the [review interface](/docs/concepts/review-workspaces#the-review-editor) and the workspace panel) and for the desktop app's external edits (an issue body, a workflow's Edit YAML). Hub-wide, so it follows you across projects. May be a bare command (`hx`) or one with flags (`code --wait`). Resolution order: this key, then `$EDITOR`, then `vim`. |
+| `editor` | command \| `{ app: <path> }` | no | `$EDITOR`, else `vim` | Editor Shelbi opens for "Edit in `<editor>`" (in the [review interface](/docs/concepts/review-workspaces#the-review-editor) and the workspace panel) and for the desktop app's external edits (an issue body, a workflow's Edit YAML). Hub-wide, so it follows you across projects. A command (`hx`, `code --wait`) runs in a pane; an app opens in the app. See [Editor and diff tool](#editor-and-diff-tool). |
+| `diff_tool` | command \| `{ app: <path> }` | no | git's difftool | Diff tool View Diff runs over a branch's changes. A command runs in a pane; an app opens in the app. A project's `review.diff_command` takes precedence. See [Editor and diff tool](#editor-and-diff-tool). |
 
 ```yaml
 # ~/.shelbi/config.yaml
@@ -52,12 +53,77 @@ desktop:
   window_blur: 30
 ```
 
-The TUI's Settings ▸ General edits `editor` too: it shows the command Shelbi
-runs and where it comes from (this key, `$EDITOR`, or the `vim` default), saves
-what you type when you press Enter, and clearing it brings back the fallback.
+### Editor and diff tool
 
-The `editor` display label is the program's basename with its first letter
-upper-cased: `hx` shows as **Edit in Hx**, `code --wait` as **Edit in Code**.
+`editor` and `diff_tool` each take one of two forms. The rule is the same for
+both: a **command-line tool opens as a pane** (a terminal in the worktree, beside
+the agent), and an **app opens in the app**.
+
+```yaml
+# ~/.shelbi/config.yaml
+
+# A command: a program on your login PATH, with flags if you like.
+editor: hx
+diff_tool: difft
+
+# An app: the path to its .app bundle.
+editor: { app: /Applications/Zed.app }
+diff_tool:
+  app: /Applications/Kaleidoscope.app
+```
+
+A plain string is a command, so a `config.yaml` written before apps were
+supported keeps working unchanged.
+
+**Editor.** A command runs in a pane in the worktree (`exec <command>`). An app
+opens the worktree with `open -a <app> <worktree>`, and "Edit in" leaves the
+current view selected rather than switching to a pane. Unset, Shelbi runs
+`$EDITOR`, then `vim`. A pane can't host an app, so anything that needs a
+terminal editor falls back past an app setting to `$EDITOR`, then `vim`.
+
+**Diff tool.** View Diff compares the branch with its base
+(`merge-base(<base branch>, HEAD)..HEAD`). In precedence order it runs:
+
+1. the project's `review.diff_command`, when it sets one,
+2. `diff_tool`, when set,
+3. git's own difftool (`diff.guitool`, else `diff.tool`).
+
+A `diff_tool` command runs in a pane through `git difftool`, one file at a
+time, with the two files appended (`nvim -d`, `vimdiff`). A command that names
+`$LOCAL` and `$REMOTE` itself is run as written. `difft`
+([difftastic](https://difftastic.wilfred.me.uk/)) runs as git's external diff
+through `less -R`.
+
+A `diff_tool` app opens the diff in the app through its own command-line helper,
+found on your login `PATH` or inside the app bundle:
+
+| App | Helper | Shows |
+| --- | --- | --- |
+| FileMerge | `opendiff` | the whole change (folders) |
+| Kaleidoscope | `ksdiff` | the whole change (folders) |
+| Beyond Compare | `bcomp` | the whole change (folders) |
+| Visual Studio Code | `code --diff` | one file at a time |
+| Sublime Merge | `smerge` | the repository |
+| P4Merge | `launchp4merge` | one file at a time |
+| Araxis Merge | `compare` | one file at a time |
+| DeltaWalker | `DeltaWalker` | one file at a time |
+
+Any other app gets the two folders with `open -W -a <app>`. If a listed app's
+helper isn't installed, View Diff says so on the status line.
+
+**Remote workspaces.** Edit and View Diff are offered for workspaces on the hub
+only, in both clients, whatever the setting: an app can't open a worktree on
+another machine, and neither can a pane Shelbi starts on the hub.
+
+**Labels.** "Edit in `<name>`" uses the tool's name: **Edit in Neovim** for
+`nvim`, **Edit in Helix** for `hx`, **Edit in Visual Studio Code** for
+`code --wait` or the app, and the bundle's name for any other app. A command
+Shelbi doesn't know shows its program name with the first letter upper-cased.
+
+**Settings.** The TUI's Settings ▸ General edits `editor` too: it shows what
+Shelbi runs and where it comes from (this key, `$EDITOR`, or the `vim` default),
+saves a command you type when you press Enter, and clearing it brings back the
+fallback.
 
 ### Theme
 

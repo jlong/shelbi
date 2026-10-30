@@ -404,6 +404,7 @@ The TUI never constructs this struct; its workspace panel reads the same facts f
 | `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | the idle page's place line when there is no worktree (`views/workspace.rs` `render_toolbar` via `WorkspaceHeader::location_line`); not in the panel |
 | `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line |
 | `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
+| `apps` | struct not used; the panel's `AppTools` (`shell/workspace.rs`): Edit / View Diff launch the app, the main area keeps its view | the panel's `WsPanelShape::with_apps` (`views/workspace.rs`): Edit / View Diff launch the app, the view stays |
 
 ### `WorkspaceHeader`
 The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the back button plus a column status (`IN PROGRESS` / `IDLE`), the title, a preview, the folder row and the switcher.
@@ -574,6 +575,7 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `worktree` | left-truncated folder row, always shown (`review_panel.rs` `render_full` via `panel.rs` `render_folder`) | worktree row, its last four components, Open reveals it in Finder, no Open on a remote slot (`views/review.rs` `render_panel` via `task_panel::worktree_row`) |
 | `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | not shown: the panel shows the task's column (REVIEW, the purple glyph) beside the back button, as State=Review draws it (`views/review.rs` `render_panel`) |
 | `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) |
+| `apps` | Edit / View Diff launch the app instead of a pane (`review_panel.rs` `with_apps`) | same (`views/review.rs` `PanelEffect::OpenApp`) |
 | `review_url` | not shown: only a `has_review_url` bool gating the Open Browser switch (`review_panel.rs` `rows`); URL resolved at open time (`review_panel.rs` `review_url`) | the Web Browser row's tooltip (`views/review.rs` `render_panel`, `render_waiting_browser`); gates the row |
 | `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
 | `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌘N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
