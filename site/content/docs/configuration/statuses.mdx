@@ -8,7 +8,7 @@ summary: Field-by-field reference for statuses.yaml — the project-wide status 
 project. Every [workflow](/docs/configuration/workflow) references these
 entries by `id` and inherits their `name` and `category`; workflows may
 pick a subset but cannot reorder or rename them. Declaration order here
-is the canonical left-to-right column order in the TUI's all-view.
+is the canonical left-to-right column order on the board's all-workflows view.
 
 ## Where it lives
 
@@ -48,7 +48,7 @@ statuses:
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `statuses` | list of [Status](#status) | yes | — | Ordered catalog of every status in the project. Order is significant — it's the column order in the TUI all-view. |
+| `statuses` | list of [Status](#status) | yes | — | Ordered catalog of every status in the project. Order is significant: it's the column order on the board's all-workflows view. |
 
 ## status
 

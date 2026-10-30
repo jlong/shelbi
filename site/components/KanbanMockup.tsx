@@ -172,7 +172,7 @@ function contentWidth(state: AppState): number {
 }
 
 /** The GitHub login branches are named after: the `user@` of the window title. */
-function branchUser(state: AppState): string {
+export function branchUser(state: AppState): string {
   return /^([^@\s]+)@/.exec(state.terminalTitle)?.[1] ?? "you"
 }
 

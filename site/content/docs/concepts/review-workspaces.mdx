@@ -16,7 +16,7 @@ review, and a **review interface** for running the change and accepting or
 rejecting it.
 
 This page covers the review tag, the serve recipe, and the review surfaces in
-the TUI. The generic tag and slot mechanics they build on (effective tags,
+the TUI and the desktop app. The generic tag and slot mechanics they build on (effective tags,
 superset routing, and `$SLOT`) live in
 [Workspaces](/docs/concepts/workspaces#tags-capability-labels).
 
@@ -202,6 +202,8 @@ See [agents](/docs/concepts/agents).
 Review-status issues surface in the sidebar under two dedicated sections, split
 by whether an issue is loaded on a review slot yet:
 
+<Tui>
+
 ```text
  — Ready for Review —
  ✓ Polish dark-mode toggle              hub:review-0
@@ -225,7 +227,24 @@ by whether an issue is loaded on a review slot yet:
   (unassigned, or still pinned to the dev workspace that produced it), waiting
   for a free review slot. No location badge, because nothing is serving yet.
 
-A `review`-tagged slot **never appears under the `— Workspaces —` section**;
+</Tui>
+<Desktop>
+
+- **Ready for review**: the issue's `assigned_to` names a `review`-tagged
+  workspace. Each row shows the issue title over its branch, and the glyph
+  shows how far the load got: a cyan **check** once it's confirmed serving
+  (the `ready:` probe passed, or a review with no URL has its agent session
+  up), a cyan **play** glyph while it's loaded but not yet confirmed.
+- **Queued for review** (a dot): every other Review-status issue (unassigned,
+  or still pinned to the dev workspace that produced it), waiting for a free
+  review slot.
+
+Each section header carries a count, and the rows are numbered with the busy
+workspaces, so `⌘1` to `⌘9` open them.
+
+</Desktop>
+
+A `review`-tagged slot **never appears under the Workspaces section**;
 its capacity surfaces exclusively through these two review sections. Dev
 workspaces list under `— Workspaces —` as usual.
 
@@ -242,8 +261,8 @@ directly.
 
 <Callout type="note" title="Sidebar collapse persists">
 
-Machine groups under `— Workspaces —` can be collapsed (Space / Enter on a
-machine header). The set of collapsed machine names is persisted to
+Machine groups under Workspaces can be collapsed (<Tui>Space / Enter on a
+machine header</Tui><Desktop>click a machine's row</Desktop>). The set of collapsed machine names is persisted to
 `~/.shelbi/state.json` under `sidebar.collapsed_machines` (the `SidebarPrefs`
 struct), so the choice survives a sidebar respawn and follows you across
 projects that share a machine name. Machine names not present in the current
@@ -258,6 +277,8 @@ Opening a Ready issue launches the **review interface**, a two-column
 layout: the **review panel** on the left and the swappable review content on
 the right. The panel takes the sidebar's column while the review is open. The
 panel is where you drive the review:
+
+<Tui>
 
 - A square **back button** at the top (a back-arrow glyph) that returns to the
   normal sidebar and your previous view (Esc does the same). It leaves the
@@ -294,6 +315,44 @@ panel is where you drive the review:
   - **❌ Reject**: open a type-the-reason dialog; on submit, the reason is
     appended to the issue body and the issue is bounced back to the workflow's
     ready status for another pass. An empty reason can't submit.
+
+</Tui>
+<Desktop>
+
+- A **back button** at the top that returns to the normal sidebar and your
+  previous view (`Esc` does the same). It leaves the review loaded, so you can
+  reopen it from the sidebar. `q` closes the review instead, ending its
+  editor, diff, and server sessions and freeing the slot.
+- The issue's column (**REVIEW**), its title, a five-line description
+  preview, and a **More** link that opens the full issue.
+- The review worktree's path with an **Open** button that reveals it in
+  Finder (not shown on a remote slot).
+- The **views**, numbered `⌘1`, `⌘2`, … while the review is open:
+  - **Reviewer** (default): talk to the Review agent.
+  - **View Diff**: run your diff tool over the review branch's changes (the
+    same `merge-base(base, HEAD)..HEAD` range `shelbi diff` shows) in the main
+    area. By default it launches git's configured diff tool (`diff.tool`, or
+    `diff.guitool` for a GUI tool) in directory-diff mode; with none
+    configured the view reports a short error. A tool that reviews a revision
+    range (such as `skim`) needs a `review.diff_command` override in
+    `project.yaml` (see [Project config](/docs/configuration/project)).
+  - **Edit in `<editor>`**: the worktree in your configured editor, inside
+    the app (see below).
+  - **Web Browser**: open the resolved review `url` in your browser. It reads
+    "loading…" until the server is serving, and appears **only** when the
+    workflow declares a review URL.
+  - **Shell**: a shell in the review worktree, beside the content.
+
+  On a remote review slot, View Diff and Edit are not offered.
+- An **Actions** group (also under **Go ▸ Reviews** in the menu bar):
+  - **Approve**: move the issue one column forward along the normal accept
+    edge (`review → done` in the default workflow), firing that edge's
+    `actions` (e.g. `merge`, `delete_branch`), then tear the interface down.
+  - **Reject**: open the **Reject task** dialog; on submit (`Ctrl-D`), the
+    reason is appended to the issue body and the issue is bounced back to the
+    workflow's ready status for another pass. An empty reason can't submit.
+
+</Desktop>
 
 ### The review editor
 

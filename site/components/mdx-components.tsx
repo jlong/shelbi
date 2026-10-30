@@ -2,6 +2,8 @@ import type { MDXComponents } from "mdx/types"
 import Link from "next/link"
 import { AppMockup } from "./KanbanMockup"
 import { Callout } from "./Callout"
+import { ClientMockup } from "./ClientMockup"
+import { Desktop, Tui } from "./ClientVariant"
 import { CodeTab, CodeTabs } from "./CodeTabs"
 import { CopyPromptBanner } from "./CopyPromptBanner"
 import { InstallCommand } from "./InstallCommand"
@@ -26,6 +28,14 @@ export const mdxComponents: MDXComponents = {
   CopyPromptBanner,
   InstallCommand,
   AppMockup,
+  // Per-client content, picked by the docs' TUI | Desktop switch (the home
+  // page's, one site-wide preference): `<Tui>` / `<Desktop>` around steps
+  // that differ (block or inline), and `<ClientMockup …>`, which takes
+  // `AppMockup`'s props and draws the scenario in whichever client is chosen.
+  // See `ClientVariant.tsx` / `ClientMockup.tsx`.
+  Tui,
+  Desktop,
+  ClientMockup,
   Steps,
   Step,
   Callout,

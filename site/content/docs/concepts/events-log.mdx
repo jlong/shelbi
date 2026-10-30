@@ -142,14 +142,14 @@ to happen, which can be hours, or never if a marker-emitting code path
 silently regresses. The recurring line is the orchestrator's fallback
 trigger to wake up and check active issues.
 
-The TUI activity feed filters heartbeats out by design. They'd
+The Activity feed (in the TUI and the desktop app) filters heartbeats out by design. They'd
 produce one "nothing happened" row every few minutes. Use
 `shelbi events tail` if you want to see them.
 
-The feed lives behind the **Activity** view in the dashboard: the same events
+The feed lives behind the **Activity** view (<Tui>`Ctrl+P` → Activity</Tui><Desktop>`⌘K` → Activity, or **Go ▸ Activity**</Desktop>): the same events
 this log records, rendered for a human instead of grepped:
 
-<AppMockup activeView="activity" />
+<ClientMockup activeView="activity" />
 
 The orchestrator distinguishes the line kinds by which marker tokens the
 body contains (`EventKind::from_body` matches on `contains`, not a fixed

@@ -1,7 +1,7 @@
 ---
 title: Run your first task
 order: 13
-summary: Open the TUI, add an issue, watch a workspace pick it up, and review the diff.
+summary: Open Shelbi, add an issue, watch a workspace pick it up, and review the diff.
 ---
 
 <CopyPromptBanner prompt="Walk me through running my first Shelbi issue. Open the TUI with `shelbi`, add an issue to the backlog (through the orchestrator chat or `shelbi issue add`), promote it to todo so the orchestrator dispatches it to a free workspace, then review the resulting PR and accept it by moving the card to Done. Explain the columns (Backlog, Todo, In Progress, Review, Done, plus Canceled) and the workspace badges as we go." />
@@ -12,7 +12,9 @@ ends: what lands in the backlog and what
 gets accepted out of review. The orchestrator drives the middle: the
 moment a card hits todo, it picks a free workspace and starts it.
 
-## Open the TUI
+## Open Shelbi
+
+<Tui>
 
 From inside the project's repository:
 
@@ -41,6 +43,30 @@ to a workspace, or swap the right pane to another view, including Activity
 and Machines, which live only in the palette. `Enter` on a
 sidebar row activates it: focus a workspace, open a review, switch to the
 Issues board.
+
+</Tui>
+<Desktop>
+
+Open **Shelbi.app**. With no hub daemon running, it opens the **Welcome to
+Shelbi** window: pick your project under **Projects on this Mac** (↑↓ to move,
+Return to open), or use **Add project** if you haven't
+[set one up](/docs/guides/getting-started/first-project) yet. To change
+projects later, click the project name at the top of the sidebar (the project
+switcher) or use **File ▸ Switch Project…**.
+
+The window is two columns. The sidebar on the left lists the project switcher,
+the nav (**Orchestrator** `⌘O`, **Issues** `⌘I`, **Changelog** `⌘L`), your
+workspaces, and any issues waiting on review. The main area shows the
+selected view; **Orchestrator** is the orchestrator's live session.
+
+`⌘K` (or `⌃P`, or the magnifier at the top of the sidebar) opens the command
+palette. Use it to switch projects, jump to a workspace, or open another
+view, including Activity and Machines, which also live under the **Go**
+menu. Click a sidebar row to open it: a workspace, a review, the Issues
+board. Busy workspaces and reviews are numbered, so `⌘1` to `⌘9` jump
+straight to them.
+
+</Desktop>
 
 ## Add an issue
 
@@ -97,7 +123,9 @@ shelbi issue add "Fix login bug" \
 - `--prefers-machine`: the orchestrator only dispatches the issue to a
   workspace on that machine, leaving it in Todo until one is free.
 
-### Via the kanban view
+### On the board
+
+<Tui>
 
 Press `Ctrl+P` and pick "Issues", or hit `Enter` on the **Issues**
 sidebar nav. You land on the Kanban board, one column per status (Backlog,
@@ -121,10 +149,44 @@ narrow strip). Keys:
 Adding an issue from the kanban view goes through the orchestrator, so it's
 faster to just talk to it in chat.
 
+</Tui>
+<Desktop>
+
+Click **Issues** in the sidebar (`⌘I`). You land on the Issues board, one
+column per status (Backlog, To Do, In Progress, Review, Done, and Canceled).
+Click **+** (**New issue**) in the toolbar, or press `n`, type a title, and
+press `Enter` to add it to Backlog. Click a card to open its task pane, where
+you edit the title and description in place and set **Status**, **Workflow**,
+and **Priority**.
+
+Drag a card to another column to move it, or within a column to reorder it.
+The keyboard works too:
+
+| Key | Action |
+|---|---|
+| `h` / `l` | Step between columns |
+| `j` / `k` | Step between cards in the current column |
+| `Enter` / `Space` | Open the highlighted card |
+| `H` / `L` (shift) | Move the selected card to the previous / next column |
+| `K` / `J` (shift) | Reorder within a column |
+| `n` | New issue |
+| `s` | Start the card on a workspace |
+| `e` / `E` (shift) | Edit the description / open it in your editor |
+| `o` | Open the selected card's workspace |
+| `/` | Search cards |
+| `f` / `w` | Filter by workspace / workflow |
+| `Esc` | Close the task pane |
+
+The task pane's **More** (⋮) menu has the same actions: **Move left**,
+**Move right**, **Start**, **Assign…**, **Edit description**, **Open in
+editor**, **Open workspace**, and **Copy branch name**.
+
+</Desktop>
+
 ## Promote to todo, watch the auto-dispatch
 
 Promotion is the start signal. Move a backlog card into **todo**,
-either by hitting `L` (shift-l) on the card in the kanban view or by
+either <Tui>by hitting `L` (shift-l) on the card in the kanban view</Tui><Desktop>by dragging the card into **To Do** on the board (or pressing `L` on it)</Desktop> or by
 asking the orchestrator to:
 
 ```
@@ -147,12 +209,12 @@ shelbi issue start fix-login-bug-on-safari --workspace delta
 That moves the card to **In Progress**, creates the branch
 `you/fix-login-bug-on-safari` in the workspace's worktree, and feeds
 the issue prompt into the workspace's agent CLI. The sidebar badge next to
-`delta` flips from `·` (idle) to `⏵` (working).
+`delta` flips from <Tui>`·` (idle) to `⏵` (working)</Tui><Desktop>a dot (idle) to a green ▶ (working), and the row names the agent it's running</Desktop>.
 
-Jump in any time. `Enter` on the workspace's sidebar row drops you straight
-into its pane to watch the run live.
+Jump in any time. <Tui>`Enter` on the workspace's sidebar row</Tui><Desktop>Clicking the workspace's sidebar row (or pressing its `⌘1`–`⌘9` shortcut)</Desktop> drops you straight
+into its session to watch the run live.
 
-<AppMockup
+<ClientMockup
   terminalTitle="you@hub — myapp"
   project="myapp"
   activeView="tasks"
@@ -199,6 +261,8 @@ into its pane to watch the run live.
   queuedReview={[]}
 />
 
+<Tui>
+
 | Badge | Workspace state |
 |---|---|
 | `·` | idle: no issue assigned |
@@ -207,8 +271,21 @@ into its pane to watch the run live.
 | `⚠` | awaiting permission: showing a permission dialog |
 | `⏸` | paused: runner stalled on a usage/session limit |
 
+</Tui>
+<Desktop>
+
+| Glyph | Workspace state |
+|---|---|
+| dot | idle: no issue assigned (the row reads **Idle**) |
+| green ▶ | working: agent actively running a turn |
+| yellow `?` | awaiting input: finished a turn, sitting at the prompt |
+| `⚠` | needs permission: showing a permission dialog |
+| `⏸` | paused: runner stalled on a usage/session limit |
+
+</Desktop>
+
 A finished dev workspace doesn't get its own completion glyph: on promotion
-the poller closes its session, so the row reads idle (`·`) immediately. The
+the poller closes its session, so the row reads idle immediately. The
 "done, awaiting human" state lives in the sidebar's review sections, not on
 the workspace row.
 
@@ -218,7 +295,9 @@ When the workspace finishes, it writes a review-ready marker into its
 worktree. The hub poller picks it up on the next tick and moves the card
 into **Review**. The `in-progress → review` transition pushes the branch
 and opens a PR, the workspace's session closes, and its row drops back to
-idle (`·`). The card shows in the sidebar's *Queued for Review* section:
+idle. The card shows in the sidebar's *Queued for Review* section:
+
+<Tui>
 
 ```
 Queued for Review
@@ -226,20 +305,29 @@ Queued for Review
   ⎇ you/fix-login-bug-on-safari
 ```
 
+</Tui>
+<Desktop>
+
+The **Queued for review** section lists it as a two-line row: the issue
+title over its branch, `you/fix-login-bug-on-safari`.
+
+</Desktop>
+
 Review the change in the PR's diff. To *run* it as well (boot its dev server
 and click through the app), tag a workspace for review; see [set up review
 workspaces](/docs/guides/getting-started/review-workspaces). With a free
 review workspace, the hub daemon loads the queued card onto it automatically
 (or press `Enter` on the queued row to pick a slot), and the Review agent
-serves the branch there. The row then moves to *Ready for Review* with a `✓`
-and its `machine:workspace` location. A fresh project has no review workspace,
-so `Enter` on the queued row only reports "No review workspace is
+serves the branch there. The row then moves to *Ready for Review* with a <Tui>`✓`
+and its `machine:workspace` location</Tui><Desktop>cyan check</Desktop>. A fresh project has no review workspace,
+so <Tui>`Enter` on</Tui><Desktop>clicking</Desktop> the queued row only reports "No review workspace is
 configured." and the card waits in the queue.
 
 ## Accept the issue
 
-Accept by moving the card to **Done**: `L` in the kanban view from
-**Review**, or:
+Accept by moving the card to **Done**: <Tui>`L` in the kanban view from
+**Review**</Tui><Desktop>drag it from **Review** to **Done** on the board (or press `L`), or
+**Approve** in its review view</Desktop>, or:
 
 ```bash
 shelbi issue move fix-login-bug-on-safari --to done

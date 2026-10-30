@@ -19,27 +19,49 @@ only thing that changes is who initiates.
 Ways to flip the switch:
 
 - **CLI**: `shelbi zen on`, `shelbi zen off`, `shelbi zen pause`.
-- **Hotkey**: `Alt+Z` in the TUI (⌥Z in the desktop app) toggles between
-  On and Off.
-- **Palette / menu**: **Turn Zen Mode on** in the command palette, or the
-  desktop app's **Turn Zen Mode On** menu item.
+- **Palette**: **Turn Zen Mode on** in the command palette
+  (<Tui>`Ctrl+P`</Tui><Desktop>`⌘K`</Desktop>).
+
+<Tui>
+
+- **Hotkey**: `Alt+Z` (the `global.zen_toggle` binding) toggles between On
+  and Off while the Activity view has focus.
+
+</Tui>
+<Desktop>
+
+- **Sidebar**: click the Zen pill at the bottom of the sidebar.
+- **Shortcut / menu**: `⌥Z`, or **View ▸ Turn Zen Mode On**.
+
+</Desktop>
+
 - **Status check**: `shelbi zen status` prints the current mode,
   configured local checks, resolved danger paths, the last orchestrator
   crash (if any), and the count of in-flight Zen issues.
 
 The first time you turn Zen on from the TUI or the desktop app, Shelbi
-shows an **Enable Zen Mode?** dialog explaining what Zen does (Cancel /
-Enable, with a "Don't show this again" box).
+shows an **Enable Zen Mode?** dialog explaining what Zen does (**Cancel** /
+**Enable Zen**, with a "Don't show this again" box).
+
+<Tui>
 
 When Zen is **on**, the sidebar shows a green **ZEN MODE ON** band on its
-bottom row, below the toolbar (desktop: a green "Zen mode on" band). That
-band is the at-a-glance "the agent is in lead mode" signal. If it's not
-there, Zen is off or paused.
+bottom row, below the toolbar. That band is the at-a-glance "the agent is in
+lead mode" signal. If it's not there, Zen is off or paused.
+
+</Tui>
+<Desktop>
+
+When Zen is **on**, the pill at the bottom of the sidebar turns green and reads
+**Zen mode on**. That pill is the at-a-glance "the agent is in lead mode"
+signal. Off or paused, it reads **Zen mode off**.
+
+</Desktop>
 
 ### Rebinding the hotkey
 
 The toggle is the ordinary keybinding `global.zen_toggle`, bound to
-`Alt+Z` by default. Some terminals (notably macOS Terminal.app, where
+`Alt+Z` (`⌥Z`) by default. Some terminals (notably macOS Terminal.app, where
 Option/Alt types accented characters) swallow `Alt+Z`. If yours does,
 rebind it in Settings ▸ Keybindings, or set
 `defaults.global.zen_toggle` in `~/.shelbi/keys.yaml`:
@@ -56,7 +78,7 @@ You can always use `shelbi zen on|off` or the palette instead.
 
 Three levels of "stop":
 
-- **`shelbi zen off`** (or the `Alt+Z` toggle): hard off. No new
+- **`shelbi zen off`** (or the Zen toggle in the app): hard off. No new
   auto-promotions, and the orchestrator stops initiating the merge
   bar on any `merge`-action transition. Anything already mid-flight
   in the conditions flow runs to completion on its current trajectory.

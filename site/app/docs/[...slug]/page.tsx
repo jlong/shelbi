@@ -8,7 +8,9 @@ import {
   getDocBySlug,
   getEditUrl,
   getPrevNext,
+  hasClientVariants,
 } from "@/lib/docs"
+import { ClientSwitch } from "@/components/ClientSwitch"
 import { DocFooter } from "@/components/DocFooter"
 import { OnThisPage } from "@/components/OnThisPage"
 import { mdxComponents } from "@/components/mdx-components"
@@ -55,6 +57,10 @@ export default async function DocsPage({ params }: DocsPageProps) {
   const headings = extractHeadings(doc)
   const { prev, next } = getPrevNext(doc)
   const editUrl = getEditUrl(doc)
+  // Pages whose steps or mockups differ between the TUI and the desktop app
+  // carry the site-wide TUI | Desktop switch (the home page's): in the header,
+  // and again atop the sticky on-this-page rail so it stays in reach.
+  const variants = hasClientVariants(doc)
 
   // contentlayer compiles MDX to a code string that must be turned into a
   // component at render — the canonical pattern. Code-block HTML is already
@@ -79,12 +85,21 @@ export default async function DocsPage({ params }: DocsPageProps) {
               View as markdown
             </a>
           </div>
+          {variants ? (
+            <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="text-sm text-gray-6">Instructions for</span>
+              <ClientSwitch label="Show instructions for" />
+            </div>
+          ) : null}
         </header>
         <MDX components={mdxComponents} />
         <DocFooter prev={prev} next={next} editUrl={editUrl} />
       </article>
       <div className="hidden lg:block">
-        <div className="sticky top-8">
+        <div className="sticky top-11">
+          {variants ? (
+            <ClientSwitch label="Show instructions for" className="mb-3" />
+          ) : null}
           <OnThisPage headings={headings} />
         </div>
       </div>

@@ -40,7 +40,7 @@ Every row should show `idle` under `STATE` and `-` under `AGENT`. A slot no
 longer selects a runner: which runner (and model) each dispatch launches is
 resolved from the [agent](/docs/configuration/agents) that runs there. Nothing
 is loaded yet. If a pane is dead, jump
-to the workspace (`Enter` on its sidebar row): the session may have
+to the workspace (<Tui>`Enter` on its sidebar row</Tui><Desktop>click its sidebar row</Desktop>): the session may have
 stalled on a permission dialog, and resolving it puts the workspace back
 in the rotation.
 
@@ -111,7 +111,7 @@ shelbi issue add "Update the OpenAPI spec for the new auth module" \
   --depends-on auth-rename
 ```
 
-The dependent card carries a `🔒` badge in the Kanban view until every id
+The dependent card carries a <Tui>`🔒` badge in the Kanban view</Tui><Desktop>lock icon and a "blocked by" line on its board card</Desktop> until every id
 in its `depends_on` list reaches `done`, and Zen Mode's auto-promote scan
 skips it. The badge itself doesn't gate dispatch: once the dependency is
 in progress, a promoted card is dispatched with its branch stacked on the
@@ -126,8 +126,10 @@ for the full state model.
 Promotion is the start signal. Move all three cards into **todo** in
 the order you want them picked up:
 
-- **From the Kanban view**: open **Issues** in the sidebar, then `H`/`L`
-  to walk cards into the next column. `K`/`J` to reorder within `todo`. The
+- **From the board**: <Tui>open **Issues** in the sidebar, then `H`/`L`
+  to walk cards into the next column. `K`/`J` to reorder within `todo`.</Tui><Desktop>open **Issues** (`⌘I`), then drag each card into **To Do** and
+  drag within the column to set the order (or `H`/`L` and `K`/`J` on the
+  keyboard).</Desktop> The
   orchestrator dispatches from the top.
 - **From the orchestrator**: just ask:
 
@@ -151,12 +153,12 @@ triggers an immediate dispatch attempt.
 ## Watch the loop in action
 
 Within a second or two, the sidebar lights up. Workspace badges flip
-from `·` to `⏵` in YAML declaration order: `alpha`, then `bravo`,
+from <Tui>`·` to `⏵`</Tui><Desktop>a dot to a green ▶</Desktop> in YAML declaration order: `alpha`, then `bravo`,
 then `charlie`, until either the `todo` column is empty or every
 workspace is busy. The sidebar groups slots under the machine they're
 pinned to, and each busy row shows the agent it's running:
 
-<AppMockup
+<ClientMockup
   terminalTitle="you@hub — myapp"
   project="myapp"
   activeView="tasks"
@@ -239,10 +241,10 @@ exactly what the orchestrator is reacting to:
 …
 ```
 
-Jump between workspace panes any time. `Enter` on `bravo` drops you
-straight into its pane to watch the Safari fix happen live. Pop back
-to the orchestrator with **Orchestrator** in the sidebar (or `Ctrl+P` →
-Orchestrator) when you're done.
+Jump between workspace panes any time. <Tui>`Enter` on `bravo`</Tui><Desktop>Clicking `bravo` (or its `⌘1`–`⌘9` shortcut)</Desktop> drops you
+straight into its session to watch the Safari fix happen live. Pop back
+to the orchestrator with **Orchestrator** in the sidebar (or <Tui>`Ctrl+P` →
+Orchestrator</Tui><Desktop>`⌘O`</Desktop>) when you're done.
 
 ## Review one branch while the others keep running
 
@@ -252,8 +254,8 @@ review-ready marker, three things happen at once:
 1. The hub poller moves the issue from `in_progress` to `review` and
    clears the marker. The workflow's `in-progress → review` transition
    pushes the branch and opens a PR.
-2. The workspace's badge drops from `⏵` back to idle (`·`) and the issue
-   appears in the sidebar under **Queued for Review** (`·`).
+2. The workspace's badge drops back to idle and the issue appears in the
+   sidebar under **Queued for Review**.
 3. The orchestrator, watching the event stream, sees the workspace free
    up and immediately dispatches the next ready `todo` card to that
    slot (if any).
@@ -265,22 +267,26 @@ time you've clicked into the review pane.
 If the project has a free `review`-tagged workspace (a new project
 ships one), the hub loads the queued issue onto it automatically. The
 **Review agent** checks the branch out in that slot's own worktree and
-serves it, and the row moves to **Ready for Review** with a `✓` and the
-`machine:workspace` it's loaded on:
+serves it, and the row moves to **Ready for Review**<Tui> with a `✓` and the
+`machine:workspace` it's loaded on</Tui><Desktop> with a cyan check</Desktop>:
+
+<Tui>
 
 ```
 ✓ Add CSV export to the reports page   hub:review     ← Enter
 ```
 
-`Enter` on the row opens the review panel, where you can talk to the
+</Tui>
+
+<Tui>`Enter` on</Tui><Desktop>Clicking</Desktop> the row opens the review panel, where you can talk to the
 Review agent, view the diff, and (once the workflow has a `review:` serve
 recipe) run the change.
 [Set up review workspaces](/docs/guides/getting-started/review-workspaces)
 covers the review slot and the panel in detail. Without a review slot,
 the card stays queued: read the diff on the PR or locally instead.
 
-Accept when you're ready: press **✅ Approve** in the review panel, or
-move the card to `done` (`L` on the board, or
+Accept when you're ready: <Tui>press **✅ Approve**</Tui><Desktop>click **Approve**</Desktop> in the review panel, or
+move the card to `done` (<Tui>`L` on the board</Tui><Desktop>drag it to **Done** on the board</Desktop>, or
 `shelbi issue move <id> --to done`). The workflow's `review → done`
 transition merges the branch, so don't also ask an agent to merge it. The
 card is yours; the orchestrator only takes the `review` → `done` step

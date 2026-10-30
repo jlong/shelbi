@@ -25,7 +25,7 @@ five concurrent slots, no more, no less.
 The pool lives in the sidebar, grouped by machine. Busy slots show the agent
 they're running; idle ones wait for work:
 
-<AppMockup />
+<ClientMockup />
 
 ## Workspace vs. agent: capacity vs. role
 
@@ -162,6 +162,8 @@ Workspaces render in the sidebar grouped under the machine they're pinned to,
 so the layout mirrors where your compute actually lives. Each row shows the
 state badge, the name, and the loaded agent (or `idle`):
 
+<Tui>
+
 ```text
  — Workspaces —
  ▾ hub
@@ -173,17 +175,27 @@ state badge, the name, and the loaded agent (or `idle`):
    · echo                      idle
 ```
 
+</Tui>
+<Desktop>
+
+The desktop draws the same rows with its own glyphs: a green ▶ for working, a
+yellow `?` for awaiting input, a dot for idle (the row reads **Idle**), plus
+`⚠` and `⏸`. Busy rows are numbered `⌘1` to `⌘9` from the top, so a keystroke
+opens that workspace.
+
+</Desktop>
+
 Machine headers only appear when the pool spans more than one machine. Idle
-slots (`·`) carry no agent. They're capacity waiting to be filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
+slots carry no agent. They're capacity waiting to be filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
 running, which is how you tell at a glance that `delta` is doing a QA pass,
 not writing code.
 
-Each machine group can be collapsed (Space / Enter on its header). The set of
+Each machine group can be collapsed (<Tui>Space / Enter on its header</Tui><Desktop>click its machine row</Desktop>). The set of
 collapsed machine names persists to `~/.shelbi/state.json` under
 `sidebar.collapsed_machines` (the `SidebarPrefs` struct), so the choice
 survives a sidebar respawn and follows you across projects that share a machine
 name. A collapsed machine shows a `(total, N active)` count on its header
-(e.g. `▸ hub   (4, 2 active)`) so capacity stays visible at a glance.
+(e.g. <Tui>`▸ hub   (4, 2 active)`</Tui><Desktop>`hub (4, 2 active)`</Desktop>) so capacity stays visible at a glance.
 
 [Review](/docs/concepts/review-workspaces)-tagged slots are the exception:
 they never render here. Their capacity surfaces under the sidebar's
@@ -220,6 +232,15 @@ The hub polls each workspace's session every few seconds (see
 | `⏵`   | `serving`          | a review slot whose branch passed the `review:` ready probe.             |
 | `·`   | (no in-flight issue) | the slot is idle and ready to be assigned.                              |
 | `…`   | (not read yet)     | the workspace's status hasn't been read yet (e.g. right after a project switch). |
+
+<Desktop>
+
+The badges above are the TUI's. The desktop app draws the same states with
+its own glyphs: a green ▶ for `working`, a yellow `?` for `awaiting_input`,
+`⚠` and `⏸` as above, a dot for idle, and `…` while loading; a serving review
+shows as a cyan check in the review sections.
+
+</Desktop>
 
 A workspace that *finishes* an issue doesn't get its own "done" badge. The
 moment it writes the review-ready marker and the poller promotes the issue,

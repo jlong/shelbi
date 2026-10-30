@@ -20,6 +20,7 @@ import {
   XMarkIcon,
 } from "@heroicons/react/24/outline"
 import {
+  branchUser,
   ClaudeCodePane,
   type AppState,
   type Card,
@@ -390,6 +391,11 @@ function ReviewRow({ title, second, ready, chord }: { title: string; second: str
   )
 }
 
+/** An agent name as the app shows it: first letter uppercased (`view.rs` `title_case`). */
+function titleCase(name: string): string {
+  return name.charAt(0).toUpperCase() + name.slice(1)
+}
+
 /** The sidebar body under the nav: Workspaces, then Ready for review, then Queued for review. */
 function SidebarSections({ state }: { state: AppState }) {
   let chord = 1
@@ -407,7 +413,7 @@ function SidebarSections({ state }: { state: AppState }) {
     for (const w of m.workspaces) {
       const working = w.state === "working"
       workspaceRows.push(
-        <WorkspaceRow key={w.name} name={w.name} agent={working ? (w.agent ?? "Developer") : undefined} chord={working ? chord++ : undefined} indent={multi} />,
+        <WorkspaceRow key={w.name} name={w.name} agent={working ? titleCase(w.agent ?? "developer") : undefined} chord={working ? chord++ : undefined} indent={multi} />,
       )
     }
   }
@@ -534,13 +540,24 @@ function BoardHeader({ banner }: { banner?: string }) {
   )
 }
 
-/** The branch a dispatched card shows (`jlong/<id>`, as dispatch cuts them); none before dispatch. */
-function branchFor(card: Card, category: Category): string | undefined {
-  return category === "yellow" || category === "magenta" ? `jlong/${card.id}` : undefined
+/** The branch a dispatched card shows (`<user>/<id>`, as dispatch cuts them); none before dispatch. */
+function branchFor(card: Card, category: Category, user: string): string | undefined {
+  return category === "yellow" || category === "magenta" ? `${user}/${card.id}` : undefined
 }
 
-export function BoardCard({ card, category, workflow }: { card: Card; category: Category; workflow?: string }) {
-  const branch = branchFor(card, category)
+export function BoardCard({
+  card,
+  category,
+  workflow,
+  user,
+}: {
+  card: Card
+  category: Category
+  workflow?: string
+  /** The branches' user (`<user>/<id>`): the scenario's `terminalTitle` user. */
+  user: string
+}) {
+  const branch = branchFor(card, category, user)
   return (
     <div
       style={{
@@ -589,7 +606,7 @@ export function StatusHeading({ category, label, count, current }: { category: C
   )
 }
 
-function BoardColumn({ column, workflow, current }: { column: Column; workflow?: string; current: boolean }) {
+function BoardColumn({ column, workflow, current, user }: { column: Column; workflow?: string; current: boolean; user: string }) {
   if (column.collapsed) {
     const s = STATUS[column.category]
     return (
@@ -609,7 +626,7 @@ function BoardColumn({ column, workflow, current }: { column: Column; workflow?:
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: u(8) }}>
         {column.cards.map((card) => (
-          <BoardCard key={card.id} card={card} category={column.category} workflow={workflow} />
+          <BoardCard key={card.id} card={card} category={column.category} workflow={workflow} user={user} />
         ))}
         {column.cards.length === 0 ? (
           // An empty column: what goes here and how to put it there.
@@ -639,13 +656,90 @@ export function DesktopBoard({ state, contentOpacity }: { state: AppState; conte
       <BoardHeader banner="board 2s" />
       <div style={{ display: "flex", flex: 1, minHeight: 0, gap: u(12), padding: `0 ${u(12)}`, overflow: "hidden", ...fadeStyle(contentOpacity) }}>
         {state.columns.map((column, i) => (
-          <BoardColumn key={column.label} column={column} workflow={state.workflow} current={i === currentIndex} />
+          <BoardColumn key={column.label} column={column} workflow={state.workflow} current={i === currentIndex} user={branchUser(state)} />
         ))}
       </div>
       <div
         style={{ display: "flex", flex: "none", alignItems: "center", height: u(29), padding: `0 ${u(16)}`, borderTop: `${u(1)} solid ${C.divider}`, ...type("xsmall"), color: C.muted, whiteSpace: "pre", overflow: "hidden" }}
       >
         {BOARD_HINTS}
+      </div>
+    </div>
+  )
+}
+
+// ── Activity ──────────────────────────────────────────────────────────
+
+/**
+ * One Activity feed row as the desktop words it (`views/activity_labels.rs`):
+ * the actor (colored by kind, no brackets), the muted verb, the title, the
+ * X-Small second line, and the status tag (where the task is now) and time
+ * pinned right.
+ */
+type ActivityLine = { actor: string; color: string; verb: string; title?: string; tag?: [string, string]; time: string; secondary?: string }
+
+/** The same `Today` feed the TUI's Activity mockup shows (`KanbanMockup` `activityRows`). */
+const activityLines = (user: string): ActivityLine[] => [
+  { actor: "charlie", color: "var(--dt-term-green)", verb: "finished", title: "Cold-start cache", tag: ["review", "var(--dt-term-magenta)"], time: "12m", secondary: `⎇ ${user}/t-011` },
+  { actor: "alpha", color: "var(--dt-term-cyan)", verb: "is building", title: "Deploy staging env", tag: ["in progress", "var(--dt-term-yellow)"], time: "18m", secondary: `⎇ ${user}/t-009` },
+  { actor: "bravo", color: C.muted, verb: "awaiting input", time: "25m" },
+  { actor: "echo", color: "var(--dt-term-blue)", verb: "is building", title: "Backfill order index", tag: ["in progress", "var(--dt-term-yellow)"], time: "40m", secondary: `⎇ ${user}/t-017` },
+  { actor: "you", color: C.fg, verb: "merged", title: "Ship dark mode", tag: ["done", "var(--dt-term-green)"], time: "1h", secondary: "moved to done" },
+]
+
+/** The footer's key hints at the default activity keymap (`render_footer`). */
+const ACTIVITY_HINTS = "j/k select   enter open   Page Up/Page Down page   g top   G bottom   r refresh   a/z/w filter"
+
+/**
+ * The Activity view (`views/activity.rs`): the `Activity` title over the kind
+ * filter (All · Tasks · Zen · Workspaces · System) and the project and
+ * workspace pickers, the day-bucketed feed, and the key hints.
+ */
+export function DesktopActivity({ state }: { state: AppState }) {
+  const segment = (label: string, on: boolean) => (
+    <span key={label} style={{ display: "flex", alignItems: "center", height: u(24), padding: `0 ${u(10)}`, borderRadius: u(6), background: on ? C.card : "transparent", ...type("smallMedium"), color: on ? C.loud : C.muted }}>
+      {label}
+    </span>
+  )
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+      <div style={{ display: "flex", flexDirection: "column", flex: "none", gap: u(8), padding: `${u(8)} ${u(16)}`, borderBottom: `${u(1)} solid ${C.divider}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: u(8) }}>
+          <span style={{ ...type("baseMedium"), color: C.loud }}>Activity</span>
+          <span style={{ ...type("xsmall"), color: C.muted }}>{state.project}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: u(4) }}>
+          <span style={{ display: "flex", gap: u(2), padding: u(2), borderRadius: u(8), background: C.fill }}>
+            {["All", "Tasks", "Zen", "Workspaces", "System"].map((label) => segment(label, label === "All"))}
+          </span>
+          <span style={{ width: u(8) }} />
+          <FilterChip label={state.project} />
+          <FilterChip label="All workspaces" />
+        </div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "hidden", padding: `0 ${u(16)}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: u(8), height: u(40), flex: "none", ...type("xsmall"), color: C.muted }}>
+          <span style={{ width: u(12), height: u(1), background: C.divider }} />
+          Today
+          <span style={{ flex: 1, height: u(1), background: C.divider }} />
+        </div>
+        {activityLines(branchUser(state)).map((line, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "flex-start", flex: "none", padding: `${u(4)} ${u(8)}`, borderRadius: u(6), background: i === 0 ? C.selection : "transparent" }}>
+            <span style={{ flex: "none", minWidth: u(88), paddingRight: u(8), color: line.color }}>{line.actor}</span>
+            <span style={{ flex: "none", paddingRight: u(8), color: C.muted }}>{line.verb}</span>
+            <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, gap: u(2) }}>
+              <span style={{ color: C.fg }}>{line.title}</span>
+              {line.secondary ? <span style={{ ...type("xsmall"), color: C.muted }}>{line.secondary}</span> : null}
+            </span>
+            <span style={{ display: "flex", alignItems: "center", flex: "none", gap: u(8), paddingLeft: u(8) }}>
+              {line.tag ? <span style={{ ...type("baseMedium"), color: line.tag[1] }}>[{line.tag[0]}]</span> : null}
+              <span style={{ color: C.muted }}>{line.time}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", flex: "none", alignItems: "center", height: u(27), padding: `0 ${u(16)}`, borderTop: `${u(1)} solid ${C.divider}`, ...type("xsmall"), color: C.muted, whiteSpace: "pre", overflow: "hidden" }}>
+        {ACTIVITY_HINTS}
       </div>
     </div>
   )
@@ -760,7 +854,7 @@ export function WorkspacePanel({
     if (card) task = { card, category: col.category }
   }
   const agent =
-    state.machines.flatMap((m) => m.workspaces).find((w) => w.name === workspace)?.agent ?? "Developer"
+    titleCase(state.machines.flatMap((m) => m.workspaces).find((w) => w.name === workspace)?.agent ?? "developer")
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: "none", width: u(280), height: "100%", background: C.sidebar, color: C.fg }}>
       <Titlebar />
@@ -961,8 +1055,8 @@ export function DesktopPalette({ state, top = 160 }: { state: AppState; top?: nu
 
 /**
  * One `AppState` scenario as the desktop app shows it: the Orchestrator
- * (`chat`), the Issues board (`tasks` and `activity`, which the desktop keeps
- * off the sidebar), or the Workspace view (`workspace`: the task panel in the
+ * (`chat`), the Issues board (`tasks`), the Activity view (`activity`, which
+ * the desktop keeps off the sidebar), or the Workspace view (`workspace`: the task panel in the
  * sidebar's place, the agent's terminal beside it), with the command palette
  * over it while `palette` is set. `contentOpacity` fades the contents (not
  * the surfaces) for the hero's loop.
@@ -1006,6 +1100,8 @@ export function DesktopAppMockup({
     >
       {chat ? (
         <DesktopTerminal state={state} lines={state.chatLines ?? []} width={mainW} height={height} contentOpacity={contentOpacity} />
+      ) : view === "activity" ? (
+        <DesktopActivity state={state} />
       ) : (
         <DesktopBoard state={state} contentOpacity={contentOpacity} />
       )}
