@@ -92,10 +92,31 @@ fn the_switcher_menu_floats_over_the_sidebar(cx: &mut TestAppContext) {
     assert_eq!(d.bounds("sidebar-nav-Issues").unwrap(), issues, "the nav doesn't move");
     assert_eq!(menu.top(), button.bottom() + px(4.0), "the component's 4pt under the button");
     assert!(menu.size.width >= button.size.width, "at least the trigger's width");
+    let sidebar = d.bounds("sidebar").unwrap();
+    assert_eq!(menu.left(), sidebar.left() + px(12.0), "12pt in from the sidebar's left");
+    assert_eq!(menu.right(), sidebar.right() - px(12.0), "12pt in from the sidebar's right");
     for name in ["sidebar-project-alpha", "sidebar-project-beta", "sidebar-project-gamma", "sidebar-add-project"] {
         let row = d.bounds(name).unwrap_or_else(|| panic!("{name} is listed"));
         assert_eq!(row.size.height, px(26.0), "{name}: the component's 26pt row");
     }
+}
+
+#[gpui::test]
+fn a_long_project_name_keeps_the_switcher_menu_inset(cx: &mut TestAppContext) {
+    let mut d = Design::open(cx);
+    let long = "a-project-whose-name-runs-far-past-the-sidebar-edge";
+    let entry = |name: &str| ProjectEntry {
+        name: name.into(),
+        label: name.into(),
+    };
+    d.h.cx.update(|_, cx| cx.set_global(Catalog::with(vec![entry("alpha"), entry(long)], Vec::new())));
+    d.open_switcher();
+    let sidebar = d.bounds("sidebar").unwrap();
+    let menu = d.bounds("sidebar-switcher").expect("the menu shows");
+    assert_eq!(menu.left(), sidebar.left() + px(12.0));
+    assert_eq!(menu.right(), sidebar.right() - px(12.0), "the name truncates instead");
+    let row = d.bounds("sidebar-project-a-project-whose-name-runs-far-past-the-sidebar-edge").expect("listed");
+    assert!(row.right() <= menu.right(), "the row stays inside the menu");
 }
 
 #[gpui::test]
