@@ -54,11 +54,14 @@ a field on the wrong side errors at load time. The canonical bucket lists are
 `SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS` in
 [`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs).
 
-In the committed `<repo>/.shelbi/project.yaml`, the `name:` key is the project
-**id** — a valid slug, which `shelbi init --pick-up` reads back to seed a
-teammate's local alias — and the human label rides under `display_name:` (only
-emitted when the entered name was slugified into a different id). This is the
-one file where `name:` carries the id rather than a label.
+In the committed `<repo>/.shelbi/project.yaml`, the `name:` key is the
+project's **canonical id**: a valid slug that `shelbi init --pick-up` reads back
+to seed a teammate's local alias. The human label rides under `display_name:`
+(only emitted when the entered name was slugified into a different id). This is
+the one file where `name:` carries an id rather than a label. The id Shelbi uses
+locally is still the registry directory name (`~/.shelbi/projects/<id>/`), which
+can be a suffixed alias such as `myapp-2` when the canonical id is already taken
+on your machine.
 
 <Callout type="note" title="A present local.yaml is authoritative">
 
@@ -78,10 +81,10 @@ same split — fresh `init --mode in-repo` and `--pick-up` produce it directly.
 # ~/.shelbi/projects/myapp.yaml (id `myapp`, taken from the filename).
 # `name:` is an optional free-form label; omit it and the id `myapp` shows.
 name: My App
-repo: git@github.com:me/myapp.git
+repo: ~/Workspaces/myapp
 default_branch: main
 # Optional: tasks without `workflow:` use workflows/app.yaml instead of
-# workflows/default.yaml.
+# workflows/task.yaml.
 default_workflow: app
 machines:
   - name: hub
@@ -106,27 +109,29 @@ workspaces:
 | --- | --- | --- | --- | --- |
 | `name` | string | no | the id | Free-form human display **label** (uppercase, spaces, anything) shown in the sidebar and command palette. It is *not* the id; the id comes from the [filename](#the-project-id-comes-from-the-filename). Omit it and the id is displayed. |
 | `display_name` | string | no | — | **Deprecated** alias for `name`, accepted for one release with a load-time warning and removed in the next. Move its value to `name:`. When both are set, `display_name` wins as the label. |
-| `repo` | string | yes | — | Clone URL or path to the repository. User-local. |
+| `repo` | path | yes | — | Local path to the repository checkout (`~` is expanded). `shelbi init` writes the absolute path. In in-repo mode Shelbi reads `<repo>/.shelbi/project.yaml` from here. User-local. |
 | `default_branch` | string | no | `main` | Branch new work is based on and the fallback merge target when `git.base_branch` is unset. |
-| `default_workflow` | string | no | `default` | Workflow used by tasks that omit `workflow:` frontmatter. Names `workflows/<name>.yaml`; explicit task `workflow:` still wins. |
+| `default_workflow` | string | no | `task` | Workflow used by tasks that omit `workflow:` frontmatter. Names `workflows/<name>.yaml`; explicit task `workflow:` still wins. `shelbi init` writes `task`. An unset or legacy `default` value is rewritten to `task` by `shelbi reload`, and until then `default` resolves to `task.yaml` when no `default.yaml` exists. |
 | `machines` | list of [Machine](#machines) | yes | — | The hosts workspaces run on. User-local. |
 | `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
-| `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |
+| `agent_runners` | map of name → [AgentRunner](#agent_runners) | yes | — | The command lines agents and the orchestrator are launched with. |
 | `runners` | map of [RunnerKind](/docs/configuration/agents#runner-kinds) → [ProjectRunner](/docs/configuration/agents#project-runners) | no | `{}` | The kind-keyed runner fleet plus an optional house `model` / `reasoning_effort` per kind. The evolution of `agent_runners`; see [agents](/docs/configuration/agents). Additive: empty projects keep resolving through `agent_runners`. |
 | `agents` | map of name → [ProjectAgent](/docs/configuration/agents#per-agent-pins) | no | `{}` | Per-agent overrides, keyed by the agent's directory name. Pins which runner kind the project runs that agent on. See [agents](/docs/configuration/agents). |
 | `workspaces` | list of [Workspace](#workspaces) | no | `[]` | Fixed pool of workspace slots. User-local. |
 | `zen` | [Zen](#zen) | no | all defaults | Zen Mode check list, CI timeout, and danger paths. |
-| `editor` | string | no | `$EDITOR` | Editor invoked by `shelbi … edit` commands. User-local. |
+| `editor` | string | no | — | Reserved; currently unused. `shelbi … edit` commands use `$VISUAL`, then `$EDITOR`, falling back to `vi`; the editor for "Edit in `<editor>`" is set in [global config](/docs/configuration/global). User-local. |
 | `github_url` | string | no | — | Informational GitHub URL recorded by the setup wizard. |
 | `config_mode` | `global` \| `in-repo` | no | `global` | Which on-disk layout the project uses. Elided from the wire form when `global`. See [config modes](/docs/concepts/config-modes). |
-| `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace pane for state changes. |
+| `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace session for state changes. |
 | `github_reconcile_interval_secs` | integer | no | `900` | How often (seconds) the hub poller reconciles review tasks whose PR was merged on GitHub out-of-band, advancing them to done and skipping the local merge. Runs on its own slow clock, never the workspace poll tick. Set to `0` to disable. |
 | `workspace_permissions_mode` | string | no | — | Explicit project-wide permission ceiling rendered into the workspace settings template. Unset (the default) passes no `--permission-mode` and renders no `defaultMode`, so agents run under your own `~/.claude/settings.json` `permissions.defaultMode`. Set it to clamp every agent's requested mode downward. |
-| `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
+| `workspace_settings_template` | path | no | `<config-root>/workspace-settings.json.template` | Override path for the workspace settings template (`~` is expanded). |
+| `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log`: the orchestrator's fallback wake-up on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `disk` | [Disk](#disk) | no | `20` / `20` | Hub disk management: the size cap on the shared cargo `target/` and the low-disk free-space warning threshold. Both default to 20 GiB and are elided from the wire form when unset. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for the review merge and Zen's auto-merge. |
 | `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, the **View Diff** escape hatch for a diff tool that reviews a revision range instead of git's directory-diff pair. |
 | `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default) or `github` (issues in a repo). See [GitHub Issues backend](/docs/concepts/github-issues). |
+| `session` | `{ raw_output_log }` | no | off | `raw_output_log: true` keeps a full raw output log of every session at `~/.shelbi/sessions/<id>/raw.log`. Opt-in, for debugging: the log is mostly repaint noise for full-screen agents and captures anything pasted into a session. |
 
 ## machines
 
@@ -138,8 +143,8 @@ workspace lives at `<work_dir>/.shelbi/wt/<workspace-name>`.
 | `name` | string | yes | — | Machine identifier, referenced by `workspaces[].machine`. |
 | `kind` | `local` \| `ssh` | yes | — | Whether commands run on this box or over SSH. |
 | `work_dir` | path | yes | — | Base directory the repo checkout and worktrees live under. `~` is expanded. |
-| `host` | string | no | `name` | SSH hostname. Required when `kind: ssh`; falls back to `name` if omitted. Ignored for `local`. |
-| `tags` | list of string | no | `[]` | Capability tags every workspace on this machine inherits (e.g. `gpu`, `review`). A tag declared here applies to all of the machine's slots without repeating it per workspace. Accepts a scalar `tag:` alias and a bare string as shorthand. Elided when empty. |
+| `host` | string | no | `name` | SSH hostname for `kind: ssh`; defaults to `name` when omitted. Ignored for `local`. |
+| `tags` | list of string | no | `[]` | Capability tags every workspace on this machine inherits (e.g. `gpu`). A tag declared here applies to all of the machine's slots without repeating it per workspace, so a machine-level `review` tag turns every slot on that machine into a review slot. The legacy shorthands (`tag: x`, `tags: x`) still load, but the [config-upgrade pass](/docs/concepts/config-upgrade) rewrites them to `tags: [x]`. Elided when empty. |
 | `forward` | `unix` \| `tcp` | no | auto | How the hub reverse-forwards its daemon socket to an `ssh` machine. Unset (the default) auto-detects: start with a Unix-socket forward and fall back to TCP loopback if the Unix landing socket is unusable (the Tailscale-SSH root-owned-socket case). `tcp` skips detection and forwards over TCP loopback from the first attempt; `unix` pins the Unix forward and disables the fallback. Ignored for `local`. Elided when unset. |
 
 ```yaml
@@ -147,7 +152,7 @@ machines:
   - name: hub
     kind: local
     work_dir: ~/Workspaces/myapp
-    tags: [review]        # every slot on hub inherits the review tag
+    tags: [gpu]           # every slot on hub inherits the gpu tag
   - name: m2
     kind: ssh
     host: m2.local
@@ -161,7 +166,7 @@ work. See [the orchestrator concept](/docs/concepts/orchestrator).
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `runner` | string | yes | — | Name of an entry in [`agent_runners`](#agent-runners) used to boot the orchestrator. |
+| `runner` | string | yes | — | Name of an entry in [`agent_runners`](#agent_runners) used to boot the orchestrator. |
 
 ```yaml
 orchestrator:
@@ -188,16 +193,18 @@ initial startup prompt containing the rendered orchestrator instructions
 and bootstrap request. Other runners launch exactly as configured. Put any
 required Codex mode flags in `agent_runners.codex.flags`.
 
-Worker hooks are deployed into each worktree under `.shelbi/hooks/`, and
-Claude's `.claude/settings.json` references `.shelbi/hooks/claude.*` so the
-pane pushes orchestrator messages to the agent as they arrive. Codex has no
+Worker hooks are deployed into each worktree under `.shelbi/hooks/`, and the
+worktree's `.claude/settings.local.json` wires
+`$CLAUDE_PROJECT_DIR/.shelbi/hooks/*.sh` (`session-start`, `stop`,
+`pane-working`, `pane-idle`, `pane-blocked`) so the session pushes orchestrator
+messages to the agent as they arrive. Codex has no
 hook channel Shelbi can wire without overwriting user-owned `.codex/`
 configuration, so a Codex worker instead pulls its messages: its startup
 prompt carries a polling contract that tails `.shelbi/messages/<task-id>.log`.
 The chosen channel (hooks or polling) is recorded per launch in the events log.
 
-`orchestrator.runner` only controls the dashboard/orchestrator pane. It does
-not change worker slots. A worker slot no longer selects a runner: the
+`orchestrator.runner` only controls the orchestrator session. It does not
+change worker slots. A worker slot no longer selects a runner: the
 dispatched **agent** (role) owns runner/model resolution through its
 [`agent.yaml` manifest](/docs/configuration/agents), and the project's runner
 fleet supplies the concrete launcher. So a project can run a Codex orchestrator
@@ -216,7 +223,9 @@ from this map when no top-level [`runners`](#runners) fleet is declared).
 | --- | --- | --- | --- | --- |
 | `command` | string | yes | — | Executable to invoke (e.g. `claude`, `codex`). |
 | `flags` | list of string | no | `[]` | Extra flags appended to every invocation. |
-| `dialog_signatures` | list of object | no | built-in per-runner set | Blocking-dialog text signatures the poller uses to detect a frozen pane. When empty, defaults keyed on `command` apply. |
+| `dialog_signatures` | list of object | no | built-in per-runner set | Blocking-dialog text signatures the poller uses to detect a session frozen on a dialog. When empty, defaults keyed on `command` apply. |
+| `prompt_injection` | `{ kind, flag? }` | no | by executable basename | How Shelbi delivers the per-task initial prompt. `kind` is `positional-arg`, `flag-file` (with `flag`, e.g. `--message-file`), `stdin`, or `paste` (for REPL-only harnesses). When omitted, `claude` and `codex` get a positional prompt, `aider` gets `--message-file <prompt-file>`, and anything else reads the prompt on stdin. |
+| `integration` | `claude` \| `codex` \| `generic` | no | detected from `command` | Pins the runner adapter, overriding the basename detection, so a wrapper executable Shelbi wouldn't recognize can still get the Claude or Codex contract. |
 
 ```yaml
 agent_runners:
@@ -282,14 +291,14 @@ cleared context) between assignments. See
 | --- | --- | --- | --- | --- |
 | `name` | string | yes | — | Workspace identifier. Names the worktree at `<machine.work_dir>/.shelbi/wt/<name>`. |
 | `machine` | string | yes | — | Name of a [machine](#machines) this slot runs on. |
-| `tags` | list of string | no | `[]` | Capability tags for this slot. A workspace's *effective* tags are these unioned with its machine's [`tags`](#machines). Tag-based routing picks a free workspace whose effective tags are a superset of a status's required [`tags`](/docs/configuration/workflow#statuses). Accepts a scalar `tag:` alias and a bare string as shorthand for a one-element list. Elided when empty. |
-| `slot` | integer | no | declaration-order index | Numeric slot exported to transition [`run`](/docs/configuration/workflow#transitions) commands as `$SLOT` (e.g. to derive a per-slot port). When unset, falls back to the slot's zero-based index among its machine's workspaces. Elided when unset. |
+| `tags` | list of string | no | `[]` | Capability tags for this slot. A workspace's *effective* tags are these unioned with its machine's [`tags`](#machines). Tag-based routing picks a free workspace whose effective tags are a superset of a status's required [`tags`](/docs/configuration/workflow#statuses). The legacy shorthands (`tag: x`, `tags: x`) still load, but the [config-upgrade pass](/docs/concepts/config-upgrade) rewrites them to `tags: [x]`. Elided when empty. |
+| `slot` | integer | no | declaration-order index | Numeric slot exported to transition [`run`](/docs/configuration/workflow#transitions) commands as `$SLOT` (e.g. to derive a per-slot port). When unset, falls back to the slot's zero-based index among its machine's workspaces. A workflow's [`review:`](/docs/configuration/workflow#review) recipe uses only an explicit `slot:` as its port (`$SLOT` / `$PORT`), so give each review slot a port-valued `slot:`. Elided when unset. |
 
 ```yaml
 workspaces:
   - { name: alice, machine: hub }
   - { name: bob,   machine: m2 }
-  - { name: rev,   machine: hub, tags: [review], slot: 0 }
+  - { name: rev,   machine: hub, tags: [review], slot: 3000 }
 ```
 
 <Callout type="note" title="A workspace no longer selects a runner">
@@ -316,30 +325,34 @@ live on the task frontmatter.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `checks.local` | list of string | no | `[]` | Shell commands run in the worktree root before handoff to CI. Each entry is one command line. |
+| `checks.local` | list of string | no | `[]` | Shell commands run in the worktree root before handoff to CI. Each entry is one command line. On a Rust project, add [`shelbi msrv-check`](/docs/cli/msrv-check) to catch a minimum-Rust-version break before CI does. |
 | `ci_timeout` | duration (seconds) | no | `900` (15m) | How long Zen waits for CI to report before timing out the promotion. |
 | `danger_paths` | see below | no | extend built-ins with `[]` | Glob patterns too sensitive to auto-promote. |
 
-`danger_paths` accepts three forms. A bare sequence is shorthand for
-`extend`, which keeps the built-in danger list and adds yours;
-`override` replaces the built-ins entirely:
+`danger_paths` takes `extend`, which keeps the built-in danger list and adds
+yours, or `override`, which replaces the built-ins entirely. A legacy bare list
+still loads as `extend`, but the
+[config-upgrade pass](/docs/concepts/config-upgrade) rewrites it to
+`{ extend: [...] }`:
 
 ```yaml
 zen:
   checks:
     local:
-      - cargo test --workspace
+      - cargo test --workspace --no-fail-fast
+      - shelbi msrv-check            # build on the Cargo.toml rust-version
       - npm --prefix site test
   ci_timeout: 1200
   danger_paths:
-    extend: [".env", "infra/**"]   # or: override: [...], or a bare list
+    extend: [".env", "infra/**"]   # or: override: [...]
 ```
 
 ## heartbeat
 
 The recurring line the hub poller writes into `events.log` so the
-orchestrator's `events tail --follow` watch wakes up to sweep active
-tasks even when no real transition has fired. See
+orchestrator wakes up to sweep active tasks even when no real transition has
+fired. It is the orchestrator's fallback wake-up and the stream's liveness
+signal. See
 [the events log](/docs/concepts/events-log#heartbeats) for how the
 orchestrator consumes it.
 
@@ -409,21 +422,28 @@ and how they integrate back. See [understanding workflows](/docs/guides/understa
 | `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
 | `branch` | string | no | none | Full branch-name template for generated task branches when a task omits `branch:`. Rendered with `{{var}}` substitution, including `{{github_user}}` (authenticated GitHub username) and `{{id}}` (task id), plus the task's frontmatter params. So `branch: '{{github_user}}/{{id}}'` yields e.g. `jlong/fix-login`. Mutually exclusive with `branch_prefix`. |
 | `branch_prefix` | string | no | none | Shorthand alternative to `branch`: when a task omits `branch:`, Shelbi cuts `<branch_prefix>/<task-id>`. Use it when a bare prefix is all you need and you don't want to spell out a full `{{var}}` template. Mutually exclusive with `branch` — declaring both in one `git:` block fails the load. |
-| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How a reviewed workspace branch is integrated. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How the workflow `merge` action integrates a reviewed branch. The `merge` action supports `squash` and `merge`; `rebase` is accepted by the parser but the action rejects it. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
 
 ```yaml
 git:
   base_branch: develop
   branch: '{{github_user}}/{{id}}'
-  merge_strategy: rebase
+  merge_strategy: merge
 ```
 
 After substitution, `branch` must use the same safe characters Shelbi allows
 for generated refs: ASCII letters, numbers, `-`, `_`, and `/`. It must not end
-with `/`. Resolution runs in order: an explicit `branch:` in the task's
-frontmatter wins; otherwise Shelbi renders `git.branch`; when neither is set it
-names the branch after your authenticated GitHub username, falling back to
-`user`. The shipped `task` workflow sets `branch: '{{github_user}}/{{id}}'`.
+with `/`. A task's branch name resolves in this order:
+
+1. An explicit `branch:` in the task's frontmatter.
+2. The task's [workflow `git:`](/docs/configuration/workflow#git) block, when it
+   sets `branch` or `branch_prefix`. It replaces the project's naming wholesale.
+3. The project's `git.branch` template.
+4. The project's `git.branch_prefix`, as `<branch_prefix>/<id>`.
+5. `<github-login>/<id>`, using your authenticated GitHub username, or
+   `user/<id>` when it can't be determined.
+
+The shipped `task` workflow sets `branch: '{{github_user}}/{{id}}'`.
 
 ## review
 
@@ -460,6 +480,10 @@ Leave `diff_command` unset and **View Diff** keeps the default `git difftool
 -d -y` path, so existing setups are unchanged. Either way, a diff tool that
 exits without rendering leaves a short message in the pane rather than only
 git warnings.
+
+The [config-upgrade pass](/docs/concepts/config-upgrade) currently misreports a
+`review:` block as a removed key (`PROJECT_REMOVED_KEY`). The block is live:
+keep it rather than acting on that finding.
 
 ## issue_tracker
 
@@ -507,7 +531,7 @@ so an untouched block is the shipped policy. See
 | --- | --- | --- | --- |
 | `graphql_high` | integer | `2000` | GraphQL points above which the refresh runs at the configured cadence unthrottled. |
 | `graphql_medium` | integer | `500` | Points down to which the daemon slows (rather than pauses) the refresh, using `slow_refresh_secs`. |
-| `graphql_low` | integer | `100` | Points below which reads are served from cache with a warning; between this and `graphql_medium` the index refresh pauses while user-initiated single fetches still run. |
+| `graphql_low` | integer | `100` | Accepted but not read today. The governor uses two thresholds: between `graphql_medium` and `graphql_high` the refresh slows to `slow_refresh_secs`, and at or below `graphql_medium` it pauses until the budget resets. |
 | `slow_refresh_secs` | integer | `120` | Throttled refresh cadence for the middle GraphQL band. |
 | `rest_reserve` | integer | `100` | REST requests-remaining reserve below which a mutating call is refused up front. |
 

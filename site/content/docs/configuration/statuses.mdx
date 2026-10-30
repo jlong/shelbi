@@ -80,10 +80,11 @@ Loading fails if no status has category `done` or `archived`. A board
 with no terminal state is degenerate, since a task could never leave it.
 Beyond that, the terminal categories `done` and `archived` may repeat
 cleanly (a pipeline can carry several done-like or archived-like lanes).
-The single-instance categories — `backlog`, `ready`, `active`, and
-`handoff` — raise a non-fatal warning if any of them appears more than
-once, as does a missing `handoff`. So two `active` statuses load, but
-with a warning.
+The single-instance categories (`backlog`, `ready`, and `handoff`) raise
+a non-fatal warning if any of them appears more than once, as does a
+missing `handoff`. `active` may repeat freely: a second active status is
+how you add an agent gate (for example `adversarial-review`) before
+review, and it loads with no warning.
 
 </Callout>
 

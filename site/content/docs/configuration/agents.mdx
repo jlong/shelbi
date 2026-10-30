@@ -5,7 +5,9 @@ summary: Field-by-field reference for agent.yaml — the runner-agnostic agent m
 ---
 
 An **agent** is a role: a system prompt plus a skill set, living under
-`~/.shelbi/projects/<id>/agents/<name>/`. Alongside its `instructions.md`,
+`<config-root>/agents/<name>/` (`<config-root>` is `~/.shelbi/projects/<id>/`
+in [global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in in-repo
+mode). Alongside its `instructions.md`,
 `skills/`, and (Claude-only) `settings.json`, each agent carries a
 runner-agnostic **manifest** at `agent.yaml` that declares its recommended
 runner and model. The consuming project overrides those recommendations to fit
@@ -13,12 +15,15 @@ its own runner fleet.
 
 `shelbi init` scaffolds a self-documenting `agent.yaml` for every default agent,
 with the identity active and every optional knob commented out beneath a pointer
-back to this page.
+back to this page. An agent you create with
+[`shelbi agent new`](/docs/cli/agent) gets only `instructions.md` and an empty
+`skills/`: it has no `agent.yaml` until you add one, so it resolves through the
+built-in defaults.
 
 ## Where it lives
 
 ```
-~/.shelbi/projects/<id>/agents/<name>/
+<config-root>/agents/<name>/
   agent.yaml        # the manifest (this page)
   instructions.md   # system prompt
   skills/           # agent-scoped skills
@@ -93,7 +98,7 @@ than leaving a stale Claude model behind.
 
 The project's runner fleet is a single top-level `runners:` map keyed by
 [runner kind](#runner-kinds). Each entry is the concrete launcher (the same
-fields as an [`agent_runners`](/docs/configuration/project#agent-runners) entry,
+fields as an [`agent_runners`](/docs/configuration/project#agent_runners) entry,
 the fleet's evolution) plus an optional house `model` / `reasoning_effort`.
 
 | Field | Type | Required | Default | Description |
@@ -101,6 +106,8 @@ the fleet's evolution) plus an optional house `model` / `reasoning_effort`.
 | `command` | string | yes | — | Executable to invoke. |
 | `flags` | list of string | no | `[]` | Extra flags appended to every invocation. |
 | `dialog_signatures` | list of object | no | built-in set | Blocking-dialog signatures, as in `agent_runners`. |
+| `prompt_injection` | `{ kind, flag? }` | no | built-in per executable | How the initial prompt reaches the runner, as in `agent_runners`. |
+| `integration` | `claude` \| `codex` \| `generic` | no | detected from `command` | Pins the adapter for a wrapper executable whose basename Shelbi wouldn't recognize, as in `agent_runners`. |
 | `model` | string | no | — | House model for **every** agent of this kind. When set it is authoritative; when omitted, each agent's manifest recommendation applies. |
 | `reasoning_effort` | `low` \| `medium` \| `high` \| `max` | no | — | House effort for every agent of this kind. Same field-level override rule as `model`. |
 
@@ -117,7 +124,7 @@ runners:
 
 Kind to concrete-runner is a direct lookup: exactly one entry per kind, no
 indirection. When a kind has no `runners` entry, resolution bridges to the
-legacy [`agent_runners`](/docs/configuration/project#agent-runners) map keyed by
+legacy [`agent_runners`](/docs/configuration/project#agent_runners) map keyed by
 the kind's canonical name, so a project predating the fleet keeps working with
 no manual migration.
 
@@ -138,18 +145,28 @@ agents:
 
 ## Resolution and precedence
 
-Two chains resolve per dispatch, both highest to lowest.
+Two chains resolve per dispatch, both highest to lowest. The top tier is the
+task itself: a `launch:` block in the task's frontmatter (`runner`, `model`,
+`effort`, `permission_mode`, each optional) overrides the project and the
+manifest for that one task.
 
 **Runner kind** (which kind an agent runs on):
 
 ```
-project agents.<name>.runner  ->  agent.yaml preferred_runner  ->  built-in default (claude)
+task launch.runner  ->  project agents.<name>.runner  ->  agent.yaml preferred_runner  ->  built-in default (claude)
 ```
 
 **Model / effort** (the values for the resolved kind, each field independent):
 
 ```
-project runners.<kind>.{model,reasoning_effort}  ->  agent.yaml runners.<kind>.{model,reasoning_effort}  ->  built-in default (none)
+task launch.{model,effort}  ->  project runners.<kind>.{model,reasoning_effort}  ->  agent.yaml runners.<kind>.{model,reasoning_effort}  ->  built-in default (none)
+```
+
+```yaml
+# a task's frontmatter: run just this task on Opus at max effort
+launch:
+  model: claude-opus-4-8
+  effort: max
 ```
 
 Each field resolves independently: a project `runners.claude` block that sets
@@ -173,6 +190,21 @@ than the ceiling is clamped down, never granted. The plan's generic names map
 onto Claude's modes at launch: `read-only` becomes `default`, `full-access` becomes
 `bypassPermissions`; `auto` / `default` / `plan` / `acceptEdits` pass through unchanged.
 An unrecognized mode ranks as `default`, so a typo can never widen the ceiling.
+A task's `launch.permission_mode` is a request too: it wins over the manifest's
+`permissions_mode`, and both are clamped by the same ceiling, so a task can only
+tighten the project's mode, never loosen it.
+
+## Editing from Settings
+
+You don't have to edit these files by hand. Settings ▸ Agents, in the desktop
+app (⌘6 while Settings is open) and in the TUI (press `,` in the sidebar, then
+`6`), lists the project's agents with the workflow statuses each one runs. From
+there you can create, duplicate, rename, and delete an agent, and edit one's
+description, instructions, preferred runner, model, reasoning effort,
+permissions mode, and skills, plus the shared instructions every agent's prompt
+starts with. `agent.yaml` is saved through a patch that keeps its comments and
+unknown keys, and Reset to default restores a shipped agent. If a file changed
+on disk since the page read it, nothing is written.
 
 ## Migration from Workspace.runner
 

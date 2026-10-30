@@ -18,51 +18,76 @@ per-workflow git or Zen overrides. For the model behind these fields
 
 `<config-root>` is `~/.shelbi/projects/<name>/` in the default
 [global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
-in-repo mode. The file's basename is its id; the in-file `name:` field
-must match. Every project has a built-in virtual `default` workflow that
-lives in code until `shelbi workflow new` or `edit` writes a file. See
-[`shelbi workflow`](/docs/cli/workflow).
+in-repo mode. The file's basename is its id. Keep the in-file `name:` equal to
+the filename: Shelbi resolves workflows by filename and only warns on a
+mismatch, so a mismatched `name:` shows up but won't load by that name (two
+files declaring the same `name:` fail the load).
+
+`shelbi init` writes two workflows, `task` (the project's
+[`default_workflow`](/docs/configuration/project#top-level-fields)) and
+`subtask`. A built-in `default` workflow is used only when `workflows/` has no
+workflow files at all, and a lingering `default` reference resolves to `task`
+when no `default.yaml` exists. See
+[shipped workflows](/docs/guides/getting-started/workflows#shipped-workflows-task-and-subtask)
+and [`shelbi workflow`](/docs/cli/workflow).
+
+## Editing from Settings
+
+You don't have to edit workflow files by hand. Settings ▸ Workflows, in the
+desktop app and in the TUI (press `,` in the sidebar, then `4`), lists the
+project's workflows and its [status catalog](/docs/configuration/statuses).
+From there you can create, duplicate, rename, and delete a workflow, pick the
+project's default, and open one in an editor: a form plus a graph builder for
+its statuses (owner, agent, tags), `initial_status`, transitions (actions,
+`target`, `run`, `ready`, `url`), `git`, `required_params`, and `review:`.
+Saves go through a patch that keeps comments and unknown keys, and Edit YAML
+opens the file itself. If a file changed on disk since the page read it,
+nothing is written.
 
 ## Example
 
-The shipped `default` workflow is a pure status track: six statuses and
-**no** transitions, so every move is a plain status change. The scaffolded
-`default.yaml` writes `transitions:` only as a commented optional block you
-uncomment to add side-effects.
+The shipped `task` workflow, as `shelbi init` writes it (the scaffold also
+carries commented-out `initial_status` and `zen` blocks):
 
 ```yaml
-# ~/.shelbi/projects/myapp/workflows/default.yaml
-name: default
-description: The standard one-track flow shipped with every project.
+# ~/.shelbi/projects/myapp/workflows/task.yaml
+name: task
+description: 'Branch work with a review gate: the default track shipped with every project.'
 
 # Reference-only statuses: name + category come from statuses.yaml.
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
   - { id: todo,        owner: agent, agent: orchestrator }
   - { id: in-progress, owner: agent, agent: developer }
-  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: review,      owner: user,  agent: review, tags: [review] }
   - { id: done,        owner: user }
   - { id: canceled,    owner: user }
 
-# transitions: omitted by default — every move is a pure status change.
-# Uncomment to add hub-side side-effects on specific edges:
-# transitions:
-#   - { from: in-progress, to: review, actions: [push_branch, open_pr] }
-#   - { from: review,      to: done,   actions: [push_branch, merge] }
+transitions:
+  - { from: in-progress, to: review,   actions: [push_branch, open_pr] }
+  - { from: review,      to: done,     actions: [push_branch, merge] }
+  - { from: in-progress, to: canceled, actions: [close_pr, delete_branch] }
+  - { from: review,      to: canceled, actions: [close_pr, delete_branch] }
+
+git:
+  base_branch: main
+  branch: '{{github_user}}/{{id}}'
+  merge_strategy: squash
 ```
 
 ## Top-level fields
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `name` | string | yes | — | Workflow id. Must match the filename (`<name>.yaml`); referenced from task frontmatter. |
-| `statuses` | list of [Status](#statuses) | yes | — | Ordered statuses this workflow uses. At least one required. Order is the column order in the TUI. |
+| `name` | string | yes | — | Workflow id, referenced from task frontmatter. Keep it equal to the filename (`<name>.yaml`): workflows are looked up by filename, and a mismatch only warns. |
+| `statuses` | list of [Status](#statuses) | yes | — | Statuses this workflow uses (at least one). Board columns render in [`statuses.yaml`](/docs/configuration/statuses) order; the first entry here is the default `initial_status`. |
 | `description` | string | no | — | Free-form description surfaced in `shelbi workflow list` and the picker. |
 | `initial_status` | string | no | first status | Stable `id` a new task lands in. Must reference a status declared here. |
 | `transitions` | list of [Transition](#transitions) | no | — | Side-effect declarations for specific edges. Omitting it means all moves are pure status changes. |
-| `required_params` | list of string | no | — | Task frontmatter fields every task on this workflow must carry. Every `{{var}}` in [`git.base_branch`](#git) must appear here, or the workflow is rejected at load. See [Required params](#required-params). |
+| `required_params` | list of string | no | — | Task frontmatter fields every task on this workflow must carry. Every `{{var}}` in [`git.base_branch`](#git) must appear here, or the workflow is rejected at load. See [Required params](#required_params). |
 | `git` | [Git](#git) | no | inherit project | Per-workflow override of the project's `git:` block. |
 | `zen` | [Zen](#zen) | no | inherit project | Per-workflow override of the project's Zen Mode config. |
+| `review` | [Review](#review) | no | — (diff-only review) | Recipe the Review agent runs to serve this workflow's branch. |
 
 ## statuses
 
@@ -80,16 +105,18 @@ drifting across workflows.
 | --- | --- | --- | --- | --- |
 | `id` | string | yes | — | Stable id, declared in [`statuses.yaml`](/docs/configuration/statuses). Conventionally lowercase kebab-case. |
 | `owner` | `user` \| `agent` | yes | — | Who moves the task next when automation is off. `agent` makes it eligible for auto-dispatch; `user` waits. |
-| `agent` | string | no | derived from category | Which agent runs this status under automation. Defaults to `developer` for `active` and `orchestrator` for `ready` when omitted. `None` means no automation path. |
+| `agent` | string | see description | — | Which agent runs this status under automation. Required when `owner: agent` (the load fails without it). Omitted on a `user` status, it means no automation path. |
 | `tags` | list of string | no | `[]` | Required workspace tags. The task routes to a free workspace whose [effective tags](/docs/configuration/project#workspaces) are a **superset** of this set (set-AND). Empty means any free workspace — the default. Accepts a scalar `tag:` alias and a bare string as shorthand. Elided when empty. |
 
 <Callout type="note" title="Tags route work to the right slot">
 
 A status's `tags` are how a workflow says "this step needs a workspace with
 these capabilities." Pair them with a workspace/machine that carries the same
-[`tags`](/docs/configuration/project#workspaces) so the orchestrator loads
-the task there. `tags: [review]` on a handoff status is the primitive behind
-[review workspaces](/docs/concepts/review-workspaces).
+[`tags`](/docs/configuration/project#workspaces) so the task is loaded
+there. `tags: [review]` on a handoff status is the primitive behind
+[review workspaces](/docs/concepts/review-workspaces). The literal `review` tag
+is also special-cased: review-tagged slots are kept out of developer dispatch,
+and the hub's review auto-loader fills them.
 
 </Callout>
 
@@ -98,7 +125,8 @@ the task there. `tags: [review]` on a handoff status is the primitive behind
 Each entry declares the hub-side side-effects that fire when a task
 crosses one edge. Transitions do **not** restrict which moves are legal.
 Moves are any-to-any; unlisted edges are pure status changes. See
-[transitions](/docs/guides/getting-started/workflows#transitions).
+[transitions](/docs/guides/getting-started/workflows#transitions). Each action
+is also a command you can run by hand: see [`shelbi action`](/docs/cli/action).
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -109,6 +137,7 @@ Moves are any-to-any; unlisted edges are pure status changes. See
 | `run` | list of string | no | `[]` | Ordered [shell commands](#run-ready-and-teardown) to run on this edge, in the task's worktree. Compose with — and run *after* — this edge's `actions`. |
 | `ready` | string | no | — | Shell command polled until it exits 0 (or `ready_timeout` elapses) after `run`. Confirms a launched server is up. |
 | `ready_timeout` | duration (seconds) | no | `90` | How long to poll `ready` before failing the edge. Ignored when `ready` is unset. |
+| `url` | string | no | — | Reviewable URL for a server this edge's `run:` starts (`$PORT` / `$SLOT` substituted). Used by Open Browser when the workflow has no [`review.url`](#review). |
 
 ### actions
 
@@ -250,24 +279,31 @@ the variable and the workflow. The shipped `subtask` workflow declares it:
 name: subtask
 required_params: [task]        # every subtask must set `task:`
 git:
-  base_branch: task/{{task}}   # the parent task's branch
+  base_branch: task/{{task}}   # resolves to task/<parent-id>
 ```
+
+The rendered base is the literal `task/<parent-id>`. It matches the parent's
+branch only when the parent's branch has that name: the shipped `task` workflow
+names branches `{{github_user}}/{{id}}`, so either give the parent an explicit
+`branch: task/<id>` or change one of the two templates to agree.
 
 Leave it out for workflows whose `base_branch` is a literal like `main`.
 
 ## git
 
 Per-workflow override of the project's [`git:`](/docs/configuration/project#git)
-block. When omitted, the workflow inherits `base_branch`, `branch`, and
-`merge_strategy` from the project. Field values may contain `{{var}}`
-placeholders resolved against task params at load time.
+block. When omitted, the workflow uses the project's `base_branch` and branch
+naming. A workflow that sets `branch` or `branch_prefix` replaces the project's
+branch naming wholesale (see
+[branch resolution](/docs/configuration/project#git)). Field values may contain
+`{{var}}` placeholders resolved against task params at load time.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | project's `base_branch` | Branch this workflow's tasks are based on and merged into. |
 | `branch` | string | no | project's `branch` | Full branch-name template for generated task branches in this workflow, rendered with `{{var}}` substitution when a task omits `branch:`. The shipped `task` workflow uses `branch: '{{github_user}}/{{id}}'`. Mutually exclusive with `branch_prefix`. |
 | `branch_prefix` | string | no | project's `branch_prefix` | Shorthand alternative to `branch`: generates `<branch_prefix>/<task-id>` when a task omits `branch:`. Mutually exclusive with `branch` — declaring both in one `git:` block fails the load. |
-| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | project's `merge_strategy` | How this workflow's branches integrate back. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | Accepted, but not consulted today: the `merge` action always uses the **project's** [`git.merge_strategy`](/docs/configuration/project#git). |
 
 ```yaml
 git:
@@ -288,7 +324,7 @@ Per-workflow override of the project's
 independently optional: override just `checks`, just `ci_timeout`, just
 `danger_paths`, or any combination. Unset subfields fall back to the
 project. The canonical use is a `research:` workflow opting out of
-code-style checks without affecting `default`.
+code-style checks without affecting `task`.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
