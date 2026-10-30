@@ -9,9 +9,9 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
-### October 29, 2026
+### October 30, 2026
 
-**On `main` since v0.11.0, not yet in a tagged release.**
+**v0.12.0. Settings and a launch screen in the TUI, a per-project Changelog, and tasks you edit in place.**
 
 **A Changelog for every project.** Each project keeps a blog-style record of
 what shipped. The orchestrator adds an entry after every merge, you read them on
@@ -47,6 +47,25 @@ in place ([#1986](https://github.com/jlong/shelbi/pull/1986), [#1989](https://gi
 **Shared boards.** On a GitHub Issues board, board search also asks GitHub
 ([#1984](https://github.com/jlong/shelbi/pull/1984)), and on a shared remote tracker Shelbi starts only the issues
 assigned to you ([#1968](https://github.com/jlong/shelbi/pull/1968)).
+
+**Polish.** In the TUI, the sidebar toolbar sits on the bottom row while Zen is
+off, its Settings and Send Feedback buttons show no hover text, and toggling Zen
+no longer prints a status line; the Zen band is the indicator
+([#2001](https://github.com/jlong/shelbi/pull/2001), [#2004](https://github.com/jlong/shelbi/pull/2004), [#2007](https://github.com/jlong/shelbi/pull/2007)). Segmented controls no longer light up
+on hover in either client ([#2012](https://github.com/jlong/shelbi/pull/2012)). On the desktop, picking an app icon no
+longer shifts the tiles, the project menu is inset from the sidebar edges, and
+Settings ▸ Shelbi CLI shows the binary in use, read-only, with a Reset for an
+override ([#2003](https://github.com/jlong/shelbi/pull/2003), [#2009](https://github.com/jlong/shelbi/pull/2009), [#2013](https://github.com/jlong/shelbi/pull/2013)).
+
+**Steadier dispatch.** A workspace left on an orphan branch with no
+`.gitignore` (such as `docs/planning`) no longer refuses its next task over
+ignored build output like `target/` ([#2020](https://github.com/jlong/shelbi/pull/2020)).
+
+**Docs.** shelbi.dev's home page and docs gain a TUI | Desktop switch that swaps
+every illustration, and in the docs the instructions too, for the client you
+use ([#2018](https://github.com/jlong/shelbi/pull/2018), [#2022](https://github.com/jlong/shelbi/pull/2022)). The guides, concepts, configuration and CLI reference
+were audited against the real app and corrected, with new pages for the
+commands that had none ([#2021](https://github.com/jlong/shelbi/pull/2021)).
 
 ### October 23, 2026
 
