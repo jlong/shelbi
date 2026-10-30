@@ -3921,21 +3921,24 @@ impl ShelbiWindow {
     }
 
     /// Toggle Zen (or apply the intro's answer) off the UI thread, then
-    /// refresh the sidebar so its Zen band follows.
+    /// refresh the sidebar so its Zen band (or, on a failure, the error
+    /// badge) follows. Success flashes nothing: the band is the indicator.
     fn run_zen(&mut self, project: String, intro: Option<(bool, bool)>, cx: &mut Context<Self>) {
         let work = cx.background_executor().spawn(async move {
-            match intro {
+            let result = match intro {
                 Some((confirmed, dont_show_again)) => {
                     shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again)
                 }
-                None => shelbi_app::zen::toggle(&project)
-                    .unwrap_or_else(|e| format!("Zen toggle failed: {e}")),
-            }
+                None => shelbi_app::zen::toggle(&project),
+            };
+            shelbi_app::zen::report(&project, result)
         });
         cx.spawn(async move |this, cx| {
             let message = work.await;
             this.update(cx, |this, cx| {
-                this.flash(message, cx);
+                if let Some(message) = message {
+                    this.flash(message, cx);
+                }
                 this.request_refresh();
             })
             .ok();

@@ -220,7 +220,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         // Provision a minimal project so toggle_zen_mode can read/write
         // its state.json successfully — otherwise the dispatch still
-        // routes correctly but status_line carries the error path.
+        // routes correctly but the toggle fails.
         crate::test_support::provision_hub_repo_for_project(&home, "demo");
 
         let (mut app, km) = default_app_and_keymaps();
@@ -230,9 +230,12 @@ mod tests {
             "Alt+Z must NOT toggle the activity Zen filter"
         );
         assert_eq!(
-            app.status_line, "zen on",
-            "Alt+Z must drive the global Zen Mode toggle (status_line set)"
+            shelbi_state::read_state("demo").unwrap().zen_mode,
+            shelbi_state::ZenModeState::On,
+            "Alt+Z must drive the global Zen Mode toggle"
         );
+        // The sidebar's Zen band is the indicator; the toggle prints nothing.
+        assert!(app.status_line.is_empty(), "{:?}", app.status_line);
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
