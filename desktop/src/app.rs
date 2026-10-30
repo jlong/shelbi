@@ -1163,6 +1163,17 @@ impl ShelbiWindow {
         .detach();
     }
 
+    /// `editor:` or `diff_tool:` was saved in Settings: the Workspace and
+    /// Review panels' Edit in … and View Diff follow it.
+    fn tools_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.clone() {
+            workspace.update(cx, |v, cx| v.tools_changed(cx));
+        }
+        if let Some(review) = self.review.clone() {
+            review.update(cx, |v, cx| v.tools_changed(cx));
+        }
+    }
+
     /// Re-read the palette's (and the menus') inputs off the UI thread: other
     /// projects, edit targets, whether another client is attached.
     fn refresh_palette_inputs(&mut self, cx: &mut Context<Self>) {
@@ -3503,6 +3514,7 @@ impl ShelbiWindow {
                     SettingsEvent::ShowPage(page) => this.show_settings_page(*page, cx),
                     SettingsEvent::OpenPoolForm(intent) => this.open_pool_form(intent.clone(), window, cx),
                     SettingsEvent::PoolChanged => this.pool_changed(cx),
+                    SettingsEvent::ToolsChanged => this.tools_changed(cx),
                     SettingsEvent::EditorClosed => {
                         // The settings sidebar comes back on the page the
                         // editor closed onto (the agent editor's links go

@@ -36,6 +36,15 @@
 //!   the Dock at once ([`crate::app_icon`]), and in About, and is saved;
 //!   unset stays unset until one is picked.
 //! - `desktop.notifications`: which system notifications the app posts.
+//! - `editor:` / `diff_tool:`, shared with the TUI: what Edit in … and
+//!   View Diff open, each picked from a Select ([`ToolSelect`]) over the
+//!   shared model ([`GeneralForm`]): the default, the installed CLI tools and
+//!   apps (detected off the UI thread), the current setting, Browse… (a
+//!   native open panel in `/Applications`) and Other command… (a typed
+//!   command line, saved on Return). A pick saves only its key at once,
+//!   shown pending until the write lands; a failed write puts the picker
+//!   back and says why. The window then refreshes what the Workspace and
+//!   Review panels say ([`SettingsEvent::ToolsChanged`]).
 //! - `desktop.terminal_colors`: the ANSI colors the user changed, regular
 //!   and bold for each of the eight, typed as hex. A valid color applies to
 //!   every terminal at once (through the same `TerminalSettings` global) and
@@ -71,14 +80,17 @@
 //! client's settings). Every read and write runs on the background executor.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, point, prelude::*, px, App, Context, Entity, EventEmitter, Focusable, PathPromptOptions,
-    ScrollHandle, SharedString, Subscription, Window,
+    div, point, prelude::*, px, App, Context, Div, Entity, EventEmitter, Focusable, Image, ImageFormat,
+    PathPromptOptions, ScrollHandle, SharedString, Subscription, Window,
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
-use shelbi_app::settings::general::{theme_label, SaveStatus, THEMES};
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use shelbi_app::settings::general::{
+    theme_label, Change, GeneralForm, PickerEntry, Preferences, SaveStatus, ToolSetting, THEMES,
+};
 use shelbi_state::{
     AppIcon, DesktopConfig, DesktopNotifications, OptionAsMeta, TerminalScrollbar, ThemePreference, UserConfig,
 };
@@ -92,6 +104,7 @@ use super::machine_form::{self, MachineFormEvent, MachineFormView};
 use super::machine_form_state;
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
+use super::tool_select::{self, AppIcons, ToolSelect, ToolSelectEvent};
 use super::workflow_editor::{EditorEvent, WorkflowEditor};
 use super::workflows::{WorkflowsEvent, WorkflowsPage};
 use shelbi_app::settings::workspace_form::Outcome;
@@ -327,6 +340,9 @@ pub enum SettingsEvent {
     /// The project's workspaces or machines changed on disk (an edit
     /// landed): what the window shows from them should follow.
     PoolChanged,
+    /// `editor:` or `diff_tool:` was saved: the Workspace and Review panels'
+    /// Edit in … and View Diff should follow.
+    ToolsChanged,
 }
 
 /// An open machine dialog.
@@ -373,6 +389,14 @@ pub struct SettingsView {
     option_as_meta: OptionAsMeta,
     scrollbar: TerminalScrollbar,
     notifications: Switches,
+    /// The editor and diff tool settings (the shared model: the entries, the
+    /// current choices, the save in flight), their pickers, the field an
+    /// Other command… is typed in, and the apps' icons.
+    tools: GeneralForm,
+    editor_select: Entity<ToolSelect>,
+    diff_select: Entity<ToolSelect>,
+    command_input: Entity<InputState>,
+    app_icons: AppIcons,
     /// The ANSI colors the user changed, the sixteen fields they are typed
     /// in (regular 0 to 7, then bold 8 to 15), and which of those hold text
     /// that isn't a color.
@@ -384,6 +408,9 @@ pub struct SettingsView {
     /// A test's view saves here, never to `~/.shelbi`.
     #[cfg(test)]
     saved: UserConfig,
+    /// A test's next tool save fails with this.
+    #[cfg(test)]
+    pub(crate) fail_tool_save: Option<String>,
     /// The Keybindings page.
     keybindings: Entity<KeybindingsPage>,
     /// The project's Workflows page.
@@ -444,6 +471,10 @@ impl SettingsView {
             cx.new(|cx| Slider::new("settings-window-blur", initial.blur.into(), range(&BLUR_RANGE), (1, 5), "", cx));
         let contrast_slider =
             cx.new(|cx| Slider::new("settings-contrast", 0, range(&CONTRAST_RANGE), (1, 10), "%", cx));
+        let tools = GeneralForm::default();
+        let editor_select = cx.new(|cx| ToolSelect::new(ToolSetting::Editor, tools.picker(ToolSetting::Editor), cx));
+        let diff_select = cx.new(|cx| ToolSelect::new(ToolSetting::DiffTool, tools.picker(ToolSetting::DiffTool), cx));
+        let command_input = cx.new(|cx| InputState::new(window, cx));
         let mut subscriptions = vec![
             cx.subscribe(&contrast_slider, |this, _, event: &SliderEvent, cx| this.slide_contrast(*event, cx)),
             cx.subscribe(&opacity_slider, |this, _, event: &SliderEvent, cx| {
@@ -480,6 +511,17 @@ impl SettingsView {
             }),
             cx.subscribe(&font_family, |this, _, event: &FontPickerEvent, cx| match event {
                 FontPickerEvent::Picked(_) => this.save(cx),
+            }),
+            cx.subscribe_in(&editor_select, window, |this, _, event: &ToolSelectEvent, window, cx| match event {
+                ToolSelectEvent::Picked(entry) => this.pick_tool(ToolSetting::Editor, entry, window, cx),
+            }),
+            cx.subscribe_in(&diff_select, window, |this, _, event: &ToolSelectEvent, window, cx| match event {
+                ToolSelectEvent::Picked(entry) => this.pick_tool(ToolSetting::DiffTool, entry, window, cx),
+            }),
+            cx.subscribe_in(&command_input, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_command(window, cx);
+                }
             }),
             // The terminal font changed elsewhere (⌘+ / ⌘−, another
             // window's settings): show it.
@@ -518,12 +560,19 @@ impl SettingsView {
             option_as_meta: OptionAsMeta::Off,
             scrollbar: TerminalScrollbar::Auto,
             notifications: Switches::default(),
+            tools,
+            editor_select,
+            diff_select,
+            command_input,
+            app_icons: AppIcons::new(),
             ansi: [None; 16],
             ansi_inputs,
             ansi_invalid: [false; 16],
             preview,
             #[cfg(test)]
             saved: UserConfig::default(),
+            #[cfg(test)]
+            fail_tool_save: None,
             keybindings,
             workflows,
             editor: None,
@@ -849,8 +898,17 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Read the config off the UI thread and fill the form.
+    /// Read the config off the UI thread and fill the form, and find the
+    /// installed editors and diff tools for the pickers.
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let detect = cx
+            .background_executor()
+            .spawn(async { shelbi_state::tools::detected_tools() });
+        cx.spawn(async move |this, cx| {
+            let detected = detect.await;
+            this.update(cx, |this, cx| this.set_detected_tools(detected, cx)).ok();
+        })
+        .detach();
         let read = cx
             .background_executor()
             .spawn(async { shelbi_state::load_user_config() });
@@ -891,6 +949,8 @@ impl SettingsView {
         self.ansi = values.ansi;
         self.ansi_invalid = [false; 16];
         self.show_colors(window, cx);
+        self.tools.load(Ok(Preferences::from_config(cfg)), std::env::var("EDITOR").ok());
+        self.sync_tools(cx);
         self.loaded = true;
     }
 
@@ -1289,6 +1349,213 @@ impl SettingsView {
         cli_shown(&self.cli_path, crate::app::automatic_cli(cx))
     }
 
+    /// The installed editors and diff tools arrived: the pickers list them.
+    pub(crate) fn set_detected_tools(&mut self, detected: shelbi_state::tools::DetectedTools, cx: &mut Context<Self>) {
+        self.tools.set_detected(detected);
+        self.sync_tools(cx);
+    }
+
+    /// The editor and diff tool form (tests).
+    #[cfg(test)]
+    pub(crate) fn tools(&self) -> &GeneralForm {
+        &self.tools
+    }
+
+    /// The save line's state (tests).
+    #[cfg(test)]
+    pub(crate) fn save_status(&self) -> &SaveStatus {
+        &self.state
+    }
+
+    /// `setting`'s picker.
+    pub(crate) fn tool_select(&self, setting: ToolSetting) -> Entity<ToolSelect> {
+        match setting {
+            ToolSetting::Editor => self.editor_select.clone(),
+            ToolSetting::DiffTool => self.diff_select.clone(),
+        }
+    }
+
+    /// Show the form's choices in both pickers, and read the icons of apps
+    /// they list that aren't read yet.
+    fn sync_tools(&mut self, cx: &mut Context<Self>) {
+        let enabled = self.tools.editable();
+        let mut missing = Vec::new();
+        for setting in [ToolSetting::Editor, ToolSetting::DiffTool] {
+            let picker = self.tools.picker(setting);
+            missing.extend(
+                picker
+                    .apps
+                    .iter()
+                    .chain(&picker.custom)
+                    .filter_map(|t| t.app_path.clone())
+                    .filter(|p| !self.app_icons.contains_key(p)),
+            );
+            let icons = &self.app_icons;
+            self.tool_select(setting).update(cx, |s, cx| s.set(picker, icons, enabled, cx));
+        }
+        self.load_icons(missing, cx);
+        cx.notify();
+    }
+
+    /// Read the icons of the apps at `paths` off the UI thread (a test's view
+    /// draws none).
+    fn load_icons(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() || cfg!(test) {
+            return;
+        }
+        let read = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .filter_map(|p| {
+                    let png = crate::platform::app_icons::png(&p, tool_select::APP_ICON_PX)?;
+                    Some((p, Arc::new(Image::from_bytes(ImageFormat::Png, png))))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let icons = read.await;
+            this.update(cx, |this, cx| {
+                if !icons.is_empty() {
+                    this.app_icons.extend(icons);
+                    this.sync_tools(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// An entry was picked from `setting`'s picker: the default or a tool
+    /// saves now; Browse… opens the open panel and Other command… the field.
+    fn pick_tool(&mut self, setting: ToolSetting, entry: &PickerEntry, window: &mut Window, cx: &mut Context<Self>) {
+        match entry {
+            PickerEntry::Browse => self.browse_tool(setting, window, cx),
+            PickerEntry::OtherCommand => self.begin_command(setting, window, cx),
+            PickerEntry::Default | PickerEntry::Tool(_) => {
+                self.cancel_command(cx);
+                if let Some(change) = self.tools.choose_entry(setting, entry) {
+                    self.write_tool(change, cx);
+                }
+            }
+        }
+    }
+
+    /// Choose an app or a program for `setting` in a native open panel
+    /// starting in `/Applications` ([`Self::browse_picked`]).
+    fn browse_tool(&mut self, setting: ToolSetting, window: &mut Window, cx: &mut Context<Self>) {
+        let message = match setting {
+            ToolSetting::Editor => "Choose an editor: an app, or a program to run in a pane.",
+            ToolSetting::DiffTool => "Choose a diff tool: an app, or a program to run in a pane.",
+        };
+        let picked = crate::platform::open_panel::choose_file(Path::new("/Applications"), message);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(path)) = picked.await else {
+                return;
+            };
+            this.update(cx, |this, cx| this.browse_picked(setting, &path, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Browse picked `path` for `setting`: an app or an executable is saved;
+    /// anything else says why it can't be one.
+    pub(crate) fn browse_picked(&mut self, setting: ToolSetting, path: &Path, cx: &mut Context<Self>) {
+        self.cancel_command(cx);
+        match self.tools.browse(setting, path) {
+            Ok(Some(change)) => self.write_tool(change, cx),
+            Ok(None) => {}
+            Err(e) => {
+                self.state = SaveStatus::Failed(e);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Other command…: type a command line for `setting`, starting from its
+    /// command (empty for the default or an app).
+    pub(crate) fn begin_command(&mut self, setting: ToolSetting, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tools.begin_edit_tool(setting) {
+            return;
+        }
+        let text = self.tools.draft().map(|d| d.text()).unwrap_or_default();
+        let focus = self.command_input.update(cx, |s, cx| {
+            s.set_value(text, window, cx);
+            s.focus_handle(cx)
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Return (or Save) in the command field: the typed command is saved
+    /// (a blank one is the default), unless it is the setting already.
+    pub(crate) fn commit_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.command_input.read(cx).value().to_string();
+        let Some(draft) = self.tools.draft_mut() else {
+            return;
+        };
+        draft.clear();
+        draft.paste(&text);
+        let change = self.tools.commit_edit();
+        // The keys go back to the picker the command was typed for.
+        if let Some(setting) = change.as_ref().map(tool_setting_of) {
+            let focus = self.tool_select(setting).read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        match change {
+            Some(change) => self.write_tool(change, cx),
+            None => self.sync_tools(cx),
+        }
+    }
+
+    /// Stop typing a command, keeping the setting.
+    fn cancel_command(&mut self, cx: &mut Context<Self>) {
+        if self.tools.draft().is_some() {
+            self.tools.cancel_edit();
+            cx.notify();
+        }
+    }
+
+    /// Write `change` (one key of `config.yaml`) off the UI thread; the
+    /// pickers show it pending until it lands.
+    fn write_tool(&mut self, change: Change, cx: &mut Context<Self>) {
+        self.state = SaveStatus::Saving;
+        self.sync_tools(cx);
+        #[cfg(test)]
+        {
+            let result = match self.fail_tool_save.take() {
+                Some(e) => Err(e),
+                None => {
+                    change.apply(&mut self.saved);
+                    Ok(self.saved.clone())
+                }
+            };
+            self.tool_saved(result, cx);
+        }
+        #[cfg(not(test))]
+        {
+            let write = cx.background_executor().spawn(async move { change.write() });
+            cx.spawn(async move |this, cx| {
+                let result = write.await;
+                this.update(cx, |this, cx| this.tool_saved(result, cx)).ok();
+            })
+            .detach();
+        }
+    }
+
+    /// A tool's write landed: the pickers show what the file holds now, and
+    /// the window refreshes the panels.
+    fn tool_saved(&mut self, result: Result<UserConfig, String>, cx: &mut Context<Self>) {
+        self.tools.saved_result(result);
+        self.state = self.tools.status().clone();
+        if self.state == SaveStatus::Saved {
+            cx.emit(SettingsEvent::Saved);
+            cx.emit(SettingsEvent::ToolsChanged);
+        }
+        self.sync_tools(cx);
+    }
+
 }
 
 #[cfg(feature = "visual-check")]
@@ -1309,6 +1576,21 @@ impl SettingsView {
     pub(crate) fn offscreen_show_app_icon(&mut self, icon: AppIcon, cx: &mut Context<Self>) {
         self.app_icon = Some(icon);
         cx.notify();
+    }
+
+    /// Show General scrolled to its end and open `setting`'s picker
+    /// (`--visual-views`).
+    pub(crate) fn offscreen_open_tool_menu(&mut self, setting: ToolSetting, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(SettingsPage::General, cx);
+        self.scroll.set_offset(point(px(0.0), px(-10_000.0)));
+        self.tool_select(setting).update(cx, |s, cx| s.open(window, cx));
+    }
+
+    /// Whether `setting`'s picker is open with the installed tools listed.
+    pub(crate) fn offscreen_tool_menu_ready(&self, setting: ToolSetting, cx: &gpui::App) -> bool {
+        let detected = self.tools.detected();
+        let listed = !(detected.editors.is_empty() && detected.diff_tools.is_empty());
+        listed && self.tool_select(setting).read(cx).is_open()
     }
 
     /// Whether `config.yaml` has been read into the form.
@@ -1333,6 +1615,28 @@ impl SettingsView {
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
+
+/// The setting a tool change writes.
+fn tool_setting_of(change: &Change) -> ToolSetting {
+    match change {
+        Change::DiffTool(_) => ToolSetting::DiffTool,
+        Change::Editor(_) | Change::Theme(_) => ToolSetting::Editor,
+    }
+}
+
+/// A tool setting's helper line.
+fn tool_help(setting: ToolSetting) -> &'static str {
+    match setting {
+        ToolSetting::Editor => {
+            "Used by Edit in … for workspaces and reviews. A command-line editor opens as a pane; \
+             an app opens in its own window. Shared with the TUI."
+        }
+        ToolSetting::DiffTool => {
+            "Used by View Diff. A command-line tool opens as a pane; an app opens in its own window. \
+             A project's review.diff_command comes first."
+        }
+    }
+}
 
 /// An Option-key choice's segment label.
 fn option_label(value: OptionAsMeta) -> &'static str {
@@ -1570,6 +1874,8 @@ impl Render for SettingsView {
                     Some(cli_help(crate::app::running_cli(cx), std::env::var_os("HOME").map(PathBuf::from)).into()),
                     &theme,
                 ))
+                .child(self.render_tool(ToolSetting::Editor, &theme, window, cx))
+                .child(self.render_tool(ToolSetting::DiffTool, &theme, window, cx))
                 .child(controls::labeled_control(
                     "Notifications",
                     controls::checkbox_list()
@@ -1686,6 +1992,52 @@ impl Render for SettingsView {
 }
 
 impl SettingsView {
+    /// A tool setting: its picker, the command field under it while Other
+    /// command… is being typed for it, and its helper.
+    fn render_tool(&self, setting: ToolSetting, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+        let prefix = tool_select::selector(setting);
+        let typing = self.tools.draft_setting() == Some(setting);
+        let field = typing.then(|| {
+            let focused = self.command_input.read(cx).focus_handle(cx).is_focused(window);
+            let input = Input::new(&self.command_input)
+                .appearance(false)
+                .h_full()
+                .px_0()
+                .type_style(Type::Base)
+                .text_color(theme.form_text);
+            controls::picker(
+                controls::textbox(div().flex_1().min_w_0().child(input), focused, theme)
+                    .id(SharedString::from(format!("{prefix}-command")))
+                    .debug_selector(move || format!("{prefix}-command"))
+                    .flex_1()
+                    .min_w_0()
+                    .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                        let setting = this.tools.draft_setting();
+                        this.cancel_command(cx);
+                        if let Some(setting) = setting {
+                            let focus = this.tool_select(setting).read(cx).focus_handle(cx);
+                            window.focus(&focus, cx);
+                        }
+                        cx.stop_propagation();
+                    })),
+                controls::form_button(SharedString::from(format!("{prefix}-command-save")), "Save", theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.commit_command(window, cx))),
+            )
+        });
+        let help = if typing {
+            "A command line, with any flags (code --wait). Return saves it; Escape cancels; a blank \
+             command uses the default."
+        } else {
+            tool_help(setting)
+        };
+        controls::labeled_control(
+            setting.label(),
+            div().flex().flex_col().gap(px(controls::CONTROL_GAP)).child(self.tool_select(setting)).children(field),
+            Some(help.into()),
+            theme,
+        )
+    }
+
     /// Window transparency and Background blur: a slider each, with a note
     /// in place of their helpers while Reduce Transparency holds the
     /// windows opaque.

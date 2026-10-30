@@ -24,7 +24,9 @@
 //! then `settings.png`, Settings'
 //! General page, its Keybindings and Terminal pages
 //! (`settings-keybindings.png`, `settings-terminal.png`), Terminal with its
-//! font picker open (`settings-font-picker.png`), the other choices
+//! font picker open (`settings-font-picker.png`), General's Editor and
+//! Diff tool pickers open (`settings-editor-menu.png`,
+//! `settings-diff-tool-menu.png`), the other choices
 //! selected with the size stepper at each end (`settings-size-min.png`,
 //! `settings-size-max.png`, `settings-option-right.png`), General's App
 //! icon tiles with each icon picked (`settings-app-icon-command-grille.png`,
@@ -293,6 +295,27 @@ pub fn run(out: PathBuf) -> ! {
     });
     expect("settings: the font picker lists the installed fonts", listed);
     save(&mut cx, window, &out, "settings-font-picker.png");
+    // General's Editor picker open, once the installed tools are found.
+    use shelbi_app::settings::general::ToolSetting;
+    let ready = wait(&mut cx, window, Duration::from_secs(20), |cx| {
+        settings.read_with(cx, |v, _| v.offscreen_loaded())
+    });
+    expect("settings: the config is read", ready);
+    for (name, setting) in [("settings-editor-menu.png", ToolSetting::Editor), ("settings-diff-tool-menu.png", ToolSetting::DiffTool)] {
+        window
+            .update(&mut cx, |_, window, cx| {
+                settings.update(cx, |v, cx| v.offscreen_open_tool_menu(setting, window, cx))
+            })
+            .expect("open the tool picker");
+        let listed = wait(&mut cx, window, Duration::from_secs(20), |cx| {
+            settings.read_with(cx, |v, cx| v.offscreen_tool_menu_ready(setting, cx))
+        });
+        expect("settings: the tool picker lists the installed tools", listed);
+        // The apps' icons are read after the list.
+        let _ = wait(&mut cx, window, Duration::from_secs(2), |_| false);
+        save(&mut cx, window, &out, name);
+        settings.update(&mut cx, |v, cx| v.tool_select(setting).update(cx, |s, cx| s.close(cx)));
+    }
     // The states the Figma frame doesn't draw: every other choice selected,
     // and the size stepper at each end of its range (that end's button dim).
     {
