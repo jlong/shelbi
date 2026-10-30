@@ -27,7 +27,7 @@ runs from is handled by [`shelbi machine`](/docs/cli/machine).
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
-| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Accepted (global flag) but ignored: the relay serves every session under the root's `sessions/` directory, whatever the project. |
 
 ## See also
 

@@ -20,8 +20,11 @@ switch behavior.
 The remaining subcommands are single-purpose primitives. The
 orchestrator sequences them per the merge-conditions policy in the
 project's [`zenmode.md`](/docs/concepts/zen-mode#the-zenmodemd-file)
-file; each one does exactly one thing and prints a single line on
-stdout. The same primitives are available to you at the shell when
+file; each one does exactly one thing and reports on stdout in a fixed,
+parseable shape: `probe` prints JSON, `scan` prints one task id per line,
+`dry-run` streams one line per decision, and `pr-create`, `ci-watch`, and
+`pr-merge` lead with a single result line (`pr-merge` follows it with the
+post-merge eligibility list). The same primitives are available to you at the shell when
 you want to probe a branch or open a PR by hand without flipping the
 global mode.
 
@@ -37,6 +40,11 @@ shelbi zen on
 Turn Zen Mode on. The orchestrator may auto-promote and auto-merge finished
 work through the exact-provenance PR flow. Idempotent. Mirrors
 `Alt+Z` in the TUI.
+
+`on`, `off`, and `pause` each print the resulting [`zen status`](#status)
+block. Like `probe`, `pr-create`, and `pr-merge`, they refuse to run when the
+hub daemon's version doesn't match the CLI's; `status`, `scan`, `ci-watch`, and
+`dry-run` only warn.
 
 ## off
 
@@ -63,11 +71,25 @@ work yourself while preserving work already in motion.
 shelbi zen status
 ```
 
-Print the current mode, the project's configured local check
-commands, the resolved danger-paths list (with detected project
-shapes labeled inline), the last crash timestamp (if any), and the
-count of in-flight tasks on the Zen track. Cheap and safe to call
-repeatedly.
+Print the current mode, the configured local check commands, the effective
+CI timeout, the resolved danger-paths list (labeled `project override`, or with
+the detected project shapes), any per-workflow `zen:` overrides, the last crash
+(with its crash-record path, or `never`), the orchestrator's
+last heartbeat, and the count of in-flight issues on the Zen track. Cheap and
+safe to call repeatedly.
+
+```text
+zen mode: on
+checks:
+  - cargo test --workspace
+ci timeout: 15m
+danger paths (project override):
+  - .github/workflows/**
+  - Cargo.lock
+last crash: never
+orchestrator alive: 2026-10-29T14:24:00+00:00
+in-flight zen issues: 1
+```
 
 ## scan
 
@@ -78,7 +100,11 @@ shelbi zen scan
 Print backlog task ids that are *mechanically* eligible for Zen
 auto-promotion, one per line, in priority order. "Mechanical" means
 not blocked on dependencies, not opted out via task frontmatter, and
-no file overlap with anything currently in flight. The orchestrator's
+no file overlap with anything currently in flight. It also skips tasks you
+demoted back to the backlog. On a GitHub board, it only considers backlog
+issues assigned to you, and lists nothing if your login can't be resolved.
+Ties in priority are broken by id. File overlap is a heuristic: a file path
+named in the task's body also appears in an in-progress task's body. The orchestrator's
 prompt applies the judgment categories on top of this list. See
 [the judgment layer](/docs/concepts/zen-mode#the-judgment-layer).
 
@@ -98,7 +124,7 @@ for real to confirm the policy matches your intent.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--for <DURATION>` | duration | run until Ctrl-C | Stop after this long. Accepts `30s`, `5m`, `2h`, `1d`, or a bare integer of seconds. |
-| `--interval <DURATION>` | duration | `5s` | Override the per-tick interval. Same duration grammar as `--for`. |
+| `--interval <DURATION>` | duration | `5s` | Override the per-tick interval. Same duration grammar as `--for`. Values below `1s` are raised to `1s`. |
 
 ## probe
 
@@ -149,6 +175,10 @@ Push the task's named branch and open a PR. Idempotent. If an open PR for
 the branch already exists, Shelbi updates the branch and returns its number
 only after the PR head matches the exact task branch commit that was pushed.
 Otherwise, it opens a new PR. Prints the PR number on stdout.
+
+Exits `0` on success. Exits `75` with empty stdout when the push landed but
+GitHub could not yet confirm the PR head; that's retry-safe, so re-run the same
+command. Exits `1` on a provenance mismatch that must not be merged.
 
 Reuse also requires the exact task branch, resolved workflow base branch and
 commit, and `origin` repository identity. A same-named PR aimed at another
@@ -233,10 +263,21 @@ three-way integration tree of `head_sha` onto it, then advances only `refs/heads
 retarget cannot redirect that update. This atomicity applies to the remote ref
 update, not to GitHub PR metadata.
 
-Repositories with branch protection, active rulesets, required-PR rules,
-fork heads, merge queues, or a non-squash strategy cannot use this boundary.
-Zen leaves the base unchanged and tells a human to review and merge through the
-repository's required GitHub workflow. A landed candidate prints its SHA.
+Rulesets are checked rule by rule. Non-PR rules such as `deletion` and
+`non_fast_forward` don't block the leased push. When the base branch has a
+`pull_request` rule Zen can satisfy (no required approvals or code-owner
+review, and squash allowed), Zen lands through GitHub's own squash merge of the
+PR, pinned to `integration_sha`, instead of the leased push; the landed commit
+is then a new GitHub-authored SHA. Classic branch protection (or protection
+state that can't be read), a merge-queue rule, required approvals or
+code-owner review, a disallowed squash method, auto-merge or a merge queue on
+the PR, fork heads, or a non-squash `merge_strategy` all stop the flow: Zen
+leaves the base unchanged and tells a human to review and merge through the
+repository's required GitHub workflow.
+
+On success it prints the landed SHA (`sha-pending` if GitHub hasn't recorded
+its merge commit yet), deletes the task branch on the remote, and then prints
+the next mechanically eligible backlog ids, or `next eligible: none`.
 
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |

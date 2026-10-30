@@ -8,10 +8,14 @@ summary: Inspect and control the project's declared workspace pool — list slot
 shelbi workspace <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi workspace` manages the project's declared workspace pool. A freshly
-[`init`](/docs/cli/init)'d project starts with an empty pool; the orchestrator
-provisions it on first boot (asking how many workspaces and which naming scheme),
-adding each slot with `shelbi workspace add <name>`. Beyond that you use these
+`shelbi workspace` manages the project's declared workspace pool. How a new
+project's pool starts depends on how it was created: `shelbi project add`,
+`shelbi wizard`, and [`shelbi init -y`](/docs/cli/init) write an empty pool,
+while `shelbi init` without `-y` and the app's Add project form write two hub
+workspaces, `dev` and a review slot named `review`. If a project's pool is
+empty, the orchestrator provisions it on
+first boot (asking how many workspaces and which naming scheme) and adds each
+slot with `shelbi workspace add <name>`. Beyond that you use these
 commands to observe (what's idle or working, which agent is loaded where), grow
 or shrink the pool (`add` / `rm`), and intervene (stop a pane to release a stuck
 issue). A slot no longer selects a runner: runner/model resolution is owned by
@@ -24,7 +28,10 @@ pool, grouped by machine, with a badge marking each state (`⏵` working, `·`
 idle):
 
 <AppMockup
+  terminalTitle="you@hub — shelbi"
   project="shelbi"
+  workflow="task"
+  zenMode={false}
   columns={[
     { label: "BACKLOG", category: "gray", cards: [
       { title: "Draft Q3 roadmap", id: "t-006" },
@@ -36,28 +43,72 @@ idle):
       { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
       { title: "Backfill order index", id: "t-017", workspace: "delta" },
     ] },
-    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "REVIEW", category: "magenta", cards: [], collapsed: true },
     { label: "DONE", category: "green", cards: [
       { title: "Ship dark-mode toggle", id: "t-013" },
     ] },
+    { label: "CANCELED", category: "darkgray", cards: [], collapsed: true },
   ]}
   machines={[
     { name: "hub", workspaces: [
-      { name: "alpha", state: "working", agent: "Developer" },
+      { name: "alpha", state: "working", agent: "developer" },
       { name: "bravo", state: "idle" },
       { name: "charlie", state: "idle" },
     ] },
     { name: "devbox", workspaces: [
-      { name: "delta", state: "working", agent: "Qa" },
+      { name: "delta", state: "working", agent: "qa" },
       { name: "echo", state: "idle" },
       { name: "foxtrot", state: "idle" },
     ] },
   ]}
-  review={[]}
+  readyReview={[]}
+  queuedReview={[]}
 />
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
 from the per-subcommand tables.
+
+## add
+
+```text
+shelbi workspace add [OPTIONS] <NAME>
+```
+
+Add a workspace to the pool, create its worktree, and wire Shelbi's Claude hooks
+into the worktree's `.claude/settings.local.json`. It refuses a name that
+already exists or slug-collides with an existing workspace.
+
+If a user-authored `settings.local.json` can't be self-healed, `add` prints a
+message describing the hooks to merge and exits with status `3` without adding
+the slot. Merge the hooks and re-run the same command.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Name for the new workspace (positional, required): lowercase letters, digits, `-`, `_`. |
+| `--machine <MACHINE>` | string | local hub | Machine to place the workspace on, as declared under `machines:`. |
+
+## rm
+
+```text
+shelbi workspace rm [OPTIONS] <NAME>
+```
+
+Remove a workspace from the pool and tear down its worktree and session. It
+refuses a workspace holding an in-progress or review issue (release it first
+with `shelbi workspace stop <name>`), or one whose worktree has uncommitted or
+unpushed work, unless you pass `--force`.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Workspace name (positional, required). |
+| `--force` | flag | off | Remove even if the workspace holds an in-progress or review issue, or its worktree holds uncommitted or unpushed work. |
+
+<Callout type="warning" title="--force discards work">
+
+`--force` tears down the worktree even when it holds uncommitted or unpushed
+changes. That work is lost.
+
+</Callout>
 
 ## list
 
@@ -84,11 +135,13 @@ delta        devbox   qa             degraded       in_progress: t-017
 echo         devbox   -              conventional   idle
 ```
 
-This is the first command the orchestrator runs at session start to snapshot
-the pool, and the same snapshot you want when answering "who's free, and what
+The same table appears in the Workspaces section of
+[`shelbi status --full`](/docs/cli/status), the snapshot the orchestrator reads
+at session start. It's the view you want when answering "who's free, and what
 are they running?" An `AGENT` of `-` with `idle` state is a free slot. `STATE`
-is live-probed, not board-derived: `list` probes each workspace's session
-(over SSH for remotes). It renders `idle`, `in_progress: <task-id>`, `review: <task-id>`,
+combines the board and a live probe: a slot with an in-progress or review issue
+shows `in_progress: <task-id>` or `review: <task-id>` from the board; every
+other slot's session is probed (over SSH for remotes) to tell `idle` from
 `occupied (user shell)`, `orphaned session`, or `unreachable (<reason>)`. For
 the poller's finer-grained read of an in-flight issue (`working`,
 `awaiting_input`, `blocked`), use [`status`](#status).
@@ -99,11 +152,12 @@ the poller's finer-grained read of an in-flight issue (`working`,
 shelbi workspace stop [OPTIONS] <NAME>
 ```
 
-Stop the workspace's session. By default the in-flight issue is released
-back to its `ready` status (`todo` in the default workflow) and its
-`assigned_to` field is cleared. The board never shows an orphaned
-`in_progress` card pointing at a dead session. Pass `--keep-task` when you're
-about to restart on the same issue and don't want the card to move.
+Stop the workspace's session. By default the in-flight issue is moved back to
+`todo` and its `assigned_to` field is cleared, so the board never shows an
+orphaned `in_progress` card pointing at a dead session. On a review slot, the
+issue it was serving is unloaded instead: it stays in the review column,
+unassigned, and isn't auto-loaded again. Pass `--keep-task` when you're about
+to restart on the same issue and don't want the card to move.
 
 For a remote workspace, `stop` also kills the remote session so no
 detached agent process lingers on the other machine.
@@ -158,11 +212,11 @@ Change which runner an agent uses (edit the project config, not the pool):
 # See /docs/configuration/agents.
 ```
 
-Restart a workspace on the same issue without losing the card:
+Bounce a stuck workspace and relaunch it on the same issue, keeping its work:
 
 ```bash
-shelbi workspace stop charlie --keep-task
-shelbi issue start docs-write-cli-reference-pages
+shelbi workspace stop alpha --keep-task
+shelbi issue resume t-009
 ```
 
 Inspect a single workspace's raw status without a live session probe:

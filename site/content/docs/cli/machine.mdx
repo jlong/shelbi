@@ -1,7 +1,7 @@
 ---
 title: shelbi machine
 order: 24
-summary: Find or install a compatible shelbi binary on the project's remote machines.
+summary: Find, check, or install a compatible shelbi binary on the project's remote machines.
 ---
 
 ```text
@@ -10,8 +10,12 @@ shelbi machine <COMMAND> [OPTIONS]
 
 `shelbi machine` manages the `shelbi` binary on the project's remote machines.
 Because each worker runs in its own Shelbi session, every machine that takes
-tasks needs a compatible `shelbi` binary of its own. These commands find one or
-install it, and report each machine's status.
+tasks needs a compatible `shelbi` binary of its own. These commands find, check,
+or install one, and report each machine's status.
+
+A remote binary is compatible when its `major.minor` version matches the hub's.
+Patch versions may differ. An older binary is reported as too old (and `setup`
+installs a managed copy alongside it); a newer one is too new.
 
 Machines are declared under the `machines:` block of the project YAML. The hub
 reaches them over SSH.
@@ -21,6 +25,7 @@ reaches them over SSH.
 | Subcommand | Description |
 | --- | --- |
 | `setup <NAME>` | Find or install a compatible `shelbi` on a remote machine. Probes the machine's interactive-login PATH for a compatible binary; otherwise installs the matching release to `~/.shelbi/bin/shelbi`. Idempotent: a second run with a compatible binary already in place changes nothing. |
+| `check <NAME>` | Verify a machine is ready for this project: SSH connects, a compatible `shelbi` is present, Git is usable, and the machine's `work_dir` is a writable checkout root. Read-only on the machine; records the verified binary when everything passes. |
 | `status [<NAME>]` | Show each machine's reachability, resolved `shelbi` path, version, and whether it is compatible with this hub. With `NAME`, shows just that one. |
 
 ### `setup`
@@ -28,8 +33,18 @@ reaches them over SSH.
 The hub probes the remote's interactive-login shell for a `shelbi` on `PATH`. A
 compatible binary found there is used as-is. A package-manager install that is
 too old is never overwritten: Shelbi installs its own copy at
-`~/.shelbi/bin/shelbi` alongside it and uses that. The resolved path is recorded
-per machine and shown by `status`.
+`~/.shelbi/bin/shelbi` alongside it and uses that. Installs detect the remote's
+OS and architecture, fetch the release matching the hub's version, and verify
+its checksum. If the machine can't reach the internet, the hub downloads the
+release and copies it over SSH. The resolved path is recorded in the hub's
+`~/.shelbi/machines.json` and shown by `status`.
+
+A `kind: local` machine needs no setup: it runs the hub's own `shelbi`, and
+`setup` says so and changes nothing. An unknown machine name is an error.
+
+`setup` prints one line per result, for example
+``devbox: already set up — compatible shelbi 0.11.0 at /home/you/.shelbi/bin/shelbi (shelbi-managed).``
+or ``devbox: installed shelbi 0.11.0 to /home/you/.shelbi/bin/shelbi.``
 
 ```text
 shelbi machine setup <NAME>
@@ -39,11 +54,48 @@ shelbi machine setup <NAME>
 | --- | --- | --- | --- |
 | `<NAME>` | string | — | Machine name, as declared under `machines:` in the project YAML (required). |
 
+### `check`
+
+Checks that a machine is ready for this project without changing anything on
+it: SSH connects, a compatible `shelbi` is present, Git is usable, and the
+machine's `work_dir` is a writable checkout root. It installs and creates
+nothing.
+
+```text
+shelbi machine check <NAME>
+```
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Machine name, as declared under `machines:` in the project YAML (required). |
+
+On success it prints `<name>: ready.` followed by a summary, and records the
+verified binary in the hub's `~/.shelbi/machines.json`. Otherwise it prints one
+`<name>: <issue>` line per problem, suggests `shelbi machine setup <name>` when
+an install would fix it, and exits non-zero with `<name>: not ready`. A local
+machine has nothing to check over SSH, and `check` says so.
+
 ### `status`
 
 ```text
 shelbi machine status [<NAME>]
 ```
+
+Prints the hub's version, then one row per machine. Each remote is probed live
+over SSH, and a reachable probe refreshes its record in `~/.shelbi/machines.json`.
+
+```text
+hub version: 0.11.0
+
+MACHINE  REACHABLE  PATH                            VERSION  COMPATIBLE
+hub      local      /opt/homebrew/bin/shelbi        0.11.0   yes
+devbox   yes        /home/you/.shelbi/bin/shelbi    0.11.0   yes
+```
+
+`REACHABLE` is `local`, `yes`, `unreachable`, `auth-denied`, or `host-key`. A
+local machine shows the hub's own executable. For a machine that can't be
+reached, the last recorded path is shown with ` (last known)`. `COMPATIBLE` is
+`yes`, `no`, `not installed`, or `-` (no record).
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -64,6 +116,12 @@ Install or verify `shelbi` on the `devbox` machine:
 
 ```bash
 shelbi machine setup devbox
+```
+
+Verify `devbox` is ready without changing anything on it:
+
+```bash
+shelbi machine check devbox
 ```
 
 Check every declared machine:

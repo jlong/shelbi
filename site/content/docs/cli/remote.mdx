@@ -13,8 +13,11 @@ shelbi remote list [--json]
 
 `shelbi remote connect` opens a project of Shelbi on another machine in this
 terminal: the same thing **Connect to Remote Session** does in the apps,
-without the dialog. `HOST` is an SSH alias or `user@hostname`; `PROJECT` can be
-left out when the machine has just one project.
+without the dialog. `HOST` is an SSH alias or `user@hostname`. `PROJECT` is the
+project's id as `shelbi remote list` shows it on that machine; it can be left
+out when the machine has just one project. If you leave it out and the machine
+has several, or name one it doesn't have, the error lists the machine's
+projects.
 
 It signs in with your own SSH setup (never a password), checks the other
 machine's Shelbi, remembers the session in **Recent remote sessions**, and runs
@@ -23,15 +26,17 @@ that machine's Shelbi for the project here. If the connection drops it shows
 Quitting the remote Shelbi brings you back.
 
 If Shelbi isn't running on the other machine, it asks before starting it
-(`--yes` starts it without asking). See
+(`--yes` starts it without asking). When it can't ask (no terminal), it stops
+and tells you to rerun with `--yes`. See
 [Remote sessions](/docs/concepts/remote-sessions) for the errors it can report.
 
 ## shelbi remote list
 
 `shelbi remote list` prints what another machine's **Connect to Remote
 Session** dialog finds here: the user Shelbi runs as, its version, whether the
-daemon is running, and every registered project with its folder. It only
-reads. It never starts the daemon or changes a project.
+daemon is running, and every registered project with its `repo:` location
+(usually its folder, with your home directory shown as `~`). A project whose
+`repo:` is a clone URL shows the URL. It only reads. It never starts the daemon or changes a project.
 
 A remote client runs `shelbi remote list --json` over SSH; you can run it by
 hand to check what a client will see.
@@ -42,6 +47,8 @@ Shelbi 0.42.0 as jlong (daemon running)
   shelbi  ~/Workspaces/shelbi
   web     /srv/web
 ```
+
+With no registered projects it prints `No projects.`
 
 ## Flags
 

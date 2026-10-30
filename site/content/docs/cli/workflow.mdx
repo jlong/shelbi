@@ -10,13 +10,15 @@ shelbi workflow <SUBCOMMAND> [OPTIONS]
 
 `shelbi workflow` manages the YAML files that declare the statuses an issue moves
 through, who owns each one, and which git side-effects fire on each transition.
-Every project has a built-in `default` workflow: the canonical six-status
-flow (`Backlog → Todo → In Progress → Review → Done → Canceled`). These
-subcommands surface it alongside any custom workflows the project authors.
+`shelbi init` ships two workflows: `task`, the review-gated default track
+(`Backlog → Todo → In Progress → Review → Done → Canceled`), and `subtask`, a
+piece of a parent task that squash-merges into the parent's branch with no PR or
+review. The project's `default_workflow:` (set to `task` at init) picks the one
+new issues use. The legacy name `default` is an alias that resolves to `task`
+when the project has no `default.yaml`. These subcommands list and edit the
+shipped workflows alongside any custom ones you add.
 
-The default is virtual: it lives in code, not on disk, until `workflow new` or
-`workflow edit` writes a file. Workflow files live at
-`<config-root>/workflows/<name>.yaml`. `<config-root>` is
+Workflow files live at `<config-root>/workflows/<name>.yaml`. `<config-root>` is
 `~/.shelbi/projects/<project>/` in the default
 [global mode](/docs/concepts/config-modes), `<repo>/.shelbi/` in in-repo mode.
 A file's basename is its name; the in-file `name:` field must match. Most
@@ -36,12 +38,18 @@ shelbi workflow list
 Print every workflow under the project's `workflows/` directory
 (`~/.shelbi/projects/<project>/workflows/` in global mode,
 `<repo>/.shelbi/workflows/` in in-repo mode), one per line, with a
-count of statuses and the YAML description. A `·` marker in the first
-column means the workflow is the built-in fallback. No file has been
-written yet. A blank marker means a file exists on disk.
+count of statuses and the YAML description. A blank marker in the first
+column means the workflow is a file on disk. A multi-line description prints
+verbatim over several lines.
 
-When the workflows directory is empty, the only entry is the built-in
-`default` workflow.
+```text
+  subtask              5 statuses     A piece of a parent task, squash-merged into the parent's branch with no PR or review.
+  task                 6 statuses     Branch work with a review gate: the default track shipped with every project.
+```
+
+On a legacy project with no workflow files, `list` shows a single code-built
+`default` row marked `·`. As soon as any workflow file exists, only on-disk
+files are listed.
 
 ## show
 
@@ -51,9 +59,14 @@ shelbi workflow show <NAME>
 
 Print the workflow's per-status table: `STATUS`, `OWNER`, and `AGENT` for
 each status, in the canonical `statuses.yaml` order (statuses the workflow
-doesn't declare are dropped). `show default` works even before any file is
-written, rendering the built-in default from code; any other missing name
-errors with the resolved file path.
+doesn't declare are dropped). Any missing name other than `default` errors
+with the resolved file path.
+
+`show default` prints the legacy built-in from code whenever there's no
+`default.yaml`, even on a project where `default` resolves to `task` everywhere
+else, so it may not match the workflow in use (for example, its `review` agent
+is `orchestrator` rather than `review`). Run `shelbi workflow show task` to see
+the shipped default track.
 
 ## new
 
@@ -67,9 +80,9 @@ basename. For non-`default` names the placeholder description is dropped.
 The default's "standard one-track flow…" copy would misrepresent a freshly
 scaffolded workflow whose author hasn't written a real description yet.
 
-Errors if a workflow with that name already exists. Names must be
-non-empty, must not start with `.`, and may only contain `a-z`, `0-9`, `-`,
-`_`. The name doubles as a YAML identifier referenced from issue
+Errors if a workflow with that name already exists. Names must start with
+a lowercase letter or digit and may contain only `a-z`, `0-9`, `-`, and `_`
+(an invalid name is reported as an "invalid agent id"). The name doubles as a YAML identifier referenced from issue
 frontmatter, so the validator is stricter than POSIX.
 
 | Flag | Type | Default | Description |
@@ -88,18 +101,24 @@ exist and the name is `default`, the built-in default is materialized to
 disk first so you have something concrete to tweak. Any other missing name
 errors with a hint to run `shelbi workflow new <NAME>` first.
 
+The materialize-`default` path is for legacy projects that predate `task` and
+`subtask`. On a current project, edit `task` instead: writing a `default.yaml`
+stops `default` from aliasing to `task`, so issues and settings that name
+`default` would switch to that legacy copy (which has no transitions or git
+actions).
+
 ## Examples
 
-See every declared workflow plus the built-in default fallback:
+See every workflow declared in the project:
 
 ```bash
 shelbi workflow list
 ```
 
-Inspect the canonical default before customizing it:
+Inspect the shipped default track before customizing it:
 
 ```bash
-shelbi workflow show default
+shelbi workflow show task
 ```
 
 Scaffold a docs-only workflow and open it in `$EDITOR`:
@@ -108,10 +127,10 @@ Scaffold a docs-only workflow and open it in `$EDITOR`:
 shelbi workflow new docs --edit
 ```
 
-Materialize the built-in default to disk and edit it:
+Edit the shipped default track:
 
 ```bash
-shelbi workflow edit default
+shelbi workflow edit task
 ```
 
 ## See also

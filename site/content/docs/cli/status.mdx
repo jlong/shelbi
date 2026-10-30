@@ -13,15 +13,18 @@ Bare `shelbi status` emits a concise, human-readable summary of where the board
 stands right now. Pass `--full` to emit the full sectioned payload the
 [orchestrator](/docs/concepts/orchestrator) consumes on bootstrap: five
 sections, `## Board`, `## Workspaces`, `## Zen`, `## Handoff`, and
-`## Daemon`, plus a sixth `## GitHub` section when the project's board is on the
-[GitHub backend](/docs/concepts/github-issues#the-budget-and-what-shelbi-status-shows)
+`## Daemon`, plus a `## Disk` section when the hub machine's `work_dir` volume
+is low on free space and a `## GitHub` section when the project's board is on
+the [GitHub backend](/docs/concepts/github-issues#the-budget-and-what-shelbi-status-shows)
 (read path, board-index age, and per-budget rate-limit numbers). Both the plain
 summary and `--full` are idempotent and safe to re-run.
 
 `--handoff` prints the contents of `HANDOFF.md` from the project's local
 `work_dir` and then **deletes the file**. It's a no-op when no `HANDOFF.md` is
 present. Because it's destructive, it's kept separate from `--full` so that
-bootstrap snapshots stay safe to re-run.
+bootstrap snapshots stay safe to re-run. Because it deletes the file,
+`--handoff` also refuses to run against a hub daemon whose version doesn't match
+the CLI; the read-only forms only warn.
 
 The flags **compose**: `shelbi status --full --handoff` emits the full payload
 *and* drains the handoff note in one call, the exact shape the orchestrator
@@ -31,7 +34,7 @@ reads when it wakes up and picks up where a previous session left off.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--full` | flag | off | Emit the full sectioned bootstrap payload (five sections: Board, Workspaces, Zen, Handoff, Daemon). Idempotent — safe to re-run. |
+| `--full` | flag | off | Emit the full sectioned bootstrap payload (Board, Workspaces, Zen, Handoff, Daemon, plus Disk and GitHub when they apply). Idempotent: safe to re-run. |
 | `--handoff` | flag | off | Print `HANDOFF.md` from the project's local `work_dir`, then delete it. No-op when absent. Destructive; kept separate from `--full` so snapshots stay re-runnable. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. Defaults to `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
 
@@ -51,7 +54,15 @@ Get a quick human read on the board:
 
 ```bash
 shelbi status
+# board: 2 backlog / 0 ready / 4 active / 0 handoff / 0 done
+# workspaces: 5 idle, 4 in-progress
+# zen: on
+# handoff: none
+# daemon: 0.11.0; cli: 0.11.0 (match)
 ```
+
+Extra `github:`, `disk:`, `session:`, and `review: <task> — no PR` lines appear
+only when they apply.
 
 Emit the full bootstrap payload for the orchestrator to consume:
 

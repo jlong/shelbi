@@ -1,78 +1,76 @@
 ---
 title: shelbi reload
 order: 27
-summary: Respawn the Shelbi-owned surfaces in place so a freshly installed binary takes effect.
+summary: Restart the hub daemon, re-exec attached clients, and replace the orchestrator session so a freshly installed binary takes effect.
 ---
 
 ```text
 shelbi reload [OPTIONS] [TARGET] [NAME]
 ```
 
-`shelbi reload` is the "I just rebuilt the binary, pick up the new code"
-command. It respawns the Shelbi-owned surfaces in place (the sidebar, the
-tasks / activity / machines views, and the orchestrator session) so a new binary
-takes effect and edits to the orchestrator's instructions or the shared
-preamble land without tearing down the dashboard.
+`shelbi reload` is the "I just installed a new binary, pick it up" command. It
+asks the orchestrator for a handoff, tells every attached TUI to re-exec (the
+desktop app prompts for relaunch), restarts the hub daemon on the current
+binary, and replaces the project's orchestrator session. Edits to the
+orchestrator's instructions or the shared preamble land at the same time,
+without tearing down the dashboard.
 
-The orchestrator's context survives the respawn. Before the old pane is
-replaced, it's asked to write `agents/orchestrator/handoff.md` covering its
-in-flight state; the new instance ingests that file (then deletes it) and
-resumes mid-thought rather than cold. A missing or timed-out handoff degrades
-to a cold start, never fatal.
+The orchestrator's context survives the swap. Before its session is replaced,
+it's asked to write `agents/orchestrator/handoff.md` covering its in-flight
+state; the new instance ingests that file (then deletes it) and resumes
+mid-thought rather than cold. A missing or timed-out handoff degrades to a cold
+start, never fatal.
 
-The workspace panes are left alone: they re-shell into `shelbi` on every call
-and pick up the new binary on their next invocation, so there's nothing to
-restart there.
+Worker sessions are left running, so a worker mid-task is never interrupted.
+Each keeps the binary it started with until that workspace is next relaunched.
+The daemon restart is hub-wide: it affects every open project's daemon-side
+work, not just this project.
 
-Use it any time `scripts/install.sh` (or your own build) has produced a new
-binary and you want the long-lived TUI surfaces to start using it.
+Use it any time you upgrade Shelbi (`brew upgrade shelbi`, `apt upgrade`, or
+`./scripts/install.sh` from a
+[source checkout](/docs/guides/getting-started/install#install-from-source-for-development))
+and want the long-lived surfaces to start using the new binary.
 
 ## Targets
 
-Pass a target to reload just one part in place without bouncing the whole hub
-(and, for `chat`, without losing the orchestrator's context). A targeted reload
-respawns only the named pane and leaves every other pane and its state
-untouched. Most targets skip the whole-hub self-heal below. `chat` first
-self-heals the agent automation that it is about to redeploy.
-
-| Target | Reloads |
-| --- | --- |
-| `chat` | The orchestrator chat pane. Carries the handoff forward exactly like the whole-hub reload, so the reloaded orchestrator keeps its mid-thought context instead of starting cold. |
-| `tasks` | The tasks / kanban pane. |
-| `activity` | The activity / events-feed pane. |
-| `sidebar` | The workspace-roster sidebar pane. |
-| `workspace <name>` | A single worker's pane. Local workers respawn with `--resume` so the agent keeps its conversation and its task wiring (`TASK_ID`, hub socket) is preserved. A missing or unknown name is a clear error. |
-| omitted, or `all` | The whole-hub reload described above (the default). |
-
-```bash
-# Get the tasks pane back without touching the orchestrator's context.
-shelbi reload tasks
-
-# Respawn just the orchestrator, carrying its handoff forward.
-shelbi reload chat
-
-# Bounce one stuck worker pane.
-shelbi reload workspace alpha
-```
+`[TARGET] [NAME]` (`chat`, `tasks`, `activity`, `sidebar`, `workspace <name>`,
+`all`) are still accepted for compatibility, but there are no per-pane reloads
+any more. Any target other than `all` prints
+`note: targeted pane reloads no longer apply on the session runtime; reloading the whole project`
+and runs the full reload, including the daemon restart.
 
 An unknown target, or a bare `workspace` with no name, errors with the valid
 set so you can self-correct.
 
-`shelbi reload` also sweeps any stray `.shelbi/project` marker files. Project
-resolution reverse-looks-up against the registered project YAMLs, so these
-markers are redundant.
+## What else reload repairs
 
-Reload also self-heals the shipped agent workspaces before respawning the
-orchestrator pane. User-customized `agents/*/instructions.md` files are
-preserved. In `agents/orchestrator/instructions.md` and `zenmode.md`, Shelbi
-upgrades only exact stock `pr-create`, `ci-watch`, and `pr-merge`
-command snippets to carry the probe's repository, base, and head identity,
-while leaving surrounding custom prose intact. Both unpinned and
-head-only stock forms are upgraded. It also appends any
-missing runner-critical orchestrator sections, such as `Polling-only event drain`,
-instead of overwriting the whole file. Both a whole-hub reload and
-`shelbi reload chat` apply these automation safeguards before the new
-orchestrator starts.
+Before restarting anything, reload also:
+
+- Sweeps any stray `.shelbi/project` marker files. Project resolution
+  reverse-looks-up against the registered project YAMLs, so these markers are
+  redundant.
+- Re-creates the Shelbi root's standard subdirectories if they're missing.
+- Migrates legacy projects to the `task` and `subtask` workflows: it writes
+  whichever of `task.yaml` and `subtask.yaml` is missing and, when
+  `default_workflow:` is unset or the legacy `default`, sets it to `task`
+  (``✓ set default_workflow: task (migrated from the legacy `default`)``). A
+  custom default is left alone.
+- Writes `workflows/statuses.yaml` if it's missing.
+- Self-heals all the shipped agents. User-customized `agents/*/instructions.md`
+  files are preserved. In `agents/orchestrator/instructions.md` and
+  `zenmode.md`, Shelbi upgrades only exact stock `pr-create`, `ci-watch`, and
+  `pr-merge` command snippets to carry the probe's repository, base, and head
+  identity, while leaving surrounding custom prose intact. Both unpinned and
+  head-only stock forms are upgraded. It also appends any missing
+  runner-critical orchestrator sections, such as `Polling-only event drain`,
+  instead of overwriting the whole file.
+- Runs the config validate-and-upgrade pass: legacy forms that can be fixed
+  mechanically are auto-healed (each disclosed on `events.log`), and findings
+  that need judgment are handed to the new orchestrator. See
+  [`shelbi config`](/docs/cli/config).
+- Re-aligns the workspace-settings template with the shipped default. To keep a
+  customized template, point `workspace_settings_template` in the project YAML
+  at your own file.
 
 ## Flags
 
@@ -80,17 +78,36 @@ orchestrator starts.
 | --- | --- | --- | --- |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
-| `-y, --yes` | flag | off | Skip confirmation prompts. |
+| `-y, --yes` | flag | off | Accepted (global flag); `reload` has no prompt, so it has no effect here. |
 
 ## Examples
 
-Rebuild, install, and reload the TUI in one shot:
+Upgrade with Homebrew and pick up the new binary:
+
+```bash
+brew upgrade shelbi && shelbi reload
+```
+
+From a source checkout, rebuild, install, and reload in one shot:
 
 ```bash
 ./scripts/install.sh && shelbi reload
 ```
 
-Reload a specific project's panes from outside that project's directory:
+A reload prints a summary like this:
+
+```text
+reload · myapp (session runtime)
+  · handoff   <outcome>
+  ✓ clients   signalled to re-exec
+  ✓ daemon    restarted on the current binary
+  ✓ orch      session replaced (workers left running)
+```
+
+If this root's daemon pid record doesn't verify, it fails with
+`restarting the hub daemon: <reason>` instead.
+
+Reload a specific project from outside that project's directory:
 
 ```bash
 shelbi reload --project shelbi

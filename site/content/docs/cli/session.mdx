@@ -25,14 +25,35 @@ These subcommands are for inspecting and poking a session directly.
 | `send` | Send text to a session's PTY, delivered as a bracketed paste. |
 | `snapshot` | Print a session's visible screen as text, optionally with scrollback. |
 
-Most subcommands take a `<SESSION>` selector: a short-id, name, workspace, or
-unambiguous prefix.
+`kill`, `send`, and `snapshot` take a `<SESSION>` selector, tried in this
+order: an exact short-id, a full name, a workspace (the last `/` segment of a
+name, e.g. `alpha`), a short-id prefix, then a name substring. When several
+sessions match, `-p <project>` narrows to that project's sessions, and a live
+session beats its dead predecessors. If none is live and they all share one
+name, the newest wins. Anything still ambiguous is an error listing the
+candidates; no match prints
+``no session matching `<sel>` (try `shelbi session ls`)``.
 
 ### `ls`
 
 ```text
 shelbi session ls
 ```
+
+Lists every session on this machine, across all projects, sorted by name then
+id:
+
+```text
+NAME             ID                STATE           SIZE    TASK        LAUNCHED
+myapp/orch       a563d23f83372c93  live            156x54  -           10-29 14:24
+myapp/ws/alpha   b307bef5303a3402  live            120x40  add-auth    10-29 22:02
+myapp/ws/alpha   b8a9ec12b4b02918  dead(code=143)  -       fix-login   10-29 21:50
+```
+
+`STATE` is `live`, `dead`, `dead(code=N)`, or `dead(sig=N)`. `SIZE` is
+`<cols>x<rows>` for a live session and `-` for a dead one. Dead sessions stay
+listed until pruned, so a relaunch leaves its predecessors behind. With no
+sessions it prints `no sessions`.
 
 ### `new`
 
@@ -50,6 +71,9 @@ shelbi session new --name <NAME> [--cwd <CWD>] [--cols <COLS>] [--rows <ROWS>] [
 | `--raw-log` | flag | off | Keep the full raw output log. |
 | `<COMMAND>...` | string | — | The child program and its arguments, everything after `--`. |
 
+Prints `started session <id> (<name>)` and the session's socket path. Session
+state (`meta.json`, the socket, `exit.json`) lives under `~/.shelbi/sessions/`.
+
 ### `kill`
 
 ```text
@@ -59,6 +83,9 @@ shelbi session kill [--signal <SIGNAL>] <SESSION>
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--signal <SIGNAL>` | number | session's graceful default | Signal number to send. |
+
+Killing a session that's already dead prints
+`session <id> (<name>) is already dead` and exits 0.
 
 ### `send`
 
@@ -70,6 +97,8 @@ shelbi session send [--enter] <SESSION> <TEXT>
 | --- | --- | --- | --- |
 | `--enter` | flag | off | Also send a carriage return after the text (submit the line). |
 
+Fails if the session is dead.
+
 ### `snapshot`
 
 ```text
@@ -80,6 +109,9 @@ shelbi session snapshot [--history <HISTORY>] <SESSION>
 | --- | --- | --- | --- |
 | `--history <HISTORY>` | number | visible screen only | Include this many lines of scrollback above the visible screen. |
 
+Works on dead sessions too: it prints the session's final screen, which is the
+way to inspect an agent that has exited.
+
 ## Flags
 
 Every subcommand accepts the same options:
@@ -87,20 +119,21 @@ Every subcommand accepts the same options:
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
-| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+| `-p, --project <PROJECT>` | string | `$SHELBI_PROJECT` | Prefer this project's sessions when a selector is ambiguous (`kill`, `send`, `snapshot`). `ls` and `new` ignore it. |
 
 ## Examples
 
-List the sessions this project is running:
+List every session on this machine, all projects, live and dead:
 
 ```bash
 shelbi session ls
 ```
 
-Dump a stuck workspace's screen for inspection:
+Dump a stuck workspace's screen for inspection (`-p` disambiguates when
+several projects have an `alpha` workspace):
 
 ```bash
-shelbi session snapshot alpha --history 200
+shelbi session snapshot alpha --history 200 -p myapp
 ```
 
 ## See also
