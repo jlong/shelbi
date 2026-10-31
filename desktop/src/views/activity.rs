@@ -838,6 +838,7 @@ pub(super) fn picker_row(theme: &Theme, selected: bool, label: String) -> gpui::
     div()
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
         .gap_2()
         .mx_1()

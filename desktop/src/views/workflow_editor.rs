@@ -70,6 +70,7 @@ use super::workflow_graph::Pt;
 use super::workflows_state::category_label;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::elements::controls;
+use crate::elements::placed::placed;
 use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
@@ -1149,7 +1150,7 @@ pub(super) fn picker_button(
         .child(style::dropdown_slot(size, chevron))
 }
 
-/// A popup menu's panel.
+/// A popup menu's panel: it scrolls when [`placed`] caps it.
 pub(super) fn popup(id: &'static str, width: f32, theme: &Theme) -> Stateful<Div> {
     style::popover(
         div()
@@ -1159,6 +1160,7 @@ pub(super) fn popup(id: &'static str, width: f32, theme: &Theme) -> Stateful<Div
             .flex_col()
             .p_1()
             .w(px(width))
+            .overflow_y_scroll()
             .occlude(),
         theme,
     )
@@ -1171,12 +1173,13 @@ pub(super) fn menu_item(id: impl Into<SharedString>, label: impl Into<SharedStri
 
 /// A menu's rule between groups.
 pub(super) fn menu_rule(theme: &Theme) -> Div {
-    div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider)
+    div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider)
 }
 
-/// `button` with a menu's `items` floating under it while `open`: the menu
-/// hangs left from the button's right edge when `right` (a button at the
-/// window's right). `toggle` runs on the button's click, `close` on a press
+/// `button` with a menu's `items` floating under it while `open` (or over
+/// it, capped and scrolling, where the window's short of room: [`placed`]):
+/// the menu hangs left from the button's right edge when `right` (a button
+/// at the window's right). `toggle` runs on the button's click, `close` on a press
 /// outside the menu (one on its button toggles it closed instead).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dropdown<V: 'static>(
@@ -1199,26 +1202,20 @@ pub(super) fn dropdown<V: 'static>(
         }));
     let theme = *cx.global::<Theme>();
     let panel = open.then(|| {
-        let anchor = anchor.clone();
+        let menu_anchor = anchor.clone();
         let items = items(cx);
-        let top = anchor.get().map_or(px(style::BUTTON_H), |b| b.size.height) + px(MENU_GAP);
-        let at = div().absolute().top(top);
-        let at = if right { at.right_0() } else { at.left_0() };
-        deferred(
-            at.child(
-                popup(id, width, &theme)
-                    .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        // A press on its button toggles it closed through its click.
-                        if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                            return;
-                        }
-                        close(this, cx);
-                        cx.notify();
-                    }))
-                    .children(items),
-            ),
-        )
-        .with_priority(1)
+        let menu = popup(id, width, &theme)
+            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                // A press on its button toggles it closed through its click.
+                if menu_anchor.get().is_some_and(|b| b.contains(&event.position)) {
+                    return;
+                }
+                close(this, cx);
+                cx.notify();
+            }))
+            .children(items);
+        let menu = placed(anchor, menu).gap(MENU_GAP);
+        deferred(if right { menu.align_right() } else { menu }).with_priority(1)
     });
     div().relative().flex().flex_none().child(button).children(panel)
 }

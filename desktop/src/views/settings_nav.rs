@@ -24,7 +24,6 @@ use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Pixels,
 
 use super::sidebar::{
     nav_item, render_titlebar, switcher_menu, switcher_trigger, SidebarEvent, SidebarHost, SwitcherProps,
-    MENU_GAP, SWITCHER_H,
 };
 use super::task_panel;
 use crate::assets::{icons, Icon};
@@ -112,10 +111,10 @@ fn section_header(label: &'static str, theme: &Theme) -> impl IntoElement {
 /// above and 4pt below, its menu opening under it.
 fn project_header<H: SidebarHost>(project: &ProjectSwitcher<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
     let trigger = switcher_trigger(project.label.clone(), project.open, &project.button, theme, cx);
-    let menu = project.menu.as_ref().map(|menu| {
-        let top = SWITCHER_TOP + SWITCHER_H + MENU_GAP;
-        switcher_menu(menu, &project.button, top, project.width, theme, cx)
-    });
+    let menu = project
+        .menu
+        .as_ref()
+        .map(|menu| switcher_menu(menu, &project.button, project.width, theme, cx));
     div()
         .flex()
         .flex_col()

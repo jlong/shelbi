@@ -4889,6 +4889,7 @@ impl ShelbiWindow {
                                 projects,
                                 highlight: self.switcher.highlight,
                                 phase,
+                                scroll: self.switcher.scroll.clone(),
                             },
                         ),
                         switcher_button: self.switcher.button.clone(),
@@ -4936,6 +4937,7 @@ impl ShelbiWindow {
                                 projects,
                                 highlight: self.switcher.highlight,
                                 phase,
+                                scroll: self.switcher.scroll.clone(),
                             }
                         }),
                         button: self.switcher.button.clone(),

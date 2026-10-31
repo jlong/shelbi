@@ -320,7 +320,7 @@ const SYSTEM_FAMILY: &str = ".SystemUIFont";
 
 /// A row in a menu or popover list (the project switcher): 32px, 8px
 /// inside, the keyboard's row on the selection fill, others fading a fill in
-/// on hover.
+/// on hover. It never shrinks, so a capped menu scrolls its rows whole.
 pub fn menu_row(id: impl Into<SharedString>, selected: bool, theme: &Theme) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
@@ -329,6 +329,7 @@ pub fn menu_row(id: impl Into<SharedString>, selected: bool, theme: &Theme) -> S
         .debug_selector(move || selector.to_string())
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
         .gap_2()
         .h(px(LIST_ROW_H + 4.0))
@@ -355,6 +356,7 @@ pub fn disabled_menu_row(id: impl Into<SharedString>, theme: &Theme) -> Stateful
         .debug_selector(move || selector.to_string())
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
         .gap_2()
         .h(px(LIST_ROW_H + 4.0))
@@ -1329,8 +1331,12 @@ pub fn anchor_probe(anchor: &Anchor) -> impl IntoElement {
 /// open, so every open slides). `id` names the menu.
 pub fn menu_entrance(id: &'static str, menu: impl IntoElement + 'static) -> impl IntoElement {
     use gpui::{Animation, AnimationExt};
+    // A flex column that can shrink, so a capped menu (`placed`) scrolls.
     div()
         .relative()
+        .flex()
+        .flex_col()
+        .min_h_0()
         .child(menu)
         .with_animation(
             id,
@@ -1340,17 +1346,11 @@ pub fn menu_entrance(id: &'static str, menu: impl IntoElement + 'static) -> impl
 }
 
 /// `menu` 6px under the control `anchor` measured, its left edges aligned,
-/// kept 8px inside the window; where the control hasn't painted yet, at
-/// `fallback` (window coordinates).
+/// flipped above it, capped or shifted to stay inside the window
+/// ([`placed`](crate::elements::placed)); where the control hasn't painted
+/// yet, against `fallback` (window coordinates).
 pub fn below(anchor: &Anchor, fallback: gpui::Point<gpui::Pixels>, menu: impl IntoElement) -> impl IntoElement {
-    let at = anchor
-        .get()
-        .map(|b| point(b.left(), b.bottom() + px(6.0)))
-        .unwrap_or(fallback);
-    gpui::anchored()
-        .position(at)
-        .snap_to_window_with_margin(px(8.0))
-        .child(menu)
+    crate::elements::placed::placed(anchor, menu).gap(6.0).fallback(fallback)
 }
 
 /// A tooltip with `text`, for gpui's `.tooltip(...)`: a small popover.

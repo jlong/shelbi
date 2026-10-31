@@ -68,6 +68,7 @@ use super::pane_width::PaneWidth;
 use super::session_view::{SessionDeps, SessionView};
 use super::task_detail;
 use crate::assets::{heroicon, icons};
+use crate::elements::placed::MenuScroll;
 use crate::elements::rotated_text::rotated_text;
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
@@ -195,8 +196,12 @@ pub struct IssuesView {
     /// The filter controls, measured so their menus open under them.
     workflow_anchor: style::Anchor,
     workspace_anchor: style::Anchor,
-    /// The task pane's More button, measured so its menu opens under it.
+    /// The open filter menu's scroll, following its cursor.
+    dropdown_scroll: MenuScroll,
+    /// The task pane's More button, measured so its menu opens under it,
+    /// and the menu's scroll, following its cursor.
     pub(super) pane_menu_anchor: style::Anchor,
+    pub(super) pane_menu_scroll: MenuScroll,
     /// The open property picker's value, measured so the picker opens
     /// under it (one picker is open at a time), and the picker's scroll.
     pub(super) property_anchor: style::Anchor,
@@ -308,8 +313,10 @@ impl IssuesView {
             column_lists: HashMap::new(),
             search_lists: HashMap::new(),
             workflow_anchor: Default::default(),
+            dropdown_scroll: Default::default(),
             workspace_anchor: Default::default(),
             pane_menu_anchor: Default::default(),
+            pane_menu_scroll: Default::default(),
             property_anchor: Default::default(),
             picker_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
@@ -2060,8 +2067,13 @@ impl IssuesView {
                 *cursor,
                 false,
             ),
-            _ => return None,
+            _ => {
+                self.dropdown_scroll.follow(None);
+                return None;
+            }
         };
+        // The title is the panel's first child.
+        self.dropdown_scroll.follow(Some(cursor + 1));
         let items: Vec<_> = rows
             .into_iter()
             .enumerate()
@@ -2097,6 +2109,8 @@ impl IssuesView {
                         .debug_selector(|| "dropdown-panel".into())
                         .min_w(px(240.0))
                         .max_w(px(360.0))
+                        .overflow_y_scroll()
+                        .track_scroll(self.dropdown_scroll.handle())
                         .child(panel_title(theme, title))
                         .children(items),
                 ),
@@ -2412,13 +2426,14 @@ pub(super) fn panel(theme: &Theme) -> gpui::Div {
 }
 
 pub(super) fn panel_title(theme: &Theme, title: &str) -> impl IntoElement {
-    style::heading(title.to_string(), theme).px_3().pt_1().pb_2()
+    style::heading(title.to_string(), theme).flex_none().px_3().pt_1().pb_2()
 }
 
 fn option_row(theme: &Theme, selected: bool, label: String, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
         .flex_row()
+        .flex_none()
         .justify_between()
         .mx_1()
         .px_2()
