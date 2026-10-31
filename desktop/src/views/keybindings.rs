@@ -591,6 +591,7 @@ impl KeybindingsPage {
                             .id("keybindings-picker-panel")
                             .debug_selector(|| "keybindings-picker-panel".into())
                             .w(px(PICKER_W))
+                            .overflow_y_scroll()
                             .on_click(|_, _, cx: &mut App| cx.stop_propagation())
                             .children(rows),
                     ),

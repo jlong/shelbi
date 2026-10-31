@@ -21,6 +21,7 @@ use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState, M
 
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::elements::controls;
+use crate::elements::placed::placed;
 use crate::elements::terminal::fonts::{self, Choice, InstalledFonts};
 use crate::theme::style::{self, Anchor, Type, Typography, BUTTON_H};
 use crate::theme::Theme;
@@ -323,18 +324,23 @@ impl Render for FontPicker {
             .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)));
         let field = controls::picker(field, choose).child(style::anchor_probe(&self.field));
 
-        // The list floats 6px under the picker, its width, drawn after
-        // everything (`deferred`) so nothing below it moves.
+        // The list floats 6px under the picker (or over it where the window
+        // is short of room below), its width, drawn after everything
+        // (`deferred`) so nothing below it moves. Capped, the list under the
+        // search box scrolls.
         let field_bounds = self.field.clone();
         let list = self.open.then(|| {
             deferred(
-                div().absolute().top(px(BUTTON_H + 6.0)).left_0().w(px(controls::CONTROL_W)).child(
+                placed(
+                    &self.field,
                     style::popover(
                         div()
                             .id("settings-font-menu")
                             .debug_selector(|| "settings-font-menu".into())
                             .flex()
                             .flex_col()
+                            .w(px(controls::CONTROL_W))
+                            .min_h_0()
                             .occlude(),
                         &theme,
                     )
@@ -365,6 +371,7 @@ impl Render for FontPicker {
                         div()
                             .flex()
                             .flex_row()
+                            .flex_none()
                             .items_center()
                             .gap_1()
                             .px_2()
@@ -379,7 +386,8 @@ impl Render for FontPicker {
                             ),
                     )
                     .child(self.render_list(&theme, cx)),
-                ),
+                )
+                .gap(6.0),
             )
             .with_priority(1)
         });

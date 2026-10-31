@@ -42,9 +42,10 @@ use super::agents_state::{
     StatusChip, Target, AGENTS_HELPER, NOT_ASSIGNED, NO_SHARED, PREVIEW_LINES, SHARED_FOOTNOTE, SHARED_HELPER,
     SHARED_TITLE, UNSET_RUNNER,
 };
-use super::workflows::{header_button, popup, row_button, row_error, section_header, table, MENU_GAP, ROW_BUTTON};
+use super::workflows::{header_button, popup, row_button, row_error, section_header, table, MENU_GAP};
 use crate::assets::icons;
 use crate::elements::controls;
+use crate::elements::placed::placed;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
@@ -652,17 +653,14 @@ impl AgentsPage {
             true,
             Confirm::Delete(name.clone()),
         );
-        deferred(
-            div().absolute().top(px(ROW_BUTTON + MENU_GAP)).right_0().child(
-                self.menu_panel(cx, theme)
-                    .child(edit_yaml)
-                    .child(duplicate)
-                    .child(reset)
-                    .child(div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
-                    .child(delete),
-            ),
-        )
-        .with_priority(1)
+        let panel = self
+            .menu_panel(cx, theme)
+            .child(edit_yaml)
+            .child(duplicate)
+            .child(reset)
+            .child(div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
+            .child(delete);
+        deferred(placed(&self.menu_anchor, panel).gap(MENU_GAP).align_right()).with_priority(1)
     }
 
     /// An unreadable agent's ⋮ menu: Edit YAML only (the rest need the
@@ -675,14 +673,8 @@ impl AgentsPage {
                 this.edit_yaml(&name, dir.clone(), window, cx);
             }),
         );
-        deferred(
-            div()
-                .absolute()
-                .top(px(ROW_BUTTON + MENU_GAP))
-                .right_0()
-                .child(self.menu_panel(cx, theme).child(edit_yaml)),
-        )
-        .with_priority(1)
+        let panel = self.menu_panel(cx, theme).child(edit_yaml);
+        deferred(placed(&self.menu_anchor, panel).gap(MENU_GAP).align_right()).with_priority(1)
     }
 
     /// Reset or Delete waiting under its row: what it does, Cancel and the

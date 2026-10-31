@@ -73,6 +73,7 @@ use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::workflow_editor::{dropdown, MENU_W};
 use crate::app::RESIZE_GRAB;
 use crate::assets::{heroicon, icons, Icon};
+use crate::elements::placed::MenuScroll;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::motion::{ease_out_expo, fill_layer};
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
@@ -291,12 +292,14 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     } else {
         Vec::new()
     };
+    view.pane_menu_scroll.follow(cursor);
+    let scroll = view.pane_menu_scroll.clone();
     let more = dropdown(
         menu_open,
         &view.pane_menu_anchor,
         "pane-menu",
         header_button("pane-more", icons::ELLIPSIS_VERTICAL, menu_open, theme).tooltip(style::tooltip("More")),
-        move |cx| menu_items(rows, cursor, cx),
+        move |cx| menu_items(rows, cursor, scroll, cx),
         MENU_W,
         true,
         |this: &mut IssuesView, cx| {
@@ -359,10 +362,17 @@ fn header_button(id: &'static str, icon: Icon, active: bool, theme: &Theme) -> S
         .child(heroicon(icon).text_color(theme.icon).group_hover(id, move |s| s.text_color(loud)))
 }
 
-/// The More menu's rows: each action and the key that does the same.
-fn menu_items(rows: Vec<(PaneAction, String)>, cursor: Option<usize>, cx: &mut Context<IssuesView>) -> Vec<AnyElement> {
+/// The More menu's rows in one scroll: each action and the key that does
+/// the same, the keyboard's row kept in view (`scroll` follows it).
+fn menu_items(
+    rows: Vec<(PaneAction, String)>,
+    cursor: Option<usize>,
+    scroll: MenuScroll,
+    cx: &mut Context<IssuesView>,
+) -> Vec<AnyElement> {
     let theme = cx.global::<Theme>().opaque();
-    rows.into_iter()
+    let items: Vec<AnyElement> = rows
+        .into_iter()
         .enumerate()
         .map(|(ix, (action, hint))| {
             style::menu_row(format!("pane-menu-{}", action.slug()), cursor == Some(ix), &theme)
@@ -375,7 +385,15 @@ fn menu_items(rows: Vec<(PaneAction, String)>, cursor: Option<usize>, cx: &mut C
                 }))
                 .into_any_element()
         })
-        .collect()
+        .collect();
+    vec![div()
+        .id("pane-menu-scroll")
+        .flex()
+        .flex_col()
+        .overflow_y_scroll()
+        .track_scroll(scroll.handle())
+        .children(items)
+        .into_any_element()]
 }
 
 /// A loading, missing or failed pane's note, at the content's inset.

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use gpui::{
     deferred, div, img, prelude::*, px, AnyElement, Context, Div, EventEmitter, FocusHandle, Focusable, Image,
-    KeyDownEvent, ScrollHandle, SharedString, Window,
+    KeyDownEvent, SharedString, Window,
 };
 use shelbi_app::settings::general::{PickerEntry, ToolPicker, ToolSetting};
 use shelbi_state::tools::ToolOption;
@@ -26,10 +26,12 @@ use shelbi_state::ToolKind;
 
 use crate::assets::{heroicon, icons, ICON_SIZE};
 use crate::elements::controls;
-use crate::theme::style::{self, Anchor, ButtonKind, ButtonSize, Type, Typography, BUTTON_H};
+use crate::elements::placed::{placed, MenuScroll};
+use crate::theme::style::{self, Anchor, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
-/// How tall the open menu grows before it scrolls.
+/// How tall the open menu grows before it scrolls (less where the window
+/// is short of room: [`placed`]).
 const MENU_MAX_H: f32 = 420.0;
 
 /// The apps' icons, by bundle path, as the pickers draw them.
@@ -59,7 +61,7 @@ pub struct ToolSelect {
     /// The keyboard's row, an index into the picker's entries.
     highlight: usize,
     focus: FocusHandle,
-    scroll: ScrollHandle,
+    scroll: MenuScroll,
     /// Where the button last painted, so a press on it toggles rather than
     /// counting as a press outside the open menu.
     button: Anchor,
@@ -91,7 +93,7 @@ impl ToolSelect {
             open: false,
             highlight: 0,
             focus: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
+            scroll: MenuScroll::default(),
             button: Anchor::default(),
         }
     }
@@ -152,7 +154,6 @@ impl ToolSelect {
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.picker.entries().len();
         self.highlight = (self.highlight as isize + delta).clamp(0, count as isize - 1) as usize;
-        self.scroll.scroll_to_item(self.highlight);
         cx.notify();
     }
 
@@ -197,24 +198,46 @@ impl ToolSelect {
         }
     }
 
+    /// What the menu shows before entry `ix`: a group's heading, the rule
+    /// before Browse…, or nothing.
+    fn lead(&self, ix: usize, entry: &PickerEntry) -> Option<Lead> {
+        let custom_at = 1 + self.picker.cli.len() + self.picker.apps.len();
+        match entry {
+            PickerEntry::Tool(_) if ix == 1 && !self.picker.cli.is_empty() => Some(Lead::Heading("Command line")),
+            PickerEntry::Tool(_) if ix == 1 + self.picker.cli.len() && !self.picker.apps.is_empty() => {
+                Some(Lead::Heading("Applications"))
+            }
+            PickerEntry::Tool(_) if ix == custom_at => Some(Lead::Heading("Your setting")),
+            PickerEntry::Browse => Some(Lead::Rule),
+            _ => None,
+        }
+    }
+
+    /// Entry `ix`'s place among the menu's children (its headings and rule
+    /// count too), for scrolling it into view.
+    fn child_of(&self, ix: usize) -> usize {
+        let leads = self
+            .picker
+            .entries()
+            .iter()
+            .enumerate()
+            .take(ix + 1)
+            .filter(|(i, e)| self.lead(*i, e).is_some())
+            .count();
+        ix + leads
+    }
+
     /// The menu's rows: the entries in order, with the group headings and
     /// the rule before Browse….
     fn render_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let prefix = selector(self.setting);
         let selected = self.picker.selected();
-        let custom_at = 1 + self.picker.cli.len() + self.picker.apps.len();
         let mut rows = Vec::new();
         for (ix, entry) in self.picker.entries().into_iter().enumerate() {
-            match &entry {
-                PickerEntry::Tool(_) if ix == 1 && !self.picker.cli.is_empty() => {
-                    rows.push(group_heading("Command line", theme))
-                }
-                PickerEntry::Tool(_) if ix == 1 + self.picker.cli.len() && !self.picker.apps.is_empty() => {
-                    rows.push(group_heading("Applications", theme))
-                }
-                PickerEntry::Tool(_) if ix == custom_at => rows.push(group_heading("Your setting", theme)),
-                PickerEntry::Browse => rows.push(rule(theme)),
-                _ => {}
+            match self.lead(ix, &entry) {
+                Some(Lead::Heading(text)) => rows.push(group_heading(text, theme)),
+                Some(Lead::Rule) => rows.push(rule(theme)),
+                None => {}
             }
             let (icon, detail) = match &entry {
                 PickerEntry::Default => (None, self.picker.default_detail.clone()),
@@ -249,6 +272,12 @@ impl ToolSelect {
         }
         rows
     }
+}
+
+/// What goes before an entry in the menu.
+enum Lead {
+    Heading(&'static str),
+    Rule,
 }
 
 /// A menu group's heading (not choosable).
@@ -305,37 +334,37 @@ impl Render for ToolSelect {
             .child(style::dropdown_slot(ButtonSize::Base, chevron))
             .child(style::anchor_probe(&self.button));
 
-        // The menu floats 4px under the button, its width, drawn after
-        // everything (`deferred`) so nothing below it moves.
+        // The menu floats 4px under the button (or over it where the window
+        // is short of room below), its width, drawn after everything
+        // (`deferred`) so nothing below it moves. The keyboard's row stays
+        // in view as it moves, and is scrolled to on opening.
+        self.scroll.follow(self.open.then(|| self.child_of(self.highlight)));
         let anchor = self.button.clone();
         let menu = self.open.then(|| {
             let rows = self.render_rows(&theme, cx);
-            deferred(
-                div().absolute().top(px(BUTTON_H + 4.0)).left_0().w(px(controls::CONTROL_W)).child(
-                    style::popover(
-                        div()
-                            .id(SharedString::from(format!("{prefix}-menu")))
-                            .debug_selector(move || format!("{prefix}-menu"))
-                            .flex()
-                            .flex_col()
-                            .max_h(px(MENU_MAX_H))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .p_1()
-                            .occlude(),
-                        &theme,
-                    )
-                    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        // A press on the button toggles it closed through its click.
-                        if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                            return;
-                        }
-                        this.close(cx);
-                    }))
-                    .children(rows),
-                ),
+            let list = style::popover(
+                div()
+                    .id(SharedString::from(format!("{prefix}-menu")))
+                    .debug_selector(move || format!("{prefix}-menu"))
+                    .flex()
+                    .flex_col()
+                    .w(px(controls::CONTROL_W))
+                    .max_h(px(MENU_MAX_H))
+                    .overflow_y_scroll()
+                    .track_scroll(self.scroll.handle())
+                    .p_1()
+                    .occlude(),
+                &theme,
             )
-            .with_priority(1)
+            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                // A press on the button toggles it closed through its click.
+                if anchor.get().is_some_and(|b| b.contains(&event.position)) {
+                    return;
+                }
+                this.close(cx);
+            }))
+            .children(rows);
+            deferred(placed(&self.button, list)).with_priority(1)
         });
         div().relative().flex_none().child(button).children(menu)
     }
@@ -366,7 +395,8 @@ mod tests {
         }
     }
 
-    fn select(cx: &mut TestAppContext) -> (Entity<ToolSelect>, VisualTestContext, Rc<RefCell<Vec<PickerEntry>>>) {
+    /// The theme and widgets set up, and the Editor's picker as detected.
+    fn editor_picker(cx: &mut TestAppContext) -> ToolPicker {
         cx.update(|cx| {
             cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
             gpui_kit::init(cx);
@@ -374,7 +404,11 @@ mod tests {
         let mut form = GeneralForm::default();
         form.load(Ok(Preferences::default()), None);
         form.set_detected(detected());
-        let picker = form.picker(ToolSetting::Editor);
+        form.picker(ToolSetting::Editor)
+    }
+
+    fn select(cx: &mut TestAppContext) -> (Entity<ToolSelect>, VisualTestContext, Rc<RefCell<Vec<PickerEntry>>>) {
+        let picker = editor_picker(cx);
         let window = cx.add_window(|_, cx| {
             let mut s = ToolSelect::new(ToolSetting::Editor, picker.clone(), cx);
             s.set(picker, &AppIcons::new(), true, cx);
@@ -440,5 +474,77 @@ mod tests {
             s.open(window, cx);
         });
         assert!(!select.read_with(&cx, |s, _| s.is_open()));
+    }
+
+    /// A picker `top` down a window `height` tall, as Settings ▸ General
+    /// lays one out further down the page.
+    struct Page {
+        select: Entity<ToolSelect>,
+        top: f32,
+    }
+
+    impl Render for Page {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().pt(px(self.top)).pl(px(16.0)).child(self.select.clone())
+        }
+    }
+
+    fn on_page(cx: &mut TestAppContext, top: f32, height: f32) -> (Entity<ToolSelect>, VisualTestContext) {
+        let picker = editor_picker(cx);
+        let window = cx.add_window(|_, cx| {
+            let select = cx.new(|cx| {
+                let mut s = ToolSelect::new(ToolSetting::Editor, picker.clone(), cx);
+                s.set(picker, &AppIcons::new(), true, cx);
+                s
+            });
+            Page { select, top }
+        });
+        let select = window.root(cx).unwrap().read_with(cx, |p, _| p.select.clone());
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(gpui::size(px(800.0), px(height)));
+        vcx.run_until_parked();
+        select.update_in(&mut vcx, |s, window, cx| s.open(window, cx));
+        vcx.run_until_parked();
+        (select, vcx)
+    }
+
+    #[gpui::test]
+    fn near_the_windows_bottom_the_menu_opens_above_its_button(cx: &mut TestAppContext) {
+        let (_, mut cx) = on_page(cx, 520.0, 600.0);
+        let button = cx.debug_bounds("settings-editor-button").unwrap();
+        let menu = cx.debug_bounds("settings-editor-menu").unwrap();
+        assert!(menu.bottom() <= button.top(), "above the button: {menu:?} over {button:?}");
+        assert!(menu.top() >= px(8.0), "inside the window: {menu:?}");
+    }
+
+    #[gpui::test]
+    fn near_the_windows_top_the_menu_still_opens_below(cx: &mut TestAppContext) {
+        let (_, mut cx) = on_page(cx, 16.0, 600.0);
+        let button = cx.debug_bounds("settings-editor-button").unwrap();
+        let menu = cx.debug_bounds("settings-editor-menu").unwrap();
+        assert_eq!(menu.top(), button.bottom() + px(4.0), "4pt under the button");
+    }
+
+    #[gpui::test]
+    fn in_a_short_window_the_menu_scrolls_and_the_keyboard_keeps_its_row_in_view(cx: &mut TestAppContext) {
+        // Room for a few rows below; the menu has five entries, two
+        // headings and a rule.
+        let (_, mut cx) = on_page(cx, 16.0, 180.0);
+        let menu = cx.debug_bounds("settings-editor-menu").unwrap();
+        assert!(menu.bottom() <= px(172.0), "capped 8pt from the window's edge: {menu:?}");
+        // Down to Other command…, the last row: it scrolls into view (the
+        // headings before it count among the menu's children).
+        cx.simulate_keystrokes("down down down down");
+        cx.run_until_parked();
+        let other = cx.debug_bounds("settings-editor-option-4").unwrap();
+        assert!(
+            other.top() >= menu.top() && other.bottom() <= menu.bottom(),
+            "the keyboard's row shows: {other:?} in {menu:?}"
+        );
+        // And back up to the top.
+        cx.simulate_keystrokes("up up up up");
+        cx.run_until_parked();
+        let default = cx.debug_bounds("settings-editor-option-0").unwrap();
+        assert!(default.top() >= menu.top(), "the first row shows again: {default:?} in {menu:?}");
     }
 }

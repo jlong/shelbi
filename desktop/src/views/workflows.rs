@@ -45,6 +45,7 @@ use super::workflows_state::{
 };
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::controls;
+use crate::elements::placed::placed;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
@@ -527,7 +528,8 @@ pub(super) fn row_error(selector: String, text: &str, theme: &Theme) -> Div {
         .child(text.to_string())
 }
 
-/// A popup menu's panel (the caller floats it under its button).
+/// A popup menu's panel (the caller places it against its button with
+/// [`placed`], which scrolls it when capped).
 pub(super) fn popup(id: &'static str, theme: &Theme) -> Stateful<Div> {
     style::popover(
         div()
@@ -537,6 +539,7 @@ pub(super) fn popup(id: &'static str, theme: &Theme) -> Stateful<Div> {
             .flex_col()
             .p_1()
             .w(px(MENU_W))
+            .overflow_y_scroll()
             .occlude(),
         theme,
     )
@@ -775,7 +778,7 @@ impl WorkflowsPage {
             }))
             .child(edit_yaml);
         let Some(w) = w else {
-            return deferred(div().absolute().top(px(ROW_BUTTON + MENU_GAP)).right_0().child(popup)).with_priority(1);
+            return deferred(placed(&self.menu_anchor, popup).gap(MENU_GAP).align_right()).with_priority(1);
         };
         let duplicate = {
             let name = name.clone();
@@ -813,16 +816,12 @@ impl WorkflowsPage {
                 }))
             }
         };
-        deferred(
-            div().absolute().top(px(ROW_BUTTON + MENU_GAP)).right_0().child(
-                popup
-                    .child(duplicate)
-                    .child(default)
-                    .child(div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
-                    .child(delete),
-            ),
-        )
-        .with_priority(1)
+        let popup = popup
+            .child(duplicate)
+            .child(default)
+            .child(div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
+            .child(delete);
+        deferred(placed(&self.menu_anchor, popup).gap(MENU_GAP).align_right()).with_priority(1)
     }
 
     /// The workflow table's new row: the name field, and Enter or Esc.
@@ -1197,20 +1196,16 @@ impl WorkflowsPage {
                         this.pick_category(target.clone(), c, window, cx)
                     }))
             });
-            deferred(
-                div().absolute().top(px(style::BUTTON_H + MENU_GAP)).left_0().child(
-                    popup("status-category-menu", theme)
-                        .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                            if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                                return;
-                            }
-                            this.menu = None;
-                            cx.notify();
-                        }))
-                        .children(items),
-                ),
-            )
-            .with_priority(1)
+            let menu = popup("status-category-menu", theme)
+                .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if anchor.get().is_some_and(|b| b.contains(&event.position)) {
+                        return;
+                    }
+                    this.menu = None;
+                    cx.notify();
+                }))
+                .children(items);
+            deferred(placed(&self.menu_anchor, menu).gap(MENU_GAP)).with_priority(1)
         });
         div().relative().flex_none().child(button).children(menu)
     }

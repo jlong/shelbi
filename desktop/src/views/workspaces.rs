@@ -45,13 +45,14 @@ use gpui::{
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
 use shelbi_core::MachineKind;
 
-use super::workflows::{popup, row_button, table, MENU_GAP, ROW_BUTTON};
+use super::workflows::{popup, row_button, table, MENU_GAP};
 use shelbi_app::settings::workspace_form::Outcome;
 use shelbi_app::settings::workspaces::{
     kind_label, read, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
 };
 use crate::assets::{heroicon, icons};
+use crate::elements::placed::placed;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
@@ -699,15 +700,11 @@ impl WorkspacesPage {
                 cx.notify();
             },
         ));
-        deferred(
-            div().absolute().top(px(ROW_BUTTON + MENU_GAP)).right_0().child(
-                panel
-                    .child(edit)
-                    .child(div().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
-                    .child(remove),
-            ),
-        )
-        .with_priority(1)
+        let panel = panel
+            .child(edit)
+            .child(div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
+            .child(remove);
+        deferred(placed(&self.menu_anchor, panel).gap(MENU_GAP).align_right()).with_priority(1)
     }
 
     fn render_machines(&self, index: &PoolIndex, theme: &Theme, cx: &mut Context<Self>) -> Div {

@@ -42,6 +42,7 @@ use shelbi_app::settings::workspace_form::{
 };
 use super::workspaces::WorkspacesPage;
 use shelbi_app::settings::workspaces::{Intent, WorkspacesState};
+use crate::elements::placed::{placed, MenuScroll};
 use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
@@ -97,6 +98,10 @@ pub struct WorkspaceDialog {
     service: PoolService,
     /// The job out, if any (a test waits on it).
     running: bool,
+    /// The Machine picker's button, measured so its menu opens against it,
+    /// and the menu's scroll, following the keyboard.
+    machine_anchor: style::Anchor,
+    machine_scroll: MenuScroll,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -224,6 +229,8 @@ impl WorkspaceDialog {
             inset: 0.0,
             service,
             running: false,
+            machine_anchor: Default::default(),
+            machine_scroll: Default::default(),
             _subscriptions: subscriptions,
         };
         dialog.sync_focus(window, cx);
@@ -653,7 +660,9 @@ impl WorkspaceDialog {
             .when_some(form.machine_choice(), |b, m| b.aria_description(m.detail()))
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(style::dropdown_slot(ButtonSize::Base, chevron))
+            .child(style::anchor_probe(&self.machine_anchor))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.click(Focus::Machine, window, cx)));
+        self.machine_scroll.follow(open);
         let menu = open.map(|highlight| {
             let items: Vec<AnyElement> = form
                 .machines()
@@ -685,30 +694,28 @@ impl WorkspaceDialog {
                         .into_any_element()
                 })
                 .collect();
-            deferred(
-                div().absolute().top(px(style::BUTTON_H + 4.0)).left_0().right_0().child(
-                    style::popover(
-                        div()
-                            .id("workspace-dialog-machines")
-                            .debug_selector(|| "workspace-dialog-machines".into())
-                            .role(Role::ListBox)
-                            .aria_label("Machines")
-                            .flex()
-                            .flex_col()
-                            .p_1()
-                            .occlude(),
-                        theme,
-                    )
-                    .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                        if let Body::Form(f) = &mut this.body {
-                            f.close_menu();
-                        }
-                        cx.notify();
-                    }))
-                    .children(items),
-                ),
+            let list = style::popover(
+                div()
+                    .id("workspace-dialog-machines")
+                    .debug_selector(|| "workspace-dialog-machines".into())
+                    .role(Role::ListBox)
+                    .aria_label("Machines")
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .overflow_y_scroll()
+                    .track_scroll(self.machine_scroll.handle())
+                    .occlude(),
+                theme,
             )
-            .with_priority(2)
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if let Body::Form(f) = &mut this.body {
+                    f.close_menu();
+                }
+                cx.notify();
+            }))
+            .children(items);
+            deferred(placed(&self.machine_anchor, list).match_width()).with_priority(2)
         });
         div().relative().w_full().child(button).children(menu)
     }

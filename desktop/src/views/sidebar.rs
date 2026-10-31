@@ -38,6 +38,7 @@ use shelbi_state::ZenModeState;
 
 use super::settings_nav::SettingsPage;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
+use crate::elements::placed::{placed, MenuScroll};
 use crate::keys::{nav_view_hotkey, row_hotkey};
 use crate::refresh::DaemonLink;
 use crate::theme::fold::{self, Folds};
@@ -458,6 +459,8 @@ pub struct SwitcherProps<'a> {
     pub highlight: usize,
     /// How shown the menu is: 0 (hidden) to 1, eased.
     pub phase: f32,
+    /// The menu's scroll, keeping the keyboard's row in view.
+    pub scroll: MenuScroll,
 }
 
 /// The project switcher's state, owned by the window: open or closed, when
@@ -469,6 +472,8 @@ pub struct Switcher {
     pub highlight: usize,
     /// The button's bounds as last painted.
     pub button: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The menu's scroll (capped where the window is short).
+    pub scroll: MenuScroll,
 }
 
 impl Switcher {
@@ -481,6 +486,8 @@ impl Switcher {
         if !self.open {
             self.open = true;
             self.changed = Some(now);
+            // Scrolled to the keyboard's row as it opens.
+            self.scroll.follow(None);
         }
         self.highlight = highlight;
     }
@@ -890,10 +897,10 @@ fn render_project<H: SidebarHost>(
         theme,
         cx,
     );
-    let menu = props.switcher.as_ref().map(|switcher| {
-        let top = (PROJECT_BLOCK_H + SWITCHER_H) / 2.0 + MENU_GAP;
-        switcher_menu(switcher, &props.switcher_button, top, props.width, theme, cx)
-    });
+    let menu = props
+        .switcher
+        .as_ref()
+        .map(|switcher| switcher_menu(switcher, &props.switcher_button, props.width, theme, cx));
 
     div()
         .relative()
@@ -967,28 +974,29 @@ pub fn switcher_trigger<H: SidebarHost>(
     }))
 }
 
-/// The switcher's menu floating `top` below its block's top, [`MENU_INSET`]
-/// in from both edges of a column `width` wide (228pt in the 252pt column),
-/// however long a project's name (it truncates): drawn after everything
-/// (`deferred`), so nothing below it moves and nothing paints over it.
+/// The switcher's menu floating [`MENU_GAP`] under its `button` (which sits
+/// [`MENU_INSET`] in), as wide as a column `width` wide less that inset on
+/// both sides (228pt in the 252pt column), however long a project's name
+/// (it truncates): drawn after everything (`deferred`), so nothing below it
+/// moves and nothing paints over it, capped and scrolling where the window
+/// is short ([`placed`]).
 pub fn switcher_menu<H: SidebarHost>(
     switcher: &SwitcherProps<'_>,
     button: &Rc<Cell<Option<Bounds<Pixels>>>>,
-    top: f32,
     width: f32,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
-    deferred(
-        div()
-            .absolute()
-            .top(px(top + (1.0 - switcher.phase) * motion::SLIDE_PX))
-            .left(px(MENU_INSET))
-            .w(px((width - 2.0 * MENU_INSET).max(0.0)))
-            .opacity(switcher.phase)
-            .child(render_switcher(switcher, button.clone(), theme, cx)),
-    )
-    .with_priority(1)
+    let menu = div()
+        .relative()
+        .top(px((1.0 - switcher.phase) * motion::SLIDE_PX))
+        .opacity(switcher.phase)
+        .flex()
+        .flex_col()
+        .min_h_0()
+        .w(px((width - 2.0 * MENU_INSET).max(0.0)))
+        .child(render_switcher(switcher, button.clone(), theme, cx));
+    deferred(placed(button, menu).gap(MENU_GAP)).with_priority(1)
 }
 
 /// The switcher's menu, the Figma `Project switcher`'s open state
@@ -1018,6 +1026,14 @@ fn render_switcher<H: SidebarHost>(
         }))
     });
     let add_ix = switcher.projects.len();
+    // The keyboard's row among the menu's children: after the heading, and
+    // "Add project" after the rule (and the loading note, while it shows).
+    let child = if switcher.highlight < add_ix {
+        1 + switcher.highlight
+    } else {
+        add_ix + 2 + usize::from(switcher.projects.is_empty())
+    };
+    switcher.scroll.follow(Some(child));
     let add = project_menu::add_row(
         "sidebar-add-project",
         "sidebar-add-project",
@@ -1034,6 +1050,8 @@ fn render_switcher<H: SidebarHost>(
         .flex_col()
         .px_1()
         .py_2()
+        .overflow_y_scroll()
+        .track_scroll(switcher.scroll.handle())
         .rounded(px(NAV_RADIUS))
         .bg(theme.raised.blend(theme.search))
         .text_color(theme.foreground)
@@ -1049,6 +1067,7 @@ fn render_switcher<H: SidebarHost>(
         .when(switcher.projects.is_empty(), |d| {
             d.child(
                 div()
+                    .flex_none()
                     .px_2()
                     .h(px(project_menu::ROW_H))
                     .flex()
