@@ -202,7 +202,7 @@ pub struct Entry {
     /// The section whose body the row is in (not its header, nor the blank
     /// before it).
     pub section: Option<Section>,
-    /// The machine group whose body the row is in (an indented workspace).
+    /// The machine group whose body the row is in (a grouped workspace).
     pub machine: Option<String>,
 }
 
@@ -1414,20 +1414,24 @@ fn render_row<H: SidebarHost>(
                 }))
                 .into_any_element()
         }
-        SidebarRow::Workspace {
-            name,
-            badge,
-            indent,
-            ..
-        } => {
+        SidebarRow::Workspace { name, badge, .. } => {
             let busy = workspace_busy(props.model, name);
+            // A machine's workspaces sit flush with its name and the section
+            // title, as the component's Multiple frame draws them.
             item(base)
                 .flex_row()
                 .items_center()
                 .gap_2()
-                // A machine's workspaces sit a chevron and a gap in from its name.
-                .when(*indent, |d| d.pl(px(8.0 + 12.0 + 8.0)))
-                .child(render_glyph(workspace_glyph(*badge, theme)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .child(render_glyph(workspace_glyph(*badge, theme)))
+                        .debug_selector({
+                            let name = name.clone();
+                            move || format!("sidebar-ws-glyph-{name}")
+                        }),
+                )
                 .child(
                     div()
                         .min_w_0()
@@ -2278,6 +2282,29 @@ mod render_tests {
         assert_eq!(chevron.size.width.as_f32(), 12.0);
         assert_eq!((row.right() - count.right()).as_f32(), 8.0, "the count at the far right");
         assert!(chevron.right() < count.left());
+    }
+
+    #[gpui::test]
+    fn a_machines_workspaces_sit_flush_with_its_name(cx: &mut TestAppContext) {
+        // The Multiple frame: the section title, each machine's name, and its
+        // workspaces' status glyphs all start 20pt in (the section's 12pt
+        // plus the row's 8pt), and every row spans the same width.
+        let (_, mut cx) = open(cx, fixture_model(), 0, None);
+        let b = |cx: &mut VisualTestContext, s: &'static str| cx.debug_bounds(s).unwrap_or_else(|| panic!("{s}"));
+        let section = b(&mut cx, "sidebar-section-Workspaces");
+        for name in ["sidebar-machine-name-hub", "sidebar-machine-name-devbox"] {
+            assert_eq!(b(&mut cx, name).left().as_f32(), 20.0, "{name}");
+        }
+        for glyph in ["sidebar-ws-glyph-alpha", "sidebar-ws-glyph-bravo", "sidebar-ws-glyph-delta"] {
+            assert_eq!(b(&mut cx, glyph).left().as_f32(), 20.0, "{glyph}");
+        }
+        assert_eq!(section.left().as_f32() + 8.0, 20.0, "the title's 8pt in");
+        let machine = b(&mut cx, "sidebar-machine-hub");
+        for row in ["sidebar-ws-alpha", "sidebar-ws-bravo", "sidebar-ws-delta"] {
+            let row = b(&mut cx, row);
+            assert_eq!(row.left(), machine.left(), "the hover fill starts at the row's edge");
+            assert_eq!(row.size.width, machine.size.width, "and spans the full width");
+        }
     }
 
     #[gpui::test]
