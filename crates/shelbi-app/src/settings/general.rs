@@ -892,17 +892,17 @@ mod tests {
         let mut f = loaded(ThemePreference::Auto, None, None);
         assert_eq!(f.app_icon(), AppIcon::CommandGrille, "unset is Command Grille");
         assert_eq!(f.choose_app_icon(AppIcon::CommandGrille), None, "already the file's");
-        assert_eq!(f.step_app_icon(-1), Some(Change::AppIcon(AppIcon::RacingS)), "← wraps to the last");
-        assert_eq!((f.app_icon(), f.status()), (AppIcon::RacingS, &SaveStatus::Saving));
+        assert_eq!(f.step_app_icon(-1), Some(Change::AppIcon(AppIcon::RetroRacingS)), "← wraps to the last");
+        assert_eq!((f.app_icon(), f.status()), (AppIcon::RetroRacingS, &SaveStatus::Saving));
         assert_eq!(f.choose_app_icon(AppIcon::Retro), None, "one save at a time");
         let mut cfg = UserConfig::default();
-        cfg.desktop.app_icon = Some(AppIcon::RacingS);
+        cfg.desktop.app_icon = Some(AppIcon::RetroRacingS);
         f.saved_result(Ok(cfg));
-        assert_eq!((f.app_icon(), f.status()), (AppIcon::RacingS, &SaveStatus::Saved));
+        assert_eq!((f.app_icon(), f.status()), (AppIcon::RetroRacingS, &SaveStatus::Saved));
         assert_eq!(f.step_app_icon(1), Some(Change::AppIcon(AppIcon::CommandGrille)), "→ wraps to the first");
         // A failed write goes back to what the file holds.
         f.saved_result(Err("disk full".into()));
-        assert_eq!(f.app_icon(), AppIcon::RacingS);
+        assert_eq!(f.app_icon(), AppIcon::RetroRacingS);
     }
 
     fn detected() -> DetectedTools {

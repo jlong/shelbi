@@ -11,7 +11,7 @@
 //! dialogs' muted single-line border ([`super::dialog_frame`]). The icon is
 //! pixel art from the desktop's icons ([`super::about_icon`]), two pixels to
 //! a cell with `▀`: the one `desktop.app_icon` chooses (Command Grille
-//! unless it says Retro), as the desktop's About shows. It is left out when
+//! unless it names another), as the desktop's About shows. It is left out when
 //! the window is too short for it.
 //!
 //! Tab (or an arrow) moves focus through the links and Close; Enter or
@@ -76,6 +76,7 @@ fn pixels(icon: AppIcon) -> &'static about_icon::Pixels {
         AppIcon::CommandGrille => &about_icon::COMMAND_GRILLE,
         AppIcon::Retro => &about_icon::RETRO,
         AppIcon::RacingS => &about_icon::RACING_S,
+        AppIcon::RetroRacingS => &about_icon::RETRO_RACING_S,
     }
 }
 
@@ -904,6 +905,9 @@ mod tests {
         assert_ne!(about_icon::COMMAND_GRILLE, about_icon::RETRO);
         assert_ne!(about_icon::COMMAND_GRILLE, about_icon::RACING_S);
         assert_ne!(about_icon::RETRO, about_icon::RACING_S);
+        for other in [about_icon::COMMAND_GRILLE, about_icon::RETRO, about_icon::RACING_S] {
+            assert_ne!(other, about_icon::RETRO_RACING_S);
+        }
     }
 
     /// About draws the icon it was opened with: Command Grille unless told
@@ -933,6 +937,10 @@ mod tests {
         let racing = icon_cells(&About::new(true).with_icon(AppIcon::RacingS));
         assert_ne!(racing, grille);
         assert_ne!(racing, retro);
+        let retro_racing = icon_cells(&About::new(true).with_icon(AppIcon::RetroRacingS));
+        for other in [&grille, &retro, &racing] {
+            assert_ne!(&retro_racing, other);
+        }
         // Its middle cell is that table's pixel, drawn in 24-bit color.
         let mid = about_icon::SIZE / 2;
         let at = (ICON_ROWS / 2) * about_icon::SIZE + mid;

@@ -30,9 +30,10 @@
 //! selected with the size stepper at each end (`settings-size-min.png`,
 //! `settings-size-max.png`, `settings-option-right.png`), General's App
 //! icon tiles with each icon picked (`settings-app-icon-command-grille.png`,
-//! `settings-app-icon-retro.png`, `settings-app-icon-racing-s.png`), About
-//! with each icon chosen (`about-command-grille.png`, `about-retro.png`,
-//! `about-racing-s.png`), the bootstrap
+//! `settings-app-icon-retro.png`, `settings-app-icon-racing-s.png`,
+//! `settings-app-icon-retro-racing-s.png`), About with each icon chosen
+//! (`about-command-grille.png`, `about-retro.png`, `about-racing-s.png`,
+//! `about-retro-racing-s.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
 //! notice bars (`notice-bars.png`: the update and relaunch bars). It prints
 //! one line per check and exits non-zero if any failed.
@@ -357,6 +358,7 @@ pub fn run(out: PathBuf) -> ! {
         ("settings-app-icon-command-grille.png", shelbi_state::AppIcon::CommandGrille),
         ("settings-app-icon-retro.png", shelbi_state::AppIcon::Retro),
         ("settings-app-icon-racing-s.png", shelbi_state::AppIcon::RacingS),
+        ("settings-app-icon-retro-racing-s.png", shelbi_state::AppIcon::RetroRacingS),
     ] {
         let window: AnyWindowHandle = cx
             .open_offscreen_window(size(px(1100.0), px(1000.0)), |window, cx| {
@@ -383,6 +385,7 @@ pub fn run(out: PathBuf) -> ! {
         ("about-command-grille.png", shelbi_state::AppIcon::CommandGrille),
         ("about-retro.png", shelbi_state::AppIcon::Retro),
         ("about-racing-s.png", shelbi_state::AppIcon::RacingS),
+        ("about-retro-racing-s.png", shelbi_state::AppIcon::RetroRacingS),
     ] {
         cx.update(|cx| crate::app_icon::set(icon, cx));
         let (w, h) = crate::views::about::SIZE;

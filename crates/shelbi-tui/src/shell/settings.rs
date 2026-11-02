@@ -3708,14 +3708,14 @@ mod tests {
         let mut s = on_general(fixture_summary(Some("proj")));
         let km = keymaps();
         let text = screen(&mut s, 100, 40);
-        for want in ["App icon", "Command Grille", "Retro", "Racing S"] {
+        for want in ["App icon", "Command Grille", " Retro ", " Racing S ", "Retro Racing S"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.handle_key(key(KeyCode::Left), &km), SettingsAction::Write(Change::AppIcon(AppIcon::RacingS)));
-        assert_eq!(s.form().app_icon(), AppIcon::RacingS, "pending shows the pick");
+        assert_eq!(s.handle_key(key(KeyCode::Left), &km), SettingsAction::Write(Change::AppIcon(AppIcon::RetroRacingS)));
+        assert_eq!(s.form().app_icon(), AppIcon::RetroRacingS, "pending shows the pick");
         let mut cfg = UserConfig::default();
-        cfg.desktop.app_icon = Some(AppIcon::RacingS);
+        cfg.desktop.app_icon = Some(AppIcon::RetroRacingS);
         s.config_written(Ok(cfg));
         assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Write(Change::AppIcon(AppIcon::CommandGrille)));
         s.config_written(Ok(UserConfig::default()));
@@ -3734,27 +3734,53 @@ mod tests {
             s.handle_mouse(click, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40)),
             SettingsAction::Write(Change::AppIcon(AppIcon::RacingS))
         );
+        let mut cfg = UserConfig::default();
+        cfg.desktop.app_icon = Some(AppIcon::RacingS);
+        s.config_written(Ok(cfg));
+        // And on Retro Racing S's, the last of the four.
+        let text = screen(&mut s, 100, 40);
+        let (x, y) = text
+            .lines()
+            .enumerate()
+            .find_map(|(y, l)| l.find(" Retro Racing S ").map(|x| (l[..x].chars().count() + 1, y)))
+            .unwrap_or_else(|| panic!("{text}"));
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE };
+        assert_eq!(
+            s.handle_mouse(click, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40)),
+            SettingsAction::Write(Change::AppIcon(AppIcon::RetroRacingS))
+        );
     }
 
-    /// Too narrow for the three names, the App icon control shows the
+    /// Too narrow for the four names, the App icon control shows the
     /// chosen one (never cut off) and a click on it steps to the next.
     #[test]
     fn a_narrow_app_icon_row_keeps_the_chosen_icon() {
         let mut summary = fixture_summary(Some("proj"));
         summary.global.preferences = Ok(general::Preferences { app_icon: AppIcon::RacingS, ..general::Preferences::default() });
         let mut s = on_general(summary);
-        let text = screen(&mut s, 60, 50);
-        assert!(text.contains(" Racing S ") && !text.contains(" Retro "), "{text}");
-        let (x, y) = text
-            .lines()
-            .enumerate()
-            .find_map(|(y, l)| l.find(" Racing S ").map(|x| (l[..x].chars().count() + 1, y)))
-            .unwrap_or_else(|| panic!("{text}"));
-        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE };
+        // The segment showing `name`, alone on its row, clicked.
+        let click_alone = |s: &mut SettingsShell, name: &str| {
+            let text = screen(s, 60, 50);
+            let (x, y) = text
+                .lines()
+                .enumerate()
+                .find_map(|(y, l)| l.find(&format!(" {name} ")).map(|x| (l[..x].chars().count() + 1, y)))
+                .unwrap_or_else(|| panic!("{name}:\n{text}"));
+            let row = text.lines().nth(y).unwrap_or_default();
+            for other in AppIcon::ALL.iter().map(|i| i.label()).filter(|l| *l != name && !name.contains(l)) {
+                assert!(!row.contains(other), "{other} beside {name}:\n{text}");
+            }
+            let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE };
+            s.handle_mouse(click, Rect::new(0, 0, 28, 50), Rect::new(28, 0, 32, 50))
+        };
+        assert_eq!(click_alone(&mut s, "Racing S"), SettingsAction::Write(Change::AppIcon(AppIcon::RetroRacingS)));
+        let mut cfg = UserConfig::default();
+        cfg.desktop.app_icon = Some(AppIcon::RetroRacingS);
+        s.config_written(Ok(cfg));
         assert_eq!(
-            s.handle_mouse(click, Rect::new(0, 0, 28, 50), Rect::new(28, 0, 32, 50)),
+            click_alone(&mut s, "Retro Racing S"),
             SettingsAction::Write(Change::AppIcon(AppIcon::CommandGrille)),
-            "Racing S wraps to the first"
+            "Retro Racing S wraps to the first"
         );
     }
 
