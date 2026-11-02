@@ -1348,9 +1348,21 @@ pub fn menu_entrance(id: &'static str, menu: impl IntoElement + 'static) -> impl
 /// `menu` 6px under the control `anchor` measured, its left edges aligned,
 /// flipped above it, capped or shifted to stay inside the window
 /// ([`placed`](crate::elements::placed)); where the control hasn't painted
-/// yet, against `fallback` (window coordinates).
-pub fn below(anchor: &Anchor, fallback: gpui::Point<gpui::Pixels>, menu: impl IntoElement) -> impl IntoElement {
-    crate::elements::placed::placed(anchor, menu).gap(6.0).fallback(fallback)
+/// yet, against `fallback` (window coordinates). Drawn after everything
+/// (`deferred`); a press outside it runs `dismiss` and goes no further.
+pub fn below(
+    anchor: &Anchor,
+    fallback: gpui::Point<gpui::Pixels>,
+    menu: impl IntoElement,
+    dismiss: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Deferred {
+    gpui::deferred(
+        crate::elements::placed::placed(anchor, menu)
+            .gap(6.0)
+            .fallback(fallback)
+            .on_dismiss(dismiss),
+    )
+    .with_priority(1)
 }
 
 /// A tooltip with `text`, for gpui's `.tooltip(...)`: a small popover.

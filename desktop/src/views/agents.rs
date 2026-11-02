@@ -591,17 +591,22 @@ impl AgentsPage {
             }))
     }
 
-    /// The menu's panel, closed by a press outside it (a press on its own
-    /// button toggles it through the click).
-    fn menu_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> Stateful<Div> {
-        let anchor = self.menu_anchor.clone();
-        popup("agent-menu", theme).on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-            if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                return;
-            }
-            this.menu = None;
-            cx.notify();
-        }))
+    /// The menu's panel.
+    fn menu_panel(&self, theme: &Theme) -> Stateful<Div> {
+        popup("agent-menu", theme)
+    }
+
+    /// `panel` placed under its ⋮ button, closed by a press outside it (its
+    /// button included, so a second click closes it).
+    fn place_menu(&self, panel: Stateful<Div>, cx: &mut Context<Self>) -> gpui::Deferred {
+        let menu = placed(&self.menu_anchor, panel)
+            .gap(MENU_GAP)
+            .align_right()
+            .on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }));
+        deferred(menu).with_priority(1)
     }
 
     /// An agent's ⋮ menu: Edit YAML, Duplicate, Reset to default, Delete,
@@ -654,13 +659,13 @@ impl AgentsPage {
             Confirm::Delete(name.clone()),
         );
         let panel = self
-            .menu_panel(cx, theme)
+            .menu_panel(theme)
             .child(edit_yaml)
             .child(duplicate)
             .child(reset)
             .child(div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
             .child(delete);
-        deferred(placed(&self.menu_anchor, panel).gap(MENU_GAP).align_right()).with_priority(1)
+        self.place_menu(panel, cx)
     }
 
     /// An unreadable agent's ⋮ menu: Edit YAML only (the rest need the
@@ -673,8 +678,8 @@ impl AgentsPage {
                 this.edit_yaml(&name, dir.clone(), window, cx);
             }),
         );
-        let panel = self.menu_panel(cx, theme).child(edit_yaml);
-        deferred(placed(&self.menu_anchor, panel).gap(MENU_GAP).align_right()).with_priority(1)
+        let panel = self.menu_panel(theme).child(edit_yaml);
+        self.place_menu(panel, cx)
     }
 
     /// Reset or Delete waiting under its row: what it does, Cancel and the

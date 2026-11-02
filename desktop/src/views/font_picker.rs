@@ -328,7 +328,6 @@ impl Render for FontPicker {
         // is short of room below), its width, drawn after everything
         // (`deferred`) so nothing below it moves. Capped, the list under the
         // search box scrolls.
-        let field_bounds = self.field.clone();
         let list = self.open.then(|| {
             deferred(
                 placed(
@@ -360,13 +359,6 @@ impl Render for FontPicker {
                         this.close(window, cx);
                         cx.stop_propagation();
                     }))
-                    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                        // A press on the picker toggles it closed through its click.
-                        if field_bounds.get().is_some_and(|b| b.contains(&event.position)) {
-                            return;
-                        }
-                        this.close(window, cx);
-                    }))
                     .child(
                         div()
                             .flex()
@@ -387,7 +379,9 @@ impl Render for FontPicker {
                     )
                     .child(self.render_list(&theme, cx)),
                 )
-                .gap(6.0),
+                .gap(6.0)
+                // A press outside the list, the picker included, closes it.
+                .on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| this.close(window, cx))),
             )
             .with_priority(1)
         });

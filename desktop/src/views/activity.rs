@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Bounds, ClickEvent, Context, EventEmitter, FocusHandle,
-    HighlightStyle, Hsla, KeyDownEvent, Pixels, SharedString, StyledText, Task, Window,
+    div, prelude::*, px, AnyElement, Bounds, ClickEvent, Context, EventEmitter, FocusHandle,
+    HighlightStyle, Hsla, KeyDownEvent, MouseDownEvent, Pixels, SharedString, StyledText, Task, Window,
 };
 use shelbi_app::activity::{ActivityKind, FeedItem, RowTarget};
 use shelbi_app::theme::Tone;
@@ -604,37 +604,27 @@ impl ActivityView {
                     }))
             })
             .collect();
-        // A menu dims nothing.
-        let dim: Hsla = gpui::transparent_black();
-        Some(
-            div()
-                .id("picker-backdrop")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(dim)
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.state.picker = None;
-                    cx.notify();
-                }))
-                .child(style::below(
-                    anchor,
-                    gpui::point(px(16.0), px(84.0)),
-                    style::menu_entrance(
-                        "picker-menu",
-                        super::issues::panel(theme)
-                        .id("picker-panel")
-                        .debug_selector(|| "picker-panel".into())
-                        .w(px(260.0))
-                        .max_h(px(360.0))
-                        .overflow_y_scroll()
-                        .on_click(|_, _, cx: &mut App| cx.stop_propagation())
-                        .child(super::issues::panel_title(theme, title))
-                        .children(items),
-                    ),
-                )),
-        )
+        Some(style::below(
+            anchor,
+            gpui::point(px(16.0), px(84.0)),
+            style::menu_entrance(
+                "picker-menu",
+                super::issues::panel(theme)
+                    .id("picker-panel")
+                    .debug_selector(|| "picker-panel".into())
+                    .w(px(260.0))
+                    .max_h(px(360.0))
+                    .overflow_y_scroll()
+                    .occlude()
+                    .child(super::issues::panel_title(theme, title))
+                    .children(items),
+            ),
+            // A menu dims nothing; a press outside it closes it.
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.state.picker = None;
+                cx.notify();
+            }),
+        ))
     }
 }
 

@@ -708,14 +708,17 @@ impl WorkspaceDialog {
                     .occlude(),
                 theme,
             )
-            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if let Body::Form(f) = &mut this.body {
-                    f.close_menu();
-                }
-                cx.notify();
-            }))
             .children(items);
-            deferred(placed(&self.machine_anchor, list).match_width()).with_priority(2)
+            // A press outside the list, the picker included, closes it.
+            let list = placed(&self.machine_anchor, list)
+                .match_width()
+                .on_dismiss(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if let Body::Form(f) = &mut this.body {
+                        f.close_menu();
+                    }
+                    cx.notify();
+                }));
+            deferred(list).with_priority(2)
         });
         div().relative().w_full().child(button).children(menu)
     }

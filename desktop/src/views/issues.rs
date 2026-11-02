@@ -2098,8 +2098,9 @@ impl IssuesView {
         };
         Some(
             // A dropdown dims nothing (a menu, not a dialog). It opens 6px
-            // under the control that opened it.
-            backdrop(theme, cx).bg(gpui::transparent_black()).child(style::below(
+            // under the control that opened it, and a press outside it (its
+            // chip included) closes it and does nothing else.
+            style::below(
                 anchor,
                 gpui::point(px(16.0), px(48.0)),
                 style::menu_entrance(
@@ -2111,10 +2112,18 @@ impl IssuesView {
                         .max_w(px(360.0))
                         .overflow_y_scroll()
                         .track_scroll(self.dropdown_scroll.handle())
+                        .occlude()
                         .child(panel_title(theme, title))
                         .children(items),
                 ),
-            )),
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if matches!(this.state.mode, Mode::WorkflowDropdown { .. } | Mode::WorkspaceDropdown { .. }) {
+                        this.state.close_overlay();
+                        this.needs_focus = true;
+                        cx.notify();
+                    }
+                }),
+            ),
         )
     }
 
@@ -2624,6 +2633,42 @@ mod tests {
         assert_eq!(panel.left(), chip.left(), "the menu lines up with its chip");
     }
 
+    #[gpui::test]
+    fn a_filter_menu_closes_on_a_second_click_or_a_click_outside(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, wide_board(), Some(gpui::size(px(1160.0), px(1024.0))));
+        let mode = |cx: &gpui::VisualTestContext| view.read_with(cx, |v, _| v.state.mode.clone());
+        for chip in ["workflow-chip", "workspace-chip"] {
+            let open = |m: &Mode| matches!(m, Mode::WorkflowDropdown { .. } | Mode::WorkspaceDropdown { .. });
+            click(&mut cx, chip);
+            assert!(open(&mode(&cx)) && drawn(&mut cx, "dropdown-panel"), "{chip} opens its menu");
+            // Its chip again toggles it closed (not closed and reopened).
+            click(&mut cx, chip);
+            assert_eq!(mode(&cx), Mode::Board, "{chip} closes its menu");
+            assert!(!drawn(&mut cx, "dropdown-panel"));
+            // A click outside closes it and does nothing else: the card
+            // under it doesn't open.
+            click(&mut cx, chip);
+            assert!(open(&mode(&cx)));
+            let (panel, card) = (bounds(&mut cx, "dropdown-panel"), bounds(&mut cx, "card-T3"));
+            assert!(!panel.intersects(&card), "card-T3 {card:?} is clear of the menu {panel:?}");
+            click(&mut cx, "card-T3");
+            assert_eq!(mode(&cx), Mode::Board, "a click on the board closes {chip}'s menu");
+            assert_eq!(pane_id(&view, &cx), None, "and doesn't open the card");
+            assert!(!drawn(&mut cx, "dropdown-panel"));
+            // The other chip: closed first, so the click doesn't open it.
+            click(&mut cx, chip);
+            let other = if chip == "workflow-chip" { "workspace-chip" } else { "workflow-chip" };
+            click(&mut cx, other);
+            assert_eq!(mode(&cx), Mode::Board, "a click on {other} only closes {chip}'s menu");
+            // Closed, the board takes clicks again.
+            click(&mut cx, "card-T3");
+            assert_eq!(pane_id(&view, &cx).as_deref(), Some("T3"));
+            cx.simulate_keystrokes("escape");
+            assert_eq!(pane_id(&view, &cx), None);
+        }
+    }
+
 
     // ---- the task pane (`dt-floating-task-pane`) ---------------------------
 
@@ -2915,6 +2960,11 @@ mod tests {
         assert!(!drawn(&mut cx, "pane-menu"));
         click(&mut cx, "pane-more");
         assert!(drawn(&mut cx, "pane-menu"));
+        // ⋮ again closes it; once more opens it.
+        click(&mut cx, "pane-more");
+        assert!(!drawn(&mut cx, "pane-menu"), "a second click on ⋮ closes More");
+        click(&mut cx, "pane-more");
+        assert!(drawn(&mut cx, "pane-menu"));
         for row in ["pane-menu-move-left", "pane-menu-move-right", "pane-menu-start", "pane-menu-assign", "pane-menu-edit", "pane-menu-editor"] {
             assert!(drawn(&mut cx, row), "More lists {row}");
         }
@@ -2962,6 +3012,17 @@ mod tests {
         cx.simulate_click(gpui::point(pane.left() + px(40.0), pane.bottom() - px(40.0)), gpui::Modifiers::none());
         assert!(!drawn(&mut cx, "property-picker"));
         assert!(drawn(&mut cx, "task-pane"));
+        // A second click on its value closes it.
+        click(&mut cx, "pane-status");
+        assert!(drawn(&mut cx, "property-picker"));
+        click(&mut cx, "pane-status");
+        assert!(!drawn(&mut cx, "property-picker"));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Detail { id: "A".into(), editing: false });
+        // A press on another card closes it and doesn't switch the pane.
+        click(&mut cx, "pane-status");
+        click(&mut cx, "card-B");
+        assert!(!drawn(&mut cx, "property-picker"));
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"), "the click went no further");
         // A choice is the registry's command; the picker closes on the pane.
         click(&mut cx, "pane-status");
         click(&mut cx, "picker-status-2");

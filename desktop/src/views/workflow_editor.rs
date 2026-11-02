@@ -1180,7 +1180,8 @@ pub(super) fn menu_rule(theme: &Theme) -> Div {
 /// it, capped and scrolling, where the window's short of room: [`placed`]):
 /// the menu hangs left from the button's right edge when `right` (a button
 /// at the window's right). `toggle` runs on the button's click, `close` on a press
-/// outside the menu (one on its button toggles it closed instead).
+/// outside the menu, its button included (so a second click closes it); that
+/// press goes no further ([`Placed::on_dismiss`](crate::elements::placed::Placed::on_dismiss)).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dropdown<V: 'static>(
     open: bool,
@@ -1202,19 +1203,14 @@ pub(super) fn dropdown<V: 'static>(
         }));
     let theme = *cx.global::<Theme>();
     let panel = open.then(|| {
-        let menu_anchor = anchor.clone();
         let items = items(cx);
-        let menu = popup(id, width, &theme)
-            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                // A press on its button toggles it closed through its click.
-                if menu_anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                    return;
-                }
+        let menu = popup(id, width, &theme).children(items);
+        let menu = placed(anchor, menu)
+            .gap(MENU_GAP)
+            .on_dismiss(cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 close(this, cx);
                 cx.notify();
-            }))
-            .children(items);
-        let menu = placed(anchor, menu).gap(MENU_GAP);
+            }));
         deferred(if right { menu.align_right() } else { menu }).with_priority(1)
     });
     div().relative().flex().flex_none().child(button).children(panel)

@@ -690,21 +690,19 @@ impl WorkspacesPage {
             true,
             cx,
         );
-        let anchor = self.menu_anchor.clone();
-        let panel = popup("workspace-menu", theme).on_mouse_down_out(cx.listener(
-            move |this, event: &gpui::MouseDownEvent, _, cx| {
-                if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                    return;
-                }
-                this.menu = None;
-                cx.notify();
-            },
-        ));
-        let panel = panel
+        let panel = popup("workspace-menu", theme)
             .child(edit)
             .child(div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
             .child(remove);
-        deferred(placed(&self.menu_anchor, panel).gap(MENU_GAP).align_right()).with_priority(1)
+        // A press outside the menu, its ⋮ button included, closes it.
+        let menu = placed(&self.menu_anchor, panel)
+            .gap(MENU_GAP)
+            .align_right()
+            .on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }));
+        deferred(menu).with_priority(1)
     }
 
     fn render_machines(&self, index: &PoolIndex, theme: &Theme, cx: &mut Context<Self>) -> Div {
