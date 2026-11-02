@@ -144,15 +144,12 @@ impl WorkspacePanel {
 
     /// The keyboard-navigable rows, top to bottom: Back, `More` (only with a
     /// body, in reading order with the task-info block it belongs to), the
-    /// folder, then the view switch.
+    /// folder, then the view switch. The same for a remote workspace (its
+    /// sessions run there); the TUI has no user-shell row.
     fn rows(&self) -> Vec<PanelRow> {
-        panel_rows(&WsPanelShape {
-            has_body: !self.description.trim().is_empty(),
-            folder: true,
-            switches: vec![SwitchItem::Agent, SwitchItem::Diff, SwitchItem::Editor],
-            shell: false,
-            apps: self.apps,
-        })
+        panel_rows(
+            &WsPanelShape::for_workspace(true, !self.description.trim().is_empty(), false).with_apps(self.apps),
+        )
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].

@@ -149,6 +149,7 @@ impl WorkspaceOps for Ops {
     fn details(&self, _project: &str, _workspace: &str) -> Result<WorkspaceDetailsInfo, String> {
         std::thread::sleep(self.latency);
         Ok(WorkspaceDetailsInfo {
+            remote_address: None,
             task: Some(("search-index".into(), "Index the search corpus incrementally".into())),
             body: BODY.into(),
             branch: Some("jlong/search-index".into()),

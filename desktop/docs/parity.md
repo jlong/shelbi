@@ -300,9 +300,11 @@ paths on every `cargo test`.
   - **A Shell row** opens the user shell beside the agent (the TUI has no
     user shell), and the active Diff or Editor row has a × that ends those
     sessions without leaving.
-  - **A remote workspace** keeps the agent and Shell rows and shows its
-    worktree path without Open, its machine in the path's tooltip; the TUI
-    opens remote workspaces with the same panel as local ones.
+  - **A remote workspace** has the same rows as a local one (its sessions
+    run on its machine, over the relay); the worktree row's Copy puts its
+    `host:path` on the clipboard in place of Open, its machine in the path's
+    tooltip. The TUI opens remote workspaces with the same panel, its
+    folder row copying the same address.
   - **Back returns to the view the workspace was opened over**, as the TUI's
     does; going from a workspace to a review (or back) pops one panel to the
     sidebar and pushes the other.
@@ -412,7 +414,7 @@ equivalent datum.
 | `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); the review panel's Web Browser row, inert with "loading…" until serving, the sub-state and detail in its tooltip (`views/review.rs` `render_waiting_browser`) |
 
 ### `WorkspaceDetailsInfo`
-The TUI never constructs this struct; its workspace panel reads the same facts from `workspace_session::workspace_open_info` into its own `WorkspacePanel` (`shell/mod.rs` `build_workspace_interface`). The TUI column describes that equivalent display.
+The TUI never constructs this struct; its workspace panel reads the same facts from `workspace_session::workspace_details` into its own `WorkspacePanel` (`shell/mod.rs` `build_workspace_interface`). The TUI column describes that equivalent display.
 
 | Field | TUI | Desktop |
 |---|---|---|
@@ -420,6 +422,7 @@ The TUI never constructs this struct; its workspace panel reads the same facts f
 | `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, only when non-empty, More opening the task pane over the screen (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`; the window draws the board's pane, `app.rs` `open_task_over`) |
 | `branch` | struct not used; the task's branch only in the More popover meta (`kanban.rs` `render_task_popover_into`); no worktree-branch fallback | the idle page's place line when there is no worktree (`views/workspace.rs` `render_toolbar` via `WorkspaceHeader::location_line`); not in the panel |
 | `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line |
+| `remote_address` | struct not used; a remote workspace's folder row copies the same `host:path` (`shell/mod.rs` `apply_workspace_action`, `WorkspaceAction::RevealFolder`) | the worktree row's Copy button and what it copies, in place of Open (`views/workspace.rs` `render_panel`, `reveal_folder`; `task_panel::copy_button`) |
 | `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
 | `apps` | struct not used; the panel's `AppTools` (`shell/workspace.rs`): Edit / View Diff launch the app, the main area keeps its view | the panel's `WsPanelShape::with_apps` (`views/workspace.rs`): Edit / View Diff launch the app, the view stays |
 

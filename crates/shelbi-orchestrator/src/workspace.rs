@@ -148,12 +148,23 @@ pub fn resolve_idle_workspace(project: &str, workspace: &str) -> Option<IdleWork
     })
 }
 
+/// How long [`worktree_current_branch`] waits on its `git rev-parse`.
+const BRANCH_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The worktree's current branch via `git rev-parse --abbrev-ref HEAD`, or
 /// `None` when the worktree is missing, isn't a git repo, or is on a detached
 /// HEAD (no branch to name). Best-effort: any failure reads as "unknown".
 pub(crate) fn worktree_current_branch(host: &Host, worktree: &Path) -> Option<String> {
     let dir = worktree.to_string_lossy();
-    let out = crate::git::run_in_dir(host, &dir, &["git", "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    // A display read: a remote machine that doesn't answer promptly leaves
+    // the branch unknown rather than holding the caller for the git default.
+    let out = crate::git::run_in_dir_with_deadline(
+        host,
+        &dir,
+        &["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        BRANCH_READ_DEADLINE,
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }

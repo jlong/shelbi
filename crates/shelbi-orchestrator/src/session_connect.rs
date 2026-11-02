@@ -14,28 +14,56 @@
 //!
 //! It lives here, not in `shelbi-app`, because resolving the machine and the
 //! relay are the orchestrator's.
+//!
+//! A remote workspace's **agent** is not registered under the client's
+//! discovery name (`<project>/ws/<ws>`): dispatch spawns it at
+//! [`crate::workspace::workspace_target`] (`shelbi-w-<ws>`, slot `agent`),
+//! which the session backend names `w-<ws>/ws/agent`. The remote lookup uses
+//! that name ([`remote_session_name`]) so it finds the live agent. A remote
+//! workspace's user shell is spawned under its discovery name
+//! (`<project>/ws/<ws>/shell`), so content targets keep it.
 
 use shelbi_app::session::{self as app_session, ConnectFailure, Connected, GridSize, IdleInfo, SessionRef};
-use shelbi_core::Host;
+use shelbi_core::{Host, Project, WorkspaceSpec};
 
 use crate::remote_session::{self, RemoteAttachError};
 
 /// Attach to `target` in `project` with a full replay, locally or through the
 /// workspace machine's relay. Blocking: run it off the UI thread.
 pub fn connect(project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
-    if let Some(host) = target.workspace().and_then(|ws| remote_host(project, ws)) {
-        return connect_remote(project, target, &host);
+    if let Some((host, want)) = remote_lookup(project, target) {
+        return connect_remote(project, target, &host, &want);
     }
     app_session::connect(project, target, local_idle_info)
 }
 
-/// The SSH host a workspace lives on, or `None` for a local (or unknown)
+/// For a target on a remote workspace: the SSH host it lives on and the name
+/// its session registers under there. `None` for a local (or unknown)
 /// workspace, which takes the local path.
-fn remote_host(project: &str, workspace: &str) -> Option<Host> {
+fn remote_lookup(project: &str, target: &SessionRef) -> Option<(Host, String)> {
     let p = shelbi_state::load_project(project).ok()?;
-    let spec = p.workspace(workspace)?;
+    let spec = p.workspace(target.workspace()?)?;
     let host = p.machine(&spec.machine)?.host();
-    host.is_ssh().then_some(host)
+    if !host.is_ssh() {
+        return None;
+    }
+    let name = remote_session_name(&p, spec, target)?;
+    Some((host, name))
+}
+
+/// The name `target`, on the remote workspace `spec`, is registered under on
+/// its machine. The agent is the name dispatch spawns it at
+/// ([`crate::workspace::workspace_target`], named by the session backend:
+/// `w-<ws>/ws/agent`); a content session (the user shell) is spawned under
+/// its discovery name. `None` when the workspace's machine is unknown.
+pub fn remote_session_name(project: &Project, spec: &WorkspaceSpec, target: &SessionRef) -> Option<String> {
+    match target {
+        SessionRef::Workspace(_) => {
+            let addr = crate::workspace::workspace_target(project, spec).ok()?;
+            Some(crate::session_process_backend::session_name(&addr))
+        }
+        _ => Some(app_session::discovery_name(&project.name, target)),
+    }
 }
 
 /// The idle placeholder's identity for a local workspace with no session.
@@ -50,9 +78,8 @@ fn local_idle_info(project: &str, name: &str) -> IdleInfo {
     }
 }
 
-fn connect_remote(project: &str, target: &SessionRef, host: &Host) -> Result<Connected, ConnectFailure> {
-    let want = app_session::discovery_name(project, target);
-    classify_remote(target, &want, remote_session::attach(host, &want), |name| {
+fn connect_remote(project: &str, target: &SessionRef, host: &Host, want: &str) -> Result<Connected, ConnectFailure> {
+    classify_remote(target, want, remote_session::attach(host, want), |name| {
         remote_idle_info(project, name)
     })
 }
@@ -104,6 +131,42 @@ fn remote_idle_info(project: &str, name: &str) -> IdleInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project() -> Project {
+        let mut p: Project = serde_yaml::from_str(
+            "name: demo\nrepo: /tmp/demo\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp/demo\n\
+             \x20 - name: devbox\n    kind: ssh\n    host: devbox\n    work_dir: /tmp/demo\n\
+             workspaces:\n  - { name: alpha, machine: hub, runner: claude }\n  - { name: delta, machine: devbox, runner: claude }\n",
+        )
+        .unwrap();
+        // The loader fills the name in from the file (`#[serde(skip)]`).
+        p.name = "demo".into();
+        p
+    }
+
+    /// The remote agent is looked up under the name dispatch spawns it at,
+    /// not the local discovery name (which never matched a remote agent).
+    #[test]
+    fn a_remote_agent_is_looked_up_under_its_dispatch_name() {
+        let p = project();
+        let delta = p.workspace("delta").unwrap();
+        let spawned = crate::session_process_backend::session_name(
+            &crate::workspace::workspace_target(&p, delta).unwrap(),
+        );
+        assert_eq!(spawned, "w-delta/ws/agent");
+        assert_eq!(
+            remote_session_name(&p, delta, &SessionRef::Workspace("delta".into())).as_deref(),
+            Some("w-delta/ws/agent")
+        );
+        // The user shell is spawned under its discovery name, so it keeps it.
+        assert_eq!(
+            remote_session_name(&p, delta, &SessionRef::workspace_shell("delta")).as_deref(),
+            Some("demo/ws/delta/shell")
+        );
+    }
 
     fn classify(target: &SessionRef, outcome: RemoteAttachError) -> ConnectFailure {
         let idle = |name: &str| IdleInfo {

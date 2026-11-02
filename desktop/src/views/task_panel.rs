@@ -220,6 +220,12 @@ pub fn open_button(id: &'static str, theme: &Theme) -> Stateful<Div> {
     style::xsmall_button(id, "Open", theme).tooltip(style::tooltip("Show the worktree in Finder"))
 }
 
+/// The worktree row's button for a worktree on another machine, which
+/// Finder can't show: it copies the worktree's `host:path` (`address`).
+pub fn copy_button(id: &'static str, address: &str, theme: &Theme) -> Stateful<Div> {
+    style::xsmall_button(id, "Copy", theme).tooltip(style::tooltip(format!("Copy {address}")))
+}
+
 /// The views' block: 12pt in, 24pt above and below, the rows 4pt apart.
 /// Relative, for the sliding chip.
 pub fn views_block() -> Div {

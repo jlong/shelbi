@@ -120,6 +120,7 @@ impl WorkspaceOps for Ops {
             }
         } else {
             WorkspaceDetailsInfo {
+                remote_address: None,
                 task: Some(("cold-start".into(), "Warm the application cache at startup".into())),
                 body: "## Summary\n\nWarm the application cache during startup so the first \
                        request is fast.\n\n## Acceptance criteria\n\n- [x] Cache warms on boot\n\

@@ -110,18 +110,20 @@ pub struct WsPanelShape {
 
 impl WsPanelShape {
     /// A workspace's panel: with a task, `More` (when it has a body), the
-    /// view switch (the agent, plus View Diff and Edit in <editor> when
-    /// local) and, when `shell`, the shell toggle; idle, only the back button
-    /// and the folder. The folder only when local.
-    pub fn for_workspace(has_task: bool, has_body: bool, local: bool, shell: bool) -> Self {
-        let switches = match (has_task, local) {
-            (false, _) => Vec::new(),
-            (true, true) => vec![WsSwitch::Agent, WsSwitch::Diff, WsSwitch::Editor],
-            (true, false) => vec![WsSwitch::Agent],
+    /// view switch (the agent, View Diff and Edit in <editor>) and, when
+    /// `shell`, the shell toggle; idle, only the back button and the folder.
+    /// The same on any machine: a remote workspace's sessions run there and
+    /// attach through its relay, and its folder row copies the remote
+    /// address (there's no local folder to reveal).
+    pub fn for_workspace(has_task: bool, has_body: bool, shell: bool) -> Self {
+        let switches = if has_task {
+            vec![WsSwitch::Agent, WsSwitch::Diff, WsSwitch::Editor]
+        } else {
+            Vec::new()
         };
         WsPanelShape {
             has_body: has_task && has_body,
-            folder: local,
+            folder: true,
             switches,
             shell: has_task && shell,
             apps: AppTools::default(),
@@ -317,8 +319,8 @@ mod tests {
     }
 
     #[test]
-    fn a_local_workspace_with_a_task_has_every_row() {
-        let shape = WsPanelShape::for_workspace(true, true, true, true);
+    fn a_workspace_with_a_task_has_every_row() {
+        let shape = WsPanelShape::for_workspace(true, true, true);
         assert_eq!(
             panel_rows(&shape),
             [
@@ -337,17 +339,8 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_workspace_has_no_folder_diff_or_editor() {
-        let shape = WsPanelShape::for_workspace(true, false, false, true);
-        assert_eq!(
-            panel_rows(&shape),
-            [WsRow::Back, WsRow::Switch(WsSwitch::Agent), WsRow::Shell]
-        );
-    }
-
-    #[test]
     fn an_idle_workspace_has_only_back_and_the_folder() {
-        let shape = WsPanelShape::for_workspace(false, true, true, true);
+        let shape = WsPanelShape::for_workspace(false, true, true);
         assert_eq!(panel_rows(&shape), [WsRow::Back, WsRow::Folder]);
         let mut panel = WorkspacePanelState::new(&shape);
         assert_eq!(panel.selected_row(), Some(WsRow::Back));
@@ -356,7 +349,7 @@ mod tests {
 
     #[test]
     fn keys_move_wrap_and_activate() {
-        let shape = WsPanelShape::for_workspace(true, true, true, true);
+        let shape = WsPanelShape::for_workspace(true, true, true);
         let mut panel = WorkspacePanelState::new(&shape);
         assert_eq!(panel.handle_key(chord(Key::Down)), WsEffect::None);
         assert_eq!(panel.handle_key(chord(Key::Enter)), WsEffect::ShowDiff);
@@ -383,7 +376,7 @@ mod tests {
 
     #[test]
     fn a_click_selects_and_activates_its_row() {
-        let shape = WsPanelShape::for_workspace(true, true, true, true);
+        let shape = WsPanelShape::for_workspace(true, true, true);
         let mut panel = WorkspacePanelState::new(&shape);
         assert_eq!(panel.click(WsRow::Switch(WsSwitch::Editor)), WsEffect::ShowEditor);
         assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Editor)));
@@ -391,30 +384,30 @@ mod tests {
         assert_eq!(panel.click(WsRow::Folder), WsEffect::RevealFolder);
         assert_eq!(panel.click(WsRow::More), WsEffect::ShowDescription);
         // A row the panel doesn't have.
-        let mut idle = WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true, true));
+        let mut idle = WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true));
         assert_eq!(idle.click(WsRow::Shell), WsEffect::None);
     }
 
     #[test]
     fn a_new_shape_keeps_the_selection_on_its_row() {
-        let mut panel = WorkspacePanelState::new(&WsPanelShape::for_workspace(true, false, true, true));
+        let mut panel = WorkspacePanelState::new(&WsPanelShape::for_workspace(true, false, true));
         assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Agent)));
         // The body resolved: More appears above, the selection follows the agent.
-        panel.sync(&WsPanelShape::for_workspace(true, true, true, true));
+        panel.sync(&WsPanelShape::for_workspace(true, true, true));
         assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Agent)));
         // The task ended: the agent row is gone, the selection clamps.
-        panel.sync(&WsPanelShape::for_workspace(false, false, true, true));
+        panel.sync(&WsPanelShape::for_workspace(false, false, true));
         assert_eq!(panel.rows(), [WsRow::Back, WsRow::Folder]);
         assert_eq!(panel.selected_row(), Some(WsRow::Folder));
         // A new task: the agent takes the selection again.
-        panel.sync(&WsPanelShape::for_workspace(true, false, true, true));
+        panel.sync(&WsPanelShape::for_workspace(true, false, true));
         assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Agent)));
     }
 
     #[test]
     fn an_app_editor_or_diff_launches_and_keeps_the_view() {
         let apps = AppTools { editor: true, diff: false };
-        let shape = WsPanelShape::for_workspace(true, true, true, false).with_apps(apps);
+        let shape = WsPanelShape::for_workspace(true, true, false).with_apps(apps);
         let mut panel = WorkspacePanelState::new(&shape);
         assert_eq!(panel.click(WsRow::Switch(WsSwitch::Editor)), WsEffect::OpenApp(ReviewRole::Editor));
         assert_eq!(panel.active(), WsSwitch::Agent, "the agent stays shown");

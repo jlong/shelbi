@@ -34,11 +34,34 @@ use shelbi_client::{serve_relay, RelayChannel};
 use shelbi_core::{Error, Host, Result};
 use shelbi_orchestrator::remote_session::{self, RelayHandle, RemoteSsh};
 use shelbi_orchestrator::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+use shelbi_orchestrator::workspace::workspace_target;
 use shelbi_session::SpawnSpec;
 
 /// These tests mutate process-global env + the remote-session seam, so they
 /// serialize against each other through this lock.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write project `demo` with one workspace, `alice`, on the SSH machine `box`,
+/// under `home`, and return the target dispatch spawns its agent at
+/// ([`workspace_target`]: `shelbi-w-alice`, slot `agent`, which the backend
+/// names `w-alice/ws/agent`). Spawning there, not at a hand-built local-style
+/// slot, keeps the tests on the name a real remote agent registers under.
+/// `SHELBI_HOME` must already point at `home`.
+fn demo_remote_workspace(home: &Path) -> SessionTarget {
+    std::fs::create_dir_all(home.join("projects/demo/tasks")).unwrap();
+    std::fs::write(
+        home.join("projects/demo.yaml"),
+        "name: demo\nrepo: /tmp/demo\ndefault_branch: main\n\
+         orchestrator:\n  runner: claude\n\
+         agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+         machines:\n  - name: box\n    kind: ssh\n    host: box\n    work_dir: /tmp/demo\n\
+         workspaces:\n  - { name: alice, machine: box, runner: claude }\n",
+    )
+    .unwrap();
+    let project = shelbi_state::load_project("demo").expect("load the demo project");
+    let spec = project.workspace("alice").expect("workspace alice");
+    workspace_target(&project, spec).expect("the remote workspace's target")
+}
 
 fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = Instant::now() + timeout;
@@ -102,13 +125,14 @@ fn remote_dispatch_to_handoff_reconnect_and_unreachable() {
     std::env::set_var("SHELBI_HOME", home.path());
     remote_session::set_test_seam(Some(Arc::new(LocalRelaySeam)));
 
-    // The remote workspace, addressed as the orchestrator addresses one: a
-    // standalone session for the slot. The backend derives the logical name
-    // `demo/ws/alice` from this, which the relay then discovers by.
+    // The remote workspace, addressed as dispatch addresses one
+    // (`workspace_target`): a standalone session for the workspace, slot
+    // `agent`. The backend derives the logical name `w-alice/ws/agent` from
+    // this, which the relay then discovers by.
     let host = Host::Ssh {
         host: "box".into(),
     };
-    let target = SessionTarget::slot("shelbi-demo", "alice");
+    let target = demo_remote_workspace(home.path());
 
     struct Guard<'a> {
         host: &'a Host,
@@ -291,16 +315,6 @@ fn a_client_attach_through_the_relay_recovers_after_an_ssh_drop() {
 
     let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("projects/demo/tasks")).unwrap();
-    std::fs::write(
-        home.path().join("projects/demo.yaml"),
-        "name: demo\nrepo: /tmp/demo\ndefault_branch: main\n\
-         orchestrator:\n  runner: claude\n\
-         agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
-         machines:\n  - name: box\n    kind: ssh\n    host: box\n    work_dir: /tmp/demo\n\
-         workspaces:\n  - { name: alice, machine: box, runner: claude }\n",
-    )
-    .unwrap();
     std::env::set_var("SHELBI_HOME", home.path());
     let seam = Arc::new(DroppableRelaySeam::default());
     remote_session::set_test_seam(Some(seam.clone()));
@@ -308,7 +322,10 @@ fn a_client_attach_through_the_relay_recovers_after_an_ssh_drop() {
     let host = Host::Ssh {
         host: "box".into(),
     };
-    let target = SessionTarget::slot("shelbi-demo", "alice");
+    // Spawned where dispatch spawns a remote agent (`w-alice/ws/agent`), not
+    // under the client's discovery name (`demo/ws/alice`): the attach below
+    // has to find it there, as it must find a real remote agent.
+    let target = demo_remote_workspace(home.path());
     struct Guard<'a> {
         host: &'a Host,
         target: &'a SessionTarget,

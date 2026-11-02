@@ -29,28 +29,16 @@ pub use shelbi_app::session::{
     RetryPolicy, SessionRef,
 };
 
-/// The production connector: discover the session on disk, open it, and attach
-/// with a full replay ([`shelbi_app::session::connect`]), resolving an idle
-/// workspace's placeholder identity from the project config.
+/// The production connector, shared with the desktop
+/// ([`shelbi_orchestrator::session_connect::connect`]): a session on this
+/// machine is discovered on disk and attached with a full replay; a remote
+/// workspace's agent (or user shell) is reached through its machine's relay.
+/// An idle workspace resolves its placeholder identity from the project config.
 pub struct LiveConnector;
 
 impl Connector for LiveConnector {
     fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
-        shelbi_app::session::connect(project, target, idle_info)
-    }
-}
-
-/// Assemble an idle workspace's [`IdleInfo`] from the project config and (for a
-/// local machine) its worktree branch. Falls back to just the name when the
-/// config can't be read, so the placeholder always has something to show.
-fn idle_info(project: &str, name: &str) -> IdleInfo {
-    match shelbi_orchestrator::workspace::resolve_idle_workspace(project, name) {
-        Some(id) => IdleInfo {
-            name: name.to_string(),
-            machine: id.machine,
-            branch: id.branch,
-        },
-        None => IdleInfo::named(name),
+        shelbi_orchestrator::session_connect::connect(project, target)
     }
 }
 
@@ -308,8 +296,8 @@ impl SessionManager {
             // converts them to a `Message`. One arriving here would mean the
             // worker didn't retry, so treat it as a plain failure rather than
             // silently dropping it.
-            // The TUI's connector is local-only, so `Unreachable` (a remote
-            // machine's relay) never arrives; were it to, it is a failure.
+            // `Unreachable` (a remote workspace's machine can't be reached
+            // through its relay) shows as a failure with its reason.
             Err(
                 ConnectFailure::Starting(error)
                 | ConnectFailure::Awaiting(error)
