@@ -35,18 +35,19 @@
 //!   editor are the daemon's `<project>/ws/<name>/{diff,editor}` content
 //!   sessions, ensured through `WorkspaceSessionOp::Ensure` and only attached
 //!   here; Close (the × on the active one) ends them, and `q` (the TUI's
-//!   Close) ends them and goes back. Like the TUI's, they are local
-//!   workspaces only.
+//!   Close) ends them and goes back. They run on the workspace's machine,
+//!   local or remote, as in the TUI.
 //! - **The user shell.** The Shell row opens a second terminal beside the
 //!   agent, split with a draggable divider ([`super::workspace_layout`]),
 //!   attached to the workspace's user shell (`<project>/ws/<name>/shell`, a
 //!   login shell in the worktree on the workspace's machine) that the daemon
 //!   starts (`WorkspaceSessionOp::EnsureShell`). Toggling it off, leaving the
 //!   view, or exiting the shell closes it.
-//! - **Remote workspaces.** A workspace on another machine attaches through
-//!   that machine's relay (`shelbi_orchestrator::session_connect`), the panel
-//!   names the machine, and a dropped SSH connection reconnects
-//!   ([`super::session_view`]).
+//! - **Remote workspaces** have full parity: every session (agent, diff,
+//!   editor, shell) runs on that machine and attaches through its relay
+//!   (`shelbi_orchestrator::session_connect`), the panel names the machine,
+//!   and a dropped SSH connection reconnects ([`super::session_view`]). The
+//!   worktree row copies the remote `host:path` rather than revealing it.
 //! - **Back** (the back button, Esc) asks the window to return to the view
 //!   the workspace was opened over, leaving its sessions as they are.
 //! - **Restart states** are the shared session view's (the Chat view's).
@@ -62,8 +63,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, AnyWindowHandle, Bounds, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Pixels, SharedString, Subscription, Window,
+    div, prelude::*, px, AnyElement, AnyWindowHandle, Bounds, ClipboardItem, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, Pixels, SharedString, Subscription, Window,
 };
 use shelbi_app::session::{SessionRef, WorkspaceContentRelauncher};
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceHeader, WorkspaceRow};
@@ -122,6 +123,7 @@ impl WorkspaceOps for LiveOps {
             body: d.task.map(|t| t.body).unwrap_or_default(),
             branch: d.branch,
             worktree: d.worktree,
+            remote_address: d.remote_address,
             editor_name: d.editor_name,
             apps: d.apps,
         })
@@ -286,7 +288,7 @@ impl WorkspaceView {
             row: None,
             details: None,
             details_pending: false,
-            panel: WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true, true)),
+            panel: WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true)),
             focus: WsFocus::Panel,
             content,
             shell,
@@ -322,7 +324,7 @@ impl WorkspaceView {
             self.details_pending = false;
             self.status_line = None;
             self.row = None;
-            self.panel = WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true, true));
+            self.panel = WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true));
             self.focus = WsFocus::Panel;
         }
         self.panel.set_active(ContentView::Agent);
@@ -479,10 +481,6 @@ impl WorkspaceView {
         self.row.as_ref().is_some_and(|r| r.current_task.is_some())
     }
 
-    fn is_remote(&self) -> bool {
-        self.row.as_ref().is_some_and(|r| r.is_remote)
-    }
-
     fn agent_target(&self) -> SessionRef {
         SessionRef::Workspace(self.workspace.clone().unwrap_or_default())
     }
@@ -515,7 +513,7 @@ impl WorkspaceView {
     fn panel_shape(&self) -> WsPanelShape {
         let has_body = self.current_details().is_some_and(|d| !d.body.trim().is_empty());
         let apps = self.details.as_ref().map(|d| d.apps).unwrap_or_default();
-        WsPanelShape::for_workspace(self.has_task(), has_body, !self.is_remote(), true).with_apps(apps)
+        WsPanelShape::for_workspace(self.has_task(), has_body, true).with_apps(apps)
     }
 
     fn sync_panel(&mut self) {
@@ -860,6 +858,14 @@ impl WorkspaceView {
     }
 
     fn reveal_folder(&mut self, cx: &mut Context<Self>) {
+        // A remote worktree has no folder here to show: copy its
+        // `host:path` instead, for an `ssh` / `scp` / editor's remote open.
+        if let Some(address) = self.details.as_ref().and_then(|d| d.remote_address.clone()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(address.clone()));
+            self.status_line = Some(format!("Copied {address}"));
+            cx.notify();
+            return;
+        }
         let Some(path) = self.details.as_ref().map(|d| d.worktree.clone()).filter(|p| !p.is_empty())
         else {
             self.status_line = Some("no workspace worktree to reveal".into());
@@ -937,12 +943,19 @@ impl WorkspaceView {
             )
         });
 
-        // The worktree, with Open when it can be revealed (a local one); a
-        // remote one names its machine in the path's tooltip.
+        // The worktree, with Open (a local one, revealed in Finder) or Copy
+        // (a remote one's `host:path`); a remote one names its machine in the
+        // path's tooltip.
         let worktree = self.details.as_ref().map(|d| d.worktree.clone()).filter(|w| !w.is_empty());
+        let remote_address = self.details.as_ref().and_then(|d| d.remote_address.clone());
         let folder = worktree.map(|path| {
-            let local = panel.rows().contains(&WsRow::Folder);
-            let open = local.then(|| task_panel::open_button("ws-folder", theme).on_click(listen(WsRow::Folder)));
+            let open = panel.rows().contains(&WsRow::Folder).then(|| {
+                match &remote_address {
+                    Some(address) => task_panel::copy_button("ws-folder", address, theme),
+                    None => task_panel::open_button("ws-folder", theme),
+                }
+                .on_click(listen(WsRow::Folder))
+            });
             let row = task_panel::worktree_row("workspace-worktree", &path, open, selected(WsRow::Folder), 8.0, theme);
             let tip = if header.is_remote {
                 format!("{path} on {}", header.machine)
@@ -1512,6 +1525,7 @@ pub(crate) mod tests {
 
     fn details_for_t1() -> WorkspaceDetailsInfo {
         WorkspaceDetailsInfo {
+            remote_address: None,
             task: Some(("t-1".into(), "Cold-start cache".into())),
             body: "## Summary\n\nWarm the cache.".into(),
             branch: Some("jlong/t-1".into()),
@@ -2027,18 +2041,34 @@ pub(crate) mod tests {
     #[gpui::test]
     fn a_remote_workspace_names_its_machine_and_recovers_from_an_ssh_drop(cx: &mut TestAppContext) {
         let mut h = open(cx);
+        *h.ops.details.lock().unwrap() = Some(WorkspaceDetailsInfo {
+            remote_address: Some("gpu:/w/alpha".into()),
+            ..details_for_t1()
+        });
         let remote = row("alpha", Some("t-1"), WorkspaceBadge::Working, true);
         h.update(|v, cx| v.show("alpha", Some(remote), cx));
         assert_eq!(h.content_phase(), SessionPhase::Live);
         let header = h.view.read_with(&h.cx, |v, _| v.header()).unwrap();
         assert_eq!(header.location_line(), "gpu (remote) · jlong/t-1");
         h.draw();
-        assert!(h.cx.debug_bounds("ws-switch-diff").is_none(), "no diff/editor off the hub");
-        assert!(h.cx.debug_bounds("ws-switch-editor").is_none());
-        assert!(h.cx.debug_bounds("ws-folder").is_none(), "nothing to reveal off the hub");
-        assert!(h.cx.debug_bounds("workspace-worktree").is_some(), "the path is still shown");
-        assert!(h.cx.debug_bounds("ws-switch-agent").is_some());
-        assert!(h.cx.debug_bounds("ws-shell-toggle").is_some());
+        // Full parity with a hub workspace: every view, the shell, and the
+        // worktree row.
+        for id in ["ws-switch-agent", "ws-switch-diff", "ws-switch-editor", "ws-shell-toggle", "ws-folder"] {
+            assert!(h.cx.debug_bounds(id).is_some(), "{id} off the hub too");
+        }
+
+        // The diff and editor run there (ensured by the daemon on the
+        // workspace's machine) and attach like a hub workspace's.
+        h.update(|v, cx| v.select_view(ContentView::Diff, cx));
+        assert_eq!(h.ops().last(), Some(&WorkspaceSessionOp::Ensure { role: ReviewRole::Diff }));
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/alpha/diff"));
+        h.update(|v, cx| v.select_view(ContentView::Agent, cx));
+
+        // Finder can't show a remote folder: the row copies `host:path`.
+        h.click("ws-folder");
+        assert!(h.ops.revealed.lock().unwrap().is_empty(), "nothing revealed locally");
+        let clip = h.cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(clip.as_deref(), Some("gpu:/w/alpha"));
 
         // The SSH connection under the relay dies: the stream ends, the
         // machine is unreachable for a while, then answers again.
@@ -2049,7 +2079,11 @@ pub(crate) mod tests {
         h.sessions.unreachable.lock().unwrap().clear();
         h.advance(Duration::from_secs(1));
         assert_eq!(h.content_phase(), SessionPhase::Live, "recovered on its own");
-        assert_eq!(h.sessions.attached(), vec!["demo/ws/alpha"]);
+        assert_eq!(
+            h.sessions.attached().last().map(String::as_str),
+            Some("demo/ws/alpha"),
+            "the agent, reattached in place"
+        );
     }
 
     #[gpui::test]

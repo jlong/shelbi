@@ -265,10 +265,13 @@ pub struct WorkspaceDetailsInfo {
     pub task: Option<(String, String)>,
     /// The task's markdown body (the description the header's More opens).
     pub body: String,
-    /// The branch: the task's, else the local worktree's.
+    /// The branch: the task's, else the worktree's (on its machine).
     pub branch: Option<String>,
     /// The worktree path on the workspace's machine.
     pub worktree: String,
+    /// A remote worktree's `<ssh host>:<path>`, what the folder row copies
+    /// in place of revealing it (there is no local folder). `None` when local.
+    pub remote_address: Option<String>,
     /// The resolved editor's display name (`Vim`, ...).
     pub editor_name: String,
     /// Which of Edit and View Diff open an app instead of a pane.

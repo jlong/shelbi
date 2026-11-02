@@ -174,6 +174,9 @@ type ToolsReader = Arc<dyn Fn(bool) -> shelbi_state::tools::DetectedTools + Send
 struct PanelTools {
     editor_name: String,
     apps: shelbi_state::AppTools,
+    /// The editor an Edit *pane* runs (`editor:` when a command, else
+    /// `$EDITOR` / vim): a remote workspace's Edit, which can't open an app.
+    pane_editor_name: String,
 }
 
 /// [`PanelTools`] for `project` under `cfg` (blocking: reads the project, for
@@ -861,6 +864,9 @@ enum MainView {
 /// the UI thread (the workspace-sidebar task).
 struct WorkspaceOpenParams {
     workspace: String,
+    /// A remote worktree's `host:path` (`None` when local): its folder row
+    /// copies this rather than revealing a local folder.
+    remote_address: Option<String>,
     worktree: String,
     editor_name: String,
     /// Which of Edit and View Diff open an app.
@@ -1525,9 +1531,13 @@ impl ShellState {
             let diff_command = !cfg!(test)
                 && shelbi_state::load_project(project).is_ok_and(|p| p.review_diff_command().is_some());
             let env = std::env::var("EDITOR").ok();
+            let pane_editor = cfg.editor.clone().filter(|c| !c.is_app());
             PanelTools {
                 editor_name: shelbi_state::resolve_editor_choice_from(cfg.editor.as_ref(), env.as_deref()).0.display_name(),
                 apps: shelbi_orchestrator::tools::app_tools_for(cfg, diff_command),
+                pane_editor_name: shelbi_state::resolve_editor_choice_from(pane_editor.as_ref(), env.as_deref())
+                    .0
+                    .display_name(),
             }
         });
         // The Agents page reads (and its saves write) a project's files; a
@@ -3393,7 +3403,13 @@ impl ShellState {
             r.set_tools(tools.editor_name.clone(), tools.apps);
         }
         if let Some(w) = self.workspace.as_mut() {
-            w.set_tools(tools.editor_name, tools.apps);
+            // A remote workspace's Edit and View Diff are always panes on its
+            // machine (an app opens local worktrees only).
+            if w.remote_address().is_some() {
+                w.set_tools(tools.pane_editor_name, shelbi_state::AppTools::default());
+            } else {
+                w.set_tools(tools.editor_name, tools.apps);
+            }
         }
     }
 
@@ -4509,11 +4525,14 @@ impl ShellState {
         std::thread::Builder::new()
             .name("shelbi-workspace-open".into())
             .spawn(move || {
-                let res = shelbi_orchestrator::workspace_session::workspace_open_info(
+                // Any machine: a remote workspace's agent, diff and editor run
+                // there and attach through its relay.
+                let res = shelbi_orchestrator::workspace_session::workspace_details(
                     &project, &name,
                 )
                 .map(|info| WorkspaceOpenParams {
                     workspace: name.clone(),
+                    remote_address: info.remote_address,
                     worktree: info.worktree,
                     editor_name: info.editor_name,
                     apps: info.apps,
@@ -4599,7 +4618,8 @@ impl ShellState {
             status,
             task,
         )
-        .with_apps(p.apps));
+        .with_apps(p.apps)
+        .with_remote_address(p.remote_address));
         self.reported_main = None;
         self.status = None;
         self.dirty = true;
@@ -4648,6 +4668,14 @@ impl ShellState {
                 });
             }
             WorkspaceAction::RevealFolder => {
+                // A remote worktree has no local folder: copy its `host:path`.
+                if let Some(address) = ws.remote_address().map(str::to_string) {
+                    copy_to_clipboard(&address);
+                    if let Some(w) = self.workspace.as_mut() {
+                        w.set_status(format!("copied {address}"));
+                    }
+                    return;
+                }
                 if let Some(w) = self.workspace.as_mut() {
                     w.set_status("opening…");
                 }
@@ -7536,6 +7564,30 @@ mod tests {
             Some("alpha"),
             "a workspace-with-task open goes through begin_workspace"
         );
+    }
+
+    #[test]
+    fn a_remote_workspace_with_a_task_opens_like_a_local_one() {
+        // Regression (remote-workspace-open): the open resolved through the
+        // local-only `workspace_open_info`, which refused a remote workspace,
+        // so the shell showed "workspace failed: … open it over SSH". A
+        // remote resolve now builds the same interface as a local one, its
+        // folder row copying the worktree's `host:path`.
+        let mut st = test_state();
+        st.workspace_opening = Some("delta".into());
+        st.on_workspace_opened(Ok(WorkspaceOpenParams {
+            workspace: "delta".into(),
+            remote_address: Some("devbox:/srv/proj/.shelbi/wt/delta".into()),
+            worktree: "/srv/proj/.shelbi/wt/delta".into(),
+            editor_name: "Vim".into(),
+            apps: Default::default(),
+            task: None,
+        }));
+        assert!(st.status.is_none(), "no error status: {:?}", st.status);
+        assert!(matches!(&st.main_view, MainView::Workspace(w) if w == "delta"));
+        let ws = st.workspace.as_ref().expect("the workspace interface is built");
+        assert_eq!(ws.workspace(), "delta");
+        assert_eq!(ws.remote_address(), Some("devbox:/srv/proj/.shelbi/wt/delta"));
     }
 
     #[test]

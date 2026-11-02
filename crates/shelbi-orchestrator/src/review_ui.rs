@@ -316,6 +316,42 @@ pub(crate) fn diff_session_command(
     Ok(diff_pane_command_for(worktree, &invocation(&base)))
 }
 
+/// The shell variable a remote diff session's merge-base lands in.
+const REMOTE_BASE_VAR: &str = "__shelbi_base";
+
+/// A placeholder [`shelbi_core::shell_escape`] leaves bare, swapped for the
+/// `"$__shelbi_base"` reference once the invocation is built.
+const REMOTE_BASE_TOKEN: &str = "__SHELBI_REMOTE_BASE__";
+
+/// [`diff_session_command`] for a worktree on **another machine**: the same
+/// precedence (`review.diff_command`, then a command `diff_tool:`, then git's
+/// configured difftool), but everything that inspects the worktree runs
+/// there, in the session's own shell, not here: the merge-base is computed
+/// by the command itself, and git's difftool is always the terminal one (a
+/// GUI tool has no display over SSH). An app `diff_tool:` takes git's path,
+/// as it does in a local pane. Pure, so it's tested without a remote.
+pub(crate) fn remote_diff_session_command(
+    project: &shelbi_core::Project,
+    worktree: &std::path::Path,
+    diff_tool: Option<&shelbi_state::ToolChoice>,
+) -> Result<String> {
+    let invocation = match project.review_diff_command() {
+        Some(template) => render_diff_command(template, worktree, REMOTE_BASE_TOKEN),
+        None => {
+            // A command `diff_tool:` needs no PATH lookup (only an app's
+            // helper does, and an app takes git's path here).
+            let launch = crate::tools::pane_diff_launch(diff_tool, &[])?;
+            crate::tools::diff_invocation(&launch, worktree, REMOTE_BASE_TOKEN, false)
+        }
+    };
+    let invocation = invocation.replace(REMOTE_BASE_TOKEN, &format!("\"${REMOTE_BASE_VAR}\""));
+    let base_branch = shelbi_core::shell_escape(project.base_branch());
+    let with_base = format!(
+        "{REMOTE_BASE_VAR}=$(git merge-base {base_branch} HEAD) && {invocation}"
+    );
+    Ok(diff_pane_command_for(worktree, &with_base))
+}
+
 // ---------------------------------------------------------------------------
 // Approve / Reject transitions
 
@@ -619,6 +655,41 @@ mod tests {
     /// `{head}` = `HEAD` range the pane computes today (AC #3), and `{worktree}`
     /// is the worktree path. Values are shell-escaped so a path/ref with spaces
     /// or metacharacters stays a single, safe argument.
+    /// A remote worktree's diff resolves its merge-base in the session's own
+    /// shell, on its machine, and diffs against that: git's terminal
+    /// difftool by default (never `-g`: no display over SSH), a command
+    /// `diff_tool:`, or the project's `review.diff_command`.
+    #[test]
+    fn a_remote_diff_resolves_its_merge_base_there() {
+        let wt = std::path::Path::new("/srv/demo/.shelbi/wt/delta");
+        let mut project = demo_project("demo");
+        let base = "__shelbi_base=$(git merge-base main HEAD) && ";
+
+        let cmd = remote_diff_session_command(&project, wt, None).unwrap();
+        assert!(cmd.starts_with("cd /srv/demo/.shelbi/wt/delta && "), "{cmd}");
+        assert!(
+            cmd.contains(&format!("{base}git difftool -d -y \"$__shelbi_base\" HEAD")),
+            "{cmd}"
+        );
+        assert!(!cmd.contains(" -g "), "{cmd}");
+
+        let app = shelbi_state::ToolChoice::App {
+            app: "/Applications/Kaleidoscope.app".into(),
+        };
+        let cmd = remote_diff_session_command(&project, wt, Some(&app)).unwrap();
+        assert!(cmd.contains("git difftool -d -y \"$__shelbi_base\" HEAD"), "an app takes git's path: {cmd}");
+
+        let difft = shelbi_state::ToolChoice::Command("difft".into());
+        let cmd = remote_diff_session_command(&project, wt, Some(&difft)).unwrap();
+        assert!(cmd.contains(base), "{cmd}");
+        assert!(cmd.contains("diff --ext-diff \"$__shelbi_base\" HEAD"), "{cmd}");
+
+        project.review.diff_command = Some("skim {base} {head}".into());
+        let cmd = remote_diff_session_command(&project, wt, Some(&difft)).unwrap();
+        assert!(cmd.contains(&format!("{base}skim \"$__shelbi_base\" HEAD")), "{cmd}");
+        assert!(!cmd.contains("__SHELBI_REMOTE_BASE__"), "{cmd}");
+    }
+
     #[test]
     fn render_diff_command_substitutes_and_shell_escapes_placeholders() {
         let out = render_diff_command(

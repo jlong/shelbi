@@ -12,6 +12,8 @@
 //! - **Diff** / **Editor** → the daemon-spawned `<project>/ws/<name>/<role>`
 //!   sessions ([`shelbi_orchestrator::workspace_session`]). The shell asks the
 //!   daemon to start these over the control socket and only attaches here.
+//!   On any machine: a remote workspace's editor and diff run there, and
+//!   they (like its agent) attach through the machine's relay.
 //!
 //! The panel's state machine is pure: a key/click yields a
 //! [`WsEffect`](crate::workspace_panel::WsEffect) which this type maps to a
@@ -75,6 +77,8 @@ pub struct WorkspaceInterface {
     /// The in-progress task on this workspace, when resolvable — the source of
     /// the panel's title / description preview and the `More` popover's data.
     task: Option<IssueFile>,
+    /// A remote worktree's `host:path` (what the folder row copies).
+    remote_address: Option<String>,
 }
 
 impl WorkspaceInterface {
@@ -107,6 +111,7 @@ impl WorkspaceInterface {
             workspace,
             focus: WsFocus::Panel,
             task,
+            remote_address: None,
         }
     }
 
@@ -115,6 +120,18 @@ impl WorkspaceInterface {
     pub fn with_apps(mut self, apps: shelbi_state::AppTools) -> Self {
         self.panel.apps = apps;
         self
+    }
+
+    /// The workspace is on a remote machine at `address` (`host:path`): its
+    /// folder row copies that, as there's no local folder to reveal.
+    pub fn with_remote_address(mut self, address: Option<String>) -> Self {
+        self.remote_address = address;
+        self
+    }
+
+    /// A remote worktree's `host:path`, `None` for a local workspace.
+    pub fn remote_address(&self) -> Option<&str> {
+        self.remote_address.as_deref()
     }
 
     /// The panel's Edit entry, as drawn.
@@ -395,7 +412,7 @@ impl WorkspaceInterface {
 /// Reveal the workspace worktree folder in the OS file manager (off the UI
 /// thread).
 pub fn reveal_folder(project: &str, workspace: &str) -> Result<(), String> {
-    let info = shelbi_orchestrator::workspace_session::workspace_open_info(project, workspace)
+    let info = shelbi_orchestrator::workspace_session::workspace_details(project, workspace)
         .map_err(|e| e.to_string())?;
     if info.worktree.is_empty() {
         return Err("no workspace worktree to reveal".into());

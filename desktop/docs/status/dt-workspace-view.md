@@ -125,10 +125,20 @@ that justifies it:
    button) sit in the header, and the window keeps its sidebar. As in the TUI,
    the panel's affordances appear only while the workspace has a task
    (`ShellState::show` opens the panel only when `workspace_has_task`).
-5. **Diff and editor are local workspaces only**, as in the TUI
-   (`workspace_session::ensure_content_session` refuses a remote workspace,
-   and the TUI's `workspace_open_info` errors). The switch and Reveal are
-   hidden for a remote workspace; More and Shell are not.
+5. **A remote workspace has full parity with a local one**, just over SSH,
+   in both clients. Agent, Diff, Editor and Shell all run on the
+   workspace's machine and attach through its relay
+   (`session_connect::connect`): the agent under the name dispatch spawned
+   it at (`w-<ws>/ws/agent`, from `workspace_target`), the content sessions
+   under `<project>/ws/<ws>/<role>`, which
+   `workspace_session::ensure_content_session` / `ensure_user_shell` spawn
+   there (the diff resolves its merge-base on that machine, under the remote
+   login shell). The panel is the same (`workspace_details`, the branch read
+   on that machine), with two differences an app or Finder forces: Edit and
+   View Diff always open panes there (an `editor:` / `diff_tool:` app opens
+   local worktrees only), and the worktree row's button is **Copy**, putting
+   the worktree's `<ssh host>:<path>` on the clipboard, since Finder can't
+   reveal a remote folder (the TUI's folder row does the same).
 6. **Back leaves the diff/editor loaded.** Leaving the view or switching back
    to the agent detaches them. Only Close ends them, as only `q` does in the
    TUI (`crates/shelbi-tui/src/shell/workspace.rs`, `WorkspaceAction::Back` vs

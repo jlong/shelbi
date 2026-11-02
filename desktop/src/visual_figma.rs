@@ -584,6 +584,7 @@ impl WorkspaceOps for Ops {
     fn details(&self, _project: &str, workspace: &str) -> Result<WorkspaceDetailsInfo, String> {
         Ok(if workspace == "alpha" {
             WorkspaceDetailsInfo {
+                remote_address: None,
                 task: Some(("desktop-app".into(), UMBRELLA_TITLE.into())),
                 body: UMBRELLA_BODY.into(),
                 branch: Some("jlong/desktop-app".into()),

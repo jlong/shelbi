@@ -17,9 +17,10 @@
 //! server to reap (a dev workspace runs no review server), so close only ends
 //! the editor/diff sessions.
 //!
-//! The editor and diff are local workspaces only: a remote workspace has no
-//! local session to spawn, so a remote workspace there is a clear `Err` the
-//! client surfaces on its status line.
+//! They work on any machine: a remote workspace's editor and diff are spawned
+//! on that machine over SSH, in its worktree, and the client reaches them
+//! through the machine's relay, as it does the remote agent
+//! ([`crate::session_connect`]).
 //!
 //! The workspace's **user shell** (`<project>/ws/<workspace>/shell`, the
 //! desktop Workspace view's split beside the agent, `dt-workspace-view`) is
@@ -41,23 +42,6 @@ use crate::session_process_backend::SessionProcessBackend;
 /// wire.
 pub fn content_session_name(project_name: &str, workspace: &str, role: ReviewContentRole) -> String {
     format!("{project_name}/ws/{workspace}/{}", role.as_str())
-}
-
-/// Everything the single-process TUI needs to build its workspace panel for a
-/// workspace, resolved from durable state in one place.
-#[derive(Debug, Clone)]
-pub struct WorkspaceOpenInfo {
-    /// Absolute workspace worktree path (shown truncated, revealed on click).
-    pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …).
-    pub editor_name: String,
-    /// Which of Edit and View Diff open an app instead of a pane.
-    pub apps: shelbi_state::AppTools,
-    /// The in-progress task on this workspace, for the panel's status / title /
-    /// description preview and the full-description popover. `None` when the
-    /// workspace has no in-progress task (the caller keeps the regular sidebar).
-    /// Boxed — [`IssueFile`](shelbi_state::IssueFile) is large and isn't `Eq`.
-    pub task: Option<Box<shelbi_state::IssueFile>>,
 }
 
 /// Find the in-progress task assigned to `workspace`, read from the **same
@@ -99,13 +83,19 @@ pub struct WorkspaceDetails {
     pub is_remote: bool,
     /// Absolute workspace worktree path (on the workspace's machine).
     pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …).
+    /// A remote worktree's `<ssh host>:<path>` address (what Reveal copies,
+    /// since there's no local folder to show). `None` for a local workspace.
+    pub remote_address: Option<String>,
+    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …): for a
+    /// remote workspace, the terminal editor its Edit pane runs there.
     pub editor_name: String,
     /// Which of Edit and View Diff open an app instead of a pane
-    /// ([`crate::tools::app_tools`]).
+    /// ([`crate::tools::app_tools`]). Neither, for a remote workspace: an
+    /// app opens local worktrees only, so both open panes on its machine.
     pub apps: shelbi_state::AppTools,
-    /// The branch the workspace is on: its in-progress task's branch, else (a
-    /// local workspace) the worktree's checked-out branch. `None` when unknown.
+    /// The branch the workspace is on: its in-progress task's branch, else
+    /// the worktree's checked-out branch (read on its machine). `None` when
+    /// unknown.
     pub branch: Option<String>,
     /// The in-progress task on this workspace, from the published board index
     /// (see [`in_progress_task_for`]).
@@ -125,21 +115,29 @@ pub fn workspace_details(project_name: &str, workspace: &str) -> Result<Workspac
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let host = machine.host();
     let worktree = crate::workspace::workspace_worktree(machine, ws);
-    let editor_name = shelbi_state::resolved_editor_name();
-    let apps = crate::tools::app_tools(&project);
+    let worktree_str = worktree.to_string_lossy().to_string();
+    let (editor_name, apps, remote_address) = match &host {
+        Host::Ssh { host } => (
+            shelbi_state::ToolChoice::Command(shelbi_state::resolve_editor()).display_name(),
+            shelbi_state::AppTools::default(),
+            Some(format!("{host}:{worktree_str}")),
+        ),
+        Host::Local => (
+            shelbi_state::resolved_editor_name(),
+            crate::tools::app_tools(&project),
+            None,
+        ),
+    };
     let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)?;
     let branch = task
         .as_ref()
         .and_then(|t| t.task.branch.clone())
-        .or_else(|| {
-            host.is_local()
-                .then(|| crate::workspace::worktree_current_branch(&host, &worktree))
-                .flatten()
-        });
+        .or_else(|| crate::workspace::worktree_current_branch(&host, &worktree));
     Ok(WorkspaceDetails {
         machine: ws.machine.clone(),
         is_remote: !host.is_local(),
-        worktree: worktree.to_string_lossy().to_string(),
+        worktree: worktree_str,
+        remote_address,
         editor_name,
         apps,
         branch,
@@ -147,29 +145,28 @@ pub fn workspace_details(project_name: &str, workspace: &str) -> Result<Workspac
     })
 }
 
-/// Resolve the workspace panel's inputs for `workspace`. Errors when the
-/// workspace is unknown or remote (no local session to open).
-pub fn workspace_open_info(project_name: &str, workspace: &str) -> Result<WorkspaceOpenInfo> {
-    let details = workspace_details(project_name, workspace)?;
-    if details.is_remote {
-        return Err(Error::Other(format!(
-            "workspace `{workspace}` is remote; open it over SSH"
-        )));
-    }
-    Ok(WorkspaceOpenInfo {
-        worktree: details.worktree,
-        editor_name: details.editor_name,
-        apps: details.apps,
-        task: details.task,
-    })
+/// Wrap a content session's `command` for a remote machine: run it under the
+/// remote user's login shell, so the editor or diff tool is found on the
+/// `PATH` it has there (a detached session starts with a bare environment).
+fn remote_content_argv(command: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "exec \"${{SHELL:-/bin/sh}}\" -lc {}",
+            shelbi_agent::shell_escape(command)
+        ),
+    ]
 }
 
-/// Ensure the `role` content session for `workspace` is spawned and live, so the
-/// TUI client can attach a terminal view to it. Idempotent: a session already
-/// live under the name is left as is. Builds the same editor / diff command the
-/// review slot's content sessions run (see
+/// Ensure the `role` content session for `workspace` is spawned and live, on
+/// the workspace's own machine, so a client can attach a terminal view to it.
+/// Idempotent: a session already live under the name is left as is. Builds
+/// the same editor / diff command the review slot's content sessions run (see
 /// [`crate::review_ui::editor_session_command`] /
-/// [`diff_session_command`](crate::review_ui)).
+/// [`diff_session_command`](crate::review_ui)); a remote workspace's diff
+/// resolves its merge-base there
+/// ([`remote_diff_session_command`](crate::review_ui)).
 pub fn ensure_content_session(
     project_name: &str,
     workspace: &str,
@@ -182,27 +179,28 @@ pub fn ensure_content_session(
     let machine = project
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
-    if machine.host() != Host::Local {
-        return Err(Error::Other(format!(
-            "workspace `{workspace}` is remote; open it over SSH"
-        )));
-    }
+    let host = machine.host();
     let worktree = crate::workspace::workspace_worktree(machine, ws);
 
     let name = content_session_name(project_name, workspace, role);
     let backend = SessionProcessBackend;
     // Idempotent: a live session under this name is reused as is.
     if backend
-        .live_session_names(&Host::Local)
+        .live_session_names(&host)
         .map(|names| names.iter().any(|n| n == &name))
         .unwrap_or(false)
     {
         return Ok(());
     }
 
-    let command = match role {
-        ReviewContentRole::Editor => crate::review_ui::editor_session_command(&worktree),
-        ReviewContentRole::Diff => crate::review_ui::diff_session_command(&project, &worktree)?,
+    let command = match (role, host.is_ssh()) {
+        (ReviewContentRole::Editor, _) => crate::review_ui::editor_session_command(&worktree),
+        (ReviewContentRole::Diff, false) => crate::review_ui::diff_session_command(&project, &worktree)?,
+        (ReviewContentRole::Diff, true) => crate::review_ui::remote_diff_session_command(
+            &project,
+            &worktree,
+            shelbi_state::resolve_diff_tool().as_ref(),
+        )?,
     };
     // Tag the session with the current task id when there is one (best-effort —
     // the editor/diff work regardless).
@@ -211,6 +209,21 @@ pub fn ensure_content_session(
         .flatten()
         .map(|tf| tf.task.id);
     let (cols, rows) = SessionProcessBackend::default_size();
+    if host.is_ssh() {
+        // The command `cd`s into the worktree itself; the session starts in
+        // the machine's `work_dir` (as the remote user shell does).
+        let spec = shelbi_session::SpawnSpec {
+            name,
+            cwd: machine.work_dir.clone(),
+            cols,
+            rows,
+            task,
+            raw_output_log: false,
+            child_argv: remote_content_argv(&command),
+        };
+        let bin = crate::remote_session::resolve_remote_bin(&ws.machine)?;
+        return crate::remote_session::spawn_remote_session(&host, &bin, &spec);
+    }
     let spec = shelbi_session::SpawnSpec {
         name,
         cwd: worktree,
@@ -244,17 +257,26 @@ pub fn open_in_app(project_name: &str, workspace: &str, role: ReviewContentRole)
     crate::tools::open_in_app(role, &worktree, project.base_branch())
 }
 
-/// End `workspace`'s editor and diff content sessions. Idempotent and
-/// best-effort — an already-gone session is fine. The agent session is left for
-/// the workspace's normal teardown; a dev workspace runs no review server, so
-/// there is nothing else to reap.
+/// End `workspace`'s editor and diff content sessions, on whichever machine
+/// they run. Idempotent and best-effort — an already-gone session is fine. The
+/// agent session is left for the workspace's normal teardown; a dev workspace
+/// runs no review server, so there is nothing else to reap.
 pub fn close_content(project_name: &str, workspace: &str) -> Result<()> {
+    let host = workspace_host(project_name, workspace).unwrap_or(Host::Local);
     let backend = SessionProcessBackend;
     for role in [ReviewContentRole::Editor, ReviewContentRole::Diff] {
         let name = content_session_name(project_name, workspace, role);
-        let _ = backend.kill_by_name(&Host::Local, &name);
+        let _ = backend.kill_by_name(&host, &name);
     }
     Ok(())
+}
+
+/// The host `workspace` lives on, or `None` when it (or its machine) is
+/// unknown.
+fn workspace_host(project_name: &str, workspace: &str) -> Option<Host> {
+    let project = shelbi_state::load_project(project_name).ok()?;
+    let ws = project.workspace(workspace)?;
+    Some(project.machine(&ws.machine)?.host())
 }
 
 /// The role token of a workspace's user shell, the last segment of its
@@ -367,6 +389,21 @@ pub fn close_user_shell(project_name: &str, workspace: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote content session runs under the remote login shell (for its
+    /// `PATH`), with the command quoted whole.
+    #[test]
+    fn a_remote_content_session_runs_under_the_login_shell() {
+        let argv = remote_content_argv("cd /srv/wt && exec vim .");
+        assert_eq!(
+            argv,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "exec \"${SHELL:-/bin/sh}\" -lc 'cd /srv/wt && exec vim .'".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn content_session_name_is_project_ws_workspace_role() {
