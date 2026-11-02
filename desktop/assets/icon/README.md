@@ -10,8 +10,8 @@ Settings ▸ General ▸ App icon, in the desktop app or the TUI
 - **Retro** (`retro`): the earlier raster icon, a cobalt and chrome tile with
   ivory stripes and a chrome-rimmed grille.
 - **Racing S** (`racing-s`): a layered macOS icon. A bright-to-deep cobalt
-  base and a bold italic racing S in porcelain white, offset over a
-  translucent ice-blue copy of itself.
+  base and a bold italic racing S drawn as two offset stripes, both white
+  at 90% opacity.
 
 The bundle always wears Command Grille, so Finder, and the Dock before the
 app launches, show it. Racing S, like Retro, is only ever drawn by the
@@ -89,7 +89,7 @@ component
 | Layer | Figma group | File | In `icon.json` |
 |---|---|---|---|
 | 00 Background | `2382:48` (rect `2382:49` "Opaque cobalt field") | `00-background.svg` | bottom group, no glass, no shadow |
-| 01 Translucent ribbon | `2382:50` (vector `2382:51` "Ice ribbon", 90% white) | `01-ribbon-translucent.svg` | glass, translucent, neutral shadow |
+| 01 Translucent ribbon | `2382:50` (vector `2382:51` "Ice ribbon", 90% white) | `01-ribbon-translucent.svg` | glass, neutral shadow |
 | 02 Opaque ribbon | `2382:52` (vector `2382:53` "Porcelain ribbon", 90% white) | `02-ribbon-opaque.svg` | glass, neutral shadow (top) |
 
 The SVGs are stripped the same way as Command Grille's (page background
@@ -98,8 +98,11 @@ The frame's notes ask to recreate the background gradient in Icon Composer;
 it is kept as the background layer's SVG instead, as Command Grille's is,
 because Icon Composer's own fill takes two stops and Figma's gradient has
 three (`#2996FC`, `#0962E5` at 48%, `#0641B8`, the same cobalt as Command
-Grille's base). The translucent ribbon's glass translucency is what turns
-it ice blue over the cobalt.
+Grille's base). The two ribbons keep Figma's layer names ("Translucent",
+"Ice", "Opaque", "Porcelain") but are drawn alike: both groups have the
+same appearance in `icon.json` (glass, neutral shadow, translucency off),
+so each SVG's own 90% white fill is the only transparency and the back
+stripe matches the front one.
 
 **Retro** (`retro-1024.png`) was the app's icon before this one: the
 [App Icon / Command Grille](https://www.figma.com/design/pu3hxHgWoCDPCzJ4u6zTQK/Shelbi?node-id=2366-9174)
