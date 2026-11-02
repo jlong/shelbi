@@ -1981,8 +1981,14 @@ impl TerminalPane {
                 .text_color(theme.text_loud)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.background))
-                .child(heroicon(icons::ARROW_DOWN).text_color(theme.icon))
-                .child(label)
+                // The arrow at 16pt beside the X-Small label, centered on it
+                // by the row's `items_center`.
+                .child(
+                    heroicon(icons::ARROW_DOWN_MENU)
+                        .text_color(theme.icon)
+                        .debug_selector(|| "terminal-jump-to-bottom-arrow".into()),
+                )
+                .child(div().debug_selector(|| "terminal-jump-to-bottom-label".into()).child(label))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.view.scroll_to_bottom();
                     window.focus(&this.focus_handle, cx);
@@ -2234,5 +2240,53 @@ mod tests {
         assert_eq!(&s[utf16_to_byte_range(s, 4..99)], "z", "clamped, from inside a pair");
         let past_the_end = 9..12;
         assert_eq!(utf16_to_byte_range(s, past_the_end), s.len()..s.len());
+    }
+
+    /// 200 numbered lines: enough history to scroll up through.
+    fn history(_size: Size) -> Vec<u8> {
+        (0..200).flat_map(|i| format!("line {i}\r\n").into_bytes()).collect()
+    }
+
+    #[gpui::test]
+    fn the_jump_to_bottom_pill_draws_a_16pt_arrow_centered_on_its_label(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Entity, Modifiers, VisualTestContext, WindowAppearance};
+        use shelbi_state::ThemePreference;
+
+        cx.update(|cx| cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark)));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| TerminalPane::canned("t".into(), history, window, cx))
+            })
+            .unwrap()
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        let pane = window.root(&mut vcx).unwrap();
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("terminal-jump-to-bottom").is_none(), "no pill at the live bottom");
+
+        pane.update(&mut vcx, |pane, cx| {
+            pane.terminal_view_mut().scroll_up(18);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let arrow = vcx.debug_bounds("terminal-jump-to-bottom-arrow").expect("the pill's arrow");
+        let label = vcx.debug_bounds("terminal-jump-to-bottom-label").expect("the pill's label");
+        assert_eq!(arrow.size, gpui::size(px(16.0), px(16.0)), "the arrow draws at 16x16");
+        assert!(
+            (arrow.center().y - label.center().y).abs() < px(0.5),
+            "the arrow is centered on the label: {arrow:?} beside {label:?}"
+        );
+
+        let focused = |pane: &Entity<TerminalPane>, vcx: &mut VisualTestContext| {
+            pane.update_in(vcx, |pane, window, _| pane.focus_handle_ref().is_focused(window))
+        };
+        assert!(!focused(&pane, &mut vcx), "the terminal starts unfocused");
+        let pill = vcx.debug_bounds("terminal-jump-to-bottom").unwrap();
+        vcx.simulate_click(pill.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let offset = pane.update(&mut vcx, |pane, _| pane.terminal_view_mut().scroll_offset());
+        assert_eq!(offset, 0, "the pill returns to the live bottom");
+        assert!(focused(&pane, &mut vcx), "and refocuses the terminal");
+        assert!(vcx.debug_bounds("terminal-jump-to-bottom").is_none(), "the pill goes once at the bottom");
     }
 }
