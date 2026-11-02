@@ -815,11 +815,11 @@ impl ChangelogView {
 }
 
 /// A link kind's chip icon: the Issues view's stack for an issue, the
-/// arrows of a merge for a PR, the globe for any other URL.
+/// Figma file's pull-request drawing for a PR, the globe for any other URL.
 pub fn link_icon(kind: LinkKind) -> Icon {
     match kind {
         LinkKind::Issue => icons::RECTANGLE_STACK,
-        LinkKind::Pr => icons::ARROWS_RIGHT_LEFT,
+        LinkKind::Pr => icons::PULL_REQUEST,
         LinkKind::Url => icons::GLOBE_ALT,
     }
 }
@@ -989,6 +989,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn a_pr_chip_draws_the_figma_pull_request_icon() {
+        assert_eq!(link_icon(LinkKind::Pr), icons::PULL_REQUEST);
+        assert_eq!(icons::PULL_REQUEST.path(), "icons/figma/pull-request.svg");
+        // The issue and generic link chips keep their Heroicons.
+        assert_eq!(link_icon(LinkKind::Issue), icons::RECTANGLE_STACK);
+        assert_eq!(link_icon(LinkKind::Url), icons::GLOBE_ALT);
+        // One size across the entry's chips.
+        for kind in [LinkKind::Issue, LinkKind::Url] {
+            assert_eq!(link_icon(LinkKind::Pr).size(), link_icon(kind).size(), "{kind:?}");
+        }
+    }
+
     #[gpui::test]
     fn the_page_reads_live_searches_and_opens_issues(cx: &mut TestAppContext) {
         let _env = crate::test_env::lock();
@@ -1029,6 +1042,10 @@ mod tests {
 
         // The first entry's issue chip opens the issue in Shelbi.
         let chip = vcx.debug_bounds("changelog-link-0-0").expect("the issue chip");
+        // Its PR chip sits beside it: the same height, on the same line.
+        let pr = vcx.debug_bounds("changelog-link-0-1").expect("the PR chip");
+        assert_eq!(pr.size.height, chip.size.height, "the PR chip is the issue chip's height");
+        assert_eq!(pr.center().y, chip.center().y, "the PR chip lines up with the issue chip");
         vcx.simulate_click(chip.center(), gpui::Modifiers::none());
         vcx.run_until_parked();
         assert_eq!(*opened.borrow(), ["dt-feedback"]);

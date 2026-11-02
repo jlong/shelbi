@@ -18,3 +18,6 @@ palette frame (2171:752) and drawn on its 20pt grid with the outline set's
   `chevron-down-small`, 2342:37950; the Issues Header's Workflow and
   Workspaces filters, 2172:722), a small flat chevron. Views reach it
   through `style::DROPDOWN_CHEVRON`.
+- `pull-request.svg`: a Changelog entry's PR link chip (component
+  `pull-request`, 2682:37448), a filled drawing. The other chips (issue,
+  generic link) stay Heroicons.
