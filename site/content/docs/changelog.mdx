@@ -11,6 +11,21 @@ are prose with `code` and links where they earn their place.
 
 ### November 2, 2026
 
+**v0.13.1. SSH passwords in a macOS dialog, and a third app icon.**
+
+**Remotes that want a password connect.** Connecting to a remote (Connect to
+remote in either client, or opening a remote workspace from the sidebar) no
+longer fails when the host asks for a password, key passphrase or one-time
+code. ssh's prompt appears in a native macOS dialog with a hidden field, led by
+a line naming the host; a new host key asks Yes/No with No the default. The
+answer goes straight to ssh and is never stored or logged, the connection is
+reused so it asks once, and background polling never prompts
+([#2069](https://github.com/jlong/shelbi/pull/2069)).
+
+**Racing S app icon.** Settings ▸ General ▸ App icon offers a third icon, a
+cobalt tile with a bold italic racing S, and the TUI's General page gains the
+App icon picker too ([#2067](https://github.com/jlong/shelbi/pull/2067)).
+
 **v0.13.0. Remote workspaces open from the sidebar, editor and diff tool pickers, and a desktop that looks right on glass.**
 
 **Remote workspaces open like local ones.** Click a workspace on another
