@@ -411,26 +411,88 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) host: String,
 }
 
-/// Return the PR head commit, head/base branch names, and owning repository.
+/// Split a repository's `OWNER/REPO` name for a GraphQL `repository(owner:,
+/// name:)` lookup, refusing anything ambiguous.
+pub(crate) fn repository_owner_and_name<'a>(
+    repository: &'a RepositoryIdentity,
+    operation: &str,
+) -> Result<(&'a str, &'a str)> {
+    let (owner, name) = repository.name_with_owner.split_once('/').ok_or_else(|| {
+        Error::Other(format!(
+            "GitHub repository `{}` is not in OWNER/REPO form; refusing an ambiguous {operation} query",
+            repository.name_with_owner
+        ))
+    })?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(Error::Other(format!(
+            "GitHub repository `{}` is not in OWNER/REPO form; refusing an ambiguous {operation} query",
+            repository.name_with_owner
+        )));
+    }
+    Ok((owner, name))
+}
+
+/// PR identity query. GraphQL rather than `gh pr view --json`: the base
+/// commit (`baseRefOid`) is only a `pr view` JSON field in newer gh releases
+/// (gh 2.46.0, Ubuntu's packaged build, rejects it with `Unknown JSON field`),
+/// while the GraphQL field exists on every GitHub version gh talks to. One
+/// request also keeps the head and base OIDs an atomic snapshot of one PR.
+const PR_IDENTITY_QUERY: &str = r#"
+query ShelbiPrIdentity($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      headRefName
+      baseRefName
+      baseRefOid
+      headRepository { id nameWithOwner }
+    }
+  }
+}
+"#;
+
+/// Return the PR head commit, head/base branch names and base commit, and the
+/// owning head repository, read from `repository` (the resolved `origin`).
 pub(crate) fn lookup_pr_identity(
     host: &Host,
     wt: &str,
-    repository: &str,
+    repository: &RepositoryIdentity,
     pr: u64,
 ) -> Result<PrIdentity> {
-    let pr_str = pr.to_string();
-    let fields = "headRefOid,headRefName,baseRefName,baseRefOid,headRepository";
-    let query = r#"[.headRefOid, .headRefName, .baseRefName, .baseRefOid, .headRepository.id, .headRepository.nameWithOwner] | .[]"#;
+    let (owner, name) = repository_owner_and_name(repository, "PR identity")?;
+    let query = format!("query={PR_IDENTITY_QUERY}");
+    let owner_field = format!("owner={owner}");
+    let name_field = format!("name={name}");
+    let number_field = format!("number={pr}");
+    let jq = "[.data.repository.pullRequest | .headRefOid, .headRefName, .baseRefName, \
+              .baseRefOid, .headRepository.id, .headRepository.nameWithOwner] | .[]";
     let out = run_in_dir(
         host,
         wt,
         &[
-            "gh", "pr", "view", &pr_str, "--repo", repository, "--json", fields, "--jq", query,
+            "gh",
+            "api",
+            "graphql",
+            "--hostname",
+            repository.host.as_str(),
+            "-f",
+            query.as_str(),
+            "-F",
+            owner_field.as_str(),
+            "-F",
+            name_field.as_str(),
+            "-F",
+            number_field.as_str(),
+            "--jq",
+            jq,
         ],
     )?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("gh pr view {pr_str} --repo {repository} --json {fields}"),
+            cmd: format!(
+                "gh api graphql --hostname {} <Shelbi PR identity for {} #{pr}>",
+                repository.host, repository.name_with_owner
+            ),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
@@ -444,7 +506,7 @@ pub(crate) fn lookup_pr_identity(
         values.as_slice()
     else {
         return Err(Error::Other(format!(
-            "gh pr view {pr_str}: expected head/base OIDs, head/base names, and head repository identity, got {} value(s)",
+            "GitHub PR #{pr}: expected head/base OIDs, head/base names, and head repository identity, got {} value(s)",
             values.len()
         )));
     };
@@ -453,7 +515,8 @@ pub(crate) fn lookup_pr_identity(
         .any(|value| value.is_empty() || value == "null")
     {
         return Err(Error::Other(format!(
-            "gh pr view {pr_str}: PR identity contains an empty head, base, or repository field"
+            "GitHub PR #{pr} in {}: PR identity contains an empty head, base, or repository field",
+            repository.name_with_owner
         )));
     }
     Ok(PrIdentity {
@@ -464,15 +527,11 @@ pub(crate) fn lookup_pr_identity(
         head_repository: RepositoryIdentity {
             id: head_repository_id.clone(),
             name_with_owner: head_repository_name.clone(),
-            // The PR was queried through the already resolved origin selector,
-            // so its host/routing identity is the same API host. Equality is
-            // still decided by the immutable repository id.
-            selector: repository.to_string(),
-            host: repository
-                .split('/')
-                .next()
-                .unwrap_or("github.com")
-                .to_string(),
+            // The PR was queried through the already resolved origin
+            // repository, so its host/routing identity is the same API host.
+            // Equality is still decided by the immutable repository id.
+            selector: repository.selector.clone(),
+            host: repository.host.clone(),
         },
     })
 }
