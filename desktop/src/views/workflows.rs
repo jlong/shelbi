@@ -766,19 +766,9 @@ impl WorkflowsPage {
                 },
             ))
         };
-        let anchor = self.menu_anchor.clone();
-        let popup = popup("workflow-menu", theme)
-            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                // A press on its button toggles it closed through its click.
-                if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                    return;
-                }
-                this.menu = None;
-                cx.notify();
-            }))
-            .child(edit_yaml);
+        let popup = popup("workflow-menu", theme).child(edit_yaml);
         let Some(w) = w else {
-            return deferred(placed(&self.menu_anchor, popup).gap(MENU_GAP).align_right()).with_priority(1);
+            return self.place_menu(popup, true, cx);
         };
         let duplicate = {
             let name = name.clone();
@@ -821,7 +811,20 @@ impl WorkflowsPage {
             .child(default)
             .child(div().flex_none().my_1().mx(px(-4.0)).h(px(1.0)).bg(theme.divider))
             .child(delete);
-        deferred(placed(&self.menu_anchor, popup).gap(MENU_GAP).align_right()).with_priority(1)
+        self.place_menu(popup, true, cx)
+    }
+
+    /// `panel` placed under the open menu's button (hanging left from its
+    /// right edge when `right`), closed by a press outside it: its button
+    /// included, so a second click closes it.
+    fn place_menu(&self, panel: Stateful<Div>, right: bool, cx: &mut Context<Self>) -> gpui::Deferred {
+        let menu = placed(&self.menu_anchor, panel)
+            .gap(MENU_GAP)
+            .on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }));
+        deferred(if right { menu.align_right() } else { menu }).with_priority(1)
     }
 
     /// The workflow table's new row: the name field, and Enter or Esc.
@@ -1186,7 +1189,6 @@ impl WorkflowsPage {
                 }))
         };
         let menu = open.then(|| {
-            let anchor = self.menu_anchor.clone();
             let items = CATEGORIES.iter().map(|&c| {
                 let target = target.clone();
                 style::menu_row(format!("status-category-{key}-{}", c.as_str()), c == category, theme)
@@ -1196,16 +1198,8 @@ impl WorkflowsPage {
                         this.pick_category(target.clone(), c, window, cx)
                     }))
             });
-            let menu = popup("status-category-menu", theme)
-                .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                        return;
-                    }
-                    this.menu = None;
-                    cx.notify();
-                }))
-                .children(items);
-            deferred(placed(&self.menu_anchor, menu).gap(MENU_GAP)).with_priority(1)
+            let menu = popup("status-category-menu", theme).children(items);
+            self.place_menu(menu, false, cx)
         });
         div().relative().flex_none().child(button).children(menu)
     }

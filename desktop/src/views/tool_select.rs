@@ -339,7 +339,6 @@ impl Render for ToolSelect {
         // (`deferred`) so nothing below it moves. The keyboard's row stays
         // in view as it moves, and is scrolled to on opening.
         self.scroll.follow(self.open.then(|| self.child_of(self.highlight)));
-        let anchor = self.button.clone();
         let menu = self.open.then(|| {
             let rows = self.render_rows(&theme, cx);
             let list = style::popover(
@@ -356,15 +355,11 @@ impl Render for ToolSelect {
                     .occlude(),
                 &theme,
             )
-            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                // A press on the button toggles it closed through its click.
-                if anchor.get().is_some_and(|b| b.contains(&event.position)) {
-                    return;
-                }
-                this.close(cx);
-            }))
             .children(rows);
-            deferred(placed(&self.button, list)).with_priority(1)
+            // A press outside the menu, the button included, closes it.
+            let list = placed(&self.button, list)
+                .on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| this.close(cx)));
+            deferred(list).with_priority(1)
         });
         div().relative().flex_none().child(button).children(menu)
     }

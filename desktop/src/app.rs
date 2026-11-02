@@ -4889,6 +4889,7 @@ impl ShelbiWindow {
                                 projects,
                                 highlight: self.switcher.highlight,
                                 phase,
+                                open: self.switcher.is_open(),
                                 scroll: self.switcher.scroll.clone(),
                             },
                         ),
@@ -4937,6 +4938,7 @@ impl ShelbiWindow {
                                 projects,
                                 highlight: self.switcher.highlight,
                                 phase,
+                                open: self.switcher.is_open(),
                                 scroll: self.switcher.scroll.clone(),
                             }
                         }),

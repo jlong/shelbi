@@ -11,14 +11,22 @@
 //! container itself (`overflow_y_scroll`, its rows `flex_none`), or it holds
 //! one (the font picker's list under its search box). [`MenuScroll`] keeps
 //! the keyboard's row in view inside it.
+//!
+//! An open menu closes on a press anywhere outside it ([`Placed::on_dismiss`]):
+//! it lays a window-wide layer under itself that takes that press, so the
+//! press does nothing else (it doesn't click the button under it, start a
+//! drag, or move focus). A press on the menu's own control lands on that
+//! layer too, so a second click on a dropdown's button closes it rather than
+//! closing and reopening it. Scrolling still reaches what's under the layer.
 
 use std::cell::Cell;
 use std::panic::Location;
 use std::rc::Rc;
 
 use gpui::{
-    div, point, prelude::*, px, size, AnyElement, App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId,
-    InspectorElementId, LayoutId, Pixels, Point, ScrollHandle, Size, Style, Window,
+    div, point, prelude::*, px, size, AnyElement, App, AvailableSpace, Bounds, DispatchPhase, Element, ElementId,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, LayoutId, MouseDownEvent, Pixels, Point,
+    ScrollHandle, Size, Style, Window,
 };
 
 use crate::theme::style::Anchor;
@@ -97,9 +105,13 @@ pub fn placed(anchor: &Anchor, menu: impl IntoElement) -> Placed {
         gap: px(4.0),
         align: Align::Left,
         match_width: false,
+        dismiss: None,
         menu: Some(menu.into_any_element()),
     }
 }
+
+/// What a press outside an open menu runs (it closes the menu).
+pub type Dismiss = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
 pub struct Placed {
     anchor: Anchor,
@@ -107,7 +119,16 @@ pub struct Placed {
     gap: Pixels,
     align: Align,
     match_width: bool,
+    dismiss: Option<Dismiss>,
     menu: Option<AnyElement>,
+}
+
+/// What [`Placed`] laid out at prepaint: the menu where it goes, its
+/// bounds, and the window-wide layer under it while it dismisses.
+pub struct PlacedMenu {
+    menu: AnyElement,
+    bounds: Bounds<Pixels>,
+    layer: Option<(Hitbox, Dismiss)>,
 }
 
 impl Placed {
@@ -126,6 +147,16 @@ impl Placed {
     /// Make the menu as wide as its control.
     pub fn match_width(mut self) -> Self {
         self.match_width = true;
+        self
+    }
+
+    /// Close the menu on a press anywhere outside it: `dismiss` runs and the
+    /// press goes no further (nothing under it acts on it). A press on the
+    /// menu's own control counts as outside, so it toggles the menu closed.
+    /// Every open menu sets this; a menu fading out after it closed doesn't,
+    /// so it doesn't hold the window's clicks while it fades.
+    pub fn on_dismiss(mut self, dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.dismiss = Some(Rc::new(dismiss));
         self
     }
 
@@ -148,7 +179,7 @@ impl IntoElement for Placed {
 impl Element for Placed {
     type RequestLayoutState = ();
     /// The menu, laid out and prepainted where it goes.
-    type PrepaintState = Option<AnyElement>;
+    type PrepaintState = Option<PlacedMenu>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -203,8 +234,22 @@ impl Element for Placed {
         let placement = place(trigger, viewport, self.gap, self.align, |h| {
             root.layout_as_root(size(AvailableSpace::MinContent, AvailableSpace::Definite(h)), window, cx)
         });
+        // The dismiss layer goes in first, so the menu's own hitboxes sit
+        // over it. Drawn deferred, its prepaint has no clip: it covers the
+        // whole window.
+        let layer = self.dismiss.clone().map(|dismiss| {
+            let hitbox = window.insert_hitbox(
+                Bounds::new(Point::default(), viewport),
+                HitboxBehavior::BlockMouseExceptScroll,
+            );
+            (hitbox, dismiss)
+        });
         root.prepaint_at(placement.bounds.origin, window, cx);
-        Some(root)
+        Some(PlacedMenu {
+            menu: root,
+            bounds: placement.bounds,
+            layer,
+        })
     }
 
     fn paint(
@@ -217,9 +262,26 @@ impl Element for Placed {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(menu) = menu {
-            menu.paint(window, cx);
+        let Some(placed) = menu else {
+            return;
+        };
+        if let Some((hitbox, dismiss)) = placed.layer.clone() {
+            let menu = placed.bounds;
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                // Bubbling, the menu's own rows have had the press; anything
+                // registered before this (all that's under the menu) hasn't.
+                if phase != DispatchPhase::Bubble
+                    || menu.contains(&event.position)
+                    || !hitbox.is_hovered_at(event.position, window)
+                {
+                    return;
+                }
+                cx.stop_propagation();
+                window.prevent_default();
+                dismiss(event, window, cx);
+            });
         }
+        placed.menu.paint(window, cx);
     }
 }
 
@@ -423,5 +485,156 @@ mod tests {
         cx.run_until_parked();
         let menu = cx.debug_bounds("menu").unwrap();
         assert_eq!(menu.bottom(), px(232.0), "re-capped to the smaller window");
+    }
+
+    // ---- dismissal ----------------------------------------------------------
+
+    /// A dropdown: a button toggling a menu with one item, beside another
+    /// button and over a row that both count their clicks.
+    #[derive(Default)]
+    struct Dropdown {
+        anchor: Anchor,
+        open: bool,
+        dismissed: usize,
+        picked: usize,
+        other: usize,
+        under: usize,
+    }
+
+    impl Render for Dropdown {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let menu = self.open.then(|| {
+                let item = div()
+                    .id("item")
+                    .debug_selector(|| "item".into())
+                    .h(px(30.0))
+                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                        this.picked += 1;
+                        this.open = false;
+                        cx.notify();
+                    }));
+                let menu = div()
+                    .id("menu")
+                    .debug_selector(|| "menu".into())
+                    .flex()
+                    .flex_col()
+                    .w(px(180.0))
+                    .p(px(4.0))
+                    .occlude()
+                    .child(item);
+                gpui::deferred(placed(&self.anchor, menu).on_dismiss(cx.listener(
+                    |this, _: &MouseDownEvent, _, cx| {
+                        this.dismissed += 1;
+                        this.open = false;
+                        cx.notify();
+                    },
+                )))
+                .with_priority(1)
+            });
+            div()
+                .id("under")
+                .debug_selector(|| "under".into())
+                .size_full()
+                .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, _| this.under += 1))
+                .child(
+                    div()
+                        .id("button")
+                        .debug_selector(|| "button".into())
+                        .absolute()
+                        .top(px(40.0))
+                        .left(px(40.0))
+                        .w(px(200.0))
+                        .h(px(32.0))
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open = !this.open;
+                            cx.notify();
+                        }))
+                        .child(crate::theme::style::anchor_probe(&self.anchor)),
+                )
+                .child(
+                    div()
+                        .id("other")
+                        .debug_selector(|| "other".into())
+                        .absolute()
+                        .top(px(40.0))
+                        .left(px(400.0))
+                        .w(px(100.0))
+                        .h(px(32.0))
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.other += 1;
+                        })),
+                )
+                .children(menu)
+        }
+    }
+
+    fn dropdown(cx: &mut TestAppContext) -> (gpui::Entity<Dropdown>, VisualTestContext) {
+        let window = cx.add_window(|_, _| Dropdown::default());
+        let view = window.root(cx).unwrap();
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(VIEWPORT);
+        vcx.run_until_parked();
+        (view, vcx)
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let at = cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn click_at(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_second_click_on_the_button_closes_its_menu(cx: &mut TestAppContext) {
+        let (view, mut cx) = dropdown(cx);
+        click(&mut cx, "button");
+        assert!(view.read_with(&cx, |v, _| v.open), "the first click opens it");
+        click(&mut cx, "button");
+        let (open, dismissed) = view.read_with(&cx, |v, _| (v.open, v.dismissed));
+        assert!(!open, "the second click closes it, and doesn't reopen it");
+        assert_eq!(dismissed, 1);
+        click(&mut cx, "button");
+        assert!(view.read_with(&cx, |v, _| v.open), "a third opens it again");
+    }
+
+    #[gpui::test]
+    fn a_click_outside_the_menu_closes_it_and_does_nothing_else(cx: &mut TestAppContext) {
+        let (view, mut cx) = dropdown(cx);
+        click(&mut cx, "button");
+        // Another control: the menu closes, the control isn't clicked.
+        click(&mut cx, "other");
+        let (open, dismissed, other) = view.read_with(&cx, |v, _| (v.open, v.dismissed, v.other));
+        assert!(!open && dismissed == 1);
+        assert_eq!(other, 0, "the press went no further than the menu's layer");
+        click(&mut cx, "other");
+        assert_eq!(view.read_with(&cx, |v, _| v.other), 1, "closed, the control clicks again");
+        // Bare background, far from the button.
+        click(&mut cx, "button");
+        click_at(&mut cx, point(px(700.0), px(500.0)));
+        let (open, dismissed, under) = view.read_with(&cx, |v, _| (v.open, v.dismissed, v.under));
+        assert!(!open && dismissed == 2);
+        assert_eq!(under, 0, "nothing under the menu took the click");
+    }
+
+    #[gpui::test]
+    fn a_click_inside_the_menu_picks_without_dismissing(cx: &mut TestAppContext) {
+        let (view, mut cx) = dropdown(cx);
+        click(&mut cx, "button");
+        // The menu's padding: neither its item nor outside it.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let menu = cx.debug_bounds("menu").unwrap();
+        click_at(&mut cx, point(menu.left() + px(2.0), menu.top() + px(2.0)));
+        let (open, dismissed, under) = view.read_with(&cx, |v, _| (v.open, v.dismissed, v.under));
+        assert!(open && dismissed == 0 && under == 0, "a press on the menu itself keeps it open");
+        click(&mut cx, "item");
+        let (open, dismissed, picked) = view.read_with(&cx, |v, _| (v.open, v.dismissed, v.picked));
+        assert_eq!((open, dismissed, picked), (false, 0, 1), "the item picks and closes it");
     }
 }

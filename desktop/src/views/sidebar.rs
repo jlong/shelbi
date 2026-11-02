@@ -459,6 +459,9 @@ pub struct SwitcherProps<'a> {
     pub highlight: usize,
     /// How shown the menu is: 0 (hidden) to 1, eased.
     pub phase: f32,
+    /// Open, not fading out after closing: only an open menu takes the
+    /// window's presses to close.
+    pub open: bool,
     /// The menu's scroll, keeping the keyboard's row in view.
     pub scroll: MenuScroll,
 }
@@ -979,7 +982,8 @@ pub fn switcher_trigger<H: SidebarHost>(
 /// both sides (228pt in the 252pt column), however long a project's name
 /// (it truncates): drawn after everything (`deferred`), so nothing below it
 /// moves and nothing paints over it, capped and scrolling where the window
-/// is short ([`placed`]).
+/// is short ([`placed`]). While open, a press outside it (its button
+/// included, so a second click closes it) closes it and goes no further.
 pub fn switcher_menu<H: SidebarHost>(
     switcher: &SwitcherProps<'_>,
     button: &Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -995,8 +999,16 @@ pub fn switcher_menu<H: SidebarHost>(
         .flex_col()
         .min_h_0()
         .w(px((width - 2.0 * MENU_INSET).max(0.0)))
-        .child(render_switcher(switcher, button.clone(), theme, cx));
-    deferred(placed(button, menu).gap(MENU_GAP)).with_priority(1)
+        .child(render_switcher(switcher, theme, cx));
+    let menu = placed(button, menu).gap(MENU_GAP);
+    let menu = if switcher.open {
+        menu.on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+            this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
+        }))
+    } else {
+        menu
+    };
+    deferred(menu).with_priority(1)
 }
 
 /// The switcher's menu, the Figma `Project switcher`'s open state
@@ -1008,7 +1020,6 @@ pub fn switcher_menu<H: SidebarHost>(
 /// the rows below it.
 fn render_switcher<H: SidebarHost>(
     switcher: &SwitcherProps<'_>,
-    button: Rc<Cell<Option<Bounds<Pixels>>>>,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
@@ -1056,13 +1067,6 @@ fn render_switcher<H: SidebarHost>(
         .bg(theme.raised.blend(theme.search))
         .text_color(theme.foreground)
         .occlude()
-        .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-            // A press on the button toggles it closed through its click.
-            if button.get().is_some_and(|b| b.contains(&event.position)) {
-                return;
-            }
-            this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
-        }))
         .child(project_menu::heading(theme))
         .when(switcher.projects.is_empty(), |d| {
             d.child(

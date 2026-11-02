@@ -24,8 +24,8 @@
 //! and the hover buttons are this client's.
 
 use gpui::{
-    div, prelude::*, px, relative, App, ClickEvent, Context, Entity, EventEmitter, Focusable, MouseButton,
-    SharedString, Subscription, Window,
+    div, prelude::*, px, relative, ClickEvent, Context, Entity, EventEmitter, Focusable, MouseButton,
+    MouseDownEvent, SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use shelbi_app::settings::keybindings::{self as shared, Group, KeyOutcome, KeybindingsState, Row, Slot};
@@ -571,32 +571,24 @@ impl KeybindingsPage {
                     }))
             })
             .collect();
-        Some(
-            div()
-                .id("keybindings-picker-backdrop")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.picker_open = false;
-                    cx.notify();
-                }))
-                .child(style::below(
-                    &self.picker_anchor,
-                    gpui::point(px(0.0), px(0.0)),
-                    style::menu_entrance(
-                        "keybindings-picker-menu",
-                        super::issues::panel(theme)
-                            .id("keybindings-picker-panel")
-                            .debug_selector(|| "keybindings-picker-panel".into())
-                            .w(px(PICKER_W))
-                            .overflow_y_scroll()
-                            .on_click(|_, _, cx: &mut App| cx.stop_propagation())
-                            .children(rows),
-                    ),
-                )),
-        )
+        Some(style::below(
+            &self.picker_anchor,
+            gpui::point(px(0.0), px(0.0)),
+            style::menu_entrance(
+                "keybindings-picker-menu",
+                super::issues::panel(theme)
+                    .id("keybindings-picker-panel")
+                    .debug_selector(|| "keybindings-picker-panel".into())
+                    .w(px(PICKER_W))
+                    .overflow_y_scroll()
+                    .occlude()
+                    .children(rows),
+            ),
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.picker_open = false;
+                cx.notify();
+            }),
+        ))
     }
 }
 
@@ -756,7 +748,7 @@ impl KeybindingsPage {
     }
 
     /// Whether the search field has the keyboard.
-    pub(crate) fn search_focused(&self, window: &Window, cx: &App) -> bool {
+    pub(crate) fn search_focused(&self, window: &Window, cx: &gpui::App) -> bool {
         self.search.read(cx).focus_handle(cx).is_focused(window)
     }
 }
