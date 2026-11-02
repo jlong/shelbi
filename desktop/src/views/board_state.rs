@@ -351,6 +351,9 @@ pub struct BoardState {
     /// the board's menus and pickers (the pane isn't modal), and only
     /// [`BoardState::close_pane`] (or opening another task) changes it.
     pane: Option<String>,
+    /// The pane's task when it last closed, until the view takes it to
+    /// slide the pane out ([`Self::take_closed`]).
+    closed: Option<String>,
     /// The pane property the keyboard is on (Tab walks them), drawn with
     /// the focus ring; Enter opens its picker, and closing the picker comes
     /// back to it.
@@ -405,6 +408,7 @@ impl BoardState {
             selected_row: 0,
             mode: Mode::Board,
             pane: None,
+            closed: None,
             pane_focus: None,
             pending: BTreeMap::new(),
             notices: BTreeMap::new(),
@@ -692,6 +696,7 @@ impl BoardState {
             self.pane_focus = None;
         }
         self.pane = Some(id.to_string());
+        self.closed = None;
         self.mode = Mode::Detail {
             id: id.to_string(),
             editing: false,
@@ -710,9 +715,18 @@ impl BoardState {
     /// Close the task pane (and anything over it): the board has the keys,
     /// its selection, filters and scroll as they were.
     pub fn close_pane(&mut self) {
-        self.pane = None;
+        if let Some(id) = self.pane.take() {
+            self.closed = Some(id);
+        }
         self.pane_focus = None;
         self.mode = Mode::Board;
+    }
+
+    /// The task whose pane closed since the last call, by any path (Close,
+    /// Esc, a click on the board, the task going away): the view slides that
+    /// pane out.
+    pub fn take_closed(&mut self) -> Option<String> {
+        self.closed.take()
     }
 
     /// The mode a menu, picker or prompt closes back to: the pane while it is

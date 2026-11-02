@@ -526,6 +526,22 @@ mod tests {
     }
 
     #[test]
+    fn the_opaque_theme_keeps_the_contrast_setting() {
+        // The task pane paints from `opaque()` in a translucent window: it
+        // drops the glass but follows Contrast like the rest of the UI.
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            let raised = Theme::resolve_with(ThemePreference::Auto, 60, system);
+            let glass = raised.with_opacity(0.85).opaque();
+            assert_eq!(glass.contrast(), 60);
+            for ((name, want), (_, got)) in raised.roles().into_iter().zip(glass.roles()) {
+                assert_eq!(rgba8(got), rgba8(want), "{name}");
+            }
+            let standard = Theme::resolve(ThemePreference::Auto, system);
+            assert_ne!(rgba8(glass.text_loud), rgba8(standard.text_loud), "the contrast moved the text");
+        }
+    }
+
+    #[test]
     fn the_window_opacity_reaches_the_surfaces_and_their_fills_only() {
         for system in [WindowAppearance::Dark, WindowAppearance::Light] {
             let opaque = Theme::resolve(ThemePreference::Auto, system);

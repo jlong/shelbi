@@ -53,6 +53,13 @@ pub fn ease_out_expo(t: f32) -> f32 {
     cubic_bezier(0.16, 1.0, 0.3, 1.0, t)
 }
 
+/// [`ease_out_expo`] played backwards in time: an animation on it retraces,
+/// frame for frame, the way one on `ease_out_expo` came (a pane sliding back
+/// out the way it slid in).
+pub fn ease_out_expo_reversed(t: f32) -> f32 {
+    1.0 - ease_out_expo(1.0 - t)
+}
+
 /// A CSS `cubic-bezier(x1, y1, x2, y2)` at time `t` (0..=1): solve the curve's
 /// x for `t` (Newton, then bisection), and return its y there.
 pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
