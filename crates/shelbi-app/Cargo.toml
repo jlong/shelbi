@@ -20,6 +20,9 @@ shelbi-palette = { workspace = true }
 # (serde/std only), so the `no_ui_deps` guard still holds.
 shelbi-proto = { workspace = true }
 shelbi-client = { workspace = true }
+# The askpass dialog and its deadline for the connections a user starts
+# (`launch::ssh`). No UI toolkit: osascript runs as a child process.
+shelbi-ssh = { workspace = true }
 serde = { workspace = true }
 # Contact Us's request body and the remembered name and email.
 serde_json = { workspace = true }

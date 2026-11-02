@@ -50,6 +50,9 @@ shelbi-state = { path = "../crates/shelbi-state" }
 shelbi-core = { path = "../crates/shelbi-core" }
 shelbi-palette = { path = "../crates/shelbi-palette" }
 shelbi-orchestrator = { path = "../crates/shelbi-orchestrator" }
+# ssh's askpass helper: the app is the program ssh runs to ask for a
+# password when the user connects to a remote (`main` answers it first).
+shelbi-ssh = { path = "../crates/shelbi-ssh" }
 
 # The emulator `shelbi-term` drives (its grid and cell types are part of
 # shelbi-term's API): the same vendored fork the root workspace uses.

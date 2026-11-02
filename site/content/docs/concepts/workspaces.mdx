@@ -359,6 +359,12 @@ bridges every session over a single SSH channel (see
 [`shelbi relay`](/docs/cli/relay)), and [`shelbi machine`](/docs/cli/machine)
 makes sure a compatible `shelbi` binary is there to run them.
 
+The hub's own SSH (dispatch, polling) never prompts, so a remote machine
+should take your key or agent. If it wants a password, opening one of its
+workspaces from the sidebar asks for it once, in a macOS dialog, and the hub
+then shares that connection until it closes. **Cancel** shows "Couldn't sign
+in to *host*" and stops; open the workspace again to retry.
+
 ## See also
 
 - [Project config](/docs/configuration/project#workspaces): the

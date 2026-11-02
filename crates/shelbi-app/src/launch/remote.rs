@@ -89,12 +89,15 @@ pub enum RemoteError {
     /// SSH couldn't reach the host.
     #[error("Couldn't connect to {host}: {reason}")]
     Unreachable { host: String, reason: String },
-    /// The host answered but wouldn't let us in with the user's SSH keys
-    /// (Shelbi never asks for a password).
-    #[error("Couldn't sign in to {host}: {reason}. Shelbi signs in with your SSH keys and never asks for a password.")]
-    AuthFailed { host: String, reason: String },
-    /// SSH doesn't trust the host's key yet (or it changed). Shelbi never
-    /// accepts a key on the user's behalf.
+    /// The host answered but wouldn't let the user in. `asked` is whether
+    /// ssh could ask for a password in a dialog (then this is a wrong
+    /// password or a Cancel); without one, the message says to add a key or
+    /// an agent ([`shelbi_ssh::askpass::auth_failed_message`]).
+    #[error("{}", shelbi_ssh::askpass::auth_failed_message(.host, .reason, *.asked))]
+    AuthFailed { host: String, reason: String, asked: bool },
+    /// SSH doesn't trust the host's key: it changed, or it is new and the
+    /// user said No (or couldn't be asked). Shelbi never accepts a key on the
+    /// user's behalf.
     #[error("{host}'s host key isn't trusted. Run `ssh {host}` in a terminal once to check and accept it.")]
     HostKey { host: String },
     /// The host answered, but has no Shelbi to connect to.
@@ -369,8 +372,12 @@ mod tests {
     fn every_error_reads_as_a_sentence_naming_the_host() {
         let cases = [
             (
-                RemoteError::AuthFailed { host: "devbox".into(), reason: "Permission denied (publickey)".into() },
-                "Couldn't sign in to devbox: Permission denied (publickey). Shelbi signs in with your SSH keys and never asks for a password.",
+                RemoteError::AuthFailed { host: "devbox".into(), reason: "Permission denied (publickey)".into(), asked: true },
+                "Couldn't sign in to devbox: Permission denied (publickey).",
+            ),
+            (
+                RemoteError::AuthFailed { host: "devbox".into(), reason: "Permission denied (publickey,password).".into(), asked: false },
+                "Couldn't sign in to devbox: Permission denied (publickey,password). If it wants a password or a key passphrase, Shelbi can't ask for one here: add an SSH key for it, or load yours into the agent with `ssh-add`.",
             ),
             (
                 RemoteError::HostKey { host: "devbox".into() },

@@ -100,6 +100,15 @@ pub trait RemoteSsh: Send + Sync {
     /// Open a relay channel to every session on `host`, started as
     /// `ssh <host> <bin> relay`.
     fn open_relay(&self, host: &Host, bin: &str) -> Result<RelayHandle>;
+
+    /// Sign in to `host` for a connection the user started ([`attach`]),
+    /// asking for a password in a dialog when ssh needs one, so the relay
+    /// (and the hub's polling after it) rides a connection that is already
+    /// in. Only [`attach`] calls it: background work never asks. A seam with
+    /// nothing to sign in to (the tests') has nothing to do.
+    fn sign_in(&self, _host: &Host) -> std::result::Result<(), RemoteAttachError> {
+        Ok(())
+    }
 }
 
 /// Production [`RemoteSsh`] over the host's `ssh`, via [`shelbi_ssh`].
@@ -159,6 +168,31 @@ impl RemoteSsh for SshSeam {
             Box::new(SshRelayGuard { child: Some(child) }),
         ))
     }
+
+    fn sign_in(&self, host: &Host) -> std::result::Result<(), RemoteAttachError> {
+        sign_in_over_ssh(host)
+    }
+}
+
+/// [`shelbi_ssh::sign_in`] for a user's attach: through the dialog where one
+/// can be shown, else in batch mode, which only finds out why a sign-in
+/// fails. A refusal is [`RemoteAttachError::Failed`], so the client shows it
+/// and stops rather than reconnecting into the same refusal (and, with a
+/// dialog, asking again and again after a Cancel).
+fn sign_in_over_ssh(host: &Host) -> std::result::Result<(), RemoteAttachError> {
+    let askpass = shelbi_ssh::askpass::Askpass::available();
+    let label = host_label(host);
+    shelbi_ssh::sign_in(host, askpass.as_ref(), shelbi_ssh::SIGN_IN_DEADLINE).map_err(|e| match e {
+        shelbi_ssh::SignInError::Auth(reason) => RemoteAttachError::Failed(
+            shelbi_ssh::askpass::auth_failed_message(&label, &reason, askpass.is_some()),
+        ),
+        shelbi_ssh::SignInError::HostKey(_) => RemoteAttachError::Failed(format!(
+            "{label}'s host key isn't trusted. Run `ssh {label}` in a terminal once to check and accept it."
+        )),
+        shelbi_ssh::SignInError::Unreachable(reason) => {
+            RemoteAttachError::Unreachable(format!("`{label}` is unreachable: {reason}"))
+        }
+    })
 }
 
 /// Keeps the `ssh … relay` child alive for the channel's lifetime and reaps it
@@ -286,6 +320,15 @@ fn get_relay(host: &Host, bin: &str) -> Result<Arc<RelayHandle>> {
     }
     cache.insert(key, handle.clone());
     Ok(handle)
+}
+
+/// Whether a reachable relay to `host` is cached (so its connection is in).
+fn relay_cached(host: &Host) -> bool {
+    relay_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&host_key(host))
+        .is_some_and(|handle| handle.reachable())
 }
 
 /// Forget the cached relay for `host` (its SSH child is reaped on drop).
@@ -606,7 +649,15 @@ impl std::fmt::Display for RemoteAttachError {
 /// client reattaching after a drop gets a fresh relay; a session that kept
 /// running replays its screen and carries on. Blocking: run it off the UI
 /// thread.
+///
+/// The user opened this, so with no relay up it first signs in
+/// ([`RemoteSsh::sign_in`]): a host that wants a password asks for it once,
+/// in a dialog, and the relay and the hub's polling then share that
+/// connection.
 pub fn attach(host: &Host, name: &str) -> std::result::Result<RemoteAttach, RemoteAttachError> {
+    if !relay_cached(host) {
+        seam().sign_in(host)?;
+    }
     let bin = relay_bin_for_host(host);
     let unreachable = |e: ClientError| match e {
         ClientError::RelayUnreachable => {
@@ -662,6 +713,78 @@ pub fn remote_launch_spec(name: String, worktree: PathBuf, task: Option<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seam that records who signs in and never opens a relay: `refuse`
+    /// makes its sign-in fail as a refused password would.
+    struct SignInSeam {
+        sign_ins: Mutex<Vec<String>>,
+        relays: Mutex<usize>,
+        refuse: bool,
+    }
+
+    impl RemoteSsh for SignInSeam {
+        fn launch(&self, _: &Host, _: &str, _: &SpawnSpec) -> Result<()> {
+            Err(Error::Other("no launches here".into()))
+        }
+        fn open_relay(&self, _: &Host, _: &str) -> Result<RelayHandle> {
+            *self.relays.lock().unwrap() += 1;
+            Err(Error::Other("unreachable (test)".into()))
+        }
+        fn sign_in(&self, host: &Host) -> std::result::Result<(), RemoteAttachError> {
+            self.sign_ins.lock().unwrap().push(host_label(host));
+            if self.refuse {
+                Err(RemoteAttachError::Failed("Couldn't sign in to box: Permission denied.".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn sign_in_seam(refuse: bool) -> Arc<SignInSeam> {
+        Arc::new(SignInSeam {
+            sign_ins: Mutex::new(Vec::new()),
+            relays: Mutex::new(0),
+            refuse,
+        })
+    }
+
+    #[test]
+    fn only_a_users_attach_signs_in_and_background_operations_never_do() {
+        let _g = crate::test_lock::acquire();
+        let seam = sign_in_seam(false);
+        set_test_seam(Some(seam.clone()));
+        let host = Host::Ssh { host: "box".into() };
+
+        // The hub's polling: probe, snapshot, title, enumerate. None asks.
+        assert!(matches!(probe(&host, "p/ws/a"), Liveness::Unreachable { .. }));
+        let _ = snapshot(&host, "p/ws/a", 0);
+        let _ = title(&host, "p/ws/a");
+        assert_eq!(enumerate(&host, "p"), None);
+        assert!(seam.sign_ins.lock().unwrap().is_empty(), "background work never signs in");
+
+        // The user opening the workspace signs in first, then opens the relay.
+        assert!(matches!(attach(&host, "p/ws/a"), Err(RemoteAttachError::Unreachable(_))));
+        assert_eq!(*seam.sign_ins.lock().unwrap(), vec!["box".to_string()]);
+        set_test_seam(None);
+    }
+
+    #[test]
+    fn a_refused_sign_in_ends_the_attach_without_a_relay() {
+        let _g = crate::test_lock::acquire();
+        let seam = sign_in_seam(true);
+        set_test_seam(Some(seam.clone()));
+        let host = Host::Ssh { host: "box".into() };
+        let before = *seam.relays.lock().unwrap();
+        // A refusal (a wrong password, a Cancel) is a message the client shows
+        // and stops on, not an unreachable machine it keeps retrying (which,
+        // with a dialog, would ask again and again).
+        assert_eq!(
+            attach(&host, "p/ws/a").err(),
+            Some(RemoteAttachError::Failed("Couldn't sign in to box: Permission denied.".into()))
+        );
+        assert_eq!(*seam.relays.lock().unwrap(), before, "no relay after a refusal");
+        set_test_seam(None);
+    }
 
     fn rec(path: &str, version: &str, compatible: bool) -> shelbi_state::machine_state::MachineRecord {
         shelbi_state::machine_state::MachineRecord {

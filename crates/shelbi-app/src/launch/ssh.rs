@@ -7,10 +7,22 @@
 //! asks it `shelbi remote list --json` ([`RemoteListing`]): the user it runs
 //! as, its version, whether its daemon is running, and its projects.
 //!
-//! - **Credentials.** `ssh` runs with `BatchMode=yes`, so it signs in with the
-//!   user's keys, agent and `~/.ssh/config` and never prompts; a host that
-//!   wants a password fails with [`RemoteError::AuthFailed`]. Shelbi stores
+//! - **Credentials.** `ssh` signs in with the user's keys, agent and
+//!   `~/.ssh/config`. When it needs more (a password, a key passphrase, a
+//!   one-time code, a new host key to accept) and a system dialog can be
+//!   shown ([`SshAuth::detect`]: macOS in a GUI login session), it asks
+//!   through OpenSSH's askpass mechanism ([`shelbi_ssh::askpass`]): ssh's own
+//!   prompt in a native dialog with a hidden field, the answer handed
+//!   straight to ssh, never logged or stored. Cancel fails the step with
+//!   [`RemoteError::AuthFailed`]. Where no dialog is possible ssh runs with
+//!   `BatchMode=yes` and never prompts; a host that wants a password fails
+//!   with [`RemoteError::AuthFailed`] saying to add a key or an agent. Time
+//!   a dialog is open doesn't count against a step's deadline. Shelbi stores
 //!   nothing but the host as typed (in the recent remote sessions).
+//! - **One sign-in.** Every step shares a ControlMaster
+//!   ([`remote_control_path`], kept for [`CONTROL_PERSIST`] after the last
+//!   use), so the user is asked once: the later steps and the session's
+//!   terminal ride the connection the first one opened.
 //! - **No hub forward.** Unlike the hub's own machine connections
 //!   (`shelbi_ssh`), these never carry the `-R` forward of this machine's hub
 //!   socket: the far side has its own Shelbi, and its `hub.sock` must stay its
@@ -26,9 +38,8 @@
 //! The transport is a seam ([`SshTransport`]): tests drive [`SshRemote`]
 //! through a scripted fake and never reach a real host.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,13 +59,11 @@ pub const START_DEADLINE: Duration = Duration::from_secs(45);
 /// What `ssh` exits with when the connection itself failed (or dropped).
 pub const SSH_CONNECTION_LOST: i32 = 255;
 
-/// The options every remote-session `ssh` runs with. `BatchMode` turns any
-/// password or passphrase prompt into a failure; the keepalives turn a dead
-/// link into exit [`SSH_CONNECTION_LOST`] within about a minute instead of a
-/// hang. The user's `~/.ssh/config` supplies everything else.
-pub const SSH_OPTIONS: &[&str] = &[
-    "-o",
-    "BatchMode=yes",
+/// The options every remote-session `ssh` runs with, however it signs in.
+/// The keepalives turn a dead link into exit [`SSH_CONNECTION_LOST`] within
+/// about a minute instead of a hang. The user's `~/.ssh/config` supplies
+/// everything else.
+const COMMON_OPTIONS: &[&str] = &[
     "-o",
     "ConnectTimeout=10",
     "-o",
@@ -64,6 +73,79 @@ pub const SSH_OPTIONS: &[&str] = &[
     "-o",
     "LogLevel=ERROR",
 ];
+
+/// How long the shared connection outlives its last step or terminal.
+pub const CONTROL_PERSIST: &str = "600";
+
+/// How a remote-session `ssh` signs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshAuth {
+    /// Keys, agent and config only: `BatchMode=yes` turns any password or
+    /// passphrase prompt into a failure.
+    Batch,
+    /// ssh may ask the user, through this askpass dialog.
+    Ask(shelbi_ssh::askpass::Askpass),
+}
+
+impl SshAuth {
+    /// [`SshAuth::Ask`] where a system dialog can be shown, else
+    /// [`SshAuth::Batch`].
+    pub fn detect() -> SshAuth {
+        shelbi_ssh::askpass::Askpass::available().map_or(SshAuth::Batch, SshAuth::Ask)
+    }
+
+    /// This sign-in for `host` (as the user typed it), which the dialog
+    /// names.
+    pub fn for_host(self, host: &str) -> SshAuth {
+        match self {
+            SshAuth::Batch => SshAuth::Batch,
+            SshAuth::Ask(askpass) => SshAuth::Ask(askpass.with_host(host)),
+        }
+    }
+
+    /// The askpass setup, when ssh may ask.
+    pub fn askpass(&self) -> Option<&shelbi_ssh::askpass::Askpass> {
+        match self {
+            SshAuth::Batch => None,
+            SshAuth::Ask(askpass) => Some(askpass),
+        }
+    }
+}
+
+/// The `-o` options a remote-session `ssh` runs with: `BatchMode=yes` for
+/// [`SshAuth::Batch`] (an explicit `BatchMode=no` when it may ask), the
+/// [`COMMON_OPTIONS`], and the shared connection on `control_path` when
+/// there is one.
+pub fn ssh_options(auth: &SshAuth, control_path: Option<&str>) -> Vec<String> {
+    let batch = match auth {
+        SshAuth::Batch => "BatchMode=yes",
+        SshAuth::Ask(_) => "BatchMode=no",
+    };
+    let mut options: Vec<String> = vec!["-o".into(), batch.into()];
+    options.extend(COMMON_OPTIONS.iter().map(|o| o.to_string()));
+    if let Some(path) = control_path {
+        options.extend([
+            "-o".to_string(),
+            "ControlMaster=auto".to_string(),
+            "-o".to_string(),
+            format!("ControlPersist={CONTROL_PERSIST}"),
+            "-o".to_string(),
+            format!("ControlPath={path}"),
+        ]);
+    }
+    options
+}
+
+/// Where the remote-session connections are shared: Shelbi's ssh directory,
+/// as `r-%C` (OpenSSH's connection hash, so the path stays short). Apart from
+/// the hub's own machine connections (`%C` in the same directory), which
+/// carry a forward of this machine's hub that a remote session must not.
+/// `None` when the directory can't be made (each step then signs in alone).
+pub fn remote_control_path() -> Option<String> {
+    shelbi_state::ensure_ssh_control_dir().ok()?;
+    let dir = shelbi_state::ssh_control_dir().ok()?;
+    Some(format!("{}/r-%C", dir.display()))
+}
 
 /// One project in a [`RemoteListing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +233,10 @@ pub struct SshOutput {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// Whether `ssh` could ask the user ([`SshAuth::Ask`]). A sign-in that
+    /// failed after asking was refused (or cancelled); one that couldn't ask
+    /// may only have wanted a password.
+    pub asked: bool,
 }
 
 /// Running a script on a host. The seam [`SshRemote`] drives, so tests can
@@ -161,58 +247,29 @@ pub trait SshTransport: Send + Sync {
     fn run(&self, host: &str, script: &str, deadline: Duration) -> std::io::Result<SshOutput>;
 }
 
-/// The host's `ssh` with [`SSH_OPTIONS`].
+/// The host's `ssh` with [`ssh_options`]: asking through the dialog where it
+/// can ([`SshAuth::detect`]), on the shared connection
+/// ([`remote_control_path`]). The deadline doesn't count time a dialog is
+/// open.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenSsh;
 
 impl SshTransport for OpenSsh {
     fn run(&self, host: &str, script: &str, deadline: Duration) -> std::io::Result<SshOutput> {
-        let mut child = Command::new("ssh")
-            .args(SSH_OPTIONS)
+        let auth = SshAuth::detect().for_host(host);
+        let mut cmd = Command::new("ssh");
+        cmd.args(ssh_options(&auth, remote_control_path().as_deref()))
             .arg(host)
             .arg("--")
-            .arg(remote_sh(script))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
-        let started = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if started.elapsed() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("no answer after {}s", deadline.as_secs()),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+            .arg(remote_sh(script));
+        let out = shelbi_ssh::askpass::run_until(&mut cmd, auth.askpass(), deadline)?;
         Ok(SshOutput {
-            code: status.code(),
-            stdout: stdout.join().unwrap_or_default(),
-            stderr: stderr.join().unwrap_or_default(),
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            asked: auth.askpass().is_some(),
         })
     }
-}
-
-/// Read a child's pipe to the end on its own thread, so a chatty one never
-/// blocks on a full pipe.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut pipe) = pipe {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            text = String::from_utf8_lossy(&bytes).into_owned();
-        }
-        text
-    })
 }
 
 /// `script` as the one remote command word `ssh` hands the far login shell:
@@ -269,16 +326,41 @@ exec \"$P\" __ensure-daemon
 /// The command a client runs, in a terminal, to open `session`: the host's
 /// own TUI for the project, over `ssh -t`. The far TUI attaches to the
 /// project's running sessions, so running this again after a drop picks up
-/// where the user left off.
+/// where the user left off. It rides the connection the connect steps
+/// opened, so it normally signs in with nothing to ask.
 pub fn terminal_command(session: &RemoteSession) -> Vec<String> {
+    if cfg!(test) {
+        // This crate's tests drive the reconnect loop through this: keep them
+        // off the real Shelbi home and independent of the machine's GUI.
+        return terminal_command_with(session, &SshAuth::Batch, None);
+    }
+    terminal_command_with(session, &SshAuth::detect(), remote_control_path().as_deref())
+}
+
+/// [`terminal_command`] for a given sign-in and shared connection. When ssh
+/// may ask, the command starts with `env` setting the askpass variables (it
+/// runs in a terminal session that only takes an argv); they name the
+/// helper and say to use it, and carry nothing secret.
+pub fn terminal_command_with(session: &RemoteSession, auth: &SshAuth, control_path: Option<&str>) -> Vec<String> {
     let script = format!(
         "{FIND_SHELBI}if [ -z \"$P\" ]; then echo 'Shelbi isn'\\''t installed on this machine.' >&2; exit 127; fi
 exec \"$P\" --project {}
 ",
         shelbi_core::shell_escape(&session.project)
     );
-    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
-    argv.extend(SSH_OPTIONS.iter().map(|o| o.to_string()));
+    let mut argv = Vec::new();
+    let auth = auth.clone().for_host(&session.host);
+    if let Some(askpass) = auth.askpass() {
+        argv.push("env".to_string());
+        argv.extend(
+            askpass
+                .env()
+                .into_iter()
+                .map(|(key, value)| format!("{key}={}", value.to_string_lossy())),
+        );
+    }
+    argv.extend(["ssh".to_string(), "-t".to_string()]);
+    argv.extend(ssh_options(&auth, control_path));
     argv.push(session.host.clone());
     argv.push("--".to_string());
     argv.push(remote_sh(&script));
@@ -478,6 +560,7 @@ pub fn classify_ssh_failure(host: &str, out: &SshOutput) -> Option<RemoteError> 
         return Some(RemoteError::AuthFailed {
             host: host_s,
             reason: reason(),
+            asked: out.asked,
         });
     }
     if out.code == Some(SSH_CONNECTION_LOST) || UNREACHABLE_MARKERS.iter().any(|m| text.contains(m)) {
@@ -595,6 +678,7 @@ mod tests {
             code: Some(code),
             stdout: String::new(),
             stderr: stderr.into(),
+            asked: false,
         }
     }
 
@@ -628,6 +712,7 @@ mod tests {
                 M_BIN.0, M_BIN.1, M_VERSION.0, M_VERSION.1, M_LISTING.0, M_LISTING.1, M_STATUS.0, M_STATUS.1
             ),
             stderr: "zsh: no job control in this shell\n".into(),
+            asked: false,
         }
     }
 
@@ -704,7 +789,7 @@ mod tests {
                     SshOutput {
                         code: Some(0),
                         stdout: format!("motd\n{M_MISSING}\n"),
-                        stderr: String::new(),
+                        ..Default::default()
                     },
                 )
                 .answer("old", answered("shelbi 0.41.9", "error: unrecognized subcommand 'remote'", 2))
@@ -716,7 +801,8 @@ mod tests {
             err("locked"),
             RemoteError::AuthFailed {
                 host: "locked".into(),
-                reason: "jlong@locked: Permission denied (publickey,password).".into()
+                reason: "jlong@locked: Permission denied (publickey,password).".into(),
+                asked: false,
             }
         );
         assert_eq!(err("newkey"), RemoteError::HostKey { host: "newkey".into() });
@@ -823,18 +909,26 @@ mod tests {
         assert!(matches!(remote.start_daemon("locked"), Err(RemoteError::AuthFailed { .. })));
     }
 
-    #[test]
-    fn the_terminal_runs_the_hosts_tui_for_the_project_without_prompting() {
-        let session = RemoteSession {
+    fn devbox_session() -> RemoteSession {
+        RemoteSession {
             host: "jlong@devbox".into(),
             user: "jlong".into(),
             project: "shelbi".into(),
             label: None,
             path: "~/Workspaces/shelbi".into(),
-        };
-        let argv = terminal_command(&session);
+        }
+    }
+
+    fn has(argv: &[String], pair: [&str; 2]) -> bool {
+        argv.windows(2).any(|w| w == pair)
+    }
+
+    #[test]
+    fn the_terminal_runs_the_hosts_tui_for_the_project_without_prompting() {
+        let argv = terminal_command_with(&devbox_session(), &SshAuth::Batch, None);
         assert_eq!(&argv[..2], ["ssh", "-t"]);
-        assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(has(&argv, ["-o", "BatchMode=yes"]));
+        assert!(!argv.iter().any(|a| a.starts_with("Control")), "no shared connection without a path");
         assert!(!argv.iter().any(|a| a == "-R"), "never forwards this hub's socket");
         let host_at = argv.iter().position(|a| a == "jlong@devbox").unwrap();
         assert_eq!(argv[host_at + 1], "--");
@@ -842,6 +936,65 @@ mod tests {
         assert!(remote_cmd.starts_with("sh -c '"));
         assert!(remote_cmd.contains("--project shelbi"));
         assert_eq!(argv.len(), host_at + 3);
+    }
+
+    #[test]
+    fn an_interactive_terminal_asks_through_the_helper_on_the_shared_connection() {
+        let askpass = shelbi_ssh::askpass::Askpass::new("/Applications/Shelbi.app/Contents/MacOS/shelbi-desktop");
+        let argv = terminal_command_with(
+            &devbox_session(),
+            &SshAuth::Ask(askpass),
+            Some("/Users/jlong/.shelbi/ssh/r-%C"),
+        );
+        assert_eq!(
+            &argv[..5],
+            [
+                "env",
+                "SSH_ASKPASS=/Applications/Shelbi.app/Contents/MacOS/shelbi-desktop",
+                "SSH_ASKPASS_REQUIRE=force",
+                "SHELBI_ASKPASS_HELPER=1",
+                "SHELBI_ASKPASS_HOST=jlong@devbox",
+            ]
+        );
+        assert_eq!(&argv[5..7], ["ssh", "-t"]);
+        assert!(has(&argv, ["-o", "BatchMode=no"]), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "BatchMode=yes"));
+        assert!(has(&argv, ["-o", "ControlMaster=auto"]));
+        assert!(has(&argv, ["-o", "ControlPath=/Users/jlong/.shelbi/ssh/r-%C"]));
+        assert!(!argv.iter().any(|a| a == "-R"), "never forwards this hub's socket");
+        assert!(argv.iter().any(|a| a == "jlong@devbox"));
+    }
+
+    #[test]
+    fn steps_ask_only_when_a_dialog_can_be_shown() {
+        let batch = ssh_options(&SshAuth::Batch, Some("/h/ssh/r-%C"));
+        assert!(has(&batch, ["-o", "BatchMode=yes"]));
+        assert!(has(&batch, ["-o", "ConnectTimeout=10"]));
+        assert!(has(&batch, ["-o", "ServerAliveInterval=15"]));
+        assert!(has(&batch, ["-o", "ControlPersist=600"]));
+        assert!(has(&batch, ["-o", "ControlPath=/h/ssh/r-%C"]));
+
+        let ask = ssh_options(
+            &SshAuth::Ask(shelbi_ssh::askpass::Askpass::new("/usr/local/bin/shelbi")),
+            None,
+        );
+        assert!(has(&ask, ["-o", "BatchMode=no"]));
+        assert!(has(&ask, ["-o", "ConnectTimeout=10"]), "still bounded");
+        assert!(!ask.iter().any(|a| a.starts_with("Control")));
+    }
+
+    #[test]
+    fn a_refused_sign_in_after_asking_is_just_the_reason() {
+        let mut out = failed(255, "jlong@devbox: Permission denied (publickey,password).");
+        out.asked = true;
+        let err = classify_ssh_failure("devbox", &out).unwrap();
+        assert_eq!(
+            err.to_string(),
+            "Couldn't sign in to devbox: jlong@devbox: Permission denied (publickey,password)."
+        );
+        out.asked = false;
+        let err = classify_ssh_failure("devbox", &out).unwrap().to_string();
+        assert!(err.contains("ssh-add"), "without a dialog it says what to do: {err}");
     }
 
     #[test]
