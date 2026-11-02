@@ -425,6 +425,17 @@ enum Cmd {
     /// session state. Not for direct use.
     #[command(hide = true)]
     Relay(commands::relay::Args),
+    /// (internal) Ask the user for what an `ssh` prompt wants (a password, a
+    /// passphrase, a yes/no) in a macOS dialog and print the answer for ssh.
+    /// ssh runs Shelbi as its askpass program with `SHELBI_ASKPASS_HELPER=1`
+    /// (handled before argument parsing); this is the same helper by name,
+    /// for trying it by hand. Exits non-zero on Cancel.
+    #[command(hide = true)]
+    #[command(name = "ssh-askpass")]
+    SshAskpass {
+        /// The prompt to show.
+        prompt: Option<String>,
+    },
     /// What another machine's Connect to Remote Session dialog reads from
     /// this one over `ssh`: `shelbi remote list [--json]` prints the user,
     /// version, daemon state and projects. Read-only.
@@ -442,6 +453,12 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // ssh running Shelbi as its askpass program: `shelbi "<prompt>"` with
+    // `SHELBI_ASKPASS_HELPER=1`. Before anything parses, logs or touches
+    // state: this process only shows the dialog.
+    if let Some(code) = shelbi_ssh::askpass::helper_requested() {
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
     let init_has_project_root = matches!(cli.cmd.as_ref(), Some(Cmd::Init(_)))
         && init_project_root_was_explicit(std::env::args_os());
@@ -544,6 +561,9 @@ fn main() -> Result<()> {
         }
         Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
         Some(Cmd::SessionProcess(args)) => commands::session::run(args),
+        Some(Cmd::SshAskpass { prompt }) => {
+            std::process::exit(shelbi_ssh::askpass::run_helper(prompt.as_deref().unwrap_or_default()))
+        }
         Some(Cmd::Relay(args)) => commands::relay::run(args),
         Some(Cmd::Remote { cmd }) => commands::remote::run(cmd),
         Some(Cmd::Session { cmd }) => commands::session_cli::run(cli.project, cmd),

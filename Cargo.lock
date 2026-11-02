@@ -1729,6 +1729,7 @@ dependencies = [
  "shelbi-core",
  "shelbi-palette",
  "shelbi-proto",
+ "shelbi-ssh",
  "shelbi-state",
  "thiserror 1.0.69",
  "tracing",

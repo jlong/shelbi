@@ -118,6 +118,9 @@ impl Sandbox {
             .env("SHELBI_HUB_SOCK", self.hub_sock())
             .env("SHELBI_CONTROL_SOCK", self.shelbi_home().join("control.sock"))
             .env("STUB_SSH_LOG", self.root.join("ssh.log"))
+            // As with no GUI session: the password dialog is never offered,
+            // whatever machine runs the test.
+            .env("SHELBI_ASKPASS", "never")
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -153,6 +156,7 @@ fn connecting_opens_the_hosts_shelbi_and_remembers_the_session() {
     assert_eq!(runs.len(), 3, "{log}");
     for run in &runs {
         assert!(run.contains("BatchMode=yes"), "never prompts: {run}");
+        assert!(run.contains("ControlMaster=auto"), "the steps share one sign-in: {run}");
         assert!(!run.contains(" -R "), "never forwards this hub: {run}");
     }
     assert!(runs[0].contains("remote list --json"));

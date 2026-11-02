@@ -31,7 +31,8 @@ pub enum RemoteCmd {
         json: bool,
     },
     /// Open a project of Shelbi on another machine in this terminal, over
-    /// your own `ssh` (keys, agent and `~/.ssh/config`; never a password).
+    /// your own `ssh` (keys, agent and `~/.ssh/config`; on macOS a password or
+    /// passphrase is asked for in a dialog when ssh needs one).
     /// Reconnects when the connection drops; Esc stops. If Shelbi isn't
     /// running there, asks before starting it (`--yes` starts it).
     Connect {

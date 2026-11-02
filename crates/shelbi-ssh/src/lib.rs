@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use shelbi_core::Host;
 
+pub mod askpass;
+
 /// An ambient cancellation scope installed on a thread for the duration of a
 /// daemon job (`shelbi_orchestrator::cancel`). While it is set, the otherwise
 /// *unbounded* entry points ([`run`], [`run_capture`]) run with the scope's
@@ -408,6 +410,114 @@ where
             }
             cmd
         }
+    }
+}
+
+/// How long [`sign_in`] may take, not counting time a password dialog is
+/// open. Generous: the far side starts a login shell.
+pub const SIGN_IN_DEADLINE: Duration = Duration::from_secs(25);
+
+/// Why [`sign_in`] couldn't open a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInError {
+    /// The host refused the user (a wrong password, a Cancel, no usable key).
+    /// The text is ssh's reason.
+    Auth(String),
+    /// SSH doesn't trust the host's key (unknown and not accepted, or
+    /// changed).
+    HostKey(String),
+    /// The host couldn't be reached, or didn't answer in time.
+    Unreachable(String),
+}
+
+/// Sign in to `host` for a connection the **user** started (opening a remote
+/// workspace): make sure Shelbi's ControlMaster to it is up, asking through
+/// `askpass`'s dialog when ssh needs a password, a passphrase or a host-key
+/// decision. Every later Shelbi `ssh` to the host — the relay, and the hub's
+/// background polling, which stays `BatchMode=yes` — then rides that master
+/// without signing in again.
+///
+/// A live master is used as is. Otherwise this runs `ssh <host> true` with
+/// the managed connection options (the `-R` hub forward included, since the
+/// master it opens is the one every later command shares), minus
+/// `BatchMode=yes` when `askpass` is given. With `askpass` `None` (no dialog
+/// possible) it stays in batch mode and only finds out why a sign-in fails.
+/// `deadline` excludes the time a dialog is open.
+///
+/// Never call this from background work: only a user's action may ask.
+pub fn sign_in(
+    host: &Host,
+    askpass: Option<&askpass::Askpass>,
+    deadline: Duration,
+) -> Result<(), SignInError> {
+    let Host::Ssh { host: hostname } = host else {
+        return Ok(());
+    };
+    if master_alive(hostname) {
+        return Ok(());
+    }
+    let mut cmd = Command::new("ssh");
+    cmd.args(sign_in_argv(hostname, build_ssh_control_opts(hostname), askpass.is_some()));
+    let out = askpass::run_until(&mut cmd, askpass, deadline)
+        .map_err(|e| SignInError::Unreachable(e.to_string()))?;
+    classify_sign_in(&out)
+}
+
+/// The `ssh` argv [`sign_in`] runs: the managed `opts`, with `BatchMode=yes`
+/// dropped when the user may be asked (`interactive`), then `<host> -- true`.
+/// Pure so the interactive / batch split is unit-testable.
+pub fn sign_in_argv(hostname: &str, opts: Vec<String>, interactive: bool) -> Vec<String> {
+    let mut argv = if interactive { allow_prompts(opts) } else { opts };
+    argv.extend([hostname.to_string(), "--".to_string(), "true".to_string()]);
+    argv
+}
+
+/// `opts` with `BatchMode=yes` turned into `BatchMode=no` (an explicit `no`,
+/// so a `BatchMode yes` in the user's `~/.ssh/config` doesn't silently win).
+fn allow_prompts(opts: Vec<String>) -> Vec<String> {
+    opts.into_iter()
+        .map(|o| {
+            if o == "BatchMode=yes" {
+                "BatchMode=no".to_string()
+            } else {
+                o
+            }
+        })
+        .collect()
+}
+
+/// Read a sign-in's result. A remote `true` that ran is in, whatever the
+/// login shell said; only ssh's own failure (exit 255) is classified.
+fn classify_sign_in(out: &Output) -> Result<(), SignInError> {
+    if out.status.code() != Some(255) && out.status.code().is_some() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lowered = stderr.to_ascii_lowercase();
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("ssh exited without saying why")
+        .trim_start_matches("ssh: ")
+        .to_string();
+    const HOST_KEY: &[&str] = &[
+        "host key verification failed",
+        "remote host identification has changed",
+        "no matching host key",
+    ];
+    const AUTH: &[&str] = &[
+        "permission denied",
+        "authentication failed",
+        "too many authentication failures",
+        "no supported authentication methods",
+    ];
+    if HOST_KEY.iter().any(|m| lowered.contains(m)) {
+        Err(SignInError::HostKey(reason))
+    } else if AUTH.iter().any(|m| lowered.contains(m)) {
+        Err(SignInError::Auth(reason))
+    } else {
+        Err(SignInError::Unreachable(reason))
     }
 }
 
@@ -1851,6 +1961,70 @@ mod tests {
             args[cp_idx].contains("/ssh/%C"),
             "ControlPath didn't carry the %C connection-hash template: {}",
             args[cp_idx],
+        );
+    }
+
+    #[test]
+    fn sign_in_asks_only_when_interactive_and_keeps_the_hub_forward() {
+        let _env = ssh_log_level_guard();
+        let opts = build_ssh_control_opts("m2.local");
+        let has = |argv: &[String], pair: [&str; 2]| argv.windows(2).any(|w| w == pair);
+
+        let interactive = sign_in_argv("m2.local", opts.clone(), true);
+        assert!(has(&interactive, ["-o", "BatchMode=no"]), "{interactive:?}");
+        assert!(!interactive.iter().any(|a| a == "BatchMode=yes"));
+        assert!(has(&interactive, ["-o", "ControlMaster=auto"]));
+        assert!(interactive.iter().any(|a| a == "-R"), "the master it opens carries the forward");
+        assert!(interactive.ends_with(&["m2.local".into(), "--".into(), "true".into()]));
+
+        let batch = sign_in_argv("m2.local", opts, false);
+        assert!(has(&batch, ["-o", "BatchMode=yes"]), "{batch:?}");
+        assert!(!batch.iter().any(|a| a == "BatchMode=no"));
+    }
+
+    #[test]
+    fn background_ssh_never_asks() {
+        // Every command the hub's polling builds stays in batch mode and
+        // carries no askpass setup, so it can never pop a dialog.
+        let _env = ssh_log_level_guard();
+        let host = Host::Ssh {
+            host: "m2.local".into(),
+        };
+        for cmd in [build_command(&host, ["true"]), build_pty_command(&host, ["vi"])] {
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]), "{args:?}");
+            assert!(
+                cmd.get_envs().all(|(k, _)| k != "SSH_ASKPASS" && k != askpass::HELPER_ENV),
+                "no askpass on a background command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sign_in_failure_says_which() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(classify_sign_in(&out(0, "")), Ok(()));
+        // The far login shell's own complaint isn't ssh's.
+        assert_eq!(classify_sign_in(&out(1, "bash: warning")), Ok(()));
+        assert_eq!(
+            classify_sign_in(&out(255, "jlong@devbox: Permission denied (publickey,password).\n")),
+            Err(SignInError::Auth("jlong@devbox: Permission denied (publickey,password).".into()))
+        );
+        assert!(matches!(
+            classify_sign_in(&out(255, "Host key verification failed.")),
+            Err(SignInError::HostKey(_))
+        ));
+        assert_eq!(
+            classify_sign_in(&out(255, "ssh: connect to host devbox port 22: Connection refused")),
+            Err(SignInError::Unreachable("connect to host devbox port 22: Connection refused".into()))
         );
     }
 
